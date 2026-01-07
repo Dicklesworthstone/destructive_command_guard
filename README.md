@@ -116,6 +116,10 @@ If you encounter commands that should be blocked, please file an issue describin
 The easiest way to install is using the install script, which downloads a prebuilt binary for your platform:
 
 ```bash
+# With cache buster (recommended - ensures latest version)
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/git_safety_guard/master/install.sh?$(date +%s)" | bash
+
+# Without cache buster
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/git_safety_guard/master/install.sh | bash
 ```
 
@@ -123,17 +127,19 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/git_safety_guard/
 
 ```bash
 # Easy mode: auto-update PATH in shell rc files
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/git_safety_guard/master/install.sh | bash -s -- --easy-mode
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/git_safety_guard/master/install.sh?$(date +%s)" | bash -s -- --easy-mode
 
 # Install specific version
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/git_safety_guard/master/install.sh | bash -s -- --version v0.1.0
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/git_safety_guard/master/install.sh?$(date +%s)" | bash -s -- --version v0.1.0
 
 # Install to /usr/local/bin (system-wide, requires sudo)
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/git_safety_guard/master/install.sh | sudo bash -s -- --system
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/git_safety_guard/master/install.sh?$(date +%s)" | sudo bash -s -- --system
 
 # Build from source instead of downloading binary
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/git_safety_guard/master/install.sh | bash -s -- --from-source
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/git_safety_guard/master/install.sh?$(date +%s)" | bash -s -- --from-source
 ```
+
+> **Note:** If you have [gum](https://github.com/charmbracelet/gum) installed, the installer will use it for fancy terminal formatting.
 
 The install script:
 - Automatically detects your OS and architecture
@@ -199,6 +205,32 @@ Add to `~/.claude/settings.json`:
 
 **Important:** Restart Claude Code after adding the hook configuration.
 
+## CLI Usage
+
+While primarily designed as a hook, the binary supports direct invocation for testing and debugging:
+
+```bash
+# Show version with build metadata
+git_safety_guard --version
+
+# Show help with blocked command categories
+git_safety_guard --help
+
+# Test a command manually (pipe JSON to stdin)
+echo '{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}' | git_safety_guard
+```
+
+The `--version` output includes build metadata for debugging:
+
+```
+git_safety_guard 0.1.0
+  Built: 2026-01-07T22:13:10.413872881Z
+  Rustc: 1.94.0-nightly
+  Target: x86_64-unknown-linux-gnu
+```
+
+This metadata is embedded at compile time via [vergen](https://github.com/rustyhorde/vergen), making it easy to identify exactly which build is running when troubleshooting.
+
 ## How It Works
 
 1. Claude Code invokes the hook before executing any Bash command
@@ -210,6 +242,15 @@ Add to `~/.claude/settings.json`:
 7. If safe: exits silently (no output = allow)
 
 The hook is designed for minimal latency with sub-millisecond execution on typical commands.
+
+### Output Behavior
+
+The hook uses two separate output channels:
+
+- **stdout (JSON)**: The Claude Code hook protocol response. On denial, outputs JSON with `permissionDecision: "deny"`. On allow, outputs nothing.
+- **stderr (colorful text)**: A human-readable warning when commands are blocked. Colors are automatically disabled when stderr is not a TTY (e.g., when piped to a file).
+
+This dual-output design ensures the hook protocol works correctly while still providing immediate visual feedback to users watching the terminal.
 
 ## Architecture
 
@@ -451,17 +492,23 @@ static SAFE_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
 
 Subsequent invocations reuse the compiled patterns with zero compilation overhead.
 
-### 2. Quick Rejection Filter
+### 2. SIMD-Accelerated Quick Rejection
 
-Before any regex matching, a simple substring check filters out irrelevant commands:
+Before any regex matching, a SIMD-accelerated substring search filters out irrelevant commands. The [memchr](https://github.com/BurntSushi/memchr) crate uses CPU vector instructions (SSE2, AVX2, NEON) when available:
 
 ```rust
+use memchr::memmem;
+
+static GIT_FINDER: LazyLock<memmem::Finder<'static>> = LazyLock::new(|| memmem::Finder::new("git"));
+static RM_FINDER: LazyLock<memmem::Finder<'static>> = LazyLock::new(|| memmem::Finder::new("rm"));
+
 fn quick_reject(cmd: &str) -> bool {
-    !(cmd.contains("git") || cmd.contains("rm"))
+    let bytes = cmd.as_bytes();
+    GIT_FINDER.find(bytes).is_none() && RM_FINDER.find(bytes).is_none()
 }
 ```
 
-For commands like `ls -la`, `cargo build`, or `npm install`, this check short-circuits the entire matching pipeline.
+For commands like `ls -la`, `cargo build`, or `npm install`, this check short-circuits the entire matching pipeline. The `memmem::Finder` is pre-compiled once and reused, avoiding repeated setup costs.
 
 ### 3. Early Exit on Safe Match
 
@@ -494,7 +541,23 @@ macro_rules! pattern {
 
 The `serde_json` parser operates on the input buffer without unnecessary copies. The command string is extracted directly from the parsed JSON value.
 
-### 6. Release Profile Optimization
+### 6. Zero-Allocation Path Normalization
+
+Command normalization uses `Cow<str>` (copy-on-write) to avoid heap allocations in the common case:
+
+```rust
+fn normalize_command(cmd: &str) -> Cow<'_, str> {
+    // Fast path: if command doesn't start with '/', no normalization needed
+    if !cmd.starts_with('/') {
+        return Cow::Borrowed(cmd);  // Zero allocation
+    }
+    PATH_NORMALIZER.replace(cmd, "$1")  // Allocation only when path is stripped
+}
+```
+
+Most commands don't use absolute paths to `git` or `rm`, so this fast path avoids allocation entirely for 99%+ of inputs.
+
+### 7. Release Profile Optimization
 
 The release build uses aggressive optimization settings:
 
@@ -509,17 +572,40 @@ strip = true        # Remove debug symbols
 
 ## Example Block Message
 
-When a destructive command is intercepted:
+When a destructive command is intercepted, the hook outputs a colorful warning to stderr (shown below without ANSI codes):
 
 ```
-BLOCKED by git_safety_guard
+════════════════════════════════════════════════════════════════════════
+BLOCKED  git_safety_guard
+────────────────────────────────────────────────────────────────────────
+Reason:  git reset --hard destroys uncommitted changes. Use 'git stash' first.
 
-Reason: git reset --hard destroys uncommitted changes. Use 'git stash' first.
+Command:  git reset --hard HEAD~1
 
-Command: git reset --hard HEAD~1
+Tip: If you need to run this command, execute it manually in a terminal.
+     Consider using 'git stash' first to save your changes.
+════════════════════════════════════════════════════════════════════════
+```
 
-If this operation is truly needed, ask the user for explicit permission
-and have them run the command manually.
+The hook provides **contextual suggestions** based on the command type:
+
+| Command Type | Suggestion |
+|-------------|------------|
+| `git reset`, `git checkout --` | "Consider using 'git stash' first to save your changes." |
+| `git clean` | "Use 'git clean -n' first to preview what would be deleted." |
+| `git push --force` | "Consider using '--force-with-lease' for safer force pushing." |
+| `rm -rf` | "Verify the path carefully before running rm -rf manually." |
+
+Simultaneously, the hook outputs JSON to stdout for the Claude Code protocol:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "BLOCKED by git_safety_guard\n\nReason: ..."
+  }
+}
 ```
 
 ## Security Considerations
@@ -598,67 +684,61 @@ cargo tarpaulin --out Html
 
 ### End-to-End Testing
 
-Create a test script to verify hook behavior:
+The repository includes a comprehensive E2E test script with 120 test cases:
 
 ```bash
-#!/bin/bash
-set -e
+# Run full E2E test suite
+./scripts/e2e_test.sh
 
-# Test helper
-test_command() {
-    local cmd="$1"
-    local expected="$2"
-    local desc="$3"
+# With verbose output
+./scripts/e2e_test.sh --verbose
 
-    result=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$cmd\"}}" | git_safety_guard)
+# With specific binary path
+./scripts/e2e_test.sh --binary ./target/release/git_safety_guard
+```
 
-    if [ "$expected" = "block" ]; then
-        if echo "$result" | grep -q "permissionDecision.*deny"; then
-            echo "✓ BLOCKED: $desc"
-        else
-            echo "✗ FAILED (should block): $desc"
-            exit 1
-        fi
-    else
-        if [ -z "$result" ]; then
-            echo "✓ ALLOWED: $desc"
-        else
-            echo "✗ FAILED (should allow): $desc"
-            exit 1
-        fi
-    fi
-}
+The E2E suite covers:
+- All destructive git commands (reset, checkout, restore, clean, push, branch, stash)
+- All safe git commands (status, log, diff, add, commit, push, branch -d)
+- Filesystem commands (rm -rf with various paths and flag orderings)
+- Absolute path handling (`/usr/bin/git`, `/bin/rm`)
+- Non-Bash tools (Read, Write, Edit, Grep, Glob)
+- Malformed JSON input (empty, missing fields, invalid syntax)
+- Edge cases (sudo prefixes, quoted paths, variable expansion)
 
-# Destructive commands (should block)
-test_command "git reset --hard" "block" "git reset --hard"
-test_command "git checkout -- ." "block" "git checkout -- ."
-test_command "git restore file.txt" "block" "git restore without --staged"
-test_command "git clean -f" "block" "git clean -f"
-test_command "git push --force" "block" "git push --force"
-test_command "git push -f" "block" "git push -f"
-test_command "git branch -D feature" "block" "git branch -D"
-test_command "git stash drop" "block" "git stash drop"
-test_command "git stash clear" "block" "git stash clear"
-test_command "rm -rf /" "block" "rm -rf /"
-test_command "rm -rf ~/" "block" "rm -rf ~/"
-test_command "rm -rf ./build" "block" "rm -rf relative path"
+## Continuous Integration
 
-# Safe commands (should allow)
-test_command "git status" "allow" "git status"
-test_command "git log" "allow" "git log"
-test_command "git diff" "allow" "git diff"
-test_command "git add ." "allow" "git add"
-test_command "git commit -m test" "allow" "git commit"
-test_command "git push" "allow" "git push (no force)"
-test_command "git checkout -b feature" "allow" "git checkout -b"
-test_command "git restore --staged file" "allow" "git restore --staged"
-test_command "git clean -n" "allow" "git clean -n (dry run)"
-test_command "rm -rf /tmp/build" "allow" "rm -rf /tmp/"
-test_command "ls -la" "allow" "non-git/rm command"
-test_command "cargo build" "allow" "cargo command"
+The project uses GitHub Actions for CI/CD:
 
-echo ""
-echo "All tests passed!"
+### CI Workflow (`.github/workflows/ci.yml`)
+
+Runs on every push and pull request:
+
+- **Formatting check**: `cargo fmt --check`
+- **Clippy lints**: `cargo clippy --all-targets -- -D warnings` (pedantic + nursery enabled)
+- **Compilation check**: `cargo check --all-targets`
+- **Unit tests**: `cargo nextest run` with JUnit XML reports
+- **Coverage**: `cargo llvm-cov` with LCOV output
+
+### Release Workflow (`.github/workflows/dist.yml`)
+
+Triggered on version tags (`v*`):
+
+- Builds optimized binaries for 5 platforms:
+  - Linux x86_64 (`x86_64-unknown-linux-gnu`)
+  - Linux ARM64 (`aarch64-unknown-linux-gnu`)
+  - macOS Intel (`x86_64-apple-darwin`)
+  - macOS Apple Silicon (`aarch64-apple-darwin`)
+  - Windows (`x86_64-pc-windows-msvc`)
+- Creates `.tar.xz` archives (Unix) or `.zip` (Windows)
+- Generates SHA256 checksums for verification
+- Publishes to GitHub Releases with auto-generated release notes
+
+To create a release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 ## FAQ
