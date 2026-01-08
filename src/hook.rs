@@ -288,6 +288,7 @@ pub fn log_blocked_command(
 }
 
 /// Simple timestamp without chrono dependency.
+/// Returns Unix epoch seconds as a string (e.g., "1704672000").
 fn chrono_lite_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -296,7 +297,6 @@ fn chrono_lite_timestamp() -> String {
         .unwrap_or_default();
 
     let secs = duration.as_secs();
-    // Convert to rough ISO format (not perfect, but good enough for logging)
     format!("{secs}")
 }
 

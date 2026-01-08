@@ -42,8 +42,9 @@
 //! use destructive_command_guard::evaluator::{evaluate_command, EvaluationDecision};
 //!
 //! let config = Config::load();
+//! let compiled_overrides = config.overrides.compile();
 //! let enabled_keywords = vec!["git", "rm"];
-//! let result = evaluate_command("git status", &config, &enabled_keywords);
+//! let result = evaluate_command("git status", &config, &enabled_keywords, &compiled_overrides);
 //!
 //! if result.is_denied() {
 //!     println!("Blocked: {}", result.reason().unwrap_or("unknown"));
