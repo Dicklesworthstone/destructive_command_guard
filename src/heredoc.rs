@@ -612,7 +612,7 @@ static HERESTRING_UNQUOTED: LazyLock<Regex> = LazyLock::new(|| {
 /// Regex for inline script flag extraction with single quotes.
 static INLINE_SCRIPT_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // Matches: command -c/-e/-p/-E followed by single-quoted content
-    // Groups: (1) command, (2) flag, (3) content
+    // Groups: (1) interpreter, (2) optional "js" suffix, (3) flag, (4) content
     // Supports versioned interpreters: python3.11, ruby3.0, perl5.36, node18, nodejs20, etc.
     Regex::new(r"\b(python[0-9.]*|ruby[0-9.]*|irb[0-9.]*|perl[0-9.]*|node(js)?[0-9.]*|sh|bash|zsh|fish)\s+(-[ceEp])\s+'([^']*)'")
         .expect("inline script single-quote regex compiles")
@@ -621,7 +621,7 @@ static INLINE_SCRIPT_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
 /// Regex for inline script flag extraction with double quotes.
 static INLINE_SCRIPT_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // Matches: command -c/-e/-p/-E followed by double-quoted content
-    // Groups: (1) command, (2) flag, (3) content
+    // Groups: (1) interpreter, (2) optional "js" suffix, (3) flag, (4) content
     // Supports versioned interpreters: python3.11, ruby3.0, perl5.36, node18, nodejs20, etc.
     Regex::new(r#"\b(python[0-9.]*|ruby[0-9.]*|irb[0-9.]*|perl[0-9.]*|node(js)?[0-9.]*|sh|bash|zsh|fish)\s+(-[ceEp])\s+"([^"]*)""#)
         .expect("inline script double-quote regex compiles")

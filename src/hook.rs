@@ -232,14 +232,16 @@ pub fn print_colorful_warning(command: &str, reason: &str, pack: Option<&str>) {
     let _ = write!(handle, "{}", "│".red());
     let _ = write!(handle, "  {} ", "Command:".cyan().bold());
 
-    // Truncate very long commands for display
-    let display_cmd = if command.len() > 50 {
-        format!("{}...", &command[..47])
+    // Truncate very long commands for display (char-safe for UTF-8)
+    let display_cmd = if command.chars().count() > 50 {
+        let truncated: String = command.chars().take(47).collect();
+        format!("{truncated}...")
     } else {
         command.to_string()
     };
     let _ = write!(handle, "{}", display_cmd.bright_white().bold());
-    let cmd_line_len = "  Command: ".len() + display_cmd.len();
+    // Use char count for padding (more correct for UTF-8 than byte length)
+    let cmd_line_len = "  Command: ".len() + display_cmd.chars().count();
     let padding = WIDTH.saturating_sub(cmd_line_len);
     let _ = writeln!(handle, "{}{}", " ".repeat(padding), "│".red());
 
