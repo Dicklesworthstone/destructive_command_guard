@@ -106,8 +106,10 @@ pub use ast_matcher::{
 
 // Re-export trace types for explain mode
 pub use trace::{
-    AllowlistInfo, ExplainTrace, MatchInfo, PackSummary, TraceCollector, TraceDetails, TraceStep,
-    format_duration, truncate_utf8,
+    AllowlistInfo, EXPLAIN_JSON_SCHEMA_VERSION, ExplainJsonOutput, ExplainTrace, JsonAllowlistInfo,
+    JsonMatchInfo, JsonPackSummary, JsonSpan, JsonSuggestion, JsonTraceDetails, JsonTraceStep,
+    MatchInfo, PackSummary, TraceCollector, TraceDetails, TraceStep, format_duration,
+    truncate_utf8,
 };
 
 // Re-export suggestion types

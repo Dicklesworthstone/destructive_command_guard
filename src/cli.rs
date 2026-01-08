@@ -1070,6 +1070,16 @@ fn allowlist_add_rule(
     let parsed_rule = RuleId::parse(rule_id)
         .ok_or_else(|| format!("Invalid rule ID: {rule_id} (expected pack_id:pattern_name)"))?;
 
+    // Validate expiration date format if provided
+    if let Some(exp) = expires {
+        validate_expiration_date(exp)?;
+    }
+
+    // Validate condition formats
+    for cond in conditions {
+        validate_condition(cond)?;
+    }
+
     let path = allowlist_path_for_layer(layer);
     let mut doc = load_or_create_allowlist_doc(&path)?;
 
@@ -1110,6 +1120,11 @@ fn allowlist_add_command(
     expires: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
+
+    // Validate expiration date format if provided
+    if let Some(exp) = expires {
+        validate_expiration_date(exp)?;
+    }
 
     let path = allowlist_path_for_layer(layer);
     let mut doc = load_or_create_allowlist_doc(&path)?;
@@ -1159,13 +1174,15 @@ fn allowlist_list(
 
     let mut all_entries: Vec<(AllowlistLayer, std::path::PathBuf, AllowEntry)> = Vec::new();
 
+    // Load all allowlists once (more efficient than loading per-layer)
+    let allowlist = crate::allowlist::load_default_allowlists();
+
     for layer in layers {
         let path = allowlist_path_for_layer(layer);
         if !path.exists() {
             continue;
         }
 
-        let allowlist = crate::allowlist::load_default_allowlists();
         for loaded in &allowlist.layers {
             if loaded.layer == layer {
                 for entry in &loaded.file.entries {
@@ -1316,6 +1333,9 @@ fn allowlist_validate(
     let mut errors = 0;
     let mut warnings = 0;
 
+    // Load all allowlists once (more efficient than loading per-layer)
+    let allowlist = crate::allowlist::load_default_allowlists();
+
     for layer in layers {
         let path = allowlist_path_for_layer(layer);
         if !path.exists() {
@@ -1324,7 +1344,6 @@ fn allowlist_validate(
 
         println!("{} allowlist: {}", layer.label().bold(), path.display());
 
-        let allowlist = crate::allowlist::load_default_allowlists();
         for loaded in &allowlist.layers {
             if loaded.layer != layer {
                 continue;
@@ -1594,6 +1613,40 @@ fn is_expired(timestamp: &str) -> bool {
         return utc < chrono::Utc::now();
     }
     false
+}
+
+/// Validate and optionally warn about expiration date format.
+/// Returns Ok(()) if valid or parseable, Err with message if completely invalid.
+fn validate_expiration_date(timestamp: &str) -> Result<(), String> {
+    // Try RFC 3339 first (e.g., "2030-01-01T00:00:00Z" or "2030-01-01T00:00:00+00:00")
+    if chrono::DateTime::parse_from_rfc3339(timestamp).is_ok() {
+        return Ok(());
+    }
+    // Try ISO 8601 without timezone
+    if chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S").is_ok() {
+        return Ok(());
+    }
+    // Try date only (YYYY-MM-DD) - treat as midnight UTC
+    if chrono::NaiveDate::parse_from_str(timestamp, "%Y-%m-%d").is_ok() {
+        return Ok(());
+    }
+    Err(format!(
+        "Invalid expiration date format: '{timestamp}'. \
+         Expected ISO 8601 format (e.g., '2030-01-01', '2030-01-01T00:00:00Z')"
+    ))
+}
+
+/// Validate condition format (KEY=VALUE).
+fn validate_condition(condition: &str) -> Result<(), String> {
+    if condition.contains('=') {
+        let parts: Vec<&str> = condition.splitn(2, '=').collect();
+        if parts.len() == 2 && !parts[0].trim().is_empty() {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "Invalid condition format: '{condition}'. Expected KEY=VALUE format (e.g., 'CI=true')"
+    ))
 }
 
 #[cfg(test)]
@@ -1903,5 +1956,45 @@ mod tests {
         assert!(!is_expired("2099-12-31T23:59:59Z"));
         // Invalid date should not be considered expired
         assert!(!is_expired("not-a-date"));
+    }
+
+    #[test]
+    fn test_validate_expiration_date_valid_formats() {
+        // RFC 3339 with Z
+        assert!(validate_expiration_date("2030-01-01T00:00:00Z").is_ok());
+        // RFC 3339 with offset
+        assert!(validate_expiration_date("2030-01-01T00:00:00+00:00").is_ok());
+        // ISO 8601 without timezone
+        assert!(validate_expiration_date("2030-01-01T00:00:00").is_ok());
+        // Date only
+        assert!(validate_expiration_date("2030-01-01").is_ok());
+    }
+
+    #[test]
+    fn test_validate_expiration_date_invalid_formats() {
+        // Not a date
+        assert!(validate_expiration_date("not-a-date").is_err());
+        // Wrong format
+        assert!(validate_expiration_date("01/01/2030").is_err());
+        // Empty
+        assert!(validate_expiration_date("").is_err());
+    }
+
+    #[test]
+    fn test_validate_condition_valid() {
+        assert!(validate_condition("CI=true").is_ok());
+        assert!(validate_condition("ENV=production").is_ok());
+        assert!(validate_condition("KEY=value with spaces").is_ok());
+        assert!(validate_condition("EMPTY=").is_ok()); // empty value is OK
+    }
+
+    #[test]
+    fn test_validate_condition_invalid() {
+        // No equals sign
+        assert!(validate_condition("invalid").is_err());
+        // Empty key
+        assert!(validate_condition("=value").is_err());
+        // Just equals
+        assert!(validate_condition("=").is_err());
     }
 }

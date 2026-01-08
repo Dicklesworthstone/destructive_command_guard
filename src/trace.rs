@@ -42,7 +42,11 @@
 
 use crate::allowlist::AllowlistLayer;
 use crate::evaluator::{EvaluationDecision, MatchSource};
+use serde::Serialize;
 use std::time::Instant;
+
+/// Current JSON schema version for explain output.
+pub const EXPLAIN_JSON_SCHEMA_VERSION: u32 = 1;
 
 /// A complete trace of a command evaluation.
 ///
@@ -356,7 +360,7 @@ impl ExplainTrace {
     /// Format examples:
     /// - `ALLOW (94us) git status`
     /// - `DENY core.git:reset-hard (847us) git reset --hard — destroys uncommitted changes`
-    /// - `WARN containers.docker:system-prune (1.2ms) docker system prune -af — removes all unused data`
+    /// - `DENY containers.docker:system-prune (1.2ms) docker system prune -af — removes all unused data`
     ///
     /// The command is truncated to `max_command_len` characters (default 60) with UTF-8 safety.
     #[must_use]
@@ -396,12 +400,15 @@ impl ExplainTrace {
     ///
     /// Set `use_color` to enable ANSI color codes for terminal output.
     #[must_use]
+    #[allow(clippy::too_many_lines, clippy::format_push_string)]
     pub fn format_pretty(&self, use_color: bool) -> String {
         let mut out = String::with_capacity(1024);
 
         // Color helpers
         let (bold, reset, green, red, yellow, cyan, dim) = if use_color {
-            ("\x1b[1m", "\x1b[0m", "\x1b[32m", "\x1b[31m", "\x1b[33m", "\x1b[36m", "\x1b[2m")
+            (
+                "\x1b[1m", "\x1b[0m", "\x1b[32m", "\x1b[31m", "\x1b[33m", "\x1b[36m", "\x1b[2m",
+            )
         } else {
             ("", "", "", "", "", "", "")
         };
@@ -409,9 +416,13 @@ impl ExplainTrace {
         // ═══════════════════════════════════════════════════════════════════
         // HEADER
         // ═══════════════════════════════════════════════════════════════════
-        out.push_str(&format!("{bold}══════════════════════════════════════════════════════════════════{reset}\n"));
+        out.push_str(&format!(
+            "{bold}══════════════════════════════════════════════════════════════════{reset}\n"
+        ));
         out.push_str(&format!("{bold}DCG EXPLAIN{reset}\n"));
-        out.push_str(&format!("{bold}══════════════════════════════════════════════════════════════════{reset}\n\n"));
+        out.push_str(&format!(
+            "{bold}══════════════════════════════════════════════════════════════════{reset}\n\n"
+        ));
 
         // Decision with color
         let decision_str = match self.decision {
@@ -419,13 +430,18 @@ impl ExplainTrace {
             EvaluationDecision::Deny => format!("{red}{bold}DENY{reset}"),
         };
         out.push_str(&format!("{bold}Decision:{reset} {decision_str}\n"));
-        out.push_str(&format!("{bold}Latency:{reset}  {}\n", format_duration(self.total_duration_us)));
+        out.push_str(&format!(
+            "{bold}Latency:{reset}  {}\n",
+            format_duration(self.total_duration_us)
+        ));
         out.push('\n');
 
         // ═══════════════════════════════════════════════════════════════════
         // COMMAND
         // ═══════════════════════════════════════════════════════════════════
-        out.push_str(&format!("{bold}─── Command ───────────────────────────────────────────────────────{reset}\n"));
+        out.push_str(&format!(
+            "{bold}─── Command ───────────────────────────────────────────────────────{reset}\n"
+        ));
         out.push_str(&format!("{cyan}Input:{reset}      {}\n", &self.command));
 
         if let Some(ref normalized) = self.normalized_command {
@@ -445,10 +461,14 @@ impl ExplainTrace {
         // MATCH INFO (for denials or allowlisted commands)
         // ═══════════════════════════════════════════════════════════════════
         if let Some(ref info) = self.match_info {
-            out.push_str(&format!("{bold}─── Match ─────────────────────────────────────────────────────────{reset}\n"));
+            out.push_str(&format!(
+                "{bold}─── Match ─────────────────────────────────────────────────────────{reset}\n"
+            ));
 
             if let Some(ref rule_id) = info.rule_id {
-                out.push_str(&format!("{cyan}Rule ID:{reset}    {yellow}{rule_id}{reset}\n"));
+                out.push_str(&format!(
+                    "{cyan}Rule ID:{reset}    {yellow}{rule_id}{reset}\n"
+                ));
             }
 
             if let Some(ref pack_id) = info.pack_id {
@@ -477,13 +497,23 @@ impl ExplainTrace {
         // ALLOWLIST OVERRIDE
         // ═══════════════════════════════════════════════════════════════════
         if let Some(ref al_info) = self.allowlist_info {
-            out.push_str(&format!("{bold}─── Allowlist Override ────────────────────────────────────────────{reset}\n"));
+            out.push_str(&format!(
+                "{bold}─── Allowlist Override ────────────────────────────────────────────{reset}\n"
+            ));
             out.push_str(&format!("{cyan}Layer:{reset}      {:?}\n", al_info.layer));
-            out.push_str(&format!("{cyan}Reason:{reset}     {}\n", al_info.entry_reason));
+            out.push_str(&format!(
+                "{cyan}Reason:{reset}     {}\n",
+                al_info.entry_reason
+            ));
 
             // Show what was overridden
-            out.push_str(&format!("{dim}(Overrode {}: {}){reset}\n",
-                al_info.original_match.rule_id.as_deref().unwrap_or("unknown"),
+            out.push_str(&format!(
+                "{dim}(Overrode {}: {}){reset}\n",
+                al_info
+                    .original_match
+                    .rule_id
+                    .as_deref()
+                    .unwrap_or("unknown"),
                 al_info.original_match.reason
             ));
             out.push('\n');
@@ -493,15 +523,26 @@ impl ExplainTrace {
         // PACK SUMMARY
         // ═══════════════════════════════════════════════════════════════════
         if let Some(ref summary) = self.pack_summary {
-            out.push_str(&format!("{bold}─── Pack Evaluation ───────────────────────────────────────────────{reset}\n"));
-            out.push_str(&format!("{cyan}Enabled:{reset}    {} packs\n", summary.enabled_count));
+            out.push_str(&format!(
+                "{bold}─── Pack Evaluation ───────────────────────────────────────────────{reset}\n"
+            ));
+            out.push_str(&format!(
+                "{cyan}Enabled:{reset}    {} packs\n",
+                summary.enabled_count
+            ));
 
             if !summary.evaluated.is_empty() {
-                out.push_str(&format!("{cyan}Evaluated:{reset}  {}\n", summary.evaluated.join(", ")));
+                out.push_str(&format!(
+                    "{cyan}Evaluated:{reset}  {}\n",
+                    summary.evaluated.join(", ")
+                ));
             }
 
             if !summary.skipped.is_empty() {
-                out.push_str(&format!("{dim}Skipped (keyword gating): {}{reset}\n", summary.skipped.join(", ")));
+                out.push_str(&format!(
+                    "{dim}Skipped (keyword gating): {}{reset}\n",
+                    summary.skipped.join(", ")
+                ));
             }
             out.push('\n');
         }
@@ -510,7 +551,9 @@ impl ExplainTrace {
         // PIPELINE TRACE (steps)
         // ═══════════════════════════════════════════════════════════════════
         if !self.steps.is_empty() {
-            out.push_str(&format!("{bold}─── Pipeline Trace ────────────────────────────────────────────────{reset}\n"));
+            out.push_str(&format!(
+                "{bold}─── Pipeline Trace ────────────────────────────────────────────────{reset}\n"
+            ));
 
             for step in &self.steps {
                 let duration_str = format_duration(step.duration_us);
@@ -534,7 +577,11 @@ impl ExplainTrace {
                         out.push_str(&format!("{bold}─── Suggestions ───────────────────────────────────────────────────{reset}\n"));
 
                         for s in suggestions {
-                            out.push_str(&format!("{yellow}• {}{reset}: {}\n", s.kind.label(), s.text));
+                            out.push_str(&format!(
+                                "{yellow}• {}{reset}: {}\n",
+                                s.kind.label(),
+                                s.text
+                            ));
                             if let Some(ref cmd) = s.command {
                                 out.push_str(&format!("  {dim}${reset} {green}{cmd}{reset}\n"));
                             }
@@ -551,20 +598,396 @@ impl ExplainTrace {
         // ═══════════════════════════════════════════════════════════════════
         // FOOTER
         // ═══════════════════════════════════════════════════════════════════
-        out.push_str(&format!("{bold}══════════════════════════════════════════════════════════════════{reset}\n"));
+        out.push_str(&format!(
+            "{bold}══════════════════════════════════════════════════════════════════{reset}\n"
+        ));
 
         out
+    }
+
+    /// Format the trace as JSON output.
+    ///
+    /// Returns a stable, versioned JSON representation suitable for:
+    /// - CI/CD tooling
+    /// - Bug reports
+    /// - Snapshot testing
+    ///
+    /// The JSON includes `schema_version` for forward compatibility.
+    /// Field ordering is stable (follows struct definition order).
+    #[must_use]
+    pub fn format_json(&self) -> String {
+        let json_output = self.to_json_output();
+        // Use pretty printing for human readability
+        serde_json::to_string_pretty(&json_output)
+            .unwrap_or_else(|e| format!("{{\"error\": \"JSON serialization failed: {e}\"}}"))
+    }
+
+    /// Convert to JSON-serializable output structure.
+    #[must_use]
+    pub fn to_json_output(&self) -> ExplainJsonOutput {
+        // Collect suggestions from registry if we have a rule_id
+        let suggestions: Vec<JsonSuggestion> = self
+            .match_info
+            .as_ref()
+            .and_then(|m| m.rule_id.as_deref())
+            .and_then(crate::suggestions::get_suggestions)
+            .map(|slist| {
+                slist
+                    .iter()
+                    .map(|s| JsonSuggestion {
+                        kind: s.kind.label().to_string(),
+                        text: s.text.clone(),
+                        command: s.command.clone(),
+                        url: s.url.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        ExplainJsonOutput {
+            schema_version: EXPLAIN_JSON_SCHEMA_VERSION,
+            command: self.command.clone(),
+            normalized_command: self.normalized_command.clone(),
+            sanitized_command: self.sanitized_command.clone(),
+            decision: match self.decision {
+                EvaluationDecision::Allow => "allow".to_string(),
+                EvaluationDecision::Deny => "deny".to_string(),
+            },
+            total_duration_us: self.total_duration_us,
+            steps: self.steps.iter().map(TraceStep::to_json).collect(),
+            match_info: self.match_info.as_ref().map(MatchInfo::to_json),
+            allowlist: self.allowlist_info.as_ref().map(AllowlistInfo::to_json),
+            pack_summary: self.pack_summary.as_ref().map(PackSummary::to_json),
+            suggestions: if suggestions.is_empty() {
+                None
+            } else {
+                Some(suggestions)
+            },
+        }
+    }
+}
+
+// ============================================================================
+// JSON Output Structures (versioned, stable schema)
+// ============================================================================
+
+/// Top-level JSON output structure for `dcg explain --format json`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplainJsonOutput {
+    /// Schema version for forward compatibility.
+    pub schema_version: u32,
+    /// Original command.
+    pub command: String,
+    /// Normalized command (if different from original).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalized_command: Option<String>,
+    /// Sanitized command (if different from original).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sanitized_command: Option<String>,
+    /// Decision: "allow" or "deny".
+    pub decision: String,
+    /// Total evaluation time in microseconds.
+    pub total_duration_us: u64,
+    /// Pipeline steps in chronological order.
+    pub steps: Vec<JsonTraceStep>,
+    /// Match information (if command matched a pattern).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_info: Option<JsonMatchInfo>,
+    /// Allowlist override information.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowlist: Option<JsonAllowlistInfo>,
+    /// Pack evaluation summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_summary: Option<JsonPackSummary>,
+    /// Actionable suggestions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestions: Option<Vec<JsonSuggestion>>,
+}
+
+/// JSON representation of a trace step.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonTraceStep {
+    /// Step name.
+    pub name: String,
+    /// Step duration in microseconds.
+    pub duration_us: u64,
+    /// Step-specific details.
+    pub details: JsonTraceDetails,
+}
+
+/// JSON representation of step details (tagged union).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum JsonTraceDetails {
+    InputParsing {
+        is_hook_input: bool,
+        command_len: usize,
+    },
+    KeywordGating {
+        quick_rejected: bool,
+        keywords_checked: Vec<String>,
+        first_match: Option<String>,
+    },
+    Normalization {
+        was_modified: bool,
+        stripped_prefix: Option<String>,
+    },
+    Sanitization {
+        was_modified: bool,
+        spans_masked: usize,
+    },
+    HeredocDetection {
+        triggered: bool,
+        scripts_extracted: usize,
+        languages: Vec<String>,
+    },
+    AllowlistCheck {
+        layers_checked: usize,
+        matched: bool,
+        matched_layer: Option<String>,
+    },
+    PackEvaluation {
+        packs_evaluated: Vec<String>,
+        packs_skipped: Vec<String>,
+        matched_pack: Option<String>,
+        matched_pattern: Option<String>,
+    },
+    ConfigOverride {
+        allow_matched: bool,
+        block_matched: bool,
+        reason: Option<String>,
+    },
+    PolicyDecision {
+        decision: String,
+        allowlisted: bool,
+    },
+}
+
+/// JSON representation of match information.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonMatchInfo {
+    /// Stable rule ID (e.g., "core.git:reset-hard").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    /// Pack ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+    /// Pattern name within the pack.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern_name: Option<String>,
+    /// Human-readable reason for the match.
+    pub reason: String,
+    /// Source of the match.
+    pub source: String,
+    /// Matched span (byte offsets).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_span: Option<JsonSpan>,
+    /// Preview of matched text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_text_preview: Option<String>,
+}
+
+/// JSON representation of a byte span.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonSpan {
+    /// Start byte offset.
+    pub start: usize,
+    /// End byte offset.
+    pub end: usize,
+}
+
+/// JSON representation of allowlist override.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonAllowlistInfo {
+    /// Layer that matched.
+    pub layer: String,
+    /// Reason from the allowlist entry.
+    pub entry_reason: String,
+    /// Original match that was overridden.
+    pub original_match: JsonMatchInfo,
+}
+
+/// JSON representation of pack evaluation summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonPackSummary {
+    /// Total enabled packs.
+    pub enabled_count: usize,
+    /// Packs that were evaluated.
+    pub evaluated: Vec<String>,
+    /// Packs skipped by keyword gating.
+    pub skipped: Vec<String>,
+}
+
+/// JSON representation of a suggestion.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonSuggestion {
+    /// Suggestion kind label.
+    pub kind: String,
+    /// Suggestion text.
+    pub text: String,
+    /// Optional command to copy/paste.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Optional documentation URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+// Conversion implementations
+impl TraceStep {
+    fn to_json(&self) -> JsonTraceStep {
+        JsonTraceStep {
+            name: self.name.to_string(),
+            duration_us: self.duration_us,
+            details: self.details.to_json(),
+        }
+    }
+}
+
+impl TraceDetails {
+    fn to_json(&self) -> JsonTraceDetails {
+        match self {
+            Self::InputParsing {
+                is_hook_input,
+                command_len,
+            } => JsonTraceDetails::InputParsing {
+                is_hook_input: *is_hook_input,
+                command_len: *command_len,
+            },
+            Self::KeywordGating {
+                quick_rejected,
+                keywords_checked,
+                first_match,
+            } => JsonTraceDetails::KeywordGating {
+                quick_rejected: *quick_rejected,
+                keywords_checked: keywords_checked.clone(),
+                first_match: first_match.clone(),
+            },
+            Self::Normalization {
+                was_modified,
+                stripped_prefix,
+            } => JsonTraceDetails::Normalization {
+                was_modified: *was_modified,
+                stripped_prefix: stripped_prefix.clone(),
+            },
+            Self::Sanitization {
+                was_modified,
+                spans_masked,
+            } => JsonTraceDetails::Sanitization {
+                was_modified: *was_modified,
+                spans_masked: *spans_masked,
+            },
+            Self::HeredocDetection {
+                triggered,
+                scripts_extracted,
+                languages,
+            } => JsonTraceDetails::HeredocDetection {
+                triggered: *triggered,
+                scripts_extracted: *scripts_extracted,
+                languages: languages.clone(),
+            },
+            Self::AllowlistCheck {
+                layers_checked,
+                matched,
+                matched_layer,
+            } => JsonTraceDetails::AllowlistCheck {
+                layers_checked: *layers_checked,
+                matched: *matched,
+                matched_layer: matched_layer.as_ref().map(|l| format!("{l:?}")),
+            },
+            Self::PackEvaluation {
+                packs_evaluated,
+                packs_skipped,
+                matched_pack,
+                matched_pattern,
+            } => JsonTraceDetails::PackEvaluation {
+                packs_evaluated: packs_evaluated.clone(),
+                packs_skipped: packs_skipped.clone(),
+                matched_pack: matched_pack.clone(),
+                matched_pattern: matched_pattern.clone(),
+            },
+            Self::ConfigOverride {
+                allow_matched,
+                block_matched,
+                reason,
+            } => JsonTraceDetails::ConfigOverride {
+                allow_matched: *allow_matched,
+                block_matched: *block_matched,
+                reason: reason.clone(),
+            },
+            Self::PolicyDecision {
+                decision,
+                allowlisted,
+            } => JsonTraceDetails::PolicyDecision {
+                decision: match decision {
+                    EvaluationDecision::Allow => "allow".to_string(),
+                    EvaluationDecision::Deny => "deny".to_string(),
+                },
+                allowlisted: *allowlisted,
+            },
+        }
+    }
+}
+
+impl MatchInfo {
+    fn to_json(&self) -> JsonMatchInfo {
+        JsonMatchInfo {
+            rule_id: self.rule_id.clone(),
+            pack_id: self.pack_id.clone(),
+            pattern_name: self.pattern_name.clone(),
+            reason: self.reason.clone(),
+            source: match self.source {
+                MatchSource::Pack => "pack".to_string(),
+                MatchSource::ConfigOverride => "config_override".to_string(),
+                MatchSource::LegacyPattern => "legacy_pattern".to_string(),
+                MatchSource::HeredocAst => "heredoc_ast".to_string(),
+            },
+            matched_span: match (self.match_start, self.match_end) {
+                (Some(start), Some(end)) => Some(JsonSpan { start, end }),
+                _ => None,
+            },
+            matched_text_preview: self.matched_text_preview.clone(),
+        }
+    }
+}
+
+impl AllowlistInfo {
+    fn to_json(&self) -> JsonAllowlistInfo {
+        JsonAllowlistInfo {
+            layer: format!("{:?}", self.layer),
+            entry_reason: self.entry_reason.clone(),
+            original_match: self.original_match.to_json(),
+        }
+    }
+}
+
+impl PackSummary {
+    fn to_json(&self) -> JsonPackSummary {
+        JsonPackSummary {
+            enabled_count: self.enabled_count,
+            evaluated: self.evaluated.clone(),
+            skipped: self.skipped.clone(),
+        }
     }
 }
 
 /// Format a one-line summary of step details.
+#[allow(clippy::option_if_let_else)]
+#[allow(clippy::too_many_lines)]
 fn format_step_details_summary(details: &TraceDetails) -> String {
     match details {
-        TraceDetails::InputParsing { is_hook_input, command_len } => {
+        TraceDetails::InputParsing {
+            is_hook_input,
+            command_len,
+        } => {
             let source = if *is_hook_input { "hook" } else { "CLI" };
             format!("source={source}, len={command_len}")
         }
-        TraceDetails::KeywordGating { quick_rejected, first_match, .. } => {
+        TraceDetails::KeywordGating {
+            quick_rejected,
+            first_match,
+            ..
+        } => {
             if *quick_rejected {
                 "quick-rejected (no keywords)".to_string()
             } else if let Some(kw) = first_match {
@@ -573,7 +996,10 @@ fn format_step_details_summary(details: &TraceDetails) -> String {
                 "no match".to_string()
             }
         }
-        TraceDetails::Normalization { was_modified, stripped_prefix } => {
+        TraceDetails::Normalization {
+            was_modified,
+            stripped_prefix,
+        } => {
             if *was_modified {
                 if let Some(prefix) = stripped_prefix {
                     format!("stripped \"{prefix}\"")
@@ -584,14 +1010,21 @@ fn format_step_details_summary(details: &TraceDetails) -> String {
                 "no change".to_string()
             }
         }
-        TraceDetails::Sanitization { was_modified, spans_masked } => {
+        TraceDetails::Sanitization {
+            was_modified,
+            spans_masked,
+        } => {
             if *was_modified {
                 format!("masked {spans_masked} span(s)")
             } else {
                 "no change".to_string()
             }
         }
-        TraceDetails::HeredocDetection { triggered, scripts_extracted, languages } => {
+        TraceDetails::HeredocDetection {
+            triggered,
+            scripts_extracted,
+            languages,
+        } => {
             if *triggered {
                 let langs = if languages.is_empty() {
                     String::new()
@@ -603,21 +1036,37 @@ fn format_step_details_summary(details: &TraceDetails) -> String {
                 "no heredocs".to_string()
             }
         }
-        TraceDetails::AllowlistCheck { layers_checked, matched, matched_layer } => {
+        TraceDetails::AllowlistCheck {
+            layers_checked,
+            matched,
+            matched_layer,
+        } => {
             if *matched {
-                format!("hit at {:?}", matched_layer.as_ref().unwrap_or(&AllowlistLayer::System))
+                format!(
+                    "hit at {:?}",
+                    matched_layer.as_ref().unwrap_or(&AllowlistLayer::System)
+                )
             } else {
                 format!("checked {layers_checked} layer(s), no match")
             }
         }
-        TraceDetails::PackEvaluation { packs_evaluated, matched_pack, matched_pattern, .. } => {
+        TraceDetails::PackEvaluation {
+            packs_evaluated,
+            matched_pack,
+            matched_pattern,
+            ..
+        } => {
             if let (Some(pack), Some(pattern)) = (matched_pack, matched_pattern) {
                 format!("matched {pack}:{pattern}")
             } else {
                 format!("checked {} pack(s), no match", packs_evaluated.len())
             }
         }
-        TraceDetails::ConfigOverride { allow_matched, block_matched, reason } => {
+        TraceDetails::ConfigOverride {
+            allow_matched,
+            block_matched,
+            reason,
+        } => {
             if *block_matched {
                 format!("BLOCK: {}", reason.as_deref().unwrap_or("config override"))
             } else if *allow_matched {
@@ -626,7 +1075,10 @@ fn format_step_details_summary(details: &TraceDetails) -> String {
                 "no override".to_string()
             }
         }
-        TraceDetails::PolicyDecision { decision, allowlisted } => {
+        TraceDetails::PolicyDecision {
+            decision,
+            allowlisted,
+        } => {
             let dec = match decision {
                 EvaluationDecision::Allow => "ALLOW",
                 EvaluationDecision::Deny => "DENY",
@@ -1064,5 +1516,632 @@ mod tests {
             compact,
             "DENY containers.docker:system-prune (1.5ms) docker system prune -af — removes all unused data"
         );
+    }
+
+    // ========================================================================
+    // Pretty formatter tests
+    // ========================================================================
+
+    #[test]
+    fn format_pretty_allow_simple() {
+        let trace = ExplainTrace {
+            command: "git status".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Allow,
+            total_duration_us: 94,
+            steps: vec![],
+            match_info: None,
+            allowlist_info: None,
+            pack_summary: None,
+        };
+
+        let pretty = trace.format_pretty(false);
+
+        // Check key sections are present
+        assert!(pretty.contains("DCG EXPLAIN"));
+        assert!(pretty.contains("Decision:"));
+        assert!(pretty.contains("ALLOW"));
+        assert!(pretty.contains("Latency:"));
+        assert!(pretty.contains("94us"));
+        assert!(pretty.contains("Input:"));
+        assert!(pretty.contains("git status"));
+
+        // Should not have match section for allowed commands
+        assert!(!pretty.contains("─── Match"));
+    }
+
+    #[test]
+    fn format_pretty_deny_with_match() {
+        let trace = ExplainTrace {
+            command: "git reset --hard".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Deny,
+            total_duration_us: 847,
+            steps: vec![],
+            match_info: Some(MatchInfo {
+                rule_id: Some("core.git:reset-hard".to_string()),
+                pack_id: Some("core.git".to_string()),
+                pattern_name: Some("reset-hard".to_string()),
+                reason: "destroys uncommitted changes".to_string(),
+                source: MatchSource::Pack,
+                match_start: Some(0),
+                match_end: Some(16),
+                matched_text_preview: Some("git reset --hard".to_string()),
+            }),
+            allowlist_info: None,
+            pack_summary: None,
+        };
+
+        let pretty = trace.format_pretty(false);
+
+        // Check decision
+        assert!(pretty.contains("DENY"));
+
+        // Check match section
+        assert!(pretty.contains("─── Match"));
+        assert!(pretty.contains("Rule ID:"));
+        assert!(pretty.contains("core.git:reset-hard"));
+        assert!(pretty.contains("Pack:"));
+        assert!(pretty.contains("core.git"));
+        assert!(pretty.contains("Pattern:"));
+        assert!(pretty.contains("reset-hard"));
+        assert!(pretty.contains("Reason:"));
+        assert!(pretty.contains("destroys uncommitted changes"));
+        assert!(pretty.contains("Span:"));
+        assert!(pretty.contains("bytes 0..16"));
+        assert!(pretty.contains("Matched:"));
+        assert!(pretty.contains("git reset --hard"));
+
+        // Check suggestions section (core.git:reset-hard has suggestions)
+        assert!(pretty.contains("─── Suggestions"));
+    }
+
+    #[test]
+    fn format_pretty_with_normalized_command() {
+        let trace = ExplainTrace {
+            command: "sudo git reset --hard".to_string(),
+            normalized_command: Some("git reset --hard".to_string()),
+            sanitized_command: None,
+            decision: EvaluationDecision::Deny,
+            total_duration_us: 1200,
+            steps: vec![],
+            match_info: Some(MatchInfo {
+                rule_id: Some("core.git:reset-hard".to_string()),
+                pack_id: Some("core.git".to_string()),
+                pattern_name: Some("reset-hard".to_string()),
+                reason: "destroys uncommitted changes".to_string(),
+                source: MatchSource::Pack,
+                match_start: None,
+                match_end: None,
+                matched_text_preview: None,
+            }),
+            allowlist_info: None,
+            pack_summary: None,
+        };
+
+        let pretty = trace.format_pretty(false);
+
+        // Check both input and normalized commands are shown
+        assert!(pretty.contains("Input:"));
+        assert!(pretty.contains("sudo git reset --hard"));
+        assert!(pretty.contains("Normalized:"));
+        assert!(pretty.contains("git reset --hard"));
+    }
+
+    #[test]
+    fn format_pretty_allowlist_override() {
+        let original_match = MatchInfo {
+            rule_id: Some("core.git:reset-hard".to_string()),
+            pack_id: Some("core.git".to_string()),
+            pattern_name: Some("reset-hard".to_string()),
+            reason: "destroys uncommitted changes".to_string(),
+            source: MatchSource::Pack,
+            match_start: None,
+            match_end: None,
+            matched_text_preview: None,
+        };
+
+        let trace = ExplainTrace {
+            command: "git reset --hard".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Allow,
+            total_duration_us: 500,
+            steps: vec![],
+            match_info: None,
+            allowlist_info: Some(AllowlistInfo {
+                layer: AllowlistLayer::Project,
+                entry_reason: "Allowed for release automation".to_string(),
+                original_match,
+            }),
+            pack_summary: None,
+        };
+
+        let pretty = trace.format_pretty(false);
+
+        // Should show allowlist override section
+        assert!(pretty.contains("─── Allowlist Override"));
+        assert!(pretty.contains("Layer:"));
+        assert!(pretty.contains("Project"));
+        assert!(pretty.contains("Reason:"));
+        assert!(pretty.contains("Allowed for release automation"));
+        assert!(pretty.contains("Overrode core.git:reset-hard"));
+    }
+
+    #[test]
+    fn format_pretty_with_pack_summary() {
+        let trace = ExplainTrace {
+            command: "git status".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Allow,
+            total_duration_us: 100,
+            steps: vec![],
+            match_info: None,
+            allowlist_info: None,
+            pack_summary: Some(PackSummary {
+                enabled_count: 5,
+                evaluated: vec!["core.git".to_string()],
+                skipped: vec![
+                    "containers.docker".to_string(),
+                    "database.postgresql".to_string(),
+                ],
+            }),
+        };
+
+        let pretty = trace.format_pretty(false);
+
+        assert!(pretty.contains("─── Pack Evaluation"));
+        assert!(pretty.contains("Enabled:"));
+        assert!(pretty.contains("5 packs"));
+        assert!(pretty.contains("Evaluated:"));
+        assert!(pretty.contains("core.git"));
+        assert!(pretty.contains("Skipped (keyword gating)"));
+        assert!(pretty.contains("containers.docker"));
+    }
+
+    #[test]
+    fn format_pretty_with_pipeline_steps() {
+        let trace = ExplainTrace {
+            command: "git status".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Allow,
+            total_duration_us: 200,
+            steps: vec![
+                TraceStep {
+                    name: "keyword_gating",
+                    duration_us: 50,
+                    details: TraceDetails::KeywordGating {
+                        quick_rejected: false,
+                        keywords_checked: vec!["git".to_string()],
+                        first_match: Some("git".to_string()),
+                    },
+                },
+                TraceStep {
+                    name: "pack_evaluation",
+                    duration_us: 100,
+                    details: TraceDetails::PackEvaluation {
+                        packs_evaluated: vec!["core.git".to_string()],
+                        packs_skipped: vec![],
+                        matched_pack: None,
+                        matched_pattern: None,
+                    },
+                },
+                TraceStep {
+                    name: "policy_decision",
+                    duration_us: 10,
+                    details: TraceDetails::PolicyDecision {
+                        decision: EvaluationDecision::Allow,
+                        allowlisted: false,
+                    },
+                },
+            ],
+            match_info: None,
+            allowlist_info: None,
+            pack_summary: None,
+        };
+
+        let pretty = trace.format_pretty(false);
+
+        assert!(pretty.contains("─── Pipeline Trace"));
+        assert!(pretty.contains("keyword_gating"));
+        assert!(pretty.contains("50us"));
+        assert!(pretty.contains("matched keyword \"git\""));
+        assert!(pretty.contains("pack_evaluation"));
+        assert!(pretty.contains("100us"));
+        assert!(pretty.contains("policy_decision"));
+        assert!(pretty.contains("ALLOW"));
+    }
+
+    #[test]
+    fn format_pretty_colors_when_enabled() {
+        let trace = ExplainTrace {
+            command: "git reset --hard".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Deny,
+            total_duration_us: 847,
+            steps: vec![],
+            match_info: Some(MatchInfo {
+                rule_id: Some("core.git:reset-hard".to_string()),
+                pack_id: None,
+                pattern_name: None,
+                reason: "destroys uncommitted changes".to_string(),
+                source: MatchSource::Pack,
+                match_start: None,
+                match_end: None,
+                matched_text_preview: None,
+            }),
+            allowlist_info: None,
+            pack_summary: None,
+        };
+
+        let with_color = trace.format_pretty(true);
+        let without_color = trace.format_pretty(false);
+
+        // Color version should have ANSI codes
+        assert!(with_color.contains("\x1b["));
+        // Non-color version should not
+        assert!(!without_color.contains("\x1b["));
+
+        // Both should have same content
+        assert!(with_color.contains("DENY"));
+        assert!(without_color.contains("DENY"));
+    }
+
+    #[test]
+    fn format_step_details_summary_all_variants() {
+        // Test each TraceDetails variant produces reasonable summary
+        let input_parsing = TraceDetails::InputParsing {
+            is_hook_input: true,
+            command_len: 42,
+        };
+        assert_eq!(
+            format_step_details_summary(&input_parsing),
+            "source=hook, len=42"
+        );
+
+        let quick_reject = TraceDetails::KeywordGating {
+            quick_rejected: true,
+            keywords_checked: vec![],
+            first_match: None,
+        };
+        assert_eq!(
+            format_step_details_summary(&quick_reject),
+            "quick-rejected (no keywords)"
+        );
+
+        let normalization = TraceDetails::Normalization {
+            was_modified: true,
+            stripped_prefix: Some("sudo ".to_string()),
+        };
+        assert_eq!(
+            format_step_details_summary(&normalization),
+            "stripped \"sudo \""
+        );
+
+        let sanitization = TraceDetails::Sanitization {
+            was_modified: true,
+            spans_masked: 3,
+        };
+        assert_eq!(
+            format_step_details_summary(&sanitization),
+            "masked 3 span(s)"
+        );
+
+        let heredoc = TraceDetails::HeredocDetection {
+            triggered: true,
+            scripts_extracted: 2,
+            languages: vec!["bash".to_string(), "python".to_string()],
+        };
+        assert_eq!(
+            format_step_details_summary(&heredoc),
+            "extracted 2 script(s) [bash, python]"
+        );
+
+        let allowlist_hit = TraceDetails::AllowlistCheck {
+            layers_checked: 2,
+            matched: true,
+            matched_layer: Some(AllowlistLayer::Project),
+        };
+        assert_eq!(
+            format_step_details_summary(&allowlist_hit),
+            "hit at Project"
+        );
+
+        let pack_match = TraceDetails::PackEvaluation {
+            packs_evaluated: vec!["core.git".to_string()],
+            packs_skipped: vec![],
+            matched_pack: Some("core.git".to_string()),
+            matched_pattern: Some("reset-hard".to_string()),
+        };
+        assert_eq!(
+            format_step_details_summary(&pack_match),
+            "matched core.git:reset-hard"
+        );
+
+        let config_block = TraceDetails::ConfigOverride {
+            allow_matched: false,
+            block_matched: true,
+            reason: Some("custom block".to_string()),
+        };
+        assert_eq!(
+            format_step_details_summary(&config_block),
+            "BLOCK: custom block"
+        );
+
+        let policy_allow = TraceDetails::PolicyDecision {
+            decision: EvaluationDecision::Allow,
+            allowlisted: true,
+        };
+        assert_eq!(
+            format_step_details_summary(&policy_allow),
+            "ALLOW (allowlisted)"
+        );
+    }
+
+    // ========================================================================
+    // JSON formatter tests
+    // ========================================================================
+
+    #[test]
+    fn format_json_has_schema_version() {
+        let trace = ExplainTrace {
+            command: "git status".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Allow,
+            total_duration_us: 94,
+            steps: vec![],
+            match_info: None,
+            allowlist_info: None,
+            pack_summary: None,
+        };
+
+        let json = trace.format_json();
+        assert!(json.contains("\"schema_version\": 1"));
+        assert!(json.contains("\"decision\": \"allow\""));
+        assert!(json.contains("\"command\": \"git status\""));
+        assert!(json.contains("\"total_duration_us\": 94"));
+    }
+
+    #[test]
+    fn format_json_deny_includes_match_info() {
+        let trace = ExplainTrace {
+            command: "git reset --hard".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Deny,
+            total_duration_us: 847,
+            steps: vec![],
+            match_info: Some(MatchInfo {
+                rule_id: Some("core.git:reset-hard".to_string()),
+                pack_id: Some("core.git".to_string()),
+                pattern_name: Some("reset-hard".to_string()),
+                reason: "destroys uncommitted changes".to_string(),
+                source: MatchSource::Pack,
+                match_start: Some(0),
+                match_end: Some(16),
+                matched_text_preview: Some("git reset --hard".to_string()),
+            }),
+            allowlist_info: None,
+            pack_summary: None,
+        };
+
+        let json = trace.format_json();
+
+        // Check decision
+        assert!(json.contains("\"decision\": \"deny\""));
+
+        // Check match_info
+        assert!(json.contains("\"match_info\":"));
+        assert!(json.contains("\"rule_id\": \"core.git:reset-hard\""));
+        assert!(json.contains("\"pack_id\": \"core.git\""));
+        assert!(json.contains("\"pattern_name\": \"reset-hard\""));
+        assert!(json.contains("\"reason\": \"destroys uncommitted changes\""));
+        assert!(json.contains("\"source\": \"pack\""));
+
+        // Check matched span
+        assert!(json.contains("\"matched_span\":"));
+        assert!(json.contains("\"start\": 0"));
+        assert!(json.contains("\"end\": 16"));
+
+        // Check suggestions (core.git:reset-hard has suggestions)
+        assert!(json.contains("\"suggestions\":"));
+    }
+
+    #[test]
+    fn format_json_with_steps() {
+        let trace = ExplainTrace {
+            command: "git status".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Allow,
+            total_duration_us: 200,
+            steps: vec![
+                TraceStep {
+                    name: "keyword_gating",
+                    duration_us: 50,
+                    details: TraceDetails::KeywordGating {
+                        quick_rejected: false,
+                        keywords_checked: vec!["git".to_string()],
+                        first_match: Some("git".to_string()),
+                    },
+                },
+                TraceStep {
+                    name: "policy_decision",
+                    duration_us: 10,
+                    details: TraceDetails::PolicyDecision {
+                        decision: EvaluationDecision::Allow,
+                        allowlisted: false,
+                    },
+                },
+            ],
+            match_info: None,
+            allowlist_info: None,
+            pack_summary: None,
+        };
+
+        let json = trace.format_json();
+
+        // Check steps array
+        assert!(json.contains("\"steps\":"));
+        assert!(json.contains("\"name\": \"keyword_gating\""));
+        assert!(json.contains("\"duration_us\": 50"));
+        assert!(json.contains("\"type\": \"keyword_gating\""));
+        assert!(json.contains("\"quick_rejected\": false"));
+        assert!(json.contains("\"first_match\": \"git\""));
+        assert!(json.contains("\"name\": \"policy_decision\""));
+    }
+
+    #[test]
+    fn format_json_with_allowlist_override() {
+        let original_match = MatchInfo {
+            rule_id: Some("core.git:reset-hard".to_string()),
+            pack_id: Some("core.git".to_string()),
+            pattern_name: Some("reset-hard".to_string()),
+            reason: "destroys uncommitted changes".to_string(),
+            source: MatchSource::Pack,
+            match_start: None,
+            match_end: None,
+            matched_text_preview: None,
+        };
+
+        let trace = ExplainTrace {
+            command: "git reset --hard".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Allow,
+            total_duration_us: 500,
+            steps: vec![],
+            match_info: None,
+            allowlist_info: Some(AllowlistInfo {
+                layer: AllowlistLayer::Project,
+                entry_reason: "Allowed for release automation".to_string(),
+                original_match,
+            }),
+            pack_summary: None,
+        };
+
+        let json = trace.format_json();
+
+        // Check allowlist section
+        assert!(json.contains("\"allowlist\":"));
+        assert!(json.contains("\"layer\": \"Project\""));
+        assert!(json.contains("\"entry_reason\": \"Allowed for release automation\""));
+        assert!(json.contains("\"original_match\":"));
+    }
+
+    #[test]
+    fn format_json_with_pack_summary() {
+        let trace = ExplainTrace {
+            command: "git status".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Allow,
+            total_duration_us: 100,
+            steps: vec![],
+            match_info: None,
+            allowlist_info: None,
+            pack_summary: Some(PackSummary {
+                enabled_count: 5,
+                evaluated: vec!["core.git".to_string()],
+                skipped: vec!["containers.docker".to_string()],
+            }),
+        };
+
+        let json = trace.format_json();
+
+        assert!(json.contains("\"pack_summary\":"));
+        assert!(json.contains("\"enabled_count\": 5"));
+        assert!(json.contains("\"evaluated\":"));
+        assert!(json.contains("\"core.git\""));
+        assert!(json.contains("\"skipped\":"));
+        assert!(json.contains("\"containers.docker\""));
+    }
+
+    #[test]
+    fn json_output_is_valid_json() {
+        let trace = ExplainTrace {
+            command: "git reset --hard".to_string(),
+            normalized_command: Some("git reset --hard".to_string()),
+            sanitized_command: None,
+            decision: EvaluationDecision::Deny,
+            total_duration_us: 847,
+            steps: vec![TraceStep {
+                name: "keyword_gating",
+                duration_us: 50,
+                details: TraceDetails::KeywordGating {
+                    quick_rejected: false,
+                    keywords_checked: vec!["git".to_string()],
+                    first_match: Some("git".to_string()),
+                },
+            }],
+            match_info: Some(MatchInfo {
+                rule_id: Some("core.git:reset-hard".to_string()),
+                pack_id: Some("core.git".to_string()),
+                pattern_name: Some("reset-hard".to_string()),
+                reason: "destroys uncommitted changes".to_string(),
+                source: MatchSource::Pack,
+                match_start: Some(0),
+                match_end: Some(16),
+                matched_text_preview: Some("git reset --hard".to_string()),
+            }),
+            allowlist_info: None,
+            pack_summary: Some(PackSummary {
+                enabled_count: 3,
+                evaluated: vec!["core.git".to_string()],
+                skipped: vec!["containers.docker".to_string()],
+            }),
+        };
+
+        let json = trace.format_json();
+
+        // Parse the JSON to verify it's valid
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&json);
+        assert!(parsed.is_ok(), "JSON should be valid: {json}");
+
+        // Verify required fields exist
+        let value = parsed.unwrap();
+        assert!(value.get("schema_version").is_some());
+        assert!(value.get("command").is_some());
+        assert!(value.get("decision").is_some());
+        assert!(value.get("total_duration_us").is_some());
+        assert!(value.get("steps").is_some());
+    }
+
+    #[test]
+    fn json_schema_version_is_stable() {
+        assert_eq!(EXPLAIN_JSON_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn to_json_output_returns_correct_struct() {
+        let trace = ExplainTrace {
+            command: "git status".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Allow,
+            total_duration_us: 100,
+            steps: vec![],
+            match_info: None,
+            allowlist_info: None,
+            pack_summary: None,
+        };
+
+        let output = trace.to_json_output();
+
+        assert_eq!(output.schema_version, 1);
+        assert_eq!(output.command, "git status");
+        assert_eq!(output.decision, "allow");
+        assert_eq!(output.total_duration_us, 100);
+        assert!(output.steps.is_empty());
+        assert!(output.match_info.is_none());
+        assert!(output.allowlist.is_none());
+        assert!(output.pack_summary.is_none());
+        assert!(output.suggestions.is_none());
     }
 }
