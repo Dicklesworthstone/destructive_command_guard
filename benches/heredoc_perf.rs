@@ -1,4 +1,4 @@
-//! Performance benchmarks for heredoc detection.
+//! Performance benchmarks for dcg hot paths.
 //!
 //! Run with: `cargo bench --bench heredoc_perf`
 //!
@@ -13,9 +13,10 @@
 use std::fmt::Write as _;
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use destructive_command_guard::packs::{REGISTRY, pack_aware_quick_reject};
 use destructive_command_guard::{
-    Config, ExtractionLimits, ScriptLanguage, check_triggers, evaluate_command, extract_content,
-    extract_shell_commands, load_default_allowlists, matched_triggers,
+    Config, ExtractionLimits, ScriptLanguage, check_triggers, evaluate_command_with_pack_order,
+    extract_content, extract_shell_commands, matched_triggers,
 };
 
 // =============================================================================
@@ -129,6 +130,202 @@ fn bench_tier1_triggers(c: &mut Criterion) {
             cmd,
             |b: &mut criterion::Bencher<'_>, cmd: &str| {
                 b.iter(|| matched_triggers(black_box(cmd)));
+            },
+        );
+    }
+
+    group.finish();
+}
+
+// =============================================================================
+// Core Pipeline: pack-aware quick reject + pack evaluation
+// =============================================================================
+
+fn build_hook_inputs(config: &Config) -> HookBenchInputs {
+    let enabled_packs = config.enabled_pack_ids();
+    let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+    let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let compiled_overrides = config.overrides.compile();
+    let heredoc_settings = config.heredoc_settings();
+
+    HookBenchInputs {
+        enabled_keywords,
+        ordered_packs,
+        compiled_overrides,
+        heredoc_settings,
+    }
+}
+
+struct HookBenchInputs {
+    enabled_keywords: Vec<&'static str>,
+    ordered_packs: Vec<String>,
+    compiled_overrides: destructive_command_guard::config::CompiledOverrides,
+    heredoc_settings: destructive_command_guard::config::HeredocSettings,
+}
+
+fn bench_pack_aware_quick_reject(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pack_aware_quick_reject");
+
+    let mut core_only = Config::default();
+    core_only.heredoc.enabled = Some(false);
+    let core_inputs = build_hook_inputs(&core_only);
+
+    let mut worst_case = Config::default();
+    worst_case.heredoc.enabled = Some(false);
+    worst_case.packs.enabled = vec![
+        "database".to_string(),
+        "containers".to_string(),
+        "kubernetes".to_string(),
+        "cloud".to_string(),
+        "infrastructure".to_string(),
+        "system".to_string(),
+        "strict_git".to_string(),
+        "package_managers".to_string(),
+    ];
+    let worst_inputs = build_hook_inputs(&worst_case);
+
+    let cases = [
+        ("no_match", SIMPLE_COMMAND),
+        ("match_git", "git status --short"),
+    ];
+
+    for (name, cmd) in cases {
+        group.bench_with_input(
+            BenchmarkId::new("core_only", name),
+            cmd,
+            |b: &mut criterion::Bencher<'_>, cmd: &str| {
+                b.iter(|| {
+                    black_box(pack_aware_quick_reject(
+                        black_box(cmd),
+                        black_box(core_inputs.enabled_keywords.as_slice()),
+                    ))
+                });
+            },
+        );
+    }
+
+    for (name, cmd) in cases {
+        group.bench_with_input(
+            BenchmarkId::new("worst_case", name),
+            cmd,
+            |b: &mut criterion::Bencher<'_>, cmd: &str| {
+                b.iter(|| {
+                    black_box(pack_aware_quick_reject(
+                        black_box(cmd),
+                        black_box(worst_inputs.enabled_keywords.as_slice()),
+                    ))
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_core_pipeline(c: &mut Criterion) {
+    let mut group = c.benchmark_group("core_pipeline");
+
+    // Keep allowlists empty for deterministic, IO-free benchmarks.
+    let allowlists = destructive_command_guard::LayeredAllowlist::default();
+
+    let mut core_only = Config::default();
+    core_only.heredoc.enabled = Some(false);
+    let core_inputs = build_hook_inputs(&core_only);
+
+    let mut docker_enabled = Config::default();
+    docker_enabled.heredoc.enabled = Some(false);
+    docker_enabled
+        .packs
+        .enabled
+        .push("containers.docker".to_string());
+    let docker_inputs = build_hook_inputs(&docker_enabled);
+
+    let mut worst_case = Config::default();
+    worst_case.heredoc.enabled = Some(false);
+    worst_case.packs.enabled = vec![
+        "database".to_string(),
+        "containers".to_string(),
+        "kubernetes".to_string(),
+        "cloud".to_string(),
+        "infrastructure".to_string(),
+        "system".to_string(),
+        "strict_git".to_string(),
+        "package_managers".to_string(),
+    ];
+    let worst_inputs = build_hook_inputs(&worst_case);
+
+    let core_cases = [
+        ("allow_quick_reject", SIMPLE_COMMAND),
+        ("allow_git_safe", "git status --short"),
+        ("deny_git_reset_hard", "git reset --hard"),
+        ("deny_rm_rf", "rm -rf ./build"),
+    ];
+
+    for (name, cmd) in core_cases {
+        group.bench_with_input(
+            BenchmarkId::new("core_only", name),
+            cmd,
+            |b: &mut criterion::Bencher<'_>, cmd: &str| {
+                b.iter(|| {
+                    let result = evaluate_command_with_pack_order(
+                        black_box(cmd),
+                        black_box(core_inputs.enabled_keywords.as_slice()),
+                        black_box(core_inputs.ordered_packs.as_slice()),
+                        black_box(&core_inputs.compiled_overrides),
+                        black_box(&allowlists),
+                        black_box(&core_inputs.heredoc_settings),
+                    );
+                    black_box(result);
+                });
+            },
+        );
+    }
+
+    let docker_cases = [
+        ("allow_docker_ps", "docker ps"),
+        ("deny_docker_prune", "docker system prune"),
+    ];
+    for (name, cmd) in docker_cases {
+        group.bench_with_input(
+            BenchmarkId::new("docker_enabled", name),
+            cmd,
+            |b: &mut criterion::Bencher<'_>, cmd: &str| {
+                b.iter(|| {
+                    let result = evaluate_command_with_pack_order(
+                        black_box(cmd),
+                        black_box(docker_inputs.enabled_keywords.as_slice()),
+                        black_box(docker_inputs.ordered_packs.as_slice()),
+                        black_box(&docker_inputs.compiled_overrides),
+                        black_box(&allowlists),
+                        black_box(&docker_inputs.heredoc_settings),
+                    );
+                    black_box(result);
+                });
+            },
+        );
+    }
+
+    let worst_cases = [
+        ("allow_quick_reject", SIMPLE_COMMAND),
+        ("deny_kubectl_delete_ns", "kubectl delete namespace test"),
+        ("deny_terraform_destroy", "terraform destroy"),
+    ];
+    for (name, cmd) in worst_cases {
+        group.bench_with_input(
+            BenchmarkId::new("worst_case", name),
+            cmd,
+            |b: &mut criterion::Bencher<'_>, cmd: &str| {
+                b.iter(|| {
+                    let result = evaluate_command_with_pack_order(
+                        black_box(cmd),
+                        black_box(worst_inputs.enabled_keywords.as_slice()),
+                        black_box(worst_inputs.ordered_packs.as_slice()),
+                        black_box(&worst_inputs.compiled_overrides),
+                        black_box(&allowlists),
+                        black_box(&worst_inputs.heredoc_settings),
+                    );
+                    black_box(result);
+                });
             },
         );
     }
@@ -256,10 +453,22 @@ fn bench_full_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("full_pipeline");
 
     // Budget: < 15ms
-    let config = Config::load();
-    let compiled_overrides = config.overrides.compile();
-    let enabled_keywords: Vec<&str> = vec!["git", "rm", "python", "bash", "node"];
-    let allowlists = load_default_allowlists();
+    //
+    // Use the same precomputed inputs as hook mode (no config file IO).
+    let allowlists = destructive_command_guard::LayeredAllowlist::default();
+
+    let mut config = Config::default();
+    config.packs.enabled = vec![
+        "database".to_string(),
+        "containers".to_string(),
+        "kubernetes".to_string(),
+        "cloud".to_string(),
+        "infrastructure".to_string(),
+        "system".to_string(),
+        "strict_git".to_string(),
+        "package_managers".to_string(),
+    ];
+    let hook_inputs = build_hook_inputs(&config);
 
     let cases: Vec<(&str, String)> = vec![
         ("safe_git", "git status".to_string()),
@@ -275,12 +484,13 @@ fn bench_full_pipeline(c: &mut Criterion) {
             cmd,
             |b: &mut criterion::Bencher<'_>, cmd: &String| {
                 b.iter(|| {
-                    evaluate_command(
+                    evaluate_command_with_pack_order(
                         black_box(cmd),
-                        black_box(&config),
-                        black_box(&enabled_keywords),
-                        black_box(&compiled_overrides),
+                        black_box(hook_inputs.enabled_keywords.as_slice()),
+                        black_box(hook_inputs.ordered_packs.as_slice()),
+                        black_box(&hook_inputs.compiled_overrides),
                         black_box(&allowlists),
+                        black_box(&hook_inputs.heredoc_settings),
                     )
                 });
             },
@@ -297,6 +507,8 @@ fn bench_full_pipeline(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_tier1_triggers,
+    bench_pack_aware_quick_reject,
+    bench_core_pipeline,
     bench_tier2_extraction,
     bench_shell_extraction,
     bench_language_detection,
