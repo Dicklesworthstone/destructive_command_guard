@@ -407,17 +407,20 @@ log_section "Non-Core Pack Regression Tests (git_safety_guard-99e.1.2)"
 # Docker pack tests
 test_command_with_packs "docker system prune" "block" "containers.docker" "docker system prune (docker pack enabled)"
 test_command_with_packs "docker system prune --all" "block" "containers.docker" "docker system prune --all (docker pack enabled)"
+test_command_with_packs "docker volume prune" "block" "containers.docker" "docker volume prune (docker pack enabled)"
 test_command_with_packs "docker ps" "allow" "containers.docker" "docker ps (docker pack enabled, safe command)"
 
 # Kubernetes pack tests
 test_command_with_packs "kubectl delete namespace production" "block" "kubernetes.kubectl" "kubectl delete namespace (kubectl pack enabled)"
 test_command_with_packs "kubectl delete deployment my-app" "block" "kubernetes.kubectl" "kubectl delete deployment (kubectl pack enabled)"
+test_command_with_packs "kubectl delete pods --all" "block" "kubernetes.kubectl" "kubectl delete pods --all (kubectl pack enabled)"
 test_command_with_packs "kubectl drain node-1" "block" "kubernetes.kubectl" "kubectl drain (kubectl pack enabled)"
 test_command_with_packs "kubectl get pods" "allow" "kubernetes.kubectl" "kubectl get pods (kubectl pack enabled, safe command)"
 
 # PostgreSQL pack tests
-test_command_with_packs "psql -c 'DROP DATABASE production'" "block" "database.postgresql" "psql DROP DATABASE (postgresql pack enabled)"
-test_command_with_packs "psql -c 'SELECT * FROM users'" "allow" "database.postgresql" "psql SELECT (postgresql pack enabled, safe command)"
+test_command_with_packs "psql -c 'DROP DATABASE production;'" "block" "database.postgresql" "psql DROP DATABASE (postgresql pack enabled)"
+test_command_with_packs "psql -c 'DELETE FROM users;'" "block" "database.postgresql" "psql DELETE without WHERE (postgresql pack enabled)"
+test_command_with_packs "psql -c 'SELECT 1;'" "allow" "database.postgresql" "psql SELECT (postgresql pack enabled, safe command)"
 
 # Redis pack tests
 test_command_with_packs "redis-cli FLUSHALL" "block" "database.redis" "redis-cli FLUSHALL (redis pack enabled)"
