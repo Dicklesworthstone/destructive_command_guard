@@ -24,7 +24,14 @@
 //! let config = Config::load();
 //! let compiled_overrides = config.overrides.compile();
 //! let enabled_keywords = vec!["git", "rm", "docker"];
-//! let result = evaluate_command("git reset --hard", &config, &enabled_keywords, &compiled_overrides);
+//! let allowlists = destructive_command_guard::load_default_allowlists();
+//! let result = evaluate_command(
+//!     "git reset --hard",
+//!     &config,
+//!     &enabled_keywords,
+//!     &compiled_overrides,
+//!     &allowlists,
+//! );
 //!
 //! match result.decision {
 //!     EvaluationDecision::Allow => println!("Command allowed"),
@@ -38,6 +45,7 @@
 
 use crate::config::Config;
 use crate::context::sanitize_for_pattern_matching;
+use crate::allowlist::{AllowlistLayer, LayeredAllowlist};
 use crate::packs::{REGISTRY, normalize_command, pack_aware_quick_reject};
 use std::collections::HashSet;
 
@@ -63,6 +71,17 @@ pub struct PatternMatch {
     pub source: MatchSource,
 }
 
+/// Information about an allowlist override (DENY -> ALLOW).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowlistOverride {
+    /// Which allowlist layer matched (project/user/system).
+    pub layer: AllowlistLayer,
+    /// The allowlist entry reason (why this override exists).
+    pub reason: String,
+    /// The match that would have denied the command.
+    pub matched: PatternMatch,
+}
+
 /// Source of a pattern match (for debugging and explain mode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchSource {
@@ -81,6 +100,8 @@ pub struct EvaluationResult {
     pub decision: EvaluationDecision,
     /// Pattern match information (present when decision is Deny).
     pub pattern_info: Option<PatternMatch>,
+    /// Allowlist override information (present when decision is Allow due to allowlist).
+    pub allowlist_override: Option<AllowlistOverride>,
 }
 
 impl EvaluationResult {
@@ -91,6 +112,7 @@ impl EvaluationResult {
         Self {
             decision: EvaluationDecision::Allow,
             pattern_info: None,
+            allowlist_override: None,
         }
     }
 
@@ -106,6 +128,7 @@ impl EvaluationResult {
                 reason,
                 source: MatchSource::ConfigOverride,
             }),
+            allowlist_override: None,
         }
     }
 
@@ -121,6 +144,7 @@ impl EvaluationResult {
                 reason: reason.to_string(),
                 source: MatchSource::LegacyPattern,
             }),
+            allowlist_override: None,
         }
     }
 
@@ -136,6 +160,7 @@ impl EvaluationResult {
                 reason: reason.to_string(),
                 source: MatchSource::Pack,
             }),
+            allowlist_override: None,
         }
     }
 
@@ -150,6 +175,21 @@ impl EvaluationResult {
                 pattern_name: Some(pattern_name.to_string()),
                 reason: reason.to_string(),
                 source: MatchSource::Pack,
+            }),
+            allowlist_override: None,
+        }
+    }
+
+    /// Create an "allowed" result due to allowlist override.
+    #[must_use]
+    pub fn allowed_by_allowlist(matched: PatternMatch, layer: AllowlistLayer, reason: String) -> Self {
+        Self {
+            decision: EvaluationDecision::Allow,
+            pattern_info: None,
+            allowlist_override: Some(AllowlistOverride {
+                layer,
+                reason,
+                matched,
             }),
         }
     }
@@ -211,6 +251,7 @@ pub fn evaluate_command(
     config: &Config,
     enabled_keywords: &[&str],
     compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
 ) -> EvaluationResult {
     // Empty commands are allowed (no-op)
     if command.is_empty() {
@@ -260,6 +301,25 @@ pub fn evaluate_command(
     if result.blocked {
         let reason = result.reason.as_deref().unwrap_or("Blocked by pack");
         let pack_id = result.pack_id.as_deref().unwrap_or("unknown");
+
+        // Allowlist check: only applies when we have a stable match identity (named pattern).
+        if let Some(pattern_name) = result.pattern_name.as_deref() {
+            if let Some(hit) = allowlists.match_rule(pack_id, pattern_name) {
+                return EvaluationResult::allowed_by_allowlist(
+                    PatternMatch {
+                        pack_id: Some(pack_id.to_string()),
+                        pattern_name: Some(pattern_name.to_string()),
+                        reason: reason.to_string(),
+                        source: MatchSource::Pack,
+                    },
+                    hit.layer,
+                    hit.entry.reason.clone(),
+                );
+            }
+
+            return EvaluationResult::denied_by_pack_pattern(pack_id, pattern_name, reason);
+        }
+
         return EvaluationResult::denied_by_pack(pack_id, reason);
     }
 
@@ -292,6 +352,7 @@ pub fn evaluate_command_with_legacy<S, D>(
     config: &Config,
     enabled_keywords: &[&str],
     compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
     safe_patterns: &[S],
     destructive_patterns: &[D],
 ) -> EvaluationResult
@@ -353,6 +414,24 @@ where
     if result.blocked {
         let reason = result.reason.as_deref().unwrap_or("Blocked by pack");
         let pack_id = result.pack_id.as_deref().unwrap_or("unknown");
+
+        if let Some(pattern_name) = result.pattern_name.as_deref() {
+            if let Some(hit) = allowlists.match_rule(pack_id, pattern_name) {
+                return EvaluationResult::allowed_by_allowlist(
+                    PatternMatch {
+                        pack_id: Some(pack_id.to_string()),
+                        pattern_name: Some(pattern_name.to_string()),
+                        reason: reason.to_string(),
+                        source: MatchSource::Pack,
+                    },
+                    hit.layer,
+                    hit.entry.reason.clone(),
+                );
+            }
+
+            return EvaluationResult::denied_by_pack_pattern(pack_id, pattern_name, reason);
+        }
+
         return EvaluationResult::denied_by_pack(pack_id, reason);
     }
 
@@ -387,11 +466,16 @@ mod tests {
         crate::config::CompiledOverrides::default()
     }
 
+    fn default_allowlists() -> LayeredAllowlist {
+        LayeredAllowlist::default()
+    }
+
     #[test]
     fn test_empty_command_allowed() {
         let config = default_config();
         let compiled = default_compiled_overrides();
-        let result = evaluate_command("", &config, &[], &compiled);
+        let allowlists = default_allowlists();
+        let result = evaluate_command("", &config, &[], &compiled, &allowlists);
         assert!(result.is_allowed());
         assert!(result.pattern_info.is_none());
     }
@@ -400,7 +484,8 @@ mod tests {
     fn test_safe_command_allowed() {
         let config = default_config();
         let compiled = default_compiled_overrides();
-        let result = evaluate_command("ls -la", &config, &["git", "rm"], &compiled);
+        let allowlists = default_allowlists();
+        let result = evaluate_command("ls -la", &config, &["git", "rm"], &compiled, &allowlists);
         assert!(result.is_allowed());
     }
 
@@ -458,8 +543,9 @@ mod tests {
     fn test_quick_reject_skips_patterns() {
         let config = default_config();
         let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
         // Command with no relevant keywords should be quickly allowed
-        let result = evaluate_command("cargo build --release", &config, &["git", "rm"], &compiled);
+        let result = evaluate_command("cargo build --release", &config, &["git", "rm"], &compiled, &allowlists);
         assert!(result.is_allowed());
 
         // Even with more keywords
@@ -468,6 +554,7 @@ mod tests {
             &config,
             &["git", "rm", "docker", "kubectl"],
             &compiled,
+            &allowlists,
         );
         assert!(result.is_allowed());
     }
@@ -526,6 +613,7 @@ mod tests {
     fn parity_allowed_commands() {
         let config = default_config();
         let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
         let keywords = &["git", "rm", "docker", "kubectl"];
         let safe_patterns: Vec<MockSafePattern> = vec![];
         let destructive_patterns: Vec<MockDestructivePattern> = vec![];
@@ -542,12 +630,13 @@ mod tests {
         ];
 
         for cmd in test_cases {
-            let result1 = evaluate_command(cmd, &config, keywords, &compiled);
+            let result1 = evaluate_command(cmd, &config, keywords, &compiled, &allowlists);
             let result2 = evaluate_command_with_legacy(
                 cmd,
                 &config,
                 keywords,
                 &compiled,
+                &allowlists,
                 &safe_patterns,
                 &destructive_patterns,
             );
@@ -571,6 +660,7 @@ mod tests {
         config.packs.enabled.push("containers.docker".to_string());
 
         let compiled = config.overrides.compile();
+        let allowlists = default_allowlists();
         let enabled_packs = config.enabled_pack_ids();
         let keywords_vec = crate::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
         let keywords: Vec<&str> = keywords_vec.clone();
@@ -582,12 +672,13 @@ mod tests {
         let blocked_commands = ["docker system prune", "docker system prune -a"];
 
         for cmd in blocked_commands {
-            let result1 = evaluate_command(cmd, &config, &keywords, &compiled);
+            let result1 = evaluate_command(cmd, &config, &keywords, &compiled, &allowlists);
             let result2 = evaluate_command_with_legacy(
                 cmd,
                 &config,
                 &keywords,
                 &compiled,
+                &allowlists,
                 &safe_patterns,
                 &destructive_patterns,
             );
@@ -622,6 +713,7 @@ mod tests {
             .push(AllowOverride::Simple("docker system prune".to_string()));
 
         let compiled = config.overrides.compile();
+        let allowlists = default_allowlists();
         let enabled_packs = config.enabled_pack_ids();
         let keywords_vec = crate::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
         let keywords: Vec<&str> = keywords_vec.clone();
@@ -631,12 +723,13 @@ mod tests {
 
         let cmd = "docker system prune";
 
-        let result1 = evaluate_command(cmd, &config, &keywords, &compiled);
+        let result1 = evaluate_command(cmd, &config, &keywords, &compiled, &allowlists);
         let result2 = evaluate_command_with_legacy(
             cmd,
             &config,
             &keywords,
             &compiled,
+            &allowlists,
             &safe_patterns,
             &destructive_patterns,
         );
@@ -664,6 +757,7 @@ mod tests {
         });
 
         let compiled = config.overrides.compile();
+        let allowlists = default_allowlists();
         let keywords = &["ls"]; // Need ls keyword to not quick-reject
 
         let safe_patterns: Vec<MockSafePattern> = vec![];
@@ -671,12 +765,13 @@ mod tests {
 
         let cmd = "ls /secret/files";
 
-        let result1 = evaluate_command(cmd, &config, keywords, &compiled);
+        let result1 = evaluate_command(cmd, &config, keywords, &compiled, &allowlists);
         let result2 = evaluate_command_with_legacy(
             cmd,
             &config,
             keywords,
             &compiled,
+            &allowlists,
             &safe_patterns,
             &destructive_patterns,
         );
@@ -701,6 +796,7 @@ mod tests {
     fn legacy_patterns_cause_expected_divergence() {
         let config = default_config();
         let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
         let keywords = &["test"];
 
         // Create a legacy destructive pattern that blocks "test dangerous"
@@ -712,12 +808,13 @@ mod tests {
 
         let cmd = "test dangerous command";
 
-        let result1 = evaluate_command(cmd, &config, keywords, &compiled);
+        let result1 = evaluate_command(cmd, &config, keywords, &compiled, &allowlists);
         let result2 = evaluate_command_with_legacy(
             cmd,
             &config,
             keywords,
             &compiled,
+            &allowlists,
             &safe_patterns,
             &destructive_patterns,
         );
@@ -748,6 +845,7 @@ mod tests {
         config.packs.enabled.push("containers.docker".to_string());
 
         let compiled = config.overrides.compile();
+        let allowlists = default_allowlists();
         let enabled_packs = config.enabled_pack_ids();
         let keywords_vec = crate::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
         let keywords: Vec<&str> = keywords_vec.clone();
@@ -758,12 +856,13 @@ mod tests {
         // Command with absolute path (should be normalized)
         let cmd = "/usr/bin/docker system prune";
 
-        let result1 = evaluate_command(cmd, &config, &keywords, &compiled);
+        let result1 = evaluate_command(cmd, &config, &keywords, &compiled, &allowlists);
         let result2 = evaluate_command_with_legacy(
             cmd,
             &config,
             &keywords,
             &compiled,
+            &allowlists,
             &safe_patterns,
             &destructive_patterns,
         );
@@ -793,6 +892,13 @@ mod proptest_invariants {
     use crate::config::Config;
     use crate::packs::normalize_command;
     use proptest::prelude::*;
+    use std::sync::LazyLock;
+
+    static EMPTY_ALLOWLISTS: LazyLock<LayeredAllowlist> = LazyLock::new(LayeredAllowlist::default);
+
+    fn default_allowlists() -> &'static LayeredAllowlist {
+        &EMPTY_ALLOWLISTS
+    }
 
     /// Strategy for generating arbitrary UTF-8 strings for command testing.
     /// Includes normal commands, edge cases, and adversarial inputs.
@@ -832,10 +938,11 @@ mod proptest_invariants {
         fn evaluation_is_deterministic(cmd in command_strategy()) {
             let config = Config::default();
             let compiled = config.overrides.compile();
+            let allowlists = default_allowlists();
             let keywords = &["git", "rm", "docker", "kubectl", "psql", "mysql"];
 
-            let result1 = evaluate_command(&cmd, &config, keywords, &compiled);
-            let result2 = evaluate_command(&cmd, &config, keywords, &compiled);
+            let result1 = evaluate_command(&cmd, &config, keywords, &compiled, allowlists);
+            let result2 = evaluate_command(&cmd, &config, keywords, &compiled, allowlists);
 
             prop_assert_eq!(
                 result1.decision, result2.decision,
@@ -861,10 +968,11 @@ mod proptest_invariants {
         fn evaluation_never_panics(cmd in "\\PC{0,1000}") {
             let config = Config::default();
             let compiled = config.overrides.compile();
+            let allowlists = default_allowlists();
             let keywords = &["git", "rm", "docker", "kubectl"];
 
             // This should not panic - if it does, proptest will catch it
-            let _result = evaluate_command(&cmd, &config, keywords, &compiled);
+            let _result = evaluate_command(&cmd, &config, keywords, &compiled, allowlists);
         }
 
         /// Property: Bounded behavior for large inputs.
@@ -879,10 +987,11 @@ mod proptest_invariants {
 
             let config = Config::default();
             let compiled = config.overrides.compile();
+            let allowlists = default_allowlists();
             let keywords = &["git", "rm"];
 
             // Should complete without issue
-            let result = evaluate_command(&cmd, &config, keywords, &compiled);
+            let result = evaluate_command(&cmd, &config, keywords, &compiled, allowlists);
 
             // Large commands without relevant keywords should be quick-rejected
             if !cmd.contains("git") && !cmd.contains("rm") {
@@ -895,10 +1004,11 @@ mod proptest_invariants {
         fn empty_and_whitespace_allowed(spaces in "[ \\t\\n]*") {
             let config = Config::default();
             let compiled = config.overrides.compile();
+            let allowlists = default_allowlists();
             let keywords = &["git", "rm"];
 
             // Empty commands should be allowed
-            let result = evaluate_command(&spaces, &config, keywords, &compiled);
+            let result = evaluate_command(&spaces, &config, keywords, &compiled, allowlists);
 
             // Commands that are only whitespace should also be allowed
             // (they don't contain any relevant keywords)
