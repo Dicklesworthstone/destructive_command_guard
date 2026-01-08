@@ -755,4 +755,240 @@ mod tests {
         assert_eq!(hit.layer, AllowlistLayer::Project);
         assert_eq!(hit.entry.reason, "allow all git rules in this pack");
     }
+
+    // ==========================================================================
+    // Entry validity tests (expiration, conditions, risk acknowledgement)
+    // ==========================================================================
+
+    fn make_test_entry() -> AllowEntry {
+        AllowEntry {
+            selector: AllowSelector::Rule(RuleId {
+                pack_id: "core.git".to_string(),
+                pattern_name: "reset-hard".to_string(),
+            }),
+            reason: "test".to_string(),
+            added_by: None,
+            added_at: None,
+            expires_at: None,
+            context: None,
+            conditions: HashMap::new(),
+            environments: Vec::new(),
+            risk_acknowledged: false,
+        }
+    }
+
+    #[test]
+    fn entry_without_expiration_is_not_expired() {
+        let entry = make_test_entry();
+        assert!(!is_expired(&entry));
+    }
+
+    #[test]
+    fn entry_with_future_rfc3339_is_not_expired() {
+        let mut entry = make_test_entry();
+        entry.expires_at = Some("2099-12-31T23:59:59Z".to_string());
+        assert!(!is_expired(&entry));
+    }
+
+    #[test]
+    fn entry_with_past_rfc3339_is_expired() {
+        let mut entry = make_test_entry();
+        entry.expires_at = Some("2020-01-01T00:00:00Z".to_string());
+        assert!(is_expired(&entry));
+    }
+
+    #[test]
+    fn entry_with_future_date_only_is_not_expired() {
+        let mut entry = make_test_entry();
+        entry.expires_at = Some("2099-12-31".to_string());
+        assert!(!is_expired(&entry));
+    }
+
+    #[test]
+    fn entry_with_past_date_only_is_expired() {
+        let mut entry = make_test_entry();
+        entry.expires_at = Some("2020-01-01".to_string());
+        assert!(is_expired(&entry));
+    }
+
+    #[test]
+    fn entry_with_invalid_timestamp_is_not_expired() {
+        // Invalid formats should fail open (treat as not expired)
+        let mut entry = make_test_entry();
+        entry.expires_at = Some("not-a-date".to_string());
+        assert!(!is_expired(&entry));
+    }
+
+    #[test]
+    fn expired_entry_is_skipped_in_match_rule() {
+        let allowlists = LayeredAllowlist {
+            layers: vec![LoadedAllowlistLayer {
+                layer: AllowlistLayer::Project,
+                path: PathBuf::from("project"),
+                file: AllowlistFile {
+                    entries: vec![AllowEntry {
+                        selector: AllowSelector::Rule(RuleId {
+                            pack_id: "core.git".to_string(),
+                            pattern_name: "reset-hard".to_string(),
+                        }),
+                        reason: "expired allowlist".to_string(),
+                        added_by: None,
+                        added_at: None,
+                        expires_at: Some("2020-01-01T00:00:00Z".to_string()),
+                        context: None,
+                        conditions: HashMap::new(),
+                        environments: Vec::new(),
+                        risk_acknowledged: false,
+                    }],
+                    errors: Vec::new(),
+                },
+            }],
+        };
+
+        // Should not match because the entry is expired
+        assert!(allowlists.match_rule("core.git", "reset-hard").is_none());
+    }
+
+    #[test]
+    fn entry_with_no_conditions_is_valid() {
+        let entry = make_test_entry();
+        assert!(conditions_met(&entry));
+    }
+
+    #[test]
+    fn entry_with_missing_env_var_is_invalid() {
+        // Use a unique env var name that definitely doesn't exist
+        let mut entry = make_test_entry();
+        entry.conditions.insert(
+            "DCG_TEST_NONEXISTENT_VAR_12345_ABCDE".to_string(),
+            "anything".to_string(),
+        );
+        assert!(!conditions_met(&entry));
+    }
+
+    #[test]
+    fn entry_with_multiple_missing_conditions_is_invalid() {
+        let mut entry = make_test_entry();
+        entry.conditions.insert(
+            "DCG_TEST_MISSING_A_99999".to_string(),
+            "value_a".to_string(),
+        );
+        entry.conditions.insert(
+            "DCG_TEST_MISSING_B_99999".to_string(),
+            "value_b".to_string(),
+        );
+        // Both conditions missing, so should fail
+        assert!(!conditions_met(&entry));
+    }
+
+    #[test]
+    fn rule_entry_without_risk_ack_is_valid() {
+        // Rule entries don't require risk_acknowledged
+        let entry = make_test_entry();
+        assert!(has_required_risk_ack(&entry));
+    }
+
+    #[test]
+    fn regex_entry_without_risk_ack_is_invalid() {
+        let entry = AllowEntry {
+            selector: AllowSelector::RegexPattern("rm.*-rf".to_string()),
+            reason: "test".to_string(),
+            added_by: None,
+            added_at: None,
+            expires_at: None,
+            context: None,
+            conditions: HashMap::new(),
+            environments: Vec::new(),
+            risk_acknowledged: false,
+        };
+        assert!(!has_required_risk_ack(&entry));
+    }
+
+    #[test]
+    fn regex_entry_with_risk_ack_is_valid() {
+        let entry = AllowEntry {
+            selector: AllowSelector::RegexPattern("rm.*-rf".to_string()),
+            reason: "test".to_string(),
+            added_by: None,
+            added_at: None,
+            expires_at: None,
+            context: None,
+            conditions: HashMap::new(),
+            environments: Vec::new(),
+            risk_acknowledged: true,
+        };
+        assert!(has_required_risk_ack(&entry));
+    }
+
+    #[test]
+    fn is_entry_valid_combines_all_checks() {
+        // Valid entry: not expired, no conditions, not regex
+        let entry = make_test_entry();
+        assert!(is_entry_valid(&entry));
+
+        // Invalid: expired
+        let mut expired = make_test_entry();
+        expired.expires_at = Some("2020-01-01".to_string());
+        assert!(!is_entry_valid(&expired));
+
+        // Invalid: condition not met (unique nonexistent env var)
+        let mut unmet_condition = make_test_entry();
+        unmet_condition.conditions.insert(
+            "DCG_TEST_COMBINED_NONEXISTENT_77777".to_string(),
+            "x".to_string(),
+        );
+        assert!(!is_entry_valid(&unmet_condition));
+
+        // Invalid: regex without ack
+        let regex_no_ack = AllowEntry {
+            selector: AllowSelector::RegexPattern(".*".to_string()),
+            reason: "test".to_string(),
+            added_by: None,
+            added_at: None,
+            expires_at: None,
+            context: None,
+            conditions: HashMap::new(),
+            environments: Vec::new(),
+            risk_acknowledged: false,
+        };
+        assert!(!is_entry_valid(&regex_no_ack));
+    }
+
+    #[test]
+    fn unmet_condition_entry_is_skipped_in_match_rule() {
+        // Use a unique nonexistent env var name
+        let allowlists = LayeredAllowlist {
+            layers: vec![LoadedAllowlistLayer {
+                layer: AllowlistLayer::Project,
+                path: PathBuf::from("project"),
+                file: AllowlistFile {
+                    entries: vec![AllowEntry {
+                        selector: AllowSelector::Rule(RuleId {
+                            pack_id: "core.git".to_string(),
+                            pattern_name: "reset-hard".to_string(),
+                        }),
+                        reason: "conditional allowlist".to_string(),
+                        added_by: None,
+                        added_at: None,
+                        expires_at: None,
+                        context: None,
+                        conditions: {
+                            let mut m = HashMap::new();
+                            m.insert(
+                                "DCG_TEST_SKIP_NONEXISTENT_88888".to_string(),
+                                "enabled".to_string(),
+                            );
+                            m
+                        },
+                        environments: Vec::new(),
+                        risk_acknowledged: false,
+                    }],
+                    errors: Vec::new(),
+                },
+            }],
+        };
+
+        // Should not match because the condition is not met
+        assert!(allowlists.match_rule("core.git", "reset-hard").is_none());
+    }
 }

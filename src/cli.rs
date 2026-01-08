@@ -2970,9 +2970,7 @@ mod tests {
         run_git(repo.path(), &["rm", "delete.rs"]);
 
         let paths = get_staged_files_at(repo.path()).expect("staged files");
-        let contains_deleted = paths
-            .iter()
-            .any(|p| p.to_string_lossy() == "delete.rs");
+        let contains_deleted = paths.iter().any(|p| p.to_string_lossy() == "delete.rs");
 
         assert!(!contains_deleted);
     }
@@ -2990,9 +2988,7 @@ mod tests {
         run_git(repo.path(), &["commit", "-m", "mod diff"]);
 
         let paths = get_git_diff_files_at(repo.path(), "HEAD~1..HEAD").expect("diff files");
-        let contains_diff = paths
-            .iter()
-            .any(|p| p.to_string_lossy() == "diff.rs");
+        let contains_diff = paths.iter().any(|p| p.to_string_lossy() == "diff.rs");
 
         assert!(contains_diff);
     }
