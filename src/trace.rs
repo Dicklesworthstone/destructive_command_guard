@@ -1153,33 +1153,6 @@ pub fn truncate_utf8(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
 
-    fn assert_json_superset(actual: &serde_json::Value, expected: &serde_json::Value) {
-        match (actual, expected) {
-            (serde_json::Value::Object(actual_map), serde_json::Value::Object(expected_map)) => {
-                for (key, expected_value) in expected_map {
-                    let Some(actual_value) = actual_map.get(key) else {
-                        panic!("missing key in JSON output: {key}");
-                    };
-                    assert_json_superset(actual_value, expected_value);
-                }
-            }
-            (serde_json::Value::Array(actual_items), serde_json::Value::Array(expected_items)) => {
-                assert!(
-                    actual_items.len() >= expected_items.len(),
-                    "array shorter than expected: actual={}, expected={}",
-                    actual_items.len(),
-                    expected_items.len()
-                );
-                for (idx, expected_item) in expected_items.iter().enumerate() {
-                    assert_json_superset(&actual_items[idx], expected_item);
-                }
-            }
-            _ => {
-                assert_eq!(actual, expected);
-            }
-        }
-    }
-
     #[test]
     fn trace_collector_basic_flow() {
         let mut collector = TraceCollector::new("git reset --hard");
