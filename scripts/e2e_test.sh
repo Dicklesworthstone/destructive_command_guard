@@ -165,7 +165,19 @@ test_command() {
             if echo "$result" | grep -q '"deny"'; then
                 log_pass "BLOCKED: $desc"
                 if $VERBOSE; then
-                    echo -e "  ${CYAN}Reason:${NC} $(echo "$result" | grep -o '"permissionDecisionReason":"[^"]*"' | head -1 | cut -d'"' -f4 | head -c 80)..."
+                    local decision_reason
+                    decision_reason=$(echo "$result" | grep -o '"permissionDecisionReason":"[^"]*"' | head -1 | cut -d'"' -f4)
+                    # Extract the human reason line from the hook message.
+                    local reason_line
+                    reason_line=${decision_reason#*Reason: }
+                    # Best-effort rule attribution: our heredoc/inline path encodes `rule <pack>:<pattern>`
+                    # inside the reason string.
+                    local rule_id=""
+                    rule_id=$(echo "$reason_line" | grep -Eo 'rule [^,)]+' | head -1 | sed 's/^rule //')
+                    echo -e "  ${CYAN}Reason:${NC} $(echo "$reason_line" | head -c 160)..."
+                    if [[ -n "$rule_id" ]]; then
+                        echo -e "  ${CYAN}Rule:${NC} $rule_id"
+                    fi
                 fi
                 return 0
             fi
@@ -487,13 +499,20 @@ test_command_with_packs "kubectl delete namespace foo" "block" "containers.docke
 test_command "docker system prune" "allow" "docker system prune (no docker pack, quick reject)"
 test_command "kubectl delete namespace foo" "allow" "kubectl delete namespace (no kubectl pack, quick reject)"
 
-log_section "Heredoc / Inline Script Tests (git_safety_guard-e7m)"
+log_section "Heredoc / Inline Script Tests (git_safety_guard-e2eh)"
 
 # Must BLOCK: destructive operations inside heredocs (requires Tier 1→2→3 integration)
 test_command $'node <<EOF\nconst fs = require(\'fs\');\nfs.rmSync(\'/etc\', { recursive: true });\nEOF\n' "block" "node heredoc fs.rmSync('/etc', {recursive:true})"
 
+# Must BLOCK: cross-language heredoc cases (at least 3 languages)
+test_command $'python3 <<EOF\nimport shutil\nshutil.rmtree(\"/tmp/test\")\nEOF\n' "block" "python heredoc shutil.rmtree('/tmp/test')"
+test_command $'ruby <<EOF\nrequire \"fileutils\"\nFileUtils.rm_rf(\"/\")\nEOF\n' "block" "ruby heredoc FileUtils.rm_rf('/')"
+test_command $'perl <<EOF\nsystem(\"rm -rf /\");\nEOF\n' "block" "perl heredoc system(\"rm -rf /\")"
+test_command $'bash <<EOF\nrm -rf /etc\nEOF\n' "block" "bash heredoc rm -rf /etc"
+
 # Must ALLOW: safe heredoc content should not be blocked
 test_command $'node <<EOF\nconsole.log(\"hello\");\nEOF\n' "allow" "node heredoc safe content"
+test_command $'python3 <<EOF\nprint(\"hello\")\nEOF\n' "allow" "python heredoc safe content"
 
 # Must ALLOW: heredoc/inline trigger strings inside known-safe string args must not be treated as executed
 test_command 'git commit -m "example: node -e \"require(\x27child_process\x27).execSync(\x27rm -rf /\x27)\""' "allow" "git commit -m contains node -e rm -rf (data context)"
