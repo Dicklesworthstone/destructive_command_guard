@@ -127,7 +127,9 @@ pub struct HeredocPattern {
     pub language: Language,
     pub matcher: PatternMatcher,
     pub reason: &'static str,
+    pub suggestion: Option<&'static str>,  // Safe alternative
     pub severity: Severity,
+    pub fp_notes: Option<&'static str>,    // FP risk documentation
 }
 ```
 
@@ -244,8 +246,8 @@ heredoc = ["ast-grep-core"]
 ```
 HookInput {command}
     ↓
-pack_aware_quick_reject(command, keywords)
-    ↓ (if keywords found)
+pack_aware_quick_reject(command, keywords) == false?
+    ↓ (if false = keywords present, proceed)
 HeredocTrigger::check(command)
     ↓ (if triggered)
 HeredocExtractor::extract(command)
@@ -256,6 +258,9 @@ AstMatcher::find_matches(content, language)
     ↓
 CheckResult {blocked, reason, rule_id}
 ```
+
+Note: `pack_aware_quick_reject()` returns `true` if safe to skip (no keywords),
+`false` if keywords present and further checking is needed.
 
 ## References
 

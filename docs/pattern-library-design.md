@@ -86,7 +86,7 @@ Pattern: `{category}.{language}.{operation}[.{variant}]`
 Examples:
 - `heredoc.python.shutil_rmtree`
 - `heredoc.python.subprocess_rm_rf`
-- `heredoc.bash.rm_rf_recursive`
+- `heredoc.bash.rm_rf.recursive` (variant uses dot separator)
 - `heredoc.javascript.fs_rmsync_recursive`
 - `heredoc.ruby.fileutils_rm_rf`
 
@@ -175,9 +175,11 @@ They're only evaluated when:
 ```rust
 PatternMatcher::Composite {
     trigger: regex!(r"subprocess\.\w+\("),
-    validator: "$EXPR.run($CMD)" // AST pattern
-    // Then check $CMD contains destructive content
+    validator: "$EXPR.run($CMD)".to_string(),
 }
+// The matcher first runs `trigger` regex. If it matches,
+// it extracts via the `validator` AST pattern, then checks
+// if $CMD contains destructive content.
 ```
 
 ---
