@@ -130,6 +130,14 @@ pub enum Command {
         #[arg(long, value_delimiter = ',')]
         with_packs: Option<Vec<String>>,
 
+        /// Show detailed decision trace (same as `dcg explain`)
+        #[arg(long)]
+        explain: bool,
+
+        /// Output format when using --explain
+        #[arg(long, short = 'f', value_enum, default_value = "pretty")]
+        format: ExplainFormat,
+
         /// Enable heredoc/inline-script scanning (overrides config)
         #[arg(long = "heredoc-scan", conflicts_with = "no_heredoc_scan")]
         heredoc_scan: bool,
@@ -418,20 +426,27 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::TestCommand {
             command,
             with_packs,
+            explain,
+            format,
             heredoc_scan,
             no_heredoc_scan,
             heredoc_timeout_ms,
             heredoc_languages,
         }) => {
-            test_command(
-                &config,
-                &command,
-                with_packs,
-                heredoc_scan,
-                no_heredoc_scan,
-                heredoc_timeout_ms,
-                heredoc_languages,
-            );
+            if explain {
+                // Delegate to explain handler for detailed trace output
+                handle_explain(&config, &command, format, with_packs);
+            } else {
+                test_command(
+                    &config,
+                    &command,
+                    with_packs,
+                    heredoc_scan,
+                    no_heredoc_scan,
+                    heredoc_timeout_ms,
+                    heredoc_languages,
+                );
+            }
         }
         Some(Command::Init { output, force }) => {
             init_config(output, force)?;
@@ -998,9 +1013,22 @@ fn glob_match(pattern: &str, path: &str) -> bool {
         if parts.len() == 2 {
             let prefix = parts[0];
             let suffix = parts[1];
-            return path.starts_with(prefix)
-                && path.ends_with(suffix)
-                && !path[prefix.len()..path.len() - suffix.len()].contains('/');
+
+            if !path.starts_with(prefix) || !path.ends_with(suffix) {
+                return false;
+            }
+
+            // Check that prefix and suffix don't overlap
+            // e.g., pattern "test*st" should NOT match "test" because the middle would be negative
+            let min_len = prefix.len() + suffix.len();
+            if path.len() < min_len {
+                return false;
+            }
+
+            // The middle section (between prefix and suffix) must not contain /
+            let middle_start = prefix.len();
+            let middle_end = path.len() - suffix.len();
+            return !path[middle_start..middle_end].contains('/');
         }
     }
 
