@@ -25,11 +25,11 @@ use destructive_command_guard::packs::{REGISTRY, pack_aware_quick_reject};
 use fancy_regex::Regex;
 #[cfg(test)]
 use memchr::memmem;
-// Import hook types for hook mode
-use destructive_command_guard::hook::{HookInput, HookOutput, HookSpecificOutput};
+// Import hook types for tests
+use destructive_command_guard::hook::HookInput;
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal};
 use std::sync::LazyLock;
 
 // Build metadata from vergen (set by build.rs)
@@ -332,37 +332,8 @@ fn configure_colors() {
 // NOTE: format_denial_message is now in hook module.
 // Use hook::format_denial_message() if needed.
 
-// NOTE: print_colorful_warning is now in hook module.
-// Use hook::print_colorful_warning() if needed.
-
-/// Output a denial response and flush stdout.
-///
-/// The response format matches Claude Code's `PreToolUse` hook protocol.
-/// Additionally prints a colorful warning to stderr for human visibility.
-#[cold]
-#[inline(never)]
-fn deny(original_command: &str, reason: &str) {
-    // Print colorful warning to stderr (visible to user)
-    hook::print_colorful_warning(original_command, reason, None);
-
-    // Build JSON response for hook protocol (stdout)
-    let message = hook::format_denial_message(original_command, reason);
-
-    let output = HookOutput {
-        hook_specific_output: HookSpecificOutput {
-            hook_event_name: "PreToolUse",
-            permission_decision: "deny",
-            permission_decision_reason: Cow::Owned(message),
-        },
-    };
-
-    // Write JSON to stdout for the hook protocol
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-    // Unwrap is safe here since stdout write failure is unrecoverable
-    serde_json::to_writer(&mut handle, &output).unwrap();
-    writeln!(handle).unwrap();
-}
+// NOTE: print_colorful_warning, format_denial_message, and deny() are now in hook module.
+// Use hook::output_denial() for all denial responses.
 
 /// Print version information and exit.
 fn print_version() {
@@ -475,7 +446,7 @@ fn main() {
 
     // Check explicit block overrides (using precompiled regexes)
     if let Some(reason) = compiled_overrides.check_block(&command) {
-        deny(&command, reason);
+        hook::output_denial(&command, reason, None);
         return;
     }
 
@@ -503,7 +474,7 @@ fn main() {
     // If any destructive pattern matches, deny with reason.
     for pattern in DESTRUCTIVE_PATTERNS.iter() {
         if pattern.regex.is_match(&normalized).unwrap_or(false) {
-            deny(&command, pattern.reason);
+            hook::output_denial(&command, pattern.reason, None);
             return;
         }
     }
@@ -1019,6 +990,7 @@ mod tests {
 
     mod deny_output_tests {
         use super::*;
+        use destructive_command_guard::hook::{HookOutput, HookSpecificOutput};
 
         fn capture_deny_output(command: &str, reason: &str) -> HookOutput<'static> {
             HookOutput {
