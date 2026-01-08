@@ -439,7 +439,12 @@ mod tests {
         assert!(result.is_allowed());
 
         // Even with more keywords
-        let result = evaluate_command("npm install", &config, &["git", "rm", "docker", "kubectl"], &compiled);
+        let result = evaluate_command(
+            "npm install",
+            &config,
+            &["git", "rm", "docker", "kubectl"],
+            &compiled,
+        );
         assert!(result.is_allowed());
     }
 
@@ -748,5 +753,132 @@ mod tests {
             result1.is_denied(),
             "Normalized docker prune should be blocked"
         );
+    }
+}
+
+// =============================================================================
+// Property-Based Tests (git_safety_guard-7tg.1)
+// =============================================================================
+//
+// These tests use proptest to verify evaluator invariants with random inputs.
+// They encode properties we never want to regress.
+
+#[cfg(test)]
+mod proptest_invariants {
+    use super::*;
+    use crate::config::Config;
+    use crate::packs::normalize_command;
+    use proptest::prelude::*;
+
+    /// Strategy for generating arbitrary UTF-8 strings for command testing.
+    /// Includes normal commands, edge cases, and adversarial inputs.
+    fn command_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            // Normal-looking commands
+            "[a-zA-Z][a-zA-Z0-9_\\-]{0,50}( [a-zA-Z0-9_\\-./]+){0,10}",
+            // Commands with special characters
+            "[!-~]{0,100}",
+            // Commands with unicode
+            "\\PC{0,100}",
+            // Very short commands
+            ".{0,5}",
+            // Empty string
+            Just(String::new()),
+            // Path-like commands
+            "(/[a-z]+){1,5} [a-z\\-]+( [a-z]+)*",
+        ]
+    }
+
+    proptest! {
+        /// Property: Normalization is idempotent.
+        /// normalize(normalize(cmd)) == normalize(cmd)
+        #[test]
+        fn normalization_is_idempotent(cmd in command_strategy()) {
+            let once = normalize_command(&cmd).into_owned();
+            let twice = normalize_command(&once).into_owned();
+            prop_assert_eq!(
+                once, twice,
+                "Normalization should be idempotent for: {:?}", cmd
+            );
+        }
+
+        /// Property: Evaluation is deterministic.
+        /// Evaluating the same input twice yields identical results.
+        #[test]
+        fn evaluation_is_deterministic(cmd in command_strategy()) {
+            let config = Config::default();
+            let compiled = config.overrides.compile();
+            let keywords = &["git", "rm", "docker", "kubectl", "psql", "mysql"];
+
+            let result1 = evaluate_command(&cmd, &config, keywords, &compiled);
+            let result2 = evaluate_command(&cmd, &config, keywords, &compiled);
+
+            prop_assert_eq!(
+                result1.decision, result2.decision,
+                "Decision should be deterministic for: {:?}", cmd
+            );
+
+            // If denied, the reason and pack_id should also match
+            if result1.is_denied() {
+                prop_assert_eq!(
+                    result1.reason(), result2.reason(),
+                    "Reason should be deterministic for: {:?}", cmd
+                );
+                prop_assert_eq!(
+                    result1.pack_id(), result2.pack_id(),
+                    "Pack ID should be deterministic for: {:?}", cmd
+                );
+            }
+        }
+
+        /// Property: Evaluation never panics for arbitrary UTF-8 input.
+        /// This test uses proptest to generate adversarial inputs.
+        #[test]
+        fn evaluation_never_panics(cmd in "\\PC{0,1000}") {
+            let config = Config::default();
+            let compiled = config.overrides.compile();
+            let keywords = &["git", "rm", "docker", "kubectl"];
+
+            // This should not panic - if it does, proptest will catch it
+            let _result = evaluate_command(&cmd, &config, keywords, &compiled);
+        }
+
+        /// Property: Bounded behavior for large inputs.
+        /// Very long commands complete in bounded time and don't cause OOM.
+        #[test]
+        fn handles_large_inputs(
+            prefix in "[a-z]{1,10}",
+            repeat_count in 1usize..1000,
+        ) {
+            // Create a large but bounded command
+            let cmd = format!("{} {}", prefix, "arg ".repeat(repeat_count));
+
+            let config = Config::default();
+            let compiled = config.overrides.compile();
+            let keywords = &["git", "rm"];
+
+            // Should complete without issue
+            let result = evaluate_command(&cmd, &config, keywords, &compiled);
+
+            // Large commands without relevant keywords should be quick-rejected
+            if !cmd.contains("git") && !cmd.contains("rm") {
+                prop_assert!(result.is_allowed());
+            }
+        }
+
+        /// Property: Empty and whitespace-only commands are always allowed.
+        #[test]
+        fn empty_and_whitespace_allowed(spaces in "[ \\t\\n]*") {
+            let config = Config::default();
+            let compiled = config.overrides.compile();
+            let keywords = &["git", "rm"];
+
+            // Empty commands should be allowed
+            let result = evaluate_command(&spaces, &config, keywords, &compiled);
+
+            // Commands that are only whitespace should also be allowed
+            // (they don't contain any relevant keywords)
+            prop_assert!(result.is_allowed());
+        }
     }
 }

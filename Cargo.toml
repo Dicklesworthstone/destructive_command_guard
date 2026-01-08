@@ -46,6 +46,7 @@ vergen-gix = { version = "1.0", features = ["build", "cargo", "rustc"] }
 assert_cmd = "2.0"
 predicates = "3.1"
 tempfile = "3.14"
+proptest = "1.4"
 
 [profile.release]
 opt-level = "z"     # Optimize for size (lean binary for distribution)
