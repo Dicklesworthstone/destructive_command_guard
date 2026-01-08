@@ -232,11 +232,6 @@ impl AstMatcher {
             budget_ms,
         };
 
-        // Check for timeout before starting
-        if start_time.elapsed() > self.timeout {
-            return Err(timeout_err(start_time));
-        }
-
         // Check language support FIRST (before patterns, so we report unsupported properly)
         let Some(ast_lang) = script_language_to_ast_lang(language) else {
             return Err(MatchError::UnsupportedLanguage(language));
@@ -287,12 +282,8 @@ impl AstMatcher {
                 // Calculate line number (1-based)
                 let line_number = code[..range.start].matches('\n').count() + 1;
 
-                // Create preview (truncate if too long)
-                let preview = if matched_text.len() > 60 {
-                    format!("{}...", &matched_text[..57])
-                } else {
-                    matched_text.to_string()
-                };
+                // Create preview (truncate if too long, UTF-8 safe)
+                let preview = truncate_preview(&matched_text, 60);
 
                 matches.push(PatternMatch {
                     rule_id: compiled.rule_id.clone(),
@@ -322,6 +313,21 @@ impl AstMatcher {
         self.find_matches(code, language)
             .ok()
             .and_then(|matches| matches.into_iter().find(|m| m.severity.blocks_by_default()))
+    }
+}
+
+/// Truncate a string to at most `max_chars` characters, UTF-8 safe.
+///
+/// If truncation occurs, appends "..." to indicate more content exists.
+fn truncate_preview(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        text.to_string()
+    } else {
+        // Leave room for "..."
+        let truncate_at = max_chars.saturating_sub(3);
+        let truncated: String = text.chars().take(truncate_at).collect();
+        format!("{truncated}...")
     }
 }
 
@@ -758,5 +764,71 @@ mod tests {
         // Just verify it can be accessed without panic
         let _ = &*DEFAULT_MATCHER;
         assert!(!DEFAULT_MATCHER.patterns.is_empty());
+    }
+
+    #[test]
+    fn truncate_preview_handles_utf8_safely() {
+        // Test with ASCII
+        assert_eq!(truncate_preview("hello", 10), "hello");
+        assert_eq!(truncate_preview("hello world!", 8), "hello...");
+
+        // Test with multi-byte UTF-8 (emojis are 4 bytes each)
+        let emojis = "🎉🎊🎁🎄🎅";
+        assert_eq!(truncate_preview(emojis, 10), emojis); // 5 chars, fits
+        assert_eq!(truncate_preview(emojis, 4), "🎉..."); // truncates to 1 emoji + ...
+
+        // Test with CJK characters (3 bytes each)
+        let cjk = "你好世界";
+        assert_eq!(truncate_preview(cjk, 10), cjk); // 4 chars, fits
+        assert_eq!(truncate_preview(cjk, 4), "你..."); // truncates to 1 char + ...
+
+        // Edge cases
+        assert_eq!(truncate_preview("", 10), "");
+        assert_eq!(truncate_preview("ab", 3), "ab");
+        assert_eq!(truncate_preview("abc", 3), "abc");
+        assert_eq!(truncate_preview("abcd", 3), "...");
+    }
+
+    #[test]
+    fn ruby_positive_match() {
+        let matcher = AstMatcher::new();
+        let code = "require 'fileutils'\nFileUtils.rm_rf('/tmp/danger')";
+
+        let matches = matcher.find_matches(code, ScriptLanguage::Ruby);
+        match matches {
+            Ok(m) => {
+                assert!(!m.is_empty(), "should match FileUtils.rm_rf");
+                assert!(m[0].rule_id.contains("ruby"));
+                assert!(m[0].severity.blocks_by_default());
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn ruby_negative_match() {
+        let matcher = AstMatcher::new();
+        let code = "puts 'hello world'";
+
+        let matches = matcher.find_matches(code, ScriptLanguage::Ruby);
+        match matches {
+            Ok(m) => assert!(m.is_empty(), "should not match safe code"),
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn typescript_positive_match() {
+        let matcher = AstMatcher::new();
+        let code = "import * as fs from 'fs';\nfs.rmSync('/tmp/test');";
+
+        let matches = matcher.find_matches(code, ScriptLanguage::TypeScript);
+        match matches {
+            Ok(m) => {
+                assert!(!m.is_empty(), "should match fs.rmSync");
+                assert!(m[0].rule_id.contains("typescript"));
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
     }
 }
