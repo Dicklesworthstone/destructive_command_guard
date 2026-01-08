@@ -668,11 +668,18 @@ fn refine_ruby_match(meta: &CompiledPattern, matched_text: &str) -> Option<Refin
             | "heredoc.ruby.kernel_system"
             | "heredoc.ruby.kernel_exec"
             | "heredoc.ruby.backticks"
+            | "heredoc.ruby.open3_capture3"
+            | "heredoc.ruby.open3_popen3"
     ) {
         let payload = if rule_id == "heredoc.ruby.backticks" {
             RUBY_BACKTICKS_LITERAL
                 .captures(matched_text)
                 .and_then(|caps| caps.name("cmd").map(|m| m.as_str()))
+        } else if rule_id.starts_with("heredoc.ruby.open3_") {
+            // Open3 methods take the command as first argument
+            RUBY_FIRST_STRING_ARG
+                .captures(matched_text)
+                .and_then(|caps| string_literal_from_caps(&caps))
         } else {
             RUBY_SYSTEM_EXEC_LITERAL
                 .captures(matched_text)
