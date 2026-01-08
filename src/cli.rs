@@ -1756,4 +1756,152 @@ mod tests {
         let cli = Cli::parse_from(["dcg", "init"]);
         assert!(matches!(cli.command, Some(Command::Init { .. })));
     }
+
+    // ========================================================================
+    // Allowlist CLI tests
+    // ========================================================================
+
+    #[test]
+    fn test_cli_parse_allowlist_add() {
+        let cli = Cli::parse_from([
+            "dcg",
+            "allowlist",
+            "add",
+            "core.git:reset-hard",
+            "-r",
+            "Testing reset workflow",
+        ]);
+        if let Some(Command::Allowlist {
+            action: AllowlistAction::Add {
+                rule_id, reason, ..
+            },
+        }) = cli.command
+        {
+            assert_eq!(rule_id, "core.git:reset-hard");
+            assert_eq!(reason, "Testing reset workflow");
+        } else {
+            panic!("Expected Allowlist Add command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_allow_shortcut() {
+        let cli = Cli::parse_from([
+            "dcg",
+            "allow",
+            "core.git:push-force",
+            "-r",
+            "CI force push",
+            "--user",
+        ]);
+        if let Some(Command::Allow {
+            rule_id,
+            reason,
+            user,
+            project,
+            ..
+        }) = cli.command
+        {
+            assert_eq!(rule_id, "core.git:push-force");
+            assert_eq!(reason, "CI force push");
+            assert!(user);
+            assert!(!project);
+        } else {
+            panic!("Expected Allow command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_unallow_shortcut() {
+        let cli = Cli::parse_from(["dcg", "unallow", "core.git:reset-hard", "--project"]);
+        if let Some(Command::Unallow {
+            rule_id,
+            project,
+            user,
+        }) = cli.command
+        {
+            assert_eq!(rule_id, "core.git:reset-hard");
+            assert!(project);
+            assert!(!user);
+        } else {
+            panic!("Expected Unallow command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_allowlist_list() {
+        let cli = Cli::parse_from(["dcg", "allowlist", "list", "--format", "json"]);
+        if let Some(Command::Allowlist {
+            action: AllowlistAction::List { format, .. },
+        }) = cli.command
+        {
+            assert_eq!(format, AllowlistOutputFormat::Json);
+        } else {
+            panic!("Expected Allowlist List command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_allowlist_validate() {
+        let cli = Cli::parse_from(["dcg", "allowlist", "validate", "--strict"]);
+        if let Some(Command::Allowlist {
+            action: AllowlistAction::Validate { strict, .. },
+        }) = cli.command
+        {
+            assert!(strict);
+        } else {
+            panic!("Expected Allowlist Validate command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_allowlist_add_command() {
+        let cli = Cli::parse_from([
+            "dcg",
+            "allowlist",
+            "add-command",
+            "git push --force origin main",
+            "-r",
+            "Release workflow",
+        ]);
+        if let Some(Command::Allowlist {
+            action: AllowlistAction::AddCommand {
+                command, reason, ..
+            },
+        }) = cli.command
+        {
+            assert_eq!(command, "git push --force origin main");
+            assert_eq!(reason, "Release workflow");
+        } else {
+            panic!("Expected Allowlist AddCommand command");
+        }
+    }
+
+    #[test]
+    fn test_allowlist_toml_helpers() {
+        // Test building a rule entry
+        let rule_id = RuleId::parse("core.git:reset-hard").unwrap();
+        let entry = build_rule_entry(&rule_id, "test reason", None, &[]);
+        assert!(entry.get("rule").is_some());
+        assert!(entry.get("reason").is_some());
+        assert!(entry.get("added_at").is_some());
+
+        // Test building entry with expiration
+        let entry_with_exp = build_rule_entry(&rule_id, "test", Some("2030-01-01T00:00:00Z"), &[]);
+        assert!(entry_with_exp.get("expires_at").is_some());
+
+        // Test building entry with conditions
+        let entry_with_cond = build_rule_entry(&rule_id, "test", None, &["CI=true".to_string()]);
+        assert!(entry_with_cond.get("conditions").is_some());
+    }
+
+    #[test]
+    fn test_is_expired() {
+        // Past date should be expired
+        assert!(is_expired("2020-01-01T00:00:00Z"));
+        // Future date should not be expired
+        assert!(!is_expired("2099-12-31T23:59:59Z"));
+        // Invalid date should not be considered expired
+        assert!(!is_expired("not-a-date"));
+    }
 }

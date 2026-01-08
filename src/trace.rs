@@ -370,23 +370,273 @@ impl ExplainTrace {
         let duration_str = format_duration(self.total_duration_us);
         let command_preview = truncate_utf8(&self.command, max_len);
 
-        #[allow(clippy::option_if_let_else)]
-        match &self.match_info {
-            Some(info) => {
+        self.match_info.as_ref().map_or_else(
+            || format!("{decision_str} ({duration_str}) {command_preview}"),
+            |info| {
                 let rule_id = info.rule_id.as_deref().unwrap_or("unknown");
                 let reason = &info.reason;
                 format!("{decision_str} {rule_id} ({duration_str}) {command_preview} — {reason}")
-            }
-            None => {
-                format!("{decision_str} ({duration_str}) {command_preview}")
-            }
-        }
+            },
+        )
     }
 
     /// Get the reason for the decision (from match info).
     #[must_use]
     pub fn reason(&self) -> Option<&str> {
         self.match_info.as_ref().map(|m| m.reason.as_str())
+    }
+
+    /// Format the trace as human-readable pretty output.
+    ///
+    /// This format is optimized for answering:
+    /// - What was the decision?
+    /// - What matched (rule id) and where?
+    /// - Which stages were run and how long did they take?
+    /// - What can I do next (safe alternatives, allowlist command)?
+    ///
+    /// Set `use_color` to enable ANSI color codes for terminal output.
+    #[must_use]
+    pub fn format_pretty(&self, use_color: bool) -> String {
+        let mut out = String::with_capacity(1024);
+
+        // Color helpers
+        let (bold, reset, green, red, yellow, cyan, dim) = if use_color {
+            ("\x1b[1m", "\x1b[0m", "\x1b[32m", "\x1b[31m", "\x1b[33m", "\x1b[36m", "\x1b[2m")
+        } else {
+            ("", "", "", "", "", "", "")
+        };
+
+        // ═══════════════════════════════════════════════════════════════════
+        // HEADER
+        // ═══════════════════════════════════════════════════════════════════
+        out.push_str(&format!("{bold}══════════════════════════════════════════════════════════════════{reset}\n"));
+        out.push_str(&format!("{bold}DCG EXPLAIN{reset}\n"));
+        out.push_str(&format!("{bold}══════════════════════════════════════════════════════════════════{reset}\n\n"));
+
+        // Decision with color
+        let decision_str = match self.decision {
+            EvaluationDecision::Allow => format!("{green}{bold}ALLOW{reset}"),
+            EvaluationDecision::Deny => format!("{red}{bold}DENY{reset}"),
+        };
+        out.push_str(&format!("{bold}Decision:{reset} {decision_str}\n"));
+        out.push_str(&format!("{bold}Latency:{reset}  {}\n", format_duration(self.total_duration_us)));
+        out.push('\n');
+
+        // ═══════════════════════════════════════════════════════════════════
+        // COMMAND
+        // ═══════════════════════════════════════════════════════════════════
+        out.push_str(&format!("{bold}─── Command ───────────────────────────────────────────────────────{reset}\n"));
+        out.push_str(&format!("{cyan}Input:{reset}      {}\n", &self.command));
+
+        if let Some(ref normalized) = self.normalized_command {
+            if normalized != &self.command {
+                out.push_str(&format!("{cyan}Normalized:{reset} {normalized}\n"));
+            }
+        }
+
+        if let Some(ref sanitized) = self.sanitized_command {
+            if sanitized != &self.command && Some(sanitized) != self.normalized_command.as_ref() {
+                out.push_str(&format!("{cyan}Sanitized:{reset}  {sanitized}\n"));
+            }
+        }
+        out.push('\n');
+
+        // ═══════════════════════════════════════════════════════════════════
+        // MATCH INFO (for denials or allowlisted commands)
+        // ═══════════════════════════════════════════════════════════════════
+        if let Some(ref info) = self.match_info {
+            out.push_str(&format!("{bold}─── Match ─────────────────────────────────────────────────────────{reset}\n"));
+
+            if let Some(ref rule_id) = info.rule_id {
+                out.push_str(&format!("{cyan}Rule ID:{reset}    {yellow}{rule_id}{reset}\n"));
+            }
+
+            if let Some(ref pack_id) = info.pack_id {
+                out.push_str(&format!("{cyan}Pack:{reset}       {pack_id}\n"));
+            }
+
+            if let Some(ref pattern) = info.pattern_name {
+                out.push_str(&format!("{cyan}Pattern:{reset}    {pattern}\n"));
+            }
+
+            out.push_str(&format!("{cyan}Reason:{reset}     {}\n", info.reason));
+
+            // Show matched span if available
+            if let (Some(start), Some(end)) = (info.match_start, info.match_end) {
+                out.push_str(&format!("{cyan}Span:{reset}       bytes {start}..{end}\n"));
+
+                // Show matched text with highlighting
+                if let Some(ref preview) = info.matched_text_preview {
+                    out.push_str(&format!("{cyan}Matched:{reset}    {red}{preview}{reset}\n"));
+                }
+            }
+            out.push('\n');
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // ALLOWLIST OVERRIDE
+        // ═══════════════════════════════════════════════════════════════════
+        if let Some(ref al_info) = self.allowlist_info {
+            out.push_str(&format!("{bold}─── Allowlist Override ────────────────────────────────────────────{reset}\n"));
+            out.push_str(&format!("{cyan}Layer:{reset}      {:?}\n", al_info.layer));
+            out.push_str(&format!("{cyan}Reason:{reset}     {}\n", al_info.entry_reason));
+
+            // Show what was overridden
+            out.push_str(&format!("{dim}(Overrode {}: {}){reset}\n",
+                al_info.original_match.rule_id.as_deref().unwrap_or("unknown"),
+                al_info.original_match.reason
+            ));
+            out.push('\n');
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // PACK SUMMARY
+        // ═══════════════════════════════════════════════════════════════════
+        if let Some(ref summary) = self.pack_summary {
+            out.push_str(&format!("{bold}─── Pack Evaluation ───────────────────────────────────────────────{reset}\n"));
+            out.push_str(&format!("{cyan}Enabled:{reset}    {} packs\n", summary.enabled_count));
+
+            if !summary.evaluated.is_empty() {
+                out.push_str(&format!("{cyan}Evaluated:{reset}  {}\n", summary.evaluated.join(", ")));
+            }
+
+            if !summary.skipped.is_empty() {
+                out.push_str(&format!("{dim}Skipped (keyword gating): {}{reset}\n", summary.skipped.join(", ")));
+            }
+            out.push('\n');
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // PIPELINE TRACE (steps)
+        // ═══════════════════════════════════════════════════════════════════
+        if !self.steps.is_empty() {
+            out.push_str(&format!("{bold}─── Pipeline Trace ────────────────────────────────────────────────{reset}\n"));
+
+            for step in &self.steps {
+                let duration_str = format_duration(step.duration_us);
+                let details_summary = format_step_details_summary(&step.details);
+
+                out.push_str(&format!(
+                    "{cyan}{:<18}{reset} {dim}({:>8}){reset} {}\n",
+                    step.name, duration_str, details_summary
+                ));
+            }
+            out.push('\n');
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // SUGGESTIONS
+        // ═══════════════════════════════════════════════════════════════════
+        if let Some(ref info) = self.match_info {
+            if let Some(rule_id) = info.rule_id.as_deref() {
+                if let Some(suggestions) = crate::suggestions::get_suggestions(rule_id) {
+                    if !suggestions.is_empty() {
+                        out.push_str(&format!("{bold}─── Suggestions ───────────────────────────────────────────────────{reset}\n"));
+
+                        for s in suggestions {
+                            out.push_str(&format!("{yellow}• {}{reset}: {}\n", s.kind.label(), s.text));
+                            if let Some(ref cmd) = s.command {
+                                out.push_str(&format!("  {dim}${reset} {green}{cmd}{reset}\n"));
+                            }
+                            if let Some(ref url) = s.url {
+                                out.push_str(&format!("  {dim}→ {url}{reset}\n"));
+                            }
+                        }
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // FOOTER
+        // ═══════════════════════════════════════════════════════════════════
+        out.push_str(&format!("{bold}══════════════════════════════════════════════════════════════════{reset}\n"));
+
+        out
+    }
+}
+
+/// Format a one-line summary of step details.
+fn format_step_details_summary(details: &TraceDetails) -> String {
+    match details {
+        TraceDetails::InputParsing { is_hook_input, command_len } => {
+            let source = if *is_hook_input { "hook" } else { "CLI" };
+            format!("source={source}, len={command_len}")
+        }
+        TraceDetails::KeywordGating { quick_rejected, first_match, .. } => {
+            if *quick_rejected {
+                "quick-rejected (no keywords)".to_string()
+            } else if let Some(kw) = first_match {
+                format!("matched keyword \"{kw}\"")
+            } else {
+                "no match".to_string()
+            }
+        }
+        TraceDetails::Normalization { was_modified, stripped_prefix } => {
+            if *was_modified {
+                if let Some(prefix) = stripped_prefix {
+                    format!("stripped \"{prefix}\"")
+                } else {
+                    "modified".to_string()
+                }
+            } else {
+                "no change".to_string()
+            }
+        }
+        TraceDetails::Sanitization { was_modified, spans_masked } => {
+            if *was_modified {
+                format!("masked {spans_masked} span(s)")
+            } else {
+                "no change".to_string()
+            }
+        }
+        TraceDetails::HeredocDetection { triggered, scripts_extracted, languages } => {
+            if *triggered {
+                let langs = if languages.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", languages.join(", "))
+                };
+                format!("extracted {scripts_extracted} script(s){langs}")
+            } else {
+                "no heredocs".to_string()
+            }
+        }
+        TraceDetails::AllowlistCheck { layers_checked, matched, matched_layer } => {
+            if *matched {
+                format!("hit at {:?}", matched_layer.as_ref().unwrap_or(&AllowlistLayer::System))
+            } else {
+                format!("checked {layers_checked} layer(s), no match")
+            }
+        }
+        TraceDetails::PackEvaluation { packs_evaluated, matched_pack, matched_pattern, .. } => {
+            if let (Some(pack), Some(pattern)) = (matched_pack, matched_pattern) {
+                format!("matched {pack}:{pattern}")
+            } else {
+                format!("checked {} pack(s), no match", packs_evaluated.len())
+            }
+        }
+        TraceDetails::ConfigOverride { allow_matched, block_matched, reason } => {
+            if *block_matched {
+                format!("BLOCK: {}", reason.as_deref().unwrap_or("config override"))
+            } else if *allow_matched {
+                "ALLOW: config override".to_string()
+            } else {
+                "no override".to_string()
+            }
+        }
+        TraceDetails::PolicyDecision { decision, allowlisted } => {
+            let dec = match decision {
+                EvaluationDecision::Allow => "ALLOW",
+                EvaluationDecision::Deny => "DENY",
+            };
+            if *allowlisted {
+                format!("{dec} (allowlisted)")
+            } else {
+                dec.to_string()
+            }
+        }
     }
 }
 
@@ -397,22 +647,26 @@ impl ExplainTrace {
 /// - 10000us to 999999us: "10ms" (no decimal)
 /// - 1000000us+: "1.5s" (one decimal place)
 #[must_use]
-#[allow(clippy::cast_precision_loss)] // Precision loss is acceptable for display formatting
 pub fn format_duration(us: u64) -> String {
     if us < 1000 {
         format!("{us}us")
     } else if us < 1_000_000 {
-        // Use integer comparison for threshold to avoid rounding issues
         if us < 10_000 {
-            let ms = us as f64 / 1000.0;
-            format!("{ms:.1}ms")
+            // 0.1ms == 100us (rounded to nearest tenth)
+            let tenths_ms = us.saturating_add(50) / 100;
+            let whole = tenths_ms / 10;
+            let frac = tenths_ms % 10;
+            format!("{whole}.{frac}ms")
         } else {
-            let ms = us / 1000; // Integer division
+            let ms = us / 1000;
             format!("{ms}ms")
         }
     } else {
-        let s = us as f64 / 1_000_000.0;
-        format!("{s:.1}s")
+        // 0.1s == 100_000us (rounded to nearest tenth)
+        let tenths_s = us.saturating_add(50_000) / 100_000;
+        let whole = tenths_s / 10;
+        let frac = tenths_s % 10;
+        format!("{whole}.{frac}s")
     }
 }
 
