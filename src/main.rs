@@ -1511,7 +1511,7 @@ mod tests {
         use super::*;
         use std::collections::HashSet;
 
-        /// Test that pack_aware_quick_reject does NOT reject docker commands
+        /// Test that `pack_aware_quick_reject` does NOT reject docker commands
         /// when docker keywords are in the enabled keywords list.
         #[test]
         fn pack_aware_quick_reject_allows_docker_when_enabled() {
@@ -1547,7 +1547,7 @@ mod tests {
             );
         }
 
-        /// Test that pack_aware_quick_reject does NOT reject kubectl commands
+        /// Test that `pack_aware_quick_reject` does NOT reject kubectl commands
         /// when kubectl keywords are in the enabled keywords list.
         #[test]
         fn pack_aware_quick_reject_allows_kubectl_when_enabled() {
@@ -1648,7 +1648,7 @@ mod tests {
             );
         }
 
-        /// Test that collect_enabled_keywords includes docker keywords when docker pack enabled.
+        /// Test that `collect_enabled_keywords` includes docker keywords when docker pack enabled.
         #[test]
         fn collect_enabled_keywords_includes_docker() {
             let mut enabled = HashSet::new();
