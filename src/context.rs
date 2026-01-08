@@ -705,6 +705,22 @@ pub fn is_argument_data(command: &str, preceding_flag: Option<&str>) -> bool {
     false
 }
 
+/// Sanitize a command by stripping known-safe string arguments.
+///
+/// This function removes safe data spans (single-quoted strings, known-safe flags)
+/// from the command before pattern matching. This reduces false positives when
+/// dangerous keywords appear in string literals rather than actual command arguments.
+///
+/// TODO(git_safety_guard-t8x): Full implementation pending - currently returns input unchanged.
+#[must_use]
+#[allow(clippy::missing_const_for_fn)] // Will not be const when fully implemented
+pub fn sanitize_for_pattern_matching(cmd: &str) -> std::borrow::Cow<'_, str> {
+    // Stub implementation: return input unchanged
+    // Full implementation will use classify_command() to identify safe spans
+    // and replace their content with harmless placeholders.
+    std::borrow::Cow::Borrowed(cmd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

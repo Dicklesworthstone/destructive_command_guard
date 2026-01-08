@@ -37,7 +37,6 @@
 //! ```
 
 use crate::config::Config;
-use crate::context::sanitize_for_pattern_matching;
 use crate::packs::{REGISTRY, normalize_command, pack_aware_quick_reject};
 use std::collections::HashSet;
 
@@ -227,20 +226,14 @@ pub fn evaluate_command(
         return EvaluationResult::denied_by_config(reason.to_string());
     }
 
-    // Strip known-safe string arguments to reduce false positives.
-    // This must happen before quick-reject and pack evaluation so safe strings don't
-    // accidentally trigger keyword gating or regex matches.
-    let sanitized = sanitize_for_pattern_matching(command);
-    let command_for_match = sanitized.as_ref();
-
     // Step 3: Quick rejection - if no relevant keywords, allow immediately
     // This handles the 99%+ case where commands don't need pattern checking
-    if pack_aware_quick_reject(command_for_match, enabled_keywords) {
+    if pack_aware_quick_reject(command, enabled_keywords) {
         return EvaluationResult::allowed();
     }
 
     // Step 4: Normalize command (strip /usr/bin/git -> git, etc.)
-    let normalized = normalize_command(command_for_match);
+    let normalized = normalize_command(command);
 
     // Step 5 & 6: Check legacy patterns (safe then destructive)
     // Note: These are currently in main.rs as SAFE_PATTERNS and DESTRUCTIVE_PATTERNS.
@@ -279,8 +272,8 @@ pub fn evaluate_command(
 /// # Type Parameters
 ///
 /// This function accepts any types that implement pattern matching:
-/// * `S` - Safe pattern type with `is_match` method returning `Result<bool, _>`
-/// * `D` - Destructive pattern type with `is_match` method and `reason` field
+/// * `S` - Safe pattern type with `is_match` method returning `bool`
+/// * `D` - Destructive pattern type with `is_match` method returning `bool` and `reason` method
 pub fn evaluate_command_with_legacy<S, D>(
     command: &str,
     config: &Config,
@@ -309,15 +302,12 @@ where
     }
 
     // Step 3: Quick rejection - if no relevant keywords, allow immediately
-    let sanitized = sanitize_for_pattern_matching(command);
-    let command_for_match = sanitized.as_ref();
-
-    if pack_aware_quick_reject(command_for_match, enabled_keywords) {
+    if pack_aware_quick_reject(command, enabled_keywords) {
         return EvaluationResult::allowed();
     }
 
     // Step 4: Normalize command (strip /usr/bin/git -> git, etc.)
-    let normalized = normalize_command(command_for_match);
+    let normalized = normalize_command(command);
 
     // Step 5: Check legacy safe patterns (whitelist)
     for pattern in safe_patterns {
