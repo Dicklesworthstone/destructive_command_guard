@@ -205,12 +205,7 @@ pub fn print_colorful_warning(
         let _ = write!(handle, "{}", "│".red());
         let _ = write!(handle, "  {} ", "Rule:".bright_black());
         let _ = write!(handle, "{}", rule.yellow());
-        let _ = writeln!(
-            handle,
-            "{}{}",
-            " ".repeat(padding.saturating_sub(2)),
-            "│".red()
-        );
+        let _ = writeln!(handle, "{}{}", " ".repeat(padding), "│".red());
     } else if let Some(pack_name) = pack {
         // Fallback: show pack if no rule_id
         let pack_line = format!("  Pack: {pack_name}");
@@ -218,12 +213,7 @@ pub fn print_colorful_warning(
         let _ = write!(handle, "{}", "│".red());
         let _ = write!(handle, "  {} ", "Pack:".bright_black());
         let _ = write!(handle, "{}", pack_name.cyan());
-        let _ = writeln!(
-            handle,
-            "{}{}",
-            " ".repeat(padding.saturating_sub(2)),
-            "│".red()
-        );
+        let _ = writeln!(handle, "{}{}", " ".repeat(padding), "│".red());
     }
 
     // Empty line

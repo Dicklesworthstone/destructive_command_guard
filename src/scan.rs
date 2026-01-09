@@ -3749,12 +3749,12 @@ resource "null_resource" "test" {
 
     #[test]
     fn docker_compose_extracts_inline_command() {
-        let content = r#"
+        let content = r"
 services:
   app:
     image: alpine
     command: rm -rf /data
-"#;
+";
         let extracted = extract_docker_compose_from_str("docker-compose.yml", content, &["rm"]);
         assert_eq!(extracted.len(), 1);
         assert_eq!(extracted[0].command, "rm -rf /data");
@@ -3817,13 +3817,13 @@ services:
 
     #[test]
     fn docker_compose_extracts_healthcheck_test() {
-        let content = r#"
+        let content = r"
 services:
   db:
     healthcheck:
       test: rm -rf /health/check
       interval: 30s
-"#;
+";
         let extracted = extract_docker_compose_from_str("docker-compose.yml", content, &["rm"]);
         assert_eq!(extracted.len(), 1);
         assert!(extracted[0].command.contains("rm -rf"));
