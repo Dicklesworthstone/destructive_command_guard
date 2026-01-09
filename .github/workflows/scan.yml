@@ -94,12 +94,18 @@ jobs:
           echo "## Destructive Command Scan Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          if [ -f scan-results.json ]; then
-            # Extract summary stats
-            FILES_SCANNED=$(jq -r '.summary.files_scanned // 0' scan-results.json)
-            FINDINGS_TOTAL=$(jq -r '.summary.findings_total // 0' scan-results.json)
-            ERRORS=$(jq -r '.summary.severities.error // 0' scan-results.json)
-            WARNINGS=$(jq -r '.summary.severities.warning // 0' scan-results.json)
+          if [ -f scan-results.json ] && [ -s scan-results.json ]; then
+            # Extract summary stats (with validation to ensure integers)
+            FILES_SCANNED=$(jq -r '.summary.files_scanned // 0' scan-results.json 2>/dev/null)
+            FINDINGS_TOTAL=$(jq -r '.summary.findings_total // 0' scan-results.json 2>/dev/null)
+            ERRORS=$(jq -r '.summary.severities.error // 0' scan-results.json 2>/dev/null)
+            WARNINGS=$(jq -r '.summary.severities.warning // 0' scan-results.json 2>/dev/null)
+
+            # Validate that values are integers (default to 0 if not)
+            [[ "${FILES_SCANNED}" =~ ^[0-9]+$ ]] || FILES_SCANNED=0
+            [[ "${FINDINGS_TOTAL}" =~ ^[0-9]+$ ]] || FINDINGS_TOTAL=0
+            [[ "${ERRORS}" =~ ^[0-9]+$ ]] || ERRORS=0
+            [[ "${WARNINGS}" =~ ^[0-9]+$ ]] || WARNINGS=0
 
             echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
             echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
