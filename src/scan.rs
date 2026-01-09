@@ -1497,6 +1497,44 @@ RUN rm -rf ./tmp # cleanup temp dir
         assert_eq!(extracted[0].command, "rm -rf ./tmp");
     }
 
+    #[test]
+    fn dockerfile_extractor_does_not_extract_env_values() {
+        let content = r#"
+FROM ubuntu:22.04
+ENV X="rm -rf /" # should not be treated as executable context
+ENV NOTE="git reset --hard"
+"#;
+
+        let extracted = extract_dockerfile_from_str("Dockerfile", content, &["rm", "git"]);
+        assert!(
+            extracted.is_empty(),
+            "Expected no extracted commands, got: {extracted:?}"
+        );
+    }
+
+    #[test]
+    fn github_actions_extractor_does_not_extract_env_or_with_fields() {
+        let content = r#"jobs:
+  test:
+    steps:
+      - name: "rm -rf /"
+        env:
+          X: "rm -rf /"
+        with:
+          args: "rm -rf /"
+        run: echo hello
+"#;
+
+        // Only `steps[].run` is executable context. This fixture includes `rm` only in
+        // data fields; the extractor must return nothing.
+        let extracted =
+            extract_github_actions_workflow_from_str(".github/workflows/ci.yml", content, &["rm"]);
+        assert!(
+            extracted.is_empty(),
+            "Expected no extracted commands, got: {extracted:?}"
+        );
+    }
+
     // ========================================================================
     // JSON schema tests (git_safety_guard-scan.2.4)
     // ========================================================================
