@@ -843,24 +843,25 @@ fn evaluate_packs_with_allowlists(
         return EvaluationResult::allowed_due_to_budget();
     }
 
+    // Pre-compute which packs might match (keyword quick-reject).
+    // This avoids calling might_match() twice per pack in the two-pass evaluation.
+    // The Vec allocation is O(p) where p = number of packs, which is much cheaper
+    // than running O(k * n) SIMD keyword searches twice per pack.
+    let candidate_packs: Vec<(&String, &crate::packs::Pack)> = ordered_packs
+        .iter()
+        .filter_map(|pack_id| REGISTRY.get(pack_id).map(|pack| (pack_id, pack)))
+        .filter(|(_, pack)| pack.might_match(normalized))
+        .collect();
+
     // Two-pass evaluation for cross-pack safe pattern support.
     //
     // Pass 1: Check safe patterns across ALL enabled packs first.
     // If any pack's safe pattern matches, allow the command immediately.
     // This enables "safe" packs (like safe.cleanup) to whitelist commands
     // that would otherwise be blocked by other packs (like core.filesystem).
-    for pack_id in ordered_packs {
+    for (_, pack) in &candidate_packs {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
             return EvaluationResult::allowed_due_to_budget();
-        }
-
-        let Some(pack) = REGISTRY.get(pack_id) else {
-            continue;
-        };
-
-        // Per-pack keyword quick reject.
-        if !pack.might_match(normalized) {
-            continue;
         }
 
         // If any safe pattern matches, allow immediately (cross-pack override).
@@ -874,18 +875,9 @@ fn evaluate_packs_with_allowlists(
     // we return ALLOW + the first allowlist override metadata for explain/logging.
     let mut first_allowlist_hit: Option<(PatternMatch, AllowlistLayer, String)> = None;
 
-    for pack_id in ordered_packs {
+    for &(pack_id, pack) in &candidate_packs {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
             return EvaluationResult::allowed_due_to_budget();
-        }
-
-        let Some(pack) = REGISTRY.get(pack_id) else {
-            continue;
-        };
-
-        // Per-pack keyword quick reject.
-        if !pack.might_match(normalized) {
-            continue;
         }
 
         for pattern in &pack.destructive_patterns {

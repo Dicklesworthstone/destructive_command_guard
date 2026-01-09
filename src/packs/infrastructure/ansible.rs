@@ -18,6 +18,7 @@ pub fn create_pack() -> Pack {
         keywords: &["ansible", "playbook"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
+        keyword_matcher: None,
     }
 }
 

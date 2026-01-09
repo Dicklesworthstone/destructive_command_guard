@@ -227,17 +227,32 @@ pub struct Pack {
 
     /// Destructive patterns (blacklist) - checked if no safe pattern matches.
     pub destructive_patterns: Vec<DestructivePattern>,
+
+    /// Pre-built Aho-Corasick automaton for O(n) keyword matching.
+    /// Built by `PackRegistry::register_pack()` from keywords. Set to `None` in pack
+    /// constructors; the registry initializes this during registration.
+    pub keyword_matcher: Option<aho_corasick::AhoCorasick>,
 }
 
 impl Pack {
     /// Check if a command contains any of this pack's keywords.
     /// Returns false if the command doesn't contain any keywords (quick reject).
+    ///
+    /// Uses an Aho-Corasick automaton for O(n) matching when available (built
+    /// by the registry during pack registration). Falls back to sequential
+    /// memchr-based search if the automaton isn't built.
     #[must_use]
     pub fn might_match(&self, cmd: &str) -> bool {
         if self.keywords.is_empty() {
             return true; // No keywords = always check patterns
         }
 
+        // Use Aho-Corasick automaton if available (O(n) regardless of keyword count).
+        if let Some(ref ac) = self.keyword_matcher {
+            return ac.is_match(cmd);
+        }
+
+        // Fallback: sequential memchr-based search (O(k * n) where k = keyword count).
         let bytes = cmd.as_bytes();
         self.keywords
             .iter()
@@ -431,8 +446,19 @@ impl PackRegistry {
     }
 
     /// Register a pack in the registry.
-    fn register_pack(&mut self, pack: Pack) {
+    ///
+    /// Builds the Aho-Corasick automaton for keyword matching during registration.
+    fn register_pack(&mut self, mut pack: Pack) {
         let id = pack.id.clone();
+
+        // Build Aho-Corasick automaton for O(n) keyword matching.
+        // This is done once at registration time, not per-command.
+        if !pack.keywords.is_empty() && pack.keyword_matcher.is_none() {
+            pack.keyword_matcher = Some(
+                aho_corasick::AhoCorasick::new(pack.keywords)
+                    .expect("pack keywords should be valid patterns"),
+            );
+        }
 
         // Extract category from ID (e.g., "database" from "database.postgresql")
         let category = id.split('.').next().unwrap_or(&id).to_string();

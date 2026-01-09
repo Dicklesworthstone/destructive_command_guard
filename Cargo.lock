@@ -592,6 +592,7 @@ dependencies = [
 name = "destructive_command_guard"
 version = "0.2.0"
 dependencies = [
+ "aho-corasick",
  "assert_cmd",
  "ast-grep-core",
  "ast-grep-language",

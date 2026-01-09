@@ -71,6 +71,7 @@ pub fn create_pack() -> Pack {
         keywords: &["rm"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: vec![], // This pack only adds safe patterns
+        keyword_matcher: None,
     }
 }
 

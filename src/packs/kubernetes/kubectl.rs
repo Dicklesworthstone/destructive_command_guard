@@ -20,6 +20,7 @@ pub fn create_pack() -> Pack {
         keywords: &["kubectl", "delete", "drain", "cordon", "taint"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
+        keyword_matcher: None,
     }
 }
 

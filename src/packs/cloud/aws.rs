@@ -20,6 +20,7 @@ pub fn create_pack() -> Pack {
         keywords: &["aws", "terminate", "delete", "s3", "ec2", "rds"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
+        keyword_matcher: None,
     }
 }
 

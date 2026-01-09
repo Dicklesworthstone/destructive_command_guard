@@ -20,6 +20,7 @@ pub fn create_pack() -> Pack {
         keywords: &["dd", "fdisk", "mkfs", "parted", "mount", "wipefs", "/dev/"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
+        keyword_matcher: None,
     }
 }
 
