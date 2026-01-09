@@ -225,25 +225,25 @@ pub struct ScanCommand {
 
     // === Output / policy flags ===
     /// Output format
-    #[arg(long, short = 'f', value_enum, default_value = "pretty")]
-    format: crate::scan::ScanFormat,
+    #[arg(long, short = 'f', value_enum)]
+    format: Option<crate::scan::ScanFormat>,
 
     /// Exit non-zero when findings meet this threshold
-    #[arg(long, value_enum, default_value = "error")]
-    fail_on: crate::scan::ScanFailOn,
+    #[arg(long, value_enum)]
+    fail_on: Option<crate::scan::ScanFailOn>,
 
     // === Safety / performance knobs ===
     /// Maximum file size to scan (bytes); larger files are skipped
     #[arg(
         long = "max-file-size",
         value_name = "BYTES",
-        default_value = "1048576"
+        value_parser = clap::value_parser!(u64)
     )]
-    max_file_size: u64,
+    max_file_size: Option<u64>,
 
     /// Maximum number of findings to report (stop scanning after limit)
-    #[arg(long = "max-findings", value_name = "N", default_value = "100")]
-    max_findings: usize,
+    #[arg(long = "max-findings", value_name = "N")]
+    max_findings: Option<usize>,
 
     /// Exclude files matching glob pattern (repeatable)
     #[arg(long, value_name = "GLOB")]
@@ -255,12 +255,12 @@ pub struct ScanCommand {
 
     // === Redaction / truncation ===
     /// Redact sensitive content in output
-    #[arg(long, value_enum, default_value = "none")]
-    redact: crate::scan::ScanRedactMode,
+    #[arg(long, value_enum)]
+    redact: Option<crate::scan::ScanRedactMode>,
 
     /// Truncate long commands in output (chars; 0 = no truncation)
-    #[arg(long, value_name = "N", default_value = "200")]
-    truncate: usize,
+    #[arg(long, value_name = "N")]
+    truncate: Option<usize>,
 
     // === UX flags ===
     /// Include verbose output (skipped-file reasons, extractor stats)
@@ -841,6 +841,60 @@ fn git_resolve_path(
     })
 }
 
+fn git_show_toplevel(
+    cwd: &std::path::Path,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    ensure_git_repo(cwd)?;
+
+    let output = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git rev-parse --show-toplevel failed: {stderr}").into());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let root = stdout.trim();
+    if root.is_empty() {
+        return Err("git rev-parse --show-toplevel returned empty output".into());
+    }
+
+    Ok(std::path::PathBuf::from(root))
+}
+
+#[derive(Debug, Clone)]
+struct LoadedHooksToml {
+    path: std::path::PathBuf,
+    cfg: crate::scan::HooksToml,
+    warnings: Vec<String>,
+}
+
+fn maybe_load_repo_hooks_toml(
+    cwd: &std::path::Path,
+) -> Result<Option<LoadedHooksToml>, Box<dyn std::error::Error>> {
+    let Ok(repo_root) = git_show_toplevel(cwd) else {
+        return Ok(None);
+    };
+
+    let path = repo_root.join(".dcg/hooks.toml");
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let contents = std::fs::read_to_string(&path)?;
+    let (cfg, warnings) = crate::scan::parse_hooks_toml(&contents)
+        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+
+    Ok(Some(LoadedHooksToml {
+        path,
+        cfg,
+        warnings,
+    }))
+}
+
 fn hook_looks_like_dcg_scan_pre_commit(hook_bytes: &[u8]) -> bool {
     String::from_utf8_lossy(hook_bytes).contains(DCG_SCAN_PRE_COMMIT_SENTINEL)
 }
@@ -931,6 +985,95 @@ If you want to keep it, you can still add dcg scanning by adding this line:\n\
 ///
 /// Validates file selection mode, builds scan options, and delegates to
 /// the scan module for execution.
+#[derive(Debug, Clone)]
+struct ResolvedScanSettings {
+    format: crate::scan::ScanFormat,
+    fail_on: crate::scan::ScanFailOn,
+    max_file_size: u64,
+    max_findings: usize,
+    redact: crate::scan::ScanRedactMode,
+    truncate: usize,
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ScanSettingsOverrides {
+    format: Option<crate::scan::ScanFormat>,
+    fail_on: Option<crate::scan::ScanFailOn>,
+    max_file_size: Option<u64>,
+    max_findings: Option<usize>,
+    redact: Option<crate::scan::ScanRedactMode>,
+    truncate: Option<usize>,
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+impl ScanSettingsOverrides {
+    fn resolve(self, hooks: Option<&crate::scan::HooksToml>) -> ResolvedScanSettings {
+        let mut resolved = ResolvedScanSettings {
+            format: crate::scan::ScanFormat::Pretty,
+            fail_on: crate::scan::ScanFailOn::Error,
+            max_file_size: 1_048_576,
+            max_findings: 100,
+            redact: crate::scan::ScanRedactMode::None,
+            truncate: 200,
+            include: Vec::new(),
+            exclude: Vec::new(),
+        };
+
+        if let Some(hooks) = hooks {
+            if let Some(format) = hooks.scan.format {
+                resolved.format = format;
+            }
+            if let Some(fail_on) = hooks.scan.fail_on {
+                resolved.fail_on = fail_on;
+            }
+            if let Some(max_file_size) = hooks.scan.max_file_size {
+                resolved.max_file_size = max_file_size;
+            }
+            if let Some(max_findings) = hooks.scan.max_findings {
+                resolved.max_findings = max_findings;
+            }
+            if let Some(redact) = hooks.scan.redact {
+                resolved.redact = redact;
+            }
+            if let Some(truncate) = hooks.scan.truncate {
+                resolved.truncate = truncate;
+            }
+            resolved.include.clone_from(&hooks.scan.paths.include);
+            resolved.exclude.clone_from(&hooks.scan.paths.exclude);
+        }
+
+        if let Some(format) = self.format {
+            resolved.format = format;
+        }
+        if let Some(fail_on) = self.fail_on {
+            resolved.fail_on = fail_on;
+        }
+        if let Some(max_file_size) = self.max_file_size {
+            resolved.max_file_size = max_file_size;
+        }
+        if let Some(max_findings) = self.max_findings {
+            resolved.max_findings = max_findings;
+        }
+        if let Some(redact) = self.redact {
+            resolved.redact = redact;
+        }
+        if let Some(truncate) = self.truncate {
+            resolved.truncate = truncate;
+        }
+        if !self.include.is_empty() {
+            resolved.include = self.include;
+        }
+        if !self.exclude.is_empty() {
+            resolved.exclude = self.exclude;
+        }
+
+        resolved
+    }
+}
+
 fn handle_scan_command(
     config: &Config,
     scan: ScanCommand,
@@ -960,19 +1103,39 @@ fn handle_scan_command(
             uninstall_scan_pre_commit_hook()?;
         }
         None => {
+            let cwd = std::env::current_dir()?;
+            let hooks = maybe_load_repo_hooks_toml(&cwd)?;
+            if let Some(hooks) = &hooks {
+                for warning in &hooks.warnings {
+                    eprintln!("Warning: {}: {warning}", hooks.path.display());
+                }
+            }
+
+            let settings = ScanSettingsOverrides {
+                format,
+                fail_on,
+                max_file_size,
+                max_findings,
+                redact,
+                truncate,
+                include,
+                exclude,
+            }
+            .resolve(hooks.as_ref().map(|h| &h.cfg));
+
             handle_scan(
                 config,
                 staged,
                 paths,
                 git_diff,
-                format,
-                fail_on,
-                max_file_size,
-                max_findings,
-                &exclude,
-                &include,
-                redact,
-                truncate,
+                settings.format,
+                settings.fail_on,
+                settings.max_file_size,
+                settings.max_findings,
+                &settings.exclude,
+                &settings.include,
+                settings.redact,
+                settings.truncate,
                 verbose,
                 top,
             )?;
@@ -2925,7 +3088,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["dcg", "scan", "--staged", "--format", "json"]).expect("parse");
         if let Some(Command::Scan(scan)) = cli.command {
-            assert_eq!(scan.format, crate::scan::ScanFormat::Json);
+            assert_eq!(scan.format, Some(crate::scan::ScanFormat::Json));
         } else {
             panic!("Expected Scan command");
         }
@@ -2936,7 +3099,7 @@ mod tests {
         let cli = Cli::try_parse_from(["dcg", "scan", "--staged", "--fail-on", "warning"])
             .expect("parse");
         if let Some(Command::Scan(scan)) = cli.command {
-            assert_eq!(scan.fail_on, crate::scan::ScanFailOn::Warning);
+            assert_eq!(scan.fail_on, Some(crate::scan::ScanFailOn::Warning));
         } else {
             panic!("Expected Scan command");
         }
@@ -2947,7 +3110,7 @@ mod tests {
         let cli = Cli::try_parse_from(["dcg", "scan", "--staged", "--max-file-size", "2048"])
             .expect("parse");
         if let Some(Command::Scan(scan)) = cli.command {
-            assert_eq!(scan.max_file_size, 2048);
+            assert_eq!(scan.max_file_size, Some(2048));
         } else {
             panic!("Expected Scan command");
         }
@@ -3024,6 +3187,78 @@ mod tests {
             result.is_err(),
             "args should conflict with scan subcommands"
         );
+    }
+
+    // ========================================================================
+    // .dcg/hooks.toml merge tests
+    // ========================================================================
+
+    #[test]
+    fn scan_settings_merge_uses_hooks_defaults_when_cli_unset() {
+        let (hooks, _warnings) = crate::scan::parse_hooks_toml(
+            r#"
+[scan]
+format = "json"
+fail_on = "warning"
+max_file_size = 123
+max_findings = 5
+redact = "quoted"
+truncate = 9
+
+[scan.paths]
+include = ["src/**"]
+exclude = ["target/**"]
+"#,
+        )
+        .expect("parse");
+
+        let settings = ScanSettingsOverrides {
+            format: None,
+            fail_on: None,
+            max_file_size: None,
+            max_findings: None,
+            redact: None,
+            truncate: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+        }
+        .resolve(Some(&hooks));
+
+        assert_eq!(settings.format, crate::scan::ScanFormat::Json);
+        assert_eq!(settings.fail_on, crate::scan::ScanFailOn::Warning);
+        assert_eq!(settings.max_file_size, 123);
+        assert_eq!(settings.max_findings, 5);
+        assert_eq!(settings.redact, crate::scan::ScanRedactMode::Quoted);
+        assert_eq!(settings.truncate, 9);
+        assert_eq!(settings.include, vec!["src/**"]);
+        assert_eq!(settings.exclude, vec!["target/**"]);
+    }
+
+    #[test]
+    fn scan_settings_merge_cli_overrides_hooks() {
+        let (hooks, _warnings) =
+            crate::scan::parse_hooks_toml("[scan]\nformat = \"json\"\n").expect("parse");
+
+        let settings = ScanSettingsOverrides {
+            format: Some(crate::scan::ScanFormat::Pretty),
+            fail_on: Some(crate::scan::ScanFailOn::Error),
+            max_file_size: Some(777),
+            max_findings: Some(42),
+            redact: Some(crate::scan::ScanRedactMode::Aggressive),
+            truncate: Some(0),
+            include: vec!["cli/**".to_string()],
+            exclude: vec!["cli/tmp/**".to_string()],
+        }
+        .resolve(Some(&hooks));
+
+        assert_eq!(settings.format, crate::scan::ScanFormat::Pretty);
+        assert_eq!(settings.fail_on, crate::scan::ScanFailOn::Error);
+        assert_eq!(settings.max_file_size, 777);
+        assert_eq!(settings.max_findings, 42);
+        assert_eq!(settings.redact, crate::scan::ScanRedactMode::Aggressive);
+        assert_eq!(settings.truncate, 0);
+        assert_eq!(settings.include, vec!["cli/**"]);
+        assert_eq!(settings.exclude, vec!["cli/tmp/**"]);
     }
 
     // ========================================================================

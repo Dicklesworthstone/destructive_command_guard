@@ -40,6 +40,91 @@ use std::path::{Path, PathBuf};
 
 pub const SCAN_SCHEMA_VERSION: u32 = 1;
 
+/// Project-level scan config for repo integrations (pre-commit/CI).
+///
+/// Loaded from `.dcg/hooks.toml` (if present).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HooksToml {
+    #[serde(default)]
+    pub scan: HooksTomlScan,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HooksTomlScan {
+    pub fail_on: Option<ScanFailOn>,
+    pub format: Option<ScanFormat>,
+    pub max_file_size: Option<u64>,
+    pub max_findings: Option<usize>,
+    pub redact: Option<ScanRedactMode>,
+    pub truncate: Option<usize>,
+    #[serde(default)]
+    pub paths: HooksTomlScanPaths,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HooksTomlScanPaths {
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+/// Parse `.dcg/hooks.toml` and return (typed config, warnings).
+///
+/// - Unknown keys are ignored, but surfaced as warnings (string messages).
+/// - Invalid values return a descriptive error.
+///
+/// # Errors
+///
+/// Returns an error string if the TOML is syntactically invalid or cannot be
+/// deserialized into the supported schema (e.g. invalid enum values).
+pub fn parse_hooks_toml(contents: &str) -> Result<(HooksToml, Vec<String>), String> {
+    let value: toml::Value = toml::from_str(contents).map_err(|e| e.to_string())?;
+    let mut warnings = Vec::new();
+    warn_unknown_hooks_toml_keys(&value, "", &mut warnings);
+
+    let cfg: HooksToml = toml::from_str(contents).map_err(|e| e.to_string())?;
+    Ok((cfg, warnings))
+}
+
+fn warn_unknown_hooks_toml_keys(value: &toml::Value, path: &str, warnings: &mut Vec<String>) {
+    let Some(table) = value.as_table() else {
+        return;
+    };
+
+    let allowed: &[&str] = match path {
+        "" => &["scan"],
+        "scan" => &[
+            "fail_on",
+            "format",
+            "max_file_size",
+            "max_findings",
+            "redact",
+            "truncate",
+            "paths",
+        ],
+        "scan.paths" => &["include", "exclude"],
+        _ => &[],
+    };
+
+    for (key, val) in table {
+        let child_path = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+
+        if !allowed.contains(&key.as_str()) {
+            warnings.push(format!("Unknown key `{child_path}` will be ignored"));
+            continue;
+        }
+
+        if val.is_table() {
+            warn_unknown_hooks_toml_keys(val, &child_path, warnings);
+        }
+    }
+}
+
 /// Scan output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -1338,6 +1423,80 @@ mod tests {
 
     fn default_config() -> Config {
         Config::default()
+    }
+
+    #[test]
+    fn hooks_toml_parses_valid_config() {
+        let input = r#"
+[scan]
+fail_on = "warning"
+format = "json"
+max_file_size = 1234
+max_findings = 50
+redact = "quoted"
+truncate = 10
+
+[scan.paths]
+include = ["scripts/**", ".github/workflows/**"]
+exclude = ["target/**"]
+"#;
+
+        let (cfg, warnings) = parse_hooks_toml(input).expect("parse");
+        assert!(warnings.is_empty(), "should not warn on valid config");
+        assert_eq!(cfg.scan.fail_on, Some(ScanFailOn::Warning));
+        assert_eq!(cfg.scan.format, Some(ScanFormat::Json));
+        assert_eq!(cfg.scan.max_file_size, Some(1234));
+        assert_eq!(cfg.scan.max_findings, Some(50));
+        assert_eq!(cfg.scan.redact, Some(ScanRedactMode::Quoted));
+        assert_eq!(cfg.scan.truncate, Some(10));
+        assert_eq!(
+            cfg.scan.paths.include,
+            vec!["scripts/**", ".github/workflows/**"]
+        );
+        assert_eq!(cfg.scan.paths.exclude, vec!["target/**"]);
+    }
+
+    #[test]
+    fn hooks_toml_warns_on_unknown_keys() {
+        let input = r#"
+top_level = "x"
+
+[scan]
+format = "json"
+unknown = 123
+
+[scan.paths]
+include = ["src/**"]
+extra = ["x"]
+"#;
+
+        let (_cfg, warnings) = parse_hooks_toml(input).expect("parse");
+        assert!(
+            warnings.iter().any(|w| w.contains("top_level")),
+            "should warn on unknown top-level keys"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("scan.unknown")),
+            "should warn on unknown scan keys"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("scan.paths.extra")),
+            "should warn on unknown scan.paths keys"
+        );
+    }
+
+    #[test]
+    fn hooks_toml_invalid_enum_value_errors() {
+        let input = r#"
+[scan]
+fail_on = "nope"
+"#;
+
+        let err = parse_hooks_toml(input).expect_err("should fail");
+        assert!(
+            err.to_lowercase().contains("fail_on") || err.to_lowercase().contains("unknown"),
+            "error should mention the invalid value: {err}"
+        );
     }
 
     #[test]
