@@ -574,6 +574,7 @@ fn redact_token(token: &str) -> String {
 /// - GitHub Actions workflow extractor (`.github/workflows/*.yml|*.yaml`)
 /// - GitLab CI extractor (`.gitlab-ci.yml`, `*.gitlab-ci.yml`)
 /// - Makefile extractor (`Makefile`)
+/// - package.json extractor (`package.json` - scripts only)
 #[allow(clippy::missing_errors_doc)]
 pub fn scan_paths(
     paths: &[PathBuf],
@@ -624,8 +625,10 @@ pub fn scan_paths(
         let is_actions = is_github_actions_workflow_path(file);
         let is_gitlab = is_gitlab_ci_path(file);
         let is_makefile = is_makefile_path(file);
+        let is_package_json = is_package_json_path(file);
 
-        if !is_shell && !is_docker && !is_actions && !is_gitlab && !is_makefile {
+        if !is_shell && !is_docker && !is_actions && !is_gitlab && !is_makefile && !is_package_json
+        {
             files_skipped += 1;
             continue;
         }
@@ -676,6 +679,14 @@ pub fn scan_paths(
 
         if is_makefile {
             extracted.extend(extract_makefile_from_str(
+                &file_label,
+                &content,
+                &ctx.enabled_keywords,
+            ));
+        }
+
+        if is_package_json {
+            extracted.extend(extract_package_json_from_str(
                 &file_label,
                 &content,
                 &ctx.enabled_keywords,
@@ -1729,6 +1740,94 @@ fn extract_makefile_from_str(
 
     out
 }
+
+// ============================================================================
+// package.json extractor
+// ============================================================================
+
+fn is_package_json_path(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return false;
+    };
+    file_name == "package.json"
+}
+
+/// Extract executable scripts from package.json.
+///
+/// Extracts:
+/// - All values in `scripts` object (these are npm script commands)
+/// - Lifecycle scripts: preinstall, postinstall, prepublish, etc.
+///
+/// Does NOT extract:
+/// - `description`, `keywords`, `repository` fields
+/// - Values in `config` or other non-executable fields
+fn extract_package_json_from_str(
+    file: &str,
+    content: &str,
+    enabled_keywords: &[&'static str],
+) -> Vec<ExtractedCommand> {
+    const EXTRACTOR_ID: &str = "package_json.script";
+
+    let mut out = Vec::new();
+
+    // Parse JSON
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(content) else {
+        return out;
+    };
+
+    // Extract scripts object
+    let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) else {
+        return out;
+    };
+
+    // Build a line number map for accurate line reporting
+    let line_map = build_json_line_map(content);
+
+    for (script_name, script_value) in scripts {
+        let Some(script_cmd) = script_value.as_str() else {
+            continue;
+        };
+
+        // Find the line number for this script
+        let line_no = find_json_key_line(&line_map, script_name, "scripts");
+
+        // Check if the command contains any enabled keywords
+        let has_keyword = enabled_keywords
+            .iter()
+            .any(|kw| script_cmd.contains(kw));
+
+        if has_keyword {
+            out.push(ExtractedCommand {
+                file: file.to_string(),
+                line: line_no,
+                col: None,
+                extractor_id: EXTRACTOR_ID.to_string(),
+                command: script_cmd.to_string(),
+                metadata: Some(serde_json::json!({ "script_name": script_name })),
+            });
+        }
+    }
+
+    out
+}
+
+/// Build a map of line content for JSON line number lookups.
+fn build_json_line_map(content: &str) -> Vec<&str> {
+    content.lines().collect()
+}
+
+/// Find the line number of a JSON key within a parent object.
+fn find_json_key_line(lines: &[&str], key: &str, _parent: &str) -> usize {
+    // Search for `"key":` pattern
+    let pattern = format!("\"{key}\"");
+    for (idx, line) in lines.iter().enumerate() {
+        if line.contains(&pattern) && line.contains(':') {
+            return idx + 1;
+        }
+    }
+    1 // Default to line 1 if not found
+}
+
 #[must_use]
 pub fn build_report(
     mut findings: Vec<ScanFinding>,
@@ -2852,5 +2951,133 @@ all:\n\
         assert_eq!(extracted[0].line, 2);
         assert_eq!(extracted[0].extractor_id, "makefile.recipe");
         assert_eq!(extracted[0].command, "git log --oneline");
+    }
+
+    // =========================================================================
+    // package.json extractor tests
+    // =========================================================================
+
+    #[test]
+    fn is_package_json_path_detects_correctly() {
+        assert!(is_package_json_path(Path::new("package.json")));
+        assert!(is_package_json_path(Path::new("/foo/bar/package.json")));
+        assert!(is_package_json_path(Path::new("./package.json")));
+
+        // Should NOT match
+        assert!(!is_package_json_path(Path::new("package.json.bak")));
+        assert!(!is_package_json_path(Path::new("package-lock.json")));
+        assert!(!is_package_json_path(Path::new("my-package.json")));
+        assert!(!is_package_json_path(Path::new("Package.json"))); // case-sensitive
+    }
+
+    #[test]
+    fn package_json_extracts_scripts() {
+        let content = r#"{
+  "name": "test-package",
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "npm run compile"
+  }
+}"#;
+
+        let extracted = extract_package_json_from_str("package.json", content, &["rm"]);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].command, "rm -rf dist");
+        assert_eq!(extracted[0].extractor_id, "package_json.script");
+        assert!(extracted[0].metadata.is_some());
+    }
+
+    #[test]
+    fn package_json_extracts_multiple_matching_scripts() {
+        let content = r#"{
+  "scripts": {
+    "clean": "rm -rf dist",
+    "nuke": "rm -rf node_modules",
+    "build": "tsc"
+  }
+}"#;
+
+        let extracted = extract_package_json_from_str("package.json", content, &["rm"]);
+        assert_eq!(extracted.len(), 2);
+        assert!(extracted.iter().any(|e| e.command == "rm -rf dist"));
+        assert!(extracted.iter().any(|e| e.command == "rm -rf node_modules"));
+    }
+
+    #[test]
+    fn package_json_ignores_non_script_fields() {
+        let content = r#"{
+  "name": "test-package",
+  "description": "Uses rm -rf for cleanup",
+  "keywords": ["rm", "cleanup"],
+  "scripts": {
+    "build": "npm run compile"
+  },
+  "config": {
+    "danger": "rm -rf /"
+  }
+}"#;
+
+        let extracted = extract_package_json_from_str("package.json", content, &["rm"]);
+        // Should NOT extract from description, keywords, or config
+        assert_eq!(extracted.len(), 0);
+    }
+
+    #[test]
+    fn package_json_handles_empty_scripts() {
+        let content = r#"{
+  "name": "test-package",
+  "scripts": {}
+}"#;
+
+        let extracted = extract_package_json_from_str("package.json", content, &["rm"]);
+        assert!(extracted.is_empty());
+    }
+
+    #[test]
+    fn package_json_handles_missing_scripts() {
+        let content = r#"{
+  "name": "test-package"
+}"#;
+
+        let extracted = extract_package_json_from_str("package.json", content, &["rm"]);
+        assert!(extracted.is_empty());
+    }
+
+    #[test]
+    fn package_json_handles_invalid_json() {
+        let content = "{ this is not valid json }";
+
+        let extracted = extract_package_json_from_str("package.json", content, &["rm"]);
+        assert!(extracted.is_empty());
+    }
+
+    #[test]
+    fn package_json_extracts_lifecycle_scripts() {
+        let content = r#"{
+  "scripts": {
+    "preinstall": "rm -rf old-cache",
+    "postinstall": "echo done",
+    "build": "tsc"
+  }
+}"#;
+
+        let extracted = extract_package_json_from_str("package.json", content, &["rm"]);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].command, "rm -rf old-cache");
+    }
+
+    #[test]
+    fn package_json_line_numbers_are_accurate() {
+        let content = r#"{
+  "name": "test",
+  "scripts": {
+    "clean": "rm -rf dist"
+  }
+}"#;
+
+        let extracted = extract_package_json_from_str("package.json", content, &["rm"]);
+        assert_eq!(extracted.len(), 1);
+        // "clean" appears on line 4
+        assert_eq!(extracted[0].line, 4);
     }
 }
