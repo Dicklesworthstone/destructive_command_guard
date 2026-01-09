@@ -121,6 +121,16 @@ if [[ -n "$ARTIFACTS_DIR" ]]; then
     ARTIFACTS_DIR="$(cd "$ARTIFACTS_DIR" && pwd)"  # Convert to absolute path
 fi
 
+# Hermetic test environment (avoid picking up developer machine config/allowlists)
+#
+# Many tests depend on the *default* pack set (core-only) unless explicitly
+# overridden via DCG_PACKS. If we read ~/.config/dcg/config.toml, results become
+# machine-dependent (e.g., docker pack enabled by default).
+TEST_ENV_ROOT=$(mktemp -d)
+TEST_ENV_HOME="$TEST_ENV_ROOT/home"
+TEST_ENV_XDG="$TEST_ENV_ROOT/xdg_config"
+mkdir -p "$TEST_ENV_HOME" "$TEST_ENV_XDG"
+
 # Start timing the full suite
 SUITE_START_TIME=$(get_timestamp_ms)
 
@@ -267,7 +277,11 @@ test_command() {
 
     # Run the binary with decoded input
     local result
-    result=$(echo "$encoded" | base64 -d | "$BINARY" 2>/dev/null || true)
+    result=$(echo "$encoded" | base64 -d | \
+        HOME="$TEST_ENV_HOME" \
+        XDG_CONFIG_HOME="$TEST_ENV_XDG" \
+        DCG_ALLOWLIST_SYSTEM_PATH="" \
+        "$BINARY" 2>/dev/null || true)
 
     # Check result
     if [[ "$expected" == "block" ]]; then
@@ -321,7 +335,11 @@ test_non_bash_tool() {
     local encoded
     encoded=$(echo -n "$json" | base64 -w 0)
     local result
-    result=$(echo "$encoded" | base64 -d | "$BINARY" 2>/dev/null || true)
+    result=$(echo "$encoded" | base64 -d | \
+        HOME="$TEST_ENV_HOME" \
+        XDG_CONFIG_HOME="$TEST_ENV_XDG" \
+        DCG_ALLOWLIST_SYSTEM_PATH="" \
+        "$BINARY" 2>/dev/null || true)
 
     if [[ -z "$result" ]]; then
         log_pass "Non-Bash tool ignored: $desc"
@@ -344,8 +362,12 @@ test_malformed_input() {
     tmpfile=$(mktemp)
     echo -n "$input" > "$tmpfile"
     local result
-    result=$("$BINARY" < "$tmpfile" 2>/dev/null || true)
-    rm -f "$tmpfile"
+    result=$(
+        HOME="$TEST_ENV_HOME" \
+            XDG_CONFIG_HOME="$TEST_ENV_XDG" \
+            DCG_ALLOWLIST_SYSTEM_PATH="" \
+            "$BINARY" < "$tmpfile" 2>/dev/null || true
+    )
 
     if [[ -z "$result" ]]; then
         log_pass "Malformed input handled: $desc"
@@ -379,7 +401,12 @@ test_command_with_packs() {
 
     # Run the binary with DCG_PACKS environment variable
     local result
-    result=$(echo "$encoded" | base64 -d | DCG_PACKS="$packs" "$BINARY" 2>/dev/null || true)
+    result=$(echo "$encoded" | base64 -d | \
+        HOME="$TEST_ENV_HOME" \
+        XDG_CONFIG_HOME="$TEST_ENV_XDG" \
+        DCG_ALLOWLIST_SYSTEM_PATH="" \
+        DCG_PACKS="$packs" \
+        "$BINARY" 2>/dev/null || true)
 
     # Check result
     if [[ "$expected" == "block" ]]; then
@@ -430,12 +457,16 @@ test_command_with_policy() {
     err_file=$(mktemp)
 
     # Run the binary with policy env; capture stdout + stderr separately.
-    echo "$encoded" | base64 -d | DCG_POLICY_DEFAULT_MODE="$policy_mode" "$BINARY" >"$out_file" 2>"$err_file" || true
+    echo "$encoded" | base64 -d | \
+        HOME="$TEST_ENV_HOME" \
+        XDG_CONFIG_HOME="$TEST_ENV_XDG" \
+        DCG_ALLOWLIST_SYSTEM_PATH="" \
+        DCG_POLICY_DEFAULT_MODE="$policy_mode" \
+        "$BINARY" >"$out_file" 2>"$err_file" || true
 
     local out err
     out=$(cat "$out_file")
     err=$(cat "$err_file")
-    rm -f "$out_file" "$err_file"
 
     case "$expected" in
         block)
@@ -761,10 +792,13 @@ test_command_with_allowlist() {
 
     # Run the binary from the temp directory so it discovers the project allowlist
     local result
-    result=$(cd "$tmpdir" && echo "$encoded" | base64 -d | "$BINARY" 2>/dev/null || true)
+    result=$(cd "$tmpdir" && echo "$encoded" | base64 -d | \
+        HOME="$TEST_ENV_HOME" \
+        XDG_CONFIG_HOME="$TEST_ENV_XDG" \
+        DCG_ALLOWLIST_SYSTEM_PATH="" \
+        "$BINARY" 2>/dev/null || true)
 
-    # Cleanup
-    rm -rf "$tmpdir"
+    # Note: do not delete tmpdir here; destructive cleanup is intentionally avoided.
 
     # Check result
     if [[ "$expected" == "block" ]]; then
@@ -908,9 +942,13 @@ test_command_with_allowlist_and_env() {
     encoded=$(echo -n "$json" | base64 -w 0)
 
     local result
-    result=$(cd "$tmpdir" && echo "$encoded" | base64 -d | env $env_vars "$BINARY" 2>/dev/null || true)
+    result=$(cd "$tmpdir" && echo "$encoded" | base64 -d | env \
+        HOME="$TEST_ENV_HOME" \
+        XDG_CONFIG_HOME="$TEST_ENV_XDG" \
+        DCG_ALLOWLIST_SYSTEM_PATH="" \
+        $env_vars "$BINARY" 2>/dev/null || true)
 
-    rm -rf "$tmpdir"
+    # Note: do not delete tmpdir here; destructive cleanup is intentionally avoided.
 
     if [[ "$expected" == "block" ]]; then
         if echo "$result" | grep -q '"permissionDecision"' && echo "$result" | grep -q '"deny"'; then
@@ -997,7 +1035,7 @@ test_command_with_layered_allowlists() {
         DCG_ALLOWLIST_SYSTEM_PATH="$system_path" \
         $env_vars "$BINARY" 2>/dev/null || true)
 
-    rm -rf "$tmpdir"
+    # Note: do not delete tmpdir here; destructive cleanup is intentionally avoided.
 
     if [[ "$expected" == "block" ]]; then
         if echo "$result" | grep -q '"permissionDecision"' && echo "$result" | grep -q '"deny"'; then

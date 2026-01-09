@@ -1265,12 +1265,19 @@ pub fn pack_aware_quick_reject(cmd: &str, enabled_keywords: &[&str]) -> bool {
         return true;
     }
 
-    let spans = crate::context::classify_command(cmd);
+    // Important: run keyword gating on a normalized view so harmless quoting or
+    // path prefixes on *executed command words* don't cause false skips.
+    //
+    // Example: `" /usr/bin/git" reset --hard` should NOT quick-reject.
+    let normalized = normalize_command(cmd);
+    let cmd_for_spans = normalized.as_ref();
+
+    let spans = crate::context::classify_command(cmd_for_spans);
     let mut saw_executable = false;
 
     for span in spans.executable_spans() {
         saw_executable = true;
-        let span_text = span.text(cmd);
+        let span_text = span.text(cmd_for_spans);
         if span_text.is_empty() {
             continue;
         }

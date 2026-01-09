@@ -264,7 +264,7 @@ pub const LANGUAGE_DETECT: Budget = Budget::new(
 pub const FULL_HEREDOC_PIPELINE: Budget = Budget::from_ms(
     5,  // target: 5ms
     15, // warning: 15ms
-    50, // panic: 50ms
+    20, // panic: 20ms
 );
 
 // =============================================================================
@@ -276,8 +276,12 @@ pub const FULL_HEREDOC_PIPELINE: Budget = Budget::from_ms(
 /// This ensures dcg never blocks a user's workflow indefinitely.
 pub const ABSOLUTE_MAX: Duration = Duration::from_millis(50);
 
-/// Hook evaluation time budget in milliseconds (tight for shell responsiveness).
-pub const HOOK_EVALUATION_BUDGET_MS: u64 = 10;
+/// Hook evaluation time budget in milliseconds.
+///
+/// This is the **fail-open** threshold for hook mode. Typical commands should
+/// complete in <10ms, but heredoc/inline-script analysis may take longer on
+/// pathological inputs; in those cases we fail open rather than break workflows.
+pub const HOOK_EVALUATION_BUDGET_MS: u64 = 50;
 
 /// Hook evaluation time budget as a Duration.
 pub const HOOK_EVALUATION_BUDGET: Duration = Duration::from_millis(HOOK_EVALUATION_BUDGET_MS);

@@ -32,6 +32,68 @@ fn run_dcg(args: &[&str]) -> std::process::Output {
         .expect("failed to execute dcg")
 }
 
+#[derive(Debug)]
+struct HookRunOutput {
+    command: String,
+    output: std::process::Output,
+}
+
+impl HookRunOutput {
+    fn stdout_str(&self) -> String {
+        String::from_utf8_lossy(&self.output.stdout).to_string()
+    }
+
+    fn stderr_str(&self) -> String {
+        String::from_utf8_lossy(&self.output.stderr).to_string()
+    }
+}
+
+/// Run dcg in hook mode (no CLI subcommand) and capture output.
+///
+/// This runs with a cleared environment and a temp CWD to ensure tests don't
+/// depend on user/system configs or allowlists.
+fn run_dcg_hook(command: &str) -> HookRunOutput {
+    let temp = tempfile::tempdir().expect("failed to create temp dir");
+    std::fs::create_dir_all(temp.path().join(".git")).expect("failed to create .git dir");
+
+    let home_dir = temp.path().join("home");
+    let xdg_config_dir = temp.path().join("xdg_config");
+    std::fs::create_dir_all(&home_dir).expect("failed to create HOME dir");
+    std::fs::create_dir_all(&xdg_config_dir).expect("failed to create XDG_CONFIG_HOME dir");
+
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": command,
+        }
+    });
+
+    let mut child = Command::new(dcg_binary())
+        .env_clear()
+        .env("HOME", &home_dir)
+        .env("XDG_CONFIG_HOME", &xdg_config_dir)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_PACKS", "core.git,core.filesystem")
+        .current_dir(temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn dcg hook mode");
+
+    {
+        let stdin = child.stdin.as_mut().expect("failed to open stdin");
+        serde_json::to_writer(stdin, &input).expect("failed to write hook input JSON");
+    }
+
+    let output = child.wait_with_output().expect("failed to wait for dcg");
+
+    HookRunOutput {
+        command: command.to_string(),
+        output,
+    }
+}
+
 // ============================================================================
 // DCG EXPLAIN Tests
 // ============================================================================
@@ -400,5 +462,110 @@ mod packs_tests {
             stdout.contains("git") || stdout.contains("Git"),
             "should show git pack info"
         );
+    }
+}
+
+// ============================================================================
+// DCG Hook Mode Tests (stdin JSON protocol)
+// ============================================================================
+
+mod hook_mode_tests {
+    use super::*;
+
+    fn assert_hook_denies(command: &str) {
+        let result = run_dcg_hook(command);
+        let stdout = result.stdout_str();
+
+        assert!(
+            result.output.status.success(),
+            "hook mode should exit successfully\ncommand: {}\nstdout:\n{}\nstderr:\n{}",
+            result.command,
+            stdout,
+            result.stderr_str()
+        );
+
+        let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!(
+                "expected hook JSON output for deny, got parse error: {e}\ncommand: {}\nstdout:\n{}\nstderr:\n{}",
+                result.command,
+                stdout,
+                result.stderr_str()
+            )
+        });
+
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+            "expected permissionDecision=deny\ncommand: {}\nstdout:\n{}\nstderr:\n{}",
+            result.command,
+            stdout,
+            result.stderr_str()
+        );
+    }
+
+    fn assert_hook_allows(command: &str) {
+        let result = run_dcg_hook(command);
+        let stdout = result.stdout_str();
+
+        assert!(
+            result.output.status.success(),
+            "hook mode should exit successfully\ncommand: {}\nstdout:\n{}\nstderr:\n{}",
+            result.command,
+            stdout,
+            result.stderr_str()
+        );
+
+        assert!(
+            stdout.trim().is_empty(),
+            "expected no stdout for allow\ncommand: {}\nstdout:\n{}\nstderr:\n{}",
+            result.command,
+            stdout,
+            result.stderr_str()
+        );
+    }
+
+    #[test]
+    fn hook_mode_path_normalization_and_wrappers_matrix() {
+        // Deny cases: absolute paths, quoted command words, wrappers, env assignments.
+        let deny_cases = [
+            "/usr/bin/git reset --hard",
+            "\"/usr/bin/git\" reset --hard",
+            "'/usr/bin/git' reset --hard",
+            "sudo /usr/bin/git reset --hard",
+            "FOO=1 /usr/bin/git reset --hard",
+            "env FOO=1 /usr/bin/git reset --hard",
+            "/bin/rm -rf /etc",
+            "\"/bin/rm\" -rf /etc",
+            "sudo \"/bin/rm\" -rf /etc",
+            "FOO=1 \"/bin/rm\" -rf /etc",
+        ];
+
+        for cmd in deny_cases {
+            assert_hook_denies(cmd);
+        }
+
+        // Allow cases: dangerous substrings in data contexts should not block.
+        let allow_cases = [
+            "git commit -m \"Fix rm -rf detection\"",
+            "rg -n \"rm -rf\" src/main.rs",
+            "echo \"rm -rf /etc\"",
+        ];
+
+        for cmd in allow_cases {
+            assert_hook_allows(cmd);
+        }
+    }
+
+    #[test]
+    fn hook_mode_command_substitution_and_backticks_are_blocked() {
+        let deny_cases = [
+            "echo $(rm -rf /etc)",
+            "echo `rm -rf /etc`",
+            r#"echo hi | bash -c "rm -rf /etc""#,
+        ];
+
+        for cmd in deny_cases {
+            assert_hook_denies(cmd);
+        }
     }
 }
