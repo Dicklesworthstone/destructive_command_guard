@@ -148,6 +148,9 @@ fn build_suggestion_registry() -> HashMap<&'static str, Vec<Suggestion>> {
     register_core_git_suggestions(&mut m);
     register_core_filesystem_suggestions(&mut m);
     register_heredoc_suggestions(&mut m);
+    register_docker_suggestions(&mut m);
+    register_kubernetes_suggestions(&mut m);
+    register_database_suggestions(&mut m);
     m
 }
 
@@ -389,6 +392,607 @@ fn register_heredoc_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>) 
             Suggestion::new(
                 SuggestionKind::SaferAlternative,
                 "Move files to a backup directory instead of deleting",
+            ),
+        ],
+    );
+}
+
+/// Register suggestions for containers.docker pack rules.
+#[allow(clippy::too_many_lines)]
+fn register_docker_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>) {
+    m.insert(
+        "containers.docker:system-prune",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Run `docker system df` to see what would be affected",
+            )
+            .with_command("docker system df"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Prune specific resources: `docker container prune`, `docker image prune`",
+            ),
+        ],
+    );
+
+    m.insert(
+        "containers.docker:volume-prune",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List volumes with `docker volume ls` to see what would be removed",
+            )
+            .with_command("docker volume ls"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Remove specific volumes with `docker volume rm <name>`",
+            ),
+        ],
+    );
+
+    m.insert(
+        "containers.docker:network-prune",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List networks with `docker network ls` to see what would be removed",
+            )
+            .with_command("docker network ls"),
+        ],
+    );
+
+    m.insert(
+        "containers.docker:image-prune",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List dangling images with `docker images -f dangling=true`",
+            )
+            .with_command("docker images -f dangling=true"),
+        ],
+    );
+
+    m.insert(
+        "containers.docker:container-prune",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List stopped containers with `docker ps -a -f status=exited`",
+            )
+            .with_command("docker ps -a -f status=exited"),
+        ],
+    );
+
+    m.insert(
+        "containers.docker:rm-force",
+        vec![
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Stop container first with `docker stop`, then `docker rm`",
+            ),
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Check container status with `docker ps -a`",
+            )
+            .with_command("docker ps -a"),
+        ],
+    );
+
+    m.insert(
+        "containers.docker:rmi-force",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Check if image is in use with `docker ps -a --filter ancestor=<image>`",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Remove without force to see dependency errors first",
+            ),
+        ],
+    );
+
+    m.insert(
+        "containers.docker:volume-rm",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Inspect volume with `docker volume inspect <name>` to verify contents",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Back up volume data before removing",
+            ),
+        ],
+    );
+
+    m.insert(
+        "containers.docker:stop-all",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List running containers with `docker ps` to see what would be stopped",
+            )
+            .with_command("docker ps"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Stop specific containers by name instead of all",
+            ),
+        ],
+    );
+}
+
+/// Register suggestions for kubernetes.kubectl pack rules.
+#[allow(clippy::too_many_lines)]
+fn register_kubernetes_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>) {
+    m.insert(
+        "kubernetes.kubectl:delete-namespace",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Run `kubectl get all -n <namespace>` to see all resources that would be deleted",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Use `kubectl delete <resource-type> --dry-run=client` to preview",
+            )
+            .with_command("kubectl delete namespace <name> --dry-run=client"),
+        ],
+    );
+
+    m.insert(
+        "kubernetes.kubectl:delete-all",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Run with `--dry-run=client` to preview what would be deleted",
+            )
+            .with_command("kubectl delete <resource> --all --dry-run=client"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Delete specific resources by name instead of --all",
+            ),
+        ],
+    );
+
+    m.insert(
+        "kubernetes.kubectl:delete-all-namespaces",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Run `kubectl get <resource> -A` to see what exists across namespaces",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Target a specific namespace with `-n <namespace>` instead of -A",
+            ),
+        ],
+    );
+
+    m.insert(
+        "kubernetes.kubectl:drain-node",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List pods on node with `kubectl get pods --field-selector spec.nodeName=<node>`",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Use `kubectl cordon` first to prevent new pods, then drain",
+            )
+            .with_command("kubectl cordon <node>"),
+        ],
+    );
+
+    m.insert(
+        "kubernetes.kubectl:cordon-node",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Check node status with `kubectl get node <node>`",
+            ),
+            Suggestion::new(
+                SuggestionKind::Documentation,
+                "Cordon marks node unschedulable; existing pods continue running",
+            ),
+        ],
+    );
+
+    m.insert(
+        "kubernetes.kubectl:taint-noexecute",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List pods on node to see what would be evicted",
+            )
+            .with_command("kubectl get pods --field-selector spec.nodeName=<node>"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Use `NoSchedule` taint to prevent new pods without evicting existing ones",
+            ),
+        ],
+    );
+
+    m.insert(
+        "kubernetes.kubectl:delete-workload",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Use `--dry-run=client` to preview the deletion",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Scale to 0 replicas first to gracefully stop pods",
+            )
+            .with_command("kubectl scale deployment <name> --replicas=0"),
+        ],
+    );
+
+    m.insert(
+        "kubernetes.kubectl:delete-pvc",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Check PVC's reclaim policy with `kubectl get pv <pv-name> -o jsonpath='{.spec.persistentVolumeReclaimPolicy}'`",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Back up data before deleting PVC if ReclaimPolicy is Delete",
+            ),
+        ],
+    );
+
+    m.insert(
+        "kubernetes.kubectl:delete-pv",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Check if PV is bound with `kubectl get pv <name>`",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Ensure data is backed up before deleting persistent volume",
+            ),
+        ],
+    );
+
+    m.insert(
+        "kubernetes.kubectl:scale-to-zero",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Check current replicas with `kubectl get deployment <name>`",
+            ),
+            Suggestion::new(
+                SuggestionKind::Documentation,
+                "Scaling to 0 stops all pods; use for maintenance or decommissioning",
+            ),
+        ],
+    );
+
+    m.insert(
+        "kubernetes.kubectl:delete-force",
+        vec![
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Remove --force --grace-period=0 to allow graceful termination",
+            ),
+            Suggestion::new(
+                SuggestionKind::Documentation,
+                "Force deletion skips graceful shutdown; use only for stuck resources",
+            ),
+        ],
+    );
+}
+
+/// Register suggestions for database pack rules (`PostgreSQL`, `MongoDB`, Redis, `SQLite`).
+#[allow(clippy::too_many_lines)]
+fn register_database_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>) {
+    // PostgreSQL suggestions
+    m.insert(
+        "database.postgresql:drop-database",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List databases with `\\l` in psql to verify target",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Back up with `pg_dump -Fc <database> > backup.dump` first",
+            )
+            .with_command("pg_dump -Fc <database> > backup.dump"),
+        ],
+    );
+
+    m.insert(
+        "database.postgresql:drop-table",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List tables with `\\dt` in psql to verify target",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Back up table with `pg_dump -t <table> <database>`",
+            ),
+        ],
+    );
+
+    m.insert(
+        "database.postgresql:drop-schema",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List schema contents with `\\dn+` in psql",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Back up schema with `pg_dump -n <schema> <database>`",
+            ),
+        ],
+    );
+
+    m.insert(
+        "database.postgresql:truncate-table",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Check row count with `SELECT count(*) FROM <table>`",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Back up data with `COPY <table> TO '/tmp/backup.csv'` first",
+            ),
+        ],
+    );
+
+    m.insert(
+        "database.postgresql:delete-without-where",
+        vec![
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Add a WHERE clause to limit deletion scope",
+            ),
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Run `SELECT count(*) FROM <table>` to see row count",
+            ),
+        ],
+    );
+
+    m.insert(
+        "database.postgresql:dropdb-cli",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List databases with `psql -l` to verify target",
+            )
+            .with_command("psql -l"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Back up with `pg_dump` before dropping",
+            ),
+        ],
+    );
+
+    m.insert(
+        "database.postgresql:pg-dump-clean",
+        vec![
+            Suggestion::new(
+                SuggestionKind::Documentation,
+                "The --clean flag drops objects before creating; be careful on restore",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Remove --clean flag to create without dropping existing objects",
+            ),
+        ],
+    );
+
+    // MongoDB suggestions
+    m.insert(
+        "database.mongodb:drop-database",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List databases with `show dbs` to verify target",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Back up with `mongodump --db <database>` first",
+            )
+            .with_command("mongodump --db <database>"),
+        ],
+    );
+
+    m.insert(
+        "database.mongodb:drop-collection",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List collections with `show collections` to verify target",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Back up with `mongoexport --collection <name>` first",
+            ),
+        ],
+    );
+
+    m.insert(
+        "database.mongodb:delete-all",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Check document count with `db.collection.countDocuments({})`",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Add filter criteria to `deleteMany()` to limit scope",
+            ),
+        ],
+    );
+
+    m.insert(
+        "database.mongodb:mongorestore-drop",
+        vec![
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Remove --drop flag to merge with existing data",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Back up existing data with `mongodump` before restoring with --drop",
+            ),
+        ],
+    );
+
+    m.insert(
+        "database.mongodb:collection-drop",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Check collection stats with `db.collection.stats()`",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Export collection with `mongoexport` before dropping",
+            ),
+        ],
+    );
+
+    // Redis suggestions
+    m.insert(
+        "database.redis:flushall",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Check total keys with `DBSIZE` across databases",
+            )
+            .with_command("redis-cli DBSIZE"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Use `FLUSHDB` to flush only current database instead of all",
+            ),
+        ],
+    );
+
+    m.insert(
+        "database.redis:flushdb",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Check key count with `DBSIZE`",
+            )
+            .with_command("redis-cli DBSIZE"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Export keys with `redis-cli --scan` before flushing",
+            ),
+        ],
+    );
+
+    m.insert(
+        "database.redis:debug-crash",
+        vec![
+            Suggestion::new(
+                SuggestionKind::Documentation,
+                "DEBUG SEGFAULT/CRASH will crash the Redis server; only use for testing",
+            ),
+        ],
+    );
+
+    m.insert(
+        "database.redis:debug-sleep",
+        vec![
+            Suggestion::new(
+                SuggestionKind::Documentation,
+                "DEBUG SLEEP blocks the server; avoid in production",
+            ),
+        ],
+    );
+
+    m.insert(
+        "database.redis:shutdown",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Check connected clients with `CLIENT LIST`",
+            )
+            .with_command("redis-cli CLIENT LIST"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Use `BGSAVE` to persist data before shutdown",
+            )
+            .with_command("redis-cli BGSAVE"),
+        ],
+    );
+
+    m.insert(
+        "database.redis:config-dangerous",
+        vec![
+            Suggestion::new(
+                SuggestionKind::Documentation,
+                "CONFIG SET for dir/dbfilename can be exploited for arbitrary file writes",
+            ),
+        ],
+    );
+
+    // SQLite suggestions
+    m.insert(
+        "database.sqlite:drop-table",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List tables with `.tables` to verify target",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Back up database with `.backup <filename>` first",
+            )
+            .with_command(".backup backup.db"),
+        ],
+    );
+
+    m.insert(
+        "database.sqlite:delete-without-where",
+        vec![
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Add a WHERE clause to limit deletion scope",
+            ),
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Check row count with `SELECT count(*) FROM <table>`",
+            ),
+        ],
+    );
+
+    m.insert(
+        "database.sqlite:vacuum-into",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Check if target file exists before VACUUM INTO",
+            ),
+            Suggestion::new(
+                SuggestionKind::Documentation,
+                "VACUUM INTO overwrites the target file if it exists",
+            ),
+        ],
+    );
+
+    m.insert(
+        "database.sqlite:sqlite3-stdin",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Review the SQL file contents before executing",
+            )
+            .with_command("cat <file.sql>"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Back up database with `.backup` before running SQL from file",
             ),
         ],
     );
