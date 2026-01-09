@@ -885,6 +885,19 @@ fn evaluate_heredoc(
     heredoc_settings: &crate::config::HeredocSettings,
     first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
 ) -> Option<EvaluationResult> {
+    // Check command-level allowlist before any extraction.
+    // This allows users to whitelist entire commands (e.g., "./scripts/approved.sh").
+    if let Some(ref content_allowlist) = heredoc_settings.content_allowlist {
+        if let Some(matched_cmd) = content_allowlist.is_command_allowlisted(command) {
+            tracing::debug!(
+                matched_command = matched_cmd,
+                "heredoc command allowlisted"
+            );
+            // Command is allowlisted - skip all heredoc analysis
+            return None;
+        }
+    }
+
     let extracted = match extract_content(command, &heredoc_settings.limits) {
         ExtractionResult::Extracted(contents) => contents,
         ExtractionResult::NoContent => return None,
@@ -933,6 +946,25 @@ fn evaluate_heredoc(
     for content in extracted {
         if let Some(allowed) = &heredoc_settings.allowed_languages {
             if !allowed.contains(&content.language) {
+                continue;
+            }
+        }
+
+        // Check content-level allowlist before AST matching.
+        // This allows users to whitelist specific patterns or content hashes.
+        if let Some(ref content_allowlist) = heredoc_settings.content_allowlist {
+            if let Some(hit) = content_allowlist.is_content_allowlisted(
+                &content.content,
+                content.language,
+                None, // TODO: pass project path when available
+            ) {
+                tracing::debug!(
+                    hit_kind = hit.kind.label(),
+                    matched = hit.matched,
+                    reason = hit.reason,
+                    "heredoc content allowlisted"
+                );
+                // Content is allowlisted - skip AST matching for this heredoc
                 continue;
             }
         }
