@@ -592,9 +592,11 @@ fn main() {
         MatchSource::ConfigOverride | MatchSource::LegacyPattern => DecisionMode::Deny,
     };
 
+    let pattern = info.pattern_name.as_deref();
+
     match mode {
         DecisionMode::Deny => {
-            hook::output_denial(&command, &info.reason, pack);
+            hook::output_denial(&command, &info.reason, pack, pattern);
 
             // Log if configured
             if let Some(log_file) = &config.general.log_file {
@@ -602,7 +604,7 @@ fn main() {
             }
         }
         DecisionMode::Warn => {
-            hook::output_warning(&command, &info.reason, pack);
+            hook::output_warning(&command, &info.reason, pack, pattern);
         }
         DecisionMode::Log => {
             // Silent allow; optionally log to file for telemetry.
