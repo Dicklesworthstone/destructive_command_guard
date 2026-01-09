@@ -822,6 +822,7 @@ fn show_config(config: &Config) {
     let lang_label = |lang: crate::heredoc::ScriptLanguage| -> &'static str {
         match lang {
             crate::heredoc::ScriptLanguage::Bash => "bash",
+            crate::heredoc::ScriptLanguage::Go => "go",
             crate::heredoc::ScriptLanguage::Python => "python",
             crate::heredoc::ScriptLanguage::Ruby => "ruby",
             crate::heredoc::ScriptLanguage::Perl => "perl",
@@ -2235,10 +2236,10 @@ fn doctor(fix: bool) {
                     until.format("%Y-%m-%d %H:%M UTC")
                 );
                 if days > 0 {
-                    println!("  {} days remaining", days);
+                    println!("  {days} days remaining");
                 } else {
                     let hours = remaining.num_hours();
-                    println!("  {} hours remaining", hours);
+                    println!("  {hours} hours remaining");
                 }
                 println!("  Non-critical rules are using WARN instead of DENY");
                 println!("  → This is expected during rollout");
@@ -2250,7 +2251,10 @@ fn doctor(fix: bool) {
                     "  Observe mode expired: {}",
                     until.format("%Y-%m-%d %H:%M UTC")
                 );
-                println!("  {} DCG is now enforcing normal severity defaults", "→".bold());
+                println!(
+                    "  {} DCG is now enforcing normal severity defaults",
+                    "→".bold()
+                );
                 println!("  To acknowledge and remove the expired setting:");
                 println!("    1. Edit your config file");
                 println!("    2. Remove or update the 'observe_until' line in [policy]");
@@ -2279,15 +2283,44 @@ fn doctor(fix: bool) {
             crate::config::PolicyMode::Warn | crate::config::PolicyMode::Log
         ) {
             println!("{}", "PERMANENT".yellow());
-            println!("  policy.default_mode = {:?} (no expiration set)", mode);
-            println!("  Non-critical rules will always use {:?} mode", mode);
+            println!("  policy.default_mode = {mode:?} (no expiration set)");
+            println!("  Non-critical rules will always use {mode:?} mode");
             println!("  → Consider adding observe_until for time-limited rollout");
         } else {
             println!("{}", "OK".green());
-            println!("  Enforcing normal policy (default_mode = {:?})", mode);
+            println!("  Enforcing normal policy (default_mode = {mode:?})");
         }
     } else {
         println!("{}", "OK".green());
+    }
+
+    // Check 8: Allowlist discovery + validation
+    print!("Checking allowlists... ");
+    let allowlist_diag = diagnose_allowlists();
+    if allowlist_diag.total_errors > 0 {
+        println!("{}", "INVALID".red());
+        issues += allowlist_diag.total_errors;
+        for msg in &allowlist_diag.error_messages {
+            println!("  {}", msg);
+        }
+        println!("  → Run 'dcg allowlist validate' for details");
+    } else if allowlist_diag.total_warnings > 0 {
+        println!("{}", "WARNING".yellow());
+        for msg in &allowlist_diag.warning_messages {
+            println!("  {}", msg);
+        }
+        println!("  → Run 'dcg allowlist validate' for details");
+    } else if allowlist_diag.layers_found == 0 {
+        println!("{}", "NONE".yellow().dimmed());
+        println!("  No allowlist files found (project or user)");
+        println!("  → Use 'dcg allow <rule-id> -r \"reason\"' to create one");
+    } else {
+        println!(
+            "{} ({} layer{})",
+            "OK".green(),
+            allowlist_diag.layers_found,
+            if allowlist_diag.layers_found == 1 { "" } else { "s" }
+        );
     }
 
     println!();
@@ -2832,6 +2865,110 @@ fn run_smoke_test() -> bool {
 }
 
 // ============================================================================
+
+/// Allowlist validation diagnostics for doctor command.
+#[derive(Debug, Default)]
+struct AllowlistDiagnostics {
+    /// Number of allowlist layers found (project/user)
+    layers_found: usize,
+    /// Total error count
+    total_errors: usize,
+    /// Total warning count
+    total_warnings: usize,
+    /// Error messages to display
+    error_messages: Vec<String>,
+    /// Warning messages to display
+    warning_messages: Vec<String>,
+}
+
+/// Diagnose allowlist health across project and user layers.
+fn diagnose_allowlists() -> AllowlistDiagnostics {
+    use crate::allowlist::{AllowSelector, AllowlistLayer};
+
+    let mut diag = AllowlistDiagnostics::default();
+
+    // Load all allowlists
+    let allowlist = crate::allowlist::load_default_allowlists();
+
+    // Check each layer
+    for loaded in &allowlist.layers {
+        // Skip system layer in doctor (less common)
+        if loaded.layer == AllowlistLayer::System {
+            continue;
+        }
+
+        // Count as found if path exists
+        let path = match loaded.layer {
+            AllowlistLayer::Project => {
+                if let Some(repo_root) = find_repo_root_from_cwd() {
+                    repo_root.join(".dcg").join("allowlist.toml")
+                } else {
+                    continue;
+                }
+            }
+            AllowlistLayer::User => config_dir().join("allowlist.toml"),
+            AllowlistLayer::System => continue,
+        };
+
+        if !path.exists() {
+            continue;
+        }
+
+        diag.layers_found += 1;
+        let layer_label = loaded.layer.label();
+
+        // Report parse errors
+        for err in &loaded.file.errors {
+            diag.total_errors += 1;
+            diag.error_messages
+                .push(format!("{layer_label}: {}", err.message));
+        }
+
+        // Check entries
+        for (idx, entry) in loaded.file.entries.iter().enumerate() {
+            let entry_num = idx + 1;
+
+            // Check for expired entries
+            if let Some(expires_at) = &entry.expires_at {
+                if is_expired(expires_at) {
+                    diag.total_warnings += 1;
+                    diag.warning_messages.push(format!(
+                        "{layer_label}: entry {entry_num} expired ({})",
+                        expires_at
+                    ));
+                }
+            }
+
+            // Check for risky regex patterns without acknowledgement
+            if matches!(entry.selector, AllowSelector::RegexPattern(_))
+                && !entry.risk_acknowledged
+            {
+                diag.total_warnings += 1;
+                diag.warning_messages.push(format!(
+                    "{layer_label}: entry {entry_num} uses regex without risk_acknowledged"
+                ));
+            }
+
+            // Check for overly broad wildcards
+            if let AllowSelector::Rule(rule_id) = &entry.selector {
+                if rule_id.pack_id == "*" {
+                    diag.total_errors += 1;
+                    diag.error_messages.push(format!(
+                        "{layer_label}: entry {entry_num} uses dangerous global wildcard (*:*)"
+                    ));
+                } else if rule_id.pattern_name == "*" {
+                    diag.total_warnings += 1;
+                    diag.warning_messages.push(format!(
+                        "{layer_label}: entry {entry_num} uses pack wildcard ({}:*)",
+                        rule_id.pack_id
+                    ));
+                }
+            }
+        }
+    }
+
+    diag
+}
 // Allowlist CLI implementation
 // ============================================================================
 

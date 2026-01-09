@@ -930,6 +930,7 @@ fn format_heredoc_denial_reason(
 ) -> String {
     let lang = match extracted.language {
         crate::heredoc::ScriptLanguage::Bash => "bash",
+        crate::heredoc::ScriptLanguage::Go => "go",
         crate::heredoc::ScriptLanguage::Python => "python",
         crate::heredoc::ScriptLanguage::Ruby => "ruby",
         crate::heredoc::ScriptLanguage::Perl => "perl",

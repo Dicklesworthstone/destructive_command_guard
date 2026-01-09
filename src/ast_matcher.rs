@@ -356,6 +356,7 @@ const fn script_language_to_ast_lang(lang: ScriptLanguage) -> Option<SupportLang
         ScriptLanguage::TypeScript => Some(SupportLang::TypeScript),
         ScriptLanguage::Ruby => Some(SupportLang::Ruby),
         ScriptLanguage::Bash => Some(SupportLang::Bash),
+        ScriptLanguage::Go => Some(SupportLang::Go),
         ScriptLanguage::Perl | ScriptLanguage::Unknown => None,
     }
 }
