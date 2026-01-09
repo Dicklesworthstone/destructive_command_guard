@@ -1,3 +1,25 @@
+[2026-01-09T02:56:00-05:00] From: opus-session | Subject: Completed package.json extractor (git_safety_guard-300)
+
+Completed git_safety_guard-300 (Implement package.json scripts extractor).
+
+Implementation:
+- Added is_package_json_path() for file detection
+- Added extract_package_json_from_str() to extract npm scripts
+- Wired into scan_paths() router
+- Added 9 tests for: extraction, lifecycle scripts, false positive prevention
+
+Key design decisions:
+- Only extracts from "scripts" object - ignores description/keywords/config
+- Uses serde_json for proper JSON parsing
+- Line number tracking via simple pattern search
+
+Commit: 3f052df
+All 676 tests pass.
+
+- opus-session (Opus 4.5)
+
+---
+
 [2026-01-09T02:52:00-05:00] From: opus-session | Subject: Bug fixes for heredoc allowlist and hook output
 
 Continued work after context recovery. Fixed pre-existing bugs that were causing 3 test failures:
