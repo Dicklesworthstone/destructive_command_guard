@@ -1231,13 +1231,21 @@ fn handle_simulate_command(sim: SimulateCommand) -> Result<(), Box<dyn std::erro
 }
 
 /// Truncate a command string for display, adding ellipsis if needed.
+///
+/// This function handles UTF-8 strings safely by not splitting multi-byte characters.
 fn truncate_command_for_display(s: &str, max_len: usize) -> String {
     // Replace newlines with visible markers
     let s = s.replace('\n', "\\n").replace('\r', "\\r");
     if s.len() <= max_len {
         s
     } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        // Find a safe truncation point that doesn't split a UTF-8 character.
+        let target = max_len.saturating_sub(3);
+        let mut truncate_at = target.min(s.len());
+        while truncate_at > 0 && !s.is_char_boundary(truncate_at) {
+            truncate_at -= 1;
+        }
+        format!("{}...", &s[..truncate_at])
     }
 }
 
@@ -2682,15 +2690,11 @@ fn is_valid_pack_id(id: &str) -> bool {
         return true;
     }
 
-    // Check if it's a valid category.subpack pattern
-    if let Some(dot_pos) = id.find('.') {
-        let category = &id[..dot_pos];
-        if known_categories.contains(&category) {
-            // It's a category prefix - check if the full ID exists
-            return REGISTRY.get(id).is_some();
-        }
-    }
-
+    // At this point:
+    // - id is NOT in REGISTRY (checked above)
+    // - id is NOT a bare category name (checked above)
+    // Therefore, if id contains a dot (e.g., "containers.fake"), it's invalid
+    // because we only accept full pack IDs that exist in REGISTRY.
     false
 }
 
