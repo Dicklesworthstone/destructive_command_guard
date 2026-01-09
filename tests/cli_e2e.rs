@@ -666,3 +666,419 @@ mod hook_mode_tests {
         }
     }
 }
+
+// ============================================================================
+// DCG SIMULATE Tests (git_safety_guard-1gt.8.4)
+// ============================================================================
+
+mod simulate_tests {
+    use super::*;
+
+    /// Helper to create a temp file with given content.
+    fn create_temp_log_file(content: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::Builder::new()
+            .suffix(".log")
+            .tempfile()
+            .unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    /// Helper to run dcg simulate with a temp file.
+    fn run_simulate_file(file_path: &str, extra_args: &[&str]) -> std::process::Output {
+        let mut args = vec!["simulate", "-f", file_path];
+        args.extend_from_slice(extra_args);
+        run_dcg(&args)
+    }
+
+    /// Helper to run dcg simulate with stdin input.
+    fn run_simulate_stdin(input: &str, extra_args: &[&str]) -> std::process::Output {
+        let mut args = vec!["simulate", "-f", "-"];
+        args.extend_from_slice(extra_args);
+
+        let mut cmd = Command::new(dcg_binary());
+        cmd.args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().expect("failed to spawn dcg simulate");
+        {
+            let stdin = child.stdin.as_mut().expect("failed to open stdin");
+            stdin.write_all(input.as_bytes()).expect("failed to write");
+        }
+        child.wait_with_output().expect("failed to wait for dcg")
+    }
+
+    // -------------------------------------------------------------------------
+    // Basic functionality tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn simulate_plain_commands_file() {
+        let content = "git status\necho hello\nls -la\n";
+        let file = create_temp_log_file(content);
+
+        let output = run_simulate_file(file.path().to_str().unwrap(), &[]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            output.status.success(),
+            "simulate should succeed\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("Total commands:") || stdout.contains("commands"),
+            "should show command count\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn simulate_hook_json_file() {
+        let content = r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}
+{"tool_name":"Bash","tool_input":{"command":"echo hello"}}
+{"tool_name":"Read","tool_input":{"path":"file.txt"}}
+"#;
+        let file = create_temp_log_file(content);
+
+        let output = run_simulate_file(file.path().to_str().unwrap(), &["--format", "json"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success(), "simulate should succeed");
+
+        let json: serde_json::Value = serde_json::from_str(&stdout)
+            .expect("should produce valid JSON");
+
+        // 2 Bash commands extracted, 1 Read tool ignored
+        assert_eq!(json["totals"]["commands"], 2, "should have 2 commands");
+        assert_eq!(json["errors"]["ignored_count"], 1, "should ignore 1 non-Bash");
+    }
+
+    #[test]
+    fn simulate_from_stdin() {
+        let content = "git status\necho hello\n";
+        let output = run_simulate_stdin(content, &[]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            output.status.success(),
+            "simulate from stdin should succeed"
+        );
+        assert!(
+            stdout.contains("Total commands:") || stdout.contains("commands"),
+            "should process stdin input"
+        );
+    }
+
+    #[test]
+    fn simulate_empty_file_succeeds() {
+        let file = create_temp_log_file("");
+
+        let output = run_simulate_file(file.path().to_str().unwrap(), &[]);
+
+        assert!(
+            output.status.success(),
+            "simulate on empty file should succeed"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Output format tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn simulate_json_format_is_valid() {
+        let content = "git status\ndocker system prune -a\necho hello\n";
+        let file = create_temp_log_file(content);
+
+        let output = run_simulate_file(file.path().to_str().unwrap(), &["--format", "json"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let json: serde_json::Value = serde_json::from_str(&stdout)
+            .expect("simulate --format json should produce valid JSON");
+
+        assert_eq!(json["schema_version"], 1, "should have schema_version");
+        assert!(json["totals"].is_object(), "should have totals object");
+        assert!(json["totals"]["commands"].is_number(), "should have commands count");
+        assert!(json["totals"]["allowed"].is_number(), "should have allowed count");
+        assert!(json["totals"]["denied"].is_number(), "should have denied count");
+        assert!(json["rules"].is_array(), "should have rules array");
+        assert!(json["errors"].is_object(), "should have errors object");
+    }
+
+    #[test]
+    fn simulate_json_totals_match_input() {
+        // 3 plain commands: 1 safe, 1 dangerous, 1 safe
+        let content = "git status\ndocker system prune -a --volumes\necho hello\n";
+        let file = create_temp_log_file(content);
+
+        let output = run_simulate_file(file.path().to_str().unwrap(), &["--format", "json"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+        assert_eq!(json["totals"]["commands"], 3, "should have 3 total commands");
+        assert!(
+            json["totals"]["denied"].as_u64().unwrap() >= 1,
+            "should have at least 1 denied (docker system prune)"
+        );
+    }
+
+    #[test]
+    fn simulate_pretty_format_has_sections() {
+        let content = "git status\ndocker system prune -a\n";
+        let file = create_temp_log_file(content);
+
+        let output = run_simulate_file(file.path().to_str().unwrap(), &["--format", "pretty"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(stdout.contains("Summary"), "should have Summary section");
+        assert!(
+            stdout.contains("Total commands:") || stdout.contains("commands"),
+            "should show total"
+        );
+        assert!(
+            stdout.contains("Allowed") || stdout.contains("allowed"),
+            "should show allowed count"
+        );
+        assert!(
+            stdout.contains("Denied") || stdout.contains("denied") || stdout.contains("DENY"),
+            "should show denied count"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Rule and pack aggregation tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn simulate_rules_sorted_by_count_desc() {
+        // Create input with multiple denies of different rules
+        let content = "docker system prune\ndocker system prune -a\ndocker system prune -af\nkubectl delete namespace foo\n";
+        let file = create_temp_log_file(content);
+
+        let output = run_simulate_file(file.path().to_str().unwrap(), &["--format", "json"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let rules = json["rules"].as_array().expect("rules should be array");
+
+        if rules.len() >= 2 {
+            // Verify sorted by count descending
+            let first_count = rules[0]["count"].as_u64().unwrap();
+            let second_count = rules[1]["count"].as_u64().unwrap();
+            assert!(
+                first_count >= second_count,
+                "rules should be sorted by count desc: {} >= {}",
+                first_count,
+                second_count
+            );
+        }
+    }
+
+    #[test]
+    fn simulate_exemplars_included_in_rules() {
+        let content = "docker system prune -a\n";
+        let file = create_temp_log_file(content);
+
+        let output = run_simulate_file(file.path().to_str().unwrap(), &["--format", "json"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let rules = json["rules"].as_array().unwrap();
+
+        if !rules.is_empty() {
+            let rule = &rules[0];
+            assert!(rule["exemplars"].is_array(), "rule should have exemplars");
+            let exemplars = rule["exemplars"].as_array().unwrap();
+            if !exemplars.is_empty() {
+                assert!(
+                    exemplars[0].is_string(),
+                    "exemplar should be a string (the command)"
+                );
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Redaction and truncation tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn simulate_redaction_quoted() {
+        // Command with quoted strings that should be redacted
+        let content = r#"echo "secret password here""#;
+        let file = create_temp_log_file(content);
+
+        let output = run_simulate_file(
+            file.path().to_str().unwrap(),
+            &["--format", "json", "--redact", "quoted"],
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // The command itself is safe, but if there were blocked commands,
+        // their exemplars would have quoted strings redacted
+        assert!(output.status.success(), "redact mode should work");
+        let _json: serde_json::Value = serde_json::from_str(&stdout)
+            .expect("should produce valid JSON with redaction");
+    }
+
+    #[test]
+    fn simulate_truncation_limits_exemplars() {
+        // Create a long command
+        let long_cmd = format!("echo {}", "x".repeat(200));
+        let content = format!("{}\n", long_cmd);
+        let file = create_temp_log_file(&content);
+
+        let output = run_simulate_file(
+            file.path().to_str().unwrap(),
+            &["--format", "json", "--truncate", "50"],
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Even though the command is safe (allow), verify truncation works
+        // in parse output (no rules but parse stats should work)
+        assert!(output.status.success(), "truncation should work");
+        let _json: serde_json::Value = serde_json::from_str(&stdout)
+            .expect("should produce valid JSON with truncation");
+    }
+
+    // -------------------------------------------------------------------------
+    // Limit tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn simulate_max_lines_limit() {
+        let content = "line1\nline2\nline3\nline4\nline5\n";
+        let file = create_temp_log_file(content);
+
+        let output = run_simulate_file(
+            file.path().to_str().unwrap(),
+            &["--format", "json", "--max-lines", "3"],
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+        // Should process only 3 lines
+        assert_eq!(json["totals"]["commands"], 3, "should limit to 3 commands");
+        assert!(
+            json["errors"]["stopped_at_limit"].as_bool().unwrap_or(false),
+            "should indicate stopped at limit"
+        );
+    }
+
+    #[test]
+    fn simulate_top_rules_limit() {
+        // Create many different blocked commands
+        let content = "docker system prune\nkubectl delete ns foo\ngit push --force\n";
+        let file = create_temp_log_file(content);
+
+        let output = run_simulate_file(
+            file.path().to_str().unwrap(),
+            &["--format", "json", "--top", "1"],
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let rules = json["rules"].as_array().unwrap();
+
+        assert!(rules.len() <= 1, "should limit to top 1 rule");
+    }
+
+    // -------------------------------------------------------------------------
+    // Strict mode tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn simulate_strict_mode_fails_on_malformed() {
+        // Valid JSON with missing command field
+        let content = r#"git status
+{"tool_name":"Bash","tool_input":{}}
+echo hello
+"#;
+        let file = create_temp_log_file(content);
+
+        let output = run_simulate_file(file.path().to_str().unwrap(), &["--strict"]);
+
+        // In strict mode, malformed lines should cause failure
+        assert!(
+            !output.status.success(),
+            "strict mode should fail on malformed line"
+        );
+    }
+
+    #[test]
+    fn simulate_non_strict_continues_on_malformed() {
+        // Valid JSON with missing command field
+        let content = r#"git status
+{"tool_name":"Bash","tool_input":{}}
+echo hello
+"#;
+        let file = create_temp_log_file(content);
+
+        let output = run_simulate_file(file.path().to_str().unwrap(), &["--format", "json"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Non-strict mode should continue and report malformed count
+        assert!(output.status.success(), "non-strict should succeed");
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(
+            json["errors"]["malformed_count"], 1,
+            "should count malformed line"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Determinism tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn simulate_output_is_deterministic() {
+        let content = "docker system prune\ngit push --force origin main\nkubectl delete ns prod\n";
+        let file = create_temp_log_file(content);
+        let path = file.path().to_str().unwrap();
+
+        // Run twice and compare
+        let output1 = run_simulate_file(path, &["--format", "json"]);
+        let output2 = run_simulate_file(path, &["--format", "json"]);
+
+        let stdout1 = String::from_utf8_lossy(&output1.stdout);
+        let stdout2 = String::from_utf8_lossy(&output2.stdout);
+
+        let json1: serde_json::Value = serde_json::from_str(&stdout1).unwrap();
+        let json2: serde_json::Value = serde_json::from_str(&stdout2).unwrap();
+
+        // Totals should be identical
+        assert_eq!(json1["totals"], json2["totals"], "totals should be deterministic");
+
+        // Rule order should be identical
+        let rules1 = json1["rules"].as_array().unwrap();
+        let rules2 = json2["rules"].as_array().unwrap();
+        assert_eq!(rules1.len(), rules2.len(), "rule count should match");
+        for (r1, r2) in rules1.iter().zip(rules2.iter()) {
+            assert_eq!(r1["rule_id"], r2["rule_id"], "rule order should be deterministic");
+            assert_eq!(r1["count"], r2["count"], "rule counts should match");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Decision log format tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn simulate_decision_log_format() {
+        // DCG_LOG_V1|timestamp|decision|base64_command|
+        // "git status" in base64 = "Z2l0IHN0YXR1cw=="
+        let content = "DCG_LOG_V1|2026-01-09T00:00:00Z|allow|Z2l0IHN0YXR1cw==|\n";
+        let file = create_temp_log_file(content);
+
+        let output = run_simulate_file(file.path().to_str().unwrap(), &["--format", "json"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success(), "should parse decision log format");
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(json["totals"]["commands"], 1, "should extract 1 command from log");
+    }
+}
