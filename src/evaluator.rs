@@ -958,6 +958,22 @@ pub trait LegacyDestructivePattern {
     fn reason(&self) -> &str;
 }
 
+impl LegacySafePattern for crate::packs::SafePattern {
+    fn is_match(&self, cmd: &str) -> bool {
+        self.regex.is_match(cmd).unwrap_or(false)
+    }
+}
+
+impl LegacyDestructivePattern for crate::packs::DestructivePattern {
+    fn is_match(&self, cmd: &str) -> bool {
+        self.regex.is_match(cmd).unwrap_or(false)
+    }
+
+    fn reason(&self) -> &str {
+        self.reason
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
