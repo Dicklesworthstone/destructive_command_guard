@@ -1179,6 +1179,52 @@ pub fn global_quick_reject(cmd: &str) -> bool {
     GIT_FINDER.find(bytes).is_none() && RM_FINDER.find(bytes).is_none()
 }
 
+#[inline]
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+#[inline]
+fn keyword_matches_span(span_text: &str, keyword: &str) -> bool {
+    if keyword.is_empty() {
+        return false;
+    }
+
+    let haystack = span_text.as_bytes();
+    let needle = keyword.as_bytes();
+    if needle.len() > haystack.len() {
+        return false;
+    }
+
+    let first_is_word = needle.first().is_some_and(|b| is_word_byte(*b));
+    let last_is_word = needle.last().is_some_and(|b| is_word_byte(*b));
+    let mut offset = 0;
+
+    while let Some(pos) = memmem::find(&haystack[offset..], needle) {
+        let start = offset + pos;
+        let end = start + needle.len();
+        let start_ok = !first_is_word
+            || start == 0
+            || !is_word_byte(haystack[start.saturating_sub(1)]);
+        let end_ok = !last_is_word || end == haystack.len() || !is_word_byte(haystack[end]);
+
+        if start_ok && end_ok {
+            return true;
+        }
+
+        offset = start + 1;
+    }
+
+    false
+}
+
+#[inline]
+fn span_matches_any_keyword(span_text: &str, enabled_keywords: &[&str]) -> bool {
+    enabled_keywords
+        .iter()
+        .any(|keyword| keyword_matches_span(span_text, keyword))
+}
+
 /// Pack-aware quick-reject filter.
 ///
 /// Returns true if the command can be safely skipped (contains none of the
@@ -1189,8 +1235,9 @@ pub fn global_quick_reject(cmd: &str) -> bool {
 ///
 /// # Performance
 ///
-/// Uses SIMD-accelerated substring search via memchr for each keyword.
-/// For typical command lengths and keyword counts, this is sub-microsecond.
+/// Uses SIMD-accelerated substring search via memchr as a fast prefilter,
+/// then applies token-aware checks inside executable spans (via context
+/// classification) to avoid substring false triggers.
 ///
 /// # Arguments
 ///
@@ -1204,8 +1251,6 @@ pub fn global_quick_reject(cmd: &str) -> bool {
 #[inline]
 #[must_use]
 pub fn pack_aware_quick_reject(cmd: &str, enabled_keywords: &[&str]) -> bool {
-    let bytes = cmd.as_bytes();
-
     // Conservative: if the caller provides no keywords, we cannot safely conclude
     // that pack evaluation can be skipped (a pack may have empty/incorrect keywords).
     // Returning false forces evaluation rather than silently allowing everything.
@@ -1213,15 +1258,33 @@ pub fn pack_aware_quick_reject(cmd: &str, enabled_keywords: &[&str]) -> bool {
         return false;
     }
 
-    // Check if any keyword appears in the command
-    // Using memchr::memmem::find for SIMD-accelerated search
-    for keyword in enabled_keywords {
-        if memmem::find(bytes, keyword.as_bytes()).is_some() {
-            return false; // Keyword found, must evaluate packs
+    let bytes = cmd.as_bytes();
+    let any_substring = enabled_keywords
+        .iter()
+        .any(|keyword| memmem::find(bytes, keyword.as_bytes()).is_some());
+    if !any_substring {
+        return true;
+    }
+
+    let spans = crate::context::classify_command(cmd);
+    let mut saw_executable = false;
+
+    for span in spans.executable_spans() {
+        saw_executable = true;
+        let span_text = span.text(cmd);
+        if span_text.is_empty() {
+            continue;
+        }
+        if span_matches_any_keyword(span_text, enabled_keywords) {
+            return false;
         }
     }
 
-    true // No keywords found, safe to skip pack checking
+    if !saw_executable {
+        return true;
+    }
+
+    true // No keywords found in executable spans, safe to skip pack checking
 }
 
 #[cfg(test)]
@@ -1237,6 +1300,34 @@ mod tests {
         assert!(
             !pack_aware_quick_reject("git reset --hard", &[]),
             "empty keyword list must not allow skipping pack evaluation"
+        );
+    }
+
+    #[test]
+    fn pack_aware_quick_reject_ignores_substring_matches() {
+        let keywords: Vec<&str> = vec!["git", "rm", "docker"];
+
+        assert!(
+            pack_aware_quick_reject("cat .gitignore", &keywords),
+            "substring in filename should not trigger keyword gating"
+        );
+        assert!(
+            pack_aware_quick_reject("echo digit", &keywords),
+            "substring in a larger token should not trigger keyword gating"
+        );
+    }
+
+    #[test]
+    fn pack_aware_quick_reject_keeps_word_boundary_matches() {
+        let keywords: Vec<&str> = vec!["git"];
+
+        assert!(
+            !pack_aware_quick_reject("git status", &keywords),
+            "word boundary keyword should prevent quick-reject"
+        );
+        assert!(
+            !pack_aware_quick_reject("/usr/bin/git status", &keywords),
+            "absolute path to git should still prevent quick-reject"
         );
     }
 
