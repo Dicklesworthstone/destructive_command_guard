@@ -452,21 +452,21 @@ fn truncate_utf8(s: &str, max_chars: usize) -> String {
         return s.to_string();
     }
 
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        return s.to_string();
+    }
+
     if max_chars == 1 {
         return "…".to_string();
     }
 
-    let cut = max_chars - 1;
-    for (count, (idx, _)) in s.char_indices().enumerate() {
-        if count == cut {
-            return format!("{}…", &s[..idx]);
-        }
-    }
-
-    s.to_string()
+    let keep = max_chars - 1;
+    let truncated: String = s.chars().take(keep).collect();
+    format!("{truncated}…")
 }
 
-fn redact_quoted_strings(s: &str) -> String {
+pub(crate) fn redact_quoted_strings(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut it = s.chars();
 
@@ -508,7 +508,7 @@ fn redact_quoted_strings(s: &str) -> String {
     out
 }
 
-fn redact_aggressively(s: &str) -> String {
+pub(crate) fn redact_aggressively(s: &str) -> String {
     // First pass: redact quoted strings (most likely secret-bearing spans).
     let s = redact_quoted_strings(s);
 
@@ -1903,7 +1903,8 @@ ENV NOTE="git reset --hard"
     #[test]
     fn truncate_utf8_handles_short_strings() {
         assert_eq!(truncate_utf8("hello", 10), "hello");
-        // With limit 5, we keep 4 chars + ellipsis = 5 total
+        assert_eq!(truncate_utf8("hello", 5), "hello");
+        // With limit 6, we keep the full string (no truncation needed)
         assert_eq!(truncate_utf8("hello", 6), "hello");
     }
 
