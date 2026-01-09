@@ -826,6 +826,93 @@ test_command_with_allowlist_and_env() {
     fi
 }
 
+test_command_with_layered_allowlists() {
+    local cmd="$1"
+    local project_allowlist="$2"
+    local user_allowlist="$3"
+    local system_allowlist="$4"
+    local env_vars="$5"
+    local expected="$6"
+    local expected_layer="$7"
+    local desc="$8"
+
+    log_test_start "$desc"
+    if $VERBOSE; then
+        echo -e "  ${CYAN}Command:${NC} $(truncate_cmd "$cmd")"
+        echo -e "  ${CYAN}Expected layer:${NC} ${expected_layer:-<none>}"
+        if [[ -n "$env_vars" ]]; then
+            echo -e "  ${CYAN}Env:${NC} $env_vars"
+        fi
+        if [[ -n "$project_allowlist" ]]; then
+            echo -e "  ${CYAN}Project allowlist:${NC} $(echo "$project_allowlist" | tr '\n' ' ' | head -c 80)..."
+        fi
+        if [[ -n "$user_allowlist" ]]; then
+            echo -e "  ${CYAN}User allowlist:${NC} $(echo "$user_allowlist" | tr '\n' ' ' | head -c 80)..."
+        fi
+        if [[ -n "$system_allowlist" ]]; then
+            echo -e "  ${CYAN}System allowlist:${NC} $(echo "$system_allowlist" | tr '\n' ' ' | head -c 80)..."
+        fi
+    fi
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    local project_dir="$tmpdir/project"
+    local home_dir="$tmpdir/home"
+    local user_config_dir="$tmpdir/user-config"
+    local system_dir="$tmpdir/system"
+    local system_path="$system_dir/allowlist.toml"
+
+    mkdir -p "$project_dir" "$home_dir" "$user_config_dir" "$system_dir"
+    (cd "$project_dir" && git init -q) 2>/dev/null || true
+
+    if [[ -n "$project_allowlist" ]]; then
+        mkdir -p "$project_dir/.dcg"
+        echo "$project_allowlist" > "$project_dir/.dcg/allowlist.toml"
+    fi
+
+    if [[ -n "$user_allowlist" ]]; then
+        mkdir -p "$user_config_dir/dcg"
+        echo "$user_allowlist" > "$user_config_dir/dcg/allowlist.toml"
+    fi
+
+    if [[ -n "$system_allowlist" ]]; then
+        echo "$system_allowlist" > "$system_path"
+    fi
+
+    local escaped_cmd
+    escaped_cmd=$(json_escape "$cmd")
+    local json="{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$escaped_cmd\"}}"
+    local encoded
+    encoded=$(echo -n "$json" | base64 -w 0)
+
+    local result
+    result=$(cd "$project_dir" && echo "$encoded" | base64 -d | env \
+        HOME="$home_dir" \
+        XDG_CONFIG_HOME="$user_config_dir" \
+        DCG_ALLOWLIST_SYSTEM_PATH="$system_path" \
+        $env_vars "$BINARY" 2>/dev/null || true)
+
+    rm -rf "$tmpdir"
+
+    if [[ "$expected" == "block" ]]; then
+        if echo "$result" | grep -q '"permissionDecision"' && echo "$result" | grep -q '"deny"'; then
+            log_pass "BLOCKED (layered allowlist): $desc"
+            return 0
+        fi
+        log_fail "Should BLOCK (layered allowlist): $desc" "deny (expected layer: ${expected_layer:-<none>})" "${result:-<empty>}"
+        return 0
+    else
+        if [[ -z "$result" ]]; then
+            log_pass "ALLOWED (layered allowlist): $desc"
+            return 0
+        else
+            log_fail "Should ALLOW (layered allowlist): $desc" "allow (expected layer: ${expected_layer:-<none>})" "$result"
+            return 0
+        fi
+    fi
+}
+
 test_command_with_allowlist_and_env \
     "git reset --hard" \
     '[[allow]]
@@ -851,6 +938,100 @@ reason = "Also allow clean"
 added_by = "e2e_test.sh"' \
     "allow" \
     "Allowlist: multiple entries, second one matches"
+
+log_section "Allowlist Layering E2E Tests (git_safety_guard-s1u)"
+
+test_command_with_layered_allowlists \
+    "git reset --hard" \
+    '[[allow]]
+rule = "core.git:reset-hard"
+reason = "Project layer allow"
+added_by = "e2e_test.sh"' \
+    "" \
+    "" \
+    "" \
+    "allow" \
+    "project" \
+    "Layering: project allowlist applies"
+
+test_command_with_layered_allowlists \
+    "git reset --hard" \
+    '[[allow]]
+rule = "core.git:reset-hard"
+reason = "Expired project allowlist"
+added_by = "e2e_test.sh"
+expires_at = "2020-01-01"' \
+    '[[allow]]
+rule = "core.git:reset-hard"
+reason = "User layer allow"
+added_by = "e2e_test.sh"' \
+    "" \
+    "" \
+    "allow" \
+    "user" \
+    "Layering: expired project entry falls back to user"
+
+test_command_with_layered_allowlists \
+    "git reset --hard" \
+    '[[allow]]
+rule = "core.git:reset-hard"
+reason = "Project requires CI"
+added_by = "e2e_test.sh"
+conditions = { CI = "true" }' \
+    '[[allow]]
+rule = "core.git:reset-hard"
+reason = "User fallback"
+added_by = "e2e_test.sh"' \
+    "" \
+    "" \
+    "allow" \
+    "user" \
+    "Layering: unmet project condition falls back to user"
+
+test_command_with_layered_allowlists \
+    "git reset --hard" \
+    "" \
+    '[[allow]]
+rule = "core.git:reset-hard"
+reason = "Expired user allowlist"
+added_by = "e2e_test.sh"
+expires_at = "2020-01-01"' \
+    '[[allow]]
+rule = "core.git:reset-hard"
+reason = "System layer allow"
+added_by = "e2e_test.sh"' \
+    "" \
+    "allow" \
+    "system" \
+    "Layering: expired user entry falls back to system"
+
+test_command_with_layered_allowlists \
+    "git reset --hard" \
+    "" \
+    "" \
+    '[[allow]]
+rule = "core.git:reset-hard"
+reason = "System requires CI"
+added_by = "e2e_test.sh"
+conditions = { CI = "true" }' \
+    "" \
+    "block" \
+    "none" \
+    "Layering: system condition unmet blocks (no other layer)"
+
+test_command_with_layered_allowlists \
+    "git reset --hard" \
+    "" \
+    "" \
+    '[[allow]]
+rule = "core.git:reset-hard"
+reason = "System allows in CI"
+added_by = "e2e_test.sh"
+conditions = { CI = "true" }' \
+    "CI=true" \
+    "allow" \
+    "system" \
+    "Layering: system condition met allows"
 
 #
 # SUMMARY

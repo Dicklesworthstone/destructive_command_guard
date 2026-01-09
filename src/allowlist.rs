@@ -5,6 +5,10 @@
 //! - User: `~/.config/dcg/allowlist.toml`
 //! - System: `/etc/dcg/allowlist.toml` (optional)
 //!
+//! Test override:
+//! - `DCG_ALLOWLIST_SYSTEM_PATH` can override the system allowlist path
+//!   (useful for hermetic E2E tests).
+//!
 //! Design goals:
 //! - Strongly-typed model (`AllowEntry`, `AllowSelector`)
 //! - Robust parsing: invalid TOML or invalid entries must not crash the hook
@@ -370,7 +374,18 @@ pub fn load_default_allowlists() -> LayeredAllowlist {
     let user = dirs::config_dir().map(|d| d.join("dcg").join("allowlist.toml"));
 
     // System allowlist is optional; keep the fixed path but treat missing as empty.
-    let system = Some(PathBuf::from("/etc/dcg/allowlist.toml"));
+    // Allow tests to override via env for hermetic E2E (no reliance on real /etc).
+    let system = match std::env::var("DCG_ALLOWLIST_SYSTEM_PATH") {
+        Ok(path) => {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(trimmed))
+            }
+        }
+        Err(_) => Some(PathBuf::from("/etc/dcg/allowlist.toml")),
+    };
 
     LayeredAllowlist::load_from_paths(project, user, system)
 }
