@@ -152,14 +152,16 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     // from being allowed (where "foo" would also be deleted).
     //
     // - flags_before: zero or more flags each followed by whitespace (comes after prefix's \s+)
-    // - flags_between: zero or more flags each preceded by whitespace (comes after --recursive)
+    // - flags_between_*: flags between the two key flags, using negative lookahead to avoid
+    //   greedily consuming the terminating flag (which would cause the pattern to fail)
     let flags_before = r"(?:--?[a-zA-Z][-a-zA-Z0-9]*\s+)*";
-    let flags_between = r"(?:\s+--?[a-zA-Z][-a-zA-Z0-9]*)*";
+    let flags_between_to_force = r"(?:\s+(?!--force\b)--?[a-zA-Z][-a-zA-Z0-9]*)*";
+    let flags_between_to_recursive = r"(?:\s+(?!--recursive\b)--?[a-zA-Z][-a-zA-Z0-9]*)*";
     let recursive_force_pattern = format!(
-        r"{prefix}{flags_before}--recursive{flags_between}\s+--force(?:\s+--)?\s+{safe_path_list}\s*$"
+        r"{prefix}{flags_before}--recursive{flags_between_to_force}\s+--force(?:\s+--)?\s+{safe_path_list}\s*$"
     );
     let force_recursive_pattern = format!(
-        r"{prefix}{flags_before}--force{flags_between}\s+--recursive(?:\s+--)?\s+{safe_path_list}\s*$"
+        r"{prefix}{flags_before}--force{flags_between_to_recursive}\s+--recursive(?:\s+--)?\s+{safe_path_list}\s*$"
     );
 
     vec![
