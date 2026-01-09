@@ -460,6 +460,10 @@ impl HeredocAllowlistConfig {
         // Check project-specific entries
         if let Some(path) = project_path {
             for project in &self.projects {
+                // Skip empty project paths to prevent accidental allow-all
+                if project.path.is_empty() {
+                    continue;
+                }
                 // Match by path components to avoid false positives
                 // e.g., "/home/user/project" should NOT match "/home/user/project-other".
                 if path.starts_with(std::path::Path::new(&project.path)) {
@@ -576,11 +580,17 @@ fn pattern_matches(
 
 /// Check if a language filter string matches the given language.
 /// Supports both full names (e.g., "javascript") and common aliases (e.g., "js").
+/// An empty or whitespace-only filter matches all languages (same as `language: None`).
 fn language_filter_matches(filter: &str, language: crate::heredoc::ScriptLanguage) -> bool {
     use crate::heredoc::ScriptLanguage::{
         Bash, Go, JavaScript, Perl, Php, Python, Ruby, TypeScript, Unknown,
     };
-    let filter_lower = filter.to_ascii_lowercase();
+    let filter_lower = filter.trim().to_ascii_lowercase();
+
+    // Empty filter matches all languages (consistent with `language: None`)
+    if filter_lower.is_empty() {
+        return true;
+    }
 
     match language {
         Bash => matches!(filter_lower.as_str(), "bash" | "sh" | "shell"),
@@ -2937,6 +2947,80 @@ allow = false
         assert!(
             allowlist.is_command_allowlisted("").is_none(),
             "Empty command prefix should not match empty command"
+        );
+    }
+
+    #[test]
+    fn test_heredoc_allowlist_empty_project_path_does_not_match() {
+        // Empty project paths should never match (security: prevents accidental allow-all)
+        let allowlist = HeredocAllowlistConfig {
+            projects: vec![ProjectHeredocAllowlist {
+                path: String::new(), // Empty project path
+                patterns: vec![AllowedHeredocPattern {
+                    language: None,
+                    pattern: "rm".to_string(),
+                    reason: "Test pattern".to_string(),
+                }],
+                content_hashes: vec![],
+            }],
+            ..Default::default()
+        };
+
+        // Empty project path should NOT match any project
+        let hit = allowlist.is_content_allowlisted(
+            "rm -rf /",
+            crate::heredoc::ScriptLanguage::Bash,
+            Some(std::path::Path::new("/home/user/project")),
+        );
+        assert!(
+            hit.is_none(),
+            "Empty project path should not match any project"
+        );
+    }
+
+    #[test]
+    fn test_heredoc_allowlist_empty_language_filter_matches_all() {
+        // Empty language filter should match all languages (same as `language: None`)
+        let allowlist = HeredocAllowlistConfig {
+            patterns: vec![AllowedHeredocPattern {
+                language: Some(String::new()), // Empty language filter
+                pattern: "test_pattern".to_string(),
+                reason: "Empty language should match all".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        // Empty language filter should match Bash
+        let hit = allowlist.is_content_allowlisted(
+            "test_pattern here",
+            crate::heredoc::ScriptLanguage::Bash,
+            None,
+        );
+        assert!(
+            hit.is_some(),
+            "Empty language filter should match Bash"
+        );
+
+        // Empty language filter should match Python
+        let hit = allowlist.is_content_allowlisted(
+            "test_pattern here",
+            crate::heredoc::ScriptLanguage::Python,
+            None,
+        );
+        assert!(
+            hit.is_some(),
+            "Empty language filter should match Python"
+        );
+
+        // Empty language filter should match JavaScript
+        let hit = allowlist.is_content_allowlisted(
+            "test_pattern here",
+            crate::heredoc::ScriptLanguage::JavaScript,
+            None,
+        );
+        assert!(
+            hit.is_some(),
+            "Empty language filter should match JavaScript"
         );
     }
 }
