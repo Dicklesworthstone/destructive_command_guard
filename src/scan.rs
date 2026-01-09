@@ -29,7 +29,7 @@
 
 use crate::config::{Config, HeredocSettings};
 use crate::evaluator::{
-    EvaluationDecision, MatchSource, PatternMatch, evaluate_command_with_pack_order,
+    EvaluationDecision, MatchSource, PatternMatch, evaluate_command_with_pack_order_at_path,
 };
 use crate::packs::{DecisionMode, REGISTRY, Severity};
 use crate::suggestions::{SuggestionKind, get_suggestion_by_kind};
@@ -345,13 +345,22 @@ pub fn evaluate_extracted_command(
     config: &Config,
     ctx: &ScanEvalContext,
 ) -> Option<ScanFinding> {
-    let result = evaluate_command_with_pack_order(
+    let project_path = {
+        let candidate = std::path::Path::new(&extracted.file);
+        if candidate.is_absolute() {
+            Some(candidate.to_path_buf())
+        } else {
+            std::env::current_dir().ok().map(|cwd| cwd.join(candidate))
+        }
+    };
+    let result = evaluate_command_with_pack_order_at_path(
         &extracted.command,
         &ctx.enabled_keywords,
         &ctx.ordered_packs,
         &ctx.compiled_overrides,
         &ctx.allowlists,
         &ctx.heredoc_settings,
+        project_path.as_deref(),
     );
 
     if result.decision == EvaluationDecision::Allow {

@@ -53,6 +53,7 @@ use crate::heredoc::{
 use crate::packs::{REGISTRY, normalize_command, pack_aware_quick_reject};
 use crate::perf::Deadline;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 /// Convert `ast_matcher::Severity` to `packs::Severity`.
 ///
@@ -480,6 +481,25 @@ fn remaining_below(deadline: Option<&Deadline>, budget: &crate::perf::Budget) ->
     deadline.is_some_and(|d| !d.has_budget_for(budget))
 }
 
+fn resolve_project_path(
+    heredoc_settings: &crate::config::HeredocSettings,
+    project_path: Option<&Path>,
+) -> Option<PathBuf> {
+    if heredoc_settings
+        .content_allowlist
+        .as_ref()
+        .is_none_or(|a| a.projects.is_empty())
+    {
+        return None;
+    }
+
+    if let Some(path) = project_path {
+        return Some(path.to_path_buf());
+    }
+
+    std::env::current_dir().ok()
+}
+
 /// Evaluate a command against all patterns and packs using a deadline.
 ///
 /// When `deadline` is provided and exceeded, evaluation fails open and returns
@@ -529,6 +549,28 @@ pub fn evaluate_command_with_pack_order(
     allowlists: &LayeredAllowlist,
     heredoc_settings: &crate::config::HeredocSettings,
 ) -> EvaluationResult {
+    evaluate_command_with_pack_order_at_path(
+        command,
+        enabled_keywords,
+        ordered_packs,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        None,
+    )
+}
+
+/// Evaluate a command using a precomputed pack order and an optional project path.
+#[must_use]
+pub fn evaluate_command_with_pack_order_at_path(
+    command: &str,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    project_path: Option<&Path>,
+) -> EvaluationResult {
     // Empty commands are allowed (no-op)
     if command.is_empty() {
         return EvaluationResult::allowed();
@@ -554,6 +596,9 @@ pub fn evaluate_command_with_pack_order(
     let mut precomputed_sanitized = None;
     let mut heredoc_allowlist_hit: Option<(PatternMatch, AllowlistLayer, String)> = None;
 
+    let project_path = resolve_project_path(heredoc_settings, project_path);
+    let project_path = project_path.as_deref();
+
     if heredoc_settings.enabled && check_triggers(command) == TriggerResult::Triggered {
         let sanitized = sanitize_for_pattern_matching(command);
         let sanitized_str = sanitized.as_ref();
@@ -570,6 +615,7 @@ pub fn evaluate_command_with_pack_order(
                 allowlists,
                 heredoc_settings,
                 &mut heredoc_allowlist_hit,
+                project_path,
                 None,
             ) {
                 return blocked;
@@ -648,6 +694,31 @@ pub fn evaluate_command_with_pack_order_deadline(
     heredoc_settings: &crate::config::HeredocSettings,
     deadline: Option<&Deadline>,
 ) -> EvaluationResult {
+    evaluate_command_with_pack_order_deadline_at_path(
+        command,
+        enabled_keywords,
+        ordered_packs,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        None,
+        deadline,
+    )
+}
+
+/// Evaluate a command with deadline support and an optional project path.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_command_with_pack_order_deadline_at_path(
+    command: &str,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+) -> EvaluationResult {
     // Check deadline at entry - if already exceeded, fail-open immediately.
     if deadline_exceeded(deadline) {
         return EvaluationResult::allowed_due_to_budget();
@@ -676,6 +747,9 @@ pub fn evaluate_command_with_pack_order_deadline(
     let mut precomputed_sanitized = None;
     let mut heredoc_allowlist_hit: Option<(PatternMatch, AllowlistLayer, String)> = None;
 
+    let project_path = resolve_project_path(heredoc_settings, project_path);
+    let project_path = project_path.as_deref();
+
     if heredoc_settings.enabled {
         if remaining_below(deadline, &crate::perf::HEREDOC_TRIGGER) {
             return EvaluationResult::allowed_due_to_budget();
@@ -697,6 +771,7 @@ pub fn evaluate_command_with_pack_order_deadline(
                     allowlists,
                     heredoc_settings,
                     &mut heredoc_allowlist_hit,
+                    project_path,
                     deadline,
                 ) {
                     return blocked;
@@ -903,6 +978,8 @@ where
     let heredoc_settings = config.heredoc_settings();
     let mut precomputed_sanitized = None;
     let mut heredoc_allowlist_hit: Option<(PatternMatch, AllowlistLayer, String)> = None;
+    let project_path = resolve_project_path(&heredoc_settings, None);
+    let project_path = project_path.as_deref();
     if heredoc_settings.enabled && check_triggers(command) == TriggerResult::Triggered {
         let sanitized = sanitize_for_pattern_matching(command);
         let sanitized_str = sanitized.as_ref();
@@ -919,6 +996,7 @@ where
                 allowlists,
                 &heredoc_settings,
                 &mut heredoc_allowlist_hit,
+                project_path,
                 None,
             ) {
                 return blocked;
@@ -988,6 +1066,7 @@ fn evaluate_heredoc(
     allowlists: &LayeredAllowlist,
     heredoc_settings: &crate::config::HeredocSettings,
     first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+    project_path: Option<&std::path::Path>,
     deadline: Option<&Deadline>,
 ) -> Option<EvaluationResult> {
     if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::FULL_HEREDOC_PIPELINE)
@@ -1069,7 +1148,7 @@ fn evaluate_heredoc(
             if let Some(hit) = content_allowlist.is_content_allowlisted(
                 &content.content,
                 content.language,
-                None, // TODO: pass project path when available
+                project_path,
             ) {
                 tracing::debug!(
                     hit_kind = hit.kind.label(),
@@ -1542,6 +1621,67 @@ mod tests {
             Some("fs_rmsync.catastrophic")
         );
         assert_eq!(override_info.matched.source, MatchSource::HeredocAst);
+    }
+
+    #[test]
+    fn heredoc_content_allowlist_project_scope_skips_ast_scan() {
+        let mut config = default_config();
+        let cwd = std::env::current_dir().expect("current_dir must be available");
+        let cwd_str = cwd.to_string_lossy().into_owned();
+
+        config.heredoc.allowlist = Some(crate::config::HeredocAllowlistConfig {
+            projects: vec![crate::config::ProjectHeredocAllowlist {
+                path: cwd_str,
+                patterns: vec![crate::config::AllowedHeredocPattern {
+                    language: Some("javascript".to_string()),
+                    pattern: "fs.rmSync('/etc'".to_string(),
+                    reason: "project allowlist".to_string(),
+                }],
+                content_hashes: vec![],
+            }],
+            ..Default::default()
+        });
+
+        let compiled = config.overrides.compile();
+        let allowlists = default_allowlists();
+
+        // This would normally be denied by heredoc AST rules (catastrophic path).
+        let cmd =
+            "node <<EOF\nconst fs = require('fs');\nfs.rmSync('/etc', { recursive: true });\nEOF";
+        let result = evaluate_command(cmd, &config, &["kubectl"], &compiled, &allowlists);
+        assert!(
+            result.is_allowed(),
+            "project-scoped heredoc content allowlist should skip AST denial"
+        );
+    }
+
+    #[test]
+    fn heredoc_content_allowlist_project_scope_does_not_match_other_projects() {
+        let mut config = default_config();
+
+        config.heredoc.allowlist = Some(crate::config::HeredocAllowlistConfig {
+            projects: vec![crate::config::ProjectHeredocAllowlist {
+                path: "/definitely-not-a-prefix".to_string(),
+                patterns: vec![crate::config::AllowedHeredocPattern {
+                    language: Some("javascript".to_string()),
+                    pattern: "fs.rmSync('/etc'".to_string(),
+                    reason: "wrong project".to_string(),
+                }],
+                content_hashes: vec![],
+            }],
+            ..Default::default()
+        });
+
+        let compiled = config.overrides.compile();
+        let allowlists = default_allowlists();
+
+        let cmd =
+            "node <<EOF\nconst fs = require('fs');\nfs.rmSync('/etc', { recursive: true });\nEOF";
+        let result = evaluate_command(cmd, &config, &["kubectl"], &compiled, &allowlists);
+        assert!(
+            result.is_denied(),
+            "content allowlist should not apply when cwd is outside configured project scope"
+        );
     }
 
     #[test]
