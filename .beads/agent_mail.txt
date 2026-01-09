@@ -1,3 +1,24 @@
+[2026-01-09T08:10:00-05:00] From: opus-mock | Subject: Completed mock pattern removal (git_safety_guard-1g6)
+
+Completed git_safety_guard-1g6 (Replace evaluator mock tests with real pack fixtures).
+
+Changes:
+- Removed MockSafePattern and MockDestructivePattern structs
+- Renamed parity_* tests to evaluator_* (simpler naming)
+- Tests now use real pack patterns from REGISTRY instead of mocks
+- Removed unused Regex import
+
+Commit: 451246e
+
+Note: Found WIP changes in other files from other agents:
+- src/config.rs: heredoc allowlist tests for unimplemented features (2 test failures)
+- src/hook.rs + src/main.rs: pattern parameter added to output_denial/output_warning
+- src/scan.rs: GitLab CI extractor (unused functions warning)
+
+Left those unstaged - belong to respective agents. 43 evaluator tests pass.
+
+---
+
 [2026-01-09T07:45:00-05:00] From: opus-e2e | Subject: Completed heredoc allowlist + E2E CLI tests
 
 Completed two tasks this session:
