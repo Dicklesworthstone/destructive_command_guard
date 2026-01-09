@@ -51,9 +51,8 @@ use crate::heredoc::{
     ExtractionResult, SkipReason, TriggerResult, check_triggers, extract_content,
 };
 use crate::packs::{REGISTRY, normalize_command, pack_aware_quick_reject};
-use crate::perf::{Deadline, FULL_HEREDOC_PIPELINE, PATTERN_MATCH};
+use crate::perf::Deadline;
 use std::collections::HashSet;
-use std::time::Duration;
 
 /// Convert `ast_matcher::Severity` to `packs::Severity`.
 ///
@@ -223,6 +222,33 @@ impl EvaluationResult {
             pattern_info: None,
             allowlist_override: None,
             effective_mode: None,
+            skipped_due_to_budget: false,
+        }
+    }
+
+    /// Create an "allowed" result due to budget exhaustion (fail-open).
+    #[inline]
+    #[must_use]
+    pub const fn allowed_due_to_budget() -> Self {
+        Self {
+            decision: EvaluationDecision::Allow,
+            pattern_info: None,
+            allowlist_override: None,
+            effective_mode: None,
+            skipped_due_to_budget: true,
+        }
+    }
+
+    /// Create an "allowed" result due to budget timeout (fail-open).
+    #[inline]
+    #[must_use]
+    pub const fn allowed_due_to_budget() -> Self {
+        Self {
+            decision: EvaluationDecision::Allow,
+            pattern_info: None,
+            allowlist_override: None,
+            effective_mode: None,
+            skipped_due_to_budget: true,
         }
     }
 
@@ -243,6 +269,7 @@ impl EvaluationResult {
             }),
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
+            skipped_due_to_budget: false,
         }
     }
 
@@ -263,6 +290,7 @@ impl EvaluationResult {
             }),
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
+            skipped_due_to_budget: false,
         }
     }
 
@@ -284,6 +312,7 @@ impl EvaluationResult {
             }),
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
+            skipped_due_to_budget: false,
         }
     }
 
@@ -304,6 +333,7 @@ impl EvaluationResult {
             }),
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
+            skipped_due_to_budget: false,
         }
     }
 
@@ -329,6 +359,7 @@ impl EvaluationResult {
             }),
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
+            skipped_due_to_budget: false,
         }
     }
 
@@ -357,6 +388,7 @@ impl EvaluationResult {
             }),
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
+            skipped_due_to_budget: false,
         }
     }
 
@@ -377,6 +409,7 @@ impl EvaluationResult {
             }),
             // Allowlist overrides apply to a matched rule (typically deny-by-default).
             effective_mode: Some(crate::packs::DecisionMode::Deny),
+            skipped_due_to_budget: false,
         }
     }
 
@@ -440,16 +473,50 @@ pub fn evaluate_command(
     compiled_overrides: &crate::config::CompiledOverrides,
     allowlists: &LayeredAllowlist,
 ) -> EvaluationResult {
+    evaluate_command_with_deadline(
+        command,
+        config,
+        enabled_keywords,
+        compiled_overrides,
+        allowlists,
+        None,
+    )
+}
+
+#[inline]
+fn deadline_exceeded(deadline: Option<&Deadline>) -> bool {
+    deadline.is_some_and(|d| d.max_duration().is_zero() || d.is_exceeded())
+}
+
+#[inline]
+fn remaining_below(deadline: Option<&Deadline>, budget: &crate::perf::Budget) -> bool {
+    deadline.is_some_and(|d| !d.has_budget_for(budget))
+}
+
+/// Evaluate a command against all patterns and packs using a deadline.
+///
+/// When `deadline` is provided and exceeded, evaluation fails open and returns
+/// `skipped_due_to_budget=true` so hook mode can allow the command safely.
+#[must_use]
+pub fn evaluate_command_with_deadline(
+    command: &str,
+    config: &Config,
+    enabled_keywords: &[&str],
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    deadline: Option<&Deadline>,
+) -> EvaluationResult {
     let enabled_packs: HashSet<String> = config.enabled_pack_ids();
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
     let heredoc_settings = config.heredoc_settings();
-    evaluate_command_with_pack_order(
+    evaluate_command_with_pack_order_deadline(
         command,
         enabled_keywords,
         &ordered_packs,
         compiled_overrides,
         allowlists,
         &heredoc_settings,
+        deadline,
     )
 }
 
@@ -563,6 +630,54 @@ pub fn evaluate_command_with_pack_order(
     }
 
     result
+}
+
+/// Evaluate a command with deadline support for fail-open behavior.
+///
+/// This is the hook-mode entry point that supports budget enforcement.
+/// If the deadline is exceeded at check points, returns `allowed_due_to_budget()`.
+///
+/// # Arguments
+///
+/// * `command` - The raw command string to evaluate
+/// * `enabled_keywords` - Keywords from enabled packs for quick rejection
+/// * `ordered_packs` - Ordered list of enabled pack IDs
+/// * `compiled_overrides` - Precompiled config overrides
+/// * `allowlists` - Layered allowlist for overrides
+/// * `heredoc_settings` - Settings for heredoc analysis
+/// * `deadline` - Optional deadline for fail-open behavior
+///
+/// # Returns
+///
+/// An `EvaluationResult` with `skipped_due_to_budget: true` if deadline exceeded.
+#[must_use]
+pub fn evaluate_command_with_pack_order_deadline(
+    command: &str,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    deadline: Option<&Deadline>,
+) -> EvaluationResult {
+    // Check deadline at entry - if already exceeded, fail-open immediately
+    if let Some(d) = deadline {
+        if d.is_exceeded() {
+            return EvaluationResult::allowed_due_to_budget();
+        }
+    }
+
+    // Delegate to standard evaluator
+    // The deadline is checked at entry; for more fine-grained control,
+    // the standard evaluator could be modified to accept deadline as well.
+    evaluate_command_with_pack_order(
+        command,
+        enabled_keywords,
+        ordered_packs,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+    )
 }
 
 fn evaluate_packs_with_allowlists(
@@ -901,6 +1016,7 @@ fn evaluate_heredoc(
                 }),
                 allowlist_override: None,
                 effective_mode: Some(crate::packs::DecisionMode::Deny),
+            skipped_due_to_budget: false,
             });
         }
     }
