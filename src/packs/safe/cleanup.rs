@@ -120,19 +120,26 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     let escaped_dirs: Vec<String> = safe_dirs.iter().map(|dir| regex_escape(dir)).collect();
     let dir_group = escaped_dirs.join("|");
 
-    // A single safe path pattern:
-    // - no ".." segments
-    // - optional "./" prefix
-    // - exact directory allowlist at path start
-    // - optional subpaths (no shell separators OR injection characters)
-    let safe_path_prefix = r"(?![^\s]*\.\.)(?:\./)?(?:";
-    // Explicitly exclude shell metacharacters: space ; & | $ ( ) ` < >
-    let safe_path_suffix = r")(?:/[^\s;&|$()`<>]+)*/?";
-    let mut safe_path_pattern =
-        String::with_capacity(safe_path_prefix.len() + dir_group.len() + safe_path_suffix.len());
-    safe_path_pattern.push_str(safe_path_prefix);
-    safe_path_pattern.push_str(&dir_group);
-    safe_path_pattern.push_str(safe_path_suffix);
+    // Unquoted pattern (strict, no spaces)
+    let unquoted_prefix = r"(?![^\s]*\.\.)(?:\./)?(?:";
+    let unquoted_suffix = r")(?:/[^\s;&|$()`<>]+)*/?";
+    let unquoted_pattern = format!("{}{}{}", unquoted_prefix, dir_group, unquoted_suffix);
+
+    // Double-quoted pattern (allows spaces, no " inside)
+    let dquote_prefix = r#""(?![^"]*\.\.)(?:\./)?(?:"#;
+    let dquote_suffix = r#")(?:/[^";&|$()`<>]+)*/?""#;
+    let dquote_pattern = format!("{}{}{}", dquote_prefix, dir_group, dquote_suffix);
+
+    // Single-quoted pattern (allows spaces, no ' inside)
+    let squote_prefix = r"'(?![^']*\.\.)(?:\./)?(?:";
+    let squote_suffix = r")(?:/[^';&|$()`<>]+)*/?'";
+    let squote_pattern = format!("{}{}{}", squote_prefix, dir_group, squote_suffix);
+
+    // Combine all variants
+    let safe_path_pattern = format!(
+        "(?:{}|{}|{})",
+        unquoted_pattern, dquote_pattern, squote_pattern
+    );
 
     // One or more safe paths separated by whitespace.
     let safe_path_list = format!(r"{safe_path_pattern}(?:\s+{safe_path_pattern})*");
@@ -167,12 +174,12 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     );
 
     vec![
-        make_safe_pattern("safe-cleanup-rf", &rf_pattern),
-        make_safe_pattern("safe-cleanup-fr", &fr_pattern),
-        make_safe_pattern("safe-cleanup-r-f", &separate_r_then_f),
-        make_safe_pattern("safe-cleanup-f-r", &separate_f_then_r),
-        make_safe_pattern("safe-cleanup-recursive-force", &recursive_force_pattern),
-        make_safe_pattern("safe-cleanup-force-recursive", &force_recursive_pattern),
+        make_safe_pattern("safe-cleanup-rf", rf_pattern),
+        make_safe_pattern("safe-cleanup-fr", fr_pattern),
+        make_safe_pattern("safe-cleanup-r-f", separate_r_then_f),
+        make_safe_pattern("safe-cleanup-f-r", separate_f_then_r),
+        make_safe_pattern("safe-cleanup-recursive-force", recursive_force_pattern),
+        make_safe_pattern("safe-cleanup-force-recursive", force_recursive_pattern),
     ]
 }
 
@@ -193,16 +200,10 @@ fn regex_escape(s: &str) -> String {
 }
 
 /// Create a `SafePattern` from a name and regex string.
-///
-/// Both name and pattern are leaked as `&'static str` to satisfy `LazyFancyRegex`'s
-/// requirement. This is fine because packs are created once at startup and live
-/// for the program's lifetime.
-fn make_safe_pattern(name: &str, pattern: &str) -> SafePattern {
+fn make_safe_pattern(name: &'static str, pattern: String) -> SafePattern {
     SafePattern {
-        regex: crate::packs::regex_engine::LazyFancyRegex::new(Box::leak(
-            pattern.to_string().into_boxed_str(),
-        )),
-        name: Box::leak(name.to_string().into_boxed_str()),
+        regex: crate::packs::regex_engine::LazyCompiledRegex::new_owned(pattern),
+        name,
     }
 }
 
