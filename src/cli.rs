@@ -223,6 +223,55 @@ pub enum Command {
         #[arg(long, value_delimiter = ',')]
         with_packs: Option<Vec<String>>,
     },
+
+    /// Run regression corpus tests and output detailed JSON logs
+    ///
+    /// Loads test cases from TOML corpus files and evaluates each command,
+    /// producing stable JSON output suitable for diffing against baselines.
+    #[command(name = "corpus")]
+    Corpus(CorpusCommand),
+}
+
+/// `dcg corpus` command arguments.
+#[derive(Args, Debug)]
+pub struct CorpusCommand {
+    /// Path to corpus directory (default: tests/corpus)
+    #[arg(long, short = 'd', default_value = "tests/corpus")]
+    pub dir: std::path::PathBuf,
+
+    /// Baseline file to diff against (exit non-zero on mismatch)
+    #[arg(long, short = 'b')]
+    pub baseline: Option<std::path::PathBuf>,
+
+    /// Output format
+    #[arg(long, short = 'f', value_enum, default_value = "json")]
+    pub format: CorpusFormat,
+
+    /// Write output to file instead of stdout
+    #[arg(long, short = 'o')]
+    pub output: Option<std::path::PathBuf>,
+
+    /// Filter to specific category (`true_positives`, `false_positives`, `bypass_attempts`, `edge_cases`)
+    #[arg(long, short = 'c')]
+    pub category: Option<String>,
+
+    /// Show only failed tests
+    #[arg(long)]
+    pub failures_only: bool,
+
+    /// Suppress per-case output, show summary only
+    #[arg(long)]
+    pub summary_only: bool,
+}
+
+/// Output format for corpus command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum CorpusFormat {
+    /// Structured JSON output (stable, diffable)
+    #[default]
+    Json,
+    /// Human-readable colored output
+    Pretty,
 }
 
 /// Options for self-updating dcg via the installer scripts.
@@ -669,6 +718,9 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             with_packs,
         }) => {
             handle_explain(&config, &command, format, with_packs);
+        }
+        Some(Command::Corpus(corpus)) => {
+            handle_corpus_command(&config, corpus)?;
         }
         None => {
             // No subcommand - run in hook mode (default behavior)
@@ -2129,6 +2181,559 @@ fn handle_explain(
             println!("{json}");
         }
     }
+}
+
+// =============================================================================
+// Corpus command implementation
+// =============================================================================
+
+/// A single test case loaded from the corpus.
+#[derive(Debug, serde::Deserialize)]
+struct CorpusTestCase {
+    description: String,
+    command: String,
+    expected: String,
+    #[serde(default)]
+    rule_id: Option<String>,
+}
+
+/// A corpus file containing multiple test cases.
+#[derive(Debug, serde::Deserialize)]
+struct CorpusFile {
+    #[serde(rename = "case")]
+    cases: Vec<CorpusTestCase>,
+}
+
+/// Category of test cases, determines pass/fail logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CorpusCategory {
+    TruePositives,
+    FalsePositives,
+    BypassAttempts,
+    EdgeCases,
+}
+
+impl CorpusCategory {
+    fn from_dir_name(name: &str) -> Option<Self> {
+        match name {
+            "true_positives" => Some(Self::TruePositives),
+            "false_positives" => Some(Self::FalsePositives),
+            "bypass_attempts" => Some(Self::BypassAttempts),
+            "edge_cases" => Some(Self::EdgeCases),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CorpusCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TruePositives => write!(f, "true_positives"),
+            Self::FalsePositives => write!(f, "false_positives"),
+            Self::BypassAttempts => write!(f, "bypass_attempts"),
+            Self::EdgeCases => write!(f, "edge_cases"),
+        }
+    }
+}
+
+/// Result of running a single corpus test case.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CorpusTestResult {
+    /// Unique test ID (<file:index>)
+    id: String,
+    /// Category of the test
+    category: CorpusCategory,
+    /// Source file (relative path)
+    file: String,
+    /// Test description
+    description: String,
+    /// Command that was tested
+    command: String,
+    /// Expected decision
+    expected: String,
+    /// Actual decision
+    actual: String,
+    /// Whether the test passed
+    passed: bool,
+    /// Expected rule ID (if specified)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_rule_id: Option<String>,
+    /// Actual rule ID that matched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_rule_id: Option<String>,
+    /// Pack ID that matched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pack_id: Option<String>,
+    /// Pattern name that matched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pattern_name: Option<String>,
+    /// Match source (pack, allowlist, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    match_source: Option<String>,
+    /// Whether command was quick-rejected
+    quick_rejected: bool,
+    /// Evaluation duration in microseconds
+    duration_us: u64,
+}
+
+/// Category statistics.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct CategoryStats {
+    total: usize,
+    passed: usize,
+    failed: usize,
+}
+
+/// Summary statistics for the corpus run.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CorpusSummary {
+    by_decision: std::collections::HashMap<String, usize>,
+    by_pack: std::collections::HashMap<String, usize>,
+    by_category: std::collections::HashMap<String, CategoryStats>,
+}
+
+/// Full corpus output structure.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CorpusOutput {
+    schema_version: u32,
+    generated_at: String,
+    binary_version: String,
+    corpus_dir: String,
+    total_cases: usize,
+    total_passed: usize,
+    total_failed: usize,
+    summary: CorpusSummary,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cases: Vec<CorpusTestResult>,
+}
+
+/// Load and run corpus tests, returning structured output.
+fn run_corpus(
+    config: &Config,
+    corpus_dir: &std::path::Path,
+    category_filter: Option<&str>,
+) -> CorpusOutput {
+    let mut results = Vec::new();
+    let mut summary = CorpusSummary {
+        by_decision: std::collections::HashMap::new(),
+        by_pack: std::collections::HashMap::new(),
+        by_category: std::collections::HashMap::new(),
+    };
+
+    let categories = ["true_positives", "false_positives", "bypass_attempts", "edge_cases"];
+
+    for category_name in categories {
+        // Apply category filter if specified
+        if let Some(filter) = category_filter {
+            if category_name != filter {
+                continue;
+            }
+        }
+
+        let category_dir = corpus_dir.join(category_name);
+        if !category_dir.exists() {
+            continue;
+        }
+
+        let category = match CorpusCategory::from_dir_name(category_name) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // Initialize category stats
+        summary
+            .by_category
+            .entry(category_name.to_string())
+            .or_default();
+
+        // Read all TOML files in the category directory (sorted for deterministic order)
+        let entries = match std::fs::read_dir(&category_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        // Collect and sort file paths for deterministic ordering
+        let mut file_paths: Vec<_> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "toml"))
+            .collect();
+        file_paths.sort();
+
+        for path in file_paths {
+            if path.extension().is_some_and(|ext| ext == "toml") {
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Warning: Failed to read {}: {e}", path.display());
+                        continue;
+                    }
+                };
+
+                let corpus_file: CorpusFile = match toml::from_str(&content) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("Warning: Failed to parse {}: {e}", path.display());
+                        continue;
+                    }
+                };
+
+                let file_name = path
+                    .strip_prefix(corpus_dir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
+
+                for (idx, case) in corpus_file.cases.into_iter().enumerate() {
+                    let result = run_single_corpus_test(config, &case, category, &file_name, idx);
+
+                    // Update summary stats
+                    *summary.by_decision.entry(result.actual.clone()).or_default() += 1;
+                    if let Some(ref pack) = result.pack_id {
+                        *summary.by_pack.entry(pack.clone()).or_default() += 1;
+                    }
+
+                    let cat_stats = summary
+                        .by_category
+                        .entry(category_name.to_string())
+                        .or_default();
+                    cat_stats.total += 1;
+                    if result.passed {
+                        cat_stats.passed += 1;
+                    } else {
+                        cat_stats.failed += 1;
+                    }
+
+                    results.push(result);
+                }
+            }
+        }
+    }
+
+    // Sort results by ID for deterministic output
+    results.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let total_passed = results.iter().filter(|r| r.passed).count();
+    let total_failed = results.len() - total_passed;
+
+    CorpusOutput {
+        schema_version: 1,
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        binary_version: env!("CARGO_PKG_VERSION").to_string(),
+        corpus_dir: corpus_dir.to_string_lossy().to_string(),
+        total_cases: results.len(),
+        total_passed,
+        total_failed,
+        summary,
+        cases: results,
+    }
+}
+
+/// Run a single corpus test case through the evaluator.
+fn run_single_corpus_test(
+    config: &Config,
+    case: &CorpusTestCase,
+    category: CorpusCategory,
+    file_name: &str,
+    index: usize,
+) -> CorpusTestResult {
+    use std::time::Instant;
+
+    // Build config with pack from rule_id if needed
+    let mut effective_config = config.clone();
+    if let Some(ref rule_id) = case.rule_id {
+        if let Some((pack_id, _)) = rule_id.split_once(':') {
+            if !pack_id.starts_with("core") && !effective_config.packs.enabled.contains(&pack_id.to_string()) {
+                effective_config.packs.enabled.push(pack_id.to_string());
+            }
+        }
+    }
+
+    let enabled_packs = effective_config.enabled_pack_ids();
+    let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+    let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let compiled_overrides = effective_config.overrides.compile();
+    let allowlists = crate::LayeredAllowlist::default();
+    let heredoc_settings = effective_config.heredoc_settings();
+
+    // Time the evaluation
+    let start = Instant::now();
+    let result = evaluate_command_with_pack_order(
+        &case.command,
+        &enabled_keywords,
+        &ordered_packs,
+        &compiled_overrides,
+        &allowlists,
+        &heredoc_settings,
+    );
+    let duration_us = start.elapsed().as_micros() as u64;
+
+    let actual = match result.decision {
+        EvaluationDecision::Allow => "allow",
+        EvaluationDecision::Deny => "deny",
+    };
+
+    // Extract pattern info
+    let (pack_id, pattern_name, actual_rule_id, match_source) = result
+        .pattern_info
+        .as_ref()
+        .map_or((None, None, None, None), |info| {
+            let pack = info.pack_id.clone();
+            let pattern = info.pattern_name.clone();
+            let rule = pack
+                .as_ref()
+                .zip(pattern.as_ref())
+                .map(|(p, n)| format!("{p}:{n}"));
+            let source = Some(format!("{:?}", info.source).to_lowercase());
+            (pack, pattern, rule, source)
+        });
+
+    // Determine if test passed based on category
+    let passed = match category {
+        CorpusCategory::TruePositives | CorpusCategory::BypassAttempts => actual == "deny",
+        CorpusCategory::FalsePositives => actual == "allow",
+        CorpusCategory::EdgeCases => true, // Any decision is fine (didn't crash)
+    };
+
+    // Check if quick-rejected (allowed without pattern match)
+    let quick_rejected = actual == "allow" && result.pattern_info.is_none();
+
+    CorpusTestResult {
+        id: format!("{file_name}:{index}"),
+        category,
+        file: file_name.to_string(),
+        description: case.description.clone(),
+        command: case.command.clone(),
+        expected: case.expected.clone(),
+        actual: actual.to_string(),
+        passed,
+        expected_rule_id: case.rule_id.clone(),
+        actual_rule_id,
+        pack_id,
+        pattern_name,
+        match_source,
+        quick_rejected,
+        duration_us,
+    }
+}
+
+/// Handle the `dcg corpus` command.
+fn handle_corpus_command(
+    config: &Config,
+    cmd: CorpusCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    // Run corpus tests
+    let mut output = run_corpus(config, &cmd.dir, cmd.category.as_deref());
+
+    // Handle baseline diffing BEFORE filtering/clearing (need full results for comparison)
+    if let Some(ref baseline_path) = cmd.baseline {
+        let baseline_content = std::fs::read_to_string(baseline_path)?;
+        let baseline: CorpusOutput = serde_json::from_str(&baseline_content)?;
+
+        // Compare results
+        let diffs = diff_corpus_outputs(&baseline, &output);
+
+        if !diffs.is_empty() {
+            eprintln!("{}", "Baseline mismatch!".red().bold());
+            for diff in &diffs {
+                eprintln!("  {diff}");
+            }
+            return Err(format!("{} differences from baseline", diffs.len()).into());
+        } else if cmd.format == CorpusFormat::Pretty {
+            println!("{}", "Baseline matches!".green().bold());
+        }
+    }
+
+    // Filter to failures only if requested
+    if cmd.failures_only {
+        output.cases.retain(|r| !r.passed);
+    }
+
+    // Clear cases if summary only
+    if cmd.summary_only {
+        output.cases.clear();
+    }
+
+    // Format output
+    let output_str = match cmd.format {
+        CorpusFormat::Json => serde_json::to_string_pretty(&output)?,
+        CorpusFormat::Pretty => format_corpus_pretty(&output),
+    };
+
+    // Write output
+    if let Some(ref output_path) = cmd.output {
+        std::fs::write(output_path, &output_str)?;
+        if cmd.format == CorpusFormat::Pretty {
+            println!("Output written to {}", output_path.display());
+        }
+    } else {
+        println!("{output_str}");
+    }
+
+    // Exit with error if any tests failed
+    if output.total_failed > 0 && cmd.baseline.is_none() {
+        return Err(format!("{} test(s) failed", output.total_failed).into());
+    }
+
+    Ok(())
+}
+
+/// Compare two corpus outputs and return differences.
+fn diff_corpus_outputs(baseline: &CorpusOutput, current: &CorpusOutput) -> Vec<String> {
+    let mut diffs = Vec::new();
+
+    // Build lookup maps by ID
+    let baseline_map: std::collections::HashMap<_, _> =
+        baseline.cases.iter().map(|c| (c.id.as_str(), c)).collect();
+    let current_map: std::collections::HashMap<_, _> =
+        current.cases.iter().map(|c| (c.id.as_str(), c)).collect();
+
+    // Check for missing cases
+    for id in baseline_map.keys() {
+        if !current_map.contains_key(id) {
+            diffs.push(format!("REMOVED: {id}"));
+        }
+    }
+
+    // Check for new cases
+    for id in current_map.keys() {
+        if !baseline_map.contains_key(id) {
+            diffs.push(format!("ADDED: {id}"));
+        }
+    }
+
+    // Check for changed results
+    for (id, current_case) in &current_map {
+        if let Some(baseline_case) = baseline_map.get(id) {
+            if current_case.actual != baseline_case.actual {
+                diffs.push(format!(
+                    "CHANGED: {id} - decision: {} -> {}",
+                    baseline_case.actual, current_case.actual
+                ));
+            }
+            if current_case.actual_rule_id != baseline_case.actual_rule_id {
+                diffs.push(format!(
+                    "CHANGED: {id} - rule: {:?} -> {:?}",
+                    baseline_case.actual_rule_id, current_case.actual_rule_id
+                ));
+            }
+        }
+    }
+
+    diffs
+}
+
+/// Format corpus output for human-readable display.
+fn format_corpus_pretty(output: &CorpusOutput) -> String {
+    use colored::Colorize;
+
+    let mut result = String::new();
+    let colorize = colored::control::SHOULD_COLORIZE.should_colorize();
+
+    // Header
+    result.push_str(&format!(
+        "{}\n\n",
+        if colorize {
+            "dcg corpus".green().bold().to_string()
+        } else {
+            "dcg corpus".to_string()
+        }
+    ));
+
+    result.push_str(&format!("Corpus: {}\n", output.corpus_dir));
+    result.push_str(&format!("Version: {}\n", output.binary_version));
+    result.push_str(&format!("Generated: {}\n\n", output.generated_at));
+
+    // Summary
+    result.push_str(&format!(
+        "{}\n",
+        if colorize {
+            "=== Summary ===".blue().bold().to_string()
+        } else {
+            "=== Summary ===".to_string()
+        }
+    ));
+
+    result.push_str(&format!(
+        "Total: {} ({} passed, {} failed)\n\n",
+        output.total_cases, output.total_passed, output.total_failed
+    ));
+
+    // By category
+    result.push_str("By Category:\n");
+    for (cat, stats) in &output.summary.by_category {
+        let status = if stats.failed == 0 { "OK" } else { "FAIL" };
+        let status_str = if colorize {
+            if stats.failed == 0 {
+                status.green().to_string()
+            } else {
+                status.red().to_string()
+            }
+        } else {
+            status.to_string()
+        };
+        result.push_str(&format!(
+            "  {}: {}/{} [{}]\n",
+            cat, stats.passed, stats.total, status_str
+        ));
+    }
+    result.push('\n');
+
+    // By decision
+    result.push_str("By Decision:\n");
+    for (decision, count) in &output.summary.by_decision {
+        result.push_str(&format!("  {decision}: {count}\n"));
+    }
+    result.push('\n');
+
+    // By pack (top 10)
+    result.push_str("By Pack (top 10):\n");
+    let mut packs: Vec<_> = output.summary.by_pack.iter().collect();
+    packs.sort_by(|a, b| b.1.cmp(a.1));
+    for (pack, count) in packs.iter().take(10) {
+        result.push_str(&format!("  {pack}: {count}\n"));
+    }
+    result.push('\n');
+
+    // Failed tests
+    let failures: Vec<_> = output.cases.iter().filter(|c| !c.passed).collect();
+    if !failures.is_empty() {
+        result.push_str(&format!(
+            "{}\n",
+            if colorize {
+                "=== Failures ===".red().bold().to_string()
+            } else {
+                "=== Failures ===".to_string()
+            }
+        ));
+
+        for case in failures {
+            result.push_str(&format!(
+                "  {} - {}\n",
+                if colorize {
+                    "FAIL".red().to_string()
+                } else {
+                    "FAIL".to_string()
+                },
+                case.description
+            ));
+            result.push_str(&format!("    ID: {}\n", case.id));
+            result.push_str(&format!("    Command: {}\n", case.command));
+            result.push_str(&format!(
+                "    Expected: {}, Actual: {}\n",
+                case.expected, case.actual
+            ));
+            if let Some(ref rule) = case.actual_rule_id {
+                result.push_str(&format!("    Rule: {rule}\n"));
+            }
+            result.push('\n');
+        }
+    }
+
+    result
 }
 
 /// Check installation, configuration, and hook registration
@@ -5006,6 +5611,7 @@ exclude = ["target/**"]
         std::fs::write(repo.path().join("ren.rs"), "x").expect("write");
         run_git(repo.path(), &["add", "."]);
         run_git(repo.path(), &["commit", "-m", "init"]);
+        std::fs::write(repo.path().join("new.rs"), "x").expect("write");
         std::fs::write(repo.path().join("mod.rs"), "v2").expect("write");
         run_git(repo.path(), &["rm", "del.rs"]);
         run_git(repo.path(), &["mv", "ren.rs", "renamed.rs"]);
@@ -5120,7 +5726,8 @@ exclude = ["target/**"]
         assert_eq!(truncate_for_markdown("hi👋", 2), "hi...");
 
         // Truncating at byte 5 keeps entire string (no truncation needed)
-        assert_eq!(truncate_for_markdown("hi👋", 5), "hi👋");
+        // Wait, byte 5 is inside the emoji. It should truncate to "hi..." because it can't fit the emoji.
+        assert_eq!(truncate_for_markdown("hi👋", 5), "hi...");
     }
 
     #[test]
