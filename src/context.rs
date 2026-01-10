@@ -819,6 +819,11 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
             continue;
         }
 
+        if token.kind == SanitizeTokenKind::Comment {
+            mask_ranges.push(token.byte_range.clone());
+            continue;
+        }
+
         let Some(token_text) = token.text(command) else {
             return Cow::Borrowed(command);
         };
@@ -1354,6 +1359,7 @@ fn combined_short_data_flag_value(cmd: &str, token: &str) -> Option<&'static str
 enum SanitizeTokenKind {
     Word,
     Separator,
+    Comment,
 }
 
 #[derive(Debug, Clone)]
@@ -1412,7 +1418,7 @@ fn tokenize_command(command: &str) -> Vec<SanitizeToken> {
                 i += 1;
             }
             tokens.push(SanitizeToken {
-                kind: SanitizeTokenKind::Word,
+                kind: SanitizeTokenKind::Comment,
                 byte_range: start..i,
                 has_inline_code: false,
             });
