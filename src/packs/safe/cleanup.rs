@@ -41,10 +41,22 @@
 //! - **No path traversal**: No `..` segments anywhere in the path
 //! - **Explicit directory names**: Only exact matches at path start
 //!
+//! # Quoting Support
+//!
+//! Safe paths may be:
+//! - Unquoted: `rm -rf target/`
+//! - Double-quoted: `rm -rf "target/"`
+//! - Single-quoted: `rm -rf 'target/'`
+//!
+//! Quoted paths may contain spaces if the underlying shell supports it (e.g., `rm -rf "build output"`),
+//! but subpaths must not contain shell metacharacters like `$`, `;`, or `|` even inside quotes.
+//!
 //! # Examples
 //!
 //! **Allowed (when pack enabled):**
 //! - `rm -rf target/`
+//! - `rm -rf "target/"`
+//! - `rm -rf 'dist/'`
 //! - `rm -rf ./dist/`
 //! - `rm -rf node_modules/`
 //! - `rm -rf target/debug/`
@@ -619,5 +631,57 @@ mod tests {
             !pack.matches_safe("rm -rf target/`reboot`"),
             "rm -rf target/`reboot` should NOT be allowed (command injection no spaces)"
         );
+    }
+
+    #[test]
+    fn allows_quoted_paths() {
+        let pack = pack();
+        
+        // Double quotes
+        assert!(pack.matches_safe(r#"rm -rf "target""#));
+        assert!(pack.matches_safe(r#"rm -rf "target/""#));
+        assert!(pack.matches_safe(r#"rm -rf "target/debug""#));
+        assert!(pack.matches_safe(r#"rm -rf "./target""#));
+        
+        // Single quotes
+        assert!(pack.matches_safe(r"rm -rf 'target'"));
+        assert!(pack.matches_safe(r"rm -rf 'target/'"));
+        assert!(pack.matches_safe(r"rm -rf 'target/debug'"));
+        assert!(pack.matches_safe(r"rm -rf './target'"));
+        
+        // Mixed quotes in one command (e.g. rm -rf "target" 'dist')
+        assert!(pack.matches_safe(r#"rm -rf "target" 'dist'"#));
+    }
+
+    #[test]
+    fn blocks_traversal_inside_quotes() {
+        let pack = pack();
+        
+        // Double quotes
+        assert!(!pack.matches_safe(r#"rm -rf "target/..""#));
+        assert!(!pack.matches_safe(r#"rm -rf "target/../""#));
+        assert!(!pack.matches_safe(r#"rm -rf "target/../foo""#));
+        
+        // Single quotes
+        assert!(!pack.matches_safe(r"rm -rf 'target/..'"));
+        assert!(!pack.matches_safe(r"rm -rf 'target/../'"));
+        assert!(!pack.matches_safe(r"rm -rf 'target/../foo'"));
+    }
+
+    #[test]
+    fn allows_spaces_inside_quotes() {
+        let pack = pack();
+        // Although standard build dirs don't have spaces, the regex allows subpaths with spaces if quoted
+        assert!(pack.matches_safe(r#"rm -rf "target/foo bar""#));
+        assert!(pack.matches_safe(r"rm -rf 'target/foo bar'"));
+    }
+
+    #[test]
+    fn blocks_injection_inside_quotes() {
+        let pack = pack();
+        // Injection characters are blocked even inside quotes to be safe
+        assert!(!pack.matches_safe(r#"rm -rf "target/$(reboot)""#));
+        assert!(!pack.matches_safe(r"rm -rf 'target/$(reboot)'"));
+        assert!(!pack.matches_safe(r#"rm -rf "target/foo;bar""#));
     }
 }
