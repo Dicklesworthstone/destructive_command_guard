@@ -1,0 +1,26 @@
+# Scenario fixture for Elasticsearch index management.
+# Schema: id, description, steps[{command, expected_pack, expected_decision, reason}]
+
+id: "search.elasticsearch.index_maintenance"
+description: "Search operator inspects indices and then issues destructive deletes."
+steps:
+  - command: "curl -X GET 'http://localhost:9200/_cluster/health'"
+    expected_pack: "search.elasticsearch"
+    expected_decision: "allow"
+    reason: "Cluster health check"
+  - command: "curl -X GET 'http://localhost:9200/_cat/indices?v'"
+    expected_pack: "search.elasticsearch"
+    expected_decision: "allow"
+    reason: "List indices"
+  - command: "curl -X POST 'http://localhost:9200/prod-index/_search' -H 'Content-Type: application/json' -d '{\"query\":{\"match_all\":{}}}'"
+    expected_pack: "search.elasticsearch"
+    expected_decision: "allow"
+    reason: "Search query"
+  - command: "curl -X DELETE 'http://localhost:9200/prod-index'"
+    expected_pack: "search.elasticsearch"
+    expected_decision: "deny"
+    reason: "Deletes entire index"
+  - command: "curl -X POST 'http://localhost:9200/prod-index/_delete_by_query' -H 'Content-Type: application/json' -d '{\"query\":{\"match_all\":{}}}'"
+    expected_pack: "search.elasticsearch"
+    expected_decision: "deny"
+    reason: "Delete-by-query removes all documents"

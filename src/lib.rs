@@ -69,6 +69,7 @@ pub mod hook;
 pub mod logging;
 pub mod normalize;
 pub mod packs;
+pub mod pending_exceptions;
 pub mod perf;
 pub mod scan;
 pub mod simulate;
@@ -90,6 +91,7 @@ pub use evaluator::{
 };
 pub use hook::{HookInput, HookOutput, HookResult, HookSpecificOutput};
 pub use packs::{Pack, PackId, PackRegistry};
+pub use pending_exceptions::{PendingExceptionRecord, PendingExceptionStore};
 
 // Re-export dual regex engine abstraction (from regex safety audit)
 pub use packs::regex_engine::{CompiledRegex, needs_backtracking_engine};

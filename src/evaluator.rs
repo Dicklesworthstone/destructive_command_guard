@@ -891,7 +891,7 @@ fn evaluate_packs_with_allowlists(
                 continue;
             }
 
-            if !pattern.regex.is_match(normalized).unwrap_or(false) {
+            if !pattern.regex.is_match(normalized) {
                 continue;
             }
 
@@ -1315,13 +1315,13 @@ pub trait LegacyDestructivePattern {
 
 impl LegacySafePattern for crate::packs::SafePattern {
     fn is_match(&self, cmd: &str) -> bool {
-        self.regex.is_match(cmd).unwrap_or(false)
+        self.regex.is_match(cmd)
     }
 }
 
 impl LegacyDestructivePattern for crate::packs::DestructivePattern {
     fn is_match(&self, cmd: &str) -> bool {
-        self.regex.is_match(cmd).unwrap_or(false)
+        self.regex.is_match(cmd)
     }
 
     fn reason(&self) -> &str {

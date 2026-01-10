@@ -51,6 +51,8 @@
 //! cargo test --test regression_corpus
 //! ```
 
+use std::collections::HashSet;
+use std::fs;
 use std::path::Path;
 
 use destructive_command_guard::packs::test_helpers::{
@@ -81,6 +83,243 @@ fn run_category_tests(category: CorpusCategory) -> (usize, Vec<String>) {
     }
 
     (total, failures)
+}
+
+// =============================================================================
+// Scenario fixture validation (YAML)
+// =============================================================================
+
+#[derive(Default)]
+struct ScenarioStep {
+    command: Option<String>,
+    expected_pack: Option<String>,
+    expected_decision: Option<String>,
+    reason: Option<String>,
+}
+
+struct ScenarioFixture {
+    id: Option<String>,
+    description: Option<String>,
+    steps: Vec<ScenarioStep>,
+}
+
+fn split_key_value(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.split_once(':')?;
+    Some((key.trim(), value.trim()))
+}
+
+fn normalize_value(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return None;
+    }
+    let trimmed = value.trim();
+    let unquoted = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    if unquoted.is_empty() {
+        None
+    } else {
+        Some(unquoted.to_string())
+    }
+}
+
+fn parse_scenario_fixture(path: &Path) -> Result<ScenarioFixture, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|err| format!("Failed to read {}: {err}", path.display()))?;
+    let mut fixture = ScenarioFixture {
+        id: None,
+        description: None,
+        steps: Vec::new(),
+    };
+    let mut current_step: Option<ScenarioStep> = None;
+    let mut in_steps = false;
+
+    for (idx, line) in contents.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let indent = line.chars().take_while(|c| c.is_whitespace()).count();
+        if indent == 0 {
+            in_steps = false;
+            let Some((key, value)) = split_key_value(trimmed) else {
+                return Err(format!(
+                    "{}:{}: expected top-level key:value pair",
+                    path.display(),
+                    line_no
+                ));
+            };
+            match key {
+                "id" => {
+                    fixture.id = normalize_value(value);
+                    if fixture.id.is_none() {
+                        return Err(format!(
+                            "{}:{}: id value must be non-empty",
+                            path.display(),
+                            line_no
+                        ));
+                    }
+                }
+                "description" => {
+                    fixture.description = normalize_value(value);
+                    if fixture.description.is_none() {
+                        return Err(format!(
+                            "{}:{}: description value must be non-empty",
+                            path.display(),
+                            line_no
+                        ));
+                    }
+                }
+                "steps" => {
+                    in_steps = true;
+                }
+                _ => {
+                    return Err(format!(
+                        "{}:{}: unexpected top-level key '{key}'",
+                        path.display(),
+                        line_no
+                    ));
+                }
+            }
+            continue;
+        }
+
+        if !in_steps {
+            return Err(format!(
+                "{}:{}: step field found before steps section",
+                path.display(),
+                line_no
+            ));
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("- ") {
+            let Some((key, value)) = split_key_value(rest) else {
+                return Err(format!(
+                    "{}:{}: expected step key:value pair",
+                    path.display(),
+                    line_no
+                ));
+            };
+            if key != "command" {
+                return Err(format!(
+                    "{}:{}: step must start with command field",
+                    path.display(),
+                    line_no
+                ));
+            }
+            if let Some(step) = current_step.take() {
+                fixture.steps.push(step);
+            }
+            current_step = Some(ScenarioStep {
+                command: normalize_value(value),
+                expected_pack: None,
+                expected_decision: None,
+                reason: None,
+            });
+            if current_step
+                .as_ref()
+                .and_then(|step| step.command.as_ref())
+                .is_none()
+            {
+                return Err(format!(
+                    "{}:{}: command value must be non-empty",
+                    path.display(),
+                    line_no
+                ));
+            }
+            continue;
+        }
+
+        let Some((key, value)) = split_key_value(trimmed) else {
+            return Err(format!(
+                "{}:{}: expected step key:value pair",
+                path.display(),
+                line_no
+            ));
+        };
+        let step = current_step.as_mut().ok_or_else(|| {
+            format!(
+                "{}:{}: step field without a command",
+                path.display(),
+                line_no
+            )
+        })?;
+        match key {
+            "expected_pack" => step.expected_pack = normalize_value(value),
+            "expected_decision" => step.expected_decision = normalize_value(value),
+            "reason" => step.reason = normalize_value(value),
+            _ => {
+                return Err(format!(
+                    "{}:{}: unexpected step key '{key}'",
+                    path.display(),
+                    line_no
+                ));
+            }
+        }
+    }
+
+    if let Some(step) = current_step.take() {
+        fixture.steps.push(step);
+    }
+
+    if fixture.id.is_none() {
+        return Err(format!("{}: missing id", path.display()));
+    }
+    if fixture.description.is_none() {
+        return Err(format!("{}: missing description", path.display()));
+    }
+    if fixture.steps.is_empty() {
+        return Err(format!("{}: no steps found", path.display()));
+    }
+
+    for (idx, step) in fixture.steps.iter().enumerate() {
+        if step.command.as_deref().unwrap_or("").is_empty() {
+            return Err(format!(
+                "{}: step {} missing command",
+                path.display(),
+                idx + 1
+            ));
+        }
+        if step.expected_pack.as_deref().unwrap_or("").is_empty() {
+            return Err(format!(
+                "{}: step {} missing expected_pack",
+                path.display(),
+                idx + 1
+            ));
+        }
+        match step.expected_decision.as_deref() {
+            Some("allow") | Some("deny") => {}
+            Some(other) => {
+                return Err(format!(
+                    "{}: step {} invalid expected_decision '{other}'",
+                    path.display(),
+                    idx + 1
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "{}: step {} missing expected_decision",
+                    path.display(),
+                    idx + 1
+                ));
+            }
+        }
+        if step.reason.as_deref().unwrap_or("").is_empty() {
+            return Err(format!(
+                "{}: step {} missing reason",
+                path.display(),
+                idx + 1
+            ));
+        }
+    }
+
+    Ok(fixture)
 }
 
 // =============================================================================
@@ -209,5 +448,46 @@ fn corpus_full_summary() {
             println!("  {failure}");
         }
         panic!("\n{} corpus test(s) failed", failures.len());
+    }
+}
+
+#[test]
+fn scenario_fixtures_are_valid() {
+    let scenario_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scenarios");
+    let mut entries: Vec<_> = fs::read_dir(&scenario_dir)
+        .expect("Failed to read scenario fixtures directory")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("yaml"))
+        .collect();
+
+    entries.sort();
+    assert!(
+        !entries.is_empty(),
+        "No scenario fixtures found in {}",
+        scenario_dir.display()
+    );
+
+    let mut ids = HashSet::new();
+    let mut failures = Vec::new();
+
+    for path in entries {
+        match parse_scenario_fixture(&path) {
+            Ok(fixture) => {
+                let id = fixture.id.expect("id should be present");
+                if !ids.insert(id.clone()) {
+                    failures.push(format!("{}: duplicate id '{id}'", path.display()));
+                }
+            }
+            Err(err) => failures.push(err),
+        }
+    }
+
+    if !failures.is_empty() {
+        let mut msg = String::from("\nScenario fixture validation failed:\n");
+        for failure in failures {
+            msg.push_str(&format!("  {failure}\n"));
+        }
+        panic!("{msg}");
     }
 }

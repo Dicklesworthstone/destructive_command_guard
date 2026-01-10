@@ -2693,7 +2693,6 @@ fn handle_corpus_command(
     Ok(())
 }
 
-
 /// Compare two corpus outputs and return differences.
 fn diff_corpus_outputs(baseline: &CorpusOutput, current: &CorpusOutput) -> Vec<String> {
     let mut diffs = Vec::new();
@@ -4712,7 +4711,7 @@ fn dev_test_pattern(
 
     // Analyze regex complexity (basic heuristics)
     let has_lookahead = pattern.contains("(?=") || pattern.contains("(?!");
-    let has_lookbehind = pattern.contains("(?<") && !pattern.contains("(?<!");
+    let has_lookbehind = pattern.contains("(?<=") || pattern.contains("(?<!");
     let has_backref =
         pattern.contains(r"\1") || pattern.contains(r"\2") || pattern.contains(r"\k<");
     let nested_quantifiers = pattern.contains("+*")
@@ -4783,10 +4782,7 @@ fn dev_validate_pack(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
-    println!(
-        "{}",
-        format!("Validating pack: {}", pack_id).bold().cyan()
-    );
+    println!("{}", format!("Validating pack: {}", pack_id).bold().cyan());
     println!();
 
     // Find the pack in the registry
@@ -4833,11 +4829,17 @@ fn dev_validate_pack(
                     match fancy_regex::Regex::new(safe.regex.as_str()) {
                         Ok(re) => {
                             if let Err(e) = re.is_match("test") {
-                                pattern_errors.push(format!("Safe pattern '{}': runtime error: {}", safe.name, e));
+                                pattern_errors.push(format!(
+                                    "Safe pattern '{}': runtime error: {}",
+                                    safe.name, e
+                                ));
                             }
                         }
                         Err(e) => {
-                            pattern_errors.push(format!("Safe pattern '{}': compile error: {}", safe.name, e));
+                            pattern_errors.push(format!(
+                                "Safe pattern '{}': compile error: {}",
+                                safe.name, e
+                            ));
                         }
                     }
                 }
@@ -4846,13 +4848,19 @@ fn dev_validate_pack(
                     match fancy_regex::Regex::new(destructive.regex.as_str()) {
                         Ok(re) => {
                             if let Err(e) = re.is_match("test") {
-                                pattern_errors
-                                    .push(format!("Destructive pattern '{}': runtime error: {}", destructive.name.unwrap_or("unnamed"), e));
+                                pattern_errors.push(format!(
+                                    "Destructive pattern '{}': runtime error: {}",
+                                    destructive.name.unwrap_or("unnamed"),
+                                    e
+                                ));
                             }
                         }
                         Err(e) => {
-                            pattern_errors
-                                .push(format!("Destructive pattern '{}': compile error: {}", destructive.name.unwrap_or("unnamed"), e));
+                            pattern_errors.push(format!(
+                                "Destructive pattern '{}': compile error: {}",
+                                destructive.name.unwrap_or("unnamed"),
+                                e
+                            ));
                         }
                     }
                 }
@@ -4951,46 +4959,40 @@ fn dev_debug(config: &Config, command: &str, all_packs: bool) {
 
             // Check safe patterns
             for safe in &pack.safe_patterns {
-                match safe.regex.is_match(command) {
-                    true => {
-                        println!(
-                            "    {} Safe pattern '{}' -> {}",
-                            "✓".green(),
-                            safe.name,
-                            "MATCH".green().bold()
-                        );
-                    }
-                    false if all_packs => {
-                        println!(
-                            "    {} Safe pattern '{}' -> no match",
-                            "○".dimmed(),
-                            safe.name
-                        );
-                    }
-                    _ => {}
+                let matched = safe.regex.is_match(command);
+                if matched {
+                    println!(
+                        "    {} Safe pattern '{}' -> {}",
+                        "✓".green(),
+                        safe.name,
+                        "MATCH".green().bold()
+                    );
+                } else if all_packs {
+                    println!(
+                        "    {} Safe pattern '{}' -> no match",
+                        "○".dimmed(),
+                        safe.name
+                    );
                 }
             }
 
             // Check destructive patterns
             for destructive in &pack.destructive_patterns {
-                match destructive.regex.is_match(command) {
-                    true => {
-                        println!(
-                            "    {} Destructive pattern '{}' -> {}",
-                            "✗".red(),
-                            destructive.name.unwrap_or("unnamed"),
-                            "MATCH".red().bold()
-                        );
-                        println!("      Reason: {}", destructive.reason);
-                    }
-                    false if all_packs => {
-                        println!(
-                            "    {} Destructive pattern '{}' -> no match",
-                            "○".dimmed(),
-                            destructive.name.unwrap_or("unnamed")
-                        );
-                    }
-                    _ => {}
+                let matched = destructive.regex.is_match(command);
+                if matched {
+                    println!(
+                        "    {} Destructive pattern '{}' -> {}",
+                        "✗".red(),
+                        destructive.name.unwrap_or("unnamed"),
+                        "MATCH".red().bold()
+                    );
+                    println!("      Reason: {}", destructive.reason);
+                } else if all_packs {
+                    println!(
+                        "    {} Destructive pattern '{}' -> no match",
+                        "○".dimmed(),
+                        destructive.name.unwrap_or("unnamed")
+                    );
                 }
             }
         }
@@ -5040,10 +5042,7 @@ fn dev_benchmark(
     };
 
     println!("{}", "Results:".bold());
-    println!(
-        "{:<40} {:>12} {:>12}",
-        "Command", "Mean (µs)", "Std (µs)"
-    );
+    println!("{:<40} {:>12} {:>12}", "Command", "Mean (µs)", "Std (µs)");
     println!("{}", "-".repeat(66));
 
     for cmd in &test_commands {
@@ -5068,8 +5067,7 @@ fn dev_benchmark(
 
         // Calculate statistics
         let mean = times.iter().sum::<f64>() / times.len() as f64;
-        let variance =
-            times.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / times.len() as f64;
+        let variance = times.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / times.len() as f64;
         let std_dev = variance.sqrt();
 
         // Truncate command for display
@@ -5101,9 +5099,20 @@ fn dev_generate_fixtures(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
+    // Helper to escape strings for TOML basic strings
+    fn escape_toml(s: &str) -> String {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    }
+
     println!(
         "{}",
-        format!("Generating fixtures for: {}", pack_id).bold().cyan()
+        format!("Generating fixtures for: {}", pack_id)
+            .bold()
+            .cyan()
     );
     println!();
 
@@ -5135,8 +5144,8 @@ fn dev_generate_fixtures(
             for safe in &p.safe_patterns {
                 safe_content.push_str(&format!(
                     "[[case]]\npattern = \"{}\"\ndescription = \"{}\"\nexpected = \"allow\"\n\n",
-                    safe.name,
-                    safe.name
+                    escape_toml(safe.name),
+                    escape_toml(safe.name)
                 ));
             }
 
@@ -5147,11 +5156,11 @@ fn dev_generate_fixtures(
             for destructive in &p.destructive_patterns {
                 destructive_content.push_str(&format!(
                     "[[case]]\npattern = \"{}\"\ndescription = \"{}\"\nreason = \"{}\"\nexpected = \"deny\"\nrule_id = \"{}:{}\"\n\n",
-                    destructive.name.unwrap_or("unnamed"),
-                    destructive.name.unwrap_or("unnamed"),
-                    destructive.reason,
+                    escape_toml(destructive.name.unwrap_or("unnamed")),
+                    escape_toml(destructive.name.unwrap_or("unnamed")),
+                    escape_toml(destructive.reason),
                     pack_id,
-                    destructive.name.unwrap_or("unnamed")
+                    escape_toml(destructive.name.unwrap_or("unnamed"))
                 ));
             }
 

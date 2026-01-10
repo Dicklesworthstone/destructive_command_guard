@@ -82,13 +82,13 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rm -f (force remove containers)
         destructive_pattern!(
             "rm-force",
-            r"docker\s+rm\s+.*-f|docker\s+rm\s+.*--force",
+            r"docker\s+rm\s+.*(?:-[a-zA-Z0-9]*f|--force)",
             "docker rm -f forcibly removes containers, potentially losing data."
         ),
         // rmi -f (force remove images)
         destructive_pattern!(
             "rmi-force",
-            r"docker\s+rmi\s+.*-f|docker\s+rmi\s+.*--force",
+            r"docker\s+rmi\s+.*(?:-[a-zA-Z0-9]*f|--force)",
             "docker rmi -f forcibly removes images even if in use."
         ),
         // volume rm
@@ -104,4 +104,31 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "Stopping/killing all containers can disrupt services. Be specific about which containers."
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packs::test_helpers::*;
+
+    #[test]
+    fn test_rm_force() {
+        let pack = create_pack();
+        assert_blocks(&pack, "docker rm -f container", "forcibly removes");
+        assert_blocks(&pack, "docker rm --force container", "forcibly removes");
+        assert_blocks(&pack, "docker rm -vf container", "forcibly removes"); // Combined flags
+        assert_blocks(&pack, "docker rm -fv container", "forcibly removes");
+
+        assert_allows(&pack, "docker rm container");
+    }
+
+    #[test]
+    fn test_rmi_force() {
+        let pack = create_pack();
+        assert_blocks(&pack, "docker rmi -f image", "forcibly removes");
+        assert_blocks(&pack, "docker rmi --force image", "forcibly removes");
+        assert_blocks(&pack, "docker rmi -nf image", "forcibly removes"); // Combined flags (no-prune + force)
+
+        assert_allows(&pack, "docker rmi image");
+    }
 }

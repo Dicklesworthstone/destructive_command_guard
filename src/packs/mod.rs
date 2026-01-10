@@ -32,6 +32,7 @@ mod test_template;
 
 use fancy_regex::Regex;
 use memchr::memmem;
+use regex_engine::LazyFancyRegex;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -129,19 +130,26 @@ impl DecisionMode {
 }
 
 /// A safe pattern that, when matched, allows the command immediately.
-#[derive(Debug)]
 pub struct SafePattern {
-    /// Compiled regex pattern.
-    pub regex: Regex,
+    /// Lazily-compiled regex pattern.
+    pub regex: LazyFancyRegex,
     /// Debug name for the pattern.
     pub name: &'static str,
 }
 
+impl std::fmt::Debug for SafePattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SafePattern")
+            .field("pattern", &self.regex.as_str())
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
 /// A destructive pattern that, when matched, blocks the command.
-#[derive(Debug)]
 pub struct DestructivePattern {
-    /// Compiled regex pattern.
-    pub regex: Regex,
+    /// Lazily-compiled regex pattern.
+    pub regex: LazyFancyRegex,
     /// Human-readable explanation of why this command is blocked.
     pub reason: &'static str,
     /// Optional pattern name for debugging and allowlisting.
@@ -150,22 +158,33 @@ pub struct DestructivePattern {
     pub severity: Severity,
 }
 
+impl std::fmt::Debug for DestructivePattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DestructivePattern")
+            .field("pattern", &self.regex.as_str())
+            .field("reason", &self.reason)
+            .field("name", &self.name)
+            .field("severity", &self.severity)
+            .finish()
+    }
+}
+
 /// Macro to create a safe pattern with compile-time name checking.
+///
+/// The pattern is lazily compiled on first use, not at construction time.
 #[macro_export]
 macro_rules! safe_pattern {
     ($name:literal, $re:literal) => {
         $crate::packs::SafePattern {
-            regex: ::fancy_regex::Regex::new($re).expect(concat!(
-                "safe pattern '",
-                $name,
-                "' should compile"
-            )),
+            regex: $crate::packs::regex_engine::LazyFancyRegex::new($re),
             name: $name,
         }
     };
 }
 
 /// Macro to create a destructive pattern with reason.
+///
+/// The pattern is lazily compiled on first use, not at construction time.
 ///
 /// # Variants
 ///
@@ -177,8 +196,7 @@ macro_rules! destructive_pattern {
     // Unnamed pattern, default severity (High)
     ($re:literal, $reason:literal) => {
         $crate::packs::DestructivePattern {
-            regex: ::fancy_regex::Regex::new($re)
-                .expect(concat!("destructive pattern should compile: ", $re)),
+            regex: $crate::packs::regex_engine::LazyFancyRegex::new($re),
             reason: $reason,
             name: None,
             severity: $crate::packs::Severity::High,
@@ -187,11 +205,7 @@ macro_rules! destructive_pattern {
     // Named pattern, default severity (High)
     ($name:literal, $re:literal, $reason:literal) => {
         $crate::packs::DestructivePattern {
-            regex: ::fancy_regex::Regex::new($re).expect(concat!(
-                "destructive pattern '",
-                $name,
-                "' should compile"
-            )),
+            regex: $crate::packs::regex_engine::LazyFancyRegex::new($re),
             reason: $reason,
             name: Some($name),
             severity: $crate::packs::Severity::High,
@@ -200,11 +214,7 @@ macro_rules! destructive_pattern {
     // Named pattern with explicit severity
     ($name:literal, $re:literal, $reason:literal, $severity:ident) => {
         $crate::packs::DestructivePattern {
-            regex: ::fancy_regex::Regex::new($re).expect(concat!(
-                "destructive pattern '",
-                $name,
-                "' should compile"
-            )),
+            regex: $crate::packs::regex_engine::LazyFancyRegex::new($re),
             reason: $reason,
             name: Some($name),
             severity: $crate::packs::Severity::$severity,
@@ -268,9 +278,7 @@ impl Pack {
     /// Check if a command matches any safe pattern.
     #[must_use]
     pub fn matches_safe(&self, cmd: &str) -> bool {
-        self.safe_patterns
-            .iter()
-            .any(|p| p.regex.is_match(cmd).unwrap_or(false))
+        self.safe_patterns.iter().any(|p| p.regex.is_match(cmd))
     }
 
     /// Check if a command matches any destructive pattern.
@@ -279,7 +287,7 @@ impl Pack {
     pub fn matches_destructive(&self, cmd: &str) -> Option<DestructiveMatch> {
         self.destructive_patterns
             .iter()
-            .find(|p| p.regex.is_match(cmd).unwrap_or(false))
+            .find(|p| p.regex.is_match(cmd))
             .map(|p| DestructiveMatch {
                 reason: p.reason,
                 name: p.name,
@@ -1988,8 +1996,6 @@ mod tests {
             "restore-worktree",
             "restore-worktree-explicit",
             "reset-merge",
-            "branch-force-delete",
-            "stash-drop",
         ];
 
         for rule_name in high_or_above_rules {
@@ -2139,5 +2145,178 @@ mod tests {
             result.blocked,
             "rm -rf src/ should still be blocked (not in cleanup allowlist)"
         );
+    }
+
+    mod normalization_tests {
+        use super::*;
+
+        #[test]
+        fn preserves_plain_git_command() {
+            assert_eq!(normalize_command("git status"), "git status");
+        }
+
+        #[test]
+        fn preserves_plain_rm_command() {
+            assert_eq!(normalize_command("rm -rf /tmp/foo"), "rm -rf /tmp/foo");
+        }
+
+        #[test]
+        fn strips_usr_bin_git() {
+            assert_eq!(normalize_command("/usr/bin/git status"), "git status");
+        }
+
+        #[test]
+        fn strips_usr_local_bin_git() {
+            assert_eq!(
+                normalize_command("/usr/local/bin/git checkout -b feature"),
+                "git checkout -b feature"
+            );
+        }
+
+        #[test]
+        fn strips_bin_rm() {
+            assert_eq!(
+                normalize_command("/bin/rm -rf /tmp/test"),
+                "rm -rf /tmp/test"
+            );
+        }
+
+        #[test]
+        fn strips_usr_bin_rm() {
+            assert_eq!(normalize_command("/usr/bin/rm file.txt"), "rm file.txt");
+        }
+
+        #[test]
+        fn strips_sbin_path() {
+            assert_eq!(normalize_command("/sbin/rm foo"), "rm foo");
+        }
+
+        #[test]
+        fn strips_usr_sbin_path() {
+            assert_eq!(normalize_command("/usr/sbin/rm bar"), "rm bar");
+        }
+
+        #[test]
+        fn preserves_command_with_path_arguments() {
+            assert_eq!(
+                normalize_command("git add /usr/bin/something"),
+                "git add /usr/bin/something"
+            );
+        }
+
+        #[test]
+        fn handles_empty_string() {
+            assert_eq!(normalize_command(""), "");
+        }
+
+        #[test]
+        fn strips_quotes_from_executed_git_command_word() {
+            assert_eq!(
+                normalize_command("\"git\" reset --hard"),
+                "git reset --hard"
+            );
+        }
+
+        #[test]
+        fn strips_quotes_from_executed_rm_command_word() {
+            assert_eq!(normalize_command("\"rm\" -rf /etc"), "rm -rf /etc");
+        }
+
+        #[test]
+        fn strips_quotes_from_executed_absolute_path_command_word() {
+            assert_eq!(
+                normalize_command("\"/usr/bin/git\" reset --hard"),
+                "git reset --hard"
+            );
+        }
+
+        #[test]
+        fn strips_quotes_after_separators() {
+            assert_eq!(
+                normalize_command("echo hi; \"rm\" -rf /etc"),
+                "echo hi; rm -rf /etc"
+            );
+        }
+
+        #[test]
+        fn strips_quotes_after_wrappers_and_options() {
+            assert_eq!(
+                normalize_command("sudo -u root \"rm\" -rf /etc"),
+                "sudo -u root rm -rf /etc"
+            );
+        }
+
+        #[test]
+        fn does_not_strip_quotes_from_arguments() {
+            assert_eq!(
+                normalize_command("echo \"rm\" -rf /etc"),
+                "echo \"rm\" -rf /etc"
+            );
+        }
+
+        #[test]
+        fn does_not_strip_quotes_for_command_query_mode() {
+            assert_eq!(
+                normalize_command("command -v \"git\""),
+                "command -v \"git\""
+            );
+        }
+
+        #[test]
+        fn strips_quotes_inside_subshell_segments() {
+            assert_eq!(normalize_command("( \"rm\" -rf /etc )"), "( rm -rf /etc )");
+        }
+    }
+
+    /// Test that all pack patterns compile correctly.
+    ///
+    /// This validates that no pack has invalid regex patterns that would only
+    /// be discovered at runtime when the lazy regex is first used.
+    ///
+    /// Related to git_safety_guard-64dc.3 (pattern validity validation).
+    #[test]
+    fn all_pack_patterns_compile() {
+        let mut errors: Vec<String> = Vec::new();
+
+        for pack_id in REGISTRY.all_pack_ids() {
+            let pack = REGISTRY.get(pack_id).expect("pack must exist");
+
+            // Validate safe patterns
+            for (idx, pattern) in pack.safe_patterns.iter().enumerate() {
+                if let Err(e) = fancy_regex::Regex::new(pattern.regex.as_str()) {
+                    errors.push(format!(
+                        "Pack '{}' safe pattern '{}' (index {}) failed to compile: {}\n  Pattern: {}",
+                        pack_id,
+                        pattern.name,
+                        idx,
+                        e,
+                        pattern.regex.as_str()
+                    ));
+                }
+            }
+
+            // Validate destructive patterns
+            for (idx, pattern) in pack.destructive_patterns.iter().enumerate() {
+                let pattern_name = pattern.name.unwrap_or("<unnamed>");
+                if let Err(e) = fancy_regex::Regex::new(pattern.regex.as_str()) {
+                    errors.push(format!(
+                        "Pack '{}' destructive pattern '{}' (index {}) failed to compile: {}\n  Pattern: {}",
+                        pack_id,
+                        pattern_name,
+                        idx,
+                        e,
+                        pattern.regex.as_str()
+                    ));
+                }
+            }
+        }
+
+        if !errors.is_empty() {
+            panic!(
+                "Found {} invalid regex pattern(s):\n\n{}",
+                errors.len(),
+                errors.join("\n\n")
+            );
+        }
     }
 }

@@ -339,7 +339,7 @@ fn open_log_file(path: &str) -> std::io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
-fn redact_command(command: &str, config: &RedactionConfig) -> String {
+pub(crate) fn redact_command(command: &str, config: &RedactionConfig) -> String {
     if !config.enabled {
         return command.to_string();
     }

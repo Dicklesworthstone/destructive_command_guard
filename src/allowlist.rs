@@ -263,6 +263,49 @@ impl LayeredAllowlist {
 
         None
     }
+    /// Find the first allowlist entry that matches an exact command string.
+    #[must_use]
+    pub fn match_exact_command(&self, command: &str) -> Option<AllowlistHit<'_>> {
+        for layer in &self.layers {
+            for entry in &layer.file.entries {
+                if !is_entry_valid(entry) {
+                    continue;
+                }
+
+                if let AllowSelector::ExactCommand(cmd) = &entry.selector {
+                    if cmd == command {
+                        return Some(AllowlistHit {
+                            layer: layer.layer,
+                            entry,
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Find the first allowlist entry that matches a command prefix.
+    #[must_use]
+    pub fn match_command_prefix(&self, command: &str) -> Option<AllowlistHit<'_>> {
+        for layer in &self.layers {
+            for entry in &layer.file.entries {
+                if !is_entry_valid(entry) {
+                    continue;
+                }
+
+                if let AllowSelector::CommandPrefix(prefix) = &entry.selector {
+                    if command.starts_with(prefix) {
+                        return Some(AllowlistHit {
+                            layer: layer.layer,
+                            entry,
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 /// A successful allowlist match (borrowed view).

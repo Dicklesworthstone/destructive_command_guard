@@ -47,19 +47,19 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chmod 777 (world writable)
         destructive_pattern!(
             "chmod-777",
-            r"chmod\s+.*777",
+            r#"chmod\s+(?:.*\s+)?["'=]?0*777(?:[\s"']|$)"#,
             "chmod 777 makes files world-writable. This is a security risk."
         ),
-        // chmod -R on root or home
+        // chmod -R on root or system directories
         destructive_pattern!(
             "chmod-recursive-root",
-            r"chmod\s+-[rR].*\s+/(?:$|[a-z])",
+            r"chmod\s+(?:.*(?:-[rR]|--recursive)).*\s+/(?:$|bin|boot|dev|etc|lib|lib64|opt|proc|root|run|sbin|srv|sys|usr|var)\b",
             "chmod -R on system directories can break system permissions."
         ),
         // chown -R on root or system directories
         destructive_pattern!(
             "chown-recursive-root",
-            r"chown\s+-[rR].*\s+/(?:$|etc|var|usr|bin|sbin|lib)",
+            r"chown\s+(?:.*(?:-[rR]|--recursive)).*\s+/(?:$|bin|boot|dev|etc|lib|lib64|opt|proc|root|run|sbin|srv|sys|usr|var)\b",
             "chown -R on system directories can break system ownership."
         ),
         // chmod u+s (setuid)
@@ -83,8 +83,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // setfacl with dangerous patterns
         destructive_pattern!(
             "setfacl-all",
-            r"setfacl\s+.*-[rR].*\s+/",
-            "setfacl -R on root can modify access control across the filesystem."
+            r"setfacl\s+.*-[rR].*\s+/(?:$|bin|boot|dev|etc|lib|lib64|opt|proc|root|run|sbin|srv|sys|usr|var)\b",
+            "setfacl -R on system directories can modify access control across the filesystem."
         ),
     ]
 }

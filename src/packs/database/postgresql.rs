@@ -17,7 +17,10 @@ pub fn create_pack() -> Pack {
         name: "PostgreSQL",
         description: "Protects against destructive PostgreSQL operations like DROP DATABASE, \
                       TRUNCATE, and dropdb",
-        keywords: &["psql", "dropdb", "DROP", "TRUNCATE", "pg_dump", "postgres"],
+        keywords: &[
+            "psql", "dropdb", "DROP", "TRUNCATE", "pg_dump", "postgres", "DELETE", "delete",
+            "drop", "truncate",
+        ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
@@ -64,7 +67,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // DELETE without WHERE (deletes all rows)
         destructive_pattern!(
             "delete-without-where",
-            r"(?i)DELETE\s+FROM\s+[a-zA-Z_][a-zA-Z0-9_]*\s*(?:;|$)",
+            r#"(?i)DELETE\s+FROM\s+(?:(?:[a-zA-Z_][a-zA-Z0-9_]*|"[^"]+")(?:\.(?:[a-zA-Z_][a-zA-Z0-9_]*|"[^"]+"))?)\s*(?:;|$)"#,
             "DELETE without WHERE clause deletes ALL rows. Add a WHERE clause or use TRUNCATE intentionally."
         ),
         // dropdb CLI command
@@ -80,4 +83,28 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "pg_dump --clean drops objects before creating them. This can be destructive on restore."
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packs::test_helpers::*;
+
+    #[test]
+    fn test_delete_without_where() {
+        let pack = create_pack();
+        assert_blocks(&pack, "DELETE FROM users;", "DELETE without WHERE");
+        assert_blocks(&pack, "DELETE FROM public.users;", "DELETE without WHERE");
+        assert_blocks(&pack, "DELETE FROM \"Users\";", "DELETE without WHERE");
+        assert_blocks(
+            &pack,
+            "DELETE FROM \"Public\".\"Users\";",
+            "DELETE without WHERE",
+        );
+        assert_blocks(&pack, "delete from users", "DELETE without WHERE");
+
+        // Should NOT block if WHERE clause is present
+        assert_allows(&pack, "DELETE FROM users WHERE id = 1;");
+        assert_allows(&pack, "DELETE FROM users WHERE active = false");
+    }
 }

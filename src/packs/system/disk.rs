@@ -28,6 +28,8 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
         // dd to regular files is generally safe
         safe_pattern!("dd-file-out", r"dd\s+.*of=[^/\s]+\."),
+        // dd to /dev/null|zero|full is safe (discard output)
+        safe_pattern!("dd-discard", r"dd\s+.*of=/dev/(?:null|zero|full)(?:\s|$)"),
         // lsblk is safe (read-only)
         safe_pattern!("lsblk", r"\blsblk\b"),
         // fdisk -l (list) is safe

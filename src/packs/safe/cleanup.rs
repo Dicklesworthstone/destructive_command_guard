@@ -194,12 +194,14 @@ fn regex_escape(s: &str) -> String {
 
 /// Create a `SafePattern` from a name and regex string.
 ///
-/// Panics if the regex is invalid (compile-time bug).
+/// Both name and pattern are leaked as `&'static str` to satisfy `LazyFancyRegex`'s
+/// requirement. This is fine because packs are created once at startup and live
+/// for the program's lifetime.
 fn make_safe_pattern(name: &str, pattern: &str) -> SafePattern {
     SafePattern {
-        regex: fancy_regex::Regex::new(pattern).expect("safe.cleanup pattern should compile"),
-        // We need a &'static str, so we leak the string. This is fine because
-        // packs are created once at startup and live for the program's lifetime.
+        regex: crate::packs::regex_engine::LazyFancyRegex::new(Box::leak(
+            pattern.to_string().into_boxed_str(),
+        )),
         name: Box::leak(name.to_string().into_boxed_str()),
     }
 }

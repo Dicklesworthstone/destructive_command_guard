@@ -1,0 +1,29 @@
+# Edge case fixtures (false positives and false negatives).
+# Schema: { false_positives: [ { command, rationale } ], false_negatives: [ { command, rationale } ] }
+false_positives:
+  - command: "echo \"vault secrets disable secret/\""
+    rationale: "String literal only"
+  - command: "grep \"rsync --delete\" deployment.log"
+    rationale: "Searching logs, not executing"
+  - command: "rg \"aws s3 rm\" README.md"
+    rationale: "Searching docs, not executing"
+  - command: "printf \"%s\" \"rclone sync /src remote:bucket --delete\""
+    rationale: "Printing a command for review"
+  - command: "python -c \"print('rm -rf /')\""
+    rationale: "Inline script prints a string only"
+  - command: "cat docs/notes.txt | sed -n 's/git reset --hard//g'"
+    rationale: "Text manipulation containing blocked phrase"
+
+false_negatives:
+  - command: "rsync --del /src/ /dest/"
+    rationale: "--del is an alias for --delete"
+  - command: "rsync -a --remove-source-files /src/ user@host:/dest/"
+    rationale: "Deletes source files after transfer"
+  - command: "rclone sync /src remote:bucket --delete-excluded"
+    rationale: "Deletes excluded files on destination"
+  - command: "aws s3 sync /empty s3://my-bucket --delete"
+    rationale: "Deletes objects in destination not in source"
+  - command: "aws s3 rm s3://my-bucket --recursive --exclude '*' --include '*'"
+    rationale: "Still deletes all objects with filters"
+  - command: "vault kv delete secret/myapp/config"
+    rationale: "Deletes secret data despite benign wording"

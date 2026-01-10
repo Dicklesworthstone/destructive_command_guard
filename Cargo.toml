@@ -52,6 +52,7 @@ ast-grep-language = "0.40"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
+fs2 = "0.4"
 
 [build-dependencies]
 vergen-gix = { version = "1.0", features = ["build", "cargo", "rustc"] }

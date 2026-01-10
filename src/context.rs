@@ -26,7 +26,7 @@ use std::ops::Range;
 /// Classification of a command-line span.
 ///
 /// Each span is classified according to whether it will be executed by the shell
-/// or is purely data. The pattern matching engine uses this to skip matching
+/// or is purely data. The pattern matching engine uses this to reduce matching
 /// in known-safe contexts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SpanKind {
@@ -478,35 +478,51 @@ impl ContextClassifier {
         spans
     }
 
-    /// Check if the word before a -c/-e/-r flag is an inline-code command.
+    /// Check if the word before a -c/-e flag is an inline-code command.
     fn check_inline_code_context(&self, command: &str, flag_start: usize, flag: &str) -> bool {
-        // Find the previous word
-        let before = &command[..flag_start];
-        let trimmed = before.trim_end();
-        if trimmed.is_empty() {
-            return false;
-        }
-
-        // Get the last word
-        let word_start = trimmed
-            .rfind(|c: char| c.is_whitespace())
-            .map_or(0, |i| i + 1);
-        let word = &trimmed[word_start..];
-
-        // Check if it's an inline-code command (or ends with one after a path)
-        let base_name = word.rsplit('/').next().unwrap_or(word);
-
+        // Special case for env -S: scan the whole segment for 'env'
         if flag == "-S" {
-            // env -S "script" treats the argument as a script/command line
-            return base_name == "env";
+            // env -S "script" treats the argument as a script/command line.
+            // Be conservative: treat as inline code if the current segment
+            // contains an env invocation anywhere before the flag.
+            return env_split_string_context(command, flag_start);
         }
 
-        if base_name == "env" {
-            // env does not use -c/-e/-r for inline code
-            return false;
+        // For standard interpreters (python -c, bash -c), scan backwards skipping flags
+        let before = &command[..flag_start];
+
+        // Limit search to reasonable lookback (e.g. 20 tokens or start of segment)
+        // to avoid performance cliffs on massive commands.
+        // We use segment_start_before_flag to respect pipe boundaries.
+        let segment_start = segment_start_before_flag(command, flag_start);
+        let segment = &before[segment_start..];
+
+        // Tokenize in reverse to find the command word
+        let mut tokens = segment.split_whitespace().rev();
+
+        while let Some(token) = tokens.next() {
+            // Skip flags (heuristic: starts with -)
+            if token.starts_with('-') && token.len() > 1 {
+                continue;
+            }
+
+            // Skip env assignments (VAR=VAL)
+            if token.contains('=') {
+                continue;
+            }
+
+            // Found a potential command word
+            let base_name = token.rsplit('/').next().unwrap_or(token);
+
+            // Skip wrappers that might precede the interpreter
+            if matches!(base_name, "sudo" | "time" | "nohup" | "env" | "command") {
+                continue;
+            }
+
+            return self.inline_code_commands.contains(&base_name);
         }
 
-        self.inline_code_commands.contains(&base_name)
+        false
     }
 }
 
@@ -1581,6 +1597,45 @@ fn consume_backticks(command: &str, start: usize) -> usize {
 }
 
 #[must_use]
+fn env_split_string_context(command: &str, flag_start: usize) -> bool {
+    let segment_start = segment_start_before_flag(command, flag_start);
+    let segment = &command[segment_start..flag_start];
+
+    segment.split_whitespace().any(|token| {
+        let token = token.trim_start_matches('\\');
+        token == "env" || token.ends_with("/env")
+    })
+}
+
+#[must_use]
+fn segment_start_before_flag(command: &str, flag_start: usize) -> usize {
+    let bytes = command.as_bytes();
+    let mut i = flag_start.min(bytes.len());
+
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b'|' => {
+                if i > 0 && bytes[i - 1] == b'|' {
+                    return i + 1;
+                }
+                return i + 1;
+            }
+            b'&' => {
+                if i > 0 && bytes[i - 1] == b'&' {
+                    return i + 1;
+                }
+                return i + 1;
+            }
+            b';' => return i + 1,
+            _ => {}
+        }
+    }
+
+    0
+}
+
+#[must_use]
 fn merge_ranges(ranges: &[Range<usize>]) -> Vec<Range<usize>> {
     let mut merged: Vec<Range<usize>> = Vec::new();
     for range in ranges {
@@ -1658,6 +1713,19 @@ mod tests {
             .find(|s| s.kind == SpanKind::InlineCode);
         assert!(inline_span.is_some());
         assert_eq!(inline_span.unwrap().text(cmd), "`rm -rf /`");
+    }
+
+    #[test]
+    fn test_env_split_string_marks_inline_code() {
+        let cmd = "env FOO=1 -S \"rm -rf /\"";
+        let spans = classify_command(cmd);
+
+        let inline_span = spans
+            .spans()
+            .iter()
+            .find(|s| s.kind == SpanKind::InlineCode);
+        assert!(inline_span.is_some());
+        assert_eq!(inline_span.unwrap().text(cmd), "\"rm -rf /\"");
     }
 
     #[test]
@@ -1797,10 +1865,7 @@ mod tests {
             .iter()
             .find(|s| s.text(cmd).contains("reset --hard"));
         if let Some(span) = msg_span {
-            assert!(
-                span.kind == SpanKind::Argument || span.kind == SpanKind::Data,
-                "Commit message should be Argument or Data"
-            );
+            assert_eq!(span.kind, SpanKind::Argument);
         }
     }
 

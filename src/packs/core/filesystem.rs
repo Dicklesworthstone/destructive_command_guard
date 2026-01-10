@@ -196,3 +196,81 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packs::Severity;
+    use crate::packs::test_helpers::*;
+
+    #[test]
+    fn test_pack_creation() {
+        let pack = create_pack();
+        assert_eq!(pack.id, "core.filesystem");
+        assert_eq!(pack.name, "Core Filesystem");
+        assert!(pack.keywords.contains(&"rm"));
+    }
+
+    #[test]
+    fn test_rm_rf_root_critical() {
+        let pack = create_pack();
+        assert_blocks_with_severity(&pack, "rm -rf /", Severity::Critical);
+        assert_blocks_with_severity(&pack, "rm -rf /etc", Severity::Critical);
+        assert_blocks_with_severity(&pack, "rm -rf /home", Severity::Critical);
+        assert_blocks_with_severity(&pack, "rm -rf ~/", Severity::Critical);
+        assert_blocks_with_pattern(&pack, "rm -rf /", "rm-rf-root-home");
+    }
+
+    #[test]
+    fn test_rm_rf_general_high() {
+        let pack = create_pack();
+        // Outside safe dirs, general rule catches it
+        assert_blocks_with_severity(&pack, "rm -rf ./build", Severity::High);
+        assert_blocks_with_pattern(&pack, "rm -rf ./build", "rm-rf-general");
+    }
+
+    #[test]
+    fn test_rm_flags_ordering() {
+        let pack = create_pack();
+        assert_blocks(&pack, "rm -r -f ./build", "separate -r -f flags");
+        assert_blocks(&pack, "rm -f -r ./build", "separate -r -f flags");
+        assert_blocks(
+            &pack,
+            "rm --recursive --force ./build",
+            "rm --recursive --force is destructive",
+        );
+        assert_blocks(
+            &pack,
+            "rm --force --recursive ./build",
+            "rm --recursive --force is destructive",
+        );
+    }
+
+    #[test]
+    fn test_safe_rm_tmp() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "rm -rf /tmp/test");
+        assert_safe_pattern_matches(&pack, "rm -rf /var/tmp/stuff");
+        assert_safe_pattern_matches(&pack, "rm -rf $TMPDIR/junk");
+        assert_safe_pattern_matches(&pack, "rm -rf ${TMPDIR}/junk");
+    }
+
+    #[test]
+    fn test_safe_rm_variants() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "rm -fr /tmp/test");
+        assert_safe_pattern_matches(&pack, "rm -r -f /tmp/test");
+        assert_safe_pattern_matches(&pack, "rm --recursive --force /tmp/test");
+    }
+
+    #[test]
+    fn test_path_traversal_blocked() {
+        let pack = create_pack();
+        // Should NOT match safe patterns (so it falls through to destructive)
+        assert!(!pack.matches_safe("rm -rf /tmp/../etc"));
+        assert!(!pack.matches_safe("rm -rf /var/tmp/../etc"));
+
+        // And should be blocked by destructive rules
+        assert_blocks(&pack, "rm -rf /tmp/../etc", "rm -rf on root or home paths");
+    }
+}
