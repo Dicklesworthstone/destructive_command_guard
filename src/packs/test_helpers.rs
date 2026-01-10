@@ -687,7 +687,7 @@ use std::path::Path;
 /// # Example
 ///
 /// ```rust,ignore
-/// let snapshot = eval_snapshot("git reset --hard", &config);
+/// let snapshot = eval_snapshot("git reset --hard");
 /// assert_eq!(snapshot.decision, "deny");
 /// assert_eq!(snapshot.rule_id, Some("core.git:reset-hard".into()));
 /// ```
@@ -748,8 +748,14 @@ impl EvalSnapshot {
                         MatchSource::HeredocAst => "heredoc".to_string(),
                         MatchSource::LegacyPattern => "legacy".to_string(),
                     });
+                    // Truncate reason to ~100 chars, but safely handle UTF-8 boundaries
                     let reason = if info.reason.len() > 100 {
-                        Some(info.reason[..100].to_string())
+                        // Find a safe truncation point at a char boundary
+                        let mut end = 100;
+                        while end > 0 && !info.reason.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        Some(info.reason[..end].to_string())
                     } else {
                         Some(info.reason.clone())
                     };
@@ -1021,7 +1027,7 @@ pub fn diff_snapshots(expected: &EvalSnapshot, actual: &EvalSnapshot) -> Option<
         None
     } else {
         Some(format!(
-            "Snapshot mismatch for command: {}\n{}\n\nReproduce:\n  cargo test -- --nocapture 'test_name' && dcg explain '{}'",
+            "Snapshot mismatch for command: {}\n{}\n\nReproduce:\n  dcg explain '{}'",
             expected.command,
             diffs.join("\n"),
             expected.command.replace('\'', "'\\''")
@@ -1034,7 +1040,27 @@ pub fn diff_snapshots(expected: &EvalSnapshot, actual: &EvalSnapshot) -> Option<
 /// Returns `Ok(())` if the test passes, or `Err(message)` with details on failure.
 #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
 pub fn verify_corpus_case(case: &CorpusTestCase, category: CorpusCategory) -> Result<(), String> {
-    let snapshot = eval_snapshot(&case.command);
+    // Get both snapshot (for most checks) and full result (for reason_contains check)
+    let config = Config::default();
+    let enabled_packs = config.enabled_pack_ids();
+    let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+    let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let compiled_overrides = config.overrides.compile();
+    let allowlists = crate::LayeredAllowlist::default();
+    let heredoc_settings = config.heredoc_settings();
+
+    let result = evaluate_command_with_pack_order(
+        &case.command,
+        &enabled_keywords,
+        &ordered_packs,
+        &compiled_overrides,
+        &allowlists,
+        &heredoc_settings,
+    );
+    let snapshot = EvalSnapshot::from_result(&case.command, &result);
+
+    // Get full reason for reason_contains check (not truncated)
+    let full_reason = result.pattern_info.as_ref().map(|info| &info.reason);
 
     // Check basic decision
     let expected_decision = case.expected.as_str();
@@ -1123,14 +1149,11 @@ pub fn verify_corpus_case(case: &CorpusTestCase, category: CorpusCategory) -> Re
         }
 
         if let Some(ref reason_contains) = log.reason_contains {
-            let contains = snapshot
-                .reason_preview
-                .as_ref()
-                .is_some_and(|r| r.contains(reason_contains));
+            // Use full_reason (not truncated reason_preview) for reason_contains check
+            let contains = full_reason.is_some_and(|r| r.contains(reason_contains));
             if !contains {
                 return Err(format!(
-                    "Log reason_contains mismatch: expected to contain '{}', got {:?}",
-                    reason_contains, snapshot.reason_preview
+                    "Log reason_contains mismatch: expected to contain '{reason_contains}', got {full_reason:?}"
                 ));
             }
         }
