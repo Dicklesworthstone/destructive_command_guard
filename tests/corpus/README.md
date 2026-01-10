@@ -157,7 +157,7 @@ These invariants must never change without an explicit design review:
 ### 2. Safe-Before-Destructive Pattern Order
 - For any command, **all safe patterns** across all enabled packs are checked first.
 - Only if no safe pattern matches are **destructive patterns** checked.
-- This enables cross-pack whitelisting (e.g., `safe.cleanup` can whitelist `rm -rf target/`).
+
 
 ### 3. Allowlist Bypass Scope
 - Allowlists only bypass the **decision** (deny -> allow), not parsing/normalization.

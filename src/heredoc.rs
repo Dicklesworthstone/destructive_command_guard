@@ -471,26 +471,15 @@ impl ScriptLanguage {
     /// - `env VAR=val python3 -c "code"` → "python3" (skips env vars)
     /// - `bash -c "code"` → "bash"
     fn extract_head_interpreter(cmd: &str) -> Option<String> {
-        let mut parts = cmd.split_whitespace();
+        // Use robust wrapper stripping to handle env flags (e.g. -u, -C) correctly.
+        let normalized = crate::normalize::strip_wrapper_prefixes(cmd);
+        let cmd_to_check = normalized.normalized;
+
+        let mut parts = cmd_to_check.split_whitespace();
         let first = parts.next()?;
 
         // Get basename (strip path)
         let basename = first.rsplit('/').next().unwrap_or(first);
-
-        // If it's "env", skip any flags and get the interpreter
-        if basename == "env" {
-            loop {
-                let next = parts.next()?;
-                // Skip flags (start with -) AND variable assignments (contain =)
-                // Note: this is a heuristic; in theory, a command name could contain =,
-                // but it's very rare for interpreters.
-                if !next.starts_with('-') && !next.contains('=') {
-                    let next_basename = next.rsplit('/').next().unwrap_or(next);
-                    return Some(next_basename.to_string());
-                }
-            }
-        }
-
         Some(basename.to_string())
     }
 }

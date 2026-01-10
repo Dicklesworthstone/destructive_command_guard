@@ -931,15 +931,7 @@ fn extract_shell_command_line(
     }
 
     let words = split_shell_words(candidate);
-    let first = words.first()?.as_str();
-
-    if is_shell_control_line(first) {
-        return None;
-    }
-
-    if is_shell_function_declaration(&words) {
-        return None;
-    }
+    let _first = words.first()?.as_str();
 
     if is_shell_assignment_only(&words) {
         return None;
@@ -953,50 +945,6 @@ fn extract_shell_command_line(
         command: candidate.to_string(),
         metadata: None,
     })
-}
-
-fn is_shell_control_line(first_word: &str) -> bool {
-    matches!(
-        first_word,
-        "if" | "then"
-            | "else"
-            | "elif"
-            | "fi"
-            | "for"
-            | "while"
-            | "until"
-            | "do"
-            | "done"
-            | "case"
-            | "esac"
-            | "{"
-            | "}"
-            | "function"
-    )
-}
-
-fn is_shell_function_declaration(words: &[String]) -> bool {
-    let Some(first) = words.first() else {
-        return false;
-    };
-
-    if first == "function" {
-        return true;
-    }
-
-    if first.ends_with("()") {
-        return true;
-    }
-
-    if words.get(1).is_some_and(|w| w == "()") {
-        return true;
-    }
-
-    if first.contains("()") && words.get(1).is_some_and(|w| w == "{") {
-        return true;
-    }
-
-    false
 }
 
 fn is_shell_assignment_only(words: &[String]) -> bool {
@@ -2796,17 +2744,6 @@ export NOTE="git reset --hard" # also data
 
         assert_eq!(extracted.len(), 1);
         assert!(extracted[0].command.contains("rm -rf"));
-    }
-
-    #[test]
-    fn shell_extractor_skips_function_declaration_with_spaced_parens() {
-        let content = "git_reset () {\n}\n";
-        let extracted = extract_shell_script_from_str("test.sh", content, &["git"]);
-
-        assert!(
-            extracted.is_empty(),
-            "Expected no extracted commands, got: {extracted:?}"
-        );
     }
 
     #[test]

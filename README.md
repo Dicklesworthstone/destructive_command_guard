@@ -139,6 +139,37 @@ Monitoring and observability data is often irreplaceable - logs and metrics capt
 
 - **monitoring.splunk** - Blocks destructive Splunk CLI operations. Splunk indexes can contain years of log data critical for security investigations, compliance audits, and debugging production issues. Protects: `remove index`, `clean eventdata`
 
+### Messaging Packs
+
+Message queues and event streaming platforms are often the backbone of distributed systems. Deleting topics, consumer groups, or records can cause data loss, break event-driven architectures, and disrupt downstream consumers.
+
+- **messaging.kafka** - Blocks destructive Apache Kafka CLI operations. Kafka topics and consumer group offsets represent critical streaming state. Protects: `kafka-topics --delete`, `kafka-consumer-groups --delete`, `kafka-consumer-groups --reset-offsets`, `kafka-delete-records`, `kafka-acls --remove`, `rpk topic delete`
+- **messaging.nats** - Blocks destructive NATS CLI operations including stream deletion, consumer removal, and key-value store purging
+- **messaging.rabbitmq** - Blocks destructive RabbitMQ operations including queue deletion, exchange removal, and vhost deletion via `rabbitmqadmin` and `rabbitmqctl`
+- **messaging.sqs_sns** - Blocks destructive AWS SQS and SNS operations. Message queues often contain unprocessed work that cannot be recovered. Protects: `sqs delete-queue`, `sqs purge-queue`, `sns delete-topic`, `sns unsubscribe`
+
+### Search Engine Packs
+
+Search indexes can take hours or days to rebuild and represent significant computational investment. These packs protect Elasticsearch, OpenSearch, and other search platforms from accidental index deletion or data corruption.
+
+- **search.elasticsearch** - Blocks destructive Elasticsearch REST API operations via curl/httpie. Protects: index deletion (`DELETE /index`), document deletion (`DELETE /_doc`), `_delete_by_query`, index close (`_close`), and cluster settings modifications
+- **search.opensearch** - Blocks destructive OpenSearch operations with patterns similar to Elasticsearch
+- **search.meilisearch** - Blocks destructive Meilisearch REST API operations including index deletion and document clearing
+- **search.algolia** - Blocks destructive Algolia CLI operations including index deletion and clearing
+
+### Backup Packs
+
+Backup systems are the last line of defense against data loss. Accidental deletion of snapshots, pruning of backup data, or removal of encryption keys can make recovery impossible when it's needed most.
+
+- **backup.restic** - Blocks destructive restic operations. Restic is a popular backup tool with powerful but dangerous commands. Protects: `restic forget` (removes snapshots), `restic prune` (removes unreferenced data), `restic key remove` (deletes encryption keys - can make backups unrecoverable), `restic unlock --remove-all`, `restic cache --cleanup`
+
+### Platform Packs
+
+Platform-level operations can have wide-reaching effects across repositories, pipelines, and team workflows.
+
+- **platform.github** - Blocks destructive GitHub CLI (`gh`) operations beyond just CI/CD. Protects: repository deletion, release deletion, deployment deletion, environment deletion, secret/variable deletion, hook deletion
+- **platform.gitlab** - Blocks destructive GitLab CLI (`glab`) operations including project deletion, merge request closure, issue closure, release deletion, and variable deletion
+
 ### Heredoc Packs
 - **heredoc.bash** - Destructive bash operations inside heredocs/inline scripts
 - **heredoc.python** - Destructive Python operations inside heredocs/inline scripts
@@ -338,7 +369,7 @@ Add to `~/.claude/settings.json`:
 
 ## CLI Usage
 
-While primarily designed as a hook, the binary supports direct invocation for testing and debugging:
+While primarily designed as a hook, the binary supports direct invocation for testing, debugging, and understanding why commands are blocked or allowed.
 
 ```bash
 # Show version with build metadata
@@ -350,6 +381,91 @@ dcg --help
 # Test a command manually (pipe JSON to stdin)
 echo '{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}' | dcg
 ```
+
+### Explain Mode
+
+When you need to understand exactly why a command was blocked (or allowed), the `dcg explain` command provides a detailed trace of the decision-making process:
+
+```bash
+# Explain why a command is blocked
+dcg explain "git reset --hard HEAD"
+
+# Explain a safe command
+dcg explain "git status"
+
+# Explain with verbose timing information
+dcg explain --verbose "rm -rf /tmp/build"
+
+# Output as JSON for programmatic use
+dcg explain --format json "kubectl delete namespace production"
+```
+
+**Example Output**:
+
+```
+Command: git reset --hard HEAD
+Normalized: git reset --hard HEAD
+
+Decision: BLOCKED
+  Pack: core.git
+  Rule: reset-hard
+  Reason: git reset --hard destroys uncommitted changes
+
+Evaluation Trace:
+  [  0.8μs] Quick reject: passed (contains 'git')
+  [  2.1μs] Normalize: no changes
+  [  5.3μs] Safe patterns: no match (checked 34 patterns)
+  [ 12.7μs] Destructive patterns: MATCH at pattern 'reset-hard'
+  [ 12.9μs] Total time: 12.9μs
+
+Suggestion: Consider using 'git stash' first to save your changes.
+```
+
+The explain mode shows:
+- **Normalized command**: How dcg sees the command after path normalization
+- **Decision**: Whether the command would be blocked or allowed
+- **Matching rule**: Which pack and pattern triggered the decision
+- **Evaluation trace**: Step-by-step timing of each evaluation stage
+- **Suggestion**: Actionable guidance for safer alternatives
+
+This is invaluable for debugging false positives, understanding pack coverage, and verifying that custom allowlist entries work as expected.
+
+### Allow-Once (Temporary Exceptions)
+
+Sometimes you need to run a blocked command exactly once without permanently modifying your allowlist. The allow-once system provides temporary exceptions with short codes:
+
+```bash
+# When a command is blocked, dcg outputs a short code
+# BLOCKED: git reset --hard HEAD
+# Allow-once code: abc123
+# To allow this once: dcg allow-once abc123
+
+# Use the short code to allow the command temporarily
+dcg allow-once abc123
+
+# The code expires after 24 hours or first use
+# Re-running the same command will be blocked again
+```
+
+**How Allow-Once Works**:
+
+1. When dcg blocks a command, it generates a unique 6-character short code
+2. The code is tied to the exact command that was blocked
+3. Running `dcg allow-once <code>` creates a temporary exception
+4. The exception is stored in `~/.config/dcg/pending_exceptions.jsonl`
+5. Exceptions expire after 24 hours or after first use (whichever comes first)
+6. The next invocation of the same command will be allowed once
+
+This workflow is useful for:
+- One-time administrative operations that are intentionally destructive
+- Migration scripts that need to reset state
+- Emergency fixes where permanent allowlist changes aren't appropriate
+
+**Security Considerations**:
+- Short codes are cryptographically random (collision-resistant)
+- Codes are never logged or transmitted
+- The pending exceptions file is readable only by the current user
+- Expired codes are automatically cleaned up
 
 The `--version` output includes build metadata for debugging:
 
@@ -695,6 +811,60 @@ This dual-output design ensures the hook protocol works correctly while still pr
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+### Context Classification System
+
+Not every occurrence of a dangerous pattern is actually dangerous. The string `git reset --hard` appearing in a comment, a heredoc body, or a quoted string is fundamentally different from the same string appearing as an executed command. dcg uses a sophisticated context classification system to reduce false positives without compromising safety.
+
+**SpanKind Classification**
+
+Every token in a command is classified into one of these categories:
+
+| SpanKind | Description | Treatment |
+|----------|-------------|-----------|
+| `Executed` | Command words and unquoted arguments | **MUST check** - highest priority |
+| `InlineCode` | Content inside `-c`/`-e` flags (bash -c, python -c) | **MUST check** - code will be executed |
+| `Argument` | Quoted arguments to known-safe commands | Lower priority, context-dependent |
+| `Data` | Single-quoted strings (shell cannot interpolate) | **Can skip** - treated as literal data |
+| `HeredocBody` | Content inside heredocs | Escalated to Tier 2/3 heredoc scanning |
+| `Comment` | Shell comments (`# ...`) | **Skip** - never executed |
+| `Unknown` | Cannot determine context | Conservative treatment as `Executed` |
+
+**Why Context Matters**
+
+Consider these commands:
+
+```bash
+# Safe: the dangerous pattern is in a comment
+echo "Reminder: never run git reset --hard"   # git reset --hard destroys changes
+
+# Safe: the dangerous pattern is data being searched for
+grep "git reset --hard" documentation.md
+
+# Safe: the dangerous pattern is in a heredoc being written to a file
+cat <<EOF > safety_guide.md
+Warning: git reset --hard destroys uncommitted changes
+EOF
+
+# DANGEROUS: the pattern will be executed
+git reset --hard HEAD
+
+# DANGEROUS: the pattern is passed to bash -c for execution
+bash -c "git reset --hard"
+```
+
+Without context classification, the first three examples would trigger false positives. The context classifier analyzes the AST (abstract syntax tree) structure to understand where patterns appear and only flags genuinely dangerous occurrences.
+
+**Implementation Details**
+
+The context classifier uses a multi-pass approach:
+
+1. **Lexical Analysis**: Identify quoted strings, comments, and heredoc markers
+2. **Structural Analysis**: Build a tree of command structure, identifying pipes, subshells, and command substitutions
+3. **Flag Analysis**: Detect `-c`, `-e`, and similar flags that introduce inline code contexts
+4. **Span Annotation**: Tag each character range with its SpanKind
+
+This approach achieves a significant reduction in false positives while maintaining the zero-false-negatives philosophy for actual command execution.
+
 ### Processing Pipeline
 
 **Stage 1: JSON Parsing**
@@ -987,7 +1157,21 @@ Tip: If you need to run this command, execute it manually in a terminal.
 ════════════════════════════════════════════════════════════════════════
 ```
 
-The hook provides **contextual suggestions** based on the command type:
+### Suggestion System
+
+dcg doesn't just block commands—it provides actionable guidance to help users make safer choices. The suggestion system generates context-aware recommendations based on the specific command that was blocked.
+
+**Suggestion Categories**:
+
+| Category | Purpose | Example |
+|----------|---------|---------|
+| `PreviewFirst` | Run a dry-run/preview command first | "Run `git clean -n` first to preview deletions" |
+| `SaferAlternative` | Use a safer command that achieves similar goals | "Use `--force-with-lease` instead of `--force`" |
+| `WorkflowFix` | Fix the workflow to avoid the dangerous operation | "Commit your changes before resetting" |
+| `Documentation` | Link to relevant documentation | "See `man git-reset` for reset options" |
+| `AllowSafely` | How to allowlist if the operation is intentional | "Add to allowlist: `dcg allowlist add core.git:reset-hard`" |
+
+**Contextual Suggestions by Command Type**:
 
 | Command Type | Suggestion |
 |-------------|------------|
@@ -995,6 +1179,24 @@ The hook provides **contextual suggestions** based on the command type:
 | `git clean` | "Use 'git clean -n' first to preview what would be deleted." |
 | `git push --force` | "Consider using '--force-with-lease' for safer force pushing." |
 | `rm -rf` | "Verify the path carefully before running rm -rf manually." |
+| `kubectl delete` | "Use `kubectl delete --dry-run=client` to preview deletions." |
+| `docker system prune` | "Run with `--dry-run` first to see what would be removed." |
+| `DROP TABLE` | "Consider `TRUNCATE` if you only need to remove data, not the schema." |
+
+**Custom Suggestions in Packs**:
+
+Each destructive pattern can specify its own suggestion tailored to the specific operation:
+
+```rust
+destructive_pattern!(
+    "restic-forget",
+    r"restic(?:\s+--?\S+(?:\s+\S+)?)*\s+forget\b",
+    "restic forget removes snapshots and can permanently delete backup data.",
+    suggestion: "Run 'restic snapshots' first to review what would be affected."
+)
+```
+
+This approach ensures that suggestions are always relevant to the specific context, not generic warnings.
 
 Simultaneously, the hook outputs JSON to stdout for the Claude Code protocol:
 

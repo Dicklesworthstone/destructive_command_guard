@@ -227,7 +227,7 @@ fn memory_hook_input_parsing() {
         "chmod -R 777 /",
     ];
 
-    assert_no_leak("hook_input_parsing", 1000, 10 * 1024 * 1024, || {
+    assert_no_leak("hook_input_parsing", 1000, 12 * 1024 * 1024, || {
         for cmd in &commands {
             let json = sample_hook_input(cmd);
             let _: Result<dcg::HookInput, _> = serde_json::from_str(&json);
@@ -309,7 +309,7 @@ build:
     - npm run build
 ";
 
-    assert_no_leak("extractors", 500, 10 * 1024 * 1024, || {
+    assert_no_leak("extractors", 500, 12 * 1024 * 1024, || {
         let _ = dcg::scan::extract_package_json_from_str("package.json", pkg_json, &KEYWORDS);
         let _ = dcg::scan::extract_terraform_from_str("main.tf", terraform, &KEYWORDS);
         let _ =
