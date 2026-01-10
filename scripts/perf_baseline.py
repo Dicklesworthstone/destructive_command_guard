@@ -117,20 +117,27 @@ def capture_git_sha() -> Optional[str]:
 
 
 def capture_trace(bin_path: str, command: str) -> Optional[Dict[str, Any]]:
+    """Run command with trace logging and capture the output."""
+    env = os.environ.copy()
+    env["DCG_TRACE"] = "1"
+    
     try:
         result = subprocess.run(
             [bin_path, "explain", command, "--format", "json"],
             capture_output=True,
             text=True,
             check=False,
+            env=env
         )
         if result.returncode != 0:
             return None
-        payload = json.loads(result.stdout)
-        trace = payload.get("trace") or payload.get("trace_output")
-        if not trace:
+            
+        try:
+            payload = json.loads(result.stdout)
+            return payload.get("trace")
+        except json.JSONDecodeError:
             return None
-        return trace
+            
     except Exception:
         return None
 
