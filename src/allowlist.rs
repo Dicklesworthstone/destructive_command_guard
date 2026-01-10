@@ -312,8 +312,9 @@ pub fn is_expired(entry: &AllowEntry) -> bool {
         return end_of_day < chrono::Utc::now();
     }
 
-    // Invalid timestamp format - treat as not expired (fail open)
-    false
+    // Invalid timestamp format - treat as expired (fail closed) for safety.
+    // This prevents typos like "2025/01/01" from accidentally creating permanent allowlists.
+    true
 }
 
 /// Check if all conditions on an allowlist entry are satisfied.
@@ -358,6 +359,48 @@ pub const fn has_required_risk_ack(entry: &AllowEntry) -> bool {
 #[must_use]
 pub fn is_entry_valid(entry: &AllowEntry) -> bool {
     !is_expired(entry) && conditions_met(entry) && has_required_risk_ack(entry)
+}
+
+/// Validate and optionally warn about expiration date format.
+/// Returns Ok(()) if valid or parseable, Err with message if completely invalid.
+///
+/// # Errors
+///
+/// Returns an error if the timestamp is not in a valid ISO 8601 format.
+pub fn validate_expiration_date(timestamp: &str) -> Result<(), String> {
+    // Try RFC 3339 first (e.g., "2030-01-01T00:00:00Z" or "2030-01-01T00:00:00+00:00")
+    if chrono::DateTime::parse_from_rfc3339(timestamp).is_ok() {
+        return Ok(());
+    }
+    // Try ISO 8601 without timezone
+    if chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S").is_ok() {
+        return Ok(());
+    }
+    // Try date only (YYYY-MM-DD) - treat as midnight UTC
+    if chrono::NaiveDate::parse_from_str(timestamp, "%Y-%m-%d").is_ok() {
+        return Ok(());
+    }
+    Err(format!(
+        "Invalid expiration date format: '{timestamp}'. \
+         Expected ISO 8601 format (e.g., '2030-01-01', '2030-01-01T00:00:00Z')"
+    ))
+}
+
+/// Validate condition format (KEY=VALUE).
+///
+/// # Errors
+///
+/// Returns an error if the condition is not in KEY=VALUE format.
+pub fn validate_condition(condition: &str) -> Result<(), String> {
+    if condition.contains('=') {
+        let parts: Vec<&str> = condition.splitn(2, '=').collect();
+        if parts.len() == 2 && !parts[0].trim().is_empty() {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "Invalid condition format: '{condition}'. Expected KEY=VALUE format (e.g., 'CI=true')"
+    ))
 }
 
 /// Load allowlist files using the default locations.
@@ -544,6 +587,10 @@ fn parse_allow_entry(tbl: &toml::value::Table) -> Result<AllowEntry, String> {
     let added_at = get_timestamp_string(tbl, "added_at");
     let expires_at = get_timestamp_string(tbl, "expires_at");
 
+    if let Some(ref exp) = expires_at {
+        validate_expiration_date(exp)?;
+    }
+
     let context = get_string(tbl, "context");
 
     let risk_acknowledged = tbl
@@ -708,6 +755,24 @@ mod tests {
     }
 
     #[test]
+    fn invalid_expiration_date_is_flagged() {
+        let toml = r#"
+            [[allow]]
+            rule = "core.git:reset-hard"
+            reason = "test"
+            expires_at = "not-a-date"
+        "#;
+        let file = parse_allowlist_toml(AllowlistLayer::Project, Path::new("dummy"), toml);
+        assert!(file.entries.is_empty());
+        assert_eq!(file.errors.len(), 1);
+        assert!(
+            file.errors[0]
+                .message
+                .contains("Invalid expiration date format")
+        );
+    }
+
+    #[test]
     fn precedence_project_over_user_for_rule_lookup() {
         let rule = RuleId::parse("core.git:reset-hard").unwrap();
 
@@ -851,11 +916,11 @@ mod tests {
     }
 
     #[test]
-    fn entry_with_invalid_timestamp_is_not_expired() {
-        // Invalid formats should fail open (treat as not expired)
+    fn entry_with_invalid_timestamp_is_expired() {
+        // Invalid formats should fail closed (treat as expired)
         let mut entry = make_test_entry();
         entry.expires_at = Some("not-a-date".to_string());
-        assert!(!is_expired(&entry));
+        assert!(is_expired(&entry));
     }
 
     #[test]
@@ -1029,5 +1094,45 @@ mod tests {
 
         // Should not match because the condition is not met
         assert!(allowlists.match_rule("core.git", "reset-hard").is_none());
+    }
+
+    #[test]
+    fn test_validate_expiration_date_valid_formats() {
+        // RFC 3339 with Z
+        assert!(validate_expiration_date("2030-01-01T00:00:00Z").is_ok());
+        // RFC 3339 with offset
+        assert!(validate_expiration_date("2030-01-01T00:00:00+00:00").is_ok());
+        // ISO 8601 without timezone
+        assert!(validate_expiration_date("2030-01-01T00:00:00").is_ok());
+        // Date only
+        assert!(validate_expiration_date("2030-01-01").is_ok());
+    }
+
+    #[test]
+    fn test_validate_expiration_date_invalid_formats() {
+        // Not a date
+        assert!(validate_expiration_date("not-a-date").is_err());
+        // Wrong format
+        assert!(validate_expiration_date("01/01/2030").is_err());
+        // Empty
+        assert!(validate_expiration_date("").is_err());
+    }
+
+    #[test]
+    fn test_validate_condition_valid() {
+        assert!(validate_condition("CI=true").is_ok());
+        assert!(validate_condition("ENV=production").is_ok());
+        assert!(validate_condition("KEY=value with spaces").is_ok());
+        assert!(validate_condition("EMPTY=").is_ok()); // empty value is OK
+    }
+
+    #[test]
+    fn test_validate_condition_invalid() {
+        // No equals sign
+        assert!(validate_condition("invalid").is_err());
+        // Empty key
+        assert!(validate_condition("=value").is_err());
+        // Just equals
+        assert!(validate_condition("=").is_err());
     }
 }

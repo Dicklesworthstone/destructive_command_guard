@@ -25,6 +25,11 @@ pub mod safe;
 pub mod strict_git;
 pub mod system;
 
+// Testing infrastructure
+pub mod test_helpers;
+#[cfg(test)]
+mod test_template;
+
 use fancy_regex::Regex;
 use memchr::memmem;
 use std::borrow::Cow;

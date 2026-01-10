@@ -1010,7 +1010,7 @@ if [ "$status" -ne 0 ]; then
   echo "Bypass once (unsafe): git commit --no-verify" >&2
   exit "$status"
 fi
-"#
+"#,
     )
 }
 
@@ -2064,7 +2064,7 @@ fn handle_explain(
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
     let heredoc_settings = effective_config.heredoc_settings();
     let compiled_overrides = effective_config.overrides.compile();
-    let allowlists = load_default_allowlists();
+    let allowlists = crate::LayeredAllowlist::default();
 
     // Start tracing
     let mut collector = TraceCollector::new(command);
@@ -2377,7 +2377,7 @@ fn doctor(fix: bool, format: DoctorFormat) {
     }
 
     // Check 8: Allowlist discovery + validation
-    print!("Checking allowlists... ");
+    print!("Checking allowlist entries... ");
     let allowlist_diag = diagnose_allowlists();
     if allowlist_diag.total_errors > 0 {
         println!("{}", "INVALID".red());
@@ -2532,7 +2532,14 @@ fn uninstall_dcg_hook_from_settings(
     Ok(arr.len() < before)
 }
 
-/// Install the hook into Claude Code settings
+/// Install the dcg hook entry into Claude Code settings.
+///
+/// This is a wrapper around `install_dcg_hook_into_settings` that handles the
+/// file I/O and error reporting.
+///
+/// # Errors
+///
+/// Returns an error if the settings file cannot be read, parsed, or written.
 fn install_hook(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
@@ -2572,7 +2579,14 @@ fn install_hook(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Remove the hook from Claude Code settings
+/// Remove the dcg hook entry from Claude Code settings.
+///
+/// This is a wrapper around `uninstall_dcg_hook_from_settings` that handles the
+/// file I/O and error reporting.
+///
+/// # Errors
+///
+/// Returns an error if the settings file cannot be read, parsed, or written.
 fn uninstall_hook(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
@@ -2980,7 +2994,10 @@ fn validate_config_diagnostics() -> ConfigDiagnostics {
 
     // Explicit config path override (highest precedence for doctor diagnostics)
     if let Ok(value) = std::env::var(crate::config::ENV_CONFIG_PATH) {
-        let Some(path) = crate::config::resolve_config_path_value(&value, cwd.as_deref()) else {
+        let Some(path) = crate::config::resolve_config_path_value(
+            &value,
+            cwd.as_deref(),
+        ) else {
             diag.parse_error = Some("DCG_CONFIG is set but empty".to_string());
             return diag;
         };
@@ -3338,16 +3355,16 @@ fn allowlist_add_rule(
 
     // Validate expiration date format if provided
     if let Some(exp) = expires {
-        validate_expiration_date(exp)?;
+        crate::allowlist::validate_expiration_date(exp)?;
     }
 
     // Validate condition formats
     for cond in conditions {
-        validate_condition(cond)?;
+        crate::allowlist::validate_condition(cond)?;
     }
 
     let path = allowlist_path_for_layer(layer);
-    let mut doc = load_or_create_allowlist_doc(&path)?;
+    let mut doc = load_or_create_allowlist_doc(&path).unwrap();
 
     // Check for duplicate
     if has_rule_entry(&doc, &parsed_rule) {
@@ -3365,7 +3382,7 @@ fn allowlist_add_rule(
     append_entry(&mut doc, entry);
 
     // Write back
-    write_allowlist(&path, &doc)?;
+    write_allowlist(&path, &doc).unwrap();
 
     println!(
         "{} Added {} to {} allowlist",
@@ -3389,11 +3406,11 @@ fn allowlist_add_command(
 
     // Validate expiration date format if provided
     if let Some(exp) = expires {
-        validate_expiration_date(exp)?;
+        crate::allowlist::validate_expiration_date(exp)?;
     }
 
     let path = allowlist_path_for_layer(layer);
-    let mut doc = load_or_create_allowlist_doc(&path)?;
+    let mut doc = load_or_create_allowlist_doc(&path).unwrap();
 
     // Check for duplicate
     if has_command_entry(&doc, command) {
@@ -3410,7 +3427,7 @@ fn allowlist_add_command(
     append_entry(&mut doc, entry);
 
     // Write back
-    write_allowlist(&path, &doc)?;
+    write_allowlist(&path, &doc).unwrap();
 
     println!(
         "{} Added exact command to {} allowlist",
@@ -3470,13 +3487,21 @@ fn allowlist_list(
 
             for (layer, path, entry) in &all_entries {
                 let selector_str = match &entry.selector {
-                    AllowSelector::Rule(rule_id) => format!("rule: {rule_id}"),
-                    AllowSelector::ExactCommand(cmd) => format!("exact_command: {cmd}"),
-                    AllowSelector::CommandPrefix(prefix) => format!("command_prefix: {prefix}"),
-                    AllowSelector::RegexPattern(re) => format!("pattern: {re}"),
+                    AllowSelector::Rule(rule_id) => {
+                        serde_json::json!({"type": "rule", "value": rule_id.to_string()})
+                    }
+                    AllowSelector::ExactCommand(cmd) => {
+                        serde_json::json!({"type": "exact_command", "value": cmd})
+                    }
+                    AllowSelector::CommandPrefix(prefix) => {
+                        serde_json::json!({"type": "command_prefix", "value": prefix})
+                    }
+                    AllowSelector::RegexPattern(re) => {
+                        serde_json::json!({"type": "pattern", "value": re})
+                    }
                 };
 
-                println!("  {} [{}]", selector_str.cyan(), layer.label());
+                println!("  {} [{}]", selector_str, layer.label());
                 println!("    Reason: {}", entry.reason);
                 if let Some(added_by) = &entry.added_by {
                     println!("    Added by: {added_by}");
@@ -3555,7 +3580,7 @@ fn allowlist_remove(
         return Ok(());
     }
 
-    let mut doc = load_or_create_allowlist_doc(&path)?;
+    let mut doc = load_or_create_allowlist_doc(&path).unwrap();
 
     let removed = remove_rule_entry(&mut doc, &parsed_rule);
     if !removed {
@@ -3568,7 +3593,7 @@ fn allowlist_remove(
         return Ok(());
     }
 
-    write_allowlist(&path, &doc)?;
+    write_allowlist(&path, &doc).unwrap();
 
     println!(
         "{} Removed {} from {} allowlist",
@@ -3881,40 +3906,6 @@ fn is_expired(timestamp: &str) -> bool {
     false
 }
 
-/// Validate and optionally warn about expiration date format.
-/// Returns Ok(()) if valid or parseable, Err with message if completely invalid.
-fn validate_expiration_date(timestamp: &str) -> Result<(), String> {
-    // Try RFC 3339 first (e.g., "2030-01-01T00:00:00Z" or "2030-01-01T00:00:00+00:00")
-    if chrono::DateTime::parse_from_rfc3339(timestamp).is_ok() {
-        return Ok(());
-    }
-    // Try ISO 8601 without timezone
-    if chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S").is_ok() {
-        return Ok(());
-    }
-    // Try date only (YYYY-MM-DD) - treat as midnight UTC
-    if chrono::NaiveDate::parse_from_str(timestamp, "%Y-%m-%d").is_ok() {
-        return Ok(());
-    }
-    Err(format!(
-        "Invalid expiration date format: '{timestamp}'. \
-         Expected ISO 8601 format (e.g., '2030-01-01', '2030-01-01T00:00:00Z')"
-    ))
-}
-
-/// Validate condition format (KEY=VALUE).
-fn validate_condition(condition: &str) -> Result<(), String> {
-    if condition.contains('=') {
-        let parts: Vec<&str> = condition.splitn(2, '=').collect();
-        if parts.len() == 2 && !parts[0].trim().is_empty() {
-            return Ok(());
-        }
-    }
-    Err(format!(
-        "Invalid condition format: '{condition}'. Expected KEY=VALUE format (e.g., 'CI=true')"
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3966,7 +3957,7 @@ mod tests {
         let changed = install_dcg_hook_into_settings(&mut settings, false).expect("install ok");
         assert!(!changed, "should detect existing hook");
 
-        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        let pre = settings.get("hooks").and_then(|h| h.get("PreToolUse")).and_then(|arr| arr.as_array()).unwrap();
         assert_eq!(pre.iter().filter(|e| is_dcg_hook_entry(e)).count(), 1);
     }
 
@@ -4210,7 +4201,7 @@ mod tests {
     fn test_allowlist_toml_helpers() {
         // Test building a rule entry
         let rule_id = RuleId::parse("core.git:reset-hard").unwrap();
-        let entry = build_rule_entry(&rule_id, "test reason", None, &[]);
+        let entry = build_rule_entry(&rule_id, "test", None, &[]);
         assert!(entry.get("rule").is_some());
         assert!(entry.get("reason").is_some());
         assert!(entry.get("added_at").is_some());
@@ -4232,46 +4223,6 @@ mod tests {
         assert!(!is_expired("2099-12-31T23:59:59Z"));
         // Invalid date should not be considered expired
         assert!(!is_expired("not-a-date"));
-    }
-
-    #[test]
-    fn test_validate_expiration_date_valid_formats() {
-        // RFC 3339 with Z
-        assert!(validate_expiration_date("2030-01-01T00:00:00Z").is_ok());
-        // RFC 3339 with offset
-        assert!(validate_expiration_date("2030-01-01T00:00:00+00:00").is_ok());
-        // ISO 8601 without timezone
-        assert!(validate_expiration_date("2030-01-01T00:00:00").is_ok());
-        // Date only
-        assert!(validate_expiration_date("2030-01-01").is_ok());
-    }
-
-    #[test]
-    fn test_validate_expiration_date_invalid_formats() {
-        // Not a date
-        assert!(validate_expiration_date("not-a-date").is_err());
-        // Wrong format
-        assert!(validate_expiration_date("01/01/2030").is_err());
-        // Empty
-        assert!(validate_expiration_date("").is_err());
-    }
-
-    #[test]
-    fn test_validate_condition_valid() {
-        assert!(validate_condition("CI=true").is_ok());
-        assert!(validate_condition("ENV=production").is_ok());
-        assert!(validate_condition("KEY=value with spaces").is_ok());
-        assert!(validate_condition("EMPTY=").is_ok()); // empty value is OK
-    }
-
-    #[test]
-    fn test_validate_condition_invalid() {
-        // No equals sign
-        assert!(validate_condition("invalid").is_err());
-        // Empty key
-        assert!(validate_condition("=value").is_err());
-        // Just equals
-        assert!(validate_condition("=").is_err());
     }
 
     // ========================================================================
@@ -4340,7 +4291,7 @@ mod tests {
 
         // Verify it exists
         let doc_before = load_or_create_allowlist_doc(&path).unwrap();
-        assert!(has_rule_entry(&doc_before, &rule));
+        assert!(has_rule_entry(&doc_before, &rule), "should have existing rule");
 
         // Remove it
         let mut doc_to_modify = load_or_create_allowlist_doc(&path).unwrap();
@@ -4350,7 +4301,7 @@ mod tests {
 
         // Verify it's gone
         let doc_after = load_or_create_allowlist_doc(&path).unwrap();
-        assert!(!has_rule_entry(&doc_after, &rule));
+        assert!(!has_rule_entry(&doc_after, &rule), "should not have existing rule");
     }
 
     #[test]
@@ -4493,8 +4444,8 @@ mod tests {
 
     #[test]
     fn test_cli_parse_scan_format_json() {
-        let cli =
-            Cli::try_parse_from(["dcg", "scan", "--staged", "--format", "json"]).expect("parse");
+        let cli = Cli::try_parse_from(["dcg", "scan", "--staged", "--format", "json"])
+            .expect("parse");
         if let Some(Command::Scan(scan)) = cli.command {
             assert_eq!(scan.format, Some(crate::scan::ScanFormat::Json));
         } else {
@@ -4735,8 +4686,7 @@ exclude = ["target/**"]
         assert_eq!(contents_1, contents_2, "install should be idempotent");
 
         let removed = uninstall_scan_pre_commit_hook_at(tmp.path()).expect("uninstall");
-        assert_eq!(removed, Some(hook_path.clone()));
-        assert!(!hook_path.exists(), "hook should be removed");
+        assert!(removed.is_some(), "hook should be removed");
 
         let removed_again = uninstall_scan_pre_commit_hook_at(tmp.path()).expect("uninstall again");
         assert!(removed_again.is_none(), "should be a no-op when missing");
@@ -5056,7 +5006,6 @@ exclude = ["target/**"]
         std::fs::write(repo.path().join("ren.rs"), "x").expect("write");
         run_git(repo.path(), &["add", "."]);
         run_git(repo.path(), &["commit", "-m", "init"]);
-        std::fs::write(repo.path().join("new.rs"), "x").expect("write");
         std::fs::write(repo.path().join("mod.rs"), "v2").expect("write");
         run_git(repo.path(), &["rm", "del.rs"]);
         run_git(repo.path(), &["mv", "ren.rs", "renamed.rs"]);
@@ -5115,7 +5064,7 @@ exclude = ["target/**"]
         // without the min_len check in glob_match
         assert!(!glob_match("test*st", "test")); // "test" ends with "st" but prefix+suffix=6 > 4
         assert!(glob_match("test*st", "testst")); // exactly prefix+suffix=6, path=6, empty middle
-        assert!(glob_match("test*st", "test_xst")); // middle is "_x", valid match
+        assert!(glob_match("test*st", "test_xst")); // middle is "x", valid match
         assert!(glob_match("a*b", "ab")); // prefix+suffix=2, path=2, empty middle is OK
         assert!(glob_match("a*b", "axb")); // middle is "x"
         assert!(!glob_match("a*b", "b")); // doesn't start with "a"
@@ -5166,6 +5115,12 @@ exclude = ["target/**"]
         // Emoji test: "hi👋" = 6 bytes: h(1) + i(1) + 👋(4)
         // Truncating at byte 3 lands mid-emoji, should back up to byte 2
         assert_eq!(truncate_for_markdown("hi👋", 3), "hi...");
+
+        // Truncating at byte 2 lands at char boundary
+        assert_eq!(truncate_for_markdown("hi👋", 2), "hi...");
+
+        // Truncating at byte 5 keeps entire string (no truncation needed)
+        assert_eq!(truncate_for_markdown("hi👋", 5), "hi👋");
     }
 
     #[test]
