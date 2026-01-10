@@ -20,12 +20,13 @@ pub mod database;
 pub mod infrastructure;
 pub mod kubernetes;
 pub mod messaging;
-pub mod package_managers;
-pub mod secrets;
-pub mod platform;
 pub mod monitoring;
+pub mod package_managers;
+pub mod platform;
 pub mod regex_engine;
 pub mod safe;
+pub mod search;
+pub mod secrets;
 pub mod strict_git;
 pub mod system;
 
@@ -479,9 +480,13 @@ pub struct PackRegistry {
 
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 36] = [
+static PACK_ENTRIES: [PackEntry; 41] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
-    PackEntry::new("core.filesystem", &["rm", "/rm"], core::filesystem::create_pack),
+    PackEntry::new(
+        "core.filesystem",
+        &["rm", "/rm"],
+        core::filesystem::create_pack,
+    ),
     PackEntry::new(
         "cicd.github_actions",
         &["gh"],
@@ -497,11 +502,7 @@ static PACK_ENTRIES: [PackEntry; 36] = [
         &["jenkins-cli", "jenkins", "doDelete"],
         cicd::jenkins::create_pack,
     ),
-    PackEntry::new(
-        "cicd.circleci",
-        &["circleci"],
-        cicd::circleci::create_pack,
-    ),
+    PackEntry::new("cicd.circleci", &["circleci"], cicd::circleci::create_pack),
     PackEntry::new("secrets.vault", &["vault"], secrets::vault::create_pack),
     PackEntry::new(
         "secrets.aws_secrets",
@@ -518,11 +519,7 @@ static PACK_ENTRIES: [PackEntry; 36] = [
         &["doppler"],
         secrets::doppler::create_pack,
     ),
-    PackEntry::new(
-        "platform.github",
-        &["gh"],
-        platform::github::create_pack,
-    ),
+    PackEntry::new("platform.github", &["gh"], platform::github::create_pack),
     PackEntry::new(
         "platform.gitlab",
         &["glab", "gitlab-rails", "gitlab-rake"],
@@ -544,6 +541,49 @@ static PACK_ENTRIES: [PackEntry; 36] = [
             "rpk",
         ],
         messaging::kafka::create_pack,
+    ),
+    PackEntry::new(
+        "messaging.rabbitmq",
+        &["rabbitmqadmin", "rabbitmqctl"],
+        messaging::rabbitmq::create_pack,
+    ),
+    PackEntry::new(
+        "search.elasticsearch",
+        &[
+            "elasticsearch",
+            "9200",
+            "_search",
+            "_cluster",
+            "_cat",
+            "_doc",
+            "_all",
+            "_delete_by_query",
+        ],
+        search::elasticsearch::create_pack,
+    ),
+    PackEntry::new(
+        "search.opensearch",
+        &[
+            "opensearch",
+            "9200",
+            "_search",
+            "_cluster",
+            "_cat",
+            "_doc",
+            "_all",
+            "_delete_by_query",
+        ],
+        search::opensearch::create_pack,
+    ),
+    PackEntry::new(
+        "search.algolia",
+        &["algolia", "algoliasearch"],
+        search::algolia::create_pack,
+    ),
+    PackEntry::new(
+        "search.meilisearch",
+        &["meili", "meilisearch", "7700", "/indexes", "/keys"],
+        search::meilisearch::create_pack,
     ),
     PackEntry::new(
         "database.postgresql",
@@ -779,7 +819,7 @@ impl PackRegistry {
     /// 4. **Tier 4 (cloud)**: `cloud.*` - aws, gcp, azure
     /// 5. **Tier 5 (kubernetes)**: `kubernetes.*` - kubectl, helm, kustomize
     /// 6. **Tier 6 (containers)**: `containers.*` - docker, compose, podman
-    /// 7. **Tier 7 (database)**: `database.*` - postgresql, mysql, etc.
+    /// 7. **Tier 7 (database/search/messaging)**: `database.*`, `search.*`, `messaging.*`
     /// 8. **Tier 8 (`package_managers`)**: package manager protections
     /// 9. **Tier 9 (`strict_git`)**: extra git paranoia
     ///
@@ -818,11 +858,11 @@ impl PackRegistry {
             "cloud" | "platform" => 4,
             "kubernetes" => 5,
             "containers" => 6,
-            "database" | "messaging" => 7,
+            "database" | "messaging" | "search" => 7,
             "package_managers" => 8,
             "strict_git" => 9,
             "cicd" | "secrets" | "monitoring" => 10, // CI/CD + secrets + monitoring tooling
-            _ => 11,      // Unknown categories go last
+            _ => 11,                                 // Unknown categories go last
         }
     }
 
@@ -1079,8 +1119,13 @@ fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
 
         match b {
             b'\\' => {
-                // Skip escaped byte. This is conservative for UTF-8.
-                i = (i + 2).min(len);
+                // Handle CRLF escape (consumes 3 bytes: \, \r, \n)
+                if i + 2 < len && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
+                    i += 3;
+                } else {
+                    // Skip escaped byte. This is conservative for UTF-8.
+                    i = (i + 2).min(len);
+                }
             }
             b'\'' => {
                 // Single-quoted segment (no escapes)
@@ -1376,8 +1421,12 @@ fn normalize_command_word_token(token: &str) -> Option<String> {
 /// "dangerous substring" matches in data contexts.
 #[must_use]
 fn dequote_segment_command_words(command: &str) -> Cow<'_, str> {
-    // Fast path: most commands contain no quotes.
-    if !command.as_bytes().iter().any(|b| matches!(b, b'\'' | b'"')) {
+    // Fast path: most commands contain no quotes or backslashes.
+    if !command
+        .as_bytes()
+        .iter()
+        .any(|b| matches!(b, b'\'' | b'"' | b'\\'))
+    {
         return Cow::Borrowed(command);
     }
 
@@ -1388,11 +1437,13 @@ fn dequote_segment_command_words(command: &str) -> Cow<'_, str> {
 
     let mut replacements: Vec<(Range<usize>, String)> = Vec::new();
     let mut segment_has_cmd = false;
+    let mut current_cmd_word: Option<String> = None;
     let mut wrapper: NormalizeWrapper = NormalizeWrapper::None;
 
     for token in &tokens {
         if token.kind == NormalizeTokenKind::Separator {
             segment_has_cmd = false;
+            current_cmd_word = None;
             wrapper = NormalizeWrapper::None;
             continue;
         }
@@ -1403,6 +1454,17 @@ fn dequote_segment_command_words(command: &str) -> Cow<'_, str> {
         };
 
         if segment_has_cmd {
+            // Check if we should skip dequoting for this command
+            if let Some(cmd) = &current_cmd_word {
+                if crate::context::SAFE_STRING_REGISTRY.is_all_args_data(cmd) {
+                    continue;
+                }
+            }
+
+            // Also normalize arguments that are simple quoted strings (e.g. git "reset" -> git reset)
+            if let Some(replacement) = normalize_command_word_token(token_text) {
+                replacements.push((token.byte_range.clone(), replacement));
+            }
             continue;
         }
 
@@ -1439,8 +1501,12 @@ fn dequote_segment_command_words(command: &str) -> Cow<'_, str> {
         // Found the segment's command word.
         segment_has_cmd = true;
 
-        if let Some(replacement) = normalize_command_word_token(current) {
-            replacements.push((token.byte_range.clone(), replacement));
+        let replacement = normalize_command_word_token(current);
+        // Track the normalized command word for safe registry checks
+        current_cmd_word = Some(replacement.clone().unwrap_or_else(|| current.to_string()));
+
+        if let Some(repl) = replacement {
+            replacements.push((token.byte_range.clone(), repl));
         }
     }
 
@@ -1482,17 +1548,13 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
 
             // 3. Strip paths
             match dequoted {
-                Cow::Borrowed(base) => {
-                    PATH_NORMALIZER
-                        .try_replacen(base, 1, "$1")
-                        .unwrap_or(Cow::Borrowed(base))
-                }
-                Cow::Owned(base) => {
-                    match PATH_NORMALIZER.try_replacen(&base, 1, "$1") {
-                        Ok(Cow::Owned(replaced)) => Cow::Owned(replaced),
-                        Ok(Cow::Borrowed(_)) | Err(_) => Cow::Owned(base),
-                    }
-                }
+                Cow::Borrowed(base) => PATH_NORMALIZER
+                    .try_replacen(base, 1, "$1")
+                    .unwrap_or(Cow::Borrowed(base)),
+                Cow::Owned(base) => match PATH_NORMALIZER.try_replacen(&base, 1, "$1") {
+                    Ok(Cow::Owned(replaced)) => Cow::Owned(replaced),
+                    Ok(Cow::Borrowed(_)) | Err(_) => Cow::Owned(base),
+                },
             }
         }
         Cow::Owned(local_string) => {
@@ -1787,6 +1849,7 @@ mod tests {
         // Database should be tier 7
         assert_eq!(PackRegistry::pack_tier("database.postgresql"), 7);
         assert_eq!(PackRegistry::pack_tier("messaging.kafka"), 7);
+        assert_eq!(PackRegistry::pack_tier("search.elasticsearch"), 7);
 
         // Package managers should be tier 8
         assert_eq!(PackRegistry::pack_tier("package_managers"), 8);
@@ -2298,8 +2361,6 @@ mod tests {
         }
     }
 
-
-
     mod normalization_tests {
         use super::*;
 
@@ -2400,7 +2461,8 @@ mod tests {
         }
 
         #[test]
-        fn does_not_strip_quotes_from_arguments() {
+        fn preserves_quotes_for_safe_commands() {
+            // Safe commands like echo should preserve argument quotes to avoid false positives
             assert_eq!(
                 normalize_command("echo \"rm\" -rf /etc"),
                 "echo \"rm\" -rf /etc"
@@ -2418,6 +2480,15 @@ mod tests {
         #[test]
         fn strips_quotes_inside_subshell_segments() {
             assert_eq!(normalize_command("( \"rm\" -rf /etc )"), "( rm -rf /etc )");
+        }
+
+        #[test]
+        fn handles_line_continuation_split() {
+            // "re\\\nset" -> "reset"
+            assert_eq!(
+                normalize_command("git re\\\nset --hard"),
+                "git reset --hard"
+            );
         }
     }
 

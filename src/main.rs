@@ -203,8 +203,7 @@ fn main() {
         Ok(input) => input,
         Err(hook::HookReadError::InputTooLarge(len)) => {
             eprintln!(
-                "[dcg] Warning: stdin input ({} bytes) exceeds limit ({} bytes); allowing command (fail-open)",
-                len, max_input_bytes
+                "[dcg] Warning: stdin input ({len} bytes) exceeds limit ({max_input_bytes} bytes); allowing command (fail-open)"
             );
             return;
         }
@@ -308,10 +307,10 @@ fn main() {
     match mode {
         DecisionMode::Deny => {
             let cwd_path = std::env::current_dir().ok();
-            let cwd_display = cwd_path
-                .as_ref()
-                .map(|path| path.to_string_lossy().to_string())
-                .unwrap_or_else(|| "<unknown>".to_string());
+            let cwd_display = cwd_path.as_ref().map_or_else(
+                || "<unknown>".to_string(),
+                |path| path.to_string_lossy().to_string(),
+            );
             let store_path = PendingExceptionStore::default_path(cwd_path.as_deref());
             let store = PendingExceptionStore::new(store_path);
             let reason = match (pack, pattern) {

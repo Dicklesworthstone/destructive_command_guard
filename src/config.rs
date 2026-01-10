@@ -1087,7 +1087,7 @@ impl OverridesConfig {
                 Err(e) => {
                     compiled.invalid_patterns.push(InvalidPattern {
                         pattern: allow.pattern().to_string(),
-                        error: e.to_string(),
+                        error: e.clone(),
                         kind: PatternKind::Allow,
                     });
                 }
@@ -1107,7 +1107,7 @@ impl OverridesConfig {
                 Err(e) => {
                     compiled.invalid_patterns.push(InvalidPattern {
                         pattern: block.pattern.clone(),
-                        error: e.to_string(),
+                        error: e.clone(),
                         kind: PatternKind::Block,
                     });
                 }

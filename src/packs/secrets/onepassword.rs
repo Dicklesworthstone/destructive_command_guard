@@ -22,22 +22,13 @@ pub fn create_pack() -> Pack {
 
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
-        safe_pattern!(
-            "op-whoami",
-            r"op(?:\s+--?\S+(?:\s+\S+)?)*\s+whoami\b"
-        ),
+        safe_pattern!("op-whoami", r"op(?:\s+--?\S+(?:\s+\S+)?)*\s+whoami\b"),
         safe_pattern!(
             "op-account-get",
             r"op(?:\s+--?\S+(?:\s+\S+)?)*\s+account\s+get\b"
         ),
-        safe_pattern!(
-            "op-read",
-            r"op(?:\s+--?\S+(?:\s+\S+)?)*\s+read\b"
-        ),
-        safe_pattern!(
-            "op-item-get",
-            r"op(?:\s+--?\S+(?:\s+\S+)?)*\s+item\s+get\b"
-        ),
+        safe_pattern!("op-read", r"op(?:\s+--?\S+(?:\s+\S+)?)*\s+read\b"),
+        safe_pattern!("op-item-get", r"op(?:\s+--?\S+(?:\s+\S+)?)*\s+item\s+get\b"),
         safe_pattern!(
             "op-item-list",
             r"op(?:\s+--?\S+(?:\s+\S+)?)*\s+item\s+list\b"
@@ -121,14 +112,26 @@ mod tests {
     #[test]
     fn test_item_delete_blocked() {
         let pack = create_pack();
-        assert_blocks_with_pattern(&pack, "op item delete \"Database Password\"", "op-item-delete");
-        assert_blocks_with_pattern(&pack, "op item delete --archive \"Legacy Token\"", "op-item-delete");
+        assert_blocks_with_pattern(
+            &pack,
+            "op item delete \"Database Password\"",
+            "op-item-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "op item delete --archive \"Legacy Token\"",
+            "op-item-delete",
+        );
     }
 
     #[test]
     fn test_document_delete_blocked() {
         let pack = create_pack();
-        assert_blocks_with_pattern(&pack, "op document delete \"Prod Cert\"", "op-document-delete");
+        assert_blocks_with_pattern(
+            &pack,
+            "op document delete \"Prod Cert\"",
+            "op-document-delete",
+        );
         assert_blocks_with_pattern(
             &pack,
             "op document delete --archive \"Old Cert\"",
@@ -141,7 +144,11 @@ mod tests {
         let pack = create_pack();
         assert_blocks_with_pattern(&pack, "op vault delete \"Engineering\"", "op-vault-delete");
         assert_blocks_with_pattern(&pack, "op group delete \"Contractors\"", "op-group-delete");
-        assert_blocks_with_pattern(&pack, "op user delete \"user@example.com\"", "op-user-delete");
+        assert_blocks_with_pattern(
+            &pack,
+            "op user delete \"user@example.com\"",
+            "op-user-delete",
+        );
     }
 
     #[test]

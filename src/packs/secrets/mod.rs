@@ -2,7 +2,7 @@
 //!
 //! These packs focus on destructive operations in secret management systems.
 
-pub mod vault;
 pub mod aws_secrets;
-pub mod onepassword;
 pub mod doppler;
+pub mod onepassword;
+pub mod vault;

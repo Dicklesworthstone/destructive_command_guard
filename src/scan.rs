@@ -1476,7 +1476,8 @@ fn is_gitlab_ci_path(path: &Path) -> bool {
 }
 
 #[allow(clippy::too_many_lines)]
-fn extract_gitlab_ci_from_str(
+#[must_use]
+pub fn extract_gitlab_ci_from_str(
     file: &str,
     content: &str,
     enabled_keywords: &[&'static str],
@@ -1887,7 +1888,8 @@ fn is_package_json_path(path: &Path) -> bool {
 /// Does NOT extract:
 /// - `description`, `keywords`, `repository` fields
 /// - Values in `config` or other non-executable fields
-fn extract_package_json_from_str(
+#[must_use]
+pub fn extract_package_json_from_str(
     file: &str,
     content: &str,
     enabled_keywords: &[&'static str],
@@ -1999,7 +2001,8 @@ fn is_terraform_path(path: &Path) -> bool {
 /// - Resource attributes (non-provisioner)
 /// - Comments
 #[allow(clippy::too_many_lines)]
-fn extract_terraform_from_str(
+#[must_use]
+pub fn extract_terraform_from_str(
     file: &str,
     content: &str,
     enabled_keywords: &[&'static str],
@@ -2331,7 +2334,8 @@ fn is_docker_compose_path(path: &Path) -> bool {
 /// - `environment:` values (data only)
 /// - `labels:` values (metadata only)
 /// - Comments
-fn extract_docker_compose_from_str(
+#[must_use]
+pub fn extract_docker_compose_from_str(
     file: &str,
     content: &str,
     enabled_keywords: &[&'static str],

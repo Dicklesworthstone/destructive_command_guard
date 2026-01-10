@@ -39,9 +39,10 @@ fn dd_dev_null_false_positive() {
     let cmd = "dd if=zero.dat of=/dev/null bs=1M count=1";
     let output = run_hook(cmd);
 
-    if output.contains("deny") {
-        panic!("False positive: '{}' was blocked! Output: {}", cmd, output);
-    }
+    assert!(
+        !output.contains("deny"),
+        "False positive: '{cmd}' was blocked! Output: {output}"
+    );
 }
 
 #[test]
@@ -50,7 +51,5 @@ fn dd_dev_block_device_blocked() {
     let cmd = "dd if=foo of=/dev/sda";
     let output = run_hook(cmd);
 
-    if !output.contains("deny") {
-        panic!("Bypass: '{}' was allowed!", cmd);
-    }
+    assert!(output.contains("deny"), "Bypass: '{cmd}' was allowed!");
 }

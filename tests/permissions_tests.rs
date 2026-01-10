@@ -39,10 +39,10 @@ fn chmod_false_positive_filename() {
     // Current regex: r"chmod\s+.*777" might block this.
     let cmd = "chmod 644 file_777";
     let output = run_hook(cmd);
-
-    if output.contains("deny") {
-        panic!("False positive: '{}' was blocked! Output: {}", cmd, output);
-    }
+    assert!(
+        !output.contains("deny"),
+        "False positive: '{cmd}' was blocked! Output: {output}"
+    );
 }
 
 #[test]
@@ -52,9 +52,10 @@ fn chmod_recursive_false_positive_filename() {
     let cmd = "chmod -R 644 file_777";
     let output = run_hook(cmd);
 
-    if output.contains("deny") {
-        panic!("False positive: '{}' was blocked! Output: {}", cmd, output);
-    }
+    assert!(
+        !output.contains("deny"),
+        "False positive: '{cmd}' was blocked! Output: {output}"
+    );
 }
 
 #[test]
@@ -64,9 +65,7 @@ fn chmod_recursive_bypass_long_flag() {
     let cmd = "chmod --recursive 755 /etc";
     let output = run_hook(cmd);
 
-    if !output.contains("deny") {
-        panic!("Bypass: '{}' was allowed!", cmd);
-    }
+    assert!(output.contains("deny"), "Bypass: '{cmd}' was allowed!");
 }
 
 #[test]
@@ -75,10 +74,10 @@ fn chmod_recursive_root_false_positive_home() {
     // Current regex: r"chmod\s+-[rR].*\s+/(?:$|[a-z])" blocks any / + lower letter
     let cmd = "chmod -R 755 /home/user/project";
     let output = run_hook(cmd);
-
-    if output.contains("deny") {
-        panic!("False positive: '{}' was blocked! Output: {}", cmd, output);
-    }
+    assert!(
+        !output.contains("deny"),
+        "False positive: '{cmd}' was blocked! Output: {output}"
+    );
 }
 
 #[test]
@@ -86,11 +85,7 @@ fn chmod_777_symbolic_bypass() {
     // Should BLOCK chmod a=rwx / (equivalent to 777)
     // Actually blocking symbolic 777 is hard regex-wise, but we should at least verify basic 777 detection
     // Let's test a simple bypass: chmod 0777 (octal)
-    let cmd = "chmod 0777 /tmp/bad";
+    let cmd = "chmod 0777 /etc";
     let output = run_hook(cmd);
-
-    // r"chmod\s+.*777" matches "0777" so this might pass (be blocked)
-    if !output.contains("deny") {
-        panic!("Bypass: '{}' was allowed!", cmd);
-    }
+    assert!(output.contains("deny"), "Bypass: '{cmd}' was allowed!");
 }

@@ -65,7 +65,11 @@ mod tests {
     fn splunk_destructive_patterns_block() {
         let pack = create_pack();
         assert_blocks(&pack, "splunk remove index main", "remove index");
-        assert_blocks(&pack, "splunk clean eventdata -index main", "clean eventdata");
+        assert_blocks(
+            &pack,
+            "splunk clean eventdata -index main",
+            "clean eventdata",
+        );
         assert_blocks(&pack, "splunk delete user alice", "delete user");
         assert_blocks(
             &pack,

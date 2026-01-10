@@ -29,7 +29,7 @@ use destructive_command_guard::packs::test_helpers::{
 };
 use std::path::Path;
 
-/// Test that all true_positives corpus cases are correctly denied.
+/// Test that all `true_positives` corpus cases are correctly denied.
 ///
 /// These are dangerous commands that MUST be blocked.
 #[test]
@@ -54,13 +54,12 @@ fn golden_true_positives_all_denied() {
         }
     }
 
-    if !failures.is_empty() {
-        panic!(
-            "True positives verification failed ({} failures):\n\n{}",
-            failures.len(),
-            failures.join("\n\n---\n\n")
-        );
-    }
+    assert!(
+        failures.is_empty(),
+        "True positives verification failed ({} failures):\n\n{}",
+        failures.len(),
+        failures.join("\n\n---\n\n")
+    );
 
     println!(
         "Verified {} true_positives cases - all correctly denied",
@@ -68,7 +67,7 @@ fn golden_true_positives_all_denied() {
     );
 }
 
-/// Test that all false_positives corpus cases are correctly allowed.
+/// Test that all `false_positives` corpus cases are correctly allowed.
 ///
 /// These are safe commands that MUST NOT be blocked.
 #[test]
@@ -93,13 +92,12 @@ fn golden_false_positives_all_allowed() {
         }
     }
 
-    if !failures.is_empty() {
-        panic!(
-            "False positives verification failed ({} failures):\n\n{}",
-            failures.len(),
-            failures.join("\n\n---\n\n")
-        );
-    }
+    assert!(
+        failures.is_empty(),
+        "False positives verification failed ({} failures):\n\n{}",
+        failures.len(),
+        failures.join("\n\n---\n\n")
+    );
 
     println!(
         "Verified {} false_positives cases - all correctly allowed",
@@ -107,7 +105,7 @@ fn golden_false_positives_all_allowed() {
     );
 }
 
-/// Test that all bypass_attempts corpus cases are correctly denied.
+/// Test that all `bypass_attempts` corpus cases are correctly denied.
 ///
 /// These are attempts to bypass security that MUST still be blocked.
 #[test]
@@ -132,13 +130,12 @@ fn golden_bypass_attempts_all_denied() {
         }
     }
 
-    if !failures.is_empty() {
-        panic!(
-            "Bypass attempts verification failed ({} failures):\n\n{}",
-            failures.len(),
-            failures.join("\n\n---\n\n")
-        );
-    }
+    assert!(
+        failures.is_empty(),
+        "Bypass attempts verification failed ({} failures):\n\n{}",
+        failures.len(),
+        failures.join("\n\n---\n\n")
+    );
 
     println!(
         "Verified {} bypass_attempts cases - all correctly denied",
@@ -146,7 +143,7 @@ fn golden_bypass_attempts_all_denied() {
     );
 }
 
-/// Test that edge_cases parse and evaluate without crashing.
+/// Test that `edge_cases` parse and evaluate without crashing.
 ///
 /// For edge cases, we don't require a specific outcome - just that
 /// they don't cause panics, infinite loops, or other issues.
@@ -214,10 +211,10 @@ fn golden_full_corpus_verification() {
         );
     }
 
-    println!("\nAll {} cases verified successfully!", passed);
+    println!("\nAll {passed} cases verified successfully!");
 }
 
-/// Test specific rule_id matching for critical patterns.
+/// Test specific `rule_id` matching for critical patterns.
 ///
 /// Verifies that specific commands are blocked by the expected rules.
 #[test]

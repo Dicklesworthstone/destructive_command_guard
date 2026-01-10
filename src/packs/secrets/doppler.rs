@@ -30,10 +30,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "doppler-secrets-list",
             r"doppler(?:\s+--?\S+(?:\s+\S+)?)*\s+secrets\s+list\b"
         ),
-        safe_pattern!(
-            "doppler-run",
-            r"doppler(?:\s+--?\S+(?:\s+\S+)?)*\s+run\b"
-        ),
+        safe_pattern!("doppler-run", r"doppler(?:\s+--?\S+(?:\s+\S+)?)*\s+run\b"),
         safe_pattern!(
             "doppler-configure",
             r"doppler(?:\s+--?\S+(?:\s+\S+)?)*\s+configure\b"
@@ -118,7 +115,11 @@ mod tests {
     #[test]
     fn test_configs_delete_blocked() {
         let pack = create_pack();
-        assert_blocks_with_pattern(&pack, "doppler configs delete dev", "doppler-configs-delete");
+        assert_blocks_with_pattern(
+            &pack,
+            "doppler configs delete dev",
+            "doppler-configs-delete",
+        );
         assert_blocks(
             &pack,
             "doppler configs delete prod --project backend --yes",

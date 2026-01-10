@@ -1,0 +1,106 @@
+{
+  "binary": {
+    "git_sha": "ec8df095018aff0cecf42519c3797bbeb3cc25b7",
+    "path": "./target/release/dcg",
+    "version_output": "\u256d\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\n  \u2502  \ud83d\udee1  Destructive Command Guard               \u2502\n  \u2502     dcg v0.2.0                           \u2502\n  \u2502                                         \u2502\n  \u2502  Built: 2026-01-10                   \u2502\n  \u2502  Rustc: 1.94.0-nightly                      \u2502\n  \u2502  Target: x86_64-unknown-linux-gnu         \u2502\n  \u2502                                         \u2502\n  \u2502  Protecting your code from destructive ops  \u2502\n  \u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f"
+  },
+  "cases": [
+    {
+      "command": "ls -la",
+      "description": "No pack keywords (fast allow)",
+      "env": {},
+      "id": "quick_reject",
+      "metrics": {
+        "mean_ms": 3.2701258466666663,
+        "p50_ms": 3.238683,
+        "p95_ms": 3.894923,
+        "p99_ms": 4.16899,
+        "sample_count": 300,
+        "throughput_per_s": 305.7986288262664
+      },
+      "trace": null
+    },
+    {
+      "command": "git status",
+      "description": "Keyword present, safe path",
+      "env": {},
+      "id": "safe_keyword",
+      "metrics": {
+        "mean_ms": 15.45251039,
+        "p50_ms": 15.3473715,
+        "p95_ms": 16.870785,
+        "p99_ms": 18.198404,
+        "sample_count": 300,
+        "throughput_per_s": 64.71440398753228
+      },
+      "trace": null
+    },
+    {
+      "command": "git reset --hard",
+      "description": "Keyword present, destructive match",
+      "env": {},
+      "id": "destructive_keyword",
+      "metrics": {
+        "mean_ms": 14.621774060000002,
+        "p50_ms": 14.242802000000001,
+        "p95_ms": 16.790514,
+        "p99_ms": 21.323529,
+        "sample_count": 300,
+        "throughput_per_s": 68.39115389805167
+      },
+      "trace": null
+    },
+    {
+      "command": "python -c \"import os; os.system('rm -rf /')\"",
+      "description": "Inline script trigger",
+      "env": {},
+      "id": "heredoc_inline",
+      "metrics": {
+        "mean_ms": 61.22030925333334,
+        "p50_ms": 59.9315715,
+        "p95_ms": 68.587389,
+        "p99_ms": 86.398915,
+        "sample_count": 300,
+        "throughput_per_s": 16.334448685352758
+      },
+      "trace": null
+    },
+    {
+      "command": "git reset --hard",
+      "description": "Bypass hook via DCG_BYPASS",
+      "env": {
+        "DCG_BYPASS": "1"
+      },
+      "id": "bypass",
+      "metrics": {
+        "mean_ms": 1.7532237366666668,
+        "p50_ms": 1.711592,
+        "p95_ms": 2.286535,
+        "p99_ms": 2.637195,
+        "sample_count": 300,
+        "throughput_per_s": 570.3778582768103
+      },
+      "trace": null
+    }
+  ],
+  "errors": [],
+  "generated_at": "2026-01-10T22:14:04Z",
+  "host": {
+    "arch": "x86_64",
+    "os": "Linux",
+    "release": "6.17.0-8-generic"
+  },
+  "method": {
+    "mode": "process",
+    "notes": "Process-per-invocation timing. Stage timings populated if trace output includes steps.",
+    "rss_method": "none",
+    "runs": 300,
+    "timer": "perf_counter_ns",
+    "warmup": 30
+  },
+  "rustc": {
+    "host": "x86_64-unknown-linux-gnu",
+    "version_output": "rustc 1.94.0-nightly (fecb335cb 2026-01-07)\nbinary: rustc\ncommit-hash: fecb335cbad3d84ef3da39191ba094e6c726a5b4\ncommit-date: 2026-01-07\nhost: x86_64-unknown-linux-gnu\nrelease: 1.94.0-nightly\nLLVM version: 21.1.8"
+  },
+  "schema_version": 1
+}

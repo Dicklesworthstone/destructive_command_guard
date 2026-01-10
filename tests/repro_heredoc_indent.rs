@@ -12,10 +12,7 @@ fn test_heredoc_squiggly_delimiter_deeper_indent() {
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0].content, "line1");
     } else {
-        panic!(
-            "Failed to extract heredoc with deeper delimiter indent: {:?}",
-            result
-        );
+        panic!("Failed to extract heredoc with deeper delimiter indent: {result:?}");
     }
 }
 
@@ -31,10 +28,7 @@ fn test_heredoc_squiggly_delimiter_shallower_indent() {
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0].content, "line1");
     } else {
-        panic!(
-            "Failed to extract heredoc with shallower delimiter indent: {:?}",
-            result
-        );
+        panic!("Failed to extract heredoc with shallower delimiter indent: {result:?}");
     }
 }
 
@@ -49,9 +43,6 @@ fn test_heredoc_squiggly_delimiter_zero_body_indent() {
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0].content, "line1");
     } else {
-        panic!(
-            "Failed to extract heredoc with zero body indent: {:?}",
-            result
-        );
+        panic!("Failed to extract heredoc with zero body indent: {result:?}");
     }
 }

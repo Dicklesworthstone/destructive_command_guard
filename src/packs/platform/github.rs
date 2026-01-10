@@ -33,10 +33,10 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     // Match optional global flags: `--flag` or `--flag value`
     // Ensure the flag value isn't one of our target subcommands (repo, gist, etc.)
     // Match the target subcommand and action
-    
+
     // Subcommands to look ahead for: repo|gist|release|issue|ssh-key|api
     // We use a robust value matcher that handles quoted strings to prevent bypasses.
-    
+
     vec![
         safe_pattern!(
             "gh-repo-list-view",
@@ -61,7 +61,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // Safe API GETs
         safe_pattern!(
             "gh-api-explicit-get",
-             r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|\S+))?)*\s+api\b.*(?:-X|--method)\s+GET\b"
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|\S+))?)*\s+api\b.*(?:-X|--method)\s+GET\b"
         ),
     ]
 }
@@ -102,7 +102,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // DELETE /repos/{owner}/{repo} -> Delete a repository
         destructive_pattern!(
             "gh-api-delete-repo",
-             r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|\S+))?)*\s+api\b.*(?:-X|--method)\s+DELETE\b",
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|\S+))?)*\s+api\b.*(?:-X|--method)\s+DELETE\b",
             "gh api DELETE calls can be destructive. Please verify the endpoint."
         ),
     ]
@@ -121,7 +121,7 @@ mod tests {
         assert!(pack.check("gh release view v1.0").is_none());
         assert!(pack.check("gh issue list").is_none());
         assert!(pack.check("gh ssh-key list").is_none());
-        
+
         // With global flags
         assert!(pack.check("gh -R owner/repo repo view").is_none());
     }
@@ -144,7 +144,9 @@ mod tests {
         ];
 
         for (cmd, expected_rule) in checks {
-            let matched = pack.check(cmd).unwrap_or_else(|| panic!("Should block: {cmd}"));
+            let matched = pack
+                .check(cmd)
+                .unwrap_or_else(|| panic!("Should block: {cmd}"));
             assert_eq!(matched.name, Some(expected_rule), "Command: {cmd}");
         }
     }

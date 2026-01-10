@@ -38,9 +38,10 @@ fn git_global_flag_bypass() {
     let cmd = "git -C /tmp reset --hard";
     let output = run_hook(cmd);
 
-    if output.trim().is_empty() {
-        panic!("Bypass confirmed: '{}' was allowed!", cmd);
-    }
+    assert!(
+        !output.trim().is_empty(),
+        "Bypass confirmed: '{cmd}' was allowed!"
+    );
 
     assert!(output.contains("deny"), "Should be denied");
 }
@@ -50,9 +51,10 @@ fn git_work_tree_bypass() {
     let cmd = "git --work-tree=/tmp clean -fd";
     let output = run_hook(cmd);
 
-    if output.trim().is_empty() {
-        panic!("Bypass confirmed: '{}' was allowed!", cmd);
-    }
+    assert!(
+        !output.trim().is_empty(),
+        "Bypass confirmed: '{cmd}' was allowed!"
+    );
 
     assert!(output.contains("deny"), "Should be denied");
 }

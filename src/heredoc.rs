@@ -59,7 +59,8 @@ use tracing::{debug, instrument, trace, warn};
 static HEREDOC_TRIGGERS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         // Heredoc operators (bash, sh, zsh)
-        r"<<-?\s*['\x22]?[\w.-]+['\x22]?", // << or <<- with optional quotes
+        // Supports quoted delimiters with spaces (e.g., << "EOF SPACE") or empty (<< "")
+        r"<<-?\s*(?:['\x22][^'\x22]*['\x22]|[\w.-]+)", 
         r"<<<",                        // Here-strings (bash)
         // Inline interpreter execution. These patterns intentionally allow:
         // - interleaved flags (python -I -c, bash --norc -c)
@@ -646,10 +647,13 @@ pub enum ExtractionResult {
 
 /// Regex patterns for heredoc extraction (compiled once).
 static HEREDOC_EXTRACTOR: LazyLock<Regex> = LazyLock::new(|| {
-    // Matches: <<[-~]? followed by optional quotes and delimiter
-    // Groups: (1) operator variant (-/~/empty), (2) quote char, (3) delimiter, (4) closing quote
-    // Delimiter group (3) allows alphanumeric, dots, hyphens, underscores.
-    Regex::new(r"<<([-~])?\s*(['\x22]?)([\w.-]+)(['\x22]?)").expect("heredoc regex compiles")
+    // Matches: <<[-~]? followed by:
+    // 1. Single-quoted delimiter: 'delim' (Group 2)
+    // 2. Double-quoted delimiter: "delim" (Group 3)
+    // 3. Unquoted delimiter: delim (Group 4)
+    // Group 1 is the operator variant (-/~/empty).
+    // Note: * instead of + allows empty delimiters (valid in bash).
+    Regex::new(r#"<<([-~])?\s*(?:'([^']*)'|"([^"]*)"|([\w.-]+))"#).expect("heredoc regex compiles")
 });
 
 /// Regex for here-string extraction with single quotes (<<<).
@@ -1084,9 +1088,17 @@ fn extract_heredocs(
         }
 
         let operator_variant = cap.get(1).map(|m| m.as_str());
-        let open_quote = cap.get(2).map_or("", |m| m.as_str());
-        let delimiter = cap.get(3).map_or("", |m| m.as_str());
-        let close_quote = cap.get(4).map_or("", |m| m.as_str());
+
+        let (delimiter, quoted) = if let Some(m) = cap.get(2) {
+            (m.as_str(), true)
+        } else if let Some(m) = cap.get(3) {
+            (m.as_str(), true)
+        } else if let Some(m) = cap.get(4) {
+            (m.as_str(), false)
+        } else {
+            // Should be unreachable if regex matched
+            continue;
+        };
 
         // Determine heredoc type
         let heredoc_type = match operator_variant {
@@ -1095,7 +1107,6 @@ fn extract_heredocs(
             _ => HeredocType::Standard,
         };
 
-        let quoted = !open_quote.is_empty() || !close_quote.is_empty();
         let full_match = cap.get(0).unwrap();
         let mut start_pos = full_match.end();
 

@@ -17,7 +17,16 @@ pub fn create_pack() -> Pack {
         name: "AWS CLI",
         description: "Protects against destructive AWS CLI operations like terminate-instances, \
                       delete-db-instance, and s3 rm --recursive",
-        keywords: &["aws", "terminate", "delete", "s3", "ec2", "rds", "ecr", "logs"],
+        keywords: &[
+            "aws",
+            "terminate",
+            "delete",
+            "s3",
+            "ec2",
+            "rds",
+            "ecr",
+            "logs",
+        ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,

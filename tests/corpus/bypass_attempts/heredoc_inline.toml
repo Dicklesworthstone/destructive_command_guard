@@ -40,7 +40,7 @@ expected = "deny"
 description = "bash -c with git reset --hard (destructive)"
 command = "bash -c 'git reset --hard'"
 expected = "deny"
-rule_id = "heredoc.bash:git_reset_hard"
+rule_id = "core.git:reset-hard"
 
 [[case]]
 description = "sh -c with rm -rf (destructive)"
@@ -51,7 +51,7 @@ expected = "deny"
 description = "zsh -c with git clean -fd (destructive)"
 command = "zsh -c 'git clean -fd'"
 expected = "deny"
-rule_id = "heredoc.bash:git_clean_fd"
+rule_id = "core.git:clean-force"
 
 # ============================================================================
 # Node.js inline execution (-e flag) - DESTRUCTIVE ONLY
@@ -110,7 +110,7 @@ expected = "deny"
 description = "heredoc containing git reset"
 command = "bash <<EOF\ngit reset --hard\nEOF"
 expected = "deny"
-rule_id = "heredoc.bash:git_reset_hard"
+rule_id = "core.git:reset-hard"
 
 # ============================================================================
 # Piped execution - DESTRUCTIVE ONLY

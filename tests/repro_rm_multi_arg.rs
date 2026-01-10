@@ -25,8 +25,7 @@ mod tests {
         // If this assertion fails (is_allowed() is true), the vulnerability exists.
         assert!(
             result.is_denied(),
-            "Command '{}' should be denied but was allowed!",
-            cmd
+            "Command '{cmd}' should be denied but was allowed!"
         );
     }
 }

@@ -3,6 +3,7 @@ use destructive_command_guard::packs::regex_engine::needs_backtracking_engine;
 use std::collections::{HashMap, HashSet};
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_audit_backtracking_requirements() {
     // Map of PackID -> Set of Pattern Names that require backtracking.
     // Based on docs/pattern_audit.md
@@ -50,7 +51,6 @@ fn test_audit_backtracking_requirements() {
                 "push-force-long",
             ]),
         ),
-
         (
             "cicd.github_actions",
             HashSet::from([
@@ -101,6 +101,27 @@ fn test_audit_backtracking_requirements() {
                 "yarn-publish",
                 "pnpm-publish",
                 "cargo-publish",
+                "poetry-publish",
+            ]),
+        ),
+        (
+            "platform.github",
+            HashSet::from([
+                // Safe patterns
+                "gh-repo-list-view",
+                "gh-gist-list-view",
+                "gh-release-list-view",
+                "gh-issue-list-view",
+                "gh-ssh-key-list",
+                "gh-api-explicit-get",
+                // Destructive patterns
+                "gh-repo-delete",
+                "gh-repo-archive",
+                "gh-gist-delete",
+                "gh-release-delete",
+                "gh-issue-delete",
+                "gh-ssh-key-delete",
+                "gh-api-delete-repo",
             ]),
         ),
         (
@@ -137,13 +158,11 @@ fn test_audit_backtracking_requirements() {
                         pack.id, p.name, pattern_str
                     ));
                 }
-            } else {
-                if pack_expected.contains(p.name) {
-                    unexpected.push(format!(
-                        "Expected backtracking in SafePattern but not found: {}/{} ({})",
-                        pack.id, p.name, pattern_str
-                    ));
-                }
+            } else if pack_expected.contains(p.name) {
+                unexpected.push(format!(
+                    "Expected backtracking in SafePattern but not found: {}/{} ({})",
+                    pack.id, p.name, pattern_str
+                ));
             }
         }
 
@@ -158,18 +177,18 @@ fn test_audit_backtracking_requirements() {
                         pack.id, name, pattern_str
                     ));
                 }
-            } else {
-                if pack_expected.contains(name) {
-                    unexpected.push(format!(
-                        "Expected backtracking in DestructivePattern but not found: {}/{} ({})",
-                        pack.id, name, pattern_str
-                    ));
-                }
+            } else if pack_expected.contains(name) {
+                unexpected.push(format!(
+                    "Expected backtracking in DestructivePattern but not found: {}/{} ({})",
+                    pack.id, name, pattern_str
+                ));
             }
         }
     }
 
-    if !unexpected.is_empty() {
-        panic!("Audit mismatch:\n{}", unexpected.join("\n"));
-    }
+    assert!(
+        unexpected.is_empty(),
+        "Audit mismatch:\n{}",
+        unexpected.join("\n")
+    );
 }

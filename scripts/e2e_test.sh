@@ -670,6 +670,15 @@ test_command "ls .git" "allow" "ls .git (contains 'git' but not git command)"
 test_command "sudo rm -rf /" "block" "sudo rm -rf /"
 test_command "sudo git reset --hard" "block" "sudo git reset --hard"
 
+# Regression tests for quoted bypasses (git_safety_guard-audit-2025-01-10)
+test_command 'git "reset" --hard' "block" 'git "reset" --hard (quoted subcommand)'
+test_command '"git" reset --hard' "block" '"git" reset --hard (quoted binary)'
+test_command 'sudo "/bin/git" reset --hard' "block" 'sudo "/bin/git" reset --hard (quoted binary with path and wrapper)'
+test_command "python3 << \"EOF SPACE\"
+import shutil
+shutil.rmtree('/tmp/test')
+EOF SPACE" "block" "heredoc with spaced delimiter"
+
 log_section "Non-Core Pack Regression Tests (git_safety_guard-99e.1.2)"
 # These tests verify that non-core packs are reachable in hook mode.
 # Previously, global quick reject only checked for "git" and "rm" keywords,
@@ -716,6 +725,23 @@ test_command_with_packs "gh workflow disable 123" "block" "cicd.github_actions" 
 test_command_with_packs "gh run cancel 123" "block" "cicd.github_actions" "gh run cancel (github actions pack enabled)"
 test_command_with_packs "gh api -X DELETE repos/o/r/actions/secrets/FOO" "block" "cicd.github_actions" "gh api -X DELETE .../actions/secrets (github actions pack enabled)"
 test_command_with_packs "gh secret list" "allow" "cicd.github_actions" "gh secret list (github actions pack enabled, safe command)"
+
+# GitLab Platform pack tests
+test_command_with_packs "glab repo delete my/group" "block" "platform.gitlab" "glab repo delete (gitlab platform pack enabled)"
+test_command_with_packs "glab repo archive my/group" "block" "platform.gitlab" "glab repo archive (gitlab platform pack enabled)"
+test_command_with_packs "glab release delete v1.2.3" "block" "platform.gitlab" "glab release delete (gitlab platform pack enabled)"
+test_command_with_packs "glab api -X DELETE /projects/123" "block" "platform.gitlab" "glab api DELETE /projects (gitlab platform pack enabled)"
+test_command_with_packs "glab api --method DELETE /projects/123/protected_branches/main" "block" "platform.gitlab" "glab api DELETE protected_branches (gitlab platform pack enabled)"
+test_command_with_packs "glab api -X DELETE /projects/123/hooks/456" "block" "platform.gitlab" "glab api DELETE hooks (gitlab platform pack enabled)"
+test_command_with_packs "gitlab-rails runner \"Project.destroy_all\"" "block" "platform.gitlab" "gitlab-rails runner destroy_all (gitlab platform pack enabled)"
+test_command_with_packs "gitlab-rake gitlab:backup:restore" "block" "platform.gitlab" "gitlab-rake backup:restore (gitlab platform pack enabled)"
+test_command_with_packs "glab repo list" "allow" "platform.gitlab" "glab repo list (gitlab platform pack enabled, safe command)"
+test_command_with_packs "glab repo view my/group" "allow" "platform.gitlab" "glab repo view (gitlab platform pack enabled, safe command)"
+test_command_with_packs "glab repo clone my/group" "allow" "platform.gitlab" "glab repo clone (gitlab platform pack enabled, safe command)"
+test_command_with_packs "glab mr list" "allow" "platform.gitlab" "glab mr list (gitlab platform pack enabled, safe command)"
+test_command_with_packs "glab issue list" "allow" "platform.gitlab" "glab issue list (gitlab platform pack enabled, safe command)"
+test_command_with_packs "glab release list" "allow" "platform.gitlab" "glab release list (gitlab platform pack enabled, safe command)"
+test_command_with_packs "glab api -X GET /projects/123" "allow" "platform.gitlab" "glab api GET (gitlab platform pack enabled, safe command)"
 
 # Multiple packs enabled simultaneously
 test_command_with_packs "docker system prune" "block" "containers.docker,kubernetes.kubectl" "docker system prune (multiple packs enabled)"

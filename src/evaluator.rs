@@ -44,8 +44,6 @@
 //! ```
 
 use crate::allowlist::{AllowlistLayer, LayeredAllowlist};
-use crate::pending_exceptions::AllowOnceStore;
-use chrono::Utc;
 use crate::ast_matcher::DEFAULT_MATCHER;
 use crate::config::Config;
 use crate::context::sanitize_for_pattern_matching;
@@ -53,7 +51,9 @@ use crate::heredoc::{
     ExtractionResult, SkipReason, TriggerResult, check_triggers, extract_content,
 };
 use crate::packs::{REGISTRY, normalize_command, pack_aware_quick_reject};
+use crate::pending_exceptions::AllowOnceStore;
 use crate::perf::Deadline;
+use chrono::Utc;
 use regex::RegexSet;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -745,7 +745,9 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
                     ordered_packs,
                     compiled_overrides,
                 };
-                if let Some(blocked) = evaluate_heredoc(command, context, &mut heredoc_allowlist_hit) {
+                if let Some(blocked) =
+                    evaluate_heredoc(command, context, &mut heredoc_allowlist_hit)
+                {
                     return blocked;
                 }
             }
@@ -922,8 +924,6 @@ fn evaluate_packs_with_allowlists(
 
     EvaluationResult::allowed()
 }
-
-
 
 /// Evaluate a command with legacy pattern support using precompiled overrides.
 ///
@@ -1337,7 +1337,8 @@ fn check_fallback_patterns(command: &str) -> Option<EvaluationResult> {
             r"os\.RemoveAll",
             r"\brm\s+(?:-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\b", // rm -rf, rm -fr, rm -r -f
             r"\bgit\s+reset\s+--hard\b",
-        ]).expect("fallback patterns must compile")
+        ])
+        .expect("fallback patterns must compile")
     });
 
     // Sanitize the command first to mask comments and safe arguments (e.g. commit messages).
@@ -1869,8 +1870,7 @@ mod tests {
         config.packs.enabled.push("strict_git".to_string());
 
         let compiled = config.overrides.compile();
-        let allowlists =
-            project_allowlists_for_pack_wildcard("core.git", "allow all core.git");
+        let allowlists = project_allowlists_for_pack_wildcard("core.git", "allow all core.git");
 
         // Matches core.git, should allow.
         let git_result = evaluate_command(

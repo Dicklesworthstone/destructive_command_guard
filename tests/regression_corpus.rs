@@ -34,13 +34,13 @@
 //! # Isomorphism Guarantee
 //!
 //! When `[case.log]` is present, the test verifies ALL fields match exactly:
-//! - decision (allow/deny)
-//! - effective_mode (deny/warn/log)
-//! - pack_id
-//! - pattern_name
-//! - rule_id (pack:pattern format)
-//! - reason_contains (substring match)
-//! - allowlist_layer (project/user/system)
+//! - `decision` (allow/deny)
+//! - `effective_mode` (deny/warn/log)
+//! - `pack_id`
+//! - `pattern_name`
+//! - `rule_id` (pack:pattern format)
+//! - `reason_contains` (substring match)
+//! - `allowlist_layer` (project/user/system)
 //!
 //! This ensures that performance optimizations and refactors don't accidentally
 //! change evaluation semantics.
@@ -52,6 +52,7 @@
 //! ```
 
 use std::collections::HashSet;
+use std::fmt::Write;
 use std::fs;
 use std::path::Path;
 
@@ -127,6 +128,7 @@ fn normalize_value(value: &str) -> Option<String> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_scenario_fixture(path: &Path) -> Result<ScenarioFixture, String> {
     let contents = fs::read_to_string(path)
         .map_err(|err| format!("Failed to read {}: {err}", path.display()))?;
@@ -294,7 +296,7 @@ fn parse_scenario_fixture(path: &Path) -> Result<ScenarioFixture, String> {
             ));
         }
         match step.expected_decision.as_deref() {
-            Some("allow") | Some("deny") => {}
+            Some("allow" | "deny") => {}
             Some(other) => {
                 return Err(format!(
                     "{}: step {} invalid expected_decision '{other}'",
@@ -337,7 +339,7 @@ fn corpus_true_positives_isomorphism() {
             total
         );
         for failure in &failures {
-            msg.push_str(&format!("  {failure}\n"));
+            let _ = writeln!(msg, "  {failure}");
         }
         panic!("{msg}");
     }
@@ -356,7 +358,7 @@ fn corpus_false_positives_isomorphism() {
             total
         );
         for failure in &failures {
-            msg.push_str(&format!("  {failure}\n"));
+            let _ = writeln!(msg, "  {failure}");
         }
         panic!("{msg}");
     }
@@ -375,7 +377,7 @@ fn corpus_bypass_attempts_isomorphism() {
             total
         );
         for failure in &failures {
-            msg.push_str(&format!("  {failure}\n"));
+            let _ = writeln!(msg, "  {failure}");
         }
         panic!("{msg}");
     }
@@ -392,7 +394,7 @@ fn corpus_edge_cases_isomorphism() {
     if !failures.is_empty() {
         let mut msg = format!("\n{}/{} edge case test(s) failed:\n", failures.len(), total);
         for failure in &failures {
-            msg.push_str(&format!("  {failure}\n"));
+            let _ = writeln!(msg, "  {failure}");
         }
         panic!("{msg}");
     }
@@ -456,7 +458,7 @@ fn scenario_fixtures_are_valid() {
     let scenario_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scenarios");
     let mut entries: Vec<_> = fs::read_dir(&scenario_dir)
         .expect("Failed to read scenario fixtures directory")
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("yaml"))
         .collect();
@@ -485,8 +487,8 @@ fn scenario_fixtures_are_valid() {
 
     if !failures.is_empty() {
         let mut msg = String::from("\nScenario fixture validation failed:\n");
-        for failure in failures {
-            msg.push_str(&format!("  {failure}\n"));
+        for failure in &failures {
+            let _ = writeln!(msg, "  {failure}");
         }
         panic!("{msg}");
     }

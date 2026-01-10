@@ -15,7 +15,7 @@ use destructive_command_guard::packs::REGISTRY;
 fn test_heredoc_size_bypass_prevention() {
     let mut config = Config::default();
     // Force fallback check by setting a tiny limit
-    config.heredoc.max_body_bytes = Some(10); 
+    config.heredoc.max_body_bytes = Some(10);
 
     let compiled_overrides = config.overrides.compile();
     let allowlists = load_default_allowlists();
@@ -26,7 +26,7 @@ fn test_heredoc_size_bypass_prevention() {
     // "padding" needs to be harmless but long enough.
     let padding = "a".repeat(200);
     // python -c '...padding...; import shutil; shutil.rmtree("/")'
-    let bypass_cmd = format!(r#"python -c '{}; import shutil; shutil.rmtree("/")'"#, padding);
+    let bypass_cmd = format!(r#"python -c '{padding}; import shutil; shutil.rmtree("/")'"#);
 
     // Verify it exceeds limit
     assert!(bypass_cmd.len() > 10);
@@ -40,7 +40,10 @@ fn test_heredoc_size_bypass_prevention() {
     );
 
     // Should be DENIED by fallback check
-    assert!(result.is_denied(), "Oversized destructive command should be denied");
+    assert!(
+        result.is_denied(),
+        "Oversized destructive command should be denied"
+    );
     if let Some(reason) = result.reason() {
         assert!(
             reason.contains("fallback check"),
@@ -50,7 +53,7 @@ fn test_heredoc_size_bypass_prevention() {
 
     // 2. Whitespace evasion attempt
     // "rm  -rf" (extra space)
-    let evasion_cmd = format!("bash -c 'echo {}; rm  -rf /'", padding);
+    let evasion_cmd = format!("bash -c 'echo {padding}; rm  -rf /'");
     let result_evasion = evaluate_command(
         &evasion_cmd,
         &config,
@@ -58,13 +61,16 @@ fn test_heredoc_size_bypass_prevention() {
         &compiled_overrides,
         &allowlists,
     );
-    assert!(result_evasion.is_denied(), "Whitespace evasion should be caught");
+    assert!(
+        result_evasion.is_denied(),
+        "Whitespace evasion should be caught"
+    );
 
     // 3. Comment masking check (False Positive Avoidance)
     // If the destructive pattern is in a Bash comment, it should be ALLOWED.
     // Note: Python comments inside -c strings are NOT masked (they are strings to Bash).
     // We use a Bash comment here: `python -c '...' # rm -rf /`
-    let comment_cmd = format!(r#"python -c 'print("safe")' # {} rm -rf /"#, padding);
+    let comment_cmd = format!(r#"python -c 'print("safe")' # {padding} rm -rf /"#);
     let result_comment = evaluate_command(
         &comment_cmd,
         &config,

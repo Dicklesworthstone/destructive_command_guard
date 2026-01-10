@@ -183,8 +183,14 @@ mod tests {
     fn test_safe_secretsmanager_commands_allowed() {
         let pack = create_pack();
         assert_allows(&pack, "aws secretsmanager list-secrets");
-        assert_allows(&pack, "aws secretsmanager describe-secret --secret-id my/secret");
-        assert_allows(&pack, "aws secretsmanager get-secret-value --secret-id my/secret");
+        assert_allows(
+            &pack,
+            "aws secretsmanager describe-secret --secret-id my/secret",
+        );
+        assert_allows(
+            &pack,
+            "aws secretsmanager get-secret-value --secret-id my/secret",
+        );
         assert_allows(
             &pack,
             "aws secretsmanager list-secret-version-ids --secret-id my/secret",
@@ -193,7 +199,10 @@ mod tests {
             &pack,
             "aws secretsmanager get-resource-policy --secret-id my/secret",
         );
-        assert_allows(&pack, "aws secretsmanager get-random-password --password-length 32");
+        assert_allows(
+            &pack,
+            "aws secretsmanager get-random-password --password-length 32",
+        );
     }
 
     #[test]

@@ -2130,7 +2130,11 @@ mod tests {
         let ast_matcher = AstMatcher::new();
         assert!(!ast_matcher.patterns.is_empty());
         assert!(ast_matcher.patterns.contains_key(&ScriptLanguage::Python));
-        assert!(ast_matcher.patterns.contains_key(&ScriptLanguage::JavaScript));
+        assert!(
+            ast_matcher
+                .patterns
+                .contains_key(&ScriptLanguage::JavaScript)
+        );
         assert!(ast_matcher.patterns.contains_key(&ScriptLanguage::Ruby));
         assert!(ast_matcher.patterns.contains_key(&ScriptLanguage::Bash));
     }
@@ -2602,7 +2606,9 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             let code = "require 'fileutils'\nFileUtils.rm_rf('/')";
 
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Ruby).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Ruby)
+                .unwrap();
             assert!(
                 matches
                     .iter()
@@ -2617,7 +2623,9 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             let code = "require 'fileutils'\nFileUtils.rm_rf('./tmp')";
 
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Ruby).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Ruby)
+                .unwrap();
             assert!(
                 matches
                     .iter()
@@ -2632,7 +2640,9 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             let code = "system('rm -rf /')";
 
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Ruby).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Ruby)
+                .unwrap();
             assert!(
                 matches
                     .iter()
@@ -2647,7 +2657,9 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             let code = "`rm -rf /`";
 
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Ruby).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Ruby)
+                .unwrap();
             assert!(
                 matches
                     .iter()
@@ -2662,7 +2674,9 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             let code = "exec('git reset --hard HEAD~1')";
 
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Ruby).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Ruby)
+                .unwrap();
             assert!(
                 matches
                     .iter()
@@ -2677,7 +2691,9 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             let code = "require 'open3'\nOpen3.capture3('rm -rf /')";
 
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Ruby).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Ruby)
+                .unwrap();
             assert!(
                 matches
                     .iter()
@@ -2692,7 +2708,9 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             let code = "Open3.popen3('git reset --hard') { |i,o,e,t| }";
 
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Ruby).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Ruby)
+                .unwrap();
             assert!(
                 matches
                     .iter()
@@ -2711,7 +2729,9 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             let code = "puts 'rm -rf /'";
 
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Ruby).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Ruby)
+                .unwrap();
             assert!(matches.is_empty());
         }
 
@@ -2720,7 +2740,9 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             let code = "system('git status')";
 
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Ruby).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Ruby)
+                .unwrap();
             assert!(matches.is_empty());
         }
 
@@ -2729,7 +2751,9 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             let code = "Open3.capture3('git status')";
 
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Ruby).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Ruby)
+                .unwrap();
             assert!(
                 matches.is_empty(),
                 "Open3.capture3 with safe payload should not match"
@@ -2741,7 +2765,9 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             let code = "`echo hello`";
 
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Ruby).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Ruby)
+                .unwrap();
             assert!(matches.is_empty());
         }
 
@@ -2750,7 +2776,9 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             let code = "require 'fileutils'";
 
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Ruby).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Ruby)
+                .unwrap();
             assert!(matches.is_empty());
         }
 
@@ -2759,7 +2787,9 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             let code = "File.delete('/tmp/test.txt')";
 
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Ruby).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Ruby)
+                .unwrap();
             assert!(
                 matches
                     .iter()
@@ -2959,7 +2989,9 @@ mod tests {
         fn shutil_rmtree_blocks() {
             let ast_matcher = AstMatcher::new();
             let code = "import shutil\nshutil.rmtree('/dangerous/path')";
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
             assert!(!matches.is_empty(), "shutil.rmtree must match");
             assert_eq!(matches[0].rule_id, "heredoc.python.shutil_rmtree");
             assert!(matches[0].severity.blocks_by_default());
@@ -2969,7 +3001,9 @@ mod tests {
         fn os_remove_blocks() {
             let ast_matcher = AstMatcher::new();
             let code = "import os\nos.remove('/etc/passwd')";
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
             assert!(!matches.is_empty(), "os.remove must match");
             assert_eq!(matches[0].rule_id, "heredoc.python.os_remove");
             assert!(matches[0].severity.blocks_by_default());
@@ -2979,7 +3013,9 @@ mod tests {
         fn os_rmdir_blocks() {
             let ast_matcher = AstMatcher::new();
             let code = "import os\nos.rmdir('/important/dir')";
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
             assert!(!matches.is_empty(), "os.rmdir must match");
             assert_eq!(matches[0].rule_id, "heredoc.python.os_rmdir");
             assert!(matches[0].severity.blocks_by_default());
@@ -2989,7 +3025,9 @@ mod tests {
         fn os_unlink_blocks() {
             let ast_matcher = AstMatcher::new();
             let code = "import os\nos.unlink('/critical/file')";
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
             assert!(!matches.is_empty(), "os.unlink must match");
             assert_eq!(matches[0].rule_id, "heredoc.python.os_unlink");
             assert!(matches[0].severity.blocks_by_default());
@@ -2999,7 +3037,9 @@ mod tests {
         fn pathlib_unlink_blocks() {
             let ast_matcher = AstMatcher::new();
             let code = "from pathlib import Path\nPath('/secret').unlink()";
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
             assert!(!matches.is_empty(), "pathlib.Path().unlink() must match");
             assert_eq!(matches[0].rule_id, "heredoc.python.pathlib_unlink");
             assert!(matches[0].severity.blocks_by_default());
@@ -3009,7 +3049,9 @@ mod tests {
         fn pathlib_rmdir_blocks() {
             let ast_matcher = AstMatcher::new();
             let code = "from pathlib import Path\nPath('/danger/dir').rmdir()";
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
             assert!(!matches.is_empty(), "pathlib.Path().rmdir() must match");
             assert_eq!(matches[0].rule_id, "heredoc.python.pathlib_rmdir");
             assert!(matches[0].severity.blocks_by_default());
@@ -3021,7 +3063,9 @@ mod tests {
             // per bead: "Do not block on shell=True alone"
             let ast_matcher = AstMatcher::new();
             let code = "import subprocess\nsubprocess.run(['ls', '-la'])";
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
             assert!(!matches.is_empty(), "subprocess.run must match");
             assert_eq!(matches[0].rule_id, "heredoc.python.subprocess_run");
             assert!(
@@ -3035,7 +3079,9 @@ mod tests {
             // os.system is Medium severity - warns but doesn't block by default
             let ast_matcher = AstMatcher::new();
             let code = "import os\nos.system('echo hello')";
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
             assert!(!matches.is_empty(), "os.system must match");
             assert_eq!(matches[0].rule_id, "heredoc.python.os_system");
             assert!(
@@ -3054,7 +3100,9 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             // String containing destructive command text is NOT executed
             let code = "print('rm -rf /')";
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
             assert!(matches.is_empty(), "print statement must not match");
         }
 
@@ -3063,7 +3111,9 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             // Just importing doesn't execute anything dangerous
             let code = "import shutil\nimport os\nimport subprocess";
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
             assert!(matches.is_empty(), "imports alone must not match");
         }
 
@@ -3072,7 +3122,9 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             // Comments mentioning dangerous operations are not executed
             let code = "# shutil.rmtree('/') would be dangerous\nx = 1";
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
             assert!(matches.is_empty(), "comments must not match");
         }
 
@@ -3088,7 +3140,9 @@ os.listdir('/tmp')
 with open('/tmp/log.txt', 'w') as f:
     f.write('hello')
 ";
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
             assert!(matches.is_empty(), "safe file operations must not match");
         }
 
@@ -3100,7 +3154,9 @@ with open('/tmp/log.txt', 'w') as f:
 dangerous_cmd = "shutil.rmtree('/')"
 docs = "Example: os.remove(path)"
 "#;
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
             assert!(matches.is_empty(), "string literals must not match");
         }
 
@@ -3115,7 +3171,9 @@ def cleanup():
     """
     pass
 "#;
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
             assert!(matches.is_empty(), "docstrings must not match");
         }
 
@@ -3127,7 +3185,9 @@ def cleanup():
             // NOTE: This test verifies the pattern DOES match (as expected)
             // Path-based filtering would be a separate concern
             let code = "import shutil\nshutil.rmtree('/tmp/build_artifacts')";
-            let matches = ast_matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
             // Pattern matching finds this - path filtering is separate policy
             assert!(!matches.is_empty(), "shutil.rmtree matches structurally");
         }

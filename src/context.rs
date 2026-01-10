@@ -206,6 +206,8 @@ enum TokenizerState {
     EscapeDouble,
     /// Inside $(...) command substitution
     CommandSubst { depth: u32 },
+    /// Inside a comment within command substitution
+    CommandSubstComment { depth: u32 },
     /// Inside backtick command substitution
     Backtick,
     /// Inside a comment (# to newline)
@@ -454,7 +456,19 @@ impl ContextClassifier {
                                 state = TokenizerState::CommandSubst { depth: depth - 1 };
                             }
                         }
+                        b'#' => {
+                            // Start comment if at start of string or preceded by whitespace
+                            if i == 0 || bytes[i - 1].is_ascii_whitespace() {
+                                state = TokenizerState::CommandSubstComment { depth };
+                            }
+                        }
                         _ => {}
+                    }
+                }
+                TokenizerState::CommandSubstComment { depth } => {
+                    if byte == b'\n' {
+                        // End comment, return to CommandSubst
+                        state = TokenizerState::CommandSubst { depth };
                     }
                 }
                 TokenizerState::Backtick => {
@@ -494,9 +508,9 @@ impl ContextClassifier {
                         current_kind
                     }
                 }
-                TokenizerState::CommandSubst { .. } | TokenizerState::Backtick => {
-                    SpanKind::InlineCode
-                }
+                TokenizerState::CommandSubst { .. }
+                | TokenizerState::CommandSubstComment { .. }
+                | TokenizerState::Backtick => SpanKind::InlineCode,
             };
             spans.push(Span::new(final_kind, span_start, len));
         }
@@ -535,8 +549,21 @@ impl ContextClassifier {
                 continue;
             }
 
+            // Strip quotes if present (handle "python", "/usr/bin/python", etc.)
+            let token_unquoted = if (token.starts_with('"') && token.ends_with('"'))
+                || (token.starts_with('\'') && token.ends_with('\''))
+            {
+                if token.len() >= 2 {
+                    &token[1..token.len() - 1]
+                } else {
+                    token
+                }
+            } else {
+                token
+            };
+
             // Found a potential command word
-            let base_name = token.rsplit('/').next().unwrap_or(token);
+            let base_name = token_unquoted.rsplit('/').next().unwrap_or(token_unquoted);
 
             // Skip wrappers that might precede the interpreter
             if matches!(base_name, "sudo" | "time" | "nohup" | "env" | "command") {
@@ -1923,7 +1950,10 @@ mod tests {
         let spans = classify_command(cmd);
 
         // The quoted message should be Argument
-        let msg_span = spans.spans().iter().find(|s| s.text(cmd).contains("reset --hard"));
+        let msg_span = spans
+            .spans()
+            .iter()
+            .find(|s| s.text(cmd).contains("reset --hard"));
         if let Some(span) = msg_span {
             assert_eq!(span.kind, SpanKind::Argument);
         }
@@ -2479,6 +2509,37 @@ mod tests {
             sanitized
                 .as_ref()
                 .contains("sudo --chdir=/tmp git commit -m")
+        );
+    }
+
+    #[test]
+    fn test_regression_quoted_interpreter_identifies_inline_code() {
+        // Regression test for bug where quoted interpreter paths (e.g. "/usr/bin/python")
+        // caused check_inline_code_context to fail, treating -c content as safe argument.
+
+        let cmd = r#""/usr/bin/python" -c "rm -rf /""#;
+        let spans = classify_command(cmd);
+
+        let code_span = spans
+            .spans()
+            .iter()
+            .find(|s| s.kind == SpanKind::InlineCode);
+
+        assert!(
+            code_span.is_some(),
+            "Quoted interpreter path must still detect -c as InlineCode"
+        );
+
+        let cmd_simple = r#""python" -c "rm -rf /""#;
+        let spans_simple = classify_command(cmd_simple);
+        let code_span_simple = spans_simple
+            .spans()
+            .iter()
+            .find(|s| s.kind == SpanKind::InlineCode);
+
+        assert!(
+            code_span_simple.is_some(),
+            "Quoted interpreter name must still detect -c as InlineCode"
         );
     }
 }

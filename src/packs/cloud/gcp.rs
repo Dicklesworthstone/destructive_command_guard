@@ -17,7 +17,15 @@ pub fn create_pack() -> Pack {
         name: "Google Cloud SDK",
         description: "Protects against destructive gcloud operations like instances delete, \
                       sql instances delete, and gsutil rm -r",
-        keywords: &["gcloud", "gsutil", "delete", "instances", "artifacts", "images", "repositories"],
+        keywords: &[
+            "gcloud",
+            "gsutil",
+            "delete",
+            "instances",
+            "artifacts",
+            "images",
+            "repositories",
+        ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,

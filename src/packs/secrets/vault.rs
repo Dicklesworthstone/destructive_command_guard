@@ -23,18 +23,12 @@ pub fn create_pack() -> Pack {
 
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
-        safe_pattern!(
-            "vault-status",
-            r"vault(?:\s+--?\S+(?:\s+\S+)?)*\s+status\b"
-        ),
+        safe_pattern!("vault-status", r"vault(?:\s+--?\S+(?:\s+\S+)?)*\s+status\b"),
         safe_pattern!(
             "vault-version",
             r"vault(?:\s+--?\S+(?:\s+\S+)?)*\s+version\b"
         ),
-        safe_pattern!(
-            "vault-read",
-            r"vault(?:\s+--?\S+(?:\s+\S+)?)*\s+read\b"
-        ),
+        safe_pattern!("vault-read", r"vault(?:\s+--?\S+(?:\s+\S+)?)*\s+read\b"),
         safe_pattern!(
             "vault-kv-get",
             r"vault(?:\s+--?\S+(?:\s+\S+)?)*\s+kv\s+get\b"
@@ -186,11 +180,7 @@ mod tests {
     #[test]
     fn test_generic_delete_blocked() {
         let pack = create_pack();
-        assert_blocks_with_pattern(
-            &pack,
-            "vault delete secret/myapp/config",
-            "vault-delete",
-        );
+        assert_blocks_with_pattern(&pack, "vault delete secret/myapp/config", "vault-delete");
     }
 
     #[test]
@@ -206,11 +196,7 @@ mod tests {
     #[test]
     fn test_auth_disable_blocked() {
         let pack = create_pack();
-        assert_blocks_with_pattern(
-            &pack,
-            "vault auth disable github",
-            "vault-auth-disable",
-        );
+        assert_blocks_with_pattern(&pack, "vault auth disable github", "vault-auth-disable");
     }
 
     #[test]

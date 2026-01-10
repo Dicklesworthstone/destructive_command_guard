@@ -442,20 +442,31 @@ pub fn debug_match_info(pack: &Pack, command: &str) -> String {
 ///
 /// Panics if any validation check fails.
 pub fn validate_pack(pack: &Pack) {
+    assert!(!pack.id.is_empty(), "Pack ID must not be empty");
     assert!(
-        !pack.id.is_empty(),
-        "Pack ID must not be empty"
-    );
-    assert!(
-        pack.id.chars().all(|c| c.is_ascii_lowercase() || c == '.' || c == '_' || c.is_numeric()),
+        pack.id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '.' || c == '_' || c.is_numeric()),
         "Pack ID '{}' should be lowercase with dots, underscores, or digits only",
         pack.id
     );
 
     // Required fields
-    assert!(!pack.name.is_empty(), "Pack '{}' name must not be empty", pack.id);
-    assert!(!pack.description.is_empty(), "Pack '{}' description must not be empty", pack.id);
-    assert!(!pack.keywords.is_empty(), "Pack '{}' must have at least one keyword", pack.id);
+    assert!(
+        !pack.name.is_empty(),
+        "Pack '{}' name must not be empty",
+        pack.id
+    );
+    assert!(
+        !pack.description.is_empty(),
+        "Pack '{}' description must not be empty",
+        pack.id
+    );
+    assert!(
+        !pack.keywords.is_empty(),
+        "Pack '{}' must have at least one keyword",
+        pack.id
+    );
 
     // Pattern validation
     assert_patterns_compile(pack);

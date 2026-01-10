@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::process::Command;
 
 fn dcg_binary() -> std::path::PathBuf {
@@ -56,10 +55,9 @@ fn test_exact_command_allowlist_ignored_bug() {
     let allowlist = format!(
         r#"
 [[allow]]
-exact_command = "{}"
+exact_command = "{cmd}"
 reason = "allowed explicitly"
-"#,
-        cmd
+"#
     );
 
     let output = run_hook_with_allowlist(cmd, &allowlist);
@@ -68,10 +66,10 @@ reason = "allowed explicitly"
     // If it is allowed (empty output), then it works (bug not present).
     // If it is blocked (contains "deny"), then bug is confirmed.
 
-    if !output.contains("deny") {
-        println!("Wait, it was allowed? Maybe I am wrong.");
-    } else {
+    if output.contains("deny") {
         println!("Confirmed: Command blocked despite exact_command allowlist.");
+    } else {
+        println!("Wait, it was allowed? Maybe I am wrong.");
     }
 
     // We expect it to be allowed if the feature worked.

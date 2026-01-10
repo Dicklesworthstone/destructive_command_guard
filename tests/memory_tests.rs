@@ -28,6 +28,7 @@
     clippy::unit_arg
 )]
 
+use destructive_command_guard as dcg;
 use std::hint::black_box;
 
 /// Get current memory usage via /proc/self/statm (Linux)
@@ -209,4 +210,163 @@ fn memory_tracking_sanity_check() {
     );
 
     println!("memory_tracking_sanity_check: PASSED");
+}
+
+//=============================================================================
+// Memory Leak Tests for DCG Hot Paths
+//=============================================================================
+
+#[test]
+fn memory_hook_input_parsing() {
+    let commands = [
+        "git status",
+        "rm -rf /tmp/test",
+        "ls -la",
+        "dd if=/dev/zero of=/dev/sda",
+        "cargo build --release",
+        "chmod -R 777 /",
+    ];
+
+    assert_no_leak("hook_input_parsing", 1000, 10 * 1024 * 1024, || {
+        for cmd in &commands {
+            let json = sample_hook_input(cmd);
+            let _: Result<dcg::HookInput, _> = serde_json::from_str(&json);
+        }
+    });
+}
+
+#[test]
+fn memory_pattern_evaluation() {
+    let config = dcg::Config::load();
+    let compiled_overrides = config.overrides.compile();
+    let enabled_packs = config.enabled_pack_ids();
+    let enabled_keywords = dcg::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
+    let allowlists = dcg::load_default_allowlists();
+
+    let commands = [
+        "git status",
+        "rm -rf build/",
+        "cargo test",
+        "sudo rm -rf /",
+        "npm install",
+    ];
+
+    assert_no_leak("pattern_evaluation", 1000, 5 * 1024 * 1024, || {
+        for cmd in &commands {
+            let _ = dcg::evaluate_command(
+                cmd,
+                &config,
+                &enabled_keywords,
+                &compiled_overrides,
+                &allowlists,
+            );
+        }
+    });
+}
+
+#[test]
+fn memory_heredoc_extraction() {
+    let heredocs = [
+        sample_heredoc("echo hello"),
+        sample_heredoc("rm -rf /tmp/test && ls"),
+        sample_heredoc("for i in 1 2 3; do echo $i; done"),
+        "#!/usr/bin/env python3\nimport os\nos.remove('/tmp/test')".to_string(),
+        "#!/bin/bash\ncat <<EOF\ninner heredoc\nEOF".to_string(),
+    ];
+
+    assert_no_leak("heredoc_extraction", 1000, 10 * 1024 * 1024, || {
+        for content in &heredocs {
+            let _ = dcg::heredoc::check_triggers(content);
+            let _ = dcg::heredoc::ScriptLanguage::detect("cat script", content);
+        }
+    });
+}
+
+#[test]
+fn memory_extractors() {
+    const KEYWORDS: [&str; 1] = ["rm"];
+
+    let pkg_json = r#"{"scripts":{"build":"rm -rf dist && webpack","test":"jest"}}"#;
+
+    let terraform = r#"
+resource "null_resource" "example" {
+  provisioner "local-exec" {
+    command = "rm -rf /tmp/test"
+  }
+}
+"#;
+
+    let compose = r#"
+services:
+  app:
+    command: ["rm", "-rf", "/data"]
+"#;
+
+    let gitlab = r"
+build:
+  script:
+    - rm -rf dist/
+    - npm run build
+";
+
+    assert_no_leak("extractors", 500, 10 * 1024 * 1024, || {
+        let _ = dcg::scan::extract_package_json_from_str("package.json", pkg_json, &KEYWORDS);
+        let _ = dcg::scan::extract_terraform_from_str("main.tf", terraform, &KEYWORDS);
+        let _ =
+            dcg::scan::extract_docker_compose_from_str("docker-compose.yml", compose, &KEYWORDS);
+        let _ = dcg::scan::extract_gitlab_ci_from_str(".gitlab-ci.yml", gitlab, &KEYWORDS);
+    });
+}
+
+#[test]
+fn memory_full_pipeline() {
+    let config = dcg::Config::load();
+    let compiled_overrides = config.overrides.compile();
+    let enabled_packs = config.enabled_pack_ids();
+    let enabled_keywords = dcg::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
+    let allowlists = dcg::load_default_allowlists();
+
+    let inputs = [
+        sample_hook_input("git status"),
+        sample_hook_input("rm -rf build/"),
+        sample_hook_input("cargo build"),
+    ];
+
+    assert_no_leak("full_pipeline", 500, 2 * 1024 * 1024, || {
+        for json in &inputs {
+            if let Ok(input) = serde_json::from_str::<dcg::HookInput>(json) {
+                if let Some(cmd) = dcg::hook::extract_command(&input) {
+                    let _ = dcg::evaluate_command(
+                        &cmd,
+                        &config,
+                        &enabled_keywords,
+                        &compiled_overrides,
+                        &allowlists,
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn memory_leak_self_test() {
+    if get_memory_usage().is_none() {
+        println!("memory_leak_self_test: SKIPPED (memory tracking not available)");
+        return;
+    }
+
+    let result = std::panic::catch_unwind(|| {
+        assert_no_leak("intentional_leak", 100, 1024 * 1024, || {
+            let leaked: Vec<u8> = vec![0u8; 1024 * 1024];
+            std::mem::forget(leaked);
+        });
+    });
+
+    assert!(
+        result.is_err(),
+        "CRITICAL: Memory leak detection is BROKEN - intentional leak was not caught!"
+    );
+
+    println!("memory_leak_self_test: PASSED (framework correctly detects leaks)");
 }

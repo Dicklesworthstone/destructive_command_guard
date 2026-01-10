@@ -86,9 +86,8 @@ pub use config::Config;
 pub use evaluator::{
     EvaluationDecision, EvaluationResult, LegacyDestructivePattern, LegacySafePattern, MatchSource,
     MatchSpan, PatternMatch, evaluate_command, evaluate_command_with_deadline,
-    evaluate_command_with_pack_order,
-    evaluate_command_with_pack_order_at_path, evaluate_command_with_pack_order_deadline,
-    evaluate_command_with_pack_order_deadline_at_path,
+    evaluate_command_with_pack_order, evaluate_command_with_pack_order_at_path,
+    evaluate_command_with_pack_order_deadline, evaluate_command_with_pack_order_deadline_at_path,
 };
 pub use hook::{HookInput, HookOutput, HookResult, HookSpecificOutput};
 pub use packs::{Pack, PackId, PackRegistry};
