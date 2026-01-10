@@ -720,7 +720,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             handle_explain(&config, &command, format, with_packs);
         }
         Some(Command::Corpus(corpus)) => {
-            handle_corpus_command(&config, corpus)?;
+            handle_corpus_command(&config, &corpus)?;
         }
         None => {
             // No subcommand - run in hook mode (default behavior)
@@ -2288,9 +2288,9 @@ struct CategoryStats {
 /// Summary statistics for the corpus run.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CorpusSummary {
-    by_decision: std::collections::HashMap<String, usize>,
-    by_pack: std::collections::HashMap<String, usize>,
-    by_category: std::collections::HashMap<String, CategoryStats>,
+    decision: std::collections::HashMap<String, usize>,
+    pack: std::collections::HashMap<String, usize>,
+    category: std::collections::HashMap<String, CategoryStats>,
 }
 
 /// Full corpus output structure.
@@ -2316,9 +2316,9 @@ fn run_corpus(
 ) -> CorpusOutput {
     let mut results = Vec::new();
     let mut summary = CorpusSummary {
-        by_decision: std::collections::HashMap::new(),
-        by_pack: std::collections::HashMap::new(),
-        by_category: std::collections::HashMap::new(),
+        decision: std::collections::HashMap::new(),
+        pack: std::collections::HashMap::new(),
+        category: std::collections::HashMap::new(),
     };
 
     let categories = ["true_positives", "false_positives", "bypass_attempts", "edge_cases"];
@@ -2336,21 +2336,19 @@ fn run_corpus(
             continue;
         }
 
-        let category = match CorpusCategory::from_dir_name(category_name) {
-            Some(c) => c,
-            None => continue,
+        let Some(category) = CorpusCategory::from_dir_name(category_name) else {
+            continue;
         };
 
         // Initialize category stats
         summary
-            .by_category
+            .category
             .entry(category_name.to_string())
             .or_default();
 
         // Read all TOML files in the category directory (sorted for deterministic order)
-        let entries = match std::fs::read_dir(&category_dir) {
-            Ok(e) => e,
-            Err(_) => continue,
+        let Ok(entries) = std::fs::read_dir(&category_dir) else {
+            continue;
         };
 
         // Collect and sort file paths for deterministic ordering
@@ -2389,13 +2387,13 @@ fn run_corpus(
                 let result = run_single_corpus_test(config, &case, category, &file_name, idx);
 
                 // Update summary stats
-                *summary.by_decision.entry(result.actual.clone()).or_default() += 1;
+                *summary.decision.entry(result.actual.clone()).or_default() += 1;
                 if let Some(ref pack) = result.pack_id {
-                    *summary.by_pack.entry(pack.clone()).or_default() += 1;
+                    *summary.pack.entry(pack.clone()).or_default() += 1;
                 }
 
                 let cat_stats = summary
-                    .by_category
+                    .category
                     .entry(category_name.to_string())
                     .or_default();
                 cat_stats.total += 1;
@@ -2466,7 +2464,7 @@ fn run_single_corpus_test(
         &allowlists,
         &heredoc_settings,
     );
-    let duration_us = start.elapsed().as_micros() as u64;
+    let duration_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
 
     let actual = match result.decision {
         EvaluationDecision::Allow => "allow",
@@ -2520,7 +2518,7 @@ fn run_single_corpus_test(
 /// Handle the `dcg corpus` command.
 fn handle_corpus_command(
     config: &Config,
-    cmd: CorpusCommand,
+    cmd: &CorpusCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
@@ -2622,48 +2620,52 @@ fn diff_corpus_outputs(baseline: &CorpusOutput, current: &CorpusOutput) -> Vec<S
         }
     }
 
+    // Sort diffs for deterministic output (HashMap iteration is non-deterministic)
+    diffs.sort();
+
     diffs
 }
 
 /// Format corpus output for human-readable display.
 fn format_corpus_pretty(output: &CorpusOutput) -> String {
     use colored::Colorize;
+    use std::fmt::Write;
 
     let mut result = String::new();
     let colorize = colored::control::SHOULD_COLORIZE.should_colorize();
 
     // Header
-    result.push_str(&format!(
-        "{}\n\n",
+    let _ = writeln!(result,
+        "{}\n",
         if colorize {
             "dcg corpus".green().bold().to_string()
         } else {
             "dcg corpus".to_string()
         }
-    ));
+    );
 
-    result.push_str(&format!("Corpus: {}\n", output.corpus_dir));
-    result.push_str(&format!("Version: {}\n", output.binary_version));
-    result.push_str(&format!("Generated: {}\n\n", output.generated_at));
+    let _ = writeln!(result, "Corpus: {}", output.corpus_dir);
+    let _ = writeln!(result, "Version: {}", output.binary_version);
+    let _ = writeln!(result, "Generated: {}\n", output.generated_at);
 
     // Summary
-    result.push_str(&format!(
-        "{}\n",
+    let _ = writeln!(result,
+        "{}",
         if colorize {
             "=== Summary ===".blue().bold().to_string()
         } else {
             "=== Summary ===".to_string()
         }
-    ));
+    );
 
-    result.push_str(&format!(
-        "Total: {} ({} passed, {} failed)\n\n",
+    let _ = writeln!(result,
+        "Total: {} ({} passed, {} failed)\n",
         output.total_cases, output.total_passed, output.total_failed
-    ));
+    );
 
     // By category (sorted for deterministic output)
     result.push_str("By Category:\n");
-    let mut categories: Vec<_> = output.summary.by_category.iter().collect();
+    let mut categories: Vec<_> = output.summary.category.iter().collect();
     categories.sort_by_key(|(k, _)| *k);
     for (cat, stats) in categories {
         let status = if stats.failed == 0 { "OK" } else { "FAIL" };
@@ -2676,61 +2678,61 @@ fn format_corpus_pretty(output: &CorpusOutput) -> String {
         } else {
             status.to_string()
         };
-        result.push_str(&format!(
-            "  {}: {}/{} [{}]\n",
+        let _ = writeln!(result,
+            "  {}: {}/{} [{}]",
             cat, stats.passed, stats.total, status_str
-        ));
+        );
     }
     result.push('\n');
 
     // By decision (sorted for deterministic output)
     result.push_str("By Decision:\n");
-    let mut decisions: Vec<_> = output.summary.by_decision.iter().collect();
+    let mut decisions: Vec<_> = output.summary.decision.iter().collect();
     decisions.sort_by_key(|(k, _)| *k);
     for (decision, count) in decisions {
-        result.push_str(&format!("  {decision}: {count}\n"));
+        let _ = writeln!(result, "  {decision}: {count}");
     }
     result.push('\n');
 
     // By pack (top 10)
     result.push_str("By Pack (top 10):\n");
-    let mut packs: Vec<_> = output.summary.by_pack.iter().collect();
+    let mut packs: Vec<_> = output.summary.pack.iter().collect();
     packs.sort_by(|a, b| b.1.cmp(a.1));
     for (pack, count) in packs.iter().take(10) {
-        result.push_str(&format!("  {pack}: {count}\n"));
+        let _ = writeln!(result, "  {pack}: {count}");
     }
     result.push('\n');
 
     // Failed tests
     let failures: Vec<_> = output.cases.iter().filter(|c| !c.passed).collect();
     if !failures.is_empty() {
-        result.push_str(&format!(
-            "{}\n",
+        let _ = writeln!(result,
+            "{}",
             if colorize {
                 "=== Failures ===".red().bold().to_string()
             } else {
                 "=== Failures ===".to_string()
             }
-        ));
+        );
 
         for case in failures {
-            result.push_str(&format!(
-                "  {} - {}\n",
+            let _ = writeln!(result,
+                "  {} - {}",
                 if colorize {
                     "FAIL".red().to_string()
                 } else {
                     "FAIL".to_string()
                 },
                 case.description
-            ));
-            result.push_str(&format!("    ID: {}\n", case.id));
-            result.push_str(&format!("    Command: {}\n", case.command));
-            result.push_str(&format!(
-                "    Expected: {}, Actual: {}\n",
+            );
+            let _ = writeln!(result, "    ID: {}", case.id);
+            let _ = writeln!(result, "    Command: {}", case.command);
+            let _ = writeln!(result,
+                "    Expected: {}, Actual: {}",
                 case.expected, case.actual
-            ));
+            );
             if let Some(ref rule) = case.actual_rule_id {
-                result.push_str(&format!("    Rule: {rule}\n"));
+                let _ = writeln!(result, "    Rule: {rule}");
             }
             result.push('\n');
         }

@@ -705,6 +705,19 @@ pub fn is_argument_data(command: &str, preceding_flag: Option<&str>) -> bool {
     false
 }
 
+/// Check if the current segment ends with a pipe (indicating potential code execution).
+fn is_piped_segment(command: &str, tokens: &[SanitizeToken], current_idx: usize) -> bool {
+    for token in &tokens[current_idx..] {
+        if token.kind == SanitizeTokenKind::Separator {
+            let sep = &command[token.byte_range.clone()];
+            // Matches "|" (pipe) or "|&" (pipe with stderr)
+            // Does NOT match "||" (OR) or ";" (sequence)
+            return sep == "|" || sep == "|&";
+        }
+    }
+    false
+}
+
 /// Create a sanitized view of `command` for regex-based pattern matching.
 ///
 /// This function replaces known-safe *string arguments* (commit messages, issue
@@ -736,7 +749,7 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
     let mut search_pattern_masked = false;
     let mut wrapper: WrapperState = WrapperState::None;
 
-    for token in &tokens {
+    for (i, token) in tokens.iter().enumerate() {
         if token.kind == SanitizeTokenKind::Separator {
             segment_cmd = None;
             segment_cmd_is_all_args_data = false;
@@ -770,6 +783,13 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
 
             segment_cmd = Some(token_text);
             segment_cmd_is_all_args_data = SAFE_STRING_REGISTRY.is_all_args_data(token_text);
+
+            // If this command feeds into a pipe, its output is likely code (e.g. echo ... | sh).
+            // Do NOT treat arguments as data in this case.
+            if segment_cmd_is_all_args_data && is_piped_segment(command, &tokens, i) {
+                segment_cmd_is_all_args_data = false;
+            }
+
             pending_safe_flag = None;
             options_ended = false;
             search_pattern_masked = false;
@@ -1195,6 +1215,10 @@ fn split_flag_assignment(token: &str, token_start: usize) -> Option<(&str, Range
     let eq_offset = flag.len();
     let value_start = token_start + eq_offset + 1;
     let value_end = token_start + token.len();
+    if value_start >= value_end {
+        return None;
+    }
+
     Some((flag, value_start..value_end))
 }
 
@@ -1461,6 +1485,18 @@ fn consume_dollar_paren(command: &str, start: usize) -> usize {
 
     while i < len {
         match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                if depth == 1 {
+                    // End of command substitution
+                    return i + 1;
+                }
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
             b'\\' => {
                 i = (i + 2).min(len);
             }
@@ -1492,24 +1528,13 @@ fn consume_dollar_paren(command: &str, start: usize) -> usize {
                     }
                 }
             }
-            b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
-                depth += 1;
-                i += 2;
-            }
-            b')' => {
-                depth = depth.saturating_sub(1);
-                i += 1;
-                if depth == 0 {
-                    break;
-                }
-            }
             _ => {
                 i += 1;
             }
         }
     }
 
-    i
+    len
 }
 
 #[must_use]
@@ -1749,10 +1774,7 @@ mod tests {
         let spans = classify_command(cmd);
 
         // The quoted message should be Argument
-        let msg_span = spans
-            .spans()
-            .iter()
-            .find(|s| s.text(cmd).contains("reset --hard"));
+        let msg_span = spans.spans().iter().find(|s| s.text(cmd).contains("reset --hard"));
         if let Some(span) = msg_span {
             assert!(
                 span.kind == SpanKind::Argument || span.kind == SpanKind::Data,
@@ -1815,6 +1837,21 @@ mod tests {
             .iter()
             .find(|s| s.kind == SpanKind::InlineCode);
         assert!(inline_span.is_some());
+    }
+
+    #[test]
+    fn test_nested_command_substitution_parens() {
+        // Test nested parentheses inside command substitution
+        let cmd = "echo $( ( echo inner ) )";
+        let spans = classify_command(cmd);
+
+        // Should include the nested parens in the InlineCode span
+        let inline_span = spans
+            .spans()
+            .iter()
+            .find(|s| s.kind == SpanKind::InlineCode);
+        assert!(inline_span.is_some());
+        assert_eq!(inline_span.unwrap().text(cmd), "$( ( echo inner ) )");
     }
 
     #[test]

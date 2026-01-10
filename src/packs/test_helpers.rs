@@ -664,6 +664,590 @@ pub fn create_debug_runner(pack: &Pack) -> LoggedPackTestRunner<'_> {
     LoggedPackTestRunner::debug(pack)
 }
 
+// ============================================================================
+// Isomorphism Test Infrastructure
+// ============================================================================
+//
+// This section provides utilities for golden/snapshot testing of the evaluator.
+// Use these helpers to verify that refactors preserve exact behavior.
+
+use crate::allowlist::AllowlistLayer;
+use crate::evaluator::{
+    evaluate_command_with_pack_order, EvaluationDecision, EvaluationResult, MatchSource,
+};
+use crate::packs::{DecisionMode, REGISTRY};
+use crate::Config;
+use std::path::Path;
+
+/// A stable, comparable snapshot of an evaluation result for golden testing.
+///
+/// This struct captures all meaningful aspects of an evaluation that tests
+/// should verify remain unchanged across refactors.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let snapshot = eval_snapshot("git reset --hard", &config);
+/// assert_eq!(snapshot.decision, "deny");
+/// assert_eq!(snapshot.rule_id, Some("core.git:reset-hard".into()));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EvalSnapshot {
+    /// The command that was evaluated.
+    pub command: String,
+    /// Decision: "allow" or "deny".
+    pub decision: String,
+    /// Effective mode: "deny", "warn", "log", or None if allowed cleanly.
+    pub effective_mode: Option<String>,
+    /// Combined pack:pattern ID (e.g., "core.git:reset-hard").
+    pub rule_id: Option<String>,
+    /// Pack that matched (e.g., "core.git").
+    pub pack_id: Option<String>,
+    /// Pattern name within the pack (e.g., "reset-hard").
+    pub pattern_name: Option<String>,
+    /// Match source: "pack", "config", "heredoc", or "legacy".
+    pub match_source: Option<String>,
+    /// Reason substring (first 100 chars).
+    pub reason_preview: Option<String>,
+    /// Whether evaluation was truncated due to time budget.
+    pub skipped_due_to_budget: bool,
+    /// Allowlist layer if overridden: "project", "user", or "system".
+    pub allowlist_layer: Option<String>,
+    /// Preview of matched text (if available).
+    pub matched_text_preview: Option<String>,
+}
+
+impl EvalSnapshot {
+    /// Create a snapshot from an evaluation result.
+    #[must_use]
+    pub fn from_result(command: &str, result: &EvaluationResult) -> Self {
+        let decision = match result.decision {
+            EvaluationDecision::Allow => "allow",
+            EvaluationDecision::Deny => "deny",
+        };
+
+        let effective_mode = result.effective_mode.map(|m| match m {
+            DecisionMode::Deny => "deny".to_string(),
+            DecisionMode::Warn => "warn".to_string(),
+            DecisionMode::Log => "log".to_string(),
+        });
+
+        let (pack_id, pattern_name, rule_id, match_source, reason_preview, matched_text_preview) =
+            result.pattern_info.as_ref().map_or(
+                (None, None, None, None, None, None),
+                |info| {
+                    let pack = info.pack_id.clone();
+                    let pattern = info.pattern_name.clone();
+                    let rule = pack
+                        .as_ref()
+                        .zip(pattern.as_ref())
+                        .map(|(p, n)| format!("{p}:{n}"));
+                    let source = Some(match info.source {
+                        MatchSource::Pack => "pack".to_string(),
+                        MatchSource::ConfigOverride => "config".to_string(),
+                        MatchSource::HeredocAst => "heredoc".to_string(),
+                        MatchSource::LegacyPattern => "legacy".to_string(),
+                    });
+                    let reason = if info.reason.len() > 100 {
+                        Some(info.reason[..100].to_string())
+                    } else {
+                        Some(info.reason.clone())
+                    };
+                    (pack, pattern, rule, source, reason, info.matched_text_preview.clone())
+                },
+            );
+
+        let allowlist_layer = result.allowlist_override.as_ref().map(|ao| match ao.layer {
+            AllowlistLayer::Project => "project".to_string(),
+            AllowlistLayer::User => "user".to_string(),
+            AllowlistLayer::System => "system".to_string(),
+        });
+
+        Self {
+            command: command.to_string(),
+            decision: decision.to_string(),
+            effective_mode,
+            rule_id,
+            pack_id,
+            pattern_name,
+            match_source,
+            reason_preview,
+            skipped_due_to_budget: result.skipped_due_to_budget,
+            allowlist_layer,
+            matched_text_preview,
+        }
+    }
+}
+
+/// Expected log fields from a corpus test case.
+///
+/// These are the fields specified in `[case.log]` sections of corpus TOML files.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ExpectedLog {
+    /// Expected decision: "allow" or "deny".
+    pub decision: Option<String>,
+    /// Expected effective mode: "deny", "warn", or "log".
+    pub mode: Option<String>,
+    /// Expected pack ID.
+    pub pack_id: Option<String>,
+    /// Expected pattern name.
+    pub pattern_name: Option<String>,
+    /// Expected rule ID (pack:pattern).
+    pub rule_id: Option<String>,
+    /// Substring that reason must contain.
+    pub reason_contains: Option<String>,
+    /// Expected allowlist layer.
+    pub allowlist_layer: Option<String>,
+}
+
+/// A corpus test case loaded from TOML.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CorpusTestCase {
+    /// Human-readable description.
+    pub description: String,
+    /// The command to evaluate.
+    pub command: String,
+    /// Expected outcome: "allow" or "deny".
+    pub expected: String,
+    /// Optional rule ID that should match (for deny cases).
+    #[serde(default)]
+    pub rule_id: Option<String>,
+    /// Optional expected log fields for detailed verification.
+    #[serde(default)]
+    pub log: Option<ExpectedLog>,
+}
+
+/// A corpus file containing multiple test cases.
+#[derive(Debug, serde::Deserialize)]
+struct CorpusFile {
+    #[serde(rename = "case")]
+    cases: Vec<CorpusTestCase>,
+}
+
+/// Category of corpus test based on directory name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorpusCategory {
+    /// Commands that should be denied (true positives).
+    TruePositives,
+    /// Commands that should be allowed (false positive prevention).
+    FalsePositives,
+    /// Bypass attempts that should still be denied.
+    BypassAttempts,
+    /// Edge cases where any outcome is acceptable (tests parsing/stability).
+    EdgeCases,
+}
+
+impl CorpusCategory {
+    /// Parse category from directory name.
+    #[must_use]
+    pub fn from_dir_name(name: &str) -> Option<Self> {
+        match name {
+            "true_positives" => Some(Self::TruePositives),
+            "false_positives" => Some(Self::FalsePositives),
+            "bypass_attempts" => Some(Self::BypassAttempts),
+            "edge_cases" => Some(Self::EdgeCases),
+            _ => None,
+        }
+    }
+
+    /// Get the expected decision for this category.
+    #[must_use]
+    pub const fn expected_decision(&self) -> Option<&'static str> {
+        match self {
+            Self::TruePositives | Self::BypassAttempts => Some("deny"),
+            Self::FalsePositives => Some("allow"),
+            Self::EdgeCases => None, // Any outcome OK
+        }
+    }
+}
+
+/// Load corpus test cases from a TOML file.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or parsed.
+#[allow(clippy::missing_errors_doc)]
+pub fn load_corpus_file(path: &Path) -> Result<Vec<CorpusTestCase>, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let corpus: CorpusFile = toml::from_str(&content)
+        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+    Ok(corpus.cases)
+}
+
+/// Load all corpus test cases from a directory.
+///
+/// Recursively loads all `.toml` files from the given directory.
+///
+/// # Errors
+///
+/// Returns an error if any file cannot be read or parsed.
+#[allow(clippy::missing_errors_doc)]
+pub fn load_corpus_dir(dir: &Path) -> Result<Vec<(CorpusCategory, String, CorpusTestCase)>, String> {
+    let mut cases = Vec::new();
+    let categories = ["true_positives", "false_positives", "bypass_attempts", "edge_cases"];
+
+    for category_name in &categories {
+        let category_dir = dir.join(category_name);
+        if !category_dir.exists() {
+            continue;
+        }
+
+        let Some(category) = CorpusCategory::from_dir_name(category_name) else {
+            continue;
+        };
+
+        let entries = std::fs::read_dir(&category_dir)
+            .map_err(|e| format!("Failed to read {}: {e}", category_dir.display()))?;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "toml") {
+                let file_cases = load_corpus_file(&path)?;
+                let file_name = path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                for case in file_cases {
+                    cases.push((category, file_name.clone(), case));
+                }
+            }
+        }
+    }
+
+    Ok(cases)
+}
+
+/// Evaluate a command and return a snapshot for comparison.
+///
+/// Uses the default configuration with all core packs enabled.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let snapshot = eval_snapshot("git reset --hard");
+/// assert_eq!(snapshot.decision, "deny");
+/// ```
+#[must_use]
+pub fn eval_snapshot(command: &str) -> EvalSnapshot {
+    eval_snapshot_with_config(command, &Config::default())
+}
+
+/// Evaluate a command with a specific configuration and return a snapshot.
+#[must_use]
+pub fn eval_snapshot_with_config(command: &str, config: &Config) -> EvalSnapshot {
+    let enabled_packs = config.enabled_pack_ids();
+    let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+    let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let compiled_overrides = config.overrides.compile();
+    let allowlists = crate::LayeredAllowlist::default();
+    let heredoc_settings = config.heredoc_settings();
+
+    let result = evaluate_command_with_pack_order(
+        command,
+        &enabled_keywords,
+        &ordered_packs,
+        &compiled_overrides,
+        &allowlists,
+        &heredoc_settings,
+    );
+
+    EvalSnapshot::from_result(command, &result)
+}
+
+/// Diff two evaluation snapshots and return human-readable differences.
+///
+/// Returns `None` if the snapshots are identical.
+#[must_use]
+pub fn diff_snapshots(expected: &EvalSnapshot, actual: &EvalSnapshot) -> Option<String> {
+    let mut diffs = Vec::new();
+
+    if expected.decision != actual.decision {
+        diffs.push(format!(
+            "  decision: expected '{}', got '{}'",
+            expected.decision, actual.decision
+        ));
+    }
+
+    if expected.effective_mode != actual.effective_mode {
+        diffs.push(format!(
+            "  effective_mode: expected {:?}, got {:?}",
+            expected.effective_mode, actual.effective_mode
+        ));
+    }
+
+    if expected.rule_id != actual.rule_id {
+        diffs.push(format!(
+            "  rule_id: expected {:?}, got {:?}",
+            expected.rule_id, actual.rule_id
+        ));
+    }
+
+    if expected.pack_id != actual.pack_id {
+        diffs.push(format!(
+            "  pack_id: expected {:?}, got {:?}",
+            expected.pack_id, actual.pack_id
+        ));
+    }
+
+    if expected.pattern_name != actual.pattern_name {
+        diffs.push(format!(
+            "  pattern_name: expected {:?}, got {:?}",
+            expected.pattern_name, actual.pattern_name
+        ));
+    }
+
+    if expected.match_source != actual.match_source {
+        diffs.push(format!(
+            "  match_source: expected {:?}, got {:?}",
+            expected.match_source, actual.match_source
+        ));
+    }
+
+    if expected.skipped_due_to_budget != actual.skipped_due_to_budget {
+        diffs.push(format!(
+            "  skipped_due_to_budget: expected {}, got {}",
+            expected.skipped_due_to_budget, actual.skipped_due_to_budget
+        ));
+    }
+
+    if expected.allowlist_layer != actual.allowlist_layer {
+        diffs.push(format!(
+            "  allowlist_layer: expected {:?}, got {:?}",
+            expected.allowlist_layer, actual.allowlist_layer
+        ));
+    }
+
+    if diffs.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Snapshot mismatch for command: {}\n{}\n\nReproduce:\n  cargo test -- --nocapture 'test_name' && dcg explain '{}'",
+            expected.command,
+            diffs.join("\n"),
+            expected.command.replace('\'', "'\\''")
+        ))
+    }
+}
+
+/// Verify a corpus test case passes.
+///
+/// Returns `Ok(())` if the test passes, or `Err(message)` with details on failure.
+#[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+pub fn verify_corpus_case(case: &CorpusTestCase, category: CorpusCategory) -> Result<(), String> {
+    let snapshot = eval_snapshot(&case.command);
+
+    // Check basic decision
+    let expected_decision = case.expected.as_str();
+    if snapshot.decision != expected_decision {
+        return Err(format!(
+            "Decision mismatch:\n\
+             Description: {}\n\
+             Command: {}\n\
+             Expected: {}\n\
+             Actual: {}\n\
+             Rule ID: {:?}\n\
+             Reproduce: dcg explain '{}'",
+            case.description,
+            case.command,
+            expected_decision,
+            snapshot.decision,
+            snapshot.rule_id,
+            case.command.replace('\'', "'\\''")
+        ));
+    }
+
+    // Check rule_id if specified
+    if let Some(ref expected_rule_id) = case.rule_id {
+        if snapshot.rule_id.as_deref() != Some(expected_rule_id) {
+            return Err(format!(
+                "Rule ID mismatch:\n\
+                 Description: {}\n\
+                 Command: {}\n\
+                 Expected rule_id: {}\n\
+                 Actual rule_id: {:?}\n\
+                 Reproduce: dcg explain '{}'",
+                case.description,
+                case.command,
+                expected_rule_id,
+                snapshot.rule_id,
+                case.command.replace('\'', "'\\''")
+            ));
+        }
+    }
+
+    // Check detailed log expectations if present
+    if let Some(ref log) = case.log {
+        if let Some(ref expected_decision) = log.decision {
+            if snapshot.decision != *expected_decision {
+                return Err(format!(
+                    "Log decision mismatch: expected {expected_decision}, got {}",
+                    snapshot.decision
+                ));
+            }
+        }
+
+        if let Some(ref expected_mode) = log.mode {
+            if snapshot.effective_mode.as_deref() != Some(expected_mode.as_str()) {
+                return Err(format!(
+                    "Log mode mismatch: expected {expected_mode}, got {:?}",
+                    snapshot.effective_mode
+                ));
+            }
+        }
+
+        if let Some(ref expected_pack_id) = log.pack_id {
+            if snapshot.pack_id.as_deref() != Some(expected_pack_id.as_str()) {
+                return Err(format!(
+                    "Log pack_id mismatch: expected {expected_pack_id}, got {:?}",
+                    snapshot.pack_id
+                ));
+            }
+        }
+
+        if let Some(ref expected_pattern_name) = log.pattern_name {
+            if snapshot.pattern_name.as_deref() != Some(expected_pattern_name.as_str()) {
+                return Err(format!(
+                    "Log pattern_name mismatch: expected {expected_pattern_name}, got {:?}",
+                    snapshot.pattern_name
+                ));
+            }
+        }
+
+        if let Some(ref expected_rule_id) = log.rule_id {
+            if snapshot.rule_id.as_deref() != Some(expected_rule_id.as_str()) {
+                return Err(format!(
+                    "Log rule_id mismatch: expected {expected_rule_id}, got {:?}",
+                    snapshot.rule_id
+                ));
+            }
+        }
+
+        if let Some(ref reason_contains) = log.reason_contains {
+            let contains = snapshot
+                .reason_preview
+                .as_ref()
+                .is_some_and(|r| r.contains(reason_contains));
+            if !contains {
+                return Err(format!(
+                    "Log reason_contains mismatch: expected to contain '{}', got {:?}",
+                    reason_contains, snapshot.reason_preview
+                ));
+            }
+        }
+    }
+
+    // Category-based validation (for cases without explicit log expectations)
+    if case.log.is_none() {
+        if let Some(cat_decision) = category.expected_decision() {
+            if snapshot.decision != cat_decision {
+                return Err(format!(
+                    "Category-based decision mismatch:\n\
+                     Description: {}\n\
+                     Command: {}\n\
+                     Category: {:?} (expects {})\n\
+                     Actual: {}",
+                    case.description, case.command, category, cat_decision, snapshot.decision
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Assert a command produces the expected snapshot.
+///
+/// Panics with a detailed diff if the snapshots don't match.
+///
+/// # Panics
+///
+/// Panics if the actual evaluation result doesn't match the expected snapshot.
+#[track_caller]
+pub fn assert_eval_snapshot(command: &str, expected: &EvalSnapshot) {
+    let actual = eval_snapshot(command);
+    if let Some(diff) = diff_snapshots(expected, &actual) {
+        panic!("Evaluation snapshot mismatch:\n{diff}");
+    }
+}
+
+/// Assert a command produces a specific decision.
+///
+/// This is a simpler helper for basic decision verification.
+///
+/// # Panics
+///
+/// Panics if the decision doesn't match.
+#[track_caller]
+pub fn assert_decision(command: &str, expected_decision: &str) {
+    let snapshot = eval_snapshot(command);
+    assert_eq!(
+        snapshot.decision, expected_decision,
+        "Decision mismatch for command: {}\nExpected: {}\nActual: {}\nRule ID: {:?}\n\nReproduce: dcg explain '{}'",
+        command, expected_decision, snapshot.decision, snapshot.rule_id,
+        command.replace('\'', "'\\''")
+    );
+}
+
+/// Assert a command is denied with a specific rule.
+///
+/// # Panics
+///
+/// Panics if the command is not denied or the rule doesn't match.
+#[track_caller]
+pub fn assert_denies_with_rule(command: &str, expected_rule_id: &str) {
+    let snapshot = eval_snapshot(command);
+    assert_eq!(
+        snapshot.decision, "deny",
+        "Expected deny for command: {}\nActual: {}\nRule ID: {:?}",
+        command, snapshot.decision, snapshot.rule_id
+    );
+    assert_eq!(
+        snapshot.rule_id.as_deref(),
+        Some(expected_rule_id),
+        "Rule mismatch for command: {}\nExpected: {}\nActual: {:?}",
+        command, expected_rule_id, snapshot.rule_id
+    );
+}
+
+/// Assert a command is allowed (not blocked).
+///
+/// # Panics
+///
+/// Panics if the command is denied.
+#[track_caller]
+pub fn assert_allows_command(command: &str) {
+    let snapshot = eval_snapshot(command);
+    assert_eq!(
+        snapshot.decision, "allow",
+        "Expected allow for command: {}\nActual: {}\nBlocked by: {:?}",
+        command, snapshot.decision, snapshot.rule_id
+    );
+}
+
+/// Batch verify corpus test cases.
+///
+/// Returns a summary of pass/fail counts and details of failures.
+#[must_use]
+pub fn verify_corpus_batch(
+    cases: &[(CorpusCategory, String, CorpusTestCase)],
+) -> (usize, usize, Vec<String>) {
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut failures = Vec::new();
+
+    for (category, file, case) in cases {
+        match verify_corpus_case(case, *category) {
+            Ok(()) => passed += 1,
+            Err(msg) => {
+                failed += 1;
+                failures.push(format!("[{file}] {msg}"));
+            }
+        }
+    }
+
+    (passed, failed, failures)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,5 +1376,169 @@ mod tests {
         let pack = core::git::create_pack();
         let runner = create_debug_runner(&pack);
         assert_eq!(runner.logger().test_result_count(), 0);
+    }
+
+    // =========================================================================
+    // Isomorphism Test Infrastructure Tests
+    // =========================================================================
+
+    #[test]
+    fn test_eval_snapshot_deny() {
+        let snapshot = eval_snapshot("git reset --hard");
+        assert_eq!(snapshot.decision, "deny");
+        assert_eq!(snapshot.rule_id, Some("core.git:reset-hard".to_string()));
+        assert_eq!(snapshot.pack_id, Some("core.git".to_string()));
+        assert_eq!(snapshot.pattern_name, Some("reset-hard".to_string()));
+        assert_eq!(snapshot.match_source, Some("pack".to_string()));
+        assert!(snapshot.reason_preview.is_some());
+        assert!(!snapshot.skipped_due_to_budget);
+    }
+
+    #[test]
+    fn test_eval_snapshot_allow() {
+        let snapshot = eval_snapshot("git status");
+        assert_eq!(snapshot.decision, "allow");
+        assert!(snapshot.rule_id.is_none());
+        assert!(snapshot.pack_id.is_none());
+    }
+
+    #[test]
+    fn test_assert_decision_works() {
+        assert_decision("git reset --hard", "deny");
+        assert_decision("git status", "allow");
+    }
+
+    #[test]
+    fn test_assert_denies_with_rule_works() {
+        assert_denies_with_rule("git reset --hard", "core.git:reset-hard");
+        assert_denies_with_rule("git clean -fd", "core.git:clean-force");
+    }
+
+    #[test]
+    fn test_assert_allows_command_works() {
+        assert_allows_command("git status");
+        assert_allows_command("ls -la");
+    }
+
+    #[test]
+    fn test_diff_snapshots_identical() {
+        let s1 = eval_snapshot("git reset --hard");
+        let s2 = eval_snapshot("git reset --hard");
+        assert!(diff_snapshots(&s1, &s2).is_none());
+    }
+
+    #[test]
+    fn test_diff_snapshots_different() {
+        let s1 = eval_snapshot("git reset --hard");
+        let s2 = eval_snapshot("git status");
+        let diff = diff_snapshots(&s1, &s2);
+        assert!(diff.is_some());
+        let diff_text = diff.unwrap();
+        assert!(diff_text.contains("decision"));
+        assert!(diff_text.contains("Reproduce"));
+    }
+
+    #[test]
+    fn test_corpus_category_from_dir_name() {
+        assert_eq!(
+            CorpusCategory::from_dir_name("true_positives"),
+            Some(CorpusCategory::TruePositives)
+        );
+        assert_eq!(
+            CorpusCategory::from_dir_name("false_positives"),
+            Some(CorpusCategory::FalsePositives)
+        );
+        assert_eq!(
+            CorpusCategory::from_dir_name("bypass_attempts"),
+            Some(CorpusCategory::BypassAttempts)
+        );
+        assert_eq!(
+            CorpusCategory::from_dir_name("edge_cases"),
+            Some(CorpusCategory::EdgeCases)
+        );
+        assert!(CorpusCategory::from_dir_name("unknown").is_none());
+    }
+
+    #[test]
+    fn test_corpus_category_expected_decision() {
+        assert_eq!(CorpusCategory::TruePositives.expected_decision(), Some("deny"));
+        assert_eq!(CorpusCategory::BypassAttempts.expected_decision(), Some("deny"));
+        assert_eq!(CorpusCategory::FalsePositives.expected_decision(), Some("allow"));
+        assert_eq!(CorpusCategory::EdgeCases.expected_decision(), None);
+    }
+
+    #[test]
+    fn test_verify_corpus_case_pass() {
+        let case = CorpusTestCase {
+            description: "git reset --hard should be blocked".to_string(),
+            command: "git reset --hard".to_string(),
+            expected: "deny".to_string(),
+            rule_id: Some("core.git:reset-hard".to_string()),
+            log: None,
+        };
+        let result = verify_corpus_case(&case, CorpusCategory::TruePositives);
+        assert!(result.is_ok(), "Expected pass: {result:?}");
+    }
+
+    #[test]
+    fn test_verify_corpus_case_fail_wrong_decision() {
+        let case = CorpusTestCase {
+            description: "git status should NOT be blocked".to_string(),
+            command: "git status".to_string(),
+            expected: "deny".to_string(), // Wrong: git status is allowed
+            rule_id: None,
+            log: None,
+        };
+        let result = verify_corpus_case(&case, CorpusCategory::TruePositives);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("Decision mismatch"));
+    }
+
+    #[test]
+    fn test_verify_corpus_case_with_log_expectations() {
+        let case = CorpusTestCase {
+            description: "git reset --hard with log checks".to_string(),
+            command: "git reset --hard".to_string(),
+            expected: "deny".to_string(),
+            rule_id: Some("core.git:reset-hard".to_string()),
+            log: Some(ExpectedLog {
+                decision: Some("deny".to_string()),
+                mode: Some("deny".to_string()),
+                pack_id: Some("core.git".to_string()),
+                pattern_name: Some("reset-hard".to_string()),
+                rule_id: Some("core.git:reset-hard".to_string()),
+                reason_contains: Some("uncommitted".to_string()),
+                allowlist_layer: None,
+            }),
+        };
+        let result = verify_corpus_case(&case, CorpusCategory::TruePositives);
+        assert!(result.is_ok(), "Expected pass: {result:?}");
+    }
+
+    #[test]
+    fn test_load_corpus_file() {
+        // Test loading a real corpus file
+        let path = std::path::Path::new("tests/corpus/true_positives/git_destructive.toml");
+        if path.exists() {
+            let cases = load_corpus_file(path);
+            assert!(cases.is_ok(), "Failed to load: {cases:?}");
+            let cases = cases.unwrap();
+            assert!(!cases.is_empty());
+            // First case should be git reset --hard
+            assert!(cases[0].command.contains("git reset"));
+        }
+    }
+
+    #[test]
+    fn test_eval_snapshot_serialization() {
+        let snapshot = eval_snapshot("git reset --hard");
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.contains("deny"));
+        assert!(json.contains("core.git:reset-hard"));
+
+        // Round-trip
+        let deserialized: EvalSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snapshot, deserialized);
     }
 }
