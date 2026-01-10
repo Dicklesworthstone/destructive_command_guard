@@ -398,24 +398,24 @@ The pack testing framework includes structured logging for debugging and CI/CD i
 For detailed debugging output, use `LoggedPackTestRunner`:
 
 ```rust
-use crate::packs::test_helpers::{LoggedPackTestRunner, create_debug_runner};
+use crate::packs::test_helpers::LoggedPackTestRunner;
 use crate::logging::{PackTestLogConfig, PackTestLogLevel};
 
 #[test]
 fn test_with_logging() {
     let pack = create_pack();
 
-    // Create a debug runner for verbose output
+    // Option 1: Quick debug runner (recommended for most debugging)
     let mut runner = LoggedPackTestRunner::debug(&pack);
 
-    // Or use custom configuration
-    let config = PackTestLogConfig {
-        level: PackTestLogLevel::Debug,
-        json_mode: true,  // Output structured JSON
-        show_timing: true,
-        show_patterns: true,
-    };
-    let mut runner = LoggedPackTestRunner::new(&pack, config);
+    // Option 2: Custom configuration (uncomment to use instead)
+    // let config = PackTestLogConfig {
+    //     level: PackTestLogLevel::Debug,
+    //     json_mode: true,  // Output structured JSON
+    //     show_timing: true,
+    //     show_patterns: true,
+    // };
+    // let mut runner = LoggedPackTestRunner::new(&pack, config);
 
     // Run assertions (automatically logged)
     runner.assert_blocks("dangerous-command", "expected reason");
