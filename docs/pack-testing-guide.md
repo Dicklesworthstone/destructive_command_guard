@@ -388,3 +388,112 @@ cargo test test_destructive_drop_table
 - [ ] Specificity tests (5+ unrelated commands)
 - [ ] Performance test with pathological input
 - [ ] All tests pass with `cargo test`
+
+## Pack Testing Logging
+
+The pack testing framework includes structured logging for debugging and CI/CD integration.
+
+### Using LoggedPackTestRunner
+
+For detailed debugging output, use `LoggedPackTestRunner`:
+
+```rust
+use crate::packs::test_helpers::{LoggedPackTestRunner, create_debug_runner};
+use crate::logging::PackTestLogConfig;
+
+#[test]
+fn test_with_logging() {
+    let pack = create_pack();
+
+    // Create a debug runner for verbose output
+    let mut runner = LoggedPackTestRunner::debug(&pack);
+
+    // Or use custom configuration
+    let config = PackTestLogConfig {
+        level: PackTestLogLevel::Debug,
+        json_mode: true,  // Output structured JSON
+        show_timing: true,
+        show_patterns: true,
+    };
+    let mut runner = LoggedPackTestRunner::new(&pack, config);
+
+    // Run assertions (automatically logged)
+    runner.assert_blocks("dangerous-command", "expected reason");
+    runner.assert_allows("safe-command");
+
+    // Get JSON report at the end
+    let report = runner.finish();
+    println!("{}", report);
+}
+```
+
+### JSON Report Format
+
+The `LoggedPackTestRunner` produces structured JSON reports:
+
+```json
+{
+  "pack": "secrets.vault",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "tests": [
+    {
+      "timestamp": "2024-01-15T10:30:00Z",
+      "pack": "secrets.vault",
+      "test_name": "assert_blocks",
+      "passed": true,
+      "duration_ms": 1.2,
+      "pattern_matched": "vault-delete",
+      "input": "vault secrets disable my-secret"
+    }
+  ],
+  "summary": {
+    "total": 25,
+    "passed": 25,
+    "failed": 0
+  },
+  "pattern_matches": [
+    {
+      "timestamp": "2024-01-15T10:30:00Z",
+      "pack": "secrets.vault",
+      "pattern": "vault-delete",
+      "input": "vault secrets disable my-secret",
+      "matched": true,
+      "duration_us": 45,
+      "severity": "Critical",
+      "reason": "Disabling secrets engine destroys all secrets"
+    }
+  ]
+}
+```
+
+### Log Levels
+
+| Level | Description | Use Case |
+|-------|-------------|----------|
+| Error | Only failures | CI/CD pipelines |
+| Warn  | Warnings and errors | Normal testing |
+| Info  | Test results (default) | Standard output |
+| Debug | Pattern match details | Debugging patterns |
+| Trace | All internal details | Deep debugging |
+
+### Interpreting Debug Output
+
+When running with `--nocapture` and debug mode enabled:
+
+```
+[DEBUG] core.git | reset-hard | MATCH | git reset --hard (45us)
+[DEBUG] core.git | checkout-discard | no-match | git reset --hard (12us)
+[PASS] test_reset_hard_blocks (1.23ms)
+```
+
+Format: `[LEVEL] pack_id | pattern_name | match_status | input (timing)`
+
+### CI/CD Integration
+
+For CI pipelines, use JSON mode and parse the summary:
+
+```bash
+cargo test packs --no-fail-fast 2>&1 | grep '"summary"' | jq '.failed'
+```
+
+The `PackTestLogger` can also be used programmatically for custom reporting.

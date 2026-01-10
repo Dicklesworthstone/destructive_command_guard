@@ -473,6 +473,203 @@ pub fn assert_unique_pattern_names(pack: &Pack) {
     }
 }
 
+// ============================================================================
+// Logging Integration
+// ============================================================================
+
+use crate::logging::{PackTestLogConfig, PackTestLogger};
+
+/// A test runner that integrates with `PackTestLogger` for structured output.
+///
+/// This allows running pack tests with detailed logging and generating
+/// JSON reports for CI/CD integration.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let runner = LoggedPackTestRunner::new(&pack, PackTestLogConfig::default());
+/// runner.assert_blocks("git reset --hard", "destroys uncommitted");
+/// runner.assert_allows("git status");
+/// let report = runner.finish();
+/// println!("{}", report);
+/// ```
+pub struct LoggedPackTestRunner<'a> {
+    pack: &'a Pack,
+    logger: PackTestLogger,
+}
+
+impl<'a> LoggedPackTestRunner<'a> {
+    /// Create a new test runner for a pack.
+    #[must_use]
+    pub fn new(pack: &'a Pack, config: PackTestLogConfig) -> Self {
+        Self {
+            pack,
+            logger: PackTestLogger::new(&pack.id, &config),
+        }
+    }
+
+    /// Create a test runner with debug-mode logging.
+    #[must_use]
+    pub fn debug(pack: &'a Pack) -> Self {
+        Self {
+            pack,
+            logger: PackTestLogger::debug_mode(&pack.id),
+        }
+    }
+
+    /// Assert that a command is blocked and log the result.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the command is not blocked or reason doesn't match.
+    #[track_caller]
+    pub fn assert_blocks(&mut self, command: &str, expected_reason_substring: &str) {
+        let start = Instant::now();
+        let result = self.pack.check(command);
+        let duration_us = start.elapsed().as_micros() as u64;
+
+        match &result {
+            Some(matched) => {
+                let passed = matched.reason.contains(expected_reason_substring);
+                self.logger.log_pattern_match_detailed(
+                    matched.name.unwrap_or("unnamed"),
+                    command,
+                    true,
+                    duration_us,
+                    Some(&format!("{:?}", matched.severity)),
+                    Some(&matched.reason),
+                );
+                self.logger.log_test_result_detailed(
+                    "assert_blocks",
+                    passed,
+                    if passed { "" } else { "reason mismatch" },
+                    matched.name,
+                    Some(command),
+                );
+                if !passed {
+                    panic!(
+                        "Command '{}' blocked but with unexpected reason.\n\
+                         Expected: '{}'\n\
+                         Actual: '{}'",
+                        command, expected_reason_substring, matched.reason
+                    );
+                }
+            }
+            None => {
+                self.logger.log_test_result_detailed(
+                    "assert_blocks",
+                    false,
+                    "command was allowed",
+                    None,
+                    Some(command),
+                );
+                panic!(
+                    "Expected pack '{}' to block command '{}' but it was allowed",
+                    self.pack.id, command
+                );
+            }
+        }
+    }
+
+    /// Assert that a command is allowed and log the result.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the command is blocked.
+    #[track_caller]
+    pub fn assert_allows(&mut self, command: &str) {
+        let start = Instant::now();
+        let result = self.pack.check(command);
+        let duration_us = start.elapsed().as_micros() as u64;
+
+        match result {
+            Some(matched) => {
+                self.logger.log_pattern_match_detailed(
+                    matched.name.unwrap_or("unnamed"),
+                    command,
+                    true,
+                    duration_us,
+                    Some(&format!("{:?}", matched.severity)),
+                    Some(&matched.reason),
+                );
+                self.logger.log_test_result_detailed(
+                    "assert_allows",
+                    false,
+                    &format!("blocked by {:?}", matched.name),
+                    matched.name,
+                    Some(command),
+                );
+                panic!(
+                    "Expected pack '{}' to allow command '{}' but it was blocked",
+                    self.pack.id, command
+                );
+            }
+            None => {
+                self.logger.log_pattern_match(
+                    "none",
+                    command,
+                    false,
+                    duration_us,
+                );
+                self.logger.log_test_result_detailed(
+                    "assert_allows",
+                    true,
+                    "",
+                    None,
+                    Some(command),
+                );
+            }
+        }
+    }
+
+    /// Run a batch of blocking assertions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any command is not blocked or has unexpected reason.
+    #[track_caller]
+    pub fn test_batch_blocks(&mut self, commands: &[&str], reason_substring: &str) {
+        for cmd in commands {
+            self.assert_blocks(cmd, reason_substring);
+        }
+    }
+
+    /// Run a batch of allowing assertions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any command is blocked.
+    #[track_caller]
+    pub fn test_batch_allows(&mut self, commands: &[&str]) {
+        for cmd in commands {
+            self.assert_allows(cmd);
+        }
+    }
+
+    /// Log a summary and get the JSON report.
+    #[must_use]
+    pub fn finish(&self) -> String {
+        let total = self.logger.test_result_count();
+        // All tests passed if we got here without panic
+        self.logger.log_summary(total, total, 0);
+        self.logger.report_json()
+    }
+
+    /// Get the underlying logger for additional customization.
+    #[must_use]
+    pub const fn logger(&self) -> &PackTestLogger {
+        &self.logger
+    }
+}
+
+/// Create a debug-mode test runner for a pack.
+///
+/// This is a convenience function for quick debugging.
+#[must_use]
+pub fn create_debug_runner(pack: &Pack) -> LoggedPackTestRunner<'_> {
+    LoggedPackTestRunner::debug(pack)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,5 +746,57 @@ mod tests {
     fn test_assert_blocks_with_severity_works() {
         let pack = core::git::create_pack();
         assert_blocks_with_severity(&pack, "git reset --hard", Severity::Critical);
+    }
+
+    // =========================================================================
+    // LoggedPackTestRunner Tests
+    // =========================================================================
+
+    #[test]
+    fn test_logged_runner_creation() {
+        let pack = core::git::create_pack();
+        let runner = LoggedPackTestRunner::debug(&pack);
+        assert_eq!(runner.logger().test_result_count(), 0);
+    }
+
+    #[test]
+    fn test_logged_runner_assert_blocks() {
+        let pack = core::git::create_pack();
+        let mut runner = LoggedPackTestRunner::debug(&pack);
+        runner.assert_blocks("git reset --hard", "destroys uncommitted");
+        assert_eq!(runner.logger().test_result_count(), 1);
+    }
+
+    #[test]
+    fn test_logged_runner_assert_allows() {
+        let pack = core::git::create_pack();
+        let mut runner = LoggedPackTestRunner::debug(&pack);
+        runner.assert_allows("git status");
+        assert_eq!(runner.logger().test_result_count(), 1);
+    }
+
+    #[test]
+    fn test_logged_runner_batch_operations() {
+        let pack = core::git::create_pack();
+        let mut runner = LoggedPackTestRunner::debug(&pack);
+        runner.test_batch_allows(&["git status", "git log"]);
+        assert_eq!(runner.logger().test_result_count(), 2);
+    }
+
+    #[test]
+    fn test_logged_runner_finish_produces_json() {
+        let pack = core::git::create_pack();
+        let mut runner = LoggedPackTestRunner::debug(&pack);
+        runner.assert_allows("git status");
+        let report = runner.finish();
+        assert!(report.contains("\"pack\""));
+        assert!(report.contains("core.git"));
+    }
+
+    #[test]
+    fn test_create_debug_runner_helper() {
+        let pack = core::git::create_pack();
+        let runner = create_debug_runner(&pack);
+        assert_eq!(runner.logger().test_result_count(), 0);
     }
 }

@@ -431,6 +431,361 @@ fn time_to_iso8601(secs: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
+// ============================================================================
+// Pack Testing Logger
+// ============================================================================
+
+/// Log level for pack testing output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackTestLogLevel {
+    /// Only errors and failures.
+    Error,
+    /// Warnings and above.
+    Warn,
+    /// Standard output (default).
+    #[default]
+    Info,
+    /// Detailed debugging output.
+    Debug,
+    /// Trace-level output (very verbose).
+    Trace,
+}
+
+impl PackTestLogLevel {
+    /// Check if this level should log at the given threshold.
+    #[must_use]
+    pub const fn should_log(&self, threshold: Self) -> bool {
+        (*self as u8) >= (threshold as u8)
+    }
+}
+
+/// Configuration for pack test logging.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PackTestLogConfig {
+    /// Logging level.
+    pub level: PackTestLogLevel,
+    /// Output in JSON format instead of text.
+    pub json_mode: bool,
+    /// Show timing information.
+    pub show_timing: bool,
+    /// Show regex pattern details.
+    pub show_patterns: bool,
+}
+
+/// A pattern match event for logging.
+#[derive(Debug, Clone, Serialize)]
+pub struct PatternMatchEvent {
+    pub timestamp: String,
+    pub pack: String,
+    pub pattern: String,
+    pub input: String,
+    pub matched: bool,
+    pub duration_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// A test result event for logging.
+#[derive(Debug, Clone, Serialize)]
+pub struct TestResultEvent {
+    pub timestamp: String,
+    pub pack: String,
+    pub test_name: String,
+    pub passed: bool,
+    pub duration_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern_matched: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Summary of a pack test run.
+#[derive(Debug, Clone, Serialize)]
+pub struct TestSummary {
+    pub pack: String,
+    pub timestamp: String,
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub duration_ms: f64,
+}
+
+/// Full test report in structured JSON format.
+#[derive(Debug, Clone, Serialize)]
+pub struct PackTestReport {
+    pub pack: String,
+    pub timestamp: String,
+    pub tests: Vec<TestResultEvent>,
+    pub summary: TestSummaryCompact,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern_matches: Option<Vec<PatternMatchEvent>>,
+}
+
+/// Compact summary for inclusion in reports.
+#[derive(Debug, Clone, Serialize)]
+pub struct TestSummaryCompact {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+}
+
+/// A structured logger for pack testing and debugging.
+pub struct PackTestLogger {
+    level: PackTestLogLevel,
+    json_mode: bool,
+    pack_name: String,
+    show_timing: bool,
+    show_patterns: bool,
+    pattern_matches: Vec<PatternMatchEvent>,
+    test_results: Vec<TestResultEvent>,
+    start_time: std::time::Instant,
+}
+
+impl PackTestLogger {
+    /// Create a new pack test logger.
+    #[must_use]
+    pub fn new(pack_name: &str, config: &PackTestLogConfig) -> Self {
+        Self {
+            level: config.level,
+            json_mode: config.json_mode,
+            pack_name: pack_name.to_string(),
+            show_timing: config.show_timing,
+            show_patterns: config.show_patterns,
+            pattern_matches: Vec::new(),
+            test_results: Vec::new(),
+            start_time: std::time::Instant::now(),
+        }
+    }
+
+    /// Create a logger with default configuration.
+    #[must_use]
+    pub fn default_for_pack(pack_name: &str) -> Self {
+        Self::new(pack_name, &PackTestLogConfig::default())
+    }
+
+    /// Create a debug-mode logger with verbose output.
+    #[must_use]
+    pub fn debug_mode(pack_name: &str) -> Self {
+        Self::new(
+            pack_name,
+            &PackTestLogConfig {
+                level: PackTestLogLevel::Debug,
+                json_mode: false,
+                show_timing: true,
+                show_patterns: true,
+            },
+        )
+    }
+
+    /// Log a pattern match attempt.
+    pub fn log_pattern_match(
+        &mut self,
+        pattern: &str,
+        input: &str,
+        matched: bool,
+        duration_us: u64,
+    ) {
+        self.log_pattern_match_detailed(pattern, input, matched, duration_us, None, None);
+    }
+
+    /// Log a pattern match with additional details.
+    pub fn log_pattern_match_detailed(
+        &mut self,
+        pattern: &str,
+        input: &str,
+        matched: bool,
+        duration_us: u64,
+        severity: Option<&str>,
+        reason: Option<&str>,
+    ) {
+        if !self.level.should_log(PackTestLogLevel::Debug) && !self.show_patterns {
+            return;
+        }
+
+        let event = PatternMatchEvent {
+            timestamp: current_iso8601(),
+            pack: self.pack_name.clone(),
+            pattern: pattern.to_string(),
+            input: input.to_string(),
+            matched,
+            duration_us,
+            severity: severity.map(String::from),
+            reason: reason.map(String::from),
+        };
+
+        if self.json_mode {
+            if let Ok(json) = serde_json::to_string(&event) {
+                eprintln!("{json}");
+            }
+        } else if self.level.should_log(PackTestLogLevel::Debug) {
+            let status = if matched { "MATCH" } else { "no-match" };
+            let timing = if self.show_timing {
+                format!(" ({duration_us}us)")
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "[DEBUG] {} | {} | {} | {}{}",
+                self.pack_name, pattern, status, input, timing
+            );
+        }
+
+        self.pattern_matches.push(event);
+    }
+
+    /// Log a test result.
+    pub fn log_test_result(&mut self, test_name: &str, passed: bool, details: &str) {
+        self.log_test_result_detailed(test_name, passed, details, None, None);
+    }
+
+    /// Log a test result with additional details.
+    pub fn log_test_result_detailed(
+        &mut self,
+        test_name: &str,
+        passed: bool,
+        details: &str,
+        pattern_matched: Option<&str>,
+        input: Option<&str>,
+    ) {
+        let duration_ms = self.start_time.elapsed().as_secs_f64() * 1000.0;
+
+        let event = TestResultEvent {
+            timestamp: current_iso8601(),
+            pack: self.pack_name.clone(),
+            test_name: test_name.to_string(),
+            passed,
+            duration_ms,
+            pattern_matched: pattern_matched.map(String::from),
+            input: input.map(String::from),
+            error: if passed { None } else { Some(details.to_string()) },
+        };
+
+        if self.json_mode {
+            if let Ok(json) = serde_json::to_string(&event) {
+                eprintln!("{json}");
+            }
+        } else {
+            let status = if passed { "PASS" } else { "FAIL" };
+            let timing = if self.show_timing {
+                format!(" ({duration_ms:.2}ms)")
+            } else {
+                String::new()
+            };
+            if passed {
+                if self.level.should_log(PackTestLogLevel::Info) {
+                    eprintln!("[{status}] {test_name}{timing}");
+                }
+            } else {
+                eprintln!("[{status}] {test_name}{timing}: {details}");
+            }
+        }
+
+        self.test_results.push(event);
+    }
+
+    /// Log a summary of test results.
+    pub fn log_summary(&self, total: usize, passed: usize, failed: usize) {
+        self.log_summary_detailed(total, passed, failed, 0);
+    }
+
+    /// Log a detailed summary of test results.
+    pub fn log_summary_detailed(&self, total: usize, passed: usize, failed: usize, skipped: usize) {
+        let duration_ms = self.start_time.elapsed().as_secs_f64() * 1000.0;
+
+        let summary = TestSummary {
+            pack: self.pack_name.clone(),
+            timestamp: current_iso8601(),
+            total,
+            passed,
+            failed,
+            skipped,
+            duration_ms,
+        };
+
+        if self.json_mode {
+            if let Ok(json) = serde_json::to_string(&summary) {
+                eprintln!("{json}");
+            }
+        } else {
+            eprintln!();
+            eprintln!("=== {} Test Summary ===", self.pack_name);
+            eprintln!("  Total:   {total}");
+            eprintln!("  Passed:  {passed}");
+            eprintln!("  Failed:  {failed}");
+            if skipped > 0 {
+                eprintln!("  Skipped: {skipped}");
+            }
+            if self.show_timing {
+                eprintln!("  Duration: {duration_ms:.2}ms");
+            }
+            eprintln!();
+        }
+    }
+
+    /// Generate a full test report.
+    #[must_use]
+    pub fn generate_report(&self) -> PackTestReport {
+        let passed = self.test_results.iter().filter(|r| r.passed).count();
+        let failed = self.test_results.len() - passed;
+
+        PackTestReport {
+            pack: self.pack_name.clone(),
+            timestamp: current_iso8601(),
+            tests: self.test_results.clone(),
+            summary: TestSummaryCompact {
+                total: self.test_results.len(),
+                passed,
+                failed,
+            },
+            pattern_matches: if self.show_patterns {
+                Some(self.pattern_matches.clone())
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Output the report as JSON.
+    #[must_use]
+    pub fn report_json(&self) -> String {
+        let report = self.generate_report();
+        serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Get the number of pattern matches recorded.
+    #[must_use]
+    pub fn pattern_match_count(&self) -> usize {
+        self.pattern_matches.len()
+    }
+
+    /// Get the number of test results recorded.
+    #[must_use]
+    pub fn test_result_count(&self) -> usize {
+        self.test_results.len()
+    }
+
+    /// Reset the logger for a new test run.
+    pub fn reset(&mut self) {
+        self.pattern_matches.clear();
+        self.test_results.clear();
+        self.start_time = std::time::Instant::now();
+    }
+}
+
+/// Get current time as ISO 8601 string.
+fn current_iso8601() -> String {
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    time_to_iso8601(secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +889,92 @@ mod tests {
         assert!(filter.deny);
         assert!(filter.warn);
         assert!(!filter.allow);
+    }
+
+    // PackTestLogger tests
+
+    #[test]
+    fn pack_test_log_level_ordering() {
+        assert!(PackTestLogLevel::Trace.should_log(PackTestLogLevel::Error));
+        assert!(PackTestLogLevel::Debug.should_log(PackTestLogLevel::Info));
+        assert!(PackTestLogLevel::Info.should_log(PackTestLogLevel::Info));
+        assert!(!PackTestLogLevel::Error.should_log(PackTestLogLevel::Info));
+    }
+
+    #[test]
+    fn pack_test_logger_creation() {
+        let logger = PackTestLogger::default_for_pack("test.pack");
+        assert_eq!(logger.pattern_match_count(), 0);
+        assert_eq!(logger.test_result_count(), 0);
+    }
+
+    #[test]
+    fn pack_test_logger_debug_mode() {
+        let logger = PackTestLogger::debug_mode("test.pack");
+        assert!(logger.show_timing);
+        assert!(logger.show_patterns);
+    }
+
+    #[test]
+    fn pack_test_logger_records_pattern_matches() {
+        let config = PackTestLogConfig {
+            level: PackTestLogLevel::Debug,
+            show_patterns: true,
+            ..Default::default()
+        };
+        let mut logger = PackTestLogger::new("test.pack", &config);
+
+        logger.log_pattern_match("pattern1", "input1", true, 100);
+        logger.log_pattern_match("pattern2", "input2", false, 50);
+
+        assert_eq!(logger.pattern_match_count(), 2);
+    }
+
+    #[test]
+    fn pack_test_logger_records_test_results() {
+        let mut logger = PackTestLogger::default_for_pack("test.pack");
+
+        logger.log_test_result("test_one", true, "");
+        logger.log_test_result("test_two", false, "assertion failed");
+
+        assert_eq!(logger.test_result_count(), 2);
+    }
+
+    #[test]
+    fn pack_test_logger_generates_report() {
+        let config = PackTestLogConfig {
+            show_patterns: true,
+            ..Default::default()
+        };
+        let mut logger = PackTestLogger::new("test.pack", &config);
+
+        logger.log_test_result("test_pass", true, "");
+        logger.log_test_result("test_fail", false, "error");
+
+        let report = logger.generate_report();
+        assert_eq!(report.pack, "test.pack");
+        assert_eq!(report.summary.total, 2);
+        assert_eq!(report.summary.passed, 1);
+        assert_eq!(report.summary.failed, 1);
+    }
+
+    #[test]
+    fn pack_test_logger_reset_clears_data() {
+        let mut logger = PackTestLogger::default_for_pack("test.pack");
+
+        logger.log_test_result("test", true, "");
+        assert_eq!(logger.test_result_count(), 1);
+
+        logger.reset();
+        assert_eq!(logger.test_result_count(), 0);
+    }
+
+    #[test]
+    fn pack_test_log_config_defaults() {
+        let config = PackTestLogConfig::default();
+        assert_eq!(config.level, PackTestLogLevel::Info);
+        assert!(!config.json_mode);
+        assert!(!config.show_timing);
+        assert!(!config.show_patterns);
     }
 }
