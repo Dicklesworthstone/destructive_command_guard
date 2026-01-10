@@ -25,7 +25,7 @@ enabled = [
 ]
 
 disabled = [
-  "safe.cleanup", # opt-in pack
+
 ]
 ```
 

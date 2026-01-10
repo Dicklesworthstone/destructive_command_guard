@@ -7,7 +7,7 @@ in config files and environment variables.
 - `core.git`
 - `core.filesystem`
 - `strict_git`
-- `safe.cleanup` (opt-in)
+
 - `package_managers`
 
 ## Containers
