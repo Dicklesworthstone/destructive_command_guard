@@ -795,6 +795,13 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
         return EvaluationResult::allowed_due_to_budget();
     }
 
+    // Check exact command and prefix allowlists
+    if allowlists.match_exact_command(&normalized).is_some()
+        || allowlists.match_command_prefix(&normalized).is_some()
+    {
+        return EvaluationResult::allowed();
+    }
+
     let result = evaluate_packs_with_allowlists(&normalized, ordered_packs, allowlists, None);
     if result.allowlist_override.is_none() {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {

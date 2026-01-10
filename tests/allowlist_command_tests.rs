@@ -50,7 +50,7 @@ fn run_hook_with_allowlist(command: &str, allowlist_content: &str) -> String {
 }
 
 #[test]
-fn test_exact_command_allowlist_ignored_bug() {
+fn test_exact_command_allowlist_works() {
     let cmd = "git reset --hard";
     let allowlist = format!(
         r#"
@@ -62,20 +62,10 @@ reason = "allowed explicitly"
 
     let output = run_hook_with_allowlist(cmd, &allowlist);
 
-    // Currently, this should FAIL (be blocked) because ExactCommand is ignored.
-    // If it is allowed (empty output), then it works (bug not present).
-    // If it is blocked (contains "deny"), then bug is confirmed.
-
-    if output.contains("deny") {
-        println!("Confirmed: Command blocked despite exact_command allowlist.");
-    } else {
-        println!("Wait, it was allowed? Maybe I am wrong.");
-    }
-
-    // We expect it to be allowed if the feature worked.
-    // Asserting failure to confirm bug.
     assert!(
-        output.contains("deny"),
-        "Bug confirmed: ExactCommand is ignored"
+        !output.contains("deny"),
+        "ExactCommand allowlist should allow the command, but got denial: {}",
+        output
     );
+    assert!(output.is_empty(), "Expected empty output for allowed command");
 }
