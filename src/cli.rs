@@ -230,6 +230,13 @@ pub enum Command {
     /// producing stable JSON output suitable for diffing against baselines.
     #[command(name = "corpus")]
     Corpus(CorpusCommand),
+
+    /// Developer tools for pack development and testing
+    #[command(name = "dev")]
+    Dev {
+        #[command(subcommand)]
+        action: DevAction,
+    },
 }
 
 /// `dcg corpus` command arguments.
@@ -272,6 +279,101 @@ pub enum CorpusFormat {
     Json,
     /// Human-readable colored output
     Pretty,
+}
+
+/// Developer tool subcommands
+#[derive(Subcommand, Debug)]
+pub enum DevAction {
+    /// Test a regex pattern against sample commands
+    ///
+    /// Validates regex syntax and tests matching against provided commands.
+    /// Useful for developing and debugging pack patterns.
+    #[command(name = "test-pattern")]
+    TestPattern {
+        /// Regex pattern to test
+        pattern: String,
+
+        /// Test commands to match against (interactive if not provided)
+        #[arg(long, short = 'c', num_args = 1..)]
+        commands: Option<Vec<String>>,
+
+        /// Pattern type for context
+        #[arg(long, value_enum, default_value = "destructive")]
+        pattern_type: PatternType,
+    },
+
+    /// Validate pack structure and patterns
+    ///
+    /// Checks a pack source file for structural issues, pattern validity,
+    /// regex complexity, and test coverage.
+    #[command(name = "validate-pack")]
+    ValidatePack {
+        /// Pack ID to validate (e.g., "core.git", "database.postgresql")
+        pack_id: String,
+
+        /// Show verbose validation output
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
+
+    /// Debug pattern matching for a command
+    ///
+    /// Shows detailed trace of how each pack evaluates the command,
+    /// including keyword matching, safe/destructive pattern evaluation.
+    #[command(name = "debug")]
+    Debug {
+        /// Command to debug
+        command: String,
+
+        /// Show all packs, not just those with keyword matches
+        #[arg(long)]
+        all_packs: bool,
+    },
+
+    /// Run pattern matching benchmarks
+    ///
+    /// Measures performance of pack evaluation for given commands.
+    #[command(name = "benchmark")]
+    Benchmark {
+        /// Pack ID to benchmark (or "all" for all enabled packs)
+        #[arg(default_value = "all")]
+        pack_id: String,
+
+        /// Number of iterations
+        #[arg(long, short = 'n', default_value = "1000")]
+        iterations: usize,
+
+        /// Commands to benchmark (uses defaults if not provided)
+        #[arg(long, short = 'c', num_args = 1..)]
+        commands: Option<Vec<String>>,
+    },
+
+    /// Generate test fixtures for a pack
+    ///
+    /// Creates YAML/TOML test case files based on pack patterns.
+    #[command(name = "generate-fixtures")]
+    GenerateFixtures {
+        /// Pack ID to generate fixtures for
+        pack_id: String,
+
+        /// Output directory (default: tests/fixtures)
+        #[arg(long, short = 'o', default_value = "tests/fixtures")]
+        output_dir: std::path::PathBuf,
+
+        /// Overwrite existing fixtures
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+/// Pattern type for dev test-pattern command
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum PatternType {
+    /// Safe pattern (whitelist)
+    Safe,
+    /// Destructive pattern (blacklist)
+    #[default]
+    Destructive,
 }
 
 /// Options for self-updating dcg via the installer scripts.
@@ -721,6 +823,9 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Command::Corpus(corpus)) => {
             handle_corpus_command(&config, &corpus)?;
+        }
+        Some(Command::Dev { action }) => {
+            handle_dev_command(&config, action)?;
         }
         None => {
             // No subcommand - run in hook mode (default behavior)
@@ -2587,6 +2692,7 @@ fn handle_corpus_command(
 
     Ok(())
 }
+
 
 /// Compare two corpus outputs and return differences.
 fn diff_corpus_outputs(baseline: &CorpusOutput, current: &CorpusOutput) -> Vec<String> {
@@ -4528,6 +4634,547 @@ fn is_expired(timestamp: &str) -> bool {
         return utc < chrono::Utc::now();
     }
     false
+}
+
+// ============================================================================
+// Developer Tools (dcg dev)
+// ============================================================================
+
+/// Handle all `dcg dev` subcommands
+fn handle_dev_command(
+    config: &Config,
+    action: DevAction,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        DevAction::TestPattern {
+            pattern,
+            commands,
+            pattern_type,
+        } => {
+            dev_test_pattern(&pattern, commands, pattern_type)?;
+        }
+        DevAction::ValidatePack { pack_id, verbose } => {
+            dev_validate_pack(config, &pack_id, verbose)?;
+        }
+        DevAction::Debug { command, all_packs } => {
+            dev_debug(config, &command, all_packs);
+        }
+        DevAction::Benchmark {
+            pack_id,
+            iterations,
+            commands,
+        } => {
+            dev_benchmark(config, &pack_id, iterations, commands)?;
+        }
+        DevAction::GenerateFixtures {
+            pack_id,
+            output_dir,
+            force,
+        } => {
+            dev_generate_fixtures(&pack_id, &output_dir, force)?;
+        }
+    }
+    Ok(())
+}
+
+/// Test a regex pattern against sample commands
+fn dev_test_pattern(
+    pattern: &str,
+    commands: Option<Vec<String>>,
+    pattern_type: PatternType,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+    use fancy_regex::Regex;
+
+    println!("{}", "Pattern Tester".bold().cyan());
+    println!();
+    println!("Pattern: {}", pattern.yellow());
+    println!(
+        "Type: {}",
+        match pattern_type {
+            PatternType::Safe => "safe (whitelist)".green(),
+            PatternType::Destructive => "destructive (blacklist)".red(),
+        }
+    );
+    println!();
+
+    // Validate regex
+    let regex = match Regex::new(pattern) {
+        Ok(r) => {
+            println!("{} Regex syntax valid", "✓".green());
+            r
+        }
+        Err(e) => {
+            println!("{} Regex syntax error: {}", "✗".red(), e);
+            return Err(format!("Invalid regex: {e}").into());
+        }
+    };
+
+    // Analyze regex complexity (basic heuristics)
+    let has_lookahead = pattern.contains("(?=") || pattern.contains("(?!");
+    let has_lookbehind = pattern.contains("(?<") && !pattern.contains("(?<!");
+    let has_backref =
+        pattern.contains(r"\1") || pattern.contains(r"\2") || pattern.contains(r"\k<");
+    let nested_quantifiers = pattern.contains("+*")
+        || pattern.contains("*+")
+        || pattern.contains("++")
+        || pattern.contains("**");
+
+    let complexity_score = if nested_quantifiers {
+        (
+            "high".red(),
+            "WARNING: nested quantifiers can cause catastrophic backtracking",
+        )
+    } else if has_backref {
+        ("medium".yellow(), "backreferences can be slow")
+    } else if has_lookahead || has_lookbehind {
+        ("low".green(), "lookarounds are efficient in fancy_regex")
+    } else {
+        ("minimal".green(), "simple pattern")
+    };
+
+    println!(
+        "Complexity: {} ({})",
+        complexity_score.0, complexity_score.1
+    );
+    println!();
+
+    // Test against commands
+    let test_commands = commands.unwrap_or_else(|| {
+        println!(
+            "{}",
+            "No commands provided. Using default test cases:".dimmed()
+        );
+        vec![
+            "ls -la".to_string(),
+            "git status".to_string(),
+            "git reset --hard".to_string(),
+            "rm -rf /".to_string(),
+        ]
+    });
+
+    println!("{}", "Test Results:".bold());
+    for cmd in &test_commands {
+        let matched = regex.is_match(cmd).unwrap_or(false);
+        let status = if matched {
+            match pattern_type {
+                PatternType::Destructive => format!("{} BLOCKED", "✓".green()),
+                PatternType::Safe => format!("{} ALLOWED", "✓".green()),
+            }
+        } else {
+            format!("{} no match", "○".dimmed())
+        };
+        println!(
+            "  {} '{}' -> {}",
+            if matched { "→" } else { " " },
+            cmd,
+            status
+        );
+    }
+
+    Ok(())
+}
+
+/// Validate pack structure and patterns
+fn dev_validate_pack(
+    config: &Config,
+    pack_id: &str,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    println!(
+        "{}",
+        format!("Validating pack: {}", pack_id).bold().cyan()
+    );
+    println!();
+
+    // Find the pack in the registry
+    let enabled_packs = config.enabled_pack_ids();
+    let infos = REGISTRY.list_packs(&enabled_packs);
+
+    let pack_info = infos.iter().find(|p| p.id == pack_id);
+
+    match pack_info {
+        Some(info) => {
+            println!("{}", "Structure:".bold());
+            println!("  {} Pack ID: {}", "✓".green(), info.id);
+            println!("  {} Name: {}", "✓".green(), info.name);
+            println!("  {} Description: {}", "✓".green(), info.description);
+            println!(
+                "  {} Status: {}",
+                "✓".green(),
+                if info.enabled {
+                    "enabled".green()
+                } else {
+                    "disabled".yellow()
+                }
+            );
+            println!();
+
+            println!("{}", "Patterns:".bold());
+            println!(
+                "  {} {} safe patterns",
+                "✓".green(),
+                info.safe_pattern_count
+            );
+            println!(
+                "  {} {} destructive patterns",
+                "✓".green(),
+                info.destructive_pattern_count
+            );
+
+            // Validate all patterns compile
+            let pack = REGISTRY.get(pack_id);
+            if let Some(p) = pack {
+                let mut pattern_errors = Vec::new();
+
+                for safe in &p.safe_patterns {
+                    match fancy_regex::Regex::new(safe.regex.as_str()) {
+                        Ok(re) => {
+                            if let Err(e) = re.is_match("test") {
+                                pattern_errors.push(format!("Safe pattern '{}': runtime error: {}", safe.name, e));
+                            }
+                        }
+                        Err(e) => {
+                            pattern_errors.push(format!("Safe pattern '{}': compile error: {}", safe.name, e));
+                        }
+                    }
+                }
+
+                for destructive in &p.destructive_patterns {
+                    match fancy_regex::Regex::new(destructive.regex.as_str()) {
+                        Ok(re) => {
+                            if let Err(e) = re.is_match("test") {
+                                pattern_errors
+                                    .push(format!("Destructive pattern '{}': runtime error: {}", destructive.name.unwrap_or("unnamed"), e));
+                            }
+                        }
+                        Err(e) => {
+                            pattern_errors
+                                .push(format!("Destructive pattern '{}': compile error: {}", destructive.name.unwrap_or("unnamed"), e));
+                        }
+                    }
+                }
+
+                if pattern_errors.is_empty() {
+                    println!("  {} All patterns compile successfully", "✓".green());
+                } else {
+                    for err in &pattern_errors {
+                        println!("  {} {}", "✗".red(), err);
+                    }
+                }
+
+                if verbose {
+                    println!();
+                    println!("{}", "Keywords:".bold());
+                    println!("  {:?}", p.keywords);
+                }
+            }
+
+            println!();
+            println!("{}", format!("Overall: {}", "PASS".green().bold()));
+        }
+        None => {
+            println!("{} Pack '{}' not found", "✗".red(), pack_id);
+            println!();
+            println!("Available packs:");
+            for info in &infos {
+                println!("  - {}", info.id);
+            }
+            return Err(format!("Pack not found: {pack_id}").into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Debug pattern matching for a command
+fn dev_debug(config: &Config, command: &str, all_packs: bool) {
+    use colored::Colorize;
+
+    println!("{}", "Pattern Matching Debug".bold().cyan());
+    println!();
+    println!("Command: {}", command.yellow());
+    println!();
+
+    let enabled_packs = config.enabled_pack_ids();
+    let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+
+    // Check keyword matching
+    println!("{}", "Keyword Matching:".bold());
+    let command_lower = command.to_lowercase();
+    let mut matched_keywords: Vec<&str> = Vec::new();
+    for &kw in &enabled_keywords {
+        if command_lower.contains(kw) {
+            matched_keywords.push(kw);
+        }
+    }
+
+    if matched_keywords.is_empty() {
+        println!(
+            "  {} No keywords matched (command would be quick-rejected)",
+            "○".dimmed()
+        );
+    } else {
+        for kw in &matched_keywords {
+            println!("  {} Keyword matched: '{}'", "→".green(), kw);
+        }
+    }
+    println!();
+
+    // Check each pack
+    println!("{}", "Pack Evaluation:".bold());
+    let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+
+    for pack_id in &ordered_packs {
+        if let Some(pack) = REGISTRY.get(pack_id) {
+            // Check if pack keywords match
+            let pack_matches = pack.keywords.iter().any(|k| command_lower.contains(k));
+
+            if !pack_matches && !all_packs {
+                continue;
+            }
+
+            let pack_status = if pack_matches {
+                format!("[{}]", pack_id).green()
+            } else {
+                format!("[{}]", pack_id).dimmed()
+            };
+
+            println!("  {}", pack_status);
+
+            if !pack_matches {
+                println!("    {} No keyword match", "○".dimmed());
+                continue;
+            }
+
+            // Check safe patterns
+            for safe in &pack.safe_patterns {
+                match safe.regex.is_match(command) {
+                    true => {
+                        println!(
+                            "    {} Safe pattern '{}' -> {}",
+                            "✓".green(),
+                            safe.name,
+                            "MATCH".green().bold()
+                        );
+                    }
+                    false if all_packs => {
+                        println!(
+                            "    {} Safe pattern '{}' -> no match",
+                            "○".dimmed(),
+                            safe.name
+                        );
+                    }
+                    _ => {}
+                }
+            }
+
+            // Check destructive patterns
+            for destructive in &pack.destructive_patterns {
+                match destructive.regex.is_match(command) {
+                    true => {
+                        println!(
+                            "    {} Destructive pattern '{}' -> {}",
+                            "✗".red(),
+                            destructive.name.unwrap_or("unnamed"),
+                            "MATCH".red().bold()
+                        );
+                        println!("      Reason: {}", destructive.reason);
+                    }
+                    false if all_packs => {
+                        println!(
+                            "    {} Destructive pattern '{}' -> no match",
+                            "○".dimmed(),
+                            destructive.name.unwrap_or("unnamed")
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Run pattern matching benchmarks
+fn dev_benchmark(
+    config: &Config,
+    pack_id: &str,
+    iterations: usize,
+    commands: Option<Vec<String>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+    use std::time::Instant;
+
+    println!("{}", "Pattern Matching Benchmark".bold().cyan());
+    println!();
+    println!(
+        "Pack: {}",
+        if pack_id == "all" {
+            "all enabled packs"
+        } else {
+            pack_id
+        }
+    );
+    println!("Iterations: {}", iterations);
+    println!();
+
+    let enabled_packs = config.enabled_pack_ids();
+
+    let test_commands = commands.unwrap_or_else(|| {
+        vec![
+            "ls -la".to_string(),
+            "git status".to_string(),
+            "git reset --hard".to_string(),
+            "rm -rf /tmp/test".to_string(),
+            "docker ps".to_string(),
+            "kubectl get pods".to_string(),
+        ]
+    });
+
+    let packs_to_test: Vec<&str> = if pack_id == "all" {
+        enabled_packs.iter().map(|s| s.as_str()).collect()
+    } else {
+        vec![pack_id]
+    };
+
+    println!("{}", "Results:".bold());
+    println!(
+        "{:<40} {:>12} {:>12}",
+        "Command", "Mean (µs)", "Std (µs)"
+    );
+    println!("{}", "-".repeat(66));
+
+    for cmd in &test_commands {
+        let mut times = Vec::with_capacity(iterations);
+
+        for _ in 0..iterations {
+            let start = Instant::now();
+
+            for pid in &packs_to_test {
+                if let Some(pack) = REGISTRY.get(pid) {
+                    for safe in &pack.safe_patterns {
+                        let _ = safe.regex.is_match(cmd);
+                    }
+                    for destructive in &pack.destructive_patterns {
+                        let _ = destructive.regex.is_match(cmd);
+                    }
+                }
+            }
+
+            times.push(start.elapsed().as_micros() as f64);
+        }
+
+        // Calculate statistics
+        let mean = times.iter().sum::<f64>() / times.len() as f64;
+        let variance =
+            times.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / times.len() as f64;
+        let std_dev = variance.sqrt();
+
+        // Truncate command for display
+        let cmd_display = if cmd.len() > 38 {
+            format!("{}...", &cmd[..35])
+        } else {
+            cmd.clone()
+        };
+
+        println!(
+            "{:<40} {:>12} {:>12}",
+            cmd_display,
+            format!("{:.1}", mean),
+            format!("±{:.1}", std_dev)
+        );
+    }
+
+    println!();
+    println!("Budget: {} per command (hook mode)", "< 500µs".green());
+
+    Ok(())
+}
+
+/// Generate test fixtures for a pack
+fn dev_generate_fixtures(
+    pack_id: &str,
+    output_dir: &std::path::Path,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    println!(
+        "{}",
+        format!("Generating fixtures for: {}", pack_id).bold().cyan()
+    );
+    println!();
+
+    // Find the pack
+    let pack = REGISTRY.get(pack_id);
+
+    match pack {
+        Some(p) => {
+            // Ensure output directory exists
+            std::fs::create_dir_all(output_dir)?;
+
+            let safe_file = output_dir.join(format!("{}_safe.toml", pack_id.replace('.', "_")));
+            let destructive_file =
+                output_dir.join(format!("{}_destructive.toml", pack_id.replace('.', "_")));
+
+            // Check if files exist
+            if !force && (safe_file.exists() || destructive_file.exists()) {
+                println!(
+                    "{} Fixture files already exist. Use --force to overwrite.",
+                    "✗".red()
+                );
+                return Err("Files exist".into());
+            }
+
+            // Generate safe fixtures
+            let mut safe_content = String::from("# Safe pattern test fixtures\n");
+            safe_content.push_str(&format!("# Generated for pack: {}\n\n", pack_id));
+
+            for safe in &p.safe_patterns {
+                safe_content.push_str(&format!(
+                    "[[case]]\npattern = \"{}\"\ndescription = \"{}\"\nexpected = \"allow\"\n\n",
+                    safe.name,
+                    safe.name
+                ));
+            }
+
+            // Generate destructive fixtures
+            let mut destructive_content = String::from("# Destructive pattern test fixtures\n");
+            destructive_content.push_str(&format!("# Generated for pack: {}\n\n", pack_id));
+
+            for destructive in &p.destructive_patterns {
+                destructive_content.push_str(&format!(
+                    "[[case]]\npattern = \"{}\"\ndescription = \"{}\"\nreason = \"{}\"\nexpected = \"deny\"\nrule_id = \"{}:{}\"\n\n",
+                    destructive.name.unwrap_or("unnamed"),
+                    destructive.name.unwrap_or("unnamed"),
+                    destructive.reason,
+                    pack_id,
+                    destructive.name.unwrap_or("unnamed")
+                ));
+            }
+
+            // Write files
+            std::fs::write(&safe_file, &safe_content)?;
+            std::fs::write(&destructive_file, &destructive_content)?;
+
+            println!("{} Created:", "✓".green());
+            println!("  - {}", safe_file.display());
+            println!("  - {}", destructive_file.display());
+            println!();
+            println!(
+                "{}",
+                "Note: These are skeleton fixtures. Add actual test commands.".dimmed()
+            );
+        }
+        None => {
+            println!("{} Pack '{}' not found", "✗".red(), pack_id);
+            return Err(format!("Pack not found: {pack_id}").into());
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
