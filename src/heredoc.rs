@@ -463,6 +463,7 @@ impl ScriptLanguage {
     /// - `/usr/bin/python -c "code"` → "python"
     /// - `env python3 -c "code"` → "python3"
     /// - `env -S python3 -c "code"` → "python3" (skips env flags)
+    /// - `env VAR=val python3 -c "code"` → "python3" (skips env vars)
     /// - `bash -c "code"` → "bash"
     fn extract_head_interpreter(cmd: &str) -> Option<String> {
         let mut parts = cmd.split_whitespace();
@@ -475,7 +476,10 @@ impl ScriptLanguage {
         if basename == "env" {
             loop {
                 let next = parts.next()?;
-                if !next.starts_with('-') {
+                // Skip flags (start with -) AND variable assignments (contain =)
+                // Note: this is a heuristic; in theory, a command name could contain =, 
+                // but it's very rare for interpreters.
+                if !next.starts_with('-') && !next.contains('=') {
                     let next_basename = next.rsplit('/').next().unwrap_or(next);
                     return Some(next_basename.to_string());
                 }
@@ -1175,22 +1179,7 @@ fn extract_heredoc_body(
         // Check if this line is the terminator
         let trimmed = match heredoc_type {
             HeredocType::TabStripped => line.trim_start_matches('\t'),
-            HeredocType::IndentStripped => {
-                // Find minimum indentation across non-empty lines
-                let min_indent = body_lines
-                    .iter()
-                    .filter(|l| !l.trim().is_empty())
-                    .map(|l| l.len() - l.trim_start().len())
-                    .min()
-                    .unwrap_or(0);
-
-                // Strip that minimum indentation from the current line
-                if line.len() >= min_indent {
-                    &line[min_indent..]
-                } else {
-                    line.trim_start()
-                }
-            }
+            HeredocType::IndentStripped => line.trim_start(),
             HeredocType::Standard | HeredocType::HereString => line,
         };
 
