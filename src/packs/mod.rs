@@ -12,6 +12,7 @@
 //! Enabling a category enables all its sub-packs. Sub-packs can be individually
 //! disabled even if their parent category is enabled.
 
+pub mod backup;
 pub mod cicd;
 pub mod cloud;
 pub mod containers;
@@ -480,7 +481,7 @@ pub struct PackRegistry {
 
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 41] = [
+static PACK_ENTRIES: [PackEntry; 44] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new(
         "core.filesystem",
@@ -547,6 +548,12 @@ static PACK_ENTRIES: [PackEntry; 41] = [
         &["rabbitmqadmin", "rabbitmqctl"],
         messaging::rabbitmq::create_pack,
     ),
+    PackEntry::new("messaging.nats", &["nats"], messaging::nats::create_pack),
+    PackEntry::new(
+        "messaging.sqs_sns",
+        &["aws", "sqs", "sns"],
+        messaging::sqs_sns::create_pack,
+    ),
     PackEntry::new(
         "search.elasticsearch",
         &[
@@ -585,6 +592,7 @@ static PACK_ENTRIES: [PackEntry; 41] = [
         &["meili", "meilisearch", "7700", "/indexes", "/keys"],
         search::meilisearch::create_pack,
     ),
+    PackEntry::new("backup.restic", &["restic"], backup::restic::create_pack),
     PackEntry::new(
         "database.postgresql",
         &[
@@ -819,7 +827,7 @@ impl PackRegistry {
     /// 4. **Tier 4 (cloud)**: `cloud.*` - aws, gcp, azure
     /// 5. **Tier 5 (kubernetes)**: `kubernetes.*` - kubectl, helm, kustomize
     /// 6. **Tier 6 (containers)**: `containers.*` - docker, compose, podman
-    /// 7. **Tier 7 (database/search/messaging)**: `database.*`, `search.*`, `messaging.*`
+    /// 7. **Tier 7 (database/search/messaging/backup)**: `database.*`, `search.*`, `messaging.*`, `backup.*`
     /// 8. **Tier 8 (`package_managers`)**: package manager protections
     /// 9. **Tier 9 (`strict_git`)**: extra git paranoia
     ///
@@ -858,7 +866,7 @@ impl PackRegistry {
             "cloud" | "platform" => 4,
             "kubernetes" => 5,
             "containers" => 6,
-            "database" | "messaging" | "search" => 7,
+            "backup" | "database" | "messaging" | "search" => 7,
             "package_managers" => 8,
             "strict_git" => 9,
             "cicd" | "secrets" | "monitoring" => 10, // CI/CD + secrets + monitoring tooling
@@ -1848,6 +1856,7 @@ mod tests {
 
         // Database should be tier 7
         assert_eq!(PackRegistry::pack_tier("database.postgresql"), 7);
+        assert_eq!(PackRegistry::pack_tier("backup.restic"), 7);
         assert_eq!(PackRegistry::pack_tier("messaging.kafka"), 7);
         assert_eq!(PackRegistry::pack_tier("search.elasticsearch"), 7);
 
