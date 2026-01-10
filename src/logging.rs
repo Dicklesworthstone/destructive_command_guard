@@ -461,7 +461,7 @@ impl PackTestLogLevel {
 }
 
 /// Configuration for pack test logging.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct PackTestLogConfig {
     /// Logging level.
     pub level: PackTestLogLevel,

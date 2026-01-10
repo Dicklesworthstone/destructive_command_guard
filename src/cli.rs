@@ -2362,51 +2362,50 @@ fn run_corpus(
         file_paths.sort();
 
         for path in file_paths {
-            if path.extension().is_some_and(|ext| ext == "toml") {
-                let content = match std::fs::read_to_string(&path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("Warning: Failed to read {}: {e}", path.display());
-                        continue;
-                    }
-                };
-
-                let corpus_file: CorpusFile = match toml::from_str(&content) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        eprintln!("Warning: Failed to parse {}: {e}", path.display());
-                        continue;
-                    }
-                };
-
-                let file_name = path
-                    .strip_prefix(corpus_dir)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string();
-
-                for (idx, case) in corpus_file.cases.into_iter().enumerate() {
-                    let result = run_single_corpus_test(config, &case, category, &file_name, idx);
-
-                    // Update summary stats
-                    *summary.by_decision.entry(result.actual.clone()).or_default() += 1;
-                    if let Some(ref pack) = result.pack_id {
-                        *summary.by_pack.entry(pack.clone()).or_default() += 1;
-                    }
-
-                    let cat_stats = summary
-                        .by_category
-                        .entry(category_name.to_string())
-                        .or_default();
-                    cat_stats.total += 1;
-                    if result.passed {
-                        cat_stats.passed += 1;
-                    } else {
-                        cat_stats.failed += 1;
-                    }
-
-                    results.push(result);
+            // Note: extension check already done in filter above
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Warning: Failed to read {}: {e}", path.display());
+                    continue;
                 }
+            };
+
+            let corpus_file: CorpusFile = match toml::from_str(&content) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("Warning: Failed to parse {}: {e}", path.display());
+                    continue;
+                }
+            };
+
+            let file_name = path
+                .strip_prefix(corpus_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+
+            for (idx, case) in corpus_file.cases.into_iter().enumerate() {
+                let result = run_single_corpus_test(config, &case, category, &file_name, idx);
+
+                // Update summary stats
+                *summary.by_decision.entry(result.actual.clone()).or_default() += 1;
+                if let Some(ref pack) = result.pack_id {
+                    *summary.by_pack.entry(pack.clone()).or_default() += 1;
+                }
+
+                let cat_stats = summary
+                    .by_category
+                    .entry(category_name.to_string())
+                    .or_default();
+                cat_stats.total += 1;
+                if result.passed {
+                    cat_stats.passed += 1;
+                } else {
+                    cat_stats.failed += 1;
+                }
+
+                results.push(result);
             }
         }
     }
@@ -2662,9 +2661,11 @@ fn format_corpus_pretty(output: &CorpusOutput) -> String {
         output.total_cases, output.total_passed, output.total_failed
     ));
 
-    // By category
+    // By category (sorted for deterministic output)
     result.push_str("By Category:\n");
-    for (cat, stats) in &output.summary.by_category {
+    let mut categories: Vec<_> = output.summary.by_category.iter().collect();
+    categories.sort_by_key(|(k, _)| *k);
+    for (cat, stats) in categories {
         let status = if stats.failed == 0 { "OK" } else { "FAIL" };
         let status_str = if colorize {
             if stats.failed == 0 {
@@ -2682,9 +2683,11 @@ fn format_corpus_pretty(output: &CorpusOutput) -> String {
     }
     result.push('\n');
 
-    // By decision
+    // By decision (sorted for deterministic output)
     result.push_str("By Decision:\n");
-    for (decision, count) in &output.summary.by_decision {
+    let mut decisions: Vec<_> = output.summary.by_decision.iter().collect();
+    decisions.sort_by_key(|(k, _)| *k);
+    for (decision, count) in decisions {
         result.push_str(&format!("  {decision}: {count}\n"));
     }
     result.push('\n');

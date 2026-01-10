@@ -487,7 +487,7 @@ use crate::logging::{PackTestLogConfig, PackTestLogger};
 /// # Example
 ///
 /// ```rust,ignore
-/// let runner = LoggedPackTestRunner::new(&pack, PackTestLogConfig::default());
+/// let mut runner = LoggedPackTestRunner::new(&pack, PackTestLogConfig::default());
 /// runner.assert_blocks("git reset --hard", "destroys uncommitted");
 /// runner.assert_allows("git status");
 /// let report = runner.finish();
@@ -526,48 +526,44 @@ impl<'a> LoggedPackTestRunner<'a> {
     pub fn assert_blocks(&mut self, command: &str, expected_reason_substring: &str) {
         let start = Instant::now();
         let result = self.pack.check(command);
-        let duration_us = start.elapsed().as_micros() as u64;
+        #[allow(clippy::cast_possible_truncation)]
+        let duration_us = start.elapsed().as_micros() as u64; // Safe: test durations won't exceed u64
 
-        match &result {
-            Some(matched) => {
-                let passed = matched.reason.contains(expected_reason_substring);
-                self.logger.log_pattern_match_detailed(
-                    matched.name.unwrap_or("unnamed"),
-                    command,
-                    true,
-                    duration_us,
-                    Some(&format!("{:?}", matched.severity)),
-                    Some(&matched.reason),
-                );
-                self.logger.log_test_result_detailed(
-                    "assert_blocks",
-                    passed,
-                    if passed { "" } else { "reason mismatch" },
-                    matched.name,
-                    Some(command),
-                );
-                if !passed {
-                    panic!(
-                        "Command '{}' blocked but with unexpected reason.\n\
-                         Expected: '{}'\n\
-                         Actual: '{}'",
-                        command, expected_reason_substring, matched.reason
-                    );
-                }
-            }
-            None => {
-                self.logger.log_test_result_detailed(
-                    "assert_blocks",
-                    false,
-                    "command was allowed",
-                    None,
-                    Some(command),
-                );
-                panic!(
-                    "Expected pack '{}' to block command '{}' but it was allowed",
-                    self.pack.id, command
-                );
-            }
+        if let Some(matched) = &result {
+            let passed = matched.reason.contains(expected_reason_substring);
+            self.logger.log_pattern_match_detailed(
+                matched.name.unwrap_or("unnamed"),
+                command,
+                true,
+                duration_us,
+                Some(&format!("{:?}", matched.severity)),
+                Some(matched.reason),
+            );
+            self.logger.log_test_result_detailed(
+                "assert_blocks",
+                passed,
+                if passed { "" } else { "reason mismatch" },
+                matched.name,
+                Some(command),
+            );
+            assert!(passed, 
+                "Command '{}' blocked but with unexpected reason.\n\
+                 Expected: '{}'\n\
+                 Actual: '{}'",
+                command, expected_reason_substring, matched.reason
+            );
+        } else {
+            self.logger.log_test_result_detailed(
+                "assert_blocks",
+                false,
+                "command was allowed",
+                None,
+                Some(command),
+            );
+            panic!(
+                "Expected pack '{}' to block command '{}' but it was allowed",
+                self.pack.id, command
+            );
         }
     }
 
@@ -580,45 +576,43 @@ impl<'a> LoggedPackTestRunner<'a> {
     pub fn assert_allows(&mut self, command: &str) {
         let start = Instant::now();
         let result = self.pack.check(command);
-        let duration_us = start.elapsed().as_micros() as u64;
+        #[allow(clippy::cast_possible_truncation)]
+        let duration_us = start.elapsed().as_micros() as u64; // Safe: test durations won't exceed u64
 
-        match result {
-            Some(matched) => {
-                self.logger.log_pattern_match_detailed(
-                    matched.name.unwrap_or("unnamed"),
-                    command,
-                    true,
-                    duration_us,
-                    Some(&format!("{:?}", matched.severity)),
-                    Some(&matched.reason),
-                );
-                self.logger.log_test_result_detailed(
-                    "assert_allows",
-                    false,
-                    &format!("blocked by {:?}", matched.name),
-                    matched.name,
-                    Some(command),
-                );
-                panic!(
-                    "Expected pack '{}' to allow command '{}' but it was blocked",
-                    self.pack.id, command
-                );
-            }
-            None => {
-                self.logger.log_pattern_match(
-                    "none",
-                    command,
-                    false,
-                    duration_us,
-                );
-                self.logger.log_test_result_detailed(
-                    "assert_allows",
-                    true,
-                    "",
-                    None,
-                    Some(command),
-                );
-            }
+        if let Some(matched) = result {
+            self.logger.log_pattern_match_detailed(
+                matched.name.unwrap_or("unnamed"),
+                command,
+                true,
+                duration_us,
+                Some(&format!("{:?}", matched.severity)),
+                Some(matched.reason),
+            );
+            self.logger.log_test_result_detailed(
+                "assert_allows",
+                false,
+                &format!("blocked by {:?}", matched.name),
+                matched.name,
+                Some(command),
+            );
+            panic!(
+                "Expected pack '{}' to allow command '{}' but it was blocked",
+                self.pack.id, command
+            );
+        } else {
+            self.logger.log_pattern_match(
+                "none",
+                command,
+                false,
+                duration_us,
+            );
+            self.logger.log_test_result_detailed(
+                "assert_allows",
+                true,
+                "",
+                None,
+                Some(command),
+            );
         }
     }
 
