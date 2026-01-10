@@ -17,7 +17,7 @@ pub fn create_pack() -> Pack {
         name: "Azure CLI",
         description: "Protects against destructive Azure CLI operations like vm delete, \
                       storage account delete, and resource group delete",
-        keywords: &["az", "delete", "vm", "storage"],
+        keywords: &["az", "delete", "vm", "storage", "acr", "registry"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
@@ -112,5 +112,45 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             r"az\s+network\s+vnet\s+delete",
             "az network vnet delete removes the virtual network."
         ),
+        // acr registry delete
+        destructive_pattern!(
+            "acr-delete",
+            r"az\s+acr\s+delete",
+            "az acr delete removes the container registry and all images."
+        ),
+        // acr repository delete
+        destructive_pattern!(
+            "acr-repository-delete",
+            r"az\s+acr\s+repository\s+delete",
+            "az acr repository delete permanently deletes the repository and its images."
+        ),
+        // acr repository untag
+        destructive_pattern!(
+            "acr-repository-untag",
+            r"az\s+acr\s+repository\s+untag",
+            "az acr repository untag removes tags from images."
+        ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packs::test_helpers::*;
+
+    #[test]
+    fn acr_patterns_block() {
+        let pack = create_pack();
+        assert_blocks(&pack, "az acr delete --name myregistry", "acr delete");
+        assert_blocks(
+            &pack,
+            "az acr repository delete --name myregistry --image repo:tag",
+            "repository delete",
+        );
+        assert_blocks(
+            &pack,
+            "az acr repository untag --name myregistry --image repo:tag",
+            "repository untag",
+        );
+    }
 }

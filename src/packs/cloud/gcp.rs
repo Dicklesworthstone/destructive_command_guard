@@ -17,7 +17,7 @@ pub fn create_pack() -> Pack {
         name: "Google Cloud SDK",
         description: "Protects against destructive gcloud operations like instances delete, \
                       sql instances delete, and gsutil rm -r",
-        keywords: &["gcloud", "gsutil", "delete", "instances"],
+        keywords: &["gcloud", "gsutil", "delete", "instances", "artifacts", "images", "repositories"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
@@ -104,5 +104,49 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             r"gcloud\s+firestore\s+.*delete",
             "gcloud firestore delete removes Firestore data."
         ),
+        // container registry image delete
+        destructive_pattern!(
+            "container-images-delete",
+            r"gcloud\s+container\s+images\s+delete",
+            "gcloud container images delete permanently deletes container images."
+        ),
+        // artifact registry docker image delete
+        destructive_pattern!(
+            "artifacts-docker-images-delete",
+            r"gcloud\s+artifacts\s+docker\s+images\s+delete",
+            "gcloud artifacts docker images delete permanently deletes container images."
+        ),
+        // artifact registry repository delete
+        destructive_pattern!(
+            "artifacts-repositories-delete",
+            r"gcloud\s+artifacts\s+repositories\s+delete",
+            "gcloud artifacts repositories delete permanently deletes the repository."
+        ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packs::test_helpers::*;
+
+    #[test]
+    fn container_registry_patterns_block() {
+        let pack = create_pack();
+        assert_blocks(
+            &pack,
+            "gcloud container images delete gcr.io/myproj/myimg:latest",
+            "container images delete",
+        );
+        assert_blocks(
+            &pack,
+            "gcloud artifacts docker images delete us-central1-docker.pkg.dev/p/repo/img:tag",
+            "docker images delete",
+        );
+        assert_blocks(
+            &pack,
+            "gcloud artifacts repositories delete my-repo --location=us-central1",
+            "repositories delete",
+        );
+    }
 }

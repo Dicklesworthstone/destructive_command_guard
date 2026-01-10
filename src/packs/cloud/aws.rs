@@ -17,7 +17,7 @@ pub fn create_pack() -> Pack {
         name: "AWS CLI",
         description: "Protects against destructive AWS CLI operations like terminate-instances, \
                       delete-db-instance, and s3 rm --recursive",
-        keywords: &["aws", "terminate", "delete", "s3", "ec2", "rds"],
+        keywords: &["aws", "terminate", "delete", "s3", "ec2", "rds", "ecr", "logs"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
@@ -113,5 +113,71 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             r"aws\s+eks\s+delete-cluster",
             "aws eks delete-cluster removes the entire EKS cluster."
         ),
+        // ecr delete-repository
+        destructive_pattern!(
+            "ecr-delete-repository",
+            r"aws\s+ecr\s+delete-repository",
+            "aws ecr delete-repository permanently deletes the repository and its images."
+        ),
+        // ecr batch-delete-image
+        destructive_pattern!(
+            "ecr-batch-delete-image",
+            r"aws\s+ecr\s+batch-delete-image",
+            "aws ecr batch-delete-image permanently deletes one or more images."
+        ),
+        // ecr delete-lifecycle-policy
+        destructive_pattern!(
+            "ecr-delete-lifecycle-policy",
+            r"aws\s+ecr\s+delete-lifecycle-policy",
+            "aws ecr delete-lifecycle-policy removes the repository lifecycle policy."
+        ),
+        // CloudWatch Logs delete-log-group
+        destructive_pattern!(
+            "logs-delete-log-group",
+            r"aws\s+logs\s+delete-log-group",
+            "aws logs delete-log-group permanently deletes a log group and all events."
+        ),
+        // CloudWatch Logs delete-log-stream
+        destructive_pattern!(
+            "logs-delete-log-stream",
+            r"aws\s+logs\s+delete-log-stream",
+            "aws logs delete-log-stream permanently deletes a log stream and all events."
+        ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packs::test_helpers::*;
+
+    #[test]
+    fn ecr_and_logs_patterns_block() {
+        let pack = create_pack();
+        assert_blocks(
+            &pack,
+            "aws ecr delete-repository --repository-name example",
+            "delete-repository",
+        );
+        assert_blocks(
+            &pack,
+            "aws ecr batch-delete-image --repository-name example --image-ids imageTag=latest",
+            "batch-delete-image",
+        );
+        assert_blocks(
+            &pack,
+            "aws ecr delete-lifecycle-policy --repository-name example",
+            "delete-lifecycle-policy",
+        );
+        assert_blocks(
+            &pack,
+            "aws logs delete-log-group --log-group-name /aws/lambda/thing",
+            "delete-log-group",
+        );
+        assert_blocks(
+            &pack,
+            "aws logs delete-log-stream --log-group-name /aws/lambda/thing --log-stream-name foo",
+            "delete-log-stream",
+        );
+    }
 }
