@@ -5,3 +5,4 @@
 pub mod github_actions;
 pub mod gitlab_ci;
 pub mod jenkins;
+pub mod circleci;

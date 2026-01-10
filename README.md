@@ -84,9 +84,6 @@ dcg uses a modular "pack" system to organize destructive command patterns by cat
 - **core.git** - Blocks destructive git commands (reset --hard, checkout --, push --force, etc.)
 - **core.filesystem** - Blocks dangerous rm -rf outside temp directories
 
-### Safe Packs (Opt-in)
-- **safe.cleanup** - Allows rm -rf on common build/cache directories (target/, dist/, node_modules/, etc.)
-
 ### Database Packs
 - **database.postgresql** - Blocks DROP/TRUNCATE in PostgreSQL
 - **database.mysql** - Blocks DROP/TRUNCATE in MySQL/MariaDB
@@ -105,9 +102,12 @@ dcg uses a modular "pack" system to organize destructive command patterns by cat
 - **kubernetes.kustomize** - Blocks kustomize delete patterns
 
 ### Cloud Provider Packs
-- **cloud.aws** - Blocks destructive AWS CLI commands
-- **cloud.gcp** - Blocks destructive gcloud commands
-- **cloud.azure** - Blocks destructive az commands
+
+Cloud resources are often expensive, time-consuming to rebuild, and may contain irreplaceable data. These packs provide broad protection across major cloud providers, with particular attention to container registries (which store deployment-critical images) and logging infrastructure (which captures audit trails and debugging data).
+
+- **cloud.aws** - Blocks destructive AWS CLI commands including EC2 instance termination, RDS deletion, S3 recursive removal, EKS cluster deletion, and **container registry operations** (ECR `delete-repository`, `batch-delete-image`, `delete-lifecycle-policy`) and **CloudWatch Logs** (`delete-log-group`, `delete-log-stream`)
+- **cloud.gcp** - Blocks destructive gcloud commands including Compute Engine deletion, Cloud SQL instance deletion, GCS recursive removal, GKE cluster deletion, Firestore deletion, and **Artifact Registry / Container Registry** (`container images delete`, `artifacts docker images delete`, `artifacts repositories delete`)
+- **cloud.azure** - Blocks destructive az commands including VM deletion, storage account deletion, resource group deletion, AKS cluster deletion, and **Azure Container Registry** (`acr delete`, `acr repository delete`, `acr repository untag`)
 
 ### Infrastructure Packs
 - **infrastructure.terraform** - Blocks terraform destroy
@@ -120,7 +120,24 @@ dcg uses a modular "pack" system to organize destructive command patterns by cat
 - **system.services** - Blocks systemctl stop/disable patterns
 
 ### CI/CD Packs
-- **cicd.github_actions** - Blocks destructive GitHub Actions operations via gh (secret/variable deletion, workflow disable, gh api DELETE /actions/*)
+- **cicd.github_actions** - Blocks destructive GitHub Actions operations via `gh` CLI (secret/variable deletion, workflow disable, `gh api DELETE /actions/*`)
+- **cicd.gitlab_ci** - Blocks destructive GitLab CI/CD operations via `glab` CLI (pipeline deletion, variable deletion, release deletion, project deletion)
+- **cicd.jenkins** - Blocks destructive Jenkins CLI and API operations (delete-job, delete-node, delete-credentials, wipe-out-workspace, clear-queue, Groovy `doDelete` calls)
+
+### Secrets Management Packs
+
+Secrets are among the most sensitive resources in any infrastructure. Accidental deletion or modification of secrets can cause authentication failures across entire systems, break deployments, and potentially expose sensitive data during recovery. These packs protect secrets management systems with a defense-in-depth approach: safe read operations are explicitly allowlisted, while mutations and deletions require deliberate manual execution.
+
+- **secrets.vault** - Blocks destructive HashiCorp Vault operations (delete, destroy, metadata delete)
+- **secrets.aws_secrets** - Blocks destructive AWS Secrets Manager and SSM Parameter Store operations. AWS secrets often contain database credentials, API keys, and service account tokens that applications depend on at runtime. Deleting these can cause cascading failures across dependent services. Protects: `delete-secret`, `delete-parameter`, `delete-parameters`, `remove-regions-from-replication`
+- **secrets.onepassword** - Blocks destructive 1Password CLI (`op`) operations. 1Password vaults often contain shared team credentials and sensitive documents. Protects: `item delete`, `vault delete`, `document delete`
+- **secrets.doppler** - Blocks destructive Doppler secrets management operations. Doppler centralizes environment variables and secrets across development, staging, and production. Protects: `secrets delete`, `configs delete`, `projects delete`, `environments delete`
+
+### Monitoring Packs
+
+Monitoring and observability data is often irreplaceable - logs and metrics capture point-in-time system state that cannot be reconstructed after deletion. These packs protect against accidental destruction of monitoring infrastructure.
+
+- **monitoring.splunk** - Blocks destructive Splunk CLI operations. Splunk indexes can contain years of log data critical for security investigations, compliance audits, and debugging production issues. Protects: `remove index`, `clean eventdata`
 
 ### Heredoc Packs
 - **heredoc.bash** - Destructive bash operations inside heredocs/inline scripts
@@ -132,8 +149,17 @@ dcg uses a modular "pack" system to organize destructive command patterns by cat
 - **heredoc.go** - Destructive Go operations inside heredocs/inline scripts
 
 ### Other Packs
-- **strict_git** - Extra paranoid git protections
-- **package_managers** - Blocks npm unpublish, cargo yank, etc.
+- **strict_git** - Extra paranoid git protections for teams requiring additional safety margins
+- **package_managers** - Blocks dangerous package manager operations across ecosystems. Publishing a package is often irreversible (npm, PyPI, Maven Central have strict policies on unpublishing), and removing dependencies can break builds. Protects:
+  - **npm/yarn/pnpm**: `unpublish` (removes published packages)
+  - **pip**: `uninstall` (removes installed packages), `install` from raw URLs (security risk)
+  - **cargo**: `yank` (marks crate versions as yanked)
+  - **gem**: `yank` (removes gem versions)
+  - **poetry**: `publish` (publishes to PyPI), `remove` (removes dependencies)
+  - **maven**: `deploy` (publishes to repository), `release:perform` (performs release)
+  - **gradle**: `publish` (uploads artifacts)
+  - **apt/yum/dnf**: removal of critical system packages
+  - **brew**: `uninstall` (removes packages)
 
 Enable packs in `~/.config/dcg/config.toml`:
 
@@ -143,7 +169,9 @@ enabled = [
     "database.postgresql",
     "containers.docker",
     "kubernetes",  # Enables all kubernetes sub-packs
-    # "safe.cleanup", # Opt-in: allow rm -rf on common build/cache dirs
+    "secrets.aws_secrets",
+    "cicd.jenkins",
+    "monitoring.splunk",
 ]
 ```
 
@@ -989,15 +1017,9 @@ Simultaneously, the hook outputs JSON to stdout for the Claude Code protocol:
 - **Stash loss**: Dropping or clearing stashes containing important work-in-progress
 - **Filesystem accidents**: Recursive deletion outside designated temp directories
 
-### What This Does NOT Protect Against (Yet)
+### Inherent Limitations
 
-**Currently not covered (see Planned Expansion above):**
-- **Database operations**: `DROP TABLE`, `TRUNCATE`, `DELETE FROM` without WHERE, etc.
-- **Container operations**: `docker system prune`, `kubectl delete`, etc.
-- **File moves/overwrites**: `mv` to overwrite important files, redirect truncation (`> file`)
-- **Low-level disk operations**: `dd`, `mkfs`, `fdisk`, etc.
-
-**Inherent limitations:**
+While dcg provides comprehensive protection across many tools and platforms, some attack vectors are inherently difficult or impossible to protect against:
 - **Malicious actors**: A determined attacker can bypass this hook
 - **Non-Bash commands**: Direct file writes via Python/JavaScript, API calls, etc. are not intercepted
 - **Committed but unpushed work**: The hook doesn't prevent loss of local-only commits
@@ -1224,9 +1246,9 @@ The block message instructs the AI to ask you for explicit permission. You can t
 
 The hook is designed for Claude Code's `PreToolUse` hook protocol. Other tools would need adapters to match the expected JSON input/output format.
 
-**Q: Will you add support for blocking database/Docker/Kubernetes commands?**
+**Q: What about database, Docker, Kubernetes, and cloud commands?**
 
-Yes! See the "Planned Expansion" section above. The architecture is designed to easily add new command categories. If you encounter a destructive command that should be blocked, please file an issue.
+dcg already includes comprehensive packs for all of these! The modular pack system covers databases (PostgreSQL, MySQL, MongoDB, Redis, SQLite), containers (Docker, Podman, docker-compose), Kubernetes (kubectl, Helm, Kustomize), and all major cloud providers (AWS, GCP, Azure) including their container registries, secrets management services, and logging infrastructure. Enable the packs you need in your config. If you encounter a destructive command that should be blocked, please file an issue.
 
 ## Contributing
 

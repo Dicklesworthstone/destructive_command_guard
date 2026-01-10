@@ -736,17 +736,16 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
             precomputed_sanitized = Some(sanitized);
 
             if should_scan {
-                if let Some(blocked) = evaluate_heredoc(
-                    command,
+                let context = HeredocEvaluationContext {
                     allowlists,
                     heredoc_settings,
-                    &mut heredoc_allowlist_hit,
                     project_path,
                     deadline,
                     enabled_keywords,
                     ordered_packs,
                     compiled_overrides,
-                ) {
+                };
+                if let Some(blocked) = evaluate_heredoc(command, context, &mut heredoc_allowlist_hit) {
                     return blocked;
                 }
             }
@@ -794,7 +793,7 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
         return EvaluationResult::allowed_due_to_budget();
     }
 
-    let result = evaluate_packs_with_allowlists(&normalized, ordered_packs, allowlists, deadline);
+    let result = evaluate_packs_with_allowlists(&normalized, ordered_packs, allowlists, None);
     if result.allowlist_override.is_none() {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
@@ -817,7 +816,6 @@ fn evaluate_packs_with_allowlists(
     // Pre-compute which packs might match (keyword quick-reject).
     // Uses metadata-only check first to avoid instantiating packs unnecessarily.
     // The Vec allocation is O(p) where p = number of packs.
-    // eprintln!("DEBUG: ordered_packs: {:?}", ordered_packs);
     let candidate_packs: Vec<(&String, &crate::packs::Pack)> = ordered_packs
         .iter()
         .filter_map(|pack_id| {
@@ -838,7 +836,7 @@ fn evaluate_packs_with_allowlists(
     // If any pack's safe pattern matches, allow the command immediately.
     // This enables "safe" packs (like safe.cleanup) to whitelist commands
     // that would otherwise be blocked by other packs (like core.filesystem).
-    for (_, pack) in &candidate_packs {
+    for (_pack_id, pack) in &candidate_packs {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
             return EvaluationResult::allowed_due_to_budget();
         }
@@ -1010,18 +1008,16 @@ where
         precomputed_sanitized = Some(sanitized);
 
         if should_scan {
-            if let Some(blocked) = evaluate_heredoc(
-                command,
+            let context = HeredocEvaluationContext {
                 allowlists,
-                &heredoc_settings,
-                &mut heredoc_allowlist_hit,
+                heredoc_settings: &heredoc_settings,
                 project_path,
-                None, // deadline
-                // Context for recursive evaluation
+                deadline: None,
                 enabled_keywords,
-                &ordered_packs,
+                ordered_packs: &ordered_packs,
                 compiled_overrides,
-            ) {
+            };
+            if let Some(blocked) = evaluate_heredoc(command, context, &mut heredoc_allowlist_hit) {
                 return blocked;
             }
         }
@@ -1076,26 +1072,33 @@ where
 
     result
 }
+/// Context for heredoc evaluation to avoid too many arguments.
+#[derive(Clone, Copy)]
+struct HeredocEvaluationContext<'a> {
+    allowlists: &'a LayeredAllowlist,
+    heredoc_settings: &'a crate::config::HeredocSettings,
+    project_path: Option<&'a Path>,
+    deadline: Option<&'a Deadline>,
+    enabled_keywords: &'a [&'a str],
+    ordered_packs: &'a [String],
+    compiled_overrides: &'a crate::config::CompiledOverrides,
+}
+
 #[allow(clippy::too_many_lines)]
 fn evaluate_heredoc(
     command: &str,
-    allowlists: &LayeredAllowlist,
-    heredoc_settings: &crate::config::HeredocSettings,
+    context: HeredocEvaluationContext<'_>,
     first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
-    project_path: Option<&std::path::Path>,
-    deadline: Option<&Deadline>,
-    enabled_keywords: &[&str],
-    ordered_packs: &[String],
-    compiled_overrides: &crate::config::CompiledOverrides,
 ) -> Option<EvaluationResult> {
-    if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::FULL_HEREDOC_PIPELINE)
+    if deadline_exceeded(context.deadline)
+        || remaining_below(context.deadline, &crate::perf::FULL_HEREDOC_PIPELINE)
     {
         return Some(EvaluationResult::allowed_due_to_budget());
     }
 
     // Check command-level allowlist before any extraction.
     // This allows users to whitelist entire commands (e.g., "./scripts/approved.sh").
-    if let Some(ref content_allowlist) = heredoc_settings.content_allowlist {
+    if let Some(ref content_allowlist) = context.heredoc_settings.content_allowlist {
         if let Some(matched_cmd) = content_allowlist.is_command_allowlisted(command) {
             tracing::debug!(matched_command = matched_cmd, "heredoc command allowlisted");
             // Command is allowlisted - skip all heredoc analysis
@@ -1103,7 +1106,7 @@ fn evaluate_heredoc(
         }
     }
 
-    let extracted = match extract_content(command, &heredoc_settings.limits) {
+    let extracted = match extract_content(command, &context.heredoc_settings.limits) {
         ExtractionResult::Extracted(contents) => contents,
         ExtractionResult::NoContent => return None,
         ExtractionResult::Skipped(reasons) => {
@@ -1111,8 +1114,8 @@ fn evaluate_heredoc(
                 .iter()
                 .any(|r| matches!(r, SkipReason::Timeout { .. }));
 
-            let strict_timeout = is_timeout && !heredoc_settings.fallback_on_timeout;
-            let strict_other = !is_timeout && !heredoc_settings.fallback_on_parse_error;
+            let strict_timeout = is_timeout && !context.heredoc_settings.fallback_on_timeout;
+            let strict_other = !is_timeout && !context.heredoc_settings.fallback_on_parse_error;
             if strict_timeout || strict_other {
                 let summary = reasons
                     .iter()
@@ -1147,7 +1150,7 @@ fn evaluate_heredoc(
             return None;
         }
         ExtractionResult::Failed(err) => {
-            if !heredoc_settings.fallback_on_parse_error {
+            if !context.heredoc_settings.fallback_on_parse_error {
                 let reason = format!(
                     "Embedded code blocked: extraction failed and \
                      fallback_on_parse_error=false ({err})"
@@ -1160,13 +1163,13 @@ fn evaluate_heredoc(
     };
 
     for content in extracted {
-        if deadline_exceeded(deadline)
-            || remaining_below(deadline, &crate::perf::FULL_HEREDOC_PIPELINE)
+        if deadline_exceeded(context.deadline)
+            || remaining_below(context.deadline, &crate::perf::FULL_HEREDOC_PIPELINE)
         {
             return Some(EvaluationResult::allowed_due_to_budget());
         }
 
-        if let Some(allowed) = &heredoc_settings.allowed_languages {
+        if let Some(allowed) = &context.heredoc_settings.allowed_languages {
             if !allowed.contains(&content.language) {
                 continue;
             }
@@ -1174,11 +1177,11 @@ fn evaluate_heredoc(
 
         // Check content-level allowlist before AST matching.
         // This allows users to whitelist specific patterns or content hashes.
-        if let Some(ref content_allowlist) = heredoc_settings.content_allowlist {
+        if let Some(ref content_allowlist) = context.heredoc_settings.content_allowlist {
             if let Some(hit) = content_allowlist.is_content_allowlisted(
                 &content.content,
                 content.language,
-                project_path,
+                context.project_path,
             ) {
                 tracing::debug!(
                     hit_kind = hit.kind.label(),
@@ -1197,19 +1200,19 @@ fn evaluate_heredoc(
         if content.language == crate::heredoc::ScriptLanguage::Bash {
             let inner_commands = crate::heredoc::extract_shell_commands(&content.content);
             for inner in inner_commands {
-                if deadline_exceeded(deadline) {
+                if deadline_exceeded(context.deadline) {
                     return Some(EvaluationResult::allowed_due_to_budget());
                 }
 
                 let result = evaluate_command_with_pack_order_deadline_at_path(
                     &inner.text,
-                    enabled_keywords,
-                    ordered_packs,
-                    compiled_overrides,
-                    allowlists,
-                    heredoc_settings,
-                    project_path,
-                    deadline,
+                    context.enabled_keywords,
+                    context.ordered_packs,
+                    context.compiled_overrides,
+                    context.allowlists,
+                    context.heredoc_settings,
+                    context.project_path,
+                    context.deadline,
                 );
 
                 if result.is_denied() {
@@ -1221,7 +1224,7 @@ fn evaluate_heredoc(
                             inner.line_number + content.byte_range.start // Approximate absolute line? No, inner.line_number is relative to content.
                         );
                         info.source = MatchSource::HeredocAst; // Mark as heredoc source
-                        
+
                         return Some(EvaluationResult {
                             decision: EvaluationDecision::Deny,
                             pattern_info: Some(info),
@@ -1239,8 +1242,8 @@ fn evaluate_heredoc(
             Ok(matches) => matches,
             Err(err) => {
                 let is_timeout = matches!(err, crate::ast_matcher::MatchError::Timeout { .. });
-                let strict_timeout = is_timeout && !heredoc_settings.fallback_on_timeout;
-                let strict_other = !is_timeout && !heredoc_settings.fallback_on_parse_error;
+                let strict_timeout = is_timeout && !context.heredoc_settings.fallback_on_timeout;
+                let strict_other = !is_timeout && !context.heredoc_settings.fallback_on_parse_error;
                 if strict_timeout || strict_other {
                     let reason = format!(
                         "Embedded code blocked: AST matching error with strict fallback \
@@ -1254,8 +1257,8 @@ fn evaluate_heredoc(
         };
 
         for m in matches {
-            if deadline_exceeded(deadline)
-                || remaining_below(deadline, &crate::perf::FULL_HEREDOC_PIPELINE)
+            if deadline_exceeded(context.deadline)
+                || remaining_below(context.deadline, &crate::perf::FULL_HEREDOC_PIPELINE)
             {
                 return Some(EvaluationResult::allowed_due_to_budget());
             }
@@ -1266,7 +1269,7 @@ fn evaluate_heredoc(
 
             let (pack_id, pattern_name) = split_ast_rule_id(&m.rule_id);
 
-            if let Some(hit) = allowlists.match_rule(&pack_id, &pattern_name) {
+            if let Some(hit) = context.allowlists.match_rule(&pack_id, &pattern_name) {
                 if first_allowlist_hit.is_none() {
                     let reason =
                         format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);

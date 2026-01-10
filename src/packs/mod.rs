@@ -19,6 +19,7 @@ pub mod core;
 pub mod database;
 pub mod infrastructure;
 pub mod kubernetes;
+pub mod messaging;
 pub mod package_managers;
 pub mod secrets;
 pub mod platform;
@@ -478,7 +479,7 @@ pub struct PackRegistry {
 
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 33] = [
+static PACK_ENTRIES: [PackEntry; 36] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new("core.filesystem", &["rm", "/rm"], core::filesystem::create_pack),
     PackEntry::new(
@@ -495,6 +496,11 @@ static PACK_ENTRIES: [PackEntry; 33] = [
         "cicd.jenkins",
         &["jenkins-cli", "jenkins", "doDelete"],
         cicd::jenkins::create_pack,
+    ),
+    PackEntry::new(
+        "cicd.circleci",
+        &["circleci"],
+        cicd::circleci::create_pack,
     ),
     PackEntry::new("secrets.vault", &["vault"], secrets::vault::create_pack),
     PackEntry::new(
@@ -518,9 +524,26 @@ static PACK_ENTRIES: [PackEntry; 33] = [
         platform::github::create_pack,
     ),
     PackEntry::new(
+        "platform.gitlab",
+        &["glab", "gitlab-rails", "gitlab-rake"],
+        platform::gitlab::create_pack,
+    ),
+    PackEntry::new(
         "monitoring.splunk",
         &["splunk"],
         monitoring::splunk::create_pack,
+    ),
+    PackEntry::new(
+        "messaging.kafka",
+        &[
+            "kafka-topics",
+            "kafka-consumer-groups",
+            "kafka-configs",
+            "kafka-acls",
+            "kafka-delete-records",
+            "rpk",
+        ],
+        messaging::kafka::create_pack,
     ),
     PackEntry::new(
         "database.postgresql",
@@ -795,7 +818,7 @@ impl PackRegistry {
             "cloud" | "platform" => 4,
             "kubernetes" => 5,
             "containers" => 6,
-            "database" => 7,
+            "database" | "messaging" => 7,
             "package_managers" => 8,
             "strict_git" => 9,
             "cicd" | "secrets" | "monitoring" => 10, // CI/CD + secrets + monitoring tooling
@@ -1298,13 +1321,14 @@ impl NormalizeWrapper {
 #[must_use]
 fn normalize_command_word_token(token: &str) -> Option<String> {
     let mut out = token.to_string();
-    let mut changed = false;
 
     // Strip line continuations (backslash + newline) anywhere in the token
-    if out.contains("\\\n") || out.contains("\\\r\n") {
+    let mut changed = if out.contains("\\\n") || out.contains("\\\r\n") {
         out = out.replace("\\\n", "").replace("\\\r\n", "");
-        changed = true;
-    }
+        true
+    } else {
+        false
+    };
 
     let stripped = out.trim_start_matches('\\');
     if !stripped.is_empty() && stripped.len() != out.len() {
@@ -1447,27 +1471,41 @@ fn dequote_segment_command_words(command: &str) -> Cow<'_, str> {
 /// Returns the original command unchanged if normalization fails (fail-open).
 #[inline]
 pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
-    let cmd = dequote_segment_command_words(cmd);
+    // 1. Strip wrappers (sudo, env, etc.)
+    let stripped = crate::normalize::strip_wrapper_prefixes(cmd);
 
-    match cmd {
-        Cow::Borrowed(cmd) => {
-            if !cmd.starts_with('/') {
-                return Cow::Borrowed(cmd);
+    match stripped.normalized {
+        Cow::Borrowed(original_slice) => {
+            // original_slice has lifetime 'a (from cmd)
+            let dequoted = dequote_segment_command_words(original_slice);
+            // dequoted has lifetime 'a.
+
+            // 3. Strip paths
+            match dequoted {
+                Cow::Borrowed(base) => {
+                    PATH_NORMALIZER
+                        .try_replacen(base, 1, "$1")
+                        .unwrap_or(Cow::Borrowed(base))
+                }
+                Cow::Owned(base) => {
+                    match PATH_NORMALIZER.try_replacen(&base, 1, "$1") {
+                        Ok(Cow::Owned(replaced)) => Cow::Owned(replaced),
+                        Ok(Cow::Borrowed(_)) | Err(_) => Cow::Owned(base),
+                    }
+                }
             }
-            // Use try_replacen to handle regex errors gracefully (e.g., backtrack limit exceeded)
-            // On error, return the original command unchanged (fail-open for safety)
-            // Limit 1: only replace the first match (path prefix)
-            PATH_NORMALIZER
-                .try_replacen(cmd, 1, "$1")
-                .unwrap_or(Cow::Borrowed(cmd))
         }
-        Cow::Owned(cmd) => {
-            if !cmd.starts_with('/') {
-                return Cow::Owned(cmd);
-            }
-            match PATH_NORMALIZER.try_replacen(&cmd, 1, "$1") {
+        Cow::Owned(local_string) => {
+            // local_string is local.
+            let dequoted = dequote_segment_command_words(&local_string);
+            // dequoted borrows from local_string.
+            // We MUST return Owned.
+            let base = dequoted.into_owned();
+
+            // 3. Strip paths
+            match PATH_NORMALIZER.try_replacen(&base, 1, "$1") {
                 Ok(Cow::Owned(replaced)) => Cow::Owned(replaced),
-                Ok(Cow::Borrowed(_)) | Err(_) => Cow::Owned(cmd),
+                Ok(Cow::Borrowed(_)) | Err(_) => Cow::Owned(base),
             }
         }
     }
@@ -1748,6 +1786,7 @@ mod tests {
 
         // Database should be tier 7
         assert_eq!(PackRegistry::pack_tier("database.postgresql"), 7);
+        assert_eq!(PackRegistry::pack_tier("messaging.kafka"), 7);
 
         // Package managers should be tier 8
         assert_eq!(PackRegistry::pack_tier("package_managers"), 8);
@@ -1759,6 +1798,7 @@ mod tests {
         assert_eq!(PackRegistry::pack_tier("cicd.github_actions"), 10);
         assert_eq!(PackRegistry::pack_tier("cicd.gitlab_ci"), 10);
         assert_eq!(PackRegistry::pack_tier("cicd.jenkins"), 10);
+        assert_eq!(PackRegistry::pack_tier("cicd.circleci"), 10);
         assert_eq!(PackRegistry::pack_tier("secrets.vault"), 10);
         assert_eq!(PackRegistry::pack_tier("monitoring.splunk"), 10);
 
@@ -2355,7 +2395,7 @@ mod tests {
         fn strips_quotes_after_wrappers_and_options() {
             assert_eq!(
                 normalize_command("sudo -u root \"rm\" -rf /etc"),
-                "sudo -u root rm -rf /etc"
+                "rm -rf /etc"
             );
         }
 
