@@ -54,10 +54,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "az-storage-blob-download-batch",
             r"\baz\s+storage\s+blob\s+download-batch\b"
         ),
-        safe_pattern!(
-            "az-storage-blob-url",
-            r"\baz\s+storage\s+blob\s+url\b"
-        ),
+        safe_pattern!("az-storage-blob-url", r"\baz\s+storage\s+blob\s+url\b"),
         safe_pattern!(
             "az-storage-blob-metadata-show",
             r"\baz\s+storage\s+blob\s+metadata\s+show\b"
@@ -101,7 +98,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "az-storage-blob-delete",
-            r"\baz\s+storage\s+blob\s+delete\b(?!-)",
+            r"\baz\s+storage\s+blob\s+delete(?:\s|$)",
             "az storage blob delete removes a blob from Azure storage."
         ),
         // Storage account deletion

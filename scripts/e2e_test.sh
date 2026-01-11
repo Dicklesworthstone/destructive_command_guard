@@ -714,6 +714,41 @@ test_command_with_packs "rsync --delete-before src/ dest/" "block" "remote.rsync
 test_command_with_packs "rsync --list-only src/ dest/" "allow" "remote.rsync" "rsync --list-only (rsync pack enabled, safe command)"
 test_command_with_packs "rsync -avzn src/ dest/" "allow" "remote.rsync" "rsync -n (rsync pack enabled, safe command)"
 
+# scp pack tests
+test_command_with_packs "scp user@host:/etc/hosts ." "allow" "remote.scp" "scp download from /etc (scp pack enabled, safe command)"
+test_command_with_packs "scp config.conf user@host:/etc/" "block" "remote.scp" "scp to /etc (scp pack enabled)"
+test_command_with_packs "scp -r ./data user@host:/" "block" "remote.scp" "scp -r to / (scp pack enabled)"
+test_command_with_packs "scp file.txt user@host:/tmp/backup/" "allow" "remote.scp" "scp to /tmp (scp pack enabled, safe command)"
+
+# CloudFront pack tests
+test_command_with_packs "aws cloudfront list-distributions" "allow" "cdn.cloudfront" "aws cloudfront list-distributions (cloudfront pack enabled, safe command)"
+test_command_with_packs "aws cloudfront get-distribution --id ABC" "allow" "cdn.cloudfront" "aws cloudfront get-distribution (cloudfront pack enabled, safe command)"
+test_command_with_packs "aws cloudfront delete-distribution --id ABC --if-match ETAG" "block" "cdn.cloudfront" "aws cloudfront delete-distribution (cloudfront pack enabled)"
+test_command_with_packs "aws cloudfront create-invalidation --distribution-id ABC --paths '/*'" "block" "cdn.cloudfront" "aws cloudfront create-invalidation (cloudfront pack enabled)"
+
+# AWS SES pack tests
+test_command_with_packs "aws ses list-identities" "allow" "email.ses" "aws ses list-identities (ses pack enabled, safe command)"
+test_command_with_packs "aws ses delete-identity --identity example.com" "block" "email.ses" "aws ses delete-identity (ses pack enabled)"
+test_command_with_packs "aws sesv2 list-email-identities" "allow" "email.ses" "aws sesv2 list-email-identities (ses pack enabled, safe command)"
+test_command_with_packs "aws sesv2 delete-email-identity --email-identity example.com" "block" "email.ses" "aws sesv2 delete-email-identity (ses pack enabled)"
+
+# SendGrid pack tests
+test_command_with_packs "curl https://api.sendgrid.com/v3/templates" "allow" "email.sendgrid" "sendgrid list templates (sendgrid pack enabled, safe command)"
+test_command_with_packs "curl -X DELETE https://api.sendgrid.com/v3/templates/d-abc123" "block" "email.sendgrid" "sendgrid delete template (sendgrid pack enabled)"
+test_command_with_packs "curl -X DELETE https://api.sendgrid.com/v3/api_keys/abc123" "block" "email.sendgrid" "sendgrid delete api key (sendgrid pack enabled)"
+
+# Kong API Gateway pack tests
+test_command_with_packs "deck diff" "allow" "apigateway.kong" "deck diff (kong pack enabled, safe command)"
+test_command_with_packs "deck reset" "block" "apigateway.kong" "deck reset (kong pack enabled)"
+test_command_with_packs "curl localhost:8001/services" "allow" "apigateway.kong" "curl localhost:8001/services (kong pack enabled, safe command)"
+test_command_with_packs "curl -X DELETE localhost:8001/services/my-service" "block" "apigateway.kong" "curl -X DELETE localhost:8001/services (kong pack enabled)"
+
+# Apigee API Gateway pack tests
+test_command_with_packs "gcloud apigee apis list" "allow" "apigateway.apigee" "gcloud apigee apis list (apigee pack enabled, safe command)"
+test_command_with_packs "gcloud apigee apis delete my-api" "block" "apigateway.apigee" "gcloud apigee apis delete (apigee pack enabled)"
+test_command_with_packs "apigeecli apis list" "allow" "apigateway.apigee" "apigeecli apis list (apigee pack enabled, safe command)"
+test_command_with_packs "apigeecli apis delete -n my-api" "block" "apigateway.apigee" "apigeecli apis delete (apigee pack enabled)"
+
 # PostgreSQL pack tests
 test_command_with_packs "psql -c 'DROP DATABASE production;'" "block" "database.postgresql" "psql DROP DATABASE (postgresql pack enabled)"
 test_command_with_packs "psql -c 'DROP DATABASE IF EXISTS production;'" "block" "database.postgresql" "psql DROP DATABASE IF EXISTS (postgresql pack enabled)"

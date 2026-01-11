@@ -31,6 +31,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!("scp-to-home", r"scp\b.*\s(?:(?:\S+@)?\S+:)?~/\S+\s*$"),
         // Copy to /tmp
         safe_pattern!("scp-to-tmp", r"scp\b.*\s(?:(?:\S+@)?\S+:)?/tmp/\S*\s*$"),
+        // Copy to /var/tmp (safe scratch space under /var)
+        safe_pattern!(
+            "scp-to-var-tmp",
+            r"scp\b.*\s(?:(?:\S+@)?\S+:)?/var/tmp(?:/\S*)?\s*$"
+        ),
     ]
 }
 
@@ -51,7 +56,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Copy to /var
         destructive_pattern!(
             "scp-to-var",
-            r"scp\b.*\s(?:(?:\S+@)?\S+:)?/var(?:/(?!tmp)\S*)?\s*$",
+            r"scp\b.*\s(?:(?:\S+@)?\S+:)?/var(?:/\S*)?\s*$",
             "scp to /var/ can overwrite system data."
         ),
         // Copy to /boot

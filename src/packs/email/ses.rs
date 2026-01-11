@@ -28,14 +28,8 @@ pub fn create_pack() -> Pack {
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
         // SES v1 read operations
-        safe_pattern!(
-            "ses-list-identities",
-            r"\baws\s+ses\s+list-identities\b"
-        ),
-        safe_pattern!(
-            "ses-list-templates",
-            r"\baws\s+ses\s+list-templates\b"
-        ),
+        safe_pattern!("ses-list-identities", r"\baws\s+ses\s+list-identities\b"),
+        safe_pattern!("ses-list-templates", r"\baws\s+ses\s+list-templates\b"),
         safe_pattern!(
             "ses-list-configuration-sets",
             r"\baws\s+ses\s+list-configuration-sets\b"
@@ -60,10 +54,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "ses-get-identity-notification-attributes",
             r"\baws\s+ses\s+get-identity-notification-attributes\b"
         ),
-        safe_pattern!(
-            "ses-get-template",
-            r"\baws\s+ses\s+get-template\b"
-        ),
+        safe_pattern!("ses-get-template", r"\baws\s+ses\s+get-template\b"),
         safe_pattern!(
             "ses-describe-configuration-set",
             r"\baws\s+ses\s+describe-configuration-set\b"
@@ -76,10 +67,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "ses-describe-receipt-rule-set",
             r"\baws\s+ses\s+describe-receipt-rule-set\b"
         ),
-        safe_pattern!(
-            "ses-get-send-quota",
-            r"\baws\s+ses\s+get-send-quota\b"
-        ),
+        safe_pattern!("ses-get-send-quota", r"\baws\s+ses\s+get-send-quota\b"),
         safe_pattern!(
             "ses-get-send-statistics",
             r"\baws\s+ses\s+get-send-statistics\b"
@@ -125,10 +113,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "sesv2-get-dedicated-ip-pool",
             r"\baws\s+sesv2\s+get-dedicated-ip-pool\b"
         ),
-        safe_pattern!(
-            "sesv2-get-account",
-            r"\baws\s+sesv2\s+get-account\b"
-        ),
+        safe_pattern!("sesv2-get-account", r"\baws\s+sesv2\s+get-account\b"),
     ]
 }
 
@@ -157,7 +142,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "ses-delete-receipt-rule",
-            r"\baws\s+ses\s+delete-receipt-rule\b(?!-)",
+            r"\baws\s+ses\s+delete-receipt-rule(?:\s|$)",
             "aws ses delete-receipt-rule removes a receipt rule."
         ),
         // SES v2 deletion operations
@@ -215,7 +200,10 @@ mod tests {
         assert_safe_pattern_matches(&pack, "aws ses list-identities");
         assert_safe_pattern_matches(&pack, "aws ses list-templates");
         assert_safe_pattern_matches(&pack, "aws ses list-configuration-sets");
-        assert_safe_pattern_matches(&pack, "aws ses list-receipt-rules --rule-set-name MyRuleSet");
+        assert_safe_pattern_matches(
+            &pack,
+            "aws ses list-receipt-rules --rule-set-name MyRuleSet",
+        );
         assert_safe_pattern_matches(&pack, "aws ses list-receipt-rule-sets");
         assert_safe_pattern_matches(
             &pack,

@@ -1,4 +1,4 @@
-//! AWS CloudFront pack - protections for destructive CloudFront CLI operations.
+//! AWS `CloudFront` pack - protections for destructive `CloudFront` CLI operations.
 //!
 //! Covers destructive operations:
 //! - Distribution deletion (`aws cloudfront delete-distribution`)
@@ -10,7 +10,7 @@
 use crate::packs::{DestructivePattern, Pack, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
 
-/// Create the AWS CloudFront pack.
+/// Create the AWS `CloudFront` pack.
 #[must_use]
 pub fn create_pack() -> Pack {
     Pack {
@@ -154,14 +154,20 @@ mod tests {
         assert_safe_pattern_matches(&pack, "aws cloudfront list-cache-policies");
         assert_safe_pattern_matches(&pack, "aws cloudfront list-origin-request-policies");
         assert_safe_pattern_matches(&pack, "aws cloudfront list-functions");
-        assert_safe_pattern_matches(&pack, "aws cloudfront list-invalidations --distribution-id ABC");
+        assert_safe_pattern_matches(
+            &pack,
+            "aws cloudfront list-invalidations --distribution-id ABC",
+        );
         // Get operations
         assert_safe_pattern_matches(&pack, "aws cloudfront get-distribution --id ABC");
         assert_safe_pattern_matches(&pack, "aws cloudfront get-distribution-config --id ABC");
         assert_safe_pattern_matches(&pack, "aws cloudfront get-cache-policy --id XYZ");
         assert_safe_pattern_matches(&pack, "aws cloudfront get-origin-request-policy --id XYZ");
         assert_safe_pattern_matches(&pack, "aws cloudfront get-function --name myfunc");
-        assert_safe_pattern_matches(&pack, "aws cloudfront get-invalidation --distribution-id ABC --id INV");
+        assert_safe_pattern_matches(
+            &pack,
+            "aws cloudfront get-invalidation --distribution-id ABC --id INV",
+        );
         assert_safe_pattern_matches(&pack, "aws cloudfront describe-function --name myfunc");
     }
 

@@ -1,4 +1,4 @@
-//! MinIO pack - protections for destructive MinIO Client (mc) operations.
+//! `MinIO` pack - protections for destructive `MinIO` Client (mc) operations.
 //!
 //! Covers destructive operations:
 //! - Bucket removal (mc rb)
@@ -9,7 +9,7 @@
 use crate::packs::{DestructivePattern, Pack, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
 
-/// Create the MinIO pack.
+/// Create the `MinIO` pack.
 #[must_use]
 pub fn create_pack() -> Pack {
     Pack {
@@ -45,8 +45,14 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!("mc-help", r"\bmc\s+(?:--\S+\s+)*(?:--help|-h)\b"),
         // Admin info (read-only)
         safe_pattern!("mc-admin-info", r"\bmc\s+(?:--\S+\s+)*admin\s+info\b"),
-        safe_pattern!("mc-admin-user-list", r"\bmc\s+(?:--\S+\s+)*admin\s+user\s+list\b"),
-        safe_pattern!("mc-admin-policy-list", r"\bmc\s+(?:--\S+\s+)*admin\s+policy\s+list\b"),
+        safe_pattern!(
+            "mc-admin-user-list",
+            r"\bmc\s+(?:--\S+\s+)*admin\s+user\s+list\b"
+        ),
+        safe_pattern!(
+            "mc-admin-policy-list",
+            r"\bmc\s+(?:--\S+\s+)*admin\s+policy\s+list\b"
+        ),
         // Alias management (config, not data)
         safe_pattern!("mc-alias-list", r"\bmc\s+(?:--\S+\s+)*alias\s+list\b"),
     ]

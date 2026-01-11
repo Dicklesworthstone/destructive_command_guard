@@ -1,6 +1,6 @@
 //! AWS API Gateway pack - protections for destructive AWS API Gateway operations.
 //!
-//! Covers destructive operations for both REST APIs (APIGateway) and HTTP APIs (APIGatewayV2):
+//! Covers destructive operations for both REST APIs (`APIGateway`) and HTTP APIs (`APIGatewayV2`):
 //! - REST API deletion (`aws apigateway delete-rest-api`)
 //! - Resource deletion (`aws apigateway delete-resource`)
 //! - Method deletion (`aws apigateway delete-method`)
