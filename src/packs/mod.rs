@@ -532,7 +532,7 @@ impl EnabledKeywordIndex {
 
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 65] = [
+static PACK_ENTRIES: [PackEntry; 66] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new(
         "core.filesystem",
@@ -546,6 +546,7 @@ static PACK_ENTRIES: [PackEntry; 65] = [
         &["ssh", "ssh-keygen", "ssh-add", "ssh-agent", "ssh-keyscan"],
         remote::ssh::create_pack,
     ),
+    PackEntry::new("remote.scp", &["scp"], remote::scp::create_pack),
     PackEntry::new(
         "cicd.github_actions",
         &["gh"],
