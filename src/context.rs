@@ -194,37 +194,15 @@ impl CommandSpans {
 /// State machine states for the shell tokenizer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TokenizerState {
-    /// Normal unquoted text
     Normal,
-    /// Inside single quotes - no escapes, no substitution
     SingleQuote,
-    /// Inside double quotes - escapes and substitution possible
     DoubleQuote,
-    /// After a backslash in normal context
-    EscapeNormal,
-    /// After a backslash in double-quoted context
-    EscapeDouble,
-    /// Inside $(...) command substitution
-    CommandSubst { depth: u32 },
-    /// Inside a comment within command substitution
-    CommandSubstComment { depth: u32 },
-    /// Inside backtick command substitution
-    Backtick,
-    /// Inside a comment (# to newline)
-    Comment,
+    CommandSubst, // Inside $(...), scanning for matching )
+    Backtick,     // Inside `...`, scanning for matching `
+    Comment,      // Inside #... (newline terminates)
 }
 
 /// Shell command tokenizer and context classifier.
-///
-/// This is a lightweight, purpose-built tokenizer that recognizes:
-/// - Single and double quotes
-/// - Backslash escapes
-/// - Pipe operators (|, ||)
-/// - Command separators (;, &&)
-/// - Command substitution ($(...), backticks)
-///
-/// It does NOT attempt to be a full shell parser - it's designed for
-/// the specific use case of identifying executable vs data contexts.
 pub struct ContextClassifier {
     /// Commands that take inline code as the next argument after -c/-e
     inline_code_commands: &'static [&'static str],
@@ -253,12 +231,14 @@ impl ContextClassifier {
         }
     }
 
-    /// Classify all spans in a command string.
-    ///
     /// Returns a `CommandSpans` structure containing classified spans.
     /// Each byte in the command will belong to exactly one span.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal stack is empty, which should be impossible given the initial state.
     #[must_use]
-    #[allow(clippy::too_many_lines)] // State machine logic is cohesive and clearer as single function
+    #[allow(clippy::too_many_lines)]
     pub fn classify(&self, command: &str) -> CommandSpans {
         let bytes = command.as_bytes();
         let len = bytes.len();
@@ -268,38 +248,61 @@ impl ContextClassifier {
         }
 
         let mut spans = CommandSpans::new();
-        let mut state = TokenizerState::Normal;
-        let mut span_start = 0;
-        let mut current_kind = SpanKind::Executed;
-        let mut i = 0;
+        let mut stack = vec![TokenizerState::Normal];
 
-        // Track if we're after a -c/-e flag
+        // Start of the current span (token or subst)
+        let mut span_start = 0;
+
+        // Current classification kind for the active span (only relevant for Normal/DoubleQuote)
+        let mut current_kind = SpanKind::Executed;
+
+        // Track inline code flags (e.g. -c)
         let mut pending_inline_code = false;
         let mut last_word_start = 0;
 
+        let in_inline_context = |state_stack: &[TokenizerState]| {
+            state_stack
+                .iter()
+                .any(|s| matches!(s, TokenizerState::CommandSubst | TokenizerState::Backtick))
+        };
+
+        let mut i = 0;
         while i < len {
             let byte = bytes[i];
+            let current_state = *stack.last().unwrap();
 
-            match state {
+            // Handle escapes first (except in SingleQuote where \ is literal)
+            if byte == b'\\' && current_state != TokenizerState::SingleQuote {
+                let effective = !matches!(current_state, TokenizerState::Comment);
+                if effective {
+                    // Consume the backslash and the next character
+                    i += 1; // Skip \
+                    if i < len {
+                        // If newline, it's line continuation (ignored/joined).
+                        // If char, it's escaped literal.
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+
+            match current_state {
                 TokenizerState::Normal => {
                     match byte {
                         b'\'' => {
-                            // End current span, start single-quote span
                             if i > span_start {
                                 spans.push(Span::new(current_kind, span_start, i));
                             }
                             span_start = i;
-                            state = TokenizerState::SingleQuote;
+                            stack.push(TokenizerState::SingleQuote);
                             current_kind = SpanKind::Data;
                         }
                         b'"' => {
-                            // End current span, start double-quote span
                             if i > span_start {
                                 spans.push(Span::new(current_kind, span_start, i));
                             }
                             span_start = i;
-                            state = TokenizerState::DoubleQuote;
-                            // Double quotes might be inline code if after -c/-e
+                            stack.push(TokenizerState::DoubleQuote);
                             current_kind = if pending_inline_code {
                                 pending_inline_code = false;
                                 SpanKind::InlineCode
@@ -307,65 +310,62 @@ impl ContextClassifier {
                                 SpanKind::Argument
                             };
                         }
-                        b'\\' => {
-                            state = TokenizerState::EscapeNormal;
-                        }
                         b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
-                            // Command substitution start
                             if i > span_start {
                                 spans.push(Span::new(current_kind, span_start, i));
                             }
                             span_start = i;
-                            i += 1; // Skip the (
-                            state = TokenizerState::CommandSubst { depth: 1 };
-                            current_kind = SpanKind::InlineCode;
+                            i += 1; // Skip (
+                            stack.push(TokenizerState::CommandSubst);
+                            // We don't set current_kind here because CommandSubst span
+                            // will be emitted when we POP.
                         }
                         b'`' => {
-                            // Backtick substitution start
                             if i > span_start {
                                 spans.push(Span::new(current_kind, span_start, i));
                             }
                             span_start = i;
-                            state = TokenizerState::Backtick;
-                            current_kind = SpanKind::InlineCode;
+                            stack.push(TokenizerState::Backtick);
                         }
-                        b'|' | b';' => {
-                            // Pipe or separator - end current span, next part is new command
+                        b'|' | b';' | b'&' => {
+                            // Check for operators
+                            // For simple classification, treat as break.
                             if i > span_start {
                                 spans.push(Span::new(current_kind, span_start, i));
                             }
-                            // Include the operator in its own span
-                            let op_end = if byte == b'|' && i + 1 < len && bytes[i + 1] == b'|' {
-                                i + 2 // ||
-                            } else {
-                                i + 1
-                            };
-                            spans.push(Span::new(SpanKind::Executed, i, op_end));
-                            i = op_end;
+                            // Determine operator length
+                            let mut op_len = 1;
+                            if i + 1 < len {
+                                let next = bytes[i + 1];
+                                if (byte == b'|' && next == b'|') || (byte == b'&' && next == b'&')
+                                {
+                                    op_len = 2;
+                                }
+                            }
+
+                            spans.push(Span::new(SpanKind::Executed, i, i + op_len));
+                            i += op_len;
+                            // Advance loop manually
                             span_start = i;
                             current_kind = SpanKind::Executed;
                             pending_inline_code = false;
                             continue;
                         }
-                        b'&' if i + 1 < len && bytes[i + 1] == b'&' => {
-                            // && separator
-                            if i > span_start {
-                                spans.push(Span::new(current_kind, span_start, i));
+                        b'#' => {
+                            // Comment start if start of word
+                            if i == 0 || bytes[i - 1].is_ascii_whitespace() {
+                                if i > span_start {
+                                    spans.push(Span::new(current_kind, span_start, i));
+                                }
+                                span_start = i;
+                                stack.push(TokenizerState::Comment);
                             }
-                            spans.push(Span::new(SpanKind::Executed, i, i + 2));
-                            i += 2;
-                            span_start = i;
-                            current_kind = SpanKind::Executed;
-                            pending_inline_code = false;
-                            continue;
                         }
                         b' ' | b'\t' | b'\n' => {
-                            // Whitespace - check if we just finished a word
+                            // Whitespace
                             if i > last_word_start {
                                 let word = &command[last_word_start..i];
-                                // Check for inline code flags
                                 if word == "-c" || word == "-e" || word == "-r" || word == "-S" {
-                                    // Check if previous word was an inline-code command
                                     pending_inline_code = self.check_inline_code_context(
                                         command,
                                         last_word_start,
@@ -375,144 +375,165 @@ impl ContextClassifier {
                             }
                             last_word_start = i + 1;
                         }
-                        b'#' => {
-                            // Start comment if at start of string or preceded by whitespace
-                            if i == 0 || bytes[i - 1].is_ascii_whitespace() {
-                                if i > span_start {
-                                    spans.push(Span::new(current_kind, span_start, i));
-                                }
-                                span_start = i;
-                                state = TokenizerState::Comment;
-                                current_kind = SpanKind::Data;
-                            }
-                        }
-                        _ => {
-                            // Regular character
-                        }
+                        _ => {}
                     }
-                }
-                TokenizerState::SingleQuote => {
-                    if byte == b'\'' {
-                        // End single quote span (include closing quote)
-                        spans.push(Span::new(SpanKind::Data, span_start, i + 1));
-                        span_start = i + 1;
-                        state = TokenizerState::Normal;
-                        current_kind = SpanKind::Executed;
-                    }
-                    // Everything inside single quotes is just data
                 }
                 TokenizerState::DoubleQuote => {
                     match byte {
                         b'"' => {
-                            // End double quote span (include closing quote)
-                            spans.push(Span::new(current_kind, span_start, i + 1));
-                            span_start = i + 1;
-                            state = TokenizerState::Normal;
-                            current_kind = SpanKind::Executed;
-                        }
-                        b'\\' => {
-                            state = TokenizerState::EscapeDouble;
+                            // Close double quote
+                            stack.pop();
+                            // Only emit span if we are not inside a command substitution
+                            if !matches!(
+                                stack.last(),
+                                Some(TokenizerState::CommandSubst | TokenizerState::Backtick)
+                            ) {
+                                spans.push(Span::new(current_kind, span_start, i + 1));
+                                span_start = i + 1;
+                                current_kind = SpanKind::Executed;
+                            }
                         }
                         b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
-                            // Command substitution inside double quotes - treat as inline code
-                            // Don't create new span, but upgrade current to Unknown if not already InlineCode
-                            if current_kind == SpanKind::Argument {
-                                current_kind = SpanKind::Unknown;
+                            // Command substitution inside double quotes
+                            // We treat it as InlineCode, but do NOT push CommandSubst to stack?
+                            // If we don't push, we don't handle nested quotes inside it correctly.
+                            // We MUST push CommandSubst to handle nesting.
+                            // But when we pop back, we are still in DoubleQuote.
+
+                            // The span logic in dcg expects flat spans.
+                            // If we have "foo $(bar) baz", we want:
+                            // "foo " (Argument)
+                            // "$(bar)" (InlineCode)
+                            // " baz" (Argument)
+
+                            // Emit preceding string part
+                            if i > span_start {
+                                spans.push(Span::new(current_kind, span_start, i));
                             }
-                            i += 1; // Skip past (
-                            // Note: we don't track nesting inside double quotes for simplicity
-                            // This is conservative (treats more as potentially dangerous)
+                            span_start = i;
+                            i += 1; // Skip (
+                            stack.push(TokenizerState::CommandSubst);
                         }
                         b'`' => {
-                            // Backtick inside double quotes - upgrade to Unknown
-                            if current_kind == SpanKind::Argument {
-                                current_kind = SpanKind::Unknown;
+                            if i > span_start {
+                                spans.push(Span::new(current_kind, span_start, i));
                             }
+                            span_start = i;
+                            stack.push(TokenizerState::Backtick);
                         }
                         _ => {}
                     }
                 }
-                TokenizerState::EscapeNormal => {
-                    // Skip this character, return to normal
-                    state = TokenizerState::Normal;
-                }
-                TokenizerState::EscapeDouble => {
-                    // Skip this character, return to double quote
-                    state = TokenizerState::DoubleQuote;
-                }
-                TokenizerState::CommandSubst { depth } => {
-                    match byte {
-                        b'(' => {
-                            state = TokenizerState::CommandSubst { depth: depth + 1 };
+                TokenizerState::SingleQuote => {
+                    if byte == b'\'' {
+                        stack.pop();
+                        // Only emit span if we are not inside a command substitution
+                        if !matches!(
+                            stack.last(),
+                            Some(TokenizerState::CommandSubst | TokenizerState::Backtick)
+                        ) {
+                            spans.push(Span::new(SpanKind::Data, span_start, i + 1));
+                            span_start = i + 1;
+                            current_kind = SpanKind::Executed;
                         }
+                    }
+                }
+                TokenizerState::CommandSubst => {
+                    // Inside $( ... )
+                    // We scan for matching ) but respect quotes
+                    match byte {
                         b')' => {
-                            if depth == 1 {
-                                // End of command substitution
+                            stack.pop();
+                            // Only emit span if we have fully exited the command substitution structure.
+                            // If we are still in CommandSubst (nested parens/subshell), we continue scanning.
+                            if !in_inline_context(&stack) {
                                 spans.push(Span::new(SpanKind::InlineCode, span_start, i + 1));
                                 span_start = i + 1;
-                                state = TokenizerState::Normal;
-                                current_kind = SpanKind::Executed;
-                            } else {
-                                state = TokenizerState::CommandSubst { depth: depth - 1 };
+                                // Restore previous kind based on state we returned to
+                                match stack.last() {
+                                    Some(TokenizerState::Normal) => {
+                                        current_kind = SpanKind::Executed;
+                                    }
+                                    Some(TokenizerState::DoubleQuote) => {
+                                        current_kind = SpanKind::Argument;
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
+                        b'(' => {
+                            // Nested $( ( ... ) ) - subshell or nested subst?
+                            // Just recurse CommandSubst to track parens nesting
+                            // Note: $( ( ) ) - the inner ( ) are a subshell.
+                            // We can just track depth by pushing another CommandSubst
+                            stack.push(TokenizerState::CommandSubst);
+                        }
+                        b'"' => stack.push(TokenizerState::DoubleQuote),
+                        b'\'' => stack.push(TokenizerState::SingleQuote),
+                        b'`' => stack.push(TokenizerState::Backtick),
                         b'#' => {
-                            // Start comment if at start of string or preceded by whitespace
                             if i == 0 || bytes[i - 1].is_ascii_whitespace() {
-                                state = TokenizerState::CommandSubstComment { depth };
+                                stack.push(TokenizerState::Comment);
                             }
                         }
                         _ => {}
-                    }
-                }
-                TokenizerState::CommandSubstComment { depth } => {
-                    if byte == b'\n' {
-                        // End comment, return to CommandSubst
-                        state = TokenizerState::CommandSubst { depth };
                     }
                 }
                 TokenizerState::Backtick => {
                     if byte == b'`' {
-                        // End of backtick substitution
-                        spans.push(Span::new(SpanKind::InlineCode, span_start, i + 1));
-                        span_start = i + 1;
-                        state = TokenizerState::Normal;
-                        current_kind = SpanKind::Executed;
+                        stack.pop();
+                        // Only emit span if we have fully exited the command substitution structure.
+                        if !in_inline_context(&stack) {
+                            spans.push(Span::new(SpanKind::InlineCode, span_start, i + 1));
+                            span_start = i + 1;
+                            match stack.last() {
+                                Some(TokenizerState::Normal) => {
+                                    current_kind = SpanKind::Executed;
+                                }
+                                Some(TokenizerState::DoubleQuote) => {
+                                    current_kind = SpanKind::Argument;
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
                 TokenizerState::Comment => {
                     if byte == b'\n' {
-                        // End comment span (include newline)
-                        spans.push(Span::new(SpanKind::Data, span_start, i + 1));
-                        span_start = i + 1;
-                        state = TokenizerState::Normal;
-                        current_kind = SpanKind::Executed;
+                        stack.pop();
+                        // Comment inside CommandSubst?
+                        // If we are in CommandSubst, we don't emit span yet.
+                        // If we are in Normal, we emit span.
+                        if matches!(stack.last(), Some(TokenizerState::Normal)) {
+                            spans.push(Span::new(SpanKind::Comment, span_start, i + 1));
+                            span_start = i + 1;
+                            current_kind = SpanKind::Executed;
+                        }
                     }
                 }
             }
-
             i += 1;
         }
 
-        // Handle any remaining content
+        // Handle remaining
         if span_start < len {
-            // If we're still in a quote, treat as Unknown (unterminated)
-            let final_kind = match state {
-                TokenizerState::Normal | TokenizerState::EscapeNormal => current_kind,
-                TokenizerState::SingleQuote | TokenizerState::Comment => SpanKind::Data, // Unterminated single quote/comment is data
-                TokenizerState::DoubleQuote | TokenizerState::EscapeDouble => {
-                    // Unterminated double quote - be conservative
+            // Determine fallback kind based on state
+            let kind = match stack.last() {
+                Some(TokenizerState::Normal) => current_kind,
+                Some(TokenizerState::DoubleQuote) => {
                     if current_kind == SpanKind::Argument {
                         SpanKind::Unknown
                     } else {
                         current_kind
                     }
                 }
-                TokenizerState::CommandSubst { .. }
-                | TokenizerState::CommandSubstComment { .. }
-                | TokenizerState::Backtick => SpanKind::InlineCode,
+                Some(TokenizerState::SingleQuote | TokenizerState::Comment) => SpanKind::Data,
+                Some(TokenizerState::CommandSubst | TokenizerState::Backtick) => {
+                    SpanKind::InlineCode
+                }
+                None => SpanKind::Unknown,
             };
-            spans.push(Span::new(final_kind, span_start, len));
+            spans.push(Span::new(kind, span_start, len));
         }
 
         spans

@@ -48,6 +48,79 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Install UBS
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh" \
+            | bash -s -- --easy-mode
+          # Add UBS to PATH for this job
+          echo "$HOME/.ubs" >> $GITHUB_PATH
+
+      - name: Run UBS on changed files
+        if: always()
+        run: |
+          echo "=== UBS Static Analysis ===" | tee -a ubs-output.log
+          echo "Timestamp: $(date -Iseconds)" | tee -a ubs-output.log
+          echo "" | tee -a ubs-output.log
+
+          echo "=== UBS Smoke Test ===" | tee -a ubs-output.log
+          cat > /tmp/ubs_smoke.rs <<'EOF'
+          fn main() {
+              println!("ubs smoke test");
+          }
+          EOF
+          if ubs --verbose /tmp/ubs_smoke.rs 2>&1 | tee -a ubs-output.log; then
+            echo "UBS Smoke Test: PASSED" | tee -a ubs-output.log
+          else
+            echo "UBS Smoke Test: WARNINGS (non-blocking)" | tee -a ubs-output.log
+            echo "::warning::UBS smoke test reported issues"
+          fi
+          echo "" | tee -a ubs-output.log
+
+          # Get changed Rust files
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- "*.rs" | tr "\n" " ")
+            echo "Mode: Pull Request (base: ${{ github.base_ref }})" | tee -a ubs-output.log
+          else
+            CHANGED=$(git diff --name-only HEAD~1 -- "*.rs" | tr "\n" " ")
+            echo "Mode: Push (comparing to HEAD~1)" | tee -a ubs-output.log
+          fi
+
+          echo "Changed files: ${CHANGED:-none}" | tee -a ubs-output.log
+          echo "" | tee -a ubs-output.log
+
+          if [ -n "$CHANGED" ]; then
+            echo "Running UBS analysis..." | tee -a ubs-output.log
+            if ubs --verbose $CHANGED 2>&1 | tee -a ubs-output.log; then
+              echo "" | tee -a ubs-output.log
+              echo "UBS Result: PASSED (no issues found)" | tee -a ubs-output.log
+            else
+              echo "" | tee -a ubs-output.log
+              echo "UBS Result: WARNINGS (issues found - non-blocking)" | tee -a ubs-output.log
+              echo "::warning::UBS found potential issues in changed files"
+            fi
+          else
+            echo "UBS Result: SKIPPED (no Rust files changed)" | tee -a ubs-output.log
+          fi
+
+          echo "" | tee -a ubs-output.log
+          echo "=== End UBS Analysis ===" | tee -a ubs-output.log
+
+      - name: UBS summary
+        if: always()
+        run: |
+          echo "## UBS Static Analysis" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          cat ubs-output.log >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No UBS output" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload UBS output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubs-output
+          path: ubs-output.log
+          retention-days: 7
+
       - name: Check compilation
         run: cargo check --all-targets
 

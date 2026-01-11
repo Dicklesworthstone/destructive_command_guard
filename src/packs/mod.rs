@@ -18,6 +18,7 @@ pub mod cloud;
 pub mod containers;
 pub mod core;
 pub mod database;
+pub mod dns;
 pub mod infrastructure;
 pub mod kubernetes;
 pub mod messaging;
@@ -25,6 +26,7 @@ pub mod monitoring;
 pub mod package_managers;
 pub mod platform;
 pub mod regex_engine;
+pub mod remote;
 pub mod safe;
 pub mod search;
 pub mod secrets;
@@ -482,26 +484,15 @@ pub struct PackRegistry {
 
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 48] = [
+static PACK_ENTRIES: [PackEntry; 50] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new(
         "core.filesystem",
         &["rm", "/rm"],
         core::filesystem::create_pack,
     ),
-    PackEntry::new(
-        "storage.s3",
-        &[
-            "s3",
-            "s3api",
-            "rb",
-            "delete-bucket",
-            "delete-object",
-            "delete-objects",
-            "--delete",
-        ],
-        storage::s3::create_pack,
-    ),
+    PackEntry::new("storage.s3", &["s3", "s3api"], storage::s3::create_pack),
+    PackEntry::new("remote.rsync", &["rsync"], remote::rsync::create_pack),
     PackEntry::new(
         "cicd.github_actions",
         &["gh"],
@@ -539,6 +530,16 @@ static PACK_ENTRIES: [PackEntry; 48] = [
         "platform.gitlab",
         &["glab", "gitlab-rails", "gitlab-rake"],
         platform::gitlab::create_pack,
+    ),
+    PackEntry::new(
+        "dns.cloudflare",
+        &[
+            "wrangler",
+            "cloudflare",
+            "api.cloudflare.com",
+            "dns-records",
+        ],
+        dns::cloudflare::create_pack,
     ),
     PackEntry::new(
         "monitoring.splunk",
@@ -838,10 +839,10 @@ impl PackRegistry {
     /// multiple packs could match the same command. The ordering is:
     ///
     /// 0. **Tier 0 (safe)**: `safe.*` packs - safe patterns checked first to whitelist
-    /// 1. **Tier 1 (core/storage)**: `core.*`, `storage.*` packs - most fundamental protections
+    /// 1. **Tier 1 (core/storage/remote)**: `core.*`, `storage.*`, `remote.*` packs - most fundamental protections
     /// 2. **Tier 2 (system)**: `system.*` - disk, permissions, services
     /// 3. **Tier 3 (infrastructure)**: `infrastructure.*` - terraform, ansible, pulumi
-    /// 4. **Tier 4 (cloud)**: `cloud.*` - aws, gcp, azure
+    /// 4. **Tier 4 (cloud/dns/platform)**: `cloud.*`, `dns.*`, `platform.*`
     /// 5. **Tier 5 (kubernetes)**: `kubernetes.*` - kubectl, helm, kustomize
     /// 6. **Tier 6 (containers)**: `containers.*` - docker, compose, podman
     /// 7. **Tier 7 (database/search/messaging/backup)**: `database.*`, `search.*`, `messaging.*`, `backup.*`
@@ -877,10 +878,10 @@ impl PackRegistry {
         let category = pack_id.split('.').next().unwrap_or(pack_id);
         match category {
             "safe" => 0,
-            "core" | "storage" => 1,
+            "core" | "storage" | "remote" => 1,
             "system" => 2,
             "infrastructure" => 3,
-            "cloud" | "platform" => 4,
+            "cloud" | "dns" | "platform" => 4,
             "kubernetes" => 5,
             "containers" => 6,
             "backup" | "database" | "messaging" | "search" => 7,
@@ -1855,6 +1856,7 @@ mod tests {
         assert_eq!(PackRegistry::pack_tier("core.git"), 1);
         assert_eq!(PackRegistry::pack_tier("core.filesystem"), 1);
         assert_eq!(PackRegistry::pack_tier("storage.s3"), 1);
+        assert_eq!(PackRegistry::pack_tier("remote.rsync"), 1);
 
         // System should be tier 2
         assert_eq!(PackRegistry::pack_tier("system.disk"), 2);
@@ -1865,6 +1867,7 @@ mod tests {
 
         // Cloud should be tier 4
         assert_eq!(PackRegistry::pack_tier("cloud.aws"), 4);
+        assert_eq!(PackRegistry::pack_tier("dns.cloudflare"), 4);
 
         // Kubernetes should be tier 5
         assert_eq!(PackRegistry::pack_tier("kubernetes.kubectl"), 5);

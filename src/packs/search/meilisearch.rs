@@ -90,7 +90,6 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             r#"curl\b.*-X\s*DELETE\b.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/indexes/[^\s/?]+(?:[\s?'"]|$)"#,
             "curl -X DELETE against /indexes/{uid} deletes a Meilisearch index."
         ),
-
         // HTTPie variants
         destructive_pattern!(
             "meili-http-delete-document",

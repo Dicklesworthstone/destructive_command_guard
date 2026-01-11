@@ -705,6 +705,13 @@ test_command_with_packs "aws s3 sync s3://src s3://dest --delete" "block" "stora
 test_command_with_packs "aws s3 sync s3://src s3://dest" "allow" "storage.s3" "aws s3 sync (s3 pack enabled, safe command)"
 test_command_with_packs "aws s3 ls s3://bucket" "allow" "storage.s3" "aws s3 ls (s3 pack enabled, safe command)"
 
+# rsync pack tests
+test_command_with_packs "rsync --delete src/ dest/" "block" "remote.rsync" "rsync --delete (rsync pack enabled)"
+test_command_with_packs "rsync --del src/ dest/" "block" "remote.rsync" "rsync --del (rsync pack enabled)"
+test_command_with_packs "rsync --delete-before src/ dest/" "block" "remote.rsync" "rsync --delete-before (rsync pack enabled)"
+test_command_with_packs "rsync --list-only src/ dest/" "allow" "remote.rsync" "rsync --list-only (rsync pack enabled, safe command)"
+test_command_with_packs "rsync -avzn src/ dest/" "allow" "remote.rsync" "rsync -n (rsync pack enabled, safe command)"
+
 # PostgreSQL pack tests
 test_command_with_packs "psql -c 'DROP DATABASE production;'" "block" "database.postgresql" "psql DROP DATABASE (postgresql pack enabled)"
 test_command_with_packs "psql -c 'DROP DATABASE IF EXISTS production;'" "block" "database.postgresql" "psql DROP DATABASE IF EXISTS (postgresql pack enabled)"
@@ -750,6 +757,14 @@ test_command_with_packs "glab mr list" "allow" "platform.gitlab" "glab mr list (
 test_command_with_packs "glab issue list" "allow" "platform.gitlab" "glab issue list (gitlab platform pack enabled, safe command)"
 test_command_with_packs "glab release list" "allow" "platform.gitlab" "glab release list (gitlab platform pack enabled, safe command)"
 test_command_with_packs "glab api -X GET /projects/123" "allow" "platform.gitlab" "glab api GET (gitlab platform pack enabled, safe command)"
+
+# Cloudflare DNS pack tests
+test_command_with_packs "wrangler dns-records delete --zone-id abc --record-id def" "block" "dns.cloudflare" "wrangler dns-records delete (cloudflare dns pack enabled)"
+test_command_with_packs "curl -X DELETE https://api.cloudflare.com/client/v4/zones/abc/dns_records/def" "block" "dns.cloudflare" "curl DELETE dns_records (cloudflare dns pack enabled)"
+test_command_with_packs "curl -X DELETE https://api.cloudflare.com/client/v4/zones/abc" "block" "dns.cloudflare" "curl DELETE zone (cloudflare dns pack enabled)"
+test_command_with_packs "wrangler dns-records list --zone-id abc" "allow" "dns.cloudflare" "wrangler dns-records list (cloudflare dns pack enabled, safe command)"
+test_command_with_packs "wrangler whoami" "allow" "dns.cloudflare" "wrangler whoami (cloudflare dns pack enabled, safe command)"
+test_command_with_packs "curl -X GET https://api.cloudflare.com/client/v4/zones" "allow" "dns.cloudflare" "curl GET zones (cloudflare dns pack enabled, safe command)"
 
 # Multiple packs enabled simultaneously
 test_command_with_packs "docker system prune" "block" "containers.docker,kubernetes.kubectl" "docker system prune (multiple packs enabled)"
