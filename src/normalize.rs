@@ -1181,7 +1181,7 @@ pub fn dequote_segment_command_words(command: &str) -> Cow<'_, str> {
         current_cmd_word = Some(replacement.clone().unwrap_or_else(|| current.to_string()));
 
         if let Some(repl) = replacement {
-            replacements.push((token.byte_range.clone(), repl));
+            replacements.push((tok.byte_range.clone(), repl));
         }
     }
 
