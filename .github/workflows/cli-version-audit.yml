@@ -10,7 +10,7 @@ jobs:
   version_audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Run CLI version checker (stub)
         run: |
@@ -26,7 +26,7 @@ jobs:
         rclone_version: ["1.65.0", "1.66.0"]
         gh_version: ["2.44.0", "2.45.0"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Placeholder for multi-version CLI testing
         run: |
           echo "TODO: install CLI versions and run pack tests."

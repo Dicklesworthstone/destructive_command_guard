@@ -35,7 +35,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           # Fetch enough history for git diff comparison
           fetch-depth: 0
@@ -44,7 +44,7 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -139,7 +139,7 @@ jobs:
 
       - name: Upload scan results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: scan-results
           path: scan-results.json
