@@ -574,6 +574,352 @@ pub fn log_allow_once_action(log_file: &str, action: &str, details: &str) -> io:
     Ok(())
 }
 
+// ============================================================================
+// Structured Allow-Once Logging
+// ============================================================================
+
+/// Event kind for structured allow-once logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllowOnceEventKind {
+    /// A short code was issued when a command was blocked.
+    CodeIssued,
+    /// A short code was resolved and an allow-once entry was created.
+    CodeResolved,
+    /// An allow-once entry granted permission to a command.
+    AllowGranted,
+    /// A single-use allow-once entry was consumed.
+    EntryConsumed,
+    /// An allow-once entry expired and was pruned.
+    EntryExpired,
+}
+
+impl AllowOnceEventKind {
+    /// Get a human-readable label for this event kind.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::CodeIssued => "code_issued",
+            Self::CodeResolved => "code_resolved",
+            Self::AllowGranted => "allow_granted",
+            Self::EntryConsumed => "entry_consumed",
+            Self::EntryExpired => "entry_expired",
+        }
+    }
+}
+
+/// A structured log entry for allow-once events.
+///
+/// This provides machine-readable, stable log entries for audit trails.
+/// All command data respects the redaction configuration.
+#[derive(Debug, Clone, Serialize)]
+pub struct AllowOnceLogEntry {
+    /// ISO 8601 timestamp of the event.
+    pub timestamp: String,
+    /// Event kind (`code_issued`, `code_resolved`, `allow_granted`, etc.).
+    pub event: String,
+    /// Short code (4 hex chars) for user interaction.
+    pub short_code: String,
+    /// Full SHA256 hash for unique identification.
+    pub full_hash: String,
+    /// Working directory where the command was executed.
+    pub cwd: String,
+    /// Command text (redacted according to configuration).
+    pub command: String,
+    /// Expiry timestamp for the exception.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// Reason the command was blocked (for `code_issued` events).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Allowlist layer used (for `allow_granted` events).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowlist_layer: Option<String>,
+    /// Scope kind (cwd or project).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_kind: Option<String>,
+    /// Whether this was a single-use exception.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub single_use: Option<bool>,
+    /// Whether this overrode a config blocklist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub force_allow_config: Option<bool>,
+    /// Match source (pack, `config_override`, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl AllowOnceLogEntry {
+    /// Create a log entry for a code issuance event (when a command is blocked).
+    #[must_use]
+    pub fn code_issued(record: &PendingExceptionRecord, redaction: &RedactionConfig) -> Self {
+        Self {
+            timestamp: format_timestamp(Utc::now()),
+            event: AllowOnceEventKind::CodeIssued.label().to_string(),
+            short_code: record.short_code.clone(),
+            full_hash: record.full_hash.clone(),
+            cwd: record.cwd.clone(),
+            command: redact_for_log(&record.command_raw, redaction),
+            expires_at: Some(record.expires_at.clone()),
+            reason: Some(record.reason.clone()),
+            allowlist_layer: None,
+            scope_kind: None,
+            single_use: Some(record.single_use),
+            force_allow_config: None,
+            source: record.source.clone(),
+        }
+    }
+
+    /// Create a log entry for a code resolution event (when allow-once is granted).
+    #[must_use]
+    pub fn code_resolved(entry: &AllowOnceEntry, redaction: &RedactionConfig) -> Self {
+        Self {
+            timestamp: format_timestamp(Utc::now()),
+            event: AllowOnceEventKind::CodeResolved.label().to_string(),
+            short_code: entry.source_short_code.clone(),
+            full_hash: entry.source_full_hash.clone(),
+            cwd: entry.scope_path.clone(),
+            command: redact_for_log(&entry.command_raw, redaction),
+            expires_at: Some(entry.expires_at.clone()),
+            reason: Some(entry.reason.clone()),
+            allowlist_layer: None,
+            scope_kind: Some(format!("{:?}", entry.scope_kind).to_lowercase()),
+            single_use: Some(entry.single_use),
+            force_allow_config: Some(entry.force_allow_config),
+            source: None,
+        }
+    }
+
+    /// Create a log entry for an allow grant event (when a command is allowed by allow-once).
+    #[must_use]
+    pub fn allow_granted(
+        entry: &AllowOnceEntry,
+        redaction: &RedactionConfig,
+        layer: &str,
+    ) -> Self {
+        Self {
+            timestamp: format_timestamp(Utc::now()),
+            event: AllowOnceEventKind::AllowGranted.label().to_string(),
+            short_code: entry.source_short_code.clone(),
+            full_hash: entry.source_full_hash.clone(),
+            cwd: entry.scope_path.clone(),
+            command: redact_for_log(&entry.command_raw, redaction),
+            expires_at: Some(entry.expires_at.clone()),
+            reason: None,
+            allowlist_layer: Some(layer.to_string()),
+            scope_kind: Some(format!("{:?}", entry.scope_kind).to_lowercase()),
+            single_use: Some(entry.single_use),
+            force_allow_config: Some(entry.force_allow_config),
+            source: None,
+        }
+    }
+
+    /// Create a log entry for an entry consumption event (single-use consumed).
+    #[must_use]
+    pub fn entry_consumed(entry: &AllowOnceEntry, redaction: &RedactionConfig) -> Self {
+        Self {
+            timestamp: format_timestamp(Utc::now()),
+            event: AllowOnceEventKind::EntryConsumed.label().to_string(),
+            short_code: entry.source_short_code.clone(),
+            full_hash: entry.source_full_hash.clone(),
+            cwd: entry.scope_path.clone(),
+            command: redact_for_log(&entry.command_raw, redaction),
+            expires_at: Some(entry.expires_at.clone()),
+            reason: None,
+            allowlist_layer: None,
+            scope_kind: Some(format!("{:?}", entry.scope_kind).to_lowercase()),
+            single_use: Some(true),
+            force_allow_config: None,
+            source: None,
+        }
+    }
+
+    /// Create a log entry for an entry expiry event.
+    #[must_use]
+    pub fn entry_expired(
+        short_code: &str,
+        full_hash: &str,
+        cwd: &str,
+        command: &str,
+        expires_at: &str,
+        redaction: &RedactionConfig,
+    ) -> Self {
+        Self {
+            timestamp: format_timestamp(Utc::now()),
+            event: AllowOnceEventKind::EntryExpired.label().to_string(),
+            short_code: short_code.to_string(),
+            full_hash: full_hash.to_string(),
+            cwd: cwd.to_string(),
+            command: redact_for_log(command, redaction),
+            expires_at: Some(expires_at.to_string()),
+            reason: None,
+            allowlist_layer: None,
+            scope_kind: None,
+            single_use: None,
+            force_allow_config: None,
+            source: None,
+        }
+    }
+
+    /// Format as a text log line.
+    #[must_use]
+    pub fn format_text(&self) -> String {
+        let mut parts = Vec::with_capacity(8);
+        parts.push(format!("[{}]", self.timestamp));
+        parts.push(format!("[allow-once:{}]", self.event));
+        parts.push(format!("code={}", self.short_code));
+        parts.push(format!("cwd=\"{}\"", self.cwd));
+        parts.push(format!("cmd=\"{}\"", self.command));
+
+        if let Some(ref expires) = self.expires_at {
+            parts.push(format!("expires={expires}"));
+        }
+        if let Some(ref reason) = self.reason {
+            parts.push(format!("reason=\"{reason}\""));
+        }
+        if let Some(ref layer) = self.allowlist_layer {
+            parts.push(format!("layer={layer}"));
+        }
+        if let Some(single) = self.single_use {
+            if single {
+                parts.push("single_use=true".to_string());
+            }
+        }
+        if let Some(force) = self.force_allow_config {
+            if force {
+                parts.push("force_allow=true".to_string());
+            }
+        }
+
+        parts.join(" ")
+    }
+
+    /// Format as a JSON line.
+    #[must_use]
+    pub fn format_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+/// Log format for allow-once structured logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AllowOnceLogFormat {
+    /// Human-readable text format.
+    #[default]
+    Text,
+    /// Machine-readable JSON format.
+    Json,
+}
+
+/// Log a structured allow-once event.
+///
+/// This is the primary function for logging allow-once events with full
+/// structured data and redaction support.
+///
+/// # Errors
+///
+/// Returns any I/O errors encountered while opening or appending to the log file.
+pub fn log_allow_once_event(
+    log_file: &str,
+    entry: &AllowOnceLogEntry,
+    format: AllowOnceLogFormat,
+) -> io::Result<()> {
+    let path = expand_log_path(log_file);
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+
+    let line = match format {
+        AllowOnceLogFormat::Text => entry.format_text(),
+        AllowOnceLogFormat::Json => entry.format_json(),
+    };
+
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
+/// Log a code issuance event (when a command is blocked and a short code is generated).
+///
+/// # Errors
+///
+/// Returns any I/O errors encountered while opening or appending to the log file.
+pub fn log_code_issued(
+    log_file: &str,
+    record: &PendingExceptionRecord,
+    redaction: &RedactionConfig,
+    format: AllowOnceLogFormat,
+) -> io::Result<()> {
+    let entry = AllowOnceLogEntry::code_issued(record, redaction);
+    log_allow_once_event(log_file, &entry, format)
+}
+
+/// Log a code resolution event (when an allow-once entry is created from a pending code).
+///
+/// # Errors
+///
+/// Returns any I/O errors encountered while opening or appending to the log file.
+pub fn log_code_resolved(
+    log_file: &str,
+    allow_entry: &AllowOnceEntry,
+    redaction: &RedactionConfig,
+    format: AllowOnceLogFormat,
+) -> io::Result<()> {
+    let entry = AllowOnceLogEntry::code_resolved(allow_entry, redaction);
+    log_allow_once_event(log_file, &entry, format)
+}
+
+/// Log an allow grant event (when a command is allowed by an allow-once entry).
+///
+/// # Errors
+///
+/// Returns any I/O errors encountered while opening or appending to the log file.
+pub fn log_allow_granted(
+    log_file: &str,
+    allow_entry: &AllowOnceEntry,
+    redaction: &RedactionConfig,
+    layer: &str,
+    format: AllowOnceLogFormat,
+) -> io::Result<()> {
+    let entry = AllowOnceLogEntry::allow_granted(allow_entry, redaction, layer);
+    log_allow_once_event(log_file, &entry, format)
+}
+
+/// Log an entry consumption event (when a single-use allow-once entry is consumed).
+///
+/// # Errors
+///
+/// Returns any I/O errors encountered while opening or appending to the log file.
+pub fn log_entry_consumed(
+    log_file: &str,
+    allow_entry: &AllowOnceEntry,
+    redaction: &RedactionConfig,
+    format: AllowOnceLogFormat,
+) -> io::Result<()> {
+    let entry = AllowOnceLogEntry::entry_consumed(allow_entry, redaction);
+    log_allow_once_event(log_file, &entry, format)
+}
+
+fn expand_log_path(log_file: &str) -> PathBuf {
+    if log_file.starts_with("~/") {
+        std::env::var_os("HOME").map_or_else(
+            || PathBuf::from(log_file),
+            |home| PathBuf::from(format!("{}{}", home.to_string_lossy(), &log_file[1..])),
+        )
+    } else {
+        PathBuf::from(log_file)
+    }
+}
+
+fn redact_for_log(command: &str, redaction: &RedactionConfig) -> String {
+    if !redaction.enabled {
+        return command.to_string();
+    }
+    redact_command(command, redaction)
+}
+
 fn open_locked(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1142,5 +1488,308 @@ mod tests {
 
         let (matches, _maintenance) = store.lookup_by_code(&record_a.short_code, now).unwrap();
         assert_eq!(matches.len(), 2);
+    }
+
+    // =========================================================================
+    // Structured Logging Tests
+    // =========================================================================
+
+    #[test]
+    fn test_allow_once_log_entry_code_issued() {
+        let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let redaction = redaction_config();
+        let record = PendingExceptionRecord::new(
+            now,
+            "/repo",
+            "git reset --hard HEAD",
+            "destructive command blocked",
+            &redaction,
+            false,
+            Some("core.git".to_string()),
+        );
+
+        let entry = AllowOnceLogEntry::code_issued(&record, &redaction);
+        assert_eq!(entry.event, "code_issued");
+        assert_eq!(entry.short_code, record.short_code);
+        assert_eq!(entry.full_hash, record.full_hash);
+        assert_eq!(entry.cwd, "/repo");
+        assert!(entry.reason.is_some());
+        assert_eq!(entry.source, Some("core.git".to_string()));
+    }
+
+    #[test]
+    fn test_allow_once_log_entry_code_resolved() {
+        let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let redaction = redaction_config();
+        let pending = PendingExceptionRecord::new(
+            now,
+            "/repo",
+            "git reset --hard",
+            "blocked",
+            &redaction,
+            false,
+            None,
+        );
+        let allow_entry = AllowOnceEntry::from_pending(
+            &pending,
+            now,
+            AllowOnceScopeKind::Cwd,
+            "/repo",
+            true,
+            false,
+            &redaction,
+        );
+
+        let entry = AllowOnceLogEntry::code_resolved(&allow_entry, &redaction);
+        assert_eq!(entry.event, "code_resolved");
+        assert_eq!(entry.scope_kind, Some("cwd".to_string()));
+        assert_eq!(entry.single_use, Some(true));
+        assert_eq!(entry.force_allow_config, Some(false));
+    }
+
+    #[test]
+    fn test_allow_once_log_entry_allow_granted() {
+        let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let redaction = redaction_config();
+        let pending = PendingExceptionRecord::new(
+            now,
+            "/repo",
+            "git reset --hard",
+            "blocked",
+            &redaction,
+            false,
+            None,
+        );
+        let allow_entry = AllowOnceEntry::from_pending(
+            &pending,
+            now,
+            AllowOnceScopeKind::Project,
+            "/repo",
+            false,
+            false,
+            &redaction,
+        );
+
+        let entry = AllowOnceLogEntry::allow_granted(&allow_entry, &redaction, "allow_once");
+        assert_eq!(entry.event, "allow_granted");
+        assert_eq!(entry.allowlist_layer, Some("allow_once".to_string()));
+        assert_eq!(entry.scope_kind, Some("project".to_string()));
+    }
+
+    #[test]
+    fn test_allow_once_log_entry_entry_consumed() {
+        let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let redaction = redaction_config();
+        let pending = PendingExceptionRecord::new(
+            now,
+            "/repo",
+            "git reset --hard",
+            "blocked",
+            &redaction,
+            true,
+            None,
+        );
+        let allow_entry = AllowOnceEntry::from_pending(
+            &pending,
+            now,
+            AllowOnceScopeKind::Cwd,
+            "/repo",
+            true,
+            false,
+            &redaction,
+        );
+
+        let entry = AllowOnceLogEntry::entry_consumed(&allow_entry, &redaction);
+        assert_eq!(entry.event, "entry_consumed");
+        assert_eq!(entry.single_use, Some(true));
+    }
+
+    #[test]
+    fn test_allow_once_log_entry_entry_expired() {
+        let redaction = redaction_config();
+        let entry = AllowOnceLogEntry::entry_expired(
+            "ab12",
+            "abc123def456",
+            "/repo",
+            "git reset --hard",
+            "2026-01-11T06:30:00Z",
+            &redaction,
+        );
+        assert_eq!(entry.event, "entry_expired");
+        assert_eq!(entry.short_code, "ab12");
+        assert_eq!(entry.expires_at, Some("2026-01-11T06:30:00Z".to_string()));
+    }
+
+    #[test]
+    fn test_allow_once_log_entry_format_text() {
+        let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let redaction = redaction_config();
+        let record = PendingExceptionRecord::new(
+            now,
+            "/repo",
+            "git reset --hard",
+            "blocked",
+            &redaction,
+            true,
+            None,
+        );
+
+        let entry = AllowOnceLogEntry::code_issued(&record, &redaction);
+        let text = entry.format_text();
+
+        assert!(text.contains("[allow-once:code_issued]"));
+        assert!(text.contains("code="));
+        assert!(text.contains("cwd=\"/repo\""));
+        assert!(text.contains("single_use=true"));
+    }
+
+    #[test]
+    fn test_allow_once_log_entry_format_json() {
+        let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let redaction = redaction_config();
+        let record = PendingExceptionRecord::new(
+            now,
+            "/repo",
+            "git reset --hard",
+            "blocked",
+            &redaction,
+            false,
+            None,
+        );
+
+        let entry = AllowOnceLogEntry::code_issued(&record, &redaction);
+        let json = entry.format_json();
+
+        // Verify it's valid JSON and contains expected fields
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "code_issued");
+        assert!(parsed["timestamp"].is_string());
+        assert!(parsed["short_code"].is_string());
+        assert!(parsed["full_hash"].is_string());
+    }
+
+    #[test]
+    fn test_allow_once_log_entry_redaction_enabled() {
+        let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let redaction = RedactionConfig {
+            enabled: true,
+            mode: crate::logging::RedactionMode::Full,
+            max_argument_len: 8,
+        };
+        let record = PendingExceptionRecord::new(
+            now,
+            "/repo",
+            "git reset --hard HEAD",
+            "blocked",
+            &redaction,
+            false,
+            None,
+        );
+
+        let entry = AllowOnceLogEntry::code_issued(&record, &redaction);
+        assert_eq!(entry.command, "[REDACTED]");
+    }
+
+    #[test]
+    fn test_allow_once_log_entry_redaction_disabled() {
+        let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let redaction = RedactionConfig {
+            enabled: false,
+            mode: crate::logging::RedactionMode::Full,
+            max_argument_len: 8,
+        };
+        let record = PendingExceptionRecord::new(
+            now,
+            "/repo",
+            "git reset --hard HEAD",
+            "blocked",
+            &redaction,
+            false,
+            None,
+        );
+
+        let entry = AllowOnceLogEntry::code_issued(&record, &redaction);
+        assert_eq!(entry.command, "git reset --hard HEAD");
+    }
+
+    #[test]
+    fn test_log_allow_once_event_writes_to_file() {
+        let dir = TempDir::new().expect("tempdir");
+        let log_path = dir.path().join("allow_once.log");
+        let log_file = log_path.to_string_lossy().to_string();
+
+        let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let redaction = redaction_config();
+        let record = PendingExceptionRecord::new(
+            now,
+            "/repo",
+            "git reset --hard",
+            "blocked",
+            &redaction,
+            false,
+            None,
+        );
+
+        let entry = AllowOnceLogEntry::code_issued(&record, &redaction);
+        log_allow_once_event(&log_file, &entry, AllowOnceLogFormat::Text).unwrap();
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(contents.contains("[allow-once:code_issued]"));
+        assert!(contents.contains("code="));
+    }
+
+    #[test]
+    fn test_log_allow_once_event_json_format() {
+        let dir = TempDir::new().expect("tempdir");
+        let log_path = dir.path().join("allow_once.log");
+        let log_file = log_path.to_string_lossy().to_string();
+
+        let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let redaction = redaction_config();
+        let record = PendingExceptionRecord::new(
+            now,
+            "/repo",
+            "git reset --hard",
+            "blocked",
+            &redaction,
+            false,
+            None,
+        );
+
+        let entry = AllowOnceLogEntry::code_issued(&record, &redaction);
+        log_allow_once_event(&log_file, &entry, AllowOnceLogFormat::Json).unwrap();
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(parsed["event"], "code_issued");
+    }
+
+    #[test]
+    fn test_allow_once_event_kind_labels() {
+        assert_eq!(AllowOnceEventKind::CodeIssued.label(), "code_issued");
+        assert_eq!(AllowOnceEventKind::CodeResolved.label(), "code_resolved");
+        assert_eq!(AllowOnceEventKind::AllowGranted.label(), "allow_granted");
+        assert_eq!(AllowOnceEventKind::EntryConsumed.label(), "entry_consumed");
+        assert_eq!(AllowOnceEventKind::EntryExpired.label(), "entry_expired");
     }
 }
