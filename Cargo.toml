@@ -34,7 +34,7 @@ serde_json = "1.0"
 toml = "0.8"
 toml_edit = "0.22"         # Preserves formatting when editing TOML files
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }  # RFC 3339 timestamps
-fancy-regex = "0.14"
+fancy-regex = "0.17"
 regex = "1.10"              # For RegexSet in heredoc detection
 memchr = "2.7"
 aho-corasick = "1.1"        # Multi-pattern string matching for keyword quick-reject
