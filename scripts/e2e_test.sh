@@ -96,12 +96,14 @@ done
 
 # Find binary
 if [[ -z "$BINARY" ]]; then
-    if command -v dcg &> /dev/null; then
-        BINARY="$(command -v dcg)"
-    elif [[ -f "./target/release/dcg" ]]; then
+    # Prefer in-repo build artifacts over any globally installed `dcg` to keep
+    # the test suite hermetic and reproducible.
+    if [[ -f "./target/release/dcg" ]]; then
         BINARY="./target/release/dcg"
     elif [[ -f "./target/debug/dcg" ]]; then
         BINARY="./target/debug/dcg"
+    elif command -v dcg &> /dev/null; then
+        BINARY="$(command -v dcg)"
     else
         echo -e "${RED}Error: dcg binary not found${NC}"
         echo "Run 'cargo build --release' first or specify --binary PATH"
