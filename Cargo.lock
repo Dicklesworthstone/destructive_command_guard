@@ -117,9 +117,9 @@ dependencies = [
 
 [[package]]
 name = "assert_cmd"
-version = "2.1.1"
+version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcbb6924530aa9e0432442af08bbcafdad182db80d2e560da42a6d442535bf85"
+checksum = "9c5bcfa8749ac45dd12cb11055aeeb6b27a3895560d60d71e3c23bf979e60514"
 dependencies = [
  "anstyle",
  "bstr",
@@ -132,9 +132,9 @@ dependencies = [
 
 [[package]]
 name = "ast-grep-core"
-version = "0.40.4"
+version = "0.40.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb7b6c11079df17f2582342b196a67fc53a1bbf74f4640f259bf622638c12fc7"
+checksum = "cbb9085c34e18b697e61c1c7e00fd040cc6b06a333fc4a0e660a9ea41253b448"
 dependencies = [
  "bit-set",
  "regex",
@@ -144,9 +144,9 @@ dependencies = [
 
 [[package]]
 name = "ast-grep-language"
-version = "0.40.4"
+version = "0.40.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f78c7cc091a37a236d3a327754a8904d451f0f229c110730bf5a52660dff9111"
+checksum = "e41c141b34d3700e6eb3edc756337548ad0451308fd83bef1e1e61033d1c6200"
 dependencies = [
  "ast-grep-core",
  "ignore",
