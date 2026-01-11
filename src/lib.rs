@@ -74,6 +74,7 @@ pub mod pending_exceptions;
 pub mod perf;
 pub mod scan;
 pub mod simulate;
+pub mod stats;
 pub mod suggestions;
 pub mod trace;
 
@@ -139,6 +140,12 @@ pub use scan::{
 pub use simulate::{
     LimitHit, ParseError, ParseStats, ParsedCommand, ParsedLine, SIMULATE_SCHEMA_VERSION,
     SimulateInputFormat, SimulateLimits, SimulateParser,
+};
+
+// Re-export stats types for `dcg stats`
+pub use stats::{
+    AggregatedStats, DEFAULT_PERIOD_SECS, Decision as StatsDecision, PackStats, ParsedLogEntry,
+    format_stats_json, format_stats_pretty, parse_log_file,
 };
 
 // Re-export performance budget types

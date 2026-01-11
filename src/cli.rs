@@ -240,6 +240,13 @@ pub enum Command {
     #[command(name = "corpus")]
     Corpus(CorpusCommand),
 
+    /// Show local statistics from the log file
+    ///
+    /// Displays aggregated statistics about blocked commands, allows,
+    /// and bypasses from the configured log file.
+    #[command(name = "stats")]
+    Stats(StatsCommand),
+
     /// Developer tools for pack development and testing
     #[command(name = "dev")]
     Dev {
@@ -288,6 +295,32 @@ pub enum CorpusFormat {
     Json,
     /// Human-readable colored output
     Pretty,
+}
+
+/// `dcg stats` command arguments.
+#[derive(Args, Debug)]
+pub struct StatsCommand {
+    /// Time period in days (default: 30)
+    #[arg(long, short = 'd', default_value = "30")]
+    pub days: u64,
+
+    /// Path to log file (overrides config)
+    #[arg(long, short = 'f')]
+    pub file: Option<std::path::PathBuf>,
+
+    /// Output format
+    #[arg(long, short = 'o', value_enum, default_value = "pretty")]
+    pub format: StatsFormat,
+}
+
+/// Output format for stats command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum StatsFormat {
+    /// Human-readable table output
+    #[default]
+    Pretty,
+    /// Structured JSON output
+    Json,
 }
 
 /// Developer tool subcommands
@@ -921,6 +954,9 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Command::Corpus(corpus)) => {
             handle_corpus_command(&config, &corpus)?;
+        }
+        Some(Command::Stats(stats)) => {
+            handle_stats_command(&config, &stats)?;
         }
         Some(Command::Dev { action }) => {
             handle_dev_command(&config, action)?;
@@ -2793,6 +2829,65 @@ fn handle_corpus_command(
     if output.total_failed > 0 && cmd.baseline.is_none() {
         return Err(format!("{} test(s) failed", output.total_failed).into());
     }
+
+    Ok(())
+}
+
+/// Handle the `dcg stats` command.
+#[allow(clippy::option_if_let_else)]
+fn handle_stats_command(
+    config: &Config,
+    cmd: &StatsCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::stats;
+
+    // Determine log file path
+    let log_path = if let Some(ref path) = cmd.file {
+        path.clone()
+    } else if let Some(ref log_file) = config.general.log_file {
+        // Expand ~ in path
+        if log_file.starts_with("~/") {
+            dirs::home_dir().map_or_else(
+                || std::path::PathBuf::from(log_file),
+                |h| h.join(&log_file[2..]),
+            )
+        } else {
+            std::path::PathBuf::from(log_file)
+        }
+    } else {
+        // Default log file location
+        dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share"))
+            .join("dcg")
+            .join("blocked.log")
+    };
+
+    // Check if log file exists
+    if !log_path.exists() {
+        println!("No log file found at: {}", log_path.display());
+        println!();
+        println!("To enable logging, add to your config (~/.config/dcg/config.toml):");
+        println!();
+        println!("  [general]");
+        println!("  log_file = \"~/.local/share/dcg/blocked.log\"");
+        println!();
+        println!("Or run with --file to specify a log file directly.");
+        return Ok(());
+    }
+
+    // Convert days to seconds
+    let period_secs = cmd.days * 24 * 60 * 60;
+
+    // Parse log file
+    let aggregated = stats::parse_log_file(&log_path, period_secs)?;
+
+    // Format and print output
+    let output = match cmd.format {
+        StatsFormat::Pretty => stats::format_stats_pretty(&aggregated, cmd.days),
+        StatsFormat::Json => stats::format_stats_json(&aggregated),
+    };
+
+    print!("{output}");
 
     Ok(())
 }
@@ -5957,7 +6052,7 @@ mod tests {
         if let Some(Command::ListPacks { verbose, .. }) = cli.command {
             assert!(verbose);
         } else {
-            panic!("Expected ListPacks command");
+            unreachable!("Expected ListPacks command");
         }
     }
 
@@ -5967,7 +6062,7 @@ mod tests {
         if let Some(Command::PackInfo { pack_id, .. }) = cli.command {
             assert_eq!(pack_id, "core.git");
         } else {
-            panic!("Expected PackInfo command");
+            unreachable!("Expected PackInfo command");
         }
     }
 
@@ -5977,7 +6072,7 @@ mod tests {
         if let Some(Command::TestCommand { command, .. }) = cli.command {
             assert_eq!(command, "git reset --hard");
         } else {
-            panic!("Expected TestCommand command");
+            unreachable!("Expected TestCommand command");
         }
     }
 
@@ -5993,7 +6088,7 @@ mod tests {
         if let Some(Command::Update(update)) = cli.command {
             assert_eq!(update.version.as_deref(), Some("v0.2.0"));
         } else {
-            panic!("Expected Update command");
+            unreachable!("Expected Update command");
         }
     }
 
@@ -6020,7 +6115,7 @@ mod tests {
             assert_eq!(rule_id, "core.git:reset-hard");
             assert_eq!(reason, "Testing reset workflow");
         } else {
-            panic!("Expected Allowlist Add command");
+            unreachable!("Expected Allowlist Add command");
         }
     }
 
@@ -6047,7 +6142,7 @@ mod tests {
             assert!(user);
             assert!(!project);
         } else {
-            panic!("Expected Allow command");
+            unreachable!("Expected Allow command");
         }
     }
 
@@ -6064,7 +6159,7 @@ mod tests {
             assert!(project);
             assert!(!user);
         } else {
-            panic!("Expected Unallow command");
+            unreachable!("Expected Unallow command");
         }
     }
 
@@ -6077,7 +6172,7 @@ mod tests {
         {
             assert_eq!(format, AllowlistOutputFormat::Json);
         } else {
-            panic!("Expected Allowlist List command");
+            unreachable!("Expected Allowlist List command");
         }
     }
 
@@ -6090,7 +6185,7 @@ mod tests {
         {
             assert!(strict);
         } else {
-            panic!("Expected Allowlist Validate command");
+            unreachable!("Expected Allowlist Validate command");
         }
     }
 
@@ -6113,7 +6208,7 @@ mod tests {
             assert_eq!(command, "git push --force origin main");
             assert_eq!(reason, "Release workflow");
         } else {
-            panic!("Expected Allowlist AddCommand command");
+            unreachable!("Expected Allowlist AddCommand command");
         }
     }
 
@@ -6137,7 +6232,7 @@ mod tests {
             assert!(cmd.yes);
             assert_eq!(cmd.pick, Some(2));
         } else {
-            panic!("Expected AllowOnce command");
+            unreachable!("Expected AllowOnce command");
         }
     }
 
@@ -6147,7 +6242,7 @@ mod tests {
         if let Some(Command::AllowOnce(cmd)) = cli.command {
             assert!(matches!(cmd.action, Some(AllowOnceAction::List)));
         } else {
-            panic!("Expected AllowOnce list command");
+            unreachable!("Expected AllowOnce list command");
         }
     }
 
@@ -6159,7 +6254,7 @@ mod tests {
             assert!(cmd.json);
             assert!(matches!(cmd.action, Some(AllowOnceAction::Revoke(_))));
         } else {
-            panic!("Expected AllowOnce revoke command");
+            unreachable!("Expected AllowOnce revoke command");
         }
     }
 
@@ -6377,7 +6472,7 @@ mod tests {
             assert!(scan.git_diff.is_none());
             assert!(scan.action.is_none());
         } else {
-            panic!("Expected Scan command");
+            unreachable!("Expected Scan command");
         }
     }
 
@@ -6397,7 +6492,7 @@ mod tests {
             assert!(scan.git_diff.is_none());
             assert!(scan.action.is_none());
         } else {
-            panic!("Expected Scan command");
+            unreachable!("Expected Scan command");
         }
     }
 
@@ -6410,7 +6505,7 @@ mod tests {
             assert_eq!(scan.git_diff, Some("main..HEAD".to_string()));
             assert!(scan.action.is_none());
         } else {
-            panic!("Expected Scan command");
+            unreachable!("Expected Scan command");
         }
     }
 
@@ -6421,7 +6516,7 @@ mod tests {
         if let Some(Command::Scan(scan)) = cli.command {
             assert_eq!(scan.format, Some(crate::scan::ScanFormat::Json));
         } else {
-            panic!("Expected Scan command");
+            unreachable!("Expected Scan command");
         }
     }
 
@@ -6432,7 +6527,7 @@ mod tests {
         if let Some(Command::Scan(scan)) = cli.command {
             assert_eq!(scan.fail_on, Some(crate::scan::ScanFailOn::Warning));
         } else {
-            panic!("Expected Scan command");
+            unreachable!("Expected Scan command");
         }
     }
 
@@ -6443,7 +6538,7 @@ mod tests {
         if let Some(Command::Scan(scan)) = cli.command {
             assert_eq!(scan.max_file_size, Some(2048));
         } else {
-            panic!("Expected Scan command");
+            unreachable!("Expected Scan command");
         }
     }
 
@@ -6465,7 +6560,7 @@ mod tests {
             assert_eq!(scan.exclude, vec!["*.log", "target/**"]);
             assert_eq!(scan.include, vec!["src/**"]);
         } else {
-            panic!("Expected Scan command");
+            unreachable!("Expected Scan command");
         }
     }
 
@@ -6497,7 +6592,7 @@ mod tests {
         if let Some(Command::Scan(scan)) = cli.command {
             assert!(matches!(scan.action, Some(ScanAction::InstallPreCommit)));
         } else {
-            panic!("Expected Scan command");
+            unreachable!("Expected Scan command");
         }
     }
 
@@ -6507,7 +6602,7 @@ mod tests {
         if let Some(Command::Scan(scan)) = cli.command {
             assert!(matches!(scan.action, Some(ScanAction::UninstallPreCommit)));
         } else {
-            panic!("Expected Scan command");
+            unreachable!("Expected Scan command");
         }
     }
 
@@ -6709,7 +6804,7 @@ exclude = ["target/**"]
             assert_eq!(format, ExplainFormat::Pretty);
             assert!(with_packs.is_none());
         } else {
-            panic!("Expected Explain command");
+            unreachable!("Expected Explain command");
         }
     }
 
@@ -6725,7 +6820,7 @@ exclude = ["target/**"]
             assert_eq!(command, "docker system prune");
             assert_eq!(format, ExplainFormat::Json);
         } else {
-            panic!("Expected Explain command");
+            unreachable!("Expected Explain command");
         }
     }
 
@@ -6744,7 +6839,7 @@ exclude = ["target/**"]
             assert!(explain);
             assert_eq!(format, ExplainFormat::Pretty); // default format
         } else {
-            panic!("Expected TestCommand");
+            unreachable!("Expected TestCommand");
         }
     }
 
@@ -6770,7 +6865,7 @@ exclude = ["target/**"]
             assert!(explain);
             assert_eq!(format, ExplainFormat::Compact);
         } else {
-            panic!("Expected TestCommand");
+            unreachable!("Expected TestCommand");
         }
     }
 
@@ -6788,7 +6883,7 @@ exclude = ["target/**"]
             assert!(!explain);
             assert_eq!(format, ExplainFormat::Pretty); // default
         } else {
-            panic!("Expected TestCommand");
+            unreachable!("Expected TestCommand");
         }
     }
 
@@ -6803,10 +6898,11 @@ exclude = ["target/**"]
             .output()
             .expect("run git");
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            panic!("git {args:?} failed: {stderr}");
-        }
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn init_fixture_repo() -> tempfile::TempDir {
@@ -7113,7 +7209,7 @@ exclude = ["target/**"]
         if let Some(Command::Scan(scan)) = cli.command {
             assert_eq!(scan.format, Some(crate::scan::ScanFormat::Markdown));
         } else {
-            panic!("Expected Scan command");
+            unreachable!("Expected Scan command");
         }
     }
 
