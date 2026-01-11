@@ -1,0 +1,23 @@
+# Fixture Dockerfile for scan regression testing
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Safe commands
+COPY package*.json ./
+RUN npm install
+RUN npm run build
+
+# Potentially dangerous commands (should be flagged in some contexts)
+RUN rm -rf /var/cache/apk/*
+RUN rm -rf node_modules
+
+# Commands that modify the system
+RUN apk update && apk upgrade
+
+# Multi-stage build cleanup
+FROM alpine:3.18
+COPY --from=0 /app/dist /app
+
+# Final cleanup
+RUN rm -rf /tmp/*

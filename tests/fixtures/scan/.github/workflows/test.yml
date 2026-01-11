@@ -1,0 +1,46 @@
+# Fixture GitHub Actions workflow for scan regression testing
+name: Test Workflow
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Safe commands
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      # Potentially destructive commands that should be flagged
+      - name: Deploy (dangerous)
+        run: |
+          git push --force origin main
+          rm -rf dist/*
+
+      - name: Database migration (dangerous)
+        run: |
+          psql -c "DROP TABLE IF EXISTS old_users;"
+
+      - name: Cleanup containers
+        run: |
+          docker system prune -af
+          docker volume prune -f
+
+  dangerous-job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reset repo
+        run: git reset --hard HEAD~1
+
+      - name: Force clean
+        run: git clean -fdx
