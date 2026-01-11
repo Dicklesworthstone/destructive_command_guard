@@ -488,8 +488,8 @@ test_command_with_packs() {
     fi
 }
 
-# Test helper: run command with decision-policy env and check stdout/stderr
-# Test default severity behavior (no policy override)
+# Test helper: run command WITHOUT policy override to test default severity behavior
+# Medium severity patterns should warn by default (recoverable operations)
 test_default_severity_behavior() {
     local cmd="$1"
     local expected="$2"  # "warn" for Medium severity
@@ -536,6 +536,8 @@ test_default_severity_behavior() {
     esac
 }
 
+# Test helper: run command WITH explicit DCG_POLICY_DEFAULT_MODE and check stdout/stderr
+# Use this to test policy override behavior (deny/warn/log modes)
 test_command_with_policy() {
     local cmd="$1"
     local policy_mode="$2"   # "deny" | "warn" | "log"
