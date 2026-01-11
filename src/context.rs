@@ -300,8 +300,21 @@ impl ContextClassifier {
                             }
                             span_start = i;
                             stack.push(TokenizerState::SingleQuote);
-                            current_kind = if pending_inline_code {
+                            let inline_here = if pending_inline_code {
                                 pending_inline_code = false;
+                                true
+                            } else if last_word_start < i {
+                                let word = &command[last_word_start..i];
+                                is_inline_code_flag(word)
+                                    && self.check_inline_code_context(
+                                        command,
+                                        last_word_start,
+                                        word,
+                                    )
+                            } else {
+                                false
+                            };
+                            current_kind = if inline_here {
                                 SpanKind::InlineCode
                             } else {
                                 SpanKind::Data
@@ -313,8 +326,21 @@ impl ContextClassifier {
                             }
                             span_start = i;
                             stack.push(TokenizerState::DoubleQuote);
-                            current_kind = if pending_inline_code {
+                            let inline_here = if pending_inline_code {
                                 pending_inline_code = false;
+                                true
+                            } else if last_word_start < i {
+                                let word = &command[last_word_start..i];
+                                is_inline_code_flag(word)
+                                    && self.check_inline_code_context(
+                                        command,
+                                        last_word_start,
+                                        word,
+                                    )
+                            } else {
+                                false
+                            };
+                            current_kind = if inline_here {
                                 SpanKind::InlineCode
                             } else {
                                 SpanKind::Argument
@@ -1959,6 +1985,21 @@ mod tests {
     }
 
     #[test]
+    fn test_bash_c_attached_single_quote_inline_code() {
+        let cmd = "bash -c'rm -rf /'";
+        let spans = classify_command(cmd);
+
+        let inline_span = spans
+            .spans()
+            .iter()
+            .find(|s| s.kind == SpanKind::InlineCode);
+        assert!(
+            inline_span.is_some(),
+            "Should detect inline code after bash -c without space"
+        );
+    }
+
+    #[test]
     fn test_bash_lc_inline_code() {
         let cmd = "bash -lc \"rm -rf /\"";
         let spans = classify_command(cmd);
@@ -1970,6 +2011,21 @@ mod tests {
         assert!(
             inline_span.is_some(),
             "Should detect inline code after bash -lc"
+        );
+    }
+
+    #[test]
+    fn test_bash_lc_attached_single_quote_inline_code() {
+        let cmd = "bash -lc'echo rm -rf /'";
+        let spans = classify_command(cmd);
+
+        let inline_span = spans
+            .spans()
+            .iter()
+            .find(|s| s.kind == SpanKind::InlineCode);
+        assert!(
+            inline_span.is_some(),
+            "Should detect inline code after bash -lc without space"
         );
     }
 
