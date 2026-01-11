@@ -151,12 +151,14 @@ fn build_hook_inputs(config: &Config) -> HookBenchInputs {
     let enabled_packs = config.enabled_pack_ids();
     let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
     let compiled_overrides = config.overrides.compile();
     let heredoc_settings = config.heredoc_settings();
 
     HookBenchInputs {
         enabled_keywords,
         ordered_packs,
+        keyword_index,
         compiled_overrides,
         heredoc_settings,
     }
@@ -165,6 +167,7 @@ fn build_hook_inputs(config: &Config) -> HookBenchInputs {
 struct HookBenchInputs {
     enabled_keywords: Vec<&'static str>,
     ordered_packs: Vec<String>,
+    keyword_index: Option<destructive_command_guard::packs::EnabledKeywordIndex>,
     compiled_overrides: destructive_command_guard::config::CompiledOverrides,
     heredoc_settings: destructive_command_guard::config::HeredocSettings,
 }
@@ -229,6 +232,7 @@ fn bench_pack_aware_quick_reject(c: &mut Criterion) {
     group.finish();
 }
 
+#[allow(clippy::too_many_lines)]
 fn bench_core_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("core_pipeline");
 
@@ -279,6 +283,7 @@ fn bench_core_pipeline(c: &mut Criterion) {
                         black_box(cmd),
                         black_box(core_inputs.enabled_keywords.as_slice()),
                         black_box(core_inputs.ordered_packs.as_slice()),
+                        black_box(core_inputs.keyword_index.as_ref()),
                         black_box(&core_inputs.compiled_overrides),
                         black_box(&allowlists),
                         black_box(&core_inputs.heredoc_settings),
@@ -303,6 +308,7 @@ fn bench_core_pipeline(c: &mut Criterion) {
                         black_box(cmd),
                         black_box(docker_inputs.enabled_keywords.as_slice()),
                         black_box(docker_inputs.ordered_packs.as_slice()),
+                        black_box(docker_inputs.keyword_index.as_ref()),
                         black_box(&docker_inputs.compiled_overrides),
                         black_box(&allowlists),
                         black_box(&docker_inputs.heredoc_settings),
@@ -328,6 +334,7 @@ fn bench_core_pipeline(c: &mut Criterion) {
                         black_box(cmd),
                         black_box(worst_inputs.enabled_keywords.as_slice()),
                         black_box(worst_inputs.ordered_packs.as_slice()),
+                        black_box(worst_inputs.keyword_index.as_ref()),
                         black_box(&worst_inputs.compiled_overrides),
                         black_box(&allowlists),
                         black_box(&worst_inputs.heredoc_settings),
@@ -497,6 +504,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
                         black_box(cmd),
                         black_box(hook_inputs.enabled_keywords.as_slice()),
                         black_box(hook_inputs.ordered_packs.as_slice()),
+                        black_box(hook_inputs.keyword_index.as_ref()),
                         black_box(&hook_inputs.compiled_overrides),
                         black_box(&allowlists),
                         black_box(&hook_inputs.heredoc_settings),

@@ -97,7 +97,7 @@ done
 # Find binary
 if [[ -z "$BINARY" ]]; then
     if command -v dcg &> /dev/null; then
-        BINARY="dcg"
+        BINARY="$(command -v dcg)"
     elif [[ -f "./target/release/dcg" ]]; then
         BINARY="./target/release/dcg"
     elif [[ -f "./target/debug/dcg" ]]; then

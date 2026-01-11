@@ -1063,6 +1063,7 @@ fn test_command(
     let enabled_packs = effective_config.enabled_pack_ids();
     let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
     let heredoc_settings = effective_config.heredoc_settings();
 
     // Compile overrides once (not per-command)
@@ -1077,6 +1078,7 @@ fn test_command(
         command,
         &enabled_keywords,
         &ordered_packs,
+        keyword_index.as_ref(),
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
@@ -2317,6 +2319,7 @@ fn handle_explain(
     let enabled_packs = effective_config.enabled_pack_ids();
     let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
     let heredoc_settings = effective_config.heredoc_settings();
     let compiled_overrides = effective_config.overrides.compile();
     let allowlists = crate::LayeredAllowlist::default();
@@ -2330,6 +2333,7 @@ fn handle_explain(
         command,
         &enabled_keywords,
         &ordered_packs,
+        keyword_index.as_ref(),
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
@@ -2663,6 +2667,7 @@ fn run_single_corpus_test(
     let enabled_packs = effective_config.enabled_pack_ids();
     let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
     let compiled_overrides = effective_config.overrides.compile();
     let allowlists = crate::LayeredAllowlist::default();
     let heredoc_settings = effective_config.heredoc_settings();
@@ -2673,6 +2678,7 @@ fn run_single_corpus_test(
         &case.command,
         &enabled_keywords,
         &ordered_packs,
+        keyword_index.as_ref(),
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
@@ -3939,6 +3945,7 @@ fn run_smoke_test() -> bool {
     let enabled_packs = config.enabled_pack_ids();
     let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
     let compiled_overrides = config.overrides.compile();
     let allowlists = crate::LayeredAllowlist::default();
     let heredoc_settings = config.heredoc_settings();
@@ -3948,6 +3955,7 @@ fn run_smoke_test() -> bool {
         "git status",
         &enabled_keywords,
         &ordered_packs,
+        keyword_index.as_ref(),
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
@@ -3961,6 +3969,7 @@ fn run_smoke_test() -> bool {
         "git reset --hard",
         &enabled_keywords,
         &ordered_packs,
+        keyword_index.as_ref(),
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,

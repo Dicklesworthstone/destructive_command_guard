@@ -482,6 +482,53 @@ pub struct PackRegistry {
     index: HashMap<&'static str, usize>,
 }
 
+/// Precomputed keyword index for a specific enabled pack set.
+///
+/// Built once per config load and reused for each command evaluation, this
+/// allows the evaluator to:
+/// - Compute a conservative candidate pack set via a single global substring scan.
+/// - Avoid repeated per-pack `might_match()` scans when iterating packs.
+///
+/// Isomorphism constraint: candidate selection must be a **superset** of the
+/// legacy per-pack `PackEntry::might_match()` semantics (raw substring matches).
+#[derive(Debug)]
+pub struct EnabledKeywordIndex {
+    pack_count: usize,
+    full_mask: u128,
+    always_check_mask: u128,
+    keyword_matcher: Option<aho_corasick::AhoCorasick>,
+    keyword_pack_masks: Vec<u128>,
+}
+
+impl EnabledKeywordIndex {
+    #[must_use]
+    pub const fn pack_count(&self) -> usize {
+        self.pack_count
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn candidate_pack_mask(&self, cmd: &str) -> u128 {
+        let mut mask = self.always_check_mask;
+
+        let Some(ac) = &self.keyword_matcher else {
+            return mask;
+        };
+
+        // Overlapping iteration is required to preserve the legacy substring
+        // semantics: if "git" is a keyword and the command contains "gitlab",
+        // we must include packs keyed on "git" even if a longer keyword also matches.
+        for m in ac.find_overlapping_iter(cmd) {
+            mask |= self.keyword_pack_masks[m.pattern().as_usize()];
+            if mask == self.full_mask {
+                break;
+            }
+        }
+
+        mask
+    }
+}
+
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
 static PACK_ENTRIES: [PackEntry; 63] = [
@@ -1085,6 +1132,82 @@ impl PackRegistry {
     #[must_use]
     pub fn get_entry(&self, id: &str) -> Option<&PackEntry> {
         self.index.get(id).map(|&idx| self.entries[idx])
+    }
+
+    /// Build an [`EnabledKeywordIndex`] for a precomputed ordered pack list.
+    ///
+    /// This is intended to run once per config load; callers reuse the returned
+    /// index for each command evaluation.
+    ///
+    /// Returns `None` if the ordered pack list exceeds the fixed bitset budget
+    /// (currently 128 packs), in which case callers should fall back to the
+    /// legacy per-pack `might_match()` filtering.
+    #[must_use]
+    pub fn build_enabled_keyword_index(
+        &self,
+        ordered_packs: &[String],
+    ) -> Option<EnabledKeywordIndex> {
+        if ordered_packs.len() > 128 {
+            return None;
+        }
+
+        let pack_count = ordered_packs.len();
+        let full_mask = if pack_count == 128 {
+            u128::MAX
+        } else {
+            (1u128 << pack_count) - 1
+        };
+
+        let mut always_check_mask: u128 = 0;
+        let mut keyword_to_index: HashMap<&'static str, usize> = HashMap::new();
+        let mut patterns: Vec<&'static str> = Vec::new();
+        let mut keyword_pack_masks: Vec<u128> = Vec::new();
+
+        for (pack_idx, pack_id) in ordered_packs.iter().enumerate() {
+            let Some(entry) = self.get_entry(pack_id.as_str()) else {
+                continue;
+            };
+
+            let bit = 1u128 << pack_idx;
+
+            if entry.keywords.is_empty() {
+                always_check_mask |= bit;
+                continue;
+            }
+
+            for &kw in entry.keywords {
+                if kw.is_empty() {
+                    continue;
+                }
+
+                if let Some(&idx) = keyword_to_index.get(kw) {
+                    keyword_pack_masks[idx] |= bit;
+                    continue;
+                }
+
+                let idx = patterns.len();
+                patterns.push(kw);
+                keyword_to_index.insert(kw, idx);
+                keyword_pack_masks.push(bit);
+            }
+        }
+
+        let keyword_matcher = if patterns.is_empty() {
+            None
+        } else {
+            match aho_corasick::AhoCorasick::new(patterns) {
+                Ok(ac) => Some(ac),
+                Err(_) => return None,
+            }
+        };
+
+        Some(EnabledKeywordIndex {
+            pack_count,
+            full_mask,
+            always_check_mask,
+            keyword_matcher,
+            keyword_pack_masks,
+        })
     }
 }
 

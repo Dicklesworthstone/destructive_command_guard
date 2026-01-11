@@ -1018,6 +1018,7 @@ pub fn eval_snapshot_with_config(command: &str, config: &Config) -> EvalSnapshot
     let enabled_packs = config.enabled_pack_ids();
     let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
     let compiled_overrides = config.overrides.compile();
     let allowlists = crate::LayeredAllowlist::default();
     let heredoc_settings = config.heredoc_settings();
@@ -1026,6 +1027,7 @@ pub fn eval_snapshot_with_config(command: &str, config: &Config) -> EvalSnapshot
         command,
         &enabled_keywords,
         &ordered_packs,
+        keyword_index.as_ref(),
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
@@ -1119,6 +1121,7 @@ pub fn verify_corpus_case(case: &CorpusTestCase, category: CorpusCategory) -> Re
     let enabled_packs = config.enabled_pack_ids();
     let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
     let compiled_overrides = config.overrides.compile();
     let allowlists = crate::LayeredAllowlist::default();
     let heredoc_settings = config.heredoc_settings();
@@ -1127,6 +1130,7 @@ pub fn verify_corpus_case(case: &CorpusTestCase, category: CorpusCategory) -> Re
         &case.command,
         &enabled_keywords,
         &ordered_packs,
+        keyword_index.as_ref(),
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,

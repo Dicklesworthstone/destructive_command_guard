@@ -198,6 +198,7 @@ fn main() {
     let enabled_packs: HashSet<String> = config.enabled_pack_ids();
     let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
 
     // Read and parse input
     let max_input_bytes = config.general.max_hook_input_bytes();
@@ -265,6 +266,7 @@ fn main() {
         &command,
         &enabled_keywords,
         &ordered_packs,
+        keyword_index.as_ref(),
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,

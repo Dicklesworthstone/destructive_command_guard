@@ -803,6 +803,7 @@ where
     let enabled_packs: HashSet<String> = config.enabled_pack_ids();
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
     let keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+    let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
     let compiled_overrides = config.overrides.compile();
     let allowlists = crate::allowlist::load_default_allowlists();
     let heredoc_settings = config.heredoc_settings();
@@ -814,6 +815,7 @@ where
             &cmd.command,
             &keywords,
             &ordered_packs,
+            keyword_index.as_ref(),
             &compiled_overrides,
             &allowlists,
             &heredoc_settings,

@@ -284,6 +284,7 @@ pub struct ScanOptions {
 pub struct ScanEvalContext {
     pub enabled_keywords: Vec<&'static str>,
     pub ordered_packs: Vec<String>,
+    pub keyword_index: Option<crate::packs::EnabledKeywordIndex>,
     pub compiled_overrides: crate::config::CompiledOverrides,
     pub allowlists: crate::allowlist::LayeredAllowlist,
     pub heredoc_settings: HeredocSettings,
@@ -295,6 +296,7 @@ impl ScanEvalContext {
         let enabled_packs: HashSet<String> = config.enabled_pack_ids();
         let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
         let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+        let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
         let compiled_overrides = config.overrides.compile();
         let allowlists = crate::load_default_allowlists();
         let heredoc_settings = config.heredoc_settings();
@@ -302,6 +304,7 @@ impl ScanEvalContext {
         Self {
             enabled_keywords,
             ordered_packs,
+            keyword_index,
             compiled_overrides,
             allowlists,
             heredoc_settings,
@@ -357,6 +360,7 @@ pub fn evaluate_extracted_command(
         &extracted.command,
         &ctx.enabled_keywords,
         &ctx.ordered_packs,
+        ctx.keyword_index.as_ref(),
         &ctx.compiled_overrides,
         &ctx.allowlists,
         &ctx.heredoc_settings,

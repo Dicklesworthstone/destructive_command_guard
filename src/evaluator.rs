@@ -555,11 +555,13 @@ pub fn evaluate_command_with_deadline(
 ) -> EvaluationResult {
     let enabled_packs: HashSet<String> = config.enabled_pack_ids();
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
     let heredoc_settings = config.heredoc_settings();
     evaluate_command_with_pack_order_deadline(
         command,
         enabled_keywords,
         &ordered_packs,
+        keyword_index.as_ref(),
         compiled_overrides,
         allowlists,
         &heredoc_settings,
@@ -585,6 +587,7 @@ pub fn evaluate_command_with_pack_order(
     command: &str,
     enabled_keywords: &[&str],
     ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
     compiled_overrides: &crate::config::CompiledOverrides,
     allowlists: &LayeredAllowlist,
     heredoc_settings: &crate::config::HeredocSettings,
@@ -593,6 +596,7 @@ pub fn evaluate_command_with_pack_order(
         command,
         enabled_keywords,
         ordered_packs,
+        keyword_index,
         compiled_overrides,
         allowlists,
         heredoc_settings,
@@ -602,10 +606,12 @@ pub fn evaluate_command_with_pack_order(
 
 /// Evaluate a command using a precomputed pack order and an optional project path.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_command_with_pack_order_at_path(
     command: &str,
     enabled_keywords: &[&str],
     ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
     compiled_overrides: &crate::config::CompiledOverrides,
     allowlists: &LayeredAllowlist,
     heredoc_settings: &crate::config::HeredocSettings,
@@ -615,6 +621,7 @@ pub fn evaluate_command_with_pack_order_at_path(
         command,
         enabled_keywords,
         ordered_packs,
+        keyword_index,
         compiled_overrides,
         allowlists,
         heredoc_settings,
@@ -642,10 +649,12 @@ pub fn evaluate_command_with_pack_order_at_path(
 ///
 /// An `EvaluationResult` with `skipped_due_to_budget: true` if deadline exceeded.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_command_with_pack_order_deadline(
     command: &str,
     enabled_keywords: &[&str],
     ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
     compiled_overrides: &crate::config::CompiledOverrides,
     allowlists: &LayeredAllowlist,
     heredoc_settings: &crate::config::HeredocSettings,
@@ -655,6 +664,7 @@ pub fn evaluate_command_with_pack_order_deadline(
         command,
         enabled_keywords,
         ordered_packs,
+        keyword_index,
         compiled_overrides,
         allowlists,
         heredoc_settings,
@@ -671,6 +681,7 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
     command: &str,
     enabled_keywords: &[&str],
     ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
     compiled_overrides: &crate::config::CompiledOverrides,
     allowlists: &LayeredAllowlist,
     heredoc_settings: &crate::config::HeredocSettings,
@@ -744,6 +755,7 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
                     deadline,
                     enabled_keywords,
                     ordered_packs,
+                    keyword_index,
                     compiled_overrides,
                 };
                 if let Some(blocked) =
@@ -803,7 +815,8 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
         return EvaluationResult::allowed();
     }
 
-    let result = evaluate_packs_with_allowlists(&normalized, ordered_packs, allowlists, None);
+    let result =
+        evaluate_packs_with_allowlists(&normalized, ordered_packs, allowlists, keyword_index, None);
     if result.allowlist_override.is_none() {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
@@ -817,28 +830,46 @@ fn evaluate_packs_with_allowlists(
     normalized: &str,
     ordered_packs: &[String],
     allowlists: &LayeredAllowlist,
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
     deadline: Option<&Deadline>,
 ) -> EvaluationResult {
     if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
         return EvaluationResult::allowed_due_to_budget();
     }
 
-    // Pre-compute which packs might match (keyword quick-reject).
-    // Uses metadata-only check first to avoid instantiating packs unnecessarily.
-    // The Vec allocation is O(p) where p = number of packs.
-    let candidate_packs: Vec<(&String, &crate::packs::Pack)> = ordered_packs
-        .iter()
-        .filter_map(|pack_id| {
-            // Check metadata first without instantiating
-            let entry = REGISTRY.get_entry(pack_id)?;
-            if !entry.might_match(normalized) {
-                return None;
-            }
-            // Only instantiate if keywords match
-            let pack = entry.get_pack();
-            Some((pack_id, pack))
-        })
-        .collect();
+    // Pre-compute which packs might match.
+    //
+    // When a keyword index is available, use a single global substring scan to
+    // conservatively select candidate packs (superset of legacy PackEntry::might_match).
+    // Otherwise, fall back to the per-pack metadata scan.
+    let candidate_packs: Vec<(&String, &crate::packs::Pack)> = keyword_index.map_or_else(
+        || {
+            ordered_packs
+                .iter()
+                .filter_map(|pack_id| {
+                    let entry = REGISTRY.get_entry(pack_id)?;
+                    if !entry.might_match(normalized) {
+                        return None;
+                    }
+                    Some((pack_id, entry.get_pack()))
+                })
+                .collect()
+        },
+        |index| {
+            let mask = index.candidate_pack_mask(normalized);
+            ordered_packs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, pack_id)| {
+                    if (mask >> i) & 1 == 0 {
+                        return None;
+                    }
+                    let entry = REGISTRY.get_entry(pack_id)?;
+                    Some((pack_id, entry.get_pack()))
+                })
+                .collect()
+        },
+    );
 
     // Two-pass evaluation for cross-pack safe pattern support.
     //
@@ -997,6 +1028,7 @@ where
     // Step 2.5: Pre-calculate ordered packs for heredoc recursion (and later use)
     let enabled_packs: HashSet<String> = config.enabled_pack_ids();
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
 
     // Step 3: Heredoc / inline-script detection (Tier 1/2/3, fail-open).
     // See `evaluate_command` for detailed rationale.
@@ -1023,6 +1055,7 @@ where
                 deadline: None,
                 enabled_keywords,
                 ordered_packs: &ordered_packs,
+                keyword_index: keyword_index.as_ref(),
                 compiled_overrides,
             };
             if let Some(blocked) = evaluate_heredoc(command, context, &mut heredoc_allowlist_hit) {
@@ -1071,7 +1104,13 @@ where
     }
 
     // Step 9: Check enabled packs with allowlist override semantics.
-    let result = evaluate_packs_with_allowlists(&normalized, &ordered_packs, allowlists, None);
+    let result = evaluate_packs_with_allowlists(
+        &normalized,
+        &ordered_packs,
+        allowlists,
+        keyword_index.as_ref(),
+        None,
+    );
     if result.allowlist_override.is_none() {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
@@ -1089,6 +1128,7 @@ struct HeredocEvaluationContext<'a> {
     deadline: Option<&'a Deadline>,
     enabled_keywords: &'a [&'a str],
     ordered_packs: &'a [String],
+    keyword_index: Option<&'a crate::packs::EnabledKeywordIndex>,
     compiled_overrides: &'a crate::config::CompiledOverrides,
 }
 
@@ -1253,6 +1293,7 @@ fn evaluate_heredoc(
                     &inner.text,
                     context.enabled_keywords,
                     context.ordered_packs,
+                    context.keyword_index,
                     context.compiled_overrides,
                     context.allowlists,
                     context.heredoc_settings,
@@ -2231,6 +2272,7 @@ mod tests {
             let heredoc_settings = test_heredoc_settings();
             let enabled_keywords: Vec<&str> = vec!["git", "rm"];
             let ordered_packs: Vec<String> = vec!["core.git".to_string()];
+            let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
 
             // Create a deadline with zero duration - should be immediately exceeded
             let deadline = Deadline::new(Duration::ZERO);
@@ -2239,6 +2281,7 @@ mod tests {
                 "git reset --hard",
                 &enabled_keywords,
                 &ordered_packs,
+                keyword_index.as_ref(),
                 &compiled_overrides,
                 &allowlists,
                 &heredoc_settings,
@@ -2264,6 +2307,7 @@ mod tests {
             let heredoc_settings = test_heredoc_settings();
             let enabled_keywords: Vec<&str> = vec!["git", "rm"];
             let ordered_packs: Vec<String> = vec!["core.git".to_string()];
+            let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
 
             // Create a generous deadline
             let deadline = Deadline::new(Duration::from_secs(10));
@@ -2272,6 +2316,7 @@ mod tests {
                 "git reset --hard",
                 &enabled_keywords,
                 &ordered_packs,
+                keyword_index.as_ref(),
                 &compiled_overrides,
                 &allowlists,
                 &heredoc_settings,
@@ -2297,11 +2342,13 @@ mod tests {
             let heredoc_settings = test_heredoc_settings();
             let enabled_keywords: Vec<&str> = vec!["git", "rm"];
             let ordered_packs: Vec<String> = vec!["core.git".to_string()];
+            let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
 
             let result = evaluate_command_with_pack_order_deadline(
                 "git reset --hard",
                 &enabled_keywords,
                 &ordered_packs,
+                keyword_index.as_ref(),
                 &compiled_overrides,
                 &allowlists,
                 &heredoc_settings,
@@ -2327,6 +2374,7 @@ mod tests {
             let heredoc_settings = test_heredoc_settings();
             let enabled_keywords: Vec<&str> = vec!["git", "rm"];
             let ordered_packs: Vec<String> = vec!["core.git".to_string()];
+            let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
 
             // Generous deadline for safe command
             let deadline = Deadline::new(Duration::from_secs(10));
@@ -2335,6 +2383,7 @@ mod tests {
                 "git status",
                 &enabled_keywords,
                 &ordered_packs,
+                keyword_index.as_ref(),
                 &compiled_overrides,
                 &allowlists,
                 &heredoc_settings,
