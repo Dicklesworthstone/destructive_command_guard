@@ -38,6 +38,7 @@ fancy-regex = "0.14"
 regex = "1.10"              # For RegexSet in heredoc detection
 memchr = "2.7"
 aho-corasick = "1.1"        # Multi-pattern string matching for keyword quick-reject
+smallvec = "1.15.1"
 colored = "2.1"
 dirs = "5.0"
 clap = { version = "4.5", features = ["derive", "env"] }

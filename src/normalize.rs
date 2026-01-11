@@ -17,6 +17,7 @@
 //! - `command [-p] [--] cmd` - but NOT `command -v` or `command -V` (query mode)
 
 use fancy_regex::Regex;
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::LazyLock;
@@ -696,12 +697,14 @@ impl NormalizeToken {
     }
 }
 
+pub type NormalizeTokens = SmallVec<[NormalizeToken; 16]>;
+
 #[must_use]
-pub fn tokenize_for_normalization(command: &str) -> Vec<NormalizeToken> {
+pub fn tokenize_for_normalization(command: &str) -> NormalizeTokens {
     let bytes = command.as_bytes();
     let len = bytes.len();
 
-    let mut tokens = Vec::new();
+    let mut tokens = NormalizeTokens::new();
     let mut i = 0;
 
     while i < len {
@@ -744,7 +747,7 @@ pub fn consume_separator_token(
     bytes: &[u8],
     i: usize,
     len: usize,
-    tokens: &mut Vec<NormalizeToken>,
+    tokens: &mut NormalizeTokens,
 ) -> Option<usize> {
     match bytes[i] {
         b'|' => {

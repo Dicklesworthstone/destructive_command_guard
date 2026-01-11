@@ -614,6 +614,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "smallvec",
  "tempfile",
  "toml",
  "toml_edit",
