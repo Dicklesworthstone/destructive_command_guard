@@ -23,7 +23,7 @@
 //! | 3 | Heredoc trigger | < 5μs | < 10μs | > 100μs |
 //! | 4 | Heredoc extract | < 200μs | < 500μs | > 2ms |
 //! | 5 | Language detect | < 20μs | < 50μs | > 200μs |
-//! | 6 | Full pipeline | < 5ms | < 15ms | > 50ms |
+//! | 6 | Full pipeline | < 5ms | < 15ms | > 20ms |
 //!
 //! # Absolute Maximum
 //!

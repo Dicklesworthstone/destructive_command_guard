@@ -234,6 +234,34 @@ log_section() {
     fi
 }
 
+# Log a skipped test (informational, not a failure)
+log_skip() {
+    local desc="$1"
+    local reason="${2:-}"
+    # Count skipped tests as passed (they're not failures)
+    ((++TESTS_PASSED))
+    record_test_result "skip" "$desc" ""
+
+    if ! $JSON_OUTPUT; then
+        if [[ -n "$reason" ]]; then
+            echo -e "${YELLOW}⊘${NC} SKIPPED: $desc (${reason})"
+        else
+            echo -e "${YELLOW}⊘${NC} SKIPPED: $desc"
+        fi
+    fi
+}
+
+# Log a warning (test passed but with caveats)
+log_warn() {
+    local desc="$1"
+    ((++TESTS_PASSED))
+    record_test_result "warn" "$desc" ""
+
+    if ! $JSON_OUTPUT; then
+        echo -e "${YELLOW}⚠${NC} $desc"
+    fi
+}
+
 # Truncate long commands for readable logs.
 truncate_cmd() {
     local s="$1"
@@ -1290,6 +1318,76 @@ conditions = { CI = "true" }' \
     "allow" \
     "system" \
     "Layering: system condition met allows"
+
+#
+# Codecov Integration Tests (git_safety_guard-aw0)
+#
+
+log_section "Codecov Integration Tests (git_safety_guard-aw0)"
+
+# Test: Verify codecov.yml exists and is valid
+log_test_start "codecov.yml exists"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "$REPO_ROOT/codecov.yml" ]]; then
+    log_pass "codecov.yml exists"
+else
+    log_skip "codecov.yml not found" "Codecov integration not configured"
+fi
+
+# Test: Verify codecov.yml has required settings (target coverage thresholds)
+log_test_start "codecov.yml has coverage settings"
+if [[ -f "$REPO_ROOT/codecov.yml" ]]; then
+    if grep -q "target:" "$REPO_ROOT/codecov.yml" && grep -q "ignore:" "$REPO_ROOT/codecov.yml"; then
+        log_pass "codecov.yml has required coverage settings"
+    else
+        log_warn "codecov.yml may be missing required settings (target or ignore)"
+    fi
+else
+    log_skip "codecov.yml not found" "skipping settings check"
+fi
+
+# Test: Verify codecov.yml is valid YAML (basic check - no syntax errors)
+log_test_start "codecov.yml is valid YAML"
+if [[ -f "$REPO_ROOT/codecov.yml" ]]; then
+    # Validate YAML only if a validator is available (non-blocking).
+    if command -v yq &>/dev/null; then
+        if yq eval . "$REPO_ROOT/codecov.yml" >/dev/null 2>&1; then
+            log_pass "codecov.yml is valid YAML (yq validated)"
+        else
+            log_fail "codecov.yml YAML validation" "valid YAML" "invalid YAML syntax"
+        fi
+    elif command -v python3 &>/dev/null && python3 -c "import yaml" >/dev/null 2>&1; then
+        if python3 - "$REPO_ROOT/codecov.yml" <<'PY' >/dev/null 2>&1
+import sys
+import yaml
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    yaml.safe_load(f)
+PY
+        then
+            log_pass "codecov.yml is valid YAML (python3 + PyYAML validated)"
+        else
+            log_fail "codecov.yml YAML validation" "valid YAML" "invalid YAML syntax"
+        fi
+    else
+        log_skip "YAML validator" "yq not installed and PyYAML not available"
+    fi
+else
+    log_skip "codecov.yml not found" "skipping YAML validation"
+fi
+
+# Test: Verify badge URL is accessible (non-blocking - badge may not exist yet)
+log_test_start "Codecov badge accessible"
+BADGE_URL="https://codecov.io/gh/Dicklesworthstone/destructive_command_guard/branch/master/graph/badge.svg"
+if command -v curl &>/dev/null; then
+    if curl -sf --max-time 5 "$BADGE_URL" >/dev/null 2>&1; then
+        log_pass "Codecov badge accessible"
+    else
+        log_warn "Codecov badge not accessible (may take time after first upload)"
+    fi
+else
+    log_skip "curl not available" "cannot test badge URL"
+fi
 
 #
 # SUMMARY
