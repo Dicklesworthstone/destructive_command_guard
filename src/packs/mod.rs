@@ -48,6 +48,7 @@ mod test_template;
 pub use crate::normalize::normalize_command;
 use memchr::memmem;
 use regex_engine::LazyCompiledRegex;
+use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, OnceLock};
 
@@ -315,14 +316,28 @@ impl Pack {
 
         // Use Aho-Corasick automaton if available (O(n) regardless of keyword count).
         if let Some(ref ac) = self.keyword_matcher {
-            return ac.is_match(cmd);
+            if ac.is_match(cmd) {
+                return true;
+            }
+
+            if !self
+                .keywords
+                .iter()
+                .any(|kw| keyword_contains_whitespace(kw))
+            {
+                return false;
+            }
+
+            return self
+                .keywords
+                .iter()
+                .any(|kw| keyword_contains_whitespace(kw) && keyword_matches_substring(cmd, kw));
         }
 
         // Fallback: sequential memchr-based search (O(k * n) where k = keyword count).
-        let bytes = cmd.as_bytes();
         self.keywords
             .iter()
-            .any(|kw| memmem::find(bytes, kw.as_bytes()).is_some())
+            .any(|kw| keyword_matches_substring(cmd, kw))
     }
 
     /// Check if a command matches any safe pattern.
@@ -533,9 +548,18 @@ impl PackEntry {
         }
 
         let bytes = cmd.as_bytes();
-        self.keywords
+        if self
+            .keywords
             .iter()
             .any(|kw| memmem::find(bytes, kw.as_bytes()).is_some())
+        {
+            return true;
+        }
+
+        self.keywords
+            .iter()
+            .filter(|kw| keyword_contains_whitespace(kw))
+            .any(|kw| keyword_matches_substring(cmd, kw))
     }
 
     /// Check if the pack has been built yet.
@@ -573,6 +597,8 @@ pub struct EnabledKeywordIndex {
     always_check_mask: u128,
     keyword_matcher: Option<aho_corasick::AhoCorasick>,
     keyword_pack_masks: Vec<u128>,
+    whitespace_keywords: Vec<&'static str>,
+    whitespace_pack_masks: Vec<u128>,
 }
 
 impl EnabledKeywordIndex {
@@ -597,6 +623,21 @@ impl EnabledKeywordIndex {
             mask |= self.keyword_pack_masks[m.pattern().as_usize()];
             if mask == self.full_mask {
                 break;
+            }
+        }
+
+        if !self.whitespace_keywords.is_empty() && mask != self.full_mask {
+            for (keyword, pack_mask) in self
+                .whitespace_keywords
+                .iter()
+                .zip(self.whitespace_pack_masks.iter())
+            {
+                if keyword_matches_substring(cmd, keyword) {
+                    mask |= *pack_mask;
+                    if mask == self.full_mask {
+                        break;
+                    }
+                }
             }
         }
 
@@ -1317,6 +1358,9 @@ impl PackRegistry {
         let mut keyword_to_index: HashMap<&'static str, usize> = HashMap::new();
         let mut patterns: Vec<&'static str> = Vec::new();
         let mut keyword_pack_masks: Vec<u128> = Vec::new();
+        let mut whitespace_keywords: Vec<&'static str> = Vec::new();
+        let mut whitespace_pack_masks: Vec<u128> = Vec::new();
+        let mut whitespace_keyword_to_index: HashMap<&'static str, usize> = HashMap::new();
 
         for (pack_idx, pack_id) in ordered_packs.iter().enumerate() {
             let Some(entry) = self.get_entry(pack_id.as_str()) else {
@@ -1333,6 +1377,17 @@ impl PackRegistry {
             for &kw in entry.keywords {
                 if kw.is_empty() {
                     continue;
+                }
+
+                if keyword_contains_whitespace(kw) {
+                    if let Some(&idx) = whitespace_keyword_to_index.get(kw) {
+                        whitespace_pack_masks[idx] |= bit;
+                    } else {
+                        let idx = whitespace_keywords.len();
+                        whitespace_keywords.push(kw);
+                        whitespace_pack_masks.push(bit);
+                        whitespace_keyword_to_index.insert(kw, idx);
+                    }
                 }
 
                 if let Some(&idx) = keyword_to_index.get(kw) {
@@ -1362,6 +1417,8 @@ impl PackRegistry {
             always_check_mask,
             keyword_matcher,
             keyword_pack_masks,
+            whitespace_keywords,
+            whitespace_pack_masks,
         })
     }
 }
@@ -1404,9 +1461,122 @@ const fn is_word_byte(byte: u8) -> bool {
 }
 
 #[inline]
+fn keyword_contains_whitespace(keyword: &str) -> bool {
+    keyword.bytes().any(|byte| byte.is_ascii_whitespace())
+}
+
+#[inline]
+fn keyword_matches_substring(haystack: &str, keyword: &str) -> bool {
+    if keyword.is_empty() {
+        return false;
+    }
+
+    if !keyword_contains_whitespace(keyword) {
+        return memmem::find(haystack.as_bytes(), keyword.as_bytes()).is_some();
+    }
+
+    keyword_matches_with_whitespace(haystack, keyword, false)
+}
+
+fn split_keyword_parts(keyword: &str) -> SmallVec<[&str; 4]> {
+    let mut parts: SmallVec<[&str; 4]> = SmallVec::new();
+    let mut start: Option<usize> = None;
+
+    for (idx, byte) in keyword.bytes().enumerate() {
+        if byte.is_ascii_whitespace() {
+            if let Some(part_start) = start.take() {
+                parts.push(&keyword[part_start..idx]);
+            }
+        } else if start.is_none() {
+            start = Some(idx);
+        }
+    }
+
+    if let Some(part_start) = start {
+        parts.push(&keyword[part_start..]);
+    }
+
+    parts
+}
+
+fn keyword_matches_with_whitespace(
+    haystack: &str,
+    keyword: &str,
+    enforce_boundaries: bool,
+) -> bool {
+    let parts = split_keyword_parts(keyword);
+    if parts.is_empty() {
+        return false;
+    }
+
+    let hay = haystack.as_bytes();
+    let first = parts[0].as_bytes();
+    if first.len() > hay.len() {
+        return false;
+    }
+
+    let first_is_word = first.first().is_some_and(|b| is_word_byte(*b));
+    let last = parts[parts.len() - 1].as_bytes();
+    let last_is_word = last.last().is_some_and(|b| is_word_byte(*b));
+    let mut offset = 0;
+
+    while let Some(pos) = memmem::find(&hay[offset..], first) {
+        let start = offset + pos;
+        if enforce_boundaries && first_is_word {
+            let start_ok = start == 0 || !is_word_byte(hay[start.saturating_sub(1)]);
+            if !start_ok {
+                offset = start + 1;
+                continue;
+            }
+        }
+
+        let mut idx = start + first.len();
+        let mut matched = true;
+        for part in parts.iter().skip(1) {
+            let mut ws = idx;
+            while ws < hay.len() && hay[ws].is_ascii_whitespace() {
+                ws += 1;
+            }
+            if ws == idx {
+                matched = false;
+                break;
+            }
+            idx = ws;
+
+            let part_bytes = part.as_bytes();
+            if idx + part_bytes.len() > hay.len() || &hay[idx..idx + part_bytes.len()] != part_bytes
+            {
+                matched = false;
+                break;
+            }
+            idx += part_bytes.len();
+        }
+
+        if matched && enforce_boundaries && last_is_word {
+            let end_ok = idx == hay.len() || !is_word_byte(hay[idx]);
+            if !end_ok {
+                matched = false;
+            }
+        }
+
+        if matched {
+            return true;
+        }
+
+        offset = start + 1;
+    }
+
+    false
+}
+
+#[inline]
 fn keyword_matches_span(span_text: &str, keyword: &str) -> bool {
     if keyword.is_empty() {
         return false;
+    }
+
+    if keyword_contains_whitespace(keyword) {
+        return keyword_matches_with_whitespace(span_text, keyword, true);
     }
 
     let haystack = span_text.as_bytes();
@@ -1495,9 +1665,15 @@ pub fn pack_aware_quick_reject_with_normalized<'a>(
     }
 
     let bytes = cmd.as_bytes();
-    let any_substring = enabled_keywords
+    let mut any_substring = enabled_keywords
         .iter()
         .any(|keyword| memmem::find(bytes, keyword.as_bytes()).is_some());
+    if !any_substring {
+        any_substring = enabled_keywords
+            .iter()
+            .filter(|keyword| keyword_contains_whitespace(keyword))
+            .any(|keyword| keyword_matches_substring(cmd, keyword));
+    }
     if !any_substring {
         // No substring match at all - return early without normalizing.
         // The caller won't need the normalized form since we're rejecting.
@@ -1666,6 +1842,39 @@ mod tests {
         assert!(
             !pack_aware_quick_reject("rm -rf foo", &keywords),
             "rm -rf foo should NOT be quick-rejected with core keywords"
+        );
+    }
+
+    #[test]
+    fn pack_aware_quick_reject_handles_multiword_keywords_with_extra_space() {
+        let keywords: Vec<&str> = vec!["gcloud storage"];
+
+        assert!(
+            !pack_aware_quick_reject("gcloud   storage rm gs://bucket", &keywords),
+            "multi-word keywords should match even with extra whitespace"
+        );
+    }
+
+    #[test]
+    fn enabled_keyword_index_matches_multiword_keyword_with_extra_space() {
+        let mut enabled = HashSet::new();
+        enabled.insert("storage.gcs".to_string());
+
+        let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+        let index = REGISTRY
+            .build_enabled_keyword_index(&ordered)
+            .expect("keyword index should build for small pack set");
+
+        let mask = index.candidate_pack_mask("gcloud   storage rm gs://bucket");
+        let pack_idx = ordered
+            .iter()
+            .position(|id| id == "storage.gcs")
+            .expect("storage.gcs should be present in ordered list");
+
+        assert_eq!(
+            (mask >> pack_idx) & 1,
+            1,
+            "candidate mask should include storage.gcs when whitespace varies"
         );
     }
 
