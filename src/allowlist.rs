@@ -327,10 +327,6 @@ pub struct AllowlistHit<'a> {
 /// For date-only formats like "2026-01-08", the entry is valid through the entire day
 /// (expires at 23:59:59 UTC on that date).
 ///
-/// # Panics
-///
-/// This function will not panic in practice. The `.expect()` on `and_hms_opt(23, 59, 59)`
-/// is safe because 23:59:59 is always a valid time.
 #[must_use]
 pub fn is_expired(entry: &AllowEntry) -> bool {
     let Some(ref expires_at) = entry.expires_at else {
@@ -351,8 +347,10 @@ pub fn is_expired(entry: &AllowEntry) -> bool {
     // Try date only (YYYY-MM-DD) - treat as end of day UTC (23:59:59)
     // This matches intuitive semantics: "expires 2026-01-08" means valid through that day
     if let Ok(date) = chrono::NaiveDate::parse_from_str(expires_at, "%Y-%m-%d") {
-        let end_of_day = date.and_hms_opt(23, 59, 59).expect("valid time").and_utc();
-        return end_of_day < chrono::Utc::now();
+        if let Some(end_of_day) = date.and_hms_opt(23, 59, 59) {
+            return end_of_day.and_utc() < chrono::Utc::now();
+        }
+        return true;
     }
 
     // Invalid timestamp format - treat as expired (fail closed) for safety.

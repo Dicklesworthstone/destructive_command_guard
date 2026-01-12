@@ -3200,9 +3200,8 @@ fn doctor(fix: bool, format: DoctorFormat) {
             );
             println!("  → Use ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ");
         }
-    } else if config.policy().default_mode.is_some() {
+    } else if let Some(mode) = config.policy().default_mode {
         // No observe_until but default_mode is set (permanent warn/log mode)
-        let mode = config.policy().default_mode.unwrap();
         if matches!(
             mode,
             crate::config::PolicyMode::Warn | crate::config::PolicyMode::Log
@@ -4962,7 +4961,7 @@ fn allowlist_remove(
         return Ok(());
     }
 
-    let mut doc = load_or_create_allowlist_doc(&path).unwrap();
+    let mut doc = load_or_create_allowlist_doc(&path)?;
 
     let removed = remove_rule_entry(&mut doc, &parsed_rule);
     if !removed {
@@ -4975,7 +4974,7 @@ fn allowlist_remove(
         return Ok(());
     }
 
-    write_allowlist(&path, &doc).unwrap();
+    write_allowlist(&path, &doc)?;
 
     println!(
         "{} Removed {} from {} allowlist",

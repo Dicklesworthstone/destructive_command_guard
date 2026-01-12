@@ -1931,8 +1931,10 @@ fn parse_timestamp_as_utc(value: &str) -> Option<DateTime<Utc>> {
 
     // Date only (YYYY-MM-DD) - treat as end of day UTC (23:59:59)
     if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-        let end_of_day = date.and_hms_opt(23, 59, 59).expect("valid time").and_utc();
-        return Some(end_of_day);
+        if let Some(end_of_day) = date.and_hms_opt(23, 59, 59) {
+            return Some(end_of_day.and_utc());
+        }
+        return None;
     }
 
     None

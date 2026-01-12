@@ -1219,6 +1219,12 @@ fn format_timestamp(timestamp: DateTime<Utc>) -> String {
 /// Type alias for HMAC-SHA256.
 type HmacSha256 = Hmac<Sha256>;
 
+fn sha256_digest(input: &str) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    hasher.finalize().to_vec()
+}
+
 /// Compute full hash for a pending exception.
 ///
 /// If `DCG_ALLOW_ONCE_SECRET` is set, uses HMAC-SHA256 for tamper resistance.
@@ -1241,18 +1247,16 @@ fn compute_full_hash_with_secret(
     let input = format!("{timestamp} | {cwd} | {command_raw}");
 
     let digest: Vec<u8> = secret.map_or_else(
-        || {
-            // Plain SHA256 for backwards compatibility
-            let mut hasher = Sha256::new();
-            hasher.update(input.as_bytes());
-            hasher.finalize().to_vec()
-        },
+        || sha256_digest(&input),
         |secret| {
             // HMAC-SHA256 with secret for tamper resistance
-            let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-                .expect("HMAC can take key of any size");
-            mac.update(input.as_bytes());
-            mac.finalize().into_bytes().to_vec()
+            HmacSha256::new_from_slice(secret.as_bytes()).map_or_else(
+                |_| sha256_digest(&input),
+                |mut mac| {
+                    mac.update(input.as_bytes());
+                    mac.finalize().into_bytes().to_vec()
+                },
+            )
         },
     );
 

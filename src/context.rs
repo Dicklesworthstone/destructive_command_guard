@@ -238,10 +238,6 @@ impl ContextClassifier {
 
     /// Returns a `CommandSpans` structure containing classified spans.
     /// Each byte in the command will belong to exactly one span.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal stack is empty, which should be impossible given the initial state.
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn classify(&self, command: &str) -> CommandSpans {
