@@ -566,6 +566,9 @@ fn parse_env_assignments(bytes: &[u8], mut idx: usize) -> usize {
         let has_equals = word_bytes.iter().position(|b| *b == b'=');
 
         if has_equals.is_some_and(|pos| pos > 0) {
+            if token_has_inline_code(word_bytes) {
+                return start;
+            }
             idx = end;
             continue;
         }
@@ -574,6 +577,24 @@ fn parse_env_assignments(bytes: &[u8], mut idx: usize) -> usize {
     }
 
     idx
+}
+
+fn token_has_inline_code(token: &[u8]) -> bool {
+    let mut i = 0;
+    while i < token.len() {
+        match token[i] {
+            b'`' => return true,
+            b'$' if i + 1 < token.len() && token[i + 1] == b'(' => return true,
+            b'\\' => {
+                i = (i + 2).min(token.len());
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    false
 }
 fn unquote_env_s_arg(arg: &str) -> String {
     let bytes = arg.as_bytes();
@@ -1431,6 +1452,15 @@ mod tests {
     fn test_env_with_quoted_assignment() {
         let result = strip_wrapper_prefixes("env FOO=\"a b\" git reset --hard");
         assert_eq!(result.normalized, "git reset --hard");
+    }
+
+    #[test]
+    fn test_env_assignment_with_backticks_preserved() {
+        let result = strip_wrapper_prefixes("env FOO=`rm -rf /` git status");
+        assert!(
+            result.normalized.contains("rm -rf /"),
+            "assignment with inline code should remain visible"
+        );
     }
 
     #[test]
