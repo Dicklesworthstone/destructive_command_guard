@@ -332,7 +332,7 @@ fn memory_full_pipeline() {
         sample_hook_input("cargo build"),
     ];
 
-    assert_no_leak("full_pipeline", 500, 2 * 1024 * 1024, || {
+    let run_inputs = || {
         for json in &inputs {
             if let Ok(input) = serde_json::from_str::<dcg::HookInput>(json) {
                 if let Some(cmd) = dcg::hook::extract_command(&input) {
@@ -346,6 +346,13 @@ fn memory_full_pipeline() {
                 }
             }
         }
+    };
+
+    // Warm up once to avoid counting one-time regex compilation in leak checks.
+    run_inputs();
+
+    assert_no_leak("full_pipeline", 500, 2 * 1024 * 1024, || {
+        run_inputs();
     });
 }
 
