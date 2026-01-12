@@ -621,8 +621,13 @@ else:
 with open(settings_file, 'w') as f:
     json.dump(settings, f, indent=2)
 PYEOF
-      ok "Configured Claude Code (backup: $backup)"
-      AUTO_CONFIGURED=1
+      if [ $? -eq 0 ]; then
+        ok "Configured Claude Code (backup: $backup)"
+        AUTO_CONFIGURED=1
+      else
+        warn "Failed to configure Claude Code; restoring backup"
+        mv "$backup" "$settings_file" 2>/dev/null || true
+      fi
     else
       warn "Python3 not available; showing manual instructions"
       return 1
@@ -694,10 +699,10 @@ if 'BeforeTool' not in settings['hooks']:
 
 dcg_hook = {"name": "dcg", "type": "command", "command": dcg_path, "timeout": 5000}
 
-# Check if shell_command matcher exists
+# Check if run_shell_command matcher exists
 shell_matcher = None
 for entry in settings['hooks']['BeforeTool']:
-    if entry.get('matcher') == 'shell_command':
+    if entry.get('matcher') == 'run_shell_command':
         shell_matcher = entry
         break
 
@@ -709,29 +714,34 @@ if shell_matcher:
         shell_matcher['hooks'].insert(0, dcg_hook)
 else:
     settings['hooks']['BeforeTool'].append({
-        "matcher": "shell_command",
+        "matcher": "run_shell_command",
         "hooks": [dcg_hook]
     })
 
 with open(settings_file, 'w') as f:
     json.dump(settings, f, indent=2)
 PYEOF
-      ok "Configured Gemini CLI (backup: $backup)"
-      AUTO_CONFIGURED=1
+      if [ $? -eq 0 ]; then
+        ok "Configured Gemini CLI (backup: $backup)"
+        AUTO_CONFIGURED=1
+      else
+        warn "Failed to configure Gemini CLI; restoring backup"
+        mv "$backup" "$settings_file" 2>/dev/null || true
+      fi
     else
       warn "Python3 not available; showing manual instructions"
       return 1
     fi
   else
     # Create new settings file with dcg hook
+    # Note: directory must exist (we checked earlier), so just create the file
     info "Creating Gemini CLI settings with dcg hook..."
-    mkdir -p "$settings_dir"
     cat > "$settings_file" <<EOFSET
 {
   "hooks": {
     "BeforeTool": [
       {
-        "matcher": "shell_command",
+        "matcher": "run_shell_command",
         "hooks": [
           {
             "name": "dcg",

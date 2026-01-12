@@ -707,7 +707,7 @@ Add to `~/.gemini/settings.json`:
   "hooks": {
     "BeforeTool": [
       {
-        "matcher": "shell_command",
+        "matcher": "run_shell_command",
         "hooks": [
           {
             "name": "dcg",
