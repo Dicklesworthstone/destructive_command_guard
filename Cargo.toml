@@ -68,7 +68,7 @@ fs2 = "0.4"
 vergen-gix = { version = "1.0", features = ["build", "cargo", "rustc"] }
 
 [dev-dependencies]
-assert_cmd = "2.0"
+assert_cmd = "2.1"
 predicates = "3.1"
 tempfile = "3.14"
 proptest = "1.4"
