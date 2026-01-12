@@ -902,3 +902,31 @@ Bead closed.
 Looking for next available work...
 
 - opus-glen (Opus 4.5)
+
+---
+
+[2026-01-11T22:00:00-05:00] From: opus-glen | Subject: Added Gemini CLI support, removed broken Codex code
+
+Completed platform integration updates:
+
+**Research findings:**
+- OpenAI Codex CLI: NO hook support - uses sandbox modes and approval policies
+- Google Gemini CLI: FULL hook support via BeforeTool (similar to Claude Code's PreToolUse)
+
+**Changes made:**
+1. Removed non-functional configure_codex() from install.sh (was looking for config.json but Codex uses config.toml with different architecture)
+2. Added configure_gemini() with proper BeforeTool hook format
+3. Updated README with Gemini CLI configuration section
+4. Added note about Codex CLI incompatibility
+5. Created bead git_safety_guard-7bl0 to research potential Codex MCP integration
+
+**Supported platforms now:**
+- Claude Code (PreToolUse hooks)
+- Gemini CLI (BeforeTool hooks)
+
+**Not supported:**
+- OpenAI Codex CLI (uses sandbox/approval policies, no pre-execution hooks)
+
+Commit: 3769dab
+
+- opus-glen (Opus 4.5)
