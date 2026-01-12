@@ -5,7 +5,7 @@
 
 use destructive_command_guard::config::ConfidenceConfig;
 use destructive_command_guard::evaluator::{
-    apply_confidence_scoring, EvaluationResult, MatchSource, MatchSpan, PatternMatch,
+    EvaluationResult, MatchSource, MatchSpan, PatternMatch, apply_confidence_scoring,
 };
 use destructive_command_guard::packs::{DecisionMode, Severity};
 
@@ -307,10 +307,7 @@ fn test_no_match_span_returns_conservative() {
         DecisionMode::Deny,
         "No match span should be conservative (keep Deny)"
     );
-    assert!(
-        confidence_result.score.is_none(),
-        "No span means no score"
-    );
+    assert!(confidence_result.score.is_none(), "No span means no score");
     assert!(!confidence_result.downgraded);
 }
 

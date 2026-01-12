@@ -411,6 +411,9 @@ mod tests {
         let command = "écho café | rm -rf /";
         // "écho café | " has multi-byte chars, "rm" starts somewhere in the middle
         let result = has_execution_operators_nearby(command, 14, 22);
-        assert!(result, "Should detect pipe operator even with unicode prefix");
+        assert!(
+            result,
+            "Should detect pipe operator even with unicode prefix"
+        );
     }
 }
