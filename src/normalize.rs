@@ -549,28 +549,30 @@ fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult
 
 fn parse_env_assignments(bytes: &[u8], mut idx: usize) -> usize {
     while idx < bytes.len() {
-        let start = idx;
-        let mut has_equals = false;
-
-        // Check if this looks like an assignment (NAME=VALUE)
-        while idx < bytes.len() && !bytes[idx].is_ascii_whitespace() {
-            if bytes[idx] == b'=' {
-                has_equals = true;
-            }
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
             idx += 1;
         }
+        if idx >= bytes.len() {
+            break;
+        }
 
-        if has_equals && start < idx {
-            // It's an assignment, skip it
-            // Skip whitespace after assignment
-            while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
-                idx += 1;
-            }
+        let start = idx;
+        let end = consume_word_token(bytes, idx, bytes.len());
+        if start >= end {
+            return start;
+        }
+
+        let word_bytes = &bytes[start..end];
+        let has_equals = word_bytes.iter().position(|b| *b == b'=');
+
+        if has_equals.is_some_and(|pos| pos > 0) {
+            idx = end;
             continue;
         }
-        // Not an assignment - this is the command
+
         return start;
     }
+
     idx
 }
 fn unquote_env_s_arg(arg: &str) -> String {
@@ -1422,6 +1424,12 @@ mod tests {
     #[test]
     fn test_env_with_assignment() {
         let result = strip_wrapper_prefixes("env GIT_DIR=.git git reset --hard");
+        assert_eq!(result.normalized, "git reset --hard");
+    }
+
+    #[test]
+    fn test_env_with_quoted_assignment() {
+        let result = strip_wrapper_prefixes("env FOO=\"a b\" git reset --hard");
         assert_eq!(result.normalized, "git reset --hard");
     }
 
