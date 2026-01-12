@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "destructive_command_guard"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "ast-grep-core",
  "ast-grep-language",

@@ -1,6 +1,6 @@
 [package]
 name = "destructive_command_guard"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 resolver = "2"
 authors = [
