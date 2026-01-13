@@ -924,6 +924,10 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
     let mut search_pattern_masked = false;
     let mut wrapper: WrapperState = WrapperState::None;
     let mut command_query_mode = false;
+    let mut search_cmd_override: Option<&str> = None;
+    let mut git_subcommand: Option<&str> = None;
+    let mut git_waiting_for_value = false;
+    let mut git_options_ended = false;
 
     for (i, token) in tokens.iter().enumerate() {
         if token.kind == SanitizeTokenKind::Separator {
@@ -934,6 +938,10 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
             search_pattern_masked = false;
             wrapper = WrapperState::None;
             command_query_mode = false;
+            search_cmd_override = None;
+            git_subcommand = None;
+            git_waiting_for_value = false;
+            git_options_ended = false;
             continue;
         }
 
@@ -986,6 +994,10 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
 
             segment_cmd = Some(token_text);
             segment_cmd_is_all_args_data = SAFE_STRING_REGISTRY.is_all_args_data(token_text);
+            search_cmd_override = None;
+            git_subcommand = None;
+            git_waiting_for_value = false;
+            git_options_ended = false;
 
             // If this command feeds into a pipe, its output is likely code (e.g. echo ... | sh).
             // Do NOT treat arguments as data in this case.
@@ -1004,6 +1016,42 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
             // but fail open for safety.
             continue;
         };
+
+        let mut is_git_subcommand_token = false;
+        if cmd == "git" && git_subcommand.is_none() {
+            if git_waiting_for_value {
+                git_waiting_for_value = false;
+            } else if token_text == "--" {
+                git_options_ended = true;
+            } else if !git_options_ended && token_text.starts_with('-') && token_text != "-" {
+                let takes_value = matches!(
+                    token_text,
+                    "-C" | "-c"
+                        | "--git-dir"
+                        | "--work-tree"
+                        | "--namespace"
+                        | "--exec-path"
+                        | "--pager"
+                        | "--config-env"
+                ) || token_text.starts_with("-C")
+                    || token_text.starts_with("-c")
+                    || token_text.starts_with("--git-dir=")
+                    || token_text.starts_with("--work-tree=")
+                    || token_text.starts_with("--namespace=")
+                    || token_text.starts_with("--exec-path=")
+                    || token_text.starts_with("--pager=")
+                    || token_text.starts_with("--config-env=");
+                if takes_value && !token_text.contains('=') {
+                    git_waiting_for_value = true;
+                }
+            } else {
+                git_subcommand = Some(token_text);
+                if token_text == "grep" {
+                    search_cmd_override = Some("grep");
+                    is_git_subcommand_token = true;
+                }
+            }
+        }
 
         if segment_cmd_is_all_args_data {
             // For commands like echo/printf, treat all args as data, but never strip inline code.
@@ -1066,7 +1114,11 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
 
         // Search tools: treat the first positional argument as pattern (when not already supplied
         // via -e/--regexp/etc).
-        if is_search_command(cmd) {
+        let search_cmd = search_cmd_override.unwrap_or(cmd);
+        if is_search_command(search_cmd) {
+            if is_git_subcommand_token {
+                continue;
+            }
             if token_text == "--" {
                 options_ended = true;
                 continue;
@@ -2610,6 +2662,31 @@ mod tests {
         assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
         assert!(!sanitized.as_ref().contains("rm -rf"));
         assert!(sanitized.as_ref().contains("rg -n"));
+    }
+
+    #[test]
+    fn sanitize_strips_git_grep_positional_pattern() {
+        let cmd = r#"git grep "rm -rf" src/main.rs"#;
+        let sanitized = sanitize_for_pattern_matching(cmd);
+
+        assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+        assert!(!sanitized.as_ref().contains("rm -rf"));
+        assert!(sanitized.as_ref().contains("git grep"));
+    }
+
+    #[test]
+    fn sanitize_handles_git_grep_with_global_options() {
+        let cmd = r#"git -C /tmp -c color.ui=auto grep -e "rm -rf" src/main.rs"#;
+        let sanitized = sanitize_for_pattern_matching(cmd);
+
+        assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+        assert!(!sanitized.as_ref().contains("rm -rf"));
+        assert!(
+            sanitized
+                .as_ref()
+                .contains("git -C /tmp -c color.ui=auto grep -e")
+        );
+        assert!(sanitized.as_ref().contains("src/main.rs"));
     }
 
     #[test]
