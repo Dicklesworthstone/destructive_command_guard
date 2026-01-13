@@ -197,7 +197,7 @@ log_pass() {
     record_test_result "pass" "$desc" ""
 
     if ! $JSON_OUTPUT; then
-        if $VERBOSE; then
+        if $VERBOSE && ! $JSON_OUTPUT; then
             local duration_ms="${TEST_TIMES[-1]}"
             echo -e "${GREEN}✓${NC} $desc ${CYAN}(${duration_ms}ms)${NC}"
         else
@@ -231,7 +231,7 @@ log_fail() {
 
     if ! $JSON_OUTPUT; then
         local duration_ms="${TEST_TIMES[-1]}"
-        if $VERBOSE; then
+        if $VERBOSE && ! $JSON_OUTPUT; then
             echo -e "${RED}✗${NC} $desc ${CYAN}(${duration_ms}ms)${NC}"
             echo -e "  ${YELLOW}Expected:${NC} $expected"
             echo -e "  ${YELLOW}Actual:${NC} $actual"
@@ -316,7 +316,7 @@ test_command() {
     local desc="$3"
 
     log_test_start "$desc"
-    if $VERBOSE; then
+    if $VERBOSE && ! $JSON_OUTPUT; then
         echo -e "  ${CYAN}Command:${NC} $(truncate_cmd "$cmd")"
     fi
 
@@ -341,7 +341,7 @@ test_command() {
         if echo "$result" | grep -q '"permissionDecision"'; then
             if echo "$result" | grep -q '"deny"'; then
                 log_pass "BLOCKED: $desc"
-                if $VERBOSE; then
+                if $VERBOSE && ! $JSON_OUTPUT; then
                     local decision_reason
                     decision_reason=$(echo "$result" | grep -o '"permissionDecisionReason":"[^"]*"' | head -1 | cut -d'"' -f4)
                     # Extract the human reason line from the hook message.
@@ -381,7 +381,7 @@ test_non_bash_tool() {
     local desc="$2"
 
     log_test_start "$desc"
-    if $VERBOSE; then
+    if $VERBOSE && ! $JSON_OUTPUT; then
         echo -e "  ${CYAN}Tool:${NC} $tool"
     fi
 
@@ -442,7 +442,7 @@ test_command_with_packs() {
     local desc="$4"
 
     log_test_start "$desc"
-    if $VERBOSE; then
+    if $VERBOSE && ! $JSON_OUTPUT; then
         echo -e "  ${CYAN}Packs:${NC} $packs"
         echo -e "  ${CYAN}Command:${NC} $(truncate_cmd "$cmd")"
     fi
@@ -468,7 +468,7 @@ test_command_with_packs() {
         if echo "$result" | grep -q '"permissionDecision"'; then
             if echo "$result" | grep -q '"deny"'; then
                 log_pass "BLOCKED (pack=$packs): $desc"
-                if $VERBOSE; then
+                if $VERBOSE && ! $JSON_OUTPUT; then
                     echo -e "  ${CYAN}Reason:${NC} $(echo "$result" | grep -o '"permissionDecisionReason":"[^"]*"' | head -1 | cut -d'"' -f4 | head -c 80)..."
                 fi
                 return 0
@@ -496,7 +496,7 @@ test_default_severity_behavior() {
     local desc="$3"
 
     log_test_start "$desc"
-    if $VERBOSE; then
+    if $VERBOSE && ! $JSON_OUTPUT; then
         echo -e "  ${CYAN}Command:${NC} $(truncate_cmd "$cmd")"
         echo -e "  ${CYAN}Expected:${NC} $expected (default severity-based)"
     fi
@@ -545,7 +545,7 @@ test_command_with_policy() {
     local desc="$4"
 
     log_test_start "$desc"
-    if $VERBOSE; then
+    if $VERBOSE && ! $JSON_OUTPUT; then
         echo -e "  ${CYAN}Policy default:${NC} $policy_mode"
         echo -e "  ${CYAN}Command:${NC} $(truncate_cmd "$cmd")"
     fi
@@ -1264,7 +1264,7 @@ test_command_with_allowlist() {
     local desc="$4"
 
     log_test_start "$desc"
-    if $VERBOSE; then
+    if $VERBOSE && ! $JSON_OUTPUT; then
         echo -e "  ${CYAN}Command:${NC} $(truncate_cmd "$cmd")"
         echo -e "  ${CYAN}Allowlist:${NC} $(echo "$allowlist_content" | tr '\n' ' ' | head -c 80)..."
     fi
@@ -1418,7 +1418,7 @@ test_command_with_allowlist_and_env() {
     local desc="$5"
 
     log_test_start "$desc"
-    if $VERBOSE; then
+    if $VERBOSE && ! $JSON_OUTPUT; then
         echo -e "  ${CYAN}Command:${NC} $(truncate_cmd "$cmd")"
         echo -e "  ${CYAN}Env:${NC} $env_vars"
     fi
@@ -1473,7 +1473,7 @@ test_command_with_layered_allowlists() {
     local desc="$8"
 
     log_test_start "$desc"
-    if $VERBOSE; then
+    if $VERBOSE && ! $JSON_OUTPUT; then
         echo -e "  ${CYAN}Command:${NC} $(truncate_cmd "$cmd")"
         echo -e "  ${CYAN}Expected layer:${NC} ${expected_layer:-<none>}"
         if [[ -n "$env_vars" ]]; then

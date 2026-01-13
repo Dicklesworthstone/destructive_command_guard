@@ -1227,7 +1227,9 @@ impl Config {
     /// 6. Compiled defaults
     #[must_use]
     pub fn load() -> Self {
-        let mut config = Self::generate_default();
+        // Start with truly empty defaults - packs must be explicitly enabled.
+        // generate_default() is for sample configs shown to users, not runtime defaults.
+        let mut config = Self::default();
         let cwd = env::current_dir().ok();
 
         // Optional explicit config path override (highest-priority file config).

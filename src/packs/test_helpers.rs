@@ -30,7 +30,9 @@ use std::time::{Duration, Instant};
 
 /// Maximum time allowed for a single pattern match operation.
 /// Pattern matching should be sub-millisecond for typical commands.
-pub const PATTERN_MATCH_TIMEOUT: Duration = Duration::from_millis(200);
+/// We use 500ms to accommodate coverage instrumentation overhead while
+/// still catching catastrophic regex backtracking (which would be 10s+).
+pub const PATTERN_MATCH_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Assert that a pack blocks a command with a reason containing the expected substring.
 ///
