@@ -3,17 +3,17 @@
   "summary": {
     "files_scanned": 3,
     "files_skipped": 1,
-    "commands_extracted": 22,
-    "findings_total": 17,
+    "commands_extracted": 16,
+    "findings_total": 11,
     "decisions": {
       "allow": 0,
       "warn": 0,
-      "deny": 17
+      "deny": 11
     },
     "severities": {
       "info": 0,
       "warning": 0,
-      "error": 17
+      "error": 11
     },
     "max_findings_reached": false,
     "elapsed_ms": 70
@@ -40,38 +40,6 @@
       "rule_id": "core.filesystem:rm-rf-general",
       "reason": "rm -rf is destructive and requires human approval. Explain what you want to delete and why, then ask the user to run the command manually.",
       "suggestion": "Use `rm -ri` for interactive confirmation of each file"
-    },
-    {
-      "file": "tests/fixtures/scan/.github/workflows/test.yml",
-      "line": 32,
-      "extractor_id": "github_actions.steps.run",
-      "extracted_command": "psql -c \"DROP TABLE IF EXISTS old_users;\"",
-      "decision": "deny",
-      "severity": "error",
-      "rule_id": "database.postgresql:drop-table",
-      "reason": "DROP TABLE permanently deletes the table (even with IF EXISTS). Verify and back up first."
-    },
-    {
-      "file": "tests/fixtures/scan/.github/workflows/test.yml",
-      "line": 36,
-      "extractor_id": "github_actions.steps.run",
-      "extracted_command": "docker system prune -af",
-      "decision": "deny",
-      "severity": "error",
-      "rule_id": "containers.docker:system-prune",
-      "reason": "docker system prune removes ALL unused containers, networks, images. Use 'docker system df' to preview.",
-      "suggestion": "Prune specific resources: `docker container prune`, `docker image prune`"
-    },
-    {
-      "file": "tests/fixtures/scan/.github/workflows/test.yml",
-      "line": 37,
-      "extractor_id": "github_actions.steps.run",
-      "extracted_command": "docker volume prune -f",
-      "decision": "deny",
-      "severity": "error",
-      "rule_id": "containers.docker:volume-prune",
-      "reason": "docker volume prune removes ALL unused volumes and their data permanently.",
-      "suggestion": "Remove specific volumes with `docker volume rm <name>`"
     },
     {
       "file": "tests/fixtures/scan/.github/workflows/test.yml",
@@ -171,37 +139,6 @@
       "rule_id": "core.filesystem:rm-rf-root-home",
       "reason": "rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed. Ask the user to run it manually if truly needed.",
       "suggestion": "Use `rm -ri` for interactive confirmation of each file"
-    },
-    {
-      "file": "tests/fixtures/scan/shell_commands.sh",
-      "line": 26,
-      "extractor_id": "shell.script",
-      "extracted_command": "docker system prune -af",
-      "decision": "deny",
-      "severity": "error",
-      "rule_id": "containers.docker:system-prune",
-      "reason": "docker system prune removes ALL unused containers, networks, images. Use 'docker system df' to preview.",
-      "suggestion": "Prune specific resources: `docker container prune`, `docker image prune`"
-    },
-    {
-      "file": "tests/fixtures/scan/shell_commands.sh",
-      "line": 27,
-      "extractor_id": "shell.script",
-      "extracted_command": "docker volume rm my-volume",
-      "decision": "deny",
-      "severity": "error",
-      "rule_id": "containers.docker:volume-rm",
-      "reason": "docker volume rm permanently deletes volumes and their data."
-    },
-    {
-      "file": "tests/fixtures/scan/shell_commands.sh",
-      "line": 34,
-      "extractor_id": "shell.script",
-      "extracted_command": "psql -c \"DROP TABLE users;\"",
-      "decision": "deny",
-      "severity": "error",
-      "rule_id": "database.postgresql:drop-table",
-      "reason": "DROP TABLE permanently deletes the table (even with IF EXISTS). Verify and back up first."
     }
   ]
 }

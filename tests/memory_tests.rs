@@ -31,6 +31,15 @@
 use destructive_command_guard as dcg;
 use std::hint::black_box;
 
+/// Check if we're running under coverage instrumentation.
+///
+/// Coverage tools (cargo-llvm-cov) add significant memory overhead that makes
+/// memory leak detection unreliable. Returns true if CARGO_LLVM_COV or
+/// LLVM_PROFILE_FILE environment variables are set.
+fn is_coverage_build() -> bool {
+    std::env::var("CARGO_LLVM_COV").is_ok() || std::env::var("LLVM_PROFILE_FILE").is_ok()
+}
+
 /// Get current memory usage via /proc/self/statm (Linux)
 /// Returns resident set size in bytes
 fn get_memory_usage() -> Option<usize> {
@@ -80,6 +89,16 @@ pub fn assert_no_leak<F>(name: &str, iterations: usize, max_growth_bytes: usize,
 where
     F: FnMut(),
 {
+    // Skip memory leak tests under coverage instrumentation.
+    // Coverage adds significant memory overhead that makes leak detection unreliable.
+    if is_coverage_build() {
+        println!(
+            "memory_{}: SKIPPED (coverage instrumentation adds overhead)",
+            name
+        );
+        return;
+    }
+
     println!("memory_{}: warming up (10 iterations)...", name);
     for _ in 0..10 {
         f();
@@ -362,6 +381,11 @@ fn memory_full_pipeline() {
 fn memory_leak_self_test() {
     if get_memory_usage().is_none() {
         println!("memory_leak_self_test: SKIPPED (memory tracking not available)");
+        return;
+    }
+
+    if is_coverage_build() {
+        println!("memory_leak_self_test: SKIPPED (coverage instrumentation adds overhead)");
         return;
     }
 
