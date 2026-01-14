@@ -602,6 +602,9 @@ fn test_telemetry_writer_async_performance() {
     );
 
     writer.flush_sync();
+    // Drop writer to ensure all writes are committed and WAL is checkpointed
+    // before opening a new reader connection
+    drop(writer);
     let reader = TelemetryDb::open(Some(db_path)).expect("open reader");
     assert_eq!(reader.count_commands().unwrap(), 1000);
 }
