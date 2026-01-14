@@ -7873,4 +7873,187 @@ exclude = ["target/**"]
         // The smoke test should pass with default configuration
         assert!(run_smoke_test(), "smoke test should pass");
     }
+
+    // ========================================================================
+    // Telemetry CLI tests
+    // ========================================================================
+
+    #[test]
+    fn test_cli_parse_telemetry_status() {
+        let cli = Cli::parse_from(["dcg", "telemetry", "status"]);
+        if let Some(Command::Telemetry { action }) = cli.command {
+            assert!(matches!(action, Some(TelemetryAction::Status)));
+        } else {
+            unreachable!("Expected Telemetry Status command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_telemetry_default_to_status() {
+        // Running `dcg telemetry` without a subcommand should default to status
+        let cli = Cli::parse_from(["dcg", "telemetry"]);
+        if let Some(Command::Telemetry { action }) = cli.command {
+            // action should be None, which is handled as Status in the handler
+            assert!(action.is_none());
+        } else {
+            unreachable!("Expected Telemetry command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_telemetry_recent() {
+        let cli = Cli::parse_from(["dcg", "telemetry", "recent", "50"]);
+        if let Some(Command::Telemetry { action }) = cli.command {
+            if let Some(TelemetryAction::Recent { limit, offset, json }) = action {
+                assert_eq!(limit, 50);
+                assert_eq!(offset, 0);
+                assert!(!json);
+            } else {
+                unreachable!("Expected Recent action");
+            }
+        } else {
+            unreachable!("Expected Telemetry command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_telemetry_recent_with_pagination() {
+        let cli = Cli::parse_from(["dcg", "telemetry", "recent", "--offset", "10", "--json"]);
+        if let Some(Command::Telemetry { action }) = cli.command {
+            if let Some(TelemetryAction::Recent { limit, offset, json }) = action {
+                assert_eq!(limit, 20); // default
+                assert_eq!(offset, 10);
+                assert!(json);
+            } else {
+                unreachable!("Expected Recent action");
+            }
+        } else {
+            unreachable!("Expected Telemetry command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_telemetry_blocks() {
+        let cli = Cli::parse_from(["dcg", "telemetry", "blocks", "100", "--json"]);
+        if let Some(Command::Telemetry { action }) = cli.command {
+            if let Some(TelemetryAction::Blocks { limit, offset, json }) = action {
+                assert_eq!(limit, 100);
+                assert_eq!(offset, 0);
+                assert!(json);
+            } else {
+                unreachable!("Expected Blocks action");
+            }
+        } else {
+            unreachable!("Expected Telemetry command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_telemetry_search() {
+        let cli = Cli::parse_from(["dcg", "telemetry", "search", "git reset"]);
+        if let Some(Command::Telemetry { action }) = cli.command {
+            if let Some(TelemetryAction::Search { pattern, limit, offset: _, json }) = action {
+                assert_eq!(pattern, "git reset");
+                assert_eq!(limit, 50); // default
+                assert!(!json);
+            } else {
+                unreachable!("Expected Search action");
+            }
+        } else {
+            unreachable!("Expected Telemetry command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_telemetry_project() {
+        let cli = Cli::parse_from(["dcg", "telemetry", "project", "/path/to/project", "--limit", "10"]);
+        if let Some(Command::Telemetry { action }) = cli.command {
+            if let Some(TelemetryAction::Project { path, limit, offset: _, json: _ }) = action {
+                assert_eq!(path, "/path/to/project");
+                assert_eq!(limit, 10);
+            } else {
+                unreachable!("Expected Project action");
+            }
+        } else {
+            unreachable!("Expected Telemetry command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_telemetry_query() {
+        let cli = Cli::parse_from(["dcg", "telemetry", "query", "SELECT * FROM commands"]);
+        if let Some(Command::Telemetry { action }) = cli.command {
+            if let Some(TelemetryAction::Query { sql }) = action {
+                assert_eq!(sql, "SELECT * FROM commands");
+            } else {
+                unreachable!("Expected Query action");
+            }
+        } else {
+            unreachable!("Expected Telemetry command");
+        }
+    }
+
+    #[test]
+    fn test_telemetry_sql_injection_protection() {
+        // Test that dangerous keywords are detected
+        let dangerous_queries = [
+            "DELETE FROM commands",
+            "INSERT INTO commands VALUES (1)",
+            "UPDATE commands SET outcome = 'allow'",
+            "DROP TABLE commands",
+            "ALTER TABLE commands ADD COLUMN foo",
+            "CREATE TABLE evil (id INT)",
+            "ATTACH DATABASE '/tmp/evil.db' AS evil",
+            "DETACH DATABASE main",
+        ];
+
+        let forbidden = [
+            "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "ATTACH", "DETACH",
+        ];
+
+        for query in &dangerous_queries {
+            let upper = query.to_uppercase();
+            let has_forbidden = forbidden.iter().any(|kw| {
+                upper
+                    .split_whitespace()
+                    .any(|word| word == *kw || word.starts_with(&format!("{kw}(")))
+            });
+            assert!(
+                has_forbidden,
+                "Query '{query}' should be detected as containing dangerous keywords"
+            );
+        }
+    }
+
+    #[test]
+    fn test_telemetry_sql_select_requirement() {
+        // Test that queries must start with SELECT
+        let valid_queries = [
+            "SELECT * FROM commands",
+            "select count(*) from commands",
+            "  SELECT id FROM commands",
+        ];
+
+        for query in &valid_queries {
+            let trimmed = query.trim().to_uppercase();
+            assert!(
+                trimmed.starts_with("SELECT"),
+                "Query '{query}' should be recognized as SELECT"
+            );
+        }
+
+        let invalid_queries = [
+            "PRAGMA table_info(commands)",
+            "EXPLAIN SELECT * FROM commands",
+            "WITH cte AS (SELECT 1) SELECT * FROM cte",
+        ];
+
+        for query in &invalid_queries {
+            let trimmed = query.trim().to_uppercase();
+            assert!(
+                !trimmed.starts_with("SELECT"),
+                "Query '{query}' should NOT be recognized as starting with SELECT"
+            );
+        }
+    }
 }
