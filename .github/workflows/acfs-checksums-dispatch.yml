@@ -14,17 +14,10 @@ jobs:
   dispatch:
     runs-on: ubuntu-latest
     steps:
-      - name: Ensure dispatch token
-        if: ${{ secrets.ACFS_REPO_DISPATCH_TOKEN == '' }}
-        run: |
-          echo "Missing secret ACFS_REPO_DISPATCH_TOKEN. Add a PAT with repo access for Dicklesworthstone/agentic_coding_flywheel_setup." >&2
-          exit 1
       - name: Dispatch to ACFS
-        if: ${{ secrets.ACFS_REPO_DISPATCH_TOKEN != '' }}
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.ACFS_REPO_DISPATCH_TOKEN }}
           repository: Dicklesworthstone/agentic_coding_flywheel_setup
           event-type: upstream-changed
-          client-payload: |
-            {"repo":"${{ github.repository }}","ref":"${{ github.ref }}","sha":"${{ github.sha }}","event":"${{ github.event_name }}"}
+          client-payload: '{"repo":"${{ github.repository }}","ref":"${{ github.ref }}","sha":"${{ github.sha }}","event":"${{ github.event_name }}"}'
