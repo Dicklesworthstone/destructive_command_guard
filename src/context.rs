@@ -1986,8 +1986,6 @@ fn consume_backticks(command: &str, start: usize) -> usize {
     i
 }
 
-#[must_use]
-
 #[inline]
 #[must_use]
 fn is_inline_code_flag(word: &str) -> bool {
@@ -2003,12 +2001,6 @@ fn is_inline_code_flag(word: &str) -> bool {
         .skip(1)
         .any(|b| matches!(b.to_ascii_lowercase(), b'c' | b'e' | b'r'))
 }
-
-#[inline]
-#[must_use]
-
-#[inline]
-#[must_use]
 
 #[inline]
 #[must_use]
