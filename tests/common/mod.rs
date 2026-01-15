@@ -1,6 +1,6 @@
-//! Common test utilities for DCG telemetry E2E tests.
+//! Common test utilities for DCG history E2E tests.
 //!
-//! This module provides shared infrastructure for testing telemetry functionality:
+//! This module provides shared infrastructure for testing history functionality:
 //! - Isolated test databases via `TestDb`
 //! - Test fixtures for realistic command data
 //! - Logging utilities for debugging test failures

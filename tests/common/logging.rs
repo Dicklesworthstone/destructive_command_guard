@@ -1,4 +1,4 @@
-//! Test logging utilities for telemetry E2E tests.
+//! Test logging utilities for history E2E tests.
 //!
 //! Provides structured logging setup for debugging test failures.
 //! Logs are captured by the test harness and only shown on failure.

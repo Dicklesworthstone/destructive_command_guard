@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Telemetry E2E Test Runner
+# History E2E Test Runner
 #
-# This script runs comprehensive end-to-end tests for the DCG telemetry system.
+# This script runs comprehensive end-to-end tests for the DCG history system.
 # It verifies database creation, command logging, querying, and cleanup.
 #
 # Usage:
@@ -26,8 +26,8 @@ TESTS_FAILED=0
 TESTS_SKIPPED=0
 
 # Create temp directory for test isolation
-TEMP_DIR=$(mktemp -d -t dcg_telemetry_e2e_XXXXXX)
-TELEMETRY_DB="${TEMP_DIR}/telemetry.db"
+TEMP_DIR=$(mktemp -d -t dcg_history_e2e_XXXXXX)
+HISTORY_DB="${TEMP_DIR}/history.db"
 DCG_CONFIG_DIR="${TEMP_DIR}/config"
 
 # Cleanup handler
@@ -66,7 +66,7 @@ log_skip() {
 # Run a single SQLite query and print the first column of the first row.
 db_query() {
     local query="$1"
-    python3 - "$TELEMETRY_DB" "$query" << 'PY'
+    python3 - "$HISTORY_DB" "$query" << 'PY'
 import os
 import sqlite3
 import sys
@@ -125,7 +125,7 @@ ensure_dcg_binary() {
 setup_test_env() {
     mkdir -p "$DCG_CONFIG_DIR"
 
-    # Create a minimal config that enables telemetry
+    # Create a minimal config that enables history
     cat > "${DCG_CONFIG_DIR}/config.toml" << 'EOF'
 [general]
 verbose = false
@@ -133,19 +133,19 @@ verbose = false
 [packs]
 enabled = ["core.git", "core.filesystem"]
 
-[telemetry]
+[history]
 enabled = true
 EOF
 
     # Export environment variables for test isolation
-    export DCG_TELEMETRY_DB="$TELEMETRY_DB"
+    export DCG_HISTORY_DB="$HISTORY_DB"
     export DCG_CONFIG="${DCG_CONFIG_DIR}/config.toml"
     export HOME="$TEMP_DIR"
     export XDG_CONFIG_HOME="$DCG_CONFIG_DIR"
 
     log_info "Test environment setup complete"
     log_info "  Temp dir: $TEMP_DIR"
-    log_info "  Telemetry DB: $TELEMETRY_DB"
+    log_info "  History DB: $HISTORY_DB"
 }
 
 # =============================================================================
@@ -156,7 +156,7 @@ test_database_creation() {
     log_info "Testing: Database creation on first command..."
 
     # Database shouldn't exist yet
-    if [[ -f "$TELEMETRY_DB" ]]; then
+    if [[ -f "$HISTORY_DB" ]]; then
         log_fail "Database exists before first run"
         return 1
     fi
@@ -166,7 +166,7 @@ test_database_creation() {
     echo "$input" | "$DCG_BIN" 2>/dev/null || true
 
     # Database should now exist
-    if [[ -f "$TELEMETRY_DB" ]]; then
+    if [[ -f "$HISTORY_DB" ]]; then
         log_pass "Database created on first command"
         return 0
     else
@@ -243,13 +243,13 @@ test_fts_search() {
     log_info "Testing: Full-text search functionality..."
 
     # Run a unique command
-    local unique_cmd="echo telemetry_e2e_test_marker_$(date +%s)"
+    local unique_cmd="echo history_e2e_test_marker_$(date +%s)"
     local input="{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$unique_cmd\"}}"
     echo "$input" | "$DCG_BIN" 2>/dev/null || true
 
     # Search for it via FTS
     local found
-    found=$(db_query "SELECT COUNT(*) FROM commands_fts WHERE commands_fts MATCH 'telemetry_e2e_test_marker';" || echo "0")
+    found=$(db_query "SELECT COUNT(*) FROM commands_fts WHERE commands_fts MATCH 'history_e2e_test_marker';" || echo "0")
 
     if [[ "$found" -ge 1 ]]; then
         log_pass "Full-text search working"
@@ -324,7 +324,7 @@ test_performance_1000_commands() {
 main() {
     echo ""
     echo "=============================================="
-    echo "  DCG Telemetry E2E Test Suite"
+    echo "  DCG History E2E Test Suite"
     echo "=============================================="
     echo ""
 

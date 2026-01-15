@@ -1,14 +1,14 @@
-//! Integration test: full telemetry pipeline (log -> query -> fts).
+//! Integration test: full history pipeline (log -> query -> fts).
 
 mod common;
 
 use chrono::Utc;
 use common::db::TestDb;
 use common::logging::init_test_logging;
-use destructive_command_guard::telemetry::{CommandEntry, Outcome};
+use destructive_command_guard::history::{CommandEntry, Outcome};
 
 #[test]
-fn test_full_telemetry_pipeline() {
+fn test_full_history_pipeline() {
     init_test_logging();
 
     let test_db = TestDb::new();
