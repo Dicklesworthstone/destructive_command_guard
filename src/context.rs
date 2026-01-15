@@ -261,11 +261,50 @@ impl ContextClassifier {
         let mut pending_inline_code = false;
         let mut last_word_start = 0;
 
+        // State tracking for command/wrapper detection (replaces look-back)
+        let mut current_command: Option<&str> = None;
+        let mut wrapper = WrapperState::None;
+        let mut is_interpreter = false;
+
         let in_inline_context = |state_stack: &[TokenizerState]| {
             state_stack
                 .iter()
                 .any(|s| matches!(s, TokenizerState::CommandSubst | TokenizerState::Backtick))
         };
+
+        // Helper to process a completed word and update state
+        macro_rules! process_word {
+            ($word:expr) => {{
+                let word_unquoted = strip_outer_quotes($word);
+                let mut is_inline = false;
+
+                // Handle env -S special case
+                if word_unquoted == "-S" {
+                    if matches!(wrapper, WrapperState::Env { .. }) {
+                        is_inline = true;
+                    }
+                } else if let Some(_cmd) = current_command {
+                    // We already have a command, so this is an argument/flag.
+                    if is_interpreter && is_inline_code_flag(word_unquoted) {
+                        is_inline = true;
+                    }
+                } else {
+                    // Still looking for the command
+                    if let Some(next) = WrapperState::from_command_word(word_unquoted) {
+                        wrapper = next;
+                    } else {
+                        let (next, skipped) = wrapper.consume_token(word_unquoted);
+                        wrapper = next;
+                        
+                        if !skipped && !is_env_assignment(word_unquoted) {
+                            current_command = Some(word_unquoted);
+                            is_interpreter = self.is_interpreter_command(word_unquoted);
+                        }
+                    }
+                }
+                is_inline
+            }};
+        }
 
         let mut i = 0;
         while i < len {
@@ -293,6 +332,15 @@ impl ContextClassifier {
                 TokenizerState::Normal => {
                     match byte {
                         b'\'' => {
+                            if i > last_word_start {
+                                let word = &command[last_word_start..i];
+                                if process_word!(word) {
+                                    pending_inline_code = true;
+                                }
+                            }
+                            // Word break happens at quote start
+                            last_word_start = i; 
+
                             if i > span_start {
                                 spans.push(Span::new(current_kind, span_start, i));
                             }
@@ -301,14 +349,6 @@ impl ContextClassifier {
                             let inline_here = if pending_inline_code {
                                 pending_inline_code = false;
                                 true
-                            } else if last_word_start < i {
-                                let word = &command[last_word_start..i];
-                                is_inline_code_flag(word)
-                                    && self.check_inline_code_context(
-                                        command,
-                                        last_word_start,
-                                        word,
-                                    )
                             } else {
                                 false
                             };
@@ -319,6 +359,14 @@ impl ContextClassifier {
                             };
                         }
                         b'"' => {
+                            if i > last_word_start {
+                                let word = &command[last_word_start..i];
+                                if process_word!(word) {
+                                    pending_inline_code = true;
+                                }
+                            }
+                            last_word_start = i;
+
                             if i > span_start {
                                 spans.push(Span::new(current_kind, span_start, i));
                             }
@@ -327,14 +375,6 @@ impl ContextClassifier {
                             let inline_here = if pending_inline_code {
                                 pending_inline_code = false;
                                 true
-                            } else if last_word_start < i {
-                                let word = &command[last_word_start..i];
-                                is_inline_code_flag(word)
-                                    && self.check_inline_code_context(
-                                        command,
-                                        last_word_start,
-                                        word,
-                                    )
                             } else {
                                 false
                             };
@@ -345,6 +385,18 @@ impl ContextClassifier {
                             };
                         }
                         b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
+                            if i > last_word_start {
+                                let word = &command[last_word_start..i];
+                                if process_word!(word) {
+                                    // Command substitution as inline code argument?
+                                    // e.g. python -c $(cat script.py)
+                                    // This is unusual but possible. 
+                                    pending_inline_code = true;
+                                }
+                            }
+                            // Reset word start to after $(
+                            last_word_start = i + 2;
+
                             if i > span_start {
                                 spans.push(Span::new(current_kind, span_start, i));
                             }
@@ -355,6 +407,14 @@ impl ContextClassifier {
                             // will be emitted when we POP.
                         }
                         b'`' => {
+                            if i > last_word_start {
+                                let word = &command[last_word_start..i];
+                                if process_word!(word) {
+                                    pending_inline_code = true;
+                                }
+                            }
+                            last_word_start = i + 1;
+
                             if i > span_start {
                                 spans.push(Span::new(current_kind, span_start, i));
                             }
@@ -364,6 +424,11 @@ impl ContextClassifier {
                         b'|' | b';' | b'&' => {
                             // Check for operators
                             // For simple classification, treat as break.
+                            if i > last_word_start {
+                                let word = &command[last_word_start..i];
+                                let _ = process_word!(word);
+                            }
+                            
                             if i > span_start {
                                 spans.push(Span::new(current_kind, span_start, i));
                             }
@@ -381,8 +446,15 @@ impl ContextClassifier {
                             i += op_len;
                             // Advance loop manually
                             span_start = i;
+                            last_word_start = i;
                             current_kind = SpanKind::Executed;
                             pending_inline_code = false;
+                            
+                            // Reset command tracking state on separator
+                            current_command = None;
+                            wrapper = WrapperState::None;
+                            is_interpreter = false;
+                            
                             continue;
                         }
                         b'#' => {
@@ -402,12 +474,8 @@ impl ContextClassifier {
                             // Whitespace
                             if i > last_word_start {
                                 let word = &command[last_word_start..i];
-                                if is_inline_code_flag(word) {
-                                    pending_inline_code = self.check_inline_code_context(
-                                        command,
-                                        last_word_start,
-                                        word,
-                                    );
+                                if process_word!(word) {
+                                    pending_inline_code = true;
                                 }
                             }
                             last_word_start = i + 1;
@@ -420,6 +488,9 @@ impl ContextClassifier {
                         b'"' => {
                             // Close double quote
                             stack.pop();
+                            // End of word? Actually, "foo"bar is one word.
+                            // We don't update last_word_start here, we just continue token.
+                            
                             // Only emit span if we are not inside a command substitution
                             if !matches!(
                                 stack.last(),
@@ -576,81 +647,19 @@ impl ContextClassifier {
         spans
     }
 
-    /// Check if the word before a -c/-e flag is an inline-code command.
-    fn check_inline_code_context(&self, command: &str, flag_start: usize, flag: &str) -> bool {
-        // Special case for env -S: scan the whole segment for 'env'
-        if flag == "-S" {
-            // env -S "script" treats the argument as a script/command line.
-            // Be conservative: treat as inline code if the current segment
-            // contains an env invocation anywhere before the flag.
-            return env_split_string_context(command, flag_start);
-        }
-
-        let is_inline_interpreter = |candidate: &str| {
-            let base_name = candidate.rsplit('/').next().unwrap_or(candidate);
-            self.inline_code_commands.iter().any(|&known| {
-                if base_name == known {
-                    return true;
-                }
-                if let Some(suffix) = base_name.strip_prefix(known) {
-                    return !suffix.is_empty()
-                        && suffix.chars().all(|c| c.is_ascii_digit() || c == '.');
-                }
-                false
-            })
-        };
-
-        if let Some(cmd_word) = command_word_before_flag(command, flag_start) {
-            if is_inline_interpreter(cmd_word) {
+    /// Check if a command word is a known inline interpreter (e.g. python, bash).
+    pub fn is_interpreter_command(&self, cmd: &str) -> bool {
+        let base_name = cmd.rsplit('/').next().unwrap_or(cmd);
+        self.inline_code_commands.iter().any(|&known| {
+            if base_name == known {
                 return true;
             }
-            return false;
-        }
-
-        // Fallback: scan backwards for interpreters if we can't identify the command word.
-        let before = &command[..flag_start];
-
-        // Limit search to reasonable lookback (e.g. 20 tokens or start of segment)
-        // to avoid performance cliffs on massive commands.
-        // We use segment_start_before_flag to respect pipe boundaries.
-        let segment_start = segment_start_before_flag(command, flag_start);
-        let segment = &before[segment_start..];
-
-        // Tokenize in reverse to find the command word
-        for token in segment.split_whitespace().rev() {
-            // Skip flags (heuristic: starts with -)
-            if token.starts_with('-') && token.len() > 1 {
-                continue;
+            if let Some(suffix) = base_name.strip_prefix(known) {
+                return !suffix.is_empty()
+                    && suffix.chars().all(|c| c.is_ascii_digit() || c == '.');
             }
-
-            // Skip env assignments (VAR=VAL)
-            if token.contains('=') {
-                continue;
-            }
-
-            // Strip quotes if present (handle "python", "/usr/bin/python", etc.)
-            let token_unquoted = if (token.starts_with('"') && token.ends_with('"'))
-                || (token.starts_with('\'') && token.ends_with('\''))
-            {
-                if token.len() >= 2 {
-                    &token[1..token.len() - 1]
-                } else {
-                    token
-                }
-            } else {
-                token
-            };
-
-            // Found a potential command word.
-            if is_inline_interpreter(token_unquoted) {
-                return true;
-            }
-
-            // If it's not a known interpreter, it might be an argument to a previous flag.
-            // Continue searching backwards.
-        }
-
-        false
+            false
+        })
     }
 }
 
@@ -1978,15 +1987,6 @@ fn consume_backticks(command: &str, start: usize) -> usize {
 }
 
 #[must_use]
-fn env_split_string_context(command: &str, flag_start: usize) -> bool {
-    let segment_start = segment_start_before_flag(command, flag_start);
-    let segment = &command[segment_start..flag_start];
-
-    segment.split_whitespace().any(|token| {
-        let token = token.trim_start_matches('\\');
-        token == "env" || token.ends_with("/env")
-    })
-}
 
 #[inline]
 #[must_use]
@@ -2004,86 +2004,11 @@ fn is_inline_code_flag(word: &str) -> bool {
         .any(|b| matches!(b.to_ascii_lowercase(), b'c' | b'e' | b'r'))
 }
 
+#[inline]
 #[must_use]
-fn segment_start_before_flag(command: &str, flag_start: usize) -> usize {
-    let bytes = command.as_bytes();
-    let mut i = flag_start.min(bytes.len());
 
-    while i > 0 {
-        i -= 1;
-        match bytes[i] {
-            b'|' => {
-                if i > 0 && bytes[i - 1] == b'|' {
-                    return i + 1;
-                }
-                return i + 1;
-            }
-            b'&' => {
-                if i > 0 && bytes[i - 1] == b'&' {
-                    return i + 1;
-                }
-                return i + 1;
-            }
-            b';' => return i + 1,
-            _ => {}
-        }
-    }
-
-    0
-}
-
+#[inline]
 #[must_use]
-fn command_word_before_flag<'a>(command: &'a str, flag_start: usize) -> Option<&'a str> {
-    let tokens = tokenize_command(command);
-    if tokens.is_empty() {
-        return None;
-    }
-
-    let mut segment_cmd: Option<&'a str> = None;
-    let mut wrapper = WrapperState::None;
-
-    for token in tokens {
-        if token.byte_range.start >= flag_start {
-            break;
-        }
-
-        match token.kind {
-            SanitizeTokenKind::Separator => {
-                segment_cmd = None;
-                wrapper = WrapperState::None;
-                continue;
-            }
-            SanitizeTokenKind::Comment => continue,
-            SanitizeTokenKind::Word => {}
-        }
-
-        let token_text = token.text(command)?;
-
-        if token_text == "\\\n" || token_text == "\\\r\n" {
-            continue;
-        }
-
-        if segment_cmd.is_none() {
-            let token_text = strip_outer_quotes(token_text);
-            if let Some(next_wrapper) = WrapperState::from_command_word(token_text) {
-                wrapper = next_wrapper;
-                continue;
-            }
-            let (next_wrapper, skip) = wrapper.consume_token(token_text);
-            wrapper = next_wrapper;
-            if skip {
-                continue;
-            }
-            if is_env_assignment(token_text) {
-                continue;
-            }
-
-            segment_cmd = Some(token_text);
-        }
-    }
-
-    segment_cmd
-}
 
 #[inline]
 #[must_use]
@@ -2303,6 +2228,7 @@ mod tests {
         let cmd = "bash -lc \"rm -rf /\"";
         let spans = classify_command(cmd);
 
+        // Should have InlineCode span for $(rm -rf /)
         let inline_span = spans
             .spans()
             .iter()
@@ -2443,9 +2369,8 @@ mod tests {
 
         // The quoted pattern should be Argument
         let pattern_span = spans.spans().iter().find(|s| s.text(cmd) == "\"rm -rf\"");
-        if let Some(span) = pattern_span {
-            assert_eq!(span.kind, SpanKind::Argument);
-        }
+        assert!(pattern_span.is_some());
+        assert_eq!(pattern_span.unwrap().kind, SpanKind::Argument);
     }
 
     #[test]
@@ -2685,7 +2610,7 @@ mod tests {
 
     #[test]
     fn test_registry_grep_pattern_flags() {
-        // grep -e/--regexp take pattern arguments (data, not code)
+        // grep -e "rm -rf" - the -e argument is data
         assert!(SAFE_STRING_REGISTRY.is_flag_data("grep", "-e"));
         assert!(SAFE_STRING_REGISTRY.is_flag_data("grep", "--regexp"));
         // grep -F/--fixed-strings do NOT take pattern arguments (pattern remains positional)
@@ -2705,7 +2630,7 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_data_flags_for_git() {
+    fn test_registry_data_flags_for_command() {
         let flags = SAFE_STRING_REGISTRY.data_flags_for_command("git");
         assert!(flags.contains(&"-m"));
         assert!(flags.contains(&"--message"));
