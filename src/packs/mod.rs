@@ -61,7 +61,7 @@ pub type PackId = String;
 /// - **Critical**: Always block. These are irreversible, high-confidence detections.
 /// - **High**: Block by default, but allowlistable by rule ID.
 /// - **Medium**: Warn by default (log + continue), blockable via config.
-/// - **Low**: Log only (for history/learning), warneable/blockable via config.
+/// - **Low**: Log only (for telemetry/learning), warneable/blockable via config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Severity {
     /// Always block. Irreversible operations with high confidence.
@@ -77,7 +77,7 @@ pub enum Severity {
     /// Examples: context-dependent patterns, lower-confidence detections.
     Medium,
 
-    /// Log only (silent, for history and learning).
+    /// Log only (silent, for telemetry and learning).
     /// Examples: advisory patterns, patterns under evaluation.
     Low,
 }
@@ -121,7 +121,7 @@ pub enum DecisionMode {
     /// Warn but allow (print warning to stderr, no JSON deny).
     Warn,
 
-    /// Log only (silent allow, record for history).
+    /// Log only (silent allow, record for telemetry).
     Log,
 }
 
@@ -170,10 +170,6 @@ pub struct DestructivePattern {
     pub name: Option<&'static str>,
     /// Severity level (determines default decision mode).
     pub severity: Severity,
-    /// Detailed explanation of why this pattern is dangerous.
-    /// Should explain consequences and suggest alternatives.
-    /// This is more verbose than `reason` and intended for verbose output modes.
-    pub explanation: Option<&'static str>,
 }
 
 impl std::fmt::Debug for DestructivePattern {
@@ -183,7 +179,6 @@ impl std::fmt::Debug for DestructivePattern {
             .field("reason", &self.reason)
             .field("name", &self.name)
             .field("severity", &self.severity)
-            .field("explanation", &self.explanation)
             .finish()
     }
 }
@@ -210,7 +205,6 @@ macro_rules! safe_pattern {
 /// - `destructive_pattern!("regex", "reason")` - unnamed, default High severity
 /// - `destructive_pattern!("name", "regex", "reason")` - named, default High severity
 /// - `destructive_pattern!("name", "regex", "reason", Critical)` - named with explicit severity
-/// - `destructive_pattern!("name", "regex", "reason", Critical, "explanation")` - with explanation
 #[macro_export]
 macro_rules! destructive_pattern {
     // Unnamed pattern, default severity (High)
@@ -220,7 +214,6 @@ macro_rules! destructive_pattern {
             reason: $reason,
             name: None,
             severity: $crate::packs::Severity::High,
-            explanation: None,
         }
     };
     // Named pattern, default severity (High)
@@ -230,7 +223,6 @@ macro_rules! destructive_pattern {
             reason: $reason,
             name: Some($name),
             severity: $crate::packs::Severity::High,
-            explanation: None,
         }
     };
     // Named pattern with explicit severity
@@ -240,17 +232,6 @@ macro_rules! destructive_pattern {
             reason: $reason,
             name: Some($name),
             severity: $crate::packs::Severity::$severity,
-            explanation: None,
-        }
-    };
-    // Named pattern with explicit severity and explanation
-    ($name:literal, $re:literal, $reason:literal, $severity:ident, $explanation:literal) => {
-        $crate::packs::DestructivePattern {
-            regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
-            reason: $reason,
-            name: Some($name),
-            severity: $crate::packs::Severity::$severity,
-            explanation: Some($explanation),
         }
     };
 }
@@ -1694,17 +1675,9 @@ pub fn pack_aware_quick_reject_with_normalized<'a>(
             .any(|keyword| keyword_matches_substring(cmd, keyword));
     }
     if !any_substring {
-        // Before returning early, check if the command contains potential obfuscation
-        // characters that could hide keywords (backslash escapes, quotes).
-        // Examples: g\it -> git, g'i't -> git
-        // If so, we must normalize before deciding to skip.
-        let has_obfuscation = bytes.iter().any(|b| matches!(b, b'\\' | b'\'' | b'"'));
-        if !has_obfuscation {
-            // No substring match and no obfuscation - safe to return early.
-            // The caller won't need the normalized form since we're rejecting.
-            return (true, std::borrow::Cow::Borrowed(cmd));
-        }
-        // Has potential obfuscation - fall through to normalize and re-check
+        // No substring match at all - return early without normalizing.
+        // The caller won't need the normalized form since we're rejecting.
+        return (true, std::borrow::Cow::Borrowed(cmd));
     }
 
     // Important: run keyword gating on a normalized view so harmless quoting or

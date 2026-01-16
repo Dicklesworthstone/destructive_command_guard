@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "destructive_command_guard"
-version = "0.2.12"
+version = "0.2.7"
 dependencies = [
  "aho-corasick",
  "assert_cmd",
@@ -613,7 +613,6 @@ dependencies = [
  "ctrlc",
  "dirs",
  "fancy-regex",
- "flate2",
  "fs2",
  "hmac",
  "libc",
