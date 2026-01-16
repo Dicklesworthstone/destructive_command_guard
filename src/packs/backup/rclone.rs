@@ -46,84 +46,37 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "rclone-sync",
             r"rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+sync\b",
-            "rclone sync deletes destination files not present in the source.",
-            Critical,
-            "rclone sync makes destination match source exactly:\n\n\
-             - Files in destination not in source are DELETED\n\
-             - This is a one-way sync (source -> destination)\n\
-             - Use --dry-run to preview changes first\n\
-             - Consider 'rclone copy' for non-destructive transfer\n\n\
-             Preview: rclone sync source: dest: --dry-run"
+            "rclone sync deletes destination files not present in the source."
         ),
         destructive_pattern!(
             "rclone-delete",
             r"rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+delete\b",
-            "rclone delete removes files and directories from the target.",
-            Critical,
-            "rclone delete removes files from remote:\n\n\
-             - Deletes files matching the path/filter\n\
-             - Does not delete directories (use purge for that)\n\
-             - Use --dry-run to preview deletions\n\
-             - Filters (--include/--exclude) affect what's deleted\n\n\
-             Preview: rclone delete remote:path --dry-run"
+            "rclone delete removes files and directories from the target."
         ),
         destructive_pattern!(
             "rclone-deletefile",
             r"rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+deletefile\b",
-            "rclone deletefile removes a single file from the target.",
-            High,
-            "rclone deletefile removes a single file:\n\n\
-             - Deletes exactly one specified file\n\
-             - More targeted than 'rclone delete'\n\
-             - Cannot be undone without backup\n\n\
-             Lower risk than bulk delete but still permanent"
+            "rclone deletefile removes a single file from the target."
         ),
         destructive_pattern!(
             "rclone-purge",
             r"rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+purge\b",
-            "rclone purge deletes a path and all its contents.",
-            Critical,
-            "rclone purge removes directory and ALL contents:\n\n\
-             - Deletes the specified path completely\n\
-             - Removes all files AND subdirectories\n\
-             - More destructive than 'rclone delete'\n\
-             - Cannot be undone without backup\n\n\
-             List contents first: rclone ls remote:path"
+            "rclone purge deletes a path and all its contents."
         ),
         destructive_pattern!(
             "rclone-cleanup",
             r"rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+cleanup\b",
-            "rclone cleanup removes old/malformed uploads.",
-            Medium,
-            "rclone cleanup removes incomplete uploads:\n\n\
-             - Removes old/incomplete multipart uploads\n\
-             - Cleans up failed transfer artifacts\n\
-             - May interrupt in-progress uploads\n\n\
-             Generally safe but check for active uploads first"
+            "rclone cleanup removes old/malformed uploads."
         ),
         destructive_pattern!(
             "rclone-dedupe",
             r"rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+dedupe\b",
-            "rclone dedupe can delete or rename duplicate files.",
-            High,
-            "rclone dedupe handles duplicate files:\n\n\
-             - Can delete duplicates (--dedupe-mode oldest/newest)\n\
-             - Can rename duplicates to unique names\n\
-             - Interactive mode lets you choose per-file\n\
-             - Use --dry-run to preview actions\n\n\
-             Preview: rclone dedupe remote:path --dry-run"
+            "rclone dedupe can delete or rename duplicate files."
         ),
         destructive_pattern!(
             "rclone-move",
             r"rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+move\b",
-            "rclone move deletes source files after copying.",
-            High,
-            "rclone move transfers and deletes source:\n\n\
-             - Copies files to destination\n\
-             - Deletes source files after successful copy\n\
-             - Use --dry-run to preview the operation\n\
-             - Consider 'rclone copy' to preserve source\n\n\
-             Preview: rclone move source: dest: --dry-run"
+            "rclone move deletes source files after copying."
         ),
     ]
 }

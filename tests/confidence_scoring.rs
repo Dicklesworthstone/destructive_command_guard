@@ -25,7 +25,6 @@ fn mock_deny_result(
             source,
             matched_span: match_span,
             matched_text_preview: Some("rm -rf".to_string()),
-            explanation: None,
         }),
         allowlist_override: None,
         effective_mode: Some(DecisionMode::Deny),
