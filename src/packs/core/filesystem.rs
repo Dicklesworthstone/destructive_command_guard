@@ -509,79 +509,28 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "rm-rf-root-home",
             r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+[/~]|rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+[/~]",
             "rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed. Ask the user to run it manually if truly needed.",
-            Critical,
-            "This command would recursively delete files starting from the root filesystem (/) \
-             or home directory (~). This is catastrophic and will destroy:\n\n\
-             - Your entire operating system\n\
-             - All installed applications and libraries\n\
-             - All user data, documents, and configurations\n\
-             - Boot files, making the system unbootable\n\n\
-             There is NO recovery without backups. Even with backups, full restoration \
-             takes hours to days.\n\n\
-             If you need to delete specific files, use explicit paths:\n  \
-             rm -rf /path/to/specific/directory\n\n\
-             Always preview what would be deleted first:\n  \
-             find /path/to/directory -type f | head -20"
+            Critical
         ),
         // General rm -rf (caught after safe patterns) - High because temp paths are allowed
         destructive_pattern!(
             "rm-rf-general",
             r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f|rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR]",
             "rm -rf is destructive and requires human approval. Explain what you want to delete and why, then ask the user to run the command manually.",
-            High,
-            "rm -rf recursively removes files and directories without confirmation prompts. \
-             The -f (force) flag suppresses all warnings, making accidental deletions \
-             silent and immediate.\n\n\
-             Why this is dangerous:\n\
-             - Deleted files bypass the trash - they're gone immediately\n\
-             - Typos in paths can delete unintended directories\n\
-             - Wildcards can expand to match more than expected\n\
-             - No undo mechanism exists\n\n\
-             Safe alternatives:\n\
-             - rm -ri: Interactive mode, confirms each file\n\
-             - trash-cli: Moves files to trash instead of deleting\n\
-             - rm -rf in /tmp, /var/tmp, $TMPDIR: Allowed (safe temp directories)\n\n\
-             Preview what would be deleted:\n  \
-             find /path/to/delete -type f | wc -l  # Count files\n  \
-             ls -la /path/to/delete               # List contents"
+            High
         ),
         // rm -r -f (separate flags)
         destructive_pattern!(
             "rm-r-f-separate",
             r"rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f|rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]",
             "rm with separate -r -f flags is destructive and requires human approval.",
-            High,
-            "rm with separate -r and -f flags has the same effect as rm -rf: recursive \
-             forced deletion without confirmation.\n\n\
-             Common variations that are all equivalent:\n\
-             - rm -r -f path\n\
-             - rm -f -r path\n\
-             - rm -r -f -v path (verbose but still forced)\n\n\
-             All carry the same risks as rm -rf: immediate, silent, irreversible deletion.\n\n\
-             Safer approach for temporary directories:\n\
-             - rm -r -f /tmp/mydir    # Allowed - temp directories are safe\n\
-             - rm -r -f $TMPDIR/mydir # Allowed - uses system temp dir\n\n\
-             For other paths, prefer:\n  \
-             rm -ri /path  # Interactive confirmation"
+            High
         ),
         // rm --recursive --force (long flags)
         destructive_pattern!(
             "rm-recursive-force-long",
             r"rm\s+.*--recursive.*--force|rm\s+.*--force.*--recursive",
             "rm --recursive --force is destructive and requires human approval.",
-            High,
-            "rm --recursive --force is the long-form equivalent of rm -rf. While more \
-             readable, it carries identical risks: silent, recursive, irreversible deletion.\n\n\
-             The long flags may appear in:\n\
-             - Scripts aiming for clarity\n\
-             - Generated code from build tools\n\
-             - Cross-platform compatibility scenarios\n\n\
-             All standard rm -rf precautions apply:\n\
-             - Verify the path before running\n\
-             - Use absolute paths to avoid ambiguity\n\
-             - Consider using trash-cli for recoverable deletion\n\n\
-             Preview command:\n  \
-             find /path --maxdepth 2 -ls | head -30"
+            High
         ),
     ]
 }
