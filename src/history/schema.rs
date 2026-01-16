@@ -1307,6 +1307,102 @@ impl HistoryDb {
         })
     }
 
+    /// Rebuild the FTS (Full-Text Search) index from scratch.
+    ///
+    /// This is useful for recovering from FTS corruption or when the FTS
+    /// index has become out of sync with the main commands table.
+    ///
+    /// # Returns
+    ///
+    /// Returns the number of commands re-indexed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rebuild fails.
+    pub fn rebuild_fts(&self) -> Result<u64, HistoryError> {
+        // First, drop triggers to prevent interference during rebuild
+        self.conn.execute_batch(
+            r"
+            DROP TRIGGER IF EXISTS commands_fts_insert;
+            DROP TRIGGER IF EXISTS commands_fts_delete;
+            DROP TRIGGER IF EXISTS commands_fts_update;
+            ",
+        )?;
+
+        // Drop and recreate the FTS table
+        self.conn.execute("DROP TABLE IF EXISTS commands_fts", [])?;
+
+        self.conn.execute(
+            r"CREATE VIRTUAL TABLE commands_fts USING fts5(
+                command,
+                content='commands',
+                content_rowid='id'
+            )",
+            [],
+        )?;
+
+        // Rebuild the index by inserting all existing commands
+        // Using the 'rebuild' command is the most efficient way
+        self.conn.execute(
+            "INSERT INTO commands_fts(commands_fts) VALUES('rebuild')",
+            [],
+        )?;
+
+        // Get the count of re-indexed entries
+        let fts_count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM commands_fts", [], |row| row.get(0))?;
+
+        // Recreate the triggers
+        self.conn.execute_batch(
+            r"
+            CREATE TRIGGER commands_fts_insert AFTER INSERT ON commands BEGIN
+                INSERT INTO commands_fts(rowid, command) VALUES (new.id, new.command);
+            END;
+
+            CREATE TRIGGER commands_fts_delete AFTER DELETE ON commands BEGIN
+                INSERT INTO commands_fts(commands_fts, rowid, command)
+                VALUES ('delete', old.id, old.command);
+            END;
+
+            CREATE TRIGGER commands_fts_update AFTER UPDATE ON commands BEGIN
+                INSERT INTO commands_fts(commands_fts, rowid, command)
+                VALUES ('delete', old.id, old.command);
+                INSERT INTO commands_fts(rowid, command) VALUES (new.id, new.command);
+            END;
+            ",
+        )?;
+
+        Ok(u64::try_from(fts_count).unwrap_or(0))
+    }
+
+    /// Check and optionally repair database health issues.
+    ///
+    /// Performs `check_health` and attempts to fix recoverable issues:
+    /// - FTS out of sync: rebuilds the FTS index
+    ///
+    /// # Returns
+    ///
+    /// Returns a tuple of (original health check, repairs made).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if health check or repairs fail.
+    pub fn repair(&self) -> Result<(CheckResult, Vec<String>), HistoryError> {
+        let health = self.check_health()?;
+        let mut repairs = Vec::new();
+
+        // Repair FTS if out of sync
+        if !health.fts_in_sync {
+            let reindexed = self.rebuild_fts()?;
+            repairs.push(format!(
+                "Rebuilt FTS index ({reindexed} commands re-indexed)"
+            ));
+        }
+
+        Ok((health, repairs))
+    }
+
     // ========================================================================
     // Backup
     // ========================================================================
@@ -3299,5 +3395,110 @@ mod tests {
             assert!(rec["type"].is_string());
             assert!(rec["description"].is_string());
         }
+    }
+
+    #[test]
+    fn test_rebuild_fts() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Insert some commands
+        let commands = ["git status", "docker ps", "npm install", "cargo build"];
+        for cmd in &commands {
+            let entry = CommandEntry {
+                timestamp: now,
+                agent_type: "test".to_string(),
+                working_dir: "/test".to_string(),
+                command: cmd.to_string(),
+                outcome: Outcome::Allow,
+                ..Default::default()
+            };
+            db.log_command(&entry).unwrap();
+        }
+
+        // Verify initial FTS state
+        let health1 = db.check_health().unwrap();
+        assert_eq!(health1.commands_count, 4);
+        assert_eq!(health1.fts_count, 4);
+        assert!(health1.fts_in_sync);
+
+        // Rebuild FTS
+        let reindexed = db.rebuild_fts().unwrap();
+        assert_eq!(reindexed, 4);
+
+        // Verify FTS still works after rebuild
+        let health2 = db.check_health().unwrap();
+        assert_eq!(health2.commands_count, 4);
+        assert_eq!(health2.fts_count, 4);
+        assert!(health2.fts_in_sync);
+    }
+
+    #[test]
+    fn test_repair_healthy_db() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Insert some commands
+        for i in 0..3 {
+            let entry = CommandEntry {
+                timestamp: now,
+                agent_type: "test".to_string(),
+                working_dir: "/test".to_string(),
+                command: format!("test command {i}"),
+                outcome: Outcome::Allow,
+                ..Default::default()
+            };
+            db.log_command(&entry).unwrap();
+        }
+
+        // Repair a healthy database
+        let (health, repairs) = db.repair().unwrap();
+
+        // Should be healthy
+        assert!(health.fts_in_sync);
+        assert_eq!(health.commands_count, 3);
+
+        // No repairs should have been made
+        assert!(
+            repairs.is_empty(),
+            "No repairs should be needed for healthy DB"
+        );
+    }
+
+    #[test]
+    fn test_fts_triggers_work_after_rebuild() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Insert initial command
+        let entry1 = CommandEntry {
+            timestamp: now,
+            agent_type: "test".to_string(),
+            working_dir: "/test".to_string(),
+            command: "initial command".to_string(),
+            outcome: Outcome::Allow,
+            ..Default::default()
+        };
+        db.log_command(&entry1).unwrap();
+
+        // Rebuild FTS
+        db.rebuild_fts().unwrap();
+
+        // Insert new command after rebuild
+        let entry2 = CommandEntry {
+            timestamp: now,
+            agent_type: "test".to_string(),
+            working_dir: "/test".to_string(),
+            command: "new command after rebuild".to_string(),
+            outcome: Outcome::Allow,
+            ..Default::default()
+        };
+        db.log_command(&entry2).unwrap();
+
+        // Verify triggers work - FTS should have both commands
+        let health = db.check_health().unwrap();
+        assert_eq!(health.commands_count, 2);
+        assert_eq!(health.fts_count, 2);
+        assert!(health.fts_in_sync);
     }
 }

@@ -42,6 +42,7 @@ use crate::logging::{RedactionConfig, RedactionMode};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+use tracing::{debug, error, trace, warn};
 
 pub use schema::{
     AgentStat, BackupResult, CURRENT_SCHEMA_VERSION, CheckResult, CommandEntry,
@@ -139,13 +140,20 @@ impl HistoryWriter {
         let (sender, receiver) = mpsc::channel::<HistoryMessage>();
         let worker_config = WorkerConfig::from(config);
 
-        let Ok(handle) = thread::Builder::new()
+        let handle = match thread::Builder::new()
             .name("dcg-history-writer".to_string())
             .spawn(move || history_worker(db, receiver, worker_config))
-        else {
-            // Thread spawn failed - return disabled writer to avoid leaking
-            // messages into a channel with no receiver.
-            return Self::disabled();
+        {
+            Ok(h) => h,
+            Err(e) => {
+                // Thread spawn failed - return disabled writer to avoid leaking
+                // messages into a channel with no receiver.
+                error!(
+                    error = %e,
+                    "Failed to spawn history writer thread - history collection disabled"
+                );
+                return Self::disabled();
+            }
         };
 
         Self {
@@ -187,7 +195,13 @@ impl HistoryWriter {
             entry.session_id = Some(self.session_id.clone());
         }
         if let Some(sender) = &self.sender {
-            let _ = sender.send(HistoryMessage::Entry(Box::new(entry)));
+            if let Err(e) = sender.send(HistoryMessage::Entry(Box::new(entry))) {
+                // Channel disconnected - worker thread likely crashed or shutdown
+                warn!(
+                    error = %e,
+                    "Failed to send history entry - worker thread unavailable"
+                );
+            }
         }
     }
 
@@ -289,7 +303,9 @@ fn history_worker(db: HistoryDb, receiver: mpsc::Receiver<HistoryMessage>, confi
                     let _ = pending_ack.send(());
                 }
                 if should_shutdown {
-                    let _ = db.checkpoint();
+                    if let Err(e) = db.checkpoint() {
+                        warn!(error = %e, "WAL checkpoint failed on shutdown");
+                    }
                     break;
                 }
             }
@@ -311,7 +327,11 @@ fn history_worker(db: HistoryDb, receiver: mpsc::Receiver<HistoryMessage>, confi
                     let _ = pending_ack.send(());
                 }
                 // Checkpoint WAL before closing
-                let _ = db.checkpoint();
+                if let Err(e) = db.checkpoint() {
+                    warn!(error = %e, "WAL checkpoint failed during shutdown");
+                } else {
+                    debug!("WAL checkpoint completed successfully");
+                }
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -329,8 +349,11 @@ fn history_worker(db: HistoryDb, receiver: mpsc::Receiver<HistoryMessage>, confi
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // Channel closed, flush and exit
+                debug!("History channel disconnected, performing final flush");
                 flush_batch(&db, &mut batch);
-                let _ = db.checkpoint();
+                if let Err(e) = db.checkpoint() {
+                    warn!(error = %e, "WAL checkpoint failed on channel disconnect");
+                }
                 break;
             }
         }
@@ -372,18 +395,66 @@ fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) {
         return;
     }
 
+    let batch_len = batch.len();
+    trace!(batch_size = batch_len, "Flushing history batch");
+
     // Try batch insert first (more efficient)
-    if batch.len() >= 2 {
-        if let Err(_e) = db.log_commands_batch(batch) {
-            // Fallback to individual inserts on error
-            for entry in batch.iter() {
-                let _ = db.log_command(entry);
+    if batch_len >= 2 {
+        match db.log_commands_batch(batch) {
+            Ok(()) => {
+                trace!(count = batch_len, "Batch insert succeeded");
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    batch_size = batch_len,
+                    "Batch insert failed, falling back to individual inserts"
+                );
+                // Fallback to individual inserts on error
+                let mut success_count = 0;
+                let mut error_count = 0;
+                for entry in batch.iter() {
+                    match db.log_command(entry) {
+                        Ok(_id) => success_count += 1,
+                        Err(insert_err) => {
+                            error_count += 1;
+                            // Log first few errors, then summarize
+                            if error_count <= 3 {
+                                error!(
+                                    error = %insert_err,
+                                    command = %entry.command,
+                                    "Failed to insert history entry"
+                                );
+                            }
+                        }
+                    }
+                }
+                if error_count > 3 {
+                    error!(
+                        total_errors = error_count,
+                        "Additional history insert errors suppressed"
+                    );
+                }
+                if error_count > 0 {
+                    warn!(
+                        success = success_count,
+                        failed = error_count,
+                        "History batch recovery completed with errors"
+                    );
+                }
             }
         }
     } else {
         // Single entry, use regular insert
         for entry in batch.iter() {
-            let _ = db.log_command(entry);
+            match db.log_command(entry) {
+                Ok(_id) => trace!(command = %entry.command, "Inserted history entry"),
+                Err(e) => error!(
+                    error = %e,
+                    command = %entry.command,
+                    "Failed to insert history entry"
+                ),
+            }
         }
     }
 
@@ -393,10 +464,26 @@ fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) {
 /// Check if pruning is needed and perform it.
 fn check_and_prune(db: &HistoryDb, retention_days: u32) {
     // Check if enough time has passed since last prune
-    if let Ok(should_prune) = db.should_auto_prune() {
-        if should_prune {
-            let _ = db.prune_older_than_days(u64::from(retention_days), false);
-            let _ = db.record_prune_timestamp();
+    match db.should_auto_prune() {
+        Ok(true) => {
+            debug!(retention_days = retention_days, "Starting auto-prune");
+            match db.prune_older_than_days(u64::from(retention_days), false) {
+                Ok(pruned_count) => {
+                    debug!(pruned = pruned_count, "Auto-prune completed");
+                    if let Err(e) = db.record_prune_timestamp() {
+                        warn!(error = %e, "Failed to record prune timestamp");
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Auto-prune failed");
+                }
+            }
+        }
+        Ok(false) => {
+            trace!("Auto-prune not needed yet");
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to check if auto-prune is needed");
         }
     }
 }

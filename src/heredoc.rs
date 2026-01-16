@@ -484,9 +484,7 @@ impl ScriptLanguage {
     pub fn from_command(cmd: &str) -> Self {
         let cmd_lower = cmd.to_lowercase();
         // Strip Windows .exe extension if present
-        let cmd_base = cmd_lower
-            .strip_suffix(".exe")
-            .unwrap_or(&cmd_lower);
+        let cmd_base = cmd_lower.strip_suffix(".exe").unwrap_or(&cmd_lower);
 
         // Helper: check if cmd matches base name, optionally followed by version digits/dots
         // e.g., "python" matches "python", "python3", "python3.11"

@@ -1,9 +1,11 @@
+#![allow(clippy::uninlined_format_args)]
+
 use destructive_command_guard::allowlist::LayeredAllowlist;
 use destructive_command_guard::config::{CompiledOverrides, Config};
 use destructive_command_guard::context::{classify_command, sanitize_for_pattern_matching};
 use destructive_command_guard::evaluator::evaluate_command;
 use destructive_command_guard::normalize::normalize_command;
-use destructive_command_guard::packs::{pack_aware_quick_reject, REGISTRY};
+use destructive_command_guard::packs::{REGISTRY, pack_aware_quick_reject};
 
 fn evaluate(cmd: &str) -> bool {
     let config = Config::default();
@@ -37,8 +39,14 @@ fn debug_compound_command_spans() {
 
     eprintln!("\n=== STEP 4: Quick-reject on sanitized command ===");
     let sanitized_quick_reject = pack_aware_quick_reject(sanitized.as_ref(), keywords);
-    eprintln!("pack_aware_quick_reject(sanitized): {}", sanitized_quick_reject);
-    eprintln!("Would skip pattern matching: {}", sanitized_is_cow_owned && sanitized_quick_reject);
+    eprintln!(
+        "pack_aware_quick_reject(sanitized): {}",
+        sanitized_quick_reject
+    );
+    eprintln!(
+        "Would skip pattern matching: {}",
+        sanitized_is_cow_owned && sanitized_quick_reject
+    );
 
     eprintln!("\n=== STEP 5: Normalization ===");
     let normalized = normalize_command(sanitized.as_ref());
@@ -49,7 +57,10 @@ fn debug_compound_command_spans() {
     eprintln!("Spans:");
     for span in spans.spans() {
         let text = span.text(normalized.as_ref());
-        eprintln!("  {:?}: {:?} ({}..{})", span.kind, text, span.byte_range.start, span.byte_range.end);
+        eprintln!(
+            "  {:?}: {:?} ({}..{})",
+            span.kind, text, span.byte_range.start, span.byte_range.end
+        );
     }
     eprintln!("Executable spans:");
     for span in spans.executable_spans() {
@@ -59,7 +70,7 @@ fn debug_compound_command_spans() {
     eprintln!("\n=== STEP 7: Keyword check in executable spans ===");
     for span in spans.executable_spans() {
         let text = span.text(normalized.as_ref());
-        for kw in keywords.iter() {
+        for kw in keywords {
             if text.contains(kw) {
                 eprintln!("  Found '{}' in '{}'", kw, text);
             }
@@ -69,8 +80,14 @@ fn debug_compound_command_spans() {
     eprintln!("\n=== STEP 8: Pack pattern test ===");
     // Test the rm-rf-root-home pattern directly
     let pattern = regex::Regex::new(r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+[/~]|rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+[/~]").unwrap();
-    eprintln!("rm-rf-root-home pattern matches original: {}", pattern.is_match(cmd));
-    eprintln!("rm-rf-root-home pattern matches normalized: {}", pattern.is_match(normalized.as_ref()));
+    eprintln!(
+        "rm-rf-root-home pattern matches original: {}",
+        pattern.is_match(cmd)
+    );
+    eprintln!(
+        "rm-rf-root-home pattern matches normalized: {}",
+        pattern.is_match(normalized.as_ref())
+    );
 
     eprintln!("\n=== STEP 9: Config and pack setup ===");
     let config = Config::default();
@@ -82,14 +99,20 @@ fn debug_compound_command_spans() {
     eprintln!("\n=== STEP 10: Test direct pack evaluation ===");
     let fs_pack = REGISTRY.get("core.filesystem").unwrap();
     eprintln!("core.filesystem pack exists: true");
-    eprintln!("Destructive patterns count: {}", fs_pack.destructive_patterns.len());
+    eprintln!(
+        "Destructive patterns count: {}",
+        fs_pack.destructive_patterns.len()
+    );
 
     // Check if the pack's regex matches
-    for (_i, dp) in fs_pack.destructive_patterns.iter().enumerate() {
+    for dp in &fs_pack.destructive_patterns {
         let matches_orig = dp.regex.find(cmd).is_some();
         let matches_norm = dp.regex.find(normalized.as_ref()).is_some();
         if matches_orig || matches_norm {
-            eprintln!("  Pattern {:?} matches: orig={} norm={}", dp.name, matches_orig, matches_norm);
+            eprintln!(
+                "  Pattern {:?} matches: orig={} norm={}",
+                dp.name, matches_orig, matches_norm
+            );
         }
     }
 

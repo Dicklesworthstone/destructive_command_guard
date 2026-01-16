@@ -798,7 +798,7 @@ pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
 
 /// Regex to strip absolute paths from git/rm binaries.
 ///
-/// Handles both Unix paths (/path/to/bin/git) and Windows paths (C:/path/to/git.exe).
+/// Handles both Unix paths (`/path/to/bin/git`) and Windows paths (`C:/path/to/git.exe`).
 /// For Windows, matches drive letters (C:) followed by either forward or back slashes.
 pub static PATH_NORMALIZER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
@@ -1157,6 +1157,7 @@ impl NormalizeWrapper {
 }
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn normalize_command_word_token(token: &str) -> Option<String> {
     let mut out = token.to_string();
 
@@ -1210,9 +1211,10 @@ pub fn normalize_command_word_token(token: &str) -> Option<String> {
 
     // Handle mixed quoting concatenation: g'i't -> git, "g"it -> git, etc.
     // In bash, adjacent quoted and unquoted sections concatenate into a single word.
+    #[allow(clippy::while_let_on_iterator)]
     if (out.contains('\'') || out.contains('"')) && out.len() > 2 {
         let mut result = String::with_capacity(out.len());
-        let mut chars = out.chars().peekable();
+        let mut chars = out.chars();
         let mut local_changed = false;
         while let Some(c) = chars.next() {
             if c == '\'' || c == '"' {
@@ -1250,7 +1252,9 @@ pub fn normalize_command_word_token(token: &str) -> Option<String> {
     // Also strip .exe from inside quotes (e.g., "C:/path/git.exe" -> "C:/path/git")
     // This handles Windows paths with spaces that need to stay quoted
     let quote_check = match (out.as_bytes().first(), out.as_bytes().last()) {
-        (Some(b'"'), Some(b'"')) if out.len() > 6 => Some((b'"', out[1..out.len() - 1].to_string())),
+        (Some(b'"'), Some(b'"')) if out.len() > 6 => {
+            Some((b'"', out[1..out.len() - 1].to_string()))
+        }
         (Some(b'\''), Some(b'\'')) if out.len() > 6 => {
             Some((b'\'', out[1..out.len() - 1].to_string()))
         }
@@ -1514,10 +1518,12 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
 
             // 3. Strip paths (try both normalizers)
             match &dequoted {
-                Cow::Borrowed(base) => apply_path_normalizers(base)
-                    .map_or_else(|| dequoted, |s| Cow::Owned(s)),
-                Cow::Owned(base) => apply_path_normalizers(base)
-                    .map_or_else(|| dequoted, |s| Cow::Owned(s)),
+                Cow::Borrowed(base) => {
+                    apply_path_normalizers(base).map_or_else(|| dequoted, Cow::Owned)
+                }
+                Cow::Owned(base) => {
+                    apply_path_normalizers(base).map_or_else(|| dequoted, Cow::Owned)
+                }
             }
         }
         Cow::Owned(local_string) => {
@@ -1887,98 +1893,122 @@ mod windows_exe_tests {
     }
 }
 
-    #[test]
-    fn test_windows_path_with_spaces_tokenization() {
-        // This path has spaces - see how tokenization handles it
-        let cmd = "C:/Program Files/Git/bin/git.exe reset --hard";
-        let tokens = tokenize_for_normalization(cmd);
-        eprintln!("Tokens:");
-        for (i, tok) in tokens.iter().enumerate() {
-            eprintln!("  {}: {:?} = {:?}", i, tok.kind, tok.text(cmd));
+#[test]
+fn test_windows_path_with_spaces_tokenization() {
+    // This path has spaces - see how tokenization handles it
+    let cmd = "C:/Program Files/Git/bin/git.exe reset --hard";
+    let tokens = tokenize_for_normalization(cmd);
+    eprintln!("Tokens:");
+    for (i, tok) in tokens.iter().enumerate() {
+        eprintln!("  {}: {:?} = {:?}", i, tok.kind, tok.text(cmd));
+    }
+
+    // The second token should contain git.exe
+    let has_git_exe = tokens.iter().any(|t| {
+        t.kind == NormalizeTokenKind::Word
+            && t.text(cmd).unwrap_or("").to_lowercase().contains("git.exe")
+    });
+    eprintln!("Has git.exe: {has_git_exe}");
+}
+
+#[test]
+fn test_quoted_windows_path_normalization() {
+    // Use git status instead of git reset to avoid triggering DCG in tests
+    let cmd = r#""C:/Program Files/Git/bin/git.exe" status"#;
+    eprintln!("Input: {cmd}");
+
+    let result = normalize_command(cmd);
+    eprintln!("Normalized: {:?}", result.as_ref());
+
+    let tokens = tokenize_for_normalization(&result);
+    eprintln!("Tokens after normalization:");
+    for (i, tok) in tokens.iter().enumerate() {
+        eprintln!("  {}: {:?} = {:?}", i, tok.kind, tok.text(&result));
+    }
+}
+
+#[test]
+fn test_keyword_matching_in_windows_path() {
+    use crate::packs::pack_aware_quick_reject;
+
+    let keywords: Vec<&str> = vec!["git", "rm"];
+
+    // Test if quick_reject correctly identifies these as git commands
+    // Using "git status" instead of destructive commands
+    let cmds = [
+        r#""C:/Program Files/Git/bin/git" status"#,
+        r#""C:/Program Files/Git/bin/git.exe" status"#, // with .exe
+        "C:/Git/bin/git status",
+        "git status",
+    ];
+
+    for cmd in cmds {
+        // First check what classify_command returns
+        let normalized = normalize_command(cmd);
+        let spans = crate::context::classify_command(&normalized);
+        eprintln!("{cmd:?} -> normalized: {:?}", normalized.as_ref());
+        eprintln!("  executable spans:");
+        for span in spans.executable_spans() {
+            eprintln!("    {:?}", span.text(&normalized));
         }
-        
-        // The second token should contain git.exe
-        let has_git_exe = tokens.iter().any(|t| {
-            t.kind == NormalizeTokenKind::Word && 
-            t.text(cmd).unwrap_or("").to_lowercase().contains("git.exe")
-        });
-        eprintln!("Has git.exe: {has_git_exe}");
+
+        let rejected = pack_aware_quick_reject(cmd, &keywords);
+        eprintln!("  quick_reject={rejected}");
+        // If rejected is FALSE, keywords were found (should NOT be quick-rejected)
+        assert!(!rejected, "Command should NOT be quick-rejected: {cmd}");
     }
+}
 
-    #[test]
-    fn test_quoted_windows_path_normalization() {
-        // Use git status instead of git reset to avoid triggering DCG in tests
-        let cmd = r#""C:/Program Files/Git/bin/git.exe" status"#;
-        eprintln!("Input: {cmd}");
+#[test]
+fn test_internal_backslash_normalization() {
+    // g\it should normalize to git (bash treats backslash as escape for regular chars)
+    let result = normalize_command_word_token(r"g\it");
+    assert_eq!(
+        result,
+        Some("git".to_string()),
+        "g\\it should normalize to git"
+    );
 
-        let result = normalize_command(cmd);
-        eprintln!("Normalized: {:?}", result.as_ref());
+    // Multiple internal backslashes
+    let result = normalize_command_word_token(r"g\i\t");
+    assert_eq!(
+        result,
+        Some("git".to_string()),
+        "g\\i\\t should normalize to git"
+    );
 
-        let tokens = tokenize_for_normalization(&result);
-        eprintln!("Tokens after normalization:");
-        for (i, tok) in tokens.iter().enumerate() {
-            eprintln!("  {}: {:?} = {:?}", i, tok.kind, tok.text(&result));
-        }
-    }
+    // Full command normalization
+    let result = normalize_command(r"g\it reset --hard");
+    assert_eq!(
+        result.as_ref(),
+        "git reset --hard",
+        "g\\it command should normalize"
+    );
+}
 
-    #[test]
-    fn test_keyword_matching_in_windows_path() {
-        use crate::packs::pack_aware_quick_reject;
+#[test]
+fn test_mixed_quoting_normalization() {
+    // g'i't should normalize to git (bash concatenates adjacent quoted/unquoted sections)
+    let result = normalize_command_word_token("g'i't");
+    assert_eq!(
+        result,
+        Some("git".to_string()),
+        "g'i't should normalize to git"
+    );
 
-        let keywords: Vec<&str> = vec!["git", "rm"];
+    // Double quotes
+    let result = normalize_command_word_token(r#"g"i"t"#);
+    assert_eq!(
+        result,
+        Some("git".to_string()),
+        r#"g"i"t should normalize to git"#
+    );
 
-        // Test if quick_reject correctly identifies these as git commands
-        // Using "git status" instead of destructive commands
-        let cmds = [
-            r#""C:/Program Files/Git/bin/git" status"#,
-            r#""C:/Program Files/Git/bin/git.exe" status"#, // with .exe
-            "C:/Git/bin/git status",
-            "git status",
-        ];
-
-        for cmd in cmds {
-            // First check what classify_command returns
-            let normalized = normalize_command(cmd);
-            let spans = crate::context::classify_command(&normalized);
-            eprintln!("{cmd:?} -> normalized: {:?}", normalized.as_ref());
-            eprintln!("  executable spans:");
-            for span in spans.executable_spans() {
-                eprintln!("    {:?}", span.text(&normalized));
-            }
-
-            let rejected = pack_aware_quick_reject(cmd, &keywords);
-            eprintln!("  quick_reject={rejected}");
-            // If rejected is FALSE, keywords were found (should NOT be quick-rejected)
-            assert!(!rejected, "Command should NOT be quick-rejected: {cmd}");
-        }
-    }
-
-    #[test]
-    fn test_internal_backslash_normalization() {
-        // g\it should normalize to git (bash treats backslash as escape for regular chars)
-        let result = normalize_command_word_token(r"g\it");
-        assert_eq!(result, Some("git".to_string()), "g\\it should normalize to git");
-
-        // Multiple internal backslashes
-        let result = normalize_command_word_token(r"g\i\t");
-        assert_eq!(result, Some("git".to_string()), "g\\i\\t should normalize to git");
-
-        // Full command normalization
-        let result = normalize_command(r"g\it reset --hard");
-        assert_eq!(result.as_ref(), "git reset --hard", "g\\it command should normalize");
-    }
-
-    #[test]
-    fn test_mixed_quoting_normalization() {
-        // g'i't should normalize to git (bash concatenates adjacent quoted/unquoted sections)
-        let result = normalize_command_word_token("g'i't");
-        assert_eq!(result, Some("git".to_string()), "g'i't should normalize to git");
-
-        // Double quotes
-        let result = normalize_command_word_token(r#"g"i"t"#);
-        assert_eq!(result, Some("git".to_string()), r#"g"i"t should normalize to git"#);
-
-        // Full command normalization
-        let result = normalize_command("g'i't reset --hard");
-        assert_eq!(result.as_ref(), "git reset --hard", "g'i't command should normalize");
-    }
+    // Full command normalization
+    let result = normalize_command("g'i't reset --hard");
+    assert_eq!(
+        result.as_ref(),
+        "git reset --hard",
+        "g'i't command should normalize"
+    );
+}
