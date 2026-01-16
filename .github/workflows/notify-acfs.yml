@@ -1,0 +1,46 @@
+# .github/workflows/notify-acfs.yml
+#
+# Notifies ACFS when installer scripts change, triggering checksum updates.
+# Use this template for repos with install.sh at the repository root.
+#
+# Setup:
+#   1. Create a PAT with 'contents:read' on agentic_coding_flywheel_setup
+#   2. Add it as a secret named ACFS_REPO_DISPATCH_TOKEN in this repo
+#   3. Copy this file to .github/workflows/notify-acfs.yml
+#
+# Related: agentic_coding_flywheel_setup-b04c
+#
+name: Notify ACFS of Installer Changes
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'install.sh'
+  workflow_dispatch:  # Manual trigger for testing
+
+jobs:
+  notify-acfs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger ACFS checksum update
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.ACFS_REPO_DISPATCH_TOKEN }}
+          repository: Dicklesworthstone/agentic_coding_flywheel_setup
+          event-type: upstream-changed
+          client-payload: |
+            {
+              "tool": "${{ github.event.repository.name }}",
+              "ref": "${{ github.ref }}",
+              "sha": "${{ github.sha }}",
+              "actor": "${{ github.actor }}",
+              "timestamp": "${{ github.event.head_commit.timestamp }}"
+            }
+
+      - name: Log dispatch
+        run: |
+          echo "✅ Dispatched upstream-changed event to ACFS"
+          echo "   Tool: ${{ github.event.repository.name }}"
+          echo "   SHA: ${{ github.sha }}"
+          echo "   Triggered by: ${{ github.actor }}"

@@ -1407,7 +1407,7 @@ echo world
         agg.record(
             "rm -rf /",
             3,
-            &EvaluationResult::denied_by_pack("core.filesystem", "destructive"),
+            &EvaluationResult::denied_by_pack("core.filesystem", "destructive", None),
         );
 
         let parse_stats = ParseStats {
@@ -1436,6 +1436,7 @@ echo world
                 "pack.b",
                 "rule1",
                 "test",
+                None,
                 crate::packs::Severity::Critical,
             ),
         );
@@ -1446,6 +1447,7 @@ echo world
                 "pack.a",
                 "rule1",
                 "test",
+                None,
                 crate::packs::Severity::Critical,
             ),
         );
@@ -1456,6 +1458,7 @@ echo world
                 "pack.b",
                 "rule1",
                 "test",
+                None,
                 crate::packs::Severity::Critical,
             ),
         );
@@ -1488,6 +1491,7 @@ echo world
                     "pack.a",
                     "rule1",
                     "test",
+                    None,
                     crate::packs::Severity::Critical,
                 ),
             );
@@ -1521,6 +1525,7 @@ echo world
                 "pack.a",
                 "rule1",
                 "test",
+                None,
                 crate::packs::Severity::Critical,
             ),
         );

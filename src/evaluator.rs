@@ -50,6 +50,7 @@ use crate::context::sanitize_for_pattern_matching;
 use crate::heredoc::{
     ExtractionResult, SkipReason, TriggerResult, check_triggers, extract_content,
 };
+use crate::normalize::{PATH_NORMALIZER, QUOTED_PATH_NORMALIZER, strip_wrapper_prefixes};
 use crate::packs::{REGISTRY, pack_aware_quick_reject, pack_aware_quick_reject_with_normalized};
 use crate::pending_exceptions::AllowOnceStore;
 use crate::perf::Deadline;
@@ -137,6 +138,251 @@ fn truncate_preview(text: &str, max_chars: usize) -> String {
     }
 }
 
+// ============================================================================
+// UTF-8 Safe Windowing for Long Commands
+// ============================================================================
+
+/// Default maximum width for command display (characters, not bytes).
+pub const DEFAULT_WINDOW_WIDTH: usize = 120;
+
+/// Result of windowing a command for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowedCommand {
+    /// The windowed command string (with "..." if truncated).
+    pub display: String,
+    /// The span adjusted for the windowed string (for caret alignment).
+    /// None if the original span couldn't be mapped to the window.
+    pub adjusted_span: Option<WindowedSpan>,
+}
+
+/// Span within the windowed command for caret alignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowedSpan {
+    /// Start character offset in the windowed display string.
+    pub start: usize,
+    /// End character offset in the windowed display string.
+    pub end: usize,
+}
+
+/// Snap a byte offset to the nearest valid UTF-8 character boundary.
+///
+/// If `prefer_forward` is true, snaps forward; otherwise snaps backward.
+fn snap_to_char_boundary(s: &str, offset: usize, prefer_forward: bool) -> usize {
+    if offset >= s.len() {
+        return s.len();
+    }
+    if s.is_char_boundary(offset) {
+        return offset;
+    }
+    if prefer_forward {
+        (offset + 1..=s.len())
+            .find(|&i| s.is_char_boundary(i))
+            .unwrap_or(s.len())
+    } else {
+        (0..offset).rfind(|&i| s.is_char_boundary(i)).unwrap_or(0)
+    }
+}
+
+/// Create a windowed view of a command centered around a match span.
+///
+/// This function:
+/// - Returns the full command if it fits within `max_width` characters
+/// - Otherwise, centers the window around the match span
+/// - Adds "..." prefix when left-truncating
+/// - Adds "..." suffix when right-truncating
+/// - Ensures all slicing respects UTF-8 character boundaries
+///
+/// # Arguments
+///
+/// * `command` - The full command string
+/// * `span` - The match span (byte offsets) to center around
+/// * `max_width` - Maximum display width in characters (not bytes)
+///
+/// # Returns
+///
+/// A `WindowedCommand` with the display string and adjusted span for caret alignment.
+///
+/// # Example
+///
+/// ```
+/// use destructive_command_guard::evaluator::{window_command, MatchSpan};
+///
+/// let cmd = "very long prefix ... git reset --hard ... more suffix text";
+/// let span = MatchSpan { start: 24, end: 40 }; // "git reset --hard"
+/// let result = window_command(cmd, &span, 40);
+///
+/// // Result shows match in context with ellipsis
+/// assert!(result.display.contains("git reset --hard"));
+/// assert!(result.adjusted_span.is_some());
+/// ```
+#[must_use]
+pub fn window_command(command: &str, span: &MatchSpan, max_width: usize) -> WindowedCommand {
+    let char_count = command.chars().count();
+
+    // If command fits, return as-is with byte-to-char span conversion
+    if char_count <= max_width {
+        let adjusted_span = byte_span_to_char_span(command, span);
+        return WindowedCommand {
+            display: command.to_string(),
+            adjusted_span,
+        };
+    }
+
+    // Snap span to character boundaries
+    let safe_start = snap_to_char_boundary(command, span.start, true);
+    let safe_end = snap_to_char_boundary(command, span.end, false);
+
+    if safe_start >= safe_end || safe_start >= command.len() {
+        // Invalid span - return truncated command without span
+        let truncated: String = command.chars().take(max_width.saturating_sub(3)).collect();
+        return WindowedCommand {
+            display: format!("{truncated}..."),
+            adjusted_span: None,
+        };
+    }
+
+    // Convert byte offsets to character positions for windowing logic
+    let match_char_start = command[..safe_start].chars().count();
+    let match_char_end = command[..safe_end].chars().count();
+    let match_char_len = match_char_end.saturating_sub(match_char_start);
+
+    // Calculate window bounds in character positions
+    // Reserve space for "..." on each side (3 chars each)
+    let ellipsis_len = 3;
+    let available_width = max_width.saturating_sub(ellipsis_len * 2);
+
+    // If match itself is larger than window, show what we can
+    if match_char_len >= available_width {
+        let visible_match: String = command[safe_start..safe_end]
+            .chars()
+            .take(available_width)
+            .collect();
+        return WindowedCommand {
+            display: format!("...{visible_match}..."),
+            adjusted_span: Some(WindowedSpan {
+                start: ellipsis_len,
+                end: ellipsis_len + visible_match.chars().count(),
+            }),
+        };
+    }
+
+    // Calculate context to show around the match
+    let context_budget = available_width.saturating_sub(match_char_len);
+    let left_context = context_budget / 2;
+    let right_context = context_budget - left_context;
+
+    // Determine window start/end in character positions
+    let window_char_start = match_char_start.saturating_sub(left_context);
+    let window_char_end = (match_char_end + right_context).min(char_count);
+
+    // Check if we need ellipsis on each side
+    let needs_left_ellipsis = window_char_start > 0;
+    let needs_right_ellipsis = window_char_end < char_count;
+
+    // Build the windowed string
+    let mut result = String::new();
+    let adjusted_start = if needs_left_ellipsis {
+        result.push_str("...");
+        ellipsis_len
+    } else {
+        0
+    };
+
+    // Extract the windowed portion
+    let windowed: String = command
+        .chars()
+        .skip(window_char_start)
+        .take(window_char_end - window_char_start)
+        .collect();
+
+    // Calculate adjusted span within the windowed result
+    let span_start_in_window = match_char_start - window_char_start + adjusted_start;
+    let span_end_in_window = span_start_in_window + match_char_len;
+
+    result.push_str(&windowed);
+
+    if needs_right_ellipsis {
+        result.push_str("...");
+    }
+
+    WindowedCommand {
+        display: result,
+        adjusted_span: Some(WindowedSpan {
+            start: span_start_in_window,
+            end: span_end_in_window,
+        }),
+    }
+}
+
+/// Convert a byte span to a character span for caret alignment.
+fn byte_span_to_char_span(command: &str, span: &MatchSpan) -> Option<WindowedSpan> {
+    let safe_start = snap_to_char_boundary(command, span.start, true);
+    let safe_end = snap_to_char_boundary(command, span.end, false);
+
+    if safe_start >= safe_end || safe_start >= command.len() {
+        return None;
+    }
+
+    let char_start = command[..safe_start].chars().count();
+    let char_end = command[..safe_end].chars().count();
+
+    Some(WindowedSpan {
+        start: char_start,
+        end: char_end,
+    })
+}
+
+fn compute_normalized_offset(command_for_match: &str, normalized: &str) -> Option<usize> {
+    if normalized == command_for_match {
+        return Some(0);
+    }
+
+    if let Some(pos) = command_for_match.find(normalized) {
+        return Some(pos);
+    }
+
+    let stripped = strip_wrapper_prefixes(command_for_match);
+    let stripped_cmd = stripped.normalized.as_ref();
+    let base_offset = command_for_match.find(stripped_cmd)?;
+
+    if stripped_cmd == normalized {
+        return Some(base_offset);
+    }
+
+    if let Some(pos) = stripped_cmd.find(normalized) {
+        return Some(base_offset + pos);
+    }
+
+    if let Ok(Some(caps)) = QUOTED_PATH_NORMALIZER.captures(stripped_cmd) {
+        if let Some(m) = caps.get(1) {
+            return Some(base_offset + m.start());
+        }
+    }
+
+    if let Ok(Some(caps)) = PATH_NORMALIZER.captures(stripped_cmd) {
+        if let Some(m) = caps.get(1) {
+            return Some(base_offset + m.start());
+        }
+    }
+
+    None
+}
+
+fn map_span_with_offset(
+    span: MatchSpan,
+    offset: Option<usize>,
+    original_len: usize,
+) -> Option<MatchSpan> {
+    let offset = offset?;
+    let start = span.start.saturating_add(offset);
+    let end = span.end.saturating_add(offset);
+    if start <= end && end <= original_len {
+        Some(MatchSpan { start, end })
+    } else {
+        None
+    }
+}
+
 /// The decision made by the evaluator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvaluationDecision {
@@ -172,6 +418,10 @@ pub struct PatternMatch {
     pub matched_span: Option<MatchSpan>,
     /// Preview of the matched text (UTF-8 safe, truncated if too long).
     pub matched_text_preview: Option<String>,
+    /// Detailed explanation of why this pattern is dangerous.
+    /// More verbose than `reason`, intended for explain/verbose output modes.
+    /// Falls back to `reason` when not provided.
+    pub explanation: Option<String>,
 }
 
 /// Information about an allowlist override (DENY -> ALLOW).
@@ -258,6 +508,7 @@ impl EvaluationResult {
                 source: MatchSource::ConfigOverride,
                 matched_span: None,
                 matched_text_preview: None,
+                explanation: None,
             }),
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
@@ -279,6 +530,7 @@ impl EvaluationResult {
                 source: MatchSource::LegacyPattern,
                 matched_span: None,
                 matched_text_preview: None,
+                explanation: None,
             }),
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
@@ -301,6 +553,7 @@ impl EvaluationResult {
                 source: MatchSource::LegacyPattern,
                 matched_span: Some(span),
                 matched_text_preview: Some(preview),
+                explanation: None,
             }),
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
@@ -311,7 +564,7 @@ impl EvaluationResult {
     /// Create a "denied" result from a pack.
     #[inline]
     #[must_use]
-    pub fn denied_by_pack(pack_id: &str, reason: &str) -> Self {
+    pub fn denied_by_pack(pack_id: &str, reason: &str, explanation: Option<&str>) -> Self {
         Self {
             decision: EvaluationDecision::Deny,
             pattern_info: Some(PatternMatch {
@@ -322,6 +575,7 @@ impl EvaluationResult {
                 source: MatchSource::Pack,
                 matched_span: None,
                 matched_text_preview: None,
+                explanation: explanation.map(str::to_string),
             }),
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
@@ -335,6 +589,7 @@ impl EvaluationResult {
     pub fn denied_by_pack_with_span(
         pack_id: &str,
         reason: &str,
+        explanation: Option<&str>,
         command: &str,
         span: MatchSpan,
     ) -> Self {
@@ -349,6 +604,7 @@ impl EvaluationResult {
                 source: MatchSource::Pack,
                 matched_span: Some(span),
                 matched_text_preview: Some(preview),
+                explanation: explanation.map(str::to_string),
             }),
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
@@ -363,6 +619,7 @@ impl EvaluationResult {
         pack_id: &str,
         pattern_name: &str,
         reason: &str,
+        explanation: Option<&str>,
         severity: crate::packs::Severity,
     ) -> Self {
         Self {
@@ -375,6 +632,7 @@ impl EvaluationResult {
                 source: MatchSource::Pack,
                 matched_span: None,
                 matched_text_preview: None,
+                explanation: explanation.map(str::to_string),
             }),
             allowlist_override: None,
             effective_mode: Some(severity.default_mode()),
@@ -389,6 +647,7 @@ impl EvaluationResult {
         pack_id: &str,
         pattern_name: &str,
         reason: &str,
+        explanation: Option<&str>,
         severity: crate::packs::Severity,
         command: &str,
         span: MatchSpan,
@@ -404,6 +663,7 @@ impl EvaluationResult {
                 source: MatchSource::Pack,
                 matched_span: Some(span),
                 matched_text_preview: Some(preview),
+                explanation: explanation.map(str::to_string),
             }),
             allowlist_override: None,
             effective_mode: Some(severity.default_mode()),
@@ -831,8 +1091,22 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
         return EvaluationResult::allowed();
     }
 
-    let result =
-        evaluate_packs_with_allowlists(&normalized, ordered_packs, allowlists, keyword_index, None);
+    // Step 7: Mask heredoc content for non-executing targets (cat, tee, etc.)
+    // This prevents false positives where documentation text containing dangerous
+    // patterns like "rm -rf /" in heredocs to cat/tee triggers blocking.
+    let masked = crate::heredoc::mask_non_executing_heredocs(&normalized);
+    let command_for_packs = masked.as_ref();
+
+    let result = evaluate_packs_with_allowlists(
+        command_for_packs,
+        &normalized,
+        command_for_match,
+        command,
+        ordered_packs,
+        allowlists,
+        keyword_index,
+        None,
+    );
     if result.allowlist_override.is_none() {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
@@ -843,8 +1117,12 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn evaluate_packs_with_allowlists(
+    command_for_packs: &str,
     normalized: &str,
+    command_for_match: &str,
+    original_command: &str,
     ordered_packs: &[String],
     allowlists: &LayeredAllowlist,
     keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
@@ -865,7 +1143,7 @@ fn evaluate_packs_with_allowlists(
                 .iter()
                 .filter_map(|pack_id| {
                     let entry = REGISTRY.get_entry(pack_id)?;
-                    if !entry.might_match(normalized) {
+                    if !entry.might_match(command_for_packs) {
                         return None;
                     }
                     Some((pack_id, entry.get_pack()))
@@ -873,7 +1151,7 @@ fn evaluate_packs_with_allowlists(
                 .collect()
         },
         |index| {
-            let mask = index.candidate_pack_mask(normalized);
+            let mask = index.candidate_pack_mask(command_for_packs);
             ordered_packs
                 .iter()
                 .enumerate()
@@ -891,44 +1169,21 @@ fn evaluate_packs_with_allowlists(
     let has_filesystem_pack = candidate_packs
         .iter()
         .any(|(pack_id, _)| pack_id.as_str() == "core.filesystem");
-    let rm_parse =
-        has_filesystem_pack.then(|| crate::packs::core::filesystem::parse_rm_command(normalized));
+    let rm_parse = has_filesystem_pack
+        .then(|| crate::packs::core::filesystem::parse_rm_command(command_for_packs));
 
-    // Two-pass evaluation for cross-pack safe pattern support.
+    let normalized_offset = compute_normalized_offset(command_for_match, normalized);
+    let original_len = original_command.len();
+
+    // Single-pass per-pack evaluation: safe patterns only protect their own pack's
+    // destructive patterns, not other packs. This prevents compound command bypass
+    // where e.g., "git checkout -b foo" safe pattern would whitelist "rm -rf / ; git checkout -b foo".
     //
-    // Pass 1: Check safe patterns across ALL enabled packs first.
-    // If any pack's safe pattern matches, allow the command immediately.
-
-    // that would otherwise be blocked by other packs (like core.filesystem).
-    if matches!(
-        rm_parse.as_ref(),
-        Some(crate::packs::core::filesystem::RmParseDecision::Allow)
-    ) {
-        return EvaluationResult::allowed();
-    }
-
-    for (pack_id, pack) in &candidate_packs {
-        if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
-            return EvaluationResult::allowed_due_to_budget();
-        }
-
-        // If any safe pattern matches, allow immediately (cross-pack override).
-        if pack_id.as_str() == "core.filesystem" {
-            if matches!(
-                rm_parse.as_ref(),
-                Some(crate::packs::core::filesystem::RmParseDecision::NoMatch)
-            ) && pack.matches_safe(normalized)
-            {
-                return EvaluationResult::allowed();
-            }
-        } else if pack.matches_safe(normalized) {
-            return EvaluationResult::allowed();
-        }
-    }
-
-    // Pass 2: Check destructive patterns across all packs.
-    // If we allowlist a deny, we keep scanning for other denies. If none appear,
-    // we return ALLOW + the first allowlist override metadata for explain/logging.
+    // For each pack:
+    // 1. Check safe patterns - if match, skip this pack's destructive patterns (continue)
+    // 2. Check destructive patterns - if match, block (unless allowlisted)
+    //
+    // The rm_parse optimization for core.filesystem is handled inline.
     let mut first_allowlist_hit: Option<(PatternMatch, AllowlistLayer, String)> = None;
 
     for &(pack_id, pack) in &candidate_packs {
@@ -936,12 +1191,22 @@ fn evaluate_packs_with_allowlists(
             return EvaluationResult::allowed_due_to_budget();
         }
 
+        // Check safe patterns for this pack first.
+        // If a safe pattern matches, skip this pack's destructive patterns only.
+        // This prevents compound command bypass where one pack's safe pattern
+        // would whitelist destructive commands from other packs.
         if pack_id == "core.filesystem" {
+            // core.filesystem uses rm_parse for more accurate safe pattern detection
             match rm_parse.as_ref() {
                 Some(crate::packs::core::filesystem::RmParseDecision::Allow) => {
-                    continue;
+                    continue; // Safe pattern match - skip this pack
                 }
-                Some(crate::packs::core::filesystem::RmParseDecision::NoMatch) | None => {}
+                Some(crate::packs::core::filesystem::RmParseDecision::NoMatch) | None => {
+                    // rm_parse didn't find rm command or wasn't computed, check safe patterns as fallback
+                    if pack.matches_safe(command_for_packs) {
+                        continue;
+                    }
+                }
                 Some(crate::packs::core::filesystem::RmParseDecision::Deny(hit)) => {
                     if let Some(allow_hit) = allowlists.match_rule(pack_id, hit.pattern_name) {
                         if first_allowlist_hit.is_none() {
@@ -949,9 +1214,16 @@ fn evaluate_packs_with_allowlists(
                                 start: span.start,
                                 end: span.end,
                             });
-                            let preview = span
+                            let mapped_span = span.and_then(|span| {
+                                map_span_with_offset(span, normalized_offset, original_len)
+                            });
+                            let preview = mapped_span
                                 .as_ref()
-                                .map(|span| extract_match_preview(normalized, span));
+                                .map(|span| extract_match_preview(original_command, span))
+                                .or_else(|| {
+                                    span.as_ref()
+                                        .map(|span| extract_match_preview(command_for_packs, span))
+                                });
                             first_allowlist_hit = Some((
                                 PatternMatch {
                                     pack_id: Some(pack_id.clone()),
@@ -959,8 +1231,9 @@ fn evaluate_packs_with_allowlists(
                                     severity: Some(hit.severity),
                                     reason: hit.reason.to_string(),
                                     source: MatchSource::Pack,
-                                    matched_span: span,
+                                    matched_span: mapped_span,
                                     matched_text_preview: preview,
+                                    explanation: None,
                                 },
                                 allow_hit.layer,
                                 allow_hit.entry.reason.clone(),
@@ -969,27 +1242,38 @@ fn evaluate_packs_with_allowlists(
                         continue;
                     }
 
-                    if let Some(span) = hit.span.as_ref() {
-                        return EvaluationResult::denied_by_pack_pattern_with_span(
-                            pack_id,
-                            hit.pattern_name,
-                            hit.reason,
-                            hit.severity,
-                            normalized,
-                            MatchSpan {
-                                start: span.start,
-                                end: span.end,
-                            },
-                        );
+                    if let Some(span) = hit.span.as_ref().map(|span| MatchSpan {
+                        start: span.start,
+                        end: span.end,
+                    }) {
+                        if let Some(mapped_span) =
+                            map_span_with_offset(span, normalized_offset, original_len)
+                        {
+                            return EvaluationResult::denied_by_pack_pattern_with_span(
+                                pack_id,
+                                hit.pattern_name,
+                                hit.reason,
+                                None,
+                                hit.severity,
+                                original_command,
+                                mapped_span,
+                            );
+                        }
                     }
 
                     return EvaluationResult::denied_by_pack_pattern(
                         pack_id,
                         hit.pattern_name,
                         hit.reason,
+                        None,
                         hit.severity,
                     );
                 }
+            }
+        } else {
+            // Non-core.filesystem packs: check safe patterns before destructive
+            if pack.matches_safe(command_for_packs) {
+                continue; // Safe pattern match - skip this pack's destructive patterns
             }
         }
 
@@ -1004,19 +1288,23 @@ fn evaluate_packs_with_allowlists(
 
             let matched_span = pattern
                 .regex
-                .find(normalized)
+                .find(command_for_packs)
                 .map(|(start, end)| MatchSpan { start, end });
             let Some(span) = matched_span else {
                 continue;
             };
 
             let reason = pattern.reason;
+            let mapped_span = map_span_with_offset(span, normalized_offset, original_len);
+            let preview = mapped_span
+                .as_ref()
+                .map(|span| extract_match_preview(original_command, span))
+                .or_else(|| Some(extract_match_preview(command_for_packs, &span)));
 
             // Allowlist check: only applies when we have a stable match identity (named pattern).
             if let Some(pattern_name) = pattern.name {
                 if let Some(hit) = allowlists.match_rule(pack_id, pattern_name) {
                     if first_allowlist_hit.is_none() {
-                        let preview = extract_match_preview(normalized, &span);
                         first_allowlist_hit = Some((
                             PatternMatch {
                                 pack_id: Some(pack_id.clone()),
@@ -1024,8 +1312,9 @@ fn evaluate_packs_with_allowlists(
                                 severity: Some(pattern.severity),
                                 reason: reason.to_string(),
                                 source: MatchSource::Pack,
-                                matched_span: Some(span),
-                                matched_text_preview: Some(preview),
+                                matched_span: mapped_span,
+                                matched_text_preview: preview,
+                                explanation: pattern.explanation.map(str::to_string),
                             },
                             hit.layer,
                             hit.entry.reason.clone(),
@@ -1036,17 +1325,38 @@ fn evaluate_packs_with_allowlists(
                     continue;
                 }
 
-                return EvaluationResult::denied_by_pack_pattern_with_span(
+                if let Some(mapped_span) = mapped_span {
+                    return EvaluationResult::denied_by_pack_pattern_with_span(
+                        pack_id,
+                        pattern_name,
+                        reason,
+                        pattern.explanation,
+                        pattern.severity,
+                        original_command,
+                        mapped_span,
+                    );
+                }
+
+                return EvaluationResult::denied_by_pack_pattern(
                     pack_id,
                     pattern_name,
                     reason,
+                    pattern.explanation,
                     pattern.severity,
-                    normalized,
-                    span,
                 );
             }
 
-            return EvaluationResult::denied_by_pack_with_span(pack_id, reason, normalized, span);
+            if let Some(mapped_span) = mapped_span {
+                return EvaluationResult::denied_by_pack_with_span(
+                    pack_id,
+                    reason,
+                    pattern.explanation,
+                    original_command,
+                    mapped_span,
+                );
+            }
+
+            return EvaluationResult::denied_by_pack(pack_id, reason, pattern.explanation);
         }
     }
 
@@ -1077,6 +1387,7 @@ fn evaluate_packs_with_allowlists(
 /// This function accepts any types that implement pattern matching:
 /// * `S` - Safe pattern type with `is_match` method returning `bool`
 /// * `D` - Destructive pattern type with `is_match` method returning `bool` and `reason` method
+#[allow(clippy::too_many_lines)]
 pub fn evaluate_command_with_legacy<S, D>(
     command: &str,
     config: &Config,
@@ -1193,9 +1504,19 @@ where
         }
     }
 
+    let normalized_offset = compute_normalized_offset(command_for_match, &normalized);
+    let original_len = command.len();
+
     // Step 8: Check legacy destructive patterns (blacklist)
     for pattern in destructive_patterns {
-        if pattern.is_match(&normalized) {
+        if let Some(span) = pattern.find_span(&normalized) {
+            if let Some(mapped_span) = map_span_with_offset(span, normalized_offset, original_len) {
+                return EvaluationResult::denied_by_legacy_with_span(
+                    pattern.reason(),
+                    command,
+                    mapped_span,
+                );
+            }
             return EvaluationResult::denied_by_legacy(pattern.reason());
         }
     }
@@ -1203,6 +1524,9 @@ where
     // Step 9: Check enabled packs with allowlist override semantics.
     let result = evaluate_packs_with_allowlists(
         &normalized,
+        &normalized,
+        command_for_match,
+        command,
         &ordered_packs,
         allowlists,
         keyword_index.as_ref(),
@@ -1377,6 +1701,22 @@ fn evaluate_heredoc(
             }
         }
 
+        // Skip ALL heredoc content analysis if the target command is non-executing.
+        // Commands like `cat`, `tee`, `grep`, etc. just output the heredoc content
+        // as data - they don't execute it as code. This prevents false positives
+        // where documentation text containing dangerous command examples is blocked.
+        if content
+            .target_command
+            .as_ref()
+            .is_some_and(|cmd| crate::heredoc::is_non_executing_heredoc_command(cmd))
+        {
+            tracing::trace!(
+                target_command = ?content.target_command,
+                "Skipping heredoc content analysis for non-executing target"
+            );
+            continue; // Skip to next extracted content - this heredoc is just data
+        }
+
         // Tier 2.5: Recursive Shell Analysis
         // If content is Bash, extract inner commands and feed them back to the full evaluator.
         // This ensures that `kubectl`, `docker`, etc. inside heredocs are checked against their packs.
@@ -1408,6 +1748,25 @@ fn evaluate_heredoc(
                             info.reason, inner.line_number
                         );
                         info.source = MatchSource::HeredocAst; // Mark as heredoc source
+                        if let Some(span) = info.matched_span {
+                            if let Some(mapped_inner) =
+                                map_heredoc_span(command, &content, inner.start, inner.end)
+                            {
+                                let mapped = MatchSpan {
+                                    start: mapped_inner.start.saturating_add(span.start),
+                                    end: mapped_inner.start.saturating_add(span.end),
+                                };
+                                if mapped.end <= command.len() {
+                                    info.matched_span = Some(mapped);
+                                    info.matched_text_preview =
+                                        Some(extract_match_preview(command, &mapped));
+                                } else {
+                                    info.matched_span = None;
+                                }
+                            } else {
+                                info.matched_span = None;
+                            }
+                        }
 
                         return Some(EvaluationResult {
                             decision: EvaluationDecision::Deny,
@@ -1457,6 +1816,7 @@ fn evaluate_heredoc(
                 if first_allowlist_hit.is_none() {
                     let reason =
                         format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
+                    let mapped_span = map_heredoc_span(command, &content, m.start, m.end);
                     *first_allowlist_hit = Some((
                         PatternMatch {
                             pack_id: Some(pack_id),
@@ -1464,12 +1824,9 @@ fn evaluate_heredoc(
                             severity: Some(ast_severity_to_pack_severity(m.severity)),
                             reason,
                             source: MatchSource::HeredocAst,
-                            // AST matches already have span info from the matcher
-                            matched_span: Some(MatchSpan {
-                                start: m.start,
-                                end: m.end,
-                            }),
+                            matched_span: mapped_span,
                             matched_text_preview: Some(m.matched_text_preview),
+                            explanation: None,
                         },
                         hit.layer,
                         hit.entry.reason.clone(),
@@ -1479,6 +1836,7 @@ fn evaluate_heredoc(
             }
 
             let reason = format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
+            let mapped_span = map_heredoc_span(command, &content, m.start, m.end);
             return Some(EvaluationResult {
                 decision: EvaluationDecision::Deny,
                 pattern_info: Some(PatternMatch {
@@ -1487,12 +1845,9 @@ fn evaluate_heredoc(
                     severity: Some(ast_severity_to_pack_severity(m.severity)),
                     reason,
                     source: MatchSource::HeredocAst,
-                    // AST matches already have span info from the matcher
-                    matched_span: Some(MatchSpan {
-                        start: m.start,
-                        end: m.end,
-                    }),
+                    matched_span: mapped_span,
                     matched_text_preview: Some(m.matched_text_preview),
+                    explanation: None,
                 }),
                 allowlist_override: None,
                 effective_mode: Some(crate::packs::DecisionMode::Deny),
@@ -1588,6 +1943,33 @@ fn format_heredoc_denial_reason(
     )
 }
 
+fn map_heredoc_span(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    start: usize,
+    end: usize,
+) -> Option<MatchSpan> {
+    let range = content.content_range.as_ref()?;
+    let raw = command.get(range.clone())?;
+    if raw.len() != content.content.len() {
+        return None;
+    }
+    if raw != content.content {
+        return None;
+    }
+
+    let mapped_start = range.start.saturating_add(start);
+    let mapped_end = range.start.saturating_add(end);
+    if mapped_start <= mapped_end && mapped_end <= command.len() {
+        Some(MatchSpan {
+            start: mapped_start,
+            end: mapped_end,
+        })
+    } else {
+        None
+    }
+}
+
 /// Trait for legacy safe patterns.
 pub trait LegacySafePattern {
     /// Check if the pattern matches the command.
@@ -1598,6 +1980,11 @@ pub trait LegacySafePattern {
 pub trait LegacyDestructivePattern {
     /// Check if the pattern matches the command.
     fn is_match(&self, cmd: &str) -> bool;
+    /// Find the first match span, if available.
+    fn find_span(&self, cmd: &str) -> Option<MatchSpan> {
+        let _ = cmd;
+        None
+    }
     /// Get the reason for blocking.
     fn reason(&self) -> &str;
 }
@@ -1611,6 +1998,12 @@ impl LegacySafePattern for crate::packs::SafePattern {
 impl LegacyDestructivePattern for crate::packs::DestructivePattern {
     fn is_match(&self, cmd: &str) -> bool {
         self.regex.is_match(cmd)
+    }
+
+    fn find_span(&self, cmd: &str) -> Option<MatchSpan> {
+        self.regex
+            .find(cmd)
+            .map(|(start, end)| MatchSpan { start, end })
     }
 
     fn reason(&self) -> &str {
@@ -1833,7 +2226,7 @@ mod tests {
         assert!(allowed.reason().is_none());
         assert!(allowed.pack_id().is_none());
 
-        let denied = EvaluationResult::denied_by_pack("test.pack", "test reason");
+        let denied = EvaluationResult::denied_by_pack("test.pack", "test reason", None);
         assert!(!denied.is_allowed());
         assert!(denied.is_denied());
         assert_eq!(denied.reason(), Some("test reason"));
@@ -1870,6 +2263,7 @@ mod tests {
             "core.git",
             "reset-hard",
             "test",
+            None,
             crate::packs::Severity::Critical,
         );
         assert!(denied.is_denied());
@@ -2458,9 +2852,34 @@ mod tests {
                         span.end <= cmd.len(),
                         "Span end should not exceed command length"
                     );
+                    let matched = cmd.get(span.start..span.end).unwrap_or("");
+                    assert!(
+                        matched.contains("rm -rf /"),
+                        "Matched span should point into heredoc content"
+                    );
                 }
             }
         }
+    }
+
+    #[test]
+    fn match_span_maps_to_original_with_wrappers() {
+        let mut config = default_config();
+        config.packs.enabled.push("core.git".to_string());
+        let compiled = config.overrides.compile();
+        let allowlists = default_allowlists();
+        let enabled_packs = config.enabled_pack_ids();
+        let keywords_vec = crate::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
+        let keywords: Vec<&str> = keywords_vec.clone();
+
+        let cmd = "sudo git reset --hard";
+        let result = evaluate_command(cmd, &config, &keywords, &compiled, &allowlists);
+
+        assert!(result.is_denied(), "Command should be denied");
+        let pattern_info = result.pattern_info.expect("Expected pattern info");
+        let span = pattern_info.matched_span.expect("Expected matched span");
+        let matched = cmd.get(span.start..span.end).unwrap_or("");
+        assert_eq!(matched, "git reset --hard");
     }
 
     #[test]
@@ -2848,5 +3267,117 @@ mod tests {
             crate::packs::DecisionMode::Deny,
             "Critical severity should always be Deny mode"
         );
+    }
+
+    // =========================================================================
+    // UTF-8 Safe Windowing Tests (git_safety_guard-jpfm.2)
+    // =========================================================================
+
+    #[test]
+    fn window_command_short_command_unchanged() {
+        let cmd = "git reset --hard";
+        let span = MatchSpan { start: 0, end: 16 };
+        let result = window_command(cmd, &span, 80);
+
+        assert_eq!(result.display, cmd);
+        assert!(result.adjusted_span.is_some());
+        let adj = result.adjusted_span.unwrap();
+        assert_eq!(adj.start, 0);
+        assert_eq!(adj.end, 16);
+    }
+
+    #[test]
+    fn window_command_long_command_with_ellipsis() {
+        // Create a long command with match in the middle
+        let prefix = "a".repeat(50);
+        let suffix = "b".repeat(50);
+        let match_text = "git reset --hard";
+        let cmd = format!("{prefix}{match_text}{suffix}");
+        let span = MatchSpan {
+            start: 50,
+            end: 50 + 16,
+        };
+
+        let result = window_command(&cmd, &span, 40);
+
+        // Should have ellipsis on both sides
+        assert!(result.display.starts_with("..."));
+        assert!(result.display.ends_with("..."));
+        assert!(result.display.contains("git reset --hard"));
+
+        // Adjusted span should point to the match within the windowed string
+        let adj = result.adjusted_span.expect("Should have adjusted span");
+        let windowed_match: String = result
+            .display
+            .chars()
+            .skip(adj.start)
+            .take(adj.end - adj.start)
+            .collect();
+        assert_eq!(windowed_match, "git reset --hard");
+    }
+
+    #[test]
+    fn window_command_match_at_start() {
+        let match_text = "rm -rf /";
+        let suffix = "x".repeat(100);
+        let cmd = format!("{match_text}{suffix}");
+        let span = MatchSpan { start: 0, end: 8 };
+
+        let result = window_command(&cmd, &span, 40);
+
+        // Should NOT have left ellipsis, but should have right
+        assert!(!result.display.starts_with("..."));
+        assert!(result.display.ends_with("..."));
+        assert!(result.display.contains("rm -rf /"));
+
+        let adj = result.adjusted_span.expect("Should have adjusted span");
+        assert_eq!(adj.start, 0);
+    }
+
+    #[test]
+    fn window_command_match_at_end() {
+        let prefix = "y".repeat(100);
+        let match_text = "rm -rf /";
+        let cmd = format!("{prefix}{match_text}");
+        let span = MatchSpan {
+            start: 100,
+            end: 108,
+        };
+
+        let result = window_command(&cmd, &span, 40);
+
+        // Should have left ellipsis, but NOT right
+        assert!(result.display.starts_with("..."));
+        assert!(!result.display.ends_with("..."));
+        assert!(result.display.contains("rm -rf /"));
+    }
+
+    #[test]
+    fn window_command_utf8_multibyte_chars() {
+        // Test with UTF-8 multibyte characters (emoji)
+        let cmd = "echo 🎉🎊🎈 && rm -rf / && echo done";
+        // "rm -rf /" starts at byte position after "echo 🎉🎊🎈 && "
+        // Each emoji is 4 bytes, so: "echo " (5) + 3*4 (12) + " && " (4) = 21 bytes
+        let span = MatchSpan { start: 21, end: 29 }; // "rm -rf /"
+
+        let result = window_command(cmd, &span, 50);
+
+        assert!(result.display.contains("rm -rf /"));
+        assert!(result.adjusted_span.is_some());
+    }
+
+    #[test]
+    fn window_command_invalid_span_handles_gracefully() {
+        let cmd = "short";
+        let span = MatchSpan {
+            start: 100,
+            end: 200,
+        }; // Way past end
+
+        let result = window_command(cmd, &span, 80);
+
+        // Should return full command but no span
+        assert_eq!(result.display, "short");
+        assert!(result.adjusted_span.is_none());
     }
 }

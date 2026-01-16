@@ -5,7 +5,7 @@
 # It verifies database creation, command logging, querying, and cleanup.
 #
 # Usage:
-#   ./tests/e2e/run_telemetry_e2e.sh
+#   ./tests/e2e/run_history_e2e.sh
 #
 # Environment Variables:
 #   DCG_VERBOSE=1    Enable verbose output
