@@ -196,8 +196,6 @@ pub struct MatchInfo {
     pub match_end: Option<usize>,
     /// Preview of matched text (truncated if too long).
     pub matched_text_preview: Option<String>,
-    /// Detailed explanation of why the match is dangerous (optional).
-    pub explanation: Option<String>,
 }
 
 /// Information about an allowlist override.
@@ -496,16 +494,6 @@ impl ExplainTrace {
             }
 
             out.push_str(&format!("{cyan}Reason:{reset}     {}\n", info.reason));
-
-            let explanation = info.explanation_or_fallback();
-            let mut lines = explanation.lines();
-            if let Some(first) = lines.next() {
-                out.push_str(&format!("{cyan}Explanation:{reset} {first}\n"));
-                let indent = " ".repeat("Explanation: ".len());
-                for line in lines {
-                    out.push_str(&format!("{dim}{indent}{reset}{line}\n"));
-                }
-            }
 
             // Show matched span if available
             if let (Some(start), Some(end)) = (info.match_start, info.match_end) {
@@ -818,9 +806,6 @@ pub struct JsonMatchInfo {
     /// Preview of matched text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_text_preview: Option<String>,
-    /// Detailed explanation or fallback text.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub explanation: Option<String>,
 }
 
 /// JSON representation of a byte span.
@@ -966,44 +951,6 @@ impl TraceDetails {
 }
 
 impl MatchInfo {
-    fn rule_label(&self) -> Option<String> {
-        if let Some(rule_id) = self.rule_id.as_ref() {
-            return Some(rule_id.clone());
-        }
-
-        if let (Some(pack_id), Some(pattern_name)) =
-            (self.pack_id.as_deref(), self.pattern_name.as_deref())
-        {
-            return Some(format!("{pack_id}:{pattern_name}"));
-        }
-
-        self.pack_id.clone()
-    }
-
-    fn fallback_explanation(&self) -> String {
-        self.rule_label().map_or_else(
-            || {
-                "Matched a destructive pattern. No additional explanation is available yet. \
-                 See pack documentation for details."
-                    .to_string()
-            },
-            |label| {
-                format!(
-                    "Matched destructive pattern {label}. No additional explanation is available \
-                     yet. See pack documentation for details."
-                )
-            },
-        )
-    }
-
-    fn explanation_or_fallback(&self) -> String {
-        self.explanation
-            .as_ref()
-            .map(|text| text.trim())
-            .filter(|text| !text.is_empty())
-            .map_or_else(|| self.fallback_explanation(), ToString::to_string)
-    }
-
     fn to_json(&self) -> JsonMatchInfo {
         JsonMatchInfo {
             rule_id: self.rule_id.clone(),
@@ -1022,7 +969,6 @@ impl MatchInfo {
                 _ => None,
             },
             matched_text_preview: self.matched_text_preview.clone(),
-            explanation: Some(self.explanation_or_fallback()),
         }
     }
 }
@@ -1255,7 +1201,6 @@ mod tests {
             match_start: Some(0),
             match_end: Some(15),
             matched_text_preview: Some("git reset --hard".to_string()),
-            explanation: None,
         });
 
         let trace = collector.finish(EvaluationDecision::Deny);
@@ -1304,7 +1249,6 @@ mod tests {
             match_start: Some(0),
             match_end: Some(15),
             matched_text_preview: Some("git reset --hard".to_string()),
-            explanation: None,
         };
 
         collector.set_allowlist(AllowlistInfo {
@@ -1397,7 +1341,6 @@ mod tests {
             match_start: Some(10),
             match_end: Some(25),
             matched_text_preview: Some("matched text".to_string()),
-            explanation: None,
         };
 
         assert_eq!(info.match_start, Some(10));
@@ -1540,7 +1483,6 @@ mod tests {
                 match_start: None,
                 match_end: None,
                 matched_text_preview: None,
-                explanation: None,
             }),
             allowlist_info: None,
             pack_summary: None,
@@ -1595,7 +1537,6 @@ mod tests {
                 match_start: None,
                 match_end: None,
                 matched_text_preview: None,
-                explanation: None,
             }),
             allowlist_info: None,
             pack_summary: None,
@@ -1662,7 +1603,6 @@ mod tests {
                 match_start: Some(0),
                 match_end: Some(16),
                 matched_text_preview: Some("git reset --hard".to_string()),
-                explanation: None,
             }),
             allowlist_info: None,
             pack_summary: None,
@@ -1683,8 +1623,6 @@ mod tests {
         assert!(pretty.contains("reset-hard"));
         assert!(pretty.contains("Reason:"));
         assert!(pretty.contains("destroys uncommitted changes"));
-        assert!(pretty.contains("Explanation:"));
-        assert!(pretty.contains("Matched destructive pattern core.git:reset-hard"));
         assert!(pretty.contains("Span:"));
         assert!(pretty.contains("bytes 0..16"));
         assert!(pretty.contains("Matched:"));
@@ -1714,7 +1652,6 @@ mod tests {
                 match_start: None,
                 match_end: None,
                 matched_text_preview: None,
-                explanation: None,
             }),
             allowlist_info: None,
             pack_summary: None,
@@ -1741,7 +1678,6 @@ mod tests {
             match_start: None,
             match_end: None,
             matched_text_preview: None,
-            explanation: None,
         };
 
         let trace = ExplainTrace {
@@ -1880,7 +1816,6 @@ mod tests {
                 match_start: None,
                 match_end: None,
                 matched_text_preview: None,
-                explanation: None,
             }),
             allowlist_info: None,
             pack_summary: None,
@@ -2055,7 +1990,6 @@ mod tests {
                 match_start: Some(0),
                 match_end: Some(16),
                 matched_text_preview: Some("git reset --hard".to_string()),
-                explanation: None,
             }),
             allowlist_info: None,
             pack_summary: None,
@@ -2073,8 +2007,6 @@ mod tests {
         assert!(json.contains("\"pattern_name\": \"reset-hard\""));
         assert!(json.contains("\"reason\": \"destroys uncommitted changes\""));
         assert!(json.contains("\"source\": \"pack\""));
-        assert!(json.contains("\"explanation\":"));
-        assert!(json.contains("Matched destructive pattern core.git:reset-hard"));
 
         // Check matched span
         assert!(json.contains("\"matched_span\":"));
@@ -2142,7 +2074,6 @@ mod tests {
             match_start: None,
             match_end: None,
             matched_text_preview: None,
-            explanation: None,
         };
 
         let trace = ExplainTrace {
@@ -2228,7 +2159,6 @@ mod tests {
                 match_start: Some(0),
                 match_end: Some(16),
                 matched_text_preview: Some("git reset --hard".to_string()),
-                explanation: None,
             }),
             allowlist_info: None,
             pack_summary: Some(PackSummary {

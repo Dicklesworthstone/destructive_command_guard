@@ -68,5 +68,5 @@ matrix:
 
 ## 7) Privacy and Safety
 
-History and version checking must never log command contents. Use hashes
+Telemetry and version checking must never log command contents. Use hashes
 and metadata only.

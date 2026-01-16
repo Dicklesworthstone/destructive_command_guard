@@ -72,7 +72,7 @@ pub enum Severity {
     /// Warn by default, blockable via config.
     Medium,
 
-    /// Log only (for history/learning).
+    /// Log only (for telemetry/learning).
     Low,
 }
 ```
