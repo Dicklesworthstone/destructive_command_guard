@@ -47,9 +47,7 @@ use serde::Serialize;
 use std::time::Instant;
 
 /// Current JSON schema version for explain output.
-/// JSON schema version for `dcg explain --format json`.
-/// v2 adds `matched_span`, `matched_text_preview`, and `explanation` in `match`.
-pub const EXPLAIN_JSON_SCHEMA_VERSION: u32 = 2;
+pub const EXPLAIN_JSON_SCHEMA_VERSION: u32 = 1;
 
 /// A complete trace of a command evaluation.
 ///
@@ -198,8 +196,6 @@ pub struct MatchInfo {
     pub match_end: Option<usize>,
     /// Preview of matched text (truncated if too long).
     pub matched_text_preview: Option<String>,
-    /// Detailed explanation of why the match is dangerous (optional).
-    pub explanation: Option<String>,
 }
 
 /// Information about an allowlist override.
@@ -499,16 +495,6 @@ impl ExplainTrace {
 
             out.push_str(&format!("{cyan}Reason:{reset}     {}\n", info.reason));
 
-            let explanation = info.explanation_or_fallback();
-            let mut lines = explanation.lines();
-            if let Some(first) = lines.next() {
-                out.push_str(&format!("{cyan}Explanation:{reset} {first}\n"));
-                let indent = " ".repeat("Explanation: ".len());
-                for line in lines {
-                    out.push_str(&format!("{dim}{indent}{reset}{line}\n"));
-                }
-            }
-
             // Show matched span if available
             if let (Some(start), Some(end)) = (info.match_start, info.match_end) {
                 out.push_str(&format!("{cyan}Span:{reset}       bytes {start}..{end}\n"));
@@ -796,7 +782,6 @@ pub enum JsonTraceDetails {
 }
 
 /// JSON representation of match information.
-/// Schema v2 adds `matched_span`, `matched_text_preview`, and `explanation`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonMatchInfo {
     /// Stable rule ID (e.g., "core.git:reset-hard").
@@ -821,9 +806,6 @@ pub struct JsonMatchInfo {
     /// Preview of matched text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_text_preview: Option<String>,
-    /// Detailed explanation or fallback text.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub explanation: Option<String>,
 }
 
 /// JSON representation of a byte span.
@@ -969,44 +951,6 @@ impl TraceDetails {
 }
 
 impl MatchInfo {
-    fn rule_label(&self) -> Option<String> {
-        if let Some(rule_id) = self.rule_id.as_ref() {
-            return Some(rule_id.clone());
-        }
-
-        if let (Some(pack_id), Some(pattern_name)) =
-            (self.pack_id.as_deref(), self.pattern_name.as_deref())
-        {
-            return Some(format!("{pack_id}:{pattern_name}"));
-        }
-
-        self.pack_id.clone()
-    }
-
-    fn fallback_explanation(&self) -> String {
-        self.rule_label().map_or_else(
-            || {
-                "Matched a destructive pattern. No additional explanation is available yet. \
-                 See pack documentation for details."
-                    .to_string()
-            },
-            |label| {
-                format!(
-                    "Matched destructive pattern {label}. No additional explanation is available \
-                     yet. See pack documentation for details."
-                )
-            },
-        )
-    }
-
-    fn explanation_or_fallback(&self) -> String {
-        self.explanation
-            .as_ref()
-            .map(|text| text.trim())
-            .filter(|text| !text.is_empty())
-            .map_or_else(|| self.fallback_explanation(), ToString::to_string)
-    }
-
     fn to_json(&self) -> JsonMatchInfo {
         JsonMatchInfo {
             rule_id: self.rule_id.clone(),
@@ -1025,7 +969,6 @@ impl MatchInfo {
                 _ => None,
             },
             matched_text_preview: self.matched_text_preview.clone(),
-            explanation: Some(self.explanation_or_fallback()),
         }
     }
 }
@@ -1258,7 +1201,6 @@ mod tests {
             match_start: Some(0),
             match_end: Some(15),
             matched_text_preview: Some("git reset --hard".to_string()),
-            explanation: None,
         });
 
         let trace = collector.finish(EvaluationDecision::Deny);
@@ -1307,7 +1249,6 @@ mod tests {
             match_start: Some(0),
             match_end: Some(15),
             matched_text_preview: Some("git reset --hard".to_string()),
-            explanation: None,
         };
 
         collector.set_allowlist(AllowlistInfo {
@@ -1400,7 +1341,6 @@ mod tests {
             match_start: Some(10),
             match_end: Some(25),
             matched_text_preview: Some("matched text".to_string()),
-            explanation: None,
         };
 
         assert_eq!(info.match_start, Some(10));
@@ -1543,7 +1483,6 @@ mod tests {
                 match_start: None,
                 match_end: None,
                 matched_text_preview: None,
-                explanation: None,
             }),
             allowlist_info: None,
             pack_summary: None,
@@ -1598,7 +1537,6 @@ mod tests {
                 match_start: None,
                 match_end: None,
                 matched_text_preview: None,
-                explanation: None,
             }),
             allowlist_info: None,
             pack_summary: None,
@@ -1665,7 +1603,6 @@ mod tests {
                 match_start: Some(0),
                 match_end: Some(16),
                 matched_text_preview: Some("git reset --hard".to_string()),
-                explanation: None,
             }),
             allowlist_info: None,
             pack_summary: None,
@@ -1686,8 +1623,6 @@ mod tests {
         assert!(pretty.contains("reset-hard"));
         assert!(pretty.contains("Reason:"));
         assert!(pretty.contains("destroys uncommitted changes"));
-        assert!(pretty.contains("Explanation:"));
-        assert!(pretty.contains("Matched destructive pattern core.git:reset-hard"));
         assert!(pretty.contains("Span:"));
         assert!(pretty.contains("bytes 0..16"));
         assert!(pretty.contains("Matched:"));
@@ -1717,7 +1652,6 @@ mod tests {
                 match_start: None,
                 match_end: None,
                 matched_text_preview: None,
-                explanation: None,
             }),
             allowlist_info: None,
             pack_summary: None,
@@ -1744,7 +1678,6 @@ mod tests {
             match_start: None,
             match_end: None,
             matched_text_preview: None,
-            explanation: None,
         };
 
         let trace = ExplainTrace {
@@ -1883,7 +1816,6 @@ mod tests {
                 match_start: None,
                 match_end: None,
                 matched_text_preview: None,
-                explanation: None,
             }),
             allowlist_info: None,
             pack_summary: None,
@@ -2013,7 +1945,7 @@ mod tests {
         };
 
         let json = trace.format_json();
-        assert!(json.contains("\"schema_version\": 2"));
+        assert!(json.contains("\"schema_version\": 1"));
         assert!(json.contains("\"decision\": \"allow\""));
         assert!(json.contains("\"command\": \"git status\""));
         assert!(json.contains("\"total_duration_us\": 94"));
@@ -2058,7 +1990,6 @@ mod tests {
                 match_start: Some(0),
                 match_end: Some(16),
                 matched_text_preview: Some("git reset --hard".to_string()),
-                explanation: None,
             }),
             allowlist_info: None,
             pack_summary: None,
@@ -2076,8 +2007,6 @@ mod tests {
         assert!(json.contains("\"pattern_name\": \"reset-hard\""));
         assert!(json.contains("\"reason\": \"destroys uncommitted changes\""));
         assert!(json.contains("\"source\": \"pack\""));
-        assert!(json.contains("\"explanation\":"));
-        assert!(json.contains("Matched destructive pattern core.git:reset-hard"));
 
         // Check matched span
         assert!(json.contains("\"matched_span\":"));
@@ -2145,7 +2074,6 @@ mod tests {
             match_start: None,
             match_end: None,
             matched_text_preview: None,
-            explanation: None,
         };
 
         let trace = ExplainTrace {
@@ -2231,7 +2159,6 @@ mod tests {
                 match_start: Some(0),
                 match_end: Some(16),
                 matched_text_preview: Some("git reset --hard".to_string()),
-                explanation: None,
             }),
             allowlist_info: None,
             pack_summary: Some(PackSummary {
@@ -2258,7 +2185,7 @@ mod tests {
 
     #[test]
     fn json_schema_version_is_stable() {
-        assert_eq!(EXPLAIN_JSON_SCHEMA_VERSION, 2);
+        assert_eq!(EXPLAIN_JSON_SCHEMA_VERSION, 1);
     }
 
     #[test]
@@ -2278,7 +2205,7 @@ mod tests {
 
         let output = trace.to_json_output();
 
-        assert_eq!(output.schema_version, 2);
+        assert_eq!(output.schema_version, 1);
         assert_eq!(output.command, "git status");
         assert_eq!(output.decision, "allow");
         assert_eq!(output.total_duration_us, 100);
@@ -2287,348 +2214,5 @@ mod tests {
         assert!(output.allowlist.is_none());
         assert!(output.pack_summary.is_none());
         assert!(output.suggestions.is_none());
-    }
-
-    // ========================================================================
-    // Explanation fallback tests (git_safety_guard-r97e.5)
-    // ========================================================================
-
-    #[test]
-    fn match_info_fallback_explanation_with_rule_id() {
-        let info = MatchInfo {
-            rule_id: Some("core.git:reset-hard".to_string()),
-            pack_id: Some("core.git".to_string()),
-            pattern_name: Some("reset-hard".to_string()),
-            severity: Some(Severity::Critical),
-            reason: "destroys uncommitted changes".to_string(),
-            source: MatchSource::Pack,
-            match_start: None,
-            match_end: None,
-            matched_text_preview: None,
-            explanation: None,
-        };
-
-        let fallback = info.fallback_explanation();
-        assert!(
-            fallback.contains("Matched destructive pattern core.git:reset-hard"),
-            "Fallback should contain rule_id, got: {fallback}"
-        );
-        assert!(
-            fallback.contains("No additional explanation is available"),
-            "Fallback should indicate no explanation available, got: {fallback}"
-        );
-    }
-
-    #[test]
-    fn match_info_fallback_explanation_builds_rule_from_pack_and_pattern() {
-        let info = MatchInfo {
-            rule_id: None, // No explicit rule_id
-            pack_id: Some("containers.docker".to_string()),
-            pattern_name: Some("system-prune".to_string()),
-            severity: Some(Severity::High),
-            reason: "removes all unused data".to_string(),
-            source: MatchSource::Pack,
-            match_start: None,
-            match_end: None,
-            matched_text_preview: None,
-            explanation: None,
-        };
-
-        let fallback = info.fallback_explanation();
-        assert!(
-            fallback.contains("Matched destructive pattern containers.docker:system-prune"),
-            "Fallback should construct rule from pack:pattern, got: {fallback}"
-        );
-    }
-
-    #[test]
-    fn match_info_fallback_explanation_pack_only() {
-        let info = MatchInfo {
-            rule_id: None,
-            pack_id: Some("core.filesystem".to_string()),
-            pattern_name: None, // No pattern name
-            severity: Some(Severity::High),
-            reason: "dangerous filesystem operation".to_string(),
-            source: MatchSource::Pack,
-            match_start: None,
-            match_end: None,
-            matched_text_preview: None,
-            explanation: None,
-        };
-
-        let fallback = info.fallback_explanation();
-        assert!(
-            fallback.contains("core.filesystem"),
-            "Fallback should contain pack_id, got: {fallback}"
-        );
-    }
-
-    #[test]
-    fn match_info_fallback_explanation_generic() {
-        let info = MatchInfo {
-            rule_id: None,
-            pack_id: None,
-            pattern_name: None,
-            severity: None,
-            reason: "matched".to_string(),
-            source: MatchSource::LegacyPattern,
-            match_start: None,
-            match_end: None,
-            matched_text_preview: None,
-            explanation: None,
-        };
-
-        let fallback = info.fallback_explanation();
-        assert!(
-            fallback.contains("Matched a destructive pattern"),
-            "Generic fallback expected, got: {fallback}"
-        );
-    }
-
-    #[test]
-    fn match_info_explanation_or_fallback_uses_explicit() {
-        let info = MatchInfo {
-            rule_id: Some("core.git:reset-hard".to_string()),
-            pack_id: Some("core.git".to_string()),
-            pattern_name: Some("reset-hard".to_string()),
-            severity: Some(Severity::Critical),
-            reason: "destroys uncommitted changes".to_string(),
-            source: MatchSource::Pack,
-            match_start: None,
-            match_end: None,
-            matched_text_preview: None,
-            explanation: Some(
-                "This command discards all uncommitted changes permanently.".to_string(),
-            ),
-        };
-
-        let result = info.explanation_or_fallback();
-        assert_eq!(
-            result,
-            "This command discards all uncommitted changes permanently."
-        );
-    }
-
-    #[test]
-    fn match_info_explanation_or_fallback_trims_whitespace() {
-        let info = MatchInfo {
-            rule_id: Some("core.git:reset-hard".to_string()),
-            pack_id: Some("core.git".to_string()),
-            pattern_name: Some("reset-hard".to_string()),
-            severity: Some(Severity::Critical),
-            reason: "destroys uncommitted changes".to_string(),
-            source: MatchSource::Pack,
-            match_start: None,
-            match_end: None,
-            matched_text_preview: None,
-            explanation: Some("  Leading and trailing whitespace  \n".to_string()),
-        };
-
-        let result = info.explanation_or_fallback();
-        assert_eq!(result, "Leading and trailing whitespace");
-    }
-
-    #[test]
-    fn match_info_explanation_or_fallback_empty_triggers_fallback() {
-        let info = MatchInfo {
-            rule_id: Some("core.git:reset-hard".to_string()),
-            pack_id: Some("core.git".to_string()),
-            pattern_name: Some("reset-hard".to_string()),
-            severity: Some(Severity::Critical),
-            reason: "destroys uncommitted changes".to_string(),
-            source: MatchSource::Pack,
-            match_start: None,
-            match_end: None,
-            matched_text_preview: None,
-            explanation: Some(String::new()), // Empty string
-        };
-
-        let result = info.explanation_or_fallback();
-        assert!(
-            result.contains("Matched destructive pattern"),
-            "Empty string should trigger fallback, got: {result}"
-        );
-    }
-
-    #[test]
-    fn match_info_explanation_or_fallback_whitespace_only_triggers_fallback() {
-        let info = MatchInfo {
-            rule_id: Some("core.git:reset-hard".to_string()),
-            pack_id: Some("core.git".to_string()),
-            pattern_name: Some("reset-hard".to_string()),
-            severity: Some(Severity::Critical),
-            reason: "destroys uncommitted changes".to_string(),
-            source: MatchSource::Pack,
-            match_start: None,
-            match_end: None,
-            matched_text_preview: None,
-            explanation: Some("   \t\n  ".to_string()), // Whitespace only
-        };
-
-        let result = info.explanation_or_fallback();
-        assert!(
-            result.contains("Matched destructive pattern"),
-            "Whitespace-only should trigger fallback, got: {result}"
-        );
-    }
-
-    // ========================================================================
-    // JSON explanation field tests (git_safety_guard-r97e.5)
-    // ========================================================================
-
-    #[test]
-    fn json_match_info_includes_explicit_explanation() {
-        let info = MatchInfo {
-            rule_id: Some("core.git:reset-hard".to_string()),
-            pack_id: Some("core.git".to_string()),
-            pattern_name: Some("reset-hard".to_string()),
-            severity: Some(Severity::Critical),
-            reason: "destroys uncommitted changes".to_string(),
-            source: MatchSource::Pack,
-            match_start: Some(0),
-            match_end: Some(16),
-            matched_text_preview: Some("git reset --hard".to_string()),
-            explanation: Some("Discards all uncommitted changes permanently.".to_string()),
-        };
-
-        let json_info = info.to_json();
-
-        assert_eq!(
-            json_info.explanation,
-            Some("Discards all uncommitted changes permanently.".to_string())
-        );
-    }
-
-    #[test]
-    fn json_match_info_uses_fallback_when_no_explanation() {
-        let info = MatchInfo {
-            rule_id: Some("core.git:reset-hard".to_string()),
-            pack_id: Some("core.git".to_string()),
-            pattern_name: Some("reset-hard".to_string()),
-            severity: Some(Severity::Critical),
-            reason: "destroys uncommitted changes".to_string(),
-            source: MatchSource::Pack,
-            match_start: Some(0),
-            match_end: Some(16),
-            matched_text_preview: Some("git reset --hard".to_string()),
-            explanation: None,
-        };
-
-        let json_info = info.to_json();
-
-        assert!(
-            json_info.explanation.is_some(),
-            "JSON should always have explanation field (fallback)"
-        );
-        let explanation = json_info.explanation.unwrap();
-        assert!(
-            explanation.contains("Matched destructive pattern"),
-            "JSON explanation should use fallback, got: {explanation}"
-        );
-    }
-
-    #[test]
-    fn json_output_match_info_has_explanation_field() {
-        let trace = ExplainTrace {
-            command: "git reset --hard".to_string(),
-            normalized_command: None,
-            sanitized_command: None,
-            decision: EvaluationDecision::Deny,
-            skipped_due_to_budget: false,
-            total_duration_us: 100,
-            steps: vec![],
-            match_info: Some(MatchInfo {
-                rule_id: Some("core.git:reset-hard".to_string()),
-                pack_id: Some("core.git".to_string()),
-                pattern_name: Some("reset-hard".to_string()),
-                severity: Some(Severity::Critical),
-                reason: "destroys uncommitted changes".to_string(),
-                source: MatchSource::Pack,
-                match_start: None,
-                match_end: None,
-                matched_text_preview: None,
-                explanation: Some("This is a detailed explanation.".to_string()),
-            }),
-            allowlist_info: None,
-            pack_summary: None,
-        };
-
-        let json = trace.format_json();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        let explanation = parsed["match"]["explanation"].as_str();
-        assert_eq!(
-            explanation,
-            Some("This is a detailed explanation."),
-            "JSON output should include explanation field"
-        );
-    }
-
-    #[test]
-    fn json_output_match_info_fallback_explanation_is_not_empty() {
-        let trace = ExplainTrace {
-            command: "docker system prune -af".to_string(),
-            normalized_command: None,
-            sanitized_command: None,
-            decision: EvaluationDecision::Deny,
-            skipped_due_to_budget: false,
-            total_duration_us: 100,
-            steps: vec![],
-            match_info: Some(MatchInfo {
-                rule_id: Some("containers.docker:system-prune".to_string()),
-                pack_id: Some("containers.docker".to_string()),
-                pattern_name: Some("system-prune".to_string()),
-                severity: Some(Severity::High),
-                reason: "removes all unused data".to_string(),
-                source: MatchSource::Pack,
-                match_start: None,
-                match_end: None,
-                matched_text_preview: None,
-                explanation: None, // No explicit explanation
-            }),
-            allowlist_info: None,
-            pack_summary: None,
-        };
-
-        let json = trace.format_json();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        let explanation = parsed["match"]["explanation"].as_str();
-        assert!(
-            explanation.is_some(),
-            "JSON match should always have explanation"
-        );
-        assert!(
-            !explanation.unwrap().is_empty(),
-            "Explanation fallback should not be empty"
-        );
-        assert!(
-            explanation
-                .unwrap()
-                .contains("containers.docker:system-prune"),
-            "Fallback should reference the rule"
-        );
-    }
-
-    #[test]
-    fn json_schema_version_field_in_output() {
-        let trace = ExplainTrace {
-            command: "git status".to_string(),
-            normalized_command: None,
-            sanitized_command: None,
-            decision: EvaluationDecision::Allow,
-            skipped_due_to_budget: false,
-            total_duration_us: 100,
-            steps: vec![],
-            match_info: None,
-            allowlist_info: None,
-            pack_summary: None,
-        };
-
-        let json = trace.format_json();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        let version = parsed["schema_version"].as_u64();
-        assert_eq!(version, Some(2), "Schema version should be 2");
     }
 }
