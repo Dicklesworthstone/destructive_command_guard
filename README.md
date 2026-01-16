@@ -765,6 +765,10 @@ dcg explain --verbose "rm -rf /tmp/build"
 dcg explain --format json "kubectl delete namespace production"
 ```
 
+JSON output is versioned via `schema_version` (currently 2). v2 adds
+`matched_span`, `matched_text_preview`, and `explanation` in the `match`
+object when a pattern is detected.
+
 **Example Output**:
 
 ```
