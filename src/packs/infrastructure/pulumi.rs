@@ -52,37 +52,78 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "destroy",
             r"pulumi\s+destroy",
-            "pulumi destroy removes ALL managed infrastructure. Use 'pulumi preview --diff' first."
+            "pulumi destroy removes ALL managed infrastructure. Use 'pulumi preview --diff' first.",
+            Critical,
+            "pulumi destroy removes ALL managed infrastructure:\n\n\
+             - Every resource in your stack is destroyed\n\
+             - Cloud resources (VMs, databases, networks) deleted\n\
+             - Cannot be undone without backups/recreation\n\
+             - Use --target to destroy specific resources only\n\n\
+             Preview first: pulumi preview --diff"
         ),
         // up with -y or --yes (auto-approve)
         destructive_pattern!(
             "up-yes",
             r"pulumi\s+up\s+.*(?:-y\b|--yes\b)",
-            "pulumi up -y skips confirmation. Remove -y flag for safety."
+            "pulumi up -y skips confirmation. Remove -y flag for safety.",
+            High,
+            "pulumi up -y skips confirmation:\n\n\
+             - No opportunity to review changes before applying\n\
+             - Intended for CI/CD, not interactive use\n\
+             - Changes may destroy or recreate resources\n\
+             - Replacements can cause downtime\n\n\
+             For safety: remove -y and review the preview"
         ),
         // state delete
         destructive_pattern!(
             "state-delete",
             r"pulumi\s+state\s+delete",
-            "pulumi state delete removes resource from state without destroying it."
+            "pulumi state delete removes resource from state without destroying it.",
+            High,
+            "pulumi state delete orphans resources:\n\n\
+             - Resource removed from Pulumi state\n\
+             - Actual cloud resource still exists\n\
+             - Resource becomes 'unmanaged' (Pulumi ignores it)\n\
+             - May cause drift between state and reality\n\n\
+             Consider: pulumi refresh to sync state with reality"
         ),
         // stack rm (remove stack)
         destructive_pattern!(
             "stack-rm",
             r"pulumi\s+stack\s+rm",
-            "pulumi stack rm removes the stack. Use --force only if stack is empty."
+            "pulumi stack rm removes the stack. Use --force only if stack is empty.",
+            High,
+            "pulumi stack rm removes the entire stack:\n\n\
+             - Stack and its state deleted\n\
+             - Does NOT destroy actual infrastructure (unless empty)\n\
+             - --force required if resources still exist\n\
+             - Resources become unmanaged (orphaned)\n\n\
+             Destroy resources first: pulumi destroy, then rm stack"
         ),
         // refresh with -y
         destructive_pattern!(
             "refresh-yes",
             r"pulumi\s+refresh\s+.*(?:-y\b|--yes\b)",
-            "pulumi refresh -y auto-approves state changes. Review changes first."
+            "pulumi refresh -y auto-approves state changes. Review changes first.",
+            Medium,
+            "pulumi refresh -y auto-approves state sync:\n\n\
+             - Syncs Pulumi state with actual cloud resources\n\
+             - May delete resources from state if not found\n\
+             - May update state with drift from cloud\n\n\
+             Run without -y first to review detected changes"
         ),
         // cancel (cancels in-progress update)
         destructive_pattern!(
             "cancel",
             r"pulumi\s+cancel",
-            "pulumi cancel terminates an in-progress update, which may leave resources in inconsistent state."
+            "pulumi cancel terminates an in-progress update, which may leave resources in inconsistent state.",
+            High,
+            "pulumi cancel stops in-progress operations:\n\n\
+             - Terminates currently running update/destroy\n\
+             - Resources may be left in inconsistent state\n\
+             - Some resources created, others not\n\
+             - May require manual cleanup\n\n\
+             Use only when operation is stuck/hung"
         ),
     ]
 }
