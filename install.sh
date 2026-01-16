@@ -493,6 +493,12 @@ CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 GEMINI_SETTINGS="$HOME/.gemini/settings.json"
 AUTO_CONFIGURED=0
 
+# Detailed tracking for what was configured
+CLAUDE_STATUS=""  # "created"|"merged"|"already"|"failed"
+GEMINI_STATUS=""  # "created"|"merged"|"already"|"failed"|"skipped"
+CLAUDE_BACKUP=""
+GEMINI_BACKUP=""
+
 configure_claude_code() {
   local settings_file="$1"
   local cleanup_predecessor="$2"
@@ -500,8 +506,8 @@ configure_claude_code() {
   [ -z "$cleanup_predecessor" ] && cleanup_predecessor=1
   local settings_dir=$(dirname "$settings_file")
 
+  # Always create the config directory if it doesn't exist
   if [ ! -d "$settings_dir" ]; then
-    info "Creating Claude Code config directory: $settings_dir"
     mkdir -p "$settings_dir"
   fi
 
@@ -510,19 +516,17 @@ configure_claude_code() {
     if grep -q '"command".*dcg' "$settings_file" 2>/dev/null; then
       # Also check if predecessor is still present (needs cleanup)
       if grep -q 'git_safety_guard' "$settings_file" 2>/dev/null; then
-        info "Found both dcg and predecessor in settings; cleaning up..."
-        # Fall through to cleanup logic below
+        : # Fall through to cleanup logic below
       else
-        ok "Claude Code already configured with dcg"
+        CLAUDE_STATUS="already"
         AUTO_CONFIGURED=1
         return 0
       fi
     fi
 
     # Settings file exists, need to merge
-    info "Merging dcg hook into existing Claude Code settings..."
-    local backup="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
-    cp "$settings_file" "$backup"
+    CLAUDE_BACKUP="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$settings_file" "$CLAUDE_BACKUP"
 
     if command -v python3 >/dev/null 2>&1; then
       python3 - "$settings_file" "$DEST/dcg" "$cleanup_predecessor" <<'PYEOF'
@@ -536,7 +540,7 @@ cleanup_predecessor = sys.argv[3] == "1" if len(sys.argv) > 3 else True
 try:
     with open(settings_file, 'r') as f:
         settings = json.load(f)
-except:
+except (IOError, ValueError, json.JSONDecodeError):
     settings = {}
 
 # Ensure hooks structure exists
@@ -596,21 +600,22 @@ if predecessor_removed:
     print("PREDECESSOR_CLEANED", file=sys.stderr)
 PYEOF
       if [ $? -eq 0 ]; then
-        ok "Configured Claude Code (backup: $backup)"
+        CLAUDE_STATUS="merged"
         AUTO_CONFIGURED=1
       else
-        warn "Failed to configure Claude Code; restoring backup"
-        mv "$backup" "$settings_file" 2>/dev/null || true
+        mv "$CLAUDE_BACKUP" "$settings_file" 2>/dev/null || true
+        CLAUDE_STATUS="failed"
+        CLAUDE_BACKUP=""
       fi
     else
-      warn "Python3 not available for JSON merging"
-      warn "Add this to ~/.claude/settings.json manually:"
-      echo '  {"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"'"$DEST/dcg"'"}]}]}}'
+      # python3 not available - remove unnecessary backup
+      rm -f "$CLAUDE_BACKUP" 2>/dev/null || true
+      CLAUDE_BACKUP=""
+      CLAUDE_STATUS="failed"
       return 1
     fi
   else
     # Create new settings file
-    info "Creating Claude Code settings with dcg hook..."
     cat > "$settings_file" <<EOFSET
 {
   "hooks": {
@@ -628,7 +633,7 @@ PYEOF
   }
 }
 EOFSET
-    ok "Created $settings_file"
+    CLAUDE_STATUS="created"
     AUTO_CONFIGURED=1
   fi
 }
@@ -637,22 +642,27 @@ configure_gemini() {
   local settings_file="$1"
   local settings_dir=$(dirname "$settings_file")
 
-  # Check if Gemini CLI is installed
+  # Check if Gemini CLI appears to be installed (has config dir or gemini command exists)
+  if [ ! -d "$settings_dir" ] && ! command -v gemini >/dev/null 2>&1; then
+    # Gemini CLI not installed - skip without error
+    GEMINI_STATUS="skipped"
+    return 0
+  fi
+
+  # Create directory if needed (gemini command exists but no config dir yet)
   if [ ! -d "$settings_dir" ]; then
-    # Gemini CLI not installed
-    return 1
+    mkdir -p "$settings_dir"
   fi
 
   if [ -f "$settings_file" ]; then
     if grep -q '"command".*dcg' "$settings_file" 2>/dev/null; then
-      ok "Gemini CLI already configured with dcg"
+      GEMINI_STATUS="already"
       AUTO_CONFIGURED=1
       return 0
     fi
 
-    info "Configuring Gemini CLI with dcg hook..."
-    local backup="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
-    cp "$settings_file" "$backup"
+    GEMINI_BACKUP="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$settings_file" "$GEMINI_BACKUP"
 
     if command -v python3 >/dev/null 2>&1; then
       python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
@@ -665,7 +675,7 @@ dcg_path = sys.argv[2]
 try:
     with open(settings_file, 'r') as f:
         settings = json.load(f)
-except:
+except (IOError, ValueError, json.JSONDecodeError):
     settings = {}
 
 # Gemini CLI uses BeforeTool instead of PreToolUse
@@ -699,22 +709,22 @@ with open(settings_file, 'w') as f:
     json.dump(settings, f, indent=2)
 PYEOF
       if [ $? -eq 0 ]; then
-        ok "Configured Gemini CLI (backup: $backup)"
+        GEMINI_STATUS="merged"
         AUTO_CONFIGURED=1
       else
-        warn "Failed to configure Gemini CLI; restoring backup"
-        mv "$backup" "$settings_file" 2>/dev/null || true
+        mv "$GEMINI_BACKUP" "$settings_file" 2>/dev/null || true
+        GEMINI_STATUS="failed"
+        GEMINI_BACKUP=""
       fi
     else
-      warn "Python3 not available for JSON merging"
-      warn "Add this to ~/.gemini/settings.json manually:"
-      echo '  {"hooks":{"BeforeTool":[{"matcher":"run_shell_command","hooks":[{"name":"dcg","type":"command","command":"'"$DEST/dcg"'","timeout":5000}]}]}}'
+      # python3 not available - remove unnecessary backup
+      rm -f "$GEMINI_BACKUP" 2>/dev/null || true
+      GEMINI_BACKUP=""
+      GEMINI_STATUS="failed"
       return 1
     fi
   else
     # Create new settings file with dcg hook
-    # Note: directory must exist (we checked earlier), so just create the file
-    info "Creating Gemini CLI settings with dcg hook..."
     cat > "$settings_file" <<EOFSET
 {
   "hooks": {
@@ -734,7 +744,7 @@ PYEOF
   }
 }
 EOFSET
-    ok "Created $settings_file"
+    GEMINI_STATUS="created"
     AUTO_CONFIGURED=1
   fi
 }
@@ -746,11 +756,13 @@ EOFSET
 # Detect predecessor
 detect_predecessor
 
+# Default: don't remove predecessor (set before conditional block)
+REMOVE_PREDECESSOR=0
+
 if [ "$PREDECESSOR_FOUND" -eq 1 ]; then
   show_upgrade_banner
 
   # Decide whether to remove predecessor
-  REMOVE_PREDECESSOR=0
   if [ "$EASY" -eq 1 ]; then
     # Easy mode: always remove
     REMOVE_PREDECESSOR=1
@@ -786,55 +798,94 @@ if [ "$PREDECESSOR_FOUND" -eq 1 ]; then
   fi
 fi
 
-# Configure Claude Code
-if [ -d "$HOME/.claude" ] || [ "$EASY" -eq 1 ]; then
-  info "Detecting Claude Code..."
-  configure_claude_code "$CLAUDE_SETTINGS" "$REMOVE_PREDECESSOR"
-fi
+# Always configure Claude Code (creates directory if needed)
+configure_claude_code "$CLAUDE_SETTINGS" "$REMOVE_PREDECESSOR"
 
 # Configure Gemini CLI (if installed)
-if [ -d "$HOME/.gemini" ]; then
-  info "Detecting Gemini CLI..."
-  configure_gemini "$GEMINI_SETTINGS"
-fi
+configure_gemini "$GEMINI_SETTINGS"
 
-# Show final status
+# ═══════════════════════════════════════════════════════════════════════════════
+# Final Summary
+# ═══════════════════════════════════════════════════════════════════════════════
+
 echo ""
-if [ "$AUTO_CONFIGURED" -eq 1 ]; then
+
+# Build summary of what was done
+summary_lines=()
+
+case "$CLAUDE_STATUS" in
+  created)
+    summary_lines+=("Claude Code: Created $CLAUDE_SETTINGS with dcg hook")
+    ;;
+  merged)
+    summary_lines+=("Claude Code: Added dcg hook to existing $CLAUDE_SETTINGS")
+    [ -n "$CLAUDE_BACKUP" ] && summary_lines+=("             Backup: $CLAUDE_BACKUP")
+    ;;
+  already)
+    summary_lines+=("Claude Code: Already configured (no changes)")
+    ;;
+  failed)
+    summary_lines+=("Claude Code: Configuration failed (python3 required)")
+    ;;
+  *)
+    summary_lines+=("Claude Code: Configured")
+    ;;
+esac
+
+case "$GEMINI_STATUS" in
+  created)
+    summary_lines+=("Gemini CLI:  Created $GEMINI_SETTINGS with dcg hook")
+    ;;
+  merged)
+    summary_lines+=("Gemini CLI:  Added dcg hook to existing $GEMINI_SETTINGS")
+    [ -n "$GEMINI_BACKUP" ] && summary_lines+=("             Backup: $GEMINI_BACKUP")
+    ;;
+  already)
+    summary_lines+=("Gemini CLI:  Already configured (no changes)")
+    ;;
+  skipped|"")
+    summary_lines+=("Gemini CLI:  Not installed (skipped)")
+    ;;
+  failed)
+    summary_lines+=("Gemini CLI:  Configuration failed")
+    ;;
+esac
+
+# Show summary
+if [ "$QUIET" -eq 0 ]; then
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style \
-      --border normal \
-      --border-foreground 42 \
-      --padding "1 2" \
-      "$(gum style --foreground 42 --bold '🛡️  dcg is now active!')" \
-      "" \
-      "$(gum style --foreground 245 'All Bash commands will be scanned for destructive patterns.')" \
-      "$(gum style --foreground 245 'Use \"dcg explain <command>\" to see why a command was blocked.')"
+    {
+      gum style --foreground 42 --bold "dcg is now active!"
+      echo ""
+      for line in "${summary_lines[@]}"; do
+        gum style --foreground 245 "$line"
+      done
+      echo ""
+      gum style --foreground 245 "All Bash commands will be scanned for destructive patterns."
+      gum style --foreground 245 "Use \"dcg explain <command>\" to see why a command was blocked."
+    } | gum style --border normal --border-foreground 42 --padding "1 2"
   else
-    echo -e "\033[0;32m╔════════════════════════════════════════════════════════════════╗\033[0m"
-    echo -e "\033[0;32m║\033[0m  \033[1;32mdcg is now active!\033[0m                                              \033[0;32m║\033[0m"
-    echo -e "\033[0;32m╠════════════════════════════════════════════════════════════════╣\033[0m"
-    echo -e "\033[0;32m║\033[0m  All Bash commands will be scanned for destructive patterns.   \033[0;32m║\033[0m"
-    echo -e "\033[0;32m║\033[0m  Use \"dcg explain <cmd>\" to see why a command was blocked.     \033[0;32m║\033[0m"
-    echo -e "\033[0;32m╚════════════════════════════════════════════════════════════════╝\033[0m"
+    echo -e "\033[1;32mdcg is now active!\033[0m"
+    echo ""
+    for line in "${summary_lines[@]}"; do
+      echo -e "  \033[0;90m$line\033[0m"
+    done
+    echo ""
+    echo -e "  All Bash commands will be scanned for destructive patterns."
+    echo -e "  Use \"\033[0;36mdcg explain <command>\033[0m\" to see why a command was blocked."
   fi
-else
-  info "To manually configure Claude Code, add to ~/.claude/settings.json:"
-  cat <<EOF
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$DEST/dcg"
-          }
-        ]
-      }
-    ]
-  }
-}
-EOF
+
+  # Show reversal instructions
+  echo ""
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+    gum style --foreground 245 --italic "To uninstall: rm $DEST/dcg && remove dcg hooks from settings files"
+    if [ -n "$CLAUDE_BACKUP" ] || [ -n "$GEMINI_BACKUP" ]; then
+      gum style --foreground 245 --italic "To revert:   restore from backup files listed above"
+    fi
+  else
+    echo -e "\033[0;90mTo uninstall: rm $DEST/dcg && remove dcg hooks from settings files\033[0m"
+    if [ -n "$CLAUDE_BACKUP" ] || [ -n "$GEMINI_BACKUP" ]; then
+      echo -e "\033[0;90mTo revert:   restore from backup files listed above\033[0m"
+    fi
+  fi
 fi

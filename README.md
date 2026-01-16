@@ -322,6 +322,26 @@ enabled = [
 ]
 ```
 
+### Custom Packs
+
+Create your own organization-specific security packs using YAML files. Custom packs let you define patterns for internal tools, deployment scripts, and proprietary systems without modifying dcg.
+
+```toml
+[packs]
+custom_paths = [
+    "~/.config/dcg/packs/*.yaml",      # User packs
+    ".dcg/packs/*.yaml",               # Project-local packs
+]
+```
+
+For detailed pack authoring guide, schema reference, and examples, see [`docs/custom-packs.md`](docs/custom-packs.md).
+
+Validate your pack before deployment:
+
+```bash
+dcg pack validate mypack.yaml
+```
+
 Heredoc scanning configuration:
 
 ```toml
@@ -764,6 +784,10 @@ dcg explain --verbose "rm -rf /tmp/build"
 # Output as JSON for programmatic use
 dcg explain --format json "kubectl delete namespace production"
 ```
+
+JSON output is versioned via `schema_version` (currently 2). v2 adds
+`matched_span`, `matched_text_preview`, and `explanation` in the `match`
+object when a pattern is detected.
 
 **Example Output**:
 

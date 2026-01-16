@@ -1,0 +1,65 @@
+# Example Custom Pack for dcg
+#
+# This is a minimal, correct example pack demonstrating the external pack
+# format. Copy this file to `~/.config/dcg/packs/` and customize for your
+# organization's needs.
+#
+# Schema: docs/pack.schema.yaml
+# Documentation: docs/custom-packs.md
+
+# Schema version for forward compatibility. Always use the latest version (1).
+schema_version: 1
+
+# Unique pack identifier. Format: namespace.name (lowercase, alphanumeric + underscore)
+# - Use your company or project name as the namespace
+# - Cannot collide with built-in packs (core.*, database.*, etc.)
+id: example.deployment
+
+# Human-readable pack name shown in denial messages
+name: Example Deployment Policies
+
+# Semantic version of YOUR pack definition (for your own tracking)
+version: 1.0.0
+
+# Optional description explaining what this pack protects against
+description: |
+  Demonstrates dcg external pack format with deployment safety patterns.
+  Blocks direct production deployments and allows staging/dev operations.
+
+# Keywords trigger evaluation - commands without these keywords skip this pack.
+# Keep keywords specific to avoid unnecessary pattern matching overhead.
+keywords:
+  - deploy
+  - release
+
+# Destructive patterns block commands based on severity level.
+# Patterns are fancy-regex syntax (supports lookahead/lookbehind).
+destructive_patterns:
+  - name: prod-direct-deploy
+    # Pattern matches "deploy --env prod" or "deploy --env=prod"
+    pattern: \bdeploy\s+(?:--env\s*[=\s]?\s*|--environment\s*[=\s]?\s*)prod(?:uction)?\b
+    # Severity determines default behavior:
+    #   critical → always deny
+    #   high     → deny by default (allowlistable)
+    #   medium   → warn but allow
+    #   low      → log only
+    severity: critical
+    # Short reason shown on denial
+    description: Direct production deployment blocked
+    # Longer explanation shown in verbose output (optional)
+    explanation: |
+      Production deployments must go through the release pipeline.
+      Direct deploys bypass approval workflows and audit logging.
+
+      Safe alternatives:
+        - Use your CI/CD pipeline to deploy to production
+        - If this is a staging deploy, use --env=staging
+        - For local testing, use --env=dev
+
+# Safe patterns explicitly allow commands, taking precedence over destructive.
+# Use these to whitelist known-safe operations that might match destructive patterns.
+safe_patterns:
+  - name: staging-dev-deploy
+    # Matches deploy --env staging/dev/development/local
+    pattern: \bdeploy\s+(?:--env\s*[=\s]?\s*|--environment\s*[=\s]?\s*)(?:staging|dev|development|local)\b
+    description: Non-production deployments are allowed
