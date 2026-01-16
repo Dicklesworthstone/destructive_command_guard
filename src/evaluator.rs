@@ -831,8 +831,19 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
         return EvaluationResult::allowed();
     }
 
-    let result =
-        evaluate_packs_with_allowlists(&normalized, ordered_packs, allowlists, keyword_index, None);
+    // Step 7: Mask heredoc content for non-executing targets (cat, tee, etc.)
+    // This prevents false positives where documentation text containing dangerous
+    // patterns like "rm -rf /" in heredocs to cat/tee triggers blocking.
+    let masked = crate::heredoc::mask_non_executing_heredocs(&normalized);
+    let command_for_packs = masked.as_ref();
+
+    let result = evaluate_packs_with_allowlists(
+        command_for_packs,
+        ordered_packs,
+        allowlists,
+        keyword_index,
+        None,
+    );
     if result.allowlist_override.is_none() {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
@@ -894,41 +905,15 @@ fn evaluate_packs_with_allowlists(
     let rm_parse =
         has_filesystem_pack.then(|| crate::packs::core::filesystem::parse_rm_command(normalized));
 
-    // Two-pass evaluation for cross-pack safe pattern support.
+    // Single-pass per-pack evaluation: safe patterns only protect their own pack's
+    // destructive patterns, not other packs. This prevents compound command bypass
+    // where e.g., "git checkout -b foo" safe pattern would whitelist "rm -rf / ; git checkout -b foo".
     //
-    // Pass 1: Check safe patterns across ALL enabled packs first.
-    // If any pack's safe pattern matches, allow the command immediately.
-
-    // that would otherwise be blocked by other packs (like core.filesystem).
-    if matches!(
-        rm_parse.as_ref(),
-        Some(crate::packs::core::filesystem::RmParseDecision::Allow)
-    ) {
-        return EvaluationResult::allowed();
-    }
-
-    for (pack_id, pack) in &candidate_packs {
-        if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
-            return EvaluationResult::allowed_due_to_budget();
-        }
-
-        // If any safe pattern matches, allow immediately (cross-pack override).
-        if pack_id.as_str() == "core.filesystem" {
-            if matches!(
-                rm_parse.as_ref(),
-                Some(crate::packs::core::filesystem::RmParseDecision::NoMatch)
-            ) && pack.matches_safe(normalized)
-            {
-                return EvaluationResult::allowed();
-            }
-        } else if pack.matches_safe(normalized) {
-            return EvaluationResult::allowed();
-        }
-    }
-
-    // Pass 2: Check destructive patterns across all packs.
-    // If we allowlist a deny, we keep scanning for other denies. If none appear,
-    // we return ALLOW + the first allowlist override metadata for explain/logging.
+    // For each pack:
+    // 1. Check safe patterns - if match, skip this pack's destructive patterns (continue)
+    // 2. Check destructive patterns - if match, block (unless allowlisted)
+    //
+    // The rm_parse optimization for core.filesystem is handled inline.
     let mut first_allowlist_hit: Option<(PatternMatch, AllowlistLayer, String)> = None;
 
     for &(pack_id, pack) in &candidate_packs {
@@ -936,12 +921,22 @@ fn evaluate_packs_with_allowlists(
             return EvaluationResult::allowed_due_to_budget();
         }
 
+        // Check safe patterns for this pack first.
+        // If a safe pattern matches, skip this pack's destructive patterns only.
+        // This prevents compound command bypass where one pack's safe pattern
+        // would whitelist destructive commands from other packs.
         if pack_id == "core.filesystem" {
+            // core.filesystem uses rm_parse for more accurate safe pattern detection
             match rm_parse.as_ref() {
                 Some(crate::packs::core::filesystem::RmParseDecision::Allow) => {
-                    continue;
+                    continue; // Safe pattern match - skip this pack
                 }
-                Some(crate::packs::core::filesystem::RmParseDecision::NoMatch) | None => {}
+                Some(crate::packs::core::filesystem::RmParseDecision::NoMatch) | None => {
+                    // rm_parse didn't find rm command or wasn't computed, check safe patterns as fallback
+                    if pack.matches_safe(normalized) {
+                        continue;
+                    }
+                }
                 Some(crate::packs::core::filesystem::RmParseDecision::Deny(hit)) => {
                     if let Some(allow_hit) = allowlists.match_rule(pack_id, hit.pattern_name) {
                         if first_allowlist_hit.is_none() {
@@ -990,6 +985,11 @@ fn evaluate_packs_with_allowlists(
                         hit.severity,
                     );
                 }
+            }
+        } else {
+            // Non-core.filesystem packs: check safe patterns before destructive
+            if pack.matches_safe(normalized) {
+                continue; // Safe pattern match - skip this pack's destructive patterns
             }
         }
 
@@ -1375,6 +1375,22 @@ fn evaluate_heredoc(
                 // Content is allowlisted - skip AST matching for this heredoc
                 continue;
             }
+        }
+
+        // Skip ALL heredoc content analysis if the target command is non-executing.
+        // Commands like `cat`, `tee`, `grep`, etc. just output the heredoc content
+        // as data - they don't execute it as code. This prevents false positives
+        // where documentation text containing dangerous command examples is blocked.
+        if content
+            .target_command
+            .as_ref()
+            .is_some_and(|cmd| crate::heredoc::is_non_executing_heredoc_command(cmd))
+        {
+            tracing::trace!(
+                target_command = ?content.target_command,
+                "Skipping heredoc content analysis for non-executing target"
+            );
+            continue; // Skip to next extracted content - this heredoc is just data
         }
 
         // Tier 2.5: Recursive Shell Analysis

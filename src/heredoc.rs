@@ -66,26 +66,27 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 12] = [
     // Inline interpreter execution. These patterns intentionally allow:
     // - interleaved flags (python -I -c, bash --norc -c)
     // - combined short-flag clusters (bash -lc, node -pe, perl -pi -e)
+    // - Windows .exe extensions (python.exe, python3.11.exe, etc.)
     //
     // Tier 1 MUST have zero false negatives for Tier 2 extraction.
     //
-    // Python inline execution (matches python, python3, python3.11, python3.12.1, etc.)
-    r"\bpython[0-9.]*\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*[ce][A-Za-z]*\s",
-    // Ruby inline execution (matches ruby, ruby3, ruby3.0, etc.)
-    r"\bruby[0-9.]*\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*e[A-Za-z]*\s",
-    r"\birb[0-9.]*\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*e[A-Za-z]*\s",
-    // Perl inline execution (matches perl, perl5, perl5.36, etc.)
-    r"\bperl[0-9.]*\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*[eE][A-Za-z]*\s",
-    // Node.js inline execution (matches node, node18, nodejs, nodejs18, etc.)
-    r"\bnode(js)?[0-9.]*\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*[ep][A-Za-z]*\s",
+    // Python inline execution (matches python, python3, python3.11, python.exe, python3.11.exe, etc.)
+    r"\bpython[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*[ce][A-Za-z]*\s",
+    // Ruby inline execution (matches ruby, ruby3, ruby3.0, ruby.exe, etc.)
+    r"\bruby[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*e[A-Za-z]*\s",
+    r"\birb[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*e[A-Za-z]*\s",
+    // Perl inline execution (matches perl, perl5, perl5.36, perl.exe, etc.)
+    r"\bperl[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*[eE][A-Za-z]*\s",
+    // Node.js inline execution (matches node, node18, nodejs, node.exe, etc.)
+    r"\bnode(?:js)?[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*[ep][A-Za-z]*\s",
     // PHP inline execution
-    r"\bphp[0-9.]*\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*r[A-Za-z]*\s",
+    r"\bphp[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*r[A-Za-z]*\s",
     // Lua inline execution
-    r"\blua[0-9.]*\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*e[A-Za-z]*\s",
+    r"\blua[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*e[A-Za-z]*\s",
     // Shell inline execution (sh -c, bash -c, zsh -c, fish -c, bash -lc, etc.)
-    r"\b(sh|bash|zsh|fish)\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*c[A-Za-z]*\s",
-    // Piped execution to interpreters (versioned)
-    r"\|\s*(python[0-9.]*|ruby[0-9.]*|perl[0-9.]*|node(js)?[0-9.]*|php[0-9.]*|lua[0-9.]*|sh|bash)\b",
+    r"\b(?:sh|bash|zsh|fish)(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*c[A-Za-z]*\s",
+    // Piped execution to interpreters (versioned, with optional .exe)
+    r"\|\s*(?:python[0-9.]*|ruby[0-9.]*|perl[0-9.]*|node(?:js)?[0-9.]*|php[0-9.]*|lua[0-9.]*|sh|bash)(?:\.exe)?\b",
     // Piped to xargs (can execute arbitrary commands)
     r"\|\s*xargs\s",
     // exec/eval in various contexts
@@ -477,20 +478,23 @@ impl ScriptLanguage {
     /// Infer language from a command prefix (e.g., "python", "python3", "python3.11").
     ///
     /// Matches exact command names or names with version suffixes (e.g., "python3.11").
+    /// Also handles Windows .exe extensions (e.g., "python.exe", "python3.11.exe").
     /// Does NOT match arbitrary words that start with a command name (e.g., "shebang" ≠ "sh").
     #[must_use]
     pub fn from_command(cmd: &str) -> Self {
         let cmd_lower = cmd.to_lowercase();
+        // Strip Windows .exe extension if present
+        let cmd_base = cmd_lower.strip_suffix(".exe").unwrap_or(&cmd_lower);
 
         // Helper: check if cmd matches base name, optionally followed by version digits/dots
         // e.g., "python" matches "python", "python3", "python3.11"
         // but "python" does NOT match "pythonic" or "python_helper"
         let matches_interpreter = |base: &str| -> bool {
-            if cmd_lower == base {
+            if cmd_base == base {
                 return true;
             }
             // Allow version suffixes: digits and dots (e.g., "3", "3.11", "3.11.4")
-            cmd_lower.strip_prefix(base).is_some_and(|suffix| {
+            cmd_base.strip_prefix(base).is_some_and(|suffix| {
                 !suffix.is_empty()
                     && suffix.chars().all(|c| c.is_ascii_digit() || c == '.')
                     && suffix.chars().next().is_some_and(|c| c.is_ascii_digit())
@@ -836,6 +840,9 @@ pub struct ExtractedContent {
     pub quoted: bool,
     /// Type of heredoc (if applicable).
     pub heredoc_type: Option<HeredocType>,
+    /// The command that receives this heredoc (e.g., "cat", "bash").
+    /// Used to determine if content should be evaluated as executable.
+    pub target_command: Option<String>,
 }
 
 /// Reason why extraction was skipped (for observability/logging).
@@ -952,18 +959,20 @@ static HERESTRING_UNQUOTED: LazyLock<Regex> = LazyLock::new(|| {
 /// Regex for inline script flag extraction with single quotes.
 static INLINE_SCRIPT_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // Matches: command -c/-e/-p/-E/-r followed by single-quoted content
-    // Groups: (1) interpreter, (2) optional "js" suffix, (3) flag, (4) content
+    // Groups: (1) interpreter, (2) optional "js" suffix for node, (3) flag, (4) content
     // Supports versioned interpreters: python3.11, ruby3.0, perl5.36, node18, nodejs20, etc.
-    Regex::new(r"\b(python[0-9.]*|ruby[0-9.]*|irb[0-9.]*|perl[0-9.]*|node(js)?[0-9.]*|php[0-9.]*|lua[0-9.]*|sh|bash|zsh|fish)\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+(-[A-Za-z]*[ceEpr][A-Za-z]*)\s*'([^']*)'")
+    // Supports Windows .exe extensions: python.exe, python3.11.exe, etc.
+    Regex::new(r"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?)\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+(-[A-Za-z]*[ceEpr][A-Za-z]*)\s*'([^']*)'")
         .expect("inline script single-quote regex compiles")
 });
 
 /// Regex for inline script flag extraction with double quotes.
 static INLINE_SCRIPT_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // Matches: command -c/-e/-p/-E/-r followed by double-quoted content
-    // Groups: (1) interpreter, (2) optional "js" suffix, (3) flag, (4) content
+    // Groups: (1) interpreter, (2) optional "js" suffix for node, (3) flag, (4) content
     // Supports versioned interpreters: python3.11, ruby3.0, perl5.36, node18, nodejs20, etc.
-    Regex::new(r#"\b(python[0-9.]*|ruby[0-9.]*|irb[0-9.]*|perl[0-9.]*|node(js)?[0-9.]*|php[0-9.]*|lua[0-9.]*|sh|bash|zsh|fish)\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+(-[A-Za-z]*[ceEpr][A-Za-z]*)\s*"([^"]*)""#)
+    // Supports Windows .exe extensions: python.exe, python3.11.exe, etc.
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?)\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+(-[A-Za-z]*[ceEpr][A-Za-z]*)\s*"([^"]*)""#)
         .expect("inline script double-quote regex compiles")
 });
 
@@ -1255,6 +1264,7 @@ fn extract_inline_scripts(
                 byte_range: full_match.start()..full_match.end(),
                 quoted: true, // -c/-e content is always in quotes
                 heredoc_type: None,
+                target_command: Some(cmd_name.to_string()), // -c/-e content is executed by the interpreter
             });
         }
     };
@@ -1308,6 +1318,9 @@ fn extract_herestrings(
 
             let full_match = cap.get(0).unwrap();
 
+            // Extract the command that receives the here-string
+            let target_cmd = extract_heredoc_target_command(command, full_match.start());
+
             extracted.push(ExtractedContent {
                 content: content.to_string(),
                 language: ScriptLanguage::Bash, // Here-strings are bash-specific
@@ -1315,6 +1328,7 @@ fn extract_herestrings(
                 byte_range: full_match.start()..full_match.end(),
                 quoted: is_quoted,
                 heredoc_type: Some(HeredocType::HereString),
+                target_command: target_cmd,
             });
         }
     };
@@ -1400,6 +1414,8 @@ fn extract_heredocs(
         ) {
             Ok((content, end_pos)) => {
                 let (language, _confidence) = ScriptLanguage::detect(command, &content);
+                // Extract the command that receives the heredoc
+                let target_cmd = extract_heredoc_target_command(command, full_match.start());
                 extracted.push(ExtractedContent {
                     content,
                     language,
@@ -1407,6 +1423,7 @@ fn extract_heredocs(
                     byte_range: full_match.start()..end_pos.min(command.len()),
                     quoted,
                     heredoc_type: Some(heredoc_type),
+                    target_command: target_cmd,
                 });
             }
             Err(reason) => {
@@ -1422,6 +1439,505 @@ fn extract_heredocs(
         skip_reasons.push(SkipReason::ExceededHeredocLimit {
             limit: limits.max_heredocs,
         });
+    }
+}
+
+/// Extract the command that receives a heredoc or here-string.
+///
+/// Looks backwards from the heredoc operator position to find the command word.
+/// Returns `Some(command_name)` if found, `None` otherwise.
+///
+/// Examples:
+/// - `cat <<EOF` -> Some("cat")
+/// - `bash <<EOF` -> Some("bash")
+/// - `cat file.txt | tee <<EOF` -> Some("tee")
+/// - `$(cat <<EOF)` -> Some("cat")
+fn extract_heredoc_target_command(command: &str, heredoc_start: usize) -> Option<String> {
+    if heredoc_start == 0 {
+        return None;
+    }
+
+    let before = &command[..heredoc_start];
+
+    // Trim trailing whitespace before the heredoc operator
+    let trimmed = before.trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Parse tokens backwards to find the command
+    // This handles quoted strings, flags, and file arguments properly
+    let tokens = tokenize_backwards(trimmed);
+
+    for token in tokens {
+        // Skip flags
+        if token.starts_with('-') {
+            continue;
+        }
+
+        // Skip quoted strings (arguments like '{print $1}' or "hello world")
+        if (token.starts_with('\'') && token.ends_with('\''))
+            || (token.starts_with('"') && token.ends_with('"'))
+        {
+            continue;
+        }
+
+        // Skip if this looks like a file path argument
+        if token.contains('/') {
+            let basename = token.rsplit('/').next().unwrap_or(&token);
+
+            // Check if this looks like a command path (/bin/cat, /usr/bin/bash)
+            // vs a file argument (/tmp/file, /path/to/data)
+            let is_known_command = NON_EXECUTING_HEREDOC_COMMANDS.contains(&basename)
+                || ["bash", "sh", "zsh", "fish", "ksh", "dash", "python", "perl", "ruby", "node"]
+                    .contains(&basename);
+
+            // Command paths are typically in standard locations
+            let looks_like_command_path = token.starts_with("/bin/")
+                || token.starts_with("/usr/bin/")
+                || token.starts_with("/usr/local/bin/")
+                || token.starts_with("/sbin/")
+                || token.starts_with("/usr/sbin/")
+                || is_known_command;
+
+            if !looks_like_command_path {
+                // Doesn't look like a command path, skip it
+                continue;
+            }
+
+            return Some(basename.to_string());
+        }
+
+        // Skip if this looks like a file with extension
+        let has_extension = token.contains('.') && !token.starts_with('.');
+        let is_known_command = NON_EXECUTING_HEREDOC_COMMANDS.contains(&token.as_str())
+            || ["bash", "sh", "zsh", "fish", "ksh", "dash", "python", "perl", "ruby", "node"]
+                .contains(&token.as_str());
+        if has_extension && !is_known_command {
+            continue;
+        }
+
+        return Some(token);
+    }
+
+    None
+}
+
+/// Tokenize a command string backwards, respecting quotes.
+/// Returns tokens in reverse order (last token first).
+///
+/// Note: This function does not handle escaped quotes inside double-quoted strings
+/// (e.g., `"foo\"bar"`). In such cases, tokenization may be incorrect. This is acceptable
+/// because the failure mode is safe - we won't find the target command and thus won't
+/// mask the heredoc content, which is the conservative choice for security.
+fn tokenize_backwards(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = s.len();
+
+    while i > 0 {
+        // Skip trailing whitespace
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        if i == 0 {
+            break;
+        }
+
+        let end = i;
+
+        // Check for quoted string
+        if bytes[i - 1] == b'\'' || bytes[i - 1] == b'"' {
+            let quote = bytes[i - 1];
+            i -= 1;
+            // Find matching opening quote
+            while i > 0 && bytes[i - 1] != quote {
+                i -= 1;
+            }
+            if i > 0 {
+                i -= 1; // Skip opening quote
+            }
+            tokens.push(s[i..end].to_string());
+            continue;
+        }
+
+        // Check for command separator (|, ;, &, $, ()
+        if matches!(
+            bytes[i - 1],
+            b'|' | b';' | b'&' | b'$' | b'(' | b')'
+        ) {
+            // Stop parsing - we've reached a command boundary
+            break;
+        }
+
+        // Regular word - scan backwards to whitespace or separator
+        while i > 0 {
+            let c = bytes[i - 1];
+            if c.is_ascii_whitespace()
+                || matches!(c, b'|' | b';' | b'&' | b'$' | b'(' | b')')
+            {
+                break;
+            }
+            i -= 1;
+        }
+
+        if i < end {
+            tokens.push(s[i..end].to_string());
+        }
+    }
+
+    tokens
+}
+
+/// Commands that do NOT execute their stdin/heredoc content as code.
+/// Heredocs passed to these commands are DATA, not executable scripts.
+const NON_EXECUTING_HEREDOC_COMMANDS: &[&str] = &[
+    // Text output commands
+    "cat",
+    "tee",
+    "echo",
+    "printf",
+    // File writing/appending
+    "dd",
+    // Text processing (read stdin, output transformed text)
+    "head",
+    "tail",
+    "grep",
+    "egrep",
+    "fgrep",
+    "sed",
+    "awk",
+    "cut",
+    "sort",
+    "uniq",
+    "tr",
+    "wc",
+    "rev",
+    "nl",
+    "fold",
+    "fmt",
+    "expand",
+    "unexpand",
+    "column",
+    "paste",
+    "join",
+    // Encoding/compression (transform data, don't execute)
+    "base64",
+    "xxd",
+    "od",
+    "hexdump",
+    "gzip",
+    "gunzip",
+    "bzip2",
+    "bunzip2",
+    "xz",
+    "lzma",
+    "zcat",
+    "bzcat",
+    "xzcat",
+    // Network (send data, don't execute)
+    "nc",
+    "netcat",
+    "curl",
+    "wget",
+    // Checksum/hash
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "sha512sum",
+    "cksum",
+    // Diff/comparison
+    "diff",
+    "cmp",
+    "comm",
+    // Mail (compose message body)
+    "mail",
+    "sendmail",
+    // Variable assignment (read into variable, don't execute)
+    "read",
+];
+
+/// Check if a command executes its heredoc/stdin content as code.
+///
+/// Returns `true` if the command is known to NOT execute its input,
+/// meaning heredoc content passed to it is DATA, not CODE.
+#[must_use]
+pub fn is_non_executing_heredoc_command(cmd: &str) -> bool {
+    // Normalize: strip path prefix if present
+    let cmd_name = cmd.rsplit('/').next().unwrap_or(cmd);
+    NON_EXECUTING_HEREDOC_COMMANDS.contains(&cmd_name)
+}
+
+/// Mask heredoc content when the target command doesn't execute it.
+///
+/// This prevents false positives where dangerous patterns in DATA (not CODE)
+/// trigger security blocks. For example, `cat <<EOF\nrm -rf /\nEOF` should
+/// not be blocked because `cat` just outputs the text - it doesn't execute it.
+///
+/// Returns a `Cow::Borrowed` if no masking was needed, or `Cow::Owned` if
+/// heredoc content was replaced with placeholder text.
+#[must_use]
+pub fn mask_non_executing_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+
+    // Quick check: no heredoc operator means nothing to mask
+    if !command.contains("<<") {
+        return Cow::Borrowed(command);
+    }
+
+    let mut result = String::new();
+    let mut pos = 0;
+    let bytes = command.as_bytes();
+
+    while pos < command.len() {
+        // Find next potential heredoc operator
+        if let Some(offset) = command[pos..].find("<<") {
+            let heredoc_start = pos + offset;
+
+            // Check for <<< (here-string)
+            if heredoc_start + 3 <= command.len()
+                && bytes.get(heredoc_start + 2) == Some(&b'<')
+            {
+                // Extract target command for here-string
+                let target_cmd = extract_heredoc_target_command(command, heredoc_start);
+                let should_mask_herestring = target_cmd
+                    .as_ref()
+                    .is_some_and(|cmd| is_non_executing_heredoc_command(cmd));
+
+                if should_mask_herestring {
+                    // Mask here-string content for non-executing targets
+                    if let Some((content_start, content_end)) =
+                        find_herestring_content_bounds(command, heredoc_start + 3)
+                    {
+                        // Copy up to the content start (includes <<<)
+                        if result.is_empty() {
+                            result = command[..content_start].to_string();
+                        } else {
+                            result.push_str(&command[pos..content_start]);
+                        }
+                        // Replace content with placeholder
+                        result.push_str("'MASKED'");
+                        pos = content_end;
+                        continue;
+                    }
+                }
+
+                // Not masking - copy up to and including <<< and continue
+                if result.is_empty() {
+                    result = command[..heredoc_start + 3].to_string();
+                } else {
+                    result.push_str(&command[pos..heredoc_start + 3]);
+                }
+                pos = heredoc_start + 3;
+                continue;
+            }
+
+            // Extract target command (what receives the heredoc)
+            let target_cmd = extract_heredoc_target_command(command, heredoc_start);
+
+            // Check if target is non-executing
+            let should_mask = target_cmd
+                .as_ref()
+                .is_some_and(|cmd| is_non_executing_heredoc_command(cmd));
+
+            if should_mask {
+                // Parse the heredoc delimiter
+                let after_op = &command[heredoc_start + 2..];
+                if let Some((delimiter, body_start_offset, heredoc_type)) =
+                    parse_heredoc_delimiter(after_op)
+                {
+                    // Find the heredoc body end (terminating delimiter)
+                    let body_start = heredoc_start + 2 + body_start_offset;
+                    if let Some(body_end) =
+                        find_heredoc_terminator(command, body_start, &delimiter, heredoc_type)
+                    {
+                        // Mask the heredoc body
+                        if result.is_empty() {
+                            result = command[..body_start].to_string();
+                        } else {
+                            result.push_str(&command[pos..body_start]);
+                        }
+                        // Replace body with safe placeholder
+                        result.push_str("\n# [heredoc content masked - non-executing target]\n");
+                        result.push_str(&delimiter);
+                        pos = body_end;
+                        continue;
+                    }
+                }
+            }
+
+            // Not masking - copy everything up to and including <<
+            if result.is_empty() {
+                // First heredoc we're not masking - check if we need to start building result
+                pos = heredoc_start + 2;
+            } else {
+                result.push_str(&command[pos..heredoc_start + 2]);
+                pos = heredoc_start + 2;
+            }
+        } else {
+            // No more heredoc operators
+            if result.is_empty() {
+                return Cow::Borrowed(command);
+            }
+            result.push_str(&command[pos..]);
+            break;
+        }
+    }
+
+    if result.is_empty() {
+        Cow::Borrowed(command)
+    } else {
+        Cow::Owned(result)
+    }
+}
+
+/// Parse a heredoc delimiter after the << operator.
+/// Returns (delimiter, body_start_offset, heredoc_type) if successful.
+fn parse_heredoc_delimiter(after_op: &str) -> Option<(String, usize, HeredocType)> {
+    let trimmed = after_op.trim_start_matches([' ', '\t']);
+    let skip_whitespace = after_op.len() - trimmed.len();
+
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (heredoc_type, delim_start) = if trimmed.starts_with('-') {
+        (HeredocType::TabStripped, 1)
+    } else {
+        (HeredocType::Standard, 0)
+    };
+
+    let delim_chars = &trimmed[delim_start..];
+
+    // Handle quoted delimiters
+    let (delimiter, delim_len) = if delim_chars.starts_with('"') {
+        // Find closing quote
+        if let Some(end) = delim_chars[1..].find('"') {
+            (delim_chars[1..=end].to_string(), end + 2)
+        } else {
+            return None;
+        }
+    } else if delim_chars.starts_with('\'') {
+        // Find closing quote
+        if let Some(end) = delim_chars[1..].find('\'') {
+            (delim_chars[1..=end].to_string(), end + 2)
+        } else {
+            return None;
+        }
+    } else {
+        // Unquoted - extract word
+        let end = delim_chars
+            .find(|c: char| c.is_whitespace() || c == '\n' || c == ';' || c == '&' || c == '|')
+            .unwrap_or(delim_chars.len());
+        if end == 0 {
+            return None;
+        }
+        (delim_chars[..end].to_string(), end)
+    };
+
+    // Calculate total offset to body start (skip to newline)
+    let total_delim_offset = skip_whitespace + delim_start + delim_len;
+    let remaining = &after_op[total_delim_offset..];
+
+    // Find the newline that starts the body
+    let newline_offset = remaining.find('\n').map_or(remaining.len(), |i| i + 1);
+
+    Some((delimiter, total_delim_offset + newline_offset, heredoc_type))
+}
+
+/// Find the end of a heredoc body (position after the terminating delimiter line).
+fn find_heredoc_terminator(
+    command: &str,
+    body_start: usize,
+    delimiter: &str,
+    heredoc_type: HeredocType,
+) -> Option<usize> {
+    if body_start >= command.len() {
+        return None;
+    }
+
+    let body = &command[body_start..];
+    let mut line_start = 0;
+
+    for line in body.split_inclusive('\n') {
+        let trimmed = match heredoc_type {
+            HeredocType::TabStripped => line.trim_start_matches('\t'),
+            HeredocType::IndentStripped => line.trim_start(),
+            HeredocType::Standard | HeredocType::HereString => line,
+        };
+
+        let line_content = trimmed.trim_end_matches(['\n', '\r']);
+
+        if line_content == delimiter {
+            // Found terminator - return position after this line
+            return Some(body_start + line_start + line.len());
+        }
+
+        line_start += line.len();
+    }
+
+    None
+}
+
+/// Find the bounds of a here-string's content (start and end byte positions).
+/// Returns `(content_start, content_end)` where `content_start` is after any opening quote
+/// and `content_end` is before any closing quote or at whitespace/end for unquoted.
+fn find_herestring_content_bounds(command: &str, after_operator: usize) -> Option<(usize, usize)> {
+    if after_operator >= command.len() {
+        return None;
+    }
+
+    let remaining = &command[after_operator..];
+    let bytes = remaining.as_bytes();
+
+    // Skip whitespace after <<<
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() && bytes[i] != b'\n' {
+        i += 1;
+    }
+
+    if i >= bytes.len() || bytes[i] == b'\n' {
+        return None;
+    }
+
+    // Check for quoted content
+    if bytes[i] == b'\'' || bytes[i] == b'"' {
+        let quote = bytes[i];
+        let quote_start = i;
+        i += 1;
+        // Find closing quote
+        while i < bytes.len() && bytes[i] != quote {
+            // Handle escaped characters in double quotes
+            if quote == b'"' && bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        if i < bytes.len() && bytes[i] == quote {
+            // Include the quotes in the masked region
+            return Some((
+                after_operator + quote_start,
+                after_operator + i + 1, // after closing quote
+            ));
+        }
+        // No closing quote found - treat as unquoted
+    }
+
+    // Unquoted - find end at whitespace or command separator
+    let word_start = i;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_whitespace() || matches!(c, b';' | b'&' | b'|' | b')' | b'\n') {
+            break;
+        }
+        i += 1;
+    }
+
+    if i > word_start {
+        Some((after_operator + word_start, after_operator + i))
+    } else {
+        None
     }
 }
 
