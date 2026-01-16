@@ -68,8 +68,6 @@ pub mod config;
 pub mod context;
 pub mod evaluator;
 pub mod heredoc;
-pub mod highlight;
-pub mod history;
 pub mod hook;
 pub mod logging;
 pub mod normalize;
@@ -80,6 +78,7 @@ pub mod scan;
 pub mod simulate;
 pub mod stats;
 pub mod suggestions;
+pub mod telemetry;
 pub mod trace;
 
 // Re-export commonly used types
@@ -132,13 +131,6 @@ pub use trace::{
     truncate_utf8,
 };
 
-// Re-export highlight types for terminal span highlighting
-pub use highlight::{
-    HighlightSpan, HighlightedCommand, configure_colors as configure_highlight_colors,
-    format_highlighted_command, format_highlighted_command_auto, format_highlighted_command_multi,
-    should_use_color,
-};
-
 // Re-export suggestion types
 pub use suggestions::{Suggestion, SuggestionKind, get_suggestion_by_kind, get_suggestions};
 
@@ -177,10 +169,9 @@ pub use confidence::{
     compute_match_confidence, should_downgrade_to_warn,
 };
 
-// Re-export history types for command tracking
-pub use history::{
-    AgentStat, BackupResult, CURRENT_SCHEMA_VERSION, CheckResult, CommandEntry,
-    DEFAULT_DB_FILENAME, ENV_HISTORY_DB_PATH, ENV_HISTORY_DISABLED, HistoryDb, HistoryError,
-    HistoryStats, HistoryWriter, Outcome as HistoryOutcome, OutcomeStats, PatternStat,
-    PerformanceStats, ProjectStat, StatsTrends,
+// Re-export telemetry types for command history tracking
+pub use telemetry::{
+    CURRENT_SCHEMA_VERSION, CommandEntry, DEFAULT_DB_FILENAME, ENV_TELEMETRY_DB_PATH,
+    ENV_TELEMETRY_DISABLED, Outcome as TelemetryOutcome, TelemetryDb, TelemetryError,
+    TelemetryWriter,
 };

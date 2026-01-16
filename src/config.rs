@@ -42,9 +42,6 @@ pub struct Config {
     /// General settings.
     pub general: GeneralConfig,
 
-    /// Output display settings.
-    pub output: OutputConfig,
-
     /// Pack configuration.
     pub packs: PacksConfig,
 
@@ -63,8 +60,8 @@ pub struct Config {
     /// Structured logging configuration.
     pub logging: crate::logging::LoggingConfig,
 
-    /// Command history configuration.
-    pub history: HistoryConfig,
+    /// Command telemetry configuration.
+    pub telemetry: TelemetryConfig,
 
     /// Project-specific configurations (keyed by absolute path).
     #[serde(default)]
@@ -90,14 +87,13 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ConfigLayer {
     general: Option<GeneralConfigLayer>,
-    output: Option<OutputConfigLayer>,
     packs: Option<PacksConfig>,
     policy: Option<PolicyConfig>,
     overrides: Option<OverridesConfig>,
     heredoc: Option<HeredocConfig>,
     confidence: Option<ConfidenceConfigLayer>,
     logging: Option<LoggingConfigLayer>,
-    history: Option<HistoryConfigLayer>,
+    telemetry: Option<TelemetryConfigLayer>,
     projects: Option<std::collections::HashMap<String, ProjectConfig>>,
 }
 
@@ -111,12 +107,6 @@ struct GeneralConfigLayer {
     max_findings_per_command: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-struct OutputConfigLayer {
-    highlight_enabled: Option<bool>,
-    explanations_enabled: Option<bool>,
-}
-
 #[derive(Debug, Clone, Default, Deserialize)]
 struct LoggingConfigLayer {
     enabled: Option<bool>,
@@ -127,9 +117,9 @@ struct LoggingConfigLayer {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-struct HistoryConfigLayer {
+struct TelemetryConfigLayer {
     enabled: Option<bool>,
-    redaction_mode: Option<HistoryRedactionMode>,
+    redaction_mode: Option<TelemetryRedactionMode>,
     retention_days: Option<u32>,
     max_size_mb: Option<u32>,
     database_path: Option<String>,
@@ -314,7 +304,7 @@ pub struct HeredocAllowlistConfig {
 }
 
 /// A pattern-based heredoc allowlist entry.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllowedHeredocPattern {
     /// Optional language filter (e.g., "python", "bash"). If None, matches any language.
     pub language: Option<String>,
@@ -784,37 +774,6 @@ impl GeneralConfig {
     }
 }
 
-/// Output display configuration.
-///
-/// Controls optional output enhancements like span highlighting and explanations.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct OutputConfig {
-    /// Enable span highlighting in denial output.
-    /// When enabled, shows caret-style markers under the matched portion.
-    /// Default: true
-    pub highlight_enabled: Option<bool>,
-
-    /// Enable explanations in denial output.
-    /// When enabled, shows detailed explanations for why patterns are dangerous.
-    /// Default: true
-    pub explanations_enabled: Option<bool>,
-}
-
-impl OutputConfig {
-    /// Check if span highlighting is enabled (default: true).
-    #[must_use]
-    pub fn highlight_enabled(&self) -> bool {
-        self.highlight_enabled.unwrap_or(true)
-    }
-
-    /// Check if explanations are enabled (default: true).
-    #[must_use]
-    pub fn explanations_enabled(&self) -> bool {
-        self.explanations_enabled.unwrap_or(true)
-    }
-}
-
 /// Pack enablement configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -898,7 +857,7 @@ pub enum PolicyMode {
     Deny,
     /// Warn but allow (print warning to stderr, no JSON deny).
     Warn,
-    /// Log only (silent allow, record for history).
+    /// Log only (silent allow, record for telemetry).
     Log,
 }
 
@@ -1050,10 +1009,10 @@ pub struct BlockOverride {
     pub reason: String,
 }
 
-/// Redaction mode for command history.
+/// Redaction mode for command telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum HistoryRedactionMode {
+pub enum TelemetryRedactionMode {
     /// Store commands without redaction.
     None,
     /// Redact sensitive values using pattern-based filters.
@@ -1063,7 +1022,7 @@ pub enum HistoryRedactionMode {
     Full,
 }
 
-impl std::str::FromStr for HistoryRedactionMode {
+impl std::str::FromStr for TelemetryRedactionMode {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -1071,48 +1030,34 @@ impl std::str::FromStr for HistoryRedactionMode {
             "none" => Ok(Self::None),
             "pattern" => Ok(Self::Pattern),
             "full" => Ok(Self::Full),
-            _ => Err(format!("invalid history redaction mode: {value}")),
+            _ => Err(format!("invalid telemetry redaction mode: {value}")),
         }
     }
 }
 
-/// History configuration options.
+/// Telemetry configuration options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct HistoryConfig {
-    /// Enable command history collection.
+pub struct TelemetryConfig {
+    /// Enable command telemetry collection.
     pub enabled: bool,
     /// Redaction mode for stored commands.
-    pub redaction_mode: HistoryRedactionMode,
+    pub redaction_mode: TelemetryRedactionMode,
     /// Retention window in days.
     pub retention_days: u32,
     /// Maximum database size in megabytes.
     pub max_size_mb: u32,
     /// Optional database file path override.
     pub database_path: Option<String>,
-    /// Enable automatic pruning of old entries.
-    pub auto_prune: bool,
-    /// Interval in hours between automatic prune checks.
-    pub prune_check_interval_hours: u32,
-    /// Batch size for write operations (improves performance).
-    pub batch_size: u32,
-    /// Flush interval in milliseconds for batched writes.
-    pub batch_flush_interval_ms: u32,
 }
 
-impl HistoryConfig {
+impl TelemetryConfig {
     /// Default retention window (days).
     pub const DEFAULT_RETENTION_DAYS: u32 = 90;
     /// Default maximum database size (MB).
     pub const DEFAULT_MAX_SIZE_MB: u32 = 500;
     /// Maximum allowed retention window (days).
     pub const MAX_RETENTION_DAYS: u32 = 3650;
-    /// Default interval between automatic prune checks (hours).
-    pub const DEFAULT_PRUNE_CHECK_INTERVAL_HOURS: u32 = 24;
-    /// Default batch size for write operations.
-    pub const DEFAULT_BATCH_SIZE: u32 = 50;
-    /// Default flush interval for batched writes (ms).
-    pub const DEFAULT_BATCH_FLUSH_INTERVAL_MS: u32 = 100;
 
     /// Expand the configured database path, if set.
     #[must_use]
@@ -1133,18 +1078,18 @@ impl HistoryConfig {
         Some(path)
     }
 
-    /// Validate history settings.
+    /// Validate telemetry settings.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid retention values.
     pub fn validate(&self) -> Result<(), String> {
         if self.retention_days == 0 {
-            return Err("history retention_days must be at least 1".to_string());
+            return Err("telemetry retention_days must be at least 1".to_string());
         }
         if self.retention_days > Self::MAX_RETENTION_DAYS {
             return Err(format!(
-                "history retention_days must be <= {}",
+                "telemetry retention_days must be <= {}",
                 Self::MAX_RETENTION_DAYS
             ));
         }
@@ -1152,18 +1097,14 @@ impl HistoryConfig {
     }
 }
 
-impl Default for HistoryConfig {
+impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            redaction_mode: HistoryRedactionMode::Pattern,
+            redaction_mode: TelemetryRedactionMode::Pattern,
             retention_days: Self::DEFAULT_RETENTION_DAYS,
             max_size_mb: Self::DEFAULT_MAX_SIZE_MB,
             database_path: None,
-            auto_prune: false,
-            prune_check_interval_hours: Self::DEFAULT_PRUNE_CHECK_INTERVAL_HOURS,
-            batch_size: Self::DEFAULT_BATCH_SIZE,
-            batch_flush_interval_ms: Self::DEFAULT_BATCH_FLUSH_INTERVAL_MS,
         }
     }
 }
@@ -1512,10 +1453,6 @@ impl Config {
             self.merge_general_layer(general);
         }
 
-        if let Some(output) = other.output {
-            self.merge_output_layer(output);
-        }
-
         if let Some(packs) = other.packs {
             self.merge_packs_layer(packs);
         }
@@ -1540,8 +1477,8 @@ impl Config {
             self.merge_logging_layer(logging);
         }
 
-        if let Some(history) = other.history {
-            self.merge_history_layer(history);
+        if let Some(telemetry) = other.telemetry {
+            self.merge_telemetry_layer(telemetry);
         }
 
         // Merge project configs
@@ -1568,15 +1505,6 @@ impl Config {
         }
         if let Some(max_findings_per_command) = general.max_findings_per_command {
             self.general.max_findings_per_command = Some(max_findings_per_command);
-        }
-    }
-
-    const fn merge_output_layer(&mut self, output: OutputConfigLayer) {
-        if let Some(highlight_enabled) = output.highlight_enabled {
-            self.output.highlight_enabled = Some(highlight_enabled);
-        }
-        if let Some(explanations_enabled) = output.explanations_enabled {
-            self.output.explanations_enabled = Some(explanations_enabled);
         }
     }
 
@@ -1684,21 +1612,21 @@ impl Config {
         }
     }
 
-    fn merge_history_layer(&mut self, history: HistoryConfigLayer) {
-        if let Some(enabled) = history.enabled {
-            self.history.enabled = enabled;
+    fn merge_telemetry_layer(&mut self, telemetry: TelemetryConfigLayer) {
+        if let Some(enabled) = telemetry.enabled {
+            self.telemetry.enabled = enabled;
         }
-        if let Some(redaction_mode) = history.redaction_mode {
-            self.history.redaction_mode = redaction_mode;
+        if let Some(redaction_mode) = telemetry.redaction_mode {
+            self.telemetry.redaction_mode = redaction_mode;
         }
-        if let Some(retention_days) = history.retention_days {
-            self.history.retention_days = retention_days;
+        if let Some(retention_days) = telemetry.retention_days {
+            self.telemetry.retention_days = retention_days;
         }
-        if let Some(max_size_mb) = history.max_size_mb {
-            self.history.max_size_mb = max_size_mb;
+        if let Some(max_size_mb) = telemetry.max_size_mb {
+            self.telemetry.max_size_mb = max_size_mb;
         }
-        if let Some(database_path) = history.database_path {
-            self.history.database_path = Some(database_path);
+        if let Some(database_path) = telemetry.database_path {
+            self.telemetry.database_path = Some(database_path);
         }
     }
 
@@ -1780,20 +1708,20 @@ impl Config {
         }
 
         // -----------------------------------------------------------------
-        // History config (env overrides)
+        // Telemetry config (env overrides)
         // -----------------------------------------------------------------
 
-        // DCG_HISTORY_ENABLED=true|false|1|0
-        if let Some(enabled) = get_env(&format!("{ENV_PREFIX}_HISTORY_ENABLED")) {
+        // DCG_TELEMETRY_ENABLED=true|false|1|0
+        if let Some(enabled) = get_env(&format!("{ENV_PREFIX}_TELEMETRY_ENABLED")) {
             if let Some(parsed) = parse_env_bool(&enabled) {
-                self.history.enabled = parsed;
+                self.telemetry.enabled = parsed;
             }
         }
 
-        // DCG_HISTORY_REDACTION_MODE=none|pattern|full
-        if let Some(mode) = get_env(&format!("{ENV_PREFIX}_HISTORY_REDACTION_MODE")) {
-            if let Ok(parsed) = HistoryRedactionMode::from_str(&mode) {
-                self.history.redaction_mode = parsed;
+        // DCG_TELEMETRY_REDACTION_MODE=none|pattern|full
+        if let Some(mode) = get_env(&format!("{ENV_PREFIX}_TELEMETRY_REDACTION_MODE")) {
+            if let Ok(parsed) = TelemetryRedactionMode::from_str(&mode) {
+                self.telemetry.redaction_mode = parsed;
             }
         }
     }
@@ -1884,7 +1812,6 @@ impl Config {
     pub fn generate_default() -> Self {
         Self {
             general: GeneralConfig::default(),
-            output: OutputConfig::default(),
             packs: PacksConfig {
                 enabled: vec![
                     // Core is implicit, but list common ones
@@ -1898,7 +1825,7 @@ impl Config {
             heredoc: HeredocConfig::default(),
             confidence: ConfidenceConfig::default(),
             logging: crate::logging::LoggingConfig::default(),
-            history: HistoryConfig::default(),
+            telemetry: TelemetryConfig::default(),
             projects: std::collections::HashMap::new(),
         }
     }
@@ -1919,19 +1846,6 @@ color = "auto"
 
 # Verbose output
 verbose = false
-
-#─────────────────────────────────────────────────────────────
-# OUTPUT CONFIGURATION
-#─────────────────────────────────────────────────────────────
-
-[output]
-# Enable span highlighting in denial output.
-# Shows caret-style markers under the matched portion.
-# highlight_enabled = true
-
-# Enable explanations in denial output.
-# Shows detailed explanations for why patterns are dangerous.
-# explanations_enabled = true
 
 #─────────────────────────────────────────────────────────────
 # PACK CONFIGURATION
@@ -1986,7 +1900,7 @@ disabled = [
 # Optional global override for how matched rules are handled:
 # - "deny": block (default)
 # - "warn": allow but print a warning to stderr (no hook JSON deny)
-# - "log": allow silently (no stderr/stdout; optional log_file history)
+# - "log": allow silently (no stderr/stdout; optional log_file telemetry)
 #
 # If unset, dcg uses severity defaults:
 # - critical/high => deny
@@ -2065,11 +1979,11 @@ fallback_on_parse_error = true
 fallback_on_timeout = true
 
 #─────────────────────────────────────────────────────────────
-# HISTORY
+# TELEMETRY
 #─────────────────────────────────────────────────────────────
 
-[history]
-# Enable command history (opt-in).
+[telemetry]
+# Enable command telemetry (opt-in).
 enabled = false
 
 # Redaction mode for stored commands: "pattern" | "full" | "none"
@@ -2080,7 +1994,7 @@ retention_days = 90
 max_size_mb = 500
 
 # Optional database path override.
-# database_path = "~/.config/dcg/history.db"
+# database_path = "~/.config/dcg/telemetry.db"
 
 #─────────────────────────────────────────────────────────────
 # PROJECT-SPECIFIC OVERRIDES
@@ -2284,73 +2198,82 @@ mod tests {
     }
 
     #[test]
-    fn test_history_config_defaults() {
-        let config = HistoryConfig::default();
+    fn test_telemetry_config_defaults() {
+        let config = TelemetryConfig::default();
         assert!(!config.enabled);
-        assert_eq!(config.redaction_mode, HistoryRedactionMode::Pattern);
-        assert_eq!(config.retention_days, HistoryConfig::DEFAULT_RETENTION_DAYS);
-        assert_eq!(config.max_size_mb, HistoryConfig::DEFAULT_MAX_SIZE_MB);
+        assert_eq!(config.redaction_mode, TelemetryRedactionMode::Pattern);
+        assert_eq!(
+            config.retention_days,
+            TelemetryConfig::DEFAULT_RETENTION_DAYS
+        );
+        assert_eq!(config.max_size_mb, TelemetryConfig::DEFAULT_MAX_SIZE_MB);
     }
 
     #[test]
-    fn test_history_config_from_toml() {
+    fn test_telemetry_config_from_toml() {
         let input = r#"
-[history]
+[telemetry]
 enabled = true
 redaction_mode = "full"
 retention_days = 30
 max_size_mb = 250
-database_path = "/tmp/dcg-history.db"
+database_path = "/tmp/dcg-telemetry.db"
 "#;
         let config: Config = toml::from_str(input).expect("config parses");
-        assert!(config.history.enabled);
-        assert_eq!(config.history.redaction_mode, HistoryRedactionMode::Full);
-        assert_eq!(config.history.retention_days, 30);
-        assert_eq!(config.history.max_size_mb, 250);
+        assert!(config.telemetry.enabled);
         assert_eq!(
-            config.history.database_path.as_deref(),
-            Some("/tmp/dcg-history.db")
+            config.telemetry.redaction_mode,
+            TelemetryRedactionMode::Full
+        );
+        assert_eq!(config.telemetry.retention_days, 30);
+        assert_eq!(config.telemetry.max_size_mb, 250);
+        assert_eq!(
+            config.telemetry.database_path.as_deref(),
+            Some("/tmp/dcg-telemetry.db")
         );
     }
 
     #[test]
-    fn test_history_redaction_mode_parsing() {
+    fn test_telemetry_redaction_mode_parsing() {
         assert_eq!(
-            HistoryRedactionMode::from_str("none").expect("none"),
-            HistoryRedactionMode::None
+            TelemetryRedactionMode::from_str("none").expect("none"),
+            TelemetryRedactionMode::None
         );
         assert_eq!(
-            HistoryRedactionMode::from_str("pattern").expect("pattern"),
-            HistoryRedactionMode::Pattern
+            TelemetryRedactionMode::from_str("pattern").expect("pattern"),
+            TelemetryRedactionMode::Pattern
         );
         assert_eq!(
-            HistoryRedactionMode::from_str("full").expect("full"),
-            HistoryRedactionMode::Full
+            TelemetryRedactionMode::from_str("full").expect("full"),
+            TelemetryRedactionMode::Full
         );
-        assert!(HistoryRedactionMode::from_str("invalid").is_err());
+        assert!(TelemetryRedactionMode::from_str("invalid").is_err());
     }
 
     #[test]
-    fn test_history_env_overrides() {
+    fn test_telemetry_env_overrides() {
         let env_map: std::collections::HashMap<&str, &str> = std::collections::HashMap::from([
-            ("DCG_HISTORY_ENABLED", "true"),
-            ("DCG_HISTORY_REDACTION_MODE", "full"),
+            ("DCG_TELEMETRY_ENABLED", "true"),
+            ("DCG_TELEMETRY_REDACTION_MODE", "full"),
         ]);
         let mut config = Config::default();
         config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
 
-        assert!(config.history.enabled);
-        assert_eq!(config.history.redaction_mode, HistoryRedactionMode::Full);
+        assert!(config.telemetry.enabled);
+        assert_eq!(
+            config.telemetry.redaction_mode,
+            TelemetryRedactionMode::Full
+        );
     }
 
     #[test]
-    fn test_history_database_path_expansion() {
+    fn test_telemetry_database_path_expansion() {
         if dirs::home_dir().is_none() {
             return;
         }
 
-        let config = HistoryConfig {
-            database_path: Some("~/.config/dcg/history.db".to_string()),
+        let config = TelemetryConfig {
+            database_path: Some("~/.config/dcg/telemetry.db".to_string()),
             ..Default::default()
         };
         let expanded = config
@@ -2361,21 +2284,21 @@ database_path = "/tmp/dcg-history.db"
     }
 
     #[test]
-    fn test_history_retention_validation() {
-        let config = HistoryConfig {
+    fn test_telemetry_retention_validation() {
+        let config = TelemetryConfig {
             retention_days: 0,
             ..Default::default()
         };
         assert!(config.validate().is_err());
 
-        let config = HistoryConfig {
-            retention_days: HistoryConfig::MAX_RETENTION_DAYS + 1,
+        let config = TelemetryConfig {
+            retention_days: TelemetryConfig::MAX_RETENTION_DAYS + 1,
             ..Default::default()
         };
         assert!(config.validate().is_err());
 
-        let config = HistoryConfig {
-            retention_days: HistoryConfig::DEFAULT_RETENTION_DAYS,
+        let config = TelemetryConfig {
+            retention_days: TelemetryConfig::DEFAULT_RETENTION_DAYS,
             ..Default::default()
         };
         assert!(config.validate().is_ok());
