@@ -148,7 +148,7 @@ mod explain_tests {
         let json: serde_json::Value =
             serde_json::from_str(&stdout).expect("explain --format json should produce valid JSON");
 
-        assert_eq!(json["schema_version"], 1, "should have schema_version");
+        assert_eq!(json["schema_version"], 2, "should have schema_version");
         assert!(json["command"].is_string(), "should have command field");
         assert!(json["decision"].is_string(), "should have decision field");
         assert!(
@@ -877,11 +877,10 @@ block = [
         let allow_output = env.run_cli(&["allow-once", &code, "--yes"]);
         assert!(allow_output.status.success(), "allow-once should succeed");
 
-        // Verify it's allowed
-        let result2 = env.run_hook(command);
-        assert_is_allowed(&result2);
+        // NOTE: We do NOT verify it's allowed here because single-use exceptions
+        // are consumed on first use. We want to test revoke on an unconsumed exception.
 
-        // Step 2: Revoke the exception
+        // Step 2: Revoke the exception before it's used
         let revoke_output = env.run_cli(&["allow-once", "revoke", &code, "--yes", "--json"]);
         assert!(
             revoke_output.status.success(),
@@ -2144,5 +2143,820 @@ echo hello
             json["totals"]["commands"], 1,
             "should extract 1 command from log"
         );
+    }
+}
+
+// ============================================================================
+// Hook Highlighting E2E Tests (git_safety_guard-jpfm.7)
+// ============================================================================
+
+mod hook_highlighting_tests {
+    use super::*;
+
+    /// Helper to check if a string contains ANSI escape sequences.
+    fn contains_ansi_escapes(s: &str) -> bool {
+        s.contains("\x1b[") || s.contains("\u{001b}[")
+    }
+
+    /// Run dcg hook with color forcing for testing highlighting.
+    fn run_dcg_hook_with_color(command: &str, force_color: bool) -> HookRunOutput {
+        let color_env: &[(&str, &std::ffi::OsStr)] = if force_color {
+            &[
+                ("FORCE_COLOR", std::ffi::OsStr::new("1")),
+                ("CLICOLOR_FORCE", std::ffi::OsStr::new("1")),
+            ]
+        } else {
+            &[
+                ("NO_COLOR", std::ffi::OsStr::new("1")),
+                ("CLICOLOR", std::ffi::OsStr::new("0")),
+            ]
+        };
+        run_dcg_hook_with_env(command, color_env)
+    }
+
+    // -------------------------------------------------------------------------
+    // Basic highlighting tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn hook_denial_stderr_contains_caret_highlighting() {
+        // Run a command that will be denied
+        let result = run_dcg_hook("git reset --hard");
+        let stderr = result.stderr_str();
+
+        // Verify the command was denied (stdout has JSON with deny decision)
+        let stdout = result.stdout_str();
+        assert!(
+            result.output.status.success(),
+            "hook should exit successfully"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("should produce JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "should be denied"
+        );
+
+        // stderr should contain caret markers for span highlighting
+        assert!(
+            stderr.contains('^'),
+            "stderr should contain caret markers for highlighting\nstderr:\n{stderr}"
+        );
+
+        // stderr should contain a "Matched:" label
+        assert!(
+            stderr.contains("Matched:"),
+            "stderr should contain 'Matched:' label\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn hook_denial_stderr_contains_command_line() {
+        let result = run_dcg_hook("git reset --hard HEAD");
+        let stderr = result.stderr_str();
+
+        // stderr should show the command
+        assert!(
+            stderr.contains("Command:"),
+            "stderr should contain 'Command:' label\nstderr:\n{stderr}"
+        );
+
+        // The command text should appear in stderr
+        assert!(
+            stderr.contains("git reset --hard") || stderr.contains("reset"),
+            "stderr should contain the blocked command\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn hook_denial_caret_line_follows_command_line() {
+        // Force color off for easier parsing
+        let result = run_dcg_hook_with_color("git reset --hard", false);
+        let stderr = result.stderr_str();
+
+        // Find lines containing Command: and caret markers
+        let lines: Vec<&str> = stderr.lines().collect();
+        let mut command_line_idx = None;
+        let mut caret_line_idx = None;
+
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("Command:") && line.contains("git") {
+                command_line_idx = Some(i);
+            }
+            if line.contains("^^^^") && command_line_idx.is_some() {
+                caret_line_idx = Some(i);
+                break;
+            }
+        }
+
+        assert!(
+            command_line_idx.is_some(),
+            "should find Command: line\nstderr:\n{stderr}"
+        );
+        assert!(
+            caret_line_idx.is_some(),
+            "should find caret line\nstderr:\n{stderr}"
+        );
+
+        // Caret line should be immediately after command line
+        let cmd_idx = command_line_idx.unwrap();
+        let caret_idx = caret_line_idx.unwrap();
+        assert_eq!(
+            caret_idx,
+            cmd_idx + 1,
+            "caret line should immediately follow command line\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn hook_denial_label_line_follows_caret_line() {
+        // Force color off for easier parsing
+        let result = run_dcg_hook_with_color("git reset --hard", false);
+        let stderr = result.stderr_str();
+
+        // Find the "Matched:" label line
+        let lines: Vec<&str> = stderr.lines().collect();
+        let mut caret_line_idx = None;
+        let mut label_line_idx = None;
+
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("^^^^") {
+                caret_line_idx = Some(i);
+            }
+            if line.contains("Matched:") && caret_line_idx.is_some() {
+                label_line_idx = Some(i);
+                break;
+            }
+        }
+
+        assert!(
+            caret_line_idx.is_some(),
+            "should find caret line\nstderr:\n{stderr}"
+        );
+        assert!(
+            label_line_idx.is_some(),
+            "should find label line with Matched:\nstderr:\n{stderr}"
+        );
+
+        // Label line should be immediately after caret line
+        let caret_idx = caret_line_idx.unwrap();
+        let label_idx = label_line_idx.unwrap();
+        assert_eq!(
+            label_idx,
+            caret_idx + 1,
+            "label line should immediately follow caret line\nstderr:\n{stderr}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Non-TTY mode tests (no ANSI escape codes)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn hook_denial_no_ansi_when_color_disabled() {
+        // Force color off
+        let result = run_dcg_hook_with_color("git reset --hard", false);
+        let stderr = result.stderr_str();
+
+        // Verify denial happened
+        let stdout = result.stdout_str();
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("should produce JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "should be denied"
+        );
+
+        // stderr should NOT contain ANSI escape codes
+        assert!(
+            !contains_ansi_escapes(&stderr),
+            "stderr should not contain ANSI escapes when color disabled\nstderr:\n{stderr}"
+        );
+
+        // But should still contain the structure
+        assert!(
+            stderr.contains("Command:"),
+            "should still have Command: label"
+        );
+        assert!(stderr.contains('^'), "should still have caret markers");
+    }
+
+    #[test]
+    fn hook_denial_structure_preserved_regardless_of_color() {
+        // Test that the highlighting structure is present regardless of color settings
+        // Note: FORCE_COLOR/CLICOLOR_FORCE don't currently work with dcg's should_use_color()
+        // which uses io::stderr().is_terminal() as the final check. This is fine for E2E
+        // testing - we verify structure is correct in both color and non-color modes.
+
+        let result = run_dcg_hook("git reset --hard");
+        let stderr = result.stderr_str();
+
+        // Verify denial happened
+        let stdout = result.stdout_str();
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("should produce JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "should be denied"
+        );
+
+        // stderr should have the highlighting structure
+        assert!(
+            stderr.contains("Command:"),
+            "stderr should contain Command: label\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains('^'),
+            "stderr should contain caret markers\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("Matched:"),
+            "stderr should contain Matched: label\nstderr:\n{stderr}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Long command windowing tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn hook_denial_long_command_windowing() {
+        // Create a long command that exceeds typical display width
+        let long_suffix = "x".repeat(100);
+        let command = format!("git reset --hard HEAD{long_suffix}");
+
+        let result = run_dcg_hook_with_color(&command, false);
+        let stderr = result.stderr_str();
+
+        // Verify denial happened
+        let stdout = result.stdout_str();
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("should produce JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "should be denied"
+        );
+
+        // stderr should still contain caret markers (windowing should preserve highlighting)
+        assert!(
+            stderr.contains('^'),
+            "stderr should contain caret markers even for long commands\nstderr:\n{stderr}"
+        );
+
+        // Should contain ellipsis or windowing indicator if command was truncated
+        // The windowing implementation may use "..." or similar
+        // At minimum, verify the highlighting structure is preserved
+        assert!(
+            stderr.contains("Command:"),
+            "should contain Command: label\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn hook_denial_long_command_with_match_at_start() {
+        // Long command where the matched pattern is at the start
+        let long_suffix = " ".to_string() + &"x".repeat(100);
+        let command = format!("git reset --hard{long_suffix}");
+
+        let result = run_dcg_hook_with_color(&command, false);
+        let stderr = result.stderr_str();
+
+        // Verify denial
+        let stdout = result.stdout_str();
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("should produce JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "should be denied"
+        );
+
+        // The important pattern "reset --hard" should be visible with carets
+        assert!(
+            stderr.contains('^'),
+            "should show caret markers for visible matched portion\nstderr:\n{stderr}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // UTF-8 handling tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn hook_denial_utf8_command_caret_alignment() {
+        // Command with UTF-8 characters before the matched pattern
+        // The caret alignment should account for multi-byte characters
+        let command = "git reset --hard # 日本語コメント";
+
+        let result = run_dcg_hook_with_color(command, false);
+        let stderr = result.stderr_str();
+
+        // Verify denial
+        let stdout = result.stdout_str();
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("should produce JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "should be denied"
+        );
+
+        // Should still have caret markers
+        assert!(
+            stderr.contains('^'),
+            "should contain caret markers with UTF-8 content\nstderr:\n{stderr}"
+        );
+
+        // Should contain the Matched: label
+        assert!(
+            stderr.contains("Matched:"),
+            "should contain Matched: label with UTF-8 content\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn hook_denial_emoji_command_caret_alignment() {
+        // Command with emoji before the matched pattern
+        let command = "git reset --hard # 🚀🔥";
+
+        let result = run_dcg_hook_with_color(command, false);
+        let stderr = result.stderr_str();
+
+        // Verify denial
+        let stdout = result.stdout_str();
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("should produce JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "should be denied"
+        );
+
+        // Should still have proper highlighting structure
+        assert!(
+            stderr.contains('^'),
+            "should contain caret markers with emoji\nstderr:\n{stderr}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Verbose log tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn hook_denial_stderr_verbose_on_failure() {
+        // When a command is denied, stderr should contain enough info for debugging
+        let result = run_dcg_hook("git clean -fdx");
+        let stderr = result.stderr_str();
+
+        // Verify denial
+        let stdout = result.stdout_str();
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("should produce JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "should be denied"
+        );
+
+        // stderr should contain the pack that blocked it
+        assert!(
+            stderr.contains("core.git") || stderr.contains("Pack:"),
+            "stderr should mention the blocking pack\nstderr:\n{stderr}"
+        );
+
+        // stderr should contain the reason
+        assert!(
+            stderr.contains("Reason:") || stderr.contains("dangerous"),
+            "stderr should contain reason information\nstderr:\n{stderr}"
+        );
+
+        // stderr should have the caret highlighting
+        assert!(
+            stderr.contains('^'),
+            "stderr should have caret highlighting\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn hook_denial_multiple_patterns_shows_first_match() {
+        // A command that might match multiple patterns - should show highlighting
+        // for at least one match
+        let result = run_dcg_hook("git push --force");
+        let stderr = result.stderr_str();
+
+        // Verify denial
+        let stdout = result.stdout_str();
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("should produce JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "should be denied"
+        );
+
+        // Should have caret highlighting for the matched portion
+        assert!(
+            stderr.contains('^'),
+            "should contain caret markers\nstderr:\n{stderr}"
+        );
+
+        // Should have the Matched label
+        assert!(
+            stderr.contains("Matched:"),
+            "should contain Matched: label\nstderr:\n{stderr}"
+        );
+    }
+}
+
+// ============================================================================
+// Explanation Output E2E Tests (git_safety_guard-r97e.6)
+// ============================================================================
+
+mod explanation_output_tests {
+    use super::*;
+
+    /// Helper to check if a string contains ANSI escape sequences.
+    fn contains_ansi_escapes(s: &str) -> bool {
+        s.contains("\x1b[") || s.contains("\u{001b}[")
+    }
+
+    /// Run dcg hook with `NO_COLOR` to disable ANSI for easier parsing.
+    fn run_dcg_hook_no_color(command: &str) -> HookRunOutput {
+        run_dcg_hook_with_env(
+            command,
+            &[
+                ("NO_COLOR", std::ffi::OsStr::new("1")),
+                ("CLICOLOR", std::ffi::OsStr::new("0")),
+            ],
+        )
+    }
+
+    // -------------------------------------------------------------------------
+    // Hook denial explanation tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn hook_denial_stderr_contains_explanation_label() {
+        // Run a command that will be denied
+        let result = run_dcg_hook_no_color("git reset --hard");
+        let stderr = result.stderr_str();
+
+        // Verify denial
+        let stdout = result.stdout_str();
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("should produce JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "should be denied"
+        );
+
+        // stderr should contain "Explanation:" label
+        assert!(
+            stderr.contains("Explanation:"),
+            "stderr should contain 'Explanation:' label\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn hook_denial_stderr_contains_explanation_text() {
+        // git reset --hard has a detailed explanation in the core.git pack
+        let result = run_dcg_hook_no_color("git reset --hard");
+        let stderr = result.stderr_str();
+
+        // Verify denial
+        let stdout = result.stdout_str();
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("should produce JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "should be denied"
+        );
+
+        // The explanation should mention key information about the danger
+        // Known explanation text includes: "discards ALL uncommitted changes"
+        assert!(
+            stderr.contains("uncommitted")
+                || stderr.contains("Matched destructive pattern")
+                || stderr.contains("discards"),
+            "stderr should contain explanation content about the danger\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn hook_denial_explanation_mentions_danger() {
+        // Test that explanations provide meaningful context about the danger
+        let result = run_dcg_hook_no_color("git push --force");
+        let stderr = result.stderr_str();
+
+        // Verify denial
+        let stdout = result.stdout_str();
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("should produce JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "should be denied"
+        );
+
+        // Should have explanation section
+        assert!(
+            stderr.contains("Explanation:"),
+            "stderr should contain Explanation: label\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn hook_denial_explanation_wrapped_long_text() {
+        // Explanations can be long and should be wrapped properly
+        let result = run_dcg_hook_no_color("git reset --hard HEAD");
+        let stderr = result.stderr_str();
+
+        // Verify denial
+        let stdout = result.stdout_str();
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("should produce JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "should be denied"
+        );
+
+        // Find the explanation section and verify it spans multiple lines
+        let lines: Vec<&str> = stderr.lines().collect();
+        let mut found_explanation = false;
+        let mut explanation_line_count = 0;
+
+        for line in &lines {
+            if line.contains("Explanation:") {
+                found_explanation = true;
+            }
+            // Count continuation lines (indented lines after Explanation:)
+            // These would be lines that are part of the explanation text
+            if found_explanation && line.starts_with("│") && !line.contains("Command:") {
+                explanation_line_count += 1;
+            }
+            if line.contains("Command:") {
+                break;
+            }
+        }
+
+        assert!(found_explanation, "should have Explanation: section");
+        // Long explanations should wrap to multiple lines
+        // This test verifies the structure exists, not exact line count
+        assert!(
+            explanation_line_count >= 1,
+            "explanation should have at least one line"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // dcg explain CLI explanation tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn explain_pretty_includes_explanation_section() {
+        let output = run_dcg(&["explain", "git reset --hard"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Pretty explain should include explanation text
+        assert!(
+            stdout.contains("Explanation:") || stdout.contains("explanation"),
+            "explain should include explanation section\nstdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn explain_json_includes_explanation_field() {
+        let output = run_dcg(&["explain", "--format", "json", "git reset --hard"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Parse as JSON to validate structure
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout).expect("explain JSON should be valid");
+
+        // Should have explanation in match info
+        assert_eq!(json["decision"], "deny", "should be denied");
+
+        // Check for explanation field in the match object
+        let has_explanation = json["match"]["explanation"].is_string();
+
+        assert!(
+            has_explanation,
+            "JSON output should contain explanation field in match object\nJSON:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn explain_json_explanation_is_meaningful() {
+        let output = run_dcg(&["explain", "--format", "json", "git reset --hard"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout).expect("explain JSON should be valid");
+
+        // Get explanation from match object
+        let explanation = json["match"]["explanation"]
+            .as_str()
+            .unwrap_or_default();
+
+        // Explanation should be non-empty and contain relevant info
+        assert!(
+            !explanation.is_empty(),
+            "explanation should not be empty\nJSON:\n{stdout}"
+        );
+
+        // Should mention the pattern or danger
+        assert!(
+            explanation.contains("Matched")
+                || explanation.contains("destructive")
+                || explanation.contains("uncommitted")
+                || explanation.contains("reset"),
+            "explanation should contain meaningful text\nExplanation: {explanation}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Non-TTY mode tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn hook_denial_explanation_no_ansi_when_color_disabled() {
+        let result = run_dcg_hook_no_color("git reset --hard");
+        let stderr = result.stderr_str();
+
+        // Verify denial
+        let stdout = result.stdout_str();
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("should produce JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "should be denied"
+        );
+
+        // stderr should NOT contain ANSI escape codes
+        assert!(
+            !contains_ansi_escapes(&stderr),
+            "stderr should not contain ANSI escapes when color disabled\nstderr:\n{stderr}"
+        );
+
+        // But should still contain the explanation structure
+        assert!(
+            stderr.contains("Explanation:"),
+            "should still have Explanation: label"
+        );
+    }
+
+    #[test]
+    fn explain_output_works_without_tty() {
+        // Explain output should work correctly in non-TTY mode
+        let output = run_dcg(&["explain", "git reset --hard"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            output.status.success() || stdout.contains("DENY"),
+            "explain should succeed in non-TTY mode"
+        );
+
+        // Should contain explanation content
+        assert!(
+            stdout.contains("Explanation:") || stdout.contains("reset"),
+            "explain should contain relevant content"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Verbose logging tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn hook_denial_stderr_contains_verbose_info() {
+        // When a command is denied, stderr should contain enough verbose info
+        let result = run_dcg_hook_no_color("git clean -fdx");
+        let stderr = result.stderr_str();
+
+        // Verify denial
+        let stdout = result.stdout_str();
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("should produce JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "should be denied"
+        );
+
+        // stderr should contain rule info (which includes pack identifier)
+        assert!(
+            stderr.contains("Rule:") || stderr.contains("core.git"),
+            "stderr should contain rule/pack information\nstderr:\n{stderr}"
+        );
+
+        // stderr should contain reason
+        assert!(
+            stderr.contains("Reason:"),
+            "stderr should contain reason\nstderr:\n{stderr}"
+        );
+
+        // stderr should contain explanation
+        assert!(
+            stderr.contains("Explanation:"),
+            "stderr should contain explanation\nstderr:\n{stderr}"
+        );
+
+        // stderr should contain the command
+        assert!(
+            stderr.contains("Command:"),
+            "stderr should contain command\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn hook_denial_shows_full_context_on_block() {
+        // When blocked, output should show comprehensive context
+        let result = run_dcg_hook_no_color("git push origin main --force");
+        let stderr = result.stderr_str();
+
+        // Verify denial
+        let stdout = result.stdout_str();
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("should produce JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "should be denied"
+        );
+
+        // Check for comprehensive context in verbose output
+        let has_rule = stderr.contains("Rule:");
+        let has_reason = stderr.contains("Reason:");
+        let has_explanation = stderr.contains("Explanation:");
+        let has_command = stderr.contains("Command:");
+        let has_suggestions = stderr.contains("💡") || stderr.contains("Safer");
+
+        assert!(
+            has_rule,
+            "should show rule info\nstderr:\n{stderr}"
+        );
+        assert!(
+            has_reason,
+            "should show reason\nstderr:\n{stderr}"
+        );
+        assert!(
+            has_explanation,
+            "should show explanation\nstderr:\n{stderr}"
+        );
+        assert!(
+            has_command,
+            "should show command\nstderr:\n{stderr}"
+        );
+        // Suggestions might not always be present
+        let _ = has_suggestions;
+    }
+
+    // -------------------------------------------------------------------------
+    // Multiple commands/patterns tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn hook_denial_shows_explanation_for_different_patterns() {
+        // Test that different blocked commands show appropriate explanations
+        let commands = [
+            "git reset --hard",
+            "git clean -fdx",
+            "git push --force",
+            "rm -rf /",
+        ];
+
+        for cmd in commands {
+            let result = run_dcg_hook_no_color(cmd);
+            let stderr = result.stderr_str();
+            let stdout = result.stdout_str();
+
+            let json: serde_json::Value =
+                serde_json::from_str(stdout.trim()).expect("should produce JSON");
+
+            if json["hookSpecificOutput"]["permissionDecision"] == "deny" {
+                assert!(
+                    stderr.contains("Explanation:"),
+                    "command '{cmd}' should show explanation when denied\nstderr:\n{stderr}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explain_json_all_blocked_have_explanation() {
+        // All blocked commands should have an explanation in JSON output
+        let commands = [
+            "git reset --hard",
+            "git clean -fdx",
+        ];
+
+        for cmd in commands {
+            let output = run_dcg(&["explain", "--format", "json", cmd]);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            let json: serde_json::Value =
+                serde_json::from_str(&stdout).expect("JSON should be valid");
+
+            if json["decision"] == "deny" {
+                let explanation = json["match"]["explanation"].as_str();
+                assert!(
+                    explanation.is_some() && !explanation.unwrap().is_empty(),
+                    "command '{cmd}' JSON should have non-empty explanation\nJSON:\n{stdout}"
+                );
+            }
+        }
     }
 }

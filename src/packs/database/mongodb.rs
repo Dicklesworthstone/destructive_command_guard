@@ -52,31 +52,84 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "drop-database",
             r"\.dropDatabase\s*\(",
-            "dropDatabase permanently deletes the entire database."
+            "dropDatabase permanently deletes the entire database.",
+            Critical,
+            "dropDatabase() removes the current database completely:\n\n\
+             - All collections are dropped\n\
+             - All indexes are removed\n\
+             - All documents are gone\n\
+             - Users scoped to the database lose access\n\n\
+             This cannot be undone. The database can be recreated but data is lost.\n\n\
+             Backup first:\n  \
+             mongodump --db=dbname --out=/path/to/backup\n\n\
+             List databases:\n  \
+             show dbs"
         ),
         // dropCollection / drop()
         destructive_pattern!(
             "drop-collection",
             r"\.drop\s*\(\s*\)|\.dropCollection\s*\(",
-            "drop/dropCollection permanently deletes the collection."
+            "drop/dropCollection permanently deletes the collection.",
+            High,
+            "drop() removes the entire collection:\n\n\
+             - All documents are deleted\n\
+             - All indexes are removed\n\
+             - Schema validation rules are lost\n\
+             - Cannot be undone\n\n\
+             Backup collection first:\n  \
+             mongodump --db=dbname --collection=collname\n\n\
+             Count documents before dropping:\n  \
+             db.collection.countDocuments()"
         ),
         // remove({}) / deleteMany({}) with empty filter
         destructive_pattern!(
             "delete-all",
             r"\.(?:remove|deleteMany)\s*\(\s*\{\s*\}\s*\)",
-            "remove({}) or deleteMany({}) deletes ALL documents. Add filter criteria."
+            "remove({}) or deleteMany({}) deletes ALL documents. Add filter criteria.",
+            High,
+            "An empty filter {} matches ALL documents in the collection:\n\n\
+             - deleteMany({}) removes every document\n\
+             - remove({}) (deprecated) does the same\n\
+             - Collection structure and indexes remain\n\n\
+             If you want to delete everything, drop() is faster.\n\
+             Otherwise, add filter criteria:\n  \
+             db.collection.deleteMany({ status: 'expired' })\n\n\
+             Preview what would be deleted:\n  \
+             db.collection.countDocuments({})  // All documents!\n  \
+             db.collection.find({}).limit(10)  // Sample docs"
         ),
         // mongorestore --drop
         destructive_pattern!(
             "mongorestore-drop",
             r"mongorestore\s+.*--drop",
-            "mongorestore --drop deletes existing data before restoring."
+            "mongorestore --drop deletes existing data before restoring.",
+            High,
+            "mongorestore --drop drops collections before restoring them:\n\n\
+             - Existing data is deleted first\n\
+             - If restore fails partway, data may be lost\n\
+             - Only affects collections being restored\n\n\
+             Safer approaches:\n\
+             - Restore to a different database first\n\
+             - Use --nsExclude to skip certain collections\n\
+             - Remove --drop and handle conflicts manually\n\n\
+             Test restore:\n  \
+             mongorestore --db=test_restore --drop /backup/path"
         ),
         // db.collection.drop()
         destructive_pattern!(
             "collection-drop",
             r"db\.[a-zA-Z_][a-zA-Z0-9_]*\.drop\s*\(",
-            "collection.drop() permanently deletes the collection."
+            "collection.drop() permanently deletes the collection.",
+            High,
+            "db.<collection>.drop() is the most common way to delete a collection:\n\n\
+             - All documents in the collection are deleted\n\
+             - Indexes on the collection are removed\n\
+             - Cannot be undone\n\n\
+             Before dropping:\n  \
+             db.collection.stats()           // Size and document count\n  \
+             db.collection.find().limit(5)   // Sample documents\n\n\
+             Backup:\n  \
+             mongodump --db=mydb --collection=mycollection"
         ),
     ]
 }
