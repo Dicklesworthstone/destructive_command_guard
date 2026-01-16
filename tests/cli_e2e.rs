@@ -877,11 +877,10 @@ block = [
         let allow_output = env.run_cli(&["allow-once", &code, "--yes"]);
         assert!(allow_output.status.success(), "allow-once should succeed");
 
-        // Verify it's allowed
-        let result2 = env.run_hook(command);
-        assert_is_allowed(&result2);
+        // NOTE: We do NOT verify it's allowed here because single-use exceptions
+        // are consumed on first use. We want to test revoke on an unconsumed exception.
 
-        // Step 2: Revoke the exception
+        // Step 2: Revoke the exception before it's used
         let revoke_output = env.run_cli(&["allow-once", "revoke", &code, "--yes", "--json"]);
         assert!(
             revoke_output.status.success(),

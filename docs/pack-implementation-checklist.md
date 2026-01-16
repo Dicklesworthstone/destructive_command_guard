@@ -15,6 +15,20 @@ Use this checklist when adding a new pack to `destructive_command_guard`.
 - [ ] Implement `destructive_patterns` (regex + reason).
 - [ ] Implement `safe_patterns` (if needed for whitelist).
 
+## 2a. Explanation Style Guide (for destructive patterns)
+
+Explanations are optional but recommended for user-facing clarity. When present:
+
+- Keep it short: 2-4 sentences, ~400 chars or less.
+- Stay neutral and factual; avoid scaremongering or moralizing.
+- Structure:
+  1) What the command does.
+  2) Why that is risky (data loss, downtime, security blast radius).
+  3) Safer alternative and/or preview command.
+- Use concrete nouns and commands (e.g., `git reset --soft`, `--dry-run`).
+- Avoid absolutes unless accurate (prefer "often" or "can").
+- Match the existing `reason` but add real detail (not repetition).
+
 ## 3. Unit Testing
 - [ ] Copy `src/packs/test_template.rs` content to `src/packs/<category>/<tool>.rs` (mod tests).
 - [ ] Update `test_pack_creation` to use `validate_pack`.

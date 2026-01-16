@@ -1,0 +1,83 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: "dcg external pack schema"
+type: object
+additionalProperties: false
+required:
+  - schema_version
+  - id
+  - name
+  - version
+properties:
+  schema_version:
+    type: integer
+    minimum: 1
+    description: Schema version for forward compatibility.
+    default: 1
+  id:
+    type: string
+    pattern: "^[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*$"
+    description: Unique pack identifier (e.g., mycompany.policies).
+  name:
+    type: string
+    description: Human-readable pack name.
+  version:
+    type: string
+    pattern: "^\\d+\\.\\d+\\.\\d+$"
+    description: Semantic version of the pack definition.
+  description:
+    type: string
+    description: What this pack protects against.
+  keywords:
+    type: array
+    description: Keywords that trigger evaluation for this pack.
+    items:
+      type: string
+    default: []
+  destructive_patterns:
+    type: array
+    description: Patterns that block or warn based on severity.
+    items:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - pattern
+      properties:
+        name:
+          type: string
+          description: Stable pattern identifier within the pack.
+        pattern:
+          type: string
+          description: fancy-regex pattern to match.
+        severity:
+          type: string
+          enum: [low, medium, high, critical]
+          default: high
+          description: Default decision mode based on severity.
+        description:
+          type: string
+          description: Short human-readable reason shown on denial.
+        explanation:
+          type: string
+          description: Longer explanation shown in verbose output.
+    default: []
+  safe_patterns:
+    type: array
+    description: Patterns that explicitly allow commands.
+    items:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - pattern
+      properties:
+        name:
+          type: string
+          description: Stable pattern identifier within the pack.
+        pattern:
+          type: string
+          description: fancy-regex pattern to match.
+        description:
+          type: string
+          description: Short reason for allowlisting.
+    default: []

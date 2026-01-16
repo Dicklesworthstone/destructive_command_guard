@@ -1,0 +1,23 @@
+name: Notify ACFS checksum monitor
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'install.sh'
+      - 'scripts/install.sh'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch to ACFS
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.ACFS_REPO_DISPATCH_TOKEN }}
+          repository: Dicklesworthstone/agentic_coding_flywheel_setup
+          event-type: upstream-changed
+          client-payload: '{"repo":"${{ github.repository }}","ref":"${{ github.ref }}","sha":"${{ github.sha }}","event":"${{ github.event_name }}"}'
