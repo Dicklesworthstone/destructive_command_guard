@@ -100,15 +100,36 @@ expected = "deny"
 # ============================================================================
 # Heredocs (bash style) - DESTRUCTIVE ONLY
 # ============================================================================
+#
+# NOTE: Heredocs to non-executing commands like `cat`, `tee`, etc. are DATA,
+# not CODE. They are correctly allowed and tested in false_positives/heredoc_data.toml.
+# Only heredocs to executing commands like `bash`, `sh`, `python` should be blocked.
 
 [[case]]
-description = "heredoc containing rm -rf"
-command = "cat <<EOF\nrm -rf /home/user\nEOF"
+description = "heredoc to bash containing git reset"
+command = "bash <<EOF\ngit reset --hard\nEOF"
+expected = "deny"
+rule_id = "core.git:reset-hard"
+
+[[case]]
+description = "heredoc to sh containing rm -rf"
+command = "sh <<EOF\nrm -rf /home/user\nEOF"
+expected = "deny"
+
+# ============================================================================
+# Here-strings (<<<) to executing commands - DESTRUCTIVE
+# ============================================================================
+#
+# Here-strings to shells ARE executed and should be blocked.
+
+[[case]]
+description = "bash here-string with rm -rf"
+command = "bash <<<'rm -rf /home/user'"
 expected = "deny"
 
 [[case]]
-description = "heredoc containing git reset"
-command = "bash <<EOF\ngit reset --hard\nEOF"
+description = "sh here-string with git reset"
+command = "sh <<<'git reset --hard'"
 expected = "deny"
 rule_id = "core.git:reset-hard"
 

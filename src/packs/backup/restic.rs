@@ -53,27 +53,61 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "restic-forget",
             r"restic\b.*\sforget\b",
-            "restic forget removes snapshots and can permanently delete backup data."
+            "restic forget removes snapshots and can permanently delete backup data.",
+            Critical,
+            "restic forget removes snapshots from repository:\n\n\
+             - Snapshot metadata removed from repository\n\
+             - Data not deleted until prune is run\n\
+             - Use --keep-* flags to retain recent snapshots\n\
+             - --dry-run shows what would be forgotten\n\n\
+             Preview first: restic forget --dry-run [options]"
         ),
         destructive_pattern!(
             "restic-prune",
             r"restic\b.*\sprune\b",
-            "restic prune removes unreferenced data and is irreversible."
+            "restic prune removes unreferenced data and is irreversible.",
+            Critical,
+            "restic prune permanently deletes unreferenced data:\n\n\
+             - Removes data no longer referenced by snapshots\n\
+             - Usually run after 'restic forget'\n\
+             - Cannot be undone - data is permanently deleted\n\
+             - May take a long time for large repositories\n\n\
+             Consider: restic forget --prune to combine operations"
         ),
         destructive_pattern!(
             "restic-key-remove",
             r"restic\b.*\skey\b.*\sremove\b",
-            "restic key remove deletes encryption keys and can make backups unrecoverable."
+            "restic key remove deletes encryption keys and can make backups unrecoverable.",
+            Critical,
+            "restic key remove deletes repository encryption keys:\n\n\
+             - Key is permanently deleted from repository\n\
+             - If all keys removed, repository becomes inaccessible\n\
+             - Cannot recover data without a valid key\n\
+             - Always keep at least one key available\n\n\
+             List keys first: restic key list"
         ),
         destructive_pattern!(
             "restic-unlock-remove-all",
             r"restic\b.*\sunlock\b.*\s--remove-all\b",
-            "restic unlock --remove-all force-removes repository locks."
+            "restic unlock --remove-all force-removes repository locks.",
+            High,
+            "restic unlock --remove-all force-removes all locks:\n\n\
+             - Removes locks from potentially active operations\n\
+             - May cause corruption if operations are in progress\n\
+             - Use only when locks are stale/orphaned\n\n\
+             Check first: ensure no other restic processes are running"
         ),
         destructive_pattern!(
             "restic-cache-cleanup",
             r"restic\b.*\scache\b.*\s--cleanup\b",
-            "restic cache --cleanup removes cached data from disk."
+            "restic cache --cleanup removes cached data from disk.",
+            Low,
+            "restic cache --cleanup removes local cache:\n\n\
+             - Deletes cached data from local disk\n\
+             - Does not affect repository data\n\
+             - Cache will be rebuilt on next operation\n\
+             - May slow down subsequent operations\n\n\
+             Lower risk: only affects local cache, not backups"
         ),
     ]
 }

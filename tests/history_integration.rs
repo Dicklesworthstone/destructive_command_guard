@@ -6,7 +6,7 @@
 //! # Running
 //!
 //! ```bash
-//! cargo test --test telemetry_integration
+//! cargo test --test history_integration
 //! ```
 
 mod common;
