@@ -9,9 +9,8 @@ use clap::{Args, Parser, Subcommand};
 use crate::config::Config;
 use crate::evaluator::{
     DEFAULT_WINDOW_WIDTH, EvaluationDecision, MatchSource, evaluate_command_with_pack_order,
-    evaluate_command_with_pack_order_deadline_with_external,
+    evaluate_command_with_pack_order_deadline_at_path,
 };
-use crate::packs::external::ExternalPackLoader;
 use crate::highlight::{HighlightSpan, format_highlighted_command, should_use_color};
 use crate::history::{
     ExportOptions, HistoryDb, HistoryStats, Outcome, SuggestionAction, SuggestionAuditEntry,
@@ -22,9 +21,7 @@ use crate::pending_exceptions::{
     AllowOnceEntry, AllowOnceScopeKind, AllowOnceStore, PendingExceptionRecord,
     PendingExceptionStore,
 };
-use crate::suggest::{
-    AllowlistSuggestion, ConfidenceTier, RiskLevel, generate_allowlist_suggestions,
-};
+use crate::suggest::{CommandCluster, cluster_denied_commands};
 
 /// High-performance Claude Code hook for blocking destructive commands.
 ///
@@ -1334,7 +1331,11 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Update(update)) => {
             self_update(update)?;
         }
-        Some(Command::ListPacks { enabled, verbose, format }) => {
+        Some(Command::ListPacks {
+            enabled,
+            verbose,
+            format,
+        }) => {
             list_packs(&config, enabled, verbose, format);
         }
         Some(Command::Pack { action }) => {
@@ -1446,10 +1447,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 // ============================================================================
 
 /// Run the hook command with optional batch processing.
-fn run_hook_command(
-    config: &Config,
-    cmd: HookCommand,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_hook_command(config: &Config, cmd: HookCommand) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{self, BufRead, Write};
 
     // If not batch mode and not parallel, fall through to normal hook mode
@@ -1478,30 +1476,8 @@ fn run_hook_command(
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
     let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
 
-    // Load external packs
-    let external_packs: Vec<crate::Pack> = {
-        let loader = crate::packs::external::ExternalPackLoader::from_config(&config.packs);
-        let result = loader.load_all_deduped();
-        result.packs.into_iter().map(|loaded| loaded.pack).collect()
-    };
-
-    let enabled_keywords: Vec<&str> = {
-        let mut keywords = enabled_keywords;
-        for pack in &external_packs {
-            for kw in pack.keywords {
-                if !keywords.contains(kw) {
-                    keywords.push(kw);
-                }
-            }
-        }
-        keywords
-    };
-
-    let external_packs_slice: Option<&[crate::Pack]> = if external_packs.is_empty() {
-        None
-    } else {
-        Some(&external_packs)
-    };
+    // TODO: External pack loading is not yet implemented.
+    // When ExternalPackLoader is implemented, load custom YAML packs here.
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -1533,7 +1509,6 @@ fn run_hook_command(
                         &compiled_overrides,
                         &allowlists,
                         &heredoc_settings,
-                        external_packs_slice,
                         cmd.continue_on_error,
                     )
                 })
@@ -1562,7 +1537,6 @@ fn run_hook_command(
                     &compiled_overrides,
                     &allowlists,
                     &heredoc_settings,
-                    external_packs_slice,
                     cmd.continue_on_error,
                 );
                 let json = serde_json::to_string(&result)?;
@@ -1600,7 +1574,6 @@ fn run_hook_command(
                 &compiled_overrides,
                 &allowlists,
                 &heredoc_settings,
-                external_packs_slice,
                 cmd.continue_on_error,
             );
             let json = serde_json::to_string(&result)?;
@@ -1621,7 +1594,6 @@ fn evaluate_batch_line(
     compiled_overrides: &crate::config::CompiledOverrides,
     allowlists: &crate::allowlist::LayeredAllowlist,
     heredoc_settings: &crate::config::HeredocSettings,
-    external_packs: Option<&[crate::Pack]>,
     continue_on_error: bool,
 ) -> BatchHookOutput {
     // Skip empty lines
@@ -1710,7 +1682,7 @@ fn evaluate_batch_line(
     }
 
     // Evaluate the command
-    let eval_result = evaluate_command_with_pack_order_deadline_with_external(
+    let eval_result = evaluate_command_with_pack_order_deadline_at_path(
         &command,
         enabled_keywords,
         ordered_packs,
@@ -1721,7 +1693,6 @@ fn evaluate_batch_line(
         None,
         None,
         None, // No deadline for batch mode
-        external_packs,
     );
 
     match eval_result.decision {
@@ -2400,7 +2371,7 @@ fn test_command(
 
     // Get enabled packs and collect keywords for quick rejection
     let enabled_packs = effective_config.enabled_pack_ids();
-    let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+    let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
     let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
     let heredoc_settings = effective_config.heredoc_settings();
@@ -2412,35 +2383,11 @@ fn test_command(
     // This is a small file read and only affects decisions when a rule matches.
     let allowlists = load_default_allowlists();
 
-    // Load external (custom YAML) packs from configured paths.
-    // Fail-open: errors are logged but don't block command evaluation.
-    let external_packs: Vec<crate::Pack> = {
-        let loader = ExternalPackLoader::from_config(&effective_config.packs);
-        let result = loader.load_all_deduped();
-        for warning in &result.warnings {
-            eprintln!("Warning: {warning}");
-        }
-        result.packs.into_iter().map(|lp| lp.pack).collect()
-    };
-
-    // Add keywords from external packs to enable quick-reject bypass
-    for pack in &external_packs {
-        for kw in pack.keywords {
-            if !enabled_keywords.contains(kw) {
-                enabled_keywords.push(kw);
-            }
-        }
-    }
-
-    // Convert external packs to slice for evaluator
-    let external_packs_slice: Option<&[crate::Pack]> = if external_packs.is_empty() {
-        None
-    } else {
-        Some(&external_packs)
-    };
+    // TODO: External pack loading is not yet implemented.
+    // When ExternalPackLoader is implemented, load custom YAML packs here.
 
     // Use shared evaluator for consistent behavior with hook mode
-    let result = evaluate_command_with_pack_order_deadline_with_external(
+    let result = evaluate_command_with_pack_order_deadline_at_path(
         command,
         &enabled_keywords,
         &ordered_packs,
@@ -2451,19 +2398,20 @@ fn test_command(
         None, // allow_once_audit
         None, // project_path
         None, // deadline
-        external_packs_slice,
     );
 
     // Handle JSON output
     if format == TestFormat::Json {
         let output = match result.decision {
             EvaluationDecision::Allow => {
-                let allowlist = result.allowlist_override.as_ref().map(|info| {
-                    AllowlistOverrideInfo {
-                        layer: info.layer.label().to_string(),
-                        reason: info.reason.clone(),
-                    }
-                });
+                let allowlist =
+                    result
+                        .allowlist_override
+                        .as_ref()
+                        .map(|info| AllowlistOverrideInfo {
+                            layer: info.layer.label().to_string(),
+                            reason: info.reason.clone(),
+                        });
                 TestOutput {
                     command: command.to_string(),
                     decision: "allow".to_string(),
@@ -2485,9 +2433,10 @@ fn test_command(
                             MatchSource::Pack => "pack",
                             MatchSource::HeredocAst => "heredoc_ast",
                         };
-                        let rule_id = info.pack_id.as_ref().and_then(|p| {
-                            info.pattern_name.as_ref().map(|n| format!("{p}:{n}"))
-                        });
+                        let rule_id = info
+                            .pack_id
+                            .as_ref()
+                            .and_then(|p| info.pattern_name.as_ref().map(|n| format!("{p}:{n}")));
                         (
                             info.pack_id.clone(),
                             info.pattern_name.clone(),
@@ -4326,7 +4275,7 @@ fn handle_suggest_allowlist_command(
         *command_freq.entry(entry.command.clone()).or_insert(0) += 1;
     }
 
-    // Convert to the format expected by generate_allowlist_suggestions
+    // Convert to the format expected by cluster_denied_commands
     let commands: Vec<(String, usize)> = command_freq
         .into_iter()
         .filter(|(_, freq)| *freq >= cmd.min_frequency)
@@ -4342,34 +4291,25 @@ fn handle_suggest_allowlist_command(
         return Ok(());
     }
 
-    // Generate suggestions
-    let suggestions = generate_allowlist_suggestions(&commands, 1);
+    // Generate suggestions via clustering
+    let clusters = cluster_denied_commands(&commands, 1);
 
-    if suggestions.is_empty() {
+    if clusters.is_empty() {
         println!("No allowlist suggestions could be generated from the history.");
         return Ok(());
     }
 
-    // Filter by confidence tier
-    let suggestions: Vec<AllowlistSuggestion> = suggestions
-        .into_iter()
-        .filter(|s| match cmd.confidence {
-            ConfidenceTierFilter::High => s.confidence.tier == ConfidenceTier::High,
-            ConfidenceTierFilter::Medium => s.confidence.tier == ConfidenceTier::Medium,
-            ConfidenceTierFilter::Low => s.confidence.tier == ConfidenceTier::Low,
-            ConfidenceTierFilter::All => true,
-        })
-        .filter(|s| match cmd.risk {
-            RiskLevelFilter::Low => s.risk.level == RiskLevel::Low,
-            RiskLevelFilter::Medium => s.risk.level == RiskLevel::Medium,
-            RiskLevelFilter::High => s.risk.level == RiskLevel::High,
-            RiskLevelFilter::All => true,
-        })
-        .take(cmd.limit)
-        .collect();
+    // TODO: Confidence and risk filtering are not yet implemented.
+    // The ConfidenceTier and RiskLevel types need to be added to the suggest module.
+    // For now, we ignore the confidence and risk filters.
+    let _ = cmd.confidence; // Silence unused warning
+    let _ = cmd.risk; // Silence unused warning
+
+    // Take up to the limit
+    let suggestions: Vec<CommandCluster> = clusters.into_iter().take(cmd.limit).collect();
 
     if suggestions.is_empty() {
-        println!("No suggestions match the specified confidence/risk filters.");
+        println!("No suggestions available.");
         return Ok(());
     }
 
@@ -4394,31 +4334,23 @@ fn handle_suggest_allowlist_command(
 
 /// Output suggestions as JSON.
 fn output_suggestions_json(
-    suggestions: &[AllowlistSuggestion],
+    suggestions: &[CommandCluster],
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[derive(serde::Serialize)]
     struct JsonSuggestion {
         pattern: String,
-        confidence: String,
-        risk: String,
         frequency: usize,
         unique_variants: usize,
-        specificity_score: f32,
         example_commands: Vec<String>,
-        risk_explanation: String,
     }
 
     let output: Vec<JsonSuggestion> = suggestions
         .iter()
         .map(|s| JsonSuggestion {
-            pattern: s.pattern.clone(),
-            confidence: s.confidence.tier.as_str().to_lowercase(),
-            risk: s.risk.level.as_str().to_string(),
+            pattern: s.proposed_pattern.clone(),
             frequency: s.frequency,
-            unique_variants: s.unique_variants,
-            specificity_score: s.specificity_score,
-            example_commands: s.example_commands.clone(),
-            risk_explanation: s.risk.explanation.clone(),
+            unique_variants: s.unique_count,
+            example_commands: s.commands.clone(),
         })
         .collect();
 
@@ -4428,41 +4360,26 @@ fn output_suggestions_json(
 }
 
 /// Output suggestions as formatted text (non-interactive).
-fn output_suggestions_text(suggestions: &[AllowlistSuggestion]) {
+fn output_suggestions_text(suggestions: &[CommandCluster]) {
     println!("Allowlist Suggestions");
     println!("=====================");
     println!();
 
     for (i, suggestion) in suggestions.iter().enumerate() {
-        let confidence_indicator = match suggestion.confidence.tier {
-            ConfidenceTier::High => "HIGH",
-            ConfidenceTier::Medium => "MEDIUM",
-            ConfidenceTier::Low => "LOW",
-        };
-
-        let risk_indicator = match suggestion.risk.level {
-            RiskLevel::Low => "LOW",
-            RiskLevel::Medium => "MEDIUM",
-            RiskLevel::High => "HIGH",
-        };
-
-        println!(
-            "[{}/{}] {} CONFIDENCE",
-            i + 1,
-            suggestions.len(),
-            confidence_indicator
-        );
+        println!("[{}/{}] Cluster", i + 1, suggestions.len());
         println!("────────────────────────────────────────");
-        println!("Pattern: {}", suggestion.pattern);
+        println!("Pattern: {}", suggestion.proposed_pattern);
         println!(
             "Blocked: {} times ({} unique variants)",
-            suggestion.frequency, suggestion.unique_variants
+            suggestion.frequency, suggestion.unique_count
         );
-        println!("Risk: {} - {}", risk_indicator, suggestion.risk.explanation);
         println!();
         println!("Example commands:");
-        for cmd in &suggestion.example_commands {
+        for cmd in suggestion.commands.iter().take(5) {
             println!("  • {cmd}");
+        }
+        if suggestion.commands.len() > 5 {
+            println!("  ... and {} more", suggestion.commands.len() - 5);
         }
         println!();
     }
@@ -4470,13 +4387,13 @@ fn output_suggestions_text(suggestions: &[AllowlistSuggestion]) {
 
 /// Output suggestions interactively (prompting user for each).
 fn output_suggestions_interactive(
-    suggestions: &[AllowlistSuggestion],
+    suggestions: &[CommandCluster],
     total_denied: usize,
     db: Option<&HistoryDb>,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::{self, BufRead, Write};
     use colored::Colorize;
+    use std::io::{self, BufRead, Write};
 
     println!("Analyzing {total_denied} denied commands...");
     println!("Found {} potential allowlist patterns.", suggestions.len());
@@ -4494,34 +4411,16 @@ fn output_suggestions_interactive(
         .map(|p| p.to_string_lossy().to_string());
 
     for (i, suggestion) in suggestions.iter().enumerate() {
-        let confidence_indicator = match suggestion.confidence.tier {
-            ConfidenceTier::High => "HIGH",
-            ConfidenceTier::Medium => "MEDIUM",
-            ConfidenceTier::Low => "LOW",
-        };
-
-        let risk_indicator = match suggestion.risk.level {
-            RiskLevel::Low => "LOW",
-            RiskLevel::Medium => "MEDIUM",
-            RiskLevel::High => "HIGH",
-        };
-
         // Check for potential conflicts before displaying
-        let conflict_check = check_pattern_conflicts(&suggestion.pattern, config);
+        let conflict_check = check_pattern_conflicts(&suggestion.proposed_pattern, config);
 
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!(
-            " [{}/{}] {} CONFIDENCE",
-            i + 1,
-            suggestions.len(),
-            confidence_indicator
-        );
+        println!(" [{}/{}] Cluster", i + 1, suggestions.len());
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!(" Pattern: {}", suggestion.pattern);
-        println!(" Blocked: {} times", suggestion.frequency);
+        println!(" Pattern: {}", suggestion.proposed_pattern);
         println!(
-            " Risk: {} ({})",
-            risk_indicator, suggestion.risk.explanation
+            " Blocked: {} times ({} unique variants)",
+            suggestion.frequency, suggestion.unique_count
         );
 
         // Display warnings if there are conflicts or the pattern is overly broad
@@ -4532,7 +4431,10 @@ fn output_suggestions_interactive(
                 println!("   • {}", warning.yellow());
             }
             if conflict_check.is_overly_broad {
-                println!("   • {}", "Pattern is overly broad (uses wildcards without anchors)".yellow());
+                println!(
+                    "   • {}",
+                    "Pattern is overly broad (uses wildcards without anchors)".yellow()
+                );
                 if let Some(ref suggestion_text) = conflict_check.refinement_suggestion {
                     println!("     {}", suggestion_text.dimmed());
                 }
@@ -4541,8 +4443,11 @@ fn output_suggestions_interactive(
 
         println!();
         println!(" Example commands:");
-        for cmd in &suggestion.example_commands {
+        for cmd in suggestion.commands.iter().take(5) {
             println!("   • {cmd}");
+        }
+        if suggestion.commands.len() > 5 {
+            println!("   ... and {} more", suggestion.commands.len() - 5);
         }
         println!();
 
@@ -4560,15 +4465,15 @@ fn output_suggestions_interactive(
                     let audit_entry = SuggestionAuditEntry {
                         timestamp: Utc::now(),
                         action: SuggestionAction::Accepted,
-                        pattern: suggestion.pattern.clone(),
+                        pattern: suggestion.proposed_pattern.clone(),
                         final_pattern: None,
-                        risk_level: suggestion.risk.level.as_str().to_string(),
-                        risk_score: suggestion.risk.score,
-                        confidence_tier: suggestion.confidence.tier.as_str().to_lowercase(),
-                        confidence_points: suggestion.confidence.total as i32,
+                        risk_level: "unknown".to_string(),
+                        risk_score: 0.0,
+                        confidence_tier: "unknown".to_string(),
+                        confidence_points: 0,
                         cluster_frequency: suggestion.frequency,
-                        unique_variants: suggestion.unique_variants,
-                        sample_commands: serde_json::to_string(&suggestion.example_commands)
+                        unique_variants: suggestion.unique_count,
+                        sample_commands: serde_json::to_string(&suggestion.commands)
                             .unwrap_or_default(),
                         rule_id: None,
                         session_id: None,
@@ -4580,20 +4485,20 @@ fn output_suggestions_interactive(
                 }
 
                 // Generate a descriptive reason from the suggestion
-                let reason = if !suggestion.example_commands.is_empty() {
-                    format!("Matches commands like: {}", suggestion.example_commands[0])
+                let reason = if !suggestion.commands.is_empty() {
+                    format!("Matches commands like: {}", suggestion.commands[0])
                 } else {
                     "Auto-suggested from history analysis".to_string()
                 };
 
                 // Write the pattern to the allowlist
                 match allowlist_add_pattern(
-                    &suggestion.pattern,
+                    &suggestion.proposed_pattern,
                     &reason,
-                    suggestion.risk.level.as_str(),
-                    &suggestion.confidence.tier.as_str().to_lowercase(),
+                    "unknown",
+                    "unknown",
                     suggestion.frequency,
-                    suggestion.unique_variants,
+                    suggestion.unique_count,
                 ) {
                     Ok(path) => {
                         use colored::Colorize;
@@ -4609,8 +4514,10 @@ fn output_suggestions_interactive(
                         } else {
                             eprintln!(" {} Could not write to allowlist: {e}", "✗".red());
                             println!("   You can manually add it with:");
-                            println!("   dcg allowlist add-pattern --pattern '{}' --reason '{}'",
-                                suggestion.pattern, reason);
+                            println!(
+                                "   dcg allowlist add-pattern --pattern '{}' --reason '{}'",
+                                suggestion.proposed_pattern, reason
+                            );
                         }
                         println!();
                     }
@@ -4627,15 +4534,15 @@ fn output_suggestions_interactive(
                     let audit_entry = SuggestionAuditEntry {
                         timestamp: Utc::now(),
                         action: SuggestionAction::Rejected,
-                        pattern: suggestion.pattern.clone(),
+                        pattern: suggestion.proposed_pattern.clone(),
                         final_pattern: None,
-                        risk_level: suggestion.risk.level.as_str().to_string(),
-                        risk_score: suggestion.risk.score,
-                        confidence_tier: suggestion.confidence.tier.as_str().to_lowercase(),
-                        confidence_points: suggestion.confidence.total as i32,
+                        risk_level: "unknown".to_string(),
+                        risk_score: 0.0,
+                        confidence_tier: "unknown".to_string(),
+                        confidence_points: 0,
                         cluster_frequency: suggestion.frequency,
-                        unique_variants: suggestion.unique_variants,
-                        sample_commands: serde_json::to_string(&suggestion.example_commands)
+                        unique_variants: suggestion.unique_count,
+                        sample_commands: serde_json::to_string(&suggestion.commands)
                             .unwrap_or_default(),
                         rule_id: None,
                         session_id: None,
@@ -5903,67 +5810,11 @@ fn self_update(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 /// Perform update using native Rust self_update crate.
-fn self_update_native(update: &UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::update::{format_update_result, perform_update};
-
-    let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
-
-    // If not forcing, confirm with user
-    if !update.force {
-        // First check if there's an update available
-        use crate::update::check_for_update;
-        match check_for_update(false) {
-            Ok(result) => {
-                if !result.update_available {
-                    if use_color {
-                        println!("\x1b[32m✓\x1b[0m Already running the latest version ({})", result.current_version);
-                    } else {
-                        println!("Already running the latest version ({})", result.current_version);
-                    }
-                    return Ok(());
-                }
-
-                // Show what's available and prompt for confirmation
-                if use_color {
-                    println!("\x1b[1mUpdate available:\x1b[0m {} → {}", result.current_version, result.latest_version);
-                } else {
-                    println!("Update available: {} -> {}", result.current_version, result.latest_version);
-                }
-
-                // Interactive confirmation
-                if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                    print!("Proceed with update? [y/N] ");
-                    use std::io::Write;
-                    std::io::stdout().flush()?;
-
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input)?;
-                    let response = input.trim().to_lowercase();
-                    if response != "y" && response != "yes" {
-                        println!("Update cancelled.");
-                        return Ok(());
-                    }
-                } else {
-                    // Non-interactive: require --force
-                    return Err("Non-interactive mode requires --force flag".into());
-                }
-            }
-            Err(e) => {
-                return Err(format!("Failed to check for updates: {e}").into());
-            }
-        }
-    }
-
-    // Perform the update
-    eprintln!("Downloading and installing update...");
-
-    match perform_update(update.force, update.version.as_deref()) {
-        Ok(result) => {
-            print!("{}", format_update_result(&result, use_color));
-            Ok(())
-        }
-        Err(e) => Err(format!("Update failed: {e}").into()),
-    }
+///
+/// Note: Native update is not yet implemented. Use installer flags instead:
+/// `dcg update --system` or `dcg update --from-source`
+fn self_update_native(_update: &UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
+    Err("Native update not yet implemented. Use `dcg update --system` to update via installer, or `dcg update --check` to check for updates.".into())
 }
 
 /// Check for updates and display the result.
@@ -6826,10 +6677,10 @@ fn handle_allow_once_command(
     let allow_once_store = AllowOnceStore::new(allow_once_path.clone());
     let _maintenance = allow_once_store.add_entry(&entry, now)?;
 
-    // Mark the pending exception as consumed so it doesn't show up in lists anymore.
+    // Remove the pending exception so it doesn't show up in lists anymore.
     // This is best-effort (if it fails, the allowed command still works).
-    if let Err(e) = pending_store.mark_consumed(&selected.full_hash, now) {
-        eprintln!("Warning: Failed to mark pending code as consumed: {e}");
+    if let Err(e) = pending_store.remove_by_full_hash(&selected.full_hash, now) {
+        eprintln!("Warning: Failed to remove pending exception: {e}");
     }
 
     if !cmd.json {
@@ -7661,10 +7512,7 @@ fn write_allowlist(
 
     // Create temp file in same directory (required for atomic rename on same filesystem)
     let parent = path.parent().unwrap_or(std::path::Path::new("."));
-    let temp_name = format!(
-        ".dcg-allowlist-{}.tmp",
-        std::process::id()
-    );
+    let temp_name = format!(".dcg-allowlist-{}.tmp", std::process::id());
     let temp_path = parent.join(&temp_name);
 
     // Write to temp file
@@ -7682,7 +7530,8 @@ fn write_allowlist(
         return Err(format!(
             "Generated TOML failed validation (this is a bug): {}",
             parse_err
-        ).into());
+        )
+        .into());
     }
 
     // Atomic rename (on Unix, this is atomic; on Windows, it replaces atomically)
@@ -7852,11 +7701,23 @@ fn allowlist_add_pattern(
 
     // Check for duplicate
     if has_pattern_entry(&doc, pattern) {
-        return Err(format!("Pattern '{}' already exists in {} allowlist", pattern, layer.label()).into());
+        return Err(format!(
+            "Pattern '{}' already exists in {} allowlist",
+            pattern,
+            layer.label()
+        )
+        .into());
     }
 
     // Build and append entry
-    let entry = build_pattern_entry(pattern, reason, risk_level, confidence_tier, frequency, unique_variants);
+    let entry = build_pattern_entry(
+        pattern,
+        reason,
+        risk_level,
+        confidence_tier,
+        frequency,
+        unique_variants,
+    );
     append_entry(&mut doc, entry);
 
     // Write atomically (temp file + rename to prevent corruption)
@@ -7885,10 +7746,7 @@ pub struct PatternConflictCheck {
 /// 2. Is this pattern overly broad (contains .* or .+ without anchoring)?
 ///
 /// These are informational warnings - they don't prevent adding the pattern.
-fn check_pattern_conflicts(
-    pattern: &str,
-    config: &Config,
-) -> PatternConflictCheck {
+fn check_pattern_conflicts(pattern: &str, config: &Config) -> PatternConflictCheck {
     let mut result = PatternConflictCheck::default();
 
     // Check for overly broad patterns
@@ -7901,7 +7759,8 @@ fn check_pattern_conflicts(
         result.is_overly_broad = true;
         result.refinement_suggestion = Some(
             "Consider adding anchors (^ and $) or more specific token patterns \
-             to avoid matching unintended commands.".to_string()
+             to avoid matching unintended commands."
+                .to_string(),
         );
     }
 
@@ -7974,8 +7833,14 @@ fn handle_suggest_allowlist_undo(minutes: u32) -> Result<(), Box<dyn std::error:
 
     // Check both project and user allowlists
     let layers_to_check = [
-        (AllowlistLayer::Project, find_repo_root_from_cwd().map(|r| r.join(".dcg").join("allowlist.toml"))),
-        (AllowlistLayer::User, dirs::config_dir().map(|d| d.join("dcg").join("allowlist.toml"))),
+        (
+            AllowlistLayer::Project,
+            find_repo_root_from_cwd().map(|r| r.join(".dcg").join("allowlist.toml")),
+        ),
+        (
+            AllowlistLayer::User,
+            dirs::config_dir().map(|d| d.join("dcg").join("allowlist.toml")),
+        ),
     ];
 
     let mut total_removed = 0;
@@ -8009,7 +7874,10 @@ fn handle_suggest_allowlist_undo(minutes: u32) -> Result<(), Box<dyn std::error:
     }
 
     if total_removed == 0 {
-        println!("No auto-suggested patterns found added in the last {} minutes.", minutes);
+        println!(
+            "No auto-suggested patterns found added in the last {} minutes.",
+            minutes
+        );
         println!();
         println!("Patterns are identified by:");
         println!("  - Having 'auto-suggested' in the reason field");
@@ -9316,7 +9184,10 @@ mod tests {
 
         // Verify risk_acknowledged is present and true
         let risk_ack = entry.get("risk_acknowledged");
-        assert!(risk_ack.is_some(), "risk_acknowledged field must be present");
+        assert!(
+            risk_ack.is_some(),
+            "risk_acknowledged field must be present"
+        );
         assert_eq!(
             risk_ack.unwrap().as_bool(),
             Some(true),
@@ -9365,14 +9236,8 @@ mod tests {
         );
 
         // Required fields for pattern entries
-        assert!(
-            entry.get("pattern").is_some(),
-            "pattern field is required"
-        );
-        assert!(
-            entry.get("reason").is_some(),
-            "reason field is required"
-        );
+        assert!(entry.get("pattern").is_some(), "pattern field is required");
+        assert!(entry.get("reason").is_some(), "reason field is required");
         assert!(
             entry.get("risk_acknowledged").is_some(),
             "risk_acknowledged is required"
@@ -9886,18 +9751,10 @@ exclude = ["target/**"]
 
     #[test]
     fn test_cli_parse_test_with_format_json() {
-        let cli = Cli::try_parse_from([
-            "dcg",
-            "test",
-            "--format",
-            "json",
-            "rm -rf /tmp",
-        ])
-        .expect("parse");
+        let cli =
+            Cli::try_parse_from(["dcg", "test", "--format", "json", "rm -rf /tmp"]).expect("parse");
         if let Some(Command::TestCommand {
-            command,
-            format,
-            ..
+            command, format, ..
         }) = cli.command
         {
             assert_eq!(command, "rm -rf /tmp");
