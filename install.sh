@@ -763,6 +763,7 @@ AUTO_CONFIGURED=0
 CLAUDE_STATUS=""  # "created"|"merged"|"already"|"failed"
 GEMINI_STATUS=""  # "created"|"merged"|"already"|"failed"|"skipped"
 AIDER_STATUS=""   # "created"|"merged"|"already"|"skipped"|"failed"
+CONTINUE_STATUS="" # "unsupported"|"skipped"
 CLAUDE_BACKUP=""
 GEMINI_BACKUP=""
 AIDER_BACKUP=""
@@ -1090,6 +1091,41 @@ EOFAIDER
   fi
 }
 
+configure_continue() {
+  # Continue (https://continue.dev) is an AI coding assistant for IDEs.
+  # Detection: check for ~/.continue directory or `cn` CLI command.
+  #
+  # IMPORTANT: Continue does NOT have shell command interception hooks.
+  # Unlike Claude Code (PreToolUse) or Gemini CLI (BeforeTool), Continue
+  # executes commands directly without a hook mechanism.
+  #
+  # There is also no git-commit-verify equivalent setting like Aider has.
+  #
+  # For users who want dcg protection with Continue, the recommended approach
+  # is to install dcg as a git pre-commit hook (see docs/scan-precommit-guide.md).
+
+  # Check if Continue is installed
+  local continue_installed=0
+
+  # Check for CLI command
+  if command -v cn >/dev/null 2>&1; then
+    continue_installed=1
+  fi
+
+  # Check for config directory (IDE extension)
+  if [ -d "$HOME/.continue" ]; then
+    continue_installed=1
+  fi
+
+  if [ "$continue_installed" -eq 0 ]; then
+    CONTINUE_STATUS="skipped"
+    return 0
+  fi
+
+  # Continue is installed but has no shell command hooks
+  CONTINUE_STATUS="unsupported"
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Run Auto-Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1147,6 +1183,9 @@ configure_gemini "$GEMINI_SETTINGS"
 
 # Configure Aider (if installed)
 configure_aider "$AIDER_SETTINGS"
+
+# Configure Continue (if installed)
+configure_continue
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Final Summary
@@ -1213,6 +1252,16 @@ case "$AIDER_STATUS" in
     ;;
   failed)
     summary_lines+=("Aider:       Configuration failed")
+    ;;
+esac
+
+case "$CONTINUE_STATUS" in
+  unsupported)
+    summary_lines+=("Continue:    Detected but has no shell command hooks")
+    summary_lines+=("             Tip: Install dcg as git pre-commit hook for protection")
+    ;;
+  skipped|"")
+    summary_lines+=("Continue:    Not installed (skipped)")
     ;;
 esac
 

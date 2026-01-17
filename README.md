@@ -14,7 +14,7 @@
 
 A high-performance hook for AI coding agents that blocks destructive commands before they execute, protecting your work from accidental deletion.
 
-**Supported:** [Claude Code](https://claude.ai/code), [Gemini CLI](https://github.com/google-gemini/gemini-cli), and [Aider](https://aider.chat/) (limited—git hooks only)
+**Supported:** [Claude Code](https://claude.ai/code), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Aider](https://aider.chat/) (limited—git hooks only), and [Continue](https://continue.dev) (detection only)
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -621,6 +621,7 @@ Easy mode automatically:
 - Configures Claude Code hooks (creates config if needed)
 - Configures Gemini CLI hooks (if Gemini CLI is installed)
 - Configures Aider (enables git hooks via `git-commit-verify: true`)
+- Detects Continue (no auto-config; lacks shell command hooks)
 
 **Other options:**
 
@@ -649,9 +650,12 @@ The install script:
 - Configures Claude Code hooks (creates config directory if needed)
 - Configures Gemini CLI hooks (if already installed)
 - Configures Aider (enables `git-commit-verify` for git hook support)
+- Detects Continue (reports it has no shell command hooks)
 - Offers to update your PATH
 
 > **Note on Aider:** Aider does not have PreToolUse-style shell command interception like Claude Code. The installer enables `git-commit-verify: true` in `~/.aider.conf.yml`, which ensures git hooks run (Aider defaults to bypassing them). For full protection, install dcg as a [git pre-commit hook](docs/scan-precommit-guide.md).
+
+> **Note on Continue:** Continue does not have shell command interception hooks. The installer detects Continue installations but cannot auto-configure protection. For dcg protection with Continue, install dcg as a [git pre-commit hook](docs/scan-precommit-guide.md).
 
 ### From source (requires Rust nightly)
 

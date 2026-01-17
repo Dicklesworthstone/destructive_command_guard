@@ -525,3 +525,65 @@ EOF
     [ -n "$AIDER_BACKUP" ]
     [ -f "$AIDER_BACKUP" ]
 }
+
+# ============================================================================
+# Continue Configuration Tests
+# ============================================================================
+
+@test "configure_continue: skips when not installed" {
+    log_test "Testing Continue skips when not installed..."
+
+    # Continue not installed (no directory, no command)
+    configure_continue
+
+    log_test "CONTINUE_STATUS: $CONTINUE_STATUS"
+
+    [ "$CONTINUE_STATUS" = "skipped" ]
+}
+
+@test "configure_continue: detects via ~/.continue directory" {
+    log_test "Testing Continue detection via directory..."
+
+    setup_mock_continue
+
+    configure_continue
+
+    log_test "CONTINUE_STATUS: $CONTINUE_STATUS"
+
+    # Should be unsupported (detected but no hooks available)
+    [ "$CONTINUE_STATUS" = "unsupported" ]
+}
+
+@test "configure_continue: detects via cn command" {
+    log_test "Testing Continue detection via cn command..."
+
+    # Create mock cn binary
+    mkdir -p "$TEST_TMPDIR/bin"
+    cat > "$TEST_TMPDIR/bin/cn" << 'EOF'
+#!/bin/bash
+echo "Continue CLI v1.0.0"
+EOF
+    chmod +x "$TEST_TMPDIR/bin/cn"
+    export PATH="$TEST_TMPDIR/bin:$PATH"
+
+    configure_continue
+
+    log_test "CONTINUE_STATUS: $CONTINUE_STATUS"
+
+    # Should be unsupported (detected but no hooks available)
+    [ "$CONTINUE_STATUS" = "unsupported" ]
+}
+
+@test "configure_continue: reports unsupported (no shell command hooks)" {
+    log_test "Testing Continue reports unsupported status..."
+
+    setup_mock_continue
+
+    configure_continue
+
+    log_test "CONTINUE_STATUS: $CONTINUE_STATUS"
+
+    # Continue does not have shell command hooks like Claude Code or Gemini
+    # Status should be "unsupported" to indicate detection but no auto-config
+    [ "$CONTINUE_STATUS" = "unsupported" ]
+}
