@@ -973,6 +973,45 @@ impl HistoryDb {
             [],
         )?;
 
+        // Create suggestion_audit table for tracking accepted/modified/rejected suggestions (v5 feature)
+        self.conn.execute(
+            r"CREATE TABLE IF NOT EXISTS suggestion_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                action TEXT NOT NULL CHECK (action IN ('accepted', 'modified', 'rejected')),
+                pattern TEXT NOT NULL,
+                final_pattern TEXT,
+                risk_level TEXT NOT NULL,
+                risk_score REAL NOT NULL,
+                confidence_tier TEXT NOT NULL,
+                confidence_points INTEGER NOT NULL,
+                cluster_frequency INTEGER NOT NULL,
+                unique_variants INTEGER NOT NULL,
+                sample_commands TEXT NOT NULL,
+                rule_id TEXT,
+                session_id TEXT,
+                working_dir TEXT
+            )",
+            [],
+        )?;
+
+        // Create indexes for suggestion_audit
+        self.conn.execute_batch(
+            r"
+            -- Time-based queries
+            CREATE INDEX IF NOT EXISTS idx_suggestion_audit_timestamp
+                ON suggestion_audit(timestamp);
+
+            -- Action filtering
+            CREATE INDEX IF NOT EXISTS idx_suggestion_audit_action
+                ON suggestion_audit(action);
+
+            -- Session grouping
+            CREATE INDEX IF NOT EXISTS idx_suggestion_audit_session_id
+                ON suggestion_audit(session_id);
+            ",
+        )?;
+
         // Record schema version
         self.conn.execute(
             "INSERT INTO schema_version (version, description, last_prune_at) VALUES (?1, ?2, NULL)",
@@ -2174,6 +2213,302 @@ impl HistoryDb {
     }
 
     // ========================================================================
+    // Rule-Level Metrics Queries
+    // ========================================================================
+
+    /// Get aggregated metrics for all rules.
+    ///
+    /// Returns per-rule statistics including hit counts, override rates, and trends.
+    ///
+    /// # Arguments
+    ///
+    /// * `since` - Optional start time (defaults to all time)
+    /// * `limit` - Maximum number of rules to return (defaults to 100)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn get_rule_metrics(
+        &self,
+        since: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<RuleMetrics>, HistoryError> {
+        let since_ts = since
+            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+
+        // Query for main aggregates
+        let mut stmt = self.conn.prepare(
+            r"SELECT
+                rule_id,
+                COUNT(*) as total_hits,
+                SUM(CASE WHEN outcome = 'bypass' THEN 1 ELSE 0 END) as overrides,
+                MIN(timestamp) as first_seen,
+                MAX(timestamp) as last_seen,
+                COUNT(DISTINCT command_hash) as unique_commands
+             FROM commands
+             WHERE rule_id IS NOT NULL
+               AND timestamp >= ?1
+             GROUP BY rule_id
+             ORDER BY total_hits DESC
+             LIMIT ?2",
+        )?;
+
+        let limit_i64 = i64::try_from(limit).unwrap_or(100);
+        let rows = stmt.query_map(params![&since_ts, limit_i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+
+        let mut metrics = Vec::new();
+        for row in rows {
+            let (rule_id, total_hits, overrides, first_seen_str, last_seen_str, unique_commands) =
+                row?;
+
+            let total_hits = u64::try_from(total_hits).unwrap_or(0);
+            let overrides = u64::try_from(overrides).unwrap_or(0);
+            let unique_commands = u64::try_from(unique_commands).unwrap_or(0);
+
+            #[allow(clippy::cast_precision_loss)]
+            let override_rate = if total_hits > 0 {
+                (overrides as f64 / total_hits as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            let first_seen = chrono::DateTime::parse_from_rfc3339(&first_seen_str)
+                .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+            let last_seen = chrono::DateTime::parse_from_rfc3339(&last_seen_str)
+                .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+
+            // Calculate trend
+            let trend = self.calculate_rule_trend(&rule_id, total_hits)?;
+
+            metrics.push(RuleMetrics {
+                rule_id,
+                total_hits,
+                allowlist_overrides: overrides,
+                override_rate,
+                first_seen,
+                last_seen,
+                unique_commands,
+                trend,
+                is_noisy: override_rate >= RuleMetrics::NOISY_THRESHOLD,
+            });
+        }
+
+        Ok(metrics)
+    }
+
+    /// Get metrics for a specific rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn get_rule_metrics_for_rule(
+        &self,
+        rule_id: &str,
+    ) -> Result<Option<RuleMetrics>, HistoryError> {
+        let mut stmt = self.conn.prepare(
+            r"SELECT
+                COUNT(*) as total_hits,
+                SUM(CASE WHEN outcome = 'bypass' THEN 1 ELSE 0 END) as overrides,
+                MIN(timestamp) as first_seen,
+                MAX(timestamp) as last_seen,
+                COUNT(DISTINCT command_hash) as unique_commands
+             FROM commands
+             WHERE rule_id = ?1",
+        )?;
+
+        let result: Result<(i64, i64, Option<String>, Option<String>, i64), _> =
+            stmt.query_row(params![rule_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            });
+
+        match result {
+            Ok((total_hits, overrides, first_seen_opt, last_seen_opt, unique_commands)) => {
+                if total_hits == 0 {
+                    return Ok(None);
+                }
+
+                let total_hits = u64::try_from(total_hits).unwrap_or(0);
+                let overrides = u64::try_from(overrides).unwrap_or(0);
+                let unique_commands = u64::try_from(unique_commands).unwrap_or(0);
+
+                #[allow(clippy::cast_precision_loss)]
+                let override_rate = if total_hits > 0 {
+                    (overrides as f64 / total_hits as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                let first_seen = first_seen_opt
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                    .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc));
+                let last_seen = last_seen_opt
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                    .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc));
+
+                let trend = self.calculate_rule_trend(rule_id, total_hits)?;
+
+                Ok(Some(RuleMetrics {
+                    rule_id: rule_id.to_string(),
+                    total_hits,
+                    allowlist_overrides: overrides,
+                    override_rate,
+                    first_seen,
+                    last_seen,
+                    unique_commands,
+                    trend,
+                    is_noisy: override_rate >= RuleMetrics::NOISY_THRESHOLD,
+                }))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(HistoryError::Sqlite(e)),
+        }
+    }
+
+    /// Get the noisiest rules (highest override rate).
+    ///
+    /// # Arguments
+    ///
+    /// * `limit` - Maximum number of rules to return
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn get_noisiest_rules(&self, limit: usize) -> Result<Vec<RuleMetrics>, HistoryError> {
+        let mut stmt = self.conn.prepare(
+            r"SELECT
+                rule_id,
+                COUNT(*) as total_hits,
+                SUM(CASE WHEN outcome = 'bypass' THEN 1 ELSE 0 END) as overrides,
+                MIN(timestamp) as first_seen,
+                MAX(timestamp) as last_seen,
+                COUNT(DISTINCT command_hash) as unique_commands
+             FROM commands
+             WHERE rule_id IS NOT NULL
+             GROUP BY rule_id
+             HAVING total_hits >= ?1
+             ORDER BY (CAST(overrides AS REAL) / CAST(total_hits AS REAL)) DESC
+             LIMIT ?2",
+        )?;
+
+        let min_hits = i64::try_from(RuleMetrics::MIN_HITS_FOR_TREND).unwrap_or(5);
+        let limit_i64 = i64::try_from(limit).unwrap_or(10);
+
+        let rows = stmt.query_map(params![min_hits, limit_i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+
+        let mut metrics = Vec::new();
+        for row in rows {
+            let (rule_id, total_hits, overrides, first_seen_str, last_seen_str, unique_commands) =
+                row?;
+
+            let total_hits = u64::try_from(total_hits).unwrap_or(0);
+            let overrides = u64::try_from(overrides).unwrap_or(0);
+            let unique_commands = u64::try_from(unique_commands).unwrap_or(0);
+
+            #[allow(clippy::cast_precision_loss)]
+            let override_rate = if total_hits > 0 {
+                (overrides as f64 / total_hits as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            let first_seen = chrono::DateTime::parse_from_rfc3339(&first_seen_str)
+                .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+            let last_seen = chrono::DateTime::parse_from_rfc3339(&last_seen_str)
+                .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+
+            let trend = self.calculate_rule_trend(&rule_id, total_hits)?;
+
+            metrics.push(RuleMetrics {
+                rule_id,
+                total_hits,
+                allowlist_overrides: overrides,
+                override_rate,
+                first_seen,
+                last_seen,
+                unique_commands,
+                trend,
+                is_noisy: override_rate >= RuleMetrics::NOISY_THRESHOLD,
+            });
+        }
+
+        Ok(metrics)
+    }
+
+    /// Calculate trend by comparing recent vs previous period.
+    fn calculate_rule_trend(
+        &self,
+        rule_id: &str,
+        total_hits: u64,
+    ) -> Result<RuleTrend, HistoryError> {
+        if total_hits < RuleMetrics::MIN_HITS_FOR_TREND {
+            return Ok(RuleTrend::Stable);
+        }
+
+        let now = Utc::now();
+        let one_week_ago = now - chrono::Duration::days(7);
+        let two_weeks_ago = now - chrono::Duration::days(14);
+
+        let recent_ts = one_week_ago.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let previous_ts = two_weeks_ago.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let now_ts = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+
+        // Count recent period
+        let recent_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM commands WHERE rule_id = ?1 AND timestamp >= ?2 AND timestamp < ?3",
+            params![rule_id, &recent_ts, &now_ts],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        // Count previous period
+        let previous_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM commands WHERE rule_id = ?1 AND timestamp >= ?2 AND timestamp < ?3",
+            params![rule_id, &previous_ts, &recent_ts],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        if previous_count == 0 {
+            // No previous data - can't determine trend
+            return Ok(RuleTrend::Stable);
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        let change_ratio = (recent_count as f64 - previous_count as f64) / previous_count as f64;
+
+        if change_ratio > RuleMetrics::TREND_THRESHOLD {
+            Ok(RuleTrend::Increasing)
+        } else if change_ratio < -RuleMetrics::TREND_THRESHOLD {
+            Ok(RuleTrend::Decreasing)
+        } else {
+            Ok(RuleTrend::Stable)
+        }
+    }
+
+    // ========================================================================
     // Suggestion Audit Logging
     // ========================================================================
 
@@ -2446,6 +2781,64 @@ pub struct PackEffectivenessAnalysis {
     pub potential_gaps: Vec<PotentialGap>,
     /// Generated recommendations.
     pub recommendations: Vec<PackRecommendation>,
+}
+
+// ============================================================================
+// Rule-Level Metrics Types
+// ============================================================================
+
+/// Trend direction for rule activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleTrend {
+    /// Rule triggers are increasing compared to previous period.
+    Increasing,
+    /// Rule triggers are stable.
+    Stable,
+    /// Rule triggers are decreasing.
+    Decreasing,
+}
+
+impl std::fmt::Display for RuleTrend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Increasing => write!(f, "↑ increasing"),
+            Self::Stable => write!(f, "→ stable"),
+            Self::Decreasing => write!(f, "↓ decreasing"),
+        }
+    }
+}
+
+/// Per-rule aggregated metrics.
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleMetrics {
+    /// Stable rule identifier (pack_id:pattern_name).
+    pub rule_id: String,
+    /// Total times this rule triggered (deny + bypass + warn).
+    pub total_hits: u64,
+    /// Times the rule resulted in allowlist override (bypass).
+    pub allowlist_overrides: u64,
+    /// Override rate as a percentage (0.0-100.0).
+    pub override_rate: f64,
+    /// When this rule was first triggered.
+    pub first_seen: DateTime<Utc>,
+    /// When this rule was last triggered.
+    pub last_seen: DateTime<Utc>,
+    /// Number of unique commands that triggered this rule.
+    pub unique_commands: u64,
+    /// Trend direction based on recent vs previous period.
+    pub trend: RuleTrend,
+    /// Whether this rule is considered noisy (high override rate).
+    pub is_noisy: bool,
+}
+
+impl RuleMetrics {
+    /// Threshold for considering a rule noisy.
+    pub const NOISY_THRESHOLD: f64 = 30.0;
+    /// Minimum hits required to calculate trend.
+    pub const MIN_HITS_FOR_TREND: u64 = 5;
+    /// Threshold change for increasing/decreasing trend (30% change).
+    pub const TREND_THRESHOLD: f64 = 0.3;
 }
 
 // ============================================================================
@@ -3945,9 +4338,14 @@ mod tests {
         assert!(id > 0);
 
         // Query and verify the final_pattern was stored
-        let results = db.query_suggestion_audits(10, Some(SuggestionAction::Modified)).unwrap();
+        let results = db
+            .query_suggestion_audits(10, Some(SuggestionAction::Modified))
+            .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].final_pattern, Some("git reset --soft".to_string()));
+        assert_eq!(
+            results[0].final_pattern,
+            Some("git reset --soft".to_string())
+        );
     }
 
     #[test]
@@ -3972,11 +4370,14 @@ mod tests {
     fn test_query_suggestion_audits_returns_all_when_no_filter() {
         let db = HistoryDb::open_in_memory().unwrap();
 
-        db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Accepted)).unwrap();
-        db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Modified)).unwrap();
-        db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Rejected)).unwrap();
+        db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Accepted))
+            .unwrap();
+        db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Modified))
+            .unwrap();
+        db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Rejected))
+            .unwrap();
 
-        let results = db.query_suggestion_audits(None, 100).unwrap();
+        let results = db.query_suggestion_audits(100, None).unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -3986,27 +4387,48 @@ mod tests {
 
         // Insert entries with different actions
         for _ in 0..4 {
-            db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Accepted)).unwrap();
+            db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Accepted))
+                .unwrap();
         }
         for _ in 0..2 {
-            db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Modified)).unwrap();
+            db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Modified))
+                .unwrap();
         }
-        db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Rejected)).unwrap();
+        db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Rejected))
+            .unwrap();
 
         // Filter by Accepted
-        let accepted = db.query_suggestion_audits(100, Some(SuggestionAction::Accepted)).unwrap();
+        let accepted = db
+            .query_suggestion_audits(100, Some(SuggestionAction::Accepted))
+            .unwrap();
         assert_eq!(accepted.len(), 4);
-        assert!(accepted.iter().all(|e| e.action == SuggestionAction::Accepted));
+        assert!(
+            accepted
+                .iter()
+                .all(|e| e.action == SuggestionAction::Accepted)
+        );
 
         // Filter by Modified
-        let modified = db.query_suggestion_audits(100, Some(SuggestionAction::Modified)).unwrap();
+        let modified = db
+            .query_suggestion_audits(100, Some(SuggestionAction::Modified))
+            .unwrap();
         assert_eq!(modified.len(), 2);
-        assert!(modified.iter().all(|e| e.action == SuggestionAction::Modified));
+        assert!(
+            modified
+                .iter()
+                .all(|e| e.action == SuggestionAction::Modified)
+        );
 
         // Filter by Rejected
-        let rejected = db.query_suggestion_audits(100, Some(SuggestionAction::Rejected)).unwrap();
+        let rejected = db
+            .query_suggestion_audits(100, Some(SuggestionAction::Rejected))
+            .unwrap();
         assert_eq!(rejected.len(), 1);
-        assert!(rejected.iter().all(|e| e.action == SuggestionAction::Rejected));
+        assert!(
+            rejected
+                .iter()
+                .all(|e| e.action == SuggestionAction::Rejected)
+        );
     }
 
     #[test]
@@ -4015,7 +4437,8 @@ mod tests {
 
         // Insert 10 entries
         for _ in 0..10 {
-            db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Accepted)).unwrap();
+            db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Accepted))
+                .unwrap();
         }
 
         // Query with limit of 5

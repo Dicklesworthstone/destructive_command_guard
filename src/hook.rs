@@ -60,7 +60,6 @@ pub struct HookSpecificOutput<'a> {
     pub allow_once_full_hash: Option<String>,
 
     // --- New fields for AI agent ergonomics (git_safety_guard-e4fl.1) ---
-
     /// Stable rule identifier (e.g., "core.git:reset-hard").
     /// Format: "{packId}:{patternName}"
     #[serde(rename = "ruleId", skip_serializing_if = "Option::is_none")]
@@ -812,8 +811,7 @@ pub fn output_denial(
 
     // Build remediation struct if we have allow_once info
     let remediation = allow_once.map(|info| {
-        let explanation_text =
-            format_explanation_text(explanation, rule_id.as_deref(), pack);
+        let explanation_text = format_explanation_text(explanation, rule_id.as_deref(), pack);
         Remediation {
             safe_alternative: get_contextual_suggestion(command).map(String::from),
             explanation: explanation_text,

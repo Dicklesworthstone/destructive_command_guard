@@ -370,6 +370,60 @@ maybe_add_path() {
   esac
 }
 
+detect_default_shell() {
+  local shell="${SHELL:-}"
+  [ -z "$shell" ] && return 1
+  shell=$(basename "$shell")
+  case "$shell" in
+    bash|zsh|fish) echo "$shell"; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+install_completions_for_shell() {
+  local shell="$1"
+  local bin="$DEST/dcg"
+  if [ ! -x "$bin" ]; then
+    warn "dcg binary not found at $bin; skipping completions"
+    return 1
+  fi
+
+  local target=""
+  case "$shell" in
+    bash)
+      target="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/dcg"
+      ;;
+    zsh)
+      target="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions/_dcg"
+      ;;
+    fish)
+      target="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions/dcg.fish"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  mkdir -p "$(dirname "$target")"
+  if "$bin" completions "$shell" > "$target" 2>/dev/null; then
+    ok "Installed $shell completions to $target"
+    return 0
+  fi
+
+  warn "Failed to install $shell completions"
+  return 1
+}
+
+maybe_install_completions() {
+  local shell=""
+  if ! shell=$(detect_default_shell); then
+    info "Shell completions: skipped (unknown shell)"
+    return 0
+  fi
+
+  install_completions_for_shell "$shell" || true
+}
+
 ensure_rust() {
   if [ "${RUSTUP_INIT_SKIP:-0}" != "0" ]; then
     info "Skipping rustup install (RUSTUP_INIT_SKIP set)"
@@ -522,6 +576,8 @@ if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
     *) : ;;
   esac
 
+  maybe_install_completions
+
   exit 0
 fi
 
@@ -614,6 +670,7 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
     ok "Self-test complete"
   fi
   ok "Done. Binary at: $DEST/dcg"
+  maybe_install_completions
   exit 0
 fi
 
@@ -664,6 +721,7 @@ if [ "$VERIFY" -eq 1 ]; then
 fi
 
 ok "Done. Binary at: $DEST/dcg"
+maybe_install_completions
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════════

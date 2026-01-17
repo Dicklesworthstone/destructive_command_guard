@@ -133,7 +133,7 @@ mod ci_fallback_tests {
             || s.contains('\u{2570}')  // ╰ bottom-left
             || s.contains('\u{2502}')  // │ vertical bar (used in borders)
             || s.contains('\u{251c}')  // ├ left tee
-            || s.contains('\u{2524}')  // ┤ right tee
+            || s.contains('\u{2524}') // ┤ right tee
         // Note: '\u{2500}' (─) is not checked as it may appear in horizontal rules
     }
 
@@ -143,7 +143,10 @@ mod ci_fallback_tests {
         let (stdout, stderr, exit_code) = run_hook_with_env("git reset --hard", &[("CI", "true")]);
 
         assert_eq!(exit_code, 0, "hook should exit 0");
-        assert!(!stdout.is_empty(), "stdout should have JSON output for denied command");
+        assert!(
+            !stdout.is_empty(),
+            "stdout should have JSON output for denied command"
+        );
 
         // In CI mode, we shouldn't have ANSI codes in stderr
         // Note: Since tests don't run in a TTY, colors are already disabled,
@@ -173,7 +176,10 @@ mod ci_fallback_tests {
             run_dcg_with_env(&["explain", "git reset --hard"], &[("CI", "true")]);
 
         assert_eq!(exit_code, 0, "explain should succeed");
-        assert!(stdout.contains("DENY") || stdout.contains("deny"), "should show deny decision");
+        assert!(
+            stdout.contains("DENY") || stdout.contains("deny"),
+            "should show deny decision"
+        );
 
         // Verify no ANSI codes in output
         assert!(
@@ -216,8 +222,7 @@ mod no_color_tests {
     fn no_color_env_with_any_value() {
         // NO_COLOR should work with any non-empty value (per spec at no-color.org)
         for value in ["1", "true", "yes", "anything"] {
-            let (stdout, stderr, _) =
-                run_hook_with_env("git reset --hard", &[("NO_COLOR", value)]);
+            let (stdout, stderr, _) = run_hook_with_env("git reset --hard", &[("NO_COLOR", value)]);
 
             assert!(
                 !contains_ansi_codes(&stdout) && !contains_ansi_codes(&stderr),
@@ -276,7 +281,7 @@ mod term_dumb_tests {
             || s.contains('\u{2570}')  // ╰
             || s.contains('\u{2502}')  // │ (vertical border)
             || s.contains('\u{251c}')  // ├
-            || s.contains('\u{2524}')  // ┤
+            || s.contains('\u{2524}') // ┤
     }
 
     fn contains_ansi_codes(s: &str) -> bool {
@@ -385,8 +390,8 @@ mod json_format_tests {
 
         // If there's output, it should be valid JSON
         if !stdout.trim().is_empty() {
-            let json: serde_json::Value =
-                serde_json::from_str(&stdout).expect("scan --format json should produce valid JSON");
+            let json: serde_json::Value = serde_json::from_str(&stdout)
+                .expect("scan --format json should produce valid JSON");
 
             // Could be an array of findings or an object
             assert!(
@@ -501,7 +506,10 @@ mod denial_content_tests {
 
         assert_eq!(hook_output["permissionDecision"], "deny");
         assert!(hook_output.get("ruleId").is_some(), "should have ruleId");
-        assert!(hook_output.get("severity").is_some(), "should have severity");
+        assert!(
+            hook_output.get("severity").is_some(),
+            "should have severity"
+        );
     }
 
     #[test]
@@ -551,10 +559,7 @@ mod output_mode_consistency_tests {
         for (config_name, env_vars) in configs {
             let (stdout, _, exit_code) = run_hook_with_env(command, env_vars);
 
-            assert_eq!(
-                exit_code, 0,
-                "{config_name}: hook should exit 0"
-            );
+            assert_eq!(exit_code, 0, "{config_name}: hook should exit 0");
 
             let json: serde_json::Value = serde_json::from_str(&stdout)
                 .unwrap_or_else(|e| panic!("{config_name}: invalid JSON: {e}\nstdout: {stdout}"));
@@ -583,8 +588,10 @@ mod output_mode_consistency_tests {
         ];
 
         for (config_name, env_vars) in configs {
-            let (stdout, _, exit_code) =
-                run_hook_with_env(command, &env_vars.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>());
+            let (stdout, _, exit_code) = run_hook_with_env(
+                command,
+                &env_vars.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
+            );
 
             assert_eq!(exit_code, 0, "{config_name}: should exit 0");
             assert!(

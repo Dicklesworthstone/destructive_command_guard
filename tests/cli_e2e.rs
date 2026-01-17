@@ -3073,7 +3073,13 @@ destructive_patterns:
     pattern: test
 "#;
         let (_temp, path) = create_temp_pack(content);
-        let output = run_dcg(&["pack", "validate", path.to_str().unwrap(), "--format", "json"]);
+        let output = run_dcg(&[
+            "pack",
+            "validate",
+            path.to_str().unwrap(),
+            "--format",
+            "json",
+        ]);
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(

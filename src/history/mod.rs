@@ -49,7 +49,8 @@ pub use schema::{
     DEFAULT_DB_FILENAME, ExportFilters, ExportOptions, ExportedData, HistoryDb, HistoryError,
     HistoryStats, Outcome, OutcomeStats, PackEffectivenessAnalysis, PackRecommendation,
     PatternEffectiveness, PatternStat, PerformanceStats, PotentialGap, ProjectStat,
-    RecommendationType, StatsTrends, SuggestionAction, SuggestionAuditEntry,
+    RecommendationType, RuleMetrics, RuleTrend, StatsTrends, SuggestionAction,
+    SuggestionAuditEntry,
 };
 
 /// Environment variable to override the history database path.

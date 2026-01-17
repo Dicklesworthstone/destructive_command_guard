@@ -59,7 +59,11 @@ impl TestEnv {
     }
 
     /// Create a config file with specific toggle settings.
-    fn with_toggles(self, highlight_enabled: Option<bool>, explanations_enabled: Option<bool>) -> Self {
+    fn with_toggles(
+        self,
+        highlight_enabled: Option<bool>,
+        explanations_enabled: Option<bool>,
+    ) -> Self {
         let mut config_content = String::from("[output]\n");
 
         if let Some(h) = highlight_enabled {
@@ -431,11 +435,15 @@ fn test_cli_test_mode_with_toggles() {
     // Both should indicate blocked (exit code or output)
     // dcg test returns non-zero for denied commands
     assert!(
-        output_enabled.exit_code != 0 || output_enabled.stdout.contains("BLOCKED") || output_enabled.stdout.contains("denied"),
+        output_enabled.exit_code != 0
+            || output_enabled.stdout.contains("BLOCKED")
+            || output_enabled.stdout.contains("denied"),
         "CLI test should indicate blocked with toggles enabled"
     );
     assert!(
-        output_disabled.exit_code != 0 || output_disabled.stdout.contains("BLOCKED") || output_disabled.stdout.contains("denied"),
+        output_disabled.exit_code != 0
+            || output_disabled.stdout.contains("BLOCKED")
+            || output_disabled.stdout.contains("denied"),
         "CLI test should indicate blocked with toggles disabled"
     );
 
@@ -564,10 +572,7 @@ fn test_verbose_failure_logging() {
     eprintln!("===== END DIAGNOSTICS =====");
 
     // The command should be denied
-    assert!(
-        output.is_denied(),
-        "git clean -fdx should be denied"
-    );
+    assert!(output.is_denied(), "git clean -fdx should be denied");
 
     eprintln!("=== Verbose failure logging test PASSED ===");
 }

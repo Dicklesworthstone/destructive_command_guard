@@ -88,12 +88,17 @@ impl TestEnv {
 
         // Create config that points to our history database
         // The CLI reads database_path from config file via DCG_CONFIG env var
-        fs::write(&self.config_path, format!(
-            r#"[history]
+        fs::write(
+            &self.config_path,
+            format!(
+                r#"[history]
 enabled = true
 database_path = "{}"
-"#, self.history_path.display()
-        )).expect("Failed to write config");
+"#,
+                self.history_path.display()
+            ),
+        )
+        .expect("Failed to write config");
 
         self
     }
@@ -117,7 +122,11 @@ database_path = "{}"
 
     /// Run dcg suggest-allowlist with stdin input (for interactive mode).
     #[allow(dead_code)]
-    fn run_suggest_allowlist_interactive(&self, args: &[&str], stdin_input: &str) -> std::process::Output {
+    fn run_suggest_allowlist_interactive(
+        &self,
+        args: &[&str],
+        stdin_input: &str,
+    ) -> std::process::Output {
         let mut cmd = Command::new(dcg_binary());
         cmd.env_clear()
             .env("HOME", &self.home_dir)
@@ -134,7 +143,9 @@ database_path = "{}"
         let mut child = cmd.spawn().expect("failed to spawn dcg");
         {
             let stdin = child.stdin.as_mut().expect("failed to open stdin");
-            stdin.write_all(stdin_input.as_bytes()).expect("failed to write stdin");
+            stdin
+                .write_all(stdin_input.as_bytes())
+                .expect("failed to write stdin");
         }
 
         child.wait_with_output().expect("failed to wait for dcg")
@@ -276,7 +287,10 @@ fn test_suggest_allowlist_non_interactive_no_writes() {
     let env = TestEnv::new().with_history(&suggest_test_fixtures());
 
     // Verify no allowlist exists initially
-    assert!(!env.allowlist_exists(), "Allowlist should not exist initially");
+    assert!(
+        !env.allowlist_exists(),
+        "Allowlist should not exist initially"
+    );
 
     // Run in non-interactive mode
     let output = env.run_suggest_allowlist(&["--non-interactive", "--min-frequency", "3"]);
@@ -291,7 +305,10 @@ fn test_suggest_allowlist_non_interactive_no_writes() {
     assert!(output.status.success(), "Command should succeed");
 
     // Verify allowlist was NOT created
-    assert!(!env.allowlist_exists(), "Non-interactive mode should NOT create allowlist");
+    assert!(
+        !env.allowlist_exists(),
+        "Non-interactive mode should NOT create allowlist"
+    );
 
     eprintln!("=== Non-interactive no-writes test PASSED ===");
 }
@@ -331,11 +348,16 @@ fn test_suggest_allowlist_empty_history() {
     eprintln!("Stderr: {}", stderr);
 
     // Should succeed even with no history
-    assert!(output.status.success(), "Command should succeed with empty history");
+    assert!(
+        output.status.success(),
+        "Command should succeed with empty history"
+    );
 
     // Should mention no denied commands found
     assert!(
-        stdout.contains("No denied commands") || stdout.contains("No commands found") || stdout.contains("No suggestions"),
+        stdout.contains("No denied commands")
+            || stdout.contains("No commands found")
+            || stdout.contains("No suggestions"),
         "Should indicate no suggestions available"
     );
 
@@ -361,7 +383,9 @@ fn test_suggest_allowlist_min_frequency_filter() {
     assert!(output.status.success(), "Command should succeed");
     // Should indicate no commands met the threshold
     assert!(
-        stdout.contains("No commands found") || stdout.contains("No denied") || stdout.contains("No suggestions"),
+        stdout.contains("No commands found")
+            || stdout.contains("No denied")
+            || stdout.contains("No suggestions"),
         "Should indicate no commands met threshold"
     );
 
@@ -380,7 +404,10 @@ fn test_suggest_allowlist_limit_filter() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     eprintln!("Stdout with limit=1: {}", stdout);
 
-    assert!(output.status.success(), "Command should succeed with limit=1");
+    assert!(
+        output.status.success(),
+        "Command should succeed with limit=1"
+    );
 
     eprintln!("=== Limit filter test PASSED ===");
 }
@@ -403,7 +430,10 @@ fn test_suggest_allowlist_invalid_since_format() {
     eprintln!("Stdout: {}", String::from_utf8_lossy(&output.stdout));
 
     // Should fail with non-zero exit code for invalid format
-    assert!(!output.status.success(), "Command should fail with invalid --since");
+    assert!(
+        !output.status.success(),
+        "Command should fail with invalid --since"
+    );
 
     eprintln!("=== Invalid --since format test PASSED ===");
 }
@@ -451,13 +481,21 @@ fn test_suggest_allowlist_cli_parsing_confidence_filter() {
     for tier in &["high", "medium", "low", "all"] {
         let output = env.run_suggest_allowlist(&["--non-interactive", "--confidence", tier]);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        
-        eprintln!("Confidence={}: exit_code={}", tier, output.status.code().unwrap_or(-1));
+
+        eprintln!(
+            "Confidence={}: exit_code={}",
+            tier,
+            output.status.code().unwrap_or(-1)
+        );
         if !output.status.success() {
             eprintln!("  stderr: {}", stderr);
         }
-        
-        assert!(output.status.success(), "Command with --confidence {} should succeed", tier);
+
+        assert!(
+            output.status.success(),
+            "Command with --confidence {} should succeed",
+            tier
+        );
     }
 
     eprintln!("=== Confidence filter parsing test PASSED ===");
@@ -472,13 +510,21 @@ fn test_suggest_allowlist_cli_parsing_risk_filter() {
     for level in &["low", "medium", "high", "all"] {
         let output = env.run_suggest_allowlist(&["--non-interactive", "--risk", level]);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        
-        eprintln!("Risk={}: exit_code={}", level, output.status.code().unwrap_or(-1));
+
+        eprintln!(
+            "Risk={}: exit_code={}",
+            level,
+            output.status.code().unwrap_or(-1)
+        );
         if !output.status.success() {
             eprintln!("  stderr: {}", stderr);
         }
-        
-        assert!(output.status.success(), "Command with --risk {} should succeed", level);
+
+        assert!(
+            output.status.success(),
+            "Command with --risk {} should succeed",
+            level
+        );
     }
 
     eprintln!("=== Risk filter parsing test PASSED ===");
@@ -493,13 +539,21 @@ fn test_suggest_allowlist_cli_parsing_format() {
     for format in &["text", "json"] {
         let output = env.run_suggest_allowlist(&["--non-interactive", "--format", format]);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        
-        eprintln!("Format={}: exit_code={}", format, output.status.code().unwrap_or(-1));
+
+        eprintln!(
+            "Format={}: exit_code={}",
+            format,
+            output.status.code().unwrap_or(-1)
+        );
         if !output.status.success() {
             eprintln!("  stderr: {}", stderr);
         }
-        
-        assert!(output.status.success(), "Command with --format {} should succeed", format);
+
+        assert!(
+            output.status.success(),
+            "Command with --format {} should succeed",
+            format
+        );
     }
 
     eprintln!("=== Format parsing test PASSED ===");
@@ -516,7 +570,13 @@ fn test_suggest_allowlist_json_output_structure() {
     let env = TestEnv::new().with_history(&suggest_test_fixtures());
 
     // Run with JSON format and low min-frequency to get suggestions
-    let output = env.run_suggest_allowlist(&["--non-interactive", "--format", "json", "--min-frequency", "2"]);
+    let output = env.run_suggest_allowlist(&[
+        "--non-interactive",
+        "--format",
+        "json",
+        "--min-frequency",
+        "2",
+    ]);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -525,17 +585,27 @@ fn test_suggest_allowlist_json_output_structure() {
     eprintln!("Stdout: {}", stdout);
     eprintln!("Stderr: {}", stderr);
 
-    assert!(output.status.success(), "JSON output command should succeed");
+    assert!(
+        output.status.success(),
+        "JSON output command should succeed"
+    );
 
     // Skip if no suggestions were generated
-    if stdout.contains("No denied commands") || stdout.contains("No commands found") || stdout.trim().is_empty() {
+    if stdout.contains("No denied commands")
+        || stdout.contains("No commands found")
+        || stdout.trim().is_empty()
+    {
         eprintln!("No suggestions generated - skipping JSON structure validation");
         return;
     }
 
     // Parse the JSON output
     let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
-    assert!(parsed.is_ok(), "Output should be valid JSON. Got: {}", stdout);
+    assert!(
+        parsed.is_ok(),
+        "Output should be valid JSON. Got: {}",
+        stdout
+    );
 
     let json = parsed.unwrap();
 
@@ -622,7 +692,13 @@ fn test_suggest_allowlist_json_output_non_empty() {
     let env = TestEnv::new().with_history(&suggest_test_fixtures());
 
     // Use min-frequency=3 since we have 4 git reset --hard commands
-    let output = env.run_suggest_allowlist(&["--non-interactive", "--format", "json", "--min-frequency", "3"]);
+    let output = env.run_suggest_allowlist(&[
+        "--non-interactive",
+        "--format",
+        "json",
+        "--min-frequency",
+        "3",
+    ]);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -635,13 +711,16 @@ fn test_suggest_allowlist_json_output_non_empty() {
 
     // With 4 git reset --hard and 3 git push --force, we should have suggestions
     if !stdout.contains("No denied commands") && !stdout.contains("No commands found") {
-        let parsed: serde_json::Value = serde_json::from_str(&stdout)
-            .expect("Should produce valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).expect("Should produce valid JSON");
 
         if let Some(arr) = parsed.as_array() {
             eprintln!("Got {} suggestions", arr.len());
             // We should have at least one suggestion for the git reset --hard pattern
-            assert!(!arr.is_empty(), "Should have at least one suggestion with test fixtures");
+            assert!(
+                !arr.is_empty(),
+                "Should have at least one suggestion with test fixtures"
+            );
         }
     }
 
@@ -659,13 +738,13 @@ fn test_suggest_allowlist_interactive_accept_writes_allowlist() {
     let env = TestEnv::new().with_history(&suggest_test_fixtures());
 
     // Verify no allowlist exists initially
-    assert!(!env.allowlist_exists(), "Allowlist should not exist initially");
+    assert!(
+        !env.allowlist_exists(),
+        "Allowlist should not exist initially"
+    );
 
     // Run in interactive mode with "a\nq\n" (accept first, then quit)
-    let output = env.run_suggest_allowlist_interactive(
-        &["--min-frequency", "3"],
-        "a\nq\n"
-    );
+    let output = env.run_suggest_allowlist_interactive(&["--min-frequency", "3"], "a\nq\n");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -675,14 +754,20 @@ fn test_suggest_allowlist_interactive_accept_writes_allowlist() {
     eprintln!("Stderr: {}", stderr);
 
     // Command should succeed (exit 0)
-    assert!(output.status.success(), "Interactive command should succeed");
+    assert!(
+        output.status.success(),
+        "Interactive command should succeed"
+    );
 
     // After accepting a suggestion, allowlist should exist
     // Note: This depends on the suggestion being generated and accepted
     if stdout.contains("[A]ccept") {
         // If we got to the accept prompt, check if allowlist was created
         if stdout.contains("Added pattern") || stdout.contains("written") {
-            assert!(env.allowlist_exists(), "Allowlist should exist after accepting suggestion");
+            assert!(
+                env.allowlist_exists(),
+                "Allowlist should exist after accepting suggestion"
+            );
 
             let contents = env.read_allowlist();
             eprintln!("Allowlist contents:\n{}", contents);
@@ -705,13 +790,14 @@ fn test_suggest_allowlist_interactive_skip_no_write() {
     let env = TestEnv::new().with_history(&suggest_test_fixtures());
 
     // Verify no allowlist exists initially
-    assert!(!env.allowlist_exists(), "Allowlist should not exist initially");
+    assert!(
+        !env.allowlist_exists(),
+        "Allowlist should not exist initially"
+    );
 
     // Run in interactive mode with "s\ns\nq\n" (skip all, then quit)
-    let output = env.run_suggest_allowlist_interactive(
-        &["--min-frequency", "3"],
-        "s\ns\ns\ns\nq\n"
-    );
+    let output =
+        env.run_suggest_allowlist_interactive(&["--min-frequency", "3"], "s\ns\ns\ns\nq\n");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -721,10 +807,16 @@ fn test_suggest_allowlist_interactive_skip_no_write() {
     eprintln!("Stderr: {}", stderr);
 
     // Command should succeed
-    assert!(output.status.success(), "Interactive skip command should succeed");
+    assert!(
+        output.status.success(),
+        "Interactive skip command should succeed"
+    );
 
     // After skipping all suggestions, allowlist should NOT exist
-    assert!(!env.allowlist_exists(), "Allowlist should NOT exist after skipping all suggestions");
+    assert!(
+        !env.allowlist_exists(),
+        "Allowlist should NOT exist after skipping all suggestions"
+    );
 
     eprintln!("=== Interactive skip test PASSED ===");
 }
@@ -736,13 +828,13 @@ fn test_suggest_allowlist_interactive_quit_early() {
     let env = TestEnv::new().with_history(&suggest_test_fixtures());
 
     // Verify no allowlist exists initially
-    assert!(!env.allowlist_exists(), "Allowlist should not exist initially");
+    assert!(
+        !env.allowlist_exists(),
+        "Allowlist should not exist initially"
+    );
 
     // Run in interactive mode with just "q\n" (quit immediately)
-    let output = env.run_suggest_allowlist_interactive(
-        &["--min-frequency", "3"],
-        "q\n"
-    );
+    let output = env.run_suggest_allowlist_interactive(&["--min-frequency", "3"], "q\n");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -752,10 +844,16 @@ fn test_suggest_allowlist_interactive_quit_early() {
     eprintln!("Stderr: {}", stderr);
 
     // Command should succeed (exit 0)
-    assert!(output.status.success(), "Interactive quit command should succeed");
+    assert!(
+        output.status.success(),
+        "Interactive quit command should succeed"
+    );
 
     // After quitting, allowlist should NOT exist
-    assert!(!env.allowlist_exists(), "Allowlist should NOT exist after quitting");
+    assert!(
+        !env.allowlist_exists(),
+        "Allowlist should NOT exist after quitting"
+    );
 
     eprintln!("=== Interactive quit test PASSED ===");
 }
@@ -834,7 +932,10 @@ fn test_suggest_allowlist_output_diagnostics() {
     eprintln!("╚════════════════════════════════════════════════════════════════════╝");
 
     // Basic sanity check - command should succeed
-    assert!(output.status.success(), "Diagnostics command should succeed");
+    assert!(
+        output.status.success(),
+        "Diagnostics command should succeed"
+    );
 
     eprintln!("=== Output diagnostics test PASSED ===");
 }
