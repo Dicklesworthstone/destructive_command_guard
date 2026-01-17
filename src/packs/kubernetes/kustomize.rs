@@ -49,19 +49,52 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "kustomize-delete",
             r"kustomize\s+build\s+.*\|\s*kubectl\s+delete",
-            "kustomize build | kubectl delete removes all resources in the kustomization."
+            "kustomize build | kubectl delete removes all resources in the kustomization.",
+            Critical,
+            "Piping kustomize build to kubectl delete removes ALL resources defined in the \
+             kustomization directory. This can delete entire applications:\n\n\
+             - Every resource in kustomization.yaml and its bases is deleted\n\
+             - Deployments, services, configmaps, secrets all removed\n\
+             - Overlays may include resources you didn't expect\n\
+             - No confirmation or preview by default\n\n\
+             Safer alternatives:\n\
+             - kustomize build <dir>: Review manifests first\n\
+             - kustomize build <dir> | kubectl delete --dry-run=client -f -: Preview\n\
+             - kustomize build <dir> | kubectl diff -f -: Compare with cluster state"
         ),
         // kubectl kustomize | kubectl delete
         destructive_pattern!(
             "kubectl-kustomize-delete",
             r"kubectl\s+kustomize\s+.*\|\s*kubectl\s+delete",
-            "kubectl kustomize | kubectl delete removes all resources in the kustomization."
+            "kubectl kustomize | kubectl delete removes all resources in the kustomization.",
+            Critical,
+            "Piping kubectl kustomize to kubectl delete removes ALL resources defined in the \
+             kustomization directory. This is equivalent to kustomize build | kubectl delete:\n\n\
+             - Entire application stack can be deleted\n\
+             - Base and overlay resources are all affected\n\
+             - Includes resources from remote URLs if referenced\n\
+             - Order of deletion may cause cascading failures\n\n\
+             Safer alternatives:\n\
+             - kubectl kustomize <dir>: Review manifests first\n\
+             - kubectl delete --dry-run=client -k <dir>: Preview deletion\n\
+             - kubectl diff -k <dir>: Compare with cluster state"
         ),
         // kubectl delete -k (kustomize flag)
         destructive_pattern!(
             "kubectl-delete-k",
             r"kubectl\s+delete\s+-k\b(?!.*--dry-run)",
-            "kubectl delete -k removes all resources defined in the kustomization. Use --dry-run first."
+            "kubectl delete -k removes all resources defined in the kustomization. Use --dry-run first.",
+            Critical,
+            "kubectl delete -k removes all resources defined in a kustomization directory. \
+             This is a convenient but dangerous shorthand:\n\n\
+             - All resources in kustomization.yaml are deleted\n\
+             - Includes base resources and all overlays\n\
+             - May include namespaces, PVCs, and other critical resources\n\
+             - No confirmation prompt by default\n\n\
+             Safer alternatives:\n\
+             - kubectl delete -k <dir> --dry-run=client: Preview what will be deleted\n\
+             - kubectl kustomize <dir>: Review manifests before deleting\n\
+             - kubectl get -k <dir>: List resources that would be affected"
         ),
     ]
 }
