@@ -520,6 +520,102 @@ impl ExternalPack {
     }
 }
 
+/// Type of regex engine used for a pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegexEngineType {
+    /// Linear-time automaton-based engine
+    Linear,
+    /// Backtracking engine (required for lookahead/lookbehind)
+    Backtracking,
+}
+
+/// Summary of regex engines used in a pack.
+#[derive(Debug)]
+pub struct EngineSummary {
+    /// Number of patterns using linear-time engine
+    pub linear_count: usize,
+    /// Number of patterns using backtracking engine
+    pub backtracking_count: usize,
+}
+
+impl EngineSummary {
+    /// Total number of patterns
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.linear_count + self.backtracking_count
+    }
+
+    /// Percentage of patterns using linear-time engine
+    #[must_use]
+    pub fn linear_percentage(&self) -> f64 {
+        let total = self.total();
+        if total == 0 {
+            100.0
+        } else {
+            (self.linear_count as f64 / total as f64) * 100.0
+        }
+    }
+}
+
+/// Information about a single pattern's engine.
+#[derive(Debug)]
+pub struct PatternEngineInfo {
+    /// Name of the pattern
+    pub name: String,
+    /// Type of engine used
+    pub engine: RegexEngineType,
+}
+
+/// Analyze which regex engine each pattern in a pack uses.
+#[must_use]
+pub fn analyze_pack_engines(pack: &ExternalPack) -> Vec<PatternEngineInfo> {
+    use crate::packs::regex_engine::needs_backtracking_engine;
+
+    let mut results = Vec::new();
+
+    for pattern in &pack.destructive_patterns {
+        let engine = if needs_backtracking_engine(&pattern.pattern) {
+            RegexEngineType::Backtracking
+        } else {
+            RegexEngineType::Linear
+        };
+        results.push(PatternEngineInfo {
+            name: pattern.name.clone(),
+            engine,
+        });
+    }
+
+    for pattern in &pack.safe_patterns {
+        let engine = if needs_backtracking_engine(&pattern.pattern) {
+            RegexEngineType::Backtracking
+        } else {
+            RegexEngineType::Linear
+        };
+        results.push(PatternEngineInfo {
+            name: pattern.name.clone(),
+            engine,
+        });
+    }
+
+    results
+}
+
+/// Summarize the regex engines used in a pack.
+#[must_use]
+pub fn summarize_pack_engines(pack: &ExternalPack) -> EngineSummary {
+    let infos = analyze_pack_engines(pack);
+    let backtracking_count = infos
+        .iter()
+        .filter(|i| i.engine == RegexEngineType::Backtracking)
+        .count();
+    let linear_count = infos.len() - backtracking_count;
+
+    EngineSummary {
+        linear_count,
+        backtracking_count,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

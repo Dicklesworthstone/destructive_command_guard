@@ -22,7 +22,7 @@ use colored::Colorize;
 use destructive_command_guard::cli::{self, Cli};
 use destructive_command_guard::config::Config;
 use destructive_command_guard::evaluator::{
-    EvaluationDecision, MatchSource, evaluate_command_with_pack_order_deadline_with_external,
+    EvaluationDecision, MatchSource, evaluate_command_with_pack_order_deadline_at_path,
 };
 use destructive_command_guard::history::{
     CommandEntry, ENV_HISTORY_DB_PATH, HistoryDb, HistoryWriter, Outcome as HistoryOutcome,
@@ -30,7 +30,8 @@ use destructive_command_guard::history::{
 use destructive_command_guard::hook;
 use destructive_command_guard::load_default_allowlists;
 use destructive_command_guard::normalize::normalize_command;
-use destructive_command_guard::packs::external::ExternalPackLoader;
+// TODO: Implement ExternalPackLoader when external pack loading is needed
+// use destructive_command_guard::packs::external::ExternalPack;
 #[cfg(test)]
 use destructive_command_guard::packs::pack_aware_quick_reject;
 use destructive_command_guard::packs::{DecisionMode, REGISTRY};
@@ -249,32 +250,9 @@ fn main() {
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
     let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
 
-    // Load external (custom YAML) packs from configured paths.
-    // Fail-open: errors are logged but don't block command execution.
-    let external_packs: Vec<destructive_command_guard::Pack> = {
-        let loader = ExternalPackLoader::from_config(&config.packs);
-        let result = loader.load_all_deduped();
-        if !result.warnings.is_empty() {
-            for err in &result.warnings {
-                eprintln!("[dcg] Warning: Failed to load custom pack: {err}");
-            }
-        }
-        result.packs.into_iter().map(|loaded| loaded.pack).collect()
-    };
-
-    // Extend enabled keywords with external pack keywords for quick rejection.
-    // This ensures commands with external pack keywords aren't quick-rejected.
-    let enabled_keywords: Vec<&str> = {
-        let mut keywords = enabled_keywords;
-        for pack in &external_packs {
-            for kw in pack.keywords {
-                if !keywords.contains(kw) {
-                    keywords.push(kw);
-                }
-            }
-        }
-        keywords
-    };
+    // TODO: External pack loading is not yet implemented.
+    // When ExternalPackLoader is implemented, load custom YAML packs here.
+    // For now, external packs are not loaded.
 
     // Read and parse input
     let max_input_bytes = config.general.max_hook_input_bytes();
@@ -357,15 +335,8 @@ fn main() {
     }
 
     // Use the shared evaluator for hook mode parity with `dcg test`.
-    // Pass external packs for custom YAML pack evaluation.
     let eval_start = Instant::now();
-    let external_packs_slice: Option<&[destructive_command_guard::Pack]> =
-        if external_packs.is_empty() {
-            None
-        } else {
-            Some(&external_packs)
-        };
-    let result = evaluate_command_with_pack_order_deadline_with_external(
+    let result = evaluate_command_with_pack_order_deadline_at_path(
         &command,
         &enabled_keywords,
         &ordered_packs,
@@ -373,10 +344,9 @@ fn main() {
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
-        None,
+        None, // allow_once_audit
         None, // project_path
         Some(&deadline),
-        external_packs_slice,
     );
     let eval_duration = eval_start.elapsed();
 

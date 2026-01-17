@@ -32,34 +32,46 @@ fn run_dcg(args: &[&str]) -> (String, String, i32) {
 fn test_test_command_json_valid() {
     let (stdout, stderr, exit_code) = run_dcg(&["test", "--format", "json", "git status"]);
 
-    assert_eq!(exit_code, 0, "test --format json should exit 0\nstderr: {stderr}");
+    assert_eq!(
+        exit_code, 0,
+        "test --format json should exit 0\nstderr: {stderr}"
+    );
 
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("test --format json should produce valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("test --format json should produce valid JSON");
 
     // Verify required fields for test output
     assert!(json.get("command").is_some(), "should have 'command' field");
-    assert!(json.get("decision").is_some(), "should have 'decision' field");
+    assert!(
+        json.get("decision").is_some(),
+        "should have 'decision' field"
+    );
 }
 
 #[test]
 fn test_test_command_json_allowed() {
     let (stdout, _stderr, _) = run_dcg(&["test", "--format", "json", "echo hello"]);
 
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("test --format json should produce valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("test --format json should produce valid JSON");
 
-    assert_eq!(json["decision"], "allow", "safe command should have decision=allow");
+    assert_eq!(
+        json["decision"], "allow",
+        "safe command should have decision=allow"
+    );
 }
 
 #[test]
 fn test_test_command_json_denied() {
     let (stdout, _stderr, _) = run_dcg(&["test", "--format", "json", "git reset --hard"]);
 
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("test --format json should produce valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("test --format json should produce valid JSON");
 
-    assert_eq!(json["decision"], "deny", "dangerous command should have decision=deny");
+    assert_eq!(
+        json["decision"], "deny",
+        "dangerous command should have decision=deny"
+    );
 
     // Denied commands should have additional fields
     assert!(json.get("rule_id").is_some(), "denied should have rule_id");
@@ -71,13 +83,16 @@ fn test_test_command_json_denied() {
 fn test_test_command_json_denied_has_matched_span() {
     let (stdout, _stderr, _) = run_dcg(&["test", "--format", "json", "git reset --hard"]);
 
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("test --format json should produce valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("test --format json should produce valid JSON");
 
     if json["decision"] == "deny" {
         // matched_span should be present for highlighting
         if let Some(span) = json.get("matched_span") {
-            assert!(span.is_array(), "matched_span should be an array [start, end]");
+            assert!(
+                span.is_array(),
+                "matched_span should be an array [start, end]"
+            );
             let arr = span.as_array().unwrap();
             assert_eq!(arr.len(), 2, "matched_span should have 2 elements");
         }
@@ -92,26 +107,38 @@ fn test_test_command_json_denied_has_matched_span() {
 fn test_explain_command_json_valid() {
     let (stdout, stderr, exit_code) = run_dcg(&["explain", "--format", "json", "git reset --hard"]);
 
-    assert_eq!(exit_code, 0, "explain --format json should exit 0\nstderr: {stderr}");
+    assert_eq!(
+        exit_code, 0,
+        "explain --format json should exit 0\nstderr: {stderr}"
+    );
 
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("explain --format json should produce valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("explain --format json should produce valid JSON");
 
     // Verify explain output structure
-    assert!(json.get("command").is_some(), "explain should have 'command' field");
-    assert!(json.get("decision").is_some(), "explain should have 'decision' field");
+    assert!(
+        json.get("command").is_some(),
+        "explain should have 'command' field"
+    );
+    assert!(
+        json.get("decision").is_some(),
+        "explain should have 'decision' field"
+    );
 }
 
 #[test]
 fn test_explain_command_json_has_trace() {
     let (stdout, _stderr, _) = run_dcg(&["explain", "--format", "json", "git reset --hard"]);
 
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("explain --format json should produce valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("explain --format json should produce valid JSON");
 
     // Explain output should include evaluation trace
     if let Some(trace) = json.get("trace") {
-        assert!(trace.is_array() || trace.is_object(), "trace should be structured");
+        assert!(
+            trace.is_array() || trace.is_object(),
+            "trace should be structured"
+        );
     }
 }
 
@@ -119,8 +146,8 @@ fn test_explain_command_json_has_trace() {
 fn test_explain_command_json_schema_version() {
     let (stdout, _stderr, _) = run_dcg(&["explain", "--format", "json", "git reset --hard"]);
 
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("explain --format json should produce valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("explain --format json should produce valid JSON");
 
     // Schema version should be present for API stability
     if let Some(version) = json.get("schema_version") {
@@ -139,10 +166,13 @@ fn test_explain_command_json_schema_version() {
 fn test_packs_command_json_valid() {
     let (stdout, stderr, exit_code) = run_dcg(&["packs", "--format", "json"]);
 
-    assert_eq!(exit_code, 0, "packs --format json should exit 0\nstderr: {stderr}");
+    assert_eq!(
+        exit_code, 0,
+        "packs --format json should exit 0\nstderr: {stderr}"
+    );
 
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("packs --format json should produce valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("packs --format json should produce valid JSON");
 
     // Verify packs output structure
     assert!(json.get("packs").is_some(), "should have 'packs' array");
@@ -153,8 +183,8 @@ fn test_packs_command_json_valid() {
 fn test_packs_command_json_pack_structure() {
     let (stdout, _stderr, _) = run_dcg(&["packs", "--format", "json"]);
 
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("packs --format json should produce valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("packs --format json should produce valid JSON");
 
     let packs = json["packs"].as_array().expect("packs should be an array");
     assert!(!packs.is_empty(), "should have at least one pack");
@@ -163,28 +193,31 @@ fn test_packs_command_json_pack_structure() {
     let first_pack = &packs[0];
     assert!(first_pack.get("id").is_some(), "pack should have 'id'");
     assert!(first_pack.get("name").is_some(), "pack should have 'name'");
-    assert!(first_pack.get("enabled").is_some(), "pack should have 'enabled'");
+    assert!(
+        first_pack.get("enabled").is_some(),
+        "pack should have 'enabled'"
+    );
 }
 
 #[test]
 fn test_packs_command_json_has_pattern_counts() {
     let (stdout, _stderr, _) = run_dcg(&["packs", "--format", "json"]);
 
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("packs --format json should produce valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("packs --format json should produce valid JSON");
 
     let packs = json["packs"].as_array().unwrap();
     let first_pack = &packs[0];
 
     // Should include pattern counts for agent awareness
     assert!(
-        first_pack.get("safe_pattern_count").is_some() ||
-        first_pack.get("safePatternCount").is_some(),
+        first_pack.get("safe_pattern_count").is_some()
+            || first_pack.get("safePatternCount").is_some(),
         "pack should have safe pattern count"
     );
     assert!(
-        first_pack.get("destructive_pattern_count").is_some() ||
-        first_pack.get("destructivePatternCount").is_some(),
+        first_pack.get("destructive_pattern_count").is_some()
+            || first_pack.get("destructivePatternCount").is_some(),
         "pack should have destructive pattern count"
     );
 }
@@ -193,16 +226,13 @@ fn test_packs_command_json_has_pattern_counts() {
 fn test_packs_command_json_contains_core_packs() {
     let (stdout, _stderr, _) = run_dcg(&["packs", "--format", "json"]);
 
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("packs --format json should produce valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("packs --format json should produce valid JSON");
 
     let packs = json["packs"].as_array().unwrap();
 
     // Core packs should always be present
-    let pack_ids: Vec<&str> = packs
-        .iter()
-        .filter_map(|p| p["id"].as_str())
-        .collect();
+    let pack_ids: Vec<&str> = packs.iter().filter_map(|p| p["id"].as_str()).collect();
 
     assert!(
         pack_ids.iter().any(|id| id.starts_with("core.")),
@@ -224,18 +254,23 @@ fn test_scan_command_json_valid() {
 
     let (stdout, stderr, exit_code) = run_dcg(&[
         "scan",
-        "--format", "json",
-        "--paths", temp_dir.to_str().unwrap(),
+        "--format",
+        "json",
+        "--paths",
+        temp_dir.to_str().unwrap(),
     ]);
 
     // Cleanup
     let _ = std::fs::remove_dir_all(&temp_dir);
 
-    assert_eq!(exit_code, 0, "scan --format json should exit 0\nstderr: {stderr}");
+    assert_eq!(
+        exit_code, 0,
+        "scan --format json should exit 0\nstderr: {stderr}"
+    );
 
     if !stdout.is_empty() {
-        let json: serde_json::Value = serde_json::from_str(&stdout)
-            .expect("scan --format json should produce valid JSON");
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout).expect("scan --format json should produce valid JSON");
 
         // Scan output should have findings array
         assert!(
@@ -268,11 +303,12 @@ fn test_all_json_outputs_are_objects() {
         );
 
         if !stdout.is_empty() {
-            let json: serde_json::Value = serde_json::from_str(&stdout)
-                .unwrap_or_else(|e| panic!(
+            let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+                panic!(
                     "command {:?} should produce valid JSON: {e}\nstdout: {stdout}",
                     cmd_args
-                ));
+                )
+            });
 
             assert!(
                 json.is_object(),
@@ -297,11 +333,9 @@ fn test_json_outputs_parseable_by_jq() {
         if !stdout.is_empty() {
             // Strict parsing - should not have trailing content
             let trimmed = stdout.trim();
-            let _: serde_json::Value = serde_json::from_str(trimmed)
-                .unwrap_or_else(|e| panic!(
-                    "command {:?} JSON should be strictly valid: {e}",
-                    cmd_args
-                ));
+            let _: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
+                panic!("command {:?} JSON should be strictly valid: {e}", cmd_args)
+            });
         }
     }
 }
@@ -321,8 +355,8 @@ fn test_json_no_trailing_newlines_or_garbage() {
         );
 
         // Should parse without extra content
-        let _: serde_json::Value = serde_json::from_str(trimmed)
-            .expect("JSON should be valid without trailing content");
+        let _: serde_json::Value =
+            serde_json::from_str(trimmed).expect("JSON should be valid without trailing content");
     }
 }
 
@@ -332,16 +366,13 @@ fn test_json_no_trailing_newlines_or_garbage() {
 
 #[test]
 fn test_decision_values_are_lowercase() {
-    let commands = [
-        ("git status", "allow"),
-        ("git reset --hard", "deny"),
-    ];
+    let commands = [("git status", "allow"), ("git reset --hard", "deny")];
 
     for (cmd, expected_decision) in commands {
         let (stdout, _stderr, _) = run_dcg(&["test", "--format", "json", cmd]);
 
-        let json: serde_json::Value = serde_json::from_str(&stdout)
-            .expect("should produce valid JSON");
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout).expect("should produce valid JSON");
 
         let decision = json["decision"].as_str().unwrap();
         assert_eq!(
@@ -349,7 +380,8 @@ fn test_decision_values_are_lowercase() {
             "decision should be lowercase '{expected_decision}' for '{cmd}'"
         );
         assert_eq!(
-            decision, decision.to_lowercase(),
+            decision,
+            decision.to_lowercase(),
             "decision should be lowercase"
         );
     }
@@ -359,15 +391,15 @@ fn test_decision_values_are_lowercase() {
 fn test_severity_values_are_lowercase() {
     let (stdout, _stderr, _) = run_dcg(&["test", "--format", "json", "git reset --hard"]);
 
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("should produce valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should produce valid JSON");
 
     // Check hook output if present
     if let Some(hook_output) = json.get("hookSpecificOutput") {
         if let Some(severity) = hook_output.get("severity") {
             let sev_str = severity.as_str().unwrap();
             assert_eq!(
-                sev_str, sev_str.to_lowercase(),
+                sev_str,
+                sev_str.to_lowercase(),
                 "severity should be lowercase"
             );
         }

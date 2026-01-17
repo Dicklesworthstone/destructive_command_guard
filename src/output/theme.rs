@@ -209,7 +209,10 @@ mod tests {
 
     #[test]
     fn test_severity_from_str() {
-        assert_eq!(Severity::from_str_loose("critical"), Some(Severity::Critical));
+        assert_eq!(
+            Severity::from_str_loose("critical"),
+            Some(Severity::Critical)
+        );
         assert_eq!(Severity::from_str_loose("CRIT"), Some(Severity::Critical));
         assert_eq!(Severity::from_str_loose("high"), Some(Severity::High));
         assert_eq!(Severity::from_str_loose("medium"), Some(Severity::Medium));
