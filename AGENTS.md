@@ -343,6 +343,280 @@ Every Bash command passes through this hook. Performance is critical:
 
 ---
 
+<!-- dcg-machine-readable-v1 -->
+
+## DCG Hook Protocol (Machine-Readable Reference)
+
+> This section provides structured documentation for AI agents integrating with dcg.
+
+### JSON Input Format
+
+dcg reads from stdin in Claude Code's `PreToolUse` hook format:
+
+```json
+{
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git reset --hard HEAD~5"
+  }
+}
+```
+
+**Required fields:**
+- `tool_name`: Must be `"Bash"` for dcg to process (other tools are ignored)
+- `tool_input.command`: The shell command string to evaluate
+
+### JSON Output Format (Denial)
+
+When a command is blocked, dcg outputs JSON to stdout:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "BLOCKED by dcg\n\nTip: dcg explain \"git reset --hard HEAD~5\"\n\nReason: git reset --hard destroys uncommitted changes\n\nExplanation: Rewrites history and discards uncommitted changes.\n\nRule: core.git:reset-hard\n\nCommand: git reset --hard HEAD~5\n\nIf this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
+    "ruleId": "core.git:reset-hard",
+    "packId": "core.git",
+    "severity": "critical",
+    "confidence": 0.95,
+    "allowOnceCode": "a1b2c3",
+    "allowOnceFullHash": "sha256:abc123...",
+    "remediation": {
+      "safeAlternative": "git stash",
+      "explanation": "Use git stash to save your changes first.",
+      "allowOnceCommand": "dcg allow-once a1b2c3"
+    }
+  }
+}
+```
+
+**Key fields for agent parsing:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `permissionDecision` | `"allow"` \| `"deny"` | The decision |
+| `ruleId` | `string` | Stable pattern ID (e.g., `"core.git:reset-hard"`) for allowlisting |
+| `packId` | `string` | Pack that matched (e.g., `"core.git"`) |
+| `severity` | `string` | `"critical"`, `"high"`, `"medium"`, or `"low"` |
+| `confidence` | `number` | Match confidence 0.0-1.0 |
+| `allowOnceCode` | `string` | Short code for `dcg allow-once` |
+| `remediation.safeAlternative` | `string?` | Suggested safe command |
+
+### JSON Output Format (Allow)
+
+When a command is allowed: **no output** (silent exit 0).
+
+---
+
+## Exit Codes Reference
+
+| Code | Meaning | Agent Action |
+|------|---------|--------------|
+| `0` | Command allowed OR denied (check stdout for JSON) | Parse stdout; if empty, command was allowed |
+| `1` | Parse error or invalid input | Retry with corrected input |
+| `2` | Configuration error | Check config file syntax |
+
+**Detection logic for agents:**
+```bash
+output=$(echo "$hook_input" | dcg 2>/dev/null)
+if [ -z "$output" ]; then
+  echo "ALLOWED"
+else
+  echo "DENIED: $output"
+fi
+```
+
+---
+
+## Error Codes Reference
+
+DCG uses standardized error codes in the format `DCG-XXXX` for machine-parseable error handling.
+
+### Error Categories
+
+| Range | Category | Description |
+|-------|----------|-------------|
+| DCG-1xxx | `pattern_match` | Pattern matching and evaluation errors |
+| DCG-2xxx | `configuration` | Configuration loading and parsing errors |
+| DCG-3xxx | `runtime` | Runtime and execution errors |
+| DCG-4xxx | `external` | External integration errors |
+
+### Common Error Codes
+
+| Code | Description | Typical Cause |
+|------|-------------|---------------|
+| `DCG-1001` | Pattern compilation failed | Invalid regex syntax in pattern |
+| `DCG-1002` | Pattern match timeout | Complex pattern taking too long |
+| `DCG-2001` | Config file not found | Missing configuration file |
+| `DCG-2002` | Config parse error | Invalid TOML/JSON syntax |
+| `DCG-2004` | Allowlist load error | Invalid allowlist file |
+| `DCG-3001` | JSON parse error | Malformed JSON input |
+| `DCG-3002` | IO error | File read/write failure |
+| `DCG-4001` | External pack load failed | Invalid external pack YAML |
+
+### Error JSON Structure
+
+When errors are returned in JSON format, they follow this structure:
+
+```json
+{
+  "error": {
+    "code": "DCG-3001",
+    "category": "runtime",
+    "message": "JSON parse error: unexpected token at position 15",
+    "context": {
+      "position": 15,
+      "input_preview": "{ \"tool_name\": ..."
+    }
+  }
+}
+```
+
+**Fields:**
+- `code`: Stable error code for programmatic handling
+- `category`: Error category (`pattern_match`, `configuration`, `runtime`, `external`)
+- `message`: Human-readable error description
+- `context`: Additional details (optional, varies by error type)
+
+---
+
+## Allowlist & Bypass Instructions
+
+### Temporary Bypass (24-hour allow-once)
+
+When a command is blocked, the output includes an `allowOnceCode`. Use it:
+
+```bash
+dcg allow-once <code>
+```
+
+This allows the specific command for 24 hours in the current directory scope.
+
+### Permanent Allowlist (by rule ID)
+
+Add a rule to the project allowlist:
+
+```bash
+dcg allowlist add <ruleId> --project
+# Example: dcg allowlist add core.git:reset-hard --project
+```
+
+Allowlist files (in priority order):
+1. `.dcg/allowlist.toml` (project)
+2. `~/.config/dcg/allowlist.toml` (user)
+3. `/etc/dcg/allowlist.toml` (system)
+
+### Bypass Environment Variable
+
+For emergency bypass (use sparingly):
+
+```bash
+DCG_BYPASS=1 <command>
+```
+
+**Warning:** This disables all protection. Log and justify any usage.
+
+---
+
+## Pattern Quick Reference
+
+### Core Git Patterns (Always Enabled)
+
+| Pattern ID | Blocks | Severity |
+|------------|--------|----------|
+| `core.git:reset-hard` | `git reset --hard` | Critical |
+| `core.git:reset-merge` | `git reset --merge` | High |
+| `core.git:checkout-discard` | `git checkout -- <file>` | High |
+| `core.git:restore-discard` | `git restore <file>` (without `--staged`) | High |
+| `core.git:clean-force` | `git clean -f`, `git clean -fd` | High |
+| `core.git:force-push` | `git push --force`, `git push -f` | High |
+| `core.git:branch-force-delete` | `git branch -D` | High |
+| `core.git:stash-drop` | `git stash drop`, `git stash clear` | High |
+
+### Core Filesystem Patterns (Always Enabled)
+
+| Pattern ID | Blocks | Severity |
+|------------|--------|----------|
+| `core.filesystem:rm-rf-root` | `rm -rf /`, `rm -rf ~` | Critical |
+| `core.filesystem:rm-rf-general` | `rm -rf` outside temp dirs | High |
+
+### Safe Patterns (Whitelist - Always Allowed)
+
+| Pattern | Command | Why Safe |
+|---------|---------|----------|
+| `git-checkout-branch` | `git checkout -b <branch>` | Creates new branch |
+| `git-checkout-orphan` | `git checkout --orphan <branch>` | Creates orphan branch |
+| `git-restore-staged` | `git restore --staged <file>` | Only unstages, doesn't discard |
+| `git-clean-dry-run` | `git clean -n`, `git clean --dry-run` | Preview only |
+| `rm-tmp` | `rm -rf /tmp/*`, `/var/tmp/*` | Temp directory cleanup |
+
+### Pack Enable/Disable Examples
+
+```toml
+# ~/.config/dcg/config.toml
+[packs]
+enabled = [
+    "database.postgresql",    # Blocks DROP TABLE, TRUNCATE
+    "kubernetes.kubectl",     # Blocks kubectl delete namespace
+    "cloud.aws",              # Blocks aws ec2 terminate-instances
+]
+
+disabled = [
+    "containers.docker",      # Disable Docker protection
+]
+```
+
+List all packs: `dcg packs --verbose`
+
+---
+
+## CLI Quick Reference for Agents
+
+| Command | Purpose |
+|---------|---------|
+| `dcg explain "<command>"` | Detailed trace of why command is blocked/allowed |
+| `dcg allow-once <code>` | Allow a blocked command for 24 hours |
+| `dcg allowlist add <ruleId> --project` | Permanently allow a rule |
+| `dcg packs` | List enabled packs |
+| `dcg packs --verbose` | List all packs with pattern counts |
+| `dcg scan .` | Scan codebase for destructive patterns |
+| `dcg --version` | Show version and build info |
+
+---
+
+## Agent Integration Checklist
+
+When integrating with dcg, ensure your agent:
+
+- [ ] Parses stdout for JSON denial responses
+- [ ] Handles empty stdout as "command allowed"
+- [ ] Uses `ruleId` for stable allowlisting (not pattern text)
+- [ ] Displays `remediation.safeAlternative` to users when available
+- [ ] Respects `severity` for prioritization (critical > high > medium > low)
+- [ ] Uses `dcg explain` before asking users to bypass
+
+---
+
+## JSON Schema Reference
+
+Formal JSON Schema definitions (Draft 2020-12) for all dcg output formats are available in `docs/json-schema/`:
+
+| Schema | Purpose |
+|--------|---------|
+| [`hook-output.json`](docs/json-schema/hook-output.json) | PreToolUse hook denial response format |
+| [`scan-results.json`](docs/json-schema/scan-results.json) | `dcg scan` command output format |
+| [`stats-output.json`](docs/json-schema/stats-output.json) | `dcg stats` command output format |
+| [`error.json`](docs/json-schema/error.json) | Error response formats for various commands |
+
+Use these schemas for:
+- Validating dcg output in automated pipelines
+- Generating type-safe client code
+- Understanding the complete output contract
+
+<!-- end-dcg-machine-readable -->
+
+---
+
 ## MCP Agent Mail — Multi-Agent Coordination
 
 A mail-like layer that lets coding agents coordinate asynchronously via MCP tools and resources. Provides identities, inbox/outbox, searchable threads, and advisory file reservations with human-auditable artifacts in Git.

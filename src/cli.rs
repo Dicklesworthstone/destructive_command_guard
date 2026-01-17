@@ -56,6 +56,16 @@ pub enum Command {
         format: DoctorFormat,
     },
 
+    /// Run in hook mode with batch processing support
+    ///
+    /// Explicit hook mode for processing commands from stdin. When `--batch` is
+    /// specified, reads JSONL (one JSON hook input per line) and outputs JSONL
+    /// with decisions.
+    ///
+    /// Without `--batch`, behaves identically to running `dcg` with no subcommand.
+    #[command(name = "hook")]
+    Hook(HookCommand),
+
     /// Manage allowlist entries (add, list, remove, validate)
     #[command(name = "allowlist")]
     Allowlist {
@@ -135,6 +145,10 @@ pub enum Command {
         /// Show detailed information including pattern counts
         #[arg(short, long)]
         verbose: bool,
+
+        /// Output format (json for structured output, pretty for human-readable)
+        #[arg(long, short = 'f', value_enum, default_value = "pretty")]
+        format: PacksFormat,
     },
 
     /// Pack management commands (info, validate)
@@ -158,9 +172,9 @@ pub enum Command {
         #[arg(long)]
         explain: bool,
 
-        /// Output format when using --explain
+        /// Output format (json for structured output, pretty for human-readable)
         #[arg(long, short = 'f', value_enum, default_value = "pretty")]
-        format: ExplainFormat,
+        format: TestFormat,
 
         /// Enable heredoc/inline-script scanning (overrides config)
         #[arg(long = "heredoc-scan", conflicts_with = "no_heredoc_scan")]
@@ -277,6 +291,59 @@ pub enum Command {
     },
 }
 
+/// `dcg hook` command arguments.
+#[derive(Args, Debug)]
+pub struct HookCommand {
+    /// Enable batch mode: read JSONL from stdin, output JSONL results
+    ///
+    /// Each line should be a JSON hook input:
+    /// ```jsonl
+    /// {"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}
+    /// {"tool_name":"Bash","tool_input":{"command":"git status"}}
+    /// ```
+    ///
+    /// Output format:
+    /// ```jsonl
+    /// {"index":0,"decision":"deny","rule_id":"core.filesystem:rm-rf-root"}
+    /// {"index":1,"decision":"allow"}
+    /// ```
+    #[arg(long)]
+    pub batch: bool,
+
+    /// Process commands in parallel (implies --batch)
+    ///
+    /// Uses multiple threads to evaluate commands concurrently.
+    /// Output maintains input order via the `index` field.
+    #[arg(long)]
+    pub parallel: bool,
+
+    /// Number of parallel workers (default: number of CPUs)
+    #[arg(long, default_value = "0")]
+    pub workers: usize,
+
+    /// Continue processing on parse errors (skip invalid lines)
+    #[arg(long)]
+    pub continue_on_error: bool,
+}
+
+/// Output format for batch hook mode.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BatchHookOutput {
+    /// Index of the input line (0-based)
+    pub index: usize,
+    /// Decision: "allow" or "deny"
+    pub decision: &'static str,
+    /// Rule ID if denied (e.g., "core.git:reset-hard")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    /// Pack ID if denied
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+    /// Error message if parsing failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// `dcg corpus` command arguments.
 #[derive(Args, Debug)]
 pub struct CorpusCommand {
@@ -345,6 +412,95 @@ pub enum StatsFormat {
     Json,
 }
 
+/// Output format for test command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum TestFormat {
+    /// Human-readable colored output
+    #[default]
+    Pretty,
+    /// Structured JSON output
+    Json,
+}
+
+/// Output format for packs list command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum PacksFormat {
+    /// Human-readable grouped output
+    #[default]
+    Pretty,
+    /// Structured JSON output
+    Json,
+}
+
+/// JSON output structure for `dcg test` command
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TestOutput {
+    /// The command that was tested
+    pub command: String,
+    /// The decision: "allow" or "deny"
+    pub decision: String,
+    /// Rule ID if blocked (e.g., "core.git:reset-hard")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    /// Pack ID that matched (e.g., "core.git")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+    /// Pattern name within the pack
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern_name: Option<String>,
+    /// Reason for blocking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Match source: "config_override", "pack", "heredoc_ast", etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Matched span (start, end) in the command
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_span: Option<(usize, usize)>,
+    /// Allowlist override info if allowed via allowlist
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowlist: Option<AllowlistOverrideInfo>,
+}
+
+/// Allowlist override information in test output
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AllowlistOverrideInfo {
+    /// Which layer: "project", "user", "system"
+    pub layer: String,
+    /// Reason from the allowlist entry
+    pub reason: String,
+}
+
+/// JSON output structure for `dcg packs` command
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PacksOutput {
+    /// List of all packs
+    pub packs: Vec<PackInfo>,
+    /// Count of enabled packs
+    pub enabled_count: usize,
+    /// Total pack count
+    pub total_count: usize,
+}
+
+/// Pack information in the packs list
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PackInfo {
+    /// Pack ID (e.g., "core.git")
+    pub id: String,
+    /// Human-readable name
+    pub name: String,
+    /// Category (e.g., "core", "database")
+    pub category: String,
+    /// Description
+    pub description: String,
+    /// Whether the pack is enabled
+    pub enabled: bool,
+    /// Number of safe patterns
+    pub safe_pattern_count: usize,
+    /// Number of destructive patterns
+    pub destructive_pattern_count: usize,
+}
+
 /// `dcg suggest-allowlist` command arguments.
 #[derive(Args, Debug)]
 pub struct SuggestAllowlistCommand {
@@ -375,6 +531,10 @@ pub struct SuggestAllowlistCommand {
     /// Maximum number of suggestions to show
     #[arg(long, default_value = "20")]
     pub limit: usize,
+
+    /// Undo recently added auto-suggested patterns (removes patterns added in the last N minutes)
+    #[arg(long)]
+    pub undo: Option<u32>,
 }
 
 /// Output format for suggest-allowlist command.
@@ -653,6 +813,10 @@ pub struct UpdateCommand {
     /// Output format for version check
     #[arg(long, short = 'f', value_enum, default_value_t = UpdateFormat::Pretty, requires = "check")]
     pub format: UpdateFormat,
+
+    /// Skip confirmation prompt (native update only)
+    #[arg(long, conflicts_with_all = ["check", "system", "easy_mode", "from_source", "quiet", "no_gum"])]
+    pub force: bool,
 
     /// Install specific version (default: latest)
     #[arg(long)]
@@ -1158,6 +1322,9 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Doctor { fix, format }) => {
             doctor(fix, format);
         }
+        Some(Command::Hook(cmd)) => {
+            run_hook_command(&config, cmd)?;
+        }
         Some(Command::Install { force }) => {
             install_hook(force)?;
         }
@@ -1167,8 +1334,8 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Update(update)) => {
             self_update(update)?;
         }
-        Some(Command::ListPacks { enabled, verbose }) => {
-            list_packs(&config, enabled, verbose);
+        Some(Command::ListPacks { enabled, verbose, format }) => {
+            list_packs(&config, enabled, verbose, format);
         }
         Some(Command::Pack { action }) => {
             handle_pack_command(&config, action)?;
@@ -1185,12 +1352,18 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }) => {
             if explain {
                 // Delegate to explain handler for detailed trace output
-                handle_explain(&config, &command, format, with_packs);
+                // Convert TestFormat to ExplainFormat for explain mode
+                let explain_format = match format {
+                    TestFormat::Pretty => ExplainFormat::Pretty,
+                    TestFormat::Json => ExplainFormat::Json,
+                };
+                handle_explain(&config, &command, explain_format, with_packs);
             } else {
                 test_command(
                     &config,
                     &command,
                     with_packs,
+                    format,
                     heredoc_scan,
                     no_heredoc_scan,
                     heredoc_timeout_ms,
@@ -1268,11 +1441,357 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// ============================================================================
+// Hook Command (dcg hook --batch)
+// ============================================================================
+
+/// Run the hook command with optional batch processing.
+fn run_hook_command(
+    config: &Config,
+    cmd: HookCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{self, BufRead, Write};
+
+    // If not batch mode and not parallel, fall through to normal hook mode
+    if !cmd.batch && !cmd.parallel {
+        // Delegate to main.rs hook mode by returning an error
+        // that main.rs will catch and handle
+        return Err("Hook mode without --batch; delegating to main.rs".into());
+    }
+
+    // Parallel implies batch
+    let _parallel = cmd.parallel;
+    let workers = if cmd.workers == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    } else {
+        cmd.workers
+    };
+
+    // Load configuration for evaluation
+    let compiled_overrides = config.overrides.compile();
+    let allowlists = crate::load_default_allowlists();
+    let heredoc_settings = config.heredoc_settings();
+    let enabled_packs = config.enabled_pack_ids();
+    let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+    let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
+
+    // Load external packs
+    let external_packs: Vec<crate::Pack> = {
+        let loader = crate::packs::external::ExternalPackLoader::from_config(&config.packs);
+        let result = loader.load_all_deduped();
+        result.packs.into_iter().map(|loaded| loaded.pack).collect()
+    };
+
+    let enabled_keywords: Vec<&str> = {
+        let mut keywords = enabled_keywords;
+        for pack in &external_packs {
+            for kw in pack.keywords {
+                if !keywords.contains(kw) {
+                    keywords.push(kw);
+                }
+            }
+        }
+        keywords
+    };
+
+    let external_packs_slice: Option<&[crate::Pack]> = if external_packs.is_empty() {
+        None
+    } else {
+        Some(&external_packs)
+    };
+
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut stdout_lock = stdout.lock();
+
+    if cmd.parallel && workers > 1 {
+        // Parallel processing: collect all lines, process in parallel, output in order
+        let lines: Vec<(usize, String)> = stdin
+            .lock()
+            .lines()
+            .enumerate()
+            .filter_map(|(idx, line)| line.ok().map(|l| (idx, l)))
+            .collect();
+
+        // Process in parallel using rayon
+        #[cfg(feature = "rayon")]
+        {
+            use rayon::prelude::*;
+
+            let results: Vec<BatchHookOutput> = lines
+                .into_par_iter()
+                .map(|(index, line)| {
+                    evaluate_batch_line(
+                        index,
+                        &line,
+                        &enabled_keywords,
+                        &ordered_packs,
+                        keyword_index.as_ref(),
+                        &compiled_overrides,
+                        &allowlists,
+                        &heredoc_settings,
+                        external_packs_slice,
+                        cmd.continue_on_error,
+                    )
+                })
+                .collect();
+
+            // Sort by index and output
+            let mut sorted = results;
+            sorted.sort_by_key(|r| r.index);
+
+            for result in sorted {
+                let json = serde_json::to_string(&result)?;
+                writeln!(stdout_lock, "{json}")?;
+            }
+        }
+
+        // Fallback to sequential if rayon is not available
+        #[cfg(not(feature = "rayon"))]
+        {
+            for (index, line) in lines {
+                let result = evaluate_batch_line(
+                    index,
+                    &line,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    keyword_index.as_ref(),
+                    &compiled_overrides,
+                    &allowlists,
+                    &heredoc_settings,
+                    external_packs_slice,
+                    cmd.continue_on_error,
+                );
+                let json = serde_json::to_string(&result)?;
+                writeln!(stdout_lock, "{json}")?;
+            }
+        }
+    } else {
+        // Sequential processing: stream input to output
+        for (index, line) in stdin.lock().lines().enumerate() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    if cmd.continue_on_error {
+                        let result = BatchHookOutput {
+                            index,
+                            decision: "error",
+                            rule_id: None,
+                            pack_id: None,
+                            error: Some(format!("IO error: {e}")),
+                        };
+                        let json = serde_json::to_string(&result)?;
+                        writeln!(stdout_lock, "{json}")?;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
+
+            let result = evaluate_batch_line(
+                index,
+                &line,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled_overrides,
+                &allowlists,
+                &heredoc_settings,
+                external_packs_slice,
+                cmd.continue_on_error,
+            );
+            let json = serde_json::to_string(&result)?;
+            writeln!(stdout_lock, "{json}")?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Evaluate a single batch line and return the result.
+fn evaluate_batch_line(
+    index: usize,
+    line: &str,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &crate::allowlist::LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    external_packs: Option<&[crate::Pack]>,
+    continue_on_error: bool,
+) -> BatchHookOutput {
+    // Skip empty lines
+    if line.trim().is_empty() {
+        return BatchHookOutput {
+            index,
+            decision: "skip",
+            rule_id: None,
+            pack_id: None,
+            error: Some("Empty line".to_string()),
+        };
+    }
+
+    // Parse JSON input
+    let hook_input: crate::hook::HookInput = match serde_json::from_str(line) {
+        Ok(input) => input,
+        Err(e) => {
+            if continue_on_error {
+                return BatchHookOutput {
+                    index,
+                    decision: "error",
+                    rule_id: None,
+                    pack_id: None,
+                    error: Some(format!("JSON parse error: {e}")),
+                };
+            }
+            return BatchHookOutput {
+                index,
+                decision: "error",
+                rule_id: None,
+                pack_id: None,
+                error: Some(format!("JSON parse error: {e}")),
+            };
+        }
+    };
+
+    // Only process Bash tool invocations
+    if hook_input.tool_name.as_deref() != Some("Bash") {
+        return BatchHookOutput {
+            index,
+            decision: "skip",
+            rule_id: None,
+            pack_id: None,
+            error: Some("Not a Bash tool invocation".to_string()),
+        };
+    }
+
+    let Some(tool_input) = hook_input.tool_input else {
+        return BatchHookOutput {
+            index,
+            decision: "skip",
+            rule_id: None,
+            pack_id: None,
+            error: Some("Missing tool_input".to_string()),
+        };
+    };
+
+    let Some(command_value) = tool_input.command else {
+        return BatchHookOutput {
+            index,
+            decision: "skip",
+            rule_id: None,
+            pack_id: None,
+            error: Some("Missing command".to_string()),
+        };
+    };
+
+    let serde_json::Value::String(command) = command_value else {
+        return BatchHookOutput {
+            index,
+            decision: "skip",
+            rule_id: None,
+            pack_id: None,
+            error: Some("Command is not a string".to_string()),
+        };
+    };
+
+    if command.is_empty() {
+        return BatchHookOutput {
+            index,
+            decision: "skip",
+            rule_id: None,
+            pack_id: None,
+            error: Some("Empty command".to_string()),
+        };
+    }
+
+    // Evaluate the command
+    let eval_result = evaluate_command_with_pack_order_deadline_with_external(
+        &command,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        None,
+        None,
+        None, // No deadline for batch mode
+        external_packs,
+    );
+
+    match eval_result.decision {
+        EvaluationDecision::Allow => BatchHookOutput {
+            index,
+            decision: "allow",
+            rule_id: None,
+            pack_id: None,
+            error: None,
+        },
+        EvaluationDecision::Deny => {
+            // Extract pattern info for deny decisions
+            let (rule_id, pack_id) = if let Some(ref info) = eval_result.pattern_info {
+                let rule_id = match (&info.pack_id, &info.pattern_name) {
+                    (Some(p), Some(pat)) => Some(format!("{p}:{pat}")),
+                    (Some(p), None) => Some(p.clone()),
+                    _ => None,
+                };
+                (rule_id, info.pack_id.clone())
+            } else {
+                (None, None)
+            };
+
+            BatchHookOutput {
+                index,
+                decision: "deny",
+                rule_id,
+                pack_id,
+                error: None,
+            }
+        }
+    }
+}
+
 /// List all packs and their status
-fn list_packs(config: &Config, enabled_only: bool, verbose: bool) {
+fn list_packs(config: &Config, enabled_only: bool, verbose: bool, format: PacksFormat) {
     let enabled_packs = config.enabled_pack_ids();
     let infos = REGISTRY.list_packs(&enabled_packs);
 
+    // Build pack list (filtered if enabled_only)
+    let pack_list: Vec<PackInfo> = infos
+        .iter()
+        .filter(|info| !enabled_only || info.enabled)
+        .map(|info| {
+            let category = info.id.split('.').next().unwrap_or(&info.id).to_string();
+            PackInfo {
+                id: info.id.to_string(),
+                name: info.name.to_string(),
+                category,
+                description: info.description.to_string(),
+                enabled: info.enabled,
+                safe_pattern_count: info.safe_pattern_count,
+                destructive_pattern_count: info.destructive_pattern_count,
+            }
+        })
+        .collect();
+
+    // Handle JSON output
+    if format == PacksFormat::Json {
+        let enabled_count = pack_list.iter().filter(|p| p.enabled).count();
+        let output = PacksOutput {
+            packs: pack_list,
+            enabled_count,
+            total_count: infos.len(),
+        };
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        return;
+    }
+
+    // Pretty output (default)
     println!("Available packs:");
     println!();
 
@@ -1849,6 +2368,7 @@ fn test_command(
     config: &Config,
     command: &str,
     extra_packs: Option<Vec<String>>,
+    format: TestFormat,
     heredoc_scan: bool,
     no_heredoc_scan: bool,
     heredoc_timeout_ms: Option<u64>,
@@ -1934,6 +2454,69 @@ fn test_command(
         external_packs_slice,
     );
 
+    // Handle JSON output
+    if format == TestFormat::Json {
+        let output = match result.decision {
+            EvaluationDecision::Allow => {
+                let allowlist = result.allowlist_override.as_ref().map(|info| {
+                    AllowlistOverrideInfo {
+                        layer: info.layer.label().to_string(),
+                        reason: info.reason.clone(),
+                    }
+                });
+                TestOutput {
+                    command: command.to_string(),
+                    decision: "allow".to_string(),
+                    rule_id: None,
+                    pack_id: None,
+                    pattern_name: None,
+                    reason: None,
+                    source: None,
+                    matched_span: None,
+                    allowlist,
+                }
+            }
+            EvaluationDecision::Deny => {
+                let (pack_id, pattern_name, reason, source_str, matched_span, rule_id) =
+                    if let Some(ref info) = result.pattern_info {
+                        let source_str = match info.source {
+                            MatchSource::ConfigOverride => "config_override",
+                            MatchSource::LegacyPattern => "legacy_pattern",
+                            MatchSource::Pack => "pack",
+                            MatchSource::HeredocAst => "heredoc_ast",
+                        };
+                        let rule_id = info.pack_id.as_ref().and_then(|p| {
+                            info.pattern_name.as_ref().map(|n| format!("{p}:{n}"))
+                        });
+                        (
+                            info.pack_id.clone(),
+                            info.pattern_name.clone(),
+                            Some(info.reason.clone()),
+                            Some(source_str.to_string()),
+                            info.matched_span.as_ref().map(|s| (s.start, s.end)),
+                            rule_id,
+                        )
+                    } else {
+                        (None, None, None, None, None, None)
+                    };
+                TestOutput {
+                    command: command.to_string(),
+                    decision: "deny".to_string(),
+                    rule_id,
+                    pack_id,
+                    pattern_name,
+                    reason,
+                    source: source_str,
+                    matched_span,
+                    allowlist: None,
+                }
+            }
+        };
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        return;
+    }
+
+    // Pretty output (default)
     // Use color based on terminal detection
     let use_color = should_use_color();
 
@@ -3151,7 +3734,7 @@ fn handle_explain(
 }
 
 // =============================================================================
-// Corpus command implementation
+// =============================================================================
 // =============================================================================
 
 /// A single test case loaded from the corpus.
@@ -3693,6 +4276,11 @@ fn handle_suggest_allowlist_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::HashMap;
 
+    // Handle --undo mode first
+    if let Some(minutes) = cmd.undo {
+        return handle_suggest_allowlist_undo(minutes);
+    }
+
     // Parse the "since" duration
     let duration = parse_duration_string(&cmd.since)?;
     let since_time = Utc::now() - duration;
@@ -3795,8 +4383,8 @@ fn handle_suggest_allowlist_command(
                 // Non-interactive mode: no writes to database
                 output_suggestions_text(&suggestions);
             } else {
-                // Interactive mode: pass db for audit logging
-                output_suggestions_interactive(&suggestions, entries.len(), Some(&db))?;
+                // Interactive mode: pass db for audit logging and config for conflict detection
+                output_suggestions_interactive(&suggestions, entries.len(), Some(&db), config)?;
             }
         }
     }
@@ -3885,8 +4473,10 @@ fn output_suggestions_interactive(
     suggestions: &[AllowlistSuggestion],
     total_denied: usize,
     db: Option<&HistoryDb>,
+    config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{self, BufRead, Write};
+    use colored::Colorize;
 
     println!("Analyzing {total_denied} denied commands...");
     println!("Found {} potential allowlist patterns.", suggestions.len());
@@ -3916,6 +4506,9 @@ fn output_suggestions_interactive(
             RiskLevel::High => "HIGH",
         };
 
+        // Check for potential conflicts before displaying
+        let conflict_check = check_pattern_conflicts(&suggestion.pattern, config);
+
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         println!(
             " [{}/{}] {} CONFIDENCE",
@@ -3930,6 +4523,22 @@ fn output_suggestions_interactive(
             " Risk: {} ({})",
             risk_indicator, suggestion.risk.explanation
         );
+
+        // Display warnings if there are conflicts or the pattern is overly broad
+        if conflict_check.conflicts_with_blocks || conflict_check.is_overly_broad {
+            println!();
+            println!(" {}", "⚠ Warnings:".yellow());
+            if let Some(ref warning) = conflict_check.block_conflict_warning {
+                println!("   • {}", warning.yellow());
+            }
+            if conflict_check.is_overly_broad {
+                println!("   • {}", "Pattern is overly broad (uses wildcards without anchors)".yellow());
+                if let Some(ref suggestion_text) = conflict_check.refinement_suggestion {
+                    println!("     {}", suggestion_text.dimmed());
+                }
+            }
+        }
+
         println!();
         println!(" Example commands:");
         for cmd in &suggestion.example_commands {
@@ -3969,10 +4578,43 @@ fn output_suggestions_interactive(
                         eprintln!(" Warning: Could not log audit entry: {e}");
                     }
                 }
-                // TODO(git_safety_guard-f2rj): Integrate with allowlist config writing
-                println!(" → Pattern accepted and logged. To add to allowlist, run:");
-                println!("   dcg allow --pattern '{}'", suggestion.pattern);
-                println!();
+
+                // Generate a descriptive reason from the suggestion
+                let reason = if !suggestion.example_commands.is_empty() {
+                    format!("Matches commands like: {}", suggestion.example_commands[0])
+                } else {
+                    "Auto-suggested from history analysis".to_string()
+                };
+
+                // Write the pattern to the allowlist
+                match allowlist_add_pattern(
+                    &suggestion.pattern,
+                    &reason,
+                    suggestion.risk.level.as_str(),
+                    &suggestion.confidence.tier.as_str().to_lowercase(),
+                    suggestion.frequency,
+                    suggestion.unique_variants,
+                ) {
+                    Ok(path) => {
+                        use colored::Colorize;
+                        println!(" {} Pattern added to allowlist", "✓".green());
+                        println!("   File: {}", path.display());
+                        println!();
+                    }
+                    Err(e) => {
+                        use colored::Colorize;
+                        // Check if it's a duplicate error (not a real failure)
+                        if e.to_string().contains("already exists") {
+                            println!(" {} Pattern already in allowlist", "ℹ".cyan());
+                        } else {
+                            eprintln!(" {} Could not write to allowlist: {e}", "✗".red());
+                            println!("   You can manually add it with:");
+                            println!("   dcg allowlist add-pattern --pattern '{}' --reason '{}'",
+                                suggestion.pattern, reason);
+                        }
+                        println!();
+                    }
+                }
             }
             "q" | "quit" => {
                 println!();
@@ -5245,11 +5887,83 @@ fn self_update(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> 
         return handle_version_check(update.refresh, update.format);
     }
 
+    // Use native Rust update if no installer-specific flags are set
+    let uses_installer_flags =
+        update.system || update.easy_mode || update.from_source || update.quiet || update.no_gum;
+
+    if !uses_installer_flags {
+        return self_update_native(&update);
+    }
+
     if cfg!(windows) {
         return self_update_windows(update);
     }
 
     self_update_unix(update)
+}
+
+/// Perform update using native Rust self_update crate.
+fn self_update_native(update: &UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::update::{format_update_result, perform_update};
+
+    let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
+
+    // If not forcing, confirm with user
+    if !update.force {
+        // First check if there's an update available
+        use crate::update::check_for_update;
+        match check_for_update(false) {
+            Ok(result) => {
+                if !result.update_available {
+                    if use_color {
+                        println!("\x1b[32m✓\x1b[0m Already running the latest version ({})", result.current_version);
+                    } else {
+                        println!("Already running the latest version ({})", result.current_version);
+                    }
+                    return Ok(());
+                }
+
+                // Show what's available and prompt for confirmation
+                if use_color {
+                    println!("\x1b[1mUpdate available:\x1b[0m {} → {}", result.current_version, result.latest_version);
+                } else {
+                    println!("Update available: {} -> {}", result.current_version, result.latest_version);
+                }
+
+                // Interactive confirmation
+                if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    print!("Proceed with update? [y/N] ");
+                    use std::io::Write;
+                    std::io::stdout().flush()?;
+
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+                    let response = input.trim().to_lowercase();
+                    if response != "y" && response != "yes" {
+                        println!("Update cancelled.");
+                        return Ok(());
+                    }
+                } else {
+                    // Non-interactive: require --force
+                    return Err("Non-interactive mode requires --force flag".into());
+                }
+            }
+            Err(e) => {
+                return Err(format!("Failed to check for updates: {e}").into());
+            }
+        }
+    }
+
+    // Perform the update
+    eprintln!("Downloading and installing update...");
+
+    match perform_update(update.force, update.version.as_deref()) {
+        Ok(result) => {
+            print!("{}", format_update_result(&result, use_color));
+            Ok(())
+        }
+        Err(e) => Err(format!("Update failed: {e}").into()),
+    }
 }
 
 /// Check for updates and display the result.
@@ -6923,17 +7637,57 @@ fn load_or_create_allowlist_doc(
     }
 }
 
-/// Write the allowlist document back to disk.
+/// Write the allowlist document back to disk atomically.
+///
+/// Uses a temp file + rename strategy to prevent corruption:
+/// 1. Write content to a temp file in the same directory
+/// 2. Validate the temp file parses correctly as TOML
+/// 3. Atomically rename temp file to target path
+///
+/// This ensures that power loss or crash during write won't leave a
+/// corrupted allowlist file.
 fn write_allowlist(
     path: &std::path::Path,
     doc: &toml_edit::DocumentMut,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
     // Create parent directory if needed
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    std::fs::write(path, doc.to_string())?;
+    let content = doc.to_string();
+
+    // Create temp file in same directory (required for atomic rename on same filesystem)
+    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    let temp_name = format!(
+        ".dcg-allowlist-{}.tmp",
+        std::process::id()
+    );
+    let temp_path = parent.join(&temp_name);
+
+    // Write to temp file
+    {
+        let mut temp_file = std::fs::File::create(&temp_path)?;
+        temp_file.write_all(content.as_bytes())?;
+        temp_file.sync_all()?; // Ensure data is flushed to disk
+    }
+
+    // Validate the temp file parses correctly before committing
+    let verification = std::fs::read_to_string(&temp_path)?;
+    if let Err(parse_err) = verification.parse::<toml_edit::DocumentMut>() {
+        // Remove temp file on parse failure
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!(
+            "Generated TOML failed validation (this is a bug): {}",
+            parse_err
+        ).into());
+    }
+
+    // Atomic rename (on Unix, this is atomic; on Windows, it replaces atomically)
+    std::fs::rename(&temp_path, path)?;
+
     Ok(())
 }
 
@@ -7023,6 +7777,298 @@ fn build_command_entry(command: &str, reason: &str, expires: Option<&str>) -> to
     }
 
     tbl
+}
+
+/// Build a new pattern entry for a regex-based allowlist (from suggest-allowlist).
+///
+/// Pattern entries require `risk_acknowledged = true` because they use regex matching.
+fn build_pattern_entry(
+    pattern: &str,
+    reason: &str,
+    risk_level: &str,
+    confidence_tier: &str,
+    frequency: usize,
+    unique_variants: usize,
+) -> toml_edit::Table {
+    let mut tbl = toml_edit::Table::new();
+
+    tbl.insert("pattern", toml_edit::value(pattern));
+
+    // Build a descriptive reason with metadata
+    let full_reason = format!(
+        "{} (auto-suggested: {} confidence, {} risk, {} occurrences, {} variants)",
+        reason, confidence_tier, risk_level, frequency, unique_variants
+    );
+    tbl.insert("reason", toml_edit::value(full_reason));
+
+    // Add audit metadata
+    if let Some(user) = get_current_user() {
+        tbl.insert("added_by", toml_edit::value(user));
+    }
+    tbl.insert("added_at", toml_edit::value(current_timestamp()));
+
+    // Pattern-based allowlist entries MUST acknowledge risk
+    tbl.insert("risk_acknowledged", toml_edit::value(true));
+
+    tbl
+}
+
+/// Check if a pattern entry already exists in the document.
+fn has_pattern_entry(doc: &toml_edit::DocumentMut, pattern: &str) -> bool {
+    let Some(allow) = doc.get("allow") else {
+        return false;
+    };
+    let Some(arr) = allow.as_array_of_tables() else {
+        return false;
+    };
+
+    arr.iter().any(|tbl| {
+        tbl.get("pattern")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s == pattern)
+    })
+}
+
+/// Add a regex pattern to the allowlist (from suggest-allowlist).
+///
+/// Returns Ok(path) on success, or Err on failure.
+fn allowlist_add_pattern(
+    pattern: &str,
+    reason: &str,
+    risk_level: &str,
+    confidence_tier: &str,
+    frequency: usize,
+    unique_variants: usize,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    // Determine layer: prefer project if in a git repo, else user
+    let layer = if find_repo_root_from_cwd().is_some() {
+        AllowlistLayer::Project
+    } else {
+        AllowlistLayer::User
+    };
+
+    let path = allowlist_path_for_layer(layer);
+    let mut doc = load_or_create_allowlist_doc(&path)?;
+
+    // Check for duplicate
+    if has_pattern_entry(&doc, pattern) {
+        return Err(format!("Pattern '{}' already exists in {} allowlist", pattern, layer.label()).into());
+    }
+
+    // Build and append entry
+    let entry = build_pattern_entry(pattern, reason, risk_level, confidence_tier, frequency, unique_variants);
+    append_entry(&mut doc, entry);
+
+    // Write atomically (temp file + rename to prevent corruption)
+    write_allowlist(&path, &doc)?;
+
+    Ok(path)
+}
+
+/// Result of pattern conflict detection.
+#[derive(Debug, Default)]
+pub struct PatternConflictCheck {
+    /// True if the pattern may conflict with existing block overrides.
+    pub conflicts_with_blocks: bool,
+    /// Human-readable warning message if conflicts exist.
+    pub block_conflict_warning: Option<String>,
+    /// True if the pattern is overly broad (contains unconstrained wildcards).
+    pub is_overly_broad: bool,
+    /// Human-readable suggestion for refinement if too broad.
+    pub refinement_suggestion: Option<String>,
+}
+
+/// Check if a suggested pattern has potential conflicts or issues.
+///
+/// This function performs two checks:
+/// 1. Does this pattern potentially overlap with any configured block overrides?
+/// 2. Is this pattern overly broad (contains .* or .+ without anchoring)?
+///
+/// These are informational warnings - they don't prevent adding the pattern.
+fn check_pattern_conflicts(
+    pattern: &str,
+    config: &Config,
+) -> PatternConflictCheck {
+    let mut result = PatternConflictCheck::default();
+
+    // Check for overly broad patterns
+    // A pattern is "overly broad" if it uses .* or .+ without anchors
+    let has_unanchored_wildcard = (pattern.contains(".*") || pattern.contains(".+"))
+        && !pattern.starts_with('^')
+        && !pattern.ends_with('$');
+
+    if has_unanchored_wildcard {
+        result.is_overly_broad = true;
+        result.refinement_suggestion = Some(
+            "Consider adding anchors (^ and $) or more specific token patterns \
+             to avoid matching unintended commands.".to_string()
+        );
+    }
+
+    // Check for conflicts with block overrides
+    // We compile the pattern and see if any of the block patterns would match
+    // the same space. This is a heuristic check.
+    let compiled_overrides = config.overrides.compile();
+    if compiled_overrides.block.is_empty() {
+        return result;
+    }
+
+    // For each block pattern, check if there's textual overlap
+    // This is a simple heuristic: we look for common substrings
+    let pattern_lower = pattern.to_lowercase();
+    for block in &compiled_overrides.block {
+        let block_pattern_lower = block.pattern.to_lowercase();
+
+        // Check for substring overlap in the pattern text
+        // This is imperfect but catches obvious cases
+        let overlap = find_pattern_overlap(&pattern_lower, &block_pattern_lower);
+        if overlap {
+            result.conflicts_with_blocks = true;
+            result.block_conflict_warning = Some(format!(
+                "This pattern may conflict with block override: '{}' ({})",
+                block.pattern, block.reason
+            ));
+            break;
+        }
+    }
+
+    result
+}
+
+/// Check for textual overlap between two regex patterns.
+///
+/// This is a heuristic check that looks for common literal substrings
+/// that might indicate the patterns could match overlapping commands.
+fn find_pattern_overlap(pattern1: &str, pattern2: &str) -> bool {
+    // Extract literal tokens from patterns (words, commands)
+    let tokens1: Vec<&str> = pattern1
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+        .filter(|s| s.len() >= 3) // Only consider meaningful tokens
+        .collect();
+
+    let tokens2: Vec<&str> = pattern2
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+        .filter(|s| s.len() >= 3)
+        .collect();
+
+    // Check for any common tokens
+    for t1 in &tokens1 {
+        for t2 in &tokens2 {
+            if t1 == t2 {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Handle the --undo flag for suggest-allowlist.
+///
+/// Removes auto-suggested pattern entries that were added within the last N minutes.
+/// This allows users to undo patterns they accepted by mistake.
+fn handle_suggest_allowlist_undo(minutes: u32) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let cutoff = Utc::now() - chrono::Duration::minutes(i64::from(minutes));
+
+    // Check both project and user allowlists
+    let layers_to_check = [
+        (AllowlistLayer::Project, find_repo_root_from_cwd().map(|r| r.join(".dcg").join("allowlist.toml"))),
+        (AllowlistLayer::User, dirs::config_dir().map(|d| d.join("dcg").join("allowlist.toml"))),
+    ];
+
+    let mut total_removed = 0;
+
+    for (layer, path_opt) in layers_to_check {
+        let Some(path) = path_opt else {
+            continue;
+        };
+
+        if !path.exists() {
+            continue;
+        }
+
+        let mut doc = match load_or_create_allowlist_doc(&path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let removed = remove_auto_suggested_entries(&mut doc, cutoff);
+        if removed > 0 {
+            write_allowlist(&path, &doc)?;
+            println!(
+                "{} Removed {} auto-suggested pattern(s) from {} allowlist ({})",
+                "✓".green(),
+                removed,
+                layer.label(),
+                path.display()
+            );
+            total_removed += removed;
+        }
+    }
+
+    if total_removed == 0 {
+        println!("No auto-suggested patterns found added in the last {} minutes.", minutes);
+        println!();
+        println!("Patterns are identified by:");
+        println!("  - Having 'auto-suggested' in the reason field");
+        println!("  - Having an added_at timestamp within the time window");
+    } else {
+        println!();
+        println!("Total: {} pattern(s) removed.", total_removed);
+    }
+
+    Ok(())
+}
+
+/// Remove auto-suggested entries added after the cutoff time.
+///
+/// Returns the number of entries removed.
+fn remove_auto_suggested_entries(
+    doc: &mut toml_edit::DocumentMut,
+    cutoff: chrono::DateTime<Utc>,
+) -> usize {
+    let Some(allow) = doc.get_mut("allow") else {
+        return 0;
+    };
+    let Some(arr) = allow.as_array_of_tables_mut() else {
+        return 0;
+    };
+
+    let initial_len = arr.len();
+
+    // Find indices to remove (reverse order to avoid index shifting)
+    let mut remove_indices: Vec<usize> = Vec::new();
+    for (idx, tbl) in arr.iter().enumerate() {
+        // Check if it's an auto-suggested pattern entry
+        let is_pattern = tbl.get("pattern").is_some();
+        let is_auto_suggested = tbl
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .is_some_and(|r| r.contains("auto-suggested"));
+
+        if !is_pattern || !is_auto_suggested {
+            continue;
+        }
+
+        // Check the added_at timestamp
+        let added_at = tbl.get("added_at").and_then(|v| v.as_str());
+        if let Some(timestamp) = added_at {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(timestamp) {
+                if dt >= cutoff {
+                    remove_indices.push(idx);
+                }
+            }
+        }
+    }
+
+    // Remove in reverse order to maintain correct indices
+    for idx in remove_indices.into_iter().rev() {
+        arr.remove(idx);
+    }
+
+    initial_len - arr.len()
 }
 
 /// Append an entry to the [[allow]] array.
@@ -8162,6 +9208,75 @@ mod tests {
     }
 
     #[test]
+    fn allowlist_pattern_entry_creates_valid_toml() {
+        use tempfile::TempDir;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("allowlist.toml");
+
+        // File should not exist yet
+        assert!(!path.exists());
+
+        // Create a pattern entry (as would be done by suggest-allowlist)
+        let mut doc = load_or_create_allowlist_doc(&path).unwrap();
+        let entry = build_pattern_entry(
+            "npm run (build|test|lint)",
+            "NPM scripts",
+            "low",
+            "high",
+            42,
+            3,
+        );
+        append_entry(&mut doc, entry);
+        write_allowlist(&path, &doc).unwrap();
+
+        // File should now exist with correct content
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("pattern = \"npm run (build|test|lint)\""),
+            "pattern should be in TOML"
+        );
+        assert!(
+            content.contains("risk_acknowledged = true"),
+            "risk_acknowledged should be true for patterns"
+        );
+        assert!(
+            content.contains("auto-suggested"),
+            "reason should mention auto-suggested"
+        );
+        assert!(
+            content.contains("42 occurrences"),
+            "reason should include frequency"
+        );
+    }
+
+    #[test]
+    fn allowlist_pattern_duplicate_detection() {
+        use tempfile::TempDir;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("allowlist.toml");
+
+        let pattern = "npm run (build|test)";
+
+        // Add first pattern entry
+        let mut doc = load_or_create_allowlist_doc(&path).unwrap();
+        let entry = build_pattern_entry(pattern, "test", "low", "high", 10, 2);
+        append_entry(&mut doc, entry);
+        write_allowlist(&path, &doc).unwrap();
+
+        // has_pattern_entry should detect duplicate
+        let doc2 = load_or_create_allowlist_doc(&path).unwrap();
+        assert!(
+            has_pattern_entry(&doc2, pattern),
+            "should detect existing pattern"
+        );
+        assert!(
+            !has_pattern_entry(&doc2, "different pattern"),
+            "should not detect different pattern"
+        );
+    }
+
+    #[test]
     fn allowlist_command_entry_duplicate_detection() {
         use tempfile::TempDir;
         let temp = TempDir::new().unwrap();
@@ -8181,6 +9296,189 @@ mod tests {
             has_command_entry(&doc2, command),
             "should detect existing command"
         );
+    }
+
+    // ========================================================================
+    // Allowlist write safety tests (5apz.5)
+    // ========================================================================
+
+    #[test]
+    fn allowlist_pattern_write_includes_risk_acknowledged() {
+        // Pattern entries must always include risk_acknowledged = true
+        let entry = build_pattern_entry(
+            "rm -rf /tmp/cache.*",
+            "Temporary cache cleanup",
+            "medium",
+            "high",
+            15,
+            3,
+        );
+
+        // Verify risk_acknowledged is present and true
+        let risk_ack = entry.get("risk_acknowledged");
+        assert!(risk_ack.is_some(), "risk_acknowledged field must be present");
+        assert_eq!(
+            risk_ack.unwrap().as_bool(),
+            Some(true),
+            "risk_acknowledged must be true for pattern entries"
+        );
+    }
+
+    #[test]
+    fn allowlist_pattern_write_prevents_duplicates() {
+        use tempfile::TempDir;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("allowlist.toml");
+
+        let pattern = "npm run (dev|start|test)";
+
+        // Write pattern once
+        let mut doc = load_or_create_allowlist_doc(&path).unwrap();
+        let entry = build_pattern_entry(pattern, "NPM scripts", "low", "high", 50, 3);
+        append_entry(&mut doc, entry);
+        write_allowlist(&path, &doc).unwrap();
+
+        // Verify the pattern exists
+        let doc2 = load_or_create_allowlist_doc(&path).unwrap();
+        assert!(
+            has_pattern_entry(&doc2, pattern),
+            "pattern should exist after write"
+        );
+
+        // Attempting to add again should be detected as duplicate
+        assert!(
+            has_pattern_entry(&doc2, pattern),
+            "duplicate detection should work before write attempt"
+        );
+    }
+
+    #[test]
+    fn allowlist_pattern_entry_format_matches_spec() {
+        // Verify all required fields are present in pattern entries
+        let entry = build_pattern_entry(
+            "git (fetch|pull|push) origin",
+            "Git remote operations",
+            "low",
+            "high",
+            100,
+            3,
+        );
+
+        // Required fields for pattern entries
+        assert!(
+            entry.get("pattern").is_some(),
+            "pattern field is required"
+        );
+        assert!(
+            entry.get("reason").is_some(),
+            "reason field is required"
+        );
+        assert!(
+            entry.get("risk_acknowledged").is_some(),
+            "risk_acknowledged is required"
+        );
+        assert!(
+            entry.get("added_at").is_some(),
+            "added_at timestamp is required"
+        );
+
+        // Verify pattern value
+        assert_eq!(
+            entry.get("pattern").unwrap().as_str(),
+            Some("git (fetch|pull|push) origin")
+        );
+
+        // Verify reason includes auto-suggested metadata
+        let reason = entry.get("reason").unwrap().as_str().unwrap();
+        assert!(
+            reason.contains("auto-suggested"),
+            "reason should mention auto-suggested"
+        );
+        assert!(
+            reason.contains("high confidence"),
+            "reason should include confidence tier"
+        );
+        assert!(
+            reason.contains("low risk"),
+            "reason should include risk level"
+        );
+        assert!(
+            reason.contains("100 occurrences"),
+            "reason should include frequency"
+        );
+        assert!(
+            reason.contains("3 variants"),
+            "reason should include variant count"
+        );
+    }
+
+    #[test]
+    fn suggestion_audit_entry_includes_required_metadata() {
+        // Verify that SuggestionAuditEntry can be constructed with all required fields
+        use crate::history::{SuggestionAction, SuggestionAuditEntry};
+
+        let entry = SuggestionAuditEntry {
+            timestamp: Utc::now(),
+            action: SuggestionAction::Accepted,
+            pattern: "npm run (build|test)".to_string(),
+            final_pattern: None,
+            risk_level: "low".to_string(),
+            risk_score: 0.15,
+            confidence_tier: "high".to_string(),
+            confidence_points: 85,
+            cluster_frequency: 42,
+            unique_variants: 3,
+            sample_commands: r#"["npm run build","npm run test"]"#.to_string(),
+            rule_id: None,
+            session_id: Some("test-session-123".to_string()),
+            working_dir: Some("/home/user/project".to_string()),
+        };
+
+        // Verify all fields are accessible and correct
+        assert_eq!(entry.pattern, "npm run (build|test)");
+        assert_eq!(entry.action, SuggestionAction::Accepted);
+        assert_eq!(entry.risk_level, "low");
+        assert!(entry.risk_score > 0.0);
+        assert_eq!(entry.confidence_tier, "high");
+        assert_eq!(entry.confidence_points, 85);
+        assert_eq!(entry.cluster_frequency, 42);
+        assert_eq!(entry.unique_variants, 3);
+        assert!(entry.sample_commands.contains("npm run build"));
+    }
+
+    #[test]
+    fn suggestion_audit_entry_can_be_stored_and_retrieved() {
+        use crate::history::{HistoryDb, SuggestionAction, SuggestionAuditEntry};
+
+        let db = HistoryDb::open_in_memory().unwrap();
+
+        let entry = SuggestionAuditEntry {
+            timestamp: Utc::now(),
+            action: SuggestionAction::Accepted,
+            pattern: "cargo (build|test|run)".to_string(),
+            final_pattern: None,
+            risk_level: "low".to_string(),
+            risk_score: 0.1,
+            confidence_tier: "high".to_string(),
+            confidence_points: 90,
+            cluster_frequency: 100,
+            unique_variants: 3,
+            sample_commands: r#"["cargo build","cargo test"]"#.to_string(),
+            rule_id: None,
+            session_id: Some("cli-test-session".to_string()),
+            working_dir: Some("/test/project".to_string()),
+        };
+
+        // Store the entry
+        let id = db.log_suggestion_audit(&entry).unwrap();
+        assert!(id > 0, "should return positive row ID");
+
+        // Retrieve and verify
+        let results = db.query_suggestion_audits(1, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].pattern, "cargo (build|test|run)");
+        assert_eq!(results[0].action, SuggestionAction::Accepted);
+        assert_eq!(results[0].session_id, Some("cli-test-session".to_string()));
     }
 
     // ========================================================================
@@ -8580,33 +9878,30 @@ exclude = ["target/**"]
         {
             assert_eq!(command, "git reset --hard");
             assert!(explain);
-            assert_eq!(format, ExplainFormat::Pretty); // default format
+            assert_eq!(format, TestFormat::Pretty); // default format
         } else {
             unreachable!("Expected TestCommand");
         }
     }
 
     #[test]
-    fn test_cli_parse_test_with_explain_and_format() {
+    fn test_cli_parse_test_with_format_json() {
         let cli = Cli::try_parse_from([
             "dcg",
             "test",
-            "--explain",
             "--format",
-            "compact",
+            "json",
             "rm -rf /tmp",
         ])
         .expect("parse");
         if let Some(Command::TestCommand {
             command,
-            explain,
             format,
             ..
         }) = cli.command
         {
             assert_eq!(command, "rm -rf /tmp");
-            assert!(explain);
-            assert_eq!(format, ExplainFormat::Compact);
+            assert_eq!(format, TestFormat::Json);
         } else {
             unreachable!("Expected TestCommand");
         }
@@ -8624,7 +9919,7 @@ exclude = ["target/**"]
         {
             assert_eq!(command, "git status");
             assert!(!explain);
-            assert_eq!(format, ExplainFormat::Pretty); // default
+            assert_eq!(format, TestFormat::Pretty); // default
         } else {
             unreachable!("Expected TestCommand");
         }

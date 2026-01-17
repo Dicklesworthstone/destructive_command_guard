@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Dicklesworthstone/destructive_command_guard/docs/json-schema/hook-output.json",
+  "title": "DCG Hook Output",
+  "description": "JSON output format for dcg when used as a Claude Code PreToolUse hook. Only emitted when a command is denied; allowed commands produce no output.",
+  "type": "object",
+  "required": ["hookSpecificOutput"],
+  "properties": {
+    "hookSpecificOutput": {
+      "type": "object",
+      "description": "The hook-specific output payload for Claude Code",
+      "required": ["hookEventName", "permissionDecision", "permissionDecisionReason"],
+      "properties": {
+        "hookEventName": {
+          "type": "string",
+          "const": "PreToolUse",
+          "description": "The hook event type, always 'PreToolUse' for dcg"
+        },
+        "permissionDecision": {
+          "type": "string",
+          "enum": ["allow", "deny"],
+          "description": "The permission decision: 'deny' blocks the command, 'allow' permits it"
+        },
+        "permissionDecisionReason": {
+          "type": "string",
+          "description": "Human-readable explanation of why the command was blocked, including the rule ID, reason, and remediation instructions"
+        },
+        "allowOnceCode": {
+          "type": "string",
+          "description": "Short alphanumeric code for one-time bypass via 'dcg allow-once <code>'",
+          "pattern": "^[a-f0-9]{6}$"
+        },
+        "allowOnceFullHash": {
+          "type": "string",
+          "description": "Full SHA-256 hash of the command for verification, prefixed with 'sha256:'",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "ruleId": {
+          "type": "string",
+          "description": "Stable pattern identifier in format 'pack.category:pattern-name' for allowlisting",
+          "examples": ["core.git:reset-hard", "core.filesystem:rm-rf-root"]
+        },
+        "packId": {
+          "type": "string",
+          "description": "The security pack that matched, in format 'category.name'",
+          "examples": ["core.git", "core.filesystem", "database.postgresql"]
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["critical", "high", "medium", "low"],
+          "description": "Severity level of the blocked command"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0,
+          "description": "Match confidence score from 0.0 to 1.0"
+        },
+        "remediation": {
+          "type": "object",
+          "description": "Suggested remediation for the blocked command",
+          "required": ["explanation", "allowOnceCommand"],
+          "properties": {
+            "safeAlternative": {
+              "type": "string",
+              "description": "A safer alternative command that achieves similar results"
+            },
+            "explanation": {
+              "type": "string",
+              "description": "Explanation of why the alternative is safer or what the user should do"
+            },
+            "allowOnceCommand": {
+              "type": "string",
+              "description": "The full 'dcg allow-once <code>' command for one-time bypass"
+            }
+          }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "BLOCKED by dcg\n\nTip: dcg explain \"git reset --hard HEAD~5\"\n\nReason: git reset --hard destroys uncommitted changes\n\nRule: core.git:reset-hard\n\nCommand: git reset --hard HEAD~5",
+        "ruleId": "core.git:reset-hard",
+        "packId": "core.git",
+        "severity": "critical",
+        "confidence": 0.95,
+        "allowOnceCode": "a1b2c3",
+        "allowOnceFullHash": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1",
+        "remediation": {
+          "safeAlternative": "git stash",
+          "explanation": "Use git stash to save your changes before resetting.",
+          "allowOnceCommand": "dcg allow-once a1b2c3"
+        }
+      }
+    }
+  ]
+}
