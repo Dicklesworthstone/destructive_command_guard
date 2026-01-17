@@ -56,16 +56,6 @@ pub enum Command {
         format: DoctorFormat,
     },
 
-    /// Run in hook mode with batch processing support
-    ///
-    /// Explicit hook mode for processing commands from stdin. When `--batch` is
-    /// specified, reads JSONL (one JSON hook input per line) and outputs JSONL
-    /// with decisions.
-    ///
-    /// Without `--batch`, behaves identically to running `dcg` with no subcommand.
-    #[command(name = "hook")]
-    Hook(HookCommand),
-
     /// Manage allowlist entries (add, list, remove, validate)
     #[command(name = "allowlist")]
     Allowlist {
@@ -145,10 +135,6 @@ pub enum Command {
         /// Show detailed information including pattern counts
         #[arg(short, long)]
         verbose: bool,
-
-        /// Output format (json for structured output, pretty for human-readable)
-        #[arg(long, short = 'f', value_enum, default_value = "pretty")]
-        format: PacksFormat,
     },
 
     /// Pack management commands (info, validate)
@@ -172,9 +158,9 @@ pub enum Command {
         #[arg(long)]
         explain: bool,
 
-        /// Output format (json for structured output, pretty for human-readable)
+        /// Output format when using --explain
         #[arg(long, short = 'f', value_enum, default_value = "pretty")]
-        format: TestFormat,
+        format: ExplainFormat,
 
         /// Enable heredoc/inline-script scanning (overrides config)
         #[arg(long = "heredoc-scan", conflicts_with = "no_heredoc_scan")]
@@ -291,59 +277,6 @@ pub enum Command {
     },
 }
 
-/// `dcg hook` command arguments.
-#[derive(Args, Debug)]
-pub struct HookCommand {
-    /// Enable batch mode: read JSONL from stdin, output JSONL results
-    ///
-    /// Each line should be a JSON hook input:
-    /// ```jsonl
-    /// {"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}
-    /// {"tool_name":"Bash","tool_input":{"command":"git status"}}
-    /// ```
-    ///
-    /// Output format:
-    /// ```jsonl
-    /// {"index":0,"decision":"deny","rule_id":"core.filesystem:rm-rf-root"}
-    /// {"index":1,"decision":"allow"}
-    /// ```
-    #[arg(long)]
-    pub batch: bool,
-
-    /// Process commands in parallel (implies --batch)
-    ///
-    /// Uses multiple threads to evaluate commands concurrently.
-    /// Output maintains input order via the `index` field.
-    #[arg(long)]
-    pub parallel: bool,
-
-    /// Number of parallel workers (default: number of CPUs)
-    #[arg(long, default_value = "0")]
-    pub workers: usize,
-
-    /// Continue processing on parse errors (skip invalid lines)
-    #[arg(long)]
-    pub continue_on_error: bool,
-}
-
-/// Output format for batch hook mode.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct BatchHookOutput {
-    /// Index of the input line (0-based)
-    pub index: usize,
-    /// Decision: "allow" or "deny"
-    pub decision: &'static str,
-    /// Rule ID if denied (e.g., "core.git:reset-hard")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rule_id: Option<String>,
-    /// Pack ID if denied
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pack_id: Option<String>,
-    /// Error message if parsing failed
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
 /// `dcg corpus` command arguments.
 #[derive(Args, Debug)]
 pub struct CorpusCommand {
@@ -410,95 +343,6 @@ pub enum StatsFormat {
     Pretty,
     /// Structured JSON output
     Json,
-}
-
-/// Output format for test command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum TestFormat {
-    /// Human-readable colored output
-    #[default]
-    Pretty,
-    /// Structured JSON output
-    Json,
-}
-
-/// Output format for packs list command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum PacksFormat {
-    /// Human-readable grouped output
-    #[default]
-    Pretty,
-    /// Structured JSON output
-    Json,
-}
-
-/// JSON output structure for `dcg test` command
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct TestOutput {
-    /// The command that was tested
-    pub command: String,
-    /// The decision: "allow" or "deny"
-    pub decision: String,
-    /// Rule ID if blocked (e.g., "core.git:reset-hard")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rule_id: Option<String>,
-    /// Pack ID that matched (e.g., "core.git")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pack_id: Option<String>,
-    /// Pattern name within the pack
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pattern_name: Option<String>,
-    /// Reason for blocking
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    /// Match source: "config_override", "pack", "heredoc_ast", etc.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    /// Matched span (start, end) in the command
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub matched_span: Option<(usize, usize)>,
-    /// Allowlist override info if allowed via allowlist
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub allowlist: Option<AllowlistOverrideInfo>,
-}
-
-/// Allowlist override information in test output
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct AllowlistOverrideInfo {
-    /// Which layer: "project", "user", "system"
-    pub layer: String,
-    /// Reason from the allowlist entry
-    pub reason: String,
-}
-
-/// JSON output structure for `dcg packs` command
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PacksOutput {
-    /// List of all packs
-    pub packs: Vec<PackInfo>,
-    /// Count of enabled packs
-    pub enabled_count: usize,
-    /// Total pack count
-    pub total_count: usize,
-}
-
-/// Pack information in the packs list
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PackInfo {
-    /// Pack ID (e.g., "core.git")
-    pub id: String,
-    /// Human-readable name
-    pub name: String,
-    /// Category (e.g., "core", "database")
-    pub category: String,
-    /// Description
-    pub description: String,
-    /// Whether the pack is enabled
-    pub enabled: bool,
-    /// Number of safe patterns
-    pub safe_pattern_count: usize,
-    /// Number of destructive patterns
-    pub destructive_pattern_count: usize,
 }
 
 /// `dcg suggest-allowlist` command arguments.
@@ -809,10 +653,6 @@ pub struct UpdateCommand {
     /// Output format for version check
     #[arg(long, short = 'f', value_enum, default_value_t = UpdateFormat::Pretty, requires = "check")]
     pub format: UpdateFormat,
-
-    /// Skip confirmation prompt (native update only)
-    #[arg(long, conflicts_with_all = ["check", "system", "easy_mode", "from_source", "quiet", "no_gum"])]
-    pub force: bool,
 
     /// Install specific version (default: latest)
     #[arg(long)]
@@ -1318,9 +1158,6 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Doctor { fix, format }) => {
             doctor(fix, format);
         }
-        Some(Command::Hook(cmd)) => {
-            run_hook_command(&config, cmd)?;
-        }
         Some(Command::Install { force }) => {
             install_hook(force)?;
         }
@@ -1330,8 +1167,8 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Update(update)) => {
             self_update(update)?;
         }
-        Some(Command::ListPacks { enabled, verbose, format }) => {
-            list_packs(&config, enabled, verbose, format);
+        Some(Command::ListPacks { enabled, verbose }) => {
+            list_packs(&config, enabled, verbose);
         }
         Some(Command::Pack { action }) => {
             handle_pack_command(&config, action)?;
@@ -1348,18 +1185,12 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }) => {
             if explain {
                 // Delegate to explain handler for detailed trace output
-                // Convert TestFormat to ExplainFormat for explain mode
-                let explain_format = match format {
-                    TestFormat::Pretty => ExplainFormat::Pretty,
-                    TestFormat::Json => ExplainFormat::Json,
-                };
-                handle_explain(&config, &command, explain_format, with_packs);
+                handle_explain(&config, &command, format, with_packs);
             } else {
                 test_command(
                     &config,
                     &command,
                     with_packs,
-                    format,
                     heredoc_scan,
                     no_heredoc_scan,
                     heredoc_timeout_ms,
@@ -1437,357 +1268,11 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// ============================================================================
-// Hook Command (dcg hook --batch)
-// ============================================================================
-
-/// Run the hook command with optional batch processing.
-fn run_hook_command(
-    config: &Config,
-    cmd: HookCommand,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::{self, BufRead, Write};
-
-    // If not batch mode and not parallel, fall through to normal hook mode
-    if !cmd.batch && !cmd.parallel {
-        // Delegate to main.rs hook mode by returning an error
-        // that main.rs will catch and handle
-        return Err("Hook mode without --batch; delegating to main.rs".into());
-    }
-
-    // Parallel implies batch
-    let _parallel = cmd.parallel;
-    let workers = if cmd.workers == 0 {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-    } else {
-        cmd.workers
-    };
-
-    // Load configuration for evaluation
-    let compiled_overrides = config.overrides.compile();
-    let allowlists = crate::load_default_allowlists();
-    let heredoc_settings = config.heredoc_settings();
-    let enabled_packs = config.enabled_pack_ids();
-    let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
-    let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
-    let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
-
-    // Load external packs
-    let external_packs: Vec<crate::Pack> = {
-        let loader = crate::packs::external::ExternalPackLoader::from_config(&config.packs);
-        let result = loader.load_all_deduped();
-        result.packs.into_iter().map(|loaded| loaded.pack).collect()
-    };
-
-    let enabled_keywords: Vec<&str> = {
-        let mut keywords = enabled_keywords;
-        for pack in &external_packs {
-            for kw in pack.keywords {
-                if !keywords.contains(kw) {
-                    keywords.push(kw);
-                }
-            }
-        }
-        keywords
-    };
-
-    let external_packs_slice: Option<&[crate::Pack]> = if external_packs.is_empty() {
-        None
-    } else {
-        Some(&external_packs)
-    };
-
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut stdout_lock = stdout.lock();
-
-    if cmd.parallel && workers > 1 {
-        // Parallel processing: collect all lines, process in parallel, output in order
-        let lines: Vec<(usize, String)> = stdin
-            .lock()
-            .lines()
-            .enumerate()
-            .filter_map(|(idx, line)| line.ok().map(|l| (idx, l)))
-            .collect();
-
-        // Process in parallel using rayon
-        #[cfg(feature = "rayon")]
-        {
-            use rayon::prelude::*;
-
-            let results: Vec<BatchHookOutput> = lines
-                .into_par_iter()
-                .map(|(index, line)| {
-                    evaluate_batch_line(
-                        index,
-                        &line,
-                        &enabled_keywords,
-                        &ordered_packs,
-                        keyword_index.as_ref(),
-                        &compiled_overrides,
-                        &allowlists,
-                        &heredoc_settings,
-                        external_packs_slice,
-                        cmd.continue_on_error,
-                    )
-                })
-                .collect();
-
-            // Sort by index and output
-            let mut sorted = results;
-            sorted.sort_by_key(|r| r.index);
-
-            for result in sorted {
-                let json = serde_json::to_string(&result)?;
-                writeln!(stdout_lock, "{json}")?;
-            }
-        }
-
-        // Fallback to sequential if rayon is not available
-        #[cfg(not(feature = "rayon"))]
-        {
-            for (index, line) in lines {
-                let result = evaluate_batch_line(
-                    index,
-                    &line,
-                    &enabled_keywords,
-                    &ordered_packs,
-                    keyword_index.as_ref(),
-                    &compiled_overrides,
-                    &allowlists,
-                    &heredoc_settings,
-                    external_packs_slice,
-                    cmd.continue_on_error,
-                );
-                let json = serde_json::to_string(&result)?;
-                writeln!(stdout_lock, "{json}")?;
-            }
-        }
-    } else {
-        // Sequential processing: stream input to output
-        for (index, line) in stdin.lock().lines().enumerate() {
-            let line = match line {
-                Ok(l) => l,
-                Err(e) => {
-                    if cmd.continue_on_error {
-                        let result = BatchHookOutput {
-                            index,
-                            decision: "error",
-                            rule_id: None,
-                            pack_id: None,
-                            error: Some(format!("IO error: {e}")),
-                        };
-                        let json = serde_json::to_string(&result)?;
-                        writeln!(stdout_lock, "{json}")?;
-                        continue;
-                    }
-                    return Err(e.into());
-                }
-            };
-
-            let result = evaluate_batch_line(
-                index,
-                &line,
-                &enabled_keywords,
-                &ordered_packs,
-                keyword_index.as_ref(),
-                &compiled_overrides,
-                &allowlists,
-                &heredoc_settings,
-                external_packs_slice,
-                cmd.continue_on_error,
-            );
-            let json = serde_json::to_string(&result)?;
-            writeln!(stdout_lock, "{json}")?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Evaluate a single batch line and return the result.
-fn evaluate_batch_line(
-    index: usize,
-    line: &str,
-    enabled_keywords: &[&str],
-    ordered_packs: &[String],
-    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
-    compiled_overrides: &crate::config::CompiledOverrides,
-    allowlists: &crate::allowlist::LayeredAllowlist,
-    heredoc_settings: &crate::config::HeredocSettings,
-    external_packs: Option<&[crate::Pack]>,
-    continue_on_error: bool,
-) -> BatchHookOutput {
-    // Skip empty lines
-    if line.trim().is_empty() {
-        return BatchHookOutput {
-            index,
-            decision: "skip",
-            rule_id: None,
-            pack_id: None,
-            error: Some("Empty line".to_string()),
-        };
-    }
-
-    // Parse JSON input
-    let hook_input: crate::hook::HookInput = match serde_json::from_str(line) {
-        Ok(input) => input,
-        Err(e) => {
-            if continue_on_error {
-                return BatchHookOutput {
-                    index,
-                    decision: "error",
-                    rule_id: None,
-                    pack_id: None,
-                    error: Some(format!("JSON parse error: {e}")),
-                };
-            }
-            return BatchHookOutput {
-                index,
-                decision: "error",
-                rule_id: None,
-                pack_id: None,
-                error: Some(format!("JSON parse error: {e}")),
-            };
-        }
-    };
-
-    // Only process Bash tool invocations
-    if hook_input.tool_name.as_deref() != Some("Bash") {
-        return BatchHookOutput {
-            index,
-            decision: "skip",
-            rule_id: None,
-            pack_id: None,
-            error: Some("Not a Bash tool invocation".to_string()),
-        };
-    }
-
-    let Some(tool_input) = hook_input.tool_input else {
-        return BatchHookOutput {
-            index,
-            decision: "skip",
-            rule_id: None,
-            pack_id: None,
-            error: Some("Missing tool_input".to_string()),
-        };
-    };
-
-    let Some(command_value) = tool_input.command else {
-        return BatchHookOutput {
-            index,
-            decision: "skip",
-            rule_id: None,
-            pack_id: None,
-            error: Some("Missing command".to_string()),
-        };
-    };
-
-    let serde_json::Value::String(command) = command_value else {
-        return BatchHookOutput {
-            index,
-            decision: "skip",
-            rule_id: None,
-            pack_id: None,
-            error: Some("Command is not a string".to_string()),
-        };
-    };
-
-    if command.is_empty() {
-        return BatchHookOutput {
-            index,
-            decision: "skip",
-            rule_id: None,
-            pack_id: None,
-            error: Some("Empty command".to_string()),
-        };
-    }
-
-    // Evaluate the command
-    let eval_result = evaluate_command_with_pack_order_deadline_with_external(
-        &command,
-        enabled_keywords,
-        ordered_packs,
-        keyword_index,
-        compiled_overrides,
-        allowlists,
-        heredoc_settings,
-        None,
-        None,
-        None, // No deadline for batch mode
-        external_packs,
-    );
-
-    match eval_result.decision {
-        EvaluationDecision::Allow => BatchHookOutput {
-            index,
-            decision: "allow",
-            rule_id: None,
-            pack_id: None,
-            error: None,
-        },
-        EvaluationDecision::Deny => {
-            // Extract pattern info for deny decisions
-            let (rule_id, pack_id) = if let Some(ref info) = eval_result.pattern_info {
-                let rule_id = match (&info.pack_id, &info.pattern_name) {
-                    (Some(p), Some(pat)) => Some(format!("{p}:{pat}")),
-                    (Some(p), None) => Some(p.clone()),
-                    _ => None,
-                };
-                (rule_id, info.pack_id.clone())
-            } else {
-                (None, None)
-            };
-
-            BatchHookOutput {
-                index,
-                decision: "deny",
-                rule_id,
-                pack_id,
-                error: None,
-            }
-        }
-    }
-}
-
 /// List all packs and their status
-fn list_packs(config: &Config, enabled_only: bool, verbose: bool, format: PacksFormat) {
+fn list_packs(config: &Config, enabled_only: bool, verbose: bool) {
     let enabled_packs = config.enabled_pack_ids();
     let infos = REGISTRY.list_packs(&enabled_packs);
 
-    // Build pack list (filtered if enabled_only)
-    let pack_list: Vec<PackInfo> = infos
-        .iter()
-        .filter(|info| !enabled_only || info.enabled)
-        .map(|info| {
-            let category = info.id.split('.').next().unwrap_or(&info.id).to_string();
-            PackInfo {
-                id: info.id.to_string(),
-                name: info.name.to_string(),
-                category,
-                description: info.description.to_string(),
-                enabled: info.enabled,
-                safe_pattern_count: info.safe_pattern_count,
-                destructive_pattern_count: info.destructive_pattern_count,
-            }
-        })
-        .collect();
-
-    // Handle JSON output
-    if format == PacksFormat::Json {
-        let enabled_count = pack_list.iter().filter(|p| p.enabled).count();
-        let output = PacksOutput {
-            packs: pack_list,
-            enabled_count,
-            total_count: infos.len(),
-        };
-        println!("{}", serde_json::to_string_pretty(&output).unwrap());
-        return;
-    }
-
-    // Pretty output (default)
     println!("Available packs:");
     println!();
 
@@ -2364,7 +1849,6 @@ fn test_command(
     config: &Config,
     command: &str,
     extra_packs: Option<Vec<String>>,
-    format: TestFormat,
     heredoc_scan: bool,
     no_heredoc_scan: bool,
     heredoc_timeout_ms: Option<u64>,
@@ -2450,69 +1934,6 @@ fn test_command(
         external_packs_slice,
     );
 
-    // Handle JSON output
-    if format == TestFormat::Json {
-        let output = match result.decision {
-            EvaluationDecision::Allow => {
-                let allowlist = result.allowlist_override.as_ref().map(|info| {
-                    AllowlistOverrideInfo {
-                        layer: info.layer.label().to_string(),
-                        reason: info.reason.clone(),
-                    }
-                });
-                TestOutput {
-                    command: command.to_string(),
-                    decision: "allow".to_string(),
-                    rule_id: None,
-                    pack_id: None,
-                    pattern_name: None,
-                    reason: None,
-                    source: None,
-                    matched_span: None,
-                    allowlist,
-                }
-            }
-            EvaluationDecision::Deny => {
-                let (pack_id, pattern_name, reason, source_str, matched_span, rule_id) =
-                    if let Some(ref info) = result.pattern_info {
-                        let source_str = match info.source {
-                            MatchSource::ConfigOverride => "config_override",
-                            MatchSource::LegacyPattern => "legacy_pattern",
-                            MatchSource::Pack => "pack",
-                            MatchSource::HeredocAst => "heredoc_ast",
-                        };
-                        let rule_id = info.pack_id.as_ref().and_then(|p| {
-                            info.pattern_name.as_ref().map(|n| format!("{p}:{n}"))
-                        });
-                        (
-                            info.pack_id.clone(),
-                            info.pattern_name.clone(),
-                            Some(info.reason.clone()),
-                            Some(source_str.to_string()),
-                            info.matched_span.as_ref().map(|s| (s.start, s.end)),
-                            rule_id,
-                        )
-                    } else {
-                        (None, None, None, None, None, None)
-                    };
-                TestOutput {
-                    command: command.to_string(),
-                    decision: "deny".to_string(),
-                    rule_id,
-                    pack_id,
-                    pattern_name,
-                    reason,
-                    source: source_str,
-                    matched_span,
-                    allowlist: None,
-                }
-            }
-        };
-        println!("{}", serde_json::to_string_pretty(&output).unwrap());
-        return;
-    }
-
-    // Pretty output (default)
     // Use color based on terminal detection
     let use_color = should_use_color();
 
@@ -3730,7 +3151,7 @@ fn handle_explain(
 }
 
 // =============================================================================
-// =============================================================================
+// Corpus command implementation
 // =============================================================================
 
 /// A single test case loaded from the corpus.
@@ -5824,83 +5245,11 @@ fn self_update(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> 
         return handle_version_check(update.refresh, update.format);
     }
 
-    // Use native Rust update if no installer-specific flags are set
-    let uses_installer_flags =
-        update.system || update.easy_mode || update.from_source || update.quiet || update.no_gum;
-
-    if !uses_installer_flags {
-        return self_update_native(&update);
-    }
-
     if cfg!(windows) {
         return self_update_windows(update);
     }
 
     self_update_unix(update)
-}
-
-/// Perform update using native Rust self_update crate.
-fn self_update_native(update: &UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::update::{format_update_result, perform_update};
-
-    let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
-
-    // If not forcing, confirm with user
-    if !update.force {
-        // First check if there's an update available
-        use crate::update::check_for_update;
-        match check_for_update(false) {
-            Ok(result) => {
-                if !result.update_available {
-                    if use_color {
-                        println!("\x1b[32m✓\x1b[0m Already running the latest version ({})", result.current_version);
-                    } else {
-                        println!("Already running the latest version ({})", result.current_version);
-                    }
-                    return Ok(());
-                }
-
-                // Show what's available and prompt for confirmation
-                if use_color {
-                    println!("\x1b[1mUpdate available:\x1b[0m {} → {}", result.current_version, result.latest_version);
-                } else {
-                    println!("Update available: {} -> {}", result.current_version, result.latest_version);
-                }
-
-                // Interactive confirmation
-                if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                    print!("Proceed with update? [y/N] ");
-                    use std::io::Write;
-                    std::io::stdout().flush()?;
-
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input)?;
-                    let response = input.trim().to_lowercase();
-                    if response != "y" && response != "yes" {
-                        println!("Update cancelled.");
-                        return Ok(());
-                    }
-                } else {
-                    // Non-interactive: require --force
-                    return Err("Non-interactive mode requires --force flag".into());
-                }
-            }
-            Err(e) => {
-                return Err(format!("Failed to check for updates: {e}").into());
-            }
-        }
-    }
-
-    // Perform the update
-    eprintln!("Downloading and installing update...");
-
-    match perform_update(update.force, update.version.as_deref()) {
-        Ok(result) => {
-            print!("{}", format_update_result(&result, use_color));
-            Ok(())
-        }
-        Err(e) => Err(format!("Update failed: {e}").into()),
-    }
 }
 
 /// Check for updates and display the result.
@@ -9231,30 +8580,33 @@ exclude = ["target/**"]
         {
             assert_eq!(command, "git reset --hard");
             assert!(explain);
-            assert_eq!(format, TestFormat::Pretty); // default format
+            assert_eq!(format, ExplainFormat::Pretty); // default format
         } else {
             unreachable!("Expected TestCommand");
         }
     }
 
     #[test]
-    fn test_cli_parse_test_with_format_json() {
+    fn test_cli_parse_test_with_explain_and_format() {
         let cli = Cli::try_parse_from([
             "dcg",
             "test",
+            "--explain",
             "--format",
-            "json",
+            "compact",
             "rm -rf /tmp",
         ])
         .expect("parse");
         if let Some(Command::TestCommand {
             command,
+            explain,
             format,
             ..
         }) = cli.command
         {
             assert_eq!(command, "rm -rf /tmp");
-            assert_eq!(format, TestFormat::Json);
+            assert!(explain);
+            assert_eq!(format, ExplainFormat::Compact);
         } else {
             unreachable!("Expected TestCommand");
         }
@@ -9272,7 +8624,7 @@ exclude = ["target/**"]
         {
             assert_eq!(command, "git status");
             assert!(!explain);
-            assert_eq!(format, TestFormat::Pretty); // default
+            assert_eq!(format, ExplainFormat::Pretty); // default
         } else {
             unreachable!("Expected TestCommand");
         }
