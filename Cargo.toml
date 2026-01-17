@@ -75,6 +75,10 @@ comfy-table = "7.2"
 indicatif = "0.17"
 console = "0.15"
 
+# Self-update version check (f9fv epic)
+self_update = { version = "0.42", default-features = false, features = ["rustls", "archive-tar", "compression-flate2"] }
+semver = "1.0"
+
 [build-dependencies]
 vergen-gix = { version = "1.0", features = ["build", "cargo", "rustc"] }
 

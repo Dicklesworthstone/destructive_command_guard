@@ -152,7 +152,11 @@ pub use suggestions::{Suggestion, SuggestionKind, get_suggestion_by_kind, get_su
 // Re-export scan types for `dcg scan`
 pub use scan::{
     ExtractedCommand, ScanDecision, ScanEvalContext, ScanFailOn, ScanFinding, ScanFormat,
-    ScanOptions, ScanReport, ScanSeverity, ScanSummary, scan_paths, should_fail, sort_findings,
+    ScanOptions, ScanReport, ScanSeverity, ScanSummary, extract_docker_compose_from_str,
+    extract_dockerfile_from_str, extract_github_actions_workflow_from_str,
+    extract_gitlab_ci_from_str, extract_makefile_from_str, extract_package_json_from_str,
+    extract_shell_script_from_str, extract_terraform_from_str, scan_paths, should_fail,
+    sort_findings,
 };
 
 // Re-export simulate types for `dcg simulate`
@@ -194,12 +198,14 @@ pub use history::{
 
 // Re-export output types for TUI/CLI visual formatting
 pub use output::{
-    BorderStyle, Severity as OutputSeverity, SeverityColors, Theme, auto_theme, init as init_output,
-    should_use_rich_output, supports_256_colors, terminal_height, terminal_width,
+    BorderStyle, DenialBox, Severity as OutputSeverity, SeverityColors, Theme, auto_theme,
+    init as init_output, should_use_rich_output, supports_256_colors, terminal_height,
+    terminal_width,
 };
 
 // Re-export update types for self-update version check
 pub use update::{
-    CACHE_DURATION, VersionCheckError, VersionCheckResult, check_for_update, clear_cache,
-    current_version, format_check_result, format_check_result_json,
+    CACHE_DURATION, UpdateResult, VersionCheckError, VersionCheckResult, check_for_update,
+    clear_cache, current_version, format_check_result, format_check_result_json,
+    format_update_result, perform_update,
 };

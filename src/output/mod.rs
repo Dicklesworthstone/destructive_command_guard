@@ -5,7 +5,7 @@
 //! # Module Structure
 //!
 //! - `theme` - Color schemes and border style definitions
-//! - `denial` - Denial message box renderer (future)
+//! - `denial` - Denial message box renderer
 //! - `tables` - Table renderer using comfy-table (future)
 //! - `progress` - Progress indicators using indicatif (future)
 //!
@@ -17,8 +17,10 @@
 //! 3. Whether stdout is a TTY
 //! 4. TERM environment variable (dumb terminals)
 
+pub mod denial;
 pub mod theme;
 
+pub use denial::DenialBox;
 pub use theme::{BorderStyle, Severity, SeverityColors, Theme};
 
 use std::sync::OnceLock;
