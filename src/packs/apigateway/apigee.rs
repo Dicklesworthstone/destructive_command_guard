@@ -109,73 +109,178 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "gcloud-apigee-apis-delete",
             r"gcloud\s+apigee\s+apis\s+delete\b",
-            "gcloud apigee apis delete removes an API proxy from Apigee."
+            "gcloud apigee apis delete removes an API proxy from Apigee.",
+            High,
+            "Deleting an API proxy removes all its revisions and deployment history. Any \
+             applications relying on this API will immediately receive errors. API keys \
+             and quotas associated with products referencing this API may be affected.\n\n\
+             Safer alternatives:\n\
+             - gcloud apigee apis list: Review APIs before deletion\n\
+             - gcloud apigee deployments undeploy: Undeploy first to verify impact\n\
+             - Export the API proxy bundle before deletion for backup"
         ),
         destructive_pattern!(
             "gcloud-apigee-environments-delete",
             r"gcloud\s+apigee\s+environments\s+delete\b",
-            "gcloud apigee environments delete removes an Apigee environment."
+            "gcloud apigee environments delete removes an Apigee environment.",
+            Critical,
+            "Deleting an environment removes all deployed API proxies, target servers, \
+             key-value maps, and caches within it. This is irreversible and will break \
+             all API traffic routed through this environment.\n\n\
+             Safer alternatives:\n\
+             - gcloud apigee environments describe: Review environment contents\n\
+             - Undeploy all APIs from the environment first\n\
+             - Export environment configuration and resources before deletion"
         ),
         destructive_pattern!(
             "gcloud-apigee-developers-delete",
             r"gcloud\s+apigee\s+developers\s+delete\b",
-            "gcloud apigee developers delete removes a developer from Apigee."
+            "gcloud apigee developers delete removes a developer from Apigee.",
+            High,
+            "Deleting a developer also deletes all their apps and associated API keys. \
+             Any applications using those keys will immediately lose API access. Developer \
+             analytics and usage history are also removed.\n\n\
+             Safer alternatives:\n\
+             - gcloud apigee developers describe: Review developer details\n\
+             - Revoke individual app credentials instead of deleting the developer\n\
+             - Set developer status to inactive rather than deleting"
         ),
         destructive_pattern!(
             "gcloud-apigee-products-delete",
             r"gcloud\s+apigee\s+products\s+delete\b",
-            "gcloud apigee products delete removes an API product from Apigee."
+            "gcloud apigee products delete removes an API product from Apigee.",
+            High,
+            "Deleting an API product immediately revokes access for all apps subscribed \
+             to it. Quota settings, rate limits, and access controls defined in the product \
+             are lost. Apps will need to be re-subscribed to a different product.\n\n\
+             Safer alternatives:\n\
+             - gcloud apigee products describe: Review product configuration\n\
+             - Remove individual apps from the product instead\n\
+             - Set product access to private before deletion to verify impact"
         ),
         destructive_pattern!(
             "gcloud-apigee-organizations-delete",
             r"gcloud\s+apigee\s+organizations\s+delete\b",
-            "gcloud apigee organizations delete removes an entire Apigee organization. EXTREMELY DANGEROUS."
+            "gcloud apigee organizations delete removes an entire Apigee organization.",
+            Critical,
+            "Deleting an organization permanently removes ALL environments, API proxies, \
+             products, developers, apps, and analytics data. This is irreversible and will \
+             completely destroy your API management infrastructure.\n\n\
+             Safer alternatives:\n\
+             - Export all configurations and proxy bundles before deletion\n\
+             - Delete individual resources to verify nothing is still in use\n\
+             - Consider disabling billing instead if just reducing costs"
         ),
         destructive_pattern!(
             "gcloud-apigee-deployments-undeploy",
             r"gcloud\s+apigee\s+deployments\s+undeploy\b",
-            "gcloud apigee deployments undeploy removes an API deployment."
+            "gcloud apigee deployments undeploy removes an API deployment.",
+            Medium,
+            "Undeploying an API proxy stops all traffic processing for that API in the \
+             specified environment. Clients will receive errors until the API is redeployed. \
+             This is reversible by redeploying the proxy.\n\n\
+             Safer alternatives:\n\
+             - gcloud apigee deployments list: Review current deployments\n\
+             - Test in a non-production environment first\n\
+             - Deploy a new revision instead of undeploying"
         ),
         // apigeecli - delete operations
         destructive_pattern!(
             "apigeecli-apis-delete",
             r"apigeecli\s+apis\s+delete\b",
-            "apigeecli apis delete removes an API proxy from Apigee."
+            "apigeecli apis delete removes an API proxy from Apigee.",
+            High,
+            "Deleting an API proxy removes all its revisions and deployment history. Any \
+             applications relying on this API will immediately receive errors.\n\n\
+             Safer alternatives:\n\
+             - apigeecli apis list: Review APIs before deletion\n\
+             - apigeecli apis export: Export the proxy bundle for backup\n\
+             - Undeploy from all environments first to verify impact"
         ),
         destructive_pattern!(
             "apigeecli-products-delete",
             r"apigeecli\s+products\s+delete\b",
-            "apigeecli products delete removes an API product from Apigee."
+            "apigeecli products delete removes an API product from Apigee.",
+            High,
+            "Deleting an API product immediately revokes access for all subscribed apps. \
+             Quota settings and rate limits are permanently lost.\n\n\
+             Safer alternatives:\n\
+             - apigeecli products list: Review products before deletion\n\
+             - apigeecli products get: Check which apps are using the product\n\
+             - Remove apps from the product first to verify impact"
         ),
         destructive_pattern!(
             "apigeecli-developers-delete",
             r"apigeecli\s+developers\s+delete\b",
-            "apigeecli developers delete removes a developer from Apigee."
+            "apigeecli developers delete removes a developer from Apigee.",
+            High,
+            "Deleting a developer also deletes all their apps and API keys. Applications \
+             using those keys will immediately lose access.\n\n\
+             Safer alternatives:\n\
+             - apigeecli developers list: Review developers before deletion\n\
+             - apigeecli apps list: Check developer's apps first\n\
+             - Set developer status to inactive instead of deleting"
         ),
         destructive_pattern!(
             "apigeecli-envs-delete",
             r"apigeecli\s+envs\s+delete\b",
-            "apigeecli envs delete removes an Apigee environment."
+            "apigeecli envs delete removes an Apigee environment.",
+            Critical,
+            "Deleting an environment removes all deployed proxies, target servers, and \
+             configurations. This breaks all API traffic through that environment.\n\n\
+             Safer alternatives:\n\
+             - apigeecli envs list: Review environments before deletion\n\
+             - Export all environment resources before deletion\n\
+             - Undeploy all APIs first to verify nothing is in use"
         ),
         destructive_pattern!(
             "apigeecli-orgs-delete",
             r"apigeecli\s+orgs\s+delete\b",
-            "apigeecli orgs delete removes an entire Apigee organization. EXTREMELY DANGEROUS."
+            "apigeecli orgs delete removes an entire Apigee organization.",
+            Critical,
+            "Deleting an organization permanently removes ALL resources: environments, \
+             APIs, products, developers, apps, and analytics. This is completely irreversible.\n\n\
+             Safer alternatives:\n\
+             - Export all configurations before deletion\n\
+             - Delete individual resources first to verify impact\n\
+             - Contact support if you need to preserve any data"
         ),
         destructive_pattern!(
             "apigeecli-apps-delete",
             r"apigeecli\s+apps\s+delete\b",
-            "apigeecli apps delete removes a developer app from Apigee."
+            "apigeecli apps delete removes a developer app from Apigee.",
+            High,
+            "Deleting an app revokes all its API keys and credentials. Any systems using \
+             those keys will immediately lose API access.\n\n\
+             Safer alternatives:\n\
+             - apigeecli apps list: Review apps before deletion\n\
+             - Revoke individual credentials instead of deleting the app\n\
+             - Set app status to revoked to disable without deleting"
         ),
         destructive_pattern!(
             "apigeecli-keyvaluemaps-delete",
             r"apigeecli\s+keyvaluemaps\s+delete\b",
-            "apigeecli keyvaluemaps delete removes a key-value map from Apigee."
+            "apigeecli keyvaluemaps delete removes a key-value map from Apigee.",
+            High,
+            "Deleting a KVM removes all stored key-value pairs. API proxies reading from \
+             this KVM will fail or return errors. Configuration data stored in the KVM is \
+             permanently lost.\n\n\
+             Safer alternatives:\n\
+             - apigeecli keyvaluemaps list: Review KVMs before deletion\n\
+             - Export KVM entries before deletion\n\
+             - Check which proxies reference this KVM first"
         ),
         destructive_pattern!(
             "apigeecli-targetservers-delete",
             r"apigeecli\s+targetservers\s+delete\b",
-            "apigeecli targetservers delete removes a target server from Apigee."
+            "apigeecli targetservers delete removes a target server from Apigee.",
+            High,
+            "Deleting a target server breaks all API proxies that route traffic to it. \
+             Requests will fail until proxies are updated to use a different target.\n\n\
+             Safer alternatives:\n\
+             - apigeecli targetservers list: Review targets before deletion\n\
+             - Update API proxies to use a different target first\n\
+             - Set the target server to disabled to test impact"
         ),
     ]
 }
