@@ -39,6 +39,7 @@ LOCK_FILE="/tmp/dcg-install.lock"
 SYSTEM=0
 NO_GUM=0
 NO_CHECKSUM=0
+FORCE_INSTALL=0
 
 # Detect gum for fancy output (https://github.com/charmbracelet/gum)
 HAS_GUM=0
@@ -288,6 +289,32 @@ is_agent_detected() {
   return 1
 }
 
+# Check if installed version matches target
+# Returns 0 if versions match, 1 if they differ or dcg not installed
+check_installed_version() {
+  local target_version="$1"
+  if [ ! -x "$DEST/dcg" ]; then
+    return 1
+  fi
+
+  local installed_version
+  installed_version=$("$DEST/dcg" --version 2>/dev/null | head -1 | sed 's/.*\([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/')
+
+  if [ -z "$installed_version" ]; then
+    return 1
+  fi
+
+  # Normalize versions (strip 'v' prefix)
+  local target_clean="${target_version#v}"
+  local installed_clean="${installed_version#v}"
+
+  if [ "$target_clean" = "$installed_clean" ]; then
+    return 0
+  fi
+
+  return 1
+}
+
 resolve_version() {
   if [ -n "$VERSION" ]; then return 0; fi
 
@@ -404,7 +431,7 @@ usage() {
   cat <<EOFU
 Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] \\
                   [--artifact-url URL] [--checksum HEX] [--checksum-url URL] [--quiet] \\
-                  [--no-gum] [--no-verify]
+                  [--no-gum] [--no-verify] [--force]
 
 Options:
   --version vX.Y.Z   Install specific version (default: latest)
@@ -416,6 +443,7 @@ Options:
   --quiet            Suppress non-error output
   --no-gum           Disable gum formatting even if available
   --no-verify        Skip checksum verification (for testing only)
+  --force            Force reinstall even if same version is installed
 EOFU
 }
 
@@ -433,6 +461,7 @@ while [ $# -gt 0 ]; do
     --quiet|-q) QUIET=1; shift;;
     --no-gum) NO_GUM=1; shift;;
     --no-verify) NO_CHECKSUM=1; shift;;
+    --force) FORCE_INSTALL=1; shift;;
     -h|--help) usage; exit 0;;
     *) shift;;
   esac
@@ -463,6 +492,38 @@ if [ "$QUIET" -eq 0 ]; then
 fi
 
 resolve_version
+
+# Check if already at target version (skip download if so, unless --force)
+if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
+  ok "dcg $VERSION is already installed at $DEST/dcg"
+  info "Use --force to reinstall"
+
+  # Still run agent configuration (idempotent) to ensure hooks are set up
+  detect_predecessor
+  if [ "$PREDECESSOR_FOUND" -eq 1 ]; then
+    show_upgrade_banner
+  fi
+
+  # Configure agents (these are already idempotent)
+  configure_claude_code "$CLAUDE_SETTINGS" "0"
+  configure_gemini "$GEMINI_SETTINGS"
+
+  # Show final summary even when skipping download
+  echo ""
+  case "$CLAUDE_STATUS" in
+    already) ok "Claude Code: Already configured" ;;
+    merged|created) ok "Claude Code: Configured" ;;
+    *) : ;;
+  esac
+  case "$GEMINI_STATUS" in
+    already) ok "Gemini CLI: Already configured" ;;
+    merged|created) ok "Gemini CLI: Configured" ;;
+    skipped|"") info "Gemini CLI: Not installed (skipped)" ;;
+    *) : ;;
+  esac
+
+  exit 0
+fi
 
 mkdir -p "$DEST"
 OS=$(uname -s | tr 'A-Z' 'a-z')
