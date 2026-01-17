@@ -90,83 +90,36 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "az-storage-container-delete",
             r"\baz\s+storage\s+container\s+delete\b",
-            "az storage container delete removes an Azure storage container.",
-            Critical,
-            "Deleting an Azure storage container removes all blobs within it permanently. \
-             Unless soft delete is enabled, data cannot be recovered. Applications and \
-             services referencing this container will fail.\n\n\
-             Safer alternatives:\n\
-             - az storage container list: Review containers first\n\
-             - az storage blob list -c X: Inventory contents\n\
-             - Enable soft delete before testing deletions"
+            "az storage container delete removes an Azure storage container."
         ),
         // Blob deletion (order matters: delete-batch before delete)
         destructive_pattern!(
             "az-storage-blob-delete-batch",
             r"\baz\s+storage\s+blob\s+delete-batch\b",
-            "az storage blob delete-batch removes multiple blobs from Azure storage.",
-            High,
-            "Batch deletion removes many blobs at once based on patterns. Without soft \
-             delete enabled, removed blobs cannot be recovered. Patterns may match more \
-             files than expected.\n\n\
-             Safer alternatives:\n\
-             - az storage blob list --pattern: Preview matching blobs\n\
-             - Enable soft delete for recovery window\n\
-             - azcopy copy to backup before deletion"
+            "az storage blob delete-batch removes multiple blobs from Azure storage."
         ),
         destructive_pattern!(
             "az-storage-blob-delete",
             r"\baz\s+storage\s+blob\s+delete(?:\s|$)",
-            "az storage blob delete removes a blob from Azure storage.",
-            Medium,
-            "Deleting a single blob removes it from storage. Without soft delete, the data \
-             is permanently lost. Applications expecting this blob will receive 404 errors.\n\n\
-             Safer alternatives:\n\
-             - az storage blob show: Verify blob before deletion\n\
-             - az storage blob download: Backup content first\n\
-             - Enable soft delete for recovery"
+            "az storage blob delete removes a blob from Azure storage."
         ),
         // Storage account deletion
         destructive_pattern!(
             "az-storage-account-delete",
             r"\baz\s+storage\s+account\s+delete\b",
-            "az storage account delete removes an entire Azure storage account.",
-            Critical,
-            "Deleting a storage account removes all containers, blobs, tables, queues, \
-             and file shares within it. The account name may not be immediately reclaimable. \
-             All dependent applications will fail completely.\n\n\
-             Safer alternatives:\n\
-             - az storage account show: Review account configuration\n\
-             - azcopy copy: Backup all data before deletion\n\
-             - Verify no active resources depend on this account"
+            "az storage account delete removes an entire Azure storage account."
         ),
         // azcopy remove
         destructive_pattern!(
             "azcopy-remove",
             r"\bazcopy\s+(?:--\S+\s+)*remove\b",
-            "azcopy remove deletes files from Azure storage.",
-            High,
-            "The azcopy remove command deletes blobs from Azure storage. With --recursive, \
-             entire directory trees are removed. Without soft delete, data is permanently \
-             lost and cannot be recovered.\n\n\
-             Safer alternatives:\n\
-             - azcopy list: Preview files to be deleted\n\
-             - Enable soft delete before removing\n\
-             - azcopy copy to backup location first"
+            "azcopy remove deletes files from Azure storage."
         ),
         // azcopy sync with delete
         destructive_pattern!(
             "azcopy-sync-delete",
             r"\bazcopy\s+(?:--\S+\s+)*sync\b.*--delete-destination\b",
-            "azcopy sync --delete-destination removes destination files not in source.",
-            High,
-            "The --delete-destination flag removes files from the destination that don't \
-             exist in the source. If source and destination are swapped, or if source is \
-             unexpectedly empty, this can cause complete data loss.\n\n\
-             Safer alternatives:\n\
-             - azcopy sync --dry-run: Preview changes first\n\
-             - azcopy sync without --delete-destination: Only adds/updates\n\
-             - Backup destination before syncing"
+            "azcopy sync --delete-destination removes destination files not in source."
         ),
     ]
 }

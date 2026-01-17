@@ -51,79 +51,32 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "newrelic-entity-delete",
             r"\bnewrelic\b(?:\s+--?\S+(?:\s+\S+)?)*\s+entity\s+delete\b",
-            "newrelic entity delete removes a New Relic entity, impacting observability.",
-            High,
-            "Deleting a New Relic entity removes all associated telemetry data, relationships, \
-             and alert configurations. Historical metrics for this entity will no longer be \
-             accessible.\n\n\
-             Safer alternatives:\n\
-             - newrelic entity search: Find and verify the entity first\n\
-             - Tag the entity as deprecated instead of deleting\n\
-             - Export entity configuration before deletion"
+            "newrelic entity delete removes a New Relic entity, impacting observability."
         ),
         destructive_pattern!(
             "newrelic-apm-app-delete",
             r"\bnewrelic\b(?:\s+--?\S+(?:\s+\S+)?)*\s+apm\s+application\s+delete\b",
-            "newrelic apm application delete removes an APM application.",
-            High,
-            "Deleting an APM application removes all application performance data, traces, \
-             and associated alert policies. You lose visibility into application behavior \
-             and historical performance trends.\n\n\
-             Safer alternatives:\n\
-             - newrelic apm application get <id>: Review application details first\n\
-             - Disable the APM agent in your application instead\n\
-             - Export application settings and dashboards as backup"
+            "newrelic apm application delete removes an APM application."
         ),
         destructive_pattern!(
             "newrelic-workload-delete",
             r"\bnewrelic\b(?:\s+--?\S+(?:\s+\S+)?)*\s+workload\s+delete\b",
-            "newrelic workload delete removes a workload definition.",
-            High,
-            "Deleting a workload removes the logical grouping of entities and any associated \
-             health status calculations. Teams using this workload for service overview will \
-             lose their aggregated view.\n\n\
-             Safer alternatives:\n\
-             - Review workload entities and dependencies first\n\
-             - Export workload definition using the API\n\
-             - Modify the workload rather than deleting and recreating"
+            "newrelic workload delete removes a workload definition."
         ),
         destructive_pattern!(
             "newrelic-synthetics-delete",
             r"\bnewrelic\b(?:\s+--?\S+(?:\s+\S+)?)*\s+synthetics\s+delete\b",
-            "newrelic synthetics delete removes a synthetics monitor.",
-            High,
-            "Deleting a synthetics monitor stops all uptime and availability checking for \
-             the monitored endpoint. You will no longer receive alerts when the endpoint \
-             becomes unavailable or slow.\n\n\
-             Safer alternatives:\n\
-             - Disable the monitor temporarily instead of deleting\n\
-             - Export monitor configuration as code (Terraform/Pulumi)\n\
-             - newrelic synthetics search: Verify you're deleting the correct monitor"
+            "newrelic synthetics delete removes a synthetics monitor."
         ),
         destructive_pattern!(
             "newrelic-api-delete",
             r"(?i)curl\s+.*(?:-X|--request)\s+DELETE\b.*api\.newrelic\.com",
-            "New Relic API DELETE calls remove monitoring/alerting resources.",
-            High,
-            "Direct API DELETE calls permanently remove New Relic resources without \
-             confirmation. Alert policies, dashboards, and monitors are deleted immediately.\n\n\
-             Safer alternatives:\n\
-             - GET the resource first to verify the ID and export configuration\n\
-             - Use the New Relic CLI for better feedback and confirmation\n\
-             - Use Terraform/Pulumi for version-controlled resource management"
+            "New Relic API DELETE calls remove monitoring/alerting resources."
         ),
         destructive_pattern!(
             "newrelic-graphql-delete-mutation",
             r"(?i)curl\s+.*api\.newrelic\.com[^\s]*?/graphql\b.*\bmutation\b.*\bdelete\w*\b",
-            "New Relic GraphQL delete mutations can remove monitoring resources.",
-            High,
-            "GraphQL delete mutations remove New Relic resources via the NerdGraph API. \
-             This affects entities, dashboards, alert policies, and other observability \
-             resources.\n\n\
-             Safer alternatives:\n\
-             - Run a query first to verify the GUID or resource ID\n\
-             - Use the New Relic CLI or UI for deletion with better feedback\n\
-             - Export the resource definition before deletion"
+            "New Relic GraphQL delete mutations can remove monitoring resources."
         ),
     ]
 }

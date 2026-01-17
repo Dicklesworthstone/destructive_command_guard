@@ -89,101 +89,43 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "cloudfront-delete-distribution",
             r"aws\s+cloudfront\s+delete-distribution\b",
-            "aws cloudfront delete-distribution removes a CloudFront distribution.",
-            Critical,
-            "Deleting a CloudFront distribution removes your CDN endpoint. All traffic \
-             to the distribution URL will fail. You must first disable the distribution \
-             and wait for propagation. Associated origins, behaviors, and cache settings \
-             are lost.\n\n\
-             Safer alternatives:\n\
-             - aws cloudfront get-distribution: Review configuration first\n\
-             - Disable the distribution before deleting\n\
-             - Export the distribution config for backup"
+            "aws cloudfront delete-distribution removes a CloudFront distribution."
         ),
         // Cache policy deletion
         destructive_pattern!(
             "cloudfront-delete-cache-policy",
             r"aws\s+cloudfront\s+delete-cache-policy\b",
-            "aws cloudfront delete-cache-policy removes a cache policy.",
-            High,
-            "Deleting a cache policy fails if any distribution behaviors reference it. \
-             If deletion succeeds, any caching optimizations you configured are lost. \
-             Custom TTLs, cache keys, and compression settings must be recreated.\n\n\
-             Safer alternatives:\n\
-             - aws cloudfront get-cache-policy: Review policy settings first\n\
-             - Check which distributions use this policy\n\
-             - Create a replacement policy before deleting"
+            "aws cloudfront delete-cache-policy removes a cache policy."
         ),
         // Origin request policy deletion
         destructive_pattern!(
             "cloudfront-delete-origin-request-policy",
             r"aws\s+cloudfront\s+delete-origin-request-policy\b",
-            "aws cloudfront delete-origin-request-policy removes an origin request policy.",
-            High,
-            "Deleting an origin request policy removes header, query string, and cookie \
-             forwarding configuration. Origins may receive different requests than \
-             expected, potentially breaking authentication or content negotiation.\n\n\
-             Safer alternatives:\n\
-             - aws cloudfront get-origin-request-policy: Review settings first\n\
-             - Verify no distributions reference this policy\n\
-             - Create replacement before deletion"
+            "aws cloudfront delete-origin-request-policy removes an origin request policy."
         ),
         // Function deletion
         destructive_pattern!(
             "cloudfront-delete-function",
             r"aws\s+cloudfront\s+delete-function\b",
-            "aws cloudfront delete-function removes a CloudFront function.",
-            High,
-            "Deleting a CloudFront Function removes edge compute logic. Any distributions \
-             using this function will lose URL rewriting, header manipulation, or other \
-             transformations. Function code is not recoverable after deletion.\n\n\
-             Safer alternatives:\n\
-             - aws cloudfront get-function: Download function code first\n\
-             - Remove function associations from distributions first\n\
-             - Test replacements before deleting the original"
+            "aws cloudfront delete-function removes a CloudFront function."
         ),
         // Response headers policy deletion
         destructive_pattern!(
             "cloudfront-delete-response-headers-policy",
             r"aws\s+cloudfront\s+delete-response-headers-policy\b",
-            "aws cloudfront delete-response-headers-policy removes a response headers policy.",
-            High,
-            "Deleting a response headers policy removes security headers like CORS, \
-             Content-Security-Policy, and HSTS settings. Browsers may block cross-origin \
-             requests or report security warnings after deletion.\n\n\
-             Safer alternatives:\n\
-             - Review which distributions use this policy\n\
-             - Test your site without these headers in staging\n\
-             - Create a replacement policy before deleting"
+            "aws cloudfront delete-response-headers-policy removes a response headers policy."
         ),
         // Key group deletion
         destructive_pattern!(
             "cloudfront-delete-key-group",
             r"aws\s+cloudfront\s+delete-key-group\b",
-            "aws cloudfront delete-key-group removes a key group used for signed URLs.",
-            Critical,
-            "Deleting a key group breaks signed URL and signed cookie validation. \
-             Users with existing signed URLs will lose access to protected content. \
-             Any distributions using this key group for restricted content will deny \
-             all requests.\n\n\
-             Safer alternatives:\n\
-             - Rotate keys by adding new keys before removing old ones\n\
-             - Verify no distributions reference this key group\n\
-             - Update applications to use new signing keys first"
+            "aws cloudfront delete-key-group removes a key group used for signed URLs."
         ),
         // Invalidation (has cost implications)
         destructive_pattern!(
             "cloudfront-create-invalidation",
             r"aws\s+cloudfront\s+create-invalidation\b",
-            "aws cloudfront create-invalidation creates a cache invalidation (has cost implications).",
-            Medium,
-            "Cache invalidations have cost implications after the first 1,000 paths per \
-             month. Wildcard invalidations (/*) count as one path but clear the entire \
-             cache, causing origin load spikes. Frequent invalidations defeat CDN benefits.\n\n\
-             Safer alternatives:\n\
-             - Use versioned URLs (file.v2.js) instead of invalidation\n\
-             - Invalidate specific paths rather than wildcards\n\
-             - Set appropriate Cache-Control headers at the origin"
+            "aws cloudfront create-invalidation creates a cache invalidation (has cost implications)."
         ),
     ]
 }

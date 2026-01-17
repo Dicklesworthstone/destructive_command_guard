@@ -66,85 +66,37 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "mc-rb",
             r"\bmc\s+(?:--\S+\s+)*rb\b",
-            "mc rb removes a MinIO bucket.",
-            Critical,
-            "Removing a MinIO bucket deletes the bucket and all objects within it. With \
-             --force, objects are deleted without confirmation. Applications referencing \
-             this bucket will fail immediately.\n\n\
-             Safer alternatives:\n\
-             - mc ls: List bucket contents first\n\
-             - mc cp --recursive: Backup to another location\n\
-             - Enable versioning or object locking before testing"
+            "mc rb removes a MinIO bucket."
         ),
         // Object removal
         destructive_pattern!(
             "mc-rm",
             r"\bmc\s+(?:--\S+\s+)*rm\b",
-            "mc rm deletes objects from MinIO.",
-            High,
-            "Deleting MinIO objects permanently removes data unless versioning is enabled. \
-             With --recursive, entire directory trees are deleted. With --force, no \
-             confirmation is requested.\n\n\
-             Safer alternatives:\n\
-             - mc ls: Preview files to be deleted\n\
-             - mc cp: Backup objects before deletion\n\
-             - Enable bucket versioning for recovery"
+            "mc rm deletes objects from MinIO."
         ),
         // Admin bucket delete
         destructive_pattern!(
             "mc-admin-bucket-delete",
             r"\bmc\s+(?:--\S+\s+)*admin\s+bucket\s+(?:delete|remove)\b",
-            "mc admin bucket delete removes a bucket via admin API.",
-            Critical,
-            "The admin bucket delete command bypasses normal bucket deletion restrictions. \
-             This can remove buckets that are protected or non-empty. The operation is \
-             immediate and cannot be undone.\n\n\
-             Safer alternatives:\n\
-             - mc admin info: Review cluster configuration\n\
-             - mc ls: Verify bucket contents first\n\
-             - Use standard mc rb for safer deletion"
+            "mc admin bucket delete removes a bucket via admin API."
         ),
         // Mirror with remove (sync with delete)
         destructive_pattern!(
             "mc-mirror-remove",
             r"\bmc\s+(?:--\S+\s+)*mirror\b.*--remove\b",
-            "mc mirror --remove deletes destination objects not in source.",
-            High,
-            "The --remove flag deletes objects from the destination that don't exist in \
-             the source. If source and destination are swapped, or source is empty, this \
-             can result in complete data loss at the destination.\n\n\
-             Safer alternatives:\n\
-             - mc diff: Preview differences before mirroring\n\
-             - mc mirror without --remove: Only adds/updates\n\
-             - Backup destination before mirroring"
+            "mc mirror --remove deletes destination objects not in source."
         ),
         // Admin user remove
         destructive_pattern!(
             "mc-admin-user-remove",
             r"\bmc\s+(?:--\S+\s+)*admin\s+user\s+(?:remove|disable)\b",
-            "mc admin user remove/disable affects user access.",
-            High,
-            "Removing or disabling a MinIO user revokes their access to all buckets and \
-             policies. Applications using this user's credentials will fail to authenticate. \
-             Service accounts created by this user may also be affected.\n\n\
-             Safer alternatives:\n\
-             - mc admin user info: Review user permissions first\n\
-             - mc admin user disable: Disable instead of remove\n\
-             - Rotate credentials before removing user"
+            "mc admin user remove/disable affects user access."
         ),
         // Admin policy remove
         destructive_pattern!(
             "mc-admin-policy-remove",
             r"\bmc\s+(?:--\S+\s+)*admin\s+policy\s+(?:remove|unset)\b",
-            "mc admin policy remove/unset modifies access policies.",
-            Medium,
-            "Removing or unsetting a policy affects all users and groups assigned to it. \
-             Users may unexpectedly lose access to buckets they need. Policy changes take \
-             effect immediately.\n\n\
-             Safer alternatives:\n\
-             - mc admin policy info: Review policy details\n\
-             - mc admin user list: Check who uses this policy\n\
-             - Create replacement policy before removing old one"
+            "mc admin policy remove/unset modifies access policies."
         ),
     ]
 }

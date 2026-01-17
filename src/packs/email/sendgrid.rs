@@ -39,111 +39,49 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "sendgrid-delete-template",
             r"(?:-X\s*DELETE|--request\s+DELETE).*sendgrid\.com/v3/templates/|sendgrid\.com/v3/templates/\S+.*(?:-X\s*DELETE|--request\s+DELETE)",
-            "DELETE to SendGrid /v3/templates removes a transactional template.",
-            High,
-            "Deleting a template breaks any email sends referencing that template ID. \
-             Applications will receive errors when trying to send with a deleted template. \
-             All versions of the template are removed.\n\n\
-             Safer alternatives:\n\
-             - GET /v3/templates/{id}: Export template before deletion\n\
-             - Create a new version instead of deleting\n\
-             - Check email code for template ID references"
+            "DELETE to SendGrid /v3/templates removes a transactional template."
         ),
         // API key deletion
         destructive_pattern!(
             "sendgrid-delete-api-key",
             r"(?:-X\s*DELETE|--request\s+DELETE).*sendgrid\.com/v3/api_keys/|sendgrid\.com/v3/api_keys/\S+.*(?:-X\s*DELETE|--request\s+DELETE)",
-            "DELETE to SendGrid /v3/api_keys removes an API key.",
-            Critical,
-            "Deleting an API key immediately revokes access. All applications using this \
-             key will fail to authenticate. You cannot recover the key value after deletion.\n\n\
-             Safer alternatives:\n\
-             - Create new API key before deleting old one\n\
-             - Update applications with new key first\n\
-             - Use API key scopes to limit damage"
+            "DELETE to SendGrid /v3/api_keys removes an API key."
         ),
         // Domain authentication deletion
         destructive_pattern!(
             "sendgrid-delete-whitelabel-domain",
             r"(?:-X\s*DELETE|--request\s+DELETE).*sendgrid\.com/v3/whitelabel/domains/|sendgrid\.com/v3/whitelabel/domains/\d+.*(?:-X\s*DELETE|--request\s+DELETE)",
-            "DELETE to SendGrid /v3/whitelabel/domains removes domain authentication.",
-            Critical,
-            "Deleting domain authentication removes DKIM and SPF records. Emails sent \
-             from this domain will fail authentication checks, leading to delivery issues \
-             and potential spam classification.\n\n\
-             Safer alternatives:\n\
-             - Document DNS records before deletion\n\
-             - Verify new domain authentication is working\n\
-             - Plan for DNS propagation delays"
+            "DELETE to SendGrid /v3/whitelabel/domains removes domain authentication."
         ),
         // Sender identity deletion
         destructive_pattern!(
             "sendgrid-delete-sender",
             r"(?:-X\s*DELETE|--request\s+DELETE).*sendgrid\.com/v3/(?:senders|verified_senders)/|sendgrid\.com/v3/(?:senders|verified_senders)/\d+.*(?:-X\s*DELETE|--request\s+DELETE)",
-            "DELETE to SendGrid /v3/senders or /v3/verified_senders removes a sender identity.",
-            High,
-            "Deleting a sender identity prevents sending from that email address. \
-             Marketing campaigns and transactional emails using this sender will fail. \
-             Re-verification may require email confirmation.\n\n\
-             Safer alternatives:\n\
-             - Create new sender identity before deleting\n\
-             - Update email configurations first\n\
-             - Check for scheduled campaigns using this sender"
+            "DELETE to SendGrid /v3/senders or /v3/verified_senders removes a sender identity."
         ),
         // Teammate deletion
         destructive_pattern!(
             "sendgrid-delete-teammate",
             r"(?:-X\s*DELETE|--request\s+DELETE).*sendgrid\.com/v3/teammates/|sendgrid\.com/v3/teammates/\w+.*(?:-X\s*DELETE|--request\s+DELETE)",
-            "DELETE to SendGrid /v3/teammates removes a teammate from the account.",
-            Medium,
-            "Deleting a teammate revokes their access to the SendGrid account. They lose \
-             access to templates, statistics, and settings they may have been managing.\n\n\
-             Safer alternatives:\n\
-             - Change teammate permissions instead of deleting\n\
-             - Ensure knowledge transfer is complete\n\
-             - Verify teammate doesn't own critical configurations"
+            "DELETE to SendGrid /v3/teammates removes a teammate from the account."
         ),
         // Suppression deletion
         destructive_pattern!(
             "sendgrid-delete-suppression",
             r"(?:-X\s*DELETE|--request\s+DELETE).*sendgrid\.com/v3/(?:suppression|asm)/",
-            "DELETE to SendGrid suppression endpoints removes entries from suppression lists.",
-            High,
-            "Removing suppression entries allows emails to be sent to addresses that \
-             previously bounced, complained, or unsubscribed. This can damage sender \
-             reputation and violate CAN-SPAM compliance.\n\n\
-             Safer alternatives:\n\
-             - Verify the email address is valid before removing\n\
-             - Check bounce reason codes\n\
-             - Respect unsubscribe requests (may be legally required)"
+            "DELETE to SendGrid suppression endpoints removes entries from suppression lists."
         ),
         // Webhook deletion
         destructive_pattern!(
             "sendgrid-delete-webhook",
             r"(?:-X\s*DELETE|--request\s+DELETE).*sendgrid\.com/v3/user/webhooks/",
-            "DELETE to SendGrid /v3/user/webhooks removes a webhook configuration.",
-            Medium,
-            "Deleting a webhook stops event notifications to your application. Bounce \
-             handling, open tracking, and click tracking data will not be received. \
-             This can affect email analytics and automation.\n\n\
-             Safer alternatives:\n\
-             - Document webhook URL and event types\n\
-             - Test new webhook before removing old one\n\
-             - Verify no critical automations depend on events"
+            "DELETE to SendGrid /v3/user/webhooks removes a webhook configuration."
         ),
         // Subuser deletion
         destructive_pattern!(
             "sendgrid-delete-subuser",
             r"(?:-X\s*DELETE|--request\s+DELETE).*sendgrid\.com/v3/subusers/|sendgrid\.com/v3/subusers/\w+.*(?:-X\s*DELETE|--request\s+DELETE)",
-            "DELETE to SendGrid /v3/subusers removes a subuser account.",
-            Critical,
-            "Deleting a subuser removes all their data including templates, statistics, \
-             and API keys. Applications using subuser credentials will fail immediately. \
-             This cannot be undone.\n\n\
-             Safer alternatives:\n\
-             - Export subuser data and configurations\n\
-             - Migrate to new subuser before deleting\n\
-             - Disable subuser access instead of deleting"
+            "DELETE to SendGrid /v3/subusers removes a subuser account."
         ),
     ]
 }

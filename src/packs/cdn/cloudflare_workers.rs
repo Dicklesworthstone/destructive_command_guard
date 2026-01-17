@@ -62,110 +62,46 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "wrangler-delete",
             r"wrangler\s+delete\b",
-            "wrangler delete removes a Worker from Cloudflare.",
-            Critical,
-            "Deleting a Cloudflare Worker immediately stops all edge processing for that \
-             Worker. Any routes pointing to it will return errors. Custom domains and \
-             bindings (KV, R2, D1) associated with the Worker remain but become orphaned.\n\n\
-             Safer alternatives:\n\
-             - wrangler deployments list: Review deployment history first\n\
-             - Disable routes instead of deleting the Worker\n\
-             - Use wrangler tail to verify traffic before deletion"
+            "wrangler delete removes a Worker from Cloudflare."
         ),
         // Deployment rollback (can break things)
         destructive_pattern!(
             "wrangler-deployments-rollback",
             r"wrangler\s+deployments\s+rollback\b",
-            "wrangler deployments rollback reverts to a previous Worker version.",
-            High,
-            "Rolling back a deployment replaces your current Worker code with a previous \
-             version. This can reintroduce bugs, break API compatibility, or cause issues \
-             if the previous version relies on removed bindings or environment variables.\n\n\
-             Safer alternatives:\n\
-             - wrangler deployments list: Review available versions first\n\
-             - Test the target version in a staging environment\n\
-             - Deploy a fix forward instead of rolling back"
+            "wrangler deployments rollback reverts to a previous Worker version."
         ),
         // KV destructive operations
         destructive_pattern!(
             "wrangler-kv-key-delete",
             r"wrangler\s+kv:key\s+delete\b",
-            "wrangler kv:key delete removes a key from KV storage.",
-            Medium,
-            "Deleting a KV key immediately removes the data at all edge locations. \
-             Applications reading this key will receive null or errors. KV deletions \
-             propagate globally within seconds.\n\n\
-             Safer alternatives:\n\
-             - wrangler kv:key get: Retrieve and backup the value first\n\
-             - Set an expiration instead of deleting for temporary data\n\
-             - Use KV namespaces for environment separation"
+            "wrangler kv:key delete removes a key from KV storage."
         ),
         destructive_pattern!(
             "wrangler-kv-namespace-delete",
             r"wrangler\s+kv:namespace\s+delete\b",
-            "wrangler kv:namespace delete removes an entire KV namespace.",
-            Critical,
-            "Deleting a KV namespace permanently removes ALL keys and values within it. \
-             Any Workers bound to this namespace will fail when accessing KV. This cannot \
-             be undone and all data is lost.\n\n\
-             Safer alternatives:\n\
-             - wrangler kv:key list: Inventory all keys first\n\
-             - Export data before deletion\n\
-             - Remove Worker bindings before deleting the namespace"
+            "wrangler kv:namespace delete removes an entire KV namespace."
         ),
         destructive_pattern!(
             "wrangler-kv-bulk-delete",
             r"wrangler\s+kv:bulk\s+delete\b",
-            "wrangler kv:bulk delete removes multiple keys from KV storage.",
-            High,
-            "Bulk delete removes many KV keys at once based on a JSON file. This is \
-             efficient but dangerous - a malformed keys file can delete unintended data. \
-             All deletions are immediate and irreversible.\n\n\
-             Safer alternatives:\n\
-             - Review the keys JSON file carefully before execution\n\
-             - Test with a single wrangler kv:key delete first\n\
-             - Back up affected keys before bulk deletion"
+            "wrangler kv:bulk delete removes multiple keys from KV storage."
         ),
         // R2 destructive operations
         destructive_pattern!(
             "wrangler-r2-object-delete",
             r"wrangler\s+r2\s+object\s+delete\b",
-            "wrangler r2 object delete removes an object from R2 storage.",
-            Medium,
-            "Deleting an R2 object permanently removes the file from storage. Any URLs \
-             or Workers accessing this object will receive 404 errors. Unlike S3, R2 does \
-             not charge for delete operations but data is unrecoverable.\n\n\
-             Safer alternatives:\n\
-             - wrangler r2 object get: Download the object first\n\
-             - Use object lifecycle rules for automatic expiration\n\
-             - Move to a separate 'archive' bucket instead of deleting"
+            "wrangler r2 object delete removes an object from R2 storage."
         ),
         destructive_pattern!(
             "wrangler-r2-bucket-delete",
             r"wrangler\s+r2\s+bucket\s+delete\b",
-            "wrangler r2 bucket delete removes an entire R2 bucket.",
-            Critical,
-            "Deleting an R2 bucket removes the bucket and ALL objects within it. Workers \
-             bound to this bucket will fail. The bucket name becomes available for reuse \
-             by any Cloudflare account.\n\n\
-             Safer alternatives:\n\
-             - wrangler r2 bucket list: Verify the bucket contents\n\
-             - Empty the bucket and verify it's truly unused\n\
-             - Remove Worker bindings before bucket deletion"
+            "wrangler r2 bucket delete removes an entire R2 bucket."
         ),
         // D1 destructive operations
         destructive_pattern!(
             "wrangler-d1-delete",
             r"wrangler\s+d1\s+delete\b",
-            "wrangler d1 delete removes a D1 database.",
-            Critical,
-            "Deleting a D1 database permanently removes all tables, data, and schema. \
-             Workers bound to this database will fail with binding errors. D1 databases \
-             cannot be recovered after deletion.\n\n\
-             Safer alternatives:\n\
-             - wrangler d1 export: Export the database first\n\
-             - wrangler d1 info: Review database details\n\
-             - Remove Worker bindings before deletion"
+            "wrangler d1 delete removes a D1 database."
         ),
     ]
 }

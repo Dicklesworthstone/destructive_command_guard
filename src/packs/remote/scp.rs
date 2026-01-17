@@ -47,98 +47,43 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "scp-recursive-root",
             r"scp\b.*\s-[A-Za-z0-9]*r[A-Za-z0-9]*\b.*\s(?:(?:\S+@)?\S+:)?/\s*$",
-            "scp -r to root (/) is extremely dangerous.",
-            Critical,
-            "Recursive copy to the root filesystem can overwrite critical system files, \
-             potentially rendering the system unbootable. This affects all system directories \
-             including /etc, /bin, /lib, and /boot.\n\n\
-             Safer alternatives:\n\
-             - Specify a target subdirectory instead of /\n\
-             - Use rsync with --dry-run to preview changes\n\
-             - Copy to /tmp first and move files individually"
+            "scp -r to root (/) is extremely dangerous."
         ),
         // Copy to /etc
         destructive_pattern!(
             "scp-to-etc",
             r"scp\b.*\s(?:(?:\S+@)?\S+:)?/etc(?:/\S*)?\s*$",
-            "scp to /etc/ can overwrite system configuration.",
-            High,
-            "The /etc directory contains critical system configuration files including passwd, \
-             shadow, fstab, and network settings. Overwriting these can lock you out of the \
-             system or cause services to fail.\n\n\
-             Safer alternatives:\n\
-             - Copy to a staging directory first\n\
-             - Back up existing files before overwriting\n\
-             - Use configuration management tools (Ansible, etc.)"
+            "scp to /etc/ can overwrite system configuration."
         ),
         // Copy to /var
         destructive_pattern!(
             "scp-to-var",
             r"scp\b.*\s(?:(?:\S+@)?\S+:)?/var(?:/\S*)?\s*$",
-            "scp to /var/ can overwrite system data.",
-            High,
-            "The /var directory contains variable data including logs, databases, mail spools, \
-             and application state. Overwriting this data can cause data loss and service \
-             disruptions.\n\n\
-             Safer alternatives:\n\
-             - Use /var/tmp for temporary staging\n\
-             - Stop affected services before modifying their data\n\
-             - Back up existing data first"
+            "scp to /var/ can overwrite system data."
         ),
         // Copy to /boot
         destructive_pattern!(
             "scp-to-boot",
             r"scp\b.*\s(?:(?:\S+@)?\S+:)?/boot(?:/\S*)?\s*$",
-            "scp to /boot/ can corrupt boot configuration.",
-            Critical,
-            "The /boot directory contains the kernel, initramfs, and bootloader configuration. \
-             Corrupting these files will prevent the system from booting, requiring rescue \
-             media to recover.\n\n\
-             Safer alternatives:\n\
-             - Use package manager for kernel updates\n\
-             - Keep backup kernels available\n\
-             - Test changes in a VM first"
+            "scp to /boot/ can corrupt boot configuration."
         ),
         // Copy to /usr
         destructive_pattern!(
             "scp-to-usr",
             r"scp\b.*\s(?:(?:\S+@)?\S+:)?/usr(?:/\S*)?\s*$",
-            "scp to /usr/ can overwrite system binaries.",
-            High,
-            "The /usr directory contains system binaries, libraries, and shared resources. \
-             Overwriting files here can break system utilities and installed applications.\n\n\
-             Safer alternatives:\n\
-             - Use /usr/local for custom installations\n\
-             - Use package managers for system updates\n\
-             - Install to user directories when possible"
+            "scp to /usr/ can overwrite system binaries."
         ),
         // Copy to /bin or /sbin
         destructive_pattern!(
             "scp-to-bin",
             r"scp\b.*\s(?:(?:\S+@)?\S+:)?/(?:bin|sbin)(?:/\S*)?\s*$",
-            "scp to /bin/ or /sbin/ can overwrite system binaries.",
-            Critical,
-            "The /bin and /sbin directories contain essential system binaries required for \
-             basic operation. Overwriting these can make the system unusable and require \
-             rescue mode recovery.\n\n\
-             Safer alternatives:\n\
-             - Install custom scripts to /usr/local/bin\n\
-             - Use package managers for system updates\n\
-             - Test binaries in user directories first"
+            "scp to /bin/ or /sbin/ can overwrite system binaries."
         ),
         // Copy to /lib
         destructive_pattern!(
             "scp-to-lib",
             r"scp\b.*\s(?:(?:\S+@)?\S+:)?/lib(?:64)?(?:/\S*)?\s*$",
-            "scp to /lib/ can overwrite system libraries.",
-            Critical,
-            "The /lib and /lib64 directories contain shared libraries required by system \
-             binaries. Overwriting these can cause immediate system instability and prevent \
-             commands from running.\n\n\
-             Safer alternatives:\n\
-             - Use package managers for library updates\n\
-             - Install custom libraries to /usr/local/lib\n\
-             - Use LD_LIBRARY_PATH for testing"
+            "scp to /lib/ can overwrite system libraries."
         ),
     ]
 }

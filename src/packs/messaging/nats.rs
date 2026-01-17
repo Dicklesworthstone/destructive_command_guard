@@ -61,79 +61,32 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "nats-stream-delete",
             r"nats(?:\s+--?\S+(?:\s+\S+)?)*\s+stream\s+(?:delete|rm)\b",
-            "nats stream delete/rm removes a JetStream stream and all its messages.",
-            Critical,
-            "Deleting a JetStream stream permanently removes all stored messages, \
-             consumers, and configuration. Applications relying on this stream will \
-             lose access to historical data.\n\n\
-             Safer alternatives:\n\
-             - nats stream info: Review stream details first\n\
-             - nats stream purge: Remove messages but keep the stream\n\
-             - Back up stream configuration before deletion"
+            "nats stream delete/rm removes a JetStream stream and all its messages."
         ),
         destructive_pattern!(
             "nats-stream-purge",
             r"nats(?:\s+--?\S+(?:\s+\S+)?)*\s+stream\s+purge\b",
-            "nats stream purge deletes ALL messages from the stream.",
-            High,
-            "Purging a stream removes all messages while keeping the stream and \
-             consumer configurations intact. Consumers will have no messages to \
-             process until new ones arrive.\n\n\
-             Safer alternatives:\n\
-             - nats stream info: Check message count first\n\
-             - Use --seq to purge only messages up to a specific sequence\n\
-             - Use --keep to retain the last N messages"
+            "nats stream purge deletes ALL messages from the stream."
         ),
         destructive_pattern!(
             "nats-consumer-delete",
             r"nats(?:\s+--?\S+(?:\s+\S+)?)*\s+consumer\s+(?:delete|rm)\b",
-            "nats consumer delete/rm removes a JetStream consumer.",
-            High,
-            "Deleting a consumer removes its acknowledgment state and delivery \
-             tracking. Messages may be redelivered to other consumers or lost \
-             if this was the only consumer.\n\n\
-             Safer alternatives:\n\
-             - nats consumer info: Review consumer state first\n\
-             - Pause the consumer instead of deleting\n\
-             - Ensure other consumers exist for critical streams"
+            "nats consumer delete/rm removes a JetStream consumer."
         ),
         destructive_pattern!(
             "nats-kv-delete",
             r"nats(?:\s+--?\S+(?:\s+\S+)?)*\s+kv\s+(?:del|rm)\b",
-            "nats kv del/rm deletes key-value entries.",
-            High,
-            "Deleting KV entries removes data that applications may depend on. \
-             If history is disabled, the deletion is permanent and cannot be \
-             recovered.\n\n\
-             Safer alternatives:\n\
-             - nats kv get: Retrieve and back up the value first\n\
-             - nats kv history: Check if history is enabled\n\
-             - Use TTL for automatic expiration instead of manual deletion"
+            "nats kv del/rm deletes key-value entries."
         ),
         destructive_pattern!(
             "nats-object-delete",
             r"nats(?:\s+--?\S+(?:\s+\S+)?)*\s+object\s+delete\b",
-            "nats object delete removes an object from the store.",
-            High,
-            "Deleting an object from the object store removes the file and its \
-             metadata. Applications expecting this object will receive errors.\n\n\
-             Safer alternatives:\n\
-             - nats object info: Review object details first\n\
-             - Download the object before deletion\n\
-             - Use object versioning if available"
+            "nats object delete removes an object from the store."
         ),
         destructive_pattern!(
             "nats-account-delete",
             r"nats(?:\s+--?\S+(?:\s+\S+)?)*\s+account\s+delete\b",
-            "nats account delete removes an account and its resources.",
-            Critical,
-            "Deleting a NATS account removes all streams, consumers, and permissions \
-             associated with that account. All applications using this account will \
-             lose connectivity.\n\n\
-             Safer alternatives:\n\
-             - Review account resources before deletion\n\
-             - Migrate resources to another account first\n\
-             - Disable the account instead of deleting"
+            "nats account delete removes an account and its resources."
         ),
     ]
 }

@@ -61,146 +61,58 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "ldcli-flags-delete",
             r"ldcli\s+flags\s+delete\b",
-            "ldcli flags delete permanently removes a feature flag. This cannot be undone.",
-            Critical,
-            "Deleting a LaunchDarkly flag permanently removes it from all environments. \
-             SDKs will return default values, potentially breaking feature gates. Targeting \
-             rules, prerequisites, and experiment data are lost.\n\n\
-             Safer alternatives:\n\
-             - ldcli flags archive: Soft-delete with recovery option\n\
-             - Turn off the flag in all environments first\n\
-             - Export flag configuration before deletion"
+            "ldcli flags delete permanently removes a feature flag. This cannot be undone."
         ),
         destructive_pattern!(
             "ldcli-flags-archive",
             r"ldcli\s+flags\s+archive\b",
-            "ldcli flags archive soft-deletes a feature flag. While recoverable, this affects all environments.",
-            High,
-            "Archiving a flag removes it from the flag list and evaluation. While archived \
-             flags can be restored, SDKs will stop receiving the flag and return defaults \
-             immediately across all environments.\n\n\
-             Safer alternatives:\n\
-             - Turn off the flag before archiving\n\
-             - Verify no code paths depend on the flag\n\
-             - Document the flag's purpose before archiving"
+            "ldcli flags archive soft-deletes a feature flag. While recoverable, this affects all environments."
         ),
         destructive_pattern!(
             "ldcli-projects-delete",
             r"ldcli\s+projects\s+delete\b",
-            "ldcli projects delete removes an entire project and all its flags, environments, and settings.",
-            Critical,
-            "Deleting a project removes ALL flags, environments, segments, and metrics \
-             within it. This is irreversible and affects all applications using this \
-             project's SDK keys.\n\n\
-             Safer alternatives:\n\
-             - Export project configuration first\n\
-             - Archive flags individually to preserve recovery options\n\
-             - Migrate critical flags to another project"
+            "ldcli projects delete removes an entire project and all its flags, environments, and settings."
         ),
         destructive_pattern!(
             "ldcli-environments-delete",
             r"ldcli\s+environments\s+delete\b",
-            "ldcli environments delete removes an environment and all its flag configurations.",
-            Critical,
-            "Deleting an environment removes all flag configurations, targeting rules, \
-             and SDK keys for that environment. Applications using this environment's \
-             SDK key will fail to connect.\n\n\
-             Safer alternatives:\n\
-             - Rotate SDK keys before deletion\n\
-             - Export environment configuration\n\
-             - Turn off all flags in the environment first"
+            "ldcli environments delete removes an environment and all its flag configurations."
         ),
         destructive_pattern!(
             "ldcli-segments-delete",
             r"ldcli\s+segments\s+delete\b",
-            "ldcli segments delete removes a user segment and its targeting rules.",
-            High,
-            "Deleting a segment removes user grouping rules across all environments. \
-             Flags targeting this segment will lose that targeting, changing which \
-             users receive which variations.\n\n\
-             Safer alternatives:\n\
-             - Review which flags use this segment\n\
-             - Update flag targeting before deletion\n\
-             - Export segment configuration"
+            "ldcli segments delete removes a user segment and its targeting rules."
         ),
         destructive_pattern!(
             "ldcli-metrics-delete",
             r"ldcli\s+metrics\s+delete\b",
-            "ldcli metrics delete removes a metric and its experiment data.",
-            High,
-            "Deleting a metric removes the metric definition and all associated \
-             experiment results. Historical experiment data for this metric is lost \
-             and cannot be recovered.\n\n\
-             Safer alternatives:\n\
-             - Export experiment results first\n\
-             - Archive the metric if possible\n\
-             - Document metric findings before deletion"
+            "ldcli metrics delete removes a metric and its experiment data."
         ),
         // API - DELETE requests (ordered from most specific to least specific)
         destructive_pattern!(
             "launchdarkly-api-delete-environments",
             r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*app\.launchdarkly\.com/api/.*/environments/",
-            "DELETE request to LaunchDarkly API removes environments.",
-            Critical,
-            "API DELETE calls to environments immediately invalidate SDK keys and remove \
-             all flag configurations for that environment. Connected applications will \
-             lose flag evaluations.\n\n\
-             Safer alternatives:\n\
-             - Use ldcli for better confirmation prompts\n\
-             - GET the environment config first\n\
-             - Rotate SDK keys before deletion"
+            "DELETE request to LaunchDarkly API removes environments."
         ),
         destructive_pattern!(
             "launchdarkly-api-delete-flags",
             r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*app\.launchdarkly\.com/api/.*/flags/",
-            "DELETE request to LaunchDarkly API removes feature flags.",
-            Critical,
-            "API DELETE calls permanently remove flags without archive recovery options. \
-             All targeting rules, variations, and prerequisites are lost across all \
-             environments.\n\n\
-             Safer alternatives:\n\
-             - Use ldcli flags archive for soft-delete\n\
-             - GET the flag configuration first\n\
-             - Use the LaunchDarkly UI for visibility"
+            "DELETE request to LaunchDarkly API removes feature flags."
         ),
         destructive_pattern!(
             "launchdarkly-api-delete-segments",
             r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*app\.launchdarkly\.com/api/.*/segments/",
-            "DELETE request to LaunchDarkly API removes segments.",
-            High,
-            "API DELETE calls to segments remove user groupings immediately. Flags \
-             using this segment will lose targeting rules, changing feature behavior \
-             for those users.\n\n\
-             Safer alternatives:\n\
-             - Check segment dependencies first\n\
-             - Update flag targeting before deletion\n\
-             - Export segment membership"
+            "DELETE request to LaunchDarkly API removes segments."
         ),
         destructive_pattern!(
             "launchdarkly-api-delete-projects",
             r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*app\.launchdarkly\.com/api/v2/projects/[^/]+$",
-            "DELETE request to LaunchDarkly API removes projects.",
-            Critical,
-            "API DELETE calls to projects remove ALL resources: flags, environments, \
-             segments, metrics, and SDK keys. This is the most destructive operation \
-             and cannot be undone.\n\n\
-             Safer alternatives:\n\
-             - Export project configuration completely\n\
-             - Use ldcli for confirmation prompts\n\
-             - Contact LaunchDarkly support for assistance"
+            "DELETE request to LaunchDarkly API removes projects."
         ),
         destructive_pattern!(
             "launchdarkly-api-delete-generic",
             r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*app\.launchdarkly\.com/api/",
-            "DELETE request to LaunchDarkly API can remove resources.",
-            High,
-            "Generic DELETE requests to the LaunchDarkly API can remove various \
-             resources including webhooks, integrations, teams, and access tokens. \
-             Review the specific endpoint before executing.\n\n\
-             Safer alternatives:\n\
-             - Verify the exact resource being deleted\n\
-             - Use the LaunchDarkly UI for better visibility\n\
-             - GET the resource first to confirm"
+            "DELETE request to LaunchDarkly API can remove resources."
         ),
     ]
 }

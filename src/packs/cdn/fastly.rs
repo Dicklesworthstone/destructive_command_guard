@@ -58,155 +58,67 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "fastly-service-delete",
             r"fastly\s+service\s+delete\b",
-            "fastly service delete removes a Fastly service entirely.",
-            Critical,
-            "Deleting a Fastly service removes ALL associated domains, backends, VCL, \
-             dictionaries, ACLs, and logging configurations. All traffic to this service \
-             will immediately fail. Service IDs cannot be reused after deletion.\n\n\
-             Safer alternatives:\n\
-             - fastly service describe: Review service configuration first\n\
-             - Export VCL and configuration for backup\n\
-             - Remove domains before deleting to confirm no active traffic"
+            "fastly service delete removes a Fastly service entirely."
         ),
         // Domain deletion
         destructive_pattern!(
             "fastly-domain-delete",
             r"fastly\s+domain\s+delete\b",
-            "fastly domain delete removes a domain from a service.",
-            High,
-            "Removing a domain from a Fastly service immediately stops CDN handling \
-             for that domain. Traffic will either fail or fall back to the origin \
-             directly, bypassing caching and edge features.\n\n\
-             Safer alternatives:\n\
-             - fastly domain list: Review all domains on the service\n\
-             - Update DNS before removing from Fastly\n\
-             - Test with a staging domain first"
+            "fastly domain delete removes a domain from a service."
         ),
         // Backend deletion
         destructive_pattern!(
             "fastly-backend-delete",
             r"fastly\s+backend\s+delete\b",
-            "fastly backend delete removes a backend origin server.",
-            High,
-            "Deleting a backend removes an origin server from the service. If VCL or \
-             routing rules reference this backend, requests will fail with 503 errors. \
-             Health checks and shield configuration are also removed.\n\n\
-             Safer alternatives:\n\
-             - fastly backend describe: Review backend configuration\n\
-             - Update VCL to stop routing to this backend first\n\
-             - Add replacement backend before removing the old one"
+            "fastly backend delete removes a backend origin server."
         ),
         // VCL deletion
         destructive_pattern!(
             "fastly-vcl-delete",
             r"fastly\s+vcl\s+delete\b",
-            "fastly vcl delete removes VCL configuration.",
-            High,
-            "Deleting VCL removes custom edge logic including routing, caching rules, \
-             header manipulation, and security policies. The service may fall back to \
-             default behavior or fail if the deleted VCL was the main configuration.\n\n\
-             Safer alternatives:\n\
-             - fastly vcl describe: Download VCL content first\n\
-             - Keep VCL in version control\n\
-             - Create new version before deleting from old"
+            "fastly vcl delete removes VCL configuration."
         ),
         // Dictionary deletion
         destructive_pattern!(
             "fastly-dictionary-delete",
             r"fastly\s+dictionary\s+delete\b",
-            "fastly dictionary delete removes an edge dictionary.",
-            High,
-            "Deleting an edge dictionary removes key-value configuration data used by \
-             VCL. If VCL references this dictionary for routing, feature flags, or \
-             blocklists, those lookups will fail causing request errors.\n\n\
-             Safer alternatives:\n\
-             - fastly dictionary-item list: Export dictionary contents\n\
-             - Update VCL to remove dictionary references first\n\
-             - Create replacement dictionary before deleting"
+            "fastly dictionary delete removes an edge dictionary."
         ),
         // Dictionary item deletion
         destructive_pattern!(
             "fastly-dictionary-item-delete",
             r"fastly\s+dictionary-item\s+delete\b",
-            "fastly dictionary-item delete removes dictionary entries.",
-            Medium,
-            "Deleting dictionary items removes edge configuration values. VCL lookups \
-             for deleted keys will return empty strings, potentially affecting routing, \
-             redirects, or feature flag logic.\n\n\
-             Safer alternatives:\n\
-             - Review which VCL snippets use this dictionary\n\
-             - Set values to empty instead of deleting if VCL expects the key\n\
-             - Back up dictionary contents before modifications"
+            "fastly dictionary-item delete removes dictionary entries."
         ),
         // ACL deletion
         destructive_pattern!(
             "fastly-acl-delete",
             r"fastly\s+acl\s+delete\b",
-            "fastly acl delete removes an access control list.",
-            High,
-            "Deleting an ACL removes IP allowlist or blocklist configuration. Security \
-             rules referencing this ACL will no longer match, potentially exposing \
-             protected resources or breaking geo-restriction logic.\n\n\
-             Safer alternatives:\n\
-             - fastly acl-entry list: Export ACL entries first\n\
-             - Update VCL to remove ACL references\n\
-             - Create replacement ACL before deleting"
+            "fastly acl delete removes an access control list."
         ),
         // ACL entry deletion
         destructive_pattern!(
             "fastly-acl-entry-delete",
             r"fastly\s+acl-entry\s+delete\b",
-            "fastly acl-entry delete removes ACL entries.",
-            Medium,
-            "Removing ACL entries changes IP matching behavior. Removing an IP from a \
-             blocklist allows that IP to access the service. Removing from an allowlist \
-             blocks that IP.\n\n\
-             Safer alternatives:\n\
-             - Review the ACL purpose (allow vs block list)\n\
-             - Verify the entry change with the security team\n\
-             - Document why the entry is being removed"
+            "fastly acl-entry delete removes ACL entries."
         ),
         // Logging endpoint deletion
         destructive_pattern!(
             "fastly-logging-delete",
             r"fastly\s+logging\s+\S+\s+delete\b",
-            "fastly logging delete removes logging endpoints.",
-            High,
-            "Deleting a logging endpoint stops log delivery to that destination. You \
-             will lose visibility into edge traffic, errors, and security events. \
-             Compliance and debugging capabilities are affected.\n\n\
-             Safer alternatives:\n\
-             - Ensure alternative logging is configured\n\
-             - Export endpoint configuration for backup\n\
-             - Disable endpoint before full deletion"
+            "fastly logging delete removes logging endpoints."
         ),
         // Service version activation (can cause outages)
         destructive_pattern!(
             "fastly-version-activate",
             r"fastly\s+service\s+version\s+activate\b",
-            "fastly service version activate can cause service disruption if misconfigured.",
-            High,
-            "Activating a service version immediately deploys that configuration to all \
-             edge nodes. Misconfigured VCL, missing backends, or broken routing rules \
-             will cause immediate outages affecting all traffic.\n\n\
-             Safer alternatives:\n\
-             - fastly vcl validate: Validate VCL syntax first\n\
-             - Use fastly diff to compare with current active version\n\
-             - Test in a staging service before production activation"
+            "fastly service version activate can cause service disruption if misconfigured."
         ),
         // Compute package deletion
         destructive_pattern!(
             "fastly-compute-delete",
             r"fastly\s+compute\s+delete\b",
-            "fastly compute delete removes compute package.",
-            Critical,
-            "Deleting a Compute@Edge package removes your WASM application from the \
-             service. All serverless edge compute functionality stops immediately. \
-             The package must be rebuilt and redeployed to restore functionality.\n\n\
-             Safer alternatives:\n\
-             - Keep package source in version control\n\
-             - Deploy replacement package before deleting\n\
-             - Use fastly compute describe to review current state"
+            "fastly compute delete removes compute package."
         ),
     ]
 }

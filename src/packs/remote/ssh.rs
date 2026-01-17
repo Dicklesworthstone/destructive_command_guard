@@ -50,82 +50,35 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "ssh-remote-rm-rf",
             r#"ssh\s+(?:\S+\s+)*(?:-[A-Za-z]+\s+)*\S+[@:]?\S*\s+['"]?.*\brm\s+-[a-zA-Z]*r[a-zA-Z]*f"#,
-            "SSH remote execution contains destructive rm -rf command.",
-            Critical,
-            "Executing rm -rf on a remote system via SSH can cause irreversible data loss. \
-             Remote systems often have different directory structures and you may not have \
-             the same safety mechanisms in place.\n\n\
-             Safer alternatives:\n\
-             - SSH in and run commands interactively with confirmation\n\
-             - Use --dry-run or preview flags when available\n\
-             - Ensure backups exist on the remote system"
+            "SSH remote execution contains destructive rm -rf command."
         ),
         destructive_pattern!(
             "ssh-remote-git-reset-hard",
             r#"ssh\s+(?:\S+\s+)*(?:-[A-Za-z]+\s+)*\S+[@:]?\S*\s+['"]?.*\bgit\s+reset\s+--hard\b"#,
-            "SSH remote execution contains destructive git reset --hard command.",
-            High,
-            "Running git reset --hard on a remote server discards all uncommitted changes. \
-             On production servers, this might destroy deployment state or configuration \
-             changes made directly on the server.\n\n\
-             Safer alternatives:\n\
-             - git stash on the remote first to save changes\n\
-             - Use git status remotely to check for uncommitted work\n\
-             - Consider proper deployment pipelines instead of direct remote git"
+            "SSH remote execution contains destructive git reset --hard command."
         ),
         destructive_pattern!(
             "ssh-remote-git-clean",
             r#"ssh\s+(?:\S+\s+)*(?:-[A-Za-z]+\s+)*\S+[@:]?\S*\s+['"]?.*\bgit\s+clean\s+-[a-zA-Z]*f"#,
-            "SSH remote execution contains destructive git clean -f command.",
-            High,
-            "Running git clean -f on a remote server permanently removes untracked files. \
-             This might delete logs, uploads, or configuration files that were never \
-             committed to the repository.\n\n\
-             Safer alternatives:\n\
-             - Run git clean -n first to preview what would be deleted\n\
-             - Use .gitignore to protect important untracked files\n\
-             - Back up untracked files before cleaning"
+            "SSH remote execution contains destructive git clean -f command."
         ),
         // Known hosts removal
         destructive_pattern!(
             "ssh-keygen-remove-host",
             r"ssh-keygen\s+(?:\S+\s+)*-R\b",
-            "ssh-keygen -R removes entries from known_hosts file.",
-            Medium,
-            "Removing entries from known_hosts weakens protection against man-in-the-middle \
-             attacks. The next connection will trust any key presented by the remote host.\n\n\
-             Safer alternatives:\n\
-             - Verify the new host key fingerprint before removing old entry\n\
-             - Use ssh-keyscan to preview the new key\n\
-             - Update entry rather than removing (add new key, then remove old)"
+            "ssh-keygen -R removes entries from known_hosts file."
         ),
         // SSH key deletion
         destructive_pattern!(
             "ssh-add-delete-all",
             r"ssh-add\s+-[dD]\b",
-            "ssh-add -d/-D removes identities from the SSH agent.",
-            Medium,
-            "Removing SSH identities from the agent will require re-authentication for \
-             subsequent connections. Using -D removes ALL identities, which may interrupt \
-             active sessions or scripts.\n\n\
-             Safer alternatives:\n\
-             - Use -d to remove specific keys rather than -D for all\n\
-             - List keys with ssh-add -l before removing\n\
-             - Re-add keys immediately if needed"
+            "ssh-add -d/-D removes identities from the SSH agent."
         ),
         // Remote sudo operations (high risk)
         destructive_pattern!(
             "ssh-remote-sudo-rm",
             r#"ssh\s+(?:\S+\s+)*\S+[@:]?\S*\s+['"]?.*\bsudo\s+rm\b"#,
-            "SSH remote execution with sudo rm is high-risk.",
-            Critical,
-            "Executing sudo rm on a remote system bypasses normal permission restrictions \
-             and can delete system files. Combined with SSH, there's no interactive \
-             confirmation and errors may not be visible.\n\n\
-             Safer alternatives:\n\
-             - SSH in and run sudo commands interactively\n\
-             - Use mv to a backup location instead of rm\n\
-             - Implement proper cleanup scripts with safety checks"
+            "SSH remote execution with sudo rm is high-risk."
         ),
     ]
 }

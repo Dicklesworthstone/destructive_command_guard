@@ -46,54 +46,22 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "datadog-ci-monitors-delete",
             r"datadog-ci\s+monitors\s+delete\b",
-            "datadog-ci monitors delete removes a Datadog monitor.",
-            High,
-            "Deleting a Datadog monitor stops all alerting for that check. You will no \
-             longer be notified if the monitored condition occurs, potentially missing \
-             critical production issues.\n\n\
-             Safer alternatives:\n\
-             - datadog-ci monitors get <id>: Review the monitor configuration first\n\
-             - Mute the monitor temporarily instead of deleting\n\
-             - Export monitor JSON configuration as backup before deletion"
+            "datadog-ci monitors delete removes a Datadog monitor."
         ),
         destructive_pattern!(
             "datadog-ci-dashboards-delete",
             r"datadog-ci\s+dashboards\s+delete\b",
-            "datadog-ci dashboards delete removes a Datadog dashboard.",
-            High,
-            "Deleting a dashboard removes all widgets, queries, and layout configuration. \
-             Team members relying on this dashboard for visibility will lose access \
-             immediately.\n\n\
-             Safer alternatives:\n\
-             - datadog-ci dashboards get <id>: Export dashboard JSON first\n\
-             - Clone the dashboard before making changes\n\
-             - Use Terraform or Pulumi for version-controlled dashboard definitions"
+            "datadog-ci dashboards delete removes a Datadog dashboard."
         ),
         destructive_pattern!(
             "datadog-api-delete",
             r"(?i)curl\s+.*(?:-X|--request)\s+DELETE\b.*api\.datadoghq\.com.*\/(monitor|dashboard|synthetics)\/",
-            "Datadog API DELETE calls remove monitors/dashboards/synthetics.",
-            High,
-            "Direct API DELETE calls permanently remove Datadog resources without \
-             confirmation prompts. Monitors, dashboards, and synthetic tests are deleted \
-             immediately.\n\n\
-             Safer alternatives:\n\
-             - GET the resource first to verify the ID and export configuration\n\
-             - Use datadog-ci CLI which provides better feedback\n\
-             - Use Terraform/Pulumi for auditable, reversible infrastructure changes"
+            "Datadog API DELETE calls remove monitors/dashboards/synthetics."
         ),
         destructive_pattern!(
             "terraform-datadog-destroy",
             r"terraform\s+destroy\b.*\bdatadog_[a-zA-Z0-9_]+\b",
-            "terraform destroy targeting Datadog resources removes monitoring infrastructure.",
-            High,
-            "Terraform destroy removes Datadog monitors, dashboards, and other resources \
-             defined in your configuration. While Terraform tracks state, the actual \
-             monitoring resources are deleted immediately from Datadog.\n\n\
-             Safer alternatives:\n\
-             - terraform plan -destroy -target=... to preview deletions\n\
-             - terraform state rm to stop managing without deleting\n\
-             - Remove from Terraform config and apply instead of destroy"
+            "terraform destroy targeting Datadog resources removes monitoring infrastructure."
         ),
     ]
 }

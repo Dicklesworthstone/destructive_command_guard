@@ -35,28 +35,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "rsync-delete",
             r"rsync\b.*\s--delete(?:-[a-z-]+)?\b",
-            "rsync --delete removes destination files not present in source.",
-            High,
-            "The --delete flag removes files from the destination that don't exist in the \
-             source. If source and destination are swapped, or if the source is unexpectedly \
-             empty, important data on the destination can be permanently deleted.\n\n\
-             Safer alternatives:\n\
-             - rsync --dry-run --delete: Preview what would be deleted\n\
-             - rsync without --delete: Only adds/updates, never deletes\n\
-             - rsync --backup --delete: Keep backup copies of deleted files"
+            "rsync --delete removes destination files not present in source."
         ),
         destructive_pattern!(
             "rsync-del-short",
             r"rsync\b.*\s--del\b",
-            "rsync --del is a short alias for --delete and is destructive.",
-            High,
-            "The --del flag is shorthand for --delete-during, which deletes destination files \
-             not present in source during the transfer. This is slightly more dangerous than \
-             --delete-after because deletions happen incrementally.\n\n\
-             Safer alternatives:\n\
-             - rsync --dry-run --del: Preview deletions first\n\
-             - rsync without deletion flags: Additive sync only\n\
-             - Use --delete-after for predictable batch deletion"
+            "rsync --del is a short alias for --delete and is destructive."
         ),
     ]
 }

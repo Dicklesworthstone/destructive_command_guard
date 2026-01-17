@@ -62,80 +62,32 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "s3-rb",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+s3\s+rb\b",
-            "aws s3 rb removes an S3 bucket and is destructive.",
-            Critical,
-            "Removing an S3 bucket deletes the bucket and optionally all objects within \
-             it (with --force). Bucket names are globally unique and may be claimed by \
-             others after deletion. Versioned objects require additional cleanup.\n\n\
-             Safer alternatives:\n\
-             - aws s3 ls: Review bucket contents first\n\
-             - Empty the bucket before removal\n\
-             - Enable bucket versioning for recovery options"
+            "aws s3 rb removes an S3 bucket and is destructive."
         ),
         destructive_pattern!(
             "s3-rm",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+s3\s+rm\b",
-            "aws s3 rm deletes S3 objects and is destructive.",
-            High,
-            "The rm command deletes objects from S3. With --recursive, it deletes all \
-             objects under a prefix. For versioned buckets, this creates delete markers; \
-             for unversioned buckets, data is permanently lost.\n\n\
-             Safer alternatives:\n\
-             - aws s3 ls: Review objects before deletion\n\
-             - Use --dryrun to preview what will be deleted\n\
-             - Enable versioning for recovery options"
+            "aws s3 rm deletes S3 objects and is destructive."
         ),
         destructive_pattern!(
             "s3-sync-delete",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+s3\s+sync\b(?:\s+[^\n]*)?\s+--delete\b",
-            "aws s3 sync --delete removes destination objects not in source.",
-            High,
-            "The --delete flag removes files from the destination that don't exist in \
-             the source. This can accidentally delete important data if source and \
-             destination are swapped or if source is empty.\n\n\
-             Safer alternatives:\n\
-             - aws s3 sync --dryrun: Preview changes first\n\
-             - Omit --delete for additive-only sync\n\
-             - Back up destination before syncing"
+            "aws s3 sync --delete removes destination objects not in source."
         ),
         destructive_pattern!(
             "s3api-delete-bucket",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+s3api\s+delete-bucket\b",
-            "aws s3api delete-bucket permanently deletes a bucket.",
-            Critical,
-            "The delete-bucket API removes an S3 bucket. The bucket must be empty \
-             (including all versions and delete markers). Once deleted, the bucket \
-             name becomes available globally and may be claimed by others.\n\n\
-             Safer alternatives:\n\
-             - aws s3api list-objects-v2: Verify bucket is empty\n\
-             - aws s3api list-object-versions: Check for versions\n\
-             - Use lifecycle policies for managed cleanup"
+            "aws s3api delete-bucket permanently deletes a bucket."
         ),
         destructive_pattern!(
             "s3api-delete-object",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+s3api\s+delete-object\b",
-            "aws s3api delete-object permanently deletes an object.",
-            Medium,
-            "Deleting an object removes it from S3. For versioned buckets, this creates \
-             a delete marker. Specifying a version-id permanently deletes that specific \
-             version. Unversioned objects are immediately and permanently deleted.\n\n\
-             Safer alternatives:\n\
-             - aws s3api head-object: Verify object exists\n\
-             - Use bucket versioning for recovery\n\
-             - Copy to backup location before deletion"
+            "aws s3api delete-object permanently deletes an object."
         ),
         destructive_pattern!(
             "s3api-delete-objects",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+s3api\s+delete-objects\b",
-            "aws s3api delete-objects permanently deletes multiple objects.",
-            High,
-            "Batch deletion removes up to 1,000 objects per request. A malformed delete \
-             JSON file can remove unintended objects. Deletions are processed in \
-             parallel and cannot be easily stopped once started.\n\n\
-             Safer alternatives:\n\
-             - Review the delete JSON file carefully\n\
-             - Test with a single object first\n\
-             - Enable versioning before bulk deletions"
+            "aws s3api delete-objects permanently deletes multiple objects."
         ),
     ]
 }

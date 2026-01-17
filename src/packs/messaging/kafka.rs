@@ -78,93 +78,37 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "kafka-topics-delete",
             r"kafka-topics(?:\.sh)?\b.*\s--delete\b",
-            "kafka-topics --delete removes Kafka topics and data.",
-            Critical,
-            "Deleting a Kafka topic permanently removes all messages and partitions. \
-             Consumers will receive errors, and any unprocessed data is lost. Producer \
-             applications may fail until they handle the missing topic.\n\n\
-             Safer alternatives:\n\
-             - kafka-topics --describe: Review topic details first\n\
-             - Set retention.ms to expire data naturally\n\
-             - Back up critical data before deletion"
+            "kafka-topics --delete removes Kafka topics and data."
         ),
         destructive_pattern!(
             "kafka-consumer-groups-delete",
             r"kafka-consumer-groups(?:\.sh)?\b.*\s--delete\b",
-            "kafka-consumer-groups --delete removes consumer groups and offsets.",
-            High,
-            "Deleting a consumer group removes all committed offsets. When consumers \
-             reconnect, they will start from the earliest or latest offset based on \
-             their configuration, potentially reprocessing or skipping messages.\n\n\
-             Safer alternatives:\n\
-             - kafka-consumer-groups --describe: Check group status first\n\
-             - Reset offsets instead of deleting the group\n\
-             - Ensure all consumers are stopped before deletion"
+            "kafka-consumer-groups --delete removes consumer groups and offsets."
         ),
         destructive_pattern!(
             "kafka-consumer-groups-reset-offsets",
             r"kafka-consumer-groups(?:\.sh)?\b.*\s--reset-offsets\b",
-            "kafka-consumer-groups --reset-offsets rewinds offsets and can cause reprocessing.",
-            High,
-            "Resetting consumer offsets can cause messages to be reprocessed or skipped. \
-             This affects data consistency if your consumers are not idempotent. Resetting \
-             to the earliest offset on a high-volume topic may trigger massive reprocessing.\n\n\
-             Safer alternatives:\n\
-             - Use --dry-run to preview the reset first\n\
-             - Reset to a specific timestamp or offset for precision\n\
-             - Ensure consumers are stopped before resetting"
+            "kafka-consumer-groups --reset-offsets rewinds offsets and can cause reprocessing."
         ),
         destructive_pattern!(
             "kafka-configs-delete-config",
             r"kafka-configs(?:\.sh)?\b.*\s--alter\b.*\s--delete-config\b",
-            "kafka-configs --alter --delete-config removes broker/topic configs.",
-            High,
-            "Deleting configuration overrides reverts topics or brokers to default \
-             settings. This can unexpectedly change retention, replication, or \
-             compression behavior.\n\n\
-             Safer alternatives:\n\
-             - kafka-configs --describe: Review current configuration first\n\
-             - Set explicit values instead of deleting to revert to defaults\n\
-             - Test configuration changes in a non-production environment"
+            "kafka-configs --alter --delete-config removes broker/topic configs."
         ),
         destructive_pattern!(
             "kafka-acls-remove",
             r"kafka-acls(?:\.sh)?\b.*\s--remove\b",
-            "kafka-acls --remove deletes ACLs and can break access controls.",
-            High,
-            "Removing ACLs can immediately break access for producers and consumers. \
-             Applications may fail with authorization errors, causing message loss \
-             or processing delays.\n\n\
-             Safer alternatives:\n\
-             - kafka-acls --list: Review existing ACLs first\n\
-             - Test ACL changes in a non-production environment\n\
-             - Add new ACLs before removing old ones during transitions"
+            "kafka-acls --remove deletes ACLs and can break access controls."
         ),
         destructive_pattern!(
             "kafka-delete-records",
             r"kafka-delete-records(?:\.sh)?\b",
-            "kafka-delete-records deletes records up to specified offsets.",
-            Critical,
-            "This command permanently deletes messages from topic partitions up to the \
-             specified offsets. Deleted data cannot be recovered. Consumers attempting \
-             to read deleted offsets will encounter errors.\n\n\
-             Safer alternatives:\n\
-             - Use retention policies for automatic data expiration\n\
-             - Verify the offset JSON file carefully before execution\n\
-             - Consider topic compaction for key-based retention"
+            "kafka-delete-records deletes records up to specified offsets."
         ),
         destructive_pattern!(
             "rpk-topic-delete",
             r"rpk\b.*\stopic\s+delete\b",
-            "rpk topic delete removes topics (Kafka-compatible).",
-            Critical,
-            "Deleting a topic via rpk (Redpanda) permanently removes all data and \
-             partitions, similar to kafka-topics --delete. This affects both Redpanda \
-             and Kafka-compatible systems.\n\n\
-             Safer alternatives:\n\
-             - rpk topic describe: Review topic details first\n\
-             - rpk topic list: Verify the topic name\n\
-             - Use retention settings for data lifecycle management"
+            "rpk topic delete removes topics (Kafka-compatible)."
         ),
     ]
 }

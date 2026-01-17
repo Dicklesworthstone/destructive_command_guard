@@ -61,54 +61,22 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "doppler-secrets-delete",
             r"doppler(?:\s+--?\S+(?:\s+\S+)?)*\s+secrets\s+delete\b",
-            "doppler secrets delete removes secrets.",
-            High,
-            "Deleting a secret removes configuration data that applications depend on. \
-             Services using 'doppler run' or synced secrets will fail when the secret \
-             is not found. Deleted secrets cannot be recovered.\n\n\
-             Safer alternatives:\n\
-             - doppler secrets get: Export secret value first\n\
-             - doppler secrets set: Update value instead of deleting\n\
-             - Verify which environments/configs reference the secret"
+            "doppler secrets delete removes secrets."
         ),
         destructive_pattern!(
             "doppler-projects-delete",
             r"doppler(?:\s+--?\S+(?:\s+\S+)?)*\s+projects\s+delete\b",
-            "doppler projects delete removes a project.",
-            Critical,
-            "Deleting a Doppler project removes all environments, configs, and secrets \
-             within it. All applications referencing this project will lose access to \
-             their secrets. This action cannot be undone.\n\n\
-             Safer alternatives:\n\
-             - doppler secrets download: Export all secrets first\n\
-             - Review active integrations and service tokens\n\
-             - Archive the project configuration for recovery"
+            "doppler projects delete removes a project."
         ),
         destructive_pattern!(
             "doppler-environments-delete",
             r"doppler(?:\s+--?\S+(?:\s+\S+)?)*\s+environments\s+delete\b",
-            "doppler environments delete removes an environment.",
-            High,
-            "Deleting a Doppler environment removes all configs within that environment. \
-             Applications targeting this environment (dev, staging, prod) will fail to \
-             retrieve secrets. Inherited configurations are also lost.\n\n\
-             Safer alternatives:\n\
-             - doppler secrets download: Export environment secrets\n\
-             - doppler configs list: Review all configs in environment\n\
-             - Ensure no active deployments use this environment"
+            "doppler environments delete removes an environment."
         ),
         destructive_pattern!(
             "doppler-configs-delete",
             r"doppler(?:\s+--?\S+(?:\s+\S+)?)*\s+configs\s+delete\b",
-            "doppler configs delete removes a config.",
-            High,
-            "Deleting a Doppler config removes all secret values specific to that config. \
-             Branch configs and inheriting configs may also be affected. Applications \
-             using this config will fail to start or authenticate.\n\n\
-             Safer alternatives:\n\
-             - doppler secrets download --config=X: Export config secrets\n\
-             - doppler configs list: Understand config hierarchy\n\
-             - Migrate secrets to a new config before deletion"
+            "doppler configs delete removes a config."
         ),
     ]
 }

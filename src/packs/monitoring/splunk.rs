@@ -38,53 +38,22 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "splunk-remove-index",
             r"splunk\s+remove\s+index\b",
-            "splunk remove index deletes an index and its data permanently.",
-            Critical,
-            "Removing a Splunk index permanently deletes all indexed data within it. \
-             Historical logs, events, and metrics are irretrievably lost. Any searches, \
-             dashboards, or alerts referencing this index will fail.\n\n\
-             Safer alternatives:\n\
-             - splunk list index: Review index before removal\n\
-             - Archive the data before deletion\n\
-             - Use retention policies instead of manual deletion"
+            "splunk remove index deletes an index and its data permanently."
         ),
         destructive_pattern!(
             "splunk-clean-eventdata",
             r"splunk\s+clean\s+eventdata\b",
-            "splunk clean eventdata permanently deletes indexed data.",
-            Critical,
-            "Clean eventdata permanently removes all events from the specified index. \
-             This cannot be undone. Use this only when you're certain the data is no \
-             longer needed.\n\n\
-             Safer alternatives:\n\
-             - Set retention policies for automatic cleanup\n\
-             - Export data before cleaning\n\
-             - Use splunk search to verify what will be deleted"
+            "splunk clean eventdata permanently deletes indexed data."
         ),
         destructive_pattern!(
             "splunk-delete-user-role",
             r"splunk\s+delete\s+(?:user|role)\b",
-            "splunk delete user/role removes access configurations. Verify before deleting.",
-            High,
-            "Deleting a user removes their access and any saved searches or dashboards \
-             owned by them. Deleting a role affects all users assigned to it, potentially \
-             breaking access controls.\n\n\
-             Safer alternatives:\n\
-             - splunk list user/role: Review before deletion\n\
-             - Disable the user instead of deleting\n\
-             - Reassign role capabilities before deletion"
+            "splunk delete user/role removes access configurations. Verify before deleting."
         ),
         destructive_pattern!(
             "splunk-api-delete",
             r"(?i)curl\s+.*(?:-X|--request)\s+DELETE\b.*splunk.*\/services\/",
-            "Splunk REST DELETE calls can permanently remove objects. Verify the endpoint.",
-            High,
-            "Direct API DELETE calls to Splunk services can remove indexes, saved searches, \
-             dashboards, alerts, and other objects without confirmation.\n\n\
-             Safer alternatives:\n\
-             - GET the resource first to verify the object\n\
-             - Use Splunk CLI or web UI for better feedback\n\
-             - Export configuration before deletion"
+            "Splunk REST DELETE calls can permanently remove objects. Verify the endpoint."
         ),
     ]
 }

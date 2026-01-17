@@ -50,90 +50,37 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "pd-service-delete",
             r"\bpd\b(?:\s+--?\S+(?:\s+\S+)?)*\s+service\s+delete\b",
-            "pd service delete removes a PagerDuty service, which can break incident routing.",
-            Critical,
-            "Deleting a PagerDuty service removes all incident routing, integrations, and \
-             escalation policies attached to it. Incidents will no longer be created for \
-             this service, potentially causing outages to go unnoticed.\n\n\
-             Safer alternatives:\n\
-             - pd service list: Verify the service before deletion\n\
-             - Disable the service temporarily instead of deleting\n\
-             - Export service configuration via API before deletion"
+            "pd service delete removes a PagerDuty service, which can break incident routing."
         ),
         destructive_pattern!(
             "pd-schedule-delete",
             r"\bpd\b(?:\s+--?\S+(?:\s+\S+)?)*\s+schedule\s+delete\b",
-            "pd schedule delete removes a PagerDuty schedule.",
-            High,
-            "Deleting a schedule removes all on-call rotations and overrides. Escalation \
-             policies using this schedule will have gaps in coverage, potentially leaving \
-             incidents unassigned.\n\n\
-             Safer alternatives:\n\
-             - pd schedule get <id>: Review schedule details first\n\
-             - Update the schedule rather than deleting\n\
-             - Check which escalation policies reference this schedule"
+            "pd schedule delete removes a PagerDuty schedule."
         ),
         destructive_pattern!(
             "pd-escalation-policy-delete",
             r"\bpd\b(?:\s+--?\S+(?:\s+\S+)?)*\s+escalation-policy\s+delete\b",
-            "pd escalation-policy delete removes a PagerDuty escalation policy.",
-            High,
-            "Deleting an escalation policy breaks incident routing for all services using \
-             it. Incidents may not be escalated properly, leading to delayed response \
-             times.\n\n\
-             Safer alternatives:\n\
-             - Review which services use this escalation policy\n\
-             - Update the policy rather than deleting\n\
-             - Assign services to a different policy before deletion"
+            "pd escalation-policy delete removes a PagerDuty escalation policy."
         ),
         destructive_pattern!(
             "pd-user-delete",
             r"\bpd\b(?:\s+--?\S+(?:\s+\S+)?)*\s+user\s+delete\b",
-            "pd user delete removes a PagerDuty user.",
-            High,
-            "Deleting a user removes them from all schedules and escalation policies. \
-             On-call coverage may have gaps, and incident history associated with this \
-             user may be affected.\n\n\
-             Safer alternatives:\n\
-             - Deactivate the user instead of deleting\n\
-             - Reassign their schedule shifts first\n\
-             - Transfer incident ownership before deletion"
+            "pd user delete removes a PagerDuty user."
         ),
         destructive_pattern!(
             "pd-team-delete",
             r"\bpd\b(?:\s+--?\S+(?:\s+\S+)?)*\s+team\s+delete\b",
-            "pd team delete removes a PagerDuty team.",
-            High,
-            "Deleting a team removes the organizational grouping and may affect access \
-             controls, service ownership, and escalation policies.\n\n\
-             Safer alternatives:\n\
-             - pd team list: Verify the team before deletion\n\
-             - Reassign team members and services first\n\
-             - Merge teams rather than delete"
+            "pd team delete removes a PagerDuty team."
         ),
         destructive_pattern!(
             "pagerduty-api-delete-service",
             r"(?i)curl\s+.*(?:-X|--request)\s+DELETE\b.*api\.pagerduty\.com[^\s]*?/services/[^\s]+",
-            "PagerDuty API DELETE /services/{id} deletes a PagerDuty service.",
-            Critical,
-            "Direct API deletion of a service removes all incident routing immediately. \
-             There is no confirmation prompt when using curl directly.\n\n\
-             Safer alternatives:\n\
-             - GET the service first to verify the ID\n\
-             - Use the pd CLI for better feedback\n\
-             - Export service configuration before deletion"
+            "PagerDuty API DELETE /services/{id} deletes a PagerDuty service."
         ),
         destructive_pattern!(
             "pagerduty-api-delete-schedule",
             r"(?i)curl\s+.*(?:-X|--request)\s+DELETE\b.*api\.pagerduty\.com[^\s]*?/schedules/[^\s]+",
-            "PagerDuty API DELETE /schedules/{id} deletes a PagerDuty schedule.",
-            High,
-            "API deletion of a schedule removes on-call rotations immediately. Escalation \
-             policies referencing this schedule will have coverage gaps.\n\n\
-             Safer alternatives:\n\
-             - GET the schedule first to verify the ID\n\
-             - Use the pd CLI for better feedback\n\
-             - Check dependent escalation policies before deletion"
+            "PagerDuty API DELETE /schedules/{id} deletes a PagerDuty schedule."
         ),
     ]
 }

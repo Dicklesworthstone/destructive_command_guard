@@ -58,107 +58,42 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "aws-sqs-delete-queue",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+sqs\s+delete-queue\b",
-            "aws sqs delete-queue permanently deletes an SQS queue.",
-            Critical,
-            "Deleting an SQS queue removes the queue and all messages in it. Messages \
-             in flight are lost, and any applications sending to this queue will \
-             receive errors. You must wait 60 seconds before recreating a queue \
-             with the same name.\n\n\
-             Safer alternatives:\n\
-             - aws sqs get-queue-attributes: Review queue metrics first\n\
-             - aws sqs purge-queue: Remove messages but keep the queue\n\
-             - Use message retention period for automatic cleanup"
+            "aws sqs delete-queue permanently deletes an SQS queue."
         ),
         destructive_pattern!(
             "aws-sqs-purge-queue",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+sqs\s+purge-queue\b",
-            "aws sqs purge-queue deletes ALL messages in the queue.",
-            High,
-            "Purging an SQS queue deletes all messages immediately. This includes \
-             messages in flight and delayed messages. The operation cannot be undone. \
-             You can only purge a queue once every 60 seconds.\n\n\
-             Safer alternatives:\n\
-             - aws sqs get-queue-attributes: Check message count first\n\
-             - Process messages normally instead of purging\n\
-             - Use dead-letter queues for failed messages"
+            "aws sqs purge-queue deletes ALL messages in the queue."
         ),
         destructive_pattern!(
             "aws-sqs-delete-message-batch",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+sqs\s+delete-message-batch\b",
-            "aws sqs delete-message-batch removes multiple messages from the queue.",
-            Medium,
-            "Batch deletion removes up to 10 messages at once. Messages must be \
-             successfully processed before deletion, or they will be lost. Ensure \
-             your processing logic is complete before calling delete.\n\n\
-             Safer alternatives:\n\
-             - Verify receipt handles are still valid\n\
-             - Use visibility timeout to prevent duplicate processing\n\
-             - Delete messages only after confirmed processing"
+            "aws sqs delete-message-batch removes multiple messages from the queue."
         ),
         destructive_pattern!(
             "aws-sqs-delete-message",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+sqs\s+delete-message(?:[\s]|$)",
-            "aws sqs delete-message removes a message from the queue.",
-            Medium,
-            "Deleting a message removes it permanently from the queue. Only delete \
-             after successful processing. If processing fails after deletion, the \
-             message is lost.\n\n\
-             Safer alternatives:\n\
-             - Extend visibility timeout if processing takes longer\n\
-             - Use dead-letter queues for failed processing\n\
-             - Implement idempotent processing for safety"
+            "aws sqs delete-message removes a message from the queue."
         ),
         destructive_pattern!(
             "aws-sns-delete-topic",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+sns\s+delete-topic\b",
-            "aws sns delete-topic removes an SNS topic and its subscriptions.",
-            Critical,
-            "Deleting an SNS topic removes all subscriptions and stops all message \
-             delivery. Publishers will receive errors. Lambda functions, SQS queues, \
-             and other subscribers will no longer receive notifications.\n\n\
-             Safer alternatives:\n\
-             - aws sns list-subscriptions-by-topic: Review subscribers first\n\
-             - Unsubscribe endpoints individually if needed\n\
-             - Use topic policies to restrict publishing instead"
+            "aws sns delete-topic removes an SNS topic and its subscriptions."
         ),
         destructive_pattern!(
             "aws-sns-unsubscribe",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+sns\s+unsubscribe\b",
-            "aws sns unsubscribe removes a subscription and stops message delivery.",
-            High,
-            "Unsubscribing stops message delivery to that endpoint. If this is a \
-             critical integration (Lambda, SQS, HTTP endpoint), that system will \
-             stop receiving notifications immediately.\n\n\
-             Safer alternatives:\n\
-             - aws sns get-subscription-attributes: Review subscription first\n\
-             - Use subscription filter policies to reduce traffic\n\
-             - Disable the endpoint instead of unsubscribing"
+            "aws sns unsubscribe removes a subscription and stops message delivery."
         ),
         destructive_pattern!(
             "aws-sns-remove-permission",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+sns\s+remove-permission\b",
-            "aws sns remove-permission revokes permissions on a topic.",
-            High,
-            "Removing permissions can break cross-account access or service \
-             integrations. AWS services and other accounts may lose the ability \
-             to publish or subscribe to the topic.\n\n\
-             Safer alternatives:\n\
-             - aws sns get-topic-attributes: Review current policy first\n\
-             - Add new permissions before removing old ones\n\
-             - Use IAM policies for fine-grained access control"
+            "aws sns remove-permission revokes permissions on a topic."
         ),
         destructive_pattern!(
             "aws-sns-delete-platform-application",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+sns\s+delete-platform-application\b",
-            "aws sns delete-platform-application removes a platform application.",
-            High,
-            "Deleting a platform application removes all endpoints and stops push \
-             notifications to mobile devices. All registered device tokens are \
-             removed, and users will stop receiving push notifications.\n\n\
-             Safer alternatives:\n\
-             - aws sns list-endpoints-by-platform-application: Review endpoints\n\
-             - Disable individual endpoints instead of deleting the app\n\
-             - Back up endpoint ARNs before deletion"
+            "aws sns delete-platform-application removes a platform application."
         ),
     ]
 }

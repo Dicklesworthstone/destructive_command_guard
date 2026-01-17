@@ -66,85 +66,37 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "gsutil-rb",
             r"gsutil\s+(?:-[a-zA-Z]+\s+)*rb\b",
-            "gsutil rb removes a GCS bucket.",
-            Critical,
-            "Removing a GCS bucket deletes the bucket and potentially all objects within it. \
-             Bucket names are globally unique and may not be immediately available for reuse. \
-             Applications and services referencing this bucket will fail.\n\n\
-             Safer alternatives:\n\
-             - gsutil ls gs://bucket: List bucket contents first\n\
-             - gsutil -m cp -r gs://bucket ./backup: Backup contents locally\n\
-             - Enable object versioning before testing deletions"
+            "gsutil rb removes a GCS bucket."
         ),
         // gsutil object removal
         destructive_pattern!(
             "gsutil-rm",
             r"gsutil\s+(?:-[a-zA-Z]+\s+)*rm\b",
-            "gsutil rm deletes objects from GCS.",
-            High,
-            "Deleting GCS objects permanently removes data unless versioning is enabled. \
-             With -r flag, entire directory trees are deleted recursively. Without \
-             versioning, deleted objects cannot be recovered.\n\n\
-             Safer alternatives:\n\
-             - gsutil ls: Preview what will be deleted\n\
-             - Enable bucket versioning for recovery options\n\
-             - gsutil mv: Move to archive bucket instead of deleting"
+            "gsutil rm deletes objects from GCS."
         ),
         // gsutil rsync with delete
         destructive_pattern!(
             "gsutil-rsync-delete",
             r"gsutil\s+(?:-[a-zA-Z]+\s+)*rsync\b.*\s+-d\b",
-            "gsutil rsync -d deletes destination objects not in source.",
-            High,
-            "The -d flag with gsutil rsync deletes destination objects that don't exist \
-             in the source. If source and destination are swapped, or source is empty, \
-             this can result in total data loss at the destination.\n\n\
-             Safer alternatives:\n\
-             - gsutil rsync -n -d: Dry run to preview deletions\n\
-             - gsutil rsync without -d: Only adds/updates, never deletes\n\
-             - Backup destination before syncing"
+            "gsutil rsync -d deletes destination objects not in source."
         ),
         // gcloud storage bucket deletion
         destructive_pattern!(
             "gcloud-storage-buckets-delete",
             r"gcloud\s+storage\s+buckets\s+delete\b",
-            "gcloud storage buckets delete removes a GCS bucket.",
-            Critical,
-            "Deleting a GCS bucket removes the bucket configuration and all objects within it \
-             (if --recursive is used). The globally unique bucket name may not be immediately \
-             reclaimable. All dependent applications will fail.\n\n\
-             Safer alternatives:\n\
-             - gcloud storage buckets describe: Review bucket configuration\n\
-             - gcloud storage cp -r: Backup contents before deletion\n\
-             - Remove objects first to understand data being deleted"
+            "gcloud storage buckets delete removes a GCS bucket."
         ),
         // gcloud storage object deletion
         destructive_pattern!(
             "gcloud-storage-objects-delete",
             r"gcloud\s+storage\s+objects\s+delete\b",
-            "gcloud storage objects delete removes objects from GCS.",
-            High,
-            "Deleting GCS objects permanently removes data. Without object versioning, \
-             deleted files cannot be recovered. Production data should be backed up \
-             before deletion.\n\n\
-             Safer alternatives:\n\
-             - gcloud storage objects describe: Verify object before deletion\n\
-             - Enable bucket versioning for soft deletes\n\
-             - Move to archive storage class instead of deleting"
+            "gcloud storage objects delete removes objects from GCS."
         ),
         // gcloud storage rm
         destructive_pattern!(
             "gcloud-storage-rm",
             r"gcloud\s+storage\s+rm\b",
-            "gcloud storage rm removes objects from GCS.",
-            High,
-            "The rm command deletes objects and can recursively remove entire bucket \
-             contents. Deleted objects are permanently lost unless versioning is enabled. \
-             Wildcards can unexpectedly match more files than intended.\n\n\
-             Safer alternatives:\n\
-             - gcloud storage ls: Preview files matching pattern\n\
-             - Enable bucket versioning before testing\n\
-             - gcloud storage mv: Move to archive bucket instead"
+            "gcloud storage rm removes objects from GCS."
         ),
     ]
 }

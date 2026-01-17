@@ -63,80 +63,32 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "op-item-delete",
             r"op(?:\s+--?\S+(?:\s+\S+)?)*\s+item\s+delete\b",
-            "op item delete removes secret items (including archive operations).",
-            High,
-            "Deleting a 1Password item permanently removes the secret (passwords, API keys, \
-             credentials). Without --archive, this cannot be undone. Applications and users \
-             relying on this item will lose access to the stored credentials.\n\n\
-             Safer alternatives:\n\
-             - op item get: Export item fields before deletion\n\
-             - op item delete --archive: Move to archive for recovery\n\
-             - Verify no applications reference this item"
+            "op item delete removes secret items (including archive operations)."
         ),
         destructive_pattern!(
             "op-document-delete",
             r"op(?:\s+--?\S+(?:\s+\S+)?)*\s+document\s+delete\b",
-            "op document delete removes secure documents (including archive operations).",
-            High,
-            "Deleting a 1Password document permanently removes the file (certificates, keys, \
-             configurations). Unlike items, documents may contain unique binary data that \
-             cannot be recreated from memory.\n\n\
-             Safer alternatives:\n\
-             - op document get: Download document before deletion\n\
-             - op document delete --archive: Move to archive for recovery\n\
-             - Back up to secure local storage first"
+            "op document delete removes secure documents (including archive operations)."
         ),
         destructive_pattern!(
             "op-vault-delete",
             r"op(?:\s+--?\S+(?:\s+\S+)?)*\s+vault\s+delete\b",
-            "op vault delete removes an entire vault.",
-            Critical,
-            "Deleting a vault removes all items, documents, and permissions within it. This \
-             affects all users with vault access and any applications using items from this \
-             vault. This action cannot be undone.\n\n\
-             Safer alternatives:\n\
-             - op item list --vault=X: Inventory vault contents\n\
-             - Export items and documents before deletion\n\
-             - Move items to a different vault instead"
+            "op vault delete removes an entire vault."
         ),
         destructive_pattern!(
             "op-user-delete",
             r"op(?:\s+--?\S+(?:\s+\S+)?)*\s+user\s+delete\b",
-            "op user delete removes a user from 1Password.",
-            High,
-            "Deleting a user revokes their access to all vaults and items. Any private vaults \
-             owned by the user may be transferred or lost. Service accounts and integrations \
-             created by this user may also be affected.\n\n\
-             Safer alternatives:\n\
-             - op user suspend: Suspend instead of delete for recovery\n\
-             - op user get: Document user permissions first\n\
-             - Transfer vault ownership before deletion"
+            "op user delete removes a user from 1Password."
         ),
         destructive_pattern!(
             "op-group-delete",
             r"op(?:\s+--?\S+(?:\s+\S+)?)*\s+group\s+delete\b",
-            "op group delete removes a group.",
-            Medium,
-            "Deleting a group removes the permission boundary and all vault assignments. \
-             Members lose access to vaults shared through this group. This affects team \
-             organization and access control policies.\n\n\
-             Safer alternatives:\n\
-             - op group list: Review group membership first\n\
-             - Reassign vault permissions to individual users\n\
-             - Create replacement group before deleting old one"
+            "op group delete removes a group."
         ),
         destructive_pattern!(
             "op-connect-token-delete",
             r"op(?:\s+--?\S+(?:\s+\S+)?)*\s+connect\s+token\s+delete\b",
-            "op connect token delete revokes access tokens.",
-            High,
-            "Deleting a Connect token immediately revokes API access for integrations using \
-             it. CI/CD pipelines, deployment scripts, and applications fetching secrets will \
-             fail to authenticate until a new token is configured.\n\n\
-             Safer alternatives:\n\
-             - op connect token list: Document token usage first\n\
-             - Create new token before deleting old one\n\
-             - Update integrations with new token prior to deletion"
+            "op connect token delete revokes access tokens."
         ),
     ]
 }

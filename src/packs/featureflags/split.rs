@@ -63,131 +63,53 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "split-splits-delete",
             r"split\s+splits\s+delete\b",
-            "split splits delete permanently removes a split definition. This cannot be undone.",
-            Critical,
-            "Deleting a split permanently removes the feature flag definition and all its \
-             targeting rules. SDKs will return control treatment for this split. Historical \
-             data and metrics are preserved but the split cannot be recovered.\n\n\
-             Safer alternatives:\n\
-             - split splits kill: Stop traffic without deleting\n\
-             - Archive the split in the UI\n\
-             - Export split configuration first"
+            "split splits delete permanently removes a split definition. This cannot be undone."
         ),
         destructive_pattern!(
             "split-splits-kill",
             r"split\s+splits\s+kill\b",
-            "split splits kill terminates a split, stopping all traffic to treatments.",
-            High,
-            "Killing a split immediately stops all treatment assignment and returns the \
-             default treatment to all users. Unlike delete, the split can be reactivated, \
-             but all users will see behavior change immediately.\n\n\
-             Safer alternatives:\n\
-             - Gradually ramp down traffic percentages first\n\
-             - Verify the default treatment behavior\n\
-             - Communicate the change to stakeholders"
+            "split splits kill terminates a split, stopping all traffic to treatments."
         ),
         destructive_pattern!(
             "split-environments-delete",
             r"split\s+environments\s+delete\b",
-            "split environments delete removes an environment and all its configurations.",
-            Critical,
-            "Deleting an environment removes all split configurations, targeting rules, \
-             and API keys for that environment. Applications using this environment will \
-             receive default treatments for all splits.\n\n\
-             Safer alternatives:\n\
-             - Export environment configuration\n\
-             - Rotate API keys before deletion\n\
-             - Kill all splits in the environment first"
+            "split environments delete removes an environment and all its configurations."
         ),
         destructive_pattern!(
             "split-segments-delete",
             r"split\s+segments\s+delete\b",
-            "split segments delete removes a segment and its targeting rules.",
-            High,
-            "Deleting a segment removes user grouping definitions. Splits targeting this \
-             segment will lose that targeting rule, changing which users receive which \
-             treatments.\n\n\
-             Safer alternatives:\n\
-             - Check which splits use this segment\n\
-             - Update split targeting before deletion\n\
-             - Export segment membership"
+            "split segments delete removes a segment and its targeting rules."
         ),
         destructive_pattern!(
             "split-traffic-types-delete",
             r"split\s+traffic-types\s+delete\b",
-            "split traffic-types delete removes a traffic type. This affects all splits using it.",
-            Critical,
-            "Deleting a traffic type affects ALL splits configured for that traffic type. \
-             SDKs sending this traffic type will no longer match any splits, returning \
-             control treatment for all evaluations.\n\n\
-             Safer alternatives:\n\
-             - Review all splits using this traffic type\n\
-             - Migrate splits to a different traffic type\n\
-             - Ensure no SDKs are sending this traffic type"
+            "split traffic-types delete removes a traffic type. This affects all splits using it."
         ),
         destructive_pattern!(
             "split-workspaces-delete",
             r"split\s+workspaces\s+delete\b",
-            "split workspaces delete removes a workspace and all its resources.",
-            Critical,
-            "Deleting a workspace removes ALL splits, segments, environments, and API keys \
-             within it. This is the most destructive operation and affects all applications \
-             using any resource in this workspace.\n\n\
-             Safer alternatives:\n\
-             - Export complete workspace configuration\n\
-             - Migrate critical splits to another workspace\n\
-             - Contact Split.io support for assistance"
+            "split workspaces delete removes a workspace and all its resources."
         ),
         // API - DELETE requests
         destructive_pattern!(
             "split-api-delete-splits",
             r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*api\.split\.io/.*/splits/",
-            "DELETE request to Split.io API removes split definitions.",
-            Critical,
-            "API DELETE calls to splits permanently remove feature flags without CLI \
-             confirmation. All targeting rules and treatments are lost immediately.\n\n\
-             Safer alternatives:\n\
-             - Use the Split CLI for confirmation prompts\n\
-             - GET the split configuration first\n\
-             - Use the Split UI for visibility into impact"
+            "DELETE request to Split.io API removes split definitions."
         ),
         destructive_pattern!(
             "split-api-delete-environments",
             r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*api\.split\.io/.*/environments/",
-            "DELETE request to Split.io API removes environments.",
-            Critical,
-            "API DELETE calls to environments invalidate all API keys and remove all \
-             split configurations for that environment. Applications will lose all \
-             feature flag evaluations.\n\n\
-             Safer alternatives:\n\
-             - Use the Split CLI for better confirmation\n\
-             - Export environment configuration first\n\
-             - Rotate API keys before deletion"
+            "DELETE request to Split.io API removes environments."
         ),
         destructive_pattern!(
             "split-api-delete-segments",
             r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*api\.split\.io/.*/segments/",
-            "DELETE request to Split.io API removes segments.",
-            High,
-            "API DELETE calls to segments remove user groupings. Splits using this \
-             segment will lose targeting rules, changing treatment assignment for \
-             affected users.\n\n\
-             Safer alternatives:\n\
-             - Check segment dependencies first\n\
-             - Update split targeting before deletion\n\
-             - Export segment membership data"
+            "DELETE request to Split.io API removes segments."
         ),
         destructive_pattern!(
             "split-api-delete-generic",
             r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*api\.split\.io",
-            "DELETE request to Split.io API can remove resources.",
-            High,
-            "Generic DELETE requests to the Split.io API can remove various resources. \
-             Review the specific endpoint to understand what will be deleted.\n\n\
-             Safer alternatives:\n\
-             - Verify the exact resource being deleted\n\
-             - Use the Split CLI or UI for better visibility\n\
-             - GET the resource first to confirm"
+            "DELETE request to Split.io API can remove resources."
         ),
     ]
 }

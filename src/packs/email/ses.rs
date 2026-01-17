@@ -125,129 +125,53 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "ses-delete-identity",
             r"\baws\s+ses\s+delete-identity\b",
-            "aws ses delete-identity removes a verified email identity.",
-            High,
-            "Deleting a verified identity prevents sending from that address or domain. \
-             Applications using this identity will fail to send emails. Re-verification \
-             requires DNS changes and propagation time.\n\n\
-             Safer alternatives:\n\
-             - aws ses list-identities: Review identities first\n\
-             - Check which applications use this identity\n\
-             - Create new identity before deleting old one"
+            "aws ses delete-identity removes a verified email identity."
         ),
         destructive_pattern!(
             "ses-delete-template",
             r"\baws\s+ses\s+delete-template\b",
-            "aws ses delete-template removes an email template.",
-            Medium,
-            "Deleting a template breaks any applications that reference it. Emails using \
-             this template will fail to send until the template is recreated.\n\n\
-             Safer alternatives:\n\
-             - aws ses get-template: Export template before deletion\n\
-             - Verify no active campaigns use this template\n\
-             - Create replacement template before deleting"
+            "aws ses delete-template removes an email template."
         ),
         destructive_pattern!(
             "ses-delete-configuration-set",
             r"\baws\s+ses\s+delete-configuration-set\b",
-            "aws ses delete-configuration-set removes a configuration set.",
-            High,
-            "Deleting a configuration set removes tracking and event destinations. \
-             Applications using this set will lose metrics, bounce handling, and \
-             complaint processing.\n\n\
-             Safer alternatives:\n\
-             - aws ses describe-configuration-set: Review configuration\n\
-             - Migrate applications to a new configuration set first\n\
-             - Document event destinations before deletion"
+            "aws ses delete-configuration-set removes a configuration set."
         ),
         destructive_pattern!(
             "ses-delete-receipt-rule-set",
             r"\baws\s+ses\s+delete-receipt-rule-set\b",
-            "aws ses delete-receipt-rule-set removes a receipt rule set.",
-            Critical,
-            "Deleting a receipt rule set stops all email receiving configured by that set. \
-             Incoming emails may bounce or be lost. This affects all receipt rules in the set.\n\n\
-             Safer alternatives:\n\
-             - aws ses describe-receipt-rule-set: Review rules first\n\
-             - Create replacement rule set before deletion\n\
-             - Test with a non-active rule set"
+            "aws ses delete-receipt-rule-set removes a receipt rule set."
         ),
         destructive_pattern!(
             "ses-delete-receipt-rule",
             r"\baws\s+ses\s+delete-receipt-rule(?:\s|$)",
-            "aws ses delete-receipt-rule removes a receipt rule.",
-            High,
-            "Deleting a receipt rule changes how incoming emails are processed. Actions \
-             like S3 storage, Lambda triggers, or SNS notifications will stop for \
-             matching emails.\n\n\
-             Safer alternatives:\n\
-             - aws ses describe-receipt-rule: Review rule configuration\n\
-             - Disable the rule before deleting\n\
-             - Ensure no critical workflows depend on this rule"
+            "aws ses delete-receipt-rule removes a receipt rule."
         ),
         // SES v2 deletion operations
         destructive_pattern!(
             "sesv2-delete-email-identity",
             r"\baws\s+sesv2\s+delete-email-identity\b",
-            "aws sesv2 delete-email-identity removes a verified email identity.",
-            High,
-            "Deleting a verified identity prevents sending from that address or domain. \
-             DKIM and SPF records become orphaned. Applications will fail until a new \
-             identity is verified.\n\n\
-             Safer alternatives:\n\
-             - aws sesv2 get-email-identity: Review identity configuration\n\
-             - Verify replacement identity before deletion\n\
-             - Update applications to use new identity first"
+            "aws sesv2 delete-email-identity removes a verified email identity."
         ),
         destructive_pattern!(
             "sesv2-delete-email-template",
             r"\baws\s+sesv2\s+delete-email-template\b",
-            "aws sesv2 delete-email-template removes an email template.",
-            Medium,
-            "Deleting a template breaks any send operations referencing it. Bulk email \
-             sends and transactional emails using this template will fail.\n\n\
-             Safer alternatives:\n\
-             - aws sesv2 get-email-template: Export template content\n\
-             - Check for active campaigns using this template\n\
-             - Version templates rather than deleting"
+            "aws sesv2 delete-email-template removes an email template."
         ),
         destructive_pattern!(
             "sesv2-delete-configuration-set",
             r"\baws\s+sesv2\s+delete-configuration-set\b",
-            "aws sesv2 delete-configuration-set removes a configuration set.",
-            High,
-            "Deleting a configuration set removes all event destinations, tracking options, \
-             and delivery settings. Applications using this set lose visibility into \
-             email delivery.\n\n\
-             Safer alternatives:\n\
-             - aws sesv2 get-configuration-set: Export configuration\n\
-             - Migrate to new configuration set first\n\
-             - Document all event destinations"
+            "aws sesv2 delete-configuration-set removes a configuration set."
         ),
         destructive_pattern!(
             "sesv2-delete-contact-list",
             r"\baws\s+sesv2\s+delete-contact-list\b",
-            "aws sesv2 delete-contact-list removes a contact list.",
-            High,
-            "Deleting a contact list permanently removes all contacts and their preferences. \
-             Subscription management and list-based sending will fail. This cannot be undone.\n\n\
-             Safer alternatives:\n\
-             - Export contact list data before deletion\n\
-             - Check for active campaigns using this list\n\
-             - Use list segmentation instead of deletion"
+            "aws sesv2 delete-contact-list removes a contact list."
         ),
         destructive_pattern!(
             "sesv2-delete-dedicated-ip-pool",
             r"\baws\s+sesv2\s+delete-dedicated-ip-pool\b",
-            "aws sesv2 delete-dedicated-ip-pool removes a dedicated IP pool.",
-            Critical,
-            "Deleting a dedicated IP pool releases the IPs back to the shared pool. \
-             Email reputation built on these IPs is lost. Configuration sets using \
-             this pool will fall back to shared IPs.\n\n\
-             Safer alternatives:\n\
-             - Migrate configuration sets to a new pool first\n\
-             - Document IP addresses and reputation metrics\n\
-             - Contact AWS support if IPs need to be preserved"
+            "aws sesv2 delete-dedicated-ip-pool removes a dedicated IP pool."
         ),
     ]
 }

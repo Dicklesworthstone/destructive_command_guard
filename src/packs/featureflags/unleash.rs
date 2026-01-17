@@ -65,119 +65,48 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "unleash-features-delete",
             r"unleash\s+features?\s+delete\b",
-            "unleash features delete permanently removes a feature toggle. This cannot be undone.",
-            Critical,
-            "Deleting an Unleash feature toggle permanently removes it and all its \
-             strategies. SDKs will return the default value (typically false). Event \
-             history is preserved but the toggle cannot be recovered.\n\n\
-             Safer alternatives:\n\
-             - unleash features archive: Soft-delete with recovery\n\
-             - Disable the toggle in all environments first\n\
-             - Export toggle configuration before deletion"
+            "unleash features delete permanently removes a feature toggle. This cannot be undone."
         ),
         destructive_pattern!(
             "unleash-features-archive",
             r"unleash\s+features?\s+archive\b",
-            "unleash features archive soft-deletes a feature toggle.",
-            High,
-            "Archiving a toggle removes it from evaluation but allows recovery. SDKs \
-             will stop receiving the toggle and return default values. Archived toggles \
-             can be restored from the Unleash UI.\n\n\
-             Safer alternatives:\n\
-             - Disable the toggle before archiving\n\
-             - Verify no code paths depend on the toggle\n\
-             - Document the toggle's purpose before archiving"
+            "unleash features archive soft-deletes a feature toggle."
         ),
         destructive_pattern!(
             "unleash-projects-delete",
             r"unleash\s+projects?\s+delete\b",
-            "unleash projects delete removes a project and all its feature toggles.",
-            Critical,
-            "Deleting a project removes ALL feature toggles, strategies, and environments \
-             within it. This is irreversible. All applications using toggles from this \
-             project will receive default values.\n\n\
-             Safer alternatives:\n\
-             - Export project configuration first\n\
-             - Archive toggles individually for recovery options\n\
-             - Migrate critical toggles to another project"
+            "unleash projects delete removes a project and all its feature toggles."
         ),
         destructive_pattern!(
             "unleash-environments-delete",
             r"unleash\s+environments?\s+delete\b",
-            "unleash environments delete removes an environment.",
-            Critical,
-            "Deleting an environment removes all toggle configurations for that \
-             environment. API keys for this environment stop working. Applications \
-             will fail to fetch toggle states.\n\n\
-             Safer alternatives:\n\
-             - Export environment configuration\n\
-             - Disable toggles in the environment first\n\
-             - Rotate API keys before deletion"
+            "unleash environments delete removes an environment."
         ),
         destructive_pattern!(
             "unleash-strategies-delete",
             r"unleash\s+strategies?\s+delete\b",
-            "unleash strategies delete removes a custom strategy.",
-            High,
-            "Deleting a custom strategy breaks all toggles using it. Those toggles \
-             will fail to evaluate properly, potentially returning unexpected values \
-             or errors.\n\n\
-             Safer alternatives:\n\
-             - Check which toggles use this strategy\n\
-             - Migrate toggles to built-in strategies first\n\
-             - Create a replacement strategy before deleting"
+            "unleash strategies delete removes a custom strategy."
         ),
         destructive_pattern!(
             "unleash-api-keys-delete",
             r"unleash\s+api-keys?\s+delete\b",
-            "unleash api-keys delete removes an API key.",
-            High,
-            "Deleting an API key immediately revokes access for all SDKs using that \
-             key. Applications will fail to connect and receive toggle updates, \
-             falling back to cached or default values.\n\n\
-             Safer alternatives:\n\
-             - Create new API keys before deleting old ones\n\
-             - Update SDK configurations first\n\
-             - Use key rotation instead of deletion"
+            "unleash api-keys delete removes an API key."
         ),
         // API - DELETE requests
         destructive_pattern!(
             "unleash-api-delete-features",
             r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*?/api/admin/projects/.*/features/",
-            "DELETE request to Unleash API removes feature toggles.",
-            Critical,
-            "API DELETE calls to features permanently remove toggles without archive \
-             recovery options. All strategies and configurations are lost immediately.\n\n\
-             Safer alternatives:\n\
-             - Use the Unleash CLI for confirmation prompts\n\
-             - Archive toggles instead of deleting\n\
-             - GET the toggle configuration first"
+            "DELETE request to Unleash API removes feature toggles."
         ),
         destructive_pattern!(
             "unleash-api-delete-projects",
             r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*?/api/admin/projects/[^/]+$",
-            "DELETE request to Unleash API removes projects.",
-            Critical,
-            "API DELETE calls to projects remove ALL toggles, strategies, and \
-             configurations within the project. This is the most destructive \
-             operation and cannot be undone.\n\n\
-             Safer alternatives:\n\
-             - Export project configuration completely\n\
-             - Use the Unleash UI for visibility\n\
-             - Archive toggles individually first"
+            "DELETE request to Unleash API removes projects."
         ),
         destructive_pattern!(
             "unleash-api-delete-generic",
             r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*?/api/admin/",
-            "DELETE request to Unleash API can remove resources.",
-            High,
-            "Generic DELETE requests to the Unleash admin API can remove various \
-             resources including strategies, environments, users, and API keys. \
-             Review the specific endpoint before executing.\n\n\
-             Safer alternatives:\n\
-             - Verify the exact resource being deleted\n\
-             - Use the Unleash CLI or UI for better visibility\n\
-             - GET the resource first to confirm"
+            "DELETE request to Unleash API can remove resources."
         ),
     ]
 }

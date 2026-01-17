@@ -66,89 +66,37 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "prometheus-rules-file-delete",
             r"\brm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:(?:-f|--force)\s+)?(?:/etc/prometheus/(?:rules\.d|rules)/\S+|/etc/prometheus/(?:prometheus|rules)\.(?:ya?ml))(?:\s|$)",
-            "Deleting Prometheus rule/config files can break alerting and monitoring coverage.",
-            Critical,
-            "Deleting Prometheus configuration or rule files stops alerting for the defined \
-             conditions. After Prometheus reloads, those alerts will no longer fire, \
-             potentially leaving critical conditions unmonitored.\n\n\
-             Safer alternatives:\n\
-             - promtool check rules: Validate rule files before changes\n\
-             - Back up files before deletion\n\
-             - Use version control (git) for rule files"
+            "Deleting Prometheus rule/config files can break alerting and monitoring coverage."
         ),
         destructive_pattern!(
             "prometheus-tsdb-delete-series",
             r"(?i)curl\s+.*(?:-X|--request)\s+POST\b.*\/api\/v1\/admin\/tsdb\/delete_series\b",
-            "Prometheus TSDB delete_series permanently deletes time series data.",
-            Critical,
-            "The delete_series admin endpoint permanently removes time series data matching \
-             the specified selectors. This data cannot be recovered. Historical metrics \
-             for the deleted series will show gaps.\n\n\
-             Safer alternatives:\n\
-             - Query the series first to verify what will be deleted\n\
-             - Use retention policies instead of manual deletion\n\
-             - Take a TSDB snapshot before deletion"
+            "Prometheus TSDB delete_series permanently deletes time series data."
         ),
         destructive_pattern!(
             "kubectl-delete-prometheus-operator-resources",
             r"\bkubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+delete\s+(?:prometheusrules?|servicemonitors?|podmonitors?)(?:\.monitoring\.coreos\.com)?\b",
-            "kubectl delete of Prometheus Operator resources (PrometheusRule/ServiceMonitor/PodMonitor) removes alerting/target configuration.",
-            High,
-            "Deleting Prometheus Operator CRDs removes alerting rules or scrape targets. \
-             The Prometheus Operator will update Prometheus configuration, potentially \
-             leaving services unmonitored.\n\n\
-             Safer alternatives:\n\
-             - kubectl get to review the resource first\n\
-             - kubectl describe to see what it configures\n\
-             - Export YAML before deletion: kubectl get -o yaml"
+            "kubectl delete of Prometheus Operator resources (PrometheusRule/ServiceMonitor/PodMonitor) removes alerting/target configuration."
         ),
         destructive_pattern!(
             "grafana-cli-plugins-uninstall",
             r"\bgrafana-cli\b(?:\s+--?\S+(?:\s+\S+)?)*\s+plugins\s+uninstall\b",
-            "grafana-cli plugins uninstall removes a Grafana plugin, potentially breaking dashboards.",
-            High,
-            "Uninstalling a Grafana plugin breaks all dashboards using that plugin's panels \
-             or datasources. Users will see error messages where those panels were.\n\n\
-             Safer alternatives:\n\
-             - grafana-cli plugins list: Review installed plugins first\n\
-             - Check which dashboards use the plugin before removal\n\
-             - Update the plugin instead of uninstalling"
+            "grafana-cli plugins uninstall removes a Grafana plugin, potentially breaking dashboards."
         ),
         destructive_pattern!(
             "grafana-api-delete-dashboard",
             r"(?i)curl\s+.*(?:-X|--request)\s+DELETE\b.*\/api\/dashboards\/",
-            "Grafana API DELETE /api/dashboards/... deletes dashboards.",
-            High,
-            "Deleting a Grafana dashboard removes all panels, queries, and configuration. \
-             Teams relying on this dashboard for monitoring will lose visibility.\n\n\
-             Safer alternatives:\n\
-             - GET /api/dashboards/uid/<uid> to export JSON first\n\
-             - Use Grafana provisioning for version-controlled dashboards\n\
-             - Use dashboard versioning in Grafana to restore later"
+            "Grafana API DELETE /api/dashboards/... deletes dashboards."
         ),
         destructive_pattern!(
             "grafana-api-delete-datasource",
             r"(?i)curl\s+.*(?:-X|--request)\s+DELETE\b.*\/api\/datasources\/",
-            "Grafana API DELETE /api/datasources/... deletes datasources.",
-            High,
-            "Deleting a datasource breaks all dashboards and alerts using it. Panels will \
-             show 'Data source not found' errors, and alerting queries will fail.\n\n\
-             Safer alternatives:\n\
-             - GET the datasource first to verify the ID\n\
-             - Check which dashboards use this datasource\n\
-             - Use Grafana provisioning for datasource-as-code"
+            "Grafana API DELETE /api/datasources/... deletes datasources."
         ),
         destructive_pattern!(
             "grafana-api-delete-alert-notification",
             r"(?i)curl\s+.*(?:-X|--request)\s+DELETE\b.*\/api\/alert-notifications\/",
-            "Grafana API DELETE /api/alert-notifications/... deletes alert notification channels.",
-            High,
-            "Deleting a notification channel stops alert delivery to that destination. \
-             Alerts using this channel will fire but notifications won't be sent.\n\n\
-             Safer alternatives:\n\
-             - GET the notification channel first to verify the ID\n\
-             - Check which alerts use this notification channel\n\
-             - Disable the channel instead of deleting"
+            "Grafana API DELETE /api/alert-notifications/... deletes alert notification channels."
         ),
     ]
 }

@@ -68,93 +68,37 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "aws-secretsmanager-delete-secret",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+secretsmanager\s+delete-secret\b",
-            "aws secretsmanager delete-secret removes secrets and may cause data loss.",
-            Critical,
-            "Deleting a secret schedules it for deletion (default 30 days) or immediately \
-             removes it with --force-delete-without-recovery. Applications using this secret \
-             will fail to authenticate or decrypt data.\n\n\
-             Safer alternatives:\n\
-             - aws secretsmanager get-secret-value: Export value first\n\
-             - aws secretsmanager describe-secret: Check rotation/replication\n\
-             - Use --recovery-window-in-days for recoverable deletion"
+            "aws secretsmanager delete-secret removes secrets and may cause data loss."
         ),
         destructive_pattern!(
             "aws-secretsmanager-delete-resource-policy",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+secretsmanager\s+delete-resource-policy\b",
-            "aws secretsmanager delete-resource-policy removes access controls.",
-            High,
-            "Deleting a resource policy removes cross-account access and custom permissions. \
-             Other AWS accounts or services that rely on this policy will lose access to the \
-             secret immediately.\n\n\
-             Safer alternatives:\n\
-             - aws secretsmanager get-resource-policy: Export policy first\n\
-             - Verify no cross-account dependencies exist\n\
-             - Update IAM policies to compensate if needed"
+            "aws secretsmanager delete-resource-policy removes access controls."
         ),
         destructive_pattern!(
             "aws-secretsmanager-remove-regions",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+secretsmanager\s+remove-regions-from-replication\b",
-            "aws secretsmanager remove-regions-from-replication can reduce availability.",
-            High,
-            "Removing regions from replication deletes the secret replica in those regions. \
-             Applications in removed regions will lose local access to the secret, increasing \
-             latency or causing failures during cross-region failover.\n\n\
-             Safer alternatives:\n\
-             - aws secretsmanager describe-secret: Review replica regions\n\
-             - Verify no applications in target regions use the secret\n\
-             - Update disaster recovery documentation"
+            "aws secretsmanager remove-regions-from-replication can reduce availability."
         ),
         destructive_pattern!(
             "aws-secretsmanager-update-secret",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+secretsmanager\s+update-secret\b",
-            "aws secretsmanager update-secret overwrites secret metadata or value.",
-            Medium,
-            "Updating a secret can change its value, KMS key, or description. The previous \
-             value becomes a non-current version. Applications using the old value may fail \
-             if automatic rotation is not configured.\n\n\
-             Safer alternatives:\n\
-             - aws secretsmanager get-secret-value: Export current value\n\
-             - Use put-secret-value to create new version instead\n\
-             - Test new value in non-production environment first"
+            "aws secretsmanager update-secret overwrites secret metadata or value."
         ),
         destructive_pattern!(
             "aws-secretsmanager-put-secret-value",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+secretsmanager\s+put-secret-value\b",
-            "aws secretsmanager put-secret-value creates a new secret version and can break clients.",
-            Medium,
-            "Creating a new secret version makes it the current value immediately. Applications \
-             caching the old value will use outdated credentials until they refresh. Rotation \
-             windows should be coordinated with application deployments.\n\n\
-             Safer alternatives:\n\
-             - aws secretsmanager get-secret-value: Export current value\n\
-             - Use version staging labels for gradual rollout\n\
-             - Coordinate secret updates with application deployments"
+            "aws secretsmanager put-secret-value creates a new secret version and can break clients."
         ),
         destructive_pattern!(
             "aws-ssm-delete-parameter",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+ssm\s+delete-parameter\b",
-            "aws ssm delete-parameter removes a parameter and can break deployments.",
-            High,
-            "Deleting an SSM parameter immediately removes it. Applications, CloudFormation \
-             stacks, and deployment scripts referencing this parameter will fail. There is no \
-             recovery window like Secrets Manager.\n\n\
-             Safer alternatives:\n\
-             - aws ssm get-parameter: Export value first\n\
-             - aws ssm describe-parameters: Check parameter history\n\
-             - Search CloudFormation templates for references"
+            "aws ssm delete-parameter removes a parameter and can break deployments."
         ),
         destructive_pattern!(
             "aws-ssm-delete-parameters",
             r"aws(?:\s+--?\S+(?:\s+\S+)?)*\s+ssm\s+delete-parameters\b",
-            "aws ssm delete-parameters removes parameters and can break deployments.",
-            High,
-            "Deleting multiple SSM parameters at once can break numerous applications and \
-             deployment pipelines simultaneously. Each parameter is deleted immediately with \
-             no recovery option.\n\n\
-             Safer alternatives:\n\
-             - aws ssm get-parameters: Export all values first\n\
-             - Delete one parameter at a time to limit blast radius\n\
-             - Verify no active deployments use these parameters"
+            "aws ssm delete-parameters removes parameters and can break deployments."
         ),
     ]
 }

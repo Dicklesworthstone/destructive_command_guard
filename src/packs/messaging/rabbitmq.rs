@@ -60,92 +60,37 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "rabbitmqadmin-delete-queue",
             r"rabbitmqadmin(?:\s+--?\S+(?:\s+\S+)?)*\s+delete\s+queue\b",
-            "rabbitmqadmin delete queue permanently deletes a queue.",
-            Critical,
-            "Deleting a queue permanently removes all messages and bindings. \
-             Consumers will disconnect, and producers will fail unless they handle \
-             the missing queue. Undelivered messages are lost.\n\n\
-             Safer alternatives:\n\
-             - rabbitmqadmin list queues: Review queues first\n\
-             - rabbitmqadmin purge queue: Remove messages but keep the queue\n\
-             - Set TTL or max-length policies for automatic cleanup"
+            "rabbitmqadmin delete queue permanently deletes a queue."
         ),
         destructive_pattern!(
             "rabbitmqadmin-delete-exchange",
             r"rabbitmqadmin(?:\s+--?\S+(?:\s+\S+)?)*\s+delete\s+exchange\b",
-            "rabbitmqadmin delete exchange removes an exchange and its bindings.",
-            High,
-            "Deleting an exchange removes all bindings to queues. Messages published \
-             to this exchange will be lost unless an alternate exchange is configured. \
-             Publishers may not receive errors if they don't use confirms.\n\n\
-             Safer alternatives:\n\
-             - rabbitmqadmin list exchanges: Review exchanges first\n\
-             - rabbitmqadmin list bindings: Check dependent bindings\n\
-             - Rebind queues to a new exchange before deletion"
+            "rabbitmqadmin delete exchange removes an exchange and its bindings."
         ),
         destructive_pattern!(
             "rabbitmqadmin-purge-queue",
             r"rabbitmqadmin(?:\s+--?\S+(?:\s+\S+)?)*\s+purge\s+queue\b",
-            "rabbitmqadmin purge queue deletes ALL messages in the queue.",
-            High,
-            "Purging a queue deletes all messages immediately. Messages that were \
-             waiting to be consumed are permanently lost. This cannot be undone.\n\n\
-             Safer alternatives:\n\
-             - rabbitmqadmin show queue: Check message count first\n\
-             - Consume and process messages instead of purging\n\
-             - Set message TTL for automatic expiration"
+            "rabbitmqadmin purge queue deletes ALL messages in the queue."
         ),
         destructive_pattern!(
             "rabbitmqctl-delete-vhost",
             r"rabbitmqctl(?:\s+--?\S+(?:\s+\S+)?)*\s+delete_vhost\b",
-            "rabbitmqctl delete_vhost removes a vhost and all its resources.",
-            Critical,
-            "Deleting a vhost removes ALL queues, exchanges, bindings, policies, \
-             and user permissions within that vhost. This is a complete wipe of \
-             that namespace.\n\n\
-             Safer alternatives:\n\
-             - rabbitmqctl list_vhosts: Review vhosts first\n\
-             - rabbitmqctl list_queues -p <vhost>: Check resources in vhost\n\
-             - Export definitions before deletion"
+            "rabbitmqctl delete_vhost removes a vhost and all its resources."
         ),
         destructive_pattern!(
             "rabbitmqctl-forget-cluster-node",
             r"rabbitmqctl(?:\s+--?\S+(?:\s+\S+)?)*\s+forget_cluster_node\b",
-            "rabbitmqctl forget_cluster_node permanently removes a node from the cluster.",
-            High,
-            "Forgetting a cluster node removes it from the cluster metadata. Use this \
-             only for permanently failed nodes. Mirrored queues may lose replicas, \
-             and quorum queues may lose availability if quorum is affected.\n\n\
-             Safer alternatives:\n\
-             - rabbitmqctl cluster_status: Review cluster state first\n\
-             - Try to recover the node instead of forgetting\n\
-             - Ensure quorum is maintained after removal"
+            "rabbitmqctl forget_cluster_node permanently removes a node from the cluster."
         ),
         destructive_pattern!(
             "rabbitmqctl-reset",
             r"rabbitmqctl(?:\s+--?\S+(?:\s+\S+)?)*\s+reset\b",
-            "rabbitmqctl reset wipes all configuration, queues, and bindings on the node.",
-            Critical,
-            "Reset returns the node to a blank state, removing all exchanges, queues, \
-             bindings, users, vhosts, and permissions. The node is removed from any \
-             cluster it was part of.\n\n\
-             Safer alternatives:\n\
-             - Export definitions before reset\n\
-             - Use stop_app/start_app for service restart without data loss\n\
-             - Consider forget_cluster_node for cluster membership changes only"
+            "rabbitmqctl reset wipes all configuration, queues, and bindings on the node."
         ),
         destructive_pattern!(
             "rabbitmqctl-force-reset",
             r"rabbitmqctl(?:\s+--?\S+(?:\s+\S+)?)*\s+force_reset\b",
-            "rabbitmqctl force_reset wipes node data and can break cluster state.",
-            Critical,
-            "Force reset ignores cluster state and wipes the node unconditionally. \
-             This can leave the cluster in an inconsistent state where other nodes \
-             still expect this node to exist.\n\n\
-             Safer alternatives:\n\
-             - Try rabbitmqctl reset first (safer)\n\
-             - Coordinate with cluster members before force reset\n\
-             - Document the cluster state for recovery"
+            "rabbitmqctl force_reset wipes node data and can break cluster state."
         ),
     ]
 }

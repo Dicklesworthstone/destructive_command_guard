@@ -55,107 +55,43 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "flipt-flag-delete",
             r"flipt\s+flag\s+delete\b",
-            "flipt flag delete permanently removes a feature flag. This cannot be undone.",
-            Critical,
-            "Deleting a Flipt feature flag immediately removes it from evaluation. All \
-             applications checking this flag will receive default values or errors. Rules, \
-             variants, and distributions associated with the flag are also removed.\n\n\
-             Safer alternatives:\n\
-             - flipt flag get: Review flag configuration first\n\
-             - Disable the flag instead of deleting\n\
-             - Export flag configuration before deletion"
+            "flipt flag delete permanently removes a feature flag. This cannot be undone."
         ),
         destructive_pattern!(
             "flipt-segment-delete",
             r"flipt\s+segment\s+delete\b",
-            "flipt segment delete removes a segment and its constraints.",
-            High,
-            "Deleting a segment removes user grouping rules. Any flags using this segment \
-             for targeting will lose that targeting logic, potentially changing which users \
-             receive which variants.\n\n\
-             Safer alternatives:\n\
-             - flipt segment get: Review segment configuration\n\
-             - Check which flags reference this segment\n\
-             - Update flags to use different segments first"
+            "flipt segment delete removes a segment and its constraints."
         ),
         destructive_pattern!(
             "flipt-namespace-delete",
             r"flipt\s+namespace\s+delete\b",
-            "flipt namespace delete removes a namespace and all its flags, segments, and rules.",
-            Critical,
-            "Deleting a namespace removes ALL flags, segments, rules, and constraints \
-             within it. This is a complete wipe of that feature flag environment. All \
-             applications using this namespace will lose flag evaluations.\n\n\
-             Safer alternatives:\n\
-             - flipt namespace get: Review namespace contents\n\
-             - Export all flags and segments before deletion\n\
-             - Migrate resources to another namespace first"
+            "flipt namespace delete removes a namespace and all its flags, segments, and rules."
         ),
         destructive_pattern!(
             "flipt-rule-delete",
             r"flipt\s+rule\s+delete\b",
-            "flipt rule delete removes a targeting rule from a flag.",
-            High,
-            "Deleting a rule changes how the flag evaluates for targeted users. Users \
-             previously matching this rule will fall through to other rules or receive \
-             the default variant.\n\n\
-             Safer alternatives:\n\
-             - flipt rule get: Review rule configuration\n\
-             - Disable the rule instead of deleting\n\
-             - Verify other rules handle affected users"
+            "flipt rule delete removes a targeting rule from a flag."
         ),
         destructive_pattern!(
             "flipt-constraint-delete",
             r"flipt\s+constraint\s+delete\b",
-            "flipt constraint delete removes a constraint from a segment.",
-            Medium,
-            "Removing a constraint changes segment membership. Users previously excluded \
-             or included by this constraint will now match or not match the segment \
-             differently.\n\n\
-             Safer alternatives:\n\
-             - Review segment membership before and after\n\
-             - Test constraint changes in a staging namespace\n\
-             - Document why the constraint is being removed"
+            "flipt constraint delete removes a constraint from a segment."
         ),
         destructive_pattern!(
             "flipt-variant-delete",
             r"flipt\s+variant\s+delete\b",
-            "flipt variant delete removes a variant from a flag.",
-            High,
-            "Deleting a variant removes a possible flag value. Rules distributing traffic \
-             to this variant will fail or need adjustment. Applications expecting this \
-             variant value may break.\n\n\
-             Safer alternatives:\n\
-             - Check which rules reference this variant\n\
-             - Update distributions before deleting\n\
-             - Zero out traffic to this variant first"
+            "flipt variant delete removes a variant from a flag."
         ),
         destructive_pattern!(
             "flipt-distribution-delete",
             r"flipt\s+distribution\s+delete\b",
-            "flipt distribution delete removes a distribution from a rule.",
-            Medium,
-            "Removing a distribution changes traffic allocation within a rule. The \
-             affected variant will no longer receive traffic from this rule, shifting \
-             all traffic to remaining distributions.\n\n\
-             Safer alternatives:\n\
-             - Review current traffic allocation\n\
-             - Adjust percentages instead of deleting\n\
-             - Verify other distributions handle the traffic"
+            "flipt distribution delete removes a distribution from a rule."
         ),
         // API - DELETE requests (Flipt uses gRPC but also has REST API)
         destructive_pattern!(
             "flipt-api-delete",
             r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*?/api/v1/",
-            "DELETE request to Flipt API can remove flags, segments, or rules.",
-            High,
-            "Direct API DELETE calls to Flipt can remove flags, segments, rules, or \
-             namespaces without CLI confirmation prompts. API deletions take effect \
-             immediately across all connected applications.\n\n\
-             Safer alternatives:\n\
-             - Use the Flipt CLI for better confirmation prompts\n\
-             - GET the resource first to verify what will be deleted\n\
-             - Use the Flipt UI for visibility into dependencies"
+            "DELETE request to Flipt API can remove flags, segments, or rules."
         ),
     ]
 }
