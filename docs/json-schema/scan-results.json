@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Dicklesworthstone/destructive_command_guard/docs/json-schema/scan-results.json",
+  "title": "DCG Scan Results",
+  "description": "JSON output format for 'dcg scan' command, which scans codebases for potentially destructive commands embedded in scripts, makefiles, and other files.",
+  "type": "object",
+  "required": ["schema_version", "summary", "findings"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version for forward compatibility"
+    },
+    "summary": {
+      "type": "object",
+      "description": "Aggregated statistics for the scan",
+      "required": ["files_scanned", "files_skipped", "commands_extracted", "findings_total", "decisions", "severities", "max_findings_reached"],
+      "properties": {
+        "files_scanned": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of files successfully scanned"
+        },
+        "files_skipped": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of files skipped (binary, too large, permission denied)"
+        },
+        "commands_extracted": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of commands extracted from all files"
+        },
+        "findings_total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of findings (warn + deny)"
+        },
+        "decisions": {
+          "type": "object",
+          "description": "Breakdown of findings by decision type",
+          "required": ["allow", "warn", "deny"],
+          "properties": {
+            "allow": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Commands that passed all checks"
+            },
+            "warn": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Commands flagged as potentially dangerous but not blocked"
+            },
+            "deny": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Commands that would be blocked by dcg"
+            }
+          }
+        },
+        "severities": {
+          "type": "object",
+          "description": "Breakdown of findings by severity level",
+          "required": ["info", "warning", "error"],
+          "properties": {
+            "info": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Informational findings (low severity)"
+            },
+            "warning": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Warning-level findings (medium severity)"
+            },
+            "error": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Error-level findings (high/critical severity)"
+            }
+          }
+        },
+        "max_findings_reached": {
+          "type": "boolean",
+          "description": "True if scan stopped early due to reaching the maximum findings limit"
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total scan duration in milliseconds"
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "description": "List of individual findings",
+      "items": {
+        "type": "object",
+        "required": ["file", "line", "extractor_id", "extracted_command", "decision", "severity"],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Relative path to the file containing the finding"
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Line number where the command was found (1-indexed)"
+          },
+          "col": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Column number where the command starts (1-indexed)"
+          },
+          "extractor_id": {
+            "type": "string",
+            "description": "Identifier for the extractor that found this command",
+            "examples": ["shell_script", "makefile", "dockerfile", "github_actions", "heredoc"]
+          },
+          "extracted_command": {
+            "type": "string",
+            "description": "The actual command text that was extracted and evaluated"
+          },
+          "decision": {
+            "type": "string",
+            "enum": ["Allow", "Warn", "Deny"],
+            "description": "The evaluation decision for this command"
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["Info", "Warning", "Error"],
+            "description": "Severity level of the finding"
+          },
+          "rule_id": {
+            "type": "string",
+            "description": "The pattern rule ID that matched, if any",
+            "examples": ["core.git:reset-hard", "core.filesystem:rm-rf-general"]
+          },
+          "reason": {
+            "type": "string",
+            "description": "Human-readable explanation of why the command was flagged"
+          },
+          "suggestion": {
+            "type": "string",
+            "description": "Suggested remediation or safer alternative"
+          }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "schema_version": 1,
+      "summary": {
+        "files_scanned": 42,
+        "files_skipped": 3,
+        "commands_extracted": 128,
+        "findings_total": 5,
+        "decisions": {
+          "allow": 123,
+          "warn": 2,
+          "deny": 3
+        },
+        "severities": {
+          "info": 0,
+          "warning": 2,
+          "error": 3
+        },
+        "max_findings_reached": false,
+        "elapsed_ms": 156
+      },
+      "findings": [
+        {
+          "file": "scripts/deploy.sh",
+          "line": 45,
+          "col": 5,
+          "extractor_id": "shell_script",
+          "extracted_command": "rm -rf /var/cache/*",
+          "decision": "Deny",
+          "severity": "Error",
+          "rule_id": "core.filesystem:rm-rf-general",
+          "reason": "rm -rf outside temp directories can cause data loss",
+          "suggestion": "Consider using 'rm -rf /tmp/*' for temporary files only"
+        }
+      ]
+    }
+  ]
+}

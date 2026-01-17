@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Dicklesworthstone/destructive_command_guard/docs/json-schema/stats-output.json",
+  "title": "DCG Statistics Output",
+  "description": "JSON output format for 'dcg stats' command, which displays aggregated statistics from dcg log files over a configurable time period.",
+  "type": "object",
+  "required": ["period_start", "period_end", "total_entries", "total_blocks", "total_allows", "total_bypasses", "total_warns", "by_pack"],
+  "properties": {
+    "period_start": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp (seconds since epoch) for the start of the statistics period"
+    },
+    "period_end": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp (seconds since epoch) for the end of the statistics period"
+    },
+    "total_entries": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of log entries processed in this period"
+    },
+    "total_blocks": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of commands blocked (denied without allowlist override)"
+    },
+    "total_allows": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of commands allowed (passed all checks)"
+    },
+    "total_bypasses": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of commands that were bypassed via allowlist or DCG_BYPASS"
+    },
+    "total_warns": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of commands that triggered warnings"
+    },
+    "by_pack": {
+      "type": "array",
+      "description": "Statistics broken down by security pack, sorted by block count descending",
+      "items": {
+        "type": "object",
+        "required": ["pack_id", "blocks", "allows", "bypasses", "warns"],
+        "properties": {
+          "pack_id": {
+            "type": "string",
+            "description": "The security pack identifier",
+            "examples": ["core.git", "core.filesystem", "database.postgresql", "unknown"]
+          },
+          "blocks": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of commands blocked by this pack"
+          },
+          "allows": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of commands allowed by this pack"
+          },
+          "bypasses": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of commands bypassed for this pack"
+          },
+          "warns": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of warnings from this pack"
+          }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "period_start": 1704672000,
+      "period_end": 1707264000,
+      "total_entries": 150,
+      "total_blocks": 23,
+      "total_allows": 120,
+      "total_bypasses": 5,
+      "total_warns": 2,
+      "by_pack": [
+        {
+          "pack_id": "core.git",
+          "blocks": 15,
+          "allows": 80,
+          "bypasses": 3,
+          "warns": 1
+        },
+        {
+          "pack_id": "core.filesystem",
+          "blocks": 8,
+          "allows": 40,
+          "bypasses": 2,
+          "warns": 1
+        }
+      ]
+    }
+  ]
+}

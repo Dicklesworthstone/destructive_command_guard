@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Dicklesworthstone/destructive_command_guard/docs/json-schema/error.json",
+  "title": "DCG Error Response",
+  "description": "JSON error format used by dcg CLI commands when errors occur. Errors are typically written to stderr, but some commands include error fields in their JSON output.",
+  "type": "object",
+  "oneOf": [
+    {
+      "title": "CLI Error Output",
+      "description": "Standard error output format for CLI commands",
+      "type": "object",
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "Human-readable error message"
+        },
+        "code": {
+          "type": "string",
+          "enum": ["parse_error", "config_error", "io_error", "validation_error"],
+          "description": "Machine-readable error code for programmatic handling"
+        },
+        "details": {
+          "type": "object",
+          "description": "Additional context about the error",
+          "properties": {
+            "file": {
+              "type": "string",
+              "description": "File path where the error occurred"
+            },
+            "line": {
+              "type": "integer",
+              "description": "Line number where the error occurred"
+            },
+            "column": {
+              "type": "integer",
+              "description": "Column number where the error occurred"
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "Simulate Command Error",
+      "description": "Error tracking in simulate command JSON output",
+      "type": "object",
+      "required": ["malformed_count", "ignored_count", "stopped_at_limit"],
+      "properties": {
+        "malformed_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of malformed JSON entries that could not be parsed"
+        },
+        "ignored_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of entries ignored due to filters or unsupported types"
+        },
+        "stopped_at_limit": {
+          "type": "boolean",
+          "description": "True if processing stopped early due to reaching error limit"
+        }
+      }
+    },
+    {
+      "title": "Allowlist Error",
+      "description": "Error in allowlist configuration",
+      "type": "object",
+      "required": ["layer", "path", "message"],
+      "properties": {
+        "layer": {
+          "type": "string",
+          "enum": ["project", "user", "system"],
+          "description": "Which allowlist layer had the error"
+        },
+        "path": {
+          "type": "string",
+          "description": "Path to the allowlist file"
+        },
+        "entry_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Index of the problematic entry in the allowlist"
+        },
+        "message": {
+          "type": "string",
+          "description": "Human-readable error message"
+        }
+      }
+    }
+  ],
+  "examples": [
+    {
+      "error": "JSON parse error: expected ':' at line 1 column 15",
+      "code": "parse_error"
+    },
+    {
+      "error": "IO error: Permission denied (os error 13)",
+      "code": "io_error",
+      "details": {
+        "file": "/etc/dcg/config.toml"
+      }
+    },
+    {
+      "malformed_count": 3,
+      "ignored_count": 12,
+      "stopped_at_limit": false
+    },
+    {
+      "layer": "project",
+      "path": ".dcg/allowlist.toml",
+      "entry_index": 5,
+      "message": "Invalid rule ID format: missing colon separator"
+    }
+  ]
+}
