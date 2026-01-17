@@ -4,9 +4,7 @@
 //! It parses incoming hook requests and formats denial responses.
 
 use crate::evaluator::MatchSpan;
-use crate::highlight::{HighlightSpan, should_use_color};
-use crate::output::{auto_theme, should_use_rich_output, DenialBox};
-use crate::output::theme::Severity as ThemeSeverity;
+use crate::highlight::{HighlightSpan, format_highlighted_command, should_use_color};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -327,9 +325,6 @@ fn allow_once_header_line(code: &str) -> String {
 }
 
 /// Print a colorful warning to stderr for human visibility.
-///
-/// Uses `DenialBox` from the output module for the core denial message,
-/// with additional context (suggestions, learning commands) printed after.
 #[allow(clippy::too_many_lines)]
 pub fn print_colorful_warning(
     command: &str,
@@ -340,138 +335,336 @@ pub fn print_colorful_warning(
     allow_once_code: Option<&str>,
     matched_span: Option<&MatchSpan>,
 ) {
+    // Box width (content area, excluding border characters)
+    const WIDTH: usize = 70;
+
     let stderr = io::stderr();
     let mut handle = stderr.lock();
 
-    // Pre-box: Allow-once header (if applicable)
     if let Some(code) = allow_once_code {
         let _ = writeln!(handle, "{}", allow_once_header_line(code));
     }
 
-    // Pre-box: Explain hint line
+    // Explain hint line (always shown, after allow-once if present)
     let _ = writeln!(handle, "{}", format_explain_hint(command).bright_black());
     let _ = writeln!(handle);
 
-    // Build rule_id for suggestions lookup
-    let rule_id = build_rule_id(pack, pattern);
-
-    // Build the denial box using the output module
-    let theme = auto_theme();
-    let use_rich = should_use_rich_output();
-
-    // Create the highlight span from the matched span
-    let highlight_span = matched_span.map_or_else(
-        || HighlightSpan::new(0, command.len().min(20)),
-        |span| {
-            let label = rule_id
-                .as_deref()
-                .map(|r| format!("Matched: {r}"))
-                .or_else(|| pack.map(|p| format!("Matched: {p}")))
-                .unwrap_or_else(|| "Matched destructive pattern".to_string());
-            HighlightSpan::with_label(span.start, span.end, label)
-        },
+    // Top border with corners
+    let _ = writeln!(
+        handle,
+        "{}{}{}",
+        "╭".red(),
+        "─".repeat(WIDTH).red(),
+        "╮".red()
     );
 
-    // Determine severity for theming (default to High if unknown)
-    let severity = ThemeSeverity::High;
+    // Shield icon and header
+    let _ = writeln!(
+        handle,
+        "{}  🛡  {}  {}{}",
+        "│".red(),
+        "BLOCKED".white().on_red().bold(),
+        " ".repeat(WIDTH - 16),
+        "│".red()
+    );
 
-    // Build pattern ID for display
-    let pattern_id = rule_id
-        .as_deref()
-        .unwrap_or_else(|| pack.unwrap_or("unknown"));
+    // DCG identifier line
+    let dcg_line = "   Destructive Command Guard (dcg)";
+    let _ = writeln!(
+        handle,
+        "{}{}{}{}",
+        "│".red(),
+        dcg_line.bright_black(),
+        " ".repeat(WIDTH - dcg_line.len()),
+        "│".red()
+    );
 
-    // Build explanation text with reason prefix and fallback
-    let base_explanation = format_explanation_text(explanation, rule_id.as_deref(), pack);
-    let explanation_text = format!("Reason: {reason}\n\n{base_explanation}");
+    // Separator
+    let _ = writeln!(
+        handle,
+        "{}{}{}",
+        "├".red(),
+        "─".repeat(WIDTH).red().dimmed(),
+        "┤".red()
+    );
 
-    // Get contextual alternatives from suggestions or fallback
-    let alternatives: Vec<String> = rule_id
-        .as_deref()
-        .and_then(crate::suggestions::get_suggestions)
-        .map(|sugg_list| {
-            sugg_list
-                .iter()
-                .take(3)
-                .map(|s| {
-                    if let Some(ref cmd) = s.command {
-                        format!("{}: {} ({})", s.kind.label(), s.text, cmd)
-                    } else {
-                        format!("{}: {}", s.kind.label(), s.text)
-                    }
-                })
-                .collect()
-        })
-        .or_else(|| {
-            get_contextual_suggestion(command).map(|s| vec![s.to_string()])
-        })
-        .unwrap_or_default();
+    // Build rule_id from pack and pattern (for registry lookup and display)
+    let rule_id = build_rule_id(pack, pattern);
 
-    // Create and render the denial box
-    let denial = DenialBox::new(command, highlight_span, pattern_id, severity)
-        .with_explanation(explanation_text)
-        .with_alternatives(alternatives);
-
-    if use_rich {
-        let _ = write!(handle, "{}", denial.render(&theme));
-    } else {
-        let _ = write!(handle, "{}", denial.render_plain());
+    // Rule ID (stable identifier for allowlisting)
+    if let Some(ref rule) = rule_id {
+        let rule_line = format!("  Rule: {rule}");
+        let padding = WIDTH.saturating_sub(rule_line.len());
+        let _ = write!(handle, "{}", "│".red());
+        let _ = write!(handle, "  {} ", "Rule:".bright_black());
+        let _ = write!(handle, "{}", rule.yellow());
+        let _ = writeln!(handle, "{}{}", " ".repeat(padding), "│".red());
+    } else if let Some(pack_name) = pack {
+        // Fallback: show pack if no rule_id
+        let pack_line = format!("  Pack: {pack_name}");
+        let padding = WIDTH.saturating_sub(pack_line.len());
+        let _ = write!(handle, "{}", "│".red());
+        let _ = write!(handle, "  {} ", "Pack:".bright_black());
+        let _ = write!(handle, "{}", pack_name.cyan());
+        let _ = writeln!(handle, "{}{}", " ".repeat(padding), "│".red());
     }
 
-    // Post-box: Learning commands section
-    print_learning_commands(&mut handle, command, rule_id.as_deref());
+    // Empty line
+    let _ = writeln!(handle, "{}{}{}", "│".red(), " ".repeat(WIDTH), "│".red());
 
-    let _ = writeln!(handle);
-}
+    // Reason section - wrap long reasons
+    let reason_label = "  Reason: ";
+    let reason_width = WIDTH - reason_label.len() - 1;
+    let wrapped_reason = wrap_text(reason, reason_width);
 
-/// Print learning commands section after the denial box.
-fn print_learning_commands(
-    handle: &mut io::StderrLock<'_>,
-    command: &str,
-    rule_id: Option<&str>,
-) {
+    for (i, line) in wrapped_reason.iter().enumerate() {
+        if i == 0 {
+            let _ = write!(handle, "{}", "│".red());
+            let _ = write!(handle, "  {} ", "Reason:".yellow().bold());
+            let _ = write!(handle, "{}", line.white());
+            let padding = WIDTH.saturating_sub(reason_label.len() + line.len());
+            let _ = writeln!(handle, "{}{}", " ".repeat(padding), "│".red());
+        } else {
+            let indent = " ".repeat(reason_label.len());
+            let padding = WIDTH.saturating_sub(indent.len() + line.len());
+            let _ = write!(handle, "{}", "│".red());
+            let _ = write!(handle, "{}{}", indent, line.white());
+            let _ = writeln!(handle, "{}{}", " ".repeat(padding), "│".red());
+        }
+    }
+
+    // Empty line
+    let _ = writeln!(handle, "{}{}{}", "│".red(), " ".repeat(WIDTH), "│".red());
+
+    let explanation_text = format_explanation_text(explanation, rule_id.as_deref(), pack);
+    let explanation_label = "  Explanation: ";
+    let explanation_width = WIDTH.saturating_sub(explanation_label.len() + 1);
+    let wrapped_explanation = wrap_text_preserve_indent(&explanation_text, explanation_width);
+
+    for (i, line) in wrapped_explanation.iter().enumerate() {
+        if i == 0 {
+            let _ = write!(handle, "{}", "│".red());
+            let _ = write!(handle, "  {} ", "Explanation:".yellow().bold());
+            let _ = write!(handle, "{}", line.white());
+            let padding = WIDTH.saturating_sub(explanation_label.len() + line.len());
+            let _ = writeln!(handle, "{}{}", " ".repeat(padding), "│".red());
+        } else {
+            let indent = " ".repeat(explanation_label.len());
+            let padding = WIDTH.saturating_sub(indent.len() + line.len());
+            let _ = write!(handle, "{}", "│".red());
+            let _ = write!(handle, "{}{}", indent, line.white());
+            let _ = writeln!(handle, "{}{}", " ".repeat(padding), "│".red());
+        }
+    }
+
+    // Empty line
+    let _ = writeln!(handle, "{}{}{}", "│".red(), " ".repeat(WIDTH), "│".red());
+
+    // Command section - highlight the dangerous command with caret span
+    let command_prefix = "  Command: ";
     let use_color = should_use_color();
+    // Max width for command display within the box (leave room for borders)
+    let max_cmd_width = WIDTH.saturating_sub(command_prefix.len() + 1);
 
-    // Learning commands header
-    if use_color {
-        let _ = writeln!(handle, "\n{}", "Learn more:".bright_black());
+    if let Some(span) = matched_span {
+        // Build highlight span with label from rule_id or pattern name
+        let label = rule_id
+            .as_deref()
+            .map(|r| format!("Matched: {r}"))
+            .or_else(|| pack.map(|p| format!("Matched: {p}")))
+            .unwrap_or_else(|| "Matched destructive pattern".to_string());
+        let highlight_span = HighlightSpan::with_label(span.start, span.end, label);
+        let highlighted =
+            format_highlighted_command(command, &highlight_span, use_color, max_cmd_width);
+
+        // Print command line
+        let _ = write!(handle, "{}", "│".red());
+        let _ = write!(handle, "  {} ", "Command:".cyan().bold());
+        let cmd_display = &highlighted.command_line;
+        let _ = write!(handle, "{}", cmd_display.bright_white().bold());
+        let cmd_line_char_len = command_prefix.len() + cmd_display.chars().count();
+        let padding = WIDTH.saturating_sub(cmd_line_char_len);
+        let _ = writeln!(handle, "{}{}", " ".repeat(padding), "│".red());
+
+        // Print caret line (showing the matched span)
+        let caret_prefix = " ".repeat(command_prefix.len());
+        let _ = write!(handle, "{}", "│".red());
+        let _ = write!(handle, "{caret_prefix}");
+        let _ = write!(handle, "{}", highlighted.caret_line);
+        let caret_line_len =
+            caret_prefix.len() + strip_ansi_codes(&highlighted.caret_line).chars().count();
+        let caret_padding = WIDTH.saturating_sub(caret_line_len);
+        let _ = writeln!(handle, "{}{}", " ".repeat(caret_padding), "│".red());
+
+        // Print label line if present
+        if let Some(ref label_line) = highlighted.label_line {
+            let _ = write!(handle, "{}", "│".red());
+            let _ = write!(handle, "{caret_prefix}");
+            let _ = write!(handle, "{label_line}");
+            let label_line_len = caret_prefix.len() + strip_ansi_codes(label_line).chars().count();
+            let label_padding = WIDTH.saturating_sub(label_line_len);
+            let _ = writeln!(handle, "{}{}", " ".repeat(label_padding), "│".red());
+        }
     } else {
-        let _ = writeln!(handle, "\nLearn more:");
+        // Fallback: no span available, use simple display (truncate if needed)
+        let _ = write!(handle, "{}", "│".red());
+        let _ = write!(handle, "  {} ", "Command:".cyan().bold());
+        let display_cmd = if command.chars().count() > 50 {
+            let truncated: String = command.chars().take(47).collect();
+            format!("{truncated}...")
+        } else {
+            command.to_string()
+        };
+        let _ = write!(handle, "{}", display_cmd.bright_white().bold());
+        let cmd_line_len = command_prefix.len() + display_cmd.chars().count();
+        let padding = WIDTH.saturating_sub(cmd_line_len);
+        let _ = writeln!(handle, "{}{}", " ".repeat(padding), "│".red());
     }
+
+    // Separator before suggestions/help
+    let _ = writeln!(
+        handle,
+        "{}{}{}",
+        "├".red(),
+        "─".repeat(WIDTH).red().dimmed(),
+        "┤".red()
+    );
+
+    // Suggestions from registry (if available) or fallback to contextual
+    let suggestions = rule_id
+        .as_deref()
+        .and_then(crate::suggestions::get_suggestions);
+
+    if let Some(sugg_list) = suggestions {
+        // Show up to 3 suggestions from registry
+        for s in sugg_list.iter().take(3) {
+            let kind_label = s.kind.label();
+            let _ = write!(handle, "{}", "│".red());
+            let _ = write!(handle, "  💡 {} ", kind_label.green());
+            // Truncate suggestion text if too long
+            let max_text = WIDTH.saturating_sub(kind_label.len() + 8);
+            let text = truncate_for_display(&s.text, max_text);
+            let _ = write!(handle, "{}", text.white());
+            let line_len = 5 + kind_label.len() + 1 + text.len();
+            let padding = WIDTH.saturating_sub(line_len);
+            let _ = writeln!(handle, "{}{}", " ".repeat(padding), "│".red());
+
+            // Show command if available
+            if let Some(ref cmd) = s.command {
+                let _ = write!(handle, "{}", "│".red());
+                let _ = write!(handle, "     {} ", "$".bright_black());
+                let max_cmd = WIDTH.saturating_sub(10);
+                let cmd_display = truncate_for_display(cmd, max_cmd);
+                let _ = write!(handle, "{}", cmd_display.cyan());
+                let cmd_line_len = 7 + cmd_display.len();
+                let cmd_padding = WIDTH.saturating_sub(cmd_line_len);
+                let _ = writeln!(handle, "{}{}", " ".repeat(cmd_padding), "│".red());
+            }
+        }
+    } else {
+        // Fallback to contextual suggestion if no registry entry
+        print_contextual_suggestion_boxed(&mut handle, command, WIDTH);
+    }
+
+    // Empty line before learning commands
+    let _ = writeln!(handle, "{}{}{}", "│".red(), " ".repeat(WIDTH), "│".red());
+
+    // Learning commands separator
+    let _ = writeln!(
+        handle,
+        "{}{}{}",
+        "├".red(),
+        "─".repeat(WIDTH).red().dimmed(),
+        "┤".red()
+    );
+
+    // Copy/paste learning commands
+    let _ = write!(handle, "{}", "│".red());
+    let _ = write!(handle, "  {} ", "Learn more:".bright_black());
+    let learn_len = "  Learn more: ".len();
+    let _ = writeln!(
+        handle,
+        "{}{}",
+        " ".repeat(WIDTH.saturating_sub(learn_len)),
+        "│".red()
+    );
 
     // dcg explain command
     let escaped_cmd = command.replace('\'', "'\\''");
     let explain_cmd = format!("dcg explain '{}'", truncate_for_display(&escaped_cmd, 45));
-    if use_color {
-        let _ = writeln!(handle, "  {} {}", "$".bright_black(), explain_cmd.cyan());
-    } else {
-        let _ = writeln!(handle, "  $ {explain_cmd}");
-    }
+    let _ = write!(handle, "{}", "│".red());
+    let _ = write!(handle, "     {} ", "$".bright_black());
+    let _ = write!(handle, "{}", explain_cmd.cyan());
+    let explain_len = 7 + explain_cmd.len();
+    let _ = writeln!(
+        handle,
+        "{}{}",
+        " ".repeat(WIDTH.saturating_sub(explain_len)),
+        "│".red()
+    );
 
     // dcg allowlist add command (if we have a rule_id)
-    if let Some(rule) = rule_id {
+    if let Some(ref rule) = rule_id {
         let allowlist_cmd = format!("dcg allowlist add {rule} --project");
-        if use_color {
-            let _ = writeln!(handle, "  {} {}", "$".bright_black(), allowlist_cmd.cyan());
-        } else {
-            let _ = writeln!(handle, "  $ {allowlist_cmd}");
-        }
+        let _ = write!(handle, "{}", "│".red());
+        let _ = write!(handle, "     {} ", "$".bright_black());
+        let _ = write!(handle, "{}", allowlist_cmd.cyan());
+        let allowlist_len = 7 + allowlist_cmd.len();
+        let _ = writeln!(
+            handle,
+            "{}{}",
+            " ".repeat(WIDTH.saturating_sub(allowlist_len)),
+            "│".red()
+        );
     }
 
-    // False positive link
-    if use_color {
-        let _ = writeln!(handle, "\n{}", "False positive? File an issue:".bright_black());
+    // Empty line before feedback link
+    let _ = writeln!(handle, "{}{}{}", "│".red(), " ".repeat(WIDTH), "│".red());
+
+    // Report false positive link
+    for line in [
+        "  False positive? File an issue:",
+        "  https://github.com/Dicklesworthstone/destructive_command_guard",
+        "  /issues/new?template=false_positive.yml",
+    ] {
+        let _ = write!(handle, "{}", "│".red());
+        let _ = write!(handle, "{}", line.bright_black());
         let _ = writeln!(
             handle,
-            "{}",
-            "  https://github.com/Dicklesworthstone/destructive_command_guard/issues/new".bright_black()
-        );
-    } else {
-        let _ = writeln!(handle, "\nFalse positive? File an issue:");
-        let _ = writeln!(
-            handle,
-            "  https://github.com/Dicklesworthstone/destructive_command_guard/issues/new"
+            "{}{}",
+            " ".repeat(WIDTH.saturating_sub(line.len())),
+            "│".red()
         );
     }
+
+    // Bottom border with corners
+    let _ = writeln!(
+        handle,
+        "{}{}{}",
+        "╰".red(),
+        "─".repeat(WIDTH).red(),
+        "╯".red()
+    );
+    let _ = writeln!(handle);
+}
+
+/// Strip ANSI escape codes from a string for length calculation.
+fn strip_ansi_codes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut in_escape = false;
+
+    for c in s.chars() {
+        if in_escape {
+            if c == 'm' {
+                in_escape = false;
+            }
+        } else if c == '\x1b' {
+            in_escape = true;
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 /// Truncate a string for display, appending "..." if truncated.
@@ -488,6 +681,66 @@ fn truncate_for_display(s: &str, max_len: usize) -> String {
             .map_or(0, |(i, c)| i + c.len_utf8());
         format!("{}...", &s[..boundary])
     }
+}
+
+/// Wrap text to fit within a given width.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current_line = String::new();
+
+    for word in text.split_whitespace() {
+        if current_line.is_empty() {
+            current_line = word.to_string();
+        } else if current_line.len() + 1 + word.len() <= width {
+            current_line.push(' ');
+            current_line.push_str(word);
+        } else {
+            lines.push(current_line);
+            current_line = word.to_string();
+        }
+    }
+
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    lines
+}
+
+/// Wrap text while preserving line breaks and indentation.
+fn wrap_text_preserve_indent(text: &str, width: usize) -> Vec<String> {
+    let mut wrapped_lines = Vec::new();
+
+    for raw_line in text.lines() {
+        if raw_line.trim().is_empty() {
+            wrapped_lines.push(String::new());
+            continue;
+        }
+
+        let indent_end = raw_line
+            .char_indices()
+            .take_while(|(_, ch)| ch.is_whitespace())
+            .last()
+            .map_or(0, |(idx, ch)| idx + ch.len_utf8());
+        let indent = &raw_line[..indent_end];
+        let content = raw_line[indent_end..].trim_start();
+        let available = width.saturating_sub(indent.chars().count());
+        let segments = wrap_text(content, available.max(1));
+
+        for segment in segments {
+            wrapped_lines.push(format!("{indent}{segment}"));
+        }
+    }
+
+    if wrapped_lines.is_empty() {
+        wrapped_lines.push(String::new());
+    }
+
+    wrapped_lines
 }
 
 /// Get context-specific suggestion based on the blocked command.
@@ -510,6 +763,17 @@ fn get_contextual_suggestion(command: &str) -> Option<&'static str> {
         Some("Use 'terraform plan -destroy' to preview changes first.")
     } else {
         None
+    }
+}
+
+/// Print context-specific suggestions in a boxed format.
+fn print_contextual_suggestion_boxed(handle: &mut io::StderrLock<'_>, command: &str, width: usize) {
+    if let Some(msg) = get_contextual_suggestion(command) {
+        let suggestion_line_len = "       ".len() + msg.len();
+        let _ = write!(handle, "{}", "│".red());
+        let _ = write!(handle, "       {}", msg.green());
+        let padding = width.saturating_sub(suggestion_line_len);
+        let _ = writeln!(handle, "{}{}", " ".repeat(padding), "│".red());
     }
 }
 
@@ -1122,6 +1386,18 @@ mod tests {
             None,
             None,
             Some(&span),
+        );
+    }
+
+    #[test]
+    fn test_strip_ansi_codes() {
+        // Test basic ANSI stripping
+        assert_eq!(strip_ansi_codes("hello"), "hello");
+        assert_eq!(strip_ansi_codes("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(strip_ansi_codes("\x1b[1;31mbold red\x1b[0m"), "bold red");
+        assert_eq!(
+            strip_ansi_codes("normal \x1b[31mred\x1b[0m normal"),
+            "normal red normal"
         );
     }
 

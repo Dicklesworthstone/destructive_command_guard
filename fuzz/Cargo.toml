@@ -78,11 +78,3 @@ path = "fuzz_targets/fuzz_shell_extract.rs"
 test = false
 doc = false
 bench = false
-
-# Fuzz target: scan mode extractors (Dockerfile, Makefile, GHA, etc.)
-[[bin]]
-name = "fuzz_scan_extractors"
-path = "fuzz_targets/fuzz_scan_extractors.rs"
-test = false
-doc = false
-bench = false
