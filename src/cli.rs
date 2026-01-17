@@ -654,10 +654,6 @@ pub struct UpdateCommand {
     #[arg(long, short = 'f', value_enum, default_value_t = UpdateFormat::Pretty, requires = "check")]
     pub format: UpdateFormat,
 
-    /// Skip confirmation prompt (native update only)
-    #[arg(long, conflicts_with_all = ["check", "system", "easy_mode", "from_source", "quiet", "no_gum"])]
-    pub force: bool,
-
     /// Install specific version (default: latest)
     #[arg(long)]
     pub version: Option<String>,
@@ -5249,83 +5245,11 @@ fn self_update(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> 
         return handle_version_check(update.refresh, update.format);
     }
 
-    // Use native Rust update if no installer-specific flags are set
-    let uses_installer_flags =
-        update.system || update.easy_mode || update.from_source || update.quiet || update.no_gum;
-
-    if !uses_installer_flags {
-        return self_update_native(&update);
-    }
-
     if cfg!(windows) {
         return self_update_windows(update);
     }
 
     self_update_unix(update)
-}
-
-/// Perform update using native Rust self_update crate.
-fn self_update_native(update: &UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::update::{format_update_result, perform_update};
-
-    let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
-
-    // If not forcing, confirm with user
-    if !update.force {
-        // First check if there's an update available
-        use crate::update::check_for_update;
-        match check_for_update(false) {
-            Ok(result) => {
-                if !result.update_available {
-                    if use_color {
-                        println!("\x1b[32m✓\x1b[0m Already running the latest version ({})", result.current_version);
-                    } else {
-                        println!("Already running the latest version ({})", result.current_version);
-                    }
-                    return Ok(());
-                }
-
-                // Show what's available and prompt for confirmation
-                if use_color {
-                    println!("\x1b[1mUpdate available:\x1b[0m {} → {}", result.current_version, result.latest_version);
-                } else {
-                    println!("Update available: {} -> {}", result.current_version, result.latest_version);
-                }
-
-                // Interactive confirmation
-                if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                    print!("Proceed with update? [y/N] ");
-                    use std::io::Write;
-                    std::io::stdout().flush()?;
-
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input)?;
-                    let response = input.trim().to_lowercase();
-                    if response != "y" && response != "yes" {
-                        println!("Update cancelled.");
-                        return Ok(());
-                    }
-                } else {
-                    // Non-interactive: require --force
-                    return Err("Non-interactive mode requires --force flag".into());
-                }
-            }
-            Err(e) => {
-                return Err(format!("Failed to check for updates: {e}").into());
-            }
-        }
-    }
-
-    // Perform the update
-    eprintln!("Downloading and installing update...");
-
-    match perform_update(update.force, update.version.as_deref()) {
-        Ok(result) => {
-            print!("{}", format_update_result(&result, use_color));
-            Ok(())
-        }
-        Err(e) => Err(format!("Update failed: {e}").into()),
-    }
 }
 
 /// Check for updates and display the result.

@@ -194,14 +194,12 @@ pub use history::{
 
 // Re-export output types for TUI/CLI visual formatting
 pub use output::{
-    BorderStyle, DenialBox, Severity as OutputSeverity, SeverityColors, Theme, auto_theme,
-    init as init_output, should_use_rich_output, supports_256_colors, terminal_height,
-    terminal_width,
+    BorderStyle, Severity as OutputSeverity, SeverityColors, Theme, auto_theme, init as init_output,
+    should_use_rich_output, supports_256_colors, terminal_height, terminal_width,
 };
 
 // Re-export update types for self-update version check
 pub use update::{
-    CACHE_DURATION, UpdateResult, VersionCheckError, VersionCheckResult, check_for_update,
-    clear_cache, current_version, format_check_result, format_check_result_json,
-    format_update_result, perform_update,
+    CACHE_DURATION, VersionCheckError, VersionCheckResult, check_for_update, clear_cache,
+    current_version, format_check_result, format_check_result_json,
 };
