@@ -42,70 +42,27 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "borg-delete",
             r"borg(?:\s+--?\S+(?:\s+\S+)?)*\s+delete\b",
-            "borg delete removes archives or entire repositories.",
-            Critical,
-            "Deleting borg archives or repositories permanently removes backup data. Without \
-             the archive, you cannot restore files to that point in time. If you delete the \
-             entire repository, all backup history is lost and cannot be recovered.\n\n\
-             Safer alternatives:\n\
-             - borg list: Review archives before deletion\n\
-             - borg info: Check archive details and size\n\
-             - borg export-tar: Export archive contents before deletion\n\
-             - Use --dry-run to preview what would be deleted"
+            "borg delete removes archives or entire repositories."
         ),
         destructive_pattern!(
             "borg-prune",
             r"borg(?:\s+--?\S+(?:\s+\S+)?)*\s+prune\b",
-            "borg prune removes archives based on retention rules.",
-            High,
-            "Pruning removes archives that don't match retention rules. Misconfigured retention \
-             policies can delete more archives than intended. Once pruned, those backup points \
-             cannot be restored. Space is not reclaimed until borg compact is run.\n\n\
-             Safer alternatives:\n\
-             - borg prune --dry-run: Preview which archives would be removed\n\
-             - borg list: Review current archives before pruning\n\
-             - Double-check retention flags (--keep-daily, --keep-weekly, etc.)"
+            "borg prune removes archives based on retention rules."
         ),
         destructive_pattern!(
             "borg-compact",
             r"borg(?:\s+--?\S+(?:\s+\S+)?)*\s+compact\b",
-            "borg compact reclaims space after deletions.",
-            Medium,
-            "Compacting permanently removes data segments that are no longer referenced after \
-             delete or prune operations. Before compacting, deleted data could theoretically \
-             be recovered. After compacting, the data is permanently gone and disk space is \
-             reclaimed.\n\n\
-             Safer alternatives:\n\
-             - borg list: Verify intended archives still exist\n\
-             - borg check: Verify repository integrity before compacting\n\
-             - Ensure all pruning was intentional before compacting"
+            "borg compact reclaims space after deletions."
         ),
         destructive_pattern!(
             "borg-recreate",
             r"borg(?:\s+--?\S+(?:\s+\S+)?)*\s+recreate\b",
-            "borg recreate can drop data from archives.",
-            High,
-            "Recreate modifies existing archives by recompressing or excluding files. Using \
-             --exclude or --exclude-from can permanently remove files from the archive. The \
-             original archive state cannot be recovered after recreation completes.\n\n\
-             Safer alternatives:\n\
-             - borg recreate --dry-run: Preview changes without applying\n\
-             - borg create: Create a new archive instead of modifying existing\n\
-             - borg export-tar: Export archive before recreation for backup"
+            "borg recreate can drop data from archives."
         ),
         destructive_pattern!(
             "borg-break-lock",
             r"borg(?:\s+--?\S+(?:\s+\S+)?)*\s+break-lock\b",
-            "borg break-lock forces removal of repository locks.",
-            Medium,
-            "Breaking locks removes lock files that protect against concurrent access. If \
-             another borg process is actually running (not a stale lock), breaking the lock \
-             can cause repository corruption. Only use when certain no other operation is \
-             in progress.\n\n\
-             Safer alternatives:\n\
-             - Check for running borg processes (ps aux | grep borg)\n\
-             - Wait for existing operations to complete\n\
-             - Verify lock is stale (check lock file timestamp)"
+            "borg break-lock forces removal of repository locks."
         ),
     ]
 }

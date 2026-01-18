@@ -4,27 +4,27 @@
 //! including subcommands for configuration management and pack information.
 
 use chrono::Utc;
-use clap::{Args, CommandFactory, Parser, Subcommand};
-use clap_complete::generate;
-use inquire::{Select, Text};
+use clap::{Args, Parser, Subcommand};
 
 use crate::config::Config;
 use crate::evaluator::{
-    DEFAULT_WINDOW_WIDTH, EvaluationDecision, EvaluationResult, MatchSource,
-    evaluate_command_with_pack_order, evaluate_command_with_pack_order_deadline_at_path,
+    DEFAULT_WINDOW_WIDTH, EvaluationDecision, MatchSource, evaluate_command_with_pack_order,
+    evaluate_command_with_pack_order_deadline_with_external,
 };
+use crate::packs::external::ExternalPackLoader;
 use crate::highlight::{HighlightSpan, format_highlighted_command, should_use_color};
 use crate::history::{
     ExportOptions, HistoryDb, HistoryStats, Outcome, SuggestionAction, SuggestionAuditEntry,
 };
 use crate::load_default_allowlists;
-use crate::packs::{DecisionMode, REGISTRY, Severity as PackSeverity};
+use crate::packs::REGISTRY;
 use crate::pending_exceptions::{
     AllowOnceEntry, AllowOnceScopeKind, AllowOnceStore, PendingExceptionRecord,
     PendingExceptionStore,
 };
-use crate::suggest::{CommandCluster, cluster_denied_commands};
-use std::io::IsTerminal;
+use crate::suggest::{
+    AllowlistSuggestion, ConfidenceTier, RiskLevel, generate_allowlist_suggestions,
+};
 
 /// High-performance Claude Code hook for blocking destructive commands.
 ///
@@ -36,20 +36,6 @@ use std::io::IsTerminal;
 #[command(version, about, long_about = None)]
 #[command(after_help = "Run 'dcg doctor' to verify your installation.")]
 pub struct Cli {
-    /// Increase verbosity (-v, -vv, -vvv)
-    #[arg(short, long, action = clap::ArgAction::Count, global = true, env = "DCG_VERBOSE")]
-    pub verbose: u8,
-
-    /// Suppress non-error output
-    #[arg(
-        short,
-        long,
-        global = true,
-        conflicts_with = "verbose",
-        env = "DCG_QUIET"
-    )]
-    pub quiet: bool,
-
     /// Subcommand to run (omit to run in hook mode)
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -66,7 +52,7 @@ pub enum Command {
         fix: bool,
 
         /// Output format (pretty or json)
-        #[arg(long, short, value_enum, default_value_t = DoctorFormat::Pretty, env = "DCG_FORMAT")]
+        #[arg(long, short, value_enum, default_value_t = DoctorFormat::Pretty)]
         format: DoctorFormat,
     },
 
@@ -149,14 +135,6 @@ pub enum Command {
     #[command(name = "update")]
     Update(UpdateCommand),
 
-    /// Generate shell completion scripts
-    #[command(name = "completions")]
-    Completions {
-        /// Shell to generate completions for
-        #[arg(value_enum)]
-        shell: CompletionShell,
-    },
-
     /// List all available packs and their status
     #[command(name = "packs")]
     ListPacks {
@@ -165,17 +143,11 @@ pub enum Command {
         enabled: bool,
 
         /// Show detailed information including pattern counts
-        #[arg(long)]
+        #[arg(short, long)]
         verbose: bool,
 
         /// Output format (json for structured output, pretty for human-readable)
-        #[arg(
-            long,
-            short = 'f',
-            value_enum,
-            default_value = "pretty",
-            env = "DCG_FORMAT"
-        )]
+        #[arg(long, short = 'f', value_enum, default_value = "pretty")]
         format: PacksFormat,
     },
 
@@ -201,13 +173,7 @@ pub enum Command {
         explain: bool,
 
         /// Output format (json for structured output, pretty for human-readable)
-        #[arg(
-            long,
-            short = 'f',
-            value_enum,
-            default_value = "pretty",
-            env = "DCG_FORMAT"
-        )]
+        #[arg(long, short = 'f', value_enum, default_value = "pretty")]
         format: TestFormat,
 
         /// Enable heredoc/inline-script scanning (overrides config)
@@ -280,13 +246,7 @@ pub enum Command {
         command: String,
 
         /// Output format
-        #[arg(
-            long,
-            short = 'f',
-            value_enum,
-            default_value = "pretty",
-            env = "DCG_FORMAT"
-        )]
+        #[arg(long, short = 'f', value_enum, default_value = "pretty")]
         format: ExplainFormat,
 
         /// Additional packs to enable for this evaluation
@@ -329,27 +289,6 @@ pub enum Command {
         #[command(subcommand)]
         action: DevAction,
     },
-
-    /// Start MCP server for direct agent integration
-    ///
-    /// Runs dcg as an MCP (Model Context Protocol) server over stdio,
-    /// allowing AI agents to integrate directly without shell hooks.
-    ///
-    /// Tools exposed:
-    /// - `check_command`: Evaluate a command using dcg policy
-    /// - `scan_file`: Scan a file or directory for destructive commands
-    /// - `explain_pattern`: Explain a dcg rule by `rule_id`
-    ///
-    /// Example agent configuration (Claude Code):
-    /// ```json
-    /// {
-    ///   "mcpServers": {
-    ///     "dcg": { "command": "dcg", "args": ["mcp-server"] }
-    ///   }
-    /// }
-    /// ```
-    #[command(name = "mcp-server")]
-    McpServer,
 }
 
 /// `dcg hook` command arguments.
@@ -417,13 +356,7 @@ pub struct CorpusCommand {
     pub baseline: Option<std::path::PathBuf>,
 
     /// Output format
-    #[arg(
-        long,
-        short = 'f',
-        value_enum,
-        default_value = "json",
-        env = "DCG_FORMAT"
-    )]
+    #[arg(long, short = 'f', value_enum, default_value = "json")]
     pub format: CorpusFormat,
 
     /// Write output to file instead of stdout
@@ -448,10 +381,8 @@ pub struct CorpusCommand {
 pub enum CorpusFormat {
     /// Structured JSON output (stable, diffable)
     #[default]
-    #[value(alias = "sarif")]
     Json,
     /// Human-readable colored output
-    #[value(alias = "text")]
     Pretty,
 }
 
@@ -467,25 +398,8 @@ pub struct StatsCommand {
     pub file: Option<std::path::PathBuf>,
 
     /// Output format
-    #[arg(
-        long,
-        short = 'o',
-        value_enum,
-        default_value = "pretty",
-        env = "DCG_FORMAT"
-    )]
+    #[arg(long, short = 'o', value_enum, default_value = "pretty")]
     pub format: StatsFormat,
-
-    /// Show per-rule metrics from history database
-    ///
-    /// Displays detailed statistics for individual rules including hit counts,
-    /// allowlist override rates, trends, and more.
-    #[arg(long, short = 'r')]
-    pub rules: bool,
-
-    /// Limit number of rules to display (default: 20)
-    #[arg(long, short = 'n', default_value = "20")]
-    pub limit: usize,
 }
 
 /// Output format for stats command.
@@ -493,10 +407,8 @@ pub struct StatsCommand {
 pub enum StatsFormat {
     /// Human-readable table output
     #[default]
-    #[value(alias = "text")]
     Pretty,
     /// Structured JSON output
-    #[value(alias = "sarif")]
     Json,
 }
 
@@ -505,10 +417,8 @@ pub enum StatsFormat {
 pub enum TestFormat {
     /// Human-readable colored output
     #[default]
-    #[value(alias = "text")]
     Pretty,
     /// Structured JSON output
-    #[value(alias = "sarif")]
     Json,
 }
 
@@ -517,10 +427,8 @@ pub enum TestFormat {
 pub enum PacksFormat {
     /// Human-readable grouped output
     #[default]
-    #[value(alias = "text")]
     Pretty,
     /// Structured JSON output
-    #[value(alias = "sarif")]
     Json,
 }
 
@@ -543,7 +451,7 @@ pub struct TestOutput {
     /// Reason for blocking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// Match source: `config_override`, `pack`, `heredoc_ast`, etc.
+    /// Match source: "config_override", "pack", "heredoc_ast", etc.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// Matched span (start, end) in the command
@@ -617,13 +525,7 @@ pub struct SuggestAllowlistCommand {
     pub non_interactive: bool,
 
     /// Output format (text, json)
-    #[arg(
-        long,
-        short = 'f',
-        value_enum,
-        default_value = "text",
-        env = "DCG_FORMAT"
-    )]
+    #[arg(long, short = 'f', value_enum, default_value = "text")]
     pub format: SuggestFormat,
 
     /// Maximum number of suggestions to show
@@ -640,10 +542,8 @@ pub struct SuggestAllowlistCommand {
 pub enum SuggestFormat {
     /// Human-readable colored output
     #[default]
-    #[value(alias = "pretty")]
     Text,
     /// Structured JSON output
-    #[value(alias = "sarif")]
     Json,
 }
 
@@ -834,7 +734,7 @@ pub enum DevAction {
         pack_id: String,
 
         /// Show verbose validation output
-        #[arg(long)]
+        #[arg(long, short = 'v')]
         verbose: bool,
     },
 
@@ -911,14 +811,7 @@ pub struct UpdateCommand {
     pub refresh: bool,
 
     /// Output format for version check
-    #[arg(
-        long,
-        short = 'f',
-        value_enum,
-        default_value_t = UpdateFormat::Pretty,
-        requires = "check",
-        env = "DCG_FORMAT"
-    )]
+    #[arg(long, short = 'f', value_enum, default_value_t = UpdateFormat::Pretty, requires = "check")]
     pub format: UpdateFormat,
 
     /// Skip confirmation prompt (native update only)
@@ -963,33 +856,9 @@ pub struct UpdateCommand {
 pub enum UpdateFormat {
     /// Human-readable colored output
     #[default]
-    #[value(alias = "text")]
     Pretty,
     /// Structured JSON output
-    #[value(alias = "sarif")]
     Json,
-}
-
-/// Shells supported for completion script generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum CompletionShell {
-    Bash,
-    Zsh,
-    Fish,
-    Powershell,
-    Elvish,
-}
-
-impl CompletionShell {
-    const fn as_shell(self) -> clap_complete::Shell {
-        match self {
-            Self::Bash => clap_complete::Shell::Bash,
-            Self::Zsh => clap_complete::Shell::Zsh,
-            Self::Fish => clap_complete::Shell::Fish,
-            Self::Powershell => clap_complete::Shell::PowerShell,
-            Self::Elvish => clap_complete::Shell::Elvish,
-        }
-    }
 }
 
 /// `dcg scan` command arguments and actions.
@@ -1015,7 +884,7 @@ pub struct ScanCommand {
 
     // === Output / policy flags ===
     /// Output format
-    #[arg(long, short = 'f', value_enum, env = "DCG_FORMAT")]
+    #[arg(long, short = 'f', value_enum)]
     format: Option<crate::scan::ScanFormat>,
 
     /// Exit non-zero when findings meet this threshold
@@ -1054,7 +923,7 @@ pub struct ScanCommand {
 
     // === UX flags ===
     /// Include verbose output (skipped-file reasons, extractor stats)
-    #[arg(long)]
+    #[arg(long, short = 'v')]
     verbose: bool,
 
     /// Limit exemplars shown in pretty output
@@ -1105,17 +974,11 @@ pub struct SimulateCommand {
     pub strict: bool,
 
     /// Output format (for parse stats, evaluation comes later)
-    #[arg(
-        long,
-        short = 'F',
-        value_enum,
-        default_value = "pretty",
-        env = "DCG_FORMAT"
-    )]
+    #[arg(long, short = 'F', value_enum, default_value = "pretty")]
     pub format: SimulateFormat,
 
     /// Show verbose output (per-line format detection, etc.)
-    #[arg(long)]
+    #[arg(long, short = 'v')]
     pub verbose: bool,
 
     /// Redact sensitive data in exemplar commands
@@ -1136,10 +999,8 @@ pub struct SimulateCommand {
 pub enum SimulateFormat {
     /// Human-readable output
     #[default]
-    #[value(alias = "text")]
     Pretty,
     /// Structured JSON output
-    #[value(alias = "sarif")]
     Json,
 }
 
@@ -1148,12 +1009,10 @@ pub enum SimulateFormat {
 pub enum ExplainFormat {
     /// Human-readable colored output
     #[default]
-    #[value(alias = "text")]
     Pretty,
     /// Compact single-line output
     Compact,
     /// Structured JSON output
-    #[value(alias = "sarif")]
     Json,
 }
 
@@ -1222,7 +1081,7 @@ pub enum AllowlistAction {
         user: bool,
 
         /// Output format
-        #[arg(long, value_enum, default_value = "pretty", env = "DCG_FORMAT")]
+        #[arg(long, value_enum, default_value = "pretty")]
         format: AllowlistOutputFormat,
     },
 
@@ -1348,10 +1207,8 @@ pub struct AllowOnceCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum AllowlistOutputFormat {
     /// Human-readable output
-    #[value(alias = "text")]
     Pretty,
     /// JSON output
-    #[value(alias = "sarif")]
     Json,
 }
 
@@ -1360,10 +1217,8 @@ pub enum AllowlistOutputFormat {
 pub enum DoctorFormat {
     /// Human-readable colored output
     #[default]
-    #[value(alias = "text")]
     Pretty,
     /// Structured JSON output for automation
-    #[value(alias = "sarif")]
     Json,
 }
 
@@ -1401,7 +1256,7 @@ pub enum PackAction {
         strict: bool,
 
         /// Output format
-        #[arg(long, short = 'f', value_enum, default_value_t = PackValidateFormat::Pretty, env = "DCG_FORMAT")]
+        #[arg(long, short = 'f', value_enum, default_value_t = PackValidateFormat::Pretty)]
         format: PackValidateFormat,
     },
 }
@@ -1411,10 +1266,8 @@ pub enum PackAction {
 pub enum PackValidateFormat {
     /// Human-readable colored output
     #[default]
-    #[value(alias = "text")]
     Pretty,
     /// Structured JSON output for tooling integration
-    #[value(alias = "sarif")]
     Json,
 }
 
@@ -1461,52 +1314,16 @@ pub struct DoctorReport {
 ///
 /// Returns an error when no subcommand is provided (hook mode), or when a
 /// subcommand that performs I/O fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Verbosity {
-    level: u8,
-    quiet: bool,
-}
-
-impl Verbosity {
-    fn from_cli(cli: &Cli) -> Self {
-        Self {
-            level: cli.verbose.min(3),
-            quiet: cli.quiet,
-        }
-    }
-
-    const fn level(self) -> u8 {
-        if self.quiet { 0 } else { self.level }
-    }
-
-    const fn is_verbose(self) -> bool {
-        self.level() >= 1
-    }
-
-    const fn is_debug(self) -> bool {
-        self.level() >= 2
-    }
-
-    const fn is_trace(self) -> bool {
-        self.level() >= 3
-    }
-}
-
-/// # Errors
-///
-/// Returns an error when no subcommand is provided (hook mode) or when a
-/// subcommand that performs I/O fails.
 #[allow(clippy::too_many_lines)]
 pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load();
-    let verbosity = Verbosity::from_cli(&cli);
 
     match cli.command {
         Some(Command::Doctor { fix, format }) => {
             doctor(fix, format);
         }
         Some(Command::Hook(cmd)) => {
-            run_hook_command(&config, &cmd)?;
+            run_hook_command(&config, cmd)?;
         }
         Some(Command::Install { force }) => {
             install_hook(force)?;
@@ -1517,21 +1334,8 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Update(update)) => {
             self_update(update)?;
         }
-        Some(Command::Completions { shell }) => {
-            write_completions(shell)?;
-        }
-        Some(Command::ListPacks {
-            enabled,
-            verbose,
-            format,
-        }) => {
-            list_packs(
-                &config,
-                enabled,
-                verbose || verbosity.is_verbose(),
-                format,
-                verbosity.quiet,
-            );
+        Some(Command::ListPacks { enabled, verbose, format }) => {
+            list_packs(&config, enabled, verbose, format);
         }
         Some(Command::Pack { action }) => {
             handle_pack_command(&config, action)?;
@@ -1560,7 +1364,6 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     &command,
                     with_packs,
                     format,
-                    verbosity,
                     heredoc_scan,
                     no_heredoc_scan,
                     heredoc_timeout_ms,
@@ -1572,9 +1375,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             init_config(output, force)?;
         }
         Some(Command::ShowConfig) => {
-            if !verbosity.quiet {
-                show_config(&config);
-            }
+            show_config(&config);
         }
         Some(Command::Allowlist { action }) => {
             handle_allowlist_command(action)?;
@@ -1603,25 +1404,23 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             handle_allow_once_command(&config, &cmd)?;
         }
         Some(Command::Scan(scan)) => {
-            handle_scan_command(&config, scan, verbosity)?;
+            handle_scan_command(&config, scan)?;
         }
         Some(Command::Simulate(sim)) => {
-            handle_simulate_command(sim, &config, verbosity)?;
+            handle_simulate_command(sim, &config)?;
         }
         Some(Command::Explain {
             command,
             format,
             with_packs,
         }) => {
-            if !verbosity.quiet {
-                handle_explain(&config, &command, format, with_packs);
-            }
+            handle_explain(&config, &command, format, with_packs);
         }
         Some(Command::Corpus(corpus)) => {
             handle_corpus_command(&config, &corpus)?;
         }
         Some(Command::Stats(stats)) => {
-            handle_stats_command(&config, &stats, verbosity.quiet)?;
+            handle_stats_command(&config, &stats)?;
         }
         Some(Command::History { action }) => {
             handle_history_command(&config, action)?;
@@ -1630,10 +1429,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             handle_suggest_allowlist_command(&config, &cmd)?;
         }
         Some(Command::Dev { action }) => {
-            handle_dev_command(&config, action, verbosity)?;
-        }
-        Some(Command::McpServer) => {
-            crate::mcp::run_mcp_server()?;
+            handle_dev_command(&config, action)?;
         }
         None => {
             // No subcommand - run in hook mode (default behavior)
@@ -1645,24 +1441,15 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn write_completions(shell: CompletionShell) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::{self, Write};
-
-    let mut cmd = Cli::command();
-    let bin_name = cmd.get_name().to_string();
-    let mut stdout = io::stdout();
-    generate(shell.as_shell(), &mut cmd, &bin_name, &mut stdout);
-    stdout.flush()?;
-    Ok(())
-}
-
 // ============================================================================
 // Hook Command (dcg hook --batch)
 // ============================================================================
 
 /// Run the hook command with optional batch processing.
-#[allow(clippy::too_many_lines)]
-fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<(), Box<dyn std::error::Error>> {
+fn run_hook_command(
+    config: &Config,
+    cmd: HookCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{self, BufRead, Write};
 
     // If not batch mode and not parallel, fall through to normal hook mode
@@ -1673,9 +1460,10 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<(), Box<dyn st
     }
 
     // Parallel implies batch
+    let _parallel = cmd.parallel;
     let workers = if cmd.workers == 0 {
         std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
+            .map(|n| n.get())
             .unwrap_or(4)
     } else {
         cmd.workers
@@ -1690,8 +1478,30 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<(), Box<dyn st
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
     let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
 
-    // TODO: External pack loading is not yet implemented.
-    // When ExternalPackLoader is implemented, load custom YAML packs here.
+    // Load external packs
+    let external_packs: Vec<crate::Pack> = {
+        let loader = crate::packs::external::ExternalPackLoader::from_config(&config.packs);
+        let result = loader.load_all_deduped();
+        result.packs.into_iter().map(|loaded| loaded.pack).collect()
+    };
+
+    let enabled_keywords: Vec<&str> = {
+        let mut keywords = enabled_keywords;
+        for pack in &external_packs {
+            for kw in pack.keywords {
+                if !keywords.contains(kw) {
+                    keywords.push(kw);
+                }
+            }
+        }
+        keywords
+    };
+
+    let external_packs_slice: Option<&[crate::Pack]> = if external_packs.is_empty() {
+        None
+    } else {
+        Some(&external_packs)
+    };
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -1723,6 +1533,7 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<(), Box<dyn st
                         &compiled_overrides,
                         &allowlists,
                         &heredoc_settings,
+                        external_packs_slice,
                         cmd.continue_on_error,
                     )
                 })
@@ -1751,6 +1562,7 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<(), Box<dyn st
                     &compiled_overrides,
                     &allowlists,
                     &heredoc_settings,
+                    external_packs_slice,
                     cmd.continue_on_error,
                 );
                 let json = serde_json::to_string(&result)?;
@@ -1788,6 +1600,7 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<(), Box<dyn st
                 &compiled_overrides,
                 &allowlists,
                 &heredoc_settings,
+                external_packs_slice,
                 cmd.continue_on_error,
             );
             let json = serde_json::to_string(&result)?;
@@ -1799,7 +1612,6 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<(), Box<dyn st
 }
 
 /// Evaluate a single batch line and return the result.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn evaluate_batch_line(
     index: usize,
     line: &str,
@@ -1809,6 +1621,7 @@ fn evaluate_batch_line(
     compiled_overrides: &crate::config::CompiledOverrides,
     allowlists: &crate::allowlist::LayeredAllowlist,
     heredoc_settings: &crate::config::HeredocSettings,
+    external_packs: Option<&[crate::Pack]>,
     continue_on_error: bool,
 ) -> BatchHookOutput {
     // Skip empty lines
@@ -1897,7 +1710,7 @@ fn evaluate_batch_line(
     }
 
     // Evaluate the command
-    let eval_result = evaluate_command_with_pack_order_deadline_at_path(
+    let eval_result = evaluate_command_with_pack_order_deadline_with_external(
         &command,
         enabled_keywords,
         ordered_packs,
@@ -1908,6 +1721,7 @@ fn evaluate_batch_line(
         None,
         None,
         None, // No deadline for batch mode
+        external_packs,
     );
 
     match eval_result.decision {
@@ -1920,18 +1734,16 @@ fn evaluate_batch_line(
         },
         EvaluationDecision::Deny => {
             // Extract pattern info for deny decisions
-            let (rule_id, pack_id) =
-                eval_result
-                    .pattern_info
-                    .as_ref()
-                    .map_or((None, None), |info| {
-                        let rule_id = match (&info.pack_id, &info.pattern_name) {
-                            (Some(p), Some(pat)) => Some(format!("{p}:{pat}")),
-                            (Some(p), None) => Some(p.clone()),
-                            _ => None,
-                        };
-                        (rule_id, info.pack_id.clone())
-                    });
+            let (rule_id, pack_id) = if let Some(ref info) = eval_result.pattern_info {
+                let rule_id = match (&info.pack_id, &info.pattern_name) {
+                    (Some(p), Some(pat)) => Some(format!("{p}:{pat}")),
+                    (Some(p), None) => Some(p.clone()),
+                    _ => None,
+                };
+                (rule_id, info.pack_id.clone())
+            } else {
+                (None, None)
+            };
 
             BatchHookOutput {
                 index,
@@ -1945,17 +1757,7 @@ fn evaluate_batch_line(
 }
 
 /// List all packs and their status
-fn list_packs(
-    config: &Config,
-    enabled_only: bool,
-    verbose: bool,
-    format: PacksFormat,
-    quiet: bool,
-) {
-    if quiet {
-        return;
-    }
-
+fn list_packs(config: &Config, enabled_only: bool, verbose: bool, format: PacksFormat) {
     let enabled_packs = config.enabled_pack_ids();
     let infos = REGISTRY.list_packs(&enabled_packs);
 
@@ -1966,7 +1768,7 @@ fn list_packs(
         .map(|info| {
             let category = info.id.split('.').next().unwrap_or(&info.id).to_string();
             PackInfo {
-                id: info.id.clone(),
+                id: info.id.to_string(),
                 name: info.name.to_string(),
                 category,
                 description: info.description.to_string(),
@@ -2092,7 +1894,6 @@ fn handle_pack_command(
 }
 
 /// Validate an external pack YAML file
-#[allow(clippy::too_many_lines)]
 fn pack_validate(
     file_path: &str,
     strict: bool,
@@ -2554,110 +2355,6 @@ struct PackEngineSummary {
     linear_percentage: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InteractiveDecision {
-    Block,
-    AllowOnce,
-    AddToAllowlist,
-    ShowDetails,
-}
-
-fn should_prompt_interactively(
-    format: TestFormat,
-    verbosity: Verbosity,
-    mode: DecisionMode,
-    severity: Option<PackSeverity>,
-) -> bool {
-    if format == TestFormat::Json || verbosity.quiet {
-        return false;
-    }
-
-    if mode != DecisionMode::Deny {
-        return false;
-    }
-
-    if !matches!(severity, Some(PackSeverity::Medium | PackSeverity::Low)) {
-        return false;
-    }
-
-    if std::env::var("DCG_NON_INTERACTIVE").is_ok() || std::env::var("CI").is_ok() {
-        return false;
-    }
-
-    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
-}
-
-fn prompt_for_block_action() -> InteractiveDecision {
-    let options = vec![
-        "Block this command (recommended)",
-        "Allow once (this time only)",
-        "Add to allowlist (remember for future)",
-        "Show more details",
-    ];
-
-    let selection = Select::new("What would you like to do?", options)
-        .with_help_message("Use arrow keys to select, Enter to confirm")
-        .prompt();
-
-    match selection {
-        Ok("Allow once (this time only)") => InteractiveDecision::AllowOnce,
-        Ok("Add to allowlist (remember for future)") => InteractiveDecision::AddToAllowlist,
-        Ok("Show more details") => InteractiveDecision::ShowDetails,
-        _ => InteractiveDecision::Block,
-    }
-}
-
-fn prompt_allowlist_reason(default_reason: &str) -> String {
-    Text::new("Reason for allowlisting?")
-        .with_initial_value(default_reason)
-        .prompt()
-        .unwrap_or_else(|_| default_reason.to_string())
-}
-
-fn resolve_mode_for_cli(
-    config: &Config,
-    command: &str,
-    result: &EvaluationResult,
-) -> Option<DecisionMode> {
-    let info = result.pattern_info.as_ref()?;
-    let pack = info.pack_id.as_deref();
-    let pattern = info.pattern_name.as_deref();
-
-    let mut mode = match info.source {
-        MatchSource::Pack | MatchSource::HeredocAst => {
-            config.policy().resolve_mode(pack, pattern, info.severity)
-        }
-        MatchSource::ConfigOverride | MatchSource::LegacyPattern => DecisionMode::Deny,
-    };
-
-    if matches!(info.source, MatchSource::Pack | MatchSource::HeredocAst) {
-        let sanitized = crate::context::sanitize_for_pattern_matching(command);
-        let normalized_command = crate::normalize::normalize_command(command);
-        let normalized_sanitized = crate::normalize::normalize_command(sanitized.as_ref());
-
-        let mut confidence_command = command;
-        let mut confidence_sanitized: Option<&str> = None;
-
-        if normalized_command.len() == normalized_sanitized.len() {
-            confidence_command = normalized_command.as_ref();
-            if sanitized.as_ref() != command {
-                confidence_sanitized = Some(normalized_sanitized.as_ref());
-            }
-        }
-
-        let confidence_result = crate::apply_confidence_scoring(
-            confidence_command,
-            confidence_sanitized,
-            result,
-            mode,
-            &config.confidence,
-        );
-        mode = confidence_result.mode;
-    }
-
-    Some(mode)
-}
-
 /// Test a command against the configured packs using the shared evaluator.
 ///
 /// This ensures parity with hook mode by using the same evaluation logic:
@@ -2667,29 +2364,16 @@ fn resolve_mode_for_cli(
 /// 4. Command normalization
 /// 5. Pack pattern matching
 #[allow(clippy::needless_pass_by_value)] // Value is consumed from CLI args
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn test_command(
     config: &Config,
     command: &str,
     extra_packs: Option<Vec<String>>,
     format: TestFormat,
-    verbosity: Verbosity,
     heredoc_scan: bool,
     no_heredoc_scan: bool,
     heredoc_timeout_ms: Option<u64>,
     heredoc_languages: Option<Vec<String>>,
 ) {
-    use std::time::Instant;
-
-    if verbosity.quiet {
-        return;
-    }
-
-    if verbosity.is_trace() && format == TestFormat::Pretty {
-        handle_explain(config, command, ExplainFormat::Pretty, extra_packs);
-        return;
-    }
-
     // Build effective config with extra packs if specified
     let mut effective_config = extra_packs.map_or_else(
         || config.clone(),
@@ -2716,7 +2400,7 @@ fn test_command(
 
     // Get enabled packs and collect keywords for quick rejection
     let enabled_packs = effective_config.enabled_pack_ids();
-    let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+    let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
     let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
     let heredoc_settings = effective_config.heredoc_settings();
@@ -2728,12 +2412,35 @@ fn test_command(
     // This is a small file read and only affects decisions when a rule matches.
     let allowlists = load_default_allowlists();
 
-    // TODO: External pack loading is not yet implemented.
-    // When ExternalPackLoader is implemented, load custom YAML packs here.
+    // Load external (custom YAML) packs from configured paths.
+    // Fail-open: errors are logged but don't block command evaluation.
+    let external_packs: Vec<crate::Pack> = {
+        let loader = ExternalPackLoader::from_config(&effective_config.packs);
+        let result = loader.load_all_deduped();
+        for warning in &result.warnings {
+            eprintln!("Warning: {warning}");
+        }
+        result.packs.into_iter().map(|lp| lp.pack).collect()
+    };
+
+    // Add keywords from external packs to enable quick-reject bypass
+    for pack in &external_packs {
+        for kw in pack.keywords {
+            if !enabled_keywords.contains(kw) {
+                enabled_keywords.push(kw);
+            }
+        }
+    }
+
+    // Convert external packs to slice for evaluator
+    let external_packs_slice: Option<&[crate::Pack]> = if external_packs.is_empty() {
+        None
+    } else {
+        Some(&external_packs)
+    };
 
     // Use shared evaluator for consistent behavior with hook mode
-    let start = Instant::now();
-    let result = evaluate_command_with_pack_order_deadline_at_path(
+    let result = evaluate_command_with_pack_order_deadline_with_external(
         command,
         &enabled_keywords,
         &ordered_packs,
@@ -2744,21 +2451,19 @@ fn test_command(
         None, // allow_once_audit
         None, // project_path
         None, // deadline
+        external_packs_slice,
     );
-    let elapsed = start.elapsed();
 
     // Handle JSON output
     if format == TestFormat::Json {
         let output = match result.decision {
             EvaluationDecision::Allow => {
-                let allowlist =
-                    result
-                        .allowlist_override
-                        .as_ref()
-                        .map(|info| AllowlistOverrideInfo {
-                            layer: info.layer.label().to_string(),
-                            reason: info.reason.clone(),
-                        });
+                let allowlist = result.allowlist_override.as_ref().map(|info| {
+                    AllowlistOverrideInfo {
+                        layer: info.layer.label().to_string(),
+                        reason: info.reason.clone(),
+                    }
+                });
                 TestOutput {
                     command: command.to_string(),
                     decision: "allow".to_string(),
@@ -2772,20 +2477,17 @@ fn test_command(
                 }
             }
             EvaluationDecision::Deny => {
-                let (pack_id, pattern_name, reason, source_str, matched_span, rule_id) = result
-                    .pattern_info
-                    .as_ref()
-                    .map_or((None, None, None, None, None, None), |info| {
+                let (pack_id, pattern_name, reason, source_str, matched_span, rule_id) =
+                    if let Some(ref info) = result.pattern_info {
                         let source_str = match info.source {
                             MatchSource::ConfigOverride => "config_override",
                             MatchSource::LegacyPattern => "legacy_pattern",
                             MatchSource::Pack => "pack",
                             MatchSource::HeredocAst => "heredoc_ast",
                         };
-                        let rule_id = info
-                            .pack_id
-                            .as_ref()
-                            .and_then(|p| info.pattern_name.as_ref().map(|n| format!("{p}:{n}")));
+                        let rule_id = info.pack_id.as_ref().and_then(|p| {
+                            info.pattern_name.as_ref().map(|n| format!("{p}:{n}"))
+                        });
                         (
                             info.pack_id.clone(),
                             info.pattern_name.clone(),
@@ -2794,7 +2496,9 @@ fn test_command(
                             info.matched_span.as_ref().map(|s| (s.start, s.end)),
                             rule_id,
                         )
-                    });
+                    } else {
+                        (None, None, None, None, None, None)
+                    };
                 TestOutput {
                     command: command.to_string(),
                     decision: "deny".to_string(),
@@ -2851,8 +2555,6 @@ fn test_command(
     }
     println!();
 
-    let resolved_mode = resolve_mode_for_cli(&effective_config, command, &result);
-
     match result.decision {
         EvaluationDecision::Allow => {
             if let Some(override_info) = &result.allowlist_override {
@@ -2866,8 +2568,7 @@ fn test_command(
             }
         }
         EvaluationDecision::Deny => {
-            let mut result_line = "Result: BLOCKED".to_string();
-
+            println!("Result: BLOCKED");
             if let Some(ref info) = result.pattern_info {
                 if let Some(ref pack_id) = info.pack_id {
                     println!("Pack: {pack_id}");
@@ -2883,103 +2584,7 @@ fn test_command(
                     MatchSource::HeredocAst => "heredoc/inline script (AST)",
                 };
                 println!("Source: {source}");
-
-                let rule_id = info
-                    .pack_id
-                    .as_ref()
-                    .zip(info.pattern_name.as_ref())
-                    .map(|(pack, pattern)| format!("{pack}:{pattern}"));
-                let mode = resolved_mode.unwrap_or(DecisionMode::Deny);
-
-                match mode {
-                    DecisionMode::Warn => {
-                        result_line = "Result: WARN (policy allows)".to_string();
-                    }
-                    DecisionMode::Log => {
-                        result_line = "Result: LOG (policy allows)".to_string();
-                    }
-                    DecisionMode::Deny => {
-                        let mut action = InteractiveDecision::Block;
-                        if should_prompt_interactively(format, verbosity, mode, info.severity) {
-                            loop {
-                                let choice = prompt_for_block_action();
-                                if choice == InteractiveDecision::ShowDetails {
-                                    handle_explain(
-                                        &effective_config,
-                                        command,
-                                        ExplainFormat::Pretty,
-                                        None,
-                                    );
-                                    println!();
-                                } else {
-                                    action = choice;
-                                    break;
-                                }
-                            }
-                        }
-
-                        match action {
-                            InteractiveDecision::AllowOnce => {
-                                result_line =
-                                    "Result: ALLOWED (allow once, not persisted)".to_string();
-                            }
-                            InteractiveDecision::AddToAllowlist => {
-                                let layer = resolve_layer(false, false);
-                                let reason =
-                                    prompt_allowlist_reason("Interactive approval via dcg test");
-                                let add_result = rule_id.as_ref().map_or_else(
-                                    || allowlist_add_command(command, &reason, layer, None),
-                                    |rule_id| {
-                                        allowlist_add_rule(rule_id, &reason, layer, None, &[])
-                                    },
-                                );
-
-                                if let Err(err) = add_result {
-                                    eprintln!("Allowlist update failed: {err}");
-                                    result_line = "Result: BLOCKED".to_string();
-                                } else {
-                                    result_line = format!(
-                                        "Result: ALLOWED (allowlisted in {})",
-                                        layer.label()
-                                    );
-                                }
-                            }
-                            InteractiveDecision::Block | InteractiveDecision::ShowDetails => {}
-                        }
-                    }
-                }
             }
-
-            println!("{result_line}");
-        }
-    }
-
-    if verbosity.is_verbose() {
-        println!("Elapsed: {:.2}ms", elapsed.as_secs_f64() * 1000.0);
-        if let Some(ref info) = result.pattern_info {
-            if let Some(severity) = info.severity {
-                println!("Severity: {}", severity.label());
-            }
-        }
-    }
-
-    if verbosity.is_debug() {
-        if let Some(ref info) = result.pattern_info {
-            if let Some(ref pack_id) = info.pack_id {
-                if let Some(ref pattern_name) = info.pattern_name {
-                    println!("Rule: {pack_id}:{pattern_name}");
-                }
-            }
-            if let Some(ref span) = info.matched_span {
-                println!("Match span: {}..{}", span.start, span.end);
-            }
-            if let Some(ref preview) = info.matched_text_preview {
-                println!("Match preview: \"{preview}\"");
-            }
-        }
-        let normalized = crate::normalize::normalize_command(command);
-        if normalized.as_ref() != command {
-            println!("Normalized: {normalized}");
         }
     }
 }
@@ -3404,7 +3009,6 @@ impl ScanSettingsOverrides {
 fn handle_simulate_command(
     sim: SimulateCommand,
     config: &Config,
-    verbosity: Verbosity,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::simulate::{
         SimulateLimits, SimulateOutputConfig, SimulationConfig, format_json_output,
@@ -3441,19 +3045,6 @@ fn handle_simulate_command(
 
     let sim_config = SimulationConfig::default();
 
-    if !verbosity.quiet {
-        if verbosity.is_debug() {
-            eprintln!(
-                "Simulate settings: format={format:?}, strict={strict}, max_command_bytes={max_command_bytes}"
-            );
-        }
-        if verbosity.is_trace() {
-            eprintln!(
-                "Simulate input: file={file}, max_lines={max_lines:?}, max_bytes={max_bytes:?}, top={top}, truncate={truncate}, redact={redact:?}"
-            );
-        }
-    }
-
     // Run simulation with evaluation loop
     let result = run_simulation_from_reader(reader, limits, config, sim_config, strict)?;
 
@@ -3462,12 +3053,8 @@ fn handle_simulate_command(
         redact,
         truncate,
         top,
-        verbose: verbose || verbosity.is_verbose(),
+        verbose,
     };
-
-    if verbosity.quiet {
-        return Ok(());
-    }
 
     // Output results using formatting functions
     match format {
@@ -3485,7 +3072,6 @@ fn handle_simulate_command(
 fn handle_scan_command(
     config: &Config,
     scan: ScanCommand,
-    verbosity: Verbosity,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ScanCommand {
         staged,
@@ -3503,10 +3089,6 @@ fn handle_scan_command(
         top,
         action,
     } = scan;
-    let effective_verbose = verbose || verbosity.is_verbose();
-    let quiet = verbosity.quiet;
-    let debug = verbosity.is_debug();
-    let trace = verbosity.is_trace();
 
     match action {
         Some(ScanAction::InstallPreCommit) => {
@@ -3549,10 +3131,7 @@ fn handle_scan_command(
                 &settings.include,
                 settings.redact,
                 settings.truncate,
-                effective_verbose,
-                quiet,
-                debug,
-                trace,
+                verbose,
                 top,
             )?;
         }
@@ -3563,7 +3142,6 @@ fn handle_scan_command(
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::needless_pass_by_value)] // Values consumed from CLI args
-#[allow(clippy::fn_params_excessive_bools)]
 fn handle_scan(
     config: &Config,
     staged: bool,
@@ -3578,9 +3156,6 @@ fn handle_scan(
     redact: crate::scan::ScanRedactMode,
     truncate: usize,
     verbose: bool,
-    quiet: bool,
-    debug: bool,
-    trace: bool,
     top: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::scan::{ScanEvalContext, ScanOptions, scan_paths, should_fail};
@@ -3625,20 +3200,8 @@ fn handle_scan(
         return Err("No file selection mode specified".into());
     };
 
-    if !quiet {
-        if verbose {
-            eprintln!("Scanning {} path(s)", scan_paths_list.len());
-        }
-        if debug {
-            eprintln!(
-                "Scan settings: format={format:?}, fail_on={fail_on:?}, max_file_size={max_file_size}, max_findings={max_findings}"
-            );
-        }
-        if trace {
-            eprintln!(
-                "Scan filters: include={include:?}, exclude={exclude:?}, truncate={truncate}, redact={redact:?}"
-            );
-        }
+    if verbose {
+        eprintln!("Scanning {} path(s)", scan_paths_list.len());
     }
 
     // Run scan
@@ -3654,23 +3217,16 @@ fn handle_scan(
     )?;
 
     // Output results
-    if !quiet {
-        match format {
-            crate::scan::ScanFormat::Pretty => {
-                print_scan_pretty(&report, verbose, top);
-            }
-            crate::scan::ScanFormat::Json => {
-                let json = serde_json::to_string_pretty(&report)?;
-                println!("{json}");
-            }
-            crate::scan::ScanFormat::Markdown => {
-                print_scan_markdown(&report, top, truncate);
-            }
-            crate::scan::ScanFormat::Sarif => {
-                let sarif = crate::sarif::SarifReport::from_scan_report(&report);
-                let json = serde_json::to_string_pretty(&sarif)?;
-                println!("{json}");
-            }
+    match format {
+        crate::scan::ScanFormat::Pretty => {
+            print_scan_pretty(&report, verbose, top);
+        }
+        crate::scan::ScanFormat::Json => {
+            let json = serde_json::to_string_pretty(&report)?;
+            println!("{json}");
+        }
+        crate::scan::ScanFormat::Markdown => {
+            print_scan_markdown(&report, top, truncate);
         }
     }
 
@@ -4626,18 +4182,8 @@ fn handle_corpus_command(
 fn handle_stats_command(
     config: &Config,
     cmd: &StatsCommand,
-    quiet: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::stats;
-
-    if quiet {
-        return Ok(());
-    }
-
-    // Handle --rules mode (query history database for rule-level metrics)
-    if cmd.rules {
-        return handle_stats_rules(config, cmd);
-    }
 
     // Determine log file path
     let log_path = if let Some(ref path) = cmd.file {
@@ -4688,273 +4234,6 @@ fn handle_stats_command(
     print!("{output}");
 
     Ok(())
-}
-
-/// Handle the `dcg stats --rules` command.
-fn handle_stats_rules(
-    config: &Config,
-    cmd: &StatsCommand,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::history::HistoryDb;
-    use chrono::{Duration, Utc};
-
-    // Open history database
-    let db_path = config.history.expanded_database_path();
-    let db = match HistoryDb::open(db_path) {
-        Ok(db) => db,
-        Err(err) => {
-            if matches!(err, crate::history::HistoryError::Disabled) {
-                println!("History is disabled. Enable it in config to use rule metrics.");
-                println!();
-                println!("To enable history, add to your config (~/.config/dcg/config.toml):");
-                println!();
-                println!("  [history]");
-                println!("  enabled = true");
-                return Ok(());
-            }
-            println!("Error opening history database: {err}");
-            return Ok(());
-        }
-    };
-
-    // Calculate the start time based on --days
-    let since = Some(Utc::now() - Duration::days(i64::try_from(cmd.days).unwrap_or(30)));
-
-    // Query rule metrics
-    let metrics = db.get_rule_metrics(since, cmd.limit)?;
-
-    if metrics.is_empty() {
-        println!("No rule metrics found in the last {} days.", cmd.days);
-        println!();
-        println!("Rule metrics are collected when commands are blocked or bypassed.");
-        println!("Run some commands through dcg to generate metrics.");
-        return Ok(());
-    }
-
-    // Format and print output
-    let output = match cmd.format {
-        StatsFormat::Pretty => format_rule_metrics_pretty(&metrics, cmd.days),
-        StatsFormat::Json => format_rule_metrics_json(&metrics, cmd.days)?,
-    };
-
-    print!("{output}");
-
-    Ok(())
-}
-
-/// Format rule metrics as a pretty table.
-fn format_rule_metrics_pretty(metrics: &[crate::history::RuleMetrics], period_days: u64) -> String {
-    use std::fmt::Write;
-
-    let mut output = String::new();
-    let _ = writeln!(output, "Rule Metrics (last {period_days} days):");
-    let _ = writeln!(output);
-
-    // Calculate column widths
-    let max_rule_len = metrics
-        .iter()
-        .map(|m| m.rule_id.len())
-        .max()
-        .unwrap_or(10)
-        .clamp(10, 40);
-
-    // Header
-    let _ = writeln!(
-        output,
-        "  {:<width$}  {:>6}  {:>9}  {:>7}  {:>8}  {:>8}  {:>9}",
-        "Rule ID",
-        "Hits",
-        "Overrides",
-        "Rate",
-        "Trend",
-        "Change",
-        "Noisy",
-        width = max_rule_len
-    );
-    let _ = writeln!(
-        output,
-        "  {:-<width$}  {:->6}  {:->9}  {:->7}  {:->8}  {:->8}  {:->9}",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        width = max_rule_len
-    );
-
-    // Rule rows
-    for m in metrics {
-        let rule_id_display = if m.rule_id.len() > max_rule_len {
-            format!("{}...", &m.rule_id[..max_rule_len - 3])
-        } else {
-            m.rule_id.clone()
-        };
-        let noisy_display = if m.is_noisy { "yes" } else { "-" };
-        let trend_display = match m.trend {
-            crate::history::RuleTrend::Increasing => "↑",
-            crate::history::RuleTrend::Stable => "→",
-            crate::history::RuleTrend::Decreasing => "↓",
-        };
-        // Format change percentage with anomaly indicator
-        let change_display = if m.change_percentage.abs() < 0.01 {
-            "-".to_string()
-        } else if m.is_anomaly {
-            format!("{:+.0}%!", m.change_percentage)
-        } else {
-            format!("{:+.0}%", m.change_percentage)
-        };
-        let _ = writeln!(
-            output,
-            "  {:<width$}  {:>6}  {:>9}  {:>6.1}%  {:>8}  {:>8}  {:>9}",
-            rule_id_display,
-            m.total_hits,
-            m.allowlist_overrides,
-            m.override_rate,
-            trend_display,
-            change_display,
-            noisy_display,
-            width = max_rule_len
-        );
-    }
-
-    // Totals
-    let total_hits: u64 = metrics.iter().map(|m| m.total_hits).sum();
-    let total_overrides: u64 = metrics.iter().map(|m| m.allowlist_overrides).sum();
-    #[allow(clippy::cast_precision_loss)]
-    let avg_rate = if total_hits > 0 {
-        (total_overrides as f64 / total_hits as f64) * 100.0
-    } else {
-        0.0
-    };
-    let _ = writeln!(
-        output,
-        "  {:-<width$}  {:->6}  {:->9}  {:->7}  {:->8}  {:->8}  {:->9}",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        width = max_rule_len
-    );
-    let _ = writeln!(
-        output,
-        "  {:<width$}  {:>6}  {:>9}  {:>6.1}%",
-        "Total",
-        total_hits,
-        total_overrides,
-        avg_rate,
-        width = max_rule_len
-    );
-    let _ = writeln!(output);
-    let _ = writeln!(
-        output,
-        "  {} rules shown (use -n to change limit)",
-        metrics.len()
-    );
-
-    output
-}
-
-/// JSON output structure for rule metrics.
-#[derive(serde::Serialize)]
-struct RuleMetricsOutput {
-    period_days: u64,
-    rules: Vec<RuleMetricEntry>,
-    totals: RuleMetricsTotals,
-}
-
-/// Single rule entry in JSON output.
-#[derive(serde::Serialize)]
-struct RuleMetricEntry {
-    rule_id: String,
-    pack_id: String,
-    pattern_name: String,
-    total_hits: u64,
-    allowlist_overrides: u64,
-    override_rate: f64,
-    first_seen: String,
-    last_seen: String,
-    unique_commands: u64,
-    trend: String,
-    is_noisy: bool,
-    /// Hits in the previous period (for comparison).
-    previous_period_hits: u64,
-    /// Percentage change from previous period.
-    change_percentage: f64,
-    /// Whether this rule shows anomalous spike behavior.
-    is_anomaly: bool,
-}
-
-/// Totals for rule metrics JSON output.
-#[derive(serde::Serialize)]
-struct RuleMetricsTotals {
-    total_hits: u64,
-    total_overrides: u64,
-    avg_override_rate: f64,
-    rule_count: usize,
-}
-
-/// Format rule metrics as JSON.
-fn format_rule_metrics_json(
-    metrics: &[crate::history::RuleMetrics],
-    period_days: u64,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let rules: Vec<RuleMetricEntry> = metrics
-        .iter()
-        .map(|m| {
-            // Split rule_id into pack_id and pattern_name
-            let (pack_id, pattern_name) = m.rule_id.split_once(':').map_or_else(
-                || (m.rule_id.clone(), String::new()),
-                |(p, n)| (p.to_string(), n.to_string()),
-            );
-            RuleMetricEntry {
-                rule_id: m.rule_id.clone(),
-                pack_id,
-                pattern_name,
-                total_hits: m.total_hits,
-                allowlist_overrides: m.allowlist_overrides,
-                override_rate: m.override_rate,
-                first_seen: m.first_seen.to_rfc3339(),
-                last_seen: m.last_seen.to_rfc3339(),
-                unique_commands: m.unique_commands,
-                trend: match m.trend {
-                    crate::history::RuleTrend::Increasing => "increasing".to_string(),
-                    crate::history::RuleTrend::Stable => "stable".to_string(),
-                    crate::history::RuleTrend::Decreasing => "decreasing".to_string(),
-                },
-                is_noisy: m.is_noisy,
-                previous_period_hits: m.previous_period_hits,
-                change_percentage: m.change_percentage,
-                is_anomaly: m.is_anomaly,
-            }
-        })
-        .collect();
-
-    let total_hits: u64 = metrics.iter().map(|m| m.total_hits).sum();
-    let total_overrides: u64 = metrics.iter().map(|m| m.allowlist_overrides).sum();
-    #[allow(clippy::cast_precision_loss)]
-    let avg_rate = if total_hits > 0 {
-        (total_overrides as f64 / total_hits as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let output = RuleMetricsOutput {
-        period_days,
-        rules,
-        totals: RuleMetricsTotals {
-            total_hits,
-            total_overrides,
-            avg_override_rate: avg_rate,
-            rule_count: metrics.len(),
-        },
-    };
-
-    Ok(serde_json::to_string_pretty(&output)?)
 }
 
 /// Handle the `dcg suggest-allowlist` command.
@@ -5047,7 +4326,7 @@ fn handle_suggest_allowlist_command(
         *command_freq.entry(entry.command.clone()).or_insert(0) += 1;
     }
 
-    // Convert to the format expected by cluster_denied_commands
+    // Convert to the format expected by generate_allowlist_suggestions
     let commands: Vec<(String, usize)> = command_freq
         .into_iter()
         .filter(|(_, freq)| *freq >= cmd.min_frequency)
@@ -5063,25 +4342,34 @@ fn handle_suggest_allowlist_command(
         return Ok(());
     }
 
-    // Generate suggestions via clustering
-    let clusters = cluster_denied_commands(&commands, 1);
+    // Generate suggestions
+    let suggestions = generate_allowlist_suggestions(&commands, 1);
 
-    if clusters.is_empty() {
+    if suggestions.is_empty() {
         println!("No allowlist suggestions could be generated from the history.");
         return Ok(());
     }
 
-    // TODO: Confidence and risk filtering are not yet implemented.
-    // The ConfidenceTier and RiskLevel types need to be added to the suggest module.
-    // For now, we ignore the confidence and risk filters.
-    let _ = cmd.confidence; // Silence unused warning
-    let _ = cmd.risk; // Silence unused warning
-
-    // Take up to the limit
-    let suggestions: Vec<CommandCluster> = clusters.into_iter().take(cmd.limit).collect();
+    // Filter by confidence tier
+    let suggestions: Vec<AllowlistSuggestion> = suggestions
+        .into_iter()
+        .filter(|s| match cmd.confidence {
+            ConfidenceTierFilter::High => s.confidence.tier == ConfidenceTier::High,
+            ConfidenceTierFilter::Medium => s.confidence.tier == ConfidenceTier::Medium,
+            ConfidenceTierFilter::Low => s.confidence.tier == ConfidenceTier::Low,
+            ConfidenceTierFilter::All => true,
+        })
+        .filter(|s| match cmd.risk {
+            RiskLevelFilter::Low => s.risk.level == RiskLevel::Low,
+            RiskLevelFilter::Medium => s.risk.level == RiskLevel::Medium,
+            RiskLevelFilter::High => s.risk.level == RiskLevel::High,
+            RiskLevelFilter::All => true,
+        })
+        .take(cmd.limit)
+        .collect();
 
     if suggestions.is_empty() {
-        println!("No suggestions available.");
+        println!("No suggestions match the specified confidence/risk filters.");
         return Ok(());
     }
 
@@ -5106,23 +4394,31 @@ fn handle_suggest_allowlist_command(
 
 /// Output suggestions as JSON.
 fn output_suggestions_json(
-    suggestions: &[CommandCluster],
+    suggestions: &[AllowlistSuggestion],
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[derive(serde::Serialize)]
     struct JsonSuggestion {
         pattern: String,
+        confidence: String,
+        risk: String,
         frequency: usize,
         unique_variants: usize,
+        specificity_score: f32,
         example_commands: Vec<String>,
+        risk_explanation: String,
     }
 
     let output: Vec<JsonSuggestion> = suggestions
         .iter()
         .map(|s| JsonSuggestion {
-            pattern: s.proposed_pattern.clone(),
+            pattern: s.pattern.clone(),
+            confidence: s.confidence.tier.as_str().to_lowercase(),
+            risk: s.risk.level.as_str().to_string(),
             frequency: s.frequency,
-            unique_variants: s.unique_count,
-            example_commands: s.commands.clone(),
+            unique_variants: s.unique_variants,
+            specificity_score: s.specificity_score,
+            example_commands: s.example_commands.clone(),
+            risk_explanation: s.risk.explanation.clone(),
         })
         .collect();
 
@@ -5132,41 +4428,55 @@ fn output_suggestions_json(
 }
 
 /// Output suggestions as formatted text (non-interactive).
-fn output_suggestions_text(suggestions: &[CommandCluster]) {
+fn output_suggestions_text(suggestions: &[AllowlistSuggestion]) {
     println!("Allowlist Suggestions");
     println!("=====================");
     println!();
 
     for (i, suggestion) in suggestions.iter().enumerate() {
-        println!("[{}/{}] Cluster", i + 1, suggestions.len());
+        let confidence_indicator = match suggestion.confidence.tier {
+            ConfidenceTier::High => "HIGH",
+            ConfidenceTier::Medium => "MEDIUM",
+            ConfidenceTier::Low => "LOW",
+        };
+
+        let risk_indicator = match suggestion.risk.level {
+            RiskLevel::Low => "LOW",
+            RiskLevel::Medium => "MEDIUM",
+            RiskLevel::High => "HIGH",
+        };
+
+        println!(
+            "[{}/{}] {} CONFIDENCE",
+            i + 1,
+            suggestions.len(),
+            confidence_indicator
+        );
         println!("────────────────────────────────────────");
-        println!("Pattern: {}", suggestion.proposed_pattern);
+        println!("Pattern: {}", suggestion.pattern);
         println!(
             "Blocked: {} times ({} unique variants)",
-            suggestion.frequency, suggestion.unique_count
+            suggestion.frequency, suggestion.unique_variants
         );
+        println!("Risk: {} - {}", risk_indicator, suggestion.risk.explanation);
         println!();
         println!("Example commands:");
-        for cmd in suggestion.commands.iter().take(5) {
+        for cmd in &suggestion.example_commands {
             println!("  • {cmd}");
-        }
-        if suggestion.commands.len() > 5 {
-            println!("  ... and {} more", suggestion.commands.len() - 5);
         }
         println!();
     }
 }
 
 /// Output suggestions interactively (prompting user for each).
-#[allow(clippy::too_many_lines)]
 fn output_suggestions_interactive(
-    suggestions: &[CommandCluster],
+    suggestions: &[AllowlistSuggestion],
     total_denied: usize,
     db: Option<&HistoryDb>,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use colored::Colorize;
     use std::io::{self, BufRead, Write};
+    use colored::Colorize;
 
     println!("Analyzing {total_denied} denied commands...");
     println!("Found {} potential allowlist patterns.", suggestions.len());
@@ -5184,16 +4494,34 @@ fn output_suggestions_interactive(
         .map(|p| p.to_string_lossy().to_string());
 
     for (i, suggestion) in suggestions.iter().enumerate() {
+        let confidence_indicator = match suggestion.confidence.tier {
+            ConfidenceTier::High => "HIGH",
+            ConfidenceTier::Medium => "MEDIUM",
+            ConfidenceTier::Low => "LOW",
+        };
+
+        let risk_indicator = match suggestion.risk.level {
+            RiskLevel::Low => "LOW",
+            RiskLevel::Medium => "MEDIUM",
+            RiskLevel::High => "HIGH",
+        };
+
         // Check for potential conflicts before displaying
-        let conflict_check = check_pattern_conflicts(&suggestion.proposed_pattern, config);
+        let conflict_check = check_pattern_conflicts(&suggestion.pattern, config);
 
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!(" [{}/{}] Cluster", i + 1, suggestions.len());
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!(" Pattern: {}", suggestion.proposed_pattern);
         println!(
-            " Blocked: {} times ({} unique variants)",
-            suggestion.frequency, suggestion.unique_count
+            " [{}/{}] {} CONFIDENCE",
+            i + 1,
+            suggestions.len(),
+            confidence_indicator
+        );
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!(" Pattern: {}", suggestion.pattern);
+        println!(" Blocked: {} times", suggestion.frequency);
+        println!(
+            " Risk: {} ({})",
+            risk_indicator, suggestion.risk.explanation
         );
 
         // Display warnings if there are conflicts or the pattern is overly broad
@@ -5204,10 +4532,7 @@ fn output_suggestions_interactive(
                 println!("   • {}", warning.yellow());
             }
             if conflict_check.is_overly_broad {
-                println!(
-                    "   • {}",
-                    "Pattern is overly broad (uses wildcards without anchors)".yellow()
-                );
+                println!("   • {}", "Pattern is overly broad (uses wildcards without anchors)".yellow());
                 if let Some(ref suggestion_text) = conflict_check.refinement_suggestion {
                     println!("     {}", suggestion_text.dimmed());
                 }
@@ -5216,11 +4541,8 @@ fn output_suggestions_interactive(
 
         println!();
         println!(" Example commands:");
-        for cmd in suggestion.commands.iter().take(5) {
+        for cmd in &suggestion.example_commands {
             println!("   • {cmd}");
-        }
-        if suggestion.commands.len() > 5 {
-            println!("   ... and {} more", suggestion.commands.len() - 5);
         }
         println!();
 
@@ -5238,15 +4560,15 @@ fn output_suggestions_interactive(
                     let audit_entry = SuggestionAuditEntry {
                         timestamp: Utc::now(),
                         action: SuggestionAction::Accepted,
-                        pattern: suggestion.proposed_pattern.clone(),
+                        pattern: suggestion.pattern.clone(),
                         final_pattern: None,
-                        risk_level: "unknown".to_string(),
-                        risk_score: 0.0,
-                        confidence_tier: "unknown".to_string(),
-                        confidence_points: 0,
+                        risk_level: suggestion.risk.level.as_str().to_string(),
+                        risk_score: suggestion.risk.score,
+                        confidence_tier: suggestion.confidence.tier.as_str().to_lowercase(),
+                        confidence_points: suggestion.confidence.total as i32,
                         cluster_frequency: suggestion.frequency,
-                        unique_variants: suggestion.unique_count,
-                        sample_commands: serde_json::to_string(&suggestion.commands)
+                        unique_variants: suggestion.unique_variants,
+                        sample_commands: serde_json::to_string(&suggestion.example_commands)
                             .unwrap_or_default(),
                         rule_id: None,
                         session_id: None,
@@ -5258,20 +4580,20 @@ fn output_suggestions_interactive(
                 }
 
                 // Generate a descriptive reason from the suggestion
-                let reason = if suggestion.commands.is_empty() {
-                    "Auto-suggested from history analysis".to_string()
+                let reason = if !suggestion.example_commands.is_empty() {
+                    format!("Matches commands like: {}", suggestion.example_commands[0])
                 } else {
-                    format!("Matches commands like: {}", suggestion.commands[0])
+                    "Auto-suggested from history analysis".to_string()
                 };
 
                 // Write the pattern to the allowlist
                 match allowlist_add_pattern(
-                    &suggestion.proposed_pattern,
+                    &suggestion.pattern,
                     &reason,
-                    "unknown",
-                    "unknown",
+                    suggestion.risk.level.as_str(),
+                    &suggestion.confidence.tier.as_str().to_lowercase(),
                     suggestion.frequency,
-                    suggestion.unique_count,
+                    suggestion.unique_variants,
                 ) {
                     Ok(path) => {
                         use colored::Colorize;
@@ -5287,10 +4609,8 @@ fn output_suggestions_interactive(
                         } else {
                             eprintln!(" {} Could not write to allowlist: {e}", "✗".red());
                             println!("   You can manually add it with:");
-                            println!(
-                                "   dcg allowlist add-pattern --pattern '{}' --reason '{}'",
-                                suggestion.proposed_pattern, reason
-                            );
+                            println!("   dcg allowlist add-pattern --pattern '{}' --reason '{}'",
+                                suggestion.pattern, reason);
                         }
                         println!();
                     }
@@ -5307,15 +4627,15 @@ fn output_suggestions_interactive(
                     let audit_entry = SuggestionAuditEntry {
                         timestamp: Utc::now(),
                         action: SuggestionAction::Rejected,
-                        pattern: suggestion.proposed_pattern.clone(),
+                        pattern: suggestion.pattern.clone(),
                         final_pattern: None,
-                        risk_level: "unknown".to_string(),
-                        risk_score: 0.0,
-                        confidence_tier: "unknown".to_string(),
-                        confidence_points: 0,
+                        risk_level: suggestion.risk.level.as_str().to_string(),
+                        risk_score: suggestion.risk.score,
+                        confidence_tier: suggestion.confidence.tier.as_str().to_lowercase(),
+                        confidence_points: suggestion.confidence.total as i32,
                         cluster_frequency: suggestion.frequency,
-                        unique_variants: suggestion.unique_count,
-                        sample_commands: serde_json::to_string(&suggestion.commands)
+                        unique_variants: suggestion.unique_variants,
+                        sample_commands: serde_json::to_string(&suggestion.example_commands)
                             .unwrap_or_default(),
                         rule_id: None,
                         session_id: None,
@@ -6062,17 +5382,12 @@ fn format_corpus_pretty(output: &CorpusOutput) -> String {
 }
 
 /// Check installation, configuration, and hook registration
-fn doctor(fix: bool, format: DoctorFormat) {
-    match format {
-        DoctorFormat::Pretty => doctor_pretty(fix),
-        DoctorFormat::Json => doctor_json(fix),
-    }
-}
-
-/// Human-readable doctor output.
 #[allow(clippy::too_many_lines, clippy::unnecessary_unwrap)]
-fn doctor_pretty(fix: bool) {
+fn doctor(fix: bool, format: DoctorFormat) {
     use colored::Colorize;
+
+    // For now, ignore format parameter - only pretty output supported
+    let _ = format;
 
     println!("{}", "dcg doctor".green().bold());
     println!();
@@ -6361,401 +5676,6 @@ fn doctor_pretty(fix: bool) {
     }
 }
 
-const DOCTOR_SCHEMA_VERSION: u32 = 1;
-
-fn doctor_json(fix: bool) {
-    let report = collect_doctor_report(fix);
-    let json = serde_json::to_string_pretty(&report).expect("serialize doctor report");
-    println!("{json}");
-}
-
-#[allow(clippy::too_many_lines, clippy::option_if_let_else)]
-fn collect_doctor_report(fix: bool) -> DoctorReport {
-    let mut checks = Vec::new();
-    let mut issues = 0usize;
-    let mut fixed = 0usize;
-
-    // Check 1: Binary in PATH
-    let (status, message, remediation) = if which_dcg().is_some() {
-        (DoctorCheckStatus::Ok, "dcg found in PATH".to_string(), None)
-    } else {
-        issues += 1;
-        (
-            DoctorCheckStatus::Error,
-            "dcg binary not found in PATH".to_string(),
-            Some("Run the install script or add dcg to PATH".to_string()),
-        )
-    };
-    checks.push(DoctorCheck {
-        id: "binary_path",
-        name: "Binary in PATH",
-        status,
-        message,
-        remediation,
-        fixed: false,
-    });
-
-    // Check 2: Claude settings file exists
-    let settings_path = claude_settings_path();
-    let (status, message) = if settings_path.exists() {
-        (
-            DoctorCheckStatus::Ok,
-            format!("settings.json found at {}", settings_path.display()),
-        )
-    } else {
-        (
-            DoctorCheckStatus::Warning,
-            "settings.json not found (Claude Code not configured)".to_string(),
-        )
-    };
-    checks.push(DoctorCheck {
-        id: "claude_settings",
-        name: "Claude Code settings file",
-        status,
-        message,
-        remediation: None,
-        fixed: false,
-    });
-
-    // Check 3: Hook wiring
-    let hook_diag = diagnose_hook_wiring();
-    let mut hook_fixed = false;
-    let (status, message, remediation) = if !hook_diag.settings_exists {
-        (
-            DoctorCheckStatus::Skipped,
-            "No settings file to check".to_string(),
-            None,
-        )
-    } else if let Some(ref err) = hook_diag.settings_error {
-        issues += 1;
-        (
-            DoctorCheckStatus::Error,
-            format!("Settings error: {err}"),
-            Some("Fix settings.json or reinstall Claude Code".to_string()),
-        )
-    } else if hook_diag.dcg_hook_count == 0 {
-        issues += 1;
-        if fix {
-            match install_hook_silent(false) {
-                Ok(true) => {
-                    fixed += 1;
-                    hook_fixed = true;
-                    (
-                        DoctorCheckStatus::Ok,
-                        "Hook registered successfully".to_string(),
-                        None,
-                    )
-                }
-                Ok(false) => (
-                    DoctorCheckStatus::Error,
-                    "Hook not registered (no changes made)".to_string(),
-                    Some("Run 'dcg install' to register the hook".to_string()),
-                ),
-                Err(e) => (
-                    DoctorCheckStatus::Error,
-                    format!("Failed to register hook: {e}"),
-                    Some("Run 'dcg install' to register the hook".to_string()),
-                ),
-            }
-        } else {
-            (
-                DoctorCheckStatus::Error,
-                "dcg hook not registered".to_string(),
-                Some("Run 'dcg install' to register the hook".to_string()),
-            )
-        }
-    } else if hook_diag.dcg_hook_count > 1 {
-        (
-            DoctorCheckStatus::Warning,
-            format!(
-                "Found {} dcg hook entries (expected 1)",
-                hook_diag.dcg_hook_count
-            ),
-            Some("Run 'dcg uninstall && dcg install' to fix duplicates".to_string()),
-        )
-    } else if !hook_diag.wrong_matcher_hooks.is_empty() {
-        issues += 1;
-        (
-            DoctorCheckStatus::Error,
-            format!(
-                "Hook registered with wrong matcher: {:?}",
-                hook_diag.wrong_matcher_hooks
-            ),
-            Some("dcg must be a Bash hook; reinstall to fix".to_string()),
-        )
-    } else if !hook_diag.missing_executable_hooks.is_empty() {
-        issues += 1;
-        (
-            DoctorCheckStatus::Error,
-            format!(
-                "Hook points to missing executable: {:?}",
-                hook_diag.missing_executable_hooks
-            ),
-            Some("Run 'dcg uninstall && dcg install' to fix".to_string()),
-        )
-    } else {
-        (
-            DoctorCheckStatus::Ok,
-            "dcg hook registered".to_string(),
-            None,
-        )
-    };
-    checks.push(DoctorCheck {
-        id: "hook_wiring",
-        name: "Hook wiring",
-        status,
-        message,
-        remediation,
-        fixed: hook_fixed,
-    });
-
-    // Check 4: Config validation
-    let config_diag = validate_config_diagnostics();
-    let mut config_fixed = false;
-    let (status, message, remediation) = match &config_diag.config_path {
-        None => {
-            if fix {
-                let cfg_path = config_path();
-                if cfg_path.exists() {
-                    issues += 1;
-                    (
-                        DoctorCheckStatus::Error,
-                        format!("Config exists at {} but was not loaded", cfg_path.display()),
-                        Some("Check permissions and config syntax".to_string()),
-                    )
-                } else {
-                    match write_default_config() {
-                        Ok(path) => {
-                            fixed += 1;
-                            config_fixed = true;
-                            (
-                                DoctorCheckStatus::Ok,
-                                format!("Created default config at {}", path.display()),
-                                None,
-                            )
-                        }
-                        Err(e) => {
-                            issues += 1;
-                            (
-                                DoctorCheckStatus::Error,
-                                format!("Failed to create config: {e}"),
-                                Some("Create config with 'dcg init'".to_string()),
-                            )
-                        }
-                    }
-                }
-            } else {
-                (
-                    DoctorCheckStatus::Warning,
-                    "No config file found; using defaults".to_string(),
-                    Some("Run 'dcg init -o ~/.config/dcg/config.toml'".to_string()),
-                )
-            }
-        }
-        Some(path) if config_diag.parse_error.is_some() => {
-            issues += 1;
-            (
-                DoctorCheckStatus::Error,
-                format!(
-                    "Invalid config at {}: {}",
-                    path.display(),
-                    config_diag.parse_error.as_deref().unwrap_or("parse error")
-                ),
-                Some("Fix the TOML syntax error in your config file".to_string()),
-            )
-        }
-        Some(path) => {
-            if config_diag.has_errors() || config_diag.has_warnings() {
-                let mut details = Vec::new();
-                if !config_diag.unknown_packs.is_empty() {
-                    details.push(format!("Unknown pack IDs: {:?}", config_diag.unknown_packs));
-                }
-                if !config_diag.invalid_override_patterns.is_empty() {
-                    details.push(format!(
-                        "Invalid override patterns: {}",
-                        config_diag.invalid_override_patterns.len()
-                    ));
-                }
-                (
-                    DoctorCheckStatus::Warning,
-                    format!(
-                        "Config warnings at {}: {}",
-                        path.display(),
-                        details.join("; ")
-                    ),
-                    Some("Run 'dcg packs list' and fix invalid overrides".to_string()),
-                )
-            } else {
-                (
-                    DoctorCheckStatus::Ok,
-                    format!("Config valid at {}", path.display()),
-                    None,
-                )
-            }
-        }
-    };
-    checks.push(DoctorCheck {
-        id: "config",
-        name: "Configuration",
-        status,
-        message,
-        remediation,
-        fixed: config_fixed,
-    });
-
-    // Check 5: Pattern packs
-    let config = Config::load();
-    let enabled = config.enabled_pack_ids();
-    checks.push(DoctorCheck {
-        id: "packs",
-        name: "Pattern packs",
-        status: DoctorCheckStatus::Ok,
-        message: format!("{} packs enabled", enabled.len()),
-        remediation: None,
-        fixed: false,
-    });
-
-    // Check 6: Smoke test
-    if run_smoke_test() {
-        checks.push(DoctorCheck {
-            id: "smoke_test",
-            name: "Evaluator smoke test",
-            status: DoctorCheckStatus::Ok,
-            message: "Evaluator smoke test passed".to_string(),
-            remediation: None,
-            fixed: false,
-        });
-    } else {
-        issues += 1;
-        checks.push(DoctorCheck {
-            id: "smoke_test",
-            name: "Evaluator smoke test",
-            status: DoctorCheckStatus::Error,
-            message: "Evaluator smoke test failed".to_string(),
-            remediation: Some("Report a bug with the failing command".to_string()),
-            fixed: false,
-        });
-    }
-
-    // Check 7: Observe mode status
-    let (status, message, remediation) =
-        if let Some(observe_until) = config.policy().observe_until.as_ref() {
-            let now = chrono::Utc::now();
-            if let Some(until) = observe_until.parsed_utc() {
-                if now < *until {
-                    (
-                        DoctorCheckStatus::Warning,
-                        format!(
-                            "Observe mode active until {}",
-                            until.format("%Y-%m-%d %H:%M UTC")
-                        ),
-                        None,
-                    )
-                } else {
-                    issues += 1;
-                    (
-                        DoctorCheckStatus::Error,
-                        format!(
-                            "Observe mode expired at {}",
-                            until.format("%Y-%m-%d %H:%M UTC")
-                        ),
-                        Some("Remove or update observe_until in [policy]".to_string()),
-                    )
-                }
-            } else {
-                issues += 1;
-                let raw: &str = observe_until;
-                (
-                    DoctorCheckStatus::Error,
-                    format!("observe_until value could not be parsed: {raw}"),
-                    Some("Use ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ".to_string()),
-                )
-            }
-        } else if let Some(mode) = config.policy().default_mode {
-            if matches!(
-                mode,
-                crate::config::PolicyMode::Warn | crate::config::PolicyMode::Log
-            ) {
-                (
-                    DoctorCheckStatus::Warning,
-                    format!("policy.default_mode = {mode:?} (no expiration)"),
-                    Some("Consider adding observe_until for time-limited rollout".to_string()),
-                )
-            } else {
-                (
-                    DoctorCheckStatus::Ok,
-                    format!("Enforcing normal policy (default_mode = {mode:?})"),
-                    None,
-                )
-            }
-        } else {
-            (
-                DoctorCheckStatus::Ok,
-                "Observe mode disabled".to_string(),
-                None,
-            )
-        };
-    checks.push(DoctorCheck {
-        id: "observe_mode",
-        name: "Observe mode",
-        status,
-        message,
-        remediation,
-        fixed: false,
-    });
-
-    // Check 8: Allowlist discovery + validation
-    let allowlist_diag = diagnose_allowlists();
-    let (status, message, remediation) = if allowlist_diag.total_errors > 0 {
-        issues += allowlist_diag.total_errors;
-        (
-            DoctorCheckStatus::Error,
-            format!(
-                "Allowlist errors: {}",
-                allowlist_diag.error_messages.join("; ")
-            ),
-            Some("Run 'dcg allowlist validate' for details".to_string()),
-        )
-    } else if allowlist_diag.total_warnings > 0 {
-        (
-            DoctorCheckStatus::Warning,
-            format!(
-                "Allowlist warnings: {}",
-                allowlist_diag.warning_messages.join("; ")
-            ),
-            Some("Run 'dcg allowlist validate' for details".to_string()),
-        )
-    } else if allowlist_diag.layers_found == 0 {
-        (
-            DoctorCheckStatus::Warning,
-            "No allowlist files found (project or user)".to_string(),
-            Some("Use 'dcg allow <rule-id> -r \"reason\"' to create one".to_string()),
-        )
-    } else {
-        (
-            DoctorCheckStatus::Ok,
-            format!("Allowlist layers found: {}", allowlist_diag.layers_found),
-            None,
-        )
-    };
-    checks.push(DoctorCheck {
-        id: "allowlists",
-        name: "Allowlists",
-        status,
-        message,
-        remediation,
-        fixed: false,
-    });
-
-    DoctorReport {
-        schema_version: DOCTOR_SCHEMA_VERSION,
-        checks,
-        issues,
-        fixed,
-        ok: issues == 0 || (fix && fixed == issues),
-    }
-}
-
 fn is_dcg_command(cmd: &str) -> bool {
     cmd == "dcg" || cmd.ends_with("/dcg")
 }
@@ -6775,38 +5695,6 @@ fn is_dcg_hook_entry(entry: &serde_json::Value) -> bool {
                         .is_some_and(is_dcg_command)
                 })
             })
-}
-
-/// Install the dcg hook entry into Claude Code settings without printing.
-fn install_hook_silent(force: bool) -> Result<bool, Box<dyn std::error::Error>> {
-    let settings_path = claude_settings_path();
-
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content)?
-    } else {
-        if let Some(parent) = settings_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        serde_json::json!({})
-    };
-
-    let changed = install_dcg_hook_into_settings(&mut settings, force)?;
-    if changed {
-        let content = serde_json::to_string_pretty(&settings)?;
-        std::fs::write(&settings_path, content)?;
-    }
-    Ok(changed)
-}
-
-/// Create the default config file at the standard path.
-fn write_default_config() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    let config_path = config_path();
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&config_path, Config::generate_sample_config())?;
-    Ok(config_path)
 }
 
 /// Install the dcg hook entry into an in-memory Claude settings JSON value.
@@ -7014,12 +5902,68 @@ fn self_update(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> 
     self_update_unix(update)
 }
 
-/// Perform update using native Rust `self_update` crate.
-///
-/// Note: Native update is not yet implemented. Use installer flags instead:
-/// `dcg update --system` or `dcg update --from-source`
-fn self_update_native(_update: &UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
-    Err("Native update not yet implemented. Use `dcg update --system` to update via installer, or `dcg update --check` to check for updates.".into())
+/// Perform update using native Rust self_update crate.
+fn self_update_native(update: &UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::update::{format_update_result, perform_update};
+
+    let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
+
+    // If not forcing, confirm with user
+    if !update.force {
+        // First check if there's an update available
+        use crate::update::check_for_update;
+        match check_for_update(false) {
+            Ok(result) => {
+                if !result.update_available {
+                    if use_color {
+                        println!("\x1b[32m✓\x1b[0m Already running the latest version ({})", result.current_version);
+                    } else {
+                        println!("Already running the latest version ({})", result.current_version);
+                    }
+                    return Ok(());
+                }
+
+                // Show what's available and prompt for confirmation
+                if use_color {
+                    println!("\x1b[1mUpdate available:\x1b[0m {} → {}", result.current_version, result.latest_version);
+                } else {
+                    println!("Update available: {} -> {}", result.current_version, result.latest_version);
+                }
+
+                // Interactive confirmation
+                if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    print!("Proceed with update? [y/N] ");
+                    use std::io::Write;
+                    std::io::stdout().flush()?;
+
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+                    let response = input.trim().to_lowercase();
+                    if response != "y" && response != "yes" {
+                        println!("Update cancelled.");
+                        return Ok(());
+                    }
+                } else {
+                    // Non-interactive: require --force
+                    return Err("Non-interactive mode requires --force flag".into());
+                }
+            }
+            Err(e) => {
+                return Err(format!("Failed to check for updates: {e}").into());
+            }
+        }
+    }
+
+    // Perform the update
+    eprintln!("Downloading and installing update...");
+
+    match perform_update(update.force, update.version.as_deref()) {
+        Ok(result) => {
+            print!("{}", format_update_result(&result, use_color));
+            Ok(())
+        }
+        Err(e) => Err(format!("Update failed: {e}").into()),
+    }
 }
 
 /// Check for updates and display the result.
@@ -7882,10 +6826,10 @@ fn handle_allow_once_command(
     let allow_once_store = AllowOnceStore::new(allow_once_path.clone());
     let _maintenance = allow_once_store.add_entry(&entry, now)?;
 
-    // Remove the pending exception so it doesn't show up in lists anymore.
+    // Mark the pending exception as consumed so it doesn't show up in lists anymore.
     // This is best-effort (if it fails, the allowed command still works).
-    if let Err(e) = pending_store.remove_by_full_hash(&selected.full_hash, now) {
-        eprintln!("Warning: Failed to remove pending exception: {e}");
+    if let Err(e) = pending_store.mark_consumed(&selected.full_hash, now) {
+        eprintln!("Warning: Failed to mark pending code as consumed: {e}");
     }
 
     if !cmd.json {
@@ -8716,8 +7660,11 @@ fn write_allowlist(
     let content = doc.to_string();
 
     // Create temp file in same directory (required for atomic rename on same filesystem)
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let temp_name = format!(".dcg-allowlist-{}.tmp", std::process::id());
+    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    let temp_name = format!(
+        ".dcg-allowlist-{}.tmp",
+        std::process::id()
+    );
     let temp_path = parent.join(&temp_name);
 
     // Write to temp file
@@ -8732,9 +7679,10 @@ fn write_allowlist(
     if let Err(parse_err) = verification.parse::<toml_edit::DocumentMut>() {
         // Remove temp file on parse failure
         let _ = std::fs::remove_file(&temp_path);
-        return Err(
-            format!("Generated TOML failed validation (this is a bug): {parse_err}").into(),
-        );
+        return Err(format!(
+            "Generated TOML failed validation (this is a bug): {}",
+            parse_err
+        ).into());
     }
 
     // Atomic rename (on Unix, this is atomic; on Windows, it replaces atomically)
@@ -8848,7 +7796,8 @@ fn build_pattern_entry(
 
     // Build a descriptive reason with metadata
     let full_reason = format!(
-        "{reason} (auto-suggested: {confidence_tier} confidence, {risk_level} risk, {frequency} occurrences, {unique_variants} variants)"
+        "{} (auto-suggested: {} confidence, {} risk, {} occurrences, {} variants)",
+        reason, confidence_tier, risk_level, frequency, unique_variants
     );
     tbl.insert("reason", toml_edit::value(full_reason));
 
@@ -8903,23 +7852,11 @@ fn allowlist_add_pattern(
 
     // Check for duplicate
     if has_pattern_entry(&doc, pattern) {
-        return Err(format!(
-            "Pattern '{}' already exists in {} allowlist",
-            pattern,
-            layer.label()
-        )
-        .into());
+        return Err(format!("Pattern '{}' already exists in {} allowlist", pattern, layer.label()).into());
     }
 
     // Build and append entry
-    let entry = build_pattern_entry(
-        pattern,
-        reason,
-        risk_level,
-        confidence_tier,
-        frequency,
-        unique_variants,
-    );
+    let entry = build_pattern_entry(pattern, reason, risk_level, confidence_tier, frequency, unique_variants);
     append_entry(&mut doc, entry);
 
     // Write atomically (temp file + rename to prevent corruption)
@@ -8948,7 +7885,10 @@ pub struct PatternConflictCheck {
 /// 2. Is this pattern overly broad (contains .* or .+ without anchoring)?
 ///
 /// These are informational warnings - they don't prevent adding the pattern.
-fn check_pattern_conflicts(pattern: &str, config: &Config) -> PatternConflictCheck {
+fn check_pattern_conflicts(
+    pattern: &str,
+    config: &Config,
+) -> PatternConflictCheck {
     let mut result = PatternConflictCheck::default();
 
     // Check for overly broad patterns
@@ -8961,8 +7901,7 @@ fn check_pattern_conflicts(pattern: &str, config: &Config) -> PatternConflictChe
         result.is_overly_broad = true;
         result.refinement_suggestion = Some(
             "Consider adding anchors (^ and $) or more specific token patterns \
-             to avoid matching unintended commands."
-                .to_string(),
+             to avoid matching unintended commands.".to_string()
         );
     }
 
@@ -9035,14 +7974,8 @@ fn handle_suggest_allowlist_undo(minutes: u32) -> Result<(), Box<dyn std::error:
 
     // Check both project and user allowlists
     let layers_to_check = [
-        (
-            AllowlistLayer::Project,
-            find_repo_root_from_cwd().map(|r| r.join(".dcg").join("allowlist.toml")),
-        ),
-        (
-            AllowlistLayer::User,
-            dirs::config_dir().map(|d| d.join("dcg").join("allowlist.toml")),
-        ),
+        (AllowlistLayer::Project, find_repo_root_from_cwd().map(|r| r.join(".dcg").join("allowlist.toml"))),
+        (AllowlistLayer::User, dirs::config_dir().map(|d| d.join("dcg").join("allowlist.toml"))),
     ];
 
     let mut total_removed = 0;
@@ -9056,8 +7989,9 @@ fn handle_suggest_allowlist_undo(minutes: u32) -> Result<(), Box<dyn std::error:
             continue;
         }
 
-        let Ok(mut doc) = load_or_create_allowlist_doc(&path) else {
-            continue;
+        let mut doc = match load_or_create_allowlist_doc(&path) {
+            Ok(d) => d,
+            Err(_) => continue,
         };
 
         let removed = remove_auto_suggested_entries(&mut doc, cutoff);
@@ -9075,14 +8009,14 @@ fn handle_suggest_allowlist_undo(minutes: u32) -> Result<(), Box<dyn std::error:
     }
 
     if total_removed == 0 {
-        println!("No auto-suggested patterns found added in the last {minutes} minutes.");
+        println!("No auto-suggested patterns found added in the last {} minutes.", minutes);
         println!();
         println!("Patterns are identified by:");
         println!("  - Having 'auto-suggested' in the reason field");
         println!("  - Having an added_at timestamp within the time window");
     } else {
         println!();
-        println!("Total: {total_removed} pattern(s) removed.");
+        println!("Total: {} pattern(s) removed.", total_removed);
     }
 
     Ok(())
@@ -9217,7 +8151,6 @@ fn is_expired(timestamp: &str) -> bool {
 fn handle_dev_command(
     config: &Config,
     action: DevAction,
-    verbosity: Verbosity,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         DevAction::TestPattern {
@@ -9228,7 +8161,7 @@ fn handle_dev_command(
             dev_test_pattern(&pattern, commands, pattern_type)?;
         }
         DevAction::ValidatePack { pack_id, verbose } => {
-            dev_validate_pack(config, &pack_id, verbose || verbosity.is_verbose())?;
+            dev_validate_pack(config, &pack_id, verbose)?;
         }
         DevAction::Debug { command, all_packs } => {
             dev_debug(config, &command, all_packs);
@@ -9754,56 +8687,6 @@ fn dev_generate_fixtures(
 mod tests {
     use super::*;
 
-    struct BatchEvalContext {
-        enabled_keywords: Vec<&'static str>,
-        ordered_packs: Vec<String>,
-        keyword_index: Option<crate::packs::EnabledKeywordIndex>,
-        compiled_overrides: crate::config::CompiledOverrides,
-        allowlists: crate::allowlist::LayeredAllowlist,
-        heredoc_settings: crate::config::HeredocSettings,
-    }
-
-    fn build_batch_eval_context() -> BatchEvalContext {
-        let config = Config::default();
-        let compiled_overrides = config.overrides.compile();
-        let allowlists = crate::allowlist::LayeredAllowlist::default();
-        let heredoc_settings = config.heredoc_settings();
-        let enabled_packs = config.enabled_pack_ids();
-        let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
-        let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
-        let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
-
-        BatchEvalContext {
-            enabled_keywords,
-            ordered_packs,
-            keyword_index,
-            compiled_overrides,
-            allowlists,
-            heredoc_settings,
-        }
-    }
-
-    fn process_batch_lines(lines: &[&str]) -> Vec<BatchHookOutput> {
-        let ctx = build_batch_eval_context();
-        lines
-            .iter()
-            .enumerate()
-            .map(|(index, line)| {
-                evaluate_batch_line(
-                    index,
-                    line,
-                    &ctx.enabled_keywords,
-                    &ctx.ordered_packs,
-                    ctx.keyword_index.as_ref(),
-                    &ctx.compiled_overrides,
-                    &ctx.allowlists,
-                    &ctx.heredoc_settings,
-                    true,
-                )
-            })
-            .collect()
-    }
-
     fn make_dcg_entry() -> serde_json::Value {
         serde_json::json!({
             "matcher": "Bash",
@@ -9976,87 +8859,6 @@ mod tests {
         } else {
             unreachable!("Expected Update command");
         }
-    }
-
-    // ========================================================================
-    // Batch hook mode tests
-    // ========================================================================
-
-    #[test]
-    fn test_batch_processes_multiple_commands() {
-        let lines = [
-            r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#,
-            r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#,
-        ];
-        let results = process_batch_lines(&lines);
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].index, 0);
-        assert_eq!(results[1].index, 1);
-        assert_eq!(results[0].decision, "deny");
-        assert_eq!(results[1].decision, "allow");
-    }
-
-    #[test]
-    fn test_batch_maintains_order() {
-        let lines = [
-            r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#,
-            r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#,
-            r#"{"tool_name":"Bash","tool_input":{"command":"git log"}}"#,
-        ];
-        let results = process_batch_lines(&lines);
-
-        let indices: Vec<usize> = results.iter().map(|r| r.index).collect();
-        assert_eq!(indices, vec![0, 1, 2]);
-        assert_eq!(results[0].decision, "allow");
-        assert_eq!(results[1].decision, "deny");
-        assert_eq!(results[2].decision, "allow");
-    }
-
-    #[test]
-    fn test_batch_handles_malformed_line() {
-        let lines = [
-            "not json",
-            r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#,
-        ];
-        let results = process_batch_lines(&lines);
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].decision, "error");
-        assert!(
-            results[0]
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("JSON parse error")
-        );
-        assert_eq!(results[1].decision, "allow");
-    }
-
-    #[test]
-    fn test_batch_skips_non_bash() {
-        let lines = [r#"{"tool_name":"Read","tool_input":{"command":"git status"}}"#];
-        let results = process_batch_lines(&lines);
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].decision, "skip");
-        assert!(
-            results[0]
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Not a Bash")
-        );
-    }
-
-    #[test]
-    fn test_batch_handles_large_input() {
-        let line = r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
-        let lines: Vec<&str> = std::iter::repeat_n(line, 1000).collect();
-        let results = process_batch_lines(&lines);
-
-        assert_eq!(results.len(), 1000);
-        assert!(results.iter().all(|r| r.decision == "allow"));
     }
 
     // ========================================================================
@@ -10514,10 +9316,7 @@ mod tests {
 
         // Verify risk_acknowledged is present and true
         let risk_ack = entry.get("risk_acknowledged");
-        assert!(
-            risk_ack.is_some(),
-            "risk_acknowledged field must be present"
-        );
+        assert!(risk_ack.is_some(), "risk_acknowledged field must be present");
         assert_eq!(
             risk_ack.unwrap().as_bool(),
             Some(true),
@@ -10566,8 +9365,14 @@ mod tests {
         );
 
         // Required fields for pattern entries
-        assert!(entry.get("pattern").is_some(), "pattern field is required");
-        assert!(entry.get("reason").is_some(), "reason field is required");
+        assert!(
+            entry.get("pattern").is_some(),
+            "pattern field is required"
+        );
+        assert!(
+            entry.get("reason").is_some(),
+            "reason field is required"
+        );
         assert!(
             entry.get("risk_acknowledged").is_some(),
             "risk_acknowledged is required"
@@ -11081,10 +9886,18 @@ exclude = ["target/**"]
 
     #[test]
     fn test_cli_parse_test_with_format_json() {
-        let cli =
-            Cli::try_parse_from(["dcg", "test", "--format", "json", "rm -rf /tmp"]).expect("parse");
+        let cli = Cli::try_parse_from([
+            "dcg",
+            "test",
+            "--format",
+            "json",
+            "rm -rf /tmp",
+        ])
+        .expect("parse");
         if let Some(Command::TestCommand {
-            command, format, ..
+            command,
+            format,
+            ..
         }) = cli.command
         {
             assert_eq!(command, "rm -rf /tmp");
@@ -11774,33 +10587,5 @@ exclude = ["target/**"]
     fn smoke_test_passes_with_default_config() {
         // The smoke test should pass with default configuration
         assert!(run_smoke_test(), "smoke test should pass");
-    }
-
-    #[test]
-    fn prompt_disabled_for_json_format() {
-        let verbosity = Verbosity {
-            level: 1,
-            quiet: false,
-        };
-        assert!(!should_prompt_interactively(
-            TestFormat::Json,
-            verbosity,
-            DecisionMode::Deny,
-            Some(PackSeverity::Medium),
-        ));
-    }
-
-    #[test]
-    fn prompt_disabled_for_non_blocking_mode() {
-        let verbosity = Verbosity {
-            level: 1,
-            quiet: false,
-        };
-        assert!(!should_prompt_interactively(
-            TestFormat::Pretty,
-            verbosity,
-            DecisionMode::Warn,
-            Some(PackSeverity::Medium),
-        ));
     }
 }

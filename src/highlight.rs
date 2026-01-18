@@ -89,7 +89,7 @@ impl HighlightedCommand {
 /// Determines whether color should be used based on TTY and environment.
 #[must_use]
 pub fn should_use_color() -> bool {
-    if std::env::var_os("NO_COLOR").is_some() || std::env::var_os("DCG_NO_COLOR").is_some() {
+    if std::env::var_os("NO_COLOR").is_some() {
         return false;
     }
 

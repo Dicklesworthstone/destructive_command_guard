@@ -62,81 +62,32 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "velero-backup-delete",
             r"velero(?:\s+--?\S+(?:\s+\S+)?)*\s+backup\s+delete\b",
-            "velero backup delete removes a backup and its data.",
-            High,
-            "Deleting a Velero backup removes both the backup metadata in Kubernetes and the \
-             actual backup data from object storage. Once deleted, you cannot restore your \
-             cluster or applications to that backup point. This is irreversible.\n\n\
-             Safer alternatives:\n\
-             - velero backup describe: Review backup contents before deletion\n\
-             - velero backup get: List all backups to verify target\n\
-             - Consider retaining backups with TTL policies instead of manual deletion"
+            "velero backup delete removes a backup and its data."
         ),
         destructive_pattern!(
             "velero-schedule-delete",
             r"velero(?:\s+--?\S+(?:\s+\S+)?)*\s+schedule\s+delete\b",
-            "velero schedule delete removes scheduled backups.",
-            Medium,
-            "Deleting a backup schedule stops automatic backup creation. Existing backups \
-             created by the schedule are not affected, but no new backups will be created. \
-             If forgotten, this can lead to outdated backups and recovery gaps.\n\n\
-             Safer alternatives:\n\
-             - velero schedule get: Review all schedules first\n\
-             - velero schedule describe: Check schedule configuration\n\
-             - Pause the schedule instead if temporary"
+            "velero schedule delete removes scheduled backups."
         ),
         destructive_pattern!(
             "velero-restore-delete",
             r"velero(?:\s+--?\S+(?:\s+\S+)?)*\s+restore\s+delete\b",
-            "velero restore delete removes restore records.",
-            Low,
-            "Deleting restore records removes the metadata about past restore operations from \
-             Kubernetes. This does not affect the restored resources themselves or the original \
-             backups. However, audit trails of restore operations will be lost.\n\n\
-             Safer alternatives:\n\
-             - velero restore get: List restores before deletion\n\
-             - Document restore history externally if needed for compliance"
+            "velero restore delete removes restore records."
         ),
         destructive_pattern!(
             "velero-backup-location-delete",
             r"velero(?:\s+--?\S+(?:\s+\S+)?)*\s+backup-location\s+delete\b",
-            "velero backup-location delete removes a backup storage location.",
-            High,
-            "Removing a backup storage location disconnects Velero from that storage backend. \
-             Backups stored there become inaccessible to Velero (though data remains in storage). \
-             You won't be able to restore from those backups until the location is recreated.\n\n\
-             Safer alternatives:\n\
-             - velero backup-location get: Review all locations\n\
-             - Verify no critical backups depend on this location\n\
-             - Migrate backups to another location before deletion"
+            "velero backup-location delete removes a backup storage location."
         ),
         destructive_pattern!(
             "velero-snapshot-location-delete",
             r"velero(?:\s+--?\S+(?:\s+\S+)?)*\s+snapshot-location\s+delete\b",
-            "velero snapshot-location delete removes a snapshot location.",
-            High,
-            "Deleting a snapshot location removes the configuration for volume snapshots. \
-             Existing snapshots may become orphaned and inaccessible through Velero. Volume \
-             restores that depend on this location will fail.\n\n\
-             Safer alternatives:\n\
-             - velero snapshot-location get: Review all snapshot locations\n\
-             - Verify no backups use this snapshot location\n\
-             - Migrate to a new snapshot location before deletion"
+            "velero snapshot-location delete removes a snapshot location."
         ),
         destructive_pattern!(
             "velero-uninstall",
             r"velero(?:\s+--?\S+(?:\s+\S+)?)*\s+uninstall\b",
-            "velero uninstall removes the Velero deployment and related resources.",
-            Critical,
-            "Uninstalling Velero removes the deployment, CRDs, and all Velero-managed resources \
-             from your cluster. Backup schedules stop immediately. While backup data in object \
-             storage is preserved, you cannot restore from backups until Velero is reinstalled \
-             and reconfigured.\n\n\
-             Safer alternatives:\n\
-             - Document current configuration before uninstalling\n\
-             - velero backup-location get: Record storage locations\n\
-             - velero schedule get: Record all schedules\n\
-             - Export Velero resources: kubectl get -o yaml"
+            "velero uninstall removes the Velero deployment and related resources."
         ),
     ]
 }

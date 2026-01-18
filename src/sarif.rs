@@ -6,7 +6,7 @@
 //! - GitLab Code Quality
 //! - Azure DevOps
 //! - VS Code SARIF Viewer extension
-//! - `SonarQube`
+//! - SonarQube
 //!
 //! Reference: <https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html>
 
@@ -15,7 +15,8 @@ use serde::Serialize;
 use std::collections::HashMap;
 
 /// SARIF 2.1.0 schema URI.
-pub const SARIF_SCHEMA: &str = "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json";
+pub const SARIF_SCHEMA: &str =
+    "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json";
 
 /// SARIF version string.
 pub const SARIF_VERSION: &str = "2.1.0";
@@ -147,9 +148,9 @@ pub enum SarifLevel {
 impl From<ScanSeverity> for SarifLevel {
     fn from(severity: ScanSeverity) -> Self {
         match severity {
-            ScanSeverity::Error => Self::Error,
-            ScanSeverity::Warning => Self::Warning,
-            ScanSeverity::Info => Self::Note,
+            ScanSeverity::Error => SarifLevel::Error,
+            ScanSeverity::Warning => SarifLevel::Warning,
+            ScanSeverity::Info => SarifLevel::Note,
         }
     }
 }
@@ -396,22 +397,24 @@ impl SarifReport {
                 .clone()
                 .unwrap_or_else(|| finding.extractor_id.clone());
 
-            let rule_key = rule_id.clone();
-            rules_map.entry(rule_key).or_insert_with(|| SarifReportingDescriptor {
-                id: rule_id.clone(),
-                name: Some(humanize_rule_id(&rule_id)),
-                short_description: finding.reason.as_ref().map(SarifMessage::text),
-                full_description: None,
-                help_uri: Some(format!(
-                    "https://github.com/Dicklesworthstone/destructive_command_guard/blob/master/docs/rules/{}.md",
-                    rule_id.replace([':', '.'], "/")
-                )),
-                default_configuration: Some(SarifReportingConfiguration {
-                    level: Some(finding.severity.into()),
-                    enabled: Some(true),
-                }),
-                properties: None,
-            });
+            if !rules_map.contains_key(&rule_id) {
+                let rule = SarifReportingDescriptor {
+                    id: rule_id.clone(),
+                    name: Some(humanize_rule_id(&rule_id)),
+                    short_description: finding.reason.as_ref().map(|r| SarifMessage::text(r)),
+                    full_description: None,
+                    help_uri: Some(format!(
+                        "https://github.com/Dicklesworthstone/destructive_command_guard/blob/master/docs/rules/{}.md",
+                        rule_id.replace(':', "/").replace('.', "/")
+                    )),
+                    default_configuration: Some(SarifReportingConfiguration {
+                        level: Some(finding.severity.into()),
+                        enabled: Some(true),
+                    }),
+                    properties: None,
+                };
+                rules_map.insert(rule_id, rule);
+            }
         }
 
         let rules: Vec<_> = rules_map.into_values().collect();
@@ -421,7 +424,7 @@ impl SarifReport {
             .findings
             .iter()
             .filter(|f| f.decision != ScanDecision::Allow) // Only include warns/denies
-            .map(finding_to_result)
+            .map(|f| finding_to_result(f))
             .collect();
 
         Self {
@@ -440,11 +443,9 @@ impl SarifReport {
                 results,
                 invocations: Some(vec![SarifInvocation {
                     execution_successful: true,
-                    working_directory: std::env::current_dir().ok().map(|p| {
-                        SarifArtifactLocation {
-                            uri: p.display().to_string(),
-                            uri_base_id: None,
-                        }
+                    working_directory: std::env::current_dir().ok().map(|p| SarifArtifactLocation {
+                        uri: p.display().to_string(),
+                        uri_base_id: None,
                     }),
                     start_time_utc: None,
                     end_time_utc: None,
@@ -467,12 +468,10 @@ fn finding_to_result(finding: &ScanFinding) -> SarifResult {
         ScanDecision::Allow => SarifLevel::Note,
     };
 
-    let message = finding.reason.clone().unwrap_or_else(|| {
-        format!(
-            "Destructive command detected: {}",
-            finding.extracted_command
-        )
-    });
+    let message = finding
+        .reason
+        .clone()
+        .unwrap_or_else(|| format!("Destructive command detected: {}", finding.extracted_command));
 
     let mut properties = SarifPropertyBag::new();
     properties.insert("extractor_id", &finding.extractor_id);
@@ -521,7 +520,7 @@ fn finding_to_result(finding: &ScanFinding) -> SarifResult {
 /// Convert a rule ID like "git.force-push" to "Git Force Push".
 fn humanize_rule_id(rule_id: &str) -> String {
     rule_id
-        .split(['.', ':', '-', '_'])
+        .split(|c| c == '.' || c == ':' || c == '-' || c == '_')
         .map(|word| {
             let mut chars: Vec<char> = word.chars().collect();
             if let Some(first) = chars.first_mut() {
@@ -561,8 +560,8 @@ mod tests {
                 files_skipped: 0,
                 commands_extracted: 2,
                 findings_total: 2,
-                decisions: crate::scan::ScanDecisionCounts::default(),
-                severities: crate::scan::ScanSeverityCounts::default(),
+                decisions: Default::default(),
+                severities: Default::default(),
                 max_findings_reached: false,
                 elapsed_ms: None,
             },
@@ -597,9 +596,7 @@ mod tests {
     #[test]
     fn test_sarif_results_exclude_allow() {
         let mut report = mock_report();
-        report
-            .findings
-            .push(mock_finding(ScanDecision::Allow, ScanSeverity::Info));
+        report.findings.push(mock_finding(ScanDecision::Allow, ScanSeverity::Info));
 
         let sarif = SarifReport::from_scan_report(&report);
 
@@ -638,11 +635,9 @@ mod tests {
 
         let rules = &sarif.runs[0].tool.driver.rules;
         assert!(!rules.is_empty());
-        assert!(
-            rules
-                .iter()
-                .any(|r| r.id == "core.filesystem:recursive-delete-root")
-        );
+        assert!(rules
+            .iter()
+            .any(|r| r.id == "core.filesystem:recursive-delete-root"));
     }
 
     #[test]
@@ -652,7 +647,10 @@ mod tests {
 
         let result = &sarif.runs[0].results[0];
         assert!(!result.fixes.is_empty());
-        assert!(result.fixes[0].description.text.contains("specific path"));
+        assert!(result.fixes[0]
+            .description
+            .text
+            .contains("specific path"));
     }
 
     #[test]
@@ -673,9 +671,6 @@ mod tests {
             humanize_rule_id("core.filesystem:recursive-delete"),
             "Core Filesystem Recursive Delete"
         );
-        assert_eq!(
-            humanize_rule_id("docker_system_prune"),
-            "Docker System Prune"
-        );
+        assert_eq!(humanize_rule_id("docker_system_prune"), "Docker System Prune");
     }
 }

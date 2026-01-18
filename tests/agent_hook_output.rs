@@ -3,13 +3,13 @@
 //! These tests verify that the hook output contains all fields required
 //! for AI agent integration as specified in `git_safety_guard-e4fl.1`.
 
-#![allow(clippy::doc_markdown, clippy::uninlined_format_args)]
+#![allow(clippy::doc_markdown)]
 
-use std::io::Write;
 use std::process::{Command, Stdio};
+use std::io::Write;
 
 /// Path to the dcg binary (built in release mode for tests).
-const fn dcg_binary() -> &'static str {
+fn dcg_binary() -> &'static str {
     "./target/release/dcg"
 }
 
@@ -29,9 +29,7 @@ fn run_hook_mode(command: &str) -> (String, String, i32) {
 
     {
         let stdin = child.stdin.as_mut().expect("failed to get stdin");
-        stdin
-            .write_all(input.as_bytes())
-            .expect("failed to write to stdin");
+        stdin.write_all(input.as_bytes()).expect("failed to write to stdin");
     }
 
     let output = child.wait_with_output().expect("failed to wait for dcg");
@@ -47,14 +45,11 @@ fn run_hook_mode(command: &str) -> (String, String, i32) {
 fn test_hook_output_contains_hook_event_name() {
     let (stdout, stderr, exit_code) = run_hook_mode("git reset --hard");
 
-    assert_eq!(
-        exit_code, 0,
-        "hook mode should exit 0 even on deny\nstderr: {stderr}"
-    );
+    assert_eq!(exit_code, 0, "hook mode should exit 0 even on deny\nstderr: {stderr}");
     assert!(!stdout.is_empty(), "stdout should contain JSON output");
 
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("hook output should be valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("hook output should be valid JSON");
 
     let hook_output = &json["hookSpecificOutput"];
     assert!(
@@ -71,8 +66,8 @@ fn test_hook_output_contains_hook_event_name() {
 fn test_hook_output_contains_permission_decision() {
     let (stdout, _stderr, _) = run_hook_mode("git reset --hard");
 
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("hook output should be valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("hook output should be valid JSON");
 
     let hook_output = &json["hookSpecificOutput"];
     assert!(
@@ -91,8 +86,8 @@ fn test_hook_output_contains_permission_decision() {
 fn test_hook_output_deny_has_rule_id() {
     let (stdout, _stderr, _) = run_hook_mode("git reset --hard");
 
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("hook output should be valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("hook output should be valid JSON");
 
     let hook_output = &json["hookSpecificOutput"];
 
@@ -115,8 +110,8 @@ fn test_hook_output_deny_has_rule_id() {
 fn test_hook_output_deny_has_pack_id() {
     let (stdout, _stderr, _) = run_hook_mode("git reset --hard");
 
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("hook output should be valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("hook output should be valid JSON");
 
     let hook_output = &json["hookSpecificOutput"];
 
@@ -135,8 +130,8 @@ fn test_hook_output_deny_has_pack_id() {
 fn test_hook_output_deny_has_severity() {
     let (stdout, _stderr, _) = run_hook_mode("git reset --hard");
 
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("hook output should be valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("hook output should be valid JSON");
 
     let hook_output = &json["hookSpecificOutput"];
 
@@ -160,8 +155,8 @@ fn test_hook_output_deny_has_severity() {
 fn test_hook_output_deny_has_remediation() {
     let (stdout, _stderr, _) = run_hook_mode("git reset --hard");
 
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("hook output should be valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("hook output should be valid JSON");
 
     let hook_output = &json["hookSpecificOutput"];
 
@@ -189,8 +184,8 @@ fn test_hook_output_deny_has_remediation() {
 fn test_hook_output_deny_has_allow_once_code() {
     let (stdout, _stderr, _) = run_hook_mode("git reset --hard");
 
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("hook output should be valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("hook output should be valid JSON");
 
     let hook_output = &json["hookSpecificOutput"];
 
@@ -222,8 +217,8 @@ fn test_hook_output_deny_has_allow_once_code() {
 fn test_hook_output_permission_decision_reason() {
     let (stdout, _stderr, _) = run_hook_mode("git reset --hard");
 
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("hook output should be valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("hook output should be valid JSON");
 
     let hook_output = &json["hookSpecificOutput"];
 
@@ -233,10 +228,7 @@ fn test_hook_output_permission_decision_reason() {
     );
 
     let reason = hook_output["permissionDecisionReason"].as_str().unwrap();
-    assert!(
-        !reason.is_empty(),
-        "permissionDecisionReason should not be empty"
-    );
+    assert!(!reason.is_empty(), "permissionDecisionReason should not be empty");
 
     // For denied commands, reason should be descriptive
     if hook_output["permissionDecision"] == "deny" {
@@ -313,8 +305,8 @@ fn test_hook_output_multiple_destructive_commands() {
 fn test_hook_output_rule_id_format() {
     let (stdout, _stderr, _) = run_hook_mode("git reset --hard");
 
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("hook output should be valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("hook output should be valid JSON");
 
     let hook_output = &json["hookSpecificOutput"];
 
@@ -324,8 +316,7 @@ fn test_hook_output_rule_id_format() {
         // Rule ID format: "{packId}:{patternName}"
         let parts: Vec<&str> = rule_id_str.split(':').collect();
         assert_eq!(
-            parts.len(),
-            2,
+            parts.len(), 2,
             "ruleId should have format 'packId:patternName', got: {rule_id_str}"
         );
 
@@ -344,8 +335,8 @@ fn test_hook_output_rule_id_format() {
 fn test_hook_output_remediation_safe_alternative() {
     let (stdout, _stderr, _) = run_hook_mode("git reset --hard");
 
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("hook output should be valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("hook output should be valid JSON");
 
     let hook_output = &json["hookSpecificOutput"];
 

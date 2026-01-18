@@ -130,15 +130,10 @@ fn warn_unknown_hooks_toml_keys(value: &toml::Value, path: &str, warnings: &mut 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanFormat {
-    /// Human-readable output
-    #[value(alias = "text")]
     Pretty,
-    /// Structured JSON output
     Json,
     /// GitHub-flavored Markdown for PR comments (uses `<details>` blocks)
     Markdown,
-    /// SARIF 2.1.0 output (for code scanning tools)
-    Sarif,
 }
 
 /// Controls scan failure behavior (CI integration).
@@ -1009,7 +1004,6 @@ fn is_shell_script_path(path: &Path) -> bool {
 }
 
 /// Extract commands from shell scripts (.sh, .bash files)
-#[must_use]
 pub fn extract_shell_script_from_str(
     file: &str,
     content: &str,
@@ -1432,7 +1426,6 @@ fn is_dockerfile_path(path: &Path) -> bool {
 }
 
 /// Extract commands from Dockerfile RUN instructions
-#[must_use]
 pub fn extract_dockerfile_from_str(
     file: &str,
     content: &str,
@@ -1578,7 +1571,6 @@ fn is_github_actions_workflow_path(path: &Path) -> bool {
 
 /// Extract commands from GitHub Actions workflow run steps
 #[allow(clippy::too_many_lines)]
-#[must_use]
 pub fn extract_github_actions_workflow_from_str(
     file: &str,
     content: &str,
@@ -2175,7 +2167,6 @@ fn is_makefile_path(path: &Path) -> bool {
 }
 
 /// Extract commands from Makefile recipe lines
-#[must_use]
 pub fn extract_makefile_from_str(
     file: &str,
     content: &str,
@@ -3270,10 +3261,7 @@ fail_on = "nope"
         let finding = finding.unwrap();
         assert_eq!(finding.decision, ScanDecision::Deny);
         assert!(
-            finding
-                .reason
-                .as_ref()
-                .is_some_and(|r| r.contains("git reset --hard")),
+            finding.reason.as_ref().map_or(false, |r| r.contains("git reset --hard")),
             "Reason should mention the blocked command: {:?}",
             finding.reason
         );
@@ -3292,14 +3280,16 @@ fail_on = "nope"
 
         // The extracted command should be the full sh -c "..." string
         let cmd = &extracted[0].command;
-        eprintln!("Extracted command: {cmd:?}");
+        eprintln!("Extracted command: {:?}", cmd);
         assert!(
             cmd.contains("sh -c"),
-            "Extracted command should contain 'sh -c': {cmd:?}"
+            "Extracted command should contain 'sh -c': {:?}",
+            cmd
         );
         assert!(
             cmd.contains("git reset --hard"),
-            "Extracted command should contain the dangerous command: {cmd:?}"
+            "Extracted command should contain the dangerous command: {:?}",
+            cmd
         );
     }
 
@@ -3323,8 +3313,7 @@ fail_on = "nope"
         };
 
         // Step 1: Extract
-        let extracted =
-            extract_docker_compose_from_str("docker-compose.yml", content, &ctx.enabled_keywords);
+        let extracted = extract_docker_compose_from_str("docker-compose.yml", content, &ctx.enabled_keywords);
         eprintln!("Enabled keywords: {:?}", ctx.enabled_keywords);
         eprintln!("Extracted {} commands: {:?}", extracted.len(), extracted);
         assert!(!extracted.is_empty(), "Should extract at least 1 command");
@@ -3334,7 +3323,7 @@ fail_on = "nope"
         for cmd in &extracted {
             eprintln!("Evaluating command: {:?}", cmd.command);
             if let Some(finding) = evaluate_extracted_command(cmd, &options, &config, &ctx) {
-                eprintln!("Found finding: {finding:?}");
+                eprintln!("Found finding: {:?}", finding);
                 found_finding = true;
                 assert_eq!(finding.decision, ScanDecision::Deny);
             }

@@ -17,9 +17,7 @@
 #   --from-source      Build from source instead of downloading binary
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
-#   --no-configure     Skip AI agent hook configuration
-#   --no-verify        Skip checksum + signature verification (for testing only)
-#   --offline          Skip network preflight checks
+#   --no-verify        Skip checksum verification (for testing only)
 #
 set -euo pipefail
 umask 022
@@ -36,17 +34,12 @@ VERIFY=0
 FROM_SOURCE=0
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
-SIGSTORE_BUNDLE_URL="${SIGSTORE_BUNDLE_URL:-}"
-COSIGN_IDENTITY_RE="${COSIGN_IDENTITY_RE:-^https://github.com/${OWNER}/${REPO}/.github/workflows/dist.yml@refs/tags/.*$}"
-COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/dcg-install.lock"
 SYSTEM=0
 NO_GUM=0
-NO_CONFIGURE=0
 NO_CHECKSUM=0
 FORCE_INSTALL=0
-OFFLINE="${DCG_OFFLINE:-0}"
 
 # Detect gum for fancy output (https://github.com/charmbracelet/gum)
 HAS_GUM=0
@@ -164,7 +157,6 @@ CODEX_VERSION=""
 GEMINI_VERSION=""
 AIDER_VERSION=""
 CONTINUE_VERSION=""
-CURSOR_VERSION=""
 
 detect_agents() {
   DETECTED_AGENTS=()
@@ -205,25 +197,6 @@ detect_agents() {
     # Continue doesn't have a standard CLI version command
     if [[ -f "$HOME/.continue/config.json" ]]; then
       CONTINUE_VERSION="config present"
-    fi
-  fi
-
-  # Cursor IDE
-  local cursor_detected=0
-  local cursor_settings_mac="$HOME/Library/Application Support/Cursor/User/settings.json"
-  local cursor_settings_linux="$HOME/.config/Cursor/User/settings.json"
-  if [[ -d "$HOME/.cursor" ]] || [[ -f "$cursor_settings_mac" ]] || [[ -f "$cursor_settings_linux" ]] || command -v cursor &>/dev/null; then
-    cursor_detected=1
-  elif command -v pgrep >/dev/null 2>&1; then
-    if pgrep -f "[Cc]ursor" >/dev/null 2>&1; then
-      cursor_detected=1
-    fi
-  fi
-
-  if [ "$cursor_detected" -eq 1 ]; then
-    DETECTED_AGENTS+=("cursor-ide")
-    if command -v cursor &>/dev/null; then
-      CURSOR_VERSION=$(cursor --version 2>/dev/null | head -1 || echo "")
     fi
   fi
 }
@@ -268,11 +241,6 @@ print_detected_agents() {
           [[ -n "$CONTINUE_VERSION" ]] && ver_info=" (${CONTINUE_VERSION})"
           gum style --foreground 42 "  ✓ Continue${ver_info}"
           ;;
-        cursor-ide)
-          local ver_info=""
-          [[ -n "$CURSOR_VERSION" ]] && ver_info=" (${CURSOR_VERSION})"
-          gum style --foreground 42 "  ✓ Cursor IDE${ver_info}"
-          ;;
       esac
     done
     echo ""
@@ -305,11 +273,6 @@ print_detected_agents() {
           local ver_info=""
           [[ -n "$CONTINUE_VERSION" ]] && ver_info=" (${CONTINUE_VERSION})"
           echo -e "  \033[0;32m✓\033[0m Continue${ver_info}"
-          ;;
-        cursor-ide)
-          local ver_info=""
-          [[ -n "$CURSOR_VERSION" ]] && ver_info=" (${CURSOR_VERSION})"
-          echo -e "  \033[0;32m✓\033[0m Cursor IDE${ver_info}"
           ;;
       esac
     done
@@ -381,119 +344,6 @@ resolve_version() {
   fi
 }
 
-detect_platform() {
-  OS=$(uname -s | tr 'A-Z' 'a-z')
-  ARCH=$(uname -m)
-  case "$ARCH" in
-    x86_64|amd64) ARCH="x86_64" ;;
-    arm64|aarch64) ARCH="aarch64" ;;
-    *) warn "Unknown arch $ARCH, using as-is" ;;
-  esac
-
-  TARGET=""
-  case "${OS}-${ARCH}" in
-    linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
-    linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
-    darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
-    darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
-    *) :;;
-  esac
-
-  if [ -z "$TARGET" ] && [ "$FROM_SOURCE" -eq 0 ] && [ -z "$ARTIFACT_URL" ]; then
-    warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
-    FROM_SOURCE=1
-  fi
-}
-
-set_artifact_url() {
-  TAR=""
-  URL=""
-  if [ "$FROM_SOURCE" -eq 0 ]; then
-    if [ -n "$ARTIFACT_URL" ]; then
-      TAR=$(basename "$ARTIFACT_URL")
-      URL="$ARTIFACT_URL"
-    elif [ -n "$TARGET" ]; then
-      TAR="dcg-${TARGET}.tar.xz"
-      URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
-    else
-      warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
-      FROM_SOURCE=1
-    fi
-  fi
-}
-
-check_disk_space() {
-  local min_kb=10240
-  local path="$DEST"
-  if [ ! -d "$path" ]; then
-    path=$(dirname "$path")
-  fi
-  if command -v df >/dev/null 2>&1; then
-    local avail_kb
-    avail_kb=$(df -Pk "$path" | awk 'NR==2 {print $4}')
-    if [ -n "$avail_kb" ] && [ "$avail_kb" -lt "$min_kb" ]; then
-      err "Insufficient disk space in $path (need at least 10MB)"
-      exit 1
-    fi
-  else
-    warn "df not found; skipping disk space check"
-  fi
-}
-
-check_write_permissions() {
-  if [ ! -d "$DEST" ]; then
-    if ! mkdir -p "$DEST" 2>/dev/null; then
-      err "Cannot create $DEST (insufficient permissions)"
-      err "Try running with sudo or choose a writable --dest"
-      exit 1
-    fi
-  fi
-  if [ ! -w "$DEST" ]; then
-    err "No write permission to $DEST"
-    err "Try running with sudo or choose a writable --dest"
-    exit 1
-  fi
-}
-
-check_existing_install() {
-  if [ -x "$DEST/dcg" ]; then
-    local current
-    current=$("$DEST/dcg" --version 2>/dev/null | head -1 || echo "")
-    if [ -n "$current" ]; then
-      info "Existing dcg detected: $current"
-    fi
-  fi
-}
-
-check_network() {
-  if [ "$OFFLINE" -eq 1 ]; then
-    info "Offline mode enabled; skipping network preflight"
-    return 0
-  fi
-  if [ "$FROM_SOURCE" -eq 1 ]; then
-    return 0
-  fi
-  if [ -z "$URL" ]; then
-    return 0
-  fi
-  if ! command -v curl >/dev/null 2>&1; then
-    warn "curl not found; skipping network check"
-    return 0
-  fi
-  if ! curl -fsSL --connect-timeout 3 --max-time 5 -o /dev/null "$URL"; then
-    warn "Network check failed for $URL"
-    warn "Continuing; download may fail"
-  fi
-}
-
-preflight_checks() {
-  info "Running preflight checks"
-  check_disk_space
-  check_write_permissions
-  check_existing_install
-  check_network
-}
-
 maybe_add_path() {
   case ":$PATH:" in
     *:"$DEST":*) return 0;;
@@ -518,60 +368,6 @@ maybe_add_path() {
       fi
     ;;
   esac
-}
-
-detect_default_shell() {
-  local shell="${SHELL:-}"
-  [ -z "$shell" ] && return 1
-  shell=$(basename "$shell")
-  case "$shell" in
-    bash|zsh|fish) echo "$shell"; return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-install_completions_for_shell() {
-  local shell="$1"
-  local bin="$DEST/dcg"
-  if [ ! -x "$bin" ]; then
-    warn "dcg binary not found at $bin; skipping completions"
-    return 1
-  fi
-
-  local target=""
-  case "$shell" in
-    bash)
-      target="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/dcg"
-      ;;
-    zsh)
-      target="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions/_dcg"
-      ;;
-    fish)
-      target="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions/dcg.fish"
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-
-  mkdir -p "$(dirname "$target")"
-  if "$bin" completions "$shell" > "$target" 2>/dev/null; then
-    ok "Installed $shell completions to $target"
-    return 0
-  fi
-
-  warn "Failed to install $shell completions"
-  return 1
-}
-
-maybe_install_completions() {
-  local shell=""
-  if ! shell=$(detect_default_shell); then
-    info "Shell completions: skipped (unknown shell)"
-    return 0
-  fi
-
-  install_completions_for_shell "$shell" || true
 }
 
 ensure_rust() {
@@ -631,47 +427,11 @@ verify_checksum() {
   return 0
 }
 
-# Verify Sigstore/cosign bundle for a file (best-effort).
-# Usage: verify_sigstore_bundle <file> <artifact_url>
-# Returns 0 on success or when verification is skipped, 1 on verification failure.
-verify_sigstore_bundle() {
-  local file="$1"
-  local artifact_url="$2"
-
-  if ! command -v cosign &>/dev/null; then
-    warn "cosign not found; skipping signature verification (install cosign for stronger authenticity checks)"
-    return 0
-  fi
-
-  local bundle_url="$SIGSTORE_BUNDLE_URL"
-  if [ -z "$bundle_url" ]; then
-    bundle_url="${artifact_url}.sigstore.json"
-  fi
-
-  local bundle_file="$TMP/$(basename "$bundle_url")"
-  info "Fetching sigstore bundle from ${bundle_url}"
-  if ! curl -fsSL "$bundle_url" -o "$bundle_file"; then
-    warn "Sigstore bundle not found; skipping signature verification"
-    return 0
-  fi
-
-  if ! cosign verify-blob \
-    --bundle "$bundle_file" \
-    --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
-    --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
-    "$file"; then
-    return 1
-  fi
-
-  ok "Signature verified (cosign)"
-  return 0
-}
-
 usage() {
   cat <<EOFU
 Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] \\
                   [--artifact-url URL] [--checksum HEX] [--checksum-url URL] [--quiet] \\
-                  [--offline] [--no-gum] [--no-configure] [--no-verify] [--force]
+                  [--no-gum] [--no-verify] [--force]
 
 Options:
   --version vX.Y.Z   Install specific version (default: latest)
@@ -681,10 +441,8 @@ Options:
   --verify           Run self-test after install
   --from-source      Build from source instead of downloading binary
   --quiet            Suppress non-error output
-  --offline          Skip network preflight checks
   --no-gum           Disable gum formatting even if available
-  --no-configure     Skip AI agent hook configuration
-  --no-verify        Skip checksum + signature verification (for testing only)
+  --no-verify        Skip checksum verification (for testing only)
   --force            Force reinstall even if same version is installed
 EOFU
 }
@@ -701,9 +459,7 @@ while [ $# -gt 0 ]; do
     --checksum-url) CHECKSUM_URL="$2"; shift 2;;
     --from-source) FROM_SOURCE=1; shift;;
     --quiet|-q) QUIET=1; shift;;
-    --offline) OFFLINE=1; shift;;
     --no-gum) NO_GUM=1; shift;;
-    --no-configure) NO_CONFIGURE=1; shift;;
     --no-verify) NO_CHECKSUM=1; shift;;
     --force) FORCE_INSTALL=1; shift;;
     -h|--help) usage; exit 0;;
@@ -736,28 +492,21 @@ if [ "$QUIET" -eq 0 ]; then
 fi
 
 resolve_version
-detect_platform
-set_artifact_url
-preflight_checks
 
 # Check if already at target version (skip download if so, unless --force)
 if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
   ok "dcg $VERSION is already installed at $DEST/dcg"
   info "Use --force to reinstall"
 
-  if [ "$NO_CONFIGURE" -eq 0 ]; then
-    # Still run agent configuration (idempotent) to ensure hooks are set up
-    detect_predecessor
-    if [ "$PREDECESSOR_FOUND" -eq 1 ]; then
-      show_upgrade_banner
-    fi
-
-    # Configure agents (these are already idempotent)
-    configure_claude_code "$CLAUDE_SETTINGS" "0"
-    configure_gemini "$GEMINI_SETTINGS"
-  else
-    info "Skipping agent configuration (--no-configure)"
+  # Still run agent configuration (idempotent) to ensure hooks are set up
+  detect_predecessor
+  if [ "$PREDECESSOR_FOUND" -eq 1 ]; then
+    show_upgrade_banner
   fi
+
+  # Configure agents (these are already idempotent)
+  configure_claude_code "$CLAUDE_SETTINGS" "0"
+  configure_gemini "$GEMINI_SETTINGS"
 
   # Show final summary even when skipping download
   echo ""
@@ -773,9 +522,41 @@ if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
     *) : ;;
   esac
 
-  maybe_install_completions
-
   exit 0
+fi
+
+mkdir -p "$DEST"
+OS=$(uname -s | tr 'A-Z' 'a-z')
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64|amd64) ARCH="x86_64" ;;
+  arm64|aarch64) ARCH="aarch64" ;;
+  *) warn "Unknown arch $ARCH, using as-is" ;;
+esac
+
+TARGET=""
+case "${OS}-${ARCH}" in
+  linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+  linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
+  darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
+  darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
+  *) :;;
+esac
+
+# Prefer prebuilt artifact when we know the target or the caller supplied a direct URL.
+TAR=""
+URL=""
+if [ "$FROM_SOURCE" -eq 0 ]; then
+  if [ -n "$ARTIFACT_URL" ]; then
+    TAR=$(basename "$ARTIFACT_URL")
+    URL="$ARTIFACT_URL"
+  elif [ -n "$TARGET" ]; then
+    TAR="dcg-${TARGET}.tar.xz"
+    URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
+  else
+    warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
+    FROM_SOURCE=1
+  fi
 fi
 
 # Cross-platform locking using mkdir (atomic on all POSIX systems including macOS)
@@ -833,13 +614,12 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
     ok "Self-test complete"
   fi
   ok "Done. Binary at: $DEST/dcg"
-  maybe_install_completions
   exit 0
 fi
 
 # Checksum verification (can be skipped with --no-verify for testing)
 if [ "$NO_CHECKSUM" -eq 1 ]; then
-  warn "Verification skipped (--no-verify)"
+  warn "Checksum verification skipped (--no-verify)"
 else
   if [ -z "$CHECKSUM" ]; then
     [ -z "$CHECKSUM_URL" ] && CHECKSUM_URL="${URL}.sha256"
@@ -859,12 +639,6 @@ else
 
   if ! verify_checksum "$TMP/$TAR" "$CHECKSUM"; then
     err "Installation aborted due to checksum failure"
-    exit 1
-  fi
-
-  if ! verify_sigstore_bundle "$TMP/$TAR" "$URL"; then
-    err "Signature verification failed"
-    err "The downloaded file may be corrupted or tampered with."
     exit 1
   fi
 fi
@@ -890,7 +664,6 @@ if [ "$VERIFY" -eq 1 ]; then
 fi
 
 ok "Done. Binary at: $DEST/dcg"
-maybe_install_completions
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -978,17 +751,12 @@ remove_predecessor() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Claude Code / Gemini CLI / Cursor Auto-Configuration
+# Claude Code / Gemini CLI Auto-Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 GEMINI_SETTINGS="$HOME/.gemini/settings.json"
 AIDER_SETTINGS="$HOME/.aider.conf.yml"
-CURSOR_SETTINGS_MAC="$HOME/Library/Application Support/Cursor/User/settings.json"
-CURSOR_SETTINGS_LINUX="$HOME/.config/Cursor/User/settings.json"
-CURSOR_HOOKS_JSON="$HOME/.cursor/hooks.json"
-CURSOR_HOOK_DIR="$HOME/.cursor/hooks"
-CURSOR_HOOK_SCRIPT="$CURSOR_HOOK_DIR/dcg-pre-shell.py"
 AUTO_CONFIGURED=0
 
 # Detailed tracking for what was configured
@@ -997,11 +765,9 @@ GEMINI_STATUS=""  # "created"|"merged"|"already"|"failed"|"skipped"
 AIDER_STATUS=""   # "created"|"merged"|"already"|"skipped"|"failed"
 CONTINUE_STATUS="" # "unsupported"|"skipped"
 CODEX_STATUS=""   # "unsupported"|"skipped"
-CURSOR_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"|"conflict"
 CLAUDE_BACKUP=""
 GEMINI_BACKUP=""
 AIDER_BACKUP=""
-CURSOR_BACKUP=""
 
 configure_claude_code() {
   local settings_file="$1"
@@ -1397,280 +1163,69 @@ configure_codex() {
   CODEX_STATUS="unsupported"
 }
 
-configure_cursor() {
-  # Cursor IDE (https://cursor.com) supports hooks via ~/.cursor/hooks.json.
-  # We install a beforeShellExecution hook that delegates to dcg.
-  local settings_file="$CURSOR_HOOKS_JSON"
-  local hook_dir="$CURSOR_HOOK_DIR"
-  local hook_script="$CURSOR_HOOK_SCRIPT"
-
-  local cursor_installed=0
-  if [[ -d "$HOME/.cursor" ]] || [[ -f "$CURSOR_SETTINGS_MAC" ]] || [[ -f "$CURSOR_SETTINGS_LINUX" ]] || command -v cursor >/dev/null 2>&1; then
-    cursor_installed=1
-  elif command -v pgrep >/dev/null 2>&1; then
-    if pgrep -f "[Cc]ursor" >/dev/null 2>&1; then
-      cursor_installed=1
-    fi
-  fi
-
-  if [ "$cursor_installed" -eq 0 ]; then
-    CURSOR_STATUS="skipped"
-    return 0
-  fi
-
-  if ! command -v python3 >/dev/null 2>&1; then
-    CURSOR_STATUS="failed"
-    return 1
-  fi
-
-  mkdir -p "$hook_dir"
-
-  local marker="dcg-cursor-hook"
-  if [ -f "$hook_script" ] && ! grep -q "$marker" "$hook_script" 2>/dev/null; then
-    CURSOR_STATUS="conflict"
-    return 1
-  fi
-
-  cat > "$hook_script" <<'PYEOF'
-#!/usr/bin/env python3
-# dcg-cursor-hook: generated by dcg installer
-import json
-import os
-import subprocess
-import sys
-
-def emit(payload):
-    sys.stdout.write(json.dumps(payload))
-    sys.stdout.flush()
-
-def allow():
-    emit({
-        "permission": "allow",
-        "continue": True,
-        "userMessage": "",
-        "agentMessage": "",
-        "user_message": "",
-        "agent_message": "",
-    })
-
-def deny(reason):
-    emit({
-        "permission": "deny",
-        "continue": False,
-        "userMessage": reason,
-        "agentMessage": reason,
-        "user_message": reason,
-        "agent_message": reason,
-    })
-
-def main():
-    try:
-        payload = json.load(sys.stdin)
-    except Exception:
-        allow()
-        return 0
-
-    command = payload.get("command") or ""
-    cwd = payload.get("cwd") or ""
-    if cwd:
-        try:
-            os.chdir(cwd)
-        except Exception:
-            pass
-
-    if not command:
-        allow()
-        return 0
-
-    dcg_bin = os.environ.get("DCG_BIN", "dcg")
-    hook_input = {"tool_name": "Bash", "tool_input": {"command": command}}
-
-    try:
-        proc = subprocess.run(
-            [dcg_bin],
-            input=json.dumps(hook_input),
-            text=True,
-            capture_output=True,
-        )
-    except Exception:
-        allow()
-        return 0
-
-    output = (proc.stdout or "").strip()
-    if not output:
-        allow()
-        return 0
-
-    try:
-        dcg_out = json.loads(output)
-    except Exception:
-        allow()
-        return 0
-
-    decision = (
-        dcg_out.get("hookSpecificOutput", {})
-        .get("permissionDecision")
-    )
-    reason = (
-        dcg_out.get("hookSpecificOutput", {})
-        .get("permissionDecisionReason", "Blocked by dcg")
-    )
-
-    if decision == "deny":
-        deny(reason)
-        return 0
-
-    allow()
-    return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-PYEOF
-  chmod +x "$hook_script" 2>/dev/null || true
-
-  if [ -f "$settings_file" ]; then
-    if grep -q "$hook_script" "$settings_file" 2>/dev/null; then
-      CURSOR_STATUS="already"
-      AUTO_CONFIGURED=1
-      return 0
-    fi
-
-    CURSOR_BACKUP="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
-    cp "$settings_file" "$CURSOR_BACKUP"
-
-    python3 - "$settings_file" "$hook_script" <<'PYEOF'
-import json
-import sys
-
-settings_file = sys.argv[1]
-hook_cmd = sys.argv[2]
-
-try:
-    with open(settings_file, "r") as f:
-        settings = json.load(f)
-except Exception:
-    settings = {}
-
-if not isinstance(settings, dict):
-    settings = {}
-
-settings.setdefault("version", 1)
-hooks = settings.setdefault("hooks", {})
-if not isinstance(hooks, dict):
-    hooks = {}
-    settings["hooks"] = hooks
-
-entries = hooks.get("beforeShellExecution")
-if not isinstance(entries, list):
-    entries = []
-hooks["beforeShellExecution"] = entries
-
-def is_match(entry):
-    return isinstance(entry, dict) and entry.get("command") == hook_cmd
-
-if not any(is_match(entry) for entry in entries):
-    entries.insert(0, {"command": hook_cmd})
-
-with open(settings_file, "w") as f:
-    json.dump(settings, f, indent=2)
-PYEOF
-    if [ $? -eq 0 ]; then
-      CURSOR_STATUS="merged"
-      AUTO_CONFIGURED=1
-    else
-      mv "$CURSOR_BACKUP" "$settings_file" 2>/dev/null || true
-      CURSOR_STATUS="failed"
-      CURSOR_BACKUP=""
-      return 1
-    fi
-  else
-    cat > "$settings_file" <<EOFSET
-{
-  "version": 1,
-  "hooks": {
-    "beforeShellExecution": [
-      {
-        "command": "$hook_script"
-      }
-    ]
-  }
-}
-EOFSET
-    CURSOR_STATUS="created"
-    AUTO_CONFIGURED=1
-  fi
-}
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Run Auto-Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 
-if [ "$NO_CONFIGURE" -eq 0 ]; then
-  # Detect predecessor
-  detect_predecessor
+# Detect predecessor
+detect_predecessor
 
-  # Default: don't remove predecessor (set before conditional block)
-  REMOVE_PREDECESSOR=0
+# Default: don't remove predecessor (set before conditional block)
+REMOVE_PREDECESSOR=0
 
-  if [ "$PREDECESSOR_FOUND" -eq 1 ]; then
-    show_upgrade_banner
+if [ "$PREDECESSOR_FOUND" -eq 1 ]; then
+  show_upgrade_banner
 
-    # Decide whether to remove predecessor
-    if [ "$EASY" -eq 1 ]; then
-      # Easy mode: always remove
-      REMOVE_PREDECESSOR=1
-      info "Easy mode: auto-removing predecessor"
-    elif [ -t 0 ]; then
-      # Interactive: ask user
-      if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-        if gum confirm "Remove predecessor ($PREDECESSOR_SCRIPT) and upgrade to dcg?"; then
-          REMOVE_PREDECESSOR=1
-        fi
-      else
-        echo -n "Remove predecessor ($PREDECESSOR_SCRIPT) and upgrade to dcg? (Y/n): "
-        read -r ans
-        case "$ans" in
-          n|N|no|No|NO) REMOVE_PREDECESSOR=0;;
-          *) REMOVE_PREDECESSOR=1;;
-        esac
+  # Decide whether to remove predecessor
+  if [ "$EASY" -eq 1 ]; then
+    # Easy mode: always remove
+    REMOVE_PREDECESSOR=1
+    info "Easy mode: auto-removing predecessor"
+  elif [ -t 0 ]; then
+    # Interactive: ask user
+    if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+      if gum confirm "Remove predecessor ($PREDECESSOR_SCRIPT) and upgrade to dcg?"; then
+        REMOVE_PREDECESSOR=1
       fi
     else
-      # Non-interactive without --easy-mode: default to removing (user ran installer intentionally)
-      REMOVE_PREDECESSOR=1
-      info "Non-interactive mode: auto-removing predecessor (use --easy-mode to suppress this message)"
+      echo -n "Remove predecessor ($PREDECESSOR_SCRIPT) and upgrade to dcg? (Y/n): "
+      read -r ans
+      case "$ans" in
+        n|N|no|No|NO) REMOVE_PREDECESSOR=0;;
+        *) REMOVE_PREDECESSOR=1;;
+      esac
     fi
-
-    if [ "$REMOVE_PREDECESSOR" -eq 1 ]; then
-      for loc in "${PREDECESSOR_LOCATIONS[@]}"; do
-        remove_predecessor "$loc"
-      done
-      # Note: settings.json cleanup is handled by configure_claude_code() below
-    else
-      warn "Keeping predecessor; dcg will run alongside it"
-      warn "Consider removing $PREDECESSOR_SCRIPT manually to avoid duplicate checks"
-    fi
+  else
+    # Non-interactive without --easy-mode: default to removing (user ran installer intentionally)
+    REMOVE_PREDECESSOR=1
+    info "Non-interactive mode: auto-removing predecessor (use --easy-mode to suppress this message)"
   fi
 
-  # Always configure Claude Code (creates directory if needed)
-  configure_claude_code "$CLAUDE_SETTINGS" "$REMOVE_PREDECESSOR"
-
-  # Configure Gemini CLI (if installed)
-  configure_gemini "$GEMINI_SETTINGS"
-
-  # Configure Aider (if installed)
-  configure_aider "$AIDER_SETTINGS"
-
-  # Configure Continue (if installed)
-  configure_continue
-
-  # Configure Codex CLI (if installed)
-  configure_codex
-
-  # Configure Cursor IDE (if installed)
-  configure_cursor
-else
-  info "Skipping agent configuration (--no-configure)"
+  if [ "$REMOVE_PREDECESSOR" -eq 1 ]; then
+    for loc in "${PREDECESSOR_LOCATIONS[@]}"; do
+      remove_predecessor "$loc"
+    done
+    # Note: settings.json cleanup is handled by configure_claude_code() below
+  else
+    warn "Keeping predecessor; dcg will run alongside it"
+    warn "Consider removing $PREDECESSOR_SCRIPT manually to avoid duplicate checks"
+  fi
 fi
+
+# Always configure Claude Code (creates directory if needed)
+configure_claude_code "$CLAUDE_SETTINGS" "$REMOVE_PREDECESSOR"
+
+# Configure Gemini CLI (if installed)
+configure_gemini "$GEMINI_SETTINGS"
+
+# Configure Aider (if installed)
+configure_aider "$AIDER_SETTINGS"
+
+# Configure Continue (if installed)
+configure_continue
+
+# Configure Codex CLI (if installed)
+configure_codex
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Final Summary
@@ -1678,11 +1233,8 @@ fi
 
 echo ""
 
-if [ "$NO_CONFIGURE" -eq 1 ]; then
-  summary_lines=("Agent configuration skipped (--no-configure)")
-else
-  # Build summary of what was done
-  summary_lines=()
+# Build summary of what was done
+summary_lines=()
 
 case "$CLAUDE_STATUS" in
   created)
@@ -1762,30 +1314,6 @@ case "$CODEX_STATUS" in
     summary_lines+=("Codex CLI:   Not installed (skipped)")
     ;;
 esac
-
-  case "$CURSOR_STATUS" in
-  created)
-    summary_lines+=("Cursor IDE:  Created $CURSOR_HOOKS_JSON with dcg hook")
-    ;;
-  merged)
-    summary_lines+=("Cursor IDE:  Added dcg hook to existing $CURSOR_HOOKS_JSON")
-    [ -n "$CURSOR_BACKUP" ] && summary_lines+=("             Backup: $CURSOR_BACKUP")
-    ;;
-  already)
-    summary_lines+=("Cursor IDE:  Already configured (no changes)")
-    ;;
-  conflict)
-    summary_lines+=("Cursor IDE:  Found existing hook script at $CURSOR_HOOK_SCRIPT")
-    summary_lines+=("             Tip: remove or rename it to let dcg configure Cursor hooks")
-    ;;
-  skipped|"")
-    summary_lines+=("Cursor IDE:  Not installed (skipped)")
-    ;;
-  failed)
-    summary_lines+=("Cursor IDE:  Configuration failed (python3 required)")
-    ;;
-esac
-fi
 
 # Show summary
 if [ "$QUIET" -eq 0 ]; then

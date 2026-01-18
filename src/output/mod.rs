@@ -13,14 +13,12 @@
 //!
 //! The module automatically detects whether rich output should be used based on:
 //! 1. Explicit flags (--json, --no-color)
-//! 2. `NO_COLOR` environment variable
+//! 2. NO_COLOR environment variable
 //! 3. Whether stdout is a TTY
 //! 4. TERM environment variable (dumb terminals)
 
-pub mod denial;
 pub mod theme;
 
-pub use denial::DenialBox;
 pub use theme::{BorderStyle, Severity, SeverityColors, Theme};
 
 use std::sync::OnceLock;
@@ -30,7 +28,7 @@ static FORCE_PLAIN: OnceLock<bool> = OnceLock::new();
 
 /// Initialize the output system with explicit settings.
 ///
-/// Call this early in `main()` if you want to override TTY detection.
+/// Call this early in main() if you want to override TTY detection.
 pub fn init(force_plain: bool) {
     let _ = FORCE_PLAIN.set(force_plain);
 }
@@ -62,7 +60,7 @@ pub fn should_use_rich_output() -> bool {
     }
 
     // 2. Check NO_COLOR environment variable (https://no-color.org/)
-    if std::env::var("NO_COLOR").is_ok() || std::env::var("DCG_NO_COLOR").is_ok() {
+    if std::env::var("NO_COLOR").is_ok() {
         return false;
     }
 
@@ -125,7 +123,8 @@ pub fn supports_256_colors() -> bool {
 pub fn terminal_width() -> u16 {
     console::Term::stdout()
         .size_checked()
-        .map_or(80, |(_, w)| w)
+        .map(|(_, w)| w)
+        .unwrap_or(80)
 }
 
 /// Returns the terminal height, or a default if not detectable.
@@ -133,7 +132,8 @@ pub fn terminal_width() -> u16 {
 pub fn terminal_height() -> u16 {
     console::Term::stdout()
         .size_checked()
-        .map_or(24, |(h, _)| h)
+        .map(|(h, _)| h)
+        .unwrap_or(24)
 }
 
 #[cfg(test)]

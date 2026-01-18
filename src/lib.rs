@@ -72,14 +72,12 @@ pub mod heredoc;
 pub mod highlight;
 pub mod history;
 pub mod hook;
-pub mod logging;
-pub mod mcp;
-pub mod normalize;
 pub mod output;
+pub mod logging;
+pub mod normalize;
 pub mod packs;
 pub mod pending_exceptions;
 pub mod perf;
-pub mod sarif;
 pub mod scan;
 pub mod simulate;
 pub mod stats;
@@ -101,9 +99,11 @@ pub use evaluator::{
     evaluate_command, evaluate_command_with_deadline, evaluate_command_with_pack_order,
     evaluate_command_with_pack_order_at_path, evaluate_command_with_pack_order_deadline,
     evaluate_command_with_pack_order_deadline_at_path,
+    evaluate_command_with_pack_order_deadline_at_path_with_external,
+    evaluate_command_with_pack_order_deadline_with_external,
 };
 pub use hook::{HookInput, HookOutput, HookResult, HookSpecificOutput};
-pub use packs::external::{ExternalPack, parse_pack_file, parse_pack_string};
+pub use packs::external::{ExternalPackLoader, LoadResult, LoadedPack};
 pub use packs::{Pack, PackId, PackRegistry};
 pub use pending_exceptions::{
     AllowOnceEntry, AllowOnceScopeKind, AllowOnceStore, PendingExceptionRecord,
@@ -207,6 +207,7 @@ pub use output::{
 
 // Re-export update types for self-update version check
 pub use update::{
-    CACHE_DURATION, VersionCheckError, VersionCheckResult, check_for_update, clear_cache,
-    current_version, format_check_result, format_check_result_json,
+    CACHE_DURATION, UpdateResult, VersionCheckError, VersionCheckResult, check_for_update,
+    clear_cache, current_version, format_check_result, format_check_result_json,
+    format_update_result, perform_update,
 };

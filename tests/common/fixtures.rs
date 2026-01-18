@@ -21,7 +21,6 @@ pub fn standard_mix() -> Vec<TestCommand> {
             timestamp_offset_secs: -3600, // 1 hour ago
             pack_id: None,
             pattern_name: None,
-            rule_id: None,
             eval_duration_us: 85,
         },
         TestCommand {
@@ -32,7 +31,6 @@ pub fn standard_mix() -> Vec<TestCommand> {
             timestamp_offset_secs: -3500,
             pack_id: None,
             pattern_name: None,
-            rule_id: None,
             eval_duration_us: 45,
         },
         TestCommand {
@@ -43,7 +41,6 @@ pub fn standard_mix() -> Vec<TestCommand> {
             timestamp_offset_secs: -3400,
             pack_id: None,
             pattern_name: None,
-            rule_id: None,
             eval_duration_us: 120,
         },
         // Blocked dangerous commands
@@ -55,7 +52,6 @@ pub fn standard_mix() -> Vec<TestCommand> {
             timestamp_offset_secs: -3300,
             pack_id: Some("core.git"),
             pattern_name: Some("reset-hard"),
-            rule_id: Some("core.git:reset-hard"),
             eval_duration_us: 250,
         },
         TestCommand {
@@ -66,7 +62,6 @@ pub fn standard_mix() -> Vec<TestCommand> {
             timestamp_offset_secs: -3200,
             pack_id: Some("core.git"),
             pattern_name: Some("force-push"),
-            rule_id: Some("core.git:force-push"),
             eval_duration_us: 180,
         },
         TestCommand {
@@ -77,7 +72,6 @@ pub fn standard_mix() -> Vec<TestCommand> {
             timestamp_offset_secs: -3100,
             pack_id: Some("core.filesystem"),
             pattern_name: Some("rm-recursive-force"),
-            rule_id: Some("core.filesystem:rm-recursive-force"),
             eval_duration_us: 150,
         },
         // Warned commands
@@ -89,7 +83,6 @@ pub fn standard_mix() -> Vec<TestCommand> {
             timestamp_offset_secs: -3000,
             pack_id: Some("containers.docker"),
             pattern_name: Some("system-prune"),
-            rule_id: Some("containers.docker:system-prune"),
             eval_duration_us: 200,
         },
         // Bypassed commands (allow-once)
@@ -101,7 +94,6 @@ pub fn standard_mix() -> Vec<TestCommand> {
             timestamp_offset_secs: -2900,
             pack_id: Some("core.git"),
             pattern_name: Some("clean-force"),
-            rule_id: Some("core.git:clean-force"),
             eval_duration_us: 160,
         },
         // Different agent types
@@ -113,7 +105,6 @@ pub fn standard_mix() -> Vec<TestCommand> {
             timestamp_offset_secs: -2800,
             pack_id: None,
             pattern_name: None,
-            rule_id: None,
             eval_duration_us: 90,
         },
         TestCommand {
@@ -124,7 +115,6 @@ pub fn standard_mix() -> Vec<TestCommand> {
             timestamp_offset_secs: -2700,
             pack_id: None,
             pattern_name: None,
-            rule_id: None,
             eval_duration_us: 75,
         },
         // More recent commands
@@ -136,7 +126,6 @@ pub fn standard_mix() -> Vec<TestCommand> {
             timestamp_offset_secs: -1800, // 30 minutes ago
             pack_id: None,
             pattern_name: None,
-            rule_id: None,
             eval_duration_us: 55,
         },
         TestCommand {
@@ -147,7 +136,6 @@ pub fn standard_mix() -> Vec<TestCommand> {
             timestamp_offset_secs: -1200, // 20 minutes ago
             pack_id: None,
             pattern_name: None,
-            rule_id: None,
             eval_duration_us: 110,
         },
         TestCommand {
@@ -158,7 +146,6 @@ pub fn standard_mix() -> Vec<TestCommand> {
             timestamp_offset_secs: -600, // 10 minutes ago
             pack_id: None,
             pattern_name: None,
-            rule_id: None,
             eval_duration_us: 95,
         },
     ]
@@ -170,34 +157,30 @@ pub fn standard_mix() -> Vec<TestCommand> {
 /// benchmarking database operations.
 #[must_use]
 pub fn large_dataset(count: usize) -> Vec<TestCommand> {
-    // (command, outcome, pack_id, pattern_name, rule_id)
-    let base_commands: [(&str, Outcome, Option<&str>, Option<&str>, Option<&str>); 9] = [
-        ("git status", Outcome::Allow, None, None, None),
-        ("git diff", Outcome::Allow, None, None, None),
-        ("ls -la", Outcome::Allow, None, None, None),
-        ("cargo build", Outcome::Allow, None, None, None),
-        ("npm test", Outcome::Allow, None, None, None),
-        ("python -m pytest", Outcome::Allow, None, None, None),
+    let base_commands = [
+        ("git status", Outcome::Allow, None, None),
+        ("git diff", Outcome::Allow, None, None),
+        ("ls -la", Outcome::Allow, None, None),
+        ("cargo build", Outcome::Allow, None, None),
+        ("npm test", Outcome::Allow, None, None),
+        ("python -m pytest", Outcome::Allow, None, None),
         (
             "git reset --hard",
             Outcome::Deny,
             Some("core.git"),
             Some("reset-hard"),
-            Some("core.git:reset-hard"),
         ),
         (
             "rm -rf /tmp",
             Outcome::Deny,
             Some("core.filesystem"),
             Some("rm-recursive-force"),
-            Some("core.filesystem:rm-recursive-force"),
         ),
         (
             "docker system prune",
             Outcome::Warn,
             Some("containers.docker"),
             Some("system-prune"),
-            Some("containers.docker:system-prune"),
         ),
     ];
 
@@ -211,8 +194,7 @@ pub fn large_dataset(count: usize) -> Vec<TestCommand> {
 
     (0..count)
         .map(|i| {
-            let (command, outcome, pack_id, pattern_name, rule_id) =
-                base_commands[i % base_commands.len()];
+            let (command, outcome, pack_id, pattern_name) = base_commands[i % base_commands.len()];
             let offset_steps = i64::try_from(count - i).unwrap_or(i64::MAX / 60);
             let offset_secs = -(offset_steps.saturating_mul(60)); // Spaced 1 minute apart
             TestCommand {
@@ -223,7 +205,6 @@ pub fn large_dataset(count: usize) -> Vec<TestCommand> {
                 timestamp_offset_secs: offset_secs,
                 pack_id,
                 pattern_name,
-                rule_id,
                 eval_duration_us: 50 + (i % 200) as u64,
             }
         })
@@ -319,131 +300,6 @@ pub fn outcome_distribution() -> Vec<TestCommand> {
     }
 
     commands
-}
-
-/// Commands for testing rule metrics queries and CLI output.
-///
-/// Provides known rule counts:
-/// - `core.git:reset-hard`: 5 hits (3 deny, 2 bypass)
-/// - `core.git:force-push`: 3 hits (2 deny, 1 bypass)
-/// - `core.filesystem:rm-rf`: 4 hits (4 deny, 0 bypass)
-///
-/// Total: 12 hits, 3 rules, 3 bypasses (overrides)
-#[must_use]
-pub fn rule_metrics_data() -> Vec<TestCommand> {
-    vec![
-        // core.git:reset-hard - 3 deny, 2 bypass = 5 hits, 40% override rate
-        TestCommand {
-            command: "git reset --hard HEAD~1",
-            outcome: Outcome::Deny,
-            pack_id: Some("core.git"),
-            pattern_name: Some("reset-hard"),
-            rule_id: Some("core.git:reset-hard"),
-            timestamp_offset_secs: -7200,
-            ..Default::default()
-        },
-        TestCommand {
-            command: "git reset --hard HEAD~2",
-            outcome: Outcome::Deny,
-            pack_id: Some("core.git"),
-            pattern_name: Some("reset-hard"),
-            rule_id: Some("core.git:reset-hard"),
-            timestamp_offset_secs: -6000,
-            ..Default::default()
-        },
-        TestCommand {
-            command: "git reset --hard origin/main",
-            outcome: Outcome::Deny,
-            pack_id: Some("core.git"),
-            pattern_name: Some("reset-hard"),
-            rule_id: Some("core.git:reset-hard"),
-            timestamp_offset_secs: -4800,
-            ..Default::default()
-        },
-        TestCommand {
-            command: "git reset --hard HEAD",
-            outcome: Outcome::Bypass,
-            pack_id: Some("core.git"),
-            pattern_name: Some("reset-hard"),
-            rule_id: Some("core.git:reset-hard"),
-            timestamp_offset_secs: -3600,
-            ..Default::default()
-        },
-        TestCommand {
-            command: "git reset --hard abc123",
-            outcome: Outcome::Bypass,
-            pack_id: Some("core.git"),
-            pattern_name: Some("reset-hard"),
-            rule_id: Some("core.git:reset-hard"),
-            timestamp_offset_secs: -2400,
-            ..Default::default()
-        },
-        // core.git:force-push - 2 deny, 1 bypass = 3 hits, 33.3% override rate
-        TestCommand {
-            command: "git push --force origin main",
-            outcome: Outcome::Deny,
-            pack_id: Some("core.git"),
-            pattern_name: Some("force-push"),
-            rule_id: Some("core.git:force-push"),
-            timestamp_offset_secs: -7000,
-            ..Default::default()
-        },
-        TestCommand {
-            command: "git push --force-with-lease origin dev",
-            outcome: Outcome::Deny,
-            pack_id: Some("core.git"),
-            pattern_name: Some("force-push"),
-            rule_id: Some("core.git:force-push"),
-            timestamp_offset_secs: -5000,
-            ..Default::default()
-        },
-        TestCommand {
-            command: "git push --force origin feature",
-            outcome: Outcome::Bypass,
-            pack_id: Some("core.git"),
-            pattern_name: Some("force-push"),
-            rule_id: Some("core.git:force-push"),
-            timestamp_offset_secs: -3000,
-            ..Default::default()
-        },
-        // core.filesystem:rm-rf - 4 deny, 0 bypass = 4 hits, 0% override rate
-        TestCommand {
-            command: "rm -rf /tmp/test",
-            outcome: Outcome::Deny,
-            pack_id: Some("core.filesystem"),
-            pattern_name: Some("rm-rf"),
-            rule_id: Some("core.filesystem:rm-rf"),
-            timestamp_offset_secs: -8000,
-            ..Default::default()
-        },
-        TestCommand {
-            command: "rm -rf ./build",
-            outcome: Outcome::Deny,
-            pack_id: Some("core.filesystem"),
-            pattern_name: Some("rm-rf"),
-            rule_id: Some("core.filesystem:rm-rf"),
-            timestamp_offset_secs: -6500,
-            ..Default::default()
-        },
-        TestCommand {
-            command: "rm -rf node_modules",
-            outcome: Outcome::Deny,
-            pack_id: Some("core.filesystem"),
-            pattern_name: Some("rm-rf"),
-            rule_id: Some("core.filesystem:rm-rf"),
-            timestamp_offset_secs: -5500,
-            ..Default::default()
-        },
-        TestCommand {
-            command: "rm -rf dist",
-            outcome: Outcome::Deny,
-            pack_id: Some("core.filesystem"),
-            pattern_name: Some("rm-rf"),
-            rule_id: Some("core.filesystem:rm-rf"),
-            timestamp_offset_secs: -4000,
-            ..Default::default()
-        },
-    ]
 }
 
 #[cfg(test)]

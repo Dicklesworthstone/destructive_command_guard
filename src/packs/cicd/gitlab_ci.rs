@@ -60,54 +60,22 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "glab-variable-delete",
             r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+variable\s+delete\b",
-            "glab variable delete removes CI variables and can break pipelines.",
-            High,
-            "Deleting a GitLab CI/CD variable removes it from the project, group, or instance. \
-             Pipelines that depend on this variable will fail with undefined variable errors. \
-             Protected or masked variable values cannot be recovered after deletion.\n\n\
-             Safer alternatives:\n\
-             - glab variable list: Review existing variables first\n\
-             - Update variable value instead of deleting\n\
-             - Check .gitlab-ci.yml for variable usage before removing"
+            "glab variable delete removes CI variables and can break pipelines."
         ),
         destructive_pattern!(
             "glab-ci-delete",
             r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+ci\s+delete\b",
-            "glab ci delete removes pipeline artifacts or pipelines.",
-            Medium,
-            "Deleting pipelines or artifacts removes build history, job logs, and generated \
-             files. This affects debugging capabilities and audit trails. Artifacts needed \
-             for deployments or releases will no longer be available.\n\n\
-             Safer alternatives:\n\
-             - glab ci list: Review pipelines before deletion\n\
-             - glab ci view: Inspect pipeline details\n\
-             - Download artifacts before deletion if needed"
+            "glab ci delete removes pipeline artifacts or pipelines."
         ),
         destructive_pattern!(
             "glab-api-delete-variables",
             r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X|--method)\s+DELETE\b.*\bvariables\b",
-            "glab api DELETE against variables endpoints removes CI variables.",
-            High,
-            "Making DELETE requests to GitLab variables API removes CI/CD variables directly. \
-             This bypasses CLI confirmations and immediately affects all pipelines using these \
-             variables. Protected variable values cannot be recovered.\n\n\
-             Safer alternatives:\n\
-             - Use glab variable delete for safer deletion\n\
-             - GET request first: Verify variable exists\n\
-             - Prefer CLI commands over direct API calls"
+            "glab api DELETE against variables endpoints removes CI variables."
         ),
         destructive_pattern!(
             "gitlab-runner-unregister",
             r"gitlab-runner(?:\s+--?\S+(?:\s+\S+)?)*\s+unregister\b",
-            "gitlab-runner unregister removes runners and can halt CI.",
-            Critical,
-            "Unregistering a GitLab runner removes it from the GitLab instance. Jobs assigned \
-             to this runner will be stuck pending or fail. With --all-runners, all runners \
-             on the machine are removed, potentially halting all CI/CD for multiple projects.\n\n\
-             Safer alternatives:\n\
-             - gitlab-runner list: Review registered runners first\n\
-             - Pause the runner in GitLab UI instead\n\
-             - Verify replacement runners are available before removing"
+            "gitlab-runner unregister removes runners and can halt CI."
         ),
     ]
 }

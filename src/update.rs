@@ -136,8 +136,7 @@ fn write_cache(result: &VersionCheckResult) -> Result<(), VersionCheckError> {
 }
 
 /// Get the current version of dcg from Cargo.toml.
-#[must_use]
-pub const fn current_version() -> &'static str {
+pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
@@ -178,9 +177,7 @@ fn fetch_latest_version() -> Result<VersionCheckResult, VersionCheckError> {
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
         .build()
-        .map_err(|e| {
-            VersionCheckError::NetworkError(format!("Failed to configure release list: {e}"))
-        })?
+        .map_err(|e| VersionCheckError::NetworkError(format!("Failed to configure release list: {e}")))?
         .fetch()
         .map_err(|e| VersionCheckError::NetworkError(format!("Failed to fetch releases: {e}")))?;
 
@@ -250,18 +247,8 @@ pub fn format_check_result(result: &VersionCheckResult, use_color: bool) -> Stri
     let mut output = String::new();
 
     if use_color {
-        writeln!(
-            output,
-            "\x1b[1mCurrent version:\x1b[0m {}",
-            result.current_version
-        )
-        .ok();
-        writeln!(
-            output,
-            "\x1b[1mLatest version:\x1b[0m  {}",
-            result.latest_version
-        )
-        .ok();
+        writeln!(output, "\x1b[1mCurrent version:\x1b[0m {}", result.current_version).ok();
+        writeln!(output, "\x1b[1mLatest version:\x1b[0m  {}", result.latest_version).ok();
         writeln!(output).ok();
 
         if result.update_available {

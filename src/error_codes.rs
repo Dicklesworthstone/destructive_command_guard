@@ -479,11 +479,7 @@ impl DcgError {
 
     /// Add a context field to the error.
     #[must_use]
-    pub fn add_context(
-        mut self,
-        key: impl Into<String>,
-        value: impl Into<serde_json::Value>,
-    ) -> Self {
+    pub fn add_context(mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
         self.context.insert(key.into(), value.into());
         self
     }
@@ -497,7 +493,7 @@ impl DcgError {
     pub fn pattern_compile_failed(pattern_name: &str, details: &str) -> Self {
         Self::new(
             ErrorCode::PatternCompileFailed,
-            format!("Failed to compile pattern '{pattern_name}': {details}"),
+            format!("Failed to compile pattern '{}': {}", pattern_name, details),
         )
         .add_context("pattern_name", pattern_name)
     }
@@ -507,7 +503,10 @@ impl DcgError {
     pub fn pattern_match_timeout(pattern_name: &str, timeout_ms: u64) -> Self {
         Self::new(
             ErrorCode::PatternMatchTimeout,
-            format!("Pattern '{pattern_name}' match timed out after {timeout_ms}ms"),
+            format!(
+                "Pattern '{}' match timed out after {}ms",
+                pattern_name, timeout_ms
+            ),
         )
         .add_context("pattern_name", pattern_name)
         .add_context("timeout_ms", timeout_ms)
@@ -518,7 +517,7 @@ impl DcgError {
     pub fn json_parse_error(details: &str) -> Self {
         Self::new(
             ErrorCode::JsonParseError,
-            format!("JSON parse error: {details}"),
+            format!("JSON parse error: {}", details),
         )
     }
 
@@ -527,7 +526,7 @@ impl DcgError {
     pub fn io_error(operation: &str, details: &str) -> Self {
         Self::new(
             ErrorCode::IoError,
-            format!("IO error during {operation}: {details}"),
+            format!("IO error during {}: {}", operation, details),
         )
         .add_context("operation", operation)
     }
@@ -537,7 +536,7 @@ impl DcgError {
     pub fn config_not_found(path: &str) -> Self {
         Self::new(
             ErrorCode::ConfigFileNotFound,
-            format!("Configuration file not found: {path}"),
+            format!("Configuration file not found: {}", path),
         )
         .add_context("path", path)
     }
@@ -547,7 +546,7 @@ impl DcgError {
     pub fn config_parse_error(path: &str, details: &str) -> Self {
         Self::new(
             ErrorCode::ConfigParseError,
-            format!("Failed to parse configuration file '{path}': {details}"),
+            format!("Failed to parse configuration file '{}': {}", path, details),
         )
         .add_context("path", path)
     }
@@ -557,7 +556,10 @@ impl DcgError {
     pub fn allowlist_load_error(layer: &str, path: &str, details: &str) -> Self {
         Self::new(
             ErrorCode::AllowlistLoadError,
-            format!("Failed to load {layer} allowlist from '{path}': {details}"),
+            format!(
+                "Failed to load {} allowlist from '{}': {}",
+                layer, path, details
+            ),
         )
         .add_context("layer", layer)
         .add_context("path", path)
@@ -568,7 +570,7 @@ impl DcgError {
     pub fn invalid_rule_id_format(rule_id: &str, details: &str) -> Self {
         Self::new(
             ErrorCode::InvalidRuleIdFormat,
-            format!("Invalid rule ID format '{rule_id}': {details}"),
+            format!("Invalid rule ID format '{}': {}", rule_id, details),
         )
         .add_context("rule_id", rule_id)
     }
@@ -578,7 +580,7 @@ impl DcgError {
     pub fn external_pack_load_failed(path: &str, details: &str) -> Self {
         Self::new(
             ErrorCode::ExternalPackLoadFailed,
-            format!("Failed to load external pack from '{path}': {details}"),
+            format!("Failed to load external pack from '{}': {}", path, details),
         )
         .add_context("path", path)
     }
@@ -588,7 +590,7 @@ impl DcgError {
     pub fn hook_protocol_error(details: &str) -> Self {
         Self::new(
             ErrorCode::HookProtocolError,
-            format!("Hook protocol error: {details}"),
+            format!("Hook protocol error: {}", details),
         )
     }
 
@@ -597,7 +599,7 @@ impl DcgError {
     pub fn stdin_read_error(details: &str) -> Self {
         Self::new(
             ErrorCode::StdinReadError,
-            format!("Failed to read from stdin: {details}"),
+            format!("Failed to read from stdin: {}", details),
         )
     }
 
@@ -606,7 +608,7 @@ impl DcgError {
     pub fn file_scan_error(file: &str, details: &str) -> Self {
         Self::new(
             ErrorCode::FileScanError,
-            format!("Error scanning file '{file}': {details}"),
+            format!("Error scanning file '{}': {}", file, details),
         )
         .add_context("file", file)
     }
@@ -647,7 +649,7 @@ pub struct ErrorResponse {
 impl ErrorResponse {
     /// Create a new error response.
     #[must_use]
-    pub const fn new(error: DcgError) -> Self {
+    pub fn new(error: DcgError) -> Self {
         Self { error }
     }
 
@@ -759,10 +761,7 @@ mod tests {
         ];
 
         for code in codes {
-            assert!(
-                !code.description().is_empty(),
-                "Code {code:?} has empty description"
-            );
+            assert!(!code.description().is_empty(), "Code {:?} has empty description", code);
         }
     }
 }

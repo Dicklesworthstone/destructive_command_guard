@@ -73,80 +73,32 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "circleci-context-delete",
             r"circleci(?:\s+--?\S+(?:\s+\S+)?)*\s+context\s+delete\b",
-            "circleci context delete removes contexts and their secrets.",
-            Critical,
-            "Deleting a CircleCI context removes all secrets stored within it. Any pipeline \
-             jobs that reference this context will fail immediately. Secret values cannot be \
-             recovered after deletion and must be manually re-entered.\n\n\
-             Safer alternatives:\n\
-             - circleci context list: Review contexts before deletion\n\
-             - circleci context show: Inspect context secrets (names only)\n\
-             - Document secret names before removing context"
+            "circleci context delete removes contexts and their secrets."
         ),
         destructive_pattern!(
             "circleci-context-remove-secret",
             r"circleci(?:\s+--?\S+(?:\s+\S+)?)*\s+context\s+remove-secret\b",
-            "circleci context remove-secret deletes secrets from a context.",
-            High,
-            "Removing a secret from a context makes it unavailable to all jobs using that \
-             context. Pipelines depending on this secret will fail. The secret value cannot \
-             be retrieved after removal.\n\n\
-             Safer alternatives:\n\
-             - circleci context show: Review secrets in context first\n\
-             - Update the secret value instead of removing\n\
-             - Document secret value externally before removal"
+            "circleci context remove-secret deletes secrets from a context."
         ),
         destructive_pattern!(
             "circleci-orb-delete",
             r"circleci(?:\s+--?\S+(?:\s+\S+)?)*\s+orb\s+delete\b",
-            "circleci orb delete removes an orb from the registry.",
-            High,
-            "Deleting an orb removes it from the CircleCI orb registry. Any pipeline using \
-             this orb will fail on the next run. If other teams or projects depend on this \
-             orb, their CI/CD will break without warning.\n\n\
-             Safer alternatives:\n\
-             - circleci orb info: Review orb details and usage\n\
-             - Deprecate the orb instead of deleting\n\
-             - Check for dependent projects before deletion"
+            "circleci orb delete removes an orb from the registry."
         ),
         destructive_pattern!(
             "circleci-namespace-delete",
             r"circleci(?:\s+--?\S+(?:\s+\S+)?)*\s+namespace\s+delete\b",
-            "circleci namespace delete removes an orb namespace.",
-            Critical,
-            "Deleting a namespace removes all orbs within that namespace from the registry. \
-             This is a cascading deletion that affects every orb published under this namespace. \
-             All pipelines using any orb from this namespace will fail.\n\n\
-             Safer alternatives:\n\
-             - circleci namespace list: Review namespaces first\n\
-             - circleci orb list: Inventory orbs in namespace\n\
-             - Delete individual orbs instead if needed"
+            "circleci namespace delete removes an orb namespace."
         ),
         destructive_pattern!(
             "circleci-pipeline-delete",
             r"circleci(?:\s+--?\S+(?:\s+\S+)?)*\s+pipeline\s+delete\b",
-            "circleci pipeline delete removes pipeline history.",
-            Medium,
-            "Deleting pipeline history removes records of past builds, including logs, artifacts, \
-             and test results. This affects audit trails and debugging capabilities. The history \
-             cannot be recovered once deleted.\n\n\
-             Safer alternatives:\n\
-             - circleci pipeline list: Review pipelines before deletion\n\
-             - Export logs and artifacts before deletion\n\
-             - Consider archiving rather than deleting"
+            "circleci pipeline delete removes pipeline history."
         ),
         destructive_pattern!(
             "circleci-api-delete-envvar",
             r"curl(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:-X|--request)\s+DELETE\b.*circleci\.com/api/[^\s]*\b(?:envvar|environment-variable)\b",
-            "curl DELETE against CircleCI envvar endpoints removes environment variables.",
-            High,
-            "Making DELETE requests to CircleCI environment variable endpoints removes variables \
-             from projects. Pipelines depending on these variables will fail on next run. \
-             Variable values cannot be recovered after deletion.\n\n\
-             Safer alternatives:\n\
-             - GET request first: Review variable exists\n\
-             - Update variable value instead of deleting\n\
-             - Use circleci CLI for safer operations"
+            "curl DELETE against CircleCI envvar endpoints removes environment variables."
         ),
     ]
 }

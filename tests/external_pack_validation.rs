@@ -1,8 +1,3 @@
-#![allow(
-    clippy::cloned_ref_to_slice_refs,
-    clippy::items_after_statements,
-    clippy::needless_raw_string_hashes
-)]
 //! Unit tests for external pack schema validation, collision behavior, and regex engine selection.
 //!
 //! These tests verify the custom pack authoring logic from beads task git_safety_guard-8kkm.4.

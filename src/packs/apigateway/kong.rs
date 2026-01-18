@@ -56,148 +56,60 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "deck-reset",
             r"deck\s+(?:gateway\s+)?reset\b",
-            "deck reset removes ALL Kong configuration. This is extremely dangerous and irreversible.",
-            Critical,
-            "Resetting Kong removes ALL services, routes, plugins, consumers, certificates, and \
-             upstreams. Your entire API gateway configuration is wiped. All traffic through Kong \
-             will fail immediately. There is no undo.\n\n\
-             Safer alternatives:\n\
-             - deck dump: Export current configuration first\n\
-             - deck diff: Review what will change before any sync\n\
-             - Delete specific entities instead of full reset"
+            "deck reset removes ALL Kong configuration. This is extremely dangerous and irreversible."
         ),
         // deck sync with --select-tag can be destructive
         destructive_pattern!(
             "deck-sync-destructive",
             r"deck\s+(?:gateway\s+)?sync\b.*--select-tag\b",
-            "deck sync with --select-tag can remove entities not matching the tag.",
-            High,
-            "Using --select-tag with deck sync removes entities not matching the tag in your \
-             state file. This can accidentally delete services and routes managed by other teams \
-             or systems. Entities without tags are at risk of deletion.\n\n\
-             Safer alternatives:\n\
-             - deck diff --select-tag: Preview changes first\n\
-             - Use consistent tagging across all entities\n\
-             - Consider deck sync without --select-tag to avoid surprises"
+            "deck sync with --select-tag can remove entities not matching the tag."
         ),
         // Kong Admin API - DELETE requests (supports both DELETE-first and URL-first ordering)
         destructive_pattern!(
             "kong-admin-delete-services",
             r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/services|(?:localhost|127\.0\.0\.1):8001/services.*(?:-X\s+DELETE|--request\s+DELETE))",
-            "DELETE request to Kong Admin API removes services.",
-            High,
-            "Deleting a Kong service removes the upstream service definition. All routes \
-             associated with the service become orphaned and stop working. Traffic to those \
-             endpoints will return 404 errors.\n\n\
-             Safer alternatives:\n\
-             - GET /services first: List services to verify the target\n\
-             - Delete routes pointing to the service first\n\
-             - Use deck dump to export configuration before changes"
+            "DELETE request to Kong Admin API removes services."
         ),
         destructive_pattern!(
             "kong-admin-delete-routes",
             r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/routes|(?:localhost|127\.0\.0\.1):8001/routes.*(?:-X\s+DELETE|--request\s+DELETE))",
-            "DELETE request to Kong Admin API removes routes.",
-            High,
-            "Deleting a Kong route removes the path-to-service mapping. Requests to that path \
-             will return 404 errors. Plugins attached to the route are also removed. The \
-             associated service is not affected.\n\n\
-             Safer alternatives:\n\
-             - GET /routes first: Verify the route details\n\
-             - Test in a non-production environment\n\
-             - Consider disabling plugins instead of deleting the route"
+            "DELETE request to Kong Admin API removes routes."
         ),
         destructive_pattern!(
             "kong-admin-delete-plugins",
             r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/plugins|(?:localhost|127\.0\.0\.1):8001/plugins.*(?:-X\s+DELETE|--request\s+DELETE))",
-            "DELETE request to Kong Admin API removes plugins.",
-            Medium,
-            "Deleting a Kong plugin removes its functionality from the associated service, route, \
-             or consumer. Authentication, rate limiting, logging, or transformation features \
-             provided by the plugin stop immediately.\n\n\
-             Safer alternatives:\n\
-             - GET /plugins first: Review plugin configuration\n\
-             - PATCH to disable the plugin instead of deleting\n\
-             - Export plugin config with deck dump before deletion"
+            "DELETE request to Kong Admin API removes plugins."
         ),
         destructive_pattern!(
             "kong-admin-delete-consumers",
             r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/consumers|(?:localhost|127\.0\.0\.1):8001/consumers.*(?:-X\s+DELETE|--request\s+DELETE))",
-            "DELETE request to Kong Admin API removes consumers.",
-            High,
-            "Deleting a Kong consumer removes the API client identity. All credentials (API keys, \
-             JWT, OAuth) for that consumer are revoked. Plugins configured per-consumer stop \
-             applying. Affected clients lose API access.\n\n\
-             Safer alternatives:\n\
-             - GET /consumers first: Review consumer details\n\
-             - Delete individual credentials instead of the consumer\n\
-             - Notify affected clients before deletion"
+            "DELETE request to Kong Admin API removes consumers."
         ),
         destructive_pattern!(
             "kong-admin-delete-upstreams",
             r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/upstreams|(?:localhost|127\.0\.0\.1):8001/upstreams.*(?:-X\s+DELETE|--request\s+DELETE))",
-            "DELETE request to Kong Admin API removes upstreams.",
-            High,
-            "Deleting a Kong upstream removes the load balancer and all its targets. Services \
-             using this upstream will fail to route traffic. Health checks and circuit breaker \
-             settings are lost.\n\n\
-             Safer alternatives:\n\
-             - GET /upstreams first: Review upstream configuration\n\
-             - Update services to use a different upstream first\n\
-             - Remove targets individually to verify impact"
+            "DELETE request to Kong Admin API removes upstreams."
         ),
         destructive_pattern!(
             "kong-admin-delete-targets",
             r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/.*targets|(?:localhost|127\.0\.0\.1):8001/.*targets.*(?:-X\s+DELETE|--request\s+DELETE))",
-            "DELETE request to Kong Admin API removes targets.",
-            Medium,
-            "Deleting a Kong target removes a backend server from the upstream pool. Traffic \
-             is redistributed to remaining targets. If this was the last target, the upstream \
-             has no backends and requests fail.\n\n\
-             Safer alternatives:\n\
-             - GET /upstreams/{id}/targets first: List current targets\n\
-             - Set target weight to 0 to drain traffic first\n\
-             - Verify other targets can handle the load"
+            "DELETE request to Kong Admin API removes targets."
         ),
         destructive_pattern!(
             "kong-admin-delete-certificates",
             r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/certificates|(?:localhost|127\.0\.0\.1):8001/certificates.*(?:-X\s+DELETE|--request\s+DELETE))",
-            "DELETE request to Kong Admin API removes certificates.",
-            High,
-            "Deleting a Kong certificate removes the TLS/SSL certificate. SNIs using this \
-             certificate will fail TLS handshakes. HTTPS traffic to affected domains will \
-             receive certificate errors.\n\n\
-             Safer alternatives:\n\
-             - GET /certificates first: Review certificate details\n\
-             - Upload a replacement certificate before deletion\n\
-             - Remove associated SNIs first"
+            "DELETE request to Kong Admin API removes certificates."
         ),
         destructive_pattern!(
             "kong-admin-delete-snis",
             r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/snis|(?:localhost|127\.0\.0\.1):8001/snis.*(?:-X\s+DELETE|--request\s+DELETE))",
-            "DELETE request to Kong Admin API removes SNIs.",
-            High,
-            "Deleting a Kong SNI removes the domain-to-certificate mapping. HTTPS requests \
-             for that hostname will fail TLS negotiation or use a default certificate if \
-             configured. Clients will see certificate warnings.\n\n\
-             Safer alternatives:\n\
-             - GET /snis first: Review SNI configuration\n\
-             - Update the SNI to point to a different certificate\n\
-             - Verify the certificate is no longer needed for this domain"
+            "DELETE request to Kong Admin API removes SNIs."
         ),
         // Generic DELETE to any Kong Admin API endpoint
         destructive_pattern!(
             "kong-admin-delete-generic",
             r"curl\s+.*(?:(?:-X\s+DELETE|--request\s+DELETE).*(?:localhost|127\.0\.0\.1):8001/|(?:localhost|127\.0\.0\.1):8001/.*(?:-X\s+DELETE|--request\s+DELETE))",
-            "DELETE request to Kong Admin API can remove configuration.",
-            Medium,
-            "DELETE requests to the Kong Admin API remove configuration objects. The specific \
-             impact depends on the endpoint: services, routes, plugins, consumers, certificates, \
-             or other Kong entities. Deletions take effect immediately.\n\n\
-             Safer alternatives:\n\
-             - Use GET requests first to review the resource\n\
-             - Export configuration with deck dump\n\
-             - Test changes in a staging environment"
+            "DELETE request to Kong Admin API can remove configuration."
         ),
     ]
 }

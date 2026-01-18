@@ -60,6 +60,7 @@ pub struct HookSpecificOutput<'a> {
     pub allow_once_full_hash: Option<String>,
 
     // --- New fields for AI agent ergonomics (git_safety_guard-e4fl.1) ---
+
     /// Stable rule identifier (e.g., "core.git:reset-hard").
     /// Format: "{packId}:{patternName}"
     #[serde(rename = "ruleId", skip_serializing_if = "Option::is_none")]
@@ -188,11 +189,6 @@ pub fn extract_command(input: &HookInput) -> Option<String> {
 
 /// Configure colored output based on TTY detection.
 pub fn configure_colors() {
-    if std::env::var_os("NO_COLOR").is_some() || std::env::var_os("DCG_NO_COLOR").is_some() {
-        colored::control::set_override(false);
-        return;
-    }
-
     if !io::stderr().is_terminal() {
         colored::control::set_override(false);
     }
@@ -293,7 +289,7 @@ fn allow_once_should_colorize(base_colorize: bool) -> bool {
         return false;
     }
 
-    if std::env::var_os("NO_COLOR").is_some() || std::env::var_os("DCG_NO_COLOR").is_some() {
+    if std::env::var_os("NO_COLOR").is_some() {
         return false;
     }
 
@@ -816,7 +812,8 @@ pub fn output_denial(
 
     // Build remediation struct if we have allow_once info
     let remediation = allow_once.map(|info| {
-        let explanation_text = format_explanation_text(explanation, rule_id.as_deref(), pack);
+        let explanation_text =
+            format_explanation_text(explanation, rule_id.as_deref(), pack);
         Remediation {
             safe_alternative: get_contextual_suggestion(command).map(String::from),
             explanation: explanation_text,

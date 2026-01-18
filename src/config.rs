@@ -106,7 +106,6 @@ struct GeneralConfigLayer {
     color: Option<String>,
     log_file: Option<String>,
     verbose: Option<bool>,
-    hook_timeout_ms: Option<u64>,
     max_hook_input_bytes: Option<usize>,
     max_command_bytes: Option<usize>,
     max_findings_per_command: Option<usize>,
@@ -729,10 +728,6 @@ pub struct GeneralConfig {
     /// Whether to show verbose output.
     pub verbose: bool,
 
-    /// Hook evaluation budget override in milliseconds.
-    /// When set, overrides the default hook evaluation budget.
-    pub hook_timeout_ms: Option<u64>,
-
     /// Maximum bytes to read from stdin in hook mode.
     /// Commands exceeding this limit are allowed (fail-open) with a warning.
     /// Default: 262144 (256 KiB).
@@ -760,7 +755,6 @@ impl Default for GeneralConfig {
             color: "auto".to_string(),
             log_file: None,
             verbose: false,
-            hook_timeout_ms: None,
             max_hook_input_bytes: None,
             max_command_bytes: None,
             max_findings_per_command: None,
@@ -1579,9 +1573,6 @@ impl Config {
         if let Some(verbose) = general.verbose {
             self.general.verbose = verbose;
         }
-        if let Some(hook_timeout_ms) = general.hook_timeout_ms {
-            self.general.hook_timeout_ms = Some(hook_timeout_ms);
-        }
         if let Some(max_hook_input_bytes) = general.max_hook_input_bytes {
             self.general.max_hook_input_bytes = Some(max_hook_input_bytes);
         }
@@ -1744,22 +1735,9 @@ impl Config {
             self.packs.disabled = disable.split(',').map(|s| s.trim().to_string()).collect();
         }
 
-        // DCG_VERBOSE=0-3
-        if let Some(verbose) = get_env(&format!("{ENV_PREFIX}_VERBOSE")) {
-            if let Ok(level) = verbose.trim().parse::<u8>() {
-                self.general.verbose = level > 0;
-            } else if let Some(parsed) = parse_env_bool(&verbose) {
-                self.general.verbose = parsed;
-            } else {
-                self.general.verbose = true;
-            }
-        }
-
-        // DCG_HOOK_TIMEOUT_MS=200
-        if let Some(timeout_ms) = get_env(&format!("{ENV_PREFIX}_HOOK_TIMEOUT_MS")) {
-            if let Ok(parsed) = timeout_ms.trim().parse::<u64>() {
-                self.general.hook_timeout_ms = Some(parsed);
-            }
+        // DCG_VERBOSE=1
+        if get_env(&format!("{ENV_PREFIX}_VERBOSE")).is_some() {
+            self.general.verbose = true;
         }
 
         // DCG_COLOR=never
@@ -1956,9 +1934,6 @@ color = "auto"
 
 # Verbose output
 verbose = false
-
-# Hook evaluation budget override (milliseconds)
-# hook_timeout_ms = 200
 
 #─────────────────────────────────────────────────────────────
 # OUTPUT CONFIGURATION
@@ -3029,31 +3004,6 @@ allow = false
                 crate::heredoc::ScriptLanguage::JavaScript
             ])
         );
-    }
-
-    #[test]
-    fn test_env_override_verbose_numeric() {
-        let mut config = Config::default();
-        let env_map: std::collections::HashMap<&str, &str> =
-            std::collections::HashMap::from([("DCG_VERBOSE", "0")]);
-        config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
-        assert!(!config.general.verbose);
-
-        let mut config = Config::default();
-        let env_map: std::collections::HashMap<&str, &str> =
-            std::collections::HashMap::from([("DCG_VERBOSE", "2")]);
-        config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
-        assert!(config.general.verbose);
-    }
-
-    #[test]
-    fn test_env_override_hook_timeout_ms() {
-        let mut config = Config::default();
-        let env_map: std::collections::HashMap<&str, &str> =
-            std::collections::HashMap::from([("DCG_HOOK_TIMEOUT_MS", "150")]);
-        config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
-
-        assert_eq!(config.general.hook_timeout_ms, Some(150));
     }
 
     #[test]
