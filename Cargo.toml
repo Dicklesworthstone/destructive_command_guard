@@ -44,8 +44,13 @@ colored = "2.1"
 dirs = "5.0"
 glob = "0.3"                # Glob pattern expansion for custom pack paths
 clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = "4.5"
 once_cell = "1.19"
 base64 = "0.22"              # For decision log format parsing in simulate
+async-trait = "0.1.89"
+rust-mcp-sdk = { version = "0.8.1", default-features = false, features = ["server", "stdio", "macros"] }
+tokio = { version = "1.49", features = ["rt-multi-thread"] }
+rayon = { version = "1.11", optional = true }
 
 # AST-based pattern matching for heredoc/inline-script content
 ast-grep-core = "0.40"
@@ -69,11 +74,16 @@ rusqlite = { version = "0.35", features = ["bundled"] }  # Telemetry database
 ctrlc = "3.5.1"
 flate2 = "1.0"  # Gzip compression for history export
 
+# Update checking dependencies
+self_update = { version = "0.42", features = ["archive-tar", "archive-zip", "compression-flate2"] }
+semver = "1.0"  # Semantic version comparison for update checks
+
 # TUI/CLI visual polish dependencies (advk epic)
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 comfy-table = "7.2"
 indicatif = "0.17"
 console = "0.15"
+inquire = "0.7"
 
 [build-dependencies]
 vergen-gix = { version = "1.0", features = ["build", "cargo", "rustc"] }
@@ -104,6 +114,9 @@ strip = true        # Remove debug symbols
 
 [profile.dev]
 opt-level = 1       # Faster compile times during development
+
+[features]
+rayon = ["dep:rayon"]
 
 [lints.rust]
 # unsafe_code = "forbid" # Moved to src/lib.rs and src/main.rs to allow unsafe in tests
