@@ -201,7 +201,7 @@ pub fn create_backup() -> Result<PathBuf, VersionCheckError> {
     Ok(backup_path)
 }
 
-/// Prune old backups, keeping only the most recent MAX_BACKUPS.
+/// Prune old backups, keeping only the most recent `MAX_BACKUPS`.
 fn prune_old_backups() -> Result<(), VersionCheckError> {
     let backups = list_backups()?;
 
@@ -343,17 +343,20 @@ pub fn format_backup_list(backups: &[BackupEntry], use_color: bool) -> String {
 
     if use_color {
         writeln!(output, "\x1b[1mAvailable backup versions:\x1b[0m").ok();
-        writeln!(output).ok();
     } else {
         writeln!(output, "Available backup versions:").ok();
-        writeln!(output).ok();
     }
+    writeln!(output).ok();
 
     for (i, backup) in backups.iter().enumerate() {
         // Format timestamp as human-readable date
-        let datetime = chrono::DateTime::from_timestamp(backup.created_at as i64, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-            .unwrap_or_else(|| backup.created_at.to_string());
+        let datetime = i64::try_from(backup.created_at)
+            .ok()
+            .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+            .map_or_else(
+                || backup.created_at.to_string(),
+                |dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+            );
 
         let marker = if i == 0 { " (most recent)" } else { "" };
 
@@ -365,12 +368,17 @@ pub fn format_backup_list(backups: &[BackupEntry], use_color: bool) -> String {
             )
             .ok();
         } else {
-            writeln!(output, "  v{}{} - backed up {}", backup.version, marker, datetime).ok();
+            writeln!(
+                output,
+                "  v{}{} - backed up {}",
+                backup.version, marker, datetime
+            )
+            .ok();
         }
     }
 
+    writeln!(output).ok();
     if use_color {
-        writeln!(output).ok();
         writeln!(
             output,
             "Use '\x1b[1mdcg update --rollback\x1b[0m' to restore the most recent backup"
@@ -382,8 +390,11 @@ pub fn format_backup_list(backups: &[BackupEntry], use_color: bool) -> String {
         )
         .ok();
     } else {
-        writeln!(output).ok();
-        writeln!(output, "Use 'dcg update --rollback' to restore the most recent backup").ok();
+        writeln!(
+            output,
+            "Use 'dcg update --rollback' to restore the most recent backup"
+        )
+        .ok();
         writeln!(
             output,
             "Use 'dcg update --rollback <version>' to restore a specific version"
@@ -682,7 +693,7 @@ pub fn get_update_notice(use_color: bool) -> Option<String> {
 
 /// Check if update checking is enabled via environment variable.
 ///
-/// Returns `false` if DCG_NO_UPDATE_CHECK is set to any non-empty value
+/// Returns `false` if `DCG_NO_UPDATE_CHECK` is set to any non-empty value
 /// (e.g., "1", "true", "yes").
 #[must_use]
 pub fn is_update_check_enabled() -> bool {
@@ -693,7 +704,7 @@ fn is_update_check_enabled_with<F>(mut get_env: F) -> bool
 where
     F: FnMut(&str) -> Option<String>,
 {
-    get_env("DCG_NO_UPDATE_CHECK").map_or(true, |v| v.is_empty())
+    get_env("DCG_NO_UPDATE_CHECK").is_none_or(|v| v.is_empty())
 }
 
 #[cfg(test)]
@@ -791,7 +802,7 @@ mod tests {
     fn test_backup_entry_serialization() {
         let entry = BackupEntry {
             version: "0.2.12".to_string(),
-            created_at: 1737200000,
+            created_at: 1_737_200_000,
             original_path: std::path::PathBuf::from("/usr/local/bin/dcg"),
         };
 
@@ -814,12 +825,12 @@ mod tests {
         let entries = vec![
             BackupEntry {
                 version: "0.2.12".to_string(),
-                created_at: 1737200000,
+                created_at: 1_737_200_000,
                 original_path: std::path::PathBuf::from("/usr/local/bin/dcg"),
             },
             BackupEntry {
                 version: "0.2.11".to_string(),
-                created_at: 1737100000,
+                created_at: 1_737_100_000,
                 original_path: std::path::PathBuf::from("/usr/local/bin/dcg"),
             },
         ];
@@ -848,5 +859,317 @@ mod tests {
         let result = list_backups();
         // Should not error, just return empty or existing backups
         assert!(result.is_ok());
+    }
+
+    // =========================================================================
+    // Version Comparison Tests
+    // =========================================================================
+
+    #[test]
+    fn test_version_comparison_newer_available() {
+        // Test semver comparison: 2.0.0 > 1.9.0
+        let current = semver::Version::parse("1.9.0").unwrap();
+        let latest = semver::Version::parse("2.0.0").unwrap();
+
+        assert!(latest > current, "2.0.0 should be newer than 1.9.0");
+    }
+
+    #[test]
+    fn test_version_comparison_already_current() {
+        // Test semver comparison when versions are equal
+        let current = semver::Version::parse("2.0.0").unwrap();
+        let latest = semver::Version::parse("2.0.0").unwrap();
+
+        assert!(!(latest > current), "Same version should not need update");
+    }
+
+    #[test]
+    fn test_version_comparison_patch_update() {
+        // Test patch version increment (1.9.0 -> 1.9.1)
+        let current = semver::Version::parse("1.9.0").unwrap();
+        let latest = semver::Version::parse("1.9.1").unwrap();
+
+        assert!(latest > current, "1.9.1 should be newer than 1.9.0");
+    }
+
+    #[test]
+    fn test_version_comparison_minor_update() {
+        // Test minor version increment (1.9.0 -> 1.10.0)
+        let current = semver::Version::parse("1.9.0").unwrap();
+        let latest = semver::Version::parse("1.10.0").unwrap();
+
+        assert!(latest > current, "1.10.0 should be newer than 1.9.0");
+    }
+
+    #[test]
+    fn test_version_comparison_major_update() {
+        // Test major version increment (1.9.0 -> 2.0.0)
+        let current = semver::Version::parse("1.9.0").unwrap();
+        let latest = semver::Version::parse("2.0.0").unwrap();
+
+        assert!(latest > current, "2.0.0 should be newer than 1.9.0");
+    }
+
+    #[test]
+    fn test_version_comparison_prerelease_vs_stable() {
+        // Prereleases are less than their release (2.0.0-beta.1 < 2.0.0)
+        let prerelease = semver::Version::parse("2.0.0-beta.1").unwrap();
+        let stable = semver::Version::parse("2.0.0").unwrap();
+
+        assert!(
+            stable > prerelease,
+            "Stable 2.0.0 should be greater than 2.0.0-beta.1"
+        );
+    }
+
+    #[test]
+    fn test_version_comparison_prerelease_ordering() {
+        // Test prerelease ordering: alpha < beta < rc
+        let alpha = semver::Version::parse("2.0.0-alpha.1").unwrap();
+        let beta = semver::Version::parse("2.0.0-beta.1").unwrap();
+        let rc = semver::Version::parse("2.0.0-rc.1").unwrap();
+
+        assert!(beta > alpha, "beta should be greater than alpha");
+        assert!(rc > beta, "rc should be greater than beta");
+    }
+
+    #[test]
+    fn test_version_comparison_with_v_prefix() {
+        // Test that 'v' prefix is properly stripped
+        let version_str = "v1.2.3";
+        let clean = version_str.trim_start_matches('v');
+        let parsed = semver::Version::parse(clean).unwrap();
+
+        assert_eq!(parsed.major, 1);
+        assert_eq!(parsed.minor, 2);
+        assert_eq!(parsed.patch, 3);
+    }
+
+    #[test]
+    fn test_version_comparison_downgrade_detection() {
+        // Test that downgrade is detected (latest < current)
+        let current = semver::Version::parse("2.0.0").unwrap();
+        let latest = semver::Version::parse("1.9.0").unwrap();
+
+        assert!(
+            !(latest > current),
+            "1.9.0 should not trigger update when current is 2.0.0"
+        );
+    }
+
+    // =========================================================================
+    // Error Handling Tests
+    // =========================================================================
+
+    #[test]
+    fn test_version_check_error_display_network() {
+        let err = VersionCheckError::NetworkError("Connection refused".to_string());
+        let display = format!("{err}");
+        assert!(display.contains("Network error"));
+        assert!(display.contains("Connection refused"));
+    }
+
+    #[test]
+    fn test_version_check_error_display_parse() {
+        let err = VersionCheckError::ParseError("Invalid JSON".to_string());
+        let display = format!("{err}");
+        assert!(display.contains("Parse error"));
+        assert!(display.contains("Invalid JSON"));
+    }
+
+    #[test]
+    fn test_version_check_error_display_cache() {
+        let err = VersionCheckError::CacheError("Permission denied".to_string());
+        let display = format!("{err}");
+        assert!(display.contains("Cache error"));
+        assert!(display.contains("Permission denied"));
+    }
+
+    #[test]
+    fn test_version_check_error_display_update() {
+        let err = VersionCheckError::UpdateError("Download failed".to_string());
+        let display = format!("{err}");
+        assert!(display.contains("Update error"));
+        assert!(display.contains("Download failed"));
+    }
+
+    #[test]
+    fn test_version_check_error_display_backup() {
+        let err = VersionCheckError::BackupError("Disk full".to_string());
+        let display = format!("{err}");
+        assert!(display.contains("Backup error"));
+        assert!(display.contains("Disk full"));
+    }
+
+    #[test]
+    fn test_version_check_error_display_no_update() {
+        let err = VersionCheckError::NoUpdateAvailable;
+        let display = format!("{err}");
+        assert!(display.contains("No update available"));
+    }
+
+    // =========================================================================
+    // Update Notice Tests
+    // =========================================================================
+
+    #[test]
+    fn test_format_check_result_with_release_notes() {
+        let result = VersionCheckResult {
+            current_version: "1.0.0".to_string(),
+            latest_version: "2.0.0".to_string(),
+            update_available: true,
+            release_url: "https://example.com".to_string(),
+            release_notes: Some("Bug fixes and improvements".to_string()),
+            checked_at: "2026-01-17T00:00:00Z".to_string(),
+        };
+
+        // The format function should not crash with release notes
+        let output = format_check_result(&result, false);
+        assert!(output.contains("2.0.0"));
+    }
+
+    #[test]
+    fn test_format_check_result_json_output() {
+        let result = VersionCheckResult {
+            current_version: "1.0.0".to_string(),
+            latest_version: "2.0.0".to_string(),
+            update_available: true,
+            release_url: "https://example.com".to_string(),
+            release_notes: None,
+            checked_at: "2026-01-17T00:00:00Z".to_string(),
+        };
+
+        let json = format_check_result_json(&result).unwrap();
+        assert!(json.contains("\"current_version\""));
+        assert!(json.contains("\"latest_version\""));
+        assert!(json.contains("\"update_available\""));
+    }
+
+    #[test]
+    fn test_format_check_result_with_color() {
+        let result = VersionCheckResult {
+            current_version: "1.0.0".to_string(),
+            latest_version: "2.0.0".to_string(),
+            update_available: true,
+            release_url: "https://example.com".to_string(),
+            release_notes: None,
+            checked_at: "2026-01-17T00:00:00Z".to_string(),
+        };
+
+        let output = format_check_result(&result, true);
+        // Should contain ANSI escape codes for color
+        assert!(output.contains("\x1b["));
+    }
+
+    #[test]
+    fn test_format_check_result_no_color() {
+        let result = VersionCheckResult {
+            current_version: "1.0.0".to_string(),
+            latest_version: "2.0.0".to_string(),
+            update_available: true,
+            release_url: "https://example.com".to_string(),
+            release_notes: None,
+            checked_at: "2026-01-17T00:00:00Z".to_string(),
+        };
+
+        let output = format_check_result(&result, false);
+        // Should NOT contain ANSI escape codes
+        assert!(!output.contains("\x1b["));
+    }
+
+    // =========================================================================
+    // Backup List Tests
+    // =========================================================================
+
+    #[test]
+    fn test_backup_list_sorting_by_date() {
+        // Test that backups are sorted newest first
+        let mut entries = vec![
+            BackupEntry {
+                version: "0.2.10".to_string(),
+                created_at: 1_737_000_000, // oldest
+                original_path: std::path::PathBuf::from("/usr/local/bin/dcg"),
+            },
+            BackupEntry {
+                version: "0.2.12".to_string(),
+                created_at: 1_737_200_000, // newest
+                original_path: std::path::PathBuf::from("/usr/local/bin/dcg"),
+            },
+            BackupEntry {
+                version: "0.2.11".to_string(),
+                created_at: 1_737_100_000, // middle
+                original_path: std::path::PathBuf::from("/usr/local/bin/dcg"),
+            },
+        ];
+
+        // Sort as list_backups does
+        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        assert_eq!(entries[0].version, "0.2.12");
+        assert_eq!(entries[1].version, "0.2.11");
+        assert_eq!(entries[2].version, "0.2.10");
+    }
+
+    #[test]
+    fn test_format_backup_list_with_color() {
+        let entries = vec![BackupEntry {
+            version: "0.2.12".to_string(),
+            created_at: 1_737_200_000,
+            original_path: std::path::PathBuf::from("/usr/local/bin/dcg"),
+        }];
+
+        let output = format_backup_list(&entries, true);
+        // Should contain ANSI escape codes
+        assert!(output.contains("\x1b["));
+        assert!(output.contains("v0.2.12"));
+    }
+
+    #[test]
+    fn test_format_backup_list_empty_with_color() {
+        let output = format_backup_list(&[], true);
+        // Should contain ANSI escape codes for colored message
+        assert!(output.contains("\x1b["));
+        assert!(output.contains("No backup versions available"));
+    }
+
+    // =========================================================================
+    // Cache Duration Tests
+    // =========================================================================
+
+    #[test]
+    fn test_cache_duration_is_24_hours() {
+        assert_eq!(CACHE_DURATION.as_secs(), 24 * 60 * 60);
+    }
+
+    #[test]
+    fn test_max_backups_limit() {
+        assert_eq!(MAX_BACKUPS, 3);
+    }
+
+    // =========================================================================
+    // Environment Variable Tests
+    // =========================================================================
+
+    #[test]
+    fn test_is_update_check_enabled_empty_value() {
+        // Empty string should NOT disable update check
+        let env_map: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::from([("DCG_NO_UPDATE_CHECK", "")]);
+        assert!(is_update_check_enabled_with(|key| {
+            env_map.get(key).map(|v| (*v).to_string())
+        }));
+    }
+
+    #[test]
+    fn test_is_update_check_disabled_various_values() {
+        // Any non-empty value should disable update check
+        for val in &["1", "true", "yes", "anything"] {
+            let env_map: std::collections::HashMap<&str, &str> =
+                std::collections::HashMap::from([("DCG_NO_UPDATE_CHECK", *val)]);
+            assert!(
+                !is_update_check_enabled_with(|key| { env_map.get(key).map(|v| (*v).to_string()) }),
+                "DCG_NO_UPDATE_CHECK={val} should disable update check"
+            );
+        }
     }
 }

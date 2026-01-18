@@ -752,7 +752,7 @@ pub struct GeneralConfig {
     /// Whether to check for updates in the background.
     /// When enabled, dcg will spawn a background thread to check for updates
     /// and show a notice if a newer version is available.
-    /// Default: true. Disable with DCG_NO_UPDATE_CHECK=1 or check_updates = false.
+    /// Default: true. Disable with `DCG_NO_UPDATE_CHECK=1` or `check_updates` = false.
     pub check_updates: bool,
 }
 

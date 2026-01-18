@@ -1498,15 +1498,15 @@ fn maybe_show_update_notice(cli: &Cli, config: &Config, verbosity: Verbosity) {
         return;
     }
 
-    match cli.command {
-        Some(Command::Update(_))
-        | Some(Command::Hook(_))
-        | Some(Command::Completions { .. })
-        | Some(Command::McpServer) => {
-            // Skip update notices for update/hook/completion/server flows.
-            return;
-        }
-        _ => {}
+    if let Some(
+        Command::Update(_)
+        | Command::Hook(_)
+        | Command::Completions { .. }
+        | Command::McpServer,
+    ) = cli.command
+    {
+        // Skip update notices for update/hook/completion/server flows.
+        return;
     }
 
     let stderr_is_tty = std::io::stderr().is_terminal();
@@ -4772,6 +4772,7 @@ fn handle_stats_rules(
 }
 
 /// Format rule metrics as a pretty table.
+#[allow(clippy::too_many_lines)]
 fn format_rule_metrics_pretty(metrics: &[crate::history::RuleMetrics], period_days: u64) -> String {
     use std::fmt::Write;
 

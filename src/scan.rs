@@ -4650,7 +4650,7 @@ job1:
 
     #[test]
     fn gitlab_ci_extractor_ignores_rules_only_except() {
-        let content = r#"rules:
+        let content = r"rules:
   - rm -rf / should not match
 only:
   - rm -rf / should not match
@@ -4659,7 +4659,7 @@ except:
 build:
   script:
     - echo safe
-"#;
+";
         let extracted = extract_gitlab_ci_from_str(".gitlab-ci.yml", content, &["rm", "echo"]);
         assert_eq!(
             extracted.len(),
@@ -4689,13 +4689,13 @@ build:
 
     #[test]
     fn gitlab_ci_extractor_line_numbers_accurate() {
-        let content = r#"# comment
+        let content = r"# comment
 # another comment
 build:
   script:
     - echo line5
     - echo line6
-"#;
+";
         let extracted = extract_gitlab_ci_from_str(".gitlab-ci.yml", content, &["echo"]);
         assert_eq!(extracted.len(), 2, "Expected 2 commands: {extracted:?}");
         assert_eq!(extracted[0].line, 5, "First echo should be on line 5");
@@ -4721,7 +4721,7 @@ build:
 
     #[test]
     fn gitlab_ci_extractor_multiple_jobs() {
-        let content = r#"build:
+        let content = r"build:
   script:
     - npm run build
 test:
@@ -4730,7 +4730,7 @@ test:
 deploy:
   script:
     - rm -rf old && deploy.sh
-"#;
+";
         let extracted =
             extract_gitlab_ci_from_str(".gitlab-ci.yml", content, &["npm", "rm", "deploy"]);
         assert_eq!(
@@ -4745,12 +4745,12 @@ deploy:
 
     #[test]
     fn gitlab_ci_empty_script_ignored() {
-        let content = r#"build:
+        let content = r"build:
   script:
 test:
   script:
     - echo real
-"#;
+";
         let extracted = extract_gitlab_ci_from_str(".gitlab-ci.yml", content, &["echo"]);
         assert_eq!(
             extracted.len(),
@@ -4763,9 +4763,9 @@ test:
     #[test]
     fn gitlab_ci_extractor_inline_script() {
         // Single-line script value
-        let content = r#"build:
+        let content = r"build:
   script: rm -rf ./build && npm run build
-"#;
+";
         let extracted = extract_gitlab_ci_from_str(".gitlab-ci.yml", content, &["rm", "npm"]);
         // This is a single command line that will be extracted
         assert!(

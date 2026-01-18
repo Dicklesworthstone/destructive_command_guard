@@ -2476,7 +2476,7 @@ impl HistoryDb {
 
     /// Calculate trend by comparing recent vs previous period.
     ///
-    /// Returns (trend, previous_period_hits, change_percentage, is_anomaly).
+    /// Returns (trend, `previous_period_hits`, `change_percentage`, `is_anomaly`).
     fn calculate_rule_trend(&self, rule_id: &str, total_hits: u64) -> (RuleTrend, u64, f64, bool) {
         if total_hits < RuleMetrics::MIN_HITS_FOR_TREND {
             return (RuleTrend::Stable, 0, 0.0, false);
@@ -4648,7 +4648,7 @@ mod tests {
     // Rule Metrics Unit Tests (1dri.3)
     // ============================================================================
 
-    /// Helper to insert a command with a specific rule_id and outcome.
+    /// Helper to insert a command with a specific `rule_id` and outcome.
     fn insert_rule_entry(
         db: &HistoryDb,
         rule_id: &str,
@@ -5192,7 +5192,7 @@ mod tests {
                 pack_id: Some("core.git".to_string()),
                 pattern_name: Some("reset-hard".to_string()),
                 rule_id: Some("core.git:reset-hard".to_string()),
-                timestamp: now - chrono::Duration::days(10) + chrono::Duration::hours(i as i64),
+                timestamp: now - chrono::Duration::days(10) + chrono::Duration::hours(i64::from(i)),
                 ..Default::default()
             };
             db.log_command(&entry).unwrap();
@@ -5208,7 +5208,7 @@ mod tests {
                 pack_id: Some("core.git".to_string()),
                 pattern_name: Some("reset-hard".to_string()),
                 rule_id: Some("core.git:reset-hard".to_string()),
-                timestamp: now - chrono::Duration::days(3) + chrono::Duration::hours(i as i64),
+                timestamp: now - chrono::Duration::days(3) + chrono::Duration::hours(i64::from(i)),
                 ..Default::default()
             };
             db.log_command(&entry).unwrap();
@@ -5240,7 +5240,7 @@ mod tests {
                 pack_id: Some("core.git".to_string()),
                 pattern_name: Some("reset-hard".to_string()),
                 rule_id: Some("core.git:reset-hard".to_string()),
-                timestamp: now - chrono::Duration::days(10) + chrono::Duration::hours(i as i64),
+                timestamp: now - chrono::Duration::days(10) + chrono::Duration::hours(i64::from(i)),
                 ..Default::default()
             };
             db.log_command(&entry).unwrap();
@@ -5256,7 +5256,7 @@ mod tests {
                 pack_id: Some("core.git".to_string()),
                 pattern_name: Some("reset-hard".to_string()),
                 rule_id: Some("core.git:reset-hard".to_string()),
-                timestamp: now - chrono::Duration::days(3) + chrono::Duration::hours(i as i64),
+                timestamp: now - chrono::Duration::days(3) + chrono::Duration::hours(i64::from(i)),
                 ..Default::default()
             };
             db.log_command(&entry).unwrap();
@@ -5287,7 +5287,7 @@ mod tests {
                 pack_id: Some("core.git".to_string()),
                 pattern_name: Some("reset-hard".to_string()),
                 rule_id: Some("core.git:reset-hard".to_string()),
-                timestamp: now - chrono::Duration::hours(i as i64),
+                timestamp: now - chrono::Duration::hours(i64::try_from(i).unwrap_or(i64::MAX)),
                 ..Default::default()
             };
             db.log_command(&entry).unwrap();
@@ -5324,7 +5324,7 @@ mod tests {
                 pack_id: Some("core.git".to_string()),
                 pattern_name: Some("clean-force".to_string()),
                 rule_id: Some("core.git:clean-force".to_string()),
-                timestamp: now - chrono::Duration::hours(i as i64),
+                timestamp: now - chrono::Duration::hours(i64::from(i)),
                 ..Default::default()
             };
             db.log_command(&entry).unwrap();
