@@ -133,6 +133,8 @@ pub struct TestCommand {
     pub pack_id: Option<&'static str>,
     /// Optional pattern name that matched.
     pub pattern_name: Option<&'static str>,
+    /// Optional rule ID (format: `pack_id:pattern_name`).
+    pub rule_id: Option<&'static str>,
     /// Evaluation duration in microseconds.
     pub eval_duration_us: u64,
 }
@@ -147,6 +149,7 @@ impl Default for TestCommand {
             timestamp_offset_secs: 0,
             pack_id: None,
             pattern_name: None,
+            rule_id: None,
             eval_duration_us: 100,
         }
     }
@@ -170,6 +173,7 @@ impl TestCommand {
             outcome: self.outcome,
             pack_id: self.pack_id.map(ToString::to_string),
             pattern_name: self.pattern_name.map(ToString::to_string),
+            rule_id: self.rule_id.map(ToString::to_string),
             eval_duration_us: self.eval_duration_us,
             ..Default::default()
         }

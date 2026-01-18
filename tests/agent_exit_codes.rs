@@ -9,11 +9,11 @@
 //! - Exit 0 for DENIED commands (JSON in stdout with permissionDecision="deny")
 //! - Exit 2 for errors that should block the agent from proceeding
 
-use std::process::{Command, Stdio};
 use std::io::Write;
+use std::process::{Command, Stdio};
 
 /// Path to the dcg binary.
-fn dcg_binary() -> &'static str {
+const fn dcg_binary() -> &'static str {
     "./target/release/dcg"
 }
 
@@ -28,7 +28,9 @@ fn run_hook_mode_raw(input: &str) -> (String, String, i32) {
 
     {
         let stdin = child.stdin.as_mut().expect("failed to get stdin");
-        stdin.write_all(input.as_bytes()).expect("failed to write to stdin");
+        stdin
+            .write_all(input.as_bytes())
+            .expect("failed to write to stdin");
     }
 
     let output = child.wait_with_output().expect("failed to wait for dcg");
@@ -73,7 +75,10 @@ fn test_exit_0_on_allow_git_status() {
     let (stdout, _stderr, exit_code) = run_hook_mode_raw(&input);
 
     assert_eq!(exit_code, 0, "git status should exit 0");
-    assert!(stdout.trim().is_empty(), "git status should produce no stdout");
+    assert!(
+        stdout.trim().is_empty(),
+        "git status should produce no stdout"
+    );
 }
 
 #[test]
@@ -89,10 +94,13 @@ fn test_exit_0_on_deny_with_json() {
     );
 
     // Verify stdout contains deny decision
-    assert!(!stdout.is_empty(), "denied command should produce JSON stdout");
+    assert!(
+        !stdout.is_empty(),
+        "denied command should produce JSON stdout"
+    );
 
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("stdout should be valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout should be valid JSON");
 
     assert_eq!(
         json["hookSpecificOutput"]["permissionDecision"], "deny",
@@ -108,8 +116,8 @@ fn test_exit_0_on_deny_rm_rf() {
     assert_eq!(exit_code, 0, "rm -rf denial should exit 0");
     assert!(!stdout.is_empty(), "denied rm -rf should produce JSON");
 
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("stdout should be valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout should be valid JSON");
 
     assert_eq!(
         json["hookSpecificOutput"]["permissionDecision"], "deny",
@@ -125,8 +133,8 @@ fn test_exit_0_on_deny_force_push() {
     assert_eq!(exit_code, 0, "force push denial should exit 0");
 
     if !stdout.is_empty() {
-        let json: serde_json::Value = serde_json::from_str(&stdout)
-            .expect("stdout should be valid JSON");
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout).expect("stdout should be valid JSON");
 
         assert_eq!(
             json["hookSpecificOutput"]["permissionDecision"], "deny",
@@ -154,11 +162,15 @@ fn test_exit_0_for_non_bash_tool() {
 
 #[test]
 fn test_exit_0_for_write_tool() {
-    let input = r#"{"tool_name":"Write","tool_input":{"file_path":"/tmp/test.txt","content":"hello"}}"#;
+    let input =
+        r#"{"tool_name":"Write","tool_input":{"file_path":"/tmp/test.txt","content":"hello"}}"#;
     let (stdout, _stderr, exit_code) = run_hook_mode_raw(input);
 
     assert_eq!(exit_code, 0, "Write tool should exit 0 (skip)");
-    assert!(stdout.trim().is_empty(), "Write tool should produce no output");
+    assert!(
+        stdout.trim().is_empty(),
+        "Write tool should produce no output"
+    );
 }
 
 // =============================================================================
@@ -175,8 +187,11 @@ fn test_exit_nonzero_on_invalid_json() {
     if exit_code != 0 {
         // Error exit is expected for malformed input
         assert!(
-            stderr.contains("error") || stderr.contains("Error") || stderr.contains("JSON") ||
-            stderr.contains("parse") || stderr.contains("invalid"),
+            stderr.contains("error")
+                || stderr.contains("Error")
+                || stderr.contains("JSON")
+                || stderr.contains("parse")
+                || stderr.contains("invalid"),
             "stderr should explain the error\nstderr: {stderr}"
         );
     }
@@ -251,7 +266,10 @@ fn test_test_command_deny_exit_0() {
         .expect("failed to run dcg test");
 
     // Even denied commands exit 0 (decision in output, not exit code)
-    assert!(output.status.success(), "dcg test <dangerous> should exit 0");
+    assert!(
+        output.status.success(),
+        "dcg test <dangerous> should exit 0"
+    );
 }
 
 #[test]

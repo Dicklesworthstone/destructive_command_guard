@@ -99,6 +99,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
@@ -111,6 +112,18 @@ jobs:
 
       - name: List artifacts
         run: ls -laR dist
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.0.0
+
+      - name: Sign release artifacts (sigstore bundle)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd dist
+          for f in dcg-*.tar.xz dcg-*.zip; do
+            cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
+          done
 
       - name: Copy install scripts to dist
         run: |

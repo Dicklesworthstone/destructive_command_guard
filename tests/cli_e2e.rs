@@ -1,3 +1,4 @@
+#![allow(clippy::needless_raw_string_hashes)]
 //! End-to-end tests for CLI flows: explain, scan, simulate.
 //!
 //! These tests verify that CLI subcommands produce structurally valid output
@@ -1192,6 +1193,24 @@ mod test_command_tests {
 mod config_tests {
     use super::*;
 
+    fn setup_doctor_env(
+        temp: &tempfile::TempDir,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let home_dir = temp.path().join("home");
+        let xdg_config_dir = temp.path().join("xdg_config");
+        let bin_dir = temp.path().join("bin");
+
+        std::fs::create_dir_all(&home_dir).expect("HOME dir");
+        std::fs::create_dir_all(&xdg_config_dir).expect("XDG_CONFIG_HOME dir");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        std::fs::create_dir_all(temp.path().join(".git")).expect(".git dir");
+
+        let dcg_stub = bin_dir.join("dcg");
+        std::fs::write(&dcg_stub, b"").expect("write dcg stub");
+
+        (home_dir, xdg_config_dir, bin_dir)
+    }
+
     #[test]
     fn config_show_produces_output() {
         let output = run_dcg(&["config"]);
@@ -1270,6 +1289,136 @@ mod config_tests {
         assert!(
             combined.contains("DCG_CONFIG points to a missing file"),
             "expected doctor to surface missing DCG_CONFIG\noutput:\n{combined}"
+        );
+    }
+
+    #[test]
+    fn doctor_pretty_output_basics() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, bin_dir) = setup_doctor_env(&temp);
+
+        let output = Command::new(dcg_binary())
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("PATH", &bin_dir)
+            .env("NO_COLOR", "1")
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .current_dir(temp.path())
+            .arg("doctor")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run dcg doctor");
+
+        assert!(output.status.success(), "dcg doctor should succeed");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            combined.contains("dcg doctor"),
+            "expected header in doctor output\noutput:\n{combined}"
+        );
+        assert!(
+            combined.contains("Checking configuration... USING DEFAULTS"),
+            "expected defaults notice\noutput:\n{combined}"
+        );
+        assert!(
+            combined.contains("Checking allowlist entries... NONE"),
+            "expected allowlist none notice\noutput:\n{combined}"
+        );
+    }
+
+    #[test]
+    fn doctor_fix_installs_hook_and_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, bin_dir) = setup_doctor_env(&temp);
+
+        let claude_dir = home_dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("claude dir");
+        let settings_path = claude_dir.join("settings.json");
+        std::fs::write(&settings_path, "{}").expect("write settings");
+
+        let output = Command::new(dcg_binary())
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("PATH", &bin_dir)
+            .env("NO_COLOR", "1")
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .current_dir(temp.path())
+            .args(["doctor", "--fix"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run dcg doctor --fix");
+
+        assert!(output.status.success(), "dcg doctor --fix should succeed");
+
+        let settings = std::fs::read_to_string(&settings_path).expect("read settings");
+        let settings_json: serde_json::Value =
+            serde_json::from_str(&settings).expect("parse settings");
+        let hooks = settings_json
+            .get("hooks")
+            .and_then(|h| h.get("PreToolUse"))
+            .and_then(|arr| arr.as_array())
+            .expect("PreToolUse array");
+        let has_dcg = hooks.iter().any(|entry| {
+            entry.get("matcher").and_then(|m| m.as_str()) == Some("Bash")
+                && entry
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .is_some_and(|hooks| {
+                        hooks.iter().any(|hook| {
+                            hook.get("command")
+                                .and_then(|c| c.as_str())
+                                .is_some_and(|c| c == "dcg")
+                        })
+                    })
+        });
+        assert!(has_dcg, "expected dcg hook to be installed");
+
+        let config_path = xdg_config_dir.join("dcg").join("config.toml");
+        let config_contents = std::fs::read_to_string(&config_path).expect("read config.toml");
+        assert!(
+            !config_contents.trim().is_empty(),
+            "expected config.toml to be created"
+        );
+    }
+
+    #[test]
+    fn doctor_json_output_is_valid() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, bin_dir) = setup_doctor_env(&temp);
+
+        let output = Command::new(dcg_binary())
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("PATH", &bin_dir)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .current_dir(temp.path())
+            .args(["doctor", "--format", "json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run dcg doctor --format json");
+
+        assert!(
+            output.status.success(),
+            "dcg doctor --format json should succeed"
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).expect("doctor JSON output should parse");
+        assert_eq!(parsed["schema_version"], 1);
+        let checks = parsed["checks"].as_array().expect("checks array");
+        assert!(
+            checks.iter().any(|c| c["id"] == "binary_path"),
+            "expected binary_path check in JSON output"
         );
     }
 }
@@ -3073,7 +3222,13 @@ destructive_patterns:
     pattern: test
 "#;
         let (_temp, path) = create_temp_pack(content);
-        let output = run_dcg(&["pack", "validate", path.to_str().unwrap(), "--format", "json"]);
+        let output = run_dcg(&[
+            "pack",
+            "validate",
+            path.to_str().unwrap(),
+            "--format",
+            "json",
+        ]);
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
@@ -3356,5 +3511,476 @@ safe_patterns:
             json["hookSpecificOutput"]["permissionDecision"], "allow",
             "safe pattern should allow staging deploy\nstdout:\n{stdout}"
         );
+    }
+}
+
+// ============================================================================
+// Stats --rules E2E Tests (git_safety_guard-1dri.4)
+// ============================================================================
+//
+// These tests validate the `dcg stats --rules` subcommand with known fixture
+// data, testing both pretty and JSON output formats.
+
+mod stats_rules_tests {
+    use super::*;
+    use chrono::Utc;
+    use destructive_command_guard::history::{CommandEntry, HistoryDb, Outcome};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// Test environment for stats --rules tests.
+    struct StatsRulesEnv {
+        temp: TempDir,
+        db_path: PathBuf,
+    }
+
+    impl StatsRulesEnv {
+        fn new() -> Self {
+            let temp = TempDir::new().expect("failed to create temp dir");
+            let db_path = temp.path().join("test_history.db");
+            Self { temp, db_path }
+        }
+
+        fn seed_rule_metrics_data(&self) {
+            let db = HistoryDb::open(Some(self.db_path.clone())).expect("open db");
+            let now = Utc::now();
+
+            // core.git:reset-hard - 5 hits (3 deny, 2 bypass)
+            let reset_entries = vec![
+                ("git reset --hard HEAD~1", Outcome::Deny, -7200),
+                ("git reset --hard HEAD~2", Outcome::Deny, -6000),
+                ("git reset --hard origin/main", Outcome::Deny, -4800),
+                ("git reset --hard HEAD", Outcome::Bypass, -3600),
+                ("git reset --hard abc123", Outcome::Bypass, -2400),
+            ];
+            for (cmd, outcome, offset) in reset_entries {
+                let entry = CommandEntry {
+                    timestamp: now + chrono::Duration::seconds(offset),
+                    agent_type: "claude_code".to_string(),
+                    working_dir: "/test".to_string(),
+                    command: cmd.to_string(),
+                    outcome,
+                    pack_id: Some("core.git".to_string()),
+                    pattern_name: Some("reset-hard".to_string()),
+                    rule_id: Some("core.git:reset-hard".to_string()),
+                    ..Default::default()
+                };
+                db.log_command(&entry).expect("insert entry");
+            }
+
+            // core.git:force-push - 3 hits (2 deny, 1 bypass)
+            let push_entries = vec![
+                ("git push --force origin main", Outcome::Deny, -7000),
+                (
+                    "git push --force-with-lease origin dev",
+                    Outcome::Deny,
+                    -5000,
+                ),
+                ("git push --force origin feature", Outcome::Bypass, -3000),
+            ];
+            for (cmd, outcome, offset) in push_entries {
+                let entry = CommandEntry {
+                    timestamp: now + chrono::Duration::seconds(offset),
+                    agent_type: "claude_code".to_string(),
+                    working_dir: "/test".to_string(),
+                    command: cmd.to_string(),
+                    outcome,
+                    pack_id: Some("core.git".to_string()),
+                    pattern_name: Some("force-push".to_string()),
+                    rule_id: Some("core.git:force-push".to_string()),
+                    ..Default::default()
+                };
+                db.log_command(&entry).expect("insert entry");
+            }
+
+            // core.filesystem:rm-rf - 4 hits (4 deny, 0 bypass)
+            let rm_entries = vec![
+                ("rm -rf /tmp/test", -8000),
+                ("rm -rf ./build", -6500),
+                ("rm -rf node_modules", -5500),
+                ("rm -rf dist", -4000),
+            ];
+            for (cmd, offset) in rm_entries {
+                let entry = CommandEntry {
+                    timestamp: now + chrono::Duration::seconds(offset),
+                    agent_type: "claude_code".to_string(),
+                    working_dir: "/test".to_string(),
+                    command: cmd.to_string(),
+                    outcome: Outcome::Deny,
+                    pack_id: Some("core.filesystem".to_string()),
+                    pattern_name: Some("rm-rf".to_string()),
+                    rule_id: Some("core.filesystem:rm-rf".to_string()),
+                    ..Default::default()
+                };
+                db.log_command(&entry).expect("insert entry");
+            }
+        }
+
+        fn run(&self, args: &[&str]) -> std::process::Output {
+            Command::new(dcg_binary())
+                .env("DCG_HISTORY_DB", &self.db_path)
+                .current_dir(self.temp.path())
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("run dcg")
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Pretty output tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn stats_rules_pretty_shows_header() {
+        let env = StatsRulesEnv::new();
+        env.seed_rule_metrics_data();
+
+        let output = env.run(&["stats", "--rules"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "stats --rules should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("Rule Metrics"),
+            "should show Rule Metrics header\nstdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn stats_rules_pretty_shows_all_rules() {
+        let env = StatsRulesEnv::new();
+        env.seed_rule_metrics_data();
+
+        let output = env.run(&["stats", "--rules"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            stdout.contains("core.git:reset-hard"),
+            "should show reset-hard rule\nstdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("core.git:force-push"),
+            "should show force-push rule\nstdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("core.filesystem:rm-rf"),
+            "should show rm-rf rule\nstdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn stats_rules_pretty_shows_totals() {
+        let env = StatsRulesEnv::new();
+        env.seed_rule_metrics_data();
+
+        let output = env.run(&["stats", "--rules"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Total: 12 hits, 3 overrides (from fixture data)
+        assert!(
+            stdout.contains("Total"),
+            "should show Total row\nstdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("12"),
+            "should show total hits of 12\nstdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn stats_rules_pretty_shows_rule_count() {
+        let env = StatsRulesEnv::new();
+        env.seed_rule_metrics_data();
+
+        let output = env.run(&["stats", "--rules"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            stdout.contains("3 rules shown"),
+            "should show '3 rules shown'\nstdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn stats_rules_limit_restricts_output() {
+        let env = StatsRulesEnv::new();
+        env.seed_rule_metrics_data();
+
+        let output = env.run(&["stats", "--rules", "-n", "2"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            stdout.contains("2 rules shown"),
+            "should show '2 rules shown' when limit=2\nstdout:\n{stdout}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // JSON output tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn stats_rules_json_is_valid() {
+        let env = StatsRulesEnv::new();
+        env.seed_rule_metrics_data();
+
+        let output = env.run(&["stats", "--rules", "--format", "json"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "stats --rules --format json should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        let json: serde_json::Value = serde_json::from_str(&stdout)
+            .expect(&format!("should produce valid JSON\nstdout:\n{stdout}"));
+
+        assert!(json.is_object(), "JSON should be an object");
+    }
+
+    #[test]
+    fn stats_rules_json_has_required_fields() {
+        let env = StatsRulesEnv::new();
+        env.seed_rule_metrics_data();
+
+        let output = env.run(&["stats", "--rules", "--format", "json"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+        assert!(
+            json["period_days"].is_number(),
+            "should have period_days field"
+        );
+        assert!(json["rules"].is_array(), "should have rules array");
+        assert!(json["totals"].is_object(), "should have totals object");
+    }
+
+    #[test]
+    fn stats_rules_json_rules_have_required_fields() {
+        let env = StatsRulesEnv::new();
+        env.seed_rule_metrics_data();
+
+        let output = env.run(&["stats", "--rules", "--format", "json"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let rules = json["rules"].as_array().unwrap();
+
+        assert!(!rules.is_empty(), "should have at least one rule");
+
+        for rule in rules {
+            assert!(
+                rule["rule_id"].is_string(),
+                "rule should have rule_id: {rule:?}"
+            );
+            assert!(
+                rule["pack_id"].is_string(),
+                "rule should have pack_id: {rule:?}"
+            );
+            assert!(
+                rule["pattern_name"].is_string(),
+                "rule should have pattern_name: {rule:?}"
+            );
+            assert!(
+                rule["total_hits"].is_number(),
+                "rule should have total_hits: {rule:?}"
+            );
+            assert!(
+                rule["allowlist_overrides"].is_number(),
+                "rule should have allowlist_overrides: {rule:?}"
+            );
+            assert!(
+                rule["override_rate"].is_number(),
+                "rule should have override_rate: {rule:?}"
+            );
+            assert!(
+                rule["first_seen"].is_string(),
+                "rule should have first_seen: {rule:?}"
+            );
+            assert!(
+                rule["last_seen"].is_string(),
+                "rule should have last_seen: {rule:?}"
+            );
+            assert!(
+                rule["unique_commands"].is_number(),
+                "rule should have unique_commands: {rule:?}"
+            );
+            assert!(
+                rule["trend"].is_string(),
+                "rule should have trend: {rule:?}"
+            );
+            assert!(
+                rule["is_noisy"].is_boolean(),
+                "rule should have is_noisy: {rule:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stats_rules_json_totals_correct() {
+        let env = StatsRulesEnv::new();
+        env.seed_rule_metrics_data();
+
+        let output = env.run(&["stats", "--rules", "--format", "json"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+        // Expected: 12 total hits, 3 total overrides (bypasses), 3 rules
+        assert_eq!(
+            json["totals"]["total_hits"], 12,
+            "should have 12 total hits\njson: {json:#}"
+        );
+        assert_eq!(
+            json["totals"]["total_overrides"], 3,
+            "should have 3 total overrides\njson: {json:#}"
+        );
+        assert_eq!(
+            json["totals"]["rule_count"], 3,
+            "should have 3 rules\njson: {json:#}"
+        );
+    }
+
+    #[test]
+    fn stats_rules_json_rule_values_correct() {
+        let env = StatsRulesEnv::new();
+        env.seed_rule_metrics_data();
+
+        let output = env.run(&["stats", "--rules", "--format", "json"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let rules = json["rules"].as_array().unwrap();
+
+        // Find the reset-hard rule and verify its values
+        let reset_rule = rules
+            .iter()
+            .find(|r| r["rule_id"] == "core.git:reset-hard")
+            .expect("should find reset-hard rule");
+
+        assert_eq!(reset_rule["total_hits"], 5, "reset-hard should have 5 hits");
+        assert_eq!(
+            reset_rule["allowlist_overrides"], 2,
+            "reset-hard should have 2 overrides"
+        );
+        assert_eq!(
+            reset_rule["unique_commands"], 5,
+            "reset-hard should have 5 unique commands"
+        );
+
+        // Find the rm-rf rule which has 0 overrides
+        let rm_rule = rules
+            .iter()
+            .find(|r| r["rule_id"] == "core.filesystem:rm-rf")
+            .expect("should find rm-rf rule");
+
+        assert_eq!(rm_rule["total_hits"], 4, "rm-rf should have 4 hits");
+        assert_eq!(
+            rm_rule["allowlist_overrides"], 0,
+            "rm-rf should have 0 overrides"
+        );
+    }
+
+    #[test]
+    fn stats_rules_json_limit_works() {
+        let env = StatsRulesEnv::new();
+        env.seed_rule_metrics_data();
+
+        let output = env.run(&["stats", "--rules", "--format", "json", "-n", "1"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let rules = json["rules"].as_array().unwrap();
+
+        assert_eq!(rules.len(), 1, "should only return 1 rule when limit=1");
+    }
+
+    #[test]
+    fn stats_rules_json_days_filter_works() {
+        let env = StatsRulesEnv::new();
+        env.seed_rule_metrics_data();
+
+        let output = env.run(&["stats", "--rules", "--format", "json", "--days", "1"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+        assert_eq!(
+            json["period_days"], 1,
+            "should show period_days=1\njson: {json:#}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Empty database tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn stats_rules_empty_database_shows_message() {
+        let env = StatsRulesEnv::new();
+        // Don't seed any data
+
+        // Create the database by opening it
+        let _db = HistoryDb::open(Some(env.db_path.clone())).expect("create db");
+
+        let output = env.run(&["stats", "--rules"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            output.status.success(),
+            "should succeed even with empty database"
+        );
+        assert!(
+            stdout.contains("No rule metrics found"),
+            "should show 'No rule metrics found' message\nstdout:\n{stdout}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Trend indicator tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn stats_rules_pretty_shows_trend_indicators() {
+        let env = StatsRulesEnv::new();
+        env.seed_rule_metrics_data();
+
+        let output = env.run(&["stats", "--rules"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Should contain at least one of the trend indicators
+        let has_trend_indicator =
+            stdout.contains("↑") || stdout.contains("→") || stdout.contains("↓");
+        assert!(
+            has_trend_indicator,
+            "should show at least one trend indicator\nstdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn stats_rules_json_trend_values_valid() {
+        let env = StatsRulesEnv::new();
+        env.seed_rule_metrics_data();
+
+        let output = env.run(&["stats", "--rules", "--format", "json"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let rules = json["rules"].as_array().unwrap();
+
+        for rule in rules {
+            let trend = rule["trend"].as_str().unwrap();
+            assert!(
+                ["increasing", "stable", "decreasing"].contains(&trend),
+                "trend should be one of increasing/stable/decreasing, got: {trend}"
+            );
+        }
     }
 }

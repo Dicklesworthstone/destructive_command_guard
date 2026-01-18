@@ -6,20 +6,15 @@
 use ratatui::style::Color;
 
 /// Border style for message boxes and tables.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BorderStyle {
     /// Unicode box-drawing characters (│, ─, ┌, ┐, └, ┘)
+    #[default]
     Unicode,
     /// ASCII-only characters (|, -, +)
     Ascii,
     /// No borders
     None,
-}
-
-impl Default for BorderStyle {
-    fn default() -> Self {
-        Self::Unicode
-    }
 }
 
 /// Colors for different severity levels.
@@ -109,7 +104,7 @@ impl Theme {
     /// - When `NO_COLOR` environment variable is set
     /// - Piping output to files or other programs
     #[must_use]
-    pub fn no_color() -> Self {
+    pub const fn no_color() -> Self {
         Self {
             border_style: BorderStyle::Ascii,
             severity_colors: SeverityColors::no_color(),
@@ -144,7 +139,7 @@ impl Theme {
 
     /// Returns the severity label with appropriate styling hint.
     #[must_use]
-    pub fn severity_label(&self, severity: Severity) -> &'static str {
+    pub const fn severity_label(&self, severity: Severity) -> &'static str {
         match severity {
             Severity::Critical => "CRITICAL",
             Severity::High => "HIGH",
@@ -209,7 +204,10 @@ mod tests {
 
     #[test]
     fn test_severity_from_str() {
-        assert_eq!(Severity::from_str_loose("critical"), Some(Severity::Critical));
+        assert_eq!(
+            Severity::from_str_loose("critical"),
+            Some(Severity::Critical)
+        );
         assert_eq!(Severity::from_str_loose("CRIT"), Some(Severity::Critical));
         assert_eq!(Severity::from_str_loose("high"), Some(Severity::High));
         assert_eq!(Severity::from_str_loose("medium"), Some(Severity::Medium));

@@ -489,14 +489,19 @@ Environment variables override config files (highest priority):
 
 - `DCG_PACKS="containers.docker,kubernetes"`: enable packs (comma-separated)
 - `DCG_DISABLE="kubernetes.helm"`: disable packs/sub-packs (comma-separated)
-- `DCG_VERBOSE=1`: verbose output
+- `DCG_VERBOSE=0-3`: verbosity level (0 = quiet, 3 = trace)
+- `DCG_QUIET=1`: suppress non-error output
 - `DCG_COLOR=auto|always|never`: color mode
+- `DCG_NO_COLOR=1`: disable colored output (same as NO_COLOR)
+- `DCG_FORMAT=text|json|sarif`: default output format (command-specific; SARIF applies to `dcg scan`)
 - `DCG_BYPASS=1`: bypass dcg entirely (escape hatch; use sparingly)
 - `DCG_CONFIG=/path/to/config.toml`: use explicit config file
 - `DCG_HEREDOC_ENABLED=true|false`: enable/disable heredoc scanning
 - `DCG_HEREDOC_TIMEOUT=50`: heredoc extraction timeout (milliseconds)
+- `DCG_HEREDOC_TIMEOUT_MS=50`: heredoc extraction timeout (milliseconds)
 - `DCG_HEREDOC_LANGUAGES=python,bash`: filter heredoc languages
 - `DCG_POLICY_DEFAULT_MODE=deny|warn|log`: global default decision mode
+- `DCG_HOOK_TIMEOUT_MS=200`: hook evaluation timeout budget (milliseconds)
 
 ### Configuration Hierarchy
 
@@ -638,6 +643,9 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_comm
 
 # Build from source instead of downloading binary
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/master/install.sh?$(date +%s)" | bash -s -- --from-source
+
+# Download/install only (skip agent hook configuration)
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/master/install.sh?$(date +%s)" | bash -s -- --no-configure
 ```
 
 > **Note:** If you have [gum](https://github.com/charmbracelet/gum) installed, the installer will use it for fancy terminal formatting.
@@ -646,6 +654,7 @@ The install script:
 - Automatically detects your OS and architecture
 - Downloads the appropriate prebuilt binary
 - Verifies SHA256 checksums for security
+- Verifies Sigstore cosign bundles when available (falls back to checksum-only if cosign is missing)
 - Falls back to building from source if no prebuilt is available
 - Detects and removes legacy Python predecessor (`git_safety_guard.py`)
 - Configures Claude Code hooks (creates config directory if needed)
@@ -654,6 +663,7 @@ The install script:
 - Detects Continue (reports it has no shell command hooks)
 - Detects Codex CLI (reports it has no pre-execution hooks)
 - Offers to update your PATH
+- Skips agent configuration when `--no-configure` is provided
 
 > **Note on Aider:** Aider does not have PreToolUse-style shell command interception like Claude Code. The installer enables `git-commit-verify: true` in `~/.aider.conf.yml`, which ensures git hooks run (Aider defaults to bypassing them). For full protection, install dcg as a [git pre-commit hook](docs/scan-precommit-guide.md).
 
@@ -711,6 +721,7 @@ Prebuilt binaries are available for:
 - Windows (`x86_64-pc-windows-msvc`)
 
 Download from [GitHub Releases](https://github.com/Dicklesworthstone/destructive_command_guard/releases) and verify the SHA256 checksum.
+If you have cosign installed, each release also includes a Sigstore bundle (`.sigstore.json`) so you can verify provenance with `cosign verify-blob`.
 
 ## Uninstalling
 

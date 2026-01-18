@@ -16,6 +16,9 @@ Param(
   [string]$Repo = "destructive_command_guard",
   [string]$Checksum = "",
   [string]$ChecksumUrl = "",
+  [string]$SigstoreBundleUrl = "",
+  [string]$CosignIdentityRegex = "",
+  [string]$CosignOidcIssuer = "",
   [string]$ArtifactUrl = "",
   [switch]$EasyMode,
   [switch]$Verify
@@ -69,6 +72,13 @@ if (-not [Environment]::Is64BitProcess) {
 $target = "x86_64-pc-windows-msvc"
 $zip = "dcg-$target.zip"
 
+if (-not $CosignIdentityRegex) {
+  $CosignIdentityRegex = "^https://github.com/$Owner/$Repo/.github/workflows/dist.yml@refs/tags/.*$"
+}
+if (-not $CosignOidcIssuer) {
+  $CosignOidcIssuer = "https://token.actions.githubusercontent.com"
+}
+
 if ($ArtifactUrl) {
   $url = $ArtifactUrl
 } else {
@@ -110,6 +120,26 @@ if ($hash.Hash.ToLower() -ne $checksumToUse.ToLower()) {
   exit 1
 }
 Write-Ok "Checksum verified"
+
+# Verify Sigstore/cosign bundle (best-effort)
+if (Get-Command cosign -ErrorAction SilentlyContinue) {
+  if (-not $SigstoreBundleUrl) { $SigstoreBundleUrl = "$url.sigstore.json" }
+  $bundleFile = Join-Path $tmp ([System.IO.Path]::GetFileName($SigstoreBundleUrl))
+  Write-Info "Fetching sigstore bundle from $SigstoreBundleUrl"
+  try {
+    Invoke-WebRequest -Uri $SigstoreBundleUrl -OutFile $bundleFile -UseBasicParsing
+    & cosign verify-blob --bundle $bundleFile --certificate-identity-regexp $CosignIdentityRegex --certificate-oidc-issuer $CosignOidcIssuer $zipFile | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      Write-Err "Signature verification failed"
+      exit 1
+    }
+    Write-Ok "Signature verified (cosign)"
+  } catch {
+    Write-Warn "Sigstore bundle not found; skipping signature verification"
+  }
+} else {
+  Write-Warn "cosign not found; skipping signature verification (install cosign for stronger authenticity checks)"
+}
 
 # Extract
 Write-Info "Extracting..."

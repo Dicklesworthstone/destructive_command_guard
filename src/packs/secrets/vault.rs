@@ -66,6 +66,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     ]
 }
 
+#[allow(clippy::too_many_lines)]
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
         destructive_pattern!(

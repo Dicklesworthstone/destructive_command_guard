@@ -868,6 +868,7 @@ impl HistoryDb {
     }
 
     /// Create the v1 schema (initial version).
+    #[allow(clippy::too_many_lines)]
     fn create_v1_schema(&self) -> Result<(), HistoryError> {
         // Main commands table
         self.conn.execute(
@@ -971,6 +972,45 @@ impl HistoryDb {
                 updated_at TEXT NOT NULL
             )",
             [],
+        )?;
+
+        // Create suggestion_audit table for tracking accepted/modified/rejected suggestions (v5 feature)
+        self.conn.execute(
+            r"CREATE TABLE IF NOT EXISTS suggestion_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                action TEXT NOT NULL CHECK (action IN ('accepted', 'modified', 'rejected')),
+                pattern TEXT NOT NULL,
+                final_pattern TEXT,
+                risk_level TEXT NOT NULL,
+                risk_score REAL NOT NULL,
+                confidence_tier TEXT NOT NULL,
+                confidence_points INTEGER NOT NULL,
+                cluster_frequency INTEGER NOT NULL,
+                unique_variants INTEGER NOT NULL,
+                sample_commands TEXT NOT NULL,
+                rule_id TEXT,
+                session_id TEXT,
+                working_dir TEXT
+            )",
+            [],
+        )?;
+
+        // Create indexes for suggestion_audit
+        self.conn.execute_batch(
+            r"
+            -- Time-based queries
+            CREATE INDEX IF NOT EXISTS idx_suggestion_audit_timestamp
+                ON suggestion_audit(timestamp);
+
+            -- Action filtering
+            CREATE INDEX IF NOT EXISTS idx_suggestion_audit_action
+                ON suggestion_audit(action);
+
+            -- Session grouping
+            CREATE INDEX IF NOT EXISTS idx_suggestion_audit_session_id
+                ON suggestion_audit(session_id);
+            ",
         )?;
 
         // Record schema version
@@ -2174,6 +2214,321 @@ impl HistoryDb {
     }
 
     // ========================================================================
+    // Rule-Level Metrics Queries
+    // ========================================================================
+
+    /// Get aggregated metrics for all rules.
+    ///
+    /// Returns per-rule statistics including hit counts, override rates, and trends.
+    ///
+    /// # Arguments
+    ///
+    /// * `since` - Optional start time (defaults to all time)
+    /// * `limit` - Maximum number of rules to return (defaults to 100)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn get_rule_metrics(
+        &self,
+        since: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<RuleMetrics>, HistoryError> {
+        let since_ts = since.map_or_else(
+            || "1970-01-01T00:00:00Z".to_string(),
+            |dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+        );
+
+        // Query for main aggregates
+        let mut stmt = self.conn.prepare(
+            r"SELECT
+                rule_id,
+                COUNT(*) as total_hits,
+                SUM(CASE WHEN outcome = 'bypass' THEN 1 ELSE 0 END) as overrides,
+                MIN(timestamp) as first_seen,
+                MAX(timestamp) as last_seen,
+                COUNT(DISTINCT command_hash) as unique_commands
+             FROM commands
+             WHERE rule_id IS NOT NULL
+               AND timestamp >= ?1
+             GROUP BY rule_id
+             ORDER BY total_hits DESC
+             LIMIT ?2",
+        )?;
+
+        let limit_i64 = i64::try_from(limit).unwrap_or(100);
+        let rows = stmt.query_map(params![&since_ts, limit_i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+
+        let mut metrics = Vec::new();
+        for row in rows {
+            let (rule_id, total_hits, overrides, first_seen_str, last_seen_str, unique_commands) =
+                row?;
+
+            let total_hits = u64::try_from(total_hits).unwrap_or(0);
+            let overrides = u64::try_from(overrides).unwrap_or(0);
+            let unique_commands = u64::try_from(unique_commands).unwrap_or(0);
+
+            #[allow(clippy::cast_precision_loss)]
+            let override_rate = if total_hits > 0 {
+                (overrides as f64 / total_hits as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            let first_seen = chrono::DateTime::parse_from_rfc3339(&first_seen_str)
+                .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+            let last_seen = chrono::DateTime::parse_from_rfc3339(&last_seen_str)
+                .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+
+            // Calculate trend with week-over-week comparison
+            let (trend, previous_period_hits, change_percentage, is_anomaly) =
+                self.calculate_rule_trend(&rule_id, total_hits);
+
+            metrics.push(RuleMetrics {
+                rule_id,
+                total_hits,
+                allowlist_overrides: overrides,
+                override_rate,
+                first_seen,
+                last_seen,
+                unique_commands,
+                trend,
+                is_noisy: override_rate >= RuleMetrics::NOISY_THRESHOLD,
+                previous_period_hits,
+                change_percentage,
+                is_anomaly,
+            });
+        }
+
+        Ok(metrics)
+    }
+
+    /// Get metrics for a specific rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn get_rule_metrics_for_rule(
+        &self,
+        rule_id: &str,
+    ) -> Result<Option<RuleMetrics>, HistoryError> {
+        let mut stmt = self.conn.prepare(
+            r"SELECT
+                COUNT(*) as total_hits,
+                COALESCE(SUM(CASE WHEN outcome = 'bypass' THEN 1 ELSE 0 END), 0) as overrides,
+                MIN(timestamp) as first_seen,
+                MAX(timestamp) as last_seen,
+                COUNT(DISTINCT command_hash) as unique_commands
+             FROM commands
+             WHERE rule_id = ?1",
+        )?;
+
+        #[allow(clippy::type_complexity)]
+        let result: Result<(i64, i64, Option<String>, Option<String>, i64), _> =
+            stmt.query_row(params![rule_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            });
+
+        match result {
+            Ok((total_hits, overrides, first_seen_opt, last_seen_opt, unique_commands)) => {
+                if total_hits == 0 {
+                    return Ok(None);
+                }
+
+                let total_hits = u64::try_from(total_hits).unwrap_or(0);
+                let overrides = u64::try_from(overrides).unwrap_or(0);
+                let unique_commands = u64::try_from(unique_commands).unwrap_or(0);
+
+                #[allow(clippy::cast_precision_loss)]
+                let override_rate = if total_hits > 0 {
+                    (overrides as f64 / total_hits as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                let first_seen = first_seen_opt
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                    .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc));
+                let last_seen = last_seen_opt
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                    .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc));
+
+                let (trend, previous_period_hits, change_percentage, is_anomaly) =
+                    self.calculate_rule_trend(rule_id, total_hits);
+
+                Ok(Some(RuleMetrics {
+                    rule_id: rule_id.to_string(),
+                    total_hits,
+                    allowlist_overrides: overrides,
+                    override_rate,
+                    first_seen,
+                    last_seen,
+                    unique_commands,
+                    trend,
+                    is_noisy: override_rate >= RuleMetrics::NOISY_THRESHOLD,
+                    previous_period_hits,
+                    change_percentage,
+                    is_anomaly,
+                }))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(HistoryError::Sqlite(e)),
+        }
+    }
+
+    /// Get the noisiest rules (highest override rate).
+    ///
+    /// # Arguments
+    ///
+    /// * `limit` - Maximum number of rules to return
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn get_noisiest_rules(&self, limit: usize) -> Result<Vec<RuleMetrics>, HistoryError> {
+        let mut stmt = self.conn.prepare(
+            r"SELECT
+                rule_id,
+                COUNT(*) as total_hits,
+                SUM(CASE WHEN outcome = 'bypass' THEN 1 ELSE 0 END) as overrides,
+                MIN(timestamp) as first_seen,
+                MAX(timestamp) as last_seen,
+                COUNT(DISTINCT command_hash) as unique_commands
+             FROM commands
+             WHERE rule_id IS NOT NULL
+             GROUP BY rule_id
+             HAVING total_hits >= ?1
+             ORDER BY (CAST(overrides AS REAL) / CAST(total_hits AS REAL)) DESC
+             LIMIT ?2",
+        )?;
+
+        let min_hits = i64::try_from(RuleMetrics::MIN_HITS_FOR_TREND).unwrap_or(5);
+        let limit_i64 = i64::try_from(limit).unwrap_or(10);
+
+        let rows = stmt.query_map(params![min_hits, limit_i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+
+        let mut metrics = Vec::new();
+        for row in rows {
+            let (rule_id, total_hits, overrides, first_seen_str, last_seen_str, unique_commands) =
+                row?;
+
+            let total_hits = u64::try_from(total_hits).unwrap_or(0);
+            let overrides = u64::try_from(overrides).unwrap_or(0);
+            let unique_commands = u64::try_from(unique_commands).unwrap_or(0);
+
+            #[allow(clippy::cast_precision_loss)]
+            let override_rate = if total_hits > 0 {
+                (overrides as f64 / total_hits as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            let first_seen = chrono::DateTime::parse_from_rfc3339(&first_seen_str)
+                .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+            let last_seen = chrono::DateTime::parse_from_rfc3339(&last_seen_str)
+                .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+
+            let (trend, previous_period_hits, change_percentage, is_anomaly) =
+                self.calculate_rule_trend(&rule_id, total_hits);
+
+            metrics.push(RuleMetrics {
+                rule_id,
+                total_hits,
+                allowlist_overrides: overrides,
+                override_rate,
+                first_seen,
+                last_seen,
+                unique_commands,
+                trend,
+                is_noisy: override_rate >= RuleMetrics::NOISY_THRESHOLD,
+                previous_period_hits,
+                change_percentage,
+                is_anomaly,
+            });
+        }
+
+        Ok(metrics)
+    }
+
+    /// Calculate trend by comparing recent vs previous period.
+    ///
+    /// Returns (trend, previous_period_hits, change_percentage, is_anomaly).
+    fn calculate_rule_trend(&self, rule_id: &str, total_hits: u64) -> (RuleTrend, u64, f64, bool) {
+        if total_hits < RuleMetrics::MIN_HITS_FOR_TREND {
+            return (RuleTrend::Stable, 0, 0.0, false);
+        }
+
+        let now = Utc::now();
+        let one_week_ago = now - chrono::Duration::days(7);
+        let two_weeks_ago = now - chrono::Duration::days(14);
+
+        let recent_ts = one_week_ago.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let previous_ts = two_weeks_ago.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let now_ts = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+
+        // Count recent period
+        let recent_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM commands WHERE rule_id = ?1 AND timestamp >= ?2 AND timestamp < ?3",
+            params![rule_id, &recent_ts, &now_ts],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        // Count previous period
+        let previous_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM commands WHERE rule_id = ?1 AND timestamp >= ?2 AND timestamp < ?3",
+            params![rule_id, &previous_ts, &recent_ts],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        let previous_hits = u64::try_from(previous_count).unwrap_or(0);
+
+        if previous_count == 0 {
+            // No previous data - can't determine trend percentage, but can be anomaly if new
+            let is_anomaly = recent_count > 10; // Treat new rules with many hits as anomalous
+            return (RuleTrend::Stable, 0, 0.0, is_anomaly);
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        let change_percentage =
+            ((recent_count as f64 - previous_count as f64) / previous_count as f64) * 100.0;
+        let is_anomaly = change_percentage >= RuleMetrics::ANOMALY_THRESHOLD;
+
+        let trend = if change_percentage > (RuleMetrics::TREND_THRESHOLD * 100.0) {
+            RuleTrend::Increasing
+        } else if change_percentage < -(RuleMetrics::TREND_THRESHOLD * 100.0) {
+            RuleTrend::Decreasing
+        } else {
+            RuleTrend::Stable
+        };
+
+        (trend, previous_hits, change_percentage, is_anomaly)
+    }
+
+    // ========================================================================
     // Suggestion Audit Logging
     // ========================================================================
 
@@ -2446,6 +2801,72 @@ pub struct PackEffectivenessAnalysis {
     pub potential_gaps: Vec<PotentialGap>,
     /// Generated recommendations.
     pub recommendations: Vec<PackRecommendation>,
+}
+
+// ============================================================================
+// Rule-Level Metrics Types
+// ============================================================================
+
+/// Trend direction for rule activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleTrend {
+    /// Rule triggers are increasing compared to previous period.
+    Increasing,
+    /// Rule triggers are stable.
+    Stable,
+    /// Rule triggers are decreasing.
+    Decreasing,
+}
+
+impl std::fmt::Display for RuleTrend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Increasing => write!(f, "↑ increasing"),
+            Self::Stable => write!(f, "→ stable"),
+            Self::Decreasing => write!(f, "↓ decreasing"),
+        }
+    }
+}
+
+/// Per-rule aggregated metrics.
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleMetrics {
+    /// Stable rule identifier (`pack_id:pattern_name`).
+    pub rule_id: String,
+    /// Total times this rule triggered (deny + bypass + warn).
+    pub total_hits: u64,
+    /// Times the rule resulted in allowlist override (bypass).
+    pub allowlist_overrides: u64,
+    /// Override rate as a percentage (0.0-100.0).
+    pub override_rate: f64,
+    /// When this rule was first triggered.
+    pub first_seen: DateTime<Utc>,
+    /// When this rule was last triggered.
+    pub last_seen: DateTime<Utc>,
+    /// Number of unique commands that triggered this rule.
+    pub unique_commands: u64,
+    /// Trend direction based on recent vs previous period.
+    pub trend: RuleTrend,
+    /// Whether this rule is considered noisy (high override rate).
+    pub is_noisy: bool,
+    /// Hits in the previous period (for week-over-week comparison).
+    pub previous_period_hits: u64,
+    /// Percentage change from previous period (-100.0 to +infinity).
+    pub change_percentage: f64,
+    /// Whether this rule shows an anomalous spike (> 200% increase).
+    pub is_anomaly: bool,
+}
+
+impl RuleMetrics {
+    /// Threshold for considering a rule noisy.
+    pub const NOISY_THRESHOLD: f64 = 30.0;
+    /// Minimum hits required to calculate trend.
+    pub const MIN_HITS_FOR_TREND: u64 = 5;
+    /// Threshold change for increasing/decreasing trend (30% change).
+    pub const TREND_THRESHOLD: f64 = 0.3;
+    /// Threshold for anomaly detection (200% increase).
+    pub const ANOMALY_THRESHOLD: f64 = 200.0;
 }
 
 // ============================================================================
@@ -2906,6 +3327,81 @@ mod tests {
             .unwrap();
 
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_log_command_computes_rule_id_from_pack_and_pattern() {
+        let db = HistoryDb::open_in_memory().unwrap();
+
+        let entry = CommandEntry {
+            timestamp: Utc::now(),
+            agent_type: "claude_code".to_string(),
+            working_dir: "/test/project".to_string(),
+            command: "git reset --hard".to_string(),
+            outcome: Outcome::Deny,
+            pack_id: Some("core.git".to_string()),
+            pattern_name: Some("reset-hard".to_string()),
+            rule_id: None,
+            ..Default::default()
+        };
+
+        db.log_command(&entry).unwrap();
+
+        let stored: Option<String> = db
+            .conn
+            .query_row("SELECT rule_id FROM commands LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, Some("core.git:reset-hard".to_string()));
+    }
+
+    #[test]
+    fn test_log_command_preserves_explicit_rule_id() {
+        let db = HistoryDb::open_in_memory().unwrap();
+
+        let entry = CommandEntry {
+            timestamp: Utc::now(),
+            agent_type: "claude_code".to_string(),
+            working_dir: "/test/project".to_string(),
+            command: "git reset --hard".to_string(),
+            outcome: Outcome::Deny,
+            pack_id: Some("core.git".to_string()),
+            pattern_name: Some("reset-hard".to_string()),
+            rule_id: Some("override.rule-id".to_string()),
+            ..Default::default()
+        };
+
+        db.log_command(&entry).unwrap();
+
+        let stored: Option<String> = db
+            .conn
+            .query_row("SELECT rule_id FROM commands LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, Some("override.rule-id".to_string()));
+    }
+
+    #[test]
+    fn test_log_command_records_rule_id_for_allowlist_override() {
+        let db = HistoryDb::open_in_memory().unwrap();
+
+        let entry = CommandEntry {
+            timestamp: Utc::now(),
+            agent_type: "claude_code".to_string(),
+            working_dir: "/test/project".to_string(),
+            command: "git reset --hard".to_string(),
+            outcome: Outcome::Allow,
+            pack_id: Some("core.git".to_string()),
+            pattern_name: Some("reset-hard".to_string()),
+            allowlist_layer: Some("user".to_string()),
+            ..Default::default()
+        };
+
+        db.log_command(&entry).unwrap();
+
+        let stored: Option<String> = db
+            .conn
+            .query_row("SELECT rule_id FROM commands LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, Some("core.git:reset-hard".to_string()));
     }
 
     #[test]
@@ -3945,9 +4441,14 @@ mod tests {
         assert!(id > 0);
 
         // Query and verify the final_pattern was stored
-        let results = db.query_suggestion_audits(10, Some(SuggestionAction::Modified)).unwrap();
+        let results = db
+            .query_suggestion_audits(10, Some(SuggestionAction::Modified))
+            .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].final_pattern, Some("git reset --soft".to_string()));
+        assert_eq!(
+            results[0].final_pattern,
+            Some("git reset --soft".to_string())
+        );
     }
 
     #[test]
@@ -3972,11 +4473,14 @@ mod tests {
     fn test_query_suggestion_audits_returns_all_when_no_filter() {
         let db = HistoryDb::open_in_memory().unwrap();
 
-        db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Accepted)).unwrap();
-        db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Modified)).unwrap();
-        db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Rejected)).unwrap();
+        db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Accepted))
+            .unwrap();
+        db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Modified))
+            .unwrap();
+        db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Rejected))
+            .unwrap();
 
-        let results = db.query_suggestion_audits(None, 100).unwrap();
+        let results = db.query_suggestion_audits(100, None).unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -3986,27 +4490,48 @@ mod tests {
 
         // Insert entries with different actions
         for _ in 0..4 {
-            db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Accepted)).unwrap();
+            db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Accepted))
+                .unwrap();
         }
         for _ in 0..2 {
-            db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Modified)).unwrap();
+            db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Modified))
+                .unwrap();
         }
-        db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Rejected)).unwrap();
+        db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Rejected))
+            .unwrap();
 
         // Filter by Accepted
-        let accepted = db.query_suggestion_audits(100, Some(SuggestionAction::Accepted)).unwrap();
+        let accepted = db
+            .query_suggestion_audits(100, Some(SuggestionAction::Accepted))
+            .unwrap();
         assert_eq!(accepted.len(), 4);
-        assert!(accepted.iter().all(|e| e.action == SuggestionAction::Accepted));
+        assert!(
+            accepted
+                .iter()
+                .all(|e| e.action == SuggestionAction::Accepted)
+        );
 
         // Filter by Modified
-        let modified = db.query_suggestion_audits(100, Some(SuggestionAction::Modified)).unwrap();
+        let modified = db
+            .query_suggestion_audits(100, Some(SuggestionAction::Modified))
+            .unwrap();
         assert_eq!(modified.len(), 2);
-        assert!(modified.iter().all(|e| e.action == SuggestionAction::Modified));
+        assert!(
+            modified
+                .iter()
+                .all(|e| e.action == SuggestionAction::Modified)
+        );
 
         // Filter by Rejected
-        let rejected = db.query_suggestion_audits(100, Some(SuggestionAction::Rejected)).unwrap();
+        let rejected = db
+            .query_suggestion_audits(100, Some(SuggestionAction::Rejected))
+            .unwrap();
         assert_eq!(rejected.len(), 1);
-        assert!(rejected.iter().all(|e| e.action == SuggestionAction::Rejected));
+        assert!(
+            rejected
+                .iter()
+                .all(|e| e.action == SuggestionAction::Rejected)
+        );
     }
 
     #[test]
@@ -4015,7 +4540,8 @@ mod tests {
 
         // Insert 10 entries
         for _ in 0..10 {
-            db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Accepted)).unwrap();
+            db.log_suggestion_audit(&test_suggestion_audit_entry(SuggestionAction::Accepted))
+                .unwrap();
         }
 
         // Query with limit of 5
@@ -4116,5 +4642,700 @@ mod tests {
         assert_eq!(stored.rule_id, None);
         assert_eq!(stored.session_id, None);
         assert_eq!(stored.working_dir, None);
+    }
+
+    // ============================================================================
+    // Rule Metrics Unit Tests (1dri.3)
+    // ============================================================================
+
+    /// Helper to insert a command with a specific rule_id and outcome.
+    fn insert_rule_entry(
+        db: &HistoryDb,
+        rule_id: &str,
+        outcome: Outcome,
+        timestamp: DateTime<Utc>,
+        command: &str,
+    ) {
+        let (pack_id, pattern_name) = rule_id.split_once(':').unwrap_or((rule_id, "pattern"));
+        let entry = CommandEntry {
+            timestamp,
+            agent_type: "test_agent".to_string(),
+            working_dir: "/test".to_string(),
+            command: command.to_string(),
+            outcome,
+            pack_id: Some(pack_id.to_string()),
+            pattern_name: Some(pattern_name.to_string()),
+            rule_id: Some(rule_id.to_string()),
+            ..Default::default()
+        };
+        db.log_command(&entry).unwrap();
+    }
+
+    #[test]
+    fn test_get_rule_metrics_basic() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Insert commands for different rules
+        for i in 0..5 {
+            insert_rule_entry(
+                &db,
+                "core.git:reset-hard",
+                Outcome::Deny,
+                now,
+                &format!("cmd-a-{i}"),
+            );
+        }
+        for i in 0..3 {
+            insert_rule_entry(
+                &db,
+                "core.filesystem:rm-rf",
+                Outcome::Deny,
+                now,
+                &format!("cmd-b-{i}"),
+            );
+        }
+
+        let metrics = db.get_rule_metrics(None, 100).unwrap();
+
+        assert_eq!(metrics.len(), 2);
+        // Ordered by total_hits descending
+        assert_eq!(metrics[0].rule_id, "core.git:reset-hard");
+        assert_eq!(metrics[0].total_hits, 5);
+        assert_eq!(metrics[1].rule_id, "core.filesystem:rm-rf");
+        assert_eq!(metrics[1].total_hits, 3);
+    }
+
+    #[test]
+    fn test_get_rule_metrics_with_limit() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Insert commands for 5 different rules
+        for (i, rule) in ["rule:a", "rule:b", "rule:c", "rule:d", "rule:e"]
+            .iter()
+            .enumerate()
+        {
+            for j in 0..(5 - i) {
+                insert_rule_entry(&db, rule, Outcome::Deny, now, &format!("cmd-{i}-{j}"));
+            }
+        }
+
+        // Limit to top 3
+        let metrics = db.get_rule_metrics(None, 3).unwrap();
+        assert_eq!(metrics.len(), 3);
+        assert_eq!(metrics[0].total_hits, 5);
+        assert_eq!(metrics[1].total_hits, 4);
+        assert_eq!(metrics[2].total_hits, 3);
+    }
+
+    #[test]
+    fn test_get_rule_metrics_with_since_filter() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+        let old = now - Duration::days(10);
+        let recent = now - Duration::hours(1);
+
+        // Insert old commands
+        insert_rule_entry(&db, "pack:old-rule", Outcome::Deny, old, "old-cmd-1");
+        insert_rule_entry(&db, "pack:old-rule", Outcome::Deny, old, "old-cmd-2");
+
+        // Insert recent commands
+        insert_rule_entry(&db, "pack:new-rule", Outcome::Deny, recent, "new-cmd-1");
+        insert_rule_entry(&db, "pack:new-rule", Outcome::Deny, recent, "new-cmd-2");
+        insert_rule_entry(&db, "pack:new-rule", Outcome::Deny, recent, "new-cmd-3");
+
+        // Query with since filter (last 7 days)
+        let since = now - Duration::days(7);
+        let metrics = db.get_rule_metrics(Some(since), 100).unwrap();
+
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].rule_id, "pack:new-rule");
+        assert_eq!(metrics[0].total_hits, 3);
+    }
+
+    #[test]
+    fn test_get_rule_metrics_override_rate() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Insert 10 denials and 5 bypasses for the same rule
+        for i in 0..10 {
+            insert_rule_entry(
+                &db,
+                "test:override-rule",
+                Outcome::Deny,
+                now,
+                &format!("deny-{i}"),
+            );
+        }
+        for i in 0..5 {
+            insert_rule_entry(
+                &db,
+                "test:override-rule",
+                Outcome::Bypass,
+                now,
+                &format!("bypass-{i}"),
+            );
+        }
+
+        let metrics = db.get_rule_metrics(None, 100).unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].total_hits, 15);
+        assert_eq!(metrics[0].allowlist_overrides, 5);
+        // 5/15 = 33.33%
+        assert!((metrics[0].override_rate - 33.333).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_get_rule_metrics_noisy_threshold() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Create a noisy rule (> 30% override rate)
+        for i in 0..7 {
+            insert_rule_entry(&db, "pack:noisy", Outcome::Deny, now, &format!("deny-{i}"));
+        }
+        for i in 0..3 {
+            insert_rule_entry(
+                &db,
+                "pack:noisy",
+                Outcome::Bypass,
+                now,
+                &format!("bypass-{i}"),
+            );
+        }
+
+        // Create a non-noisy rule (< 30% override rate)
+        for i in 0..9 {
+            insert_rule_entry(
+                &db,
+                "pack:quiet",
+                Outcome::Deny,
+                now,
+                &format!("deny-q-{i}"),
+            );
+        }
+        insert_rule_entry(&db, "pack:quiet", Outcome::Bypass, now, "bypass-q-1");
+
+        let metrics = db.get_rule_metrics(None, 100).unwrap();
+        let noisy = metrics.iter().find(|m| m.rule_id == "pack:noisy").unwrap();
+        let quiet = metrics.iter().find(|m| m.rule_id == "pack:quiet").unwrap();
+
+        // 3/10 = 30%, which is >= NOISY_THRESHOLD
+        assert!(noisy.is_noisy);
+        // 1/10 = 10%, which is < NOISY_THRESHOLD
+        assert!(!quiet.is_noisy);
+    }
+
+    #[test]
+    fn test_get_rule_metrics_unique_commands() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Same command multiple times (should count as 1 unique)
+        for _ in 0..5 {
+            insert_rule_entry(&db, "pack:repeated", Outcome::Deny, now, "same-command");
+        }
+
+        // Different commands
+        for i in 0..3 {
+            insert_rule_entry(
+                &db,
+                "pack:varied",
+                Outcome::Deny,
+                now,
+                &format!("unique-cmd-{i}"),
+            );
+        }
+
+        let metrics = db.get_rule_metrics(None, 100).unwrap();
+        let repeated = metrics
+            .iter()
+            .find(|m| m.rule_id == "pack:repeated")
+            .unwrap();
+        let varied = metrics.iter().find(|m| m.rule_id == "pack:varied").unwrap();
+
+        assert_eq!(repeated.total_hits, 5);
+        assert_eq!(repeated.unique_commands, 1);
+        assert_eq!(varied.total_hits, 3);
+        assert_eq!(varied.unique_commands, 3);
+    }
+
+    #[test]
+    fn test_get_rule_metrics_for_rule_exists() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        insert_rule_entry(&db, "core.git:force-push", Outcome::Deny, now, "cmd-1");
+        insert_rule_entry(&db, "core.git:force-push", Outcome::Deny, now, "cmd-2");
+        insert_rule_entry(&db, "core.git:force-push", Outcome::Bypass, now, "cmd-3");
+
+        let metrics = db.get_rule_metrics_for_rule("core.git:force-push").unwrap();
+        assert!(metrics.is_some());
+        let m = metrics.unwrap();
+        assert_eq!(m.total_hits, 3);
+        assert_eq!(m.allowlist_overrides, 1);
+        assert_eq!(m.unique_commands, 3);
+    }
+
+    #[test]
+    fn test_get_rule_metrics_for_rule_not_found() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        insert_rule_entry(&db, "core.git:reset-hard", Outcome::Deny, now, "cmd-1");
+
+        // When querying a non-existent rule, total_hits will be 0 and the function returns None
+        let metrics = db.get_rule_metrics_for_rule("nonexistent:rule").unwrap();
+        // The implementation returns None for rules with 0 hits
+        assert!(metrics.is_none());
+    }
+
+    #[test]
+    fn test_get_noisiest_rules() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Create rules with varying override rates
+        // Rule A: 50% override rate (5 deny, 5 bypass) - very noisy
+        for i in 0..5 {
+            insert_rule_entry(
+                &db,
+                "pack:rule-a",
+                Outcome::Deny,
+                now,
+                &format!("a-deny-{i}"),
+            );
+        }
+        for i in 0..5 {
+            insert_rule_entry(
+                &db,
+                "pack:rule-a",
+                Outcome::Bypass,
+                now,
+                &format!("a-bypass-{i}"),
+            );
+        }
+
+        // Rule B: 40% override rate (6 deny, 4 bypass)
+        for i in 0..6 {
+            insert_rule_entry(
+                &db,
+                "pack:rule-b",
+                Outcome::Deny,
+                now,
+                &format!("b-deny-{i}"),
+            );
+        }
+        for i in 0..4 {
+            insert_rule_entry(
+                &db,
+                "pack:rule-b",
+                Outcome::Bypass,
+                now,
+                &format!("b-bypass-{i}"),
+            );
+        }
+
+        // Rule C: 10% override rate (9 deny, 1 bypass) - less noisy
+        for i in 0..9 {
+            insert_rule_entry(
+                &db,
+                "pack:rule-c",
+                Outcome::Deny,
+                now,
+                &format!("c-deny-{i}"),
+            );
+        }
+        insert_rule_entry(&db, "pack:rule-c", Outcome::Bypass, now, "c-bypass-1");
+
+        let noisy = db.get_noisiest_rules(10).unwrap();
+
+        // get_noisiest_rules returns all rules >= MIN_HITS_FOR_TREND, ordered by override rate desc
+        // It does NOT filter by NOISY_THRESHOLD - it just orders by noisiness
+        assert_eq!(noisy.len(), 3);
+        // Ordered by override rate descending
+        assert_eq!(noisy[0].rule_id, "pack:rule-a");
+        assert!((noisy[0].override_rate - 50.0).abs() < 0.1);
+        assert_eq!(noisy[1].rule_id, "pack:rule-b");
+        assert!((noisy[1].override_rate - 40.0).abs() < 0.1);
+        assert_eq!(noisy[2].rule_id, "pack:rule-c");
+        assert!((noisy[2].override_rate - 10.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_get_noisiest_rules_respects_limit() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Create 5 noisy rules
+        for rule_num in 0..5 {
+            let rule_id = format!("pack:noisy-{rule_num}");
+            // Each rule has 50% override rate
+            for i in 0..5 {
+                insert_rule_entry(
+                    &db,
+                    &rule_id,
+                    Outcome::Deny,
+                    now,
+                    &format!("deny-{rule_num}-{i}"),
+                );
+            }
+            for i in 0..5 {
+                insert_rule_entry(
+                    &db,
+                    &rule_id,
+                    Outcome::Bypass,
+                    now,
+                    &format!("bypass-{rule_num}-{i}"),
+                );
+            }
+        }
+
+        let noisy = db.get_noisiest_rules(3).unwrap();
+        assert_eq!(noisy.len(), 3);
+    }
+
+    #[test]
+    fn test_get_noisiest_rules_minimum_hits() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Rule with high override rate but too few hits (< MIN_HITS_FOR_TREND = 5)
+        insert_rule_entry(&db, "pack:few-hits", Outcome::Deny, now, "deny-1");
+        insert_rule_entry(&db, "pack:few-hits", Outcome::Bypass, now, "bypass-1");
+        insert_rule_entry(&db, "pack:few-hits", Outcome::Bypass, now, "bypass-2");
+        // 2/3 = 66% but only 3 hits
+
+        // Rule with enough hits
+        for i in 0..5 {
+            insert_rule_entry(
+                &db,
+                "pack:enough-hits",
+                Outcome::Deny,
+                now,
+                &format!("deny-{i}"),
+            );
+        }
+        for i in 0..5 {
+            insert_rule_entry(
+                &db,
+                "pack:enough-hits",
+                Outcome::Bypass,
+                now,
+                &format!("bypass-{i}"),
+            );
+        }
+
+        let noisy = db.get_noisiest_rules(10).unwrap();
+
+        // Only the rule with >= 5 hits should appear
+        assert_eq!(noisy.len(), 1);
+        assert_eq!(noisy[0].rule_id, "pack:enough-hits");
+    }
+
+    #[test]
+    fn test_rule_metrics_first_and_last_seen() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+        let earlier = now - Duration::days(5);
+        let later = now - Duration::hours(1);
+
+        insert_rule_entry(&db, "pack:time-test", Outcome::Deny, earlier, "first-cmd");
+        insert_rule_entry(
+            &db,
+            "pack:time-test",
+            Outcome::Deny,
+            now - Duration::days(2),
+            "middle-cmd",
+        );
+        insert_rule_entry(&db, "pack:time-test", Outcome::Deny, later, "last-cmd");
+
+        let metrics = db.get_rule_metrics(None, 100).unwrap();
+        assert_eq!(metrics.len(), 1);
+
+        let m = &metrics[0];
+        // First seen should be the earliest timestamp
+        assert!(m.first_seen <= earlier + Duration::seconds(1));
+        // Last seen should be the latest timestamp
+        assert!(m.last_seen >= later - Duration::seconds(1));
+    }
+
+    #[test]
+    fn test_rule_trend_stable_insufficient_data() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Only 3 hits - below MIN_HITS_FOR_TREND threshold
+        for i in 0..3 {
+            insert_rule_entry(&db, "pack:few", Outcome::Deny, now, &format!("cmd-{i}"));
+        }
+
+        let metrics = db.get_rule_metrics(None, 100).unwrap();
+        assert_eq!(metrics[0].trend, RuleTrend::Stable);
+    }
+
+    #[test]
+    fn test_rule_metrics_empty_database() {
+        let db = HistoryDb::open_in_memory().unwrap();
+
+        let metrics = db.get_rule_metrics(None, 100).unwrap();
+        assert!(metrics.is_empty());
+
+        let noisy = db.get_noisiest_rules(10).unwrap();
+        assert!(noisy.is_empty());
+    }
+
+    #[test]
+    fn test_rule_metrics_only_allow_outcomes_excluded() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Only allow outcomes (no rule_id typically set)
+        let entry = CommandEntry {
+            timestamp: now,
+            agent_type: "test".to_string(),
+            working_dir: "/test".to_string(),
+            command: "git status".to_string(),
+            outcome: Outcome::Allow,
+            rule_id: None, // Allow typically has no rule_id
+            ..Default::default()
+        };
+        db.log_command(&entry).unwrap();
+
+        let metrics = db.get_rule_metrics(None, 100).unwrap();
+        // Should be empty since we filter on rule_id IS NOT NULL
+        assert!(metrics.is_empty());
+    }
+
+    #[test]
+    fn test_rule_metrics_mixed_packs() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Multiple rules from different packs
+        insert_rule_entry(&db, "core.git:reset-hard", Outcome::Deny, now, "git-1");
+        insert_rule_entry(&db, "core.git:force-push", Outcome::Deny, now, "git-2");
+        insert_rule_entry(&db, "core.filesystem:rm-rf", Outcome::Deny, now, "fs-1");
+        insert_rule_entry(
+            &db,
+            "containers.docker:prune",
+            Outcome::Deny,
+            now,
+            "docker-1",
+        );
+        insert_rule_entry(
+            &db,
+            "containers.docker:prune",
+            Outcome::Deny,
+            now,
+            "docker-2",
+        );
+
+        let metrics = db.get_rule_metrics(None, 100).unwrap();
+        assert_eq!(metrics.len(), 4);
+
+        // Verify all packs represented
+        let rule_ids: Vec<&str> = metrics.iter().map(|m| m.rule_id.as_str()).collect();
+        assert!(rule_ids.contains(&"core.git:reset-hard"));
+        assert!(rule_ids.contains(&"core.git:force-push"));
+        assert!(rule_ids.contains(&"core.filesystem:rm-rf"));
+        assert!(rule_ids.contains(&"containers.docker:prune"));
+    }
+
+    #[test]
+    fn test_rule_metrics_contains_trending_fields() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Insert data for a rule with enough hits for trend calculation
+        for i in 0..10 {
+            let entry = CommandEntry {
+                command: format!("git reset --hard HEAD~{i}"),
+                outcome: Outcome::Deny,
+                agent_type: "test".to_string(),
+                working_dir: "/test".to_string(),
+                pack_id: Some("core.git".to_string()),
+                pattern_name: Some("reset-hard".to_string()),
+                rule_id: Some("core.git:reset-hard".to_string()),
+                timestamp: now - chrono::Duration::hours(i),
+                ..Default::default()
+            };
+            db.log_command(&entry).unwrap();
+        }
+
+        let metrics = db.get_rule_metrics(None, 10).unwrap();
+        assert_eq!(metrics.len(), 1);
+
+        let m = &metrics[0];
+        // Trending fields should be present and initialized
+        // previous_period_hits is 0 since no data from 7-14 days ago
+        assert_eq!(m.previous_period_hits, 0);
+        // change_percentage and is_anomaly depend on previous data
+        // With no previous period data, check they have reasonable defaults
+        assert!(m.change_percentage.is_finite());
+    }
+
+    #[test]
+    fn test_rule_metrics_change_percentage_with_trend_data() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Insert data from 10 days ago (previous period: 7-14 days)
+        for i in 0..5 {
+            let entry = CommandEntry {
+                command: format!("git reset --hard HEAD~{i}"),
+                outcome: Outcome::Deny,
+                agent_type: "test".to_string(),
+                working_dir: "/test".to_string(),
+                pack_id: Some("core.git".to_string()),
+                pattern_name: Some("reset-hard".to_string()),
+                rule_id: Some("core.git:reset-hard".to_string()),
+                timestamp: now - chrono::Duration::days(10) + chrono::Duration::hours(i as i64),
+                ..Default::default()
+            };
+            db.log_command(&entry).unwrap();
+        }
+
+        // Insert data from 3 days ago (recent period: 0-7 days)
+        for i in 0..10 {
+            let entry = CommandEntry {
+                command: format!("git reset --hard HEAD~{i}"),
+                outcome: Outcome::Deny,
+                agent_type: "test".to_string(),
+                working_dir: "/test".to_string(),
+                pack_id: Some("core.git".to_string()),
+                pattern_name: Some("reset-hard".to_string()),
+                rule_id: Some("core.git:reset-hard".to_string()),
+                timestamp: now - chrono::Duration::days(3) + chrono::Duration::hours(i as i64),
+                ..Default::default()
+            };
+            db.log_command(&entry).unwrap();
+        }
+
+        let metrics = db.get_rule_metrics(None, 10).unwrap();
+        assert_eq!(metrics.len(), 1);
+
+        let m = &metrics[0];
+        // 5 hits in previous period, 10 in recent = 100% increase
+        assert_eq!(m.previous_period_hits, 5);
+        assert!((m.change_percentage - 100.0).abs() < 0.1);
+        // 100% is not >= 200%, so not an anomaly
+        assert!(!m.is_anomaly);
+    }
+
+    #[test]
+    fn test_rule_metrics_anomaly_detection() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Insert 2 hits from 10 days ago (previous period)
+        for i in 0..2 {
+            let entry = CommandEntry {
+                command: format!("git reset --hard HEAD~{i}"),
+                outcome: Outcome::Deny,
+                agent_type: "test".to_string(),
+                working_dir: "/test".to_string(),
+                pack_id: Some("core.git".to_string()),
+                pattern_name: Some("reset-hard".to_string()),
+                rule_id: Some("core.git:reset-hard".to_string()),
+                timestamp: now - chrono::Duration::days(10) + chrono::Duration::hours(i as i64),
+                ..Default::default()
+            };
+            db.log_command(&entry).unwrap();
+        }
+
+        // Insert 10 hits from 3 days ago (recent period) - 400% increase
+        for i in 0..10 {
+            let entry = CommandEntry {
+                command: format!("git reset --hard HEAD~{i}"),
+                outcome: Outcome::Deny,
+                agent_type: "test".to_string(),
+                working_dir: "/test".to_string(),
+                pack_id: Some("core.git".to_string()),
+                pattern_name: Some("reset-hard".to_string()),
+                rule_id: Some("core.git:reset-hard".to_string()),
+                timestamp: now - chrono::Duration::days(3) + chrono::Duration::hours(i as i64),
+                ..Default::default()
+            };
+            db.log_command(&entry).unwrap();
+        }
+
+        let metrics = db.get_rule_metrics(None, 10).unwrap();
+        let m = &metrics[0];
+
+        // 2 hits previous, 10 recent = (10-2)/2 * 100 = 400% change
+        assert_eq!(m.previous_period_hits, 2);
+        assert!((m.change_percentage - 400.0).abs() < 0.1);
+        // 400% >= 200% threshold, so is_anomaly should be true
+        assert!(m.is_anomaly);
+    }
+
+    #[test]
+    fn test_get_rule_metrics_for_rule_includes_trending_fields() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Insert enough data for a rule
+        for i in 0..RuleMetrics::MIN_HITS_FOR_TREND {
+            let entry = CommandEntry {
+                command: format!("git reset --hard HEAD~{i}"),
+                outcome: Outcome::Deny,
+                agent_type: "test".to_string(),
+                working_dir: "/test".to_string(),
+                pack_id: Some("core.git".to_string()),
+                pattern_name: Some("reset-hard".to_string()),
+                rule_id: Some("core.git:reset-hard".to_string()),
+                timestamp: now - chrono::Duration::hours(i as i64),
+                ..Default::default()
+            };
+            db.log_command(&entry).unwrap();
+        }
+
+        let m = db
+            .get_rule_metrics_for_rule("core.git:reset-hard")
+            .unwrap()
+            .unwrap();
+
+        // Verify trending fields are populated
+        assert!(m.change_percentage.is_finite());
+        // previous_period_hits should be 0 (no data 7-14 days ago)
+        assert_eq!(m.previous_period_hits, 0);
+    }
+
+    #[test]
+    fn test_get_noisiest_rules_includes_trending_fields() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Create a noisy rule with high bypass rate
+        for i in 0..10 {
+            let outcome = if i < 8 {
+                Outcome::Bypass
+            } else {
+                Outcome::Deny
+            };
+            let entry = CommandEntry {
+                command: format!("git clean -fdx {i}"),
+                outcome,
+                agent_type: "test".to_string(),
+                working_dir: "/test".to_string(),
+                pack_id: Some("core.git".to_string()),
+                pattern_name: Some("clean-force".to_string()),
+                rule_id: Some("core.git:clean-force".to_string()),
+                timestamp: now - chrono::Duration::hours(i as i64),
+                ..Default::default()
+            };
+            db.log_command(&entry).unwrap();
+        }
+
+        let metrics = db.get_noisiest_rules(10).unwrap();
+        assert_eq!(metrics.len(), 1);
+
+        let m = &metrics[0];
+        // Verify trending fields exist
+        assert!(m.change_percentage.is_finite());
+        assert_eq!(m.previous_period_hits, 0);
     }
 }

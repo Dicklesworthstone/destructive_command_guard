@@ -106,6 +106,8 @@ struct GeneralConfigLayer {
     color: Option<String>,
     log_file: Option<String>,
     verbose: Option<bool>,
+    check_updates: Option<bool>,
+    hook_timeout_ms: Option<u64>,
     max_hook_input_bytes: Option<usize>,
     max_command_bytes: Option<usize>,
     max_findings_per_command: Option<usize>,
@@ -728,6 +730,10 @@ pub struct GeneralConfig {
     /// Whether to show verbose output.
     pub verbose: bool,
 
+    /// Hook evaluation budget override in milliseconds.
+    /// When set, overrides the default hook evaluation budget.
+    pub hook_timeout_ms: Option<u64>,
+
     /// Maximum bytes to read from stdin in hook mode.
     /// Commands exceeding this limit are allowed (fail-open) with a warning.
     /// Default: 262144 (256 KiB).
@@ -742,6 +748,12 @@ pub struct GeneralConfig {
     /// Limits output size and processing time for pathological inputs.
     /// Default: 100.
     pub max_findings_per_command: Option<usize>,
+
+    /// Whether to check for updates in the background.
+    /// When enabled, dcg will spawn a background thread to check for updates
+    /// and show a notice if a newer version is available.
+    /// Default: true. Disable with DCG_NO_UPDATE_CHECK=1 or check_updates = false.
+    pub check_updates: bool,
 }
 
 /// Default limits for input size (used when not configured).
@@ -755,9 +767,11 @@ impl Default for GeneralConfig {
             color: "auto".to_string(),
             log_file: None,
             verbose: false,
+            hook_timeout_ms: None,
             max_hook_input_bytes: None,
             max_command_bytes: None,
             max_findings_per_command: None,
+            check_updates: true,
         }
     }
 }
@@ -1573,6 +1587,9 @@ impl Config {
         if let Some(verbose) = general.verbose {
             self.general.verbose = verbose;
         }
+        if let Some(hook_timeout_ms) = general.hook_timeout_ms {
+            self.general.hook_timeout_ms = Some(hook_timeout_ms);
+        }
         if let Some(max_hook_input_bytes) = general.max_hook_input_bytes {
             self.general.max_hook_input_bytes = Some(max_hook_input_bytes);
         }
@@ -1581,6 +1598,9 @@ impl Config {
         }
         if let Some(max_findings_per_command) = general.max_findings_per_command {
             self.general.max_findings_per_command = Some(max_findings_per_command);
+        }
+        if let Some(check_updates) = general.check_updates {
+            self.general.check_updates = check_updates;
         }
     }
 
@@ -1735,9 +1755,37 @@ impl Config {
             self.packs.disabled = disable.split(',').map(|s| s.trim().to_string()).collect();
         }
 
-        // DCG_VERBOSE=1
-        if get_env(&format!("{ENV_PREFIX}_VERBOSE")).is_some() {
-            self.general.verbose = true;
+        // DCG_VERBOSE=0-3
+        if let Some(verbose) = get_env(&format!("{ENV_PREFIX}_VERBOSE")) {
+            if let Ok(level) = verbose.trim().parse::<u8>() {
+                self.general.verbose = level > 0;
+            } else if let Some(parsed) = parse_env_bool(&verbose) {
+                self.general.verbose = parsed;
+            } else {
+                self.general.verbose = true;
+            }
+        }
+
+        // DCG_CHECK_UPDATES=true|false|1|0
+        if let Some(check_updates) = get_env(&format!("{ENV_PREFIX}_CHECK_UPDATES")) {
+            if let Some(parsed) = parse_env_bool(&check_updates) {
+                self.general.check_updates = parsed;
+            }
+        }
+
+        // DCG_NO_UPDATE_CHECK=1 (override)
+        if let Some(disable) = get_env("DCG_NO_UPDATE_CHECK") {
+            let parsed = parse_env_bool(&disable).unwrap_or(true);
+            if parsed {
+                self.general.check_updates = false;
+            }
+        }
+
+        // DCG_HOOK_TIMEOUT_MS=200
+        if let Some(timeout_ms) = get_env(&format!("{ENV_PREFIX}_HOOK_TIMEOUT_MS")) {
+            if let Ok(parsed) = timeout_ms.trim().parse::<u64>() {
+                self.general.hook_timeout_ms = Some(parsed);
+            }
         }
 
         // DCG_COLOR=never
@@ -1934,6 +1982,12 @@ color = "auto"
 
 # Verbose output
 verbose = false
+
+# Check for updates in the background (shows a notice if available)
+# check_updates = true
+
+# Hook evaluation budget override (milliseconds)
+# hook_timeout_ms = 200
 
 #─────────────────────────────────────────────────────────────
 # OUTPUT CONFIGURATION
@@ -3004,6 +3058,52 @@ allow = false
                 crate::heredoc::ScriptLanguage::JavaScript
             ])
         );
+    }
+
+    #[test]
+    fn test_env_override_verbose_numeric() {
+        let mut config = Config::default();
+        let env_map: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::from([("DCG_VERBOSE", "0")]);
+        config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
+        assert!(!config.general.verbose);
+
+        let mut config = Config::default();
+        let env_map: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::from([("DCG_VERBOSE", "2")]);
+        config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
+        assert!(config.general.verbose);
+    }
+
+    #[test]
+    fn test_env_override_check_updates() {
+        let mut config = Config::default();
+        let env_map: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::from([("DCG_CHECK_UPDATES", "0")]);
+        config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
+        assert!(!config.general.check_updates);
+
+        let mut config = Config::default();
+        let env_map: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::from([("DCG_NO_UPDATE_CHECK", "1")]);
+        config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
+        assert!(!config.general.check_updates);
+
+        let mut config = Config::default();
+        let env_map: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::from([("DCG_NO_UPDATE_CHECK", "false")]);
+        config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
+        assert!(config.general.check_updates);
+    }
+
+    #[test]
+    fn test_env_override_hook_timeout_ms() {
+        let mut config = Config::default();
+        let env_map: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::from([("DCG_HOOK_TIMEOUT_MS", "150")]);
+        config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
+
+        assert_eq!(config.general.hook_timeout_ms, Some(150));
     }
 
     #[test]

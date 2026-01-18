@@ -1,3 +1,4 @@
+#![allow(clippy::too_many_lines)]
 //! Pack system for modular command blocking.
 //!
 //! This module provides the infrastructure for organizing patterns into "packs"

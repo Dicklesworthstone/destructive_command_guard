@@ -130,10 +130,15 @@ fn warn_unknown_hooks_toml_keys(value: &toml::Value, path: &str, warnings: &mut 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanFormat {
+    /// Human-readable output
+    #[value(alias = "text")]
     Pretty,
+    /// Structured JSON output
     Json,
     /// GitHub-flavored Markdown for PR comments (uses `<details>` blocks)
     Markdown,
+    /// SARIF 2.1.0 output (for code scanning tools)
+    Sarif,
 }
 
 /// Controls scan failure behavior (CI integration).
@@ -657,6 +662,7 @@ pub fn scan_paths(
         let is_docker = is_dockerfile_path(file);
         let is_actions = is_github_actions_workflow_path(file);
         let is_gitlab = is_gitlab_ci_path(file);
+        let is_azure = is_azure_pipelines_path(file);
         let is_makefile = is_makefile_path(file);
         let is_package_json = is_package_json_path(file);
         let is_terraform = is_terraform_path(file);
@@ -666,6 +672,7 @@ pub fn scan_paths(
             && !is_docker
             && !is_actions
             && !is_gitlab
+            && !is_azure
             && !is_makefile
             && !is_package_json
             && !is_terraform
@@ -713,6 +720,14 @@ pub fn scan_paths(
 
         if is_gitlab {
             extracted.extend(extract_gitlab_ci_from_str(
+                &file_label,
+                &content,
+                &ctx.enabled_keywords,
+            ));
+        }
+
+        if is_azure {
+            extracted.extend(extract_azure_pipelines_from_str(
                 &file_label,
                 &content,
                 &ctx.enabled_keywords,
@@ -1004,6 +1019,7 @@ fn is_shell_script_path(path: &Path) -> bool {
 }
 
 /// Extract commands from shell scripts (.sh, .bash files)
+#[must_use]
 pub fn extract_shell_script_from_str(
     file: &str,
     content: &str,
@@ -1426,6 +1442,7 @@ fn is_dockerfile_path(path: &Path) -> bool {
 }
 
 /// Extract commands from Dockerfile RUN instructions
+#[must_use]
 pub fn extract_dockerfile_from_str(
     file: &str,
     content: &str,
@@ -1571,6 +1588,7 @@ fn is_github_actions_workflow_path(path: &Path) -> bool {
 
 /// Extract commands from GitHub Actions workflow run steps
 #[allow(clippy::too_many_lines)]
+#[must_use]
 pub fn extract_github_actions_workflow_from_str(
     file: &str,
     content: &str,
@@ -2158,6 +2176,184 @@ fn yaml_key_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 }
 
 // ============================================================================
+// Azure Pipelines extractor (azure-pipelines.yml)
+// ============================================================================
+
+fn is_azure_pipelines_path(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return false;
+    };
+    let lower = file_name.to_ascii_lowercase();
+    // Common patterns: azure-pipelines.yml, azure-pipelines.yaml
+    // Also supports azure-pipelines-*.yml for variants
+    lower == "azure-pipelines.yml"
+        || lower == "azure-pipelines.yaml"
+        || (lower.starts_with("azure-pipelines")
+            && (lower.ends_with(".yml") || lower.ends_with(".yaml")))
+}
+
+/// Extract commands from Azure Pipelines YAML files.
+///
+/// Azure Pipelines supports several script task types:
+/// - `script`: Runs a script (shell on Linux/macOS, cmd on Windows)
+/// - `bash`: Runs a bash script
+/// - `powershell`: Runs PowerShell script
+/// - `pwsh`: Runs PowerShell Core script
+///
+/// Each can be inline or multi-line using YAML block scalars.
+#[allow(clippy::too_many_lines)]
+#[must_use]
+pub fn extract_azure_pipelines_from_str(
+    file: &str,
+    content: &str,
+    enabled_keywords: &[&'static str],
+) -> Vec<ExtractedCommand> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = Vec::new();
+    let mut skip_indent: Option<usize> = None;
+
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let line_no = idx + 1;
+        let raw_line = lines[idx];
+        let trimmed_start = raw_line.trim_start();
+
+        if trimmed_start.is_empty() || trimmed_start.starts_with('#') {
+            idx += 1;
+            continue;
+        }
+
+        let indent = raw_line.len() - trimmed_start.len();
+
+        // Skip non-script sections
+        if let Some(skip) = skip_indent {
+            if indent <= skip {
+                skip_indent = None;
+            } else {
+                idx += 1;
+                continue;
+            }
+        }
+
+        // Strip list item prefix if present: "- script: echo" -> "script: echo"
+        let candidate = if let Some(after_dash) = trimmed_start.strip_prefix('-') {
+            after_dash.trim_start()
+        } else {
+            trimmed_start
+        };
+
+        // Skip variables, parameters, and other non-script sections
+        if yaml_key_value(candidate, "variables").is_some()
+            || yaml_key_value(candidate, "parameters").is_some()
+            || yaml_key_value(candidate, "resources").is_some()
+            || yaml_key_value(candidate, "trigger").is_some()
+            || yaml_key_value(candidate, "pr").is_some()
+            || yaml_key_value(candidate, "pool").is_some()
+            || yaml_key_value(candidate, "condition").is_some()
+            || yaml_key_value(candidate, "dependsOn").is_some()
+            || yaml_key_value(candidate, "displayName").is_some()
+            || yaml_key_value(candidate, "env").is_some()
+            || yaml_key_value(candidate, "inputs").is_some()
+        {
+            skip_indent = Some(indent);
+            idx += 1;
+            continue;
+        }
+
+        // Check for script task types: script, bash, powershell, pwsh
+        let (extractor_id, value) = if let Some(v) = yaml_key_value(candidate, "script") {
+            ("azure_pipelines.script", v)
+        } else if let Some(v) = yaml_key_value(candidate, "bash") {
+            ("azure_pipelines.bash", v)
+        } else if let Some(v) = yaml_key_value(candidate, "powershell") {
+            ("azure_pipelines.powershell", v)
+        } else if let Some(v) = yaml_key_value(candidate, "pwsh") {
+            ("azure_pipelines.pwsh", v)
+        } else {
+            idx += 1;
+            continue;
+        };
+
+        // Handle block scalar (| or >)
+        if value.starts_with('|') || value.starts_with('>') {
+            let (block, block_start_line, next_idx) = parse_yaml_block(&lines, idx + 1, indent);
+            out.extend(extract_shell_script_with_offset_and_id(
+                file,
+                block_start_line,
+                &block,
+                enabled_keywords,
+                extractor_id,
+            ));
+            idx = next_idx;
+            continue;
+        }
+
+        // Handle inline sequence [cmd1, cmd2]
+        if let Some(items) = parse_inline_yaml_sequence(value) {
+            for item in items {
+                out.extend(extract_shell_script_with_offset_and_id(
+                    file,
+                    line_no,
+                    &item,
+                    enabled_keywords,
+                    extractor_id,
+                ));
+            }
+            idx += 1;
+            continue;
+        }
+
+        // Handle empty value followed by list
+        if value.is_empty() || value.starts_with('#') {
+            // Check if next lines have list items
+            let mut j = idx + 1;
+            while j < lines.len() {
+                let next_raw = lines[j];
+                let next_trimmed = next_raw.trim_start();
+                if next_trimmed.is_empty() || next_trimmed.starts_with('#') {
+                    j += 1;
+                    continue;
+                }
+                let next_indent = next_raw.len() - next_trimmed.len();
+                if next_indent <= indent {
+                    break;
+                }
+                if next_trimmed.starts_with('-') {
+                    let item = next_trimmed.strip_prefix('-').unwrap_or("").trim_start();
+                    let item = unquote_yaml_scalar(item);
+                    if !item.is_empty() {
+                        out.extend(extract_shell_script_with_offset_and_id(
+                            file,
+                            j + 1,
+                            &item,
+                            enabled_keywords,
+                            extractor_id,
+                        ));
+                    }
+                }
+                j += 1;
+            }
+            idx = j;
+            continue;
+        }
+
+        // Handle inline scalar value
+        let unquoted = unquote_yaml_scalar(value);
+        out.extend(extract_shell_script_with_offset_and_id(
+            file,
+            line_no,
+            &unquoted,
+            enabled_keywords,
+            extractor_id,
+        ));
+
+        idx += 1;
+    }
+
+    out
+}
+
+// ============================================================================
 // Makefile extractor (Makefile)
 // ============================================================================
 
@@ -2167,6 +2363,7 @@ fn is_makefile_path(path: &Path) -> bool {
 }
 
 /// Extract commands from Makefile recipe lines
+#[must_use]
 pub fn extract_makefile_from_str(
     file: &str,
     content: &str,
@@ -3261,7 +3458,10 @@ fail_on = "nope"
         let finding = finding.unwrap();
         assert_eq!(finding.decision, ScanDecision::Deny);
         assert!(
-            finding.reason.as_ref().map_or(false, |r| r.contains("git reset --hard")),
+            finding
+                .reason
+                .as_ref()
+                .is_some_and(|r| r.contains("git reset --hard")),
             "Reason should mention the blocked command: {:?}",
             finding.reason
         );
@@ -3280,16 +3480,14 @@ fail_on = "nope"
 
         // The extracted command should be the full sh -c "..." string
         let cmd = &extracted[0].command;
-        eprintln!("Extracted command: {:?}", cmd);
+        eprintln!("Extracted command: {cmd:?}");
         assert!(
             cmd.contains("sh -c"),
-            "Extracted command should contain 'sh -c': {:?}",
-            cmd
+            "Extracted command should contain 'sh -c': {cmd:?}"
         );
         assert!(
             cmd.contains("git reset --hard"),
-            "Extracted command should contain the dangerous command: {:?}",
-            cmd
+            "Extracted command should contain the dangerous command: {cmd:?}"
         );
     }
 
@@ -3313,7 +3511,8 @@ fail_on = "nope"
         };
 
         // Step 1: Extract
-        let extracted = extract_docker_compose_from_str("docker-compose.yml", content, &ctx.enabled_keywords);
+        let extracted =
+            extract_docker_compose_from_str("docker-compose.yml", content, &ctx.enabled_keywords);
         eprintln!("Enabled keywords: {:?}", ctx.enabled_keywords);
         eprintln!("Extracted {} commands: {:?}", extracted.len(), extracted);
         assert!(!extracted.is_empty(), "Should extract at least 1 command");
@@ -3323,7 +3522,7 @@ fail_on = "nope"
         for cmd in &extracted {
             eprintln!("Evaluating command: {:?}", cmd.command);
             if let Some(finding) = evaluate_extracted_command(cmd, &options, &config, &ctx) {
-                eprintln!("Found finding: {:?}", finding);
+                eprintln!("Found finding: {finding:?}");
                 found_finding = true;
                 assert_eq!(finding.decision, ScanDecision::Deny);
             }
@@ -4191,6 +4390,205 @@ deploy:
     }
 
     // ========================================================================
+    // Azure Pipelines extractor tests (git_safety_guard-5rbb.11)
+    // ========================================================================
+
+    #[test]
+    fn azure_pipelines_path_detection() {
+        use std::path::Path;
+        assert!(is_azure_pipelines_path(Path::new("azure-pipelines.yml")));
+        assert!(is_azure_pipelines_path(Path::new("azure-pipelines.yaml")));
+        assert!(is_azure_pipelines_path(Path::new("Azure-Pipelines.yml")));
+        assert!(is_azure_pipelines_path(Path::new("AZURE-PIPELINES.YML")));
+        assert!(is_azure_pipelines_path(Path::new(
+            "azure-pipelines-prod.yml"
+        )));
+        assert!(is_azure_pipelines_path(Path::new(
+            "azure-pipelines-dev.yaml"
+        )));
+        assert!(!is_azure_pipelines_path(Path::new("pipelines.yml")));
+        assert!(!is_azure_pipelines_path(Path::new("azure.yml")));
+        assert!(!is_azure_pipelines_path(Path::new("ci.yml")));
+    }
+
+    #[test]
+    fn azure_pipelines_extractor_extracts_script_tasks() {
+        let content = r#"trigger:
+  - main
+pool:
+  vmImage: ubuntu-latest
+steps:
+  - script: echo Hello
+  - script: rm -rf ./build
+"#;
+        let extracted =
+            extract_azure_pipelines_from_str("azure-pipelines.yml", content, &["echo", "rm"]);
+        assert_eq!(
+            extracted.len(),
+            2,
+            "Expected 2 script commands: {extracted:?}"
+        );
+        assert_eq!(extracted[0].command, "echo Hello");
+        assert_eq!(extracted[0].extractor_id, "azure_pipelines.script");
+        assert_eq!(extracted[1].command, "rm -rf ./build");
+        assert_eq!(extracted[1].extractor_id, "azure_pipelines.script");
+    }
+
+    #[test]
+    fn azure_pipelines_extractor_extracts_bash_tasks() {
+        let content = r#"steps:
+  - bash: echo "bash command"
+  - bash: rm -rf /tmp/cache
+"#;
+        let extracted =
+            extract_azure_pipelines_from_str("azure-pipelines.yml", content, &["echo", "rm"]);
+        assert_eq!(
+            extracted.len(),
+            2,
+            "Expected 2 bash commands: {extracted:?}"
+        );
+        assert_eq!(extracted[0].extractor_id, "azure_pipelines.bash");
+        assert_eq!(extracted[1].extractor_id, "azure_pipelines.bash");
+    }
+
+    #[test]
+    fn azure_pipelines_extractor_extracts_powershell_tasks() {
+        let content = r#"steps:
+  - powershell: Write-Host "Hello"
+  - pwsh: Remove-Item -Recurse -Force ./build
+"#;
+        let extracted =
+            extract_azure_pipelines_from_str("azure-pipelines.yml", content, &["Write", "Remove"]);
+        assert_eq!(
+            extracted.len(),
+            2,
+            "Expected 2 powershell commands: {extracted:?}"
+        );
+        assert_eq!(extracted[0].extractor_id, "azure_pipelines.powershell");
+        assert_eq!(extracted[1].extractor_id, "azure_pipelines.pwsh");
+    }
+
+    #[test]
+    fn azure_pipelines_extractor_handles_block_scalars() {
+        let content = r#"steps:
+  - script: |
+      echo "line1"
+      rm -rf ./build
+      echo "done"
+"#;
+        let extracted =
+            extract_azure_pipelines_from_str("azure-pipelines.yml", content, &["echo", "rm"]);
+        // Block scalars are parsed into individual shell commands by keyword filter
+        assert_eq!(
+            extracted.len(),
+            3,
+            "Expected 3 individual commands from block: {extracted:?}"
+        );
+        assert!(extracted[0].command.contains("echo"));
+        assert!(extracted[1].command.contains("rm -rf"));
+        assert!(extracted[2].command.contains("echo"));
+    }
+
+    #[test]
+    fn azure_pipelines_extractor_ignores_variables() {
+        let content = r#"variables:
+  DANGEROUS: rm -rf /
+  BUILD_DIR: ./build
+steps:
+  - script: echo safe
+"#;
+        let extracted =
+            extract_azure_pipelines_from_str("azure-pipelines.yml", content, &["rm", "echo"]);
+        assert_eq!(
+            extracted.len(),
+            1,
+            "Variables should not be extracted: {extracted:?}"
+        );
+        assert_eq!(extracted[0].command, "echo safe");
+    }
+
+    #[test]
+    fn azure_pipelines_extractor_ignores_parameters() {
+        let content = r#"parameters:
+  - name: buildCommand
+    default: rm -rf /
+steps:
+  - script: echo hello
+"#;
+        let extracted =
+            extract_azure_pipelines_from_str("azure-pipelines.yml", content, &["rm", "echo"]);
+        assert_eq!(
+            extracted.len(),
+            1,
+            "Parameters should not be extracted: {extracted:?}"
+        );
+    }
+
+    #[test]
+    fn azure_pipelines_extractor_ignores_displayname_and_env() {
+        let content = r#"steps:
+  - script: rm -rf ./build
+    displayName: Delete build with rm -rf
+    env:
+      CLEANUP_CMD: rm -rf /
+"#;
+        let extracted = extract_azure_pipelines_from_str("azure-pipelines.yml", content, &["rm"]);
+        assert_eq!(
+            extracted.len(),
+            1,
+            "Only script should be extracted, not displayName/env: {extracted:?}"
+        );
+        assert_eq!(extracted[0].command, "rm -rf ./build");
+    }
+
+    #[test]
+    fn azure_pipelines_extractor_line_numbers_accurate() {
+        let content = r#"trigger:
+  - main
+
+steps:
+  - script: echo line5
+  - script: echo line6
+"#;
+        let extracted = extract_azure_pipelines_from_str("azure-pipelines.yml", content, &["echo"]);
+        assert_eq!(extracted.len(), 2, "Expected 2 commands: {extracted:?}");
+        assert_eq!(extracted[0].line, 5, "First script should be on line 5");
+        assert_eq!(extracted[1].line, 6, "Second script should be on line 6");
+    }
+
+    #[test]
+    fn azure_pipelines_extractor_quoted_strings() {
+        let content = r#"steps:
+  - script: "rm -rf ./build"
+  - bash: 'echo "hello"'
+"#;
+        let extracted =
+            extract_azure_pipelines_from_str("azure-pipelines.yml", content, &["rm", "echo"]);
+        assert_eq!(
+            extracted.len(),
+            2,
+            "Quoted strings should be extracted: {extracted:?}"
+        );
+        assert_eq!(extracted[0].command, "rm -rf ./build");
+        assert!(extracted[1].command.contains("echo"));
+    }
+
+    #[test]
+    fn azure_pipelines_empty_script_ignored() {
+        let content = r#"steps:
+  - script:
+  - script: echo real
+"#;
+        let extracted = extract_azure_pipelines_from_str("azure-pipelines.yml", content, &["echo"]);
+        assert_eq!(
+            extracted.len(),
+            1,
+            "Empty script should be ignored: {extracted:?}"
+        );
+        assert_eq!(extracted[0].command, "echo real");
+    }
+
+    // ========================================================================
     // Makefile extractor tests (git_safety_guard-scan.3.4)
     // ========================================================================
 
@@ -4760,7 +5158,119 @@ RUN echo "path\\with\\backslashes" && rm -rf /tmp"#;
             ENV CLEANUP_CMD=\"rm -rf /tmp\"\n\
             RUN echo safe";
         let extracted = extract_dockerfile_from_str("Dockerfile", content, &["rm"]);
-        assert!(extracted.is_empty());
+        assert!(
+            extracted.is_empty(),
+            "ENV values should not be extracted as commands: got {extracted:?}"
+        );
+    }
+
+    #[test]
+    fn dockerfile_empty_run_instruction() {
+        // Empty RUN should be skipped (no command to extract)
+        let content = "FROM alpine\nRUN\nRUN apt-get update";
+        let extracted = extract_dockerfile_from_str("Dockerfile", content, &["apt"]);
+        assert_eq!(
+            extracted.len(),
+            1,
+            "Expected 1 command from non-empty RUN, got: {extracted:?}"
+        );
+        assert_eq!(extracted[0].command, "apt-get update");
+    }
+
+    #[test]
+    fn dockerfile_run_with_only_whitespace() {
+        // RUN followed by only whitespace should be skipped
+        let content = "FROM alpine\nRUN   \nRUN apt-get update";
+        let extracted = extract_dockerfile_from_str("Dockerfile", content, &["apt"]);
+        assert_eq!(
+            extracted.len(),
+            1,
+            "Expected 1 command (whitespace-only RUN skipped), got: {extracted:?}"
+        );
+    }
+
+    #[test]
+    fn dockerfile_case_insensitive_run() {
+        // RUN instruction is case-insensitive per Dockerfile spec
+        let content = "FROM alpine\nrun apt-get update\nRUN apt-get install";
+        let extracted = extract_dockerfile_from_str("Dockerfile", content, &["apt"]);
+        assert_eq!(
+            extracted.len(),
+            2,
+            "Both 'run' and 'RUN' should be extracted: {extracted:?}"
+        );
+    }
+
+    #[test]
+    fn dockerfile_mixed_case_run() {
+        // Mixed case RUN should also work
+        let content = "FROM alpine\nRuN apt-get update";
+        let extracted = extract_dockerfile_from_str("Dockerfile", content, &["apt"]);
+        assert_eq!(
+            extracted.len(),
+            1,
+            "Mixed case 'RuN' should be extracted: {extracted:?}"
+        );
+    }
+
+    #[test]
+    fn dockerfile_line_numbers_accurate() {
+        // Verify line numbers are correctly reported
+        let content = "FROM alpine\n\nRUN echo line3\n\nRUN echo line5";
+        let extracted = extract_dockerfile_from_str("Dockerfile", content, &["echo"]);
+        assert_eq!(extracted.len(), 2, "Expected 2 RUN commands: {extracted:?}");
+        assert_eq!(
+            extracted[0].line, 3,
+            "First RUN should be on line 3: {extracted:?}"
+        );
+        assert_eq!(
+            extracted[1].line, 5,
+            "Second RUN should be on line 5: {extracted:?}"
+        );
+    }
+
+    #[test]
+    fn dockerfile_extractor_id_correct() {
+        // Verify extractor_id is set correctly for shell vs exec form
+        let content = "FROM alpine\nRUN echo shell\nRUN [\"echo\", \"exec\"]";
+        let extracted = extract_dockerfile_from_str("Dockerfile", content, &["echo"]);
+        assert_eq!(extracted.len(), 2, "Expected 2 commands: {extracted:?}");
+        assert_eq!(
+            extracted[0].extractor_id, "dockerfile.run",
+            "Shell form should have 'dockerfile.run' extractor_id"
+        );
+        assert_eq!(
+            extracted[1].extractor_id, "dockerfile.run.exec",
+            "Exec form should have 'dockerfile.run.exec' extractor_id"
+        );
+    }
+
+    #[test]
+    fn dockerfile_keyword_filtering_works() {
+        // Verify keyword filtering correctly limits extraction
+        let content = "FROM alpine\nRUN apt-get update\nRUN npm install\nRUN pip install";
+        let extracted = extract_dockerfile_from_str("Dockerfile", content, &["apt"]);
+        assert_eq!(
+            extracted.len(),
+            1,
+            "Only apt command should be extracted with 'apt' keyword: {extracted:?}"
+        );
+        assert!(
+            extracted[0].command.contains("apt"),
+            "Extracted command should contain 'apt': {extracted:?}"
+        );
+    }
+
+    #[test]
+    fn dockerfile_empty_keywords_extracts_all() {
+        // Empty keywords array should extract all RUN commands
+        let content = "FROM alpine\nRUN apt-get update\nRUN npm install\nRUN pip install";
+        let extracted = extract_dockerfile_from_str("Dockerfile", content, &[]);
+        assert_eq!(
+            extracted.len(),
+            3,
+            "All 3 RUN commands should be extracted with empty keywords: {extracted:?}"
+        );
     }
 
     // ------------------------------------------------------------------------

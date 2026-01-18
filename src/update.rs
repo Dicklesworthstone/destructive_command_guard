@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,299 @@ impl std::fmt::Display for VersionCheckError {
 
 impl std::error::Error for VersionCheckError {}
 
+// =============================================================================
+// Backup Manager for Version Rollback
+// =============================================================================
+
+/// Maximum number of backup versions to keep.
+const MAX_BACKUPS: usize = 3;
+
+/// Backup entry metadata stored alongside the backup binary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupEntry {
+    /// Version of the backed-up binary.
+    pub version: String,
+    /// Unix timestamp when the backup was created.
+    pub created_at: u64,
+    /// Original path where dcg was installed.
+    pub original_path: PathBuf,
+}
+
+/// Get the path to the backup directory.
+#[must_use]
+pub fn backup_dir() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("dcg").join("backups"))
+}
+
+/// List all available backup versions, sorted by creation time (newest first).
+///
+/// # Errors
+///
+/// Returns `VersionCheckError::BackupError` if the backup directory cannot be read.
+pub fn list_backups() -> Result<Vec<BackupEntry>, VersionCheckError> {
+    let dir = backup_dir().ok_or_else(|| {
+        VersionCheckError::BackupError("Could not determine backup directory".to_string())
+    })?;
+
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+
+    for entry in fs::read_dir(&dir).map_err(|e| {
+        VersionCheckError::BackupError(format!("Failed to read backup directory: {e}"))
+    })? {
+        let entry = entry.map_err(|e| {
+            VersionCheckError::BackupError(format!("Failed to read directory entry: {e}"))
+        })?;
+
+        let path = entry.path();
+
+        // Look for .json metadata files
+        if path.extension().is_some_and(|ext| ext == "json") {
+            if let Ok(content) = fs::read_to_string(&path) {
+                if let Ok(backup) = serde_json::from_str::<BackupEntry>(&content) {
+                    entries.push(backup);
+                }
+            }
+        }
+    }
+
+    // Sort by creation time, newest first
+    entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    Ok(entries)
+}
+
+/// Create a backup of the current dcg binary before updating.
+///
+/// # Errors
+///
+/// Returns `VersionCheckError::BackupError` if the backup cannot be created.
+pub fn create_backup() -> Result<PathBuf, VersionCheckError> {
+    let dir = backup_dir().ok_or_else(|| {
+        VersionCheckError::BackupError("Could not determine backup directory".to_string())
+    })?;
+
+    // Ensure backup directory exists
+    fs::create_dir_all(&dir).map_err(|e| {
+        VersionCheckError::BackupError(format!("Failed to create backup directory: {e}"))
+    })?;
+
+    // Get current executable path
+    let current_exe = std::env::current_exe().map_err(|e| {
+        VersionCheckError::BackupError(format!("Failed to get current executable path: {e}"))
+    })?;
+
+    let version = current_version();
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|e| VersionCheckError::BackupError(format!("Failed to get timestamp: {e}")))?
+        .as_secs();
+
+    let backup_name = format!("dcg-{version}-{timestamp}");
+    let backup_path = dir.join(&backup_name);
+    let metadata_path = dir.join(format!("{backup_name}.json"));
+
+    // Copy current binary to backup location
+    fs::copy(&current_exe, &backup_path).map_err(|e| {
+        VersionCheckError::BackupError(format!("Failed to copy binary to backup: {e}"))
+    })?;
+
+    // Write metadata
+    let entry = BackupEntry {
+        version: version.to_string(),
+        created_at: timestamp,
+        original_path: current_exe,
+    };
+
+    let metadata_content = serde_json::to_string_pretty(&entry).map_err(|e| {
+        VersionCheckError::BackupError(format!("Failed to serialize backup metadata: {e}"))
+    })?;
+
+    fs::write(&metadata_path, metadata_content).map_err(|e| {
+        VersionCheckError::BackupError(format!("Failed to write backup metadata: {e}"))
+    })?;
+
+    // Prune old backups
+    prune_old_backups()?;
+
+    Ok(backup_path)
+}
+
+/// Prune old backups, keeping only the most recent MAX_BACKUPS.
+fn prune_old_backups() -> Result<(), VersionCheckError> {
+    let backups = list_backups()?;
+
+    if backups.len() <= MAX_BACKUPS {
+        return Ok(());
+    }
+
+    let dir = backup_dir().ok_or_else(|| {
+        VersionCheckError::BackupError("Could not determine backup directory".to_string())
+    })?;
+
+    // Remove oldest backups (they're already sorted newest first)
+    for backup in backups.into_iter().skip(MAX_BACKUPS) {
+        let backup_name = format!("dcg-{}-{}", backup.version, backup.created_at);
+        let backup_path = dir.join(&backup_name);
+        let metadata_path = dir.join(format!("{backup_name}.json"));
+
+        let _ = fs::remove_file(&backup_path);
+        let _ = fs::remove_file(&metadata_path);
+    }
+
+    Ok(())
+}
+
+/// Rollback to a previous version.
+///
+/// If `target_version` is None, rolls back to the most recent backup.
+/// If `target_version` is Some, rolls back to that specific version.
+///
+/// # Errors
+///
+/// Returns `VersionCheckError::BackupError` if no matching backup is found
+/// or if the rollback operation fails.
+pub fn rollback(target_version: Option<&str>) -> Result<String, VersionCheckError> {
+    let backups = list_backups()?;
+
+    if backups.is_empty() {
+        return Err(VersionCheckError::BackupError(
+            "No backup versions available".to_string(),
+        ));
+    }
+
+    // Find the backup to restore
+    let backup = if let Some(version) = target_version {
+        let version_clean = version.trim_start_matches('v');
+        backups
+            .iter()
+            .find(|b| b.version == version_clean || b.version == version)
+            .ok_or_else(|| {
+                VersionCheckError::BackupError(format!(
+                    "No backup found for version {version}. Available versions: {}",
+                    backups
+                        .iter()
+                        .map(|b| b.version.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?
+    } else {
+        // Use most recent backup
+        backups.first().ok_or_else(|| {
+            VersionCheckError::BackupError("No backup versions available".to_string())
+        })?
+    };
+
+    let dir = backup_dir().ok_or_else(|| {
+        VersionCheckError::BackupError("Could not determine backup directory".to_string())
+    })?;
+
+    let backup_name = format!("dcg-{}-{}", backup.version, backup.created_at);
+    let backup_path = dir.join(&backup_name);
+
+    if !backup_path.exists() {
+        return Err(VersionCheckError::BackupError(format!(
+            "Backup file not found: {}",
+            backup_path.display()
+        )));
+    }
+
+    // Get current executable path for restoration
+    let current_exe = std::env::current_exe().map_err(|e| {
+        VersionCheckError::BackupError(format!("Failed to get current executable path: {e}"))
+    })?;
+
+    // Create a backup of the current version before rollback
+    create_backup()?;
+
+    // Replace current binary with backup using self-replace for safety
+    self_replace::self_replace(&backup_path).map_err(|e| {
+        VersionCheckError::BackupError(format!("Failed to restore backup: {e}"))
+    })?;
+
+    Ok(format!(
+        "Successfully rolled back to version {} (was at {})",
+        backup.version,
+        current_version()
+    ))
+}
+
+/// Format backup list for display.
+#[must_use]
+pub fn format_backup_list(backups: &[BackupEntry], use_color: bool) -> String {
+    use std::fmt::Write;
+
+    if backups.is_empty() {
+        return if use_color {
+            "\x1b[33mNo backup versions available.\x1b[0m\n\
+             Run 'dcg update' to create a backup of the current version."
+                .to_string()
+        } else {
+            "No backup versions available.\n\
+             Run 'dcg update' to create a backup of the current version."
+                .to_string()
+        };
+    }
+
+    let mut output = String::new();
+
+    if use_color {
+        writeln!(output, "\x1b[1mAvailable backup versions:\x1b[0m").ok();
+        writeln!(output).ok();
+    } else {
+        writeln!(output, "Available backup versions:").ok();
+        writeln!(output).ok();
+    }
+
+    for (i, backup) in backups.iter().enumerate() {
+        // Format timestamp as human-readable date
+        let datetime = chrono::DateTime::from_timestamp(backup.created_at as i64, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| backup.created_at.to_string());
+
+        let marker = if i == 0 { " (most recent)" } else { "" };
+
+        if use_color {
+            writeln!(
+                output,
+                "  \x1b[1mv{}\x1b[0m{} - backed up {}",
+                backup.version, marker, datetime
+            )
+            .ok();
+        } else {
+            writeln!(output, "  v{}{} - backed up {}", backup.version, marker, datetime).ok();
+        }
+    }
+
+    if use_color {
+        writeln!(output).ok();
+        writeln!(
+            output,
+            "Use '\x1b[1mdcg update --rollback\x1b[0m' to restore the most recent backup"
+        )
+        .ok();
+        writeln!(
+            output,
+            "Use '\x1b[1mdcg update --rollback <version>\x1b[0m' to restore a specific version"
+        )
+        .ok();
+    } else {
+        writeln!(output).ok();
+        writeln!(output, "Use 'dcg update --rollback' to restore the most recent backup").ok();
+        writeln!(
+            output,
+            "Use 'dcg update --rollback <version>' to restore a specific version"
+        )
+        .ok();
+    }
+
+    output
+}
+
 /// Get the path to the version check cache file.
 fn cache_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("dcg").join("version_check.json"))
@@ -101,6 +395,28 @@ fn read_cache() -> Option<VersionCheckResult> {
     } else {
         None
     }
+}
+
+/// Read a cached version check result if it is still fresh.
+#[must_use]
+pub fn read_cached_check() -> Option<VersionCheckResult> {
+    read_cache()
+}
+
+/// Spawn a background update check to refresh the cache if needed.
+///
+/// This is best-effort and ignores failures. If a fresh cache already exists,
+/// no thread is spawned.
+pub fn spawn_update_check_if_needed() {
+    if read_cache().is_some() {
+        return;
+    }
+
+    let _ = thread::Builder::new()
+        .name("dcg-update-check".to_string())
+        .spawn(|| {
+            let _ = check_for_update(false);
+        });
 }
 
 /// Write version check result to cache.
@@ -136,7 +452,8 @@ fn write_cache(result: &VersionCheckResult) -> Result<(), VersionCheckError> {
 }
 
 /// Get the current version of dcg from Cargo.toml.
-pub fn current_version() -> &'static str {
+#[must_use]
+pub const fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
@@ -177,7 +494,9 @@ fn fetch_latest_version() -> Result<VersionCheckResult, VersionCheckError> {
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
         .build()
-        .map_err(|e| VersionCheckError::NetworkError(format!("Failed to configure release list: {e}")))?
+        .map_err(|e| {
+            VersionCheckError::NetworkError(format!("Failed to configure release list: {e}"))
+        })?
         .fetch()
         .map_err(|e| VersionCheckError::NetworkError(format!("Failed to fetch releases: {e}")))?;
 
@@ -247,8 +566,18 @@ pub fn format_check_result(result: &VersionCheckResult, use_color: bool) -> Stri
     let mut output = String::new();
 
     if use_color {
-        writeln!(output, "\x1b[1mCurrent version:\x1b[0m {}", result.current_version).ok();
-        writeln!(output, "\x1b[1mLatest version:\x1b[0m  {}", result.latest_version).ok();
+        writeln!(
+            output,
+            "\x1b[1mCurrent version:\x1b[0m {}",
+            result.current_version
+        )
+        .ok();
+        writeln!(
+            output,
+            "\x1b[1mLatest version:\x1b[0m  {}",
+            result.latest_version
+        )
+        .ok();
         writeln!(output).ok();
 
         if result.update_available {
@@ -283,6 +612,67 @@ pub fn format_check_result(result: &VersionCheckResult, use_color: bool) -> Stri
 pub fn format_check_result_json(result: &VersionCheckResult) -> Result<String, VersionCheckError> {
     serde_json::to_string_pretty(result)
         .map_err(|e| VersionCheckError::ParseError(format!("Failed to serialize result: {e}")))
+}
+
+/// Spawn a background thread to check for updates.
+///
+/// This function returns immediately. The check runs in the background and
+/// caches the result for future calls to [`get_update_notice`].
+///
+/// This is fire-and-forget: errors are silently ignored since this is
+/// a non-critical enhancement.
+pub fn spawn_background_check() {
+    std::thread::spawn(|| {
+        // Silent check - ignore all errors
+        let _ = check_for_update(false);
+    });
+}
+
+/// Get an update notice from the cache without blocking.
+///
+/// Returns `Some(notice_string)` if an update is available and cached,
+/// `None` if no update is available, the cache is expired, or any error occurs.
+///
+/// This function never blocks on network I/O - it only reads from the cache.
+#[must_use]
+pub fn get_update_notice(use_color: bool) -> Option<String> {
+    // Only read from cache - never fetch
+    let cached = read_cache()?;
+
+    if !cached.update_available {
+        return None;
+    }
+
+    // Format a subtle notice
+    let notice = if use_color {
+        format!(
+            "\x1b[33m!\x1b[0m A new version of dcg is available: {} -> {}\n  Run '\x1b[1mdcg update\x1b[0m' to upgrade",
+            cached.current_version, cached.latest_version
+        )
+    } else {
+        format!(
+            "! A new version of dcg is available: {} -> {}\n  Run 'dcg update' to upgrade",
+            cached.current_version, cached.latest_version
+        )
+    };
+
+    Some(notice)
+}
+
+/// Check if update checking is enabled via environment variable.
+///
+/// Returns `false` if DCG_NO_UPDATE_CHECK is set to any non-empty value
+/// (e.g., "1", "true", "yes").
+#[must_use]
+pub fn is_update_check_enabled() -> bool {
+    is_update_check_enabled_with(|key| std::env::var(key).ok())
+}
+
+fn is_update_check_enabled_with<F>(mut get_env: F) -> bool
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    get_env("DCG_NO_UPDATE_CHECK").map_or(true, |v| v.is_empty())
 }
 
 #[cfg(test)]
@@ -346,5 +736,33 @@ mod tests {
         let output = format_check_result(&result, false);
         assert!(output.contains("Update available"));
         assert!(output.contains("dcg update"));
+    }
+
+    #[test]
+    fn test_is_update_check_enabled_default() {
+        let env_map: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        assert!(is_update_check_enabled_with(|key| {
+            env_map.get(key).map(|v| (*v).to_string())
+        }));
+    }
+
+    #[test]
+    fn test_is_update_check_disabled_by_env() {
+        let env_map: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::from([("DCG_NO_UPDATE_CHECK", "1")]);
+        assert!(!is_update_check_enabled_with(|key| {
+            env_map.get(key).map(|v| (*v).to_string())
+        }));
+    }
+
+    #[test]
+    fn test_get_update_notice_no_cache() {
+        // With no cache file, should return None
+        // This is safe because get_update_notice only reads cache
+        // and doesn't create it
+        let notice = get_update_notice(false);
+        // May or may not be Some depending on actual cache state
+        // but should not panic
+        let _ = notice;
     }
 }

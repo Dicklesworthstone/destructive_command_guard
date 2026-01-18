@@ -21,7 +21,7 @@ pub struct DenialBox {
     pub command: String,
     /// Span within the command that matched.
     pub span: HighlightSpan,
-    /// Pattern identifier (e.g., "core.git.reset_hard").
+    /// Pattern identifier (e.g., "`core.git.reset_hard`").
     pub pattern_id: String,
     /// Severity level of the match.
     pub severity: Severity,
@@ -88,7 +88,7 @@ impl DenialBox {
 
         // Header
         let _ = writeln!(output, "BLOCKED: Destructive Command Detected");
-        let _ = writeln!(output, "");
+        let _ = writeln!(output);
 
         // Command with highlighting
         let highlighted =
@@ -98,7 +98,7 @@ impl DenialBox {
         if let Some(label) = &highlighted.label_line {
             let _ = writeln!(output, "           {label}");
         }
-        let _ = writeln!(output, "");
+        let _ = writeln!(output);
 
         // Pattern info
         let _ = writeln!(
@@ -110,13 +110,13 @@ impl DenialBox {
 
         // Explanation
         if let Some(explanation) = &self.explanation {
-            let _ = writeln!(output, "");
+            let _ = writeln!(output);
             let _ = writeln!(output, "  Reason: {explanation}");
         }
 
         // Alternatives
         if !self.alternatives.is_empty() {
-            let _ = writeln!(output, "");
+            let _ = writeln!(output);
             let _ = writeln!(output, "  Safe alternatives:");
             for alt in &self.alternatives {
                 let _ = writeln!(output, "    - {alt}");
@@ -127,6 +127,7 @@ impl DenialBox {
     }
 
     /// Render with Unicode box-drawing characters.
+    #[allow(clippy::too_many_lines)]
     fn render_unicode(&self, theme: &Theme) -> String {
         let width = terminal_width().saturating_sub(4).max(40) as usize;
         let mut output = String::new();
@@ -439,7 +440,7 @@ impl DenialBox {
 }
 
 /// Get ANSI color code for severity level.
-fn severity_color_code(severity: Severity) -> u8 {
+const fn severity_color_code(severity: Severity) -> u8 {
     match severity {
         Severity::Critical => 31, // Red
         Severity::High => 91,     // Bright red
@@ -517,7 +518,12 @@ mod tests {
     #[test]
     fn test_denial_box_plain_render() {
         let span = HighlightSpan::with_label(0, 16, "Matched: git reset --hard");
-        let denial = DenialBox::new("git reset --hard HEAD", span, "core.git.reset_hard", Severity::Critical);
+        let denial = DenialBox::new(
+            "git reset --hard HEAD",
+            span,
+            "core.git.reset_hard",
+            Severity::Critical,
+        );
 
         let output = denial.render_plain();
 
@@ -530,8 +536,13 @@ mod tests {
     #[test]
     fn test_denial_box_with_explanation() {
         let span = HighlightSpan::new(0, 10);
-        let denial = DenialBox::new("rm -rf /", span, "core.filesystem.rm_rf", Severity::Critical)
-            .with_explanation("This command would delete all files on the system.");
+        let denial = DenialBox::new(
+            "rm -rf /",
+            span,
+            "core.filesystem.rm_rf",
+            Severity::Critical,
+        )
+        .with_explanation("This command would delete all files on the system.");
 
         let output = denial.render_plain();
 
@@ -541,11 +552,16 @@ mod tests {
     #[test]
     fn test_denial_box_with_alternatives() {
         let span = HighlightSpan::new(0, 10);
-        let denial = DenialBox::new("rm -rf /tmp/foo", span, "core.filesystem.rm_rf", Severity::Medium)
-            .with_alternatives(vec![
-                "rm -ri /tmp/foo (interactive)".to_string(),
-                "mv /tmp/foo /tmp/foo.bak (backup first)".to_string(),
-            ]);
+        let denial = DenialBox::new(
+            "rm -rf /tmp/foo",
+            span,
+            "core.filesystem.rm_rf",
+            Severity::Medium,
+        )
+        .with_alternatives(vec![
+            "rm -ri /tmp/foo (interactive)".to_string(),
+            "mv /tmp/foo /tmp/foo.bak (backup first)".to_string(),
+        ]);
 
         let output = denial.render_plain();
 
@@ -558,7 +574,12 @@ mod tests {
     fn test_denial_box_unicode_render() {
         let span = HighlightSpan::new(0, 10);
         let theme = Theme::default();
-        let denial = DenialBox::new("git push --force", span, "core.git.force_push", Severity::High);
+        let denial = DenialBox::new(
+            "git push --force",
+            span,
+            "core.git.force_push",
+            Severity::High,
+        );
 
         let output = denial.render(&theme);
 
@@ -571,10 +592,17 @@ mod tests {
     #[test]
     fn test_denial_box_ascii_render() {
         let span = HighlightSpan::new(0, 10);
-        let mut theme = Theme::default();
-        theme.border_style = BorderStyle::Ascii;
-        theme.colors_enabled = true;
-        let denial = DenialBox::new("git push --force", span, "core.git.force_push", Severity::High);
+        let theme = Theme {
+            border_style: BorderStyle::Ascii,
+            colors_enabled: true,
+            ..Default::default()
+        };
+        let denial = DenialBox::new(
+            "git push --force",
+            span,
+            "core.git.force_push",
+            Severity::High,
+        );
 
         let output = denial.render(&theme);
 
@@ -586,7 +614,8 @@ mod tests {
 
     #[test]
     fn test_wrap_text() {
-        let text = "This is a long explanation that needs to be wrapped to fit within the terminal width.";
+        let text =
+            "This is a long explanation that needs to be wrapped to fit within the terminal width.";
         let wrapped = wrap_text(text, 30);
 
         assert!(wrapped.len() > 1);
@@ -631,16 +660,23 @@ mod tests {
     #[test]
     fn test_denial_box_all_severity_levels() {
         // Verify all severity levels render correctly
-        for severity in [Severity::Critical, Severity::High, Severity::Medium, Severity::Low] {
+        for severity in [
+            Severity::Critical,
+            Severity::High,
+            Severity::Medium,
+            Severity::Low,
+        ] {
             let span = HighlightSpan::new(0, 10);
             let denial = DenialBox::new("test command", span, "test.pattern", severity);
             let output = denial.render_plain();
 
-            assert!(output.contains("BLOCKED"), "All severities must show BLOCKED header");
             assert!(
-                output.contains(&format!("{:?}", severity).to_uppercase()),
-                "Output must contain severity level: {:?}",
-                severity
+                output.contains("BLOCKED"),
+                "All severities must show BLOCKED header"
+            );
+            assert!(
+                output.contains(&format!("{severity:?}").to_uppercase()),
+                "Output must contain severity level: {severity:?}"
             );
         }
     }
@@ -648,9 +684,16 @@ mod tests {
     #[test]
     fn test_denial_box_minimal_render() {
         let span = HighlightSpan::new(0, 10);
-        let mut theme = Theme::default();
-        theme.border_style = BorderStyle::None;
-        let denial = DenialBox::new("git push --force", span, "core.git.force_push", Severity::High);
+        let theme = Theme {
+            border_style: BorderStyle::None,
+            ..Default::default()
+        };
+        let denial = DenialBox::new(
+            "git push --force",
+            span,
+            "core.git.force_push",
+            Severity::High,
+        );
 
         let output = denial.render(&theme);
 
