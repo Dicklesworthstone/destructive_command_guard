@@ -70,7 +70,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
 hmac = "0.12"  # HMAC for optional short-code hardening (ksk.1.10)
 fs2 = "0.4"
-rusqlite = { version = "0.35", features = ["bundled"] }  # Telemetry database
+rusqlite = { version = "0.38", features = ["bundled"] }  # Telemetry database
 ctrlc = "3.5.1"
 flate2 = "1.0"  # Gzip compression for history export
 
