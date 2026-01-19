@@ -3,7 +3,7 @@
 //! This module handles the JSON input/output for the Claude Code `PreToolUse` hook.
 //! It parses incoming hook requests and formats denial responses.
 
-use crate::evaluator::MatchSpan;
+use crate::evaluator::{DEFAULT_WINDOW_WIDTH, MatchSpan};
 use crate::highlight::{HighlightSpan, format_highlighted_command, should_use_color};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
@@ -328,6 +328,31 @@ fn allow_once_header_line(code: &str) -> String {
     allow_once_header_line_with_color(code, colorize)
 }
 
+/// Check if plain (non-box) output should be used.
+/// Returns true for CI environments, dumb terminals, or when `NO_COLOR` is set.
+/// Unlike `output::should_use_rich_output()`, this does NOT check for TTY status,
+/// allowing box output to be used even in piped/captured scenarios.
+/// Check if plain (non-box) output should be used.
+///
+/// Returns true for CI environments or dumb terminals.
+/// Note: NO_COLOR only disables ANSI color codes, it does NOT disable box formatting.
+/// This is intentional because users may want the visual box structure without colors.
+fn should_use_plain_output() -> bool {
+    // Check CI environment variable (common in CI/CD systems)
+    if std::env::var("CI").is_ok() {
+        return true;
+    }
+
+    // Check for dumb terminal
+    if let Ok(term) = std::env::var("TERM") {
+        if term == "dumb" {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Print a colorful warning to stderr for human visibility.
 #[allow(clippy::too_many_lines)]
 pub fn print_colorful_warning(
@@ -341,6 +366,23 @@ pub fn print_colorful_warning(
 ) {
     // Box width (content area, excluding border characters)
     const WIDTH: usize = 70;
+
+    // Check if box output should be disabled (CI, TERM=dumb, NO_COLOR)
+    // Note: We explicitly allow box output even in non-TTY contexts (e.g., piped output)
+    // because users may still want the visual formatting in logs/captures.
+    // Only explicit environment signals disable the box.
+    if should_use_plain_output() {
+        print_plain_warning(
+            command,
+            reason,
+            pack,
+            pattern,
+            explanation,
+            allow_once_code,
+            matched_span,
+        );
+        return;
+    }
 
     let stderr = io::stderr();
     let mut handle = stderr.lock();
@@ -648,6 +690,115 @@ pub fn print_colorful_warning(
         "╰".red(),
         "─".repeat(WIDTH).red(),
         "╯".red()
+    );
+    let _ = writeln!(handle);
+}
+
+/// Print a plain text warning (no box-drawing characters or colors).
+/// Used when CI=true, TERM=dumb, `NO_COLOR`, or non-TTY environment.
+fn print_plain_warning(
+    command: &str,
+    reason: &str,
+    pack: Option<&str>,
+    pattern: Option<&str>,
+    explanation: Option<&str>,
+    allow_once_code: Option<&str>,
+    matched_span: Option<&MatchSpan>,
+) {
+    let stderr = io::stderr();
+    let mut handle = stderr.lock();
+
+    if let Some(code) = allow_once_code {
+        let _ = writeln!(
+            handle,
+            "ALLOW-24H CODE: [{code}] | run: dcg allow-once {code}"
+        );
+    }
+
+    // Explain hint
+    let _ = writeln!(
+        handle,
+        "Tip: dcg explain \"{}\"",
+        command.replace('"', "\\\"")
+    );
+    let _ = writeln!(handle);
+
+    // Header
+    let _ = writeln!(handle, "BLOCKED: Destructive Command Detected");
+    let _ = writeln!(handle, "Destructive Command Guard (dcg)");
+    let _ = writeln!(handle);
+
+    // Rule ID
+    let rule_id = build_rule_id(pack, pattern);
+    if let Some(ref rule) = rule_id {
+        let _ = writeln!(handle, "Rule: {rule}");
+    } else if let Some(pack_name) = pack {
+        let _ = writeln!(handle, "Pack: {pack_name}");
+    }
+
+    // Reason
+    let _ = writeln!(handle, "Reason: {reason}");
+    let _ = writeln!(handle);
+
+    // Explanation
+    let explanation_text = format_explanation_text(explanation, rule_id.as_deref(), pack);
+    let _ = writeln!(handle, "Explanation: {explanation_text}");
+    let _ = writeln!(handle);
+
+    // Command
+    if let Some(span) = matched_span {
+        // Build label from rule_id or pattern name (same as box output)
+        let label = rule_id
+            .as_deref()
+            .map(|r| format!("Matched: {r}"))
+            .or_else(|| pack.map(|p| format!("Matched: {p}")))
+            .unwrap_or_else(|| "Matched destructive pattern".to_string());
+        let highlight_span = HighlightSpan::with_label(span.start, span.end, label);
+        let highlighted =
+            format_highlighted_command(command, &highlight_span, false, DEFAULT_WINDOW_WIDTH);
+        let prefix = "Command: ";
+        let _ = writeln!(handle, "{prefix}{}", highlighted.command_line);
+        let indent = " ".repeat(prefix.len());
+        let _ = writeln!(handle, "{indent}{}", highlighted.caret_line);
+        if let Some(label_line) = highlighted.label_line {
+            let _ = writeln!(handle, "{indent}{label_line}");
+        }
+    } else {
+        let _ = writeln!(handle, "Command: {command}");
+    }
+    let _ = writeln!(handle);
+
+    // Suggestions
+    let suggestions = rule_id
+        .as_deref()
+        .and_then(crate::suggestions::get_suggestions);
+
+    if let Some(sugg_list) = suggestions {
+        for s in sugg_list.iter().take(3) {
+            let _ = writeln!(handle, "* {}: {}", s.kind.label(), s.text);
+            if let Some(ref cmd) = s.command {
+                let _ = writeln!(handle, "    $ {cmd}");
+            }
+        }
+    } else if let Some(suggestion) = get_contextual_suggestion(command) {
+        let _ = writeln!(handle, "* Suggestion: {suggestion}");
+    }
+    let _ = writeln!(handle);
+
+    // Learning commands
+    let _ = writeln!(handle, "Learn more:");
+    let escaped_cmd = command.replace('\'', "'\\''");
+    let _ = writeln!(handle, "  $ dcg explain '{escaped_cmd}'");
+    if let Some(ref rule) = rule_id {
+        let _ = writeln!(handle, "  $ dcg allowlist add {rule} --project");
+    }
+    let _ = writeln!(handle);
+
+    // False positive link
+    let _ = writeln!(handle, "False positive? File an issue:");
+    let _ = writeln!(
+        handle,
+        "https://github.com/Dicklesworthstone/destructive_command_guard/issues/new?template=false_positive.yml"
     );
     let _ = writeln!(handle);
 }

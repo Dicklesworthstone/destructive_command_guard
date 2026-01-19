@@ -21,8 +21,9 @@ pub mod denial;
 pub mod theme;
 
 pub use denial::DenialBox;
-pub use theme::{BorderStyle, Severity, SeverityColors, Theme};
+pub use theme::{BorderStyle, Severity, SeverityColors, Theme, ThemePalette};
 
+use crate::config::Config;
 use std::sync::OnceLock;
 
 /// Global flag to force plain output (set by --no-color or similar).
@@ -66,12 +67,17 @@ pub fn should_use_rich_output() -> bool {
         return false;
     }
 
-    // 3. Check if stdout is a TTY
+    // 3. Check CI environment variable (common in CI/CD systems)
+    if std::env::var("CI").is_ok() {
+        return false;
+    }
+
+    // 4. Check if stdout is a TTY
     if !console::Term::stdout().is_term() {
         return false;
     }
 
-    // 4. Check for dumb terminal
+    // 5. Check for dumb terminal
     if let Ok(term) = std::env::var("TERM") {
         if term == "dumb" {
             return false;
@@ -88,10 +94,65 @@ pub fn should_use_rich_output() -> bool {
 #[must_use]
 pub fn auto_theme() -> Theme {
     if should_use_rich_output() {
-        Theme::default()
+        if env_flag_enabled("DCG_HIGH_CONTRAST") {
+            Theme::high_contrast()
+        } else {
+            Theme::default()
+        }
     } else {
         Theme::no_color()
     }
+}
+
+/// Returns the appropriate theme based on config and environment.
+#[must_use]
+pub fn auto_theme_with_config(config: &Config) -> Theme {
+    if !should_use_rich_output() {
+        return Theme::no_color();
+    }
+
+    let palette = if env_flag_enabled("DCG_HIGH_CONTRAST") || config.output.high_contrast_enabled()
+    {
+        ThemePalette::HighContrast
+    } else if let Some(palette) = config
+        .theme
+        .palette
+        .as_deref()
+        .and_then(|value| value.parse::<ThemePalette>().ok())
+    {
+        palette
+    } else {
+        ThemePalette::Default
+    };
+
+    let mut theme = Theme::from_palette(palette);
+
+    if let Some(use_color) = config.theme.use_color {
+        if !use_color {
+            theme = theme.without_colors();
+        }
+    }
+
+    if let Some(use_unicode) = config.theme.use_unicode {
+        if palette != ThemePalette::HighContrast {
+            theme.border_style = if use_unicode {
+                BorderStyle::Unicode
+            } else {
+                BorderStyle::Ascii
+            };
+        }
+    }
+
+    theme
+}
+
+fn env_flag_enabled(var: &str) -> bool {
+    std::env::var(var).is_ok_and(|value| {
+        !matches!(
+            value.trim().to_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        )
+    })
 }
 
 /// Checks if the terminal supports 256 colors.

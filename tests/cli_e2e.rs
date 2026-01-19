@@ -1445,7 +1445,7 @@ mod packs_tests {
 
     #[test]
     fn pack_show_displays_pack_info() {
-        let output = run_dcg(&["pack", "core.git"]);
+        let output = run_dcg(&["pack", "info", "core.git"]);
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(output.status.success(), "pack show should succeed");
@@ -3739,7 +3739,7 @@ mod stats_rules_tests {
         );
 
         let json: serde_json::Value = serde_json::from_str(&stdout)
-            .expect(&format!("should produce valid JSON\nstdout:\n{stdout}"));
+            .unwrap_or_else(|_| panic!("should produce valid JSON\nstdout:\n{stdout}"));
 
         assert!(json.is_object(), "JSON should be an object");
     }
