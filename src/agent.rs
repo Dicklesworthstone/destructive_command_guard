@@ -46,7 +46,7 @@ pub enum Agent {
     Aider,
     /// Continue.dev IDE extension.
     Continue,
-    /// OpenAI Codex CLI.
+    /// `OpenAI` Codex CLI.
     CodexCli,
     /// Google Gemini CLI.
     GeminiCli,
@@ -76,13 +76,16 @@ impl Agent {
 
     /// Returns `true` if this is a known agent (not Unknown or Custom).
     #[must_use]
-    pub fn is_known(&self) -> bool {
-        !matches!(self, Self::Unknown | Self::Custom(_))
+    pub const fn is_known(&self) -> bool {
+        matches!(
+            self,
+            Self::ClaudeCode | Self::Aider | Self::Continue | Self::CodexCli | Self::GeminiCli
+        )
     }
 
     /// Returns `true` if this agent was explicitly specified (not auto-detected).
     #[must_use]
-    pub fn is_explicit(&self) -> bool {
+    pub const fn is_explicit(&self) -> bool {
         matches!(self, Self::Custom(_))
     }
 
@@ -517,6 +520,16 @@ mod env_tests {
     // SAFETY: These tests manipulate environment variables. They must be run
     // with --test-threads=1 or use proper synchronization.
 
+    /// All known agent environment variable keys.
+    const AGENT_ENV_VARS: &[&str] = &[
+        "CLAUDE_CODE",
+        "CLAUDE_SESSION_ID",
+        "AIDER_SESSION",
+        "CONTINUE_SESSION_ID",
+        "CODEX_CLI",
+        "GEMINI_CLI",
+    ];
+
     fn with_env_var<F, R>(key: &str, value: &str, f: F) -> R
     where
         F: FnOnce() -> R,
@@ -527,8 +540,18 @@ mod env_tests {
         // SAFETY: Tests are run single-threaded with `--test-threads=1` or with
         // `serial_test` crate. No other code is reading these environment
         // variables concurrently within this test.
+
+        // Save and clear all agent env vars (to avoid ambient env interference)
+        let saved: Vec<_> = AGENT_ENV_VARS
+            .iter()
+            .map(|&k| (k, std::env::var(k).ok()))
+            .collect();
+
         unsafe {
-            // Set env var
+            for &k in AGENT_ENV_VARS {
+                std::env::remove_var(k);
+            }
+            // Set the test env var
             std::env::set_var(key, value);
         }
 
@@ -537,8 +560,13 @@ mod env_tests {
 
         // SAFETY: See above
         unsafe {
-            // Clean up
+            // Clean up - restore original values
             std::env::remove_var(key);
+            for (k, v) in saved {
+                if let Some(val) = v {
+                    std::env::set_var(k, val);
+                }
+            }
         }
         clear_cache();
 

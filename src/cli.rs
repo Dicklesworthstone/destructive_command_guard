@@ -8,6 +8,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::generate;
 use inquire::{Select, Text};
 
+use crate::agent::{DetectionMethod, detect_agent_with_details};
 use crate::config::Config;
 use crate::evaluator::{
     DEFAULT_WINDOW_WIDTH, EvaluationDecision, EvaluationResult, MatchSource,
@@ -569,6 +570,9 @@ pub struct TestOutput {
     /// Allowlist override info if allowed via allowlist
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowlist: Option<AllowlistOverrideInfo>,
+    /// Detected agent information
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentInfo>,
 }
 
 /// Allowlist override information in test output
@@ -578,6 +582,17 @@ pub struct AllowlistOverrideInfo {
     pub layer: String,
     /// Reason from the allowlist entry
     pub reason: String,
+}
+
+/// Agent detection information in test output
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentInfo {
+    /// The detected agent name (e.g., "claude-code", "aider", "unknown")
+    pub detected: String,
+    /// Trust level for this agent (e.g., "high", "medium", "low")
+    pub trust_level: String,
+    /// How the agent was detected (e.g., "environment_variable", "explicit", "process", "none")
+    pub detection_method: String,
 }
 
 /// JSON output structure for `dcg packs` command
@@ -2891,6 +2906,20 @@ fn test_command(
     // This is a small file read and only affects decisions when a rule matches.
     let allowlists = load_default_allowlists();
 
+    // Detect the current AI coding agent for agent-specific profiles
+    let detection = detect_agent_with_details();
+    let trust_level = effective_config.trust_level_for_agent(&detection.agent);
+    let agent_info = AgentInfo {
+        detected: detection.agent.config_key().to_string(),
+        trust_level: format!("{:?}", trust_level).to_lowercase(),
+        detection_method: match detection.method {
+            DetectionMethod::Environment => "environment_variable".to_string(),
+            DetectionMethod::Explicit => "explicit".to_string(),
+            DetectionMethod::Process => "process".to_string(),
+            DetectionMethod::None => "none".to_string(),
+        },
+    };
+
     // TODO: External pack loading is not yet implemented.
     // When ExternalPackLoader is implemented, load custom YAML packs here.
 
@@ -2932,6 +2961,7 @@ fn test_command(
                     source: None,
                     matched_span: None,
                     allowlist,
+                    agent: Some(agent_info.clone()),
                 }
             }
             EvaluationDecision::Deny => {
@@ -2968,6 +2998,7 @@ fn test_command(
                     source: source_str,
                     matched_span,
                     allowlist: None,
+                    agent: Some(agent_info.clone()),
                 }
             }
         };
@@ -3174,6 +3205,8 @@ fn test_command(
 
     if verbosity.is_verbose() {
         println!("Elapsed: {:.2}ms", elapsed.as_secs_f64() * 1000.0);
+        println!("Agent: {}", detection.agent);
+        println!("Trust level: {}", agent_info.trust_level);
         if let Some(ref info) = result.pattern_info {
             if let Some(severity) = info.severity {
                 println!("Severity: {}", severity.label());
@@ -3182,6 +3215,16 @@ fn test_command(
     }
 
     if verbosity.is_debug() {
+        // Agent detection details
+        println!("Agent detection:");
+        println!("  Detected: {} ({})", detection.agent, detection.agent.config_key());
+        println!("  Method: {}", agent_info.detection_method);
+        if let Some(ref matched) = detection.matched_value {
+            println!("  Matched: {matched}");
+        }
+        println!("  Profile: agents.{}", detection.agent.config_key());
+        println!("  Trust level: {}", agent_info.trust_level);
+
         if let Some(ref info) = result.pattern_info {
             if let Some(ref pack_id) = info.pack_id {
                 if let Some(ref pattern_name) = info.pattern_name {

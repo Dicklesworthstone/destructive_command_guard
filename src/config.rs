@@ -2701,6 +2701,51 @@ impl Config {
         self.packs.enabled_pack_ids()
     }
 
+    /// Get enabled pack IDs adjusted for an agent's profile.
+    ///
+    /// This applies the agent's `disabled_packs` and `extra_packs` settings
+    /// on top of the base configuration.
+    #[must_use]
+    pub fn enabled_pack_ids_for_agent(&self, agent: &crate::agent::Agent) -> HashSet<String> {
+        let mut packs = self.enabled_pack_ids();
+        let profile = self.agents.profile_for_agent(agent);
+
+        // Remove disabled packs (and their sub-packs)
+        for disabled in &profile.disabled_packs {
+            packs.remove(disabled);
+            packs.retain(|p| !p.starts_with(&format!("{disabled}.")));
+        }
+
+        // Add extra packs
+        for extra in &profile.extra_packs {
+            packs.insert(extra.clone());
+        }
+
+        packs
+    }
+
+    /// Get additional allowlist entries for an agent.
+    ///
+    /// Returns the patterns from the agent profile's `additional_allowlist`.
+    #[must_use]
+    pub fn additional_allowlist_for_agent(&self, agent: &crate::agent::Agent) -> &[String] {
+        &self.agents.profile_for_agent(agent).additional_allowlist
+    }
+
+    /// Check if allowlists are disabled for an agent.
+    ///
+    /// When `true`, all allowlist checks should be skipped (more restrictive).
+    #[must_use]
+    pub fn allowlist_disabled_for_agent(&self, agent: &crate::agent::Agent) -> bool {
+        self.agents.profile_for_agent(agent).disabled_allowlist
+    }
+
+    /// Get the trust level for an agent.
+    #[must_use]
+    pub fn trust_level_for_agent(&self, agent: &crate::agent::Agent) -> TrustLevel {
+        self.agents.profile_for_agent(agent).trust_level
+    }
+
     /// Get effective heredoc scanning settings for evaluation.
     #[must_use]
     pub fn heredoc_settings(&self) -> HeredocSettings {
@@ -5327,6 +5372,281 @@ allow = false
         assert!(
             hit.is_some(),
             "Empty language filter should match JavaScript"
+        );
+    }
+
+    // =========================================================================
+    // Agent Profile Tests (Epic 9)
+    // =========================================================================
+
+    #[test]
+    fn test_agents_config_default() {
+        let config = AgentsConfig::default();
+        assert_eq!(config.default.trust_level, TrustLevel::Medium);
+        assert!(config.default.disabled_packs.is_empty());
+        assert!(config.default.extra_packs.is_empty());
+        assert!(config.default.additional_allowlist.is_empty());
+        assert!(!config.default.disabled_allowlist);
+        assert!(config.profiles.is_empty());
+    }
+
+    #[test]
+    fn test_agents_config_profile_for_known_agent() {
+        let mut config = AgentsConfig::default();
+        config.profiles.insert(
+            "claude-code".to_string(),
+            AgentProfile {
+                trust_level: TrustLevel::High,
+                ..Default::default()
+            },
+        );
+
+        let profile = config.profile_for("claude-code");
+        assert_eq!(profile.trust_level, TrustLevel::High);
+    }
+
+    #[test]
+    fn test_agents_config_profile_for_unknown_falls_back_to_default() {
+        let mut config = AgentsConfig::default();
+        config.default.trust_level = TrustLevel::Low;
+
+        let profile = config.profile_for("nonexistent-agent");
+        assert_eq!(profile.trust_level, TrustLevel::Low);
+    }
+
+    #[test]
+    fn test_agents_config_profile_for_unknown_with_unknown_profile() {
+        let mut config = AgentsConfig::default();
+        config.profiles.insert(
+            "unknown".to_string(),
+            AgentProfile {
+                trust_level: TrustLevel::Low,
+                disabled_allowlist: true,
+                ..Default::default()
+            },
+        );
+
+        // Unrecognized agents should use the "unknown" profile
+        let profile = config.profile_for("some-new-agent");
+        assert_eq!(profile.trust_level, TrustLevel::Low);
+        assert!(profile.disabled_allowlist);
+
+        // The "unknown" key itself should also match
+        let profile = config.profile_for("unknown");
+        assert_eq!(profile.trust_level, TrustLevel::Low);
+    }
+
+    #[test]
+    fn test_agents_config_from_toml() {
+        let input = r#"
+[agents]
+[agents.default]
+trust_level = "low"
+disabled_packs = ["kubernetes"]
+
+[agents.claude-code]
+trust_level = "high"
+extra_packs = ["database.postgresql"]
+additional_allowlist = ["git push origin main"]
+"#;
+        let config: Config = toml::from_str(input).expect("config parses");
+        assert_eq!(config.agents.default.trust_level, TrustLevel::Low);
+        assert!(
+            config
+                .agents
+                .default
+                .disabled_packs
+                .contains(&"kubernetes".to_string())
+        );
+
+        let claude_profile = config.agents.profile_for("claude-code");
+        assert_eq!(claude_profile.trust_level, TrustLevel::High);
+        assert!(
+            claude_profile
+                .extra_packs
+                .contains(&"database.postgresql".to_string())
+        );
+        assert!(
+            claude_profile
+                .additional_allowlist
+                .contains(&"git push origin main".to_string())
+        );
+    }
+
+    #[test]
+    fn test_enabled_pack_ids_for_agent_with_disabled_packs() {
+        use crate::agent::Agent;
+
+        let mut config = Config::default();
+        config.packs.enabled = vec![
+            "kubernetes".to_string(),
+            "kubernetes.helm".to_string(),
+            "database.postgresql".to_string(),
+        ];
+        config.agents.profiles.insert(
+            "aider".to_string(),
+            AgentProfile {
+                disabled_packs: vec!["kubernetes".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let packs = config.enabled_pack_ids_for_agent(&Agent::Aider);
+
+        // kubernetes and its sub-packs should be removed
+        assert!(!packs.contains("kubernetes"));
+        assert!(!packs.contains("kubernetes.helm"));
+        // Other packs should remain
+        assert!(packs.contains("database.postgresql"));
+        // Core is always present
+        assert!(packs.contains("core"));
+    }
+
+    #[test]
+    fn test_enabled_pack_ids_for_agent_with_extra_packs() {
+        use crate::agent::Agent;
+
+        let config = Config {
+            agents: AgentsConfig {
+                profiles: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert(
+                        "claude-code".to_string(),
+                        AgentProfile {
+                            extra_packs: vec!["containers.docker".to_string()],
+                            ..Default::default()
+                        },
+                    );
+                    m
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let packs = config.enabled_pack_ids_for_agent(&Agent::ClaudeCode);
+        assert!(packs.contains("containers.docker"));
+        assert!(packs.contains("core"));
+    }
+
+    #[test]
+    fn test_trust_level_for_agent() {
+        use crate::agent::Agent;
+
+        let mut config = Config::default();
+        config.agents.default.trust_level = TrustLevel::Medium;
+        config.agents.profiles.insert(
+            "claude-code".to_string(),
+            AgentProfile {
+                trust_level: TrustLevel::High,
+                ..Default::default()
+            },
+        );
+        config.agents.profiles.insert(
+            "unknown".to_string(),
+            AgentProfile {
+                trust_level: TrustLevel::Low,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            config.trust_level_for_agent(&Agent::ClaudeCode),
+            TrustLevel::High
+        );
+        assert_eq!(config.trust_level_for_agent(&Agent::Aider), TrustLevel::Low); // Falls back to unknown
+        assert_eq!(
+            config.trust_level_for_agent(&Agent::Unknown),
+            TrustLevel::Low
+        );
+    }
+
+    #[test]
+    fn test_allowlist_disabled_for_agent() {
+        use crate::agent::Agent;
+
+        let mut config = Config::default();
+        // Set up a specific profile for claude-code
+        config.agents.profiles.insert(
+            "claude-code".to_string(),
+            AgentProfile {
+                disabled_allowlist: false,
+                ..Default::default()
+            },
+        );
+        // Set up the unknown profile with disabled allowlist
+        config.agents.profiles.insert(
+            "unknown".to_string(),
+            AgentProfile {
+                disabled_allowlist: true,
+                ..Default::default()
+            },
+        );
+
+        // ClaudeCode has explicit profile with disabled_allowlist: false
+        assert!(!config.allowlist_disabled_for_agent(&Agent::ClaudeCode));
+        // Unknown agents fall back to "unknown" profile
+        assert!(config.allowlist_disabled_for_agent(&Agent::Unknown));
+        // Aider has no profile, falls back to "unknown"
+        assert!(config.allowlist_disabled_for_agent(&Agent::Aider));
+    }
+
+    #[test]
+    fn test_additional_allowlist_for_agent() {
+        use crate::agent::Agent;
+
+        let mut config = Config::default();
+        config.agents.profiles.insert(
+            "claude-code".to_string(),
+            AgentProfile {
+                additional_allowlist: vec![
+                    "git push origin main".to_string(),
+                    "npm publish".to_string(),
+                ],
+                ..Default::default()
+            },
+        );
+
+        let allowlist = config.additional_allowlist_for_agent(&Agent::ClaudeCode);
+        assert_eq!(allowlist.len(), 2);
+        assert!(allowlist.contains(&"git push origin main".to_string()));
+        assert!(allowlist.contains(&"npm publish".to_string()));
+
+        // Agent without profile should have empty additional allowlist
+        let allowlist = config.additional_allowlist_for_agent(&Agent::Aider);
+        assert!(allowlist.is_empty());
+    }
+
+    #[test]
+    fn test_agents_config_layer_merge() {
+        let mut config = Config::default();
+        config.agents.default.trust_level = TrustLevel::Medium;
+
+        let layer: ConfigLayer = toml::from_str(
+            r#"
+[agents.default]
+trust_level = "low"
+disabled_packs = ["kubernetes"]
+
+[agents.claude-code]
+trust_level = "high"
+"#,
+        )
+        .expect("layer parses");
+
+        config.merge_layer(layer);
+
+        assert_eq!(config.agents.default.trust_level, TrustLevel::Low);
+        assert!(
+            config
+                .agents
+                .default
+                .disabled_packs
+                .contains(&"kubernetes".to_string())
+        );
+        assert_eq!(
+            config.agents.profile_for("claude-code").trust_level,
+            TrustLevel::High
         );
     }
 }
