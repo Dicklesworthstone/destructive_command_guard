@@ -6,8 +6,148 @@
 //! - volume/network prune
 //! - container stop/kill without confirmation
 
-use crate::packs::{DestructivePattern, Pack, SafePattern};
+use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
+
+// ============================================================================
+// Suggestion constants (must be 'static for the pattern struct)
+// ============================================================================
+
+/// Suggestions for `docker system prune` pattern.
+const SYSTEM_PRUNE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "docker system df -v",
+        "Preview what would be removed without deleting anything",
+    ),
+    PatternSuggestion::new(
+        "docker system prune --filter 'until=24h'",
+        "Only removes items older than 24 hours",
+    ),
+    PatternSuggestion::new(
+        "docker container prune",
+        "Remove only stopped containers (preserves images and volumes)",
+    ),
+    PatternSuggestion::new(
+        "docker image prune",
+        "Remove only dangling images (preserves containers and volumes)",
+    ),
+];
+
+/// Suggestions for `docker volume prune` pattern.
+const VOLUME_PRUNE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "docker volume ls -q -f dangling=true",
+        "List unused volumes first to review what would be deleted",
+    ),
+    PatternSuggestion::new(
+        "docker volume rm {volume-name}",
+        "Remove specific volumes by name instead of all unused",
+    ),
+    PatternSuggestion::new(
+        "docker volume inspect {volume-name}",
+        "Inspect volume contents and metadata before removal",
+    ),
+];
+
+/// Suggestions for `docker network prune` pattern.
+const NETWORK_PRUNE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "docker network ls",
+        "List all networks to review before pruning",
+    ),
+    PatternSuggestion::new(
+        "docker network rm {network-name}",
+        "Remove specific networks by name instead of all unused",
+    ),
+];
+
+/// Suggestions for `docker image prune` pattern.
+const IMAGE_PRUNE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "docker images -f dangling=true",
+        "List dangling images first to see what would be removed",
+    ),
+    PatternSuggestion::new(
+        "docker rmi {image-id}",
+        "Remove specific images by ID or tag",
+    ),
+];
+
+/// Suggestions for `docker container prune` pattern.
+const CONTAINER_PRUNE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "docker ps -a -f status=exited",
+        "List stopped containers first to review before removal",
+    ),
+    PatternSuggestion::new(
+        "docker rm {container-id}",
+        "Remove specific containers instead of all stopped",
+    ),
+];
+
+/// Suggestions for `docker rm -f` pattern.
+const RM_FORCE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "docker stop {container} && docker rm {container}",
+        "Graceful shutdown with SIGTERM before removal",
+    ),
+    PatternSuggestion::new(
+        "docker container prune",
+        "Remove stopped containers with confirmation prompt",
+    ),
+    PatternSuggestion::new(
+        "docker ps -a | grep {container}",
+        "Check container status before removal",
+    ),
+];
+
+/// Suggestions for `docker rmi -f` pattern.
+const RMI_FORCE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "docker rmi {image}",
+        "Remove without force - fails safely if image is in use",
+    ),
+    PatternSuggestion::new(
+        "docker image prune",
+        "Remove only dangling (untagged) images",
+    ),
+    PatternSuggestion::new(
+        "docker ps -a --filter ancestor={image}",
+        "Check what containers are using the image first",
+    ),
+];
+
+/// Suggestions for `docker volume rm` pattern.
+const VOLUME_RM_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "docker volume inspect {volume}",
+        "Inspect volume metadata and mount point before removal",
+    ),
+    PatternSuggestion::new(
+        "docker run --rm -v {volume}:/data alpine ls -la /data",
+        "List volume contents before deletion",
+    ),
+    PatternSuggestion::new(
+        "docker run --rm -v {volume}:/data -v $(pwd):/backup alpine tar czf /backup/backup.tar.gz /data",
+        "Backup volume data before removal",
+    ),
+];
+
+/// Suggestions for `docker stop/kill $(docker ps ...)` pattern.
+const STOP_ALL_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "docker stop {container-name}",
+        "Stop specific containers by name",
+    ),
+    PatternSuggestion::new(
+        "docker stop $(docker ps -q -f name={pattern})",
+        "Stop containers matching a name filter",
+    ),
+    PatternSuggestion::new(
+        "docker ps --format '{{.Names}}: {{.Status}}'",
+        "List running containers before stopping",
+    ),
+];
 
 /// Create the Docker pack.
 #[must_use]
@@ -70,7 +210,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              docker system df -v       # Verbose with details\n\n\
              Safer alternative:\n  \
              docker container prune    # Only stopped containers\n  \
-             docker image prune        # Only dangling images"
+             docker image prune        # Only dangling images",
+            SYSTEM_PRUNE_SUGGESTIONS
         ),
         // volume prune - removes all unused volumes
         destructive_pattern!(
@@ -88,7 +229,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              docker volume ls                    # List all volumes\n  \
              docker volume ls -f dangling=true   # Show only unused\n\n\
              Safer approach:\n  \
-             docker volume rm <specific-volume>  # Remove by name"
+             docker volume rm <specific-volume>  # Remove by name",
+            VOLUME_PRUNE_SUGGESTIONS
         ),
         // network prune - removes all unused networks
         destructive_pattern!(
@@ -105,7 +247,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              docker network ls\n  \
              docker network ls -f dangling=true\n\n\
              Safer alternative:\n  \
-             docker network rm <specific-network>"
+             docker network rm <specific-network>",
+            NETWORK_PRUNE_SUGGESTIONS
         ),
         // image prune - removes unused images (Medium: only affects unused images)
         destructive_pattern!(
@@ -121,7 +264,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Preview what would be removed:\n  \
              docker images -f dangling=true\n  \
              docker images                       # With -a flag\n\n\
-             Usually safe, but may slow down builds."
+             Usually safe, but may slow down builds.",
+            IMAGE_PRUNE_SUGGESTIONS
         ),
         // container prune - removes stopped containers (Medium: only affects stopped)
         destructive_pattern!(
@@ -137,7 +281,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Preview stopped containers:\n  \
              docker ps -a -f status=exited\n  \
              docker ps -a -f status=created\n\n\
-             Consider keeping recent containers for debugging."
+             Consider keeping recent containers for debugging.",
+            CONTAINER_PRUNE_SUGGESTIONS
         ),
         // rm -f (force remove containers)
         destructive_pattern!(
@@ -154,7 +299,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              docker stop <container>  # Graceful shutdown (SIGTERM)\n  \
              docker rm <container>    # Then remove\n\n\
              Check container status first:\n  \
-             docker ps -a | grep <container>"
+             docker ps -a | grep <container>",
+            RM_FORCE_SUGGESTIONS
         ),
         // rmi -f (force remove images)
         destructive_pattern!(
@@ -170,7 +316,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Check what's using the image:\n  \
              docker ps -a --filter ancestor=<image>\n\n\
              Safer approach:\n  \
-             docker rmi <image>  # Fails safely if in use"
+             docker rmi <image>  # Fails safely if in use",
+            RMI_FORCE_SUGGESTIONS
         ),
         // volume rm
         destructive_pattern!(
@@ -188,7 +335,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              docker run --rm -v <volume>:/data alpine ls -la /data\n\n\
              Consider backing up:\n  \
              docker run --rm -v <volume>:/data -v $(pwd):/backup alpine \\\n    \
-             tar czf /backup/volume-backup.tar.gz /data"
+             tar czf /backup/volume-backup.tar.gz /data",
+            VOLUME_RM_SUGGESTIONS
         ),
         // stop/kill all containers pattern
         destructive_pattern!(
@@ -206,7 +354,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              docker stop <container-name>     # Stop by name\n  \
              docker stop $(docker ps -q -f name=myapp)  # Filter by name\n\n\
              Preview what would be stopped:\n  \
-             docker ps --format '{{.Names}}: {{.Status}}'"
+             docker ps --format '{{.Names}}: {{.Status}}'",
+            STOP_ALL_SUGGESTIONS
         ),
     ]
 }
