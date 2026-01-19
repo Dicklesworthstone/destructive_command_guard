@@ -51,7 +51,9 @@ use crate::heredoc::{
     ExtractionResult, SkipReason, TriggerResult, check_triggers, extract_content,
 };
 use crate::normalize::{PATH_NORMALIZER, QUOTED_PATH_NORMALIZER, strip_wrapper_prefixes};
-use crate::packs::{REGISTRY, pack_aware_quick_reject, pack_aware_quick_reject_with_normalized};
+use crate::packs::{
+    PatternSuggestion, REGISTRY, pack_aware_quick_reject, pack_aware_quick_reject_with_normalized,
+};
 use crate::pending_exceptions::AllowOnceStore;
 use crate::perf::Deadline;
 use chrono::Utc;
@@ -422,6 +424,8 @@ pub struct PatternMatch {
     /// More verbose than `reason`, intended for explain/verbose output modes.
     /// Falls back to `reason` when not provided.
     pub explanation: Option<String>,
+    /// Safer alternative commands suggested for this pattern.
+    pub suggestions: &'static [PatternSuggestion],
 }
 
 /// Information about an allowlist override (DENY -> ALLOW).
@@ -448,6 +452,25 @@ pub enum MatchSource {
     HeredocAst,
 }
 
+/// Git branch context for the evaluation.
+///
+/// Present when git branch awareness is enabled and we're in a git repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchContext {
+    /// The current branch name (None if detached HEAD or not in git repo).
+    pub branch_name: Option<String>,
+    /// Whether this is a protected branch.
+    pub is_protected: bool,
+    /// Whether this is a relaxed branch.
+    pub is_relaxed: bool,
+    /// The effective strictness level for this branch.
+    pub strictness: crate::config::StrictnessLevel,
+    /// Whether the decision was affected by branch awareness.
+    /// True if the command would have been blocked but was allowed due to
+    /// relaxed strictness on a non-protected branch.
+    pub affected_decision: bool,
+}
+
 /// Result of evaluating a command.
 #[derive(Debug, Clone)]
 pub struct EvaluationResult {
@@ -465,6 +488,8 @@ pub struct EvaluationResult {
     pub effective_mode: Option<crate::packs::DecisionMode>,
     /// Whether evaluation skipped deeper analysis due to a deadline overrun.
     pub skipped_due_to_budget: bool,
+    /// Git branch context (present when branch awareness is enabled).
+    pub branch_context: Option<BranchContext>,
 }
 
 impl EvaluationResult {
@@ -478,6 +503,7 @@ impl EvaluationResult {
             allowlist_override: None,
             effective_mode: None,
             skipped_due_to_budget: false,
+            branch_context: None,
         }
     }
 
@@ -491,6 +517,7 @@ impl EvaluationResult {
             allowlist_override: None,
             effective_mode: None,
             skipped_due_to_budget: true,
+            branch_context: None,
         }
     }
 
@@ -509,10 +536,12 @@ impl EvaluationResult {
                 matched_span: None,
                 matched_text_preview: None,
                 explanation: None,
+                suggestions: &[],
             }),
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
+            branch_context: None,
         }
     }
 
@@ -531,10 +560,12 @@ impl EvaluationResult {
                 matched_span: None,
                 matched_text_preview: None,
                 explanation: None,
+                suggestions: &[],
             }),
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
+            branch_context: None,
         }
     }
 
@@ -554,10 +585,12 @@ impl EvaluationResult {
                 matched_span: Some(span),
                 matched_text_preview: Some(preview),
                 explanation: None,
+                suggestions: &[],
             }),
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
+            branch_context: None,
         }
     }
 
@@ -576,10 +609,12 @@ impl EvaluationResult {
                 matched_span: None,
                 matched_text_preview: None,
                 explanation: explanation.map(str::to_string),
+                suggestions: &[],
             }),
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
+            branch_context: None,
         }
     }
 
@@ -605,10 +640,12 @@ impl EvaluationResult {
                 matched_span: Some(span),
                 matched_text_preview: Some(preview),
                 explanation: explanation.map(str::to_string),
+                suggestions: &[],
             }),
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
+            branch_context: None,
         }
     }
 
@@ -621,6 +658,7 @@ impl EvaluationResult {
         reason: &str,
         explanation: Option<&str>,
         severity: crate::packs::Severity,
+        suggestions: &'static [PatternSuggestion],
     ) -> Self {
         Self {
             decision: EvaluationDecision::Deny,
@@ -633,10 +671,12 @@ impl EvaluationResult {
                 matched_span: None,
                 matched_text_preview: None,
                 explanation: explanation.map(str::to_string),
+                suggestions,
             }),
             allowlist_override: None,
             effective_mode: Some(severity.default_mode()),
             skipped_due_to_budget: false,
+            branch_context: None,
         }
     }
 
@@ -649,6 +689,7 @@ impl EvaluationResult {
         reason: &str,
         explanation: Option<&str>,
         severity: crate::packs::Severity,
+        suggestions: &'static [PatternSuggestion],
         command: &str,
         span: MatchSpan,
     ) -> Self {
@@ -664,10 +705,12 @@ impl EvaluationResult {
                 matched_span: Some(span),
                 matched_text_preview: Some(preview),
                 explanation: explanation.map(str::to_string),
+                suggestions,
             }),
             allowlist_override: None,
             effective_mode: Some(severity.default_mode()),
             skipped_due_to_budget: false,
+            branch_context: None,
         }
     }
 
@@ -689,6 +732,7 @@ impl EvaluationResult {
             // Allowlist overrides apply to a matched rule (typically deny-by-default).
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
+            branch_context: None,
         }
     }
 
@@ -718,6 +762,209 @@ impl EvaluationResult {
         self.pattern_info
             .as_ref()
             .and_then(|p| p.pack_id.as_deref())
+    }
+}
+
+// =============================================================================
+// Detailed Evaluation Result (E1-T3: Expose detailed evaluation in evaluator)
+// =============================================================================
+
+/// Detailed evaluation result with timing and diagnostic information.
+///
+/// This struct wraps [`EvaluationResult`] with additional metadata useful for
+/// verbose output, debugging, and the `dcg test` command. It captures timing
+/// information and which keywords were checked during evaluation.
+///
+/// # Example
+///
+/// ```ignore
+/// use destructive_command_guard::evaluator::{evaluate_detailed, DetailedEvaluationResult};
+/// use destructive_command_guard::config::Config;
+///
+/// let config = Config::load();
+/// let result = evaluate_detailed("git reset --hard", &config);
+///
+/// println!("Decision: {:?}", result.result.decision);
+/// println!("Evaluation time: {}μs", result.evaluation_time_us);
+/// println!("Keywords checked: {:?}", result.keywords_checked);
+/// ```
+#[derive(Debug, Clone)]
+pub struct DetailedEvaluationResult {
+    /// The core evaluation result.
+    pub result: EvaluationResult,
+    /// Keywords that were checked during evaluation (from enabled packs).
+    /// Useful for verbose mode to show what the quick-reject filter considered.
+    pub keywords_checked: Vec<String>,
+    /// Evaluation duration in microseconds.
+    pub evaluation_time_us: u64,
+    /// Confidence scoring result (if confidence scoring was applied).
+    pub confidence: Option<ConfidenceResult>,
+    /// The normalized form of the command (after path stripping).
+    /// Useful for debugging to see what the pattern matcher actually evaluated.
+    pub normalized_command: Option<String>,
+    /// Whether quick-reject filtered out this command before pattern matching.
+    pub quick_rejected: bool,
+}
+
+impl DetailedEvaluationResult {
+    /// Check if the command was allowed.
+    #[inline]
+    #[must_use]
+    pub fn is_allowed(&self) -> bool {
+        self.result.is_allowed()
+    }
+
+    /// Check if the command was denied.
+    #[inline]
+    #[must_use]
+    pub fn is_denied(&self) -> bool {
+        self.result.is_denied()
+    }
+
+    /// Get the core evaluation result.
+    #[inline]
+    #[must_use]
+    pub fn into_result(self) -> EvaluationResult {
+        self.result
+    }
+
+    /// Get a reference to the core evaluation result.
+    #[inline]
+    #[must_use]
+    pub const fn result(&self) -> &EvaluationResult {
+        &self.result
+    }
+}
+
+/// Evaluate a command with detailed timing and diagnostic information.
+///
+/// This function wraps [`evaluate_command`] and captures additional metadata
+/// useful for verbose output, debugging, and the `dcg test` command.
+///
+/// # Arguments
+///
+/// * `command` - The raw command string to evaluate
+/// * `config` - Loaded configuration with pack settings
+///
+/// # Returns
+///
+/// A [`DetailedEvaluationResult`] containing the evaluation result along with
+/// timing information, keywords checked, and other diagnostic data.
+///
+/// # Performance
+///
+/// This function has slightly more overhead than [`evaluate_command`] due to
+/// timing capture and metadata collection. For high-throughput hook mode,
+/// prefer [`evaluate_command`] or [`evaluate_command_with_pack_order`].
+///
+/// # Example
+///
+/// ```ignore
+/// use destructive_command_guard::evaluator::evaluate_detailed;
+/// use destructive_command_guard::config::Config;
+///
+/// let config = Config::load();
+/// let result = evaluate_detailed("git reset --hard", &config);
+///
+/// if result.is_denied() {
+///     println!("Command blocked in {}μs", result.evaluation_time_us);
+///     if let Some(info) = &result.result.pattern_info {
+///         println!("Blocked by: {:?}", info.pack_id);
+///     }
+/// }
+/// ```
+#[must_use]
+pub fn evaluate_detailed(command: &str, config: &Config) -> DetailedEvaluationResult {
+    let allowlists = LayeredAllowlist::default();
+    evaluate_detailed_with_allowlists(command, config, &allowlists)
+}
+
+/// Evaluate a command with detailed timing and diagnostic information, using custom allowlists.
+///
+/// This is the extended version of [`evaluate_detailed`] that accepts custom allowlists.
+///
+/// # Arguments
+///
+/// * `command` - The raw command string to evaluate
+/// * `config` - Loaded configuration with pack settings
+/// * `allowlists` - Layered allowlists (project/user/system)
+///
+/// # Returns
+///
+/// A [`DetailedEvaluationResult`] containing the evaluation result along with
+/// timing information, keywords checked, and other diagnostic data.
+#[must_use]
+pub fn evaluate_detailed_with_allowlists(
+    command: &str,
+    config: &Config,
+    allowlists: &LayeredAllowlist,
+) -> DetailedEvaluationResult {
+    use std::time::Instant;
+
+    let start = Instant::now();
+
+    // Collect enabled keywords for quick-reject tracking
+    let enabled_packs = config.enabled_pack_ids();
+    let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+    let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
+    let heredoc_settings = config.heredoc_settings();
+    let compiled_overrides = config.overrides.compile();
+
+    // Track quick-reject status
+    let quick_rejected = pack_aware_quick_reject(command, &enabled_keywords);
+
+    // Get normalized command for diagnostics
+    let stripped = strip_wrapper_prefixes(command);
+    let normalized = crate::normalize::normalize_command(stripped.normalized.as_ref());
+    let normalized_command = if normalized.as_ref() != command {
+        Some(normalized.into_owned())
+    } else {
+        None
+    };
+
+    // Perform evaluation
+    let result = evaluate_command_with_pack_order(
+        command,
+        &enabled_keywords,
+        &ordered_packs,
+        keyword_index.as_ref(),
+        &compiled_overrides,
+        allowlists,
+        &heredoc_settings,
+    );
+
+    let evaluation_time_us = start.elapsed().as_micros() as u64;
+
+    // Apply confidence scoring if applicable
+    let confidence = if result.is_denied() {
+        let sanitized = sanitize_for_pattern_matching(command);
+        let sanitized_str = if matches!(sanitized, std::borrow::Cow::Owned(_)) {
+            Some(sanitized.as_ref())
+        } else {
+            None
+        };
+        let mode = result
+            .effective_mode
+            .unwrap_or(crate::packs::DecisionMode::Deny);
+        Some(apply_confidence_scoring(
+            command,
+            sanitized_str,
+            &result,
+            mode,
+            &config.confidence,
+        ))
+    } else {
+        None
+    };
+
+    DetailedEvaluationResult {
+        result,
+        keywords_checked: enabled_keywords.iter().map(|s| (*s).to_string()).collect(),
+        evaluation_time_us,
+        confidence,
+        normalized_command,
+        quick_rejected,
     }
 }
 
@@ -1085,8 +1332,13 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
     }
 
     // Check exact command and prefix allowlists (reusing normalized from quick-reject)
-    if allowlists.match_exact_command(&normalized).is_some()
-        || allowlists.match_command_prefix(&normalized).is_some()
+    // Use path-aware matching for context-aware allowlisting (Epic 5)
+    if allowlists
+        .match_exact_command_at_path(&normalized, project_path)
+        .is_some()
+        || allowlists
+            .match_command_prefix_at_path(&normalized, project_path)
+            .is_some()
     {
         return EvaluationResult::allowed();
     }
@@ -1106,6 +1358,7 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
         allowlists,
         keyword_index,
         None,
+        project_path,
     );
     if result.allowlist_override.is_none() {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
@@ -1127,6 +1380,7 @@ fn evaluate_packs_with_allowlists(
     allowlists: &LayeredAllowlist,
     keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
     deadline: Option<&Deadline>,
+    project_path: Option<&Path>,
 ) -> EvaluationResult {
     if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
         return EvaluationResult::allowed_due_to_budget();
@@ -1208,7 +1462,9 @@ fn evaluate_packs_with_allowlists(
                     }
                 }
                 Some(crate::packs::core::filesystem::RmParseDecision::Deny(hit)) => {
-                    if let Some(allow_hit) = allowlists.match_rule(pack_id, hit.pattern_name) {
+                    if let Some(allow_hit) =
+                        allowlists.match_rule_at_path(pack_id, hit.pattern_name, project_path)
+                    {
                         if first_allowlist_hit.is_none() {
                             let span = hit.span.as_ref().map(|span| MatchSpan {
                                 start: span.start,
@@ -1234,6 +1490,7 @@ fn evaluate_packs_with_allowlists(
                                     matched_span: mapped_span,
                                     matched_text_preview: preview,
                                     explanation: None,
+                                    suggestions: &[],
                                 },
                                 allow_hit.layer,
                                 allow_hit.entry.reason.clone(),
@@ -1255,6 +1512,7 @@ fn evaluate_packs_with_allowlists(
                                 hit.reason,
                                 None,
                                 hit.severity,
+                                &[], // fast_match path doesn't have suggestions
                                 original_command,
                                 mapped_span,
                             );
@@ -1267,6 +1525,7 @@ fn evaluate_packs_with_allowlists(
                         hit.reason,
                         None,
                         hit.severity,
+                        &[], // fast_match path doesn't have suggestions
                     );
                 }
             }
@@ -1303,7 +1562,9 @@ fn evaluate_packs_with_allowlists(
 
             // Allowlist check: only applies when we have a stable match identity (named pattern).
             if let Some(pattern_name) = pattern.name {
-                if let Some(hit) = allowlists.match_rule(pack_id, pattern_name) {
+                if let Some(hit) =
+                    allowlists.match_rule_at_path(pack_id, pattern_name, project_path)
+                {
                     if first_allowlist_hit.is_none() {
                         first_allowlist_hit = Some((
                             PatternMatch {
@@ -1315,6 +1576,7 @@ fn evaluate_packs_with_allowlists(
                                 matched_span: mapped_span,
                                 matched_text_preview: preview,
                                 explanation: pattern.explanation.map(str::to_string),
+                                suggestions: pattern.suggestions,
                             },
                             hit.layer,
                             hit.entry.reason.clone(),
@@ -1332,6 +1594,7 @@ fn evaluate_packs_with_allowlists(
                         reason,
                         pattern.explanation,
                         pattern.severity,
+                        pattern.suggestions,
                         original_command,
                         mapped_span,
                     );
@@ -1343,6 +1606,7 @@ fn evaluate_packs_with_allowlists(
                     reason,
                     pattern.explanation,
                     pattern.severity,
+                    pattern.suggestions,
                 );
             }
 
@@ -1522,6 +1786,7 @@ where
     }
 
     // Step 9: Check enabled packs with allowlist override semantics.
+    // Note: Legacy function doesn't receive project_path - path-aware allowlisting not available here
     let result = evaluate_packs_with_allowlists(
         &normalized,
         &normalized,
@@ -1531,6 +1796,7 @@ where
         allowlists,
         keyword_index.as_ref(),
         None,
+        None, // project_path: legacy function, path-aware allowlisting unavailable
     );
     if result.allowlist_override.is_none() {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
@@ -1774,6 +2040,7 @@ fn evaluate_heredoc(
                             allowlist_override: None,
                             effective_mode: Some(crate::packs::DecisionMode::Deny),
                             skipped_due_to_budget: false,
+                            branch_context: None,
                         });
                     }
                     return Some(result);
@@ -1827,6 +2094,7 @@ fn evaluate_heredoc(
                             matched_span: mapped_span,
                             matched_text_preview: Some(m.matched_text_preview),
                             explanation: None,
+                            suggestions: &[],
                         },
                         hit.layer,
                         hit.entry.reason.clone(),
@@ -1848,10 +2116,12 @@ fn evaluate_heredoc(
                     matched_span: mapped_span,
                     matched_text_preview: Some(m.matched_text_preview),
                     explanation: None,
+                    suggestions: &[],
                 }),
                 allowlist_override: None,
                 effective_mode: Some(crate::packs::DecisionMode::Deny),
                 skipped_due_to_budget: false,
+                branch_context: None,
             });
         }
     }
@@ -2161,9 +2431,12 @@ mod tests {
                         added_by: None,
                         added_at: None,
                         expires_at: None,
+                        ttl: None,
+                        session: None,
                         context: None,
                         conditions: HashMap::new(),
                         environments: Vec::new(),
+                        paths: None,
                         risk_acknowledged: false,
                     }],
                     errors: Vec::new(),
@@ -2188,9 +2461,12 @@ mod tests {
                         added_by: None,
                         added_at: None,
                         expires_at: None,
+                        ttl: None,
+                        session: None,
                         context: None,
                         conditions: HashMap::new(),
                         environments: Vec::new(),
+                        paths: None,
                         risk_acknowledged: false,
                     }],
                     errors: Vec::new(),
@@ -2265,6 +2541,7 @@ mod tests {
             "test",
             None,
             crate::packs::Severity::Critical,
+            &[],
         );
         assert!(denied.is_denied());
         assert_eq!(denied.pack_id(), Some("core.git"));

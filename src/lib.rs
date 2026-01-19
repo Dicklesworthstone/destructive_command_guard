@@ -60,6 +60,7 @@
 //! }
 //! ```
 
+pub mod agent;
 pub mod allowlist;
 pub mod ast_matcher;
 pub mod cli;
@@ -73,6 +74,7 @@ pub mod heredoc;
 pub mod highlight;
 pub mod history;
 pub mod hook;
+pub mod interactive;
 pub mod logging;
 pub mod mcp;
 pub mod normalize;
@@ -97,11 +99,12 @@ pub use allowlist::{
 pub use config::Config;
 pub use error_codes::{DcgError, ErrorCategory, ErrorCode, ErrorResponse};
 pub use evaluator::{
-    ConfidenceResult, EvaluationDecision, EvaluationResult, LegacyDestructivePattern,
-    LegacySafePattern, MatchSource, MatchSpan, PatternMatch, apply_confidence_scoring,
-    evaluate_command, evaluate_command_with_deadline, evaluate_command_with_pack_order,
-    evaluate_command_with_pack_order_at_path, evaluate_command_with_pack_order_deadline,
-    evaluate_command_with_pack_order_deadline_at_path,
+    ConfidenceResult, DetailedEvaluationResult, EvaluationDecision, EvaluationResult,
+    LegacyDestructivePattern, LegacySafePattern, MatchSource, MatchSpan, PatternMatch,
+    apply_confidence_scoring, evaluate_command, evaluate_command_with_deadline,
+    evaluate_command_with_pack_order, evaluate_command_with_pack_order_at_path,
+    evaluate_command_with_pack_order_deadline, evaluate_command_with_pack_order_deadline_at_path,
+    evaluate_detailed, evaluate_detailed_with_allowlists,
 };
 pub use hook::{HookInput, HookOutput, HookResult, HookSpecificOutput};
 pub use packs::external::{ExternalPack, parse_pack_file, parse_pack_string};
@@ -199,10 +202,22 @@ pub use history::{
     PerformanceStats, ProjectStat, StatsTrends,
 };
 
+// Re-export interactive prompt types for human verification
+pub use interactive::{
+    AllowlistScope, InteractiveConfig, InteractiveResult, NotAvailableReason,
+    check_interactive_available, generate_verification_code, run_interactive_prompt,
+};
+
 // Re-export git branch detection types
 pub use git::{
     BranchInfo, clear_cache as clear_git_cache, get_branch_info, get_branch_info_at_path,
     get_current_branch, is_in_git_repo, is_in_git_repo_at_path,
+};
+
+// Re-export agent detection types
+pub use agent::{
+    Agent, DetectionMethod, DetectionResult, clear_cache as clear_agent_cache, detect_agent,
+    detect_agent_with_details, from_explicit as agent_from_explicit,
 };
 
 // Re-export output types for TUI/CLI visual formatting
