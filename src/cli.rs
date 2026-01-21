@@ -5276,12 +5276,21 @@ fn handle_stats_command(
     let aggregated = stats::parse_log_file(&log_path, period_secs)?;
 
     // Format and print output
-    let output = match cmd.format {
-        StatsFormat::Pretty => stats::format_stats_pretty(&aggregated, cmd.days),
-        StatsFormat::Json => stats::format_stats_json(&aggregated),
+    match cmd.format {
+        StatsFormat::Pretty => {
+            #[cfg(feature = "rich-output")]
+            {
+                format_stats_pack_rich(&aggregated, cmd.days);
+            }
+            #[cfg(not(feature = "rich-output"))]
+            {
+                print!("{}", stats::format_stats_pretty(&aggregated, cmd.days));
+            }
+        }
+        StatsFormat::Json => {
+            print!("{}", stats::format_stats_json(&aggregated));
+        }
     };
-
-    print!("{output}");
 
     Ok(())
 }
@@ -5328,17 +5337,27 @@ fn handle_stats_rules(
     }
 
     // Format and print output
-    let output = match cmd.format {
-        StatsFormat::Pretty => format_rule_metrics_pretty(&metrics, cmd.days),
-        StatsFormat::Json => format_rule_metrics_json(&metrics, cmd.days)?,
+    match cmd.format {
+        StatsFormat::Pretty => {
+            #[cfg(feature = "rich-output")]
+            {
+                format_rule_metrics_rich(&metrics, cmd.days);
+            }
+            #[cfg(not(feature = "rich-output"))]
+            {
+                print!("{}", format_rule_metrics_pretty(&metrics, cmd.days));
+            }
+        }
+        StatsFormat::Json => {
+            print!("{}", format_rule_metrics_json(&metrics, cmd.days)?);
+        }
     };
-
-    print!("{output}");
 
     Ok(())
 }
 
 /// Format rule metrics as a pretty table.
+#[cfg(not(feature = "rich-output"))]
 #[allow(clippy::too_many_lines)]
 fn format_rule_metrics_pretty(metrics: &[crate::history::RuleMetrics], period_days: u64) -> String {
     use std::fmt::Write;
@@ -5454,6 +5473,129 @@ fn format_rule_metrics_pretty(metrics: &[crate::history::RuleMetrics], period_da
     );
 
     output
+}
+
+/// Rich output for pack statistics.
+#[cfg(feature = "rich-output")]
+fn format_stats_pack_rich(stats: &crate::stats::AggregatedStats, period_days: u64) {
+    use crate::output::console::console;
+
+    let con = console();
+
+    con.rule(Some(&format!("[bold] Pack Statistics ({period_days} days) [/]")));
+    con.print("");
+
+    if stats.by_pack.is_empty() {
+        con.print("[dim]No events recorded in this period.[/]");
+        return;
+    }
+
+    // Header
+    con.print("[bold cyan]Pack                      Blocks   Allows  Bypasses   Warns[/]");
+    con.print("[dim]─────────────────────────────────────────────────────────────[/]");
+
+    // Pack rows
+    for pack in &stats.by_pack {
+        let blocks_color = if pack.blocks > 0 { "red" } else { "dim" };
+        let allows_color = if pack.allows > 0 { "green" } else { "dim" };
+        let bypasses_color = if pack.bypasses > 0 { "yellow" } else { "dim" };
+        let warns_color = if pack.warns > 0 { "yellow" } else { "dim" };
+
+        con.print(&format!(
+            "{:<24}  [{blocks_color}]{:>7}[/]  [{allows_color}]{:>7}[/]  [{bypasses_color}]{:>8}[/]  [{warns_color}]{:>6}[/]",
+            pack.pack_id, pack.blocks, pack.allows, pack.bypasses, pack.warns
+        ));
+    }
+
+    // Total row
+    con.print("[dim]─────────────────────────────────────────────────────────────[/]");
+    con.print(&format!(
+        "[bold]{:<24}  {:>7}  {:>7}  {:>8}  {:>6}[/]",
+        "Total", stats.total_blocks, stats.total_allows, stats.total_bypasses, stats.total_warns
+    ));
+}
+
+/// Rich output for rule metrics.
+#[cfg(feature = "rich-output")]
+fn format_rule_metrics_rich(metrics: &[crate::history::RuleMetrics], period_days: u64) {
+    use crate::output::console::console;
+
+    let con = console();
+
+    con.rule(Some(&format!("[bold] Rule Metrics ({period_days} days) [/]")));
+    con.print("");
+
+    // Header
+    con.print("[bold cyan]Rule ID                            Hits  Overrides    Rate  Trend  Change    Noisy[/]");
+    con.print("[dim]─────────────────────────────────────────────────────────────────────────────────────[/]");
+
+    // Rule rows
+    for m in metrics {
+        let rule_display = if m.rule_id.len() > 32 {
+            format!("{}...", &m.rule_id[..29])
+        } else {
+            m.rule_id.clone()
+        };
+
+        let trend_display = match m.trend {
+            crate::history::RuleTrend::Increasing => "[red]↑[/]",
+            crate::history::RuleTrend::Stable => "[dim]→[/]",
+            crate::history::RuleTrend::Decreasing => "[green]↓[/]",
+        };
+
+        let change_display = if m.change_percentage.abs() < 0.01 {
+            "[dim]-[/]".to_string()
+        } else if m.is_anomaly {
+            format!("[red bold]{:+.0}%![/]", m.change_percentage)
+        } else if m.change_percentage > 0.0 {
+            format!("[yellow]{:+.0}%[/]", m.change_percentage)
+        } else {
+            format!("[green]{:+.0}%[/]", m.change_percentage)
+        };
+
+        let noisy_display = if m.is_noisy {
+            "[yellow]yes[/]"
+        } else {
+            "[dim]-[/]"
+        };
+
+        let rate_color = if m.override_rate > 50.0 {
+            "yellow"
+        } else if m.override_rate > 20.0 {
+            "white"
+        } else {
+            "dim"
+        };
+
+        con.print(&format!(
+            "{:<32}  {:>6}  {:>9}  [{rate_color}]{:>5.1}%[/]  {:>5}  {:>8}  {:>8}",
+            rule_display,
+            m.total_hits,
+            m.allowlist_overrides,
+            m.override_rate,
+            trend_display,
+            change_display,
+            noisy_display
+        ));
+    }
+
+    // Totals
+    let total_hits: u64 = metrics.iter().map(|m| m.total_hits).sum();
+    let total_overrides: u64 = metrics.iter().map(|m| m.allowlist_overrides).sum();
+    #[allow(clippy::cast_precision_loss)]
+    let avg_rate = if total_hits > 0 {
+        (total_overrides as f64 / total_hits as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    con.print("[dim]─────────────────────────────────────────────────────────────────────────────────────[/]");
+    con.print(&format!(
+        "[bold]{:<32}  {:>6}  {:>9}  {:>5.1}%[/]",
+        "Total", total_hits, total_overrides, avg_rate
+    ));
+    con.print("");
+    con.print(&format!("[dim]{} rules shown (use -n to change limit)[/]", metrics.len()));
 }
 
 /// JSON output structure for rule metrics.
