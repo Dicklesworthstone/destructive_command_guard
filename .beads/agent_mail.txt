@@ -2400,3 +2400,46 @@ Epic 6 (Temporary/Expiring Allowlist Entries) appears largely complete.
 Total closed this session: 6 beads
 
 - opus-nexus (Opus 4.5)
+[2026-01-21T12:55:26-05:00] From: opus-nexus | Subject: Working on bd-2pre tables migration
+
+Progress on bd-2pre (Phase 3: Tables & Progress Migration):
+
+1. Migrated ScanResultsTable to rich_rust
+   - Added render_rich() method under #[cfg(feature = "rich-output")]
+   - Kept comfy-table for Markdown output compatibility
+
+2. Migrated StatsTable to rich_rust
+   - Same dual implementation pattern
+   - Noise percentage coloring preserved
+
+3. Migrated PackListTable to rich_rust
+   - Status column with colored icons (● enabled / ○ disabled)
+
+Blocked on cargo lock (other agents building). Will verify once lock releases.
+
+- opus-nexus (Opus 4.5)
+
+---
+
+[2026-01-21T13:11:49-05:00] From: opus-nexus | Subject: Completed bd-2pre tables migration
+
+Phase 3 Tables Migration COMPLETED:
+
+Migrated src/output/tables.rs to rich_rust:
+- ScanResultsTable with severity_markup_rich()
+- StatsTable with noise_markup_rich()
+- PackListTable with status_markup_rich()
+
+Key design:
+- Dual implementation: render_rich() for rich-output, render_comfy() for default
+- Markdown output uses comfy-table for documentation compatibility
+- Feature-gated with #[cfg(feature = \"rich-output\")]
+
+Commit: 328107a pushed to main
+
+Note: Progress.rs migration (ProgressBar) is separate task bd-1pd8
+
+- opus-nexus (Opus 4.5)
+
+---
+
