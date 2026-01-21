@@ -339,8 +339,12 @@ pub fn print_colorful_warning(
         .map(|s| HighlightSpan::new(s.start, s.end))
         .unwrap_or_else(|| HighlightSpan::new(0, 0)); // Fallback
 
-    // Convert suggestions to alternatives
-    let mut alternatives: Vec<String> = pattern_suggestions
+    // Convert suggestions to alternatives (platform-filtered)
+    let filtered_suggestions: Vec<&PatternSuggestion> = pattern_suggestions
+        .iter()
+        .filter(|s| s.platform.matches_current())
+        .collect();
+    let mut alternatives: Vec<String> = filtered_suggestions
         .iter()
         .map(|s| format!("{}: {}", s.description, s.command))
         .collect();
@@ -408,7 +412,12 @@ fn render_suggestions_panel(suggestions: &[PatternSuggestion]) -> String {
 
     // Build content as a Vec of lines, then join
     let mut lines = Vec::new();
-    for (i, s) in suggestions.iter().enumerate() {
+    let filtered: Vec<&PatternSuggestion> = suggestions
+        .iter()
+        .filter(|s| s.platform.matches_current())
+        .collect();
+
+    for (i, s) in filtered.iter().enumerate() {
         lines.push(format!("[bold cyan]{}.[/] {}", i + 1, s.description));
         lines.push(format!("   [green]$[/] [cyan]{}[/]", s.command));
     }
