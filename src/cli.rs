@@ -4519,8 +4519,16 @@ fn handle_explain(
     // Format and print based on selected format
     match format {
         ExplainFormat::Pretty => {
-            let output = trace.format_pretty(colored::control::SHOULD_COLORIZE.should_colorize());
-            println!("{output}");
+            #[cfg(feature = "rich-output")]
+            {
+                explain_rich(&trace);
+            }
+            #[cfg(not(feature = "rich-output"))]
+            {
+                let output =
+                    trace.format_pretty(colored::control::SHOULD_COLORIZE.should_colorize());
+                println!("{output}");
+            }
         }
         ExplainFormat::Compact => {
             println!("{}", trace.format_compact(None));
@@ -4530,6 +4538,237 @@ fn handle_explain(
             let json = serde_json::to_string_pretty(&json_output)
                 .unwrap_or_else(|e| format!("{{\"error\": \"JSON serialization failed: {e}\"}}"));
             println!("{json}");
+        }
+    }
+}
+
+/// Rich output for explain command with tree visualization.
+#[cfg(feature = "rich-output")]
+fn explain_rich(trace: &crate::trace::ExplainTrace) {
+    use crate::output::console::console;
+    use crate::evaluator::EvaluationDecision;
+    use crate::trace::TraceDetails;
+
+    let con = console();
+
+    // Header
+    con.rule(Some("[bold] DCG EXPLAIN [/]"));
+    con.print("");
+
+    // Decision with color
+    let (decision_icon, decision_color, decision_text) = match trace.decision {
+        EvaluationDecision::Allow => ("✓", "green", "ALLOW"),
+        EvaluationDecision::Deny => ("✗", "red", "DENY"),
+    };
+    con.print(&format!(
+        "[bold]Decision:[/] [{decision_color} bold]{decision_icon} {decision_text}[/]"
+    ));
+    con.print(&format!(
+        "[bold]Latency:[/]  [dim]{:.2}ms[/]",
+        trace.total_duration_us as f64 / 1000.0
+    ));
+    con.print("");
+
+    // Command tree
+    con.print("[bold cyan]Command[/]");
+    let has_normalized = trace.normalized_command.as_ref().is_some_and(|n| n != &trace.command);
+    let has_sanitized = trace.sanitized_command.as_ref().is_some_and(|s| {
+        s != &trace.command && Some(s) != trace.normalized_command.as_ref()
+    });
+
+    if has_normalized || has_sanitized {
+        con.print(&format!("├─ [cyan]Input:[/]      {}", trace.command));
+        if has_normalized {
+            let branch = if has_sanitized { "├─" } else { "└─" };
+            con.print(&format!(
+                "{branch} [cyan]Normalized:[/] {}",
+                trace.normalized_command.as_ref().unwrap()
+            ));
+        }
+        if has_sanitized {
+            con.print(&format!(
+                "└─ [cyan]Sanitized:[/]  {}",
+                trace.sanitized_command.as_ref().unwrap()
+            ));
+        }
+    } else {
+        con.print(&format!("└─ [cyan]Input:[/] {}", trace.command));
+    }
+    con.print("");
+
+    // Match tree (for denials or when there's match info)
+    if let Some(ref info) = trace.match_info {
+        con.print("[bold yellow]Match[/]");
+
+        let has_explanation = info.explanation.is_some();
+        let mut items: Vec<(&str, String)> = vec![];
+
+        if let Some(ref rule_id) = info.rule_id {
+            items.push(("Rule ID", format!("[yellow]{rule_id}[/]")));
+        }
+        if let Some(ref pack_id) = info.pack_id {
+            items.push(("Pack", pack_id.clone()));
+        }
+        if let Some(ref pattern) = info.pattern_name {
+            items.push(("Pattern", pattern.clone()));
+        }
+        items.push(("Reason", info.reason.clone()));
+
+        if let (Some(start), Some(end)) = (info.match_start, info.match_end) {
+            items.push(("Span", format!("bytes {start}..{end}")));
+        }
+        if let Some(ref preview) = info.matched_text_preview {
+            items.push(("Matched", format!("[red]{preview}[/]")));
+        }
+
+        for (i, (label, value)) in items.iter().enumerate() {
+            let branch = if i == items.len() - 1 && !has_explanation {
+                "└─"
+            } else {
+                "├─"
+            };
+            con.print(&format!("{branch} [cyan]{label}:[/] {value}"));
+        }
+
+        if let Some(ref explanation) = info.explanation {
+            con.print("└─ [cyan]Explanation:[/]");
+            for line in explanation.lines() {
+                con.print(&format!("   [dim]{line}[/]"));
+            }
+        }
+        con.print("");
+    }
+
+    // Allowlist override
+    if let Some(ref al_info) = trace.allowlist_info {
+        con.print("[bold green]Allowlist Override[/]");
+        con.print(&format!("├─ [cyan]Layer:[/]  {:?}", al_info.layer));
+        con.print(&format!("├─ [cyan]Reason:[/] {}", al_info.entry_reason));
+        con.print(&format!(
+            "└─ [dim]Overrode: {} - {}[/]",
+            al_info.original_match.rule_id.as_deref().unwrap_or("unknown"),
+            al_info.original_match.reason
+        ));
+        con.print("");
+    }
+
+    // Pack summary tree
+    if let Some(ref summary) = trace.pack_summary {
+        con.print("[bold magenta]Packs[/]");
+        con.print(&format!(
+            "├─ [cyan]Enabled:[/] {} packs",
+            summary.enabled_count
+        ));
+
+        if !summary.evaluated.is_empty() {
+            let branch = if summary.skipped.is_empty() { "└─" } else { "├─" };
+            con.print(&format!(
+                "{branch} [cyan]Evaluated:[/] {}",
+                summary.evaluated.join(", ")
+            ));
+        }
+
+        if !summary.skipped.is_empty() {
+            con.print(&format!(
+                "└─ [dim]Skipped (keyword gating): {}[/]",
+                summary.skipped.join(", ")
+            ));
+        }
+        con.print("");
+    }
+
+    // Pipeline trace tree
+    if !trace.steps.is_empty() {
+        con.print("[bold blue]Pipeline Trace[/]");
+        let step_count = trace.steps.len();
+
+        for (i, step) in trace.steps.iter().enumerate() {
+            let branch = if i == step_count - 1 { "└─" } else { "├─" };
+            let duration_ms = step.duration_us as f64 / 1000.0;
+
+            // Format details summary
+            let details_summary = match &step.details {
+                TraceDetails::KeywordGating { quick_rejected, first_match, .. } => {
+                    if *quick_rejected {
+                        "[green]quick pass[/]".to_string()
+                    } else if let Some(kw) = first_match {
+                        format!("matched: {kw}")
+                    } else {
+                        "no match".to_string()
+                    }
+                }
+                TraceDetails::Normalization { was_modified, .. } => {
+                    if *was_modified { "modified" } else { "unchanged" }.to_string()
+                }
+                TraceDetails::Sanitization { was_modified, spans_masked, .. } => {
+                    if *was_modified {
+                        format!("{spans_masked} spans masked")
+                    } else {
+                        "unchanged".to_string()
+                    }
+                }
+                TraceDetails::HeredocDetection { triggered, scripts_extracted, .. } => {
+                    if *triggered {
+                        format!("{scripts_extracted} scripts")
+                    } else {
+                        "none".to_string()
+                    }
+                }
+                TraceDetails::AllowlistCheck { matched, matched_layer, .. } => {
+                    if *matched {
+                        format!("matched: {:?}", matched_layer.as_ref().unwrap())
+                    } else {
+                        "no match".to_string()
+                    }
+                }
+                TraceDetails::PackEvaluation { matched_pack, packs_evaluated, .. } => {
+                    if let Some(pack) = matched_pack {
+                        format!("matched in {pack}")
+                    } else {
+                        format!("{} packs checked", packs_evaluated.len())
+                    }
+                }
+                TraceDetails::PolicyDecision { decision, .. } => {
+                    match decision {
+                        EvaluationDecision::Allow => "[green]allow[/]".to_string(),
+                        EvaluationDecision::Deny => "[red]deny[/]".to_string(),
+                    }
+                }
+                _ => String::new(),
+            };
+
+            con.print(&format!(
+                "{branch} [cyan]{:<18}[/] [dim]({:>6.2}ms)[/] {}",
+                step.name, duration_ms, details_summary
+            ));
+        }
+        con.print("");
+    }
+
+    // Suggestions
+    if let Some(ref info) = trace.match_info {
+        if let Some(rule_id) = info.rule_id.as_deref() {
+            if let Some(suggestions) = crate::suggestions::get_suggestions(rule_id) {
+                if !suggestions.is_empty() && crate::output::suggestions_enabled() {
+                    con.print("[bold yellow]Suggestions[/]");
+                    let suggestion_count = suggestions.len();
+
+                    for (i, s) in suggestions.iter().enumerate() {
+                        let branch = if i == suggestion_count - 1 { "└─" } else { "├─" };
+                        con.print(&format!(
+                            "{branch} [yellow]{}[/]: {}",
+                            s.kind.label(),
+                            s.text
+                        ));
+                        if let Some(ref cmd) = s.command {
+                            con.print(&format!("   [dim]$[/] [green]{cmd}[/]"));
+                        }
+                        if let Some(ref url) = s.url {
+                            con.print(&format!("   [dim]→ {url}[/]"));
+                        }
+                    }
+                }
+            }
         }
     }
 }
