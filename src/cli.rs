@@ -4159,6 +4159,7 @@ fn parse_git_name_status_z(stdout: &[u8]) -> Vec<std::path::PathBuf> {
 /// Print scan report in pretty format.
 #[cfg(not(feature = "rich-output"))]
 fn print_scan_pretty(report: &crate::scan::ScanReport, verbose: bool, top: usize) {
+    use crate::output::{ScanResultRow, ScanResultsTable, TableStyle, auto_theme};
     use colored::Colorize;
 
     if report.findings.is_empty() {
@@ -4169,46 +4170,45 @@ fn print_scan_pretty(report: &crate::scan::ScanReport, verbose: bool, top: usize
         println!("{} finding(s):", total.to_string().yellow().bold());
         println!();
 
-        let mut current_file: Option<&str> = None;
-        for finding in report.findings.iter().take(shown) {
-            if current_file != Some(finding.file.as_str()) {
-                current_file = Some(finding.file.as_str());
-                println!("{}", finding.file.bold());
-            }
+        // Render findings as a table
+        let rows: Vec<ScanResultRow> = report
+            .findings
+            .iter()
+            .take(shown)
+            .map(ScanResultRow::from_scan_finding)
+            .collect();
 
-            let decision_icon = match finding.decision {
-                crate::scan::ScanDecision::Deny => "DENY".red().bold(),
-                crate::scan::ScanDecision::Warn => "WARN".yellow().bold(),
-                crate::scan::ScanDecision::Allow => "ALLOW".green().bold(),
-            };
+        let theme = auto_theme();
+        let table = ScanResultsTable::new(rows)
+            .with_theme(&theme)
+            .with_style(TableStyle::Ascii)
+            .with_command_preview();
 
-            let severity_icon = match finding.severity {
-                crate::scan::ScanSeverity::Error => "error".red(),
-                crate::scan::ScanSeverity::Warning => "warning".yellow(),
-                crate::scan::ScanSeverity::Info => "info".blue(),
-            };
+        println!("{}", table.render());
 
-            let location = finding.col.map_or_else(
-                || finding.line.to_string(),
-                |col| format!("{}:{col}", finding.line),
-            );
+        // Show detailed info for findings with reasons/suggestions
+        let findings_with_details: Vec<_> = report
+            .findings
+            .iter()
+            .take(shown)
+            .filter(|f| f.reason.is_some() || f.suggestion.is_some())
+            .collect();
 
-            println!(
-                "  [{decision_icon}] ({severity_icon}) {location}  extractor={}",
-                finding.extractor_id
-            );
-            println!("    {}", finding.extracted_command.dimmed());
-
-            if let Some(ref rule_id) = finding.rule_id {
-                println!("    Rule: {rule_id}");
-            }
-
-            if let Some(ref reason) = finding.reason {
-                println!("    Reason: {reason}");
-            }
-
-            if let Some(ref suggestion) = finding.suggestion {
-                println!("    Suggestion: {}", suggestion.green());
+        if !findings_with_details.is_empty() && verbose {
+            println!();
+            println!("{}", "Details:".bold());
+            for finding in findings_with_details {
+                let location = finding.col.map_or_else(
+                    || format!("{}:{}", finding.file, finding.line),
+                    |col| format!("{}:{}:{col}", finding.file, finding.line),
+                );
+                println!("  {}", location.dimmed());
+                if let Some(ref reason) = finding.reason {
+                    println!("    Reason: {reason}");
+                }
+                if let Some(ref suggestion) = finding.suggestion {
+                    println!("    Suggestion: {}", suggestion.green());
+                }
             }
         }
 
@@ -4267,6 +4267,7 @@ fn print_scan_pretty(report: &crate::scan::ScanReport, verbose: bool, top: usize
 #[cfg(feature = "rich-output")]
 fn print_scan_pretty(report: &crate::scan::ScanReport, verbose: bool, top: usize) {
     use crate::output::console::console;
+    use crate::output::{ScanResultRow, ScanResultsTable, auto_theme};
 
     let con = console();
 
@@ -4280,49 +4281,44 @@ fn print_scan_pretty(report: &crate::scan::ScanReport, verbose: bool, top: usize
         con.print(&format!("[yellow bold]{total}[/] finding(s)"));
         con.print("");
 
-        let mut current_file: Option<&str> = None;
-        for finding in report.findings.iter().take(shown) {
-            if current_file != Some(finding.file.as_str()) {
-                if current_file.is_some() {
-                    con.print("");
+        // Render findings as a table using rich_rust
+        let rows: Vec<ScanResultRow> = report
+            .findings
+            .iter()
+            .take(shown)
+            .map(ScanResultRow::from_scan_finding)
+            .collect();
+
+        let theme = auto_theme();
+        let table = ScanResultsTable::new(rows)
+            .with_theme(&theme)
+            .with_command_preview();
+
+        con.print(&table.render());
+
+        // Show detailed info for findings with reasons/suggestions
+        let findings_with_details: Vec<_> = report
+            .findings
+            .iter()
+            .take(shown)
+            .filter(|f| f.reason.is_some() || f.suggestion.is_some())
+            .collect();
+
+        if !findings_with_details.is_empty() && verbose {
+            con.print("");
+            con.print("[bold]Details:[/]");
+            for finding in findings_with_details {
+                let location = finding.col.map_or_else(
+                    || format!("{}:{}", finding.file, finding.line),
+                    |col| format!("{}:{}:{col}", finding.file, finding.line),
+                );
+                con.print(&format!("  [dim]{location}[/]"));
+                if let Some(ref reason) = finding.reason {
+                    con.print(&format!("    [cyan]Reason:[/] {reason}"));
                 }
-                current_file = Some(finding.file.as_str());
-                con.print(&format!("[bold]{file}[/]", file = finding.file));
-            }
-
-            let decision_icon = match finding.decision {
-                crate::scan::ScanDecision::Deny => "[red bold]DENY[/]",
-                crate::scan::ScanDecision::Warn => "[yellow bold]WARN[/]",
-                crate::scan::ScanDecision::Allow => "[green bold]ALLOW[/]",
-            };
-
-            let severity_icon = match finding.severity {
-                crate::scan::ScanSeverity::Error => "[red]error[/]",
-                crate::scan::ScanSeverity::Warning => "[yellow]warning[/]",
-                crate::scan::ScanSeverity::Info => "[blue]info[/]",
-            };
-
-            let location = finding.col.map_or_else(
-                || finding.line.to_string(),
-                |col| format!("{}:{col}", finding.line),
-            );
-
-            con.print(&format!(
-                "  [{decision_icon}] ({severity_icon}) {location}  [dim]extractor={}[/]",
-                finding.extractor_id
-            ));
-            con.print(&format!("    [dim]{}[/]", finding.extracted_command));
-
-            if let Some(ref rule_id) = finding.rule_id {
-                con.print(&format!("    [cyan]Rule:[/] {rule_id}"));
-            }
-
-            if let Some(ref reason) = finding.reason {
-                con.print(&format!("    [cyan]Reason:[/] {reason}"));
-            }
-
-            if let Some(ref suggestion) = finding.suggestion {
-                con.print(&format!("    [green]Suggestion:[/] {suggestion}"));
+                if let Some(ref suggestion) = finding.suggestion {
+                    con.print(&format!("    [green]Suggestion:[/] {suggestion}"));
+                }
             }
         }
 

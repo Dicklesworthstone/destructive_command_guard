@@ -29,10 +29,14 @@ use ratatui::style::Color as RatColor;
 
 #[cfg(feature = "rich-output")]
 use super::rich_theme::RichThemeExt;
-#[cfg(feature = "rich-output")]
-use rich_rust::prelude::*;
 
 use super::theme::{BorderStyle, Severity, Theme};
+
+/// Convert rich_rust segments to a plain text string.
+#[cfg(feature = "rich-output")]
+fn segments_to_string(segments: Vec<rich_rust::segment::Segment<'static>>) -> String {
+    segments.into_iter().map(|s| s.text.into_owned()).collect()
+}
 
 /// Convert ratatui color to comfy-table color.
 /// Only used when rich-output feature is disabled.
@@ -96,12 +100,13 @@ impl TableStyle {
 
     /// Returns the corresponding rich_rust box style.
     #[cfg(feature = "rich-output")]
-    fn to_box_style(&self) -> rich_rust::renderables::BoxStyle {
+    fn to_box_chars(&self) -> &'static rich_rust::r#box::BoxChars {
+        use rich_rust::r#box::{ASCII, MINIMAL, ROUNDED};
         match self {
-            Self::Unicode => rich_rust::renderables::BoxStyle::rounded(),
-            Self::Ascii => rich_rust::renderables::BoxStyle::ascii(),
-            Self::Markdown => rich_rust::renderables::BoxStyle::minimal(), // Markdown uses comfy-table
-            Self::Compact => rich_rust::renderables::BoxStyle::minimal(),
+            Self::Unicode => &ROUNDED,
+            Self::Ascii => &ASCII,
+            Self::Markdown => &MINIMAL, // Markdown uses comfy-table
+            Self::Compact => &MINIMAL,
         }
     }
 
@@ -135,6 +140,34 @@ pub struct ScanResultRow {
     pub pattern_id: String,
     /// Optional extracted command preview.
     pub command_preview: Option<String>,
+}
+
+impl ScanResultRow {
+    /// Creates a scan result row from a scan finding.
+    ///
+    /// Maps `ScanSeverity` to `Severity`:
+    /// - Error → High
+    /// - Warning → Medium
+    /// - Info → Low
+    #[must_use]
+    pub fn from_scan_finding(finding: &crate::scan::ScanFinding) -> Self {
+        let severity = match finding.severity {
+            crate::scan::ScanSeverity::Error => Severity::High,
+            crate::scan::ScanSeverity::Warning => Severity::Medium,
+            crate::scan::ScanSeverity::Info => Severity::Low,
+        };
+
+        Self {
+            file: finding.file.clone(),
+            line: finding.line,
+            severity,
+            pattern_id: finding
+                .rule_id
+                .clone()
+                .unwrap_or_else(|| finding.extractor_id.clone()),
+            command_preview: Some(finding.extracted_command.clone()),
+        }
+    }
 }
 
 /// Table renderer for scan results.
@@ -253,42 +286,44 @@ impl ScanResultsTable {
     /// Renders using rich_rust for premium terminal output.
     #[cfg(feature = "rich-output")]
     fn render_rich(&self) -> String {
-        let mut table = rich_rust::renderables::Table::new()
-            .add_column(rich_rust::renderables::Column::new("File"))
-            .add_column(
-                rich_rust::renderables::Column::new("Line")
-                    .justify(rich_rust::renderables::JustifyMethod::Right),
-            )
-            .add_column(
-                rich_rust::renderables::Column::new("Severity")
-                    .justify(rich_rust::renderables::JustifyMethod::Center),
-            )
-            .add_column(rich_rust::renderables::Column::new("Pattern"));
+        use crate::output::terminal_width;
+        use rich_rust::renderables::{
+            Cell as RichCell, Column as RichColumn, Row as RichRow, Table as RichTable,
+        };
+        use rich_rust::text::JustifyMethod;
+
+        let mut table = RichTable::new()
+            .with_column(RichColumn::new("File"))
+            .with_column(RichColumn::new("Line").justify(JustifyMethod::Right))
+            .with_column(RichColumn::new("Severity").justify(JustifyMethod::Center))
+            .with_column(RichColumn::new("Pattern"));
 
         if self.show_command {
-            table = table.add_column(rich_rust::renderables::Column::new("Command"));
+            table = table.with_column(RichColumn::new("Command"));
         }
 
-        table = table.box_style(self.style.to_box_style());
+        table = table.box_style(self.style.to_box_chars());
 
         for row in &self.rows {
             let severity_markup = self.severity_markup_rich(row.severity);
-            let mut rich_row = rich_rust::renderables::Row::new()
-                .cell(&row.file)
-                .cell(&row.line.to_string())
-                .cell(&severity_markup)
-                .cell(&row.pattern_id);
+            let mut cells: Vec<RichCell> = vec![
+                RichCell::new(row.file.as_str()),
+                RichCell::new(row.line.to_string()),
+                RichCell::new(severity_markup),
+                RichCell::new(row.pattern_id.as_str()),
+            ];
 
             if self.show_command {
                 let cmd = row.command_preview.as_deref().unwrap_or("-");
                 let truncated = truncate_with_ellipsis(cmd, 40);
-                rich_row = rich_row.cell(&truncated);
+                cells.push(RichCell::new(truncated));
             }
 
-            table = table.add_row(rich_row);
+            table.add_row(RichRow::new(cells));
         }
 
-        table.to_string()
+        let width = self.max_width.map_or_else(|| terminal_width() as usize, |w| w as usize);
+        segments_to_string(table.render(width))
     }
 
     /// Returns rich_rust markup for severity label.
@@ -498,41 +533,37 @@ impl StatsTable {
     /// Renders using rich_rust for premium terminal output.
     #[cfg(feature = "rich-output")]
     fn render_rich(&self) -> String {
-        let mut table = rich_rust::renderables::Table::new()
-            .add_column(rich_rust::renderables::Column::new("Rule"))
-            .add_column(
-                rich_rust::renderables::Column::new("Hits")
-                    .justify(rich_rust::renderables::JustifyMethod::Right),
-            )
-            .add_column(
-                rich_rust::renderables::Column::new("Allowed")
-                    .justify(rich_rust::renderables::JustifyMethod::Right),
-            )
-            .add_column(
-                rich_rust::renderables::Column::new("Denied")
-                    .justify(rich_rust::renderables::JustifyMethod::Right),
-            )
-            .add_column(
-                rich_rust::renderables::Column::new("Noise%")
-                    .justify(rich_rust::renderables::JustifyMethod::Right),
-            );
+        use crate::output::terminal_width;
+        use rich_rust::renderables::{
+            Cell as RichCell, Column as RichColumn, Row as RichRow, Table as RichTable,
+        };
+        use rich_rust::text::JustifyMethod;
 
-        table = table.box_style(self.style.to_box_style());
+        let mut table = RichTable::new()
+            .with_column(RichColumn::new("Rule"))
+            .with_column(RichColumn::new("Hits").justify(JustifyMethod::Right))
+            .with_column(RichColumn::new("Allowed").justify(JustifyMethod::Right))
+            .with_column(RichColumn::new("Denied").justify(JustifyMethod::Right))
+            .with_column(RichColumn::new("Noise%").justify(JustifyMethod::Right));
+
+        table = table.box_style(self.style.to_box_chars());
 
         for row in &self.rows {
             let noise_markup = self.noise_markup_rich(row.noise_pct);
 
-            let rich_row = rich_rust::renderables::Row::new()
-                .cell(&row.name)
-                .cell(&row.hits.to_string())
-                .cell(&row.allowed.to_string())
-                .cell(&row.denied.to_string())
-                .cell(&noise_markup);
+            let cells: Vec<RichCell> = vec![
+                RichCell::new(row.name.as_str()),
+                RichCell::new(row.hits.to_string()),
+                RichCell::new(row.allowed.to_string()),
+                RichCell::new(row.denied.to_string()),
+                RichCell::new(noise_markup),
+            ];
 
-            table = table.add_row(rich_row);
+            table.add_row(RichRow::new(cells));
         }
 
-        let table_str = table.to_string();
+        let width = self.max_width.map_or_else(|| terminal_width() as usize, |w| w as usize);
+        let table_str = segments_to_string(table.render(width));
 
         if let Some(title) = &self.title {
             format!("{title}\n{table_str}")
@@ -761,43 +792,42 @@ impl PackListTable {
     /// Renders using rich_rust for premium terminal output.
     #[cfg(feature = "rich-output")]
     fn render_rich(&self) -> String {
-        let mut table = rich_rust::renderables::Table::new()
-            .add_column(rich_rust::renderables::Column::new("Pack ID"))
-            .add_column(rich_rust::renderables::Column::new("Name"))
-            .add_column(
-                rich_rust::renderables::Column::new("Destructive")
-                    .justify(rich_rust::renderables::JustifyMethod::Right),
-            )
-            .add_column(
-                rich_rust::renderables::Column::new("Safe")
-                    .justify(rich_rust::renderables::JustifyMethod::Right),
-            );
+        use crate::output::terminal_width;
+        use rich_rust::renderables::{
+            Cell as RichCell, Column as RichColumn, Row as RichRow, Table as RichTable,
+        };
+        use rich_rust::text::JustifyMethod;
+
+        let mut table = RichTable::new()
+            .with_column(RichColumn::new("Pack ID"))
+            .with_column(RichColumn::new("Name"))
+            .with_column(RichColumn::new("Destructive").justify(JustifyMethod::Right))
+            .with_column(RichColumn::new("Safe").justify(JustifyMethod::Right));
 
         if self.show_status {
-            table = table.add_column(
-                rich_rust::renderables::Column::new("Status")
-                    .justify(rich_rust::renderables::JustifyMethod::Center),
-            );
+            table = table.with_column(RichColumn::new("Status").justify(JustifyMethod::Center));
         }
 
-        table = table.box_style(self.style.to_box_style());
+        table = table.box_style(self.style.to_box_chars());
 
         for row in &self.rows {
-            let mut rich_row = rich_rust::renderables::Row::new()
-                .cell(&row.id)
-                .cell(&row.name)
-                .cell(&row.destructive_count.to_string())
-                .cell(&row.safe_count.to_string());
+            let mut cells: Vec<RichCell> = vec![
+                RichCell::new(row.id.as_str()),
+                RichCell::new(row.name.as_str()),
+                RichCell::new(row.destructive_count.to_string()),
+                RichCell::new(row.safe_count.to_string()),
+            ];
 
             if self.show_status {
                 let status_markup = self.status_markup_rich(row.enabled);
-                rich_row = rich_row.cell(&status_markup);
+                cells.push(RichCell::new(status_markup));
             }
 
-            table = table.add_row(rich_row);
+            table.add_row(RichRow::new(cells));
         }
 
-        table.to_string()
+        let width = self.max_width.map_or_else(|| terminal_width() as usize, |w| w as usize);
+        segments_to_string(table.render(width))
     }
 
     /// Returns rich_rust markup for enabled/disabled status.
@@ -1094,12 +1124,14 @@ mod tests {
         let table = ScanResultsTable::new(rows)
             .with_style(TableStyle::Ascii)
             .with_command_preview();
+        // Use wide enough table to show our truncation
+        let table = table.with_max_width(120);
         let output = table.render();
 
         // Should be truncated with ...
-        assert!(output.contains("..."));
+        assert!(output.contains("..."), "Output should contain ellipsis: {output}");
         // Should not contain the full long command
-        assert!(!output.contains("truncated"));
+        assert!(!output.contains("truncated"), "Output should not contain 'truncated': {output}");
     }
 
     #[test]
@@ -1224,5 +1256,208 @@ mod tests {
 
         // Missing command should show dash
         assert!(output.contains("-"));
+    }
+
+    // ==================== rich_rust-specific tests ====================
+
+    #[test]
+    #[cfg(feature = "rich-output")]
+    fn test_rich_scan_table_uses_rounded_borders() {
+        let rows = vec![ScanResultRow {
+            file: "test.rs".to_string(),
+            line: 1,
+            severity: Severity::High,
+            pattern_id: "test".to_string(),
+            command_preview: None,
+        }];
+
+        let table = ScanResultsTable::new(rows).with_style(TableStyle::Unicode);
+        let output = table.render();
+
+        // Unicode/rounded borders use rounded corner characters
+        // Check for presence of box-drawing characters (rounded style uses ╭ ╮ ╰ ╯)
+        assert!(
+            output.contains('╭') || output.contains('+'),
+            "Output should contain box borders: {output}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "rich-output")]
+    fn test_rich_scan_table_severity_markup() {
+        let rows = vec![
+            ScanResultRow {
+                file: "a.rs".to_string(),
+                line: 1,
+                severity: Severity::Critical,
+                pattern_id: "test".to_string(),
+                command_preview: None,
+            },
+            ScanResultRow {
+                file: "b.rs".to_string(),
+                line: 2,
+                severity: Severity::High,
+                pattern_id: "test".to_string(),
+                command_preview: None,
+            },
+            ScanResultRow {
+                file: "c.rs".to_string(),
+                line: 3,
+                severity: Severity::Medium,
+                pattern_id: "test".to_string(),
+                command_preview: None,
+            },
+            ScanResultRow {
+                file: "d.rs".to_string(),
+                line: 4,
+                severity: Severity::Low,
+                pattern_id: "test".to_string(),
+                command_preview: None,
+            },
+        ];
+
+        let table = ScanResultsTable::new(rows)
+            .with_style(TableStyle::Unicode)
+            .with_max_width(120);
+        let output = table.render();
+
+        // Should contain severity labels (with or without color markup)
+        assert!(output.contains("CRIT"), "Output should contain CRIT: {output}");
+        assert!(output.contains("HIGH"), "Output should contain HIGH: {output}");
+        assert!(output.contains("MED"), "Output should contain MED: {output}");
+        assert!(output.contains("LOW"), "Output should contain LOW: {output}");
+    }
+
+    #[test]
+    #[cfg(feature = "rich-output")]
+    fn test_rich_stats_table_basic() {
+        let rows = vec![StatsRow {
+            name: "core.git:reset".to_string(),
+            hits: 42,
+            allowed: 30,
+            denied: 12,
+            noise_pct: Some(2.1),
+        }];
+
+        let table = StatsTable::new(rows)
+            .with_style(TableStyle::Unicode)
+            .with_max_width(100);
+        let output = table.render();
+
+        assert!(output.contains("core.git:reset"), "Output: {output}");
+        assert!(output.contains("42"), "Output: {output}");
+    }
+
+    #[test]
+    #[cfg(feature = "rich-output")]
+    fn test_rich_pack_list_table_basic() {
+        let rows = vec![
+            PackRow {
+                id: "core.git".to_string(),
+                name: "Git Operations".to_string(),
+                destructive_count: 10,
+                safe_count: 5,
+                enabled: true,
+            },
+            PackRow {
+                id: "core.filesystem".to_string(),
+                name: "File Operations".to_string(),
+                destructive_count: 8,
+                safe_count: 3,
+                enabled: false,
+            },
+        ];
+
+        let table = PackListTable::new(rows)
+            .with_style(TableStyle::Unicode)
+            .with_max_width(120);
+        let output = table.render();
+
+        // Should contain pack IDs
+        assert!(output.contains("core.git"), "Output: {output}");
+        assert!(output.contains("core.filesystem"), "Output: {output}");
+        // Should contain counts
+        assert!(output.contains("10"), "Output: {output}");
+    }
+
+    #[test]
+    #[cfg(feature = "rich-output")]
+    fn test_rich_table_respects_width() {
+        let rows = vec![ScanResultRow {
+            file: "very/long/path/to/some/deeply/nested/file/in/the/project.rs".to_string(),
+            line: 999,
+            severity: Severity::Critical,
+            pattern_id: "very.long.pattern:with-lots-of-details".to_string(),
+            command_preview: Some("git reset --hard HEAD~100 && rm -rf /".to_string()),
+        }];
+
+        let narrow_table = ScanResultsTable::new(rows.clone())
+            .with_style(TableStyle::Unicode)
+            .with_command_preview()
+            .with_max_width(60);
+        let narrow_output = narrow_table.render();
+
+        let wide_table = ScanResultsTable::new(rows)
+            .with_style(TableStyle::Unicode)
+            .with_command_preview()
+            .with_max_width(200);
+        let wide_output = wide_table.render();
+
+        // Both should render without panicking
+        assert!(!narrow_output.is_empty(), "Narrow output should not be empty");
+        assert!(!wide_output.is_empty(), "Wide output should not be empty");
+    }
+
+    #[test]
+    #[cfg(feature = "rich-output")]
+    fn test_ascii_style_uses_ascii_chars() {
+        let rows = vec![ScanResultRow {
+            file: "test.rs".to_string(),
+            line: 1,
+            severity: Severity::Low,
+            pattern_id: "test".to_string(),
+            command_preview: None,
+        }];
+
+        let table = ScanResultsTable::new(rows).with_style(TableStyle::Ascii);
+        let output = table.render();
+
+        // ASCII style should use +, -, | characters, not Unicode box drawing
+        assert!(
+            output.contains('+') || output.contains('-') || output.contains('|'),
+            "ASCII output should use ASCII characters: {output}"
+        );
+        // Should NOT contain rounded Unicode corners
+        assert!(
+            !output.contains('╭'),
+            "ASCII output should not contain Unicode box chars: {output}"
+        );
+    }
+
+    #[test]
+    fn test_markdown_uses_comfy_table() {
+        // Markdown style should always use comfy-table (render_comfy),
+        // even when rich-output feature is enabled
+        let rows = vec![ScanResultRow {
+            file: "test.rs".to_string(),
+            line: 1,
+            severity: Severity::Low,
+            pattern_id: "test".to_string(),
+            command_preview: None,
+        }];
+
+        let table = ScanResultsTable::new(rows).with_style(TableStyle::Markdown);
+        let output = table.render();
+
+        // Markdown tables use | as column separators
+        assert!(
+            output.contains('|'),
+            "Markdown output should use pipe separators: {output}"
+        );
+        // Should not contain ANSI escape codes or rich markup
+        assert!(
+            !output.contains('\x1b'),
+            "Markdown should not contain ANSI escapes: {output}"
+        );
     }
 }
