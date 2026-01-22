@@ -1686,8 +1686,14 @@ impl std::fmt::Display for StrictnessLevel {
 /// relaxed_branches = ["feature/*", "experiment/*", "sandbox/*"]
 /// relaxed_strictness = "critical"  # Only block Critical severity
 ///
+/// # Packs to disable on relaxed branches
+/// relaxed_disabled_packs = []
+///
 /// # Default strictness when not matching any pattern
 /// default_strictness = "high"  # Block Critical and High (normal behavior)
+///
+/// # Show branch context in output
+/// show_branch_in_output = true
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1715,6 +1721,16 @@ pub struct GitAwarenessConfig {
     /// Default strictness level when not on a protected or relaxed branch.
     /// Default: `High` (normal behavior)
     pub default_strictness: StrictnessLevel,
+
+    /// Packs to disable on relaxed branches.
+    /// These packs will be skipped during evaluation when on a relaxed branch.
+    /// Default: empty (no packs disabled)
+    pub relaxed_disabled_packs: Vec<String>,
+
+    /// Show the current git branch in output messages.
+    /// When enabled, blocked command output will include the branch context.
+    /// Default: `true`
+    pub show_branch_in_output: bool,
 }
 
 impl Default for GitAwarenessConfig {
@@ -1735,6 +1751,8 @@ impl Default for GitAwarenessConfig {
             ],
             relaxed_strictness: StrictnessLevel::Critical,
             default_strictness: StrictnessLevel::High,
+            relaxed_disabled_packs: Vec::new(),
+            show_branch_in_output: true,
         }
     }
 }
@@ -1821,6 +1839,28 @@ impl GitAwarenessConfig {
             return false;
         }
         branch.is_some_and(|b| self.matches_any_pattern(b, &self.relaxed_branches))
+    }
+
+    /// Get the list of packs that should be disabled on relaxed branches.
+    ///
+    /// Returns an empty slice if git awareness is disabled or if the current
+    /// branch is not a relaxed branch.
+    #[must_use]
+    pub fn disabled_packs_for_branch(&self, branch: Option<&str>) -> &[String] {
+        if !self.enabled {
+            return &[];
+        }
+        if self.is_relaxed_branch(branch) {
+            &self.relaxed_disabled_packs
+        } else {
+            &[]
+        }
+    }
+
+    /// Returns `true` if branch context should be shown in output.
+    #[must_use]
+    pub const fn should_show_branch_in_output(&self) -> bool {
+        self.enabled && self.show_branch_in_output
     }
 }
 
