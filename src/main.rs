@@ -20,6 +20,9 @@
 use clap::Parser;
 use colored::Colorize;
 use destructive_command_guard::cli::{self, Cli};
+// Exit codes are used by cli.rs for robot mode; main.rs uses them for hook mode errors
+#[allow(unused_imports)]
+use destructive_command_guard::exit_codes::{EXIT_DENIED, EXIT_PARSE_ERROR, EXIT_SUCCESS};
 use destructive_command_guard::config::Config;
 use destructive_command_guard::evaluator::{
     EvaluationDecision, MatchSource, evaluate_command_with_pack_order_deadline_at_path,
@@ -222,11 +225,18 @@ fn main() {
     };
 
     // Initialize output system based on CLI flags.
-    // --legacy-output or --no-color forces plain output mode.
-    let force_plain_output = cli.legacy_output || cli.no_color;
+    // --legacy-output, --no-color, or --robot forces plain output mode.
+    // Robot mode also suppresses all stderr output.
+    let robot_mode = cli.robot || std::env::var("DCG_ROBOT").is_ok();
+    let force_plain_output = cli.legacy_output || cli.no_color || robot_mode;
     destructive_command_guard::output::init(force_plain_output);
     destructive_command_guard::output::init_console(force_plain_output);
-    destructive_command_guard::output::init_suggestions(!cli.no_suggestions);
+    destructive_command_guard::output::init_suggestions(!cli.no_suggestions && !robot_mode);
+
+    // In robot mode, also disable colors completely
+    if robot_mode {
+        colored::control::set_override(false);
+    }
 
     // If there's a subcommand, handle it and exit.
     if cli.command.is_some() {
@@ -641,6 +651,10 @@ fn print_help() {
     eprintln!(
         "    {}=ms  Hook evaluation timeout budget",
         "DCG_HOOK_TIMEOUT_MS".green()
+    );
+    eprintln!(
+        "    {}=1      Robot mode for AI agents (JSON output, no stderr)",
+        "DCG_ROBOT".green()
     );
     eprintln!();
 

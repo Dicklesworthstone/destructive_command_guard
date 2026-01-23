@@ -9,6 +9,7 @@ use clap_complete::generate;
 use inquire::{Select, Text};
 
 use crate::agent::{DetectionMethod, detect_agent_with_details};
+use crate::exit_codes::EXIT_DENIED;
 use crate::config::Config;
 use crate::evaluator::{
     DEFAULT_WINDOW_WIDTH, EvaluationDecision, EvaluationResult, MatchSource,
@@ -33,6 +34,69 @@ use crate::suggest::{
     filter_by_risk, generate_enhanced_suggestions,
 };
 use std::io::IsTerminal;
+
+/// Unified output format for all dcg commands.
+///
+/// This enum provides a consistent interface for output format selection across
+/// all commands. It supports the common formats needed by both human users
+/// (pretty/text) and AI agents (json/jsonl).
+///
+/// # Robot Mode
+///
+/// When `--robot` mode is enabled, the format defaults to `Json` regardless
+/// of the command-specific default.
+///
+/// # Aliases
+///
+/// Several aliases are provided for compatibility:
+/// - `text` and `human` map to `Pretty`
+/// - `sarif` and `structured` map to `Json`
+///
+/// # Example
+///
+/// ```bash
+/// # Human-readable output (default)
+/// dcg test "rm -rf /"
+///
+/// # JSON output for scripting
+/// dcg test "rm -rf /" --format json
+///
+/// # Robot mode (implies JSON, suppresses stderr)
+/// dcg --robot test "rm -rf /"
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    /// Human-readable colored output (default for interactive use)
+    #[default]
+    #[value(alias = "text", alias = "human")]
+    Pretty,
+
+    /// Structured JSON output (for agents and scripting)
+    #[value(alias = "sarif", alias = "structured")]
+    Json,
+
+    /// JSON Lines format (one JSON object per line, for streaming)
+    #[value(name = "jsonl")]
+    Jsonl,
+
+    /// Compact single-line output (for specific commands)
+    Compact,
+}
+
+impl OutputFormat {
+    /// Returns true if this format produces JSON output.
+    #[must_use]
+    pub const fn is_json(&self) -> bool {
+        matches!(self, Self::Json | Self::Jsonl)
+    }
+
+    /// Returns true if this format is human-readable.
+    #[must_use]
+    pub const fn is_human_readable(&self) -> bool {
+        matches!(self, Self::Pretty | Self::Compact)
+    }
+}
 
 /// High-performance Claude Code hook for blocking destructive commands.
 ///
@@ -69,6 +133,29 @@ pub struct Cli {
     /// Disable suggestion output in warnings/denials
     #[arg(long, global = true, env = "DCG_NO_SUGGESTIONS")]
     pub no_suggestions: bool,
+
+    /// Enable robot/machine mode for AI agent integration
+    ///
+    /// When enabled:
+    /// - All output is JSON on stdout
+    /// - stderr is completely silent (no rich output, no human messages)
+    /// - Exit codes follow standardized values (see docs/adr-002-robot-mode-api.md)
+    /// - Human-friendly decorations are suppressed
+    ///
+    /// This flag is designed for AI coding agents (Claude Code, Gemini CLI, etc.)
+    /// that need to parse dcg's output programmatically.
+    ///
+    /// Exit codes in robot mode:
+    /// - 0: Success / Allow
+    /// - 1: Denied / Blocked
+    /// - 2: Warning (with --fail-on warn)
+    /// - 3: Configuration error
+    /// - 4: Parse/input error
+    /// - 5: IO error
+    /// Enable robot mode for machine-friendly output (also enabled by DCG_ROBOT=1 env var).
+    /// In robot mode: always outputs JSON, silent stderr, standardized exit codes.
+    #[arg(long, global = true)]
+    pub robot: bool,
 
     /// Subcommand to run (omit to run in hook mode)
     #[command(subcommand)]
@@ -582,6 +669,9 @@ pub struct TestOutput {
     /// Matched span (start, end) in the command
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_span: Option<(usize, usize)>,
+    /// Severity level: "critical", "high", "medium", "low"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
     /// Allowlist override info if allowed via allowlist
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowlist: Option<AllowlistOverrideInfo>,
@@ -1602,11 +1692,19 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             write_completions(shell)?;
         }
         Some(Command::ListPacks { enabled, format }) => {
+            // Robot mode forces JSON output
+            let robot_mode = cli.robot || std::env::var("DCG_ROBOT").is_ok();
+            let effective_format = if robot_mode {
+                PacksFormat::Json
+            } else {
+                format
+            };
+
             list_packs(
                 &config,
                 enabled,
                 verbosity.is_verbose(),
-                format,
+                effective_format,
                 verbosity.quiet,
             );
         }
@@ -1625,6 +1723,14 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             heredoc_timeout_ms,
             heredoc_languages,
         }) => {
+            // Robot mode forces JSON output
+            let robot_mode = cli.robot || std::env::var("DCG_ROBOT").is_ok();
+            let effective_format = if robot_mode {
+                TestFormat::Json
+            } else {
+                format
+            };
+
             // Load specific config file if provided, otherwise use default
             let effective_config = if let Some(ref path) = config_path {
                 Config::load_from_file(path).unwrap_or_else(|| {
@@ -1638,7 +1744,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if explain {
                 // Delegate to explain handler for detailed trace output
                 // Convert TestFormat to ExplainFormat for explain mode
-                let explain_format = match format {
+                let explain_format = match effective_format {
                     TestFormat::Pretty => ExplainFormat::Pretty,
                     TestFormat::Json => ExplainFormat::Json,
                 };
@@ -1648,17 +1754,17 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     &effective_config,
                     &command,
                     with_packs,
-                    format,
+                    effective_format,
                     verbosity,
-                    no_color,
+                    no_color || robot_mode, // Robot mode also implies no color
                     heredoc_scan,
                     no_heredoc_scan,
                     heredoc_timeout_ms,
                     heredoc_languages,
                 );
-                // Exit with code 1 if command would be blocked (for CI scripting)
+                // Exit with code 1 if command would be blocked (for CI/robot mode scripting)
                 if was_blocked {
-                    std::process::exit(1);
+                    std::process::exit(EXIT_DENIED);
                 }
             }
         }
@@ -1739,8 +1845,16 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             format,
             with_packs,
         }) => {
+            // Robot mode forces JSON output
+            let robot_mode = cli.robot || std::env::var("DCG_ROBOT").is_ok();
+            let effective_format = if robot_mode {
+                ExplainFormat::Json
+            } else {
+                format
+            };
+
             if !verbosity.quiet {
-                handle_explain(&config, &command, format, with_packs);
+                handle_explain(&config, &command, effective_format, with_packs);
             }
         }
         Some(Command::Corpus(corpus)) => {
@@ -3044,14 +3158,15 @@ fn test_command(
                     explanation: None,
                     source: None,
                     matched_span: None,
+                    severity: None,
                     allowlist,
                     agent: Some(agent_info.clone()),
                 }
             }
             EvaluationDecision::Deny => {
-                let (pack_id, pattern_name, reason, explanation, source_str, matched_span, rule_id) =
+                let (pack_id, pattern_name, reason, explanation, source_str, matched_span, rule_id, severity) =
                     result.pattern_info.as_ref().map_or(
-                        (None, None, None, None, None, None, None),
+                        (None, None, None, None, None, None, None, None),
                         |info| {
                             let source_str = match info.source {
                                 MatchSource::ConfigOverride => "config_override",
@@ -3062,6 +3177,12 @@ fn test_command(
                             let rule_id = info.pack_id.as_ref().and_then(|p| {
                                 info.pattern_name.as_ref().map(|n| format!("{p}:{n}"))
                             });
+                            let severity_str = info.severity.map(|s| match s {
+                                PackSeverity::Critical => "critical",
+                                PackSeverity::High => "high",
+                                PackSeverity::Medium => "medium",
+                                PackSeverity::Low => "low",
+                            });
                             (
                                 info.pack_id.clone(),
                                 info.pattern_name.clone(),
@@ -3070,6 +3191,7 @@ fn test_command(
                                 Some(source_str.to_string()),
                                 info.matched_span.as_ref().map(|s| (s.start, s.end)),
                                 rule_id,
+                                severity_str.map(|s| s.to_string()),
                             )
                         },
                     );
@@ -3083,6 +3205,7 @@ fn test_command(
                     explanation,
                     source: source_str,
                     matched_span,
+                    severity,
                     allowlist: None,
                     agent: Some(agent_info.clone()),
                 }

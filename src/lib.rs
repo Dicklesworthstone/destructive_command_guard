@@ -69,6 +69,7 @@ pub mod config;
 pub mod context;
 pub mod error_codes;
 pub mod evaluator;
+pub mod exit_codes;
 pub mod git;
 pub mod heredoc;
 pub mod highlight;
@@ -98,6 +99,10 @@ pub use allowlist::{
 };
 pub use config::Config;
 pub use error_codes::{DcgError, ErrorCategory, ErrorCode, ErrorResponse};
+pub use exit_codes::{
+    EXIT_CONFIG_ERROR, EXIT_DENIED, EXIT_IO_ERROR, EXIT_PARSE_ERROR, EXIT_SUCCESS, EXIT_WARNING,
+    ToExitCode, exit_with, to_exit_code,
+};
 pub use evaluator::{
     ConfidenceResult, DetailedEvaluationResult, EvaluationDecision, EvaluationResult,
     LegacyDestructivePattern, LegacySafePattern, MatchSource, MatchSpan, PatternMatch,
@@ -152,7 +157,13 @@ pub use highlight::{
 };
 
 // Re-export suggestion types
-pub use suggest::{CommandCluster, cluster_denied_commands};
+pub use suggest::{
+    AllowlistSuggestion, CommandCluster, CommandEntryInfo, ConfidenceTier, GeneratedPattern,
+    PathPattern, RiskLevel, SuggestionReason, analyze_path_patterns, assess_risk_level,
+    calculate_confidence_tier, calculate_suggestion_score, cluster_denied_commands,
+    determine_primary_reason, filter_by_confidence, filter_by_risk, generate_enhanced_suggestions,
+    generate_pattern_from_cluster,
+};
 pub use suggestions::{Suggestion, SuggestionKind, get_suggestion_by_kind, get_suggestions};
 
 // Re-export scan types for `dcg scan`
