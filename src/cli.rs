@@ -152,6 +152,7 @@ pub struct Cli {
     /// - 3: Configuration error
     /// - 4: Parse/input error
     /// - 5: IO error
+    ///
     /// Enable robot mode for machine-friendly output (also enabled by DCG_ROBOT=1 env var).
     /// In robot mode: always outputs JSON, silent stderr, standardized exit codes.
     #[arg(long, global = true)]
@@ -3206,7 +3207,7 @@ fn test_command(
                             Some(source_str.to_string()),
                             info.matched_span.as_ref().map(|s| (s.start, s.end)),
                             rule_id,
-                            severity_str.map(|s| s.to_string()),
+                            severity_str.map(std::string::ToString::to_string),
                         )
                     },
                 );
@@ -5626,7 +5627,7 @@ fn handle_stats_command(
         StatsFormat::Json => {
             print!("{}", stats::format_stats_json(&aggregated));
         }
-    };
+    }
 
     Ok(())
 }
@@ -5697,7 +5698,7 @@ fn handle_stats_rules(
         StatsFormat::Json => {
             print!("{}", format_rule_metrics_json(&metrics, cmd.days)?);
         }
-    };
+    }
 
     Ok(())
 }
