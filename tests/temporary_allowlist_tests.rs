@@ -99,8 +99,7 @@ mod duration_parsing {
         // Decimals might be truncated or rejected depending on implementation
         let result = parse_duration("1.5h");
         // Either should work or fail gracefully
-        if result.is_ok() {
-            let duration = result.unwrap();
+        if let Ok(duration) = result {
             // Expect either 1 or 1.5 hours
             assert!(duration.num_minutes() >= 60);
         }
@@ -125,19 +124,12 @@ mod duration_parsing {
 // ============================================================================
 
 mod timestamp_parsing {
-    use destructive_command_guard::allowlist::AllowEntry;
-    use destructive_command_guard::allowlist::is_expired;
+    use destructive_command_guard::allowlist::{AllowEntry, AllowSelector, RuleId, is_expired};
+    use std::collections::HashMap;
 
     fn make_test_entry() -> AllowEntry {
         AllowEntry {
-            rule: Some("core.git:*".to_string()),
-            exact_command: None,
-            pattern: None,
-            glob_command: None,
-            env: None,
-            paths: None,
-            working_dir: None,
-            risk_acknowledged: None,
+            selector: AllowSelector::Rule(RuleId::parse("core.git:*").expect("valid rule id")),
             reason: "test".to_string(),
             added_by: None,
             added_at: None,
@@ -145,6 +137,10 @@ mod timestamp_parsing {
             ttl: None,
             session: None,
             context: None,
+            conditions: HashMap::new(),
+            environments: Vec::new(),
+            paths: None,
+            risk_acknowledged: false,
         }
     }
 
@@ -246,18 +242,12 @@ mod timestamp_parsing {
 
 mod ttl_expiration {
     use chrono::{Duration, Utc};
-    use destructive_command_guard::allowlist::{AllowEntry, is_expired};
+    use destructive_command_guard::allowlist::{AllowEntry, AllowSelector, RuleId, is_expired};
+    use std::collections::HashMap;
 
     fn make_test_entry() -> AllowEntry {
         AllowEntry {
-            rule: Some("core.git:*".to_string()),
-            exact_command: None,
-            pattern: None,
-            glob_command: None,
-            env: None,
-            paths: None,
-            working_dir: None,
-            risk_acknowledged: None,
+            selector: AllowSelector::Rule(RuleId::parse("core.git:*").expect("valid rule id")),
             reason: "test".to_string(),
             added_by: None,
             added_at: None,
@@ -265,6 +255,10 @@ mod ttl_expiration {
             ttl: None,
             session: None,
             context: None,
+            conditions: HashMap::new(),
+            environments: Vec::new(),
+            paths: None,
+            risk_acknowledged: false,
         }
     }
 
@@ -340,18 +334,12 @@ mod ttl_expiration {
 // ============================================================================
 
 mod session_entries {
-    use destructive_command_guard::allowlist::{AllowEntry, is_expired};
+    use destructive_command_guard::allowlist::{AllowEntry, AllowSelector, RuleId, is_expired};
+    use std::collections::HashMap;
 
     fn make_test_entry() -> AllowEntry {
         AllowEntry {
-            rule: Some("core.git:*".to_string()),
-            exact_command: None,
-            pattern: None,
-            glob_command: None,
-            env: None,
-            paths: None,
-            working_dir: None,
-            risk_acknowledged: None,
+            selector: AllowSelector::Rule(RuleId::parse("core.git:*").expect("valid rule id")),
             reason: "test".to_string(),
             added_by: None,
             added_at: None,
@@ -359,6 +347,10 @@ mod session_entries {
             ttl: None,
             session: None,
             context: None,
+            conditions: HashMap::new(),
+            environments: Vec::new(),
+            paths: None,
+            risk_acknowledged: false,
         }
     }
 
@@ -606,18 +598,12 @@ fn e2e_validate_checks_expired_entries() {
 
 #[test]
 fn integration_entry_validity_check() {
-    use destructive_command_guard::allowlist::{AllowEntry, is_entry_valid};
+    use destructive_command_guard::allowlist::{AllowEntry, AllowSelector, RuleId, is_entry_valid};
+    use std::collections::HashMap;
 
     // Valid entry (no expiration)
     let valid = AllowEntry {
-        rule: Some("core.git:*".to_string()),
-        exact_command: None,
-        pattern: None,
-        glob_command: None,
-        env: None,
-        paths: None,
-        working_dir: None,
-        risk_acknowledged: None,
+        selector: AllowSelector::Rule(RuleId::parse("core.git:*").expect("valid rule id")),
         reason: "test".to_string(),
         added_by: None,
         added_at: None,
@@ -625,6 +611,10 @@ fn integration_entry_validity_check() {
         ttl: None,
         session: None,
         context: None,
+        conditions: HashMap::new(),
+        environments: Vec::new(),
+        paths: None,
+        risk_acknowledged: false,
     };
     assert!(
         is_entry_valid(&valid),
@@ -633,14 +623,7 @@ fn integration_entry_validity_check() {
 
     // Expired entry
     let expired = AllowEntry {
-        rule: Some("core.git:*".to_string()),
-        exact_command: None,
-        pattern: None,
-        glob_command: None,
-        env: None,
-        paths: None,
-        working_dir: None,
-        risk_acknowledged: None,
+        selector: AllowSelector::Rule(RuleId::parse("core.git:*").expect("valid rule id")),
         reason: "test".to_string(),
         added_by: None,
         added_at: None,
@@ -648,6 +631,10 @@ fn integration_entry_validity_check() {
         ttl: None,
         session: None,
         context: None,
+        conditions: HashMap::new(),
+        environments: Vec::new(),
+        paths: None,
+        risk_acknowledged: false,
     };
     assert!(
         !is_entry_valid(&expired),
@@ -661,17 +648,11 @@ fn integration_entry_validity_check() {
 
 #[test]
 fn regression_permanent_entries_never_expire() {
-    use destructive_command_guard::allowlist::{AllowEntry, is_expired};
+    use destructive_command_guard::allowlist::{AllowEntry, AllowSelector, RuleId, is_expired};
+    use std::collections::HashMap;
 
     let permanent = AllowEntry {
-        rule: Some("core.git:*".to_string()),
-        exact_command: None,
-        pattern: None,
-        glob_command: None,
-        env: None,
-        paths: None,
-        working_dir: None,
-        risk_acknowledged: None,
+        selector: AllowSelector::Rule(RuleId::parse("core.git:*").expect("valid rule id")),
         reason: "permanent rule".to_string(),
         added_by: None,
         added_at: None,
@@ -679,6 +660,10 @@ fn regression_permanent_entries_never_expire() {
         ttl: None,
         session: None,
         context: None,
+        conditions: HashMap::new(),
+        environments: Vec::new(),
+        paths: None,
+        risk_acknowledged: false,
     };
 
     assert!(
@@ -689,17 +674,11 @@ fn regression_permanent_entries_never_expire() {
 
 #[test]
 fn regression_far_future_dates_not_expired() {
-    use destructive_command_guard::allowlist::{AllowEntry, is_expired};
+    use destructive_command_guard::allowlist::{AllowEntry, AllowSelector, RuleId, is_expired};
+    use std::collections::HashMap;
 
     let far_future = AllowEntry {
-        rule: Some("core.git:*".to_string()),
-        exact_command: None,
-        pattern: None,
-        glob_command: None,
-        env: None,
-        paths: None,
-        working_dir: None,
-        risk_acknowledged: None,
+        selector: AllowSelector::Rule(RuleId::parse("core.git:*").expect("valid rule id")),
         reason: "far future".to_string(),
         added_by: None,
         added_at: None,
@@ -707,6 +686,10 @@ fn regression_far_future_dates_not_expired() {
         ttl: None,
         session: None,
         context: None,
+        conditions: HashMap::new(),
+        environments: Vec::new(),
+        paths: None,
+        risk_acknowledged: false,
     };
 
     assert!(

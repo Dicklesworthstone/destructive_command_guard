@@ -3,6 +3,8 @@
 //! Provides the `E2ETestContext` struct for managing isolated test environments
 //! and running DCG commands with detailed output capture.
 
+#![allow(dead_code)]
+
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Write;
@@ -706,7 +708,7 @@ mod tests {
         let ctx = E2ETestContext::builder("env_test")
             .with_env("TEST_VAR", "test_value")
             .build();
-        assert!(ctx.env_vars.get("TEST_VAR").is_some());
+        assert!(ctx.env_vars.contains_key("TEST_VAR"));
     }
 
     #[test]

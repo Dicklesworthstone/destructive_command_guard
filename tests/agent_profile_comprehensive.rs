@@ -87,6 +87,7 @@ fn run_robot_mode_with_env(args: &[&str], env_vars: &[(&str, &str)]) -> (String,
 }
 
 /// Run DCG test command with agent type.
+#[allow(dead_code)]
 fn run_test_command_as_agent(command: &str, agent: &str) -> (String, String, i32) {
     let agent_env_var = match agent {
         "claude-code" | "claude_code" => "CLAUDE_CODE",
@@ -221,7 +222,7 @@ mod profile_loading_tests {
         );
         // Config command outputs the loaded configuration
         assert!(
-            stdout.contains("{") || stdout.contains("["),
+            stdout.contains('{') || stdout.contains('['),
             "config output should contain structured data. stdout: {stdout}"
         );
     }

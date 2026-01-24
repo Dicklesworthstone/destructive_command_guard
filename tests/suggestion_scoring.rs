@@ -381,7 +381,7 @@ fn suggestion_score_always_in_valid_range() {
         for risk in [RiskLevel::Low, RiskLevel::Medium, RiskLevel::High] {
             let score = calculate_suggestion_score(confidence, risk);
             assert!(
-                score >= 0.0 && score <= 1.0,
+                (0.0..=1.0).contains(&score),
                 "Score {score} for {confidence:?}/{risk:?} out of range [0,1]"
             );
         }

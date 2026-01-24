@@ -86,7 +86,9 @@ pub mod framework;
 pub mod logging;
 
 // Re-export commonly used types for convenience
+#[allow(unused_imports)]
 pub use framework::{DcgOutput, E2ETestContext, E2ETestContextBuilder, TestResult};
+#[allow(unused_imports)]
 pub use logging::{TestLogger, TestReport, TestStep};
 
 /// Module-level test initialization.

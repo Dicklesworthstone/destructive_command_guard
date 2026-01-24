@@ -3,8 +3,10 @@
 //! Provides structured logging for E2E tests with detailed output for debugging
 //! test failures and generating test reports.
 
+#![allow(dead_code, clippy::format_push_string)]
+
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Once;
