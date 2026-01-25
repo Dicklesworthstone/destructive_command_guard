@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "checks": [
+    {
+      "id": "binary_path",
+      "name": "Binary in PATH",
+      "status": "ok",
+      "message": "dcg found in PATH"
+    },
+    {
+      "id": "claude_settings",
+      "name": "Claude Code settings file",
+      "status": "ok",
+      "message": "settings.json found at /home/ubuntu/.claude/settings.json"
+    },
+    {
+      "id": "hook_wiring",
+      "name": "Hook wiring",
+      "status": "error",
+      "message": "dcg hook not registered",
+      "remediation": "Run 'dcg install' to register the hook"
+    },
+    {
+      "id": "config",
+      "name": "Configuration",
+      "status": "ok",
+      "message": "Config valid at /home/ubuntu/.config/dcg/config.toml"
+    },
+    {
+      "id": "packs",
+      "name": "Pattern packs",
+      "status": "ok",
+      "message": "3 packs enabled"
+    },
+    {
+      "id": "smoke_test",
+      "name": "Evaluator smoke test",
+      "status": "ok",
+      "message": "Evaluator smoke test passed"
+    },
+    {
+      "id": "observe_mode",
+      "name": "Observe mode",
+      "status": "ok",
+      "message": "Observe mode disabled"
+    },
+    {
+      "id": "allowlists",
+      "name": "Allowlists",
+      "status": "ok",
+      "message": "Allowlist layers found: 1"
+    }
+  ],
+  "issues": 1,
+  "fixed": 0,
+  "ok": false
+}

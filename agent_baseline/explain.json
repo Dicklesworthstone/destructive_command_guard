@@ -1,0 +1,67 @@
+{
+  "schema_version": 2,
+  "command": "git reset --hard",
+  "decision": "deny",
+  "total_duration_us": 117144,
+  "steps": [
+    {
+      "name": "full_evaluation",
+      "duration_us": 117010,
+      "details": {
+        "type": "keyword_gating",
+        "quick_rejected": false,
+        "keywords_checked": [
+          "psql",
+          "dropdb",
+          "createdb",
+          "pg_dump",
+          "pg_restore",
+          "DROP",
+          "TRUNCATE",
+          "DELETE",
+          "rm",
+          "/rm",
+          "git",
+          "docker"
+        ],
+        "first_match": "core.git"
+      }
+    }
+  ],
+  "match": {
+    "rule_id": "core.git:reset-hard",
+    "pack_id": "core.git",
+    "pattern_name": "reset-hard",
+    "severity": "critical",
+    "reason": "git reset --hard destroys uncommitted changes. Use 'git stash' first.",
+    "source": "pack",
+    "matched_span": {
+      "start": 0,
+      "end": 16
+    },
+    "matched_text_preview": "git reset --hard",
+    "explanation": "git reset --hard discards ALL uncommitted changes in your working directory AND staging area. This is one of the most dangerous git commands because changes that were never committed cannot be recovered by any means.\n\nWhat gets destroyed:\n- All modified files revert to the target commit\n- All staged changes are lost\n- Untracked files remain (use git clean to remove those)\n\nSafer alternatives:\n- git reset --soft <ref>: Move HEAD but keep all changes staged\n- git reset --mixed <ref>: Move HEAD, unstage changes, keep working dir (default)\n- git stash: Save changes before resetting\n\nPreview what would be lost:\n  git status && git diff"
+  },
+  "suggestions": [
+    {
+      "kind": "Preview first",
+      "text": "Run `git diff` and `git status` to see what would be lost",
+      "command": "git diff && git status"
+    },
+    {
+      "kind": "Safer alternative",
+      "text": "Use `git reset --soft` or `--mixed` to preserve changes",
+      "command": "git reset --soft HEAD~1"
+    },
+    {
+      "kind": "Workflow fix",
+      "text": "Consider using `git stash` to save changes temporarily",
+      "command": "git stash"
+    },
+    {
+      "kind": "Documentation",
+      "text": "See Git documentation for reset options",
+      "url": "https://git-scm.com/docs/git-reset"
+    }
+  ]
+}
