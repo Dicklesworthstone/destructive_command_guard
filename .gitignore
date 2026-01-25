@@ -48,3 +48,12 @@ tarpaulin-report.html
 test-artifacts/
 junit.xml
 proptest-regressions/
+
+# Ephemeral/temporary files (agent workflow artifacts)
+RESEARCH_FINDINGS.md
+TOON_INTEGRATION_BRIEF.md
+cov_*.out
+*.snap.new
+sweep_*.png
+test_screenshot.png
+target-*/
