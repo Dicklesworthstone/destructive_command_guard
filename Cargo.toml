@@ -84,7 +84,7 @@ comfy-table = "7.2"
 indicatif = "0.17"
 console = "0.15"
 inquire = "0.7"
-rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+rand = { version = "0.9", default-features = false, features = ["std", "std_rng"] }
 
 # rich_rust for premium terminal output (rich_rust epic)
 rich_rust = { version = "0.1", features = ["full"], optional = true }
