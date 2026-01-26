@@ -82,7 +82,7 @@ semver = "1.0"  # Semantic version comparison for update checks
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 comfy-table = "7.2"
 indicatif = "0.17"
-console = "0.15"
+console = "0.16"
 inquire = "0.7"
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 
