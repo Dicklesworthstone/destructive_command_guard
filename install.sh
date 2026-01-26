@@ -1074,9 +1074,7 @@ new_pre_tool_use = []
 predecessor_removed = False
 
 for entry in settings['hooks']['PreToolUse']:
-    matcher = entry.get('matcher')
-    is_bash_matcher = matcher == 'Bash' or (isinstance(matcher, dict) and matcher.get('tools') == ['Bash'])
-    if is_bash_matcher:
+    if entry.get('matcher') == 'Bash':
         # Collect hooks from this Bash matcher
         if 'hooks' in entry:
             for hook in entry['hooks']:
@@ -1107,7 +1105,7 @@ if not dcg_exists:
 # Create consolidated Bash matcher with dcg first
 if bash_hooks:
     new_pre_tool_use.insert(0, {
-        "matcher": {"tools": ["Bash"]},
+        "matcher": "Bash",
         "hooks": bash_hooks
     })
 
@@ -1141,7 +1139,7 @@ PYEOF
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": {"tools": ["Bash"]},
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
