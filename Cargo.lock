@@ -3703,12 +3703,13 @@ dependencies = [
 
 [[package]]
 name = "rich_rust"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f77c52b741c057945a7cf35c706cfe36e479d790f0674313de22f7ceeb619556"
+checksum = "8a7c2ecb6193f75fc8143648beb454f8b1d3a4fbd2fe13813a504760867d91b1"
 dependencies = [
  "bitflags 2.10.0",
  "crossterm 0.29.0",
+ "log",
  "lru",
  "num-rational",
  "once_cell",
@@ -3716,6 +3717,7 @@ dependencies = [
  "regex",
  "serde_json",
  "syntect",
+ "time",
  "unicode-width 0.2.2",
 ]
 
