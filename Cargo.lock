@@ -379,9 +379,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.5.54"
+version = "4.5.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6e6ff9dcd79cff5cd969a17a545d79e84ab086e444102a591e288a8aa3ce394"
+checksum = "a75ca66430e33a14957acc24c5077b503e7d374151b2b4b3a10c83b4ceb4be0e"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -389,9 +389,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.5.54"
+version = "4.5.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa42cf4d2b7a41bc8f663a7cab4031ebafa1bf3875705bfaf8466dc60ab52c00"
+checksum = "793207c7fa6300a0608d1080b858e5fdbe713cdc1c8db9fb17777d8a13e63df0"
 dependencies = [
  "anstream",
  "anstyle",
@@ -410,9 +410,9 @@ dependencies = [
 
 [[package]]
 name = "clap_derive"
-version = "4.5.49"
+version = "4.5.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a0b5487afeab2deb2ff4e03a807ad1a03ac532ff5a2cee5d86884440c7f7671"
+checksum = "a92793da1a46a5f2a02a6f4c46c6496b28c43638adea8306fcb0caa1634f24e5"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -3703,12 +3703,13 @@ dependencies = [
 
 [[package]]
 name = "rich_rust"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f77c52b741c057945a7cf35c706cfe36e479d790f0674313de22f7ceeb619556"
+checksum = "8a7c2ecb6193f75fc8143648beb454f8b1d3a4fbd2fe13813a504760867d91b1"
 dependencies = [
  "bitflags 2.10.0",
  "crossterm 0.29.0",
+ "log",
  "lru",
  "num-rational",
  "once_cell",
@@ -3716,6 +3717,7 @@ dependencies = [
  "regex",
  "serde_json",
  "syntect",
+ "time",
  "unicode-width 0.2.2",
 ]
 
@@ -3749,9 +3751,9 @@ dependencies = [
 
 [[package]]
 name = "rust-mcp-macros"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ca08e51769637b29c365e88f67096acb29310c080775af9dd73a936c2b9ccb7"
+checksum = "a4b2466f90db7bb97dfc3de9422c2411ee505ae457428190490e4ef9d42607ed"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3772,9 +3774,9 @@ dependencies = [
 
 [[package]]
 name = "rust-mcp-sdk"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f26451e57e1872f1727e29b961cb2a1f7793c567a349aeb52b5b7716475dbf05"
+checksum = "67357f0d9ee9c28bdb0d4cf5ae23c0359342a14d177c23b4ee992df93e9a87d7"
 dependencies = [
  "async-trait",
  "base64",
