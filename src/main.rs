@@ -383,7 +383,7 @@ fn main() {
 
     // Use the shared evaluator for hook mode parity with `dcg test`.
     let eval_start = Instant::now();
-    let mut result = evaluate_command_with_pack_order_deadline_at_path(
+    let result = evaluate_command_with_pack_order_deadline_at_path(
         &command,
         &enabled_keywords,
         &ordered_packs,

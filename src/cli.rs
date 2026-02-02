@@ -3166,7 +3166,7 @@ fn test_command(
 
     // Use shared evaluator for consistent behavior with hook mode
     let start = Instant::now();
-    let mut result = evaluate_command_with_pack_order_deadline_at_path(
+    let result = evaluate_command_with_pack_order_deadline_at_path(
         command,
         &enabled_keywords,
         &ordered_packs,
