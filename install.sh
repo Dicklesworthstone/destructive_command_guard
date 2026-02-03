@@ -47,6 +47,8 @@ NO_CONFIGURE=0
 NO_CHECKSUM=0
 FORCE_INSTALL=0
 OFFLINE="${DCG_OFFLINE:-0}"
+AGENT_VERSION_LOOKUP="${DCG_INSTALLER_AGENT_VERSIONS:-0}"
+AGENT_VERSION_TIMEOUT="${DCG_INSTALLER_AGENT_VERSION_TIMEOUT:-1}"
 
 # Detect gum for fancy output (https://github.com/charmbracelet/gum)
 HAS_GUM=0
@@ -166,37 +168,75 @@ AIDER_VERSION=""
 CONTINUE_VERSION=""
 CURSOR_VERSION=""
 
+print_agent_scan_notice() {
+  [ "$QUIET" -eq 1 ] && return 0
+
+  local line1="Scanning for installed coding agents..."
+  local line2="This can take several minutes depending on your machine."
+  local line3="The installer is still running - thanks for your patience."
+
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+    echo ""
+    gum style \
+      --border normal \
+      --border-foreground 244 \
+      --padding "0 1" \
+      "$(gum style --foreground 212 --bold 'Agent scan')" \
+      "$(gum style --foreground 247 "$line1")" \
+      "$(gum style --foreground 245 "$line2")" \
+      "$(gum style --foreground 245 "$line3")"
+    echo ""
+  else
+    echo ""
+    draw_box "0;36" "$line1" "$line2" "$line3"
+    echo ""
+  fi
+}
+
+try_version() {
+  local cmd="$1"
+  [[ "$AGENT_VERSION_LOOKUP" == "1" ]] || return 0
+  command -v "$cmd" >/dev/null 2>&1 || return 0
+
+  local timeout_secs="${AGENT_VERSION_TIMEOUT:-1}"
+  if ! [[ "$timeout_secs" =~ ^[0-9]+$ ]]; then
+    timeout_secs=1
+  fi
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$timeout_secs" "$cmd" --version 2>/dev/null | head -1 || true
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$timeout_secs" "$cmd" --version 2>/dev/null | head -1 || true
+  else
+    "$cmd" --version 2>/dev/null | head -1 || true
+  fi
+}
+
 detect_agents() {
   DETECTED_AGENTS=()
 
   # Claude Code
   if [[ -d "$HOME/.claude" ]] || command -v claude &>/dev/null; then
     DETECTED_AGENTS+=("claude-code")
-    if command -v claude &>/dev/null; then
-      CLAUDE_VERSION=$(claude --version 2>/dev/null | head -1 || echo "")
-    fi
+    CLAUDE_VERSION=$(try_version claude)
   fi
 
   # Codex CLI
   if [[ -d "$HOME/.codex" ]] || command -v codex &>/dev/null; then
     DETECTED_AGENTS+=("codex-cli")
-    if command -v codex &>/dev/null; then
-      CODEX_VERSION=$(codex --version 2>/dev/null | head -1 || echo "")
-    fi
+    CODEX_VERSION=$(try_version codex)
   fi
 
   # Gemini CLI (check both ~/.gemini and ~/.gemini-cli for compatibility)
   if [[ -d "$HOME/.gemini" ]] || [[ -d "$HOME/.gemini-cli" ]] || command -v gemini &>/dev/null; then
     DETECTED_AGENTS+=("gemini-cli")
-    if command -v gemini &>/dev/null; then
-      GEMINI_VERSION=$(gemini --version 2>/dev/null | head -1 || echo "")
-    fi
+    GEMINI_VERSION=$(try_version gemini)
   fi
 
   # Aider
   if command -v aider &>/dev/null; then
     DETECTED_AGENTS+=("aider")
-    AIDER_VERSION=$(aider --version 2>/dev/null | head -1 || echo "")
+    AIDER_VERSION=$(try_version aider)
   fi
 
   # Continue
@@ -222,9 +262,7 @@ detect_agents() {
 
   if [ "$cursor_detected" -eq 1 ]; then
     DETECTED_AGENTS+=("cursor-ide")
-    if command -v cursor &>/dev/null; then
-      CURSOR_VERSION=$(cursor --version 2>/dev/null | head -1 || echo "")
-    fi
+    CURSOR_VERSION=$(try_version cursor)
   fi
 }
 
@@ -744,6 +782,7 @@ if [ "$QUIET" -eq 0 ]; then
 fi
 
 # Detect installed AI coding agents early (for informational display and smart configuration)
+print_agent_scan_notice
 detect_agents
 if [ "$QUIET" -eq 0 ]; then
   print_detected_agents
