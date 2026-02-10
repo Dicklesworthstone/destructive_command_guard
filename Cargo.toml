@@ -29,6 +29,7 @@ name = "dcg"
 path = "src/main.rs"
 
 [dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"          # External pack YAML parsing
