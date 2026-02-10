@@ -817,6 +817,7 @@ if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
   case "$CLAUDE_STATUS" in
     already) ok "Claude Code: Already configured" ;;
     merged|created) ok "Claude Code: Configured" ;;
+    clobbered) warn "Claude Code: Hook overwritten by running Claude process (re-run after closing Claude)" ;;
     *) : ;;
   esac
   case "$GEMINI_STATUS" in
@@ -1045,7 +1046,7 @@ CURSOR_HOOK_SCRIPT="$CURSOR_HOOK_DIR/dcg-pre-shell.py"
 AUTO_CONFIGURED=0
 
 # Detailed tracking for what was configured
-CLAUDE_STATUS=""  # "created"|"merged"|"already"|"failed"
+CLAUDE_STATUS=""  # "created"|"merged"|"already"|"failed"|"clobbered"
 GEMINI_STATUS=""  # "created"|"merged"|"already"|"failed"|"skipped"
 AIDER_STATUS=""   # "created"|"merged"|"already"|"skipped"|"failed"
 CONTINUE_STATUS="" # "unsupported"|"skipped"
@@ -1062,6 +1063,12 @@ configure_claude_code() {
   # Default to cleaning up predecessor if not specified or empty
   [ -z "$cleanup_predecessor" ] && cleanup_predecessor=1
   local settings_dir=$(dirname "$settings_file")
+  local claude_running=0
+  if command -v pgrep >/dev/null 2>&1; then
+    if pgrep -f '[Cc]laude' >/dev/null 2>&1; then
+      claude_running=1
+    fi
+  fi
 
   # Always create the config directory if it doesn't exist
   if [ ! -d "$settings_dir" ]; then
@@ -1157,8 +1164,34 @@ if predecessor_removed:
     print("PREDECESSOR_CLEANED", file=sys.stderr)
 PYEOF
       if [ $? -eq 0 ]; then
-        CLAUDE_STATUS="merged"
-        AUTO_CONFIGURED=1
+        # Verify the hook actually persisted (a running Claude process can overwrite)
+        sleep 0.2
+        if grep -q '"command".*dcg' "$settings_file" 2>/dev/null; then
+          CLAUDE_STATUS="merged"
+          AUTO_CONFIGURED=1
+        else
+          CLAUDE_STATUS="clobbered"
+          AUTO_CONFIGURED=1
+        fi
+        if [ "$claude_running" -eq 1 ]; then
+          warn "A running Claude process was detected."
+          warn "It may overwrite $settings_file and remove the dcg hook."
+          if [ "$CLAUDE_STATUS" = "clobbered" ]; then
+            warn "Verification confirms the hook was already overwritten."
+          else
+            warn "The hook is present now, but may be lost when Claude saves settings."
+          fi
+          warn ""
+          warn "If the hook is lost, add the following to $settings_file manually"
+          warn "(inside \"hooks\" > \"PreToolUse\"):"
+          warn ""
+          warn '  {'
+          warn '    "matcher": "Bash",'
+          warn '    "hooks": [{ "type": "command", "command": "'"$DEST/dcg"'" }]'
+          warn '  }'
+          warn ""
+          warn "Or re-run this installer after closing all Claude processes."
+        fi
       else
         mv "$CLAUDE_BACKUP" "$settings_file" 2>/dev/null || true
         CLAUDE_STATUS="failed"
@@ -1192,6 +1225,20 @@ PYEOF
 EOFSET
     CLAUDE_STATUS="created"
     AUTO_CONFIGURED=1
+    if [ "$claude_running" -eq 1 ]; then
+      warn "A running Claude process was detected."
+      warn "It may overwrite $settings_file and remove the dcg hook."
+      warn ""
+      warn "If the hook is lost, add the following to $settings_file manually"
+      warn "(inside \"hooks\" > \"PreToolUse\"):"
+      warn ""
+      warn '  {'
+      warn '    "matcher": "Bash",'
+      warn '    "hooks": [{ "type": "command", "command": "'"$DEST/dcg"'" }]'
+      warn '  }'
+      warn ""
+      warn "Or re-run this installer after closing all Claude processes."
+    fi
   fi
 }
 
@@ -1743,6 +1790,11 @@ case "$CLAUDE_STATUS" in
     ;;
   merged)
     summary_lines+=("Claude Code: Added dcg hook to existing $CLAUDE_SETTINGS")
+    [ -n "$CLAUDE_BACKUP" ] && summary_lines+=("             Backup: $CLAUDE_BACKUP")
+    ;;
+  clobbered)
+    summary_lines+=("Claude Code: ⚠ Hook written but overwritten by running Claude process")
+    summary_lines+=("             Re-run installer after closing Claude, or add hook manually")
     [ -n "$CLAUDE_BACKUP" ] && summary_lines+=("             Backup: $CLAUDE_BACKUP")
     ;;
   already)
