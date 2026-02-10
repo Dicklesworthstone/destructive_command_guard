@@ -3129,8 +3129,6 @@ fn test_command(
     // Get enabled packs and collect keywords for quick rejection
     let mut enabled_packs = effective_config.enabled_pack_ids();
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
-    let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
-    let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
     let heredoc_settings = effective_config.heredoc_settings();
 
     // Compile overrides once (not per-command)
@@ -3149,6 +3147,20 @@ fn test_command(
         enabled_packs.insert(id.clone());
     }
     enabled_keywords.extend(external_store.keywords().iter().copied());
+
+    // Build ordered pack list AFTER external packs are loaded so they're included.
+    let mut ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    for id in external_store.pack_ids() {
+        if !ordered_packs.contains(id) {
+            ordered_packs.push(id.clone());
+        }
+    }
+    // Disable keyword index when external packs are present (not covered by index).
+    let keyword_index = if external_store.pack_ids().next().is_some() {
+        None
+    } else {
+        REGISTRY.build_enabled_keyword_index(&ordered_packs)
+    };
 
     // Detect the current AI coding agent for agent-specific profiles
     let detection = detect_agent_with_details();

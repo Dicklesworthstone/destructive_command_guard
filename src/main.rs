@@ -268,8 +268,6 @@ fn main() {
     // This is done before stdin read to minimize latency on the critical path.
     let mut enabled_packs: HashSet<String> = config.enabled_pack_ids();
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
-    let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
-    let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
 
     // Load external packs from custom_paths (glob + tilde expansion).
     // External packs are loaded once and cached for the process lifetime.
@@ -292,6 +290,23 @@ fn main() {
     // Merge external pack keywords into enabled keywords for quick rejection.
     // This ensures commands with external pack keywords are not prematurely rejected.
     enabled_keywords.extend(external_store.keywords().iter().copied());
+
+    // Build ordered pack list and keyword index AFTER external packs are loaded,
+    // so external pack IDs are included in the evaluation iteration list.
+    let mut ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    // Append external pack IDs (not in the registry, so expand_enabled_ordered won't include them).
+    for id in external_store.pack_ids() {
+        if !ordered_packs.contains(id) {
+            ordered_packs.push(id.clone());
+        }
+    }
+    // Keyword index only covers built-in packs; disable when external packs are present
+    // to ensure the non-indexed path (which handles both built-in and external) is used.
+    let keyword_index = if external_store.pack_ids().next().is_some() {
+        None
+    } else {
+        REGISTRY.build_enabled_keyword_index(&ordered_packs)
+    };
 
     // Read and parse input
     let max_input_bytes = config.general.max_hook_input_bytes();
