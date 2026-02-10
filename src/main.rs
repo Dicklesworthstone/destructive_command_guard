@@ -329,29 +329,9 @@ fn main() {
             .map_or(HOOK_EVALUATION_BUDGET, Duration::from_millis),
     );
 
-    // Only process Bash (Claude Code) or launch-process (Augment Code CLI) tool invocations
-    if !matches!(
-        hook_input.tool_name.as_deref(),
-        Some("Bash") | Some("launch-process")
-    ) {
-        return;
-    }
-
-    let Some(tool_input) = hook_input.tool_input else {
+    let Some((command, hook_protocol)) = hook::extract_command_with_protocol(&hook_input) else {
         return;
     };
-
-    let Some(command_value) = tool_input.command else {
-        return;
-    };
-
-    let serde_json::Value::String(command) = command_value else {
-        return;
-    };
-
-    if command.is_empty() {
-        return;
-    }
 
     // Check command size limit (fail-open: allow and warn)
     let max_command_bytes = config.general.max_command_bytes();
@@ -573,7 +553,8 @@ fn main() {
                 }
             }
 
-            hook::output_denial(
+            hook::output_denial_for_protocol(
+                hook_protocol,
                 &command,
                 &info.reason,
                 pack,
@@ -847,15 +828,7 @@ mod tests {
 
         fn parse_and_get_command(json: &str) -> Option<String> {
             let hook_input: HookInput = serde_json::from_str(json).ok()?;
-            if hook_input.tool_name.as_deref() != Some("Bash") {
-                return None;
-            }
-            let tool_input = hook_input.tool_input?;
-            let command_value = tool_input.command?;
-            match command_value {
-                serde_json::Value::String(s) if !s.is_empty() => Some(s),
-                _ => None,
-            }
+            hook::extract_command(&hook_input)
         }
 
         #[test]
@@ -868,6 +841,12 @@ mod tests {
         fn rejects_non_bash_tool() {
             let json = r#"{"tool_name": "Read", "tool_input": {"command": "git status"}}"#;
             assert_eq!(parse_and_get_command(json), None);
+        }
+
+        #[test]
+        fn parses_valid_copilot_input() {
+            let json = r#"{"event":"pre-tool-use","toolName":"run_shell_command","toolInput":{"command":"git status"}}"#;
+            assert_eq!(parse_and_get_command(json), Some("git status".to_string()));
         }
 
         #[test]

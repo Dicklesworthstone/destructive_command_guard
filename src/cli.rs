@@ -25,7 +25,8 @@ use crate::interactive::{
 };
 use crate::load_default_allowlists;
 use crate::packs::{
-    DecisionMode, REGISTRY, Severity as PackSeverity, get_external_packs, load_external_packs,
+    DecisionMode, ExternalPackStore, REGISTRY, Severity as PackSeverity, get_external_packs,
+    load_external_packs,
 };
 use crate::pending_exceptions::{
     AllowOnceEntry, AllowOnceScopeKind, AllowOnceStore, PendingExceptionRecord,
@@ -2098,59 +2099,15 @@ fn evaluate_batch_line(
         }
     };
 
-    // Only process Bash (Claude Code) or launch-process (Augment Code CLI) tool invocations
-    if !matches!(
-        hook_input.tool_name.as_deref(),
-        Some("Bash") | Some("launch-process")
-    ) {
+    let Some((command, _protocol)) = crate::hook::extract_command_with_protocol(&hook_input) else {
         return BatchHookOutput {
             index,
             decision: "skip",
             rule_id: None,
             pack_id: None,
-            error: Some("Not a Bash or launch-process tool invocation".to_string()),
-        };
-    }
-
-    let Some(tool_input) = hook_input.tool_input else {
-        return BatchHookOutput {
-            index,
-            decision: "skip",
-            rule_id: None,
-            pack_id: None,
-            error: Some("Missing tool_input".to_string()),
+            error: Some("Not a supported shell tool invocation or missing command".to_string()),
         };
     };
-
-    let Some(command_value) = tool_input.command else {
-        return BatchHookOutput {
-            index,
-            decision: "skip",
-            rule_id: None,
-            pack_id: None,
-            error: Some("Missing command".to_string()),
-        };
-    };
-
-    let serde_json::Value::String(command) = command_value else {
-        return BatchHookOutput {
-            index,
-            decision: "skip",
-            rule_id: None,
-            pack_id: None,
-            error: Some("Command is not a string".to_string()),
-        };
-    };
-
-    if command.is_empty() {
-        return BatchHookOutput {
-            index,
-            decision: "skip",
-            rule_id: None,
-            pack_id: None,
-            error: Some("Empty command".to_string()),
-        };
-    }
 
     // Evaluate the command
     let eval_result = evaluate_command_with_pack_order_deadline_at_path(
@@ -2257,7 +2214,7 @@ fn list_packs(
     }
 
     // Handle JSON output
-    let total_count = infos.len() + get_external_packs().map_or(0, |s| s.len());
+    let total_count = infos.len() + get_external_packs().map_or(0, ExternalPackStore::len);
     if format == PacksFormat::Json {
         let enabled_count = pack_list.iter().filter(|p| p.enabled).count();
         let output = PacksOutput {
@@ -11467,8 +11424,19 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("Not a Bash")
+                .contains("supported shell tool")
         );
+    }
+
+    #[test]
+    fn test_batch_accepts_copilot_hook_input() {
+        let lines = [
+            r#"{"event":"pre-tool-use","toolName":"run_shell_command","toolInput":{"command":"rm -rf /"}}"#,
+        ];
+        let results = process_batch_lines(&lines);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].decision, "deny");
     }
 
     #[test]

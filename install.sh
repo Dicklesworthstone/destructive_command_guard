@@ -167,6 +167,7 @@ GEMINI_VERSION=""
 AIDER_VERSION=""
 CONTINUE_VERSION=""
 CURSOR_VERSION=""
+COPILOT_VERSION=""
 
 print_agent_scan_notice() {
   [ "$QUIET" -eq 1 ] && return 0
@@ -239,6 +240,12 @@ detect_agents() {
     AIDER_VERSION=$(try_version aider)
   fi
 
+  # GitHub Copilot CLI
+  if command -v copilot &>/dev/null || [[ -d "$HOME/.copilot" ]]; then
+    DETECTED_AGENTS+=("github-copilot-cli")
+    COPILOT_VERSION=$(try_version copilot)
+  fi
+
   # Continue
   if [[ -d "$HOME/.continue" ]]; then
     DETECTED_AGENTS+=("continue")
@@ -301,6 +308,11 @@ print_detected_agents() {
           [[ -n "$AIDER_VERSION" ]] && ver_info=" (${AIDER_VERSION})"
           gum style --foreground 42 "  ✓ Aider${ver_info}"
           ;;
+        github-copilot-cli)
+          local ver_info=""
+          [[ -n "$COPILOT_VERSION" ]] && ver_info=" (${COPILOT_VERSION})"
+          gum style --foreground 42 "  ✓ GitHub Copilot CLI${ver_info}"
+          ;;
         continue)
           local ver_info=""
           [[ -n "$CONTINUE_VERSION" ]] && ver_info=" (${CONTINUE_VERSION})"
@@ -338,6 +350,11 @@ print_detected_agents() {
           local ver_info=""
           [[ -n "$AIDER_VERSION" ]] && ver_info=" (${AIDER_VERSION})"
           echo -e "  \033[0;32m✓\033[0m Aider${ver_info}"
+          ;;
+        github-copilot-cli)
+          local ver_info=""
+          [[ -n "$COPILOT_VERSION" ]] && ver_info=" (${COPILOT_VERSION})"
+          echo -e "  \033[0;32m✓\033[0m GitHub Copilot CLI${ver_info}"
           ;;
         continue)
           local ver_info=""
@@ -808,6 +825,11 @@ if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
     # Configure agents (these are already idempotent)
     configure_claude_code "$CLAUDE_SETTINGS" "0"
     configure_gemini "$GEMINI_SETTINGS"
+    configure_aider "$AIDER_SETTINGS"
+    configure_continue
+    configure_codex
+    configure_copilot
+    configure_cursor
   else
     info "Skipping agent configuration (--no-configure)"
   fi
@@ -825,6 +847,15 @@ if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
     skipped|"") info "Gemini CLI: Not installed (skipped)" ;;
     *) : ;;
   esac
+  case "$COPILOT_STATUS" in
+    already) ok "GitHub Copilot CLI: Already configured" ;;
+    merged|created) ok "GitHub Copilot CLI: Configured ($COPILOT_HOOK_FILE)" ;;
+    no_repo) info "GitHub Copilot CLI: Installed, but not in a git repository (skipped)" ;;
+    skipped|"") info "GitHub Copilot CLI: Not installed (skipped)" ;;
+    failed) warn "GitHub Copilot CLI: Configuration failed (python3 required for merge)" ;;
+    *) : ;;
+  esac
+  [ -n "$COPILOT_BACKUP" ] && info "GitHub Copilot CLI backup: $COPILOT_BACKUP"
 
   maybe_install_completions
 
@@ -1051,10 +1082,13 @@ AIDER_STATUS=""   # "created"|"merged"|"already"|"skipped"|"failed"
 CONTINUE_STATUS="" # "unsupported"|"skipped"
 CODEX_STATUS=""   # "unsupported"|"skipped"
 CURSOR_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"|"conflict"
+COPILOT_STATUS="" # "created"|"merged"|"already"|"skipped"|"no_repo"|"failed"
 CLAUDE_BACKUP=""
 GEMINI_BACKUP=""
 AIDER_BACKUP=""
 CURSOR_BACKUP=""
+COPILOT_BACKUP=""
+COPILOT_HOOK_FILE=""
 
 configure_claude_code() {
   local settings_file="$1"
@@ -1450,6 +1484,177 @@ configure_codex() {
   CODEX_STATUS="unsupported"
 }
 
+configure_copilot() {
+  # GitHub Copilot CLI supports repository-local hooks via .github/hooks/*.json.
+  # For Copilot CLI, hooks are loaded from the current working directory.
+  #
+  # We install/merge a dedicated file at:
+  #   <repo>/.github/hooks/dcg.json
+  #
+  # containing a preToolUse command hook that executes dcg.
+
+  local copilot_installed=0
+  if command -v copilot >/dev/null 2>&1 || [ -d "$HOME/.copilot" ]; then
+    copilot_installed=1
+  fi
+
+  if [ "$copilot_installed" -eq 0 ]; then
+    COPILOT_STATUS="skipped"
+    return 0
+  fi
+
+  # Copilot hooks are repository-local, so we need to be inside a git repository.
+  if ! command -v git >/dev/null 2>&1; then
+    COPILOT_STATUS="no_repo"
+    return 0
+  fi
+
+  local repo_root=""
+  repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+  if [ -z "$repo_root" ]; then
+    COPILOT_STATUS="no_repo"
+    return 0
+  fi
+
+  local hook_dir="$repo_root/.github/hooks"
+  local hook_file="$hook_dir/dcg.json"
+  COPILOT_HOOK_FILE="$hook_file"
+
+  mkdir -p "$hook_dir"
+
+  if [ -f "$hook_file" ]; then
+    # Merge into existing hook file.
+    COPILOT_BACKUP="${hook_file}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$hook_file" "$COPILOT_BACKUP"
+
+    if command -v python3 >/dev/null 2>&1; then
+      local py_result
+      py_result=$(python3 - "$hook_file" "$DEST/dcg" <<'PYEOF'
+import json
+import sys
+
+hook_file = sys.argv[1]
+dcg_path = sys.argv[2]
+
+try:
+    with open(hook_file, "r") as f:
+        settings = json.load(f)
+except Exception:
+    settings = {}
+
+if not isinstance(settings, dict):
+    settings = {}
+
+before = json.dumps(settings, sort_keys=True)
+
+settings["version"] = 1
+hooks = settings.setdefault("hooks", {})
+if not isinstance(hooks, dict):
+    hooks = {}
+    settings["hooks"] = hooks
+
+pre_tool = hooks.get("preToolUse")
+if not isinstance(pre_tool, list):
+    pre_tool = []
+    hooks["preToolUse"] = pre_tool
+
+desired = {
+    "type": "command",
+    "bash": dcg_path,
+    "powershell": dcg_path,
+    "cwd": ".",
+    "timeoutSec": 30,
+}
+
+def is_dcg_entry(entry):
+    if not isinstance(entry, dict):
+        return False
+    bash_cmd = str(entry.get("bash", ""))
+    pwsh_cmd = str(entry.get("powershell", ""))
+    return "dcg" in bash_cmd or "dcg" in pwsh_cmd
+
+found = False
+changed = False
+
+for entry in pre_tool:
+    if is_dcg_entry(entry):
+        found = True
+        for key, value in desired.items():
+            if entry.get(key) != value:
+                entry[key] = value
+                changed = True
+        break
+
+if not found:
+    pre_tool.insert(0, desired)
+    changed = True
+
+after = json.dumps(settings, sort_keys=True)
+if not changed and before == after:
+    print("UNCHANGED")
+    raise SystemExit(0)
+
+with open(hook_file, "w") as f:
+    json.dump(settings, f, indent=2)
+
+if found:
+    print("UPDATED")
+else:
+    print("ADDED")
+PYEOF
+)
+      if [ $? -eq 0 ]; then
+        case "$py_result" in
+          UNCHANGED)
+            COPILOT_STATUS="already"
+            rm -f "$COPILOT_BACKUP" 2>/dev/null || true
+            COPILOT_BACKUP=""
+            ;;
+          UPDATED|ADDED)
+            COPILOT_STATUS="merged"
+            AUTO_CONFIGURED=1
+            ;;
+          *)
+            COPILOT_STATUS="merged"
+            AUTO_CONFIGURED=1
+            ;;
+        esac
+      else
+        mv "$COPILOT_BACKUP" "$hook_file" 2>/dev/null || true
+        COPILOT_STATUS="failed"
+        COPILOT_BACKUP=""
+        return 1
+      fi
+    else
+      # python3 not available - remove unnecessary backup
+      rm -f "$COPILOT_BACKUP" 2>/dev/null || true
+      COPILOT_BACKUP=""
+      COPILOT_STATUS="failed"
+      return 1
+    fi
+  else
+    # Create new dedicated dcg hook file.
+    cat > "$hook_file" <<EOFSET
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "$DEST/dcg",
+        "powershell": "$DEST/dcg",
+        "cwd": ".",
+        "timeoutSec": 30
+      }
+    ]
+  }
+}
+EOFSET
+    COPILOT_STATUS="created"
+    AUTO_CONFIGURED=1
+  fi
+}
+
 configure_cursor() {
   # Cursor IDE (https://cursor.com) supports hooks via ~/.cursor/hooks.json.
   # We install a beforeShellExecution hook that delegates to dcg.
@@ -1719,6 +1924,9 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
   # Configure Codex CLI (if installed)
   configure_codex
 
+  # Configure GitHub Copilot CLI hooks (repo-local, if installed and in a git repo)
+  configure_copilot
+
   # Configure Cursor IDE (if installed)
   configure_cursor
 else
@@ -1816,7 +2024,30 @@ case "$CODEX_STATUS" in
     ;;
 esac
 
-  case "$CURSOR_STATUS" in
+case "$COPILOT_STATUS" in
+  created)
+    summary_lines+=("GitHub Copilot CLI: Created $COPILOT_HOOK_FILE with dcg hook")
+    ;;
+  merged)
+    summary_lines+=("GitHub Copilot CLI: Added/updated dcg hook in $COPILOT_HOOK_FILE")
+    [ -n "$COPILOT_BACKUP" ] && summary_lines+=("             Backup: $COPILOT_BACKUP")
+    ;;
+  already)
+    summary_lines+=("GitHub Copilot CLI: Already configured (no changes)")
+    ;;
+  no_repo)
+    summary_lines+=("GitHub Copilot CLI: Installed but current directory is not a git repository")
+    summary_lines+=("             Tip: run installer from the target repository to configure hooks")
+    ;;
+  skipped|"")
+    summary_lines+=("GitHub Copilot CLI: Not installed (skipped)")
+    ;;
+  failed)
+    summary_lines+=("GitHub Copilot CLI: Configuration failed (python3 required for merge)")
+    ;;
+esac
+
+case "$CURSOR_STATUS" in
   created)
     summary_lines+=("Cursor IDE:  Created $CURSOR_HOOKS_JSON with dcg hook")
     ;;
@@ -1867,13 +2098,13 @@ if [ "$QUIET" -eq 0 ]; then
   # Show reversal instructions
   echo ""
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 245 --italic "To uninstall: rm $DEST/dcg && remove dcg hooks from settings files"
-    if [ -n "$CLAUDE_BACKUP" ] || [ -n "$GEMINI_BACKUP" ]; then
+    gum style --foreground 245 --italic "To uninstall: rm $DEST/dcg && remove dcg hooks from settings files and repo hook files"
+    if [ -n "$CLAUDE_BACKUP" ] || [ -n "$GEMINI_BACKUP" ] || [ -n "$COPILOT_BACKUP" ]; then
       gum style --foreground 245 --italic "To revert:   restore from backup files listed above"
     fi
   else
-    echo -e "\033[0;90mTo uninstall: rm $DEST/dcg && remove dcg hooks from settings files\033[0m"
-    if [ -n "$CLAUDE_BACKUP" ] || [ -n "$GEMINI_BACKUP" ]; then
+    echo -e "\033[0;90mTo uninstall: rm $DEST/dcg && remove dcg hooks from settings files and repo hook files\033[0m"
+    if [ -n "$CLAUDE_BACKUP" ] || [ -n "$GEMINI_BACKUP" ] || [ -n "$COPILOT_BACKUP" ]; then
       echo -e "\033[0;90mTo revert:   restore from backup files listed above\033[0m"
     fi
   fi

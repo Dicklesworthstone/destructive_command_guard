@@ -162,7 +162,7 @@ fn test_backup_sorting_newest_first() {
     }
 
     // Sort by timestamp descending (newest first)
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
     assert_eq!(entries[0].0, "0.2.12");
     assert_eq!(entries[1].0, "0.2.11");
@@ -320,7 +320,7 @@ fn test_rollback_to_most_recent_backup() {
             entries.push((backup_dir.join(binary_name), timestamp));
         }
     }
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
     // Rollback to most recent
     fs::copy(&entries[0].0, &binary_path).unwrap();
@@ -421,7 +421,7 @@ fn test_backup_pruning_keeps_max_backups() {
             ));
         }
     }
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
     // Simulate pruning: keep only MAX_BACKUPS newest
     let to_keep: Vec<_> = entries.iter().take(MAX_BACKUPS).collect();

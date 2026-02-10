@@ -795,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "destructive_command_guard"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aho-corasick",
  "assert_cmd",

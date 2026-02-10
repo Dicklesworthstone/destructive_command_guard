@@ -1649,13 +1649,11 @@ impl ExternalPackStore {
     }
 
     /// Get all pack IDs.
-    #[must_use]
     pub fn pack_ids(&self) -> impl Iterator<Item = &String> {
         self.packs.keys()
     }
 
     /// Iterate over all packs with their IDs.
-    #[must_use]
     pub fn iter_packs(&self) -> impl Iterator<Item = (&String, &Pack)> {
         self.packs.iter()
     }

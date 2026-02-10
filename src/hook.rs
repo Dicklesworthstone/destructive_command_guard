@@ -23,11 +23,21 @@ use std::time::Duration;
 /// Input structure from Claude Code's `PreToolUse` hook.
 #[derive(Debug, Deserialize)]
 pub struct HookInput {
+    /// Hook event name (used by some clients, e.g. Copilot CLI: "pre-tool-use").
+    pub event: Option<String>,
+
     /// The name of the tool being invoked (e.g., "Bash", "Read", "Write").
+    #[serde(alias = "toolName")]
     pub tool_name: Option<String>,
 
     /// Tool-specific input parameters.
+    #[serde(alias = "toolInput")]
     pub tool_input: Option<ToolInput>,
+
+    /// Alternate tool arguments format used by some clients.
+    /// May be a JSON string (e.g. "{\"command\":\"...\"}") or an object.
+    #[serde(alias = "toolArgs")]
+    pub tool_args: Option<serde_json::Value>,
 }
 
 /// Tool-specific input containing the command to execute.
@@ -90,6 +100,69 @@ pub struct HookSpecificOutput<'a> {
     /// Remediation suggestions for the blocked command.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remediation: Option<Remediation>,
+}
+
+/// Copilot-compatible denial output for pre-tool-use hooks.
+///
+/// Copilot hooks can consume either:
+/// - `continue=false` with `stopReason`
+/// - `permissionDecision=deny` with `permissionDecisionReason`
+///
+/// We emit both for compatibility across documented variants.
+#[derive(Debug, Serialize)]
+pub struct CopilotHookOutput<'a> {
+    /// Whether execution should continue.
+    #[serde(rename = "continue")]
+    pub continue_execution: bool,
+
+    /// Human-readable stop reason.
+    #[serde(rename = "stopReason")]
+    pub stop_reason: Cow<'a, str>,
+
+    /// Permission decision (`deny`).
+    #[serde(rename = "permissionDecision")]
+    pub permission_decision: &'static str,
+
+    /// Human-readable explanation of the decision.
+    #[serde(rename = "permissionDecisionReason")]
+    pub permission_decision_reason: Cow<'a, str>,
+
+    /// Short allow-once code (if a pending exception was recorded).
+    #[serde(rename = "allowOnceCode", skip_serializing_if = "Option::is_none")]
+    pub allow_once_code: Option<String>,
+
+    /// Full hash for allow-once disambiguation (if available).
+    #[serde(rename = "allowOnceFullHash", skip_serializing_if = "Option::is_none")]
+    pub allow_once_full_hash: Option<String>,
+
+    /// Stable rule identifier (e.g., "core.git:reset-hard").
+    #[serde(rename = "ruleId", skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+
+    /// Pack identifier that matched (e.g., "core.git").
+    #[serde(rename = "packId", skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+
+    /// Severity level of the matched pattern.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<crate::packs::Severity>,
+
+    /// Confidence score for this match (0.0-1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+
+    /// Remediation suggestions for the blocked command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<Remediation>,
+}
+
+/// Hook protocol variant for response formatting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookProtocol {
+    /// Claude Code / Augment-compatible `hookSpecificOutput` protocol.
+    ClaudeCompatible,
+    /// Copilot hook protocol (`continue` / `stopReason` + permission fields).
+    Copilot,
 }
 
 /// Allow-once metadata for denial output.
@@ -178,24 +251,89 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
     serde_json::from_str(&input).map_err(HookReadError::Json)
 }
 
-/// Extract the command string from hook input.
+/// Detect which hook protocol should be used for output formatting.
 #[must_use]
-pub fn extract_command(input: &HookInput) -> Option<String> {
-    // Only process Bash (Claude Code) or launch-process (Augment Code CLI) tool invocations
-    if !matches!(
-        input.tool_name.as_deref(),
-        Some("Bash") | Some("launch-process")
-    ) {
+pub fn detect_protocol(input: &HookInput) -> HookProtocol {
+    let tool_name = input
+        .tool_name
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+
+    if input.event.is_some()
+        || input.tool_args.is_some()
+        || matches!(
+            tool_name.as_str(),
+            "run_shell_command" | "run-shell-command"
+        )
+    {
+        HookProtocol::Copilot
+    } else {
+        HookProtocol::ClaudeCompatible
+    }
+}
+
+fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
+    let Some(tool_name) = tool_name else {
+        return false;
+    };
+
+    matches!(
+        tool_name.to_ascii_lowercase().as_str(),
+        "bash" | "launch-process" | "run_shell_command" | "run-shell-command"
+    )
+}
+
+fn extract_command_from_tool_args(tool_args: &serde_json::Value) -> Option<String> {
+    match tool_args {
+        serde_json::Value::Object(map) => map.get("command").and_then(|v| match v {
+            serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        }),
+        serde_json::Value::String(s) => {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                extract_command_from_tool_args(&parsed)
+            } else if s.is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Extract command and protocol from hook input.
+#[must_use]
+pub fn extract_command_with_protocol(input: &HookInput) -> Option<(String, HookProtocol)> {
+    // Only process shell-command invocations for supported clients.
+    if !is_supported_shell_tool(input.tool_name.as_deref()) {
         return None;
     }
 
-    let tool_input = input.tool_input.as_ref()?;
-    let command_value = tool_input.command.as_ref()?;
+    let protocol = detect_protocol(input);
 
-    match command_value {
-        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
-        _ => None,
+    if let Some(tool_input) = input.tool_input.as_ref() {
+        if let Some(serde_json::Value::String(s)) = tool_input.command.as_ref() {
+            if !s.is_empty() {
+                return Some((s.clone(), protocol));
+            }
+        }
     }
+
+    if let Some(tool_args) = input.tool_args.as_ref() {
+        if let Some(command) = extract_command_from_tool_args(tool_args) {
+            return Some((command, protocol));
+        }
+    }
+
+    None
+}
+
+/// Extract the command string from hook input.
+#[must_use]
+pub fn extract_command(input: &HookInput) -> Option<String> {
+    extract_command_with_protocol(input).map(|(command, _)| command)
 }
 
 /// Configure colored output based on TTY detection.
@@ -491,7 +629,8 @@ fn get_contextual_suggestion(command: &str) -> Option<&'static str> {
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-pub fn output_denial(
+pub fn output_denial_for_protocol(
+    protocol: HookProtocol,
     command: &str,
     reason: &str,
     pack: Option<&str>,
@@ -519,11 +658,7 @@ pub fn output_denial(
 
     // Build JSON response for hook protocol (stdout)
     let message = format_denial_message(command, reason, explanation, pack, pattern);
-
-    // Build rule_id from pack and pattern
     let rule_id = build_rule_id(pack, pattern);
-
-    // Build remediation struct if we have allow_once info
     let remediation = allow_once.map(|info| {
         let explanation_text = format_explanation_text(explanation, rule_id.as_deref(), pack);
         Remediation {
@@ -533,26 +668,79 @@ pub fn output_denial(
         }
     });
 
-    let output = HookOutput {
-        hook_specific_output: HookSpecificOutput {
-            hook_event_name: "PreToolUse",
-            permission_decision: "deny",
-            permission_decision_reason: Cow::Owned(message),
-            allow_once_code: allow_once.map(|info| info.code.clone()),
-            allow_once_full_hash: allow_once.map(|info| info.full_hash.clone()),
-            rule_id,
-            pack_id: pack.map(String::from),
-            severity,
-            confidence,
-            remediation,
-        },
-    };
-
-    // Write JSON to stdout for the hook protocol
     let stdout = io::stdout();
     let mut handle = stdout.lock();
-    let _ = serde_json::to_writer(&mut handle, &output);
-    let _ = writeln!(handle);
+
+    match protocol {
+        HookProtocol::ClaudeCompatible => {
+            let output = HookOutput {
+                hook_specific_output: HookSpecificOutput {
+                    hook_event_name: "PreToolUse",
+                    permission_decision: "deny",
+                    permission_decision_reason: Cow::Owned(message),
+                    allow_once_code: allow_once.map(|info| info.code.clone()),
+                    allow_once_full_hash: allow_once.map(|info| info.full_hash.clone()),
+                    rule_id,
+                    pack_id: pack.map(String::from),
+                    severity,
+                    confidence,
+                    remediation,
+                },
+            };
+
+            let _ = serde_json::to_writer(&mut handle, &output);
+            let _ = writeln!(handle);
+        }
+        HookProtocol::Copilot => {
+            let output = CopilotHookOutput {
+                continue_execution: false,
+                stop_reason: Cow::Owned(format!("BLOCKED by dcg: {reason}")),
+                permission_decision: "deny",
+                permission_decision_reason: Cow::Owned(message),
+                allow_once_code: allow_once.map(|info| info.code.clone()),
+                allow_once_full_hash: allow_once.map(|info| info.full_hash.clone()),
+                rule_id,
+                pack_id: pack.map(String::from),
+                severity,
+                confidence,
+                remediation,
+            };
+
+            let _ = serde_json::to_writer(&mut handle, &output);
+            let _ = writeln!(handle);
+        }
+    }
+}
+
+/// Output a denial response to stdout (JSON for hook protocol).
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub fn output_denial(
+    command: &str,
+    reason: &str,
+    pack: Option<&str>,
+    pattern: Option<&str>,
+    explanation: Option<&str>,
+    allow_once: Option<&AllowOnceInfo>,
+    matched_span: Option<&MatchSpan>,
+    severity: Option<crate::packs::Severity>,
+    confidence: Option<f64>,
+    pattern_suggestions: &[PatternSuggestion],
+) {
+    output_denial_for_protocol(
+        HookProtocol::ClaudeCompatible,
+        command,
+        reason,
+        pack,
+        pattern,
+        explanation,
+        allow_once,
+        matched_span,
+        severity,
+        confidence,
+        pattern_suggestions,
+    );
 }
 
 /// Output a warning to stderr (no JSON deny; command is allowed).
@@ -769,6 +957,25 @@ mod tests {
         let json = r#"{"tool_name":"Bash","tool_input":{}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(extract_command(&input), None);
+    }
+
+    #[test]
+    fn test_parse_copilot_tool_input_command() {
+        let json = r#"{"event":"pre-tool-use","toolName":"run_shell_command","toolInput":{"command":"git status"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(extract_command(&input), Some("git status".to_string()));
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+    }
+
+    #[test]
+    fn test_parse_copilot_tool_args_json_string() {
+        let json = r#"{"event":"pre-tool-use","toolName":"bash","toolArgs":"{\"command\":\"rm -rf /tmp/build\"}"}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            extract_command(&input),
+            Some("rm -rf /tmp/build".to_string())
+        );
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
     }
 
     #[test]

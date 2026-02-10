@@ -215,6 +215,91 @@ PYEOF
     fi
 }
 
+# Remove dcg hook from GitHub Copilot CLI repo-local hook file
+unconfigure_copilot() {
+    if ! command -v git >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local repo_root=""
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    if [ -z "$repo_root" ]; then
+        return 0
+    fi
+
+    local hook_file="$repo_root/.github/hooks/dcg.json"
+    if [ ! -f "$hook_file" ]; then
+        return 0
+    fi
+
+    if ! grep -q 'dcg' "$hook_file" 2>/dev/null; then
+        return 0
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$hook_file" <<'PYEOF'
+import json
+import os
+import sys
+
+hook_file = sys.argv[1]
+
+try:
+    with open(hook_file, "r", encoding="utf-8") as f:
+        settings = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(0)
+
+if not isinstance(settings, dict):
+    sys.exit(0)
+
+hooks = settings.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(0)
+
+pre_tool = hooks.get("preToolUse")
+if not isinstance(pre_tool, list):
+    sys.exit(0)
+
+def is_dcg_entry(entry):
+    if not isinstance(entry, dict):
+        return False
+    bash_cmd = str(entry.get("bash", ""))
+    pwsh_cmd = str(entry.get("powershell", ""))
+    return "dcg" in bash_cmd or "dcg" in pwsh_cmd
+
+new_pre = [entry for entry in pre_tool if not is_dcg_entry(entry)]
+if len(new_pre) == len(pre_tool):
+    sys.exit(0)
+
+if new_pre:
+    hooks["preToolUse"] = new_pre
+else:
+    hooks.pop("preToolUse", None)
+
+for key in list(hooks.keys()):
+    if hooks.get(key) == []:
+        hooks.pop(key, None)
+
+if not hooks:
+    settings.pop("hooks", None)
+
+if not settings or settings == {"version": 1}:
+    os.remove(hook_file)
+else:
+    with open(hook_file, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+
+print("removed", file=sys.stderr)
+PYEOF
+        return $?
+    else
+        warn "python3 not available - cannot safely edit GitHub Copilot hook file"
+        warn "Please manually remove dcg from $hook_file"
+        return 1
+    fi
+}
+
 # Remove dcg settings from Aider config
 unconfigure_aider() {
     local config="$HOME/.aider.conf.yml"
@@ -264,6 +349,15 @@ main() {
     local claude_settings="$HOME/.claude/settings.json"
     local gemini_settings="$HOME/.gemini/settings.json"
     local aider_config="$HOME/.aider.conf.yml"
+    local copilot_hook_file=""
+
+    if command -v git >/dev/null 2>&1; then
+        local repo_root=""
+        repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+        if [ -n "$repo_root" ]; then
+            copilot_hook_file="$repo_root/.github/hooks/dcg.json"
+        fi
+    fi
 
     # Show what will be removed
     log "The following will be removed:"
@@ -282,6 +376,10 @@ main() {
     fi
     if [ -f "$aider_config" ] && grep -q 'Added by dcg installer' "$aider_config" 2>/dev/null; then
         log "  • Aider configuration ($aider_config)"
+        found_anything=1
+    fi
+    if [ -n "$copilot_hook_file" ] && [ -f "$copilot_hook_file" ] && grep -q 'dcg' "$copilot_hook_file" 2>/dev/null; then
+        log "  • GitHub Copilot CLI hook ($copilot_hook_file)"
         found_anything=1
     fi
 
@@ -334,6 +432,11 @@ main() {
     # Remove Gemini CLI hook
     if unconfigure_gemini 2>&1 | grep -q "removed"; then
         ok "Removed Gemini CLI hook"
+    fi
+
+    # Remove GitHub Copilot CLI hook (repo-local .github/hooks/dcg.json)
+    if unconfigure_copilot 2>&1 | grep -q "removed"; then
+        ok "Removed GitHub Copilot CLI hook"
     fi
 
     # Remove Aider config

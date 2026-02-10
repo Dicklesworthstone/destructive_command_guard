@@ -14,7 +14,7 @@
 
 A high-performance hook for AI coding agents that blocks destructive commands before they execute, protecting your work from accidental deletion.
 
-**Supported:** [Claude Code](https://claude.ai/code), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenCode](https://opencode.ai) (via [community plugin](https://github.com/jms830/opencode-dcg-plugin)), [Aider](https://aider.chat/) (limited—git hooks only), [Continue](https://continue.dev) (detection only), [Codex CLI](https://github.com/openai/codex) (detection only)
+**Supported:** [Claude Code](https://claude.ai/code), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-hooks), [OpenCode](https://opencode.ai) (via [community plugin](https://github.com/jms830/opencode-dcg-plugin)), [Aider](https://aider.chat/) (limited—git hooks only), [Continue](https://continue.dev) (detection only), [Codex CLI](https://github.com/openai/codex) (detection only)
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -659,6 +659,7 @@ Easy mode automatically:
 - Removes the legacy Python predecessor (if present)
 - Configures Claude Code hooks (creates config if needed)
 - Configures Gemini CLI hooks (if Gemini CLI is installed)
+- Configures GitHub Copilot CLI hooks in `.github/hooks/dcg.json` (if Copilot is installed and you're in a git repo)
 - Configures Aider (enables git hooks via `git-commit-verify: true`)
 - Detects Continue (no auto-config; lacks shell command hooks)
 - Detects Codex CLI (no auto-config; lacks pre-execution hooks)
@@ -706,6 +707,7 @@ The install script:
 - Detects and removes legacy Python predecessor (`git_safety_guard.py`)
 - Configures Claude Code hooks (creates config directory if needed)
 - Configures Gemini CLI hooks (if already installed)
+- Configures GitHub Copilot CLI hooks in `.github/hooks/dcg.json` (if installed and run from a git repo)
 - Configures Aider (enables `git-commit-verify` for git hook support)
 - Detects Continue (reports it has no shell command hooks)
 - Detects Codex CLI (reports it has no pre-execution hooks)
@@ -717,6 +719,8 @@ The install script:
 > **Note on Continue:** Continue does not have shell command interception hooks. The installer detects Continue installations but cannot auto-configure protection. For dcg protection with Continue, install dcg as a [git pre-commit hook](docs/scan-precommit-guide.md).
 
 > **Note on Codex CLI:** OpenAI's Codex CLI only supports post-execution hooks (`notify`, `agent-turn-complete`), not pre-execution command interception. The installer detects Codex CLI but cannot auto-configure protection. For dcg protection with Codex CLI, install dcg as a [git pre-commit hook](docs/scan-precommit-guide.md).
+
+> **Note on GitHub Copilot CLI:** Copilot hooks are repository-local (`.github/hooks/*.json`) and loaded from the current working directory. Run the installer from each repository where you want protection so it can create/merge `.github/hooks/dcg.json`.
 
 ### From source (requires Rust nightly)
 
@@ -779,7 +783,7 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_comma
 ```
 
 The uninstaller:
-- Removes dcg hooks from Claude Code, Gemini CLI, and Aider
+- Removes dcg hooks from Claude Code, Gemini CLI, GitHub Copilot CLI (repo-local), and Aider
 - Removes the dcg binary
 - Removes configuration (`~/.config/dcg/`) and history (`~/.local/share/dcg/`)
 - Prompts for confirmation before making changes
@@ -1329,7 +1333,7 @@ This is logged and visible in git history. For permanent exceptions, use allowli
 
 ## How It Works
 
-1. Claude Code invokes the hook before executing any Bash command
+1. Claude Code or GitHub Copilot CLI invokes the hook before executing a shell command
 2. The hook receives the command as JSON on stdin
 3. Commands are normalized (e.g., `/usr/bin/git` becomes `git`)
 4. Safe patterns are checked first (whitelist approach)
@@ -1343,7 +1347,7 @@ The hook is designed for minimal latency with sub-millisecond execution on typic
 
 The hook uses two separate output channels:
 
-- **stdout (JSON)**: The Claude Code hook protocol response. On denial, outputs JSON with `permissionDecision: "deny"`. On allow, outputs nothing.
+- **stdout (JSON)**: Hook protocol response (Claude-compatible `hookSpecificOutput` or Copilot-compatible `continue: false` + denial fields). On allow, outputs nothing.
 - **stderr (colorful text)**: A human-readable warning when commands are blocked. Colors are automatically disabled when stderr is not a TTY (e.g., when piped to a file).
 
 This dual-output design ensures the hook protocol works correctly while still providing immediate visual feedback to users watching the terminal.
@@ -1352,7 +1356,7 @@ This dual-output design ensures the hook protocol works correctly while still pr
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Claude Code                               │
+│                 Claude Code / Copilot CLI                        │
 │                                                                  │
 │  User: "delete the build artifacts"                             │
 │  Agent: executes `rm -rf ./build`                               │
@@ -1383,7 +1387,7 @@ This dual-output design ensures the hook protocol works correctly while still pr
                       │
                       ▼ stdout: JSON (deny) or empty (allow)
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Claude Code                               │
+│                 Claude Code / Copilot CLI                        │
 │                                                                  │
 │  If denied: Shows block message, does NOT execute command       │
 │  If allowed: Proceeds with command execution                    │
@@ -1449,9 +1453,9 @@ This approach achieves a significant reduction in false positives while maintain
 
 **Stage 1: JSON Parsing**
 - Reads the hook input from stdin
-- Validates the structure matches Claude Code's `PreToolUse` format
-- Extracts the command string from `tool_input.command`
-- Non-Bash tools are immediately allowed (no output)
+- Validates supported hook payload shapes (Claude/Augment/Copilot variants)
+- Extracts command string from `tool_input.command` or Copilot `toolInput/toolArgs`
+- Non-shell tools are immediately allowed (no output)
 
 **Stage 2: Command Normalization**
 - Strips absolute paths from `git` and `rm` binaries
@@ -2211,7 +2215,7 @@ The block message instructs the AI to ask you for explicit permission. You can t
 
 **Q: Does this work with other AI coding tools?**
 
-The hook is designed for Claude Code's `PreToolUse` hook protocol. Other tools would need adapters to match the expected JSON input/output format.
+Yes. dcg natively supports Claude Code and GitHub Copilot CLI hook payloads. For other tools, support depends on whether they expose a pre-execution shell hook with compatible JSON input/output.
 
 **Q: What about database, Docker, Kubernetes, and cloud commands?**
 
