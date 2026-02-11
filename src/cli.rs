@@ -1529,9 +1529,13 @@ pub enum PackAction {
         /// Pack ID (e.g., "database.postgresql", "core.git")
         pack_id: String,
 
-        /// Show all patterns in the pack
+        /// Hide pattern details (patterns are shown by default)
         #[arg(long)]
-        patterns: bool,
+        no_patterns: bool,
+
+        /// Output as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Validate an external pack YAML file
@@ -2334,10 +2338,104 @@ fn list_packs_rich(config: &Config, enabled_only: bool, verbose: bool) {
 }
 
 /// Show detailed information about a pack
-fn pack_info(pack_id: &str, show_patterns: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn pack_info(
+    pack_id: &str,
+    show_patterns: bool,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let pack = REGISTRY
         .get(pack_id)
         .ok_or_else(|| format!("Pack not found: {pack_id}"))?;
+
+    if json_output {
+        #[derive(serde::Serialize)]
+        struct PackInfoJson {
+            id: String,
+            name: String,
+            description: String,
+            keywords: Vec<String>,
+            safe_pattern_count: usize,
+            destructive_pattern_count: usize,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            safe_patterns: Option<Vec<SafePatternJson>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            destructive_patterns: Option<Vec<DestructivePatternJson>>,
+        }
+        #[derive(serde::Serialize)]
+        struct SafePatternJson {
+            name: String,
+            regex: String,
+        }
+        #[derive(serde::Serialize)]
+        struct DestructivePatternJson {
+            name: String,
+            regex: String,
+            severity: String,
+            reason: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            explanation: Option<String>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            suggestions: Vec<SuggestionJson>,
+        }
+        #[derive(serde::Serialize)]
+        struct SuggestionJson {
+            command: String,
+            description: String,
+        }
+
+        let safe_patterns = if show_patterns {
+            Some(
+                pack.safe_patterns
+                    .iter()
+                    .map(|p| SafePatternJson {
+                        name: p.name.to_string(),
+                        regex: p.regex.as_str().to_string(),
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        let destructive_patterns = if show_patterns {
+            Some(
+                pack.destructive_patterns
+                    .iter()
+                    .map(|p| DestructivePatternJson {
+                        name: p.name.unwrap_or("unnamed").to_string(),
+                        regex: p.regex.as_str().to_string(),
+                        severity: p.severity.label().to_string(),
+                        reason: p.reason.to_string(),
+                        explanation: p.explanation.map(String::from),
+                        suggestions: p
+                            .suggestions
+                            .iter()
+                            .map(|s| SuggestionJson {
+                                command: s.command.to_string(),
+                                description: s.description.to_string(),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        let info = PackInfoJson {
+            id: pack.id.to_string(),
+            name: pack.name.to_string(),
+            description: pack.description.to_string(),
+            keywords: pack.keywords.iter().map(|k| (*k).to_string()).collect(),
+            safe_pattern_count: pack.safe_patterns.len(),
+            destructive_pattern_count: pack.destructive_patterns.len(),
+            safe_patterns,
+            destructive_patterns,
+        };
+
+        println!("{}", serde_json::to_string_pretty(&info)?);
+        return Ok(());
+    }
 
     println!("Pack: {}", pack.name);
     println!("ID: {}", pack.id);
@@ -2362,8 +2460,15 @@ fn pack_info(pack_id: &str, show_patterns: bool) -> Result<(), Box<dyn std::erro
         println!("Destructive patterns:");
         for pattern in &pack.destructive_patterns {
             let name = pattern.name.unwrap_or("unnamed");
-            println!("  - {} : {}", name, pattern.regex.as_str());
+            let severity_label = pattern.severity.label().to_uppercase();
+            println!("  - {name} [{severity_label}] : {}", pattern.regex.as_str());
             println!("    Reason: {}", pattern.reason);
+            if let Some(explanation) = pattern.explanation {
+                println!("    Explanation: {explanation}");
+            }
+            for suggestion in pattern.suggestions {
+                println!("    Suggestion: {} - {}", suggestion.command, suggestion.description);
+            }
         }
     }
 
@@ -2380,8 +2485,12 @@ fn handle_pack_command(
     action: PackAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
-        PackAction::Info { pack_id, patterns } => {
-            pack_info(&pack_id, patterns)?;
+        PackAction::Info {
+            pack_id,
+            no_patterns,
+            json,
+        } => {
+            pack_info(&pack_id, !no_patterns, json)?;
         }
         PackAction::Validate {
             file_path,

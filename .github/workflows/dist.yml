@@ -35,9 +35,9 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             artifact_name: dcg
-          # Linux ARM64 (native build on ARM64 runner)
+          # Linux ARM64 (musl for static linking / portable binaries)
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             artifact_name: dcg
           # macOS Intel
           - os: macos-15-intel
@@ -70,6 +70,12 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify static linking (Linux musl)
+        if: contains(matrix.target, 'musl')
+        run: |
+          file target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          ! ldd target/${{ matrix.target }}/release/${{ matrix.artifact_name }} 2>&1 | grep -q "dynamic"
 
       - name: Create tarball (Unix)
         if: runner.os != 'Windows'

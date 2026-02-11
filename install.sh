@@ -448,7 +448,7 @@ detect_platform() {
   TARGET=""
   case "${OS}-${ARCH}" in
     linux-x86_64) TARGET="x86_64-unknown-linux-musl" ;;
-    linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
+    linux-aarch64) TARGET="aarch64-unknown-linux-musl" ;;
     darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
     darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
     *) :;;
