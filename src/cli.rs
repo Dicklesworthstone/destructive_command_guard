@@ -2467,7 +2467,10 @@ fn pack_info(
                 println!("    Explanation: {explanation}");
             }
             for suggestion in pattern.suggestions {
-                println!("    Suggestion: {} - {}", suggestion.command, suggestion.description);
+                println!(
+                    "    Suggestion: {} - {}",
+                    suggestion.command, suggestion.description
+                );
             }
         }
     }
