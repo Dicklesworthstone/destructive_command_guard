@@ -55,7 +55,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 - **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
-- **Configuration:** Cargo.toml only
+- **Configuration:** Cargo.toml only (single crate, not a workspace)
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
 
 ### Key Dependencies
@@ -63,10 +63,25 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | Crate | Purpose |
 |-------|---------|
 | `serde` + `serde_json` | JSON parsing for Claude Code hook protocol |
+| `serde_yaml` | External pack YAML parsing |
+| `toml` + `toml_edit` | TOML config parsing with formatting preservation |
 | `fancy-regex` | Advanced regex with lookahead/lookbehind |
+| `regex` | `RegexSet` for heredoc detection |
 | `memchr` | SIMD-accelerated substring search |
+| `aho-corasick` | Multi-pattern string matching for keyword quick-reject |
 | `colored` | Terminal colors with TTY detection |
+| `clap` + `clap_complete` | CLI argument parsing with shell completions |
+| `chrono` | RFC 3339 timestamps |
+| `ast-grep-core` + `ast-grep-language` | AST-based pattern matching for heredoc/inline-script content |
+| `rusqlite` | Telemetry database (bundled SQLite) |
+| `rust-mcp-sdk` | MCP server integration (stdio transport) |
+| `tokio` | Async runtime for MCP server mode |
+| `ratatui` + `comfy-table` + `indicatif` + `console` | TUI/CLI visual polish |
+| `self_update` | Binary self-update from GitHub Releases |
 | `vergen-gix` | Build metadata embedding (build.rs) |
+| `tracing` + `tracing-subscriber` | Structured logging and diagnostics |
+| `sha2` + `hmac` | Hashing and HMAC for allow-once short codes |
+| `flate2` | Gzip compression for history export |
 
 ### Release Profile
 
@@ -79,6 +94,15 @@ lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit for better optimization
 panic = "abort"     # Smaller binary, no unwinding overhead
 strip = true        # Remove debug symbols
+```
+
+### Feature Flags
+
+```toml
+[features]
+rayon = ["dep:rayon"]           # Rayon data parallelism (optional)
+rich-output = ["dep:rich_rust"] # Enable rich_rust for premium terminal output
+legacy-output = []              # Keep old rendering (placeholder for gradual migration)
 ```
 
 ---
@@ -116,23 +140,6 @@ We do not care about backwards compatibility—we're in early development with n
 
 ---
 
-## Output Style
-
-This tool has two output modes:
-
-- **JSON to stdout:** For Claude Code hook protocol (`hookSpecificOutput` with `permissionDecision: "deny"`)
-- **Colorful warning to stderr:** For human visibility when commands are blocked
-
-Output behavior:
-- **Deny:** Colorful warning to stderr + JSON to stdout
-- **Allow:** No output (silent exit)
-- **--version/-V:** Version info with build metadata to stderr
-- **--help/-h:** Usage information to stderr
-
-Colors are automatically disabled when stderr is not a TTY (e.g., piped to file).
-
----
-
 ## Compiler Checks (CRITICAL)
 
 **After any substantive code changes, you MUST verify no errors were introduced:**
@@ -153,6 +160,15 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 ---
 
 ## Testing
+
+### Testing Policy
+
+Every module includes inline `#[cfg(test)]` unit tests alongside the implementation. Tests must cover:
+- Happy path
+- Edge cases (empty input, max values, boundary conditions)
+- Error conditions
+
+End-to-end tests live in `scripts/e2e_test.sh`.
 
 ### Unit Tests
 
@@ -201,189 +217,6 @@ echo '{"tool_name":"Bash","tool_input":{"command":"git status"}}' | cargo run --
 
 ---
 
-## CI/CD Pipeline
-
-### Jobs Overview
-
-| Job | Trigger | Purpose | Blocking |
-|-----|---------|---------|----------|
-| `check` | PR, push | Format, clippy, UBS, tests | Yes |
-| `coverage` | PR, push | Coverage thresholds | Yes |
-| `memory-tests` | PR, push | Memory leak detection | Yes |
-| `benchmarks` | push to master | Performance budgets | Warn only |
-| `e2e` | PR, push | End-to-end shell tests | Yes |
-| `scan-regression` | PR, push | Scan output stability | Yes |
-| `perf-regression` | PR, push | Process-per-invocation perf | Yes |
-
-### Check Job
-
-Runs format, clippy, UBS static analysis, and unit tests. Includes:
-- `cargo fmt --check` - Code formatting
-- `cargo clippy --all-targets -- -D warnings` - Lints (pedantic + nursery enabled)
-- UBS analysis on changed Rust files (warning-only, non-blocking)
-- `cargo nextest run` - Full test suite with JUnit XML report
-
-### Coverage Job
-
-Runs `cargo llvm-cov` and enforces thresholds:
-- **Overall:** ≥ 70%
-- **src/evaluator.rs:** ≥ 80%
-- **src/hook.rs:** ≥ 80%
-
-Coverage is uploaded to Codecov for trend tracking. Dashboard: https://codecov.io/gh/Dicklesworthstone/destructive_command_guard
-
-### Memory Tests Job
-
-Runs dedicated memory leak tests with:
-- `--test-threads=1` for accurate measurements
-- Release mode for realistic performance
-- 1-2MB growth budgets per test
-
-Tests include: hook input parsing, pattern evaluation, heredoc extraction, file extractors, full pipeline, and a self-test that verifies the framework catches leaks.
-
-### Benchmarks Job
-
-Runs on push to master only (benchmarks are noisy on PRs). Checks performance budgets from `src/perf.rs`:
-- Quick reject: < 50μs panic
-- Fast path: < 500μs panic
-- Pattern match: < 1ms panic
-- Heredoc extract: < 2ms panic
-- Full pipeline: < 50ms panic
-
-### UBS Static Analysis
-
-Ultimate Bug Scanner runs on changed Rust files. Currently warning-only (non-blocking) to tune for false positives. Configuration in `.ubsignore` excludes test/bench/fuzz directories.
-
-### Dependabot
-
-Automated dependency updates configured in `.github/dependabot.yml`:
-- **Cargo dependencies:** Weekly (Monday 9am EST), 5 PR limit
-- **GitHub Actions:** Weekly (Monday 9am EST), 3 PR limit
-- **Grouping:** Minor/patch updates grouped; serde updates separate (more careful review)
-
-### Debugging CI Failures
-
-#### Coverage Threshold Failure
-1. Check which file(s) dropped below threshold in CI output
-2. Run `cargo llvm-cov --html` locally to see uncovered lines
-3. Add tests for uncovered code paths
-4. Download `coverage-report` artifact for full details
-
-#### Memory Test Failure
-1. Download `memory-test-output` artifact
-2. Check which test failed and growth amount
-3. Run locally: `cargo test --test memory_tests --release -- --nocapture --test-threads=1`
-4. Profile with valgrind if needed
-
-#### UBS Warnings
-1. Check ubs-output.log in CI summary
-2. Review flagged issues - may be false positives
-3. If valid issues, fix them; if false positives, add to `.ubsignore`
-
-#### E2E Test Failure
-1. Download `e2e-artifacts` artifact
-2. Check `e2e_output.json` for failing test details
-3. Run locally: `./scripts/e2e_test.sh --verbose`
-4. The step summary shows the first failure with output
-
-#### Benchmark Regression
-1. Download `benchmark-results` artifact
-2. Compare against budgets in `src/perf.rs`
-3. Profile locally with `cargo bench --bench heredoc_perf`
-4. Check for algorithmic regressions in hot path
-
----
-
-## Release Process
-
-When fixes are ready for release, follow this process:
-
-### 1. Verify CI Passes Locally
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --lib
-```
-
-### 2. Commit Changes
-
-```bash
-git add -A
-git commit -m "fix: description of fixes
-
-- List specific fixes
-- Include any breaking changes
-
-Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
-```
-
-### 3. Bump Version (if needed)
-
-The version in `Cargo.toml` determines the release tag. If the current version already has a failed release, you can reuse it. Otherwise bump appropriately:
-
-- **Patch** (0.2.10 → 0.2.11): Bug fixes, no new features
-- **Minor** (0.2.x → 0.3.0): New features, backward compatible
-- **Major** (0.x → 1.0): Breaking changes
-
-### 4. Push and Trigger Release
-
-```bash
-git push origin main
-git push origin main:master  # Keep master in sync
-```
-
-The `release-automation.yml` workflow will:
-1. Detect version change in `Cargo.toml`
-2. Create an annotated git tag (e.g., `v0.2.13`)
-3. Push the tag, which triggers `dist.yml`
-
-The `dist.yml` workflow will:
-1. Run tests and clippy
-2. Build binaries for all platforms (Linux x86/ARM, macOS Intel/Apple Silicon, Windows)
-3. Create `.tar.xz` archives with SHA256 checksums
-4. Sign artifacts with Sigstore (cosign) - creates `.sigstore.json` bundles
-5. Upload everything to GitHub Releases
-
-### 5. Verify Release
-
-```bash
-gh release list --limit 5
-gh release view v0.2.13  # Check assets were uploaded
-```
-
-Expected assets per release:
-- `dcg-{target}.tar.xz` - Binary archive
-- `dcg-{target}.tar.xz.sha256` - Checksum
-- `dcg-{target}.tar.xz.sigstore.json` - Sigstore signature bundle
-- `install.sh`, `install.ps1` - Install scripts
-
-### Troubleshooting Failed Releases
-
-If CI fails:
-1. Check workflow run: `gh run list --workflow=dist.yml --limit=5`
-2. View failed job: `gh run view <run-id>`
-3. Fix issues locally, commit, and push again
-4. The same version tag will be updated on successful build
-
-Common failures:
-- **Clippy errors**: Fix lints, ensure `cargo clippy -- -D warnings` passes
-- **Test failures**: Run `cargo test --lib` to reproduce
-- **Format errors**: Run `cargo fmt` to fix
-
----
-
-## Heredoc Detection Notes (for contributors)
-
-- **Rule IDs**: Heredoc patterns use stable IDs like `heredoc.python.shutil_rmtree` for allowlisting.
-- **Fail-open**: In hook mode, heredoc parse errors/timeouts must allow (do not block).
-- **Tests**: Prefer targeted tests in `src/ast_matcher.rs` and `src/heredoc.rs`.
-  - `cargo test ast_matcher`
-  - `cargo test heredoc`
-  - Add positive and negative fixtures for each new pattern.
-
----
-
 ## Third-Party Library Usage
 
 If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to find the latest documentation and current best practices.
@@ -393,6 +226,10 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 ## dcg (Destructive Command Guard) — This Project
 
 **This is the project you're working on.** dcg is a high-performance Claude Code hook that blocks destructive commands before they execute. It protects against dangerous git commands, filesystem operations, database queries, container commands, and more through a modular pack system.
+
+### What It Does
+
+Guards AI coding agents from executing destructive commands by intercepting Claude Code's `PreToolUse` hook protocol, evaluating commands against safe/destructive pattern lists, and denying dangerous operations with structured JSON output including remediation suggestions.
 
 ### Architecture
 
@@ -404,11 +241,53 @@ JSON Input → Parse → Quick Reject (memchr) → Normalize → Safe Patterns �
 
 | File | Purpose |
 |------|---------|
-| `src/main.rs` | Complete implementation (~40KB) + 80 tests |
+| `src/main.rs` | Entry point, hook I/O, CLI dispatch |
+| `src/evaluator.rs` | Pattern matching engine (safe + destructive evaluation) |
+| `src/hook.rs` | Claude Code PreToolUse hook protocol handling |
+| `src/normalize.rs` | Command normalization (path stripping, alias expansion) |
+| `src/heredoc.rs` | Heredoc and inline script extraction |
+| `src/ast_matcher.rs` | AST-based pattern matching for embedded code |
+| `src/config.rs` | Configuration loading (TOML, allowlists, pack enable/disable) |
+| `src/allowlist.rs` | Allowlist management (project, user, system scopes) |
+| `src/cli.rs` | CLI commands (explain, scan, packs, allowlist, etc.) |
+| `src/scan.rs` | Codebase scanning for destructive patterns |
+| `src/context.rs` | Contextual analysis for pattern matching |
+| `src/confidence.rs` | Match confidence scoring |
+| `src/error_codes.rs` | Standardized DCG-XXXX error codes |
+| `src/exit_codes.rs` | Process exit code definitions |
+| `src/packs/` | Modular pattern pack system (core + extensions) |
+| `src/output/` | Output formatting (JSON, colorful stderr) |
+| `src/highlight.rs` | Syntax highlighting for command display |
+| `src/logging.rs` | Tracing/logging configuration |
+| `src/perf.rs` | Performance budgets and benchmarks |
+| `src/simulate.rs` | Command simulation and dry-run support |
+| `src/mcp.rs` | MCP server integration |
+| `src/agent.rs` | Agent detection and identification |
+| `src/interactive.rs` | Interactive mode |
+| `src/git.rs` | Git-specific command analysis |
+| `src/history/` | Decision history and telemetry |
+| `src/sarif.rs` | SARIF output format for scan results |
+| `src/pending_exceptions.rs` | Pending exception management |
+| `src/lib.rs` | Library re-exports |
 | `Cargo.toml` | Dependencies and release optimizations |
 | `build.rs` | Build script for version metadata (vergen) |
 | `rust-toolchain.toml` | Nightly toolchain requirement |
 | `scripts/e2e_test.sh` | End-to-end test script (120 tests) |
+
+### Output Style
+
+This tool has two output modes:
+
+- **JSON to stdout:** For Claude Code hook protocol (`hookSpecificOutput` with `permissionDecision: "deny"`)
+- **Colorful warning to stderr:** For human visibility when commands are blocked
+
+Output behavior:
+- **Deny:** Colorful warning to stderr + JSON to stdout
+- **Allow:** No output (silent exit)
+- **--version/-V:** Version info with build metadata to stderr
+- **--help/-h:** Usage information to stderr
+
+Colors are automatically disabled when stderr is not a TTY (e.g., piped to file).
 
 ### Pattern System
 
@@ -444,6 +323,15 @@ Every Bash command passes through this hook. Performance is critical:
 - Lazy-initialized static regex patterns (compiled once, reused)
 - Sub-millisecond execution for typical commands
 - Zero allocations on the hot path for safe commands
+
+### Heredoc Detection Notes
+
+- **Rule IDs**: Heredoc patterns use stable IDs like `heredoc.python.shutil_rmtree` for allowlisting.
+- **Fail-open**: In hook mode, heredoc parse errors/timeouts must allow (do not block).
+- **Tests**: Prefer targeted tests in `src/ast_matcher.rs` and `src/heredoc.rs`.
+  - `cargo test ast_matcher`
+  - `cargo test heredoc`
+  - Add positive and negative fixtures for each new pattern.
 
 ---
 
@@ -721,6 +609,178 @@ Use these schemas for:
 
 ---
 
+## CI/CD Pipeline
+
+### Jobs Overview
+
+| Job | Trigger | Purpose | Blocking |
+|-----|---------|---------|----------|
+| `check` | PR, push | Format, clippy, UBS, tests | Yes |
+| `coverage` | PR, push | Coverage thresholds | Yes |
+| `memory-tests` | PR, push | Memory leak detection | Yes |
+| `benchmarks` | push to main | Performance budgets | Warn only |
+| `e2e` | PR, push | End-to-end shell tests | Yes |
+| `scan-regression` | PR, push | Scan output stability | Yes |
+| `perf-regression` | PR, push | Process-per-invocation perf | Yes |
+
+### Check Job
+
+Runs format, clippy, UBS static analysis, and unit tests. Includes:
+- `cargo fmt --check` - Code formatting
+- `cargo clippy --all-targets -- -D warnings` - Lints (pedantic + nursery enabled)
+- UBS analysis on changed Rust files (warning-only, non-blocking)
+- `cargo nextest run` - Full test suite with JUnit XML report
+
+### Coverage Job
+
+Runs `cargo llvm-cov` and enforces thresholds:
+- **Overall:** >= 70%
+- **src/evaluator.rs:** >= 80%
+- **src/hook.rs:** >= 80%
+
+Coverage is uploaded to Codecov for trend tracking. Dashboard: https://codecov.io/gh/Dicklesworthstone/destructive_command_guard
+
+### Memory Tests Job
+
+Runs dedicated memory leak tests with:
+- `--test-threads=1` for accurate measurements
+- Release mode for realistic performance
+- 1-2MB growth budgets per test
+
+Tests include: hook input parsing, pattern evaluation, heredoc extraction, file extractors, full pipeline, and a self-test that verifies the framework catches leaks.
+
+### Benchmarks Job
+
+Runs on push to main only (benchmarks are noisy on PRs). Checks performance budgets from `src/perf.rs`:
+- Quick reject: < 50us panic
+- Fast path: < 500us panic
+- Pattern match: < 1ms panic
+- Heredoc extract: < 2ms panic
+- Full pipeline: < 50ms panic
+
+### UBS Static Analysis
+
+Ultimate Bug Scanner runs on changed Rust files. Currently warning-only (non-blocking) to tune for false positives. Configuration in `.ubsignore` excludes test/bench/fuzz directories.
+
+### Dependabot
+
+Automated dependency updates configured in `.github/dependabot.yml`:
+- **Cargo dependencies:** Weekly (Monday 9am EST), 5 PR limit
+- **GitHub Actions:** Weekly (Monday 9am EST), 3 PR limit
+- **Grouping:** Minor/patch updates grouped; serde updates separate (more careful review)
+
+### Debugging CI Failures
+
+#### Coverage Threshold Failure
+1. Check which file(s) dropped below threshold in CI output
+2. Run `cargo llvm-cov --html` locally to see uncovered lines
+3. Add tests for uncovered code paths
+4. Download `coverage-report` artifact for full details
+
+#### Memory Test Failure
+1. Download `memory-test-output` artifact
+2. Check which test failed and growth amount
+3. Run locally: `cargo test --test memory_tests --release -- --nocapture --test-threads=1`
+4. Profile with valgrind if needed
+
+#### UBS Warnings
+1. Check ubs-output.log in CI summary
+2. Review flagged issues - may be false positives
+3. If valid issues, fix them; if false positives, add to `.ubsignore`
+
+#### E2E Test Failure
+1. Download `e2e-artifacts` artifact
+2. Check `e2e_output.json` for failing test details
+3. Run locally: `./scripts/e2e_test.sh --verbose`
+4. The step summary shows the first failure with output
+
+#### Benchmark Regression
+1. Download `benchmark-results` artifact
+2. Compare against budgets in `src/perf.rs`
+3. Profile locally with `cargo bench --bench heredoc_perf`
+4. Check for algorithmic regressions in hot path
+
+---
+
+## Release Process
+
+When fixes are ready for release, follow this process:
+
+### 1. Verify CI Passes Locally
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --lib
+```
+
+### 2. Commit Changes
+
+```bash
+git add -A
+git commit -m "fix: description of fixes
+
+- List specific fixes
+- Include any breaking changes
+
+Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
+```
+
+### 3. Bump Version (if needed)
+
+The version in `Cargo.toml` determines the release tag. If the current version already has a failed release, you can reuse it. Otherwise bump appropriately:
+
+- **Patch** (0.2.10 -> 0.2.11): Bug fixes, no new features
+- **Minor** (0.2.x -> 0.3.0): New features, backward compatible
+- **Major** (0.x -> 1.0): Breaking changes
+
+### 4. Push and Trigger Release
+
+```bash
+git push origin main
+git push origin main:master  # Keep master in sync
+```
+
+The `release-automation.yml` workflow will:
+1. Detect version change in `Cargo.toml`
+2. Create an annotated git tag (e.g., `v0.2.13`)
+3. Push the tag, which triggers `dist.yml`
+
+The `dist.yml` workflow will:
+1. Run tests and clippy
+2. Build binaries for all platforms (Linux x86/ARM, macOS Intel/Apple Silicon, Windows)
+3. Create `.tar.xz` archives with SHA256 checksums
+4. Sign artifacts with Sigstore (cosign) - creates `.sigstore.json` bundles
+5. Upload everything to GitHub Releases
+
+### 5. Verify Release
+
+```bash
+gh release list --limit 5
+gh release view v0.2.13  # Check assets were uploaded
+```
+
+Expected assets per release:
+- `dcg-{target}.tar.xz` - Binary archive
+- `dcg-{target}.tar.xz.sha256` - Checksum
+- `dcg-{target}.tar.xz.sigstore.json` - Sigstore signature bundle
+- `install.sh`, `install.ps1` - Install scripts
+
+### Troubleshooting Failed Releases
+
+If CI fails:
+1. Check workflow run: `gh run list --workflow=dist.yml --limit=5`
+2. View failed job: `gh run view <run-id>`
+3. Fix issues locally, commit, and push again
+4. The same version tag will be updated on successful build
+
+Common failures:
+- **Clippy errors**: Fix lints, ensure `cargo clippy -- -D warnings` passes
+- **Test failures**: Run `cargo test --lib` to reproduce
+- **Format errors**: Run `cargo fmt` to fix
+
+---
+
 ## MCP Agent Mail — Multi-Agent Coordination
 
 A mail-like layer that lets coding agents coordinate asynchronously via MCP tools and resources. Provides identities, inbox/outbox, searchable threads, and advisory file reservations with human-auditable artifacts in Git.
@@ -928,21 +988,21 @@ ubs .                                   # Whole project (ignores target/, Cargo.
 ### Output Format
 
 ```
-⚠️  Category (N errors)
-    file.rs:42:5 – Issue description
-    💡 Suggested fix
+Warning  Category (N errors)
+    file.rs:42:5 - Issue description
+    Suggested fix
 Exit code: 1
 ```
 
-Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fail
+Parse: `file:line:col` -> location | fix hint -> how to fix | Exit 0/1 -> pass/fail
 
 ### Fix Workflow
 
-1. Read finding → category + fix suggestion
-2. Navigate `file:line:col` → view context
+1. Read finding -> category + fix suggestion
+2. Navigate `file:line:col` -> view context
 3. Verify real issue (not false positive)
 4. Fix root cause (not symptom)
-5. Re-run `ubs <file>` → exit 0
+5. Re-run `ubs <file>` -> exit 0
 6. Commit
 
 ### Bug Severity
@@ -950,6 +1010,33 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 - **Critical (always fix):** Memory safety, use-after-free, data races, SQL injection
 - **Important (production):** Unwrap panics, resource leaks, overflow checks
 - **Contextual (judgment):** TODO/FIXME, println! debugging
+
+---
+
+## RCH — Remote Compilation Helper
+
+RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of 8 remote Contabo VPS workers instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.
+
+**RCH is installed at `~/.local/bin/rch` and is hooked into Claude Code's PreToolUse automatically.** Most of the time you don't need to do anything if you are Claude Code — builds are intercepted and offloaded transparently.
+
+To manually offload a build:
+```bash
+rch exec -- cargo build --release
+rch exec -- cargo test
+rch exec -- cargo clippy
+```
+
+Quick commands:
+```bash
+rch doctor                    # Health check
+rch workers probe --all       # Test connectivity to all 8 workers
+rch status                    # Overview of current state
+rch queue                     # See active/waiting builds
+```
+
+If rch or its workers are unavailable, it fails open — builds run locally as normal.
+
+**Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 
 ---
 
@@ -968,8 +1055,8 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 
 ### Rule of Thumb
 
-- Need correctness or **applying changes** → `ast-grep`
-- Need raw speed or **hunting text** → `rg`
+- Need correctness or **applying changes** -> `ast-grep`
+- Need raw speed or **hunting text** -> `rg`
 - Often combine: `rg` to shortlist files, then `ast-grep` to match/modify
 
 ### Rust Examples
@@ -1012,7 +1099,7 @@ rg -l -t rust 'unwrap\(' | xargs ast-grep run -l Rust -p '$X.unwrap()' --json
 
 ```
 mcp__morph-mcp__warp_grep(
-  repoPath: "/path/to/dcg",
+  repoPath: "/dp/destructive_command_guard",
   query: "How does the safe pattern whitelist work?"
 )
 ```
@@ -1021,9 +1108,9 @@ Returns structured results with file paths, line ranges, and extracted code snip
 
 ### Anti-Patterns
 
-- **Don't** use `warp_grep` to find a specific function name → use `ripgrep`
-- **Don't** use `ripgrep` to understand "how does X work" → wastes time with manual reads
-- **Don't** use `ripgrep` for codemods → risks collateral edits
+- **Don't** use `warp_grep` to find a specific function name -> use `ripgrep`
+- **Don't** use `ripgrep` to understand "how does X work" -> wastes time with manual reads
+- **Don't** use `ripgrep` for codemods -> risks collateral edits
 
 <!-- bv-agent-instructions-v1 -->
 
@@ -1083,7 +1170,7 @@ git push                # Push to remote
 ### Best Practices
 
 - Check `br ready` at session start to find available work
-- Update status as you work (in_progress → closed)
+- Update status as you work (in_progress -> closed)
 - Create new issues with `br create` when you discover tasks
 - Use descriptive titles and set appropriate priority/type
 - Always `br sync --flush-only && git add .beads/` before ending session
@@ -1092,32 +1179,15 @@ git push                # Push to remote
 
 ## Landing the Plane (Session Completion)
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+**When ending a work session**, you MUST complete ALL steps below.
 
 **MANDATORY WORKFLOW:**
 
 1. **File issues for remaining work** - Create issues for anything that needs follow-up
 2. **Run quality gates** (if code changed) - Tests, linters, builds
 3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   br sync --flush-only    # Export beads to JSONL (no git ops)
-   git add .beads/         # Stage beads changes
-   git add <other files>   # Stage code changes
-   git commit -m "..."     # Commit everything
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
+4. **Sync beads** - `br sync --flush-only` to export to JSONL
+5. **Hand off** - Provide context for next session
 
 
 ---
@@ -1135,10 +1205,10 @@ Next steps (pick one)
 
 1. Decide how to handle the unrelated modified files above so we can resume cleanly.
 2. Triage beads_rust-orko (clippy/cargo warnings) and beads_rust-ydqr (rustfmt failures).
-3. If you want a full suite run later, fix conformance/clippy blockers and re‑run cargo test --all.
+3. If you want a full suite run later, fix conformance/clippy blockers and re-run cargo test --all.
 ```
 
-NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into thinking YOU made the changes and simply don't recall it for some reason.
+NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurrence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into thinking YOU made the changes and simply don't recall it for some reason.
 
 ---
 
