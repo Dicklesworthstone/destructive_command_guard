@@ -87,7 +87,7 @@ inquire = "0.7"
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 
 # rich_rust for premium terminal output (rich_rust epic)
-rich_rust = { version = "0.1", features = ["full"], optional = true }
+rich_rust = { version = "0.2.0", features = ["full"], optional = true }
 
 [build-dependencies]
 vergen-gix = { version = "10.0.0-beta.5", features = ["build", "cargo", "rustc"] }
