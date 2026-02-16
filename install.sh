@@ -262,7 +262,7 @@ detect_agents() {
   if [[ -d "$HOME/.cursor" ]] || [[ -f "$cursor_settings_mac" ]] || [[ -f "$cursor_settings_linux" ]] || command -v cursor &>/dev/null; then
     cursor_detected=1
   elif command -v pgrep >/dev/null 2>&1; then
-    if pgrep -f "[Cc]ursor" >/dev/null 2>&1; then
+    if pgrep -fl "[Cc]ursor" 2>/dev/null | grep -qv 'CursorUIViewService\|/System/Library/'; then
       cursor_detected=1
     fi
   fi
@@ -1671,7 +1671,7 @@ configure_cursor() {
   if [[ -d "$HOME/.cursor" ]] || [[ -f "$CURSOR_SETTINGS_MAC" ]] || [[ -f "$CURSOR_SETTINGS_LINUX" ]] || command -v cursor >/dev/null 2>&1; then
     cursor_installed=1
   elif command -v pgrep >/dev/null 2>&1; then
-    if pgrep -f "[Cc]ursor" >/dev/null 2>&1; then
+    if pgrep -fl "[Cc]ursor" 2>/dev/null | grep -qv 'CursorUIViewService\|/System/Library/'; then
       cursor_installed=1
     fi
   fi
