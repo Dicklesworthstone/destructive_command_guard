@@ -10,7 +10,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -57,7 +57,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -99,7 +99,7 @@ jobs:
           "$hash  $zipName" | Out-File -Encoding ASCII "$zipName.sha256"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.target }}
           path: dist/*
@@ -112,10 +112,10 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
@@ -176,7 +176,7 @@ jobs:
 
       - name: Trigger formula update
         if: steps.check.outputs.skip != 'true'
-        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3
+        uses: peter-evans/repository-dispatch@f49a8ac5751834a0666df77deb0289abbe2b3a78 # v3
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           repository: Dicklesworthstone/homebrew-tap
@@ -211,7 +211,7 @@ jobs:
 
       - name: Trigger manifest update
         if: steps.check.outputs.skip != 'true'
-        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3
+        uses: peter-evans/repository-dispatch@f49a8ac5751834a0666df77deb0289abbe2b3a78 # v3
         with:
           token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
           repository: Dicklesworthstone/scoop-bucket
