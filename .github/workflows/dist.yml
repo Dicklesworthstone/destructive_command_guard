@@ -75,7 +75,7 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: |
           file target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-          file target/${{ matrix.target }}/release/${{ matrix.artifact_name }} | grep -q "statically linked"
+          file target/${{ matrix.target }}/release/${{ matrix.artifact_name }} | grep -qE "statically linked|static-pie linked"
 
       - name: Create tarball (Unix)
         if: runner.os != 'Windows'
