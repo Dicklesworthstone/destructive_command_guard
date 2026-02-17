@@ -75,7 +75,7 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: |
           file target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-          ! ldd target/${{ matrix.target }}/release/${{ matrix.artifact_name }} 2>&1 | grep -q "dynamic"
+          file target/${{ matrix.target }}/release/${{ matrix.artifact_name }} | grep -q "statically linked"
 
       - name: Create tarball (Unix)
         if: runner.os != 'Windows'
