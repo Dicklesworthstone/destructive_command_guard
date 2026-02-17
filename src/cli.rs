@@ -2423,7 +2423,7 @@ fn pack_info(
         };
 
         let info = PackInfoJson {
-            id: pack.id.to_string(),
+            id: pack.id.clone(),
             name: pack.name.to_string(),
             description: pack.description.to_string(),
             keywords: pack.keywords.iter().map(|k| (*k).to_string()).collect(),
