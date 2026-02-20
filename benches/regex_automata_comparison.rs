@@ -4,9 +4,10 @@
 //!
 //! Run with: cargo bench --bench `regex_automata_comparison`
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use regex::Regex;
 use regex_automata::{Input, meta::Regex as MetaRegex};
+use std::hint::black_box;
 use std::time::Duration;
 
 /// Representative patterns from dcg packs (from most common to least common)

@@ -18,12 +18,13 @@
 
 use std::fmt::Write as _;
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use destructive_command_guard::packs::{REGISTRY, pack_aware_quick_reject};
 use destructive_command_guard::{
     Config, ExtractionLimits, ScriptLanguage, check_triggers, evaluate_command_with_pack_order,
     extract_content, extract_shell_commands, matched_triggers,
 };
+use std::hint::black_box;
 
 // =============================================================================
 // Benchmark Fixtures

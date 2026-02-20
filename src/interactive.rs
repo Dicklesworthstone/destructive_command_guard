@@ -18,7 +18,7 @@
 //! - **Code freshness**: Each prompt generates a new code; codes are single-use
 
 use colored::Colorize;
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::time::{Duration, Instant};
@@ -218,11 +218,11 @@ impl InteractiveConfig {
 #[must_use]
 pub fn generate_verification_code(length: usize) -> String {
     let length = length.clamp(MIN_CODE_LENGTH, MAX_CODE_LENGTH);
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     (0..length)
         .map(|_| {
-            let idx = rng.gen_range(0..CODE_CHARSET.len());
+            let idx = rng.random_range(0..CODE_CHARSET.len());
             CODE_CHARSET[idx] as char
         })
         .collect()

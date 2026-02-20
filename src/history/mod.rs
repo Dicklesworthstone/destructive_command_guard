@@ -109,7 +109,7 @@ pub struct HistoryFlushHandle {
 impl HistoryFlushHandle {
     /// Flush and wait for pending writes to complete.
     pub fn flush_sync(&self) {
-        const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+        const FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
         let (ack_tx, ack_rx) = mpsc::channel();
         if self.sender.send(HistoryMessage::Flush(ack_tx)).is_ok() {
             let _ = ack_rx.recv_timeout(FLUSH_TIMEOUT);
@@ -128,9 +128,13 @@ pub struct HistoryWriter {
 impl HistoryWriter {
     /// Create a new history writer.
     ///
+    /// The database path is passed to the worker thread, which opens the
+    /// connection itself. This avoids needing `Send` on `HistoryDb` (which
+    /// uses `Rc`-based `fsqlite::Connection` internally).
+    ///
     /// The writer is disabled when `config.enabled` is false.
     #[must_use]
-    pub fn new(db: HistoryDb, config: &HistoryConfig) -> Self {
+    pub fn new(db_path: Option<std::path::PathBuf>, config: &HistoryConfig) -> Self {
         if !config.enabled {
             return Self::disabled();
         }
@@ -143,8 +147,16 @@ impl HistoryWriter {
 
         let handle = match thread::Builder::new()
             .name("dcg-history-writer".to_string())
-            .spawn(move || history_worker(db, receiver, worker_config))
-        {
+            .spawn(move || {
+                match HistoryDb::open(db_path) {
+                    Ok(db) => history_worker(db, receiver, worker_config),
+                    Err(e) => {
+                        error!(error = %e, "Failed to open history DB in worker thread");
+                        // Drain the receiver so senders don't block
+                        drop(receiver);
+                    }
+                }
+            }) {
             Ok(h) => h,
             Err(e) => {
                 // Thread spawn failed - return disabled writer to avoid leaking
@@ -282,21 +294,30 @@ fn history_worker(db: HistoryDb, receiver: mpsc::Receiver<HistoryMessage>, confi
                 }
             }
             Ok(HistoryMessage::Flush(ack)) => {
-                // Drain any pending entries first, handling any control message encountered
+                // Drain and flush ALL pending entries before acknowledging.
+                // drain_entries_into_batch caps at batch_size*2, so we loop
+                // to ensure the entire channel is emptied before sending the ack.
                 let mut pending_acks = vec![ack];
                 let mut should_shutdown = false;
-                while let Some(msg) =
-                    drain_entries_into_batch(&receiver, &mut batch, config.batch_size)
-                {
-                    match msg {
-                        HistoryMessage::Flush(pending_ack) => pending_acks.push(pending_ack),
-                        HistoryMessage::Shutdown => {
-                            should_shutdown = true;
-                            break;
+                loop {
+                    while let Some(msg) =
+                        drain_entries_into_batch(&receiver, &mut batch, config.batch_size)
+                    {
+                        match msg {
+                            HistoryMessage::Flush(pending_ack) => pending_acks.push(pending_ack),
+                            HistoryMessage::Shutdown => {
+                                should_shutdown = true;
+                                break;
+                            }
+                            HistoryMessage::Entry(_) => unreachable!(),
                         }
-                        HistoryMessage::Entry(_) => unreachable!(),
                     }
+                    if batch.is_empty() || should_shutdown {
+                        break;
+                    }
+                    flush_batch(&db, &mut batch);
                 }
+                // Final flush for any remaining entries
                 flush_batch(&db, &mut batch);
                 last_flush = Instant::now();
                 // Send all pending acks

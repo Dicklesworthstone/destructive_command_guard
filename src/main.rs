@@ -28,7 +28,7 @@ use destructive_command_guard::evaluator::{
 #[allow(unused_imports)]
 use destructive_command_guard::exit_codes::{EXIT_DENIED, EXIT_PARSE_ERROR, EXIT_SUCCESS};
 use destructive_command_guard::history::{
-    CommandEntry, ENV_HISTORY_DB_PATH, HistoryDb, HistoryWriter, Outcome as HistoryOutcome,
+    CommandEntry, ENV_HISTORY_DB_PATH, HistoryWriter, Outcome as HistoryOutcome,
 };
 use destructive_command_guard::hook;
 use destructive_command_guard::load_default_allowlists;
@@ -351,8 +351,10 @@ fn main() {
     );
 
     let history_writer = if config.history.enabled {
-        HistoryDb::try_open(history_db_path(&config.history))
-            .map(|db| HistoryWriter::new(db, &config.history))
+        Some(HistoryWriter::new(
+            history_db_path(&config.history),
+            &config.history,
+        ))
     } else {
         None
     };

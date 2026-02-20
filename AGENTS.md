@@ -73,7 +73,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `clap` + `clap_complete` | CLI argument parsing with shell completions |
 | `chrono` | RFC 3339 timestamps |
 | `ast-grep-core` + `ast-grep-language` | AST-based pattern matching for heredoc/inline-script content |
-| `rusqlite` | Telemetry database (bundled SQLite) |
+| `fsqlite` | Telemetry database (FrankenSQLite with concurrent writing) |
 | `rust-mcp-sdk` | MCP server integration (stdio transport) |
 | `tokio` | Async runtime for MCP server mode |
 | `ratatui` + `comfy-table` + `indicatif` + `console` | TUI/CLI visual polish |
