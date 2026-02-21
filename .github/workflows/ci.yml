@@ -3,7 +3,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [master, main]
+    branches: [main]
   schedule:
     # Run deep suite daily at 3am UTC
     - cron: '0 3 * * *'
@@ -50,7 +50,7 @@ jobs:
 
       - name: Install UBS
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh" \
+          curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main/install.sh" \
             | bash -s -- --easy-mode
           # Add UBS to PATH for this job
           echo "$HOME/.ubs" >> $GITHUB_PATH
@@ -426,8 +426,8 @@ jobs:
   benchmarks:
     runs-on: ubuntu-latest
     needs: check
-    # Only run on push to master/main, not on PRs (benchmarks are noisy)
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    # Only run on push to main, not on PRs (benchmarks are noisy)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
 

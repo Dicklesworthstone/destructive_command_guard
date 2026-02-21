@@ -1229,18 +1229,21 @@ pub fn normalize_command_word_token(token: &str) -> Option<String> {
                 let quote = c;
                 // Look for matching close quote
                 let mut found_close = false;
+                let mut inner_str = String::new();
                 while let Some(inner) = chars.next() {
                     if inner == quote {
                         found_close = true;
                         local_changed = true;
                         break;
                     }
-                    result.push(inner);
+                    inner_str.push(inner);
                 }
-                if !found_close {
-                    // Unclosed quote - put quote back (but local_changed stays false,
-                    // so we won't use this partial result)
+                if found_close {
+                    result.push_str(&inner_str);
+                } else {
+                    // Unclosed quote - put quote back and keep the rest as is
                     result.push(quote);
+                    result.push_str(&inner_str);
                 }
             } else {
                 result.push(c);

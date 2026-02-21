@@ -3,7 +3,7 @@
 # dcg uninstaller
 #
 # One-liner uninstall:
-#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/master/uninstall.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/uninstall.sh | bash
 #
 # Options:
 #   --yes            Skip confirmation prompt

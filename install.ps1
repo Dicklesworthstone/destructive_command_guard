@@ -1,7 +1,7 @@
 # dcg PowerShell installer
 #
 # Usage:
-#   irm https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/master/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.ps1 | iex
 #
 # Options:
 #   -Version vX.Y.Z   Install specific version (default: latest)
