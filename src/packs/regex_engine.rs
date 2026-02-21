@@ -58,9 +58,18 @@ impl CompiledRegex {
                 .map(Self::Backtracking)
                 .map_err(|e| format!("fancy_regex compile error: {e}"))
         } else {
-            regex::Regex::new(pattern)
-                .map(Self::Linear)
-                .map_err(|e| format!("regex compile error: {e}"))
+            match regex::Regex::new(pattern) {
+                Ok(re) => Ok(Self::Linear(re)),
+                Err(e) => {
+                    // Fall back to backtracking engine if linear engine fails
+                    // This handles any advanced features that needs_backtracking_engine() missed
+                    fancy_regex::Regex::new(pattern)
+                        .map(Self::Backtracking)
+                        .map_err(|fancy_err| {
+                            format!("regex compile error: {e}, fancy_regex compile error: {fancy_err}")
+                        })
+                }
+            }
         }
     }
 

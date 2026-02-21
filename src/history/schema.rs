@@ -1227,7 +1227,7 @@ impl HistoryDb {
         // DELETE/UPDATE triggers. Instead, prune_older_than_days rebuilds FTS after deletion.
         self.conn.execute(
             r"CREATE TRIGGER IF NOT EXISTS commands_fts_insert AFTER INSERT ON commands BEGIN
-                INSERT INTO commands_fts(command) VALUES (new.command);
+                INSERT INTO commands_fts(rowid, command) VALUES (new.id, new.command);
             END",
         )?;
 
@@ -1785,8 +1785,9 @@ impl HistoryDb {
             // Manually rebuild FTS by inserting all existing commands.
             // fsqlite FTS5 does not support the control column syntax
             // INSERT INTO fts(fts) VALUES('rebuild'), so we do it explicitly.
+            // MUST explicitly provide rowid to keep FTS index synchronized with commands table.
             self.conn
-                .execute("INSERT INTO commands_fts(command) SELECT command FROM commands")?;
+                .execute("INSERT INTO commands_fts(rowid, command) SELECT id, command FROM commands")?;
 
             // Get the count of re-indexed entries
             let fts_row = self.conn.query_row("SELECT COUNT(*) FROM commands_fts")?;
@@ -1795,7 +1796,7 @@ impl HistoryDb {
             // Recreate INSERT trigger only (fsqlite FTS5 does not support 'delete' control command)
             self.conn.execute(
                 r"CREATE TRIGGER commands_fts_insert AFTER INSERT ON commands BEGIN
-                    INSERT INTO commands_fts(command) VALUES (new.command);
+                    INSERT INTO commands_fts(rowid, command) VALUES (new.id, new.command);
                 END",
             )?;
 
