@@ -225,6 +225,55 @@ mod tests {
         assert!(!console.is_plain());
     }
 
+    #[test]
+    fn test_default_trait_matches_new() {
+        let default_console = DcgConsole::default();
+        let new_console = DcgConsole::new();
+        assert_eq!(default_console.is_plain(), new_console.is_plain());
+        assert!(!default_console.is_plain());
+    }
+
+    #[test]
+    fn test_init_console_does_not_panic() {
+        // init_console should be safe to call even in tests
+        init_console(true);
+        init_console(false);
+        // OnceLock only sets first time, subsequent calls are no-ops
+    }
+
+    #[test]
+    fn test_plain_console_print_does_not_panic() {
+        let console = DcgConsole::plain();
+        // Printing to a plain console should never panic
+        console.print("simple text");
+        console.print("[bold]markup text[/]");
+        console.print("");
+    }
+
+    #[test]
+    fn test_new_console_print_does_not_panic() {
+        let console = DcgConsole::new();
+        console.print("simple text");
+        console.print("[bold]markup text[/]");
+        console.print("");
+    }
+
+    #[test]
+    fn test_plain_console_rule_does_not_panic() {
+        let console = DcgConsole::plain();
+        console.rule(None);
+        console.rule(Some("Title"));
+        console.rule(Some(""));
+    }
+
+    #[test]
+    fn test_console_function_returns_valid_console() {
+        // console() should always return a valid console in any environment
+        let c = console();
+        // Should have a valid width
+        assert!(c.width() > 0);
+    }
+
     #[cfg(not(feature = "rich-output"))]
     #[test]
     fn test_strip_markup() {
@@ -232,5 +281,25 @@ mod tests {
         assert_eq!(strip_markup("[red]error[/]: message"), "error: message");
         assert_eq!(strip_markup("no markup here"), "no markup here");
         assert_eq!(strip_markup("[a][b][c]"), "");
+    }
+
+    #[cfg(not(feature = "rich-output"))]
+    #[test]
+    fn test_strip_markup_nested() {
+        // Nested brackets: first ] closes bracket state, second ] is literal
+        assert_eq!(strip_markup("[bold [red]]text[/]"), "]text");
+    }
+
+    #[cfg(not(feature = "rich-output"))]
+    #[test]
+    fn test_strip_markup_empty() {
+        assert_eq!(strip_markup(""), "");
+    }
+
+    #[cfg(not(feature = "rich-output"))]
+    #[test]
+    fn test_strip_markup_no_close() {
+        // Unclosed bracket - rest of string is consumed
+        assert_eq!(strip_markup("[bold"), "");
     }
 }

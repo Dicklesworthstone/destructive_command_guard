@@ -388,7 +388,6 @@ impl ScanResultsTable {
 }
 
 /// Returns short severity label.
-#[expect(dead_code)]
 fn severity_label(severity: Severity) -> &'static str {
     match severity {
         Severity::Critical => "CRIT",
@@ -1487,5 +1486,112 @@ mod tests {
             !output.contains('\x1b'),
             "Markdown should not contain ANSI escapes: {output}"
         );
+    }
+
+    #[test]
+    fn test_truncate_with_ellipsis_short_string() {
+        assert_eq!(truncate_with_ellipsis("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_with_ellipsis_exact_length() {
+        assert_eq!(truncate_with_ellipsis("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_with_ellipsis_needs_truncation() {
+        let result = truncate_with_ellipsis("hello world", 8);
+        assert_eq!(result.chars().count(), 8);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_with_ellipsis_very_short_max() {
+        // max_chars <= 3, no ellipsis, just truncate
+        let result = truncate_with_ellipsis("hello", 2);
+        assert_eq!(result, "he");
+    }
+
+    #[test]
+    fn test_truncate_with_ellipsis_max_three() {
+        let result = truncate_with_ellipsis("hello", 3);
+        assert_eq!(result, "hel");
+    }
+
+    #[test]
+    fn test_truncate_with_ellipsis_empty() {
+        assert_eq!(truncate_with_ellipsis("", 5), "");
+    }
+
+    #[test]
+    fn test_table_style_is_markdown() {
+        assert!(TableStyle::Markdown.is_markdown());
+        assert!(!TableStyle::Unicode.is_markdown());
+        assert!(!TableStyle::Ascii.is_markdown());
+        assert!(!TableStyle::Compact.is_markdown());
+    }
+
+    #[test]
+    fn test_table_style_default() {
+        assert_eq!(TableStyle::default(), TableStyle::Unicode);
+    }
+
+    #[test]
+    fn test_severity_label() {
+        assert_eq!(severity_label(Severity::Critical), "CRIT");
+        assert_eq!(severity_label(Severity::High), "HIGH");
+        assert_eq!(severity_label(Severity::Medium), "MED");
+        assert_eq!(severity_label(Severity::Low), "LOW");
+    }
+
+    #[test]
+    fn test_stats_table_high_noise() {
+        let rows = vec![StatsRow {
+            name: "noisy.rule".to_string(),
+            hits: 100,
+            allowed: 90,
+            denied: 10,
+            noise_pct: Some(90.0),
+        }];
+
+        let table = StatsTable::new(rows).with_style(TableStyle::Ascii);
+        let output = table.render();
+        assert!(output.contains("90.0%"));
+    }
+
+    #[test]
+    fn test_stats_table_with_title_and_width() {
+        let rows = vec![StatsRow {
+            name: "rule".to_string(),
+            hits: 10,
+            allowed: 5,
+            denied: 5,
+            noise_pct: Some(50.0),
+        }];
+
+        let table = StatsTable::new(rows)
+            .with_style(TableStyle::Ascii)
+            .with_title("Statistics Report")
+            .with_max_width(80);
+        let output = table.render();
+        assert!(output.starts_with("Statistics Report"));
+    }
+
+    #[test]
+    fn test_scan_results_colors_disabled() {
+        let rows = vec![ScanResultRow {
+            file: "test.rs".to_string(),
+            line: 1,
+            severity: Severity::Critical,
+            pattern_id: "test".to_string(),
+            command_preview: None,
+        }];
+
+        let mut table = ScanResultsTable::new(rows).with_style(TableStyle::Ascii);
+        table.colors_enabled = false;
+        let output = table.render();
+        // Should render without ANSI codes
+        assert!(!output.contains('\x1b'));
+        assert!(output.contains("CRIT"));
     }
 }

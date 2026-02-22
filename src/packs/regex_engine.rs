@@ -66,7 +66,9 @@ impl CompiledRegex {
                     fancy_regex::Regex::new(pattern)
                         .map(Self::Backtracking)
                         .map_err(|fancy_err| {
-                            format!("regex compile error: {e}, fancy_regex compile error: {fancy_err}")
+                            format!(
+                                "regex compile error: {e}, fancy_regex compile error: {fancy_err}"
+                            )
                         })
                 }
             }

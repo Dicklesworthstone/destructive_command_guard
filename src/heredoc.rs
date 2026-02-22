@@ -72,20 +72,20 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 12] = [
     // Tier 1 MUST have zero false negatives for Tier 2 extraction.
     //
     // Python inline execution (matches python, python3, python3.11, python.exe, python3.11.exe, etc.)
-    r"\bpython[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*[ce][A-Za-z]*(?:\s|['"]|$)",
+    r#"\bpython[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*[ce][A-Za-z]*(?:\s|['"]|$)"#,
     // Ruby inline execution (matches ruby, ruby3, ruby3.0, ruby.exe, etc.)
-    r"\bruby[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)",
-    r"\birb[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)",
+    r#"\bruby[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\birb[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
     // Perl inline execution (matches perl, perl5, perl5.36, perl.exe, etc.)
-    r"\bperl[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*[eE][A-Za-z]*(?:\s|['"]|$)",
+    r#"\bperl[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*[eE][A-Za-z]*(?:\s|['"]|$)"#,
     // Node.js inline execution (matches node, node18, nodejs, node.exe, etc.)
-    r"\bnode(?:js)?[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)",
+    r#"\bnode(?:js)?[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
     // PHP inline execution
-    r"\bphp[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*r[A-Za-z]*(?:\s|['"]|$)",
+    r#"\bphp[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*r[A-Za-z]*(?:\s|['"]|$)"#,
     // Lua inline execution
-    r"\blua[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)",
+    r#"\blua[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
     // Shell inline execution (sh -c, bash -c, zsh -c, fish -c, bash -lc, etc.)
-    r"\b(?:sh|bash|zsh|fish)(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)",
+    r#"\b(?:sh|bash|zsh|fish)(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)"#,
     // Piped execution to interpreters (versioned, with optional .exe)
     r"\|\s*(?:python[0-9.]*|ruby[0-9.]*|perl[0-9.]*|node(?:js)?[0-9.]*|php[0-9.]*|lua[0-9.]*|sh|bash)(?:\.exe)?\b",
     // Piped to xargs (can execute arbitrary commands)
@@ -1017,10 +1017,12 @@ pub fn check_binary_content(content: &str) -> Option<SkipReason> {
     // We count actual control characters (excluding whitespace) and U+FFFD (replacement chars).
     let mut suspect_chars = 0;
     let mut total_chars = 0;
-    
+
     for c in content.chars() {
         total_chars += 1;
-        if (c.is_control() && c != '\n' && c != '\r' && c != '\t') || c == std::char::REPLACEMENT_CHARACTER {
+        if (c.is_control() && c != '\n' && c != '\r' && c != '\t')
+            || c == std::char::REPLACEMENT_CHARACTER
+        {
             suspect_chars += 1;
         }
     }

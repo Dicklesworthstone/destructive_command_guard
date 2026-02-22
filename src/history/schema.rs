@@ -1786,8 +1786,9 @@ impl HistoryDb {
             // fsqlite FTS5 does not support the control column syntax
             // INSERT INTO fts(fts) VALUES('rebuild'), so we do it explicitly.
             // MUST explicitly provide rowid to keep FTS index synchronized with commands table.
-            self.conn
-                .execute("INSERT INTO commands_fts(rowid, command) SELECT id, command FROM commands")?;
+            self.conn.execute(
+                "INSERT INTO commands_fts(rowid, command) SELECT id, command FROM commands",
+            )?;
 
             // Get the count of re-indexed entries
             let fts_row = self.conn.query_row("SELECT COUNT(*) FROM commands_fts")?;

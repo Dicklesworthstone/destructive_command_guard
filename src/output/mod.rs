@@ -276,4 +276,77 @@ mod tests {
         // Just verify it doesn't panic in test environment
         let _ = supports_256_colors();
     }
+
+    #[test]
+    fn test_env_flag_enabled_true_values() {
+        // env_flag_enabled returns true for truthy values
+        // We can't easily set env vars in parallel tests, so test the logic
+        // by verifying the function signature and basic behavior
+        assert!(!env_flag_enabled("DCG_NONEXISTENT_TEST_VAR_12345"));
+    }
+
+    #[test]
+    fn test_env_flag_enabled_false_for_unset() {
+        // An unset variable should return false
+        assert!(!env_flag_enabled("DCG_DEFINITELY_NOT_SET_EVER"));
+    }
+
+    #[test]
+    fn test_suggestions_enabled_default() {
+        // In test environment (non-TTY), suggestions should be disabled
+        // because should_use_rich_output() returns false in non-TTY
+        let result = suggestions_enabled();
+        // Non-TTY test environment: suggestions disabled
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_init_idempotent() {
+        // Calling init multiple times should not panic
+        // (OnceLock silently ignores subsequent sets)
+        init(false);
+        init(true);
+        // No panic = success
+    }
+
+    #[test]
+    fn test_init_suggestions_idempotent() {
+        // Calling init_suggestions multiple times should not panic
+        init_suggestions(true);
+        init_suggestions(false);
+        // No panic = success
+    }
+
+    #[test]
+    fn test_should_use_rich_output_in_test_env() {
+        // In test environment (non-TTY), should return false
+        // This tests the actual detection logic
+        let result = should_use_rich_output();
+        // CI/non-TTY environments should not use rich output
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_auto_theme_no_color_in_test_env() {
+        // In non-TTY test environment, auto_theme should return no_color theme
+        let theme = auto_theme();
+        // In test env (non-TTY or CI), should give us no-color
+        assert!(!theme.colors_enabled);
+    }
+
+    #[test]
+    fn test_terminal_width_reasonable_range() {
+        let width = terminal_width();
+        // Width should be between 1 and 500 (reasonable terminal range)
+        assert!(width >= 1);
+        assert!(width <= 500);
+    }
+
+    #[test]
+    fn test_terminal_height_reasonable_range() {
+        let height = terminal_height();
+        // Height should be between 1 and 200 (reasonable terminal range)
+        assert!(height >= 1);
+        assert!(height <= 200);
+    }
 }

@@ -512,4 +512,191 @@ mod tests {
         let lines = tree.render_plain();
         assert!(!lines.is_empty());
     }
+
+    #[test]
+    fn test_tree_node_no_children() {
+        let node = TreeNode::new("leaf");
+        assert!(!node.has_children());
+    }
+
+    #[test]
+    fn test_tree_node_styled() {
+        let node = TreeNode::new("styled").styled("[bold red]");
+        assert_eq!(node.style.as_deref(), Some("[bold red]"));
+    }
+
+    #[test]
+    fn test_tree_node_children_batch() {
+        let children = vec![TreeNode::new("a"), TreeNode::new("b"), TreeNode::new("c")];
+        let node = TreeNode::new("root").children(children);
+        assert_eq!(node.children.len(), 3);
+    }
+
+    #[test]
+    fn test_bold_guides() {
+        let guides = DcgTreeGuides::Bold;
+        assert_eq!(guides.branch(), "┣━━ ");
+        assert_eq!(guides.last(), "┗━━ ");
+        assert_eq!(guides.vertical(), "┃   ");
+    }
+
+    #[test]
+    fn test_rounded_guides() {
+        let guides = DcgTreeGuides::Rounded;
+        assert_eq!(guides.branch(), "├── ");
+        assert_eq!(guides.last(), "╰── ");
+        assert_eq!(guides.vertical(), "│   ");
+    }
+
+    #[test]
+    fn test_guides_space() {
+        // All guide styles should have the same space indent
+        assert_eq!(DcgTreeGuides::Ascii.space(), "    ");
+        assert_eq!(DcgTreeGuides::Unicode.space(), "    ");
+        assert_eq!(DcgTreeGuides::Bold.space(), "    ");
+        assert_eq!(DcgTreeGuides::Rounded.space(), "    ");
+    }
+
+    #[test]
+    fn test_guides_from_theme() {
+        let theme = Theme::default();
+        let guides = DcgTreeGuides::from_theme(&theme);
+        assert_eq!(guides, DcgTreeGuides::Unicode);
+
+        let no_color = Theme::no_color();
+        let guides = DcgTreeGuides::from_theme(&no_color);
+        assert_eq!(guides, DcgTreeGuides::Ascii);
+
+        let minimal = Theme::minimal();
+        let guides = DcgTreeGuides::from_theme(&minimal);
+        assert_eq!(guides, DcgTreeGuides::Ascii);
+    }
+
+    #[test]
+    fn test_tree_render_plain_with_title() {
+        let tree = DcgTree::with_label("Root")
+            .title("My Tree Title")
+            .child(TreeNode::new("Item 1"));
+
+        let lines = tree.render_plain();
+        assert_eq!(lines[0], "My Tree Title");
+        assert!(lines.len() >= 3); // title + root + child
+    }
+
+    #[test]
+    fn test_tree_render_plain_hidden_root() {
+        let tree = DcgTree::with_label("Hidden Root")
+            .hide_root()
+            .child(TreeNode::new("Child A"))
+            .child(TreeNode::new("Child B"));
+
+        let lines = tree.render_plain();
+        // Root should not appear in output
+        assert!(!lines.iter().any(|l| l.contains("Hidden Root")));
+        // Children should appear
+        assert!(lines.iter().any(|l| l.contains("Child A")));
+        assert!(lines.iter().any(|l| l.contains("Child B")));
+    }
+
+    #[test]
+    fn test_tree_render_plain_ascii_guides() {
+        let tree = DcgTree::with_label("Root")
+            .guides(DcgTreeGuides::Ascii)
+            .child(TreeNode::new("A"))
+            .child(TreeNode::new("B"));
+
+        let lines = tree.render_plain();
+        // Should use ASCII branch characters
+        assert!(lines.iter().any(|l| l.contains("+-- ")));
+        assert!(lines.iter().any(|l| l.contains("`-- ")));
+    }
+
+    #[test]
+    fn test_tree_render_plain_unicode_guides() {
+        let tree = DcgTree::with_label("Root")
+            .guides(DcgTreeGuides::Unicode)
+            .child(TreeNode::new("A"))
+            .child(TreeNode::new("B"));
+
+        let lines = tree.render_plain();
+        assert!(lines.iter().any(|l| l.contains("├── ")));
+        assert!(lines.iter().any(|l| l.contains("└── ")));
+    }
+
+    #[test]
+    fn test_tree_render_plain_deeply_nested() {
+        let tree =
+            DcgTree::with_label("L0").child(TreeNode::new("L1").child(
+                TreeNode::new("L2").child(TreeNode::new("L3").child(TreeNode::new("L4 leaf"))),
+            ));
+
+        let lines = tree.render_plain();
+        assert_eq!(lines.len(), 5); // L0, L1, L2, L3, L4
+        assert!(lines[4].contains("L4 leaf"));
+    }
+
+    #[test]
+    fn test_tree_render_plain_with_icons() {
+        let tree = DcgTree::with_label("Packages")
+            .child(TreeNode::with_icon("📦", "core.git"))
+            .child(TreeNode::with_icon("📦", "core.filesystem"));
+
+        let lines = tree.render_plain();
+        assert!(lines.iter().any(|l| l.contains("📦 core.git")));
+        assert!(lines.iter().any(|l| l.contains("📦 core.filesystem")));
+    }
+
+    #[test]
+    fn test_tree_with_theme() {
+        let theme = Theme::no_color();
+        let tree = DcgTree::with_label("Root")
+            .with_theme(&theme)
+            .child(TreeNode::new("child"));
+
+        let lines = tree.render_plain();
+        // ASCII guides from no_color theme
+        assert!(lines.iter().any(|l| l.contains("`-- ")));
+    }
+
+    #[test]
+    fn test_explain_tree_builder_all_sections() {
+        let tree = ExplainTreeBuilder::new()
+            .command(TreeNode::new("Command"))
+            .match_info(TreeNode::new("Match"))
+            .allowlist(TreeNode::new("Allowlist"))
+            .packs(TreeNode::new("Packs"))
+            .pipeline(TreeNode::new("Pipeline"))
+            .suggestions(TreeNode::new("Suggestions"))
+            .build();
+
+        let lines = tree.render_plain();
+        // All sections should appear (root is hidden)
+        assert!(lines.iter().any(|l| l.contains("Command")));
+        assert!(lines.iter().any(|l| l.contains("Match")));
+        assert!(lines.iter().any(|l| l.contains("Allowlist")));
+        assert!(lines.iter().any(|l| l.contains("Packs")));
+        assert!(lines.iter().any(|l| l.contains("Pipeline")));
+        assert!(lines.iter().any(|l| l.contains("Suggestions")));
+    }
+
+    #[test]
+    fn test_explain_tree_builder_empty() {
+        let tree = ExplainTreeBuilder::new().build();
+        let lines = tree.render_plain();
+        // Empty builder with hidden root should produce no output
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn test_default_guides() {
+        let guides = DcgTreeGuides::default();
+        assert_eq!(guides, DcgTreeGuides::Unicode);
+    }
+
+    #[test]
+    fn test_tree_render_does_not_panic() {
+        // render() goes to stderr, just verify no panic
+        let tree = DcgTree::with_label("Test").child(TreeNode::new("child"));
+        tree.render();
+    }
 }
