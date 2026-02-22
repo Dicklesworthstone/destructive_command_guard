@@ -1,4 +1,7 @@
 {
+  "schema_version": 1,
+  "dcg_version": "0.4.1",
+  "robot_mode": true,
   "command": "git reset --hard",
   "decision": "deny",
   "rule_id": "core.git:reset-hard",
