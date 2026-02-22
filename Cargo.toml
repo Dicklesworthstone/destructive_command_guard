@@ -70,9 +70,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
 hmac = "0.12"  # HMAC for optional short-code hardening (ksk.1.10)
 fs2 = "0.4"
-fsqlite = { path = "/dp/frankensqlite/crates/fsqlite", features = ["fts5"] }  # FrankenSQLite with concurrent writing
-fsqlite-types = { path = "/dp/frankensqlite/crates/fsqlite-types" }  # SqliteValue type
-fsqlite-error = { path = "/dp/frankensqlite/crates/fsqlite-error" }  # FrankenError type
+fsqlite = { version = "0.1.0", features = ["fts5"] }  # FrankenSQLite with concurrent writing
+fsqlite-types = "0.1.0"  # SqliteValue type
+fsqlite-error = "0.1.0"  # FrankenError type
 ctrlc = "3.5.1"
 flate2 = "1.0"  # Gzip compression for history export
 
