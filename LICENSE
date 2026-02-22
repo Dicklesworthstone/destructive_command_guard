@@ -1,4 +1,4 @@
-MIT License
+MIT License (with OpenAI/Anthropic Rider)
 
 Copyright (c) 2026 Jeffrey Emanuel
 
@@ -8,6 +8,58 @@ in the Software without restriction, including without limitation the rights
 to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 copies of the Software, and to permit persons to whom the Software is
 furnished to do so, subject to the following conditions:
+
+ADDITIONAL RIDER / RESTRICTION (OpenAI / Anthropic):
+
+This rider is part of the "conditions" of this License. In the event of any
+conflict between this rider and any other portion of this License, this rider
+controls.
+
+"Restricted Parties" means OpenAI, L.L.C.; Anthropic, PBC; any of their
+respective Affiliates; and any person or entity acting directly or indirectly
+on behalf of, for the benefit of, or under the direction of any of the
+foregoing (including any officer, director, employee, contractor, agent,
+consultant, service provider, or representative).
+
+Notwithstanding any other provision of this License, no rights are granted to
+any Restricted Party. Any purported license, sublicense, assignment, transfer,
+or other permission to any Restricted Party is null and void absent the
+express prior written permission of Jeffrey Emanuel.
+
+You may not provide, disclose, distribute, sublicense, sell, lease, lend,
+host, make available, or otherwise permit access to the Software or any
+derivative work of the Software (as defined in applicable copyright law)
+(collectively, "Derivative Works") to or for any Restricted Party.
+
+For purposes of this rider, "use" includes, without limitation: copying,
+modifying, merging, publishing, distributing, sublicensing, selling,
+transferring, making available, hosting, deploying, executing, benchmarking,
+testing, analyzing, indexing, or incorporating the Software or any Derivative
+Works into any dataset, training corpus, evaluation harness, or pipeline for
+machine learning or other automated systems.
+
+This rider applies to the Software and all Derivative Works. As a condition of
+use, you agree that this rider is a precondition to exercising any rights
+under this License, and you agree that any distribution of the Software or any
+Derivative Works must include this rider provision unmodified.
+
+Any breach of this rider automatically and immediately terminates the
+permissions granted by this License. Upon termination, you must immediately
+cease all use and distribution of the Software and any Derivative Works and
+destroy all copies under your control.
+
+You agree that a breach of this rider would cause irreparable harm and that
+Jeffrey Emanuel may seek injunctive or other equitable relief to enforce this
+rider, in addition to any other remedies available at law. To the maximum
+extent permitted by applicable law, the prevailing party in any action to
+enforce this rider shall be entitled to recover reasonable attorneys' fees and
+costs.
+
+For purposes of this rider, "Affiliate" means any entity that directly or
+indirectly controls, is controlled by, or is under common control with the
+specified party. "Control" means ownership of more than 50% of the voting
+securities or other ownership interest, or the power to direct management or
+policies by contract or otherwise.
 
 The above copyright notice and this permission notice shall be included in all
 copies or substantial portions of the Software.
