@@ -544,9 +544,9 @@ dependencies = [
 
 [[package]]
 name = "chrono"
-version = "0.4.43"
+version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fac4744fb15ae8337dc853fee7fb3f4e48c0fbaa23d0afe49c447b4fab126118"
+checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
 dependencies = [
  "iana-time-zone",
  "num-traits",
@@ -1055,7 +1055,7 @@ dependencies = [
  "criterion",
  "ctrlc",
  "dirs",
- "fancy-regex 0.17.0",
+ "fancy-regex",
  "flate2",
  "fs2",
  "fsqlite",
@@ -1243,17 +1243,6 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "fancy-regex"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e24cb5a94bcae1e5408b0effca5cd7172ea3c5755049c5f3af4cd283a165298"
-dependencies = [
- "bit-set",
- "regex-automata",
- "regex-syntax",
 ]
 
 [[package]]
@@ -4317,14 +4306,14 @@ dependencies = [
 
 [[package]]
 name = "rich_rust"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77a3675ba77f298090ec08e0b16484a9691f763f8d40c3bd6aa578ed8ac1019c"
+checksum = "28b19f5711867dc33a82cdbfd437c03b4089308f63a7ec3ee6ab34a9d74ff519"
 dependencies = [
  "backtrace",
  "bitflags 2.11.0",
  "crossterm",
- "fancy-regex 0.14.0",
+ "fancy-regex",
  "log",
  "lru",
  "num-rational",
