@@ -38,7 +38,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           # Fetch enough history for git diff
           fetch-depth: 0
@@ -135,7 +135,7 @@ jobs:
 
       - name: Upload scan results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: dcg-scan-results
           path: scan-results.json
@@ -153,7 +153,7 @@ jobs:
   #     - name: Build dcg
   #       run: cargo install destructive_command_guard --locked
   #     - name: Upload binary
-  #       uses: actions/upload-artifact@v4
+  #       uses: actions/upload-artifact@v6
   #       with:
   #         name: dcg-binary
   #         path: ~/.cargo/bin/dcg
