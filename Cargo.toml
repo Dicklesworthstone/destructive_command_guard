@@ -90,7 +90,7 @@ rand = { version = "0.10", default-features = false, features = ["std", "thread_
 toon-rust = "0.1.3"
 
 # rich_rust for premium terminal output (rich_rust epic)
-rich_rust = { version = "0.2.0", features = ["full"], optional = true }
+rich_rust = { version = "0.2.1", features = ["full"], optional = true }
 
 [build-dependencies]
 vergen-gix = { version = "10.0.0-beta.5", features = ["build", "cargo", "rustc"] }
