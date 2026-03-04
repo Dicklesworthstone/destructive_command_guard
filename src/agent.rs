@@ -17,6 +17,7 @@
 //! - Continue: `CONTINUE_SESSION_ID` env var
 //! - Codex CLI: `CODEX_CLI=1` env var
 //! - Gemini CLI: `GEMINI_CLI=1` env var
+//! - GitHub Copilot CLI: `COPILOT_CLI=1`, `TERM_PROGRAM=vscode`, or `COPILOT_AGENT_START_TIME_SEC` env var
 //!
 //! # Usage
 //!
@@ -53,6 +54,8 @@ pub enum Agent {
     CodexCli,
     /// Google Gemini CLI.
     GeminiCli,
+    /// GitHub Copilot CLI.
+    CopilotCli,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -73,6 +76,7 @@ impl Agent {
             Self::Continue => "continue",
             Self::CodexCli => "codex-cli",
             Self::GeminiCli => "gemini-cli",
+            Self::CopilotCli => "copilot-cli",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -89,6 +93,7 @@ impl Agent {
                 | Self::Continue
                 | Self::CodexCli
                 | Self::GeminiCli
+                | Self::CopilotCli
         )
     }
 
@@ -107,6 +112,7 @@ impl Agent {
     /// - `"continue"` -> `Continue`
     /// - `"codex"`, `"codex-cli"`, `"codex_cli"` -> `CodexCli`
     /// - `"gemini"`, `"gemini-cli"`, `"gemini_cli"` -> `GeminiCli`
+    /// - `"copilot"`, `"copilot-cli"`, `"copilot_cli"`, -> `CopilotCli`
     /// - `"unknown"` -> `Unknown`
     /// - Any other value -> `Custom(value)`
     #[must_use]
@@ -119,6 +125,7 @@ impl Agent {
             "continue" => Self::Continue,
             "codexcli" | "codex" => Self::CodexCli,
             "geminicli" | "gemini" => Self::GeminiCli,
+            "copilotcli" | "copilot" => Self::CopilotCli,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -134,6 +141,7 @@ impl fmt::Display for Agent {
             Self::Continue => write!(f, "Continue"),
             Self::CodexCli => write!(f, "Codex CLI"),
             Self::GeminiCli => write!(f, "Gemini CLI"),
+            Self::CopilotCli => write!(f, "GitHub Copilot CLI"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -363,6 +371,29 @@ fn detect_from_environment() -> Option<DetectionResult> {
         ));
     }
 
+    // GitHub Copilot CLI detection
+    if matches!(std::env::var("COPILOT_CLI").as_deref(), Ok("1")) {
+        return Some(DetectionResult::new(
+            Agent::CopilotCli,
+            DetectionMethod::Environment,
+            Some("COPILOT_CLI".to_string()),
+        ));
+    }
+    if matches!(std::env::var("TERM_PROGRAM").as_deref(), Ok("vscode")) {
+        return Some(DetectionResult::new(
+            Agent::CopilotCli,
+            DetectionMethod::Environment,
+            Some("TERM_PROGRAM".to_string()),
+        ));
+    }
+    if std::env::var_os("COPILOT_AGENT_START_TIME_SEC").is_some() {
+        return Some(DetectionResult::new(
+            Agent::CopilotCli,
+            DetectionMethod::Environment,
+            Some("COPILOT_AGENT_START_TIME_SEC".to_string()),
+        ));
+    }
+
     None
 }
 
@@ -458,6 +489,7 @@ mod tests {
         assert_eq!(Agent::Continue.config_key(), "continue");
         assert_eq!(Agent::CodexCli.config_key(), "codex-cli");
         assert_eq!(Agent::GeminiCli.config_key(), "gemini-cli");
+        assert_eq!(Agent::CopilotCli.config_key(), "copilot-cli");
         assert_eq!(Agent::Unknown.config_key(), "unknown");
         assert_eq!(
             Agent::Custom("my-agent".to_string()).config_key(),
@@ -474,6 +506,7 @@ mod tests {
         assert_eq!(Agent::from_name("continue"), Agent::Continue);
         assert_eq!(Agent::from_name("codex-cli"), Agent::CodexCli);
         assert_eq!(Agent::from_name("gemini-cli"), Agent::GeminiCli);
+        assert_eq!(Agent::from_name("copilot-cli"), Agent::CopilotCli);
         assert_eq!(Agent::from_name("unknown"), Agent::Unknown);
 
         // Variations
@@ -485,6 +518,7 @@ mod tests {
         assert_eq!(Agent::from_name("augment"), Agent::AugmentCode);
         assert_eq!(Agent::from_name("codex"), Agent::CodexCli);
         assert_eq!(Agent::from_name("gemini"), Agent::GeminiCli);
+        assert_eq!(Agent::from_name("copilot"), Agent::CopilotCli);
 
         // Custom agents
         assert_eq!(
@@ -501,6 +535,7 @@ mod tests {
         assert_eq!(format!("{}", Agent::Continue), "Continue");
         assert_eq!(format!("{}", Agent::CodexCli), "Codex CLI");
         assert_eq!(format!("{}", Agent::GeminiCli), "Gemini CLI");
+        assert_eq!(format!("{}", Agent::CopilotCli), "GitHub Copilot CLI");
         assert_eq!(format!("{}", Agent::Unknown), "Unknown");
         assert_eq!(
             format!("{}", Agent::Custom("MyAgent".to_string())),
@@ -513,6 +548,7 @@ mod tests {
         assert!(Agent::ClaudeCode.is_known());
         assert!(Agent::AugmentCode.is_known());
         assert!(Agent::Aider.is_known());
+        assert!(Agent::CopilotCli.is_known());
         assert!(!Agent::Unknown.is_known());
         assert!(!Agent::Custom("x".to_string()).is_known());
     }
@@ -567,6 +603,9 @@ mod env_tests {
         "CONTINUE_SESSION_ID",
         "CODEX_CLI",
         "GEMINI_CLI",
+        "COPILOT_CLI",
+        "TERM_PROGRAM",
+        "COPILOT_AGENT_START_TIME_SEC",
     ];
 
     fn with_env_var<F, R>(key: &str, value: &str, f: F) -> R
@@ -694,6 +733,55 @@ mod env_tests {
     }
 
     #[test]
+    fn test_detect_copilot_cli_env() {
+        with_env_var("COPILOT_CLI", "1", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::CopilotCli);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value, Some("COPILOT_CLI".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_detect_copilot_in_vscode_env() {
+        with_env_var("TERM_PROGRAM", "vscode", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::CopilotCli);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value, Some("TERM_PROGRAM".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_detect_copilot_in_github_actions_env() {
+        with_env_var("COPILOT_AGENT_START_TIME_SEC", "", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::CopilotCli);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(
+                result.matched_value,
+                Some("COPILOT_AGENT_START_TIME_SEC".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn test_ignore_copilot_cli_when_not_one() {
+        with_env_var("COPILOT_CLI", "0", || {
+            let result = detect_agent_with_details();
+            assert_ne!(result.agent, Agent::CopilotCli);
+        });
+    }
+
+    #[test]
+    fn test_ignore_term_program_when_not_vscode() {
+        with_env_var("TERM_PROGRAM", "xterm-256color", || {
+            let result = detect_agent_with_details();
+            assert_ne!(result.agent, Agent::CopilotCli);
+        });
+    }
+
+    #[test]
     fn test_detect_unknown_no_env() {
         // Acquire lock to prevent race conditions with parallel tests
         let _lock = ENV_LOCK.lock().unwrap();
@@ -709,6 +797,7 @@ mod env_tests {
             std::env::remove_var("CONTINUE_SESSION_ID");
             std::env::remove_var("CODEX_CLI");
             std::env::remove_var("GEMINI_CLI");
+            std::env::remove_var("COPILOT_CLI");
         }
 
         // Detection should fall back to process detection or Unknown

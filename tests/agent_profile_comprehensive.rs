@@ -99,6 +99,7 @@ fn run_test_command_as_agent(command: &str, agent: &str) -> (String, String, i32
         "continue" => "CONTINUE_SESSION_ID",
         "codex" | "codex-cli" => "CODEX_CLI",
         "gemini" | "gemini-cli" => "GEMINI_CLI",
+        "copilot" | "copilot-cli" => "COPILOT_CLI",
         _ => "DCG_AGENT_TYPE",
     };
 
@@ -167,6 +168,18 @@ mod agent_detection_tests {
     fn test_detects_gemini_via_env() {
         let (_stdout, stderr, exit_code) =
             run_robot_mode_with_env(&["--version"], &[("GEMINI_CLI", "1")]);
+
+        assert_eq!(exit_code, 0, "version command should succeed");
+        assert!(
+            stderr.contains("dcg") || !stderr.is_empty(),
+            "should produce output on stderr"
+        );
+    }
+
+    #[test]
+    fn test_detects_copilot_via_env() {
+        let (_stdout, stderr, exit_code) =
+            run_robot_mode_with_env(&["--version"], &[("COPILOT_CLI", "1")]);
 
         assert_eq!(exit_code, 0, "version command should succeed");
         assert!(
@@ -270,6 +283,7 @@ mod trust_level_tests {
             ("AIDER_SESSION", "1"),
             ("CODEX_CLI", "1"),
             ("GEMINI_CLI", "1"),
+            ("COPILOT_CLI", "1"),
         ];
 
         for cmd in destructive_commands {
@@ -320,6 +334,7 @@ mod trust_level_tests {
             ("AIDER_SESSION", "1"),
             ("CODEX_CLI", "1"),
             ("GEMINI_CLI", "1"),
+            ("COPILOT_CLI", "1"),
         ];
 
         for cmd in safe_commands {
@@ -378,6 +393,7 @@ mod agent_allowlist_tests {
             ("CLAUDE_CODE", "1"),
             ("AIDER_SESSION", "1"),
             ("CODEX_CLI", "1"),
+            ("COPILOT_CLI", "1"),
         ];
 
         let mut results: HashMap<&str, bool> = HashMap::new();

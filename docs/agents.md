@@ -13,6 +13,7 @@ trust to well-behaved agents while maintaining strict controls for unknown ones.
 | Continue | Environment | `CONTINUE_SESSION_ID` |
 | Codex CLI | Environment | `CODEX_CLI=1` |
 | Gemini CLI | Environment | `GEMINI_CLI=1` |
+| GitHub Copilot CLI | Environment | `COPILOT_CLI=1`, `TERM_PROGRAM=vscode`, or `COPILOT_AGENT_START_TIME_SEC` |
 
 ## Detection Priority
 
@@ -42,6 +43,10 @@ Configure agent profiles in your `config.toml`:
 [agents.claude-code]
 trust_level = "high"
 additional_allowlist = ["npm run build", "cargo test"]
+
+[agents.copilot]
+trust_level = "medium"
+additional_allowlist = ["npm test"]
 
 # Restrict unknown agents
 [agents.unknown]
