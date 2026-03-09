@@ -49,7 +49,7 @@ once_cell = "1.19"
 base64 = "0.22"              # For decision log format parsing in simulate
 async-trait = "0.1.89"
 rust-mcp-sdk = { version = "0.8.3", default-features = false, features = ["server", "stdio", "macros"] }
-tokio = { version = "1.49", features = ["rt-multi-thread"] }
+tokio = { version = "1.50", features = ["rt-multi-thread"] }
 rayon = { version = "1.11", optional = true }
 
 # AST-based pattern matching for heredoc/inline-script content
@@ -90,7 +90,7 @@ rand = { version = "0.10", default-features = false, features = ["std", "thread_
 toon-rust = "0.1.3"
 
 # rich_rust for premium terminal output (rich_rust epic)
-rich_rust = { version = "0.2.0", features = ["full"], optional = true }
+rich_rust = { version = "0.2.1", features = ["full"], optional = true }
 
 [build-dependencies]
 vergen-gix = { version = "10.0.0-beta.5", features = ["build", "cargo", "rustc"] }
