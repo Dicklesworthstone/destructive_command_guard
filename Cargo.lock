@@ -207,7 +207,19 @@ version = "0.40.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cbb9085c34e18b697e61c1c7e00fd040cc6b06a333fc4a0e660a9ea41253b448"
 dependencies = [
- "bit-set",
+ "bit-set 0.8.0",
+ "regex",
+ "thiserror 2.0.18",
+ "tree-sitter",
+]
+
+[[package]]
+name = "ast-grep-core"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bdde23a7460d533ac757b053ad37d59e33d6ca6cfc21707000e07d8cfc431e9"
+dependencies = [
+ "bit-set 0.9.1",
  "regex",
  "thiserror 2.0.18",
  "tree-sitter",
@@ -219,7 +231,7 @@ version = "0.40.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e41c141b34d3700e6eb3edc756337548ad0451308fd83bef1e1e61033d1c6200"
 dependencies = [
- "ast-grep-core",
+ "ast-grep-core 0.40.5",
  "ignore",
  "serde",
  "tree-sitter",
@@ -351,7 +363,16 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
 dependencies = [
- "bit-vec",
+ "bit-vec 0.8.0",
+]
+
+[[package]]
+name = "bit-set"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34ddef2995421ab6a5c779542c81ee77c115206f4ad9d5a8e05f4ff49716a3dd"
+dependencies = [
+ "bit-vec 0.9.1",
 ]
 
 [[package]]
@@ -359,6 +380,15 @@ name = "bit-vec"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+
+[[package]]
+name = "bit-vec"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bitflags"
@@ -1042,7 +1072,7 @@ version = "0.4.3"
 dependencies = [
  "aho-corasick",
  "assert_cmd",
- "ast-grep-core",
+ "ast-grep-core 0.42.0",
  "ast-grep-language",
  "async-trait",
  "base64",
@@ -1252,7 +1282,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e24cb5a94bcae1e5408b0effca5cd7172ea3c5755049c5f3af4cd283a165298"
 dependencies = [
- "bit-set",
+ "bit-set 0.8.0",
  "regex-automata",
  "regex-syntax",
 ]
@@ -1263,7 +1293,7 @@ version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72cf461f865c862bb7dc573f643dd6a2b6842f7c30b07882b56bd148cc2761b8"
 dependencies = [
- "bit-set",
+ "bit-set 0.8.0",
  "regex-automata",
  "regex-syntax",
 ]
@@ -3944,8 +3974,8 @@ version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37566cb3fdacef14c0737f9546df7cfeadbfbc9fef10991038bf5015d0c80532"
 dependencies = [
- "bit-set",
- "bit-vec",
+ "bit-set 0.8.0",
+ "bit-vec 0.8.0",
  "bitflags 2.11.0",
  "num-traits",
  "rand 0.9.2",
