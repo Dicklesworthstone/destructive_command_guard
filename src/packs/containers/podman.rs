@@ -131,7 +131,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rm -f (force remove containers)
         destructive_pattern!(
             "rm-force",
-            r"podman\s+rm\s+.*-f|podman\s+rm\s+.*--force",
+            r"podman\s+rm\s+(-\w*f\w*|--force)|podman\s+rm\s+.*\s+(-\w*f\w*|--force)",
             "podman rm -f forcibly removes containers, potentially losing data.",
             High,
             "podman rm -f forcibly stops and removes containers. This is dangerous because:\n\n\
@@ -147,7 +147,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rmi -f (force remove images)
         destructive_pattern!(
             "rmi-force",
-            r"podman\s+rmi\s+.*-f|podman\s+rmi\s+.*--force",
+            r"podman\s+rmi\s+(-\w*f\w*|--force)|podman\s+rmi\s+.*\s+(-\w*f\w*|--force)",
             "podman rmi -f forcibly removes images even if in use.",
             High,
             "podman rmi -f forcibly removes images, even if containers reference them. \
