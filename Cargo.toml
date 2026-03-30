@@ -67,7 +67,7 @@ ast-grep-language = { version = "0.40", default-features = false, features = [
 # Tracing/logging for heredoc detection debugging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hmac = "0.12"  # HMAC for optional short-code hardening (ksk.1.10)
 fs2 = "0.4"
 fsqlite = { version = "0.1.2", features = ["fts5"] }  # FrankenSQLite with concurrent writing
