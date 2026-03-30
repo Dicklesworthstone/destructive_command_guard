@@ -68,7 +68,7 @@ ast-grep-language = { version = "0.40", default-features = false, features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
-hmac = "0.12"  # HMAC for optional short-code hardening (ksk.1.10)
+hmac = "0.13"  # HMAC for optional short-code hardening (ksk.1.10)
 fs2 = "0.4"
 fsqlite = { version = "0.1.2", features = ["fts5"] }  # FrankenSQLite with concurrent writing
 fsqlite-types = "0.1.2"  # SqliteValue type
