@@ -35,6 +35,8 @@ pub fn create_pack() -> Pack {
             "DROP",
             "TRUNCATE",
             "DELETE",
+            "drop",
+            "truncate",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
