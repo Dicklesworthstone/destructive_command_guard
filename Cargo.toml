@@ -35,7 +35,7 @@ serde_yaml = "0.9"          # External pack YAML parsing
 toml = "1.0"
 toml_edit = "0.25"         # Preserves formatting when editing TOML files
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }  # RFC 3339 timestamps
-fancy-regex = "0.17"
+fancy-regex = "0.18"
 regex = "1.10"              # For RegexSet in heredoc detection
 memchr = "2.7"
 aho-corasick = "1.1"        # Multi-pattern string matching for keyword quick-reject
