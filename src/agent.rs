@@ -601,6 +601,7 @@ fn first_non_empty_line(value: &str) -> Option<&str> {
     value.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn nul_separated_args_to_string(bytes: &[u8]) -> Option<String> {
     let mut args = Vec::new();
 

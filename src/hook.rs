@@ -124,6 +124,10 @@ pub struct HookSpecificOutput<'a> {
     /// Remediation suggestions for the blocked command.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remediation: Option<Remediation>,
+
+    /// Repeat-denial metadata for anti-thrashing agents.
+    #[serde(rename = "repeatDenial", skip_serializing_if = "Option::is_none")]
+    pub repeat_denial: Option<RepeatDenialInfo>,
 }
 
 /// Copilot-compatible denial output for pre-tool-use hooks.
@@ -178,6 +182,10 @@ pub struct CopilotHookOutput<'a> {
     /// Remediation suggestions for the blocked command.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remediation: Option<Remediation>,
+
+    /// Repeat-denial metadata for anti-thrashing agents.
+    #[serde(rename = "repeatDenial", skip_serializing_if = "Option::is_none")]
+    pub repeat_denial: Option<RepeatDenialInfo>,
 }
 
 /// Gemini-compatible denial output for `BeforeTool` hooks.
@@ -220,6 +228,10 @@ pub struct GeminiHookOutput<'a> {
     /// Remediation suggestions for the blocked command.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remediation: Option<Remediation>,
+
+    /// Repeat-denial metadata for anti-thrashing agents.
+    #[serde(rename = "repeatDenial", skip_serializing_if = "Option::is_none")]
+    pub repeat_denial: Option<RepeatDenialInfo>,
 }
 
 /// Hermes Agent denial output for shell `pre_tool_call` hooks.
@@ -282,6 +294,10 @@ pub struct HermesHookOutput<'a> {
     /// Remediation suggestions for the blocked command.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remediation: Option<Remediation>,
+
+    /// Repeat-denial metadata for anti-thrashing agents.
+    #[serde(rename = "repeatDenial", skip_serializing_if = "Option::is_none")]
+    pub repeat_denial: Option<RepeatDenialInfo>,
 }
 
 /// Hook protocol variant for response formatting.
@@ -338,6 +354,37 @@ pub struct Remediation {
     /// The command to run to allow this specific command once (e.g., "dcg allow-once abc12").
     #[serde(rename = "allowOnceCommand")]
     pub allow_once_command: String,
+}
+
+/// Metadata emitted when an agent repeatedly hits the same hard denial.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct RepeatDenialInfo {
+    /// Current attempt count within the configured window.
+    pub attempt: u32,
+    /// Lookback window in seconds.
+    #[serde(rename = "windowSeconds")]
+    pub window_seconds: u64,
+    /// Stable instruction token for machine readers.
+    pub instruction: &'static str,
+}
+
+impl RepeatDenialInfo {
+    #[must_use]
+    pub const fn new(attempt: u32, window_seconds: u64) -> Self {
+        Self {
+            attempt,
+            window_seconds,
+            instruction: "stop_retrying_and_ask_user",
+        }
+    }
+
+    #[must_use]
+    pub fn model_message(self) -> String {
+        format!(
+            "DCG_REPEAT_DENIAL: This command has been blocked {} times in {}s. Stop retrying it. Ask the user for explicit permission before trying again.",
+            self.attempt, self.window_seconds
+        )
+    }
 }
 
 /// Result of processing a hook request.
@@ -702,6 +749,7 @@ pub fn format_denial_message(
     explanation: Option<&str>,
     pack: Option<&str>,
     pattern: Option<&str>,
+    repeat_denial: Option<&RepeatDenialInfo>,
 ) -> String {
     let explain_hint = format_explain_hint(command);
     let rule_id = build_rule_id(pack, pattern);
@@ -715,6 +763,9 @@ pub fn format_denial_message(
         },
         |rule| format!("Rule: {rule}\n\n"),
     );
+    let repeat_block = repeat_denial
+        .map(|info| format!("\n\n{}", info.model_message()))
+        .unwrap_or_default();
 
     format!(
         "BLOCKED by dcg\n\n\
@@ -724,7 +775,8 @@ pub fn format_denial_message(
          {rule_line}\
          Command: {command}\n\n\
          If this operation is truly needed, ask the user for explicit \
-         permission and have them run the command manually."
+         permission and have them run the command manually.\
+         {repeat_block}"
     )
 }
 
@@ -755,6 +807,7 @@ pub(crate) fn print_colorful_warning_to(
     severity: Option<crate::packs::Severity>,
     branch_context: Option<&crate::evaluator::BranchContext>,
     audience: WarningAudience,
+    repeat_denial: Option<&RepeatDenialInfo>,
 ) {
     let theme = auto_theme();
 
@@ -814,6 +867,11 @@ pub(crate) fn print_colorful_warning_to(
 
     match audience {
         WarningAudience::HumanOperator => {
+            if let Some(info) = repeat_denial {
+                let _ = writeln!(writer, "{}", info.model_message());
+                let _ = writeln!(writer);
+            }
+
             let _ = writeln!(writer, "{footer_style}Learn more:{reset}");
             let _ = writeln!(writer, "  $ {cyan}{explain_cmd}{reset}");
 
@@ -838,6 +896,9 @@ pub(crate) fn print_colorful_warning_to(
         WarningAudience::CodexModel => {
             if let Some(ref rule) = rule_id {
                 let _ = writeln!(writer, "{footer_style}Rule: {rule}{reset}");
+            }
+            if let Some(info) = repeat_denial {
+                let _ = writeln!(writer, "{}", info.model_message());
             }
             let _ = writeln!(
                 writer,
@@ -907,6 +968,7 @@ pub fn print_colorful_warning(
         severity,
         None,
         WarningAudience::HumanOperator,
+        None,
     );
 }
 
@@ -971,6 +1033,7 @@ pub fn write_denial_to(
     confidence: Option<f64>,
     pattern_suggestions: &[PatternSuggestion],
     branch_context: Option<&crate::evaluator::BranchContext>,
+    repeat_denial: Option<&RepeatDenialInfo>,
 ) {
     let allow_once_code = allow_once.map(|info| info.code.as_str());
     let warning_audience = match protocol {
@@ -994,9 +1057,10 @@ pub fn write_denial_to(
         severity,
         branch_context,
         warning_audience,
+        repeat_denial,
     );
 
-    let message = format_denial_message(command, reason, explanation, pack, pattern);
+    let message = format_denial_message(command, reason, explanation, pack, pattern, repeat_denial);
     let rule_id = build_rule_id(pack, pattern);
     let remediation = allow_once.map(|info| {
         let explanation_text = format_explanation_text(explanation, rule_id.as_deref(), pack);
@@ -1021,6 +1085,7 @@ pub fn write_denial_to(
                     severity,
                     confidence,
                     remediation,
+                    repeat_denial: repeat_denial.copied(),
                 },
             };
 
@@ -1045,6 +1110,7 @@ pub fn write_denial_to(
                 severity,
                 confidence,
                 remediation,
+                repeat_denial: repeat_denial.copied(),
             };
 
             let _ = serde_json::to_writer(&mut *stdout, &output);
@@ -1062,6 +1128,7 @@ pub fn write_denial_to(
                 severity,
                 confidence,
                 remediation,
+                repeat_denial: repeat_denial.copied(),
             };
 
             let _ = serde_json::to_writer(&mut *stdout, &output);
@@ -1087,6 +1154,7 @@ pub fn write_denial_to(
                 severity,
                 confidence,
                 remediation,
+                repeat_denial: repeat_denial.copied(),
             };
 
             let _ = serde_json::to_writer(&mut *stdout, &output);
@@ -1112,6 +1180,7 @@ pub fn output_denial_for_protocol(
     confidence: Option<f64>,
     pattern_suggestions: &[PatternSuggestion],
     branch_context: Option<&crate::evaluator::BranchContext>,
+    repeat_denial: Option<&RepeatDenialInfo>,
 ) {
     let out = io::stdout();
     let mut out_handle = out.lock();
@@ -1132,6 +1201,7 @@ pub fn output_denial_for_protocol(
         confidence,
         pattern_suggestions,
         branch_context,
+        repeat_denial,
     );
 }
 
@@ -1163,6 +1233,7 @@ pub fn output_denial(
         severity,
         confidence,
         pattern_suggestions,
+        None,
         None,
     );
 }
@@ -1223,6 +1294,7 @@ pub(crate) fn write_warning_to(
                     severity: None,
                     confidence: None,
                     remediation: None,
+                    repeat_denial: None,
                 },
             };
 
@@ -1244,6 +1316,7 @@ pub(crate) fn write_warning_to(
                 severity: None,
                 confidence: None,
                 remediation: None,
+                repeat_denial: None,
             };
 
             let _ = serde_json::to_writer(&mut *stdout, &output);
@@ -1263,6 +1336,7 @@ pub(crate) fn write_warning_to(
                 severity: None,
                 confidence: None,
                 remediation: None,
+                repeat_denial: None,
             };
 
             let _ = serde_json::to_writer(&mut *stdout, &output);
@@ -1670,6 +1744,7 @@ mod tests {
             severity: None,
             confidence: None,
             remediation: None,
+            repeat_denial: None,
         };
         let json = serde_json::to_value(&output).unwrap();
         assert_eq!(json["decision"], "deny");
@@ -1696,6 +1771,7 @@ mod tests {
             Some("This is irreversible."),
             Some("core.git"),
             Some("reset-hard"),
+            None,
         );
 
         assert!(message.contains("Reason: destructive"));
@@ -1718,6 +1794,7 @@ mod tests {
                 severity: None,
                 confidence: None,
                 remediation: None,
+                repeat_denial: None,
             },
         };
         let json = serde_json::to_value(&output).unwrap();
@@ -1748,6 +1825,7 @@ mod tests {
             severity: None,
             confidence: None,
             remediation: None,
+            repeat_denial: None,
         };
         let json = serde_json::to_value(&output).unwrap();
         assert_eq!(json["permissionDecision"], "ask");
@@ -1767,6 +1845,7 @@ mod tests {
             severity: None,
             confidence: None,
             remediation: None,
+            repeat_denial: None,
         };
         let json = serde_json::to_value(&output).unwrap();
         assert_eq!(json["decision"], "allow");
@@ -1880,6 +1959,7 @@ mod tests {
             severity: None,
             confidence: None,
             remediation: None,
+            repeat_denial: None,
         };
         let json = serde_json::to_value(&output).unwrap();
         assert_eq!(json["decision"], "block");
@@ -1914,6 +1994,7 @@ mod tests {
             Some(crate::packs::Severity::Critical),
             None,
             &[],
+            None,
             None,
         );
 
@@ -2160,6 +2241,7 @@ mod tests {
             Some(0.95),
             &[],
             None,
+            None,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);
@@ -2253,6 +2335,7 @@ mod tests {
             Some(0.95),
             &[],
             None,
+            None,
         );
 
         assert!(
@@ -2312,6 +2395,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);
@@ -2347,6 +2431,7 @@ mod tests {
             Some(crate::packs::Severity::High),
             None,
             &[],
+            None,
             None,
         );
 

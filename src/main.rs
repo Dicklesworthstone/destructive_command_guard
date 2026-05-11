@@ -57,6 +57,8 @@ const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TIMESTAMP: Option<&str> = option_env!("VERGEN_BUILD_TIMESTAMP");
 const RUSTC_SEMVER: Option<&str> = option_env!("VERGEN_RUSTC_SEMVER");
 const CARGO_TARGET: Option<&str> = option_env!("VERGEN_CARGO_TARGET_TRIPLE");
+const ANTI_THRASH_WINDOW_SECONDS: i64 = 60;
+const ANTI_THRASH_THRESHOLD: u32 = 3;
 
 // NOTE: HookInput, ToolInput, HookOutput, HookSpecificOutput types are now defined
 // in the hook module. Use hook::HookInput, hook::read_hook_input(), etc.
@@ -761,6 +763,27 @@ fn main() {
                 _ => info.reason.clone(),
             };
 
+            let anti_thrash_enabled = matches!(effective_agent, Agent::CodexCli | Agent::CursorIde);
+            let block_source = format!("agent={history_agent_type};match_source={:?}", info.source);
+            let repeat_denial = if anti_thrash_enabled {
+                let previous_blocks = store
+                    .count_recent_blocks(
+                        &command,
+                        &working_dir,
+                        &reason,
+                        Some(block_source.as_str()),
+                        chrono::Duration::seconds(ANTI_THRASH_WINDOW_SECONDS),
+                        chrono::Utc::now(),
+                    )
+                    .unwrap_or(0);
+                let attempt = previous_blocks.saturating_add(1);
+                (attempt >= ANTI_THRASH_THRESHOLD).then(|| {
+                    hook::RepeatDenialInfo::new(attempt, ANTI_THRASH_WINDOW_SECONDS as u64)
+                })
+            } else {
+                None
+            };
+
             let mut allow_once_info: Option<hook::AllowOnceInfo> = None;
             if let Ok((record, maintenance)) = store.record_block(
                 &command,
@@ -768,7 +791,7 @@ fn main() {
                 &reason,
                 &config.logging.redaction,
                 false,
-                Some(format!("{:?}", info.source)),
+                Some(block_source),
                 None,
             ) {
                 allow_once_info = Some(hook::AllowOnceInfo {
@@ -798,6 +821,7 @@ fn main() {
                 None, // confidence not yet available in PatternMatch
                 info.suggestions,
                 branch_ctx,
+                repeat_denial.as_ref(),
             );
 
             // Log if configured
@@ -1290,6 +1314,7 @@ mod tests {
                     severity: None,
                     confidence: None,
                     remediation: None,
+                    repeat_denial: None,
                 },
             }
         }

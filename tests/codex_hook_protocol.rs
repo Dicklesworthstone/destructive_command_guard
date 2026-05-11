@@ -296,6 +296,59 @@ pub fn run_hook_raw_with_config(
     }
 }
 
+/// Spawn dcg with raw JSON bytes and a shared HOME/TMPDIR.
+///
+/// Use this only for tests that intentionally verify cross-process state
+/// such as pending exception records. Most tests should use `run_hook_raw`
+/// to keep each invocation fully isolated.
+pub fn run_hook_raw_with_home(
+    json_bytes: &[u8],
+    home_path: &std::path::Path,
+    extra_env: &[(&str, &str)],
+) -> HookOutcome {
+    let tmp_path = home_path.join("tmp");
+    std::fs::create_dir_all(&tmp_path).ok();
+
+    let system_path = std::env::var("PATH").unwrap_or_default();
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", &system_path)
+        .env("HOME", home_path)
+        .env("TMPDIR", &tmp_path)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+
+    let mut child = cmd.spawn().expect("failed to spawn dcg process");
+
+    {
+        let stdin = child.stdin.as_mut().expect("failed to get stdin");
+        if let Err(err) = stdin.write_all(json_bytes) {
+            assert_eq!(
+                err.kind(),
+                ErrorKind::BrokenPipe,
+                "failed to write to stdin: {err}"
+            );
+        }
+    }
+
+    let output = child.wait_with_output().expect("failed to wait for dcg");
+
+    HookOutcome {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_code: output.status.code().unwrap_or(-1),
+        stdin_sent: json_bytes.to_vec(),
+        home_dir: home_path.to_path_buf(),
+    }
+}
+
 /// Run dcg with a Codex 0.125.0+ payload for the given command.
 pub fn run_codex_hook(command: &str) -> HookOutcome {
     run_codex_hook_with_env(command, &[], &[])
@@ -518,6 +571,147 @@ fn codex_deny_stderr_is_not_empty_even_when_nosuggest() {
         "stderr must be substantive (>10 bytes), got {} bytes\n{outcome}",
         outcome.stderr.len()
     );
+}
+
+#[test]
+fn codex_third_repeated_deny_gets_anti_thrash_marker() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let pending_path = home.path().join("pending.jsonl");
+    let payload = build_codex_payload("git reset --hard HEAD~1");
+
+    let first = run_hook_raw_with_home(
+        payload.as_bytes(),
+        home.path(),
+        &[(
+            "DCG_PENDING_EXCEPTIONS_PATH",
+            pending_path.to_str().expect("utf8 pending path"),
+        )],
+    );
+    assert!(
+        first.is_codex_block_shape(),
+        "first Codex deny must block normally\n{first}"
+    );
+    assert!(
+        !first.stderr_contains("DCG_REPEAT_DENIAL"),
+        "first deny should not be marked as thrash\n{first}"
+    );
+
+    let second = run_hook_raw_with_home(
+        payload.as_bytes(),
+        home.path(),
+        &[(
+            "DCG_PENDING_EXCEPTIONS_PATH",
+            pending_path.to_str().expect("utf8 pending path"),
+        )],
+    );
+    assert!(
+        second.is_codex_block_shape(),
+        "second Codex deny must block normally\n{second}"
+    );
+    assert!(
+        !second.stderr_contains("DCG_REPEAT_DENIAL"),
+        "second deny should not be marked as thrash\n{second}"
+    );
+
+    let third = run_hook_raw_with_home(
+        payload.as_bytes(),
+        home.path(),
+        &[(
+            "DCG_PENDING_EXCEPTIONS_PATH",
+            pending_path.to_str().expect("utf8 pending path"),
+        )],
+    );
+    assert!(
+        third.is_codex_block_shape(),
+        "third Codex deny must keep Codex block shape\n{third}"
+    );
+    assert!(
+        third.stderr_contains("DCG_REPEAT_DENIAL"),
+        "third repeated Codex deny should tell the model to stop retrying\n{third}"
+    );
+}
+
+#[test]
+fn cursor_third_repeated_deny_gets_anti_thrash_marker_in_json_reason() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let pending_path = home.path().join("pending.jsonl");
+    let payload = build_claude_payload("git reset --hard HEAD~1");
+    let env = [
+        ("CURSOR_IDE", "1"),
+        (
+            "DCG_PENDING_EXCEPTIONS_PATH",
+            pending_path.to_str().expect("utf8 pending path"),
+        ),
+    ];
+
+    let first = run_hook_raw_with_home(payload.as_bytes(), home.path(), &env);
+    assert!(
+        first.is_claude_block_shape(),
+        "Cursor bridge uses Claude-compatible JSON shape\n{first}"
+    );
+    let first_json = first.stdout_json();
+    let first_reason = first_json["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        !first_reason.contains("DCG_REPEAT_DENIAL"),
+        "first Cursor deny should not be marked as thrash\n{first}"
+    );
+
+    let second = run_hook_raw_with_home(payload.as_bytes(), home.path(), &env);
+    assert!(
+        second.is_claude_block_shape(),
+        "second Cursor deny must block normally\n{second}"
+    );
+    let second_json = second.stdout_json();
+    let second_reason = second_json["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        !second_reason.contains("DCG_REPEAT_DENIAL"),
+        "second Cursor deny should not be marked as thrash\n{second}"
+    );
+
+    let third = run_hook_raw_with_home(payload.as_bytes(), home.path(), &env);
+    assert!(
+        third.is_claude_block_shape(),
+        "third Cursor deny must keep Claude-compatible JSON shape\n{third}"
+    );
+    let third_json = third.stdout_json();
+    let third_reason = third_json["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        third_reason.contains("DCG_REPEAT_DENIAL"),
+        "third repeated Cursor deny should tell the agent to stop retrying\n{third}"
+    );
+}
+
+#[test]
+fn claude_repeated_deny_does_not_get_anti_thrash_marker() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let pending_path = home.path().join("pending.jsonl");
+    let payload = build_claude_payload("git reset --hard HEAD~1");
+    let env = [(
+        "DCG_PENDING_EXCEPTIONS_PATH",
+        pending_path.to_str().expect("utf8 pending path"),
+    )];
+
+    for attempt in 1..=3 {
+        let outcome = run_hook_raw_with_home(payload.as_bytes(), home.path(), &env);
+        assert!(
+            outcome.is_claude_block_shape(),
+            "Claude deny attempt {attempt} must block normally\n{outcome}"
+        );
+        let json = outcome.stdout_json();
+        let reason = json["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !reason.contains("DCG_REPEAT_DENIAL"),
+            "Claude deny attempt {attempt} must not get Codex/Cursor anti-thrash marker\n{outcome}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,8 +1913,13 @@ fn disable_core_filesystem_still_blocks_git_claude() {
 /// Extract the allow-once short_code from the pending_exceptions.jsonl
 /// in the hermetic HOME directory.
 fn extract_allow_once_code_from_pending_store(home: &std::path::Path) -> Option<String> {
-    let pending_path = home.join(".config/dcg/pending_exceptions.jsonl");
-    let content = std::fs::read_to_string(&pending_path).ok()?;
+    let pending_paths = [
+        home.join(".config/dcg/pending_exceptions.jsonl"),
+        home.join("Library/Application Support/dcg/pending_exceptions.jsonl"),
+    ];
+    let content = pending_paths
+        .iter()
+        .find_map(|pending_path| std::fs::read_to_string(pending_path).ok())?;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {

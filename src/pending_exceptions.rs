@@ -323,6 +323,41 @@ impl PendingExceptionStore {
         Ok((active, maintenance))
     }
 
+    /// Count active pending block records that match the same command context
+    /// within a recent lookback window.
+    ///
+    /// This supports hook anti-thrashing without depending on the history
+    /// database, which is intentionally disabled by default. The count is
+    /// computed from active pending exception records, so expired/consumed
+    /// entries are ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns any I/O errors encountered while opening or locking the store file.
+    pub fn count_recent_blocks(
+        &self,
+        command: &str,
+        cwd: &str,
+        reason: &str,
+        source: Option<&str>,
+        window: Duration,
+        now: DateTime<Utc>,
+    ) -> io::Result<u32> {
+        let (active, _) = self.preview_active(now)?;
+        let cutoff = now - window;
+        let count = active
+            .iter()
+            .filter(|record| {
+                record.command_raw == command
+                    && record.cwd == cwd
+                    && record.reason == reason
+                    && record.source.as_deref() == source
+                    && parse_timestamp(&record.created_at).is_some_and(|created| created >= cutoff)
+            })
+            .count();
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
     /// Remove all active records (expired/consumed are also pruned).
     ///
     /// # Errors
@@ -1312,12 +1347,18 @@ fn append_allow_once_record(file: &mut File, record: &AllowOnceEntry) -> io::Res
 }
 
 fn is_expired(expires_at: &str, now: DateTime<Utc>) -> bool {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(expires_at) {
-        return dt.with_timezone(&Utc) < now;
+    if let Some(dt) = parse_timestamp(expires_at) {
+        return dt < now;
     }
     // Fail-closed: treat unparseable timestamps as expired for security.
     // This prevents entries with corrupted/invalid timestamps from persisting indefinitely.
     true
+}
+
+fn parse_timestamp(timestamp: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 fn format_timestamp(timestamp: DateTime<Utc>) -> String {

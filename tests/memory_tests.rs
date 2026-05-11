@@ -530,6 +530,7 @@ fn memory_codex_deny_pipeline() {
                             None,
                             pi.map_or(&[], |p| p.suggestions),
                             None,
+                            None,
                         );
                         black_box(&stdout_buf);
                         black_box(&stderr_buf);
@@ -576,6 +577,7 @@ fn memory_codex_deny_output_formatting() {
                 Some(dcg::packs::Severity::Critical),
                 Some(0.95),
                 &[],
+                None,
                 None,
             );
             black_box(&stdout_buf);
@@ -643,6 +645,7 @@ fn memory_codex_vs_claude_deny_parity() {
                             pi.and_then(|p| p.severity),
                             None,
                             pi.map_or(&[], |p| p.suggestions),
+                            None,
                             None,
                         );
                         black_box(&stdout_buf);
