@@ -21,7 +21,7 @@ enabled = ["kubernetes", "database", "containers"]
 | [cicd](cicd.md) | 4 | GitHub Actions, GitLab CI, Jenkins, ... |
 | [cloud](cloud.md) | 3 | AWS CLI, Google Cloud SDK, Azure CLI |
 | [containers](containers.md) | 3 | Docker, Docker Compose, Podman |
-| [core](core.md) | 2 | Core Git, Core Filesystem |
+| [core](core.md) | 3 | Core Git, Core Filesystem, Sensitive Data and Bulk Actions |
 | [database](database.md) | 6 | PostgreSQL, MySQL/MariaDB, MongoDB, ... |
 | [dns](dns.md) | 3 | Cloudflare DNS, AWS Route53, Generic DNS Tools |
 | [email](email.md) | 4 | AWS SES, SendGrid, Mailgun, ... |
@@ -45,6 +45,7 @@ enabled = ["kubernetes", "database", "containers"]
 
 - [`core.git`](core.md#coregit)
 - [`core.filesystem`](core.md#corefilesystem)
+- [`core.sensitive`](core.md#coresensitive)
 - [`storage.s3`](storage.md#storages3)
 - [`storage.gcs`](storage.md#storagegcs)
 - [`storage.minio`](storage.md#storageminio)

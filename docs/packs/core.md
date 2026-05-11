@@ -6,6 +6,7 @@ This document describes packs in the `core` category.
 
 - [Core Git](#coregit)
 - [Core Filesystem](#corefilesystem)
+- [Sensitive Data and Bulk Actions](#coresensitive)
 
 ---
 
@@ -68,6 +69,74 @@ To allowlist all rules from this pack (use with caution):
 ```toml
 [[allow]]
 rule = "core.git:*"
+reason = "Your reason here"
+risk_acknowledged = true
+```
+
+---
+
+## Sensitive Data and Bulk Actions
+
+**Pack ID:** `core.sensitive`
+
+Blocks sensitive local credential reads, secret exfiltration sinks, and bulk mailbox delete/archive actions.
+
+### Keywords
+
+Commands containing these keywords are checked against this pack:
+
+- `.env`
+- `.envrc`
+- `.ssh`
+- `id_rsa`
+- `id_ed25519`
+- `.aws/credentials`
+- `.config/gh/hosts.yml`
+- `.netrc`
+- `.kube/config`
+- `.docker/config.json`
+- `.npmrc`
+- `.pypirc`
+- `.cargo/credentials`
+- `.git-credentials`
+- `.pem`
+- `.key`
+- `gmail.googleapis.com`
+- `batchDelete`
+- `batchModify`
+- `removeLabelIds`
+- `gam`
+- `gh auth`
+- `auth token`
+- `--show-token`
+
+### Destructive Patterns (Blocked)
+
+These patterns match sensitive or disruptive commands:
+
+| Pattern Name | Reason | Severity |
+|--------------|--------|----------|
+| `sensitive-file-exfil` | Sending or copying sensitive local files is blocked. | critical |
+| `sensitive-file-read` | Reading sensitive local credentials or secret material is blocked. | critical |
+| `github-token-read` | Reading a GitHub authentication token is blocked. | critical |
+| `bulk-email-delete` | Bulk mailbox deletion or trashing is blocked. | critical |
+| `bulk-email-archive` | Bulk mailbox archive/hide actions are blocked. | high |
+
+### Allowlist Guidance
+
+To allowlist a specific rule from this pack, add to your allowlist:
+
+```toml
+[[allow]]
+rule = "core.sensitive:<pattern-name>"
+reason = "Your reason here"
+```
+
+To allowlist all rules from this pack (use with caution):
+
+```toml
+[[allow]]
+rule = "core.sensitive:*"
 reason = "Your reason here"
 risk_acknowledged = true
 ```

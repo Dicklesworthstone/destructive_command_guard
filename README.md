@@ -167,6 +167,7 @@ dcg uses a modular "pack" system to organize destructive command patterns by cat
 ### Core Packs (enabled by default)
 - `core.filesystem` - Protects against dangerous rm -rf commands outside temp directories
 - `core.git` - Protects against destructive git commands that can lose uncommitted work, rewrite history, or destroy stashes
+- `core.sensitive` - Blocks sensitive local credential reads, secret exfiltration sinks, and bulk mailbox delete/archive actions
 
 **Common packs enabled by default:**
 - `database.postgresql` - Protects against destructive PostgreSQL operations
