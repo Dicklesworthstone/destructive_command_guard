@@ -9122,6 +9122,39 @@ fn doctor_pretty(fix: bool) {
         println!("{}", "OK".green());
     }
 
+    // Check 3b: Grok (xAI) hook registration (native path)
+    // Grok uses ~/.grok/hooks/dcg.json (preferred) or ~/.grok/settings.json for hooks,
+    // plus the Claude compatibility layer (~/.claude/settings.json) also works.
+    // We detect Grok via its environment variables set during hook invocation.
+    let grok_session = std::env::var("GROK_SESSION_ID").is_ok();
+    let grok_hook_event = std::env::var("GROK_HOOK_EVENT").is_ok();
+    if grok_session || grok_hook_event {
+        print!("Checking Grok hook registration... ");
+        let grok_hooks_dir = dirs::home_dir()
+            .map(|h| h.join(".grok").join("hooks").join("dcg.json"))
+            .filter(|p| p.exists());
+        let grok_settings = dirs::home_dir()
+            .map(|h| h.join(".grok").join("settings.json"))
+            .filter(|p| p.exists());
+
+        if grok_hooks_dir.is_some() || grok_settings.is_some() {
+            println!("{}", "OK (native)".green());
+            if grok_hooks_dir.is_some() {
+                println!("  Found ~/.grok/hooks/dcg.json");
+            }
+            if grok_settings.is_some() {
+                println!("  Found ~/.grok/settings.json (hooks section)");
+            }
+            println!("  Grok also works via Claude compatibility layer in ~/.claude/settings.json");
+        } else {
+            println!("{}", "NOT REGISTERED (native)".yellow());
+            println!("  No ~/.grok/hooks/dcg.json or ~/.grok/settings.json hooks found");
+            println!("  Grok can still use the Claude compatibility layer (~/.claude/settings.json)");
+            println!("  For native Grok support, create ~/.grok/hooks/dcg.json with a PreToolUse/Bash hook");
+            println!("  See docs/agents.md for the recommended JSON structure");
+        }
+    }
+
     // Check 4: Config validation (expanded diagnostics)
     print!("Checking configuration... ");
     let config_diag = validate_config_diagnostics();

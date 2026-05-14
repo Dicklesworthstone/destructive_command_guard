@@ -20,6 +20,7 @@
 //! - Copilot CLI: `COPILOT_CLI=1` or `COPILOT_AGENT_START_TIME_SEC` env var
 //! - Cursor IDE: `CURSOR_IDE=1` env var (set by dcg's Cursor hook script)
 //! - Hermes Agent: `HERMES_AGENT=1` or `HERMES_SESSION_ID` env var
+//! - Grok (xAI): `GROK_SESSION_ID` or `GROK_HOOK_EVENT` env var (native Grok hooks)
 //!
 //! # Usage
 //!
@@ -64,6 +65,8 @@ pub enum Agent {
     CursorIde,
     /// `NousResearch` Hermes Agent (via shell `pre_tool_call` hook).
     Hermes,
+    /// xAI Grok CLI / Grok Build TUI (via native `~/.grok/hooks/*.json` and `~/.grok/settings.json`).
+    Grok,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -87,6 +90,7 @@ impl Agent {
             Self::CopilotCli => "copilot-cli",
             Self::CursorIde => "cursor-ide",
             Self::Hermes => "hermes",
+            Self::Grok => "grok",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -106,6 +110,7 @@ impl Agent {
                 | Self::CopilotCli
                 | Self::CursorIde
                 | Self::Hermes
+                | Self::Grok
         )
     }
 
@@ -143,6 +148,7 @@ impl Agent {
             "copilotcli" | "copilot" => Self::CopilotCli,
             "cursoride" | "cursor" => Self::CursorIde,
             "hermes" | "hermesagent" | "hermescli" => Self::Hermes,
+            "grok" | "grokcli" | "grok-build" | "xai" | "xai-grok" => Self::Grok,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -161,6 +167,7 @@ impl fmt::Display for Agent {
             Self::CopilotCli => write!(f, "GitHub Copilot CLI"),
             Self::CursorIde => write!(f, "Cursor IDE"),
             Self::Hermes => write!(f, "Hermes Agent"),
+            Self::Grok => write!(f, "Grok (xAI)"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -472,6 +479,25 @@ fn detect_from_environment() -> Option<DetectionResult> {
         ));
     }
 
+    // Grok (xAI) detection.
+    // Grok sets GROK_SESSION_ID and/or GROK_HOOK_EVENT when invoking hooks
+    // (via its native ~/.grok/hooks/*.json and ~/.grok/settings.json system,
+    // and also when reading ~/.claude/settings.json for Claude Code compatibility).
+    if std::env::var("GROK_SESSION_ID").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::Grok,
+            DetectionMethod::Environment,
+            Some("GROK_SESSION_ID".to_string()),
+        ));
+    }
+    if std::env::var("GROK_HOOK_EVENT").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::Grok,
+            DetectionMethod::Environment,
+            Some("GROK_HOOK_EVENT".to_string()),
+        ));
+    }
+
     None
 }
 
@@ -680,6 +706,7 @@ fn agent_for_basename(basename: &str) -> Option<Agent> {
         "copilot" | "copilot-cli" | "gh-copilot" => Some(Agent::CopilotCli),
         "cursor" | "cursor-ide" => Some(Agent::CursorIde),
         "hermes" | "hermes-agent" | "hermes-cli" => Some(Agent::Hermes),
+        "grok" | "grok-cli" | "grok-build" => Some(Agent::Grok),
         _ => None,
     }
 }

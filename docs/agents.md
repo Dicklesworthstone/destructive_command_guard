@@ -17,6 +17,7 @@ trust to well-behaved agents while maintaining strict controls for unknown ones.
 | GitHub Copilot CLI | Environment | `COPILOT_CLI=1` or `COPILOT_AGENT_START_TIME_SEC` |
 | Cursor IDE | Environment | `CURSOR_IDE=1` (set by dcg's hook script) |
 | Hermes Agent | Environment | `HERMES_AGENT=1` or `HERMES_SESSION_ID` |
+| Grok (xAI) | Environment | `GROK_SESSION_ID` or `GROK_HOOK_EVENT` |
 
 ## Detection Priority
 

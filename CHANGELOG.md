@@ -13,6 +13,20 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## [Unreleased] (after v0.5.1)
 
+### Agent support
+
+- **Grok (xAI) agent detection and doctor awareness** (native hooks).
+  Grok CLI / Grok Build TUI is now recognized via `GROK_SESSION_ID` and `GROK_HOOK_EVENT`
+  environment variables (set when Grok invokes hooks through its native `~/.grok/hooks/*.json`
+  and `~/.grok/settings.json` mechanism, or via the Claude Code compatibility layer).
+  - Added `Agent::Grok` variant, environment + process-name detection, config key `grok`,
+    and Display name "Grok (xAI)".
+  - `dcg doctor` (pretty output) now detects Grok sessions and reports on the presence of
+    `~/.grok/hooks/dcg.json` or `~/.grok/settings.json` hook configuration (in addition to the
+    existing Claude compatibility path). Full structured JSON doctor checks and `dcg install --grok`
+    support are planned follow-ups.
+  - Updated supported agents list in README and the agent table in `docs/agents.md`.
+
 ### Release-engineering fixes
 
 - **Linux x86_64 now ships as static musl** ([#114](https://github.com/Dicklesworthstone/destructive_command_guard/issues/114)).
