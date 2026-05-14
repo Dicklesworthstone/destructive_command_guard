@@ -287,7 +287,7 @@ pub enum Command {
         ttl: Option<u64>,
     },
 
-    /// Install the hook into Claude Code settings
+    /// Install the hook into Claude Code settings (or Grok with --grok)
     #[command(name = "install")]
     Install {
         /// Force overwrite existing hook configuration
@@ -298,6 +298,11 @@ pub enum Command {
         /// instead of user-level `~/.claude/settings.json`
         #[arg(long)]
         project: bool,
+
+        /// Install the hook for Grok (xAI) using the native ~/.grok/hooks/dcg.json path
+        /// (and ~/.grok/settings.json if needed for compatibility).
+        #[arg(long)]
+        grok: bool,
     },
 
     /// Full setup: install hook + add shell startup check
@@ -1955,8 +1960,12 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Hook(cmd)) => {
             run_hook_command(&config, &cmd)?;
         }
-        Some(Command::Install { force, project }) => {
-            install_hook(force, project)?;
+        Some(Command::Install { force, project, grok }) => {
+            if grok {
+                install_grok_hook(force)?;
+            } else {
+                install_hook(force, project)?;
+            }
         }
         Some(Command::Setup {
             force,
@@ -9899,6 +9908,77 @@ fn install_hook_silent(force: bool) -> Result<bool, Box<dyn std::error::Error>> 
         std::fs::write(&settings_path, content)?;
     }
     Ok(changed)
+}
+
+/// Returns the path to the user's Grok dcg hook file: ~/.grok/hooks/dcg.json
+fn grok_dcg_hook_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".grok")
+        .join("hooks")
+        .join("dcg.json")
+}
+
+/// Install the dcg hook for Grok (xAI) using the native ~/.grok/hooks/dcg.json path.
+///
+/// This is the Grok equivalent of `install_hook` for Claude. It creates the
+/// proper hook JSON so that `dcg doctor` and the Grok TUI recognize the installation.
+fn install_grok_hook(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let hook_path = grok_dcg_hook_path();
+
+    if hook_path.exists() && !force {
+        println!(
+            "{} Hook already exists at {}. Use --force to overwrite.",
+            "Warning:".yellow(),
+            hook_path.display()
+        );
+        return Ok(());
+    }
+
+    // Ensure ~/.grok/hooks/ exists
+    if let Some(parent) = hook_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Best-effort: use the path of the currently running dcg binary.
+    // Falls back to "dcg" (relies on PATH) if we can't determine the exe.
+    let dcg_cmd = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "dcg".to_string());
+
+    let hook_json = serde_json::json!({
+        "description": "Destructive Command Guard for Grok (xAI) — blocks rm -rf, git reset --hard, force pushes, DROP DATABASE, kubectl delete, etc. via PreToolUse on Bash commands.",
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": dcg_cmd,
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+
+    let content = serde_json::to_string_pretty(&hook_json)?;
+    std::fs::write(&hook_path, content)?;
+
+    println!(
+        "{} Installed Grok native hook to {}",
+        "Success:".green(),
+        hook_path.display()
+    );
+    println!("  Grok will now invoke dcg before Bash / run_command tool calls.");
+    println!("  The Claude compatibility layer (~/.claude/settings.json) can still be used in parallel if desired.");
+
+    Ok(())
 }
 
 /// Create the default config file at the standard path.
