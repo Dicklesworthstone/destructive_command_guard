@@ -306,7 +306,7 @@ exposed via `Engine::protected_paths().contains(p)` for consumer use).
   effects field is purely additive — it changes how `Mode::Plan` /
   `Mode::AcceptEdits` interpret a rule, not whether the rule fires.
 
-`tests/backward_compat_v06.rs` enforces these invariants in CI.
+`tests/pack_schema_compat.rs` enforces these invariants in CI.
 
 ---
 

@@ -117,7 +117,7 @@ let decision = destructive_command_guard::evaluate_with_mode(
 - v0.5 verdicts (`Allow` / `Deny`) on destructive rules are unchanged;
   v0.6 only changes how `Mode::Plan` / `Mode::AcceptEdits` interpret
   unmatched and tier-A-tagged rules.
-- `tests/backward_compat_v06.rs` enforces these invariants in CI.
+- `tests/pack_schema_compat.rs` enforces these invariants in CI.
 
 ### Tests
 
