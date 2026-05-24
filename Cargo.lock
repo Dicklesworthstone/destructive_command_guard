@@ -1190,6 +1190,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcg-core"
+version = "0.6.0-rc.1"
+dependencies = [
+ "aho-corasick",
+ "chrono",
+ "dirs",
+ "fancy-regex 0.18.0",
+ "memchr",
+ "proptest",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "smallvec",
+]
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1274,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "destructive_command_guard"
-version = "0.5.3"
+version = "0.6.0-rc.1"
 dependencies = [
  "aho-corasick",
  "assert_cmd",
@@ -1289,6 +1306,7 @@ dependencies = [
  "console",
  "criterion",
  "ctrlc",
+ "dcg-core",
  "dirs",
  "fancy-regex 0.18.0",
  "flate2",

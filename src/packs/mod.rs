@@ -22,6 +22,7 @@ pub mod containers;
 pub mod core;
 pub mod database;
 pub mod dns;
+pub mod effects;
 pub mod email;
 pub mod external;
 pub mod featureflags;
@@ -281,6 +282,12 @@ pub struct DestructivePattern {
     /// Safer command alternatives to suggest when this pattern matches.
     /// Each suggestion includes the command, why it's safer, and which platforms it applies to.
     pub suggestions: &'static [PatternSuggestion],
+    /// Effect tags for v0.6 permission-modes evaluation.
+    ///
+    /// `None` means "use the parent pack's `default_effects`" (Tier-B).
+    /// `Some(&[…])` is an explicit Tier-A tag that overrides the pack default.
+    /// See `dcg-core::Effect` and `docs/permission-modes.md`.
+    pub effects: Option<&'static [dcg_core::Effect]>,
 }
 
 impl std::fmt::Debug for DestructivePattern {
@@ -320,6 +327,7 @@ macro_rules! safe_pattern {
 /// - `destructive_pattern!("name", "regex", "reason", Critical)` - named with explicit severity
 /// - `destructive_pattern!("name", "regex", "reason", Critical, "explanation")` - with explanation
 /// - `destructive_pattern!("name", "regex", "reason", Critical, "explanation", &[...])` - with suggestions
+/// - `destructive_pattern!(@effects "name", "regex", "reason", Critical, "explanation", &[...], &[Effect::Write, Effect::Irreversible])` - with Tier-A effect tags
 #[macro_export]
 macro_rules! destructive_pattern {
     // Unnamed pattern, default severity (High)
@@ -331,6 +339,7 @@ macro_rules! destructive_pattern {
             severity: $crate::packs::Severity::High,
             explanation: None,
             suggestions: &[],
+            effects: None,
         }
     };
     // Named pattern, default severity (High)
@@ -342,6 +351,7 @@ macro_rules! destructive_pattern {
             severity: $crate::packs::Severity::High,
             explanation: None,
             suggestions: &[],
+            effects: None,
         }
     };
     // Named pattern with explicit severity
@@ -353,6 +363,7 @@ macro_rules! destructive_pattern {
             severity: $crate::packs::Severity::$severity,
             explanation: None,
             suggestions: &[],
+            effects: None,
         }
     };
     // Named pattern with explicit severity and explanation
@@ -364,6 +375,7 @@ macro_rules! destructive_pattern {
             severity: $crate::packs::Severity::$severity,
             explanation: Some($explanation),
             suggestions: &[],
+            effects: None,
         }
     };
     // Named pattern with explicit severity, explanation, and suggestions
@@ -375,6 +387,20 @@ macro_rules! destructive_pattern {
             severity: $crate::packs::Severity::$severity,
             explanation: Some($explanation),
             suggestions: $suggestions,
+            effects: None,
+        }
+    };
+    // Tier-A: explicit effect tags. Use the @effects sentinel to disambiguate
+    // from existing arms while keeping suggestions slot.
+    (@effects $name:literal, $re:literal, $reason:literal, $severity:ident, $explanation:literal, $suggestions:expr, $effects:expr) => {
+        $crate::packs::DestructivePattern {
+            regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
+            reason: $reason,
+            name: Some($name),
+            severity: $crate::packs::Severity::$severity,
+            explanation: Some($explanation),
+            suggestions: $suggestions,
+            effects: Some($effects),
         }
     };
 }
@@ -415,7 +441,20 @@ pub struct Pack {
     /// True if `safe_regex_set` covers ALL safe patterns (no backtracking patterns exist).
     /// When true and the `RegexSet` misses, we can skip individual pattern checks.
     pub safe_regex_set_is_complete: bool,
+
+    /// Tier-B effect default for rules in this pack that don't carry their own
+    /// `effects` tag. Per the v0.6 plan, conservative default is
+    /// `[Effect::Write, Effect::Irreversible]`. Tagged packs (e.g. core.git
+    /// read-only) can override via [`Pack::new_with_effects`].
+    pub default_effects: &'static [dcg_core::Effect],
 }
+
+/// Conservative default effects for any pack that hasn't tagged itself.
+///
+/// Treating an unknown rule as `Write + Irreversible` means it cannot
+/// auto-allow under `Mode::Plan` and will prompt under `Mode::AcceptEdits`.
+pub const DEFAULT_PACK_EFFECTS: &[dcg_core::Effect] =
+    &[dcg_core::Effect::Write, dcg_core::Effect::Irreversible];
 
 impl Pack {
     /// Create a new pack with the given patterns.
@@ -423,6 +462,9 @@ impl Pack {
     /// This constructor initializes the lazy fields (`keyword_matcher`, `safe_regex_set`,
     /// `safe_regex_set_is_complete`) to their default values. These are populated
     /// during pack registration by `PackEntry::get_pack()`.
+    ///
+    /// `default_effects` is set to [`DEFAULT_PACK_EFFECTS`] (Tier-B fallback).
+    /// Use [`Pack::new_with_effects`] to override with pack-specific tags.
     #[must_use]
     pub const fn new(
         id: PackId,
@@ -431,6 +473,32 @@ impl Pack {
         keywords: &'static [&'static str],
         safe_patterns: Vec<SafePattern>,
         destructive_patterns: Vec<DestructivePattern>,
+    ) -> Self {
+        Self::new_with_effects(
+            id,
+            name,
+            description,
+            keywords,
+            safe_patterns,
+            destructive_patterns,
+            DEFAULT_PACK_EFFECTS,
+        )
+    }
+
+    /// Like [`Pack::new`] but with an explicit `default_effects` slice.
+    ///
+    /// Phase B Tier-A packs (core.git, core.fs, core.network) use this to
+    /// declare their natural effect surface; per-rule overrides via the
+    /// `effects` field still take precedence at evaluation time.
+    #[must_use]
+    pub const fn new_with_effects(
+        id: PackId,
+        name: &'static str,
+        description: &'static str,
+        keywords: &'static [&'static str],
+        safe_patterns: Vec<SafePattern>,
+        destructive_patterns: Vec<DestructivePattern>,
+        default_effects: &'static [dcg_core::Effect],
     ) -> Self {
         Self {
             id,
@@ -442,12 +510,27 @@ impl Pack {
             keyword_matcher: None,
             safe_regex_set: None,
             safe_regex_set_is_complete: false,
+            default_effects,
         }
     }
 
     /// Check if a command contains any of this pack's keywords.
     /// Returns false if the command doesn't contain any keywords (quick reject).
     ///
+    /// Resolve the effective effect set for a destructive pattern.
+    ///
+    /// Returns `pattern.effects` (Tier-A explicit) when present, otherwise
+    /// falls back to `self.default_effects` (Tier-B). This is the single
+    /// place callers should consult when feeding effects into
+    /// [`dcg_core::Mode::pre_check`].
+    #[must_use]
+    pub fn resolve_effects(
+        &self,
+        pattern: &DestructivePattern,
+    ) -> &'static [dcg_core::Effect] {
+        pattern.effects.unwrap_or(self.default_effects)
+    }
+
     /// Uses an Aho-Corasick automaton for O(n) matching when available (built
     /// by the registry during pack registration). Falls back to sequential
     /// memchr-based search if the automaton isn't built.
@@ -4380,6 +4463,7 @@ mod tests {
             keyword_matcher: None,
             safe_regex_set: None,
             safe_regex_set_is_complete: false,
+            default_effects: crate::packs::DEFAULT_PACK_EFFECTS,
         };
 
         let deadline = Deadline::new(Duration::ZERO);
@@ -4407,6 +4491,7 @@ mod tests {
             keyword_matcher: None,
             safe_regex_set: None,
             safe_regex_set_is_complete: false,
+            default_effects: crate::packs::DEFAULT_PACK_EFFECTS,
         };
 
         let deadline = Deadline::new(Duration::from_secs(10));
@@ -4431,6 +4516,7 @@ mod tests {
             keyword_matcher: None,
             safe_regex_set: None,
             safe_regex_set_is_complete: false,
+            default_effects: crate::packs::DEFAULT_PACK_EFFECTS,
         };
 
         let cmd = "rm --dry-run safe_target";

@@ -3,9 +3,23 @@
 //! This includes patterns for:
 //! - rm -rf outside temp directories (blocked)
 //! - rm -rf in /tmp, /var/tmp, $TMPDIR (allowed)
+//!
+//! # Effect tagging (v0.6)
+//!
+//! - Pack `default_effects` is `[Write, Fs]` — most fs ops touch the
+//!   filesystem and write data; not all are irreversible.
+//! - Tier-A explicit tags via [`crate::packs::effects::tier_a_filesystem`]
+//!   add `Irreversible` for the catastrophic `rm -rf` / `find -delete` /
+//!   `dd` / `shred` / `truncate` general / root-home variants.
 
+use dcg_core::Effect;
+
+use crate::packs::effects::{apply_tier_a_effects, tier_a_filesystem};
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, Platform, SafePattern, Severity};
 use crate::{destructive_pattern, safe_pattern};
+
+/// Baseline effects for filesystem ops in this pack.
+const FS_PACK_DEFAULT_EFFECTS: &[Effect] = &[Effect::Write, Effect::Fs];
 
 // ============================================================================
 // Suggestion constants (must be 'static for the pattern struct)
@@ -762,6 +776,7 @@ pub fn create_pack() -> Pack {
         keyword_matcher: None,
         safe_regex_set: None,
         safe_regex_set_is_complete: false,
+        default_effects: FS_PACK_DEFAULT_EFFECTS,
     }
 }
 
@@ -1176,7 +1191,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
     // - Medium: Warn by default
     // - Low: Log only
 
-    vec![
+    let mut patterns = vec![
         // ----- cross-segment sensitive propagation before rm fallbacks -----
         //
         // These patterns must run before the general rm rules below. Otherwise
@@ -1826,7 +1841,13 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Read redirects (`< <file>`) are not affected — they don't truncate.",
             REDIRECT_TRUNCATE_SUGGESTIONS
         ),
-    ]
+    ];
+
+    // Apply Tier-A explicit effect tags. Untagged rules keep their pack-level
+    // default (`FS_PACK_DEFAULT_EFFECTS`).
+    apply_tier_a_effects(&mut patterns, tier_a_filesystem);
+
+    patterns
 }
 
 #[cfg(test)]

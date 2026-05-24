@@ -197,6 +197,7 @@ pub fn create_pack() -> Pack {
         keyword_matcher: None,
         safe_regex_set: None,
         safe_regex_set_is_complete: false,
+        default_effects: crate::packs::DEFAULT_PACK_EFFECTS,
     }
 }
 

@@ -1,6 +1,11 @@
+[workspace]
+members = ["dcg-core"]
+# Existing destructive_command_guard package is the root package of this workspace.
+# dcg-core is a new sibling crate (v0.6) that provides the permission-modes library API.
+
 [package]
 name = "destructive_command_guard"
-version = "0.5.3"
+version = "0.6.0-rc.1"
 edition = "2024"
 resolver = "2"
 authors = [
@@ -29,6 +34,9 @@ name = "dcg"
 path = "src/main.rs"
 
 [dependencies]
+# Core library — provides Effect/Mode/ToolCall/Decision API for v0.6
+dcg-core = { path = "dcg-core", version = "0.6.0-rc.1" }
+
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"          # External pack YAML parsing

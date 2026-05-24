@@ -4695,6 +4695,7 @@ mod tests {
                 keyword_matcher: None,
                 safe_regex_set: None,
                 safe_regex_set_is_complete: false,
+                default_effects: crate::packs::DEFAULT_PACK_EFFECTS,
             };
 
             // Craft adversarial input: keyword match + repetitive whitespace tokens

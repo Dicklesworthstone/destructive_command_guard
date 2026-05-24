@@ -1,0 +1,62 @@
+[package]
+name = "dcg-core"
+version = "0.6.0-rc.1"
+edition = "2024"
+authors = [
+    "Jeffrey Emanuel <jeff@jeffreyemanuel.dev>",
+    "Dowwie <dowwie@gmail.com>",
+]
+description = "Core library for Destructive Command Guard: permission modes, effect-tagged rules, and tool-aware command evaluation"
+repository = "https://github.com/Dicklesworthstone/destructive_command_guard"
+homepage = "https://github.com/Dicklesworthstone/destructive_command_guard"
+license = "MIT"
+keywords = ["security", "permissions", "agent", "guard", "library"]
+categories = ["development-tools", "command-line-utilities"]
+readme = "README.md"
+rust-version = "1.85"
+
+[lib]
+name = "dcg_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Serialization (kept narrow — no YAML/TOML in core; consumers handle config formats)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Pattern engines
+fancy-regex = "0.18"
+regex = "1.10"
+
+# Fast string search
+memchr = "2.7"
+aho-corasick = "1.1"
+
+# Small utilities
+smallvec = "1.15.1"
+
+# Hashing for allow-once codes
+sha2 = "0.11"
+
+# Time handling for 24h expiry
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+
+# Path helpers (~/.ssh expansion)
+dirs = "6.0"
+
+[dev-dependencies]
+# Property-based testing for the Mode × ToolCall × Effect matrix
+proptest = "1.4"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allow same set as parent crate to keep style consistent
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"

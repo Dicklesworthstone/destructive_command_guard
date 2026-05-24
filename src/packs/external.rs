@@ -86,6 +86,14 @@ pub struct ExternalPack {
     /// Safe patterns that explicitly allow commands.
     #[serde(default)]
     pub safe_patterns: Vec<ExternalSafePattern>,
+
+    /// Optional pack-level default effect set (Tier-B).
+    /// When omitted, falls back to the in-code [`crate::packs::DEFAULT_PACK_EFFECTS`]
+    /// list, i.e. `[Write, Irreversible]`.
+    /// Schema-version-bumping fields are additive — packs without this
+    /// field continue to load against schema_version=1.
+    #[serde(default)]
+    pub default_effects: Option<Vec<ExternalEffect>>,
 }
 
 /// Default schema version for packs that don't specify one.
@@ -117,6 +125,12 @@ pub struct ExternalDestructivePattern {
     /// Safer command alternatives to suggest when this pattern matches.
     #[serde(default)]
     pub suggestions: Vec<ExternalSuggestion>,
+
+    /// Optional Tier-A effect tags. When omitted, falls back to the parent
+    /// pack's `default_effects`, then to [`crate::packs::DEFAULT_PACK_EFFECTS`].
+    /// See `dcg_core::Effect` for valid values.
+    #[serde(default)]
+    pub effects: Option<Vec<ExternalEffect>>,
 }
 
 /// A safer command suggestion from an external pack file.
@@ -154,6 +168,38 @@ impl From<ExternalPlatform> for super::Platform {
             ExternalPlatform::MacOS => Self::MacOS,
             ExternalPlatform::Windows => Self::Windows,
             ExternalPlatform::Bsd => Self::Bsd,
+        }
+    }
+}
+
+/// Effect tag in an external (YAML) pack file.
+///
+/// Mirrors [`dcg_core::Effect`] but is its own type so the YAML loader can
+/// remain decoupled from `dcg-core` serde details. Accepts both `snake_case`
+/// and `kebab-case` for `mutate_vcs`.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalEffect {
+    Read,
+    Write,
+    Network,
+    Spawn,
+    Irreversible,
+    #[serde(alias = "mutate-vcs")]
+    MutateVcs,
+    Fs,
+}
+
+impl From<ExternalEffect> for dcg_core::Effect {
+    fn from(e: ExternalEffect) -> Self {
+        match e {
+            ExternalEffect::Read => Self::Read,
+            ExternalEffect::Write => Self::Write,
+            ExternalEffect::Network => Self::Network,
+            ExternalEffect::Spawn => Self::Spawn,
+            ExternalEffect::Irreversible => Self::Irreversible,
+            ExternalEffect::MutateVcs => Self::MutateVcs,
+            ExternalEffect::Fs => Self::Fs,
         }
     }
 }
@@ -503,6 +549,17 @@ impl ExternalPack {
             .description
             .map_or("", |s| Box::leak(s.into_boxed_str()) as &'static str);
 
+        // Pack-level default effects (Tier-B fallback). When absent, use the
+        // built-in conservative default `[Write, Irreversible]`.
+        let pack_default_effects: &'static [dcg_core::Effect] = match self.default_effects {
+            None => super::DEFAULT_PACK_EFFECTS,
+            Some(v) => {
+                let core_effects: Vec<dcg_core::Effect> =
+                    v.into_iter().map(Into::into).collect();
+                Box::leak(core_effects.into_boxed_slice()) as &'static [dcg_core::Effect]
+            }
+        };
+
         // Convert keywords to static slice
         let keywords: &'static [&'static str] = if self.keywords.is_empty() {
             &[]
@@ -559,6 +616,13 @@ impl ExternalPack {
                     Box::leak(suggestion_vec.into_boxed_slice())
                 };
 
+                // Convert pattern-level effects (Tier-A) to a 'static slice.
+                let effects: Option<&'static [dcg_core::Effect]> = p.effects.map(|v| {
+                    let core_effects: Vec<dcg_core::Effect> =
+                        v.into_iter().map(Into::into).collect();
+                    Box::leak(core_effects.into_boxed_slice()) as &'static [dcg_core::Effect]
+                });
+
                 DestructivePattern {
                     regex: LazyCompiledRegex::new(Box::leak(p.pattern.into_boxed_str())),
                     reason,
@@ -566,17 +630,19 @@ impl ExternalPack {
                     severity: p.severity.into(),
                     explanation,
                     suggestions,
+                    effects, // None falls back to pack-level default_effects (Tier-B).
                 }
             })
             .collect();
 
-        Pack::new(
+        Pack::new_with_effects(
             self.id,
             name,
             description,
             keywords,
             safe_patterns,
             destructive_patterns,
+            pack_default_effects,
         )
     }
 }

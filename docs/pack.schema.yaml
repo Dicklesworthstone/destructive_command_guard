@@ -33,6 +33,14 @@ properties:
     items:
       type: string
     default: []
+  default_effects:
+    type: array
+    description: |
+      v0.6+ optional pack-level Tier-B fallback for rules that don't
+      carry their own `effects` field. When omitted, falls back to
+      the in-code `DEFAULT_PACK_EFFECTS` (`[write, irreversible]`).
+    items:
+      $ref: "#/definitions/effect"
   destructive_patterns:
     type: array
     description: Patterns that block or warn based on severity.
@@ -60,6 +68,13 @@ properties:
         explanation:
           type: string
           description: Longer explanation shown in verbose output.
+        effects:
+          type: array
+          description: |
+            v0.6+ optional Tier-A explicit effect tags that override
+            the parent pack's `default_effects` for this rule.
+          items:
+            $ref: "#/definitions/effect"
     default: []
   safe_patterns:
     type: array
@@ -81,3 +96,17 @@ properties:
           type: string
           description: Short reason for allowlisting.
     default: []
+definitions:
+  effect:
+    type: string
+    enum:
+      - read
+      - write
+      - network
+      - spawn
+      - irreversible
+      - mutate_vcs
+      - fs
+    description: |
+      A coarse-grained effect tag used by v0.6 permission modes to
+      classify what a rule does. See `docs/permission-modes.md`.

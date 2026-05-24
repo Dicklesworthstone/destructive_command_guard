@@ -4,9 +4,26 @@
 //! - Work destruction (reset --hard, checkout --, restore)
 //! - History rewriting (push --force, branch -D)
 //! - Stash destruction (stash drop, stash clear)
+//!
+//! # Effect tagging (v0.6)
+//!
+//! - Pack `default_effects` is `[MutateVcs, Write]` — the natural baseline
+//!   for unrecognised git ops in this pack.
+//! - Tier-A explicit tags are applied via [`crate::packs::effects::apply_tier_a_effects`]
+//!   for ~10 high-impact rules (force push, reset --hard, clean -f, …).
+
+use dcg_core::Effect;
 
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
+use crate::packs::effects::{apply_tier_a_effects, tier_a_git};
 use crate::{destructive_pattern, safe_pattern};
+
+/// Baseline effects for a "regular" git command in this pack.
+///
+/// Most git ops mutate VCS state and may write to the working tree, but are
+/// reversible (`commit`, `checkout <branch>`, `merge`, `branch <name>`).
+/// More-dangerous rules override this via Tier-A tags.
+const GIT_PACK_DEFAULT_EFFECTS: &[Effect] = &[Effect::MutateVcs, Effect::Write];
 
 /// Create the core git pack.
 #[must_use]
@@ -22,6 +39,7 @@ pub fn create_pack() -> Pack {
         keyword_matcher: None,
         safe_regex_set: None,
         safe_regex_set_is_complete: false,
+        default_effects: GIT_PACK_DEFAULT_EFFECTS,
     }
 }
 
@@ -65,7 +83,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
     // - Medium: Warn by default
     // - Low: Log only
 
-    vec![
+    let mut patterns = vec![
         // checkout -- discards uncommitted changes
         destructive_pattern!(
             "checkout-discard",
@@ -499,7 +517,13 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 ]
             }
         ),
-    ]
+    ];
+
+    // Apply Tier-A effect tags for high-impact rules. Untagged rules inherit
+    // the pack's GIT_PACK_DEFAULT_EFFECTS at evaluation time.
+    apply_tier_a_effects(&mut patterns, tier_a_git);
+
+    patterns
 }
 
 #[cfg(test)]

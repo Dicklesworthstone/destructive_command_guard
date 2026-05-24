@@ -83,6 +83,7 @@ pub mod output;
 pub mod packs;
 pub mod pending_exceptions;
 pub mod perf;
+pub mod permission_modes;
 pub mod rebase_recovery;
 pub mod sarif;
 pub mod scan;
@@ -99,6 +100,13 @@ pub use allowlist::{
     AllowEntry, AllowSelector, AllowlistError, AllowlistFile, AllowlistLayer, LayeredAllowlist,
     LoadedAllowlistLayer, RuleId, load_default_allowlists,
 };
+
+// v0.6: re-export dcg-core types so consumers can `use destructive_command_guard::Engine` etc.
+pub use dcg_core::{
+    Decision, Effect, Engine, EngineConfig, EngineConfigBuilder, Mode, ModePreCheck,
+    ProtectedPaths, Session as PermissionSession, ToolCall,
+};
+pub use permission_modes::{evaluate_with_mode, evaluate_with_mode_and_packs};
 pub use config::Config;
 pub use error_codes::{DcgError, ErrorCategory, ErrorCode, ErrorResponse};
 pub use evaluator::{
