@@ -7,7 +7,7 @@
 
 #![no_main]
 
-use destructive_command_guard::heredoc::{
+use dcg_cli::heredoc::{
     ExtractionLimits, ExtractionResult, TriggerResult, check_triggers, extract_content,
 };
 use libfuzzer_sys::fuzz_target;

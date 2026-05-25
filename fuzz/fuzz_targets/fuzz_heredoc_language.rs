@@ -6,7 +6,7 @@
 
 #![no_main]
 
-use destructive_command_guard::heredoc::ScriptLanguage;
+use dcg_cli::heredoc::ScriptLanguage;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

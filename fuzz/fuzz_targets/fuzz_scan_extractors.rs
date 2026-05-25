@@ -8,7 +8,7 @@
 
 #![no_main]
 
-use destructive_command_guard::scan::{
+use dcg_cli::scan::{
     extract_docker_compose_from_str, extract_dockerfile_from_str,
     extract_github_actions_workflow_from_str, extract_gitlab_ci_from_str,
     extract_makefile_from_str, extract_package_json_from_str, extract_shell_script_from_str,

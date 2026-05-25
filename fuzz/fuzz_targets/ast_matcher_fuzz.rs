@@ -6,7 +6,7 @@
 
 #![no_main]
 
-use destructive_command_guard::{AstMatcher, MatchError, ScriptLanguage};
+use dcg_cli::{AstMatcher, MatchError, ScriptLanguage};
 use libfuzzer_sys::fuzz_target;
 use std::sync::LazyLock;
 use std::time::Duration;

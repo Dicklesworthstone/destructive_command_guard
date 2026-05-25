@@ -7,7 +7,7 @@
 
 #![no_main]
 
-use destructive_command_guard::heredoc::extract_shell_commands;
+use dcg_cli::heredoc::extract_shell_commands;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

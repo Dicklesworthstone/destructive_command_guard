@@ -6,7 +6,7 @@
 
 #![no_main]
 
-use destructive_command_guard::heredoc::{TriggerResult, check_triggers, matched_triggers};
+use dcg_cli::heredoc::{TriggerResult, check_triggers, matched_triggers};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

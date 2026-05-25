@@ -9,10 +9,10 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use destructive_command_guard::LayeredAllowlist;
-use destructive_command_guard::config::CompiledOverrides;
-use destructive_command_guard::config::Config;
-use destructive_command_guard::evaluator::evaluate_command;
+use dcg_cli::LayeredAllowlist;
+use dcg_cli::config::CompiledOverrides;
+use dcg_cli::config::Config;
+use dcg_cli::evaluator::evaluate_command;
 use std::sync::LazyLock;
 
 static EMPTY_ALLOWLISTS: LazyLock<LayeredAllowlist> = LazyLock::new(LayeredAllowlist::default);

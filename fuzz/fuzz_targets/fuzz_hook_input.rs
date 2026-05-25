@@ -10,7 +10,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use destructive_command_guard::hook::HookInput;
+use dcg_cli::hook::HookInput;
 
 fuzz_target!(|data: &[u8]| {
     // Skip extremely large inputs to avoid timeout (not a real bug)

@@ -10,7 +10,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use destructive_command_guard::packs::normalize_command;
+use dcg_cli::packs::normalize_command;
 
 fuzz_target!(|data: &[u8]| {
     // Try to interpret as UTF-8

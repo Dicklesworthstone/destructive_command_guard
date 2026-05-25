@@ -7,9 +7,9 @@
 
 #![no_main]
 
-use destructive_command_guard::config::{CompiledOverrides, Config};
-use destructive_command_guard::perf::Deadline;
-use destructive_command_guard::{
+use dcg_cli::config::{CompiledOverrides, Config};
+use dcg_cli::perf::Deadline;
+use dcg_cli::{
     AstMatcher, ExtractionLimits, ExtractionResult, LayeredAllowlist, ScriptLanguage,
     TriggerResult, check_triggers, evaluate_command_with_deadline, extract_content,
     extract_shell_commands, matched_triggers,
@@ -160,7 +160,7 @@ fn exercise_heredoc_pipeline(command: &str) {
 
 fn validate_extracted(
     command: &str,
-    contents: &[destructive_command_guard::ExtractedContent],
+    contents: &[dcg_cli::ExtractedContent],
     limits: &ExtractionLimits,
 ) {
     assert!(contents.len() <= limits.max_heredocs);

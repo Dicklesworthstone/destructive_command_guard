@@ -142,11 +142,39 @@ let decision = destructive_command_guard::evaluate_with_mode(
 
 - `Mode::Auto` LLM classifier — variant reserved, currently routes as
   `Default` (Phase C).
-- Full workspace migration: `dcg-core` is a sibling crate to the
-  existing `destructive_command_guard` crate. Moving the rest of the
-  codebase (evaluator, packs, scan, history) into `dcg-core` is
-  Phase 2 follow-up work; not required for jcode/Codex/Hermes/Grok
-  integration.
+- Full migration of evaluator/packs/scan **into `dcg-core`** — the
+  workspace is now split into `dcg-core` (lightweight library) and
+  `dcg-cli` (the existing binary + heavy deps). Moving the evaluator
+  and pack registry from `dcg-cli` into `dcg-core` is Phase 2 follow-up
+  work; not required for jcode/Codex/Hermes/Grok integration since
+  they only need the `dcg-core` API surface.
+
+### Workspace layout
+
+```
+destructive_command_guard/      ← repo root (workspace)
+├── Cargo.toml                  ← [workspace] members + shared profiles
+├── dcg-core/                   ← v0.6 library, minimal deps
+│   └── …
+├── dcg-cli/                    ← legacy library + `dcg` binary, heavy deps
+│   ├── src/
+│   ├── tests/
+│   ├── benches/
+│   └── build.rs
+├── docs/                       ← workspace docs
+├── fuzz/                       ← targets dcg-cli
+└── …
+```
+
+Consumers depending on the binary: no change. The `dcg` binary still
+ships from `dcg-cli` and behaves identically (with the new
+`--mode <NAME>` flag opt-in).
+
+Consumers using the library:
+- Lightweight: `dcg-core = "0.6"` (minimal deps).
+- Heavy:       `dcg-cli  = "0.6"` (re-exports `dcg_core::*`,
+                                    plus pack registry, scan engine,
+                                    history, MCP server, …).
 
 ---
 

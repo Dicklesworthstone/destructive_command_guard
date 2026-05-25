@@ -1,0 +1,260 @@
+// Forbid unsafe code in production, but allow in tests for env var manipulation
+#![cfg_attr(not(test), forbid(unsafe_code))]
+//! Destructive Command Guard (dcg) library.
+//!
+//! This library provides the core functionality for blocking destructive commands
+//! in AI coding agent workflows. It supports modular "packs" of patterns for
+//! different use cases (databases, containers, Kubernetes, cloud providers, etc.).
+//!
+//! # Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                        Configuration                             │
+//! │  (env vars → project config → user config → system → defaults)  │
+//! └─────────────────────────────────────────────────────────────────┘
+//!                                  │
+//!                                  ▼
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                         Evaluator                                │
+//! │  (unified entry point for hook mode and CLI)                    │
+//! └─────────────────────────────────────────────────────────────────┘
+//!                                  │
+//!                                  ▼
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                         Pack Registry                            │
+//! │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐           │
+//! │  │   Core   │ │ Database │ │  K8s     │ │  Cloud   │  ...      │
+//! │  └──────────┘ └──────────┘ └──────────┘ └──────────┘           │
+//! └─────────────────────────────────────────────────────────────────┘
+//!                                  │
+//!                                  ▼
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                      Pattern Matching                            │
+//! │  Quick Reject (memchr) → Safe Patterns → Destructive Patterns   │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! # Usage
+//!
+//! The main entry point for command evaluation is the [`evaluator`] module:
+//!
+//! ```ignore
+//! use dcg_cli::config::Config;
+//! use dcg_cli::evaluator::{evaluate_command, EvaluationDecision};
+//!
+//! let config = Config::load();
+//! let compiled_overrides = config.overrides.compile();
+//! let enabled_keywords = vec!["git", "rm"];
+//! let allowlists = dcg_cli::load_default_allowlists();
+//! let result = evaluate_command(
+//!     "git status",
+//!     &config,
+//!     &enabled_keywords,
+//!     &compiled_overrides,
+//!     &allowlists,
+//! );
+//!
+//! if result.is_denied() {
+//!     println!("Blocked: {}", result.reason().unwrap_or("unknown"));
+//! }
+//! ```
+
+pub mod agent;
+pub mod allowlist;
+pub mod ast_matcher;
+pub mod cli;
+pub mod confidence;
+pub mod config;
+pub mod context;
+pub mod error_codes;
+pub mod evaluator;
+pub mod exit_codes;
+pub mod git;
+pub mod heredoc;
+pub mod highlight;
+pub mod history;
+pub mod hook;
+pub mod interactive;
+pub mod logging;
+pub mod mcp;
+pub mod normalize;
+pub mod output;
+pub mod packs;
+pub mod pending_exceptions;
+pub mod perf;
+pub mod permission_modes;
+pub mod rebase_recovery;
+pub mod sarif;
+pub mod scan;
+pub mod session;
+pub mod simulate;
+pub mod stats;
+pub mod suggest;
+pub mod suggestions;
+pub mod trace;
+pub mod update;
+
+// Re-export commonly used types
+pub use allowlist::{
+    AllowEntry, AllowSelector, AllowlistError, AllowlistFile, AllowlistLayer, LayeredAllowlist,
+    LoadedAllowlistLayer, RuleId, load_default_allowlists,
+};
+
+// v0.6: re-export dcg-core types so consumers can `use dcg_cli::Engine` etc.
+pub use dcg_core::{
+    Decision, Effect, Engine, EngineConfig, EngineConfigBuilder, Mode, ModePreCheck,
+    ProtectedPaths, Session as PermissionSession, ToolCall,
+};
+pub use permission_modes::{evaluate_with_mode, evaluate_with_mode_and_packs};
+pub use config::Config;
+pub use error_codes::{DcgError, ErrorCategory, ErrorCode, ErrorResponse};
+pub use evaluator::{
+    BypassMethod, ConfidenceResult, DetailedEvaluationResult, EvaluationDecision, EvaluationResult,
+    GraduatedResponse, LegacyDestructivePattern, LegacySafePattern, MatchSource, MatchSpan,
+    PatternMatch, apply_confidence_scoring, determine_graduated_response, evaluate_command,
+    evaluate_command_with_deadline, evaluate_command_with_pack_order,
+    evaluate_command_with_pack_order_at_path, evaluate_command_with_pack_order_deadline,
+    evaluate_command_with_pack_order_deadline_at_path, evaluate_detailed,
+    evaluate_detailed_with_allowlists,
+};
+pub use exit_codes::{
+    EXIT_CONFIG_ERROR, EXIT_DENIED, EXIT_IO_ERROR, EXIT_PARSE_ERROR, EXIT_SUCCESS, EXIT_WARNING,
+    ToExitCode, exit_with, to_exit_code,
+};
+pub use hook::{HookInput, HookOutput, HookResult, HookSpecificOutput};
+pub use packs::external::{ExternalPack, parse_pack_file, parse_pack_string};
+pub use packs::{Pack, PackId, PackRegistry, PatternSuggestion, Platform};
+pub use pending_exceptions::{
+    AllowOnceEntry, AllowOnceScopeKind, AllowOnceStore, PendingExceptionRecord,
+    PendingExceptionStore,
+};
+
+// Re-export dual regex engine abstraction (from regex safety audit)
+pub use packs::regex_engine::{BACKTRACK_LIMIT, CompiledRegex, needs_backtracking_engine};
+
+// Re-export context types
+pub use context::{
+    CommandSpans, ContextClassifier, SAFE_STRING_REGISTRY, SafeFlagEntry, SafeStringRegistry, Span,
+    SpanKind, classify_command, is_argument_data, sanitize_for_pattern_matching,
+};
+
+// Re-export heredoc detection types
+pub use heredoc::{
+    ExtractedContent, ExtractedShellCommand, ExtractionLimits, ExtractionResult, HeredocType,
+    ScriptLanguage, TriggerResult, check_triggers, extract_content, extract_shell_commands,
+    matched_triggers,
+};
+
+// Re-export AST matcher types
+pub use ast_matcher::{
+    AstMatcher, CompiledPattern, DEFAULT_MATCHER, MatchError, PatternMatch as AstPatternMatch,
+    Severity,
+};
+
+// Re-export trace types for explain mode
+pub use trace::{
+    AllowlistInfo, EXPLAIN_JSON_SCHEMA_VERSION, ExplainJsonOutput, ExplainTrace, JsonAllowlistInfo,
+    JsonMatchInfo, JsonPackSummary, JsonSpan, JsonSuggestion, JsonTraceDetails, JsonTraceStep,
+    MatchInfo, PackSummary, TraceCollector, TraceDetails, TraceStep, format_duration,
+    truncate_utf8,
+};
+
+// Re-export highlight types for terminal span highlighting
+pub use highlight::{
+    HighlightSpan, HighlightedCommand, configure_colors as configure_highlight_colors,
+    format_highlighted_command, format_highlighted_command_auto, format_highlighted_command_multi,
+    should_use_color,
+};
+
+// Re-export suggestion types
+pub use suggest::{
+    AllowlistSuggestion, CommandCluster, CommandEntryInfo, ConfidenceTier, GeneratedPattern,
+    PathPattern, RiskLevel, SuggestionReason, analyze_path_patterns, assess_risk_level,
+    calculate_confidence_tier, calculate_suggestion_score, cluster_denied_commands,
+    determine_primary_reason, filter_by_confidence, filter_by_risk, generate_enhanced_suggestions,
+    generate_pattern_from_cluster,
+};
+pub use suggestions::{Suggestion, SuggestionKind, get_suggestion_by_kind, get_suggestions};
+
+// Re-export scan types for `dcg scan`
+pub use scan::{
+    ExtractedCommand, ScanDecision, ScanEvalContext, ScanFailOn, ScanFinding, ScanFormat,
+    ScanOptions, ScanReport, ScanSeverity, ScanSummary, extract_docker_compose_from_str,
+    extract_dockerfile_from_str, extract_github_actions_workflow_from_str,
+    extract_gitlab_ci_from_str, extract_makefile_from_str, extract_package_json_from_str,
+    extract_shell_script_from_str, extract_terraform_from_str, scan_paths, should_fail,
+    sort_findings,
+};
+
+// Re-export simulate types for `dcg simulate`
+pub use simulate::{
+    LimitHit, ParseError, ParseStats, ParsedCommand, ParsedLine, SIMULATE_SCHEMA_VERSION,
+    SimulateInputFormat, SimulateLimits, SimulateParser,
+};
+
+// Re-export stats types for `dcg stats`
+pub use stats::{
+    AggregatedStats, DEFAULT_PERIOD_SECS, Decision as StatsDecision, PackStats, ParsedLogEntry,
+    format_stats_json, format_stats_pretty, parse_log_file,
+};
+
+// Re-export performance budget types
+pub use perf::{
+    ABSOLUTE_MAX, Budget, BudgetStatus, Deadline, FAIL_OPEN_THRESHOLD_MS, FAST_PATH,
+    FAST_PATH_BUDGET_US, FULL_HEREDOC_PIPELINE, HEREDOC_EXTRACT, HEREDOC_TRIGGER,
+    HOOK_EVALUATION_BUDGET, HOOK_EVALUATION_BUDGET_MS, LANGUAGE_DETECT, PATTERN_MATCH,
+    QUICK_REJECT, SLOW_PATH_BUDGET_MS, should_fail_open,
+};
+
+// Re-export normalize types for wrapper stripping
+pub use normalize::{NormalizedCommand, StrippedWrapper, strip_wrapper_prefixes};
+
+// Re-export confidence types for pattern match confidence scoring
+pub use confidence::{
+    ConfidenceContext, ConfidenceScore, ConfidenceSignal, DEFAULT_WARN_THRESHOLD,
+    compute_match_confidence, should_downgrade_to_warn,
+};
+
+// Re-export history types for command tracking
+pub use history::{
+    AgentStat, BackupResult, CURRENT_SCHEMA_VERSION, CheckResult, CommandEntry,
+    DEFAULT_DB_FILENAME, ENV_HISTORY_DB_PATH, ENV_HISTORY_DISABLED, HistoryDb, HistoryError,
+    HistoryStats, HistoryWriter, Outcome as HistoryOutcome, OutcomeStats, PatternStat,
+    PerformanceStats, ProjectStat, StatsTrends,
+};
+
+// Re-export interactive prompt types for human verification
+pub use interactive::{
+    AllowlistScope, InteractiveConfig, InteractiveResult, NotAvailableReason,
+    check_interactive_available, generate_verification_code, run_interactive_prompt,
+};
+
+// Re-export git branch detection types
+pub use git::{
+    BranchInfo, clear_cache as clear_git_cache, get_branch_info, get_branch_info_at_path,
+    get_current_branch, is_in_git_repo, is_in_git_repo_at_path,
+};
+
+// Re-export agent detection types
+pub use agent::{
+    Agent, DetectionMethod, DetectionResult, clear_cache as clear_agent_cache, detect_agent,
+    detect_agent_with_details, from_explicit as agent_from_explicit,
+};
+
+// Re-export output types for TUI/CLI visual formatting
+pub use output::{
+    BorderStyle, DenialBox, EscalationContext, Severity as OutputSeverity, SeverityColors, Theme,
+    ThemePalette, auto_theme, auto_theme_with_config, format_escalation_message,
+    init as init_output, should_use_rich_output, supports_256_colors, terminal_height,
+    terminal_width,
+};
+
+// Re-export update types for self-update version check
+pub use update::{
+    CACHE_DURATION, VersionCheckError, VersionCheckResult, check_for_update, clear_cache,
+    current_version, format_check_result, format_check_result_json,
+};
+
+// Re-export session occurrence tracking types for graduated response system
+pub use session::{OccurrenceSnapshot, hash_command as session_hash_command};
