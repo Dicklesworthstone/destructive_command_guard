@@ -429,10 +429,10 @@ mod tests {
 
     #[test]
     fn budget_documentation_matches_source_of_truth() {
-        let readme = include_str!("../../README.md");
-        let agents = include_str!("../../AGENTS.md");
-        let ci = include_str!("../../.github/workflows/ci.yml");
-        let bench = include_str!("../../.github/workflows/bench.yml");
+        let readme = include_str!("../../../README.md");
+        let agents = include_str!("../../../AGENTS.md");
+        let ci = include_str!("../../../.github/workflows/ci.yml");
+        let bench = include_str!("../../../.github/workflows/bench.yml");
 
         for row in [
             budget_row(0, "Quick reject", QUICK_REJECT),

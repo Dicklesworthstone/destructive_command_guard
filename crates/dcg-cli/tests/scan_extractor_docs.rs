@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 fn read_repo_file(path: &str) -> std::io::Result<String> {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("manifest dir has parent");
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("manifest dir has parent").parent().expect("crates dir has parent");
     std::fs::read_to_string(repo_root.join(path))
 }
 

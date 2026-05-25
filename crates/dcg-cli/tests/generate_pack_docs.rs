@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use std::fs;
 
 fn repo_root() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("manifest dir has parent").to_path_buf()
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("manifest dir has parent").parent().expect("crates dir has parent").to_path_buf()
 }
 
 /// Get the category from a pack ID (e.g., "core.git" -> "core").

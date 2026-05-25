@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 fn read_repo_file(path: &str) -> std::io::Result<String> {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("manifest dir has parent");
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("manifest dir has parent").parent().expect("crates dir has parent");
     let full_path = repo_root.join(path);
     std::fs::read_to_string(&full_path)
 }

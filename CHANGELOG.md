@@ -154,13 +154,14 @@ let decision = destructive_command_guard::evaluate_with_mode(
 ```
 destructive_command_guard/      ← repo root (workspace)
 ├── Cargo.toml                  ← [workspace] members + shared profiles
-├── dcg-core/                   ← v0.6 library, minimal deps
-│   └── …
-├── dcg-cli/                    ← legacy library + `dcg` binary, heavy deps
-│   ├── src/
-│   ├── tests/
-│   ├── benches/
-│   └── build.rs
+├── crates/
+│   ├── dcg-core/               ← v0.6 library, minimal deps
+│   │   └── …
+│   └── dcg-cli/                ← legacy library + `dcg` binary, heavy deps
+│       ├── src/
+│       ├── tests/
+│       ├── benches/
+│       └── build.rs
 ├── docs/                       ← workspace docs
 ├── fuzz/                       ← targets dcg-cli
 └── …
