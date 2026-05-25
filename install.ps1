@@ -75,6 +75,12 @@ function Get-ObjectPropertyValue {
   if ($null -eq $Object) { return $null }
   $prop = $Object.PSObject.Properties[$Name]
   if ($null -eq $prop) { return $null }
+  # PowerShell unwraps single-element arrays when they leave a function via the
+  # output stream, which silently turns a one-entry JSON array into a scalar
+  # PSCustomObject. Callers downstream then fail Test-JsonArray and throw
+  # "PreToolUse must contain a list" on a perfectly valid hooks.json with a
+  # single PreToolUse entry. Preserve array-ness with the unary comma operator.
+  if ($prop.Value -is [array]) { return ,$prop.Value }
   $prop.Value
 }
 

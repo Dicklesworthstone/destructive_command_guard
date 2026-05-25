@@ -676,8 +676,74 @@ EOFSNIPPET
   fi
 }
 
+# caller_user — the human who actually invoked the installer.
+#
+# Under `sudo`, the EUID is root and $SHELL/$HOME/$USER have been env_reset'd
+# to root's values, which is the wrong identity for "whose shell completions
+# are we installing." If $SUDO_USER is set and isn't itself root, that is the
+# real caller. Otherwise fall back to $USER or the OS-reported login name.
+caller_user() {
+  if [ "${EUID:-$(id -u)}" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    printf '%s\n' "$SUDO_USER"
+    return 0
+  fi
+  if [ -n "${USER:-}" ]; then
+    printf '%s\n' "$USER"
+    return 0
+  fi
+  id -un 2>/dev/null
+}
+
+# caller_home / caller_login_shell — resolve the caller's home directory and
+# login shell from the OS user database, so they're stable under sudo where
+# $HOME and $SHELL have been rewritten. Uses dscl on macOS (where /etc/passwd
+# is not authoritative for user records) and getent on every other Unix.
+caller_home() {
+  local user
+  user=$(caller_user) || return 1
+  [ -z "$user" ] && return 1
+  case "$(uname -s)" in
+    Darwin)
+      dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null \
+        | awk '/^NFSHomeDirectory:/ {print $2}'
+      ;;
+    *)
+      getent passwd "$user" 2>/dev/null | cut -d: -f6
+      ;;
+  esac
+}
+
+caller_login_shell() {
+  local user
+  user=$(caller_user) || return 1
+  [ -z "$user" ] && return 1
+  case "$(uname -s)" in
+    Darwin)
+      dscl . -read "/Users/$user" UserShell 2>/dev/null \
+        | awk '/^UserShell:/ {print $2}'
+      ;;
+    *)
+      getent passwd "$user" 2>/dev/null | cut -d: -f7
+      ;;
+  esac
+}
+
+# detect_default_shell — pick which completion flavor to install.
+#
+# $SHELL is the obvious source, but `sudo` defaults to env_reset (since
+# sudo 1.7.4), which rewrites $SHELL to the *target user's* login shell
+# (root's). On Linux that's typically /bin/bash and produces a silent
+# misplace into /root/.local/share/bash-completion. On macOS root's shell
+# is /bin/sh and we'd print "skipped (unknown shell)" instead.
+#
+# When EUID==0 and $SUDO_USER is the actual caller, look up that user's
+# login shell from the OS user database before falling back to $SHELL.
 detect_default_shell() {
-  local shell="${SHELL:-}"
+  local shell=""
+  if [ "${EUID:-$(id -u)}" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    shell=$(caller_login_shell || true)
+  fi
+  [ -z "$shell" ] && shell="${SHELL:-}"
   [ -z "$shell" ] && return 1
   shell=$(basename "$shell")
   case "$shell" in
@@ -700,16 +766,37 @@ install_completions_for_shell() {
     return 0
   fi
 
+  # Resolve the *caller's* XDG paths, not root's. Under sudo $HOME points at
+  # /root and $XDG_DATA_HOME/$XDG_CONFIG_HOME (if exported by the user's shell)
+  # were stripped by env_reset, so we'd silently install into /root's home —
+  # invisible to the user who actually ran the installer.
+  local home xdg_data xdg_config running_sudo=0
+  if [ "${EUID:-$(id -u)}" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    running_sudo=1
+    home=$(caller_home || true)
+    if [ -z "$home" ]; then
+      warn "Could not resolve home directory for caller $SUDO_USER; falling back to \$HOME"
+      home="$HOME"
+    fi
+    # Force defaults from caller's home; ignore root-shell-leaked XDG_*.
+    xdg_data="$home/.local/share"
+    xdg_config="$home/.config"
+  else
+    home="$HOME"
+    xdg_data="${XDG_DATA_HOME:-$home/.local/share}"
+    xdg_config="${XDG_CONFIG_HOME:-$home/.config}"
+  fi
+
   local target=""
   case "$shell" in
     bash)
-      target="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/dcg"
+      target="$xdg_data/bash-completion/completions/dcg"
       ;;
     zsh)
-      target="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions/_dcg"
+      target="$xdg_data/zsh/site-functions/_dcg"
       ;;
     fish)
-      target="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions/dcg.fish"
+      target="$xdg_config/fish/completions/dcg.fish"
       ;;
     *)
       return 1
@@ -726,6 +813,28 @@ install_completions_for_shell() {
   local error_output
   if error_output=$("$bin" completions "$shell" 2>&1) && [ -n "$error_output" ]; then
     printf '%s\n' "$error_output" > "$target"
+
+    # When the installer is running as root under sudo, the directory tree we
+    # just (potentially) created and the completion file itself are owned by
+    # root. The caller's shell loads completions as the caller, not as root —
+    # ownership matters for any tooling that later re-writes these paths
+    # (next dcg upgrade, package manager hooks). Hand the path back to them.
+    if [ "$running_sudo" -eq 1 ]; then
+      local caller_group
+      caller_group=$(id -gn "$SUDO_USER" 2>/dev/null || printf '%s' "$SUDO_USER")
+      chown "$SUDO_USER:$caller_group" "$target" 2>/dev/null || true
+      # Walk up from the target's directory to (but not past) the caller's
+      # $HOME, chowning anything we just created. Don't recurse into
+      # pre-existing trees — that could clobber legitimate ownership of
+      # files we didn't write.
+      local dir
+      dir=$(dirname "$target")
+      while [ "$dir" != "$home" ] && [ "$dir" != "/" ] && [ -n "$dir" ]; do
+        chown "$SUDO_USER:$caller_group" "$dir" 2>/dev/null || true
+        dir=$(dirname "$dir")
+      done
+    fi
+
     ok "Installed $shell completions to $target"
     return 0
   fi
@@ -737,7 +846,14 @@ install_completions_for_shell() {
 maybe_install_completions() {
   local shell=""
   if ! shell=$(detect_default_shell); then
-    info "Shell completions: skipped (unknown shell)"
+    # Distinguish the "running as root with no caller to attribute" case
+    # (e.g. logged in directly as root, no sudo) from "user has an exotic
+    # shell we don't generate completions for" — the remediation differs.
+    if [ "${EUID:-$(id -u)}" -eq 0 ] && [ -z "${SUDO_USER:-}" ]; then
+      info "Shell completions: skipped (no caller user detected; install as a regular user or via sudo)"
+    else
+      info "Shell completions: skipped (unsupported login shell; bash/zsh/fish only)"
+    fi
     return 0
   fi
 

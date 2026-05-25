@@ -74,6 +74,13 @@ function Get-ObjectPropertyValue {
   if ($null -eq $Object) { return $null }
   $prop = $Object.PSObject.Properties[$Name]
   if ($null -eq $prop) { return $null }
+  # PowerShell unwraps single-element arrays when they leave a function via the
+  # output stream, which silently turns a one-entry JSON array into a scalar
+  # PSCustomObject. Callers downstream then fail Test-JsonArray, and the
+  # uninstaller bails out without stripping the dcg hook from a hooks.json
+  # that has only one Bash matcher / one inner hook. Preserve array-ness with
+  # the unary comma operator.
+  if ($prop.Value -is [array]) { return ,$prop.Value }
   $prop.Value
 }
 
@@ -190,7 +197,15 @@ function Remove-DcgHooksFromJsonFile {
   if ((Test-EmptyObject $config) -and $DeleteEmptyFile) {
     Remove-Item -Force -Path $Path
   } else {
-    $config | ConvertTo-Json -Depth 20 | Set-Content -Path $Path -Encoding UTF8
+    # Write UTF-8 without BOM: Codex's JSON parser rejects the BOM byte sequence
+    # at offset 0 ("expected value at line 1 column 1"), and `Set-Content -Encoding UTF8`
+    # on Windows PowerShell 5.1 writes a BOM. Use the .NET API directly because
+    # `-Encoding UTF8NoBOM` is PowerShell 6+ only. Mirrors the install.ps1 fix. (#125)
+    [System.IO.File]::WriteAllText(
+      $Path,
+      ($config | ConvertTo-Json -Depth 20),
+      (New-Object System.Text.UTF8Encoding $false)
+    )
   }
 
   $true
