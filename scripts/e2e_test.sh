@@ -670,7 +670,7 @@ test_command_with_policy() {
 # CI feature tests (git_safety_guard-cuo)
 test_memory_tests_exist() {
     local desc="Memory tests exist"
-    local test_file="$REPO_ROOT/tests/memory_tests.rs"
+    local test_file="$REPO_ROOT/crates/dcg-cli/tests/memory_tests.rs"
 
     log_test_start "$desc"
 

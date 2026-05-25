@@ -299,6 +299,7 @@ impl std::fmt::Debug for DestructivePattern {
             .field("severity", &self.severity)
             .field("explanation", &self.explanation)
             .field("suggestions", &self.suggestions)
+            .field("effects", &self.effects)
             .finish()
     }
 }
@@ -524,10 +525,7 @@ impl Pack {
     /// place callers should consult when feeding effects into
     /// [`dcg_core::Mode::pre_check`].
     #[must_use]
-    pub fn resolve_effects(
-        &self,
-        pattern: &DestructivePattern,
-    ) -> &'static [dcg_core::Effect] {
+    pub fn resolve_effects(&self, pattern: &DestructivePattern) -> &'static [dcg_core::Effect] {
         pattern.effects.unwrap_or(self.default_effects)
     }
 

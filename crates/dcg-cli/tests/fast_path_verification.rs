@@ -20,6 +20,7 @@ mod tests {
             keyword_matcher: None,
             safe_regex_set: None,
             safe_regex_set_is_complete: false,
+            default_effects: dcg_cli::packs::DEFAULT_PACK_EFFECTS,
         }
     }
 

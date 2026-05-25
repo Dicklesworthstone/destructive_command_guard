@@ -102,12 +102,11 @@ pub use allowlist::{
 };
 
 // v0.6: re-export dcg-core types so consumers can `use dcg_cli::Engine` etc.
+pub use config::Config;
 pub use dcg_core::{
     Decision, Effect, Engine, EngineConfig, EngineConfigBuilder, Mode, ModePreCheck,
     ProtectedPaths, Session as PermissionSession, ToolCall,
 };
-pub use permission_modes::{evaluate_with_mode, evaluate_with_mode_and_packs};
-pub use config::Config;
 pub use error_codes::{DcgError, ErrorCategory, ErrorCode, ErrorResponse};
 pub use evaluator::{
     BypassMethod, ConfidenceResult, DetailedEvaluationResult, EvaluationDecision, EvaluationResult,
@@ -129,6 +128,7 @@ pub use pending_exceptions::{
     AllowOnceEntry, AllowOnceScopeKind, AllowOnceStore, PendingExceptionRecord,
     PendingExceptionStore,
 };
+pub use permission_modes::{evaluate_with_mode, evaluate_with_mode_and_packs};
 
 // Re-export dual regex engine abstraction (from regex safety audit)
 pub use packs::regex_engine::{BACKTRACK_LIMIT, CompiledRegex, needs_backtracking_engine};

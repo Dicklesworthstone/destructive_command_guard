@@ -75,6 +75,8 @@ pub fn evaluate_with_mode(
     engine.evaluate(session, &tool, mode, effects)
 }
 
+/// Evaluate a command with mode + pack-aware effect resolution.
+///
 /// Variant that also resolves Tier-A effects from the matched pack/rule
 /// when the command was allowed at the rule level (e.g. an effect-tagged
 /// safe pattern). Useful for `Plan` mode evaluation of an enabled-but-not-

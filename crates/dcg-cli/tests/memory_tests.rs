@@ -29,7 +29,7 @@
     clippy::unit_arg
 )]
 
-use destructive_command_guard as dcg;
+use dcg_cli as dcg;
 use std::cell::Cell;
 use std::hint::black_box;
 use std::sync::{Mutex, MutexGuard, PoisonError};

@@ -65,9 +65,7 @@ const CARGO_TARGET: Option<&str> = option_env!("VERGEN_CARGO_TARGET_TRIPLE");
 ///
 /// Disables colors if stderr is not a terminal (e.g., piped to a file).
 fn configure_colors() {
-    if std::env::var_os("NO_COLOR").is_some()
-        || dcg_cli::output::env_flag_enabled("DCG_NO_COLOR")
-    {
+    if std::env::var_os("NO_COLOR").is_some() || dcg_cli::output::env_flag_enabled("DCG_NO_COLOR") {
         colored::control::set_override(false);
         return;
     }
@@ -189,9 +187,7 @@ fn install_signal_shutdown_handler() {
     });
 }
 
-fn install_history_shutdown_handler(
-    handle: dcg_cli::history::HistoryFlushHandle,
-) {
+fn install_history_shutdown_handler(handle: dcg_cli::history::HistoryFlushHandle) {
     register_shutdown_action(move || {
         handle.flush_sync();
     });
@@ -697,9 +693,9 @@ fn main() {
     // Outside this narrow window the original deny path is unchanged.
     if matches!(mode, DecisionMode::Deny) {
         if let Some(cwd_ref) = cwd_path.as_deref() {
-            if let Some(reason) = dcg_cli::rebase_recovery::should_allow_recovery(
-                cwd_ref, pack, pattern,
-            ) {
+            if let Some(reason) =
+                dcg_cli::rebase_recovery::should_allow_recovery(cwd_ref, pack, pattern)
+            {
                 // Consume the permit if that's why we allowed (single-shot).
                 if matches!(
                     reason,

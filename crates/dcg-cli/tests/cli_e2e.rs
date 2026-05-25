@@ -248,9 +248,7 @@ mod allow_once_management_tests {
 
     use chrono::{DateTime, Utc};
     use dcg_cli::logging::{RedactionConfig, RedactionMode};
-    use dcg_cli::pending_exceptions::{
-        AllowOnceEntry, AllowOnceScopeKind, PendingExceptionRecord,
-    };
+    use dcg_cli::pending_exceptions::{AllowOnceEntry, AllowOnceScopeKind, PendingExceptionRecord};
 
     struct AllowOnceEnv {
         temp: tempfile::TempDir,
@@ -1514,9 +1512,7 @@ mod hook_mode_tests {
     use super::*;
     use chrono::{DateTime, Utc};
     use dcg_cli::logging::{RedactionConfig, RedactionMode};
-    use dcg_cli::pending_exceptions::{
-        AllowOnceEntry, AllowOnceScopeKind, PendingExceptionRecord,
-    };
+    use dcg_cli::pending_exceptions::{AllowOnceEntry, AllowOnceScopeKind, PendingExceptionRecord};
 
     fn assert_hook_denies(command: &str) {
         let result = run_dcg_hook(command);

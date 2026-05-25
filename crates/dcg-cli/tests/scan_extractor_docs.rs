@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 fn read_repo_file(path: &str) -> std::io::Result<String> {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("manifest dir has parent").parent().expect("crates dir has parent");
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("manifest dir has parent")
+        .parent()
+        .expect("crates dir has parent");
     std::fs::read_to_string(repo_root.join(path))
 }
 
@@ -23,11 +27,11 @@ fn expected_detector_docs() -> BTreeMap<&'static str, &'static str> {
 fn scan_loop_detectors(scan_rs: &str) -> BTreeSet<String> {
     let start = scan_rs
         .find("// Determine which extractor(s) to use")
-        .expect("src/scan.rs must contain the extractor dispatch marker");
+        .expect("crates/dcg-cli/src/scan.rs must contain the extractor dispatch marker");
     let dispatch = &scan_rs[start..];
     let end = dispatch
         .find("if !is_shell")
-        .expect("src/scan.rs must contain the extractor skip guard");
+        .expect("crates/dcg-cli/src/scan.rs must contain the extractor skip guard");
 
     dispatch[..end]
         .lines()
@@ -65,7 +69,7 @@ fn readme_supported_file_types(readme: &str) -> BTreeSet<String> {
 
 #[test]
 fn readme_scan_format_table_matches_wired_extractors() -> std::io::Result<()> {
-    let scan_rs = read_repo_file("src/scan.rs")?;
+    let scan_rs = read_repo_file("crates/dcg-cli/src/scan.rs")?;
     let readme = read_repo_file("README.md")?;
 
     let expected = expected_detector_docs();
@@ -76,7 +80,7 @@ fn readme_scan_format_table_matches_wired_extractors() -> std::io::Result<()> {
 
     assert_eq!(
         wired_detectors, expected_detectors,
-        "update expected_detector_docs when src/scan.rs wires a scan extractor"
+        "update expected_detector_docs when crates/dcg-cli/src/scan.rs wires a scan extractor"
     );
     assert_eq!(
         documented_formats, expected_formats,

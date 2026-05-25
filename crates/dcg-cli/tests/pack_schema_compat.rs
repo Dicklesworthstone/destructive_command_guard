@@ -16,7 +16,7 @@
 
 use dcg_cli::packs::{DEFAULT_PACK_EFFECTS, external::ExternalPack};
 
-const LEGACY_PACK_YAML: &str = r#"
+const LEGACY_PACK_YAML: &str = r"
 schema_version: 1
 id: example.legacy
 name: Example Legacy v0.5 Pack
@@ -29,9 +29,9 @@ destructive_patterns:
     pattern: \blegacy_tool\s+destroy\b
     severity: critical
     description: legacy_tool destroy is irreversible
-"#;
+";
 
-const PACK_YAML_WITH_EFFECTS: &str = r#"
+const PACK_YAML_WITH_EFFECTS: &str = r"
 schema_version: 1
 id: example.tagged
 name: Example Effect-Tagged Pack
@@ -55,7 +55,7 @@ destructive_patterns:
     pattern: \btagged_tool\s+meh\b
     severity: high
     description: meh just sits there
-"#;
+";
 
 #[test]
 fn legacy_yaml_pack_without_effects_loads() {
@@ -107,7 +107,8 @@ fn yaml_pack_with_default_effects_loads() {
 
 #[test]
 fn per_rule_effects_override_pack_default() {
-    let parsed: ExternalPack = serde_yaml::from_str(PACK_YAML_WITH_EFFECTS).expect("parse effect-tagged YAML");
+    let parsed: ExternalPack =
+        serde_yaml::from_str(PACK_YAML_WITH_EFFECTS).expect("parse effect-tagged YAML");
     let pack = parsed.into_pack();
 
     let tagged = pack
@@ -141,7 +142,7 @@ fn per_rule_effects_override_pack_default() {
 #[test]
 fn effects_fields_are_strict_superset_of_legacy_schema() {
     // Removing the new effects fields yields a valid pre-effects YAML.
-    let stripped = r#"
+    let stripped = r"
 schema_version: 1
 id: example.tagged
 name: Example Effect-Tagged Pack
@@ -158,7 +159,7 @@ destructive_patterns:
     pattern: \btagged_tool\s+meh\b
     severity: high
     description: meh just sits there
-"#;
+";
     let parsed: ExternalPack = serde_yaml::from_str(stripped).expect("strip-back must still parse");
     assert_eq!(parsed.destructive_patterns.len(), 2);
     let pack = parsed.into_pack();
@@ -169,7 +170,7 @@ destructive_patterns:
 fn unknown_yaml_fields_do_not_break_loader() {
     // Future schema versions might add fields; loader should not be strict
     // about unknowns from forward-compatible additions.
-    let yaml_with_unknown = r#"
+    let yaml_with_unknown = r"
 schema_version: 1
 id: example.future
 name: Future Pack
@@ -181,7 +182,7 @@ destructive_patterns:
     pattern: \bfuture\s+thing\b
     severity: high
     description: A future rule
-"#;
+";
     let parsed: ExternalPack =
         serde_yaml::from_str(yaml_with_unknown).expect("forward-compat parse");
     let pack = parsed.into_pack();

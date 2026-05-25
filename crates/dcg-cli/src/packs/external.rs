@@ -554,8 +554,7 @@ impl ExternalPack {
         let pack_default_effects: &'static [dcg_core::Effect] = match self.default_effects {
             None => super::DEFAULT_PACK_EFFECTS,
             Some(v) => {
-                let core_effects: Vec<dcg_core::Effect> =
-                    v.into_iter().map(Into::into).collect();
+                let core_effects: Vec<dcg_core::Effect> = v.into_iter().map(Into::into).collect();
                 Box::leak(core_effects.into_boxed_slice()) as &'static [dcg_core::Effect]
             }
         };

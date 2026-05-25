@@ -9,9 +9,7 @@ use dcg_cli::hook::{
     AllowOnceInfo, HookInput, HookProtocol, extract_command_with_protocol, write_denial_to,
 };
 use dcg_cli::packs::{REGISTRY, Severity};
-use dcg_cli::{
-    Config, EvaluationDecision, LayeredAllowlist, evaluate_command_with_pack_order,
-};
+use dcg_cli::{Config, EvaluationDecision, LayeredAllowlist, evaluate_command_with_pack_order};
 
 const COMMAND: &str = "git reset --hard HEAD~1";
 

@@ -91,6 +91,8 @@ pub fn tier_a_filesystem(rule_name: &str) -> Option<&'static [Effect]> {
     })
 }
 
+/// Apply Tier-A effects to destructive patterns from a name → effects lookup.
+///
 /// Mutates `patterns` in place: for each pattern whose name appears in
 /// `lookup`, sets `effects` to the returned slice. Patterns that are already
 /// tagged or whose names aren't in the lookup are left unchanged.
@@ -132,7 +134,10 @@ mod tests {
 
     #[test]
     fn fs_lookup_tags_general_rm() {
-        assert_eq!(tier_a_filesystem("rm-rf-general"), Some(FS_REMOVE_IRREVERSIBLE));
+        assert_eq!(
+            tier_a_filesystem("rm-rf-general"),
+            Some(FS_REMOVE_IRREVERSIBLE)
+        );
     }
 
     #[test]

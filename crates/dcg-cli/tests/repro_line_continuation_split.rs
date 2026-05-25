@@ -1,6 +1,4 @@
-use dcg_cli::{
-    config::Config, evaluator::evaluate_command, load_default_allowlists,
-};
+use dcg_cli::{config::Config, evaluator::evaluate_command, load_default_allowlists};
 
 #[test]
 fn test_line_continuation_split_bypass() {

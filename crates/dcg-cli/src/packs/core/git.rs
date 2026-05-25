@@ -14,8 +14,8 @@
 
 use dcg_core::Effect;
 
-use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
 use crate::packs::effects::{apply_tier_a_effects, tier_a_git};
+use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
 
 /// Baseline effects for a "regular" git command in this pack.
