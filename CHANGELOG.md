@@ -179,6 +179,83 @@ Consumers using the library:
 
 ---
 
+## [v0.5.5](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.5.5) -- 2026-05-26 [Release]
+
+Fixes the history full-text-search rebuild, which was broken by an upstream
+FrankenSQLite bug.
+
+### History FTS
+
+- **`rebuild_fts` / FTS-backed history no longer raise `Sqlite(PrimaryKeyViolation)`.**
+  FrankenSQLite did not intercept `DELETE` against a live FTS5 virtual table: the
+  generic table-delete emptied the backing B-tree but left the in-memory FTS5
+  module instance stale, so the `DELETE FROM commands_fts; <re-INSERT>` rebuild
+  pattern collided on re-insert of the same rowid. Fixed upstream in
+  [frankensqlite#94](https://github.com/Dicklesworthstone/frankensqlite/issues/94)
+  (commit `a0425adb` — live virtual-table DELETE now routes through the module's
+  per-row `xUpdate` delete, matching SQLite). dcg pins that fix via a git rev of
+  `fsqlite`/`fsqlite-types`/`fsqlite-error`. The three previously-failing
+  `history::schema` FTS tests now pass.
+
+### Packaging note
+
+- This release is distributed as **GitHub-release binaries** (the primary install
+  path). Because it pins FrankenSQLite to a git revision pending an `fsqlite`
+  crates.io release, **v0.5.5 is not published to crates.io**; the registry stays
+  at v0.5.4 for the guard feature (the FTS-rebuild fix lands there once `fsqlite`
+  publishes the fix).
+
+---
+
+## [v0.5.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.5.4) -- 2026-05-25 [crates.io only — no GitHub binaries]
+
+Published to **crates.io** (first registry publish of the 0.5.x line since
+v0.4.5), but the GitHub-release binaries did **not** ship: the `dist` run was
+blocked first by `cargo fmt`/clippy and then by the FrankenSQLite FTS5 bug above.
+GitHub binaries resume at v0.5.5.
+
+First successful release and crates.io publish of the 0.5.x line since v0.4.5:
+v0.5.0–v0.5.2 were cut as GitHub releases but never published to the registry,
+and v0.5.3's `dist` run failed at `cargo fmt --check`, so it shipped nothing.
+v0.5.4 carries the v0.5.3 fixes forward and adds the items below. Closes
+[#126](https://github.com/Dicklesworthstone/destructive_command_guard/issues/126).
+
+### Codex on Windows
+
+- **dcg now descends into `powershell -Command` / `pwsh -c` inline scripts** ([#125](https://github.com/Dicklesworthstone/destructive_command_guard/issues/125)).
+  Codex on Windows executes shell commands via `powershell.exe -Command '<cmd>'`.
+  dcg previously unwrapped only `bash -c` / `sh -c`, so a destructive command
+  inside the PowerShell wrapper reached the shell unevaluated. The inline-script
+  extractor now unwraps `powershell` / `pwsh` — including the quoted full-path
+  `"C:\…\powershell.exe" -Command '…'` form and the `-c` abbreviation — and
+  re-evaluates the inner command against every pack. Note: whether Codex on
+  Windows actually *fires* the PreToolUse hook for its `command_execution` event
+  is Codex-side behavior; this change guarantees that once a wrapped command
+  reaches dcg, it is caught.
+- **`uninstall.ps1` also writes `hooks.json` as UTF-8 without a BOM**, matching
+  the `install.ps1` fix; both installer and uninstaller now preserve array-ness
+  when reading an existing hook config.
+
+### Installer
+
+- **`install.sh` installs shell completions for the invoking user, not root,
+  when run under `sudo`** — completions land in the caller's config directories.
+
+### Tests
+
+- Added an end-to-end regression test for the [#124](https://github.com/Dicklesworthstone/destructive_command_guard/issues/124)
+  multi-line `git commit -m "…git push --force…"` body case, and dropped an
+  overclaimed pack-level assertion that cannot hold at the raw-regex layer
+  (documented inline) — the multi-line body is defended by `-m` masking in the
+  full `evaluate_command` pipeline, not by `pack.check()`.
+
+### Packaging
+
+- Slimmed the published crate via `exclude` (drops `.ntm/`, `*.png`, `*.webp`,
+  `agent_baseline/`, `action/`). Source and binary are unaffected.
+
+---
+
 ## [v0.5.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.5.3) -- 2026-05-23 [Release]
 
 ### Pattern false-positive fixes
@@ -207,9 +284,9 @@ Consumers using the library:
 
 ### crates.io
 
-- **First publish to crates.io since v0.4.5.** v0.5.0/v0.5.1/v0.5.2 were
-  cut as GitHub releases but never published to the registry. v0.5.3
-  ships there too via `cargo publish`. Closes [#126](https://github.com/Dicklesworthstone/destructive_command_guard/issues/126).
+- **Intended as the first crates.io publish since v0.4.5 — but the `dist` run
+  for v0.5.3 failed at `cargo fmt --check`, so no binaries or crate were
+  published.** Superseded by v0.5.4, which completes the publish ([#126](https://github.com/Dicklesworthstone/destructive_command_guard/issues/126)).
 
 ---
 

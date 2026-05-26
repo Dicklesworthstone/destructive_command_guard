@@ -1294,7 +1294,7 @@ fn extract_inline_scripts(
                 // The inline-execution flag is `-Command`, which PowerShell accepts as
                 // any unambiguous prefix (`-c`, `-co`, `-com`, …), case-insensitively. (#125)
                 let f = flag.to_ascii_lowercase();
-                f.starts_with("-c") || f.starts_with("-co")
+                f.starts_with("-c")
             } else {
                 // sh/bash/zsh/fish
                 flag.contains('c')
@@ -2703,6 +2703,72 @@ mod tests {
                 assert_eq!(contents[0].language, ScriptLanguage::Perl);
             } else {
                 panic!("Expected Extracted result");
+            }
+        }
+
+        /// #125: Codex on Windows executes shell commands as
+        /// `powershell.exe -Command '<inner>'`. dcg must descend into the
+        /// `-Command` body and re-evaluate it as a shell command (mapped to
+        /// `ScriptLanguage::Bash`) so destructive inner commands are caught.
+        #[test]
+        fn extracts_powershell_command_body() {
+            // Bare host name, single-quoted body.
+            let result = extract_content(
+                "powershell -Command 'echo hi'",
+                &ExtractionLimits::default(),
+            );
+            if let ExtractionResult::Extracted(contents) = result {
+                assert_eq!(contents.len(), 1);
+                assert_eq!(contents[0].content, "echo hi");
+                assert_eq!(contents[0].language, ScriptLanguage::Bash);
+            } else {
+                panic!("Expected Extracted result for `powershell -Command '...'`");
+            }
+        }
+
+        #[test]
+        fn extracts_powershell_exe_command_body_double_quotes() {
+            let result = extract_content(
+                r#"powershell.exe -Command "echo hi""#,
+                &ExtractionLimits::default(),
+            );
+            if let ExtractionResult::Extracted(contents) = result {
+                assert_eq!(contents.len(), 1);
+                assert_eq!(contents[0].content, "echo hi");
+                assert_eq!(contents[0].language, ScriptLanguage::Bash);
+            } else {
+                panic!("Expected Extracted result for `powershell.exe -Command \"...\"`");
+            }
+        }
+
+        #[test]
+        fn extracts_pwsh_short_flag_body() {
+            // PowerShell accepts `-c` as an abbreviation of `-Command`.
+            let result = extract_content("pwsh -c 'echo hi'", &ExtractionLimits::default());
+            if let ExtractionResult::Extracted(contents) = result {
+                assert_eq!(contents.len(), 1);
+                assert_eq!(contents[0].content, "echo hi");
+                assert_eq!(contents[0].language, ScriptLanguage::Bash);
+            } else {
+                panic!("Expected Extracted result for `pwsh -c '...'`");
+            }
+        }
+
+        #[test]
+        fn extracts_powershell_quoted_full_path_body() {
+            // Codex's exact Windows command_execution shape: a quoted absolute
+            // path to powershell.exe followed by -Command and the inner command.
+            let cmd = "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -Command 'echo hi'";
+            let result = extract_content(cmd, &ExtractionLimits::default());
+            if let ExtractionResult::Extracted(contents) = result {
+                assert!(
+                    contents
+                        .iter()
+                        .any(|c| c.content == "echo hi" && c.language == ScriptLanguage::Bash),
+                    "expected to extract the -Command body from a quoted powershell.exe path; got {contents:?}"
+                );
+            } else {
+                panic!("Expected Extracted result for quoted-full-path powershell.exe -Command");
             }
         }
 

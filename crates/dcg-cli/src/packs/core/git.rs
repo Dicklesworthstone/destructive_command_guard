@@ -632,6 +632,48 @@ mod tests {
                 .is_none(),
             "--force-with-lease is the safer alternative and must not be blocked"
         );
+        // --force-if-includes (safer) must also stay allowed.
+        assert!(
+            pack.check("git push --force-with-lease --force-if-includes origin main")
+                .is_none(),
+            "--force-with-lease --force-if-includes must not be blocked"
+        );
+
+        // Regression for #124: the bounded token-walker must not span shell
+        // command boundaries (`&&`, `||`, `;`, `|`, `$( )`, backticks) the way
+        // the old unbounded `(?:\S+\s+)*` walker did. A read-only `git push`
+        // (or unrelated `git push --force-with-lease`) in one statement must
+        // not let a later statement's `--force` flag back-match the earlier
+        // `git push`, and a `git ... push ...` walker must not reach across a
+        // separator into a `--force` token that belongs to a different command.
+        for cmd in [
+            // `git push` (no force) in one statement; `--force` text lives in a
+            // separate statement that is NOT a push — must not match push-force.
+            "git push origin main && echo done --force",
+            "git push origin main; echo --force",
+            "git push origin main || echo --force",
+            "git push origin main | tee log --force",
+            "branch=$(git rev-parse HEAD) && git push --force-with-lease origin main",
+            "echo `git push origin main` && true --force",
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "push-force must not span shell boundaries; cmd={cmd}"
+            );
+        }
+
+        // ...but a genuine force-push that spans a separator (its own complete
+        // `git push --force` statement) must STILL be blocked.
+        for cmd in [
+            "git fetch && git push --force origin main",
+            "git fetch; git push -f origin main",
+            "git fetch || git push --force",
+        ] {
+            assert!(
+                pack.check(cmd).is_some(),
+                "a real force-push statement after a separator must still be blocked; cmd={cmd}"
+            );
+        }
     }
 
     #[test]

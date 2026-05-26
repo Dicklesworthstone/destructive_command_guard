@@ -78,9 +78,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.11"
 hmac = "0.13"  # HMAC for optional short-code hardening (ksk.1.10)
 fs2 = "0.4"
-fsqlite = { version = "0.1.3", features = ["fts5"] }  # FrankenSQLite with concurrent writing
-fsqlite-types = "0.1.2"  # SqliteValue type
-fsqlite-error = "0.1.2"  # FrankenError type
+fsqlite = { version = "0.1.3", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "a0425adba62c64d5581d2227827f76e9ec0c9829", features = ["fts5"] }  # FrankenSQLite (FTS5 delete-all fix, frankensqlite#94)
+fsqlite-types = { version = "0.1.3", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "a0425adba62c64d5581d2227827f76e9ec0c9829" }  # SqliteValue type
+fsqlite-error = { version = "0.1.3", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "a0425adba62c64d5581d2227827f76e9ec0c9829" }  # FrankenError type
 ctrlc = "3.5.1"
 flate2 = "1.0"  # Gzip compression for history export
 
