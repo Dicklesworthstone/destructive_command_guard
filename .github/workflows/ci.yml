@@ -202,7 +202,12 @@ jobs:
       - name: Run heredoc fuzz smoke
         run: |
           cd fuzz
-          cargo fuzz run heredoc_fuzz -- -max_total_time=30
+          # Build/run the fuzzer for the gnu host target. AddressSanitizer is
+          # incompatible with musl's statically-linked libc (crt-static) and
+          # fails with "sanitizer is incompatible with statically linked libc";
+          # the default x86_64-unknown-linux-gnu (dynamic glibc) is the
+          # supported ASan target.
+          cargo fuzz run heredoc_fuzz --target x86_64-unknown-linux-gnu -- -max_total_time=30
 
   coverage:
     runs-on: ubuntu-latest
