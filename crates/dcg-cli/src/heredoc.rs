@@ -62,7 +62,7 @@ use tracing::{debug, instrument, trace, warn};
 /// quote-aware scanner so we can suppress obvious false positives inside quoted
 /// literals (commit messages, search patterns, etc.) without introducing false
 /// negatives for real shell syntax (including `$()`/backtick substitutions).
-const HEREDOC_TRIGGER_PATTERNS: [&str; 13] = [
+const HEREDOC_TRIGGER_PATTERNS: [&str; 14] = [
     // Inline interpreter execution. These patterns intentionally allow:
     // - interleaved flags (python -I -c, bash --norc -c)
     // - combined short-flag clusters (bash -lc, node -pe, perl -pi -e)
@@ -91,6 +91,17 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 13] = [
     r#"\blua[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
     // Shell inline execution (sh -c, bash -c, zsh -c, fish -c, bash -lc, etc.)
     r#"\b(?:sh|bash|zsh|fish)(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)"#,
+    // PowerShell inline execution (powershell -Command '...', pwsh -c "...",
+    // and Windows full-path forms like
+    //   "C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command '...'
+    // which Codex emits as its Windows command_execution shape (#125)). The
+    // `-Command` parameter (PowerShell abbreviates it to any prefix, e.g. `-c`,
+    // `-com`, case-insensitively) runs an arbitrary inner shell command, so we
+    // must descend into its body. `(?i)` makes the interpreter + flag
+    // case-insensitive (Windows paths are case-insensitive). A possible closing
+    // `"` of a quoted interpreter path is allowed before the flag. Tier 1 may
+    // over-trigger; Tier 2 validates the actual flag.
+    r#"(?i)\b(?:powershell|pwsh)(?:\.exe)?["']?(?:\s+(?:-\S+))*\s+-c[a-z]*\s*['"]"#,
     // Piped execution to interpreters (versioned, with optional .exe)
     r"\|\s*(?:python[0-9.]*|ruby[0-9.]*|perl[0-9.]*|node(?:js)?[0-9.]*|php[0-9.]*|lua[0-9.]*|sh|bash)(?:\.exe)?\b",
     // Piped to xargs (can execute arbitrary commands)
@@ -526,6 +537,15 @@ impl ScriptLanguage {
             || matches_interpreter("bash")
             || matches_interpreter("zsh")
             || matches_interpreter("fish")
+            // PowerShell (`powershell`, `powershell.exe`, `pwsh`) running an
+            // inner command via `-Command`/`-c`. We re-check the body as a
+            // shell command: destructive command names (git, rm, etc.) are
+            // identical across PowerShell and POSIX shells, so Bash-style
+            // re-evaluation surfaces the same rules. This is what lets dcg
+            // descend into Codex's Windows `powershell.exe -Command '...'`
+            // command shape (#125).
+            || matches_interpreter("powershell")
+            || matches_interpreter("pwsh")
         {
             Self::Bash
         } else {
@@ -974,7 +994,10 @@ static INLINE_SCRIPT_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // Groups: (1) interpreter, (2) optional "js" suffix for node, (3) flag, (4) content
     // Supports versioned interpreters: python3.11, ruby3.0, perl5.36, node18, nodejs20, etc.
     // Supports Windows .exe extensions: python.exe, python3.11.exe, etc.
-    Regex::new(r"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?)\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+(-[A-Za-z]*[ceEpr][A-Za-z]*)\s*'([^']*)'")
+    // `(?i:powershell|pwsh)` matches the Windows PowerShell host case-insensitively;
+    // `["']?` after the interpreter swallows the closing quote of a quoted full
+    // path (e.g. `"...\powershell.exe" -Command '...'`) before flags (#125).
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+(?:--\S+|-[A-Za-z]+))*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*'([^']*)'"#)
         .expect("inline script single-quote regex compiles")
 });
 
@@ -984,7 +1007,9 @@ static INLINE_SCRIPT_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // Groups: (1) interpreter, (2) optional "js" suffix for node, (3) flag, (4) content
     // Supports versioned interpreters: python3.11, ruby3.0, perl5.36, node18, nodejs20, etc.
     // Supports Windows .exe extensions: python.exe, python3.11.exe, etc.
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?)\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+(-[A-Za-z]*[ceEpr][A-Za-z]*)\s*"([^"]*)""#)
+    // PowerShell host + quoted-path closing quote handled as in the single-quote
+    // variant above (#125).
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+(?:--\S+|-[A-Za-z]+))*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*"([^"]*)""#)
         .expect("inline script double-quote regex compiles")
 });
 
@@ -1247,6 +1272,12 @@ fn extract_inline_scripts(
 
             // The regex covers multiple interpreters; validate that the matched flag actually
             // implies inline code for this interpreter (e.g. bash needs -c, perl needs -e/-E).
+            // PowerShell host names are case-insensitive on Windows
+            // (`powershell`, `PowerShell.exe`, `pwsh`). Computed up front so the
+            // branch condition below isn't a block (clippy::blocks_in_conditions). (#125)
+            let cmd_lower = cmd_name.to_ascii_lowercase();
+            let is_powershell =
+                cmd_lower.starts_with("powershell") || cmd_lower.starts_with("pwsh");
             let is_inline_flag = if cmd_name.starts_with("python") {
                 flag.contains('c') || flag.contains('e')
             } else if cmd_name.starts_with("ruby") || cmd_name.starts_with("irb") {
@@ -1259,6 +1290,11 @@ fn extract_inline_scripts(
                 flag.contains('r')
             } else if cmd_name.starts_with("lua") {
                 flag.contains('e')
+            } else if is_powershell {
+                // The inline-execution flag is `-Command`, which PowerShell accepts as
+                // any unambiguous prefix (`-c`, `-co`, `-com`, …), case-insensitively. (#125)
+                let f = flag.to_ascii_lowercase();
+                f.starts_with("-c") || f.starts_with("-co")
             } else {
                 // sh/bash/zsh/fish
                 flag.contains('c')
