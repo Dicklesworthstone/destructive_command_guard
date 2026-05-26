@@ -11,6 +11,174 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.6.0-rc.1](https://github.com/Dicklesworthstone/destructive_command_guard) -- 2026-05-24 [Pre-release]
+
+### New: `dcg-core` library crate + permission-modes API
+
+dcg becomes embeddable as a Rust library, not just a binary hook. The new
+[`dcg-core`](dcg-core/) crate (also published on crates.io as
+`dcg-core = "0.6"`) provides a small, stable, low-dep API that consumer
+applications (jcode, Codex, Hermes, Grok, agent SDKs, …) can link directly.
+
+**Public API:**
+
+```rust
+use dcg_core::{Engine, EngineConfig, Mode, Session, ToolCall, Effect, Decision};
+
+let engine = Engine::new(EngineConfig::builder()
+    .working_dir("/work/project")
+    .protected_paths(vec!["~/.ssh".into(), ".git".into()])
+    .build());
+let mut session = Session::with_working_dir("/work/project".into());
+
+let decision = engine.evaluate(
+    &mut session,
+    &ToolCall::bash("git status"),
+    Mode::Plan,
+    &[Effect::Read],
+);
+// → Decision::Allow
+```
+
+**Key types:**
+
+- **`Mode { Default, AcceptEdits, Plan, DontAsk, BypassPermissions, Auto }`** —
+  permission modes mirroring [Claude Code's permission docs][cc-permissions].
+- **`ToolCall { Bash, Edit, Write, Read, Network }`** — tool-aware payloads;
+  consumer maps native tool taxonomy onto these five variants.
+- **`Effect { Read, Write, Network, Spawn, Irreversible, MutateVcs, Fs }`** —
+  effect taxonomy used by Plan/AcceptEdits/Auto policies.
+- **`Decision { Allow, Prompt, Deny }`** — three-state outcome with
+  `allow_once_code` (single-use, 24h TTL) and safer-alternative `alternatives`.
+- **`Session`** — per-agent-run state replacing v0.5's global `SessionTracker`
+  Mutex. Owns the allow-once cache, deny counter, and working dir.
+
+[cc-permissions]: https://docs.anthropic.com/en/docs/claude-code/sdk/sdk-permissions
+
+### Effect tags on rules
+
+Destructive rules can now declare an `effects` slice. The v0.6 evaluator
+combines per-rule (Tier-A) and per-pack (Tier-B) tags to feed the mode
+policy:
+
+- **Tier-A explicit (~30-50 rules)** in `core.git` and `core.filesystem`:
+  - `core.git:reset-hard` → `[MutateVcs, Irreversible]`
+  - `core.git:push-force-long/short` → `[MutateVcs, Network, Irreversible]`
+  - `core.git:clean-force` → `[Write, Fs, Irreversible]`
+  - `core.git:branch-force-delete` / `stash-drop` / `stash-clear` → `[MutateVcs, Irreversible]`
+  - `core.git:checkout-discard*` / `restore-worktree*` → `[Write, Fs, Irreversible]`
+  - `core.fs:rm-rf-general/root-home`, `find-delete-*`, `dd-overwrite-*`,
+    `shred-*`, `tar-remove-files-*`, `truncate-zero-*`, `redirect-truncate-*`,
+    `unlink-*` → `[Write, Fs, Irreversible]`
+- **Tier-B pack defaults**:
+  - `core.git` → `[MutateVcs, Write]`
+  - `core.filesystem` → `[Write, Fs]`
+  - all other packs → `[Write, Irreversible]` (the conservative
+    `DEFAULT_PACK_EFFECTS` constant)
+
+### YAML pack schema extension
+
+External (custom) packs can declare both fields. Both are optional —
+v0.5 packs load unchanged.
+
+```yaml
+schema_version: 1
+id: example.pack
+default_effects: [mutate_vcs, write]   # NEW: pack-level Tier-B fallback
+destructive_patterns:
+  - name: yeet
+    pattern: \byeet\b
+    effects: [irreversible, write, fs] # NEW: per-rule Tier-A override
+```
+
+`docs/pack.schema.yaml` updated with the new fields and an `effect` enum
+definition (`read | write | network | spawn | irreversible | mutate_vcs | fs`).
+
+### Bridging existing pack evaluator
+
+The `destructive_command_guard` crate gains
+`destructive_command_guard::evaluate_with_mode` (and
+`evaluate_with_mode_and_packs`) which combines the legacy pack-rule
+pipeline with the new mode policy in one call. Existing shell-out
+consumers can drop the subprocess and link the library:
+
+```rust
+let decision = destructive_command_guard::evaluate_with_mode(
+    "git push --force",
+    &config, &keywords, &overrides, &allowlists,
+    &engine, &mut session, Mode::Default,
+);
+```
+
+### Backward compatibility
+
+- v0.5 binary clients (CLI shell-out) continue to work unchanged.
+- v0.5 YAML packs without `effects` / `default_effects` load unchanged.
+- v0.5 verdicts (`Allow` / `Deny`) on destructive rules are unchanged;
+  v0.6 only changes how `Mode::Plan` / `Mode::AcceptEdits` interpret
+  unmatched and tier-A-tagged rules.
+- `tests/pack_schema_compat.rs` enforces these invariants in CI.
+
+### Tests
+
+- `dcg-core`: 52 unit + 34 integration (`tests/permission_modes.rs`,
+  Mode × ToolCall × Effect matrix) + 2 doc tests = **88 tests, all pass**.
+- `destructive_command_guard`: existing test suite unchanged + 7 new
+  backward-compat tests + 3 new permission-modes bridge tests.
+- `cargo clippy --all-targets -- -D warnings` clean on dcg-core.
+- `cargo fmt --check` clean on dcg-core.
+
+### Documentation
+
+- New: [`docs/permission-modes.md`](docs/permission-modes.md) — full
+  Mode/Effect/Decision reference with decision-flow diagram.
+- New: [`docs/integration-guide.md`](docs/integration-guide.md) — Rust
+  embedding guide, tool-taxonomy mapping examples, allow-once flow,
+  bridging from shell-out consumers.
+- Updated: [`docs/pack.schema.yaml`](docs/pack.schema.yaml) with
+  `default_effects` (pack-level) and per-rule `effects` field.
+
+### Out of scope (deferred)
+
+- `Mode::Auto` LLM classifier — variant reserved, currently routes as
+  `Default` (Phase C).
+- Full migration of evaluator/packs/scan **into `dcg-core`** — the
+  workspace is now split into `dcg-core` (lightweight library) and
+  `dcg-cli` (the existing binary + heavy deps). Moving the evaluator
+  and pack registry from `dcg-cli` into `dcg-core` is Phase 2 follow-up
+  work; not required for jcode/Codex/Hermes/Grok integration since
+  they only need the `dcg-core` API surface.
+
+### Workspace layout
+
+```
+destructive_command_guard/      ← repo root (workspace)
+├── Cargo.toml                  ← [workspace] members + shared profiles
+├── crates/
+│   ├── dcg-core/               ← v0.6 library, minimal deps
+│   │   └── …
+│   └── dcg-cli/                ← legacy library + `dcg` binary, heavy deps
+│       ├── src/
+│       ├── tests/
+│       ├── benches/
+│       └── build.rs
+├── docs/                       ← workspace docs
+├── fuzz/                       ← targets dcg-cli
+└── …
+```
+
+Consumers depending on the binary: no change. The `dcg` binary still
+ships from `dcg-cli` and behaves identically (with the new
+`--mode <NAME>` flag opt-in).
+
+Consumers using the library:
+- Lightweight: `dcg-core = "0.6"` (minimal deps).
+- Heavy:       `dcg-cli  = "0.6"` (re-exports `dcg_core::*`,
+                                    plus pack registry, scan engine,
+                                    history, MCP server, …).
+
+---
+
 ## [v0.5.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.5.3) -- 2026-05-23 [Release]
 
 ### Pattern false-positive fixes

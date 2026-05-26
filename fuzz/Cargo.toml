@@ -1,5 +1,5 @@
 [package]
-name = "destructive_command_guard-fuzz"
+name = "dcg-cli-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -12,8 +12,8 @@ libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 
-[dependencies.destructive_command_guard]
-path = ".."
+[dependencies.dcg-cli]
+path = "../crates/dcg-cli"
 
 # Fuzz target: full evaluator
 [[bin]]
