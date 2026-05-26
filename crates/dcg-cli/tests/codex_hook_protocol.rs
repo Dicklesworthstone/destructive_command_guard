@@ -367,6 +367,51 @@ fn smoke_claude_destructive_command_blocked() {
     );
 }
 
+/// Regression for #125 (part b, dcg-side): on Windows, Codex executes shell
+/// commands by wrapping them as `powershell.exe -Command '<inner>'`. When that
+/// wrapped form reaches dcg as the hook command, dcg must descend into the
+/// `-Command` body and block a destructive inner command. Before this fix dcg
+/// only unwrapped `sh -c`/`bash -c`, so PowerShell-wrapped destructive commands
+/// slipped through as ALLOW. This does NOT address whether Codex on Windows
+/// fires the hook at all (that is the Codex matcher question, which needs a
+/// Windows box to verify) — it closes the dcg-side detection gap so that
+/// whenever the wrapped command IS surfaced to dcg, the inner command is caught.
+#[test]
+fn codex_powershell_wrapped_destructive_command_blocked() {
+    // Single-quoted body (the shape Codex emits on Windows).
+    let outcome = run_codex_hook("powershell.exe -Command 'git reset --hard HEAD~1'");
+    assert!(
+        outcome.is_codex_block_shape(),
+        "PowerShell-wrapped destructive command via Codex must produce exit 2 + empty stdout + non-empty stderr\n{outcome}"
+    );
+
+    // Quoted full-path host (the literal Codex Windows command_execution shape).
+    let full_path = "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -Command 'git reset --hard HEAD~1'";
+    let outcome_fp = run_codex_hook(full_path);
+    assert!(
+        outcome_fp.is_codex_block_shape(),
+        "quoted-full-path PowerShell-wrapped destructive command via Codex must be blocked\n{outcome_fp}"
+    );
+
+    // pwsh with the `-c` abbreviation of `-Command`.
+    let outcome_pwsh = run_codex_hook("pwsh -c 'git reset --hard HEAD~1'");
+    assert!(
+        outcome_pwsh.is_codex_block_shape(),
+        "pwsh -c wrapped destructive command via Codex must be blocked\n{outcome_pwsh}"
+    );
+}
+
+/// A safe command wrapped in PowerShell must still be ALLOWED (no
+/// over-blocking from the new PowerShell descent).
+#[test]
+fn codex_powershell_wrapped_safe_command_allowed() {
+    let outcome = run_codex_hook("powershell.exe -Command 'git status'");
+    assert!(
+        outcome.is_allow_shape(),
+        "safe PowerShell-wrapped command via Codex must be allowed (exit 0, empty stdout)\n{outcome}"
+    );
+}
+
 #[test]
 fn copilot_tool_args_without_tool_name_blocks_destructive_command() {
     let payload = serde_json::json!({

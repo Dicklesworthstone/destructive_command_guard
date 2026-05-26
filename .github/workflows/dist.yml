@@ -84,7 +84,17 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends ${{ matrix.apt_install }}
 
+      # The fsqlite git dependency checkout includes deeply-nested perf
+      # artifacts under tests/artifacts/perf/... that exceed Windows' 260-char
+      # MAX_PATH. Enable git long-path support and force cargo to fetch via the
+      # git CLI (which honors core.longpaths) so the checkout succeeds.
+      - name: Enable git long paths (Windows git-dep checkout)
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+
       - name: Build release binary
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Verify Linux x86_64 musl binary has no glibc symbols
