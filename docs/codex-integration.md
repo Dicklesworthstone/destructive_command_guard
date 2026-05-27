@@ -202,6 +202,77 @@ If Codex has stale hooks that still point to an old binary, the safest fix is to
 run dcg's installer or uninstaller. They update only dcg-owned hook entries and
 preserve coexisting hooks.
 
+## Known Limitation: Codex `unified_exec` Path (Windows Desktop / CLI)
+
+Codex's `PreToolUse` hook dispatch does **not** intercept every shell call. Per
+OpenAI's hook docs: PreToolUse "doesn't intercept all shell calls yet, only the
+simple ones. The newer `unified_exec` mechanism allows richer streaming
+stdin/stdout handling of shell, but interception is incomplete."
+(https://developers.openai.com/codex/hooks)
+
+This is the root cause behind the unresolved part of issue #125 (Windows Codex
+Desktop / `codex exec`). On that path Codex routes the command through
+`unified_exec` and emits a `command_execution` event with a wrapped PowerShell
+invocation, e.g.:
+
+```json
+{
+  "type": "command_execution",
+  "command": "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -Command 'git reset --hard HEAD~1'"
+}
+```
+
+`command_execution` is **not** a tool-use event, so `PreToolUse` never fires for
+it — regardless of the `matcher` value. This was confirmed empirically: a reporter
+tested `matcher: "Bash"`, `matcher: "command_execution"`, and `matcher: "*"`
+(wildcard) and none fired for the `command_execution` path. The hook command is
+never invoked, so dcg never sees the payload.
+
+### Why the matcher is `Bash` and stays `Bash`
+
+The `matcher` field is a **regex applied to `tool_name`**, and Codex's canonical
+shell `tool_name` is `Bash` — there is no `shell_command` alias. (Codex's docs:
+"Currently, the tool name is always `\"Bash\"` in Codex CLI"; matcher "is applied
+to `tool_name`".) When Codex *does* dispatch a shell call through `PreToolUse`
+(the "simple" path), the payload reports `tool_name: "Bash"`, so the installer's
+`matcher: "Bash"` is correct. The Desktop runtime log line `tool_name="shell_command"`
+the reporter observed comes from the `unified_exec`/`command_execution` runtime
+internals — not from a `PreToolUse` payload that dcg would ever receive, and not a
+matcher dcg can usefully target (the hook isn't dispatched at all on that path).
+
+Changing the installed matcher to `shell_command` would therefore be a regression:
+it would fail to match the canonical `Bash` payload on the path where hooks *do*
+fire, while still not helping the `unified_exec` path (where no hook fires under
+any matcher). The fix has to land upstream in Codex (extend `PreToolUse` dispatch
+to cover `unified_exec`/`command_execution`).
+
+Upstream tracking:
+- https://github.com/openai/codex/issues/16246 — PostToolUse missing for the
+  exec-session / polling path.
+- https://github.com/openai/codex/issues/21639 — hooks stopped firing after a
+  Codex Desktop update (regression in the alpha line the reporter is on).
+- https://github.com/openai/codex/pull/18888 — work to emit Bash hook events when
+  `exec_command` completes via the `write_stdin` polling mechanism.
+
+### dcg-side state (already correct)
+
+The dcg engine and its installed hook config are correct for every path Codex
+*does* route through `PreToolUse`:
+
+- The PowerShell-wrapped command form (`powershell.exe -Command '...'`,
+  `pwsh -c`, quoted-full-path variants, `cmd /c`) is unwrapped and re-evaluated by
+  the inline-script extractor (commit `57ec7ec`), so a wrapped destructive command
+  that **reaches** dcg is blocked (verified by direct payload).
+- `~/.codex/hooks.json` is written as UTF-8 without a BOM on Windows (commits
+  `17746e8`, `5703a8a`), so Codex's strict JSON parser accepts it.
+- The matcher is `Bash` (the canonical shell `tool_name`).
+
+No further dcg-side change can make the `unified_exec` path block until Codex
+fires `PreToolUse` for it. Until then, treat Codex hooks as a guardrail that
+covers the simple-shell path, not a complete enforcement boundary on Windows
+Desktop / `codex exec` — consistent with the existing "the model can still write
+scripts to disk to bypass hook-based blocking" caveat.
+
 ## Verifying It Works
 
 Before closing Codex hook work, collect evidence for the relevant layer:
