@@ -26,7 +26,7 @@ enabled = ["kubernetes", "database", "containers"]
 | [dns](dns.md) | 3 | Cloudflare DNS, AWS Route53, Generic DNS Tools |
 | [email](email.md) | 4 | AWS SES, SendGrid, Mailgun, ... |
 | [featureflags](featureflags.md) | 4 | Flipt, LaunchDarkly, Split.io, ... |
-| [infrastructure](infrastructure.md) | 3 | Terraform, Ansible, Pulumi |
+| [infrastructure](infrastructure.md) | 4 | Terraform, Ansible, Pulumi, ... |
 | [kubernetes](kubernetes.md) | 3 | kubectl, Helm, Kustomize |
 | [loadbalancer](loadbalancer.md) | 4 | HAProxy, nginx, Traefik, ... |
 | [messaging](messaging.md) | 4 | Apache Kafka, RabbitMQ, NATS, ... |
@@ -124,6 +124,7 @@ enabled = ["kubernetes", "database", "containers"]
 - [`infrastructure.terraform`](infrastructure.md#infrastructureterraform)
 - [`infrastructure.ansible`](infrastructure.md#infrastructureansible)
 - [`infrastructure.pulumi`](infrastructure.md#infrastructurepulumi)
+- [`infrastructure.atmos`](infrastructure.md#infrastructureatmos)
 - [`system.disk`](system.md#systemdisk)
 - [`system.permissions`](system.md#systempermissions)
 - [`system.services`](system.md#systemservices)

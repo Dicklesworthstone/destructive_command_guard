@@ -7,6 +7,7 @@ This document describes packs in the `infrastructure` category.
 - [Terraform](#infrastructureterraform)
 - [Ansible](#infrastructureansible)
 - [Pulumi](#infrastructurepulumi)
+- [Atmos](#infrastructureatmos)
 
 ---
 
@@ -197,6 +198,69 @@ To allowlist all rules from this pack (use with caution):
 ```toml
 [[allow]]
 rule = "infrastructure.pulumi:*"
+reason = "Your reason here"
+risk_acknowledged = true
+```
+
+---
+
+## Atmos
+
+**Pack ID:** `infrastructure.atmos`
+
+Protects against destructive Atmos operations like terraform deploy (auto-approve), destroy, clean, state rm/taint, and helmfile destroy
+
+### Keywords
+
+Commands containing these keywords are checked against this pack:
+
+- `atmos`
+
+### Safe Patterns (Allowed)
+
+These patterns match safe commands that are always allowed:
+
+| Pattern Name | Pattern |
+|--------------|----------|
+| `atmos-terraform-plan` | `atmos\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:terraform\|tf\|tofu\|opentofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+plan(?=\s\|$)(?!\s+.*-destroy)` |
+| `atmos-terraform-output` | `atmos\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:terraform\|tf\|tofu\|opentofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+output(?=\s\|$)` |
+| `atmos-terraform-validate` | `atmos\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:terraform\|tf\|tofu\|opentofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+validate(?=\s\|$)` |
+| `atmos-describe` | `atmos\b(?:\s+--?\S+(?:\s+\S+)?)*\s+describe\b` |
+| `atmos-helmfile-diff` | `atmos\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:helmfile\|hf)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+diff(?=\s\|$)` |
+
+### Destructive Patterns (Blocked)
+
+These patterns match potentially destructive commands:
+
+| Pattern Name | Reason | Severity |
+|--------------|--------|----------|
+| `atmos-plan-destroy` | atmos terraform plan -destroy previews destruction. Review carefully before deploying. | medium |
+| `atmos-destroy` | atmos terraform destroy removes ALL managed infrastructure for the component/stack. | critical |
+| `atmos-deploy` | atmos terraform deploy runs apply with -auto-approve (no confirmation). Preview with 'atmos terraform plan' first. | high |
+| `atmos-apply-auto-approve` | atmos terraform apply -auto-approve skips confirmation. Remove -auto-approve for safety. | high |
+| `atmos-clean` | atmos terraform clean deletes local Terraform state and generated files. | high |
+| `atmos-taint` | atmos terraform taint marks a resource to be destroyed and recreated on next apply. | high |
+| `atmos-state-rm` | atmos terraform state rm removes a resource from state without destroying it. Resource becomes unmanaged. | high |
+| `atmos-state-mv` | atmos terraform state mv moves resources in state. Incorrect moves can cause resource recreation. | high |
+| `atmos-force-unlock` | atmos terraform force-unlock removes a state lock. Only use if the lock is stale. | high |
+| `atmos-workspace-delete` | atmos terraform workspace delete removes a workspace and its state. | medium |
+| `atmos-helmfile-destroy` | atmos helmfile destroy removes Helm releases from the cluster. | critical |
+
+### Allowlist Guidance
+
+To allowlist a specific rule from this pack, add to your allowlist:
+
+```toml
+[[allow]]
+rule = "infrastructure.atmos:<pattern-name>"
+reason = "Your reason here"
+```
+
+To allowlist all rules from this pack (use with caution):
+
+```toml
+[[allow]]
+rule = "infrastructure.atmos:*"
 reason = "Your reason here"
 risk_acknowledged = true
 ```
