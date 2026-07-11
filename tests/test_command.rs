@@ -125,6 +125,46 @@ reason = "test fixture allowlist entry"
 }
 
 #[test]
+fn test_path_scoped_allowlist_only_applies_inside_configured_path() {
+    let repo = tempfile::tempdir().expect("temp repo");
+    std::fs::create_dir(repo.path().join(".git")).expect("create .git marker");
+    std::fs::create_dir(repo.path().join(".dcg")).expect("create .dcg dir");
+    let allowed = repo.path().join("allowed/project");
+    let outside = repo.path().join("outside");
+    std::fs::create_dir_all(&allowed).expect("create allowed dir");
+    std::fs::create_dir(&outside).expect("create outside dir");
+    std::fs::write(
+        repo.path().join(".dcg/allowlist.toml"),
+        r#"
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "allowed project only"
+paths = ["**/allowed/**"]
+"#,
+    )
+    .expect("write allowlist");
+
+    let denied = run_dcg_isolated(
+        &["test", "--format", "json", "git reset --hard"],
+        Some(&outside),
+    );
+    assert_eq!(denied.status.code(), Some(1));
+    assert_eq!(parse_json(&denied)["decision"], "deny");
+
+    let allowed = run_dcg_isolated(
+        &["test", "--format", "json", "git reset --hard"],
+        Some(&allowed),
+    );
+    assert_eq!(
+        allowed.status.code(),
+        Some(0),
+        "path-scoped allowlist should apply inside configured path\nstderr: {}",
+        stderr_text(&allowed)
+    );
+    assert_eq!(parse_json(&allowed)["decision"], "allow");
+}
+
+#[test]
 fn test_json_output_has_expected_fields() {
     let output = run_dcg_isolated(&["test", "--format", "json", "git reset --hard"], None);
     let json = parse_json(&output);

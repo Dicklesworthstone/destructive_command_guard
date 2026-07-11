@@ -2616,6 +2616,7 @@ fn evaluate_batch_line(
     };
 
     // Evaluate the command
+    let project_path = std::env::current_dir().ok();
     let eval_result = evaluate_command_with_pack_order_deadline_at_path(
         &command,
         enabled_keywords,
@@ -2625,7 +2626,7 @@ fn evaluate_batch_line(
         allowlists,
         heredoc_settings,
         None,
-        None,
+        project_path.as_deref(),
         None, // No deadline for batch mode
     );
 
@@ -4072,6 +4073,7 @@ fn test_command(
     };
 
     // Use shared evaluator for consistent behavior with hook mode
+    let project_path = std::env::current_dir().ok();
     let start = Instant::now();
     let mut result = evaluate_command_with_pack_order_deadline_at_path(
         command,
@@ -4082,7 +4084,7 @@ fn test_command(
         &allowlists,
         &heredoc_settings,
         None, // allow_once_audit
-        None, // project_path
+        project_path.as_deref(),
         None, // deadline
     );
 
@@ -4603,6 +4605,7 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
     };
 
     // Evaluate the command
+    let project_path = std::env::current_dir().ok();
     let result = evaluate_command_with_pack_order_deadline_at_path(
         command,
         &enabled_keywords,
@@ -4612,7 +4615,7 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
         &allowlists,
         &heredoc_settings,
         None, // allow_once_audit
-        None, // project_path
+        project_path.as_deref(),
         None, // deadline
     );
 

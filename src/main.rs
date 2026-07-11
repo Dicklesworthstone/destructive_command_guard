@@ -713,7 +713,7 @@ fn main() {
         &allowlists,
         &heredoc_settings,
         None, // allow_once_audit
-        None, // project_path
+        cwd_path.as_deref(),
         Some(&deadline),
     );
 

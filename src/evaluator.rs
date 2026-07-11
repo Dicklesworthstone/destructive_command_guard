@@ -1381,16 +1381,16 @@ fn resolve_project_path(
     heredoc_settings: &crate::config::HeredocSettings,
     project_path: Option<&Path>,
 ) -> Option<PathBuf> {
+    if let Some(path) = project_path {
+        return Some(path.to_path_buf());
+    }
+
     if heredoc_settings
         .content_allowlist
         .as_ref()
         .is_none_or(|a| a.projects.is_empty())
     {
         return None;
-    }
-
-    if let Some(path) = project_path {
-        return Some(path.to_path_buf());
     }
 
     std::env::current_dir().ok()
@@ -2849,7 +2849,11 @@ fn evaluate_heredoc(
             if m.severity.blocks_by_default() {
                 let (pack_id, pattern_name) = split_ast_rule_id(&m.rule_id);
 
-                if let Some(hit) = context.allowlists.match_rule(&pack_id, &pattern_name) {
+                if let Some(hit) = context.allowlists.match_rule_at_path(
+                    &pack_id,
+                    &pattern_name,
+                    context.project_path,
+                ) {
                     if first_allowlist_hit.is_none() {
                         let reason =
                             format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
@@ -3016,7 +3020,11 @@ fn evaluate_heredoc(
 
             let (pack_id, pattern_name) = split_ast_rule_id(&m.rule_id);
 
-            if let Some(hit) = context.allowlists.match_rule(&pack_id, &pattern_name) {
+            if let Some(hit) =
+                context
+                    .allowlists
+                    .match_rule_at_path(&pack_id, &pattern_name, context.project_path)
+            {
                 if first_allowlist_hit.is_none() {
                     let reason =
                         format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
@@ -3086,7 +3094,11 @@ fn evaluate_heredoc(
                 if m.severity.blocks_by_default() {
                     let (pack_id, pattern_name) = split_ast_rule_id(&m.rule_id);
 
-                    if let Some(hit) = context.allowlists.match_rule(&pack_id, &pattern_name) {
+                    if let Some(hit) = context.allowlists.match_rule_at_path(
+                        &pack_id,
+                        &pattern_name,
+                        context.project_path,
+                    ) {
                         if first_allowlist_hit.is_none() {
                             let reason =
                                 format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
@@ -3511,7 +3523,7 @@ mod tests {
         AllowEntry, AllowSelector, AllowlistFile, LoadedAllowlistLayer, RuleId,
     };
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -3529,27 +3541,45 @@ mod tests {
     }
 
     fn evaluate_with_pack_ids(command: &str, pack_ids: &[&str]) -> EvaluationResult {
+        let allowlists = default_allowlists();
+        evaluate_with_pack_ids_at_path(command, pack_ids, &allowlists, None)
+    }
+
+    fn evaluate_with_pack_ids_at_path(
+        command: &str,
+        pack_ids: &[&str],
+        allowlists: &LayeredAllowlist,
+        project_path: Option<&Path>,
+    ) -> EvaluationResult {
         let enabled_packs: std::collections::HashSet<String> =
             pack_ids.iter().map(|id| (*id).to_string()).collect();
         let ordered_packs = crate::packs::REGISTRY.expand_enabled_ordered(&enabled_packs);
         let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
         let enabled_keywords = crate::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
         let compiled = default_compiled_overrides();
-        let allowlists = default_allowlists();
         let heredoc_settings = default_config().heredoc_settings();
 
-        evaluate_command_with_pack_order(
+        evaluate_command_with_pack_order_at_path(
             command,
             enabled_keywords.as_slice(),
             ordered_packs.as_slice(),
             keyword_index.as_ref(),
             &compiled,
-            &allowlists,
+            allowlists,
             &heredoc_settings,
+            project_path,
         )
     }
 
     fn project_allowlists_for_rule(rule: &str, reason: &str) -> LayeredAllowlist {
+        project_allowlists_for_rule_at_paths(rule, reason, None)
+    }
+
+    fn project_allowlists_for_rule_at_paths(
+        rule: &str,
+        reason: &str,
+        paths: Option<Vec<String>>,
+    ) -> LayeredAllowlist {
         let rule = RuleId::parse(rule).expect("rule id must parse");
         LayeredAllowlist {
             layers: vec![LoadedAllowlistLayer {
@@ -3568,7 +3598,7 @@ mod tests {
                         context: None,
                         conditions: HashMap::new(),
                         environments: Vec::new(),
-                        paths: None,
+                        paths,
                         risk_acknowledged: false,
                     }],
                     errors: Vec::new(),
@@ -4352,6 +4382,54 @@ mod tests {
         );
         assert!(result.is_allowed());
         assert!(result.allowlist_override.is_some());
+    }
+
+    #[test]
+    fn path_scoped_allowlist_applies_only_at_matching_path() {
+        let allowlists = project_allowlists_for_rule_at_paths(
+            "core.git:reset-hard",
+            "allowed project only",
+            Some(vec!["/allowed/**".to_string()]),
+        );
+        let outside = evaluate_with_pack_ids_at_path(
+            "git reset --hard",
+            &["core.git"],
+            &allowlists,
+            Some(Path::new("/outside")),
+        );
+        assert!(outside.is_denied());
+
+        let inside = evaluate_with_pack_ids_at_path(
+            "git reset --hard",
+            &["core.git"],
+            &allowlists,
+            Some(Path::new("/allowed/project")),
+        );
+        assert!(inside.is_allowed());
+        assert!(inside.allowlist_override.is_some());
+    }
+
+    #[test]
+    fn path_scoped_allowlist_applies_to_heredoc_ast_matches() {
+        let allowlists = project_allowlists_for_rule_at_paths(
+            "heredoc.python:shutil_rmtree",
+            "allowed project only",
+            Some(vec!["/allowed/**".to_string()]),
+        );
+        let command = "python3 - <<PY\nimport shutil\nshutil.rmtree(\"/etc\")\nPY";
+
+        let outside =
+            evaluate_with_pack_ids_at_path(command, &[], &allowlists, Some(Path::new("/outside")));
+        assert!(outside.is_denied());
+
+        let inside = evaluate_with_pack_ids_at_path(
+            command,
+            &[],
+            &allowlists,
+            Some(Path::new("/allowed/project")),
+        );
+        assert!(inside.is_allowed());
+        assert!(inside.allowlist_override.is_some());
     }
 
     #[test]

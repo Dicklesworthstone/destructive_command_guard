@@ -11,7 +11,7 @@
 
 use std::fmt;
 use std::io::{ErrorKind, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 // ---------------------------------------------------------------------------
@@ -1969,6 +1969,15 @@ fn codex_allow_once_round_trip() {
 
 /// Helper: spawn dcg with a hermetic HOME that has an allowlist.toml.
 fn run_with_user_allowlist(allowlist_toml: &str, command: &str, use_codex: bool) -> HookOutcome {
+    run_with_user_allowlist_at_path(allowlist_toml, command, use_codex, None)
+}
+
+fn run_with_user_allowlist_at_path(
+    allowlist_toml: &str,
+    command: &str,
+    use_codex: bool,
+    cwd: Option<&Path>,
+) -> HookOutcome {
     let home = tempfile::tempdir().expect("tempdir");
     let config_dir = home.path().join(".config/dcg");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -1994,6 +2003,10 @@ fn run_with_user_allowlist(allowlist_toml: &str, command: &str, use_codex: bool)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
 
     let mut child = cmd.spawn().expect("spawn");
     {
@@ -2035,6 +2048,47 @@ reason = "Team accepts this risk in CI"
     assert!(
         outcome.is_allow_shape(),
         "user allowlist rule must produce silent allow under Claude\n{outcome}"
+    );
+}
+
+#[test]
+fn path_scoped_allowlist_only_applies_inside_configured_path() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    std::fs::create_dir(repo.path().join(".git")).expect("create git marker");
+    std::fs::create_dir(repo.path().join(".dcg")).expect("create dcg dir");
+    let allowed_project = repo.path().join("allowed/project");
+    let outside_project = repo.path().join("outside");
+    std::fs::create_dir_all(&allowed_project).expect("create allowed project");
+    std::fs::create_dir(&outside_project).expect("create outside project");
+    let allowlist = r#"
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "allowed project only"
+paths = ["**/allowed/**"]
+"#;
+    std::fs::write(repo.path().join(".dcg/allowlist.toml"), allowlist)
+        .expect("write project allowlist");
+
+    let denied = run_with_user_allowlist_at_path(
+        "",
+        "git reset --hard HEAD~1",
+        true,
+        Some(&outside_project),
+    );
+    assert!(
+        denied.is_codex_block_shape(),
+        "path-scoped rule must not apply outside configured path\n{denied}"
+    );
+
+    let allowed = run_with_user_allowlist_at_path(
+        "",
+        "git reset --hard HEAD~1",
+        true,
+        Some(&allowed_project),
+    );
+    assert!(
+        allowed.is_allow_shape(),
+        "path-scoped rule must apply inside configured path\n{allowed}"
     );
 }
 
