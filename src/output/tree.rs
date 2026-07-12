@@ -9,9 +9,13 @@
 //! for premium terminal output. Otherwise, a fallback ASCII tree renderer is used.
 
 #[cfg(feature = "rich-output")]
+use rich_rust::markup::render_or_plain;
+#[cfg(feature = "rich-output")]
 use rich_rust::renderables::tree::{Tree as RichTree, TreeGuides, TreeNode as RichTreeNode};
 #[cfg(feature = "rich-output")]
 use rich_rust::style::Style;
+#[cfg(feature = "rich-output")]
+use rich_rust::text::Text as RichText;
 
 use super::theme::{BorderStyle, Theme};
 use crate::evaluator::EvaluationDecision;
@@ -324,10 +328,22 @@ impl TreeNode {
     /// Convert to rich_rust TreeNode (when feature enabled).
     #[cfg(feature = "rich-output")]
     fn to_rich_node(&self) -> RichTreeNode {
+        // TreeNode::new()/with_icon() accept `impl Into<Text>`, and a bare
+        // String/&str goes through Text::new() — which does NOT parse markup
+        // (see rich_rust's own doc comment on TreeNode::new). Passing the
+        // raw "[style]label[/]" string through unparsed is exactly why the
+        // bracket tags showed up literally in `dcg packs` output instead of
+        // being rendered as color/bold. render_or_plain() does the parsing
+        // rich_rust expects the caller to do before construction.
+        //
+        // Only styled labels go through render_or_plain: an unstyled label
+        // may legitimately contain literal '[' (e.g. `extra_packs =
+        // ["paranoid"]`, see #187) and must NOT be run through the markup
+        // parser, which would try to interpret those brackets as tags.
         let label = if let Some(ref style) = self.style {
-            format!("{style}{}{style_end}", self.label, style_end = "[/]")
+            render_or_plain(&format!("{style}{}{style_end}", self.label, style_end = "[/]"))
         } else {
-            self.label.clone()
+            RichText::new(self.label.clone())
         };
 
         let mut node = if let Some(ref icon) = self.icon {
@@ -1308,6 +1324,47 @@ mod tests {
     fn test_tree_node_styled() {
         let node = TreeNode::new("styled").styled("[bold red]");
         assert_eq!(node.style.as_deref(), Some("[bold red]"));
+    }
+
+    // Regression tests for #187: `dcg packs` printed literal "[bold]"/"[dim]"/
+    // "[green]" tags instead of applying the styling. Root cause: TreeNode::new()
+    // accepts `impl Into<Text>`, and a bare String goes through Text::new(),
+    // which rich_rust documents as NOT parsing markup — the raw
+    // "[style]label[/]" string was never being interpreted.
+    #[cfg(feature = "rich-output")]
+    #[test]
+    fn test_to_rich_node_parses_style_markup_instead_of_leaving_it_literal() {
+        let node = TreeNode::new("No packs to display").styled("[dim]");
+        let rich = node.to_rich_node();
+
+        let plain = rich.label().plain();
+        assert!(
+            !plain.contains("[dim]") && !plain.contains("[/]"),
+            "markup tags leaked into rendered text: {plain:?}"
+        );
+        assert_eq!(plain, "No packs to display");
+
+        // Parsed markup must actually apply styling, not just silently strip
+        // the tags (which would look identical to unstyled text). rich_rust's
+        // Text::style() is the *base* style — markup parsing applies styling
+        // via per-range spans instead, so that's what to check here.
+        assert!(
+            !rich.label().spans().is_empty(),
+            "expected [dim] markup to produce at least one styled span, got none: {:?}",
+            rich.label().spans()
+        );
+    }
+
+    #[cfg(feature = "rich-output")]
+    #[test]
+    fn test_to_rich_node_unstyled_label_keeps_literal_brackets() {
+        // An unstyled label may legitimately contain '[' as real content
+        // (e.g. `extra_packs = ["paranoid"]`, see #187) and must NOT be run
+        // through the markup parser, or those brackets would be
+        // misinterpreted as tag syntax.
+        let node = TreeNode::new(r#"extra_packs = ["paranoid"]"#);
+        let rich = node.to_rich_node();
+        assert_eq!(rich.label().plain(), r#"extra_packs = ["paranoid"]"#);
     }
 
     #[test]
