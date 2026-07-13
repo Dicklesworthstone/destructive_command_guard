@@ -96,7 +96,10 @@ the allowlist so every command is evaluated against the full rule set:
 [agents.unknown]
 trust_level = "low"
 disabled_allowlist = true
-extra_packs = ["core", "database", "filesystem"]
+# Real pack / category IDs (see `dcg packs` / docs/packs/README.md).
+# Category IDs like "database" expand to every database.* sub-pack.
+# "paranoid" is a graduation mode, not a pack — use strict_git for extra git rules.
+extra_packs = ["strict_git", "database", "system"]
 ```
 
 ## Configuration
@@ -113,7 +116,7 @@ additional_allowlist = ["npm run build", "cargo test"]
 [agents.unknown]
 trust_level = "low"
 disabled_allowlist = true
-extra_packs = ["paranoid"]
+extra_packs = ["strict_git", "database"]
 
 # Default profile for unspecified agents
 [agents.default]
@@ -125,8 +128,8 @@ trust_level = "medium"
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `trust_level` | string | `"medium"` | Advisory label: `"high"`, `"medium"`, or `"low"`. Included in JSON/verbose output but does not change rule evaluation by itself. |
-| `disabled_packs` | array | `[]` | Packs to remove from evaluation for this agent (including sub-packs). |
-| `extra_packs` | array | `[]` | Additional packs to enable for this agent. |
+| `disabled_packs` | array | `[]` | Pack or category IDs to remove from evaluation for this agent (category IDs drop every matching sub-pack). |
+| `extra_packs` | array | `[]` | Additional pack or category IDs to enable for this agent (category IDs expand to all sub-packs). |
 | `additional_allowlist` | array | `[]` | Command patterns to allowlist for this agent (added on top of the base allowlist). |
 | `disabled_allowlist` | bool | `false` | If `true`, ignore all allowlist entries for this agent (more restrictive). |
 
@@ -137,7 +140,7 @@ trust_level = "medium"
 [agents.unknown]
 trust_level = "low"
 disabled_allowlist = true
-extra_packs = ["core", "database", "filesystem"]
+extra_packs = ["strict_git", "database", "system"]
 
 [agents.claude-code]
 trust_level = "medium"

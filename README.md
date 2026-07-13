@@ -83,7 +83,7 @@ Tip: Consider using 'git stash' first to save your changes.
 [packs]
 enabled = [
     "database.postgresql",    # Blocks DROP TABLE, TRUNCATE
-    "kubernetes.kubectl",     # Blocks kubectl delete namespace
+    "kubernetes",             # Category ID — enables all kubernetes.* sub-packs
     "cloud.aws",              # Blocks aws ec2 terminate-instances
     "containers.docker",      # Blocks docker system prune
 ]
@@ -113,7 +113,7 @@ disabled_packs = ["kubernetes"]
 # Restrict unknown agents — extra rules, no allowlist bypass
 [agents.unknown]
 trust_level = "low"
-extra_packs = ["paranoid"]
+extra_packs = ["strict_git", "database"]  # real pack / category IDs (not graduation modes)
 disabled_allowlist = true
 ```
 
@@ -168,6 +168,8 @@ If dcg is blocking something you genuinely need to run:
 ## Modular Pack System
 
 dcg uses a modular "pack" system to organize destructive command patterns by category. Packs can be enabled or disabled in the configuration file.
+
+Category IDs expand to every sub-pack under them: `enabled = ["database"]` turns on `database.postgresql`, `database.mysql`, and the rest of that category. You can still disable individual sub-packs with `disabled = ["database.redis"]`. The same expansion applies to agent-profile `extra_packs` / `disabled_packs`. Use real pack or category IDs from `dcg packs` / `docs/packs/README.md` — names like `"paranoid"` are [graduation modes](docs/graduated-response.md), not packs.
 
 - Full pack ID index: `docs/packs/README.md`
 - Canonical descriptions + pattern counts: `dcg packs --verbose`
