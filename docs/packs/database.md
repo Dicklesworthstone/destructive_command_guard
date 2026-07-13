@@ -227,6 +227,8 @@ Protects against destructive Redis operations like FLUSHALL, FLUSHDB, and mass k
 Commands containing these keywords are checked against this pack:
 
 - `redis`
+- `valkey`
+- `keydb`
 - `FLUSHALL`
 - `FLUSHDB`
 - `DEBUG`

@@ -73,14 +73,15 @@ The same thresholds are also enforced by `scripts/coverage.sh`, which writes
 checks. The script fails if overall, `src/evaluator.rs`, or `src/hook.rs`
 coverage falls below the targets above.
 
-### Codex Hook Protocol Coverage (2026-04-28)
+### Codex Hook Protocol Coverage (2026-07-11)
 
 The Codex-specific match arms in `src/hook.rs` are covered without spawning the
 real `dcg` binary:
 
-- `test_write_denial_codex_produces_empty_stdout` exercises
+- `test_write_denial_codex_produces_minimal_json_stdout` exercises
   `write_denial_to(..., HookProtocol::Codex, ...)` and verifies the Codex
-  contract: zero stdout bytes and a non-empty stderr denial.
+  contract: an exact three-field `hookSpecificOutput` deny on stdout plus a
+  non-empty stderr explanation.
 - `test_write_warning_codex_produces_empty_stdout` exercises
   `write_warning_to(..., HookProtocol::Codex, ...)` and verifies warnings use
   stderr only for Codex.

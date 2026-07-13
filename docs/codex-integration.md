@@ -1,11 +1,11 @@
 # Codex Integration
 
-Last updated: 2026-04-28
+Last updated: 2026-07-11
 
 This document is the maintainer reference for dcg's Codex CLI hook path. It
 explains how dcg distinguishes Codex from Claude-compatible hook payloads, why
-Codex denials use exit code 2 with stderr instead of stdout JSON, and how to
-debug a hook run that Codex reports as failed instead of blocked.
+Codex denials use a minimal stdout JSON contract, and how to debug a hook run
+that Codex reports as failed instead of blocked.
 
 ## Protocol Detection
 
@@ -43,26 +43,34 @@ contains fields dcg users and agents rely on, including `hookSpecificOutput`,
 `ruleId`, `packId`, `severity`, `confidence`, `allowOnceCode`, and
 `remediation`.
 
-Codex's hook output parser is stricter. The Codex deny parser rejects unknown
-fields, so sending dcg's Claude-compatible JSON to Codex can turn a policy
-decision into a `PreToolUse Failed` event instead of a blocked command. That is
-the unsafe failure mode this integration avoids.
+Codex's hook output parser is stricter. The Codex deny parser can reject unknown
+fields, so sending dcg's extended Claude-compatible payload can turn a policy
+decision into a `PreToolUse Failed` event instead of a blocked command. dcg
+therefore emits only Codex's documented fields:
 
-For Codex, dcg uses Codex's alternate deny path:
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "Destructive command blocked by dcg."
+  }
+}
+```
 
-- stdout is empty;
-- stderr contains the human-readable deny reason, command, rule, and
-  remediation;
-- the process exits with code 2.
+The process exits 0. stderr still contains the human-readable warning for an
+operator, but Codex's blocking decision comes from the JSON on stdout. This is
+important on Codex 0.144.x for Windows: a verified report showed the legacy
+exit-2 path being classified as `PreToolUse Failed` and then failing open,
+whereas the minimal JSON denial blocks correctly (#183).
 
 The implementation points are:
 
-- `src/hook.rs:output_denial_for_protocol` selects the Codex stderr-only output
-  shape.
-- The deny branch in `src/main.rs` flushes pending history writes before calling
-  `std::process::exit(2)` for `HookProtocol::Codex`.
-- `src/hook.rs` keeps the Claude-compatible JSON path unchanged for Claude,
-  Gemini, Copilot, and other non-Codex hook callers.
+- `src/hook.rs:output_denial_for_protocol` selects the minimal Codex JSON shape.
+- The deny branch in `src/main.rs` returns normally, so pending history writes
+  flush through `HistoryWriter::Drop`.
+- `src/hook.rs` keeps each other agent's established protocol-specific output
+  path unchanged.
 
 The exit-code split is intentional:
 
@@ -70,11 +78,11 @@ The exit-code split is intentional:
 |------|--------|--------|------|
 | Allow under any protocol | empty | empty | 0 |
 | Claude-compatible deny | JSON denial | warning text | 0 |
-| Codex deny | empty | deny reason | 2 |
+| Codex deny | minimal JSON denial | warning text | 0 |
 | Parse/config/runtime error | optional error output | error details | 1 or 2 |
 
-For Codex hook integrations, interpret exit code 2 plus non-empty stderr as a
-policy denial. Do not require stdout JSON on the Codex path.
+For Codex hook integrations, parse the minimal stdout JSON. Empty stdout with
+exit 0 still means allow.
 
 ## Manual Protocol Probe
 
@@ -92,8 +100,8 @@ wc -c /tmp/dcg-codex-stdout.txt /tmp/dcg-codex-stderr.txt
 
 Expected result:
 
-- exit code is 2;
-- stdout is empty;
+- exit code is 0;
+- stdout contains a three-field `hookSpecificOutput` denial;
 - stderr is non-empty and mentions the blocked command plus the matching rule.
 
 For a Claude-compatible negative control, remove `turn_id` from the same payload.
@@ -111,8 +119,9 @@ block. Check these in order:
 2. Confirm the binary is executable and runs from the same shell environment
    Codex uses.
 3. Confirm `codex --version` reports 0.125.0 or newer.
-4. Run the manual protocol probe above. If stdout contains a Claude-style JSON
-   denial, dcg did not detect the payload as Codex.
+4. Run the manual protocol probe above. The Codex payload must contain only
+   `hookEventName`, `permissionDecision`, and `permissionDecisionReason` inside
+   `hookSpecificOutput`; dcg-only metadata belongs only on tolerant protocols.
 5. If stderr is empty on a destructive command, inspect `src/hook.rs` output
    dispatch and `src/main.rs` deny handling before looking at installer code.
 
@@ -121,6 +130,10 @@ block. Check these in order:
 Look for a failed-hook symptom first. A failed hook is not the same as a blocked
 hook. The common causes are an old dcg binary, stale hook configuration, or a
 hook output shape that no longer matches Codex's parser.
+
+Also open `/hooks` once in Codex and trust the installed hook. Current Codex can
+silently skip an untrusted user hook, which is observationally similar to a
+failed-open hook.
 
 The real-Codex harness checks the smoking-gun condition directly: after Codex is
 asked to run a destructive command, the test verifies the repository state is
@@ -176,15 +189,15 @@ are the PR gate; the real-Codex harness is a push-to-main smoke layer.
 Codex does not get a separate matching engine. The hot path remains the same:
 parse, quick reject, normalize, safe patterns, destructive patterns, then output
 formatting. The Codex-specific work happens after the decision, where dcg chooses
-stderr-only output and exit code 2 for denials.
+minimal JSON output for denials.
 
 Performance-sensitive changes should keep these properties:
 
 - allowed commands stay silent and fast;
 - protocol detection stays O(1) over parsed hook metadata;
-- stderr formatting for Codex denials does not force JSON serialization;
-- history writes are flushed synchronously only before Codex's `process::exit(2)`
-  deny path.
+- Codex serialization stays minimal and excludes dcg-only fields;
+- history writes flush through normal scope teardown rather than a special
+  process-exit path.
 
 The `codex_deny` benchmark exists to catch regressions in the Codex denial path.
 
@@ -212,7 +225,7 @@ stdin/stdout handling of shell, but interception is incomplete."
 
 This is the root cause behind the unresolved part of issue #125 (Windows Codex
 Desktop / `codex exec`). On that path Codex routes the command through
-`unified_exec` and emits a `command_execution` event with a wrapped PowerShell
+`unified_exec` and may emit a `command_execution` event with a wrapped PowerShell
 invocation, e.g.:
 
 ```json
@@ -259,7 +272,7 @@ command through `unified_exec`/`command_execution`, *no* `PreToolUse` hook fires
 dcg is simply never invoked — it cannot block what it never sees, and it neither
 crashes nor interferes. The simple per-tool shell path (Codex's `Bash` /
 PowerShell-named payload) **is** intercepted (it dispatches as `HookProtocol::Codex`,
-the exit-2 deny path). See also the Windows limitations summary in
+the minimal-JSON deny path). See also the Windows limitations summary in
 [docs/windows.md](windows.md#limitations-honest).
 
 ### dcg-side state (already correct)
@@ -290,11 +303,11 @@ Before closing Codex hook work, collect evidence for the relevant layer:
   changes.
 - `cargo check --all-targets` passes.
 - `cargo clippy --all-targets -- -D warnings` passes.
-- The manual protocol probe returns exit code 2, empty stdout, and non-empty
-  stderr for a destructive Codex-shaped payload.
+- The manual protocol probe returns exit code 0, minimal denial JSON on stdout,
+  and non-empty stderr for a destructive Codex-shaped payload.
 - `scripts/e2e_codex.sh --verbose --json --artifacts <dir> --dcg-binary <path>`
   either passes against an authenticated Codex CLI or exits successfully with an
   explicit skip reason.
 - README's Codex CLI note links back to this document.
-- AGENTS.md states that exit code 2 can mean either a configuration error or a
-  Codex hook denial, with non-empty stderr distinguishing the Codex denial case.
+- AGENTS.md states that a Codex deny uses the minimal JSON contract and that
+  empty stdout with exit 0 remains the allow signal.

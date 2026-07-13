@@ -52,8 +52,8 @@ pub use test::{AllowedReason, TestOutcome, TestResultBox};
 pub use theme::{BorderStyle, Severity, SeverityColors, Theme, ThemePalette};
 pub use tree::{
     DEFAULT_PACK_TREE_MAX_PATTERNS, DcgTree, DcgTreeGuides, ExplainTreeBuilder, PackTreeItem,
-    PackTreeOptions, PackTreePattern, TreeNode, explain_trace_tree, pack_list_tree,
-    pack_list_tree_with_options,
+    PackTreeOptions, PackTreePattern, TreeNode, explain_trace_tree, pack_legend_lines,
+    pack_list_tree, pack_list_tree_with_options,
 };
 
 use crate::config::Config;

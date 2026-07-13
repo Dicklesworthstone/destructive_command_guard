@@ -595,8 +595,23 @@ fn destructive_bash_blocks_with_protocol_specific_output() {
 
             let codex_env = RealServiceEnv::new("deny-codex");
             let codex = run_hook(log, &codex_env, Protocol::Codex, DESTRUCTIVE_COMMAND, &[]);
-            assert_eq!(codex.exit_code, 2, "Codex deny should exit 2");
-            assert_empty(log, "Codex deny stdout", &codex.stdout);
+            assert_eq!(codex.exit_code, 0, "Codex deny should exit normally");
+            let codex_json = codex.stdout_json();
+            let codex_specific = codex_json["hookSpecificOutput"]
+                .as_object()
+                .expect("Codex hookSpecificOutput object");
+            assert_eq!(codex_specific.len(), 3, "Codex deny must stay minimal");
+            assert_eq!(codex_specific["hookEventName"], "PreToolUse");
+            assert_eq!(codex_specific["permissionDecision"], "deny");
+            assert!(
+                codex_specific["permissionDecisionReason"]
+                    .as_str()
+                    .is_some_and(|reason| {
+                        reason.contains(DESTRUCTIVE_COMMAND)
+                            && reason.contains("core.git:reset-hard")
+                    }),
+                "Codex deny reason must contain command and rule"
+            );
             assert_contains(log, "Codex deny stderr marker", &codex.stderr, "BLOCKED");
             assert_contains(
                 log,
@@ -674,8 +689,21 @@ fn heredoc_embedded_destructive_blocks_for_claude_and_codex() {
 
             let codex_env = RealServiceEnv::new("heredoc-codex");
             let codex = run_hook(log, &codex_env, Protocol::Codex, command, &[]);
-            assert_eq!(codex.exit_code, 2, "Codex heredoc deny should exit 2");
-            assert_empty(log, "Codex heredoc stdout", &codex.stdout);
+            assert_eq!(
+                codex.exit_code, 0,
+                "Codex heredoc deny should exit normally"
+            );
+            let codex_json = codex.stdout_json();
+            assert_eq!(
+                codex_json["hookSpecificOutput"]["permissionDecision"],
+                "deny"
+            );
+            assert_eq!(
+                codex_json["hookSpecificOutput"]
+                    .as_object()
+                    .map(serde_json::Map::len),
+                Some(3)
+            );
             assert_contains(log, "Codex heredoc stderr", &codex.stderr, "BLOCKED");
             assert_contains(log, "Codex heredoc pack", &codex.stderr, "heredoc.");
         },
@@ -781,7 +809,7 @@ fn cli_version_and_help_emit_human_output() {
             log,
             "--help stderr codex contract",
             &help.stderr,
-            "Codex denials use stderr + exit 2",
+            "including Codex, receive protocol-specific stdout JSON",
         );
         assert_contains(log, "--help stderr command", &help.stderr, "COMMANDS");
     });

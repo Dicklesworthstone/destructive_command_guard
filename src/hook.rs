@@ -1,8 +1,8 @@
 //! Hook protocol handling.
 //!
 //! This module handles JSON input/output for supported hook protocols
-//! (Claude Code, Codex CLI, Copilot, Gemini, and Hermes Agent). It parses
-//! incoming hook requests and formats denial responses.
+//! (Claude Code, Codex CLI, Copilot, VS Code Copilot Chat, Gemini, and Hermes
+//! Agent). It parses incoming hook requests and formats denial responses.
 
 use crate::evaluator::MatchSpan;
 use crate::highlight::HighlightSpan;
@@ -38,7 +38,7 @@ pub struct HookInput {
     /// Gemini event timestamp.
     pub timestamp: Option<String>,
 
-    /// The name of the tool being invoked (e.g., "Bash", "Read", "Write").
+    /// The name of the tool being invoked (e.g., "Bash", "runTerminalCommand").
     #[serde(alias = "toolName")]
     pub tool_name: Option<String>,
 
@@ -57,9 +57,9 @@ pub struct HookInput {
     /// divergence from Claude's public hook docs. Claude Code does NOT send
     /// this field (Claude does send `tool_use_id`, so that field can't be
     /// used to disambiguate the two otherwise-similar wire formats). When
-    /// `turn_id` is present and non-blank we switch to Codex's strict exit-2 + stderr
-    /// deny path because Codex's JSON parser uses `deny_unknown_fields` and
-    /// would silently drop dcg's standard hookSpecificOutput payload.
+    /// `turn_id` is present and non-blank we switch to Codex's minimal
+    /// `hookSpecificOutput` deny payload because Codex's parser can reject the
+    /// dcg-only fields carried by the extended Claude-compatible response.
     #[serde(alias = "turnId")]
     pub turn_id: Option<String>,
 
@@ -149,58 +149,21 @@ pub struct HookSpecificOutput<'a> {
     pub remediation: Option<Remediation>,
 }
 
-/// Copilot-compatible denial output for pre-tool-use hooks.
+/// Copilot-compatible output for `preToolUse` hooks.
 ///
-/// Copilot hooks can consume either:
-/// - `continue=false` with `stopReason`
-/// - `permissionDecision=deny` with `permissionDecisionReason`
-///
-/// We emit both for compatibility across documented variants.
+/// Copilot parses stdout as one JSON document and documents these two top-level
+/// fields as the decision contract.  Emitting legacy `continue`/`stopReason`
+/// fields alongside them can make current Copilot CLI discard the decision
+/// entirely, so this wire type is intentionally minimal (#182).
 #[derive(Debug, Serialize)]
 pub struct CopilotHookOutput<'a> {
-    /// Whether execution should continue.
-    #[serde(rename = "continue")]
-    pub continue_execution: bool,
-
-    /// Human-readable stop reason.
-    #[serde(rename = "stopReason")]
-    pub stop_reason: Cow<'a, str>,
-
-    /// Permission decision (`deny`).
+    /// Permission decision (`allow`, `deny`, or `ask`).
     #[serde(rename = "permissionDecision")]
     pub permission_decision: &'static str,
 
     /// Human-readable explanation of the decision.
     #[serde(rename = "permissionDecisionReason")]
     pub permission_decision_reason: Cow<'a, str>,
-
-    /// Short allow-once code (if a pending exception was recorded).
-    #[serde(rename = "allowOnceCode", skip_serializing_if = "Option::is_none")]
-    pub allow_once_code: Option<String>,
-
-    /// Full hash for allow-once disambiguation (if available).
-    #[serde(rename = "allowOnceFullHash", skip_serializing_if = "Option::is_none")]
-    pub allow_once_full_hash: Option<String>,
-
-    /// Stable rule identifier (e.g., "core.git:reset-hard").
-    #[serde(rename = "ruleId", skip_serializing_if = "Option::is_none")]
-    pub rule_id: Option<String>,
-
-    /// Pack identifier that matched (e.g., "core.git").
-    #[serde(rename = "packId", skip_serializing_if = "Option::is_none")]
-    pub pack_id: Option<String>,
-
-    /// Severity level of the matched pattern.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub severity: Option<crate::packs::Severity>,
-
-    /// Confidence score for this match (0.0-1.0).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<f64>,
-
-    /// Remediation suggestions for the blocked command.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub remediation: Option<Remediation>,
 }
 
 /// Gemini-compatible denial output for `BeforeTool` hooks.
@@ -365,17 +328,15 @@ pub enum HookProtocol {
     /// Tolerant JSON parser; accepts dcg's full deny payload with
     /// `allowOnceCode`, `ruleId`, `severity`, `remediation`, etc.
     ClaudeCompatible,
-    /// Copilot hook protocol (`continue` / `stopReason` + permission fields).
+    /// Copilot hook protocol (top-level permission decision and reason).
     Copilot,
     /// Gemini hook protocol (`decision` / `reason`).
     Gemini,
-    /// Codex CLI 0.125.0+ protocol. Wire shape mirrors Claude Code's, but
-    /// Codex's JSON parser annotates every output struct with
-    /// `#[serde(deny_unknown_fields)]` and silently treats any extra field
-    /// as an invalid hook (the deny is dropped and the command runs).
-    /// To make blocks stick we use Codex's documented "exit code 2 +
-    /// stderr reason" alternative path: dcg writes its colored message
-    /// to stderr (existing behavior) and the process exits with code 2.
+    /// Codex CLI protocol. Input carries the Codex-specific `turn_id`; denials
+    /// use the current minimal `hookSpecificOutput` JSON contract on stdout
+    /// with exit code 0.  Keeping this payload minimal avoids Codex rejecting
+    /// dcg-specific ergonomics fields while also avoiding the legacy exit-2
+    /// path that Codex 0.144.x can classify as a failed hook and fail open.
     Codex,
     /// Hermes Agent (NousResearch) protocol. Wire shape: stdin carries
     /// snake_case `hook_event_name: "pre_tool_call"`, `tool_name: "terminal"`,
@@ -615,7 +576,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     let is_claude_compatible_shell_tool = matches!(
         tool_name.as_str(),
         "bash" | "launch-process" | "powershell" | "pwsh"
-    );
+    ) || is_vscode_terminal_tool(&tool_name);
     let has_codex_turn_id = input
         .turn_id
         .as_deref()
@@ -630,11 +591,11 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // Claude Code. On Windows, Codex drives commands through PowerShell but
     // does not always populate `turn_id` (issue #125), so the turn_id-gated
     // check above misses it and the destructive command would otherwise slip
-    // through as a non-blocking ClaudeCompatible result (exit 0 + JSON that
-    // Codex's strict parser drops). Classify a PowerShell tool name as Codex
-    // unconditionally so the exit-2 deny path -- the one that actually blocks
-    // under Codex -- is used. (`bash`/`launch-process` stay turn_id-gated
-    // because Claude Code legitimately uses those names.)
+    // through as a ClaudeCompatible result whose extension fields Codex's
+    // strict parser drops. Classify a PowerShell tool name as Codex
+    // unconditionally so the minimal Codex JSON path is used.
+    // (`bash`/`launch-process` stay turn_id-gated because Claude Code
+    // legitimately uses those names.)
     let is_powershell_tool = matches!(tool_name.as_str(), "powershell" | "pwsh");
     if is_powershell_tool {
         return HookProtocol::Codex;
@@ -701,14 +662,28 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     HookProtocol::ClaudeCompatible
 }
 
+/// Return whether `tool_name` is a VS Code Copilot Chat terminal tool.
+///
+/// Current VS Code documentation uses `runTerminalCommand`; live payloads have
+/// also used `run_in_terminal`, and `runInTerminal` appears in compatibility
+/// layers. Names are lowercased by the caller before reaching this helper.
+fn is_vscode_terminal_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "runterminalcommand" | "run_in_terminal" | "runinterminal"
+    )
+}
+
 pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
     let Some(tool_name) = tool_name else {
         return false;
     };
 
-    matches!(
-        tool_name.to_ascii_lowercase().as_str(),
-        "bash"
+    let normalized = tool_name.to_ascii_lowercase();
+    is_vscode_terminal_tool(&normalized)
+        || matches!(
+            normalized.as_str(),
+            "bash"
             | "launch-process"
             | "powershell"
             | "pwsh"
@@ -722,7 +697,7 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             // internal name `run_terminal_cmd` before invoking hooks, so the
             // toolName field on the wire is always this canonical form.
             | "run_terminal_cmd"
-    )
+        )
 }
 
 pub(crate) fn is_shell_hook_candidate(input: &HookInput) -> bool {
@@ -1238,23 +1213,32 @@ pub fn write_denial_to(
             let _ = writeln!(stdout);
         }
         HookProtocol::Codex => {
-            // Codex 0.125.0+: exit code 2 + stderr reason. The colored
-            // stderr message was already written above; main.rs propagates
-            // exit code 2 when this protocol is active. No stdout JSON.
+            // Codex 0.144.x: emit only the documented PreToolUse fields.
+            // Extra dcg metadata is intentionally omitted because Codex's
+            // parser is stricter than Claude's.  Exit remains 0; some current
+            // Codex builds classify exit 2 as hook failure and then fail open.
+            let output = HookOutput {
+                hook_specific_output: HookSpecificOutput {
+                    hook_event_name: "PreToolUse",
+                    permission_decision: "deny",
+                    permission_decision_reason: Cow::Owned(message),
+                    allow_once_code: None,
+                    allow_once_full_hash: None,
+                    rule_id: None,
+                    pack_id: None,
+                    severity: None,
+                    confidence: None,
+                    remediation: None,
+                },
+            };
+
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
         }
         HookProtocol::Copilot => {
             let output = CopilotHookOutput {
-                continue_execution: false,
-                stop_reason: Cow::Owned(format!("BLOCKED by dcg: {reason}")),
                 permission_decision: "deny",
-                permission_decision_reason: Cow::Owned(message.clone()),
-                allow_once_code: allow_once.map(|info| info.code.clone()),
-                allow_once_full_hash: allow_once.map(|info| info.full_hash.clone()),
-                rule_id,
-                pack_id: pack.map(String::from),
-                severity,
-                confidence,
-                remediation,
+                permission_decision_reason: Cow::Owned(message),
             };
 
             let _ = serde_json::to_writer(&mut *stdout, &output);
@@ -1486,20 +1470,10 @@ pub(crate) fn write_warning_to(
             let _ = writeln!(stdout);
         }
         HookProtocol::Copilot => {
-            // Warnings should ask/surface policy context without using the
-            // legacy stop signal. Hard denials set `continue=false` above.
+            // `ask` is part of Copilot's documented preToolUse contract.
             let output = CopilotHookOutput {
-                continue_execution: true,
-                stop_reason: Cow::Owned(format!("DCG warn: {reason}")),
                 permission_decision: "ask",
                 permission_decision_reason: Cow::Owned(warn_reason),
-                allow_once_code: None,
-                allow_once_full_hash: None,
-                rule_id,
-                pack_id: pack.map(String::from),
-                severity: None,
-                confidence: None,
-                remediation: None,
             };
 
             let _ = serde_json::to_writer(&mut *stdout, &output);
@@ -1892,6 +1866,37 @@ mod tests {
     }
 
     #[test]
+    fn test_vscode_terminal_tool_variants_are_claude_compatible() {
+        for tool_name in ["runTerminalCommand", "run_in_terminal", "runInTerminal"] {
+            let json = serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool_name,
+                "tool_input": {
+                    "command": "git reset --hard",
+                    "explanation": "Reset the repository",
+                    "mode": "run",
+                    "timeout": 30_000,
+                },
+            });
+            let input: HookInput = serde_json::from_value(json).unwrap();
+
+            assert!(
+                is_supported_shell_tool(Some(tool_name)),
+                "VS Code terminal tool {tool_name:?} must be evaluated"
+            );
+            assert_eq!(
+                detect_protocol(&input),
+                HookProtocol::ClaudeCompatible,
+                "VS Code uses hookSpecificOutput, not the Copilot CLI wire format"
+            );
+            assert_eq!(
+                extract_command(&input),
+                Some("git reset --hard".to_string())
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_missing_command() {
         let json = r#"{"tool_name":"Bash","tool_input":{}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
@@ -2081,21 +2086,13 @@ mod tests {
     #[test]
     fn test_copilot_warn_ask_json_shape() {
         let output = CopilotHookOutput {
-            continue_execution: true,
-            stop_reason: Cow::Borrowed("DCG warn: risky pattern"),
             permission_decision: "ask",
             permission_decision_reason: Cow::Borrowed("DCG warn: risky pattern"),
-            allow_once_code: None,
-            allow_once_full_hash: None,
-            rule_id: None,
-            pack_id: None,
-            severity: None,
-            confidence: None,
-            remediation: None,
         };
         let json = serde_json::to_value(&output).unwrap();
         assert_eq!(json["permissionDecision"], "ask");
-        assert_eq!(json["continue"], true);
+        assert!(json.get("continue").is_none());
+        assert!(json.get("stopReason").is_none());
     }
 
     #[test]
@@ -2914,7 +2911,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_denial_codex_produces_empty_stdout() {
+    fn test_write_denial_codex_produces_minimal_json_stdout() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let allow = test_allow_once();
@@ -2936,11 +2933,20 @@ mod tests {
             None,
         );
 
+        let json: serde_json::Value = serde_json::from_slice(&stdout)
+            .unwrap_or_else(|error| panic!("Codex deny stdout must be JSON: {error}"));
+        let specific = &json["hookSpecificOutput"];
+        assert_eq!(specific["hookEventName"], "PreToolUse");
+        assert_eq!(specific["permissionDecision"], "deny");
         assert!(
-            stdout.is_empty(),
-            "Codex deny must produce zero bytes on stdout; got {} bytes: {:?}",
-            stdout.len(),
-            String::from_utf8_lossy(&stdout)
+            specific["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("git reset --hard HEAD~1"))
+        );
+        assert_eq!(
+            specific.as_object().map(serde_json::Map::len),
+            Some(3),
+            "Codex payload must omit dcg-only fields: {json}"
         );
         assert!(
             !stderr.is_empty(),
@@ -2999,14 +3005,15 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
             .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
 
-        assert_eq!(json["continue"], false);
         assert_eq!(json["permissionDecision"], "deny");
         assert!(
-            json["stopReason"]
+            json["permissionDecisionReason"]
                 .as_str()
                 .unwrap()
                 .contains("BLOCKED by dcg")
         );
+        assert!(json.get("continue").is_none());
+        assert!(json.get("stopReason").is_none());
     }
 
     #[test]
@@ -3133,7 +3140,8 @@ mod tests {
             .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
 
         assert_eq!(json["permissionDecision"], "ask");
-        assert_eq!(json["continue"], true);
+        assert!(json.get("continue").is_none());
+        assert!(json.get("stopReason").is_none());
     }
 
     #[test]

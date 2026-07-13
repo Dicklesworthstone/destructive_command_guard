@@ -320,17 +320,23 @@ function Unconfigure-CursorHook {
 }
 
 function Unconfigure-CopilotHook {
-  # Remove dcg from a repo-local <repo>/.github/hooks/dcg.json (preToolUse[]):
+  # Remove dcg from the user-level hook by default. -RepoRoot selects the
+  # legacy repo-local path written by dcg <= 0.6.5 so uninstall can clean both.
   # strip the dcg bash/powershell fields, drop an entry only if it has no other
   # platform field, preserve coexisting hooks. Returns $true if removed.
-  param([string]$RepoRoot)
-  if ([string]::IsNullOrEmpty($RepoRoot)) {
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return $false }
-    $RepoRoot = (& git rev-parse --show-toplevel 2>$null)
-    if ([string]::IsNullOrWhiteSpace($RepoRoot)) { return $false }
-    $RepoRoot = $RepoRoot.Trim()
+  param([string]$CopilotHome, [string]$RepoRoot)
+  if (-not [string]::IsNullOrEmpty($RepoRoot)) {
+    $hookFile = Join-Path (Join-Path (Join-Path $RepoRoot ".github") "hooks") "dcg.json"
+  } else {
+    if ([string]::IsNullOrEmpty($CopilotHome)) {
+      if (-not [string]::IsNullOrWhiteSpace($env:COPILOT_HOME)) {
+        $CopilotHome = $env:COPILOT_HOME
+      } else {
+        $CopilotHome = Join-Path $HOME ".copilot"
+      }
+    }
+    $hookFile = Join-Path (Join-Path $CopilotHome "hooks") "dcg.json"
   }
-  $hookFile = Join-Path (Join-Path (Join-Path $RepoRoot ".github") "hooks") "dcg.json"
   if (-not (Test-Path $hookFile -PathType Leaf)) { return $false }
   try { $config = Get-Content -Raw -LiteralPath $hookFile | ConvertFrom-Json } catch { return $false }
   if ($null -eq $config -or $config -isnot [psobject]) { return $false }
@@ -434,8 +440,16 @@ if (Remove-DcgHooksFromJsonFile -Path $geminiSettings -EventName "BeforeTool" -M
 # Cursor IDE (hooks.json + PowerShell bridge).
 if (Unconfigure-CursorHook) { Write-Ok "Removed Cursor IDE hook + bridge" }
 
-# GitHub Copilot CLI (repo-local .github/hooks/dcg.json).
-if (Unconfigure-CopilotHook) { Write-Ok "Removed GitHub Copilot CLI hook (this repo)" }
+# GitHub Copilot CLI: user-level hook plus the legacy repo-local hook, if the
+# uninstaller is running inside a repository that still has one.
+if (Unconfigure-CopilotHook) { Write-Ok "Removed user-level GitHub Copilot CLI hook" }
+if (Get-Command git -ErrorAction SilentlyContinue) {
+  $legacyRepo = (& git rev-parse --show-toplevel 2>$null)
+  if (-not [string]::IsNullOrWhiteSpace($legacyRepo) -and
+      (Unconfigure-CopilotHook -RepoRoot ($legacyRepo.Trim()))) {
+    Write-Ok "Removed legacy repo-local GitHub Copilot CLI hook"
+  }
+}
 
 # Hermes Agent (~/.hermes/config.yaml).
 if (Unconfigure-HermesHook) { Write-Ok "Removed Hermes hook" }

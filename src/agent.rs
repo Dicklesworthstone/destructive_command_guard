@@ -29,6 +29,8 @@
 //!   subprocesses). `agy` reads Claude-Code-compatible `PreToolUse` hooks from
 //!   `~/.gemini/config/hooks.json` (with `~/.gemini/antigravity-cli/hooks.json`
 //!   symlinked to it for backward compatibility).
+//! - Pi (earendil-works `pi` coding agent): `PI_CODING_AGENT=true` env var (set
+//!   by `pi` into the environment of the subprocesses it spawns).
 //!
 //! # Usage
 //!
@@ -82,6 +84,9 @@ pub enum Agent {
     /// envelope with `toolCall.name = "run_command"` and the shell command in
     /// `toolCall.args.CommandLine`.
     Antigravity,
+    /// earendil-works Pi coding agent (`pi`). Injects `PI_CODING_AGENT=true`
+    /// into the environment of the subprocesses it spawns.
+    Pi,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -107,6 +112,7 @@ impl Agent {
             Self::Hermes => "hermes",
             Self::Grok => "grok",
             Self::Antigravity => "antigravity",
+            Self::Pi => "pi",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -128,6 +134,7 @@ impl Agent {
                 | Self::Hermes
                 | Self::Grok
                 | Self::Antigravity
+                | Self::Pi
         )
     }
 
@@ -167,6 +174,7 @@ impl Agent {
             "hermes" | "hermesagent" | "hermescli" => Self::Hermes,
             "grok" | "grokcli" | "grokbuild" | "xai" | "xaigrok" => Self::Grok,
             "agy" | "antigravity" | "antigravitycli" => Self::Antigravity,
+            "pi" | "picli" | "picodingagent" => Self::Pi,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -187,6 +195,7 @@ impl fmt::Display for Agent {
             Self::Hermes => write!(f, "Hermes Agent"),
             Self::Grok => write!(f, "Grok (xAI)"),
             Self::Antigravity => write!(f, "Antigravity CLI"),
+            Self::Pi => write!(f, "Pi"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -554,6 +563,18 @@ fn detect_from_environment() -> Option<DetectionResult> {
         ));
     }
 
+    // Pi (earendil-works) detection. The `pi` coding agent injects
+    // `PI_CODING_AGENT=true` into the environment of the subprocesses it
+    // spawns. As with the other env markers we only check for the variable's
+    // presence, so any truthy value (`true`, `1`, ...) identifies the agent.
+    if std::env::var("PI_CODING_AGENT").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::Pi,
+            DetectionMethod::Environment,
+            Some("PI_CODING_AGENT".to_string()),
+        ));
+    }
+
     None
 }
 
@@ -770,6 +791,7 @@ fn agent_for_basename(basename: &str) -> Option<Agent> {
         "hermes" | "hermes-agent" | "hermes-cli" => Some(Agent::Hermes),
         "grok" | "grok-cli" | "grok-build" => Some(Agent::Grok),
         "agy" | "antigravity" | "antigravity-cli" => Some(Agent::Antigravity),
+        "pi" | "pi-cli" => Some(Agent::Pi),
         _ => None,
     }
 }
@@ -816,6 +838,7 @@ mod tests {
         assert_eq!(Agent::Hermes.config_key(), "hermes");
         assert_eq!(Agent::Grok.config_key(), "grok");
         assert_eq!(Agent::Antigravity.config_key(), "antigravity");
+        assert_eq!(Agent::Pi.config_key(), "pi");
         assert_eq!(Agent::Unknown.config_key(), "unknown");
         assert_eq!(
             Agent::Custom("my-agent".to_string()).config_key(),
@@ -864,6 +887,11 @@ mod tests {
         assert_eq!(Agent::from_name("antigravity-cli"), Agent::Antigravity);
         assert_eq!(Agent::from_name("Antigravity"), Agent::Antigravity);
         assert_eq!(Agent::from_name("ANTIGRAVITY_CLI"), Agent::Antigravity);
+        assert_eq!(Agent::from_name("pi"), Agent::Pi);
+        assert_eq!(Agent::from_name("Pi"), Agent::Pi);
+        assert_eq!(Agent::from_name("pi-cli"), Agent::Pi);
+        assert_eq!(Agent::from_name("pi_cli"), Agent::Pi);
+        assert_eq!(Agent::from_name("PI_CODING_AGENT"), Agent::Pi);
 
         // Custom agents
         assert_eq!(
@@ -885,6 +913,7 @@ mod tests {
         assert_eq!(format!("{}", Agent::Hermes), "Hermes Agent");
         assert_eq!(format!("{}", Agent::Grok), "Grok (xAI)");
         assert_eq!(format!("{}", Agent::Antigravity), "Antigravity CLI");
+        assert_eq!(format!("{}", Agent::Pi), "Pi");
         assert_eq!(format!("{}", Agent::Unknown), "Unknown");
         assert_eq!(
             format!("{}", Agent::Custom("MyAgent".to_string())),
@@ -902,6 +931,7 @@ mod tests {
         assert!(Agent::Hermes.is_known());
         assert!(Agent::Grok.is_known());
         assert!(Agent::Antigravity.is_known());
+        assert!(Agent::Pi.is_known());
         assert!(!Agent::Unknown.is_known());
         assert!(!Agent::Custom("x".to_string()).is_known());
     }
@@ -979,6 +1009,12 @@ mod tests {
             agent_from_process_name("/home/user/.local/bin/agy"),
             Some(Agent::Antigravity)
         );
+        assert_eq!(agent_from_process_name("pi"), Some(Agent::Pi));
+        assert_eq!(agent_from_process_name("pi-cli"), Some(Agent::Pi));
+        assert_eq!(
+            agent_from_process_name("/home/user/.local/bin/pi"),
+            Some(Agent::Pi)
+        );
     }
 
     #[test]
@@ -1025,6 +1061,12 @@ mod tests {
         assert_eq!(agent_from_process_name("legacy"), None);
         assert_eq!(agent_from_process_name("antigravity-helper"), None);
         assert_eq!(agent_from_process_name("xantigravity"), None);
+        // "pi" is short and must be exact; common near-misses are not Pi.
+        assert_eq!(agent_from_process_name("pip"), None);
+        assert_eq!(agent_from_process_name("pipx"), None);
+        assert_eq!(agent_from_process_name("pip3"), None);
+        assert_eq!(agent_from_process_name("xpi"), None);
+        assert_eq!(agent_from_process_name("pi-helper"), None);
     }
 
     #[test]
@@ -1183,6 +1225,7 @@ mod env_tests {
         "GROK_HOOK_EVENT",
         "GROK_WORKSPACE_ROOT",
         "ANTIGRAVITY_CONVERSATION_ID",
+        "PI_CODING_AGENT",
     ];
 
     fn with_env_var<F, R>(key: &str, value: &str, f: F) -> R
@@ -1385,6 +1428,27 @@ mod env_tests {
                 result.matched_value,
                 Some("ANTIGRAVITY_CONVERSATION_ID".to_string())
             );
+        });
+    }
+
+    #[test]
+    fn test_detect_pi_coding_agent_env() {
+        with_env_var("PI_CODING_AGENT", "true", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::Pi);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value, Some("PI_CODING_AGENT".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_detect_pi_coding_agent_env_numeric_flag() {
+        // Detection is presence-based, so a `1` value works just like `true`.
+        with_env_var("PI_CODING_AGENT", "1", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::Pi);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value, Some("PI_CODING_AGENT".to_string()));
         });
     }
 

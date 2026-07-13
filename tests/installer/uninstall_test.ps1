@@ -1,6 +1,6 @@
 #!/usr/bin/env pwsh
 # Tests uninstall.ps1 agent-hook removal parity (.5.1): Gemini (generalized
-# Remove-DcgHooksFromJsonFile), Cursor (hooks.json + bridge), Copilot (repo-local
+# Remove-DcgHooksFromJsonFile), Cursor (hooks.json + bridge), Copilot (user-level
 # field-level), agy/Grok (PreToolUse/Bash shape). Builds the post-install state
 # (with a coexisting hook) and asserts dcg is removed while coexisting survives.
 
@@ -63,16 +63,16 @@ try {
     Check (-not (Test-Path (Join-Path $h3 '.cursor/hooks.json'))) "dcg-only hooks.json deleted (clean round-trip)"
 } finally { Remove-Item -Recurse -Force $h3 -ErrorAction SilentlyContinue }
 
-Write-Host "Test 4: Copilot (repo-local, field-level) - strip dcg field, keep coexisting"
+Write-Host "Test 4: Copilot (user-level, field-level) - strip dcg field, keep coexisting"
 $r4 = New-Tmp
 try {
-    $hookDir = Join-Path $r4 '.github/hooks'; New-Item -ItemType Directory -Path $hookDir -Force | Out-Null
+    $hookDir = Join-Path $r4 'hooks'; New-Item -ItemType Directory -Path $hookDir -Force | Out-Null
     @{ version = 1; hooks = @{ preToolUse = @(
         @{ type = 'command'; bash = $dcg; powershell = $dcg; cwd = '.'; timeoutSec = 30 },
         @{ type = 'command'; bash = $dcg; powershell = 'my-formatter' },   # dcg bash + foreign powershell
         @{ type = 'command'; bash = 'linter'; powershell = 'linter.exe' }) } } |
         ConvertTo-Json -Depth 20 | Set-Content (Join-Path $hookDir 'dcg.json')
-    Check ((Unconfigure-CopilotHook -RepoRoot $r4) -eq $true) "returns true (removed)"
+    Check ((Unconfigure-CopilotHook -CopilotHome $r4) -eq $true) "returns true (removed)"
     $cfg = Get-Content -Raw (Join-Path $hookDir 'dcg.json') | ConvertFrom-Json
     $entries = @($cfg.hooks.preToolUse)
     Check ($null -eq ($entries | Where-Object { $_.bash -eq $dcg -or $_.powershell -eq $dcg })) "all dcg fields stripped"

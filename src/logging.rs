@@ -18,7 +18,7 @@ use crate::packs::DecisionMode;
 // ============================================================================
 
 /// Logging configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct LoggingConfig {
     /// Whether structured logging is enabled.
@@ -46,7 +46,9 @@ impl Default for LoggingConfig {
 }
 
 /// Log output format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
     #[default]
@@ -55,7 +57,7 @@ pub enum LogFormat {
 }
 
 /// Redaction configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RedactionConfig {
     pub enabled: bool,
@@ -74,7 +76,9 @@ impl Default for RedactionConfig {
 }
 
 /// Redaction mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum RedactionMode {
     None,
@@ -84,7 +88,7 @@ pub enum RedactionMode {
 }
 
 /// Filter for which events to log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct LogEventFilter {
     pub deny: bool,

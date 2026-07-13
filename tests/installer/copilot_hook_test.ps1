@@ -1,8 +1,8 @@
 #!/usr/bin/env pwsh
-# Tests Configure-CopilotHook from install.ps1: repo-local .github/hooks/dcg.json
+# Tests Configure-CopilotHook from install.ps1: user-level hooks/dcg.json
 # with preToolUse[] entries carrying bash+powershell platform fields. Verifies
 # create/idempotent/merge, field-level dedup (preserves a coexisting platform
-# hook sharing an entry with dcg), and no_repo.
+# hook sharing an entry with dcg), and COPILOT_HOME behavior.
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -22,10 +22,10 @@ $dcgPath = 'C:\Users\me\.local\bin\dcg.exe'
 Write-Host "Test 1: create (bash+powershell+cwd+timeoutSec) + idempotent"
 $r1 = New-TempRepo
 try {
-    $s = Configure-CopilotHook -DcgPath $dcgPath -RepoRoot $r1
+    $s = Configure-CopilotHook -DcgPath $dcgPath -CopilotHome $r1
     Check ($s -eq 'created') "create returns 'created' (got '$s')"
-    $f = Join-Path $r1 '.github/hooks/dcg.json'
-    Check (Test-Path $f) "repo-local .github/hooks/dcg.json created"
+    $f = Join-Path $r1 'hooks/dcg.json'
+    Check (Test-Path $f) "user-level hooks/dcg.json created"
     $p = Get-Content -Raw $f | ConvertFrom-Json
     Check ($p.version -eq 1) "version=1"
     $e = $p.hooks.preToolUse[0]
@@ -33,14 +33,14 @@ try {
     Check ($e.powershell -eq $dcgPath) "powershell field = dcg path (Windows support)"
     Check ($e.cwd -eq '.') "cwd = ."
     Check ($e.timeoutSec -eq 30) "timeoutSec = 30"
-    $s2 = Configure-CopilotHook -DcgPath $dcgPath -RepoRoot $r1
+    $s2 = Configure-CopilotHook -DcgPath $dcgPath -CopilotHome $r1
     Check ($s2 -eq 'already') "idempotent returns 'already' (got '$s2')"
 } finally { Remove-Item -Recurse -Force $r1 -ErrorAction SilentlyContinue }
 
 Write-Host "Test 2: merge - field-level dedup preserves a coexisting platform hook"
 $r2 = New-TempRepo
 try {
-    $hookDir = Join-Path $r2 '.github/hooks'; New-Item -ItemType Directory -Path $hookDir -Force | Out-Null
+    $hookDir = Join-Path $r2 'hooks'; New-Item -ItemType Directory -Path $hookDir -Force | Out-Null
     $existing = [ordered]@{
         version = 1
         hooks = [ordered]@{
@@ -51,7 +51,7 @@ try {
         }
     }
     $existing | ConvertTo-Json -Depth 20 | Set-Content -Path (Join-Path $hookDir 'dcg.json')
-    $s = Configure-CopilotHook -DcgPath $dcgPath -RepoRoot $r2
+    $s = Configure-CopilotHook -DcgPath $dcgPath -CopilotHome $r2
     Check ($s -eq 'merged') "returns 'merged' (got '$s')"
     $p = Get-Content -Raw (Join-Path $hookDir 'dcg.json') | ConvertFrom-Json
     Check ($p.hooks.preToolUse[0].bash -eq $dcgPath) "canonical dcg entry prepended (first)"
@@ -64,13 +64,18 @@ try {
     Check (($null -ne $linter) -and ($linter.bash -eq 'linter')) "coexisting non-dcg entry preserved intact"
 } finally { Remove-Item -Recurse -Force $r2 -ErrorAction SilentlyContinue }
 
-Write-Host "Test 3: no_repo when not in a git repo and no -RepoRoot"
-$savedPath = $env:PATH
+Write-Host "Test 3: COPILOT_HOME works outside a git repository"
+$r3 = New-TempRepo
+$savedHome = $env:COPILOT_HOME
 try {
-    $env:PATH = ''  # git not discoverable
+    $env:COPILOT_HOME = $r3
     $s = Configure-CopilotHook -DcgPath $dcgPath
-    Check ($s -eq 'no_repo') "returns 'no_repo' (got '$s')"
-} finally { $env:PATH = $savedPath }
+    Check ($s -eq 'created') "creates user-level hook without git (got '$s')"
+    Check (Test-Path (Join-Path $r3 'hooks/dcg.json')) "honors COPILOT_HOME"
+} finally {
+    $env:COPILOT_HOME = $savedHome
+    Remove-Item -Recurse -Force $r3 -ErrorAction SilentlyContinue
+}
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
 Write-Host "All Configure-CopilotHook tests passed." -ForegroundColor Green

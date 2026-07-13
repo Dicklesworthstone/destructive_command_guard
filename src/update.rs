@@ -637,10 +637,10 @@ fn fetch_latest_version() -> Result<VersionCheckResult, VersionCheckError> {
         .fetch()
         .map_err(|e| VersionCheckError::NetworkError(format!("Failed to fetch releases: {e}")))?;
 
-    let latest = select_latest_release(&releases)
+    let latest = select_latest_release(releases.all())
         .ok_or_else(|| VersionCheckError::ParseError("No releases found".to_string()))?;
 
-    let latest_version = latest.version.trim_start_matches('v').to_string();
+    let latest_version = latest.version().trim_start_matches('v').to_string();
     let current_clean = current.trim_start_matches('v');
 
     // Compare versions using semver
@@ -658,16 +658,13 @@ fn fetch_latest_version() -> Result<VersionCheckResult, VersionCheckError> {
     let checked_at = chrono::Utc::now().to_rfc3339();
 
     // Truncate release notes if too long
-    let release_notes = latest
-        .body
-        .as_ref()
-        .map(|body| truncate_release_notes(body, 500));
+    let release_notes = latest.body().map(|body| truncate_release_notes(body, 500));
 
     let result = VersionCheckResult {
         current_version: current.to_string(),
         latest_version,
         update_available,
-        release_url: release_url_for_tag(&latest.version),
+        release_url: release_url_for_tag(latest.version()),
         release_notes,
         checked_at,
     };
@@ -680,7 +677,7 @@ fn select_latest_release(releases: &[Release]) -> Option<&Release> {
     let mut best_any: Option<(&Release, semver::Version)> = None;
 
     for release in releases {
-        let version_str = release.version.trim_start_matches('v');
+        let version_str = release.version().trim_start_matches('v');
         let Ok(version) = semver::Version::parse(version_str) else {
             continue;
         };
@@ -938,13 +935,12 @@ mod tests {
     }
 
     fn make_release(version: &str) -> Release {
-        Release {
-            name: version.to_string(),
-            version: version.to_string(),
-            date: "2026-01-01T00:00:00Z".to_string(),
-            body: None,
-            assets: Vec::new(),
-        }
+        let mut builder = Release::builder();
+        builder
+            .name(version)
+            .version(version)
+            .date("2026-01-01T00:00:00Z");
+        builder.build().expect("valid test release")
     }
 
     #[test]
@@ -956,7 +952,7 @@ mod tests {
         ];
 
         let selected = select_latest_release(&releases).expect("select");
-        assert_eq!(selected.version, "1.9.0");
+        assert_eq!(selected.version(), "1.9.0");
     }
 
     #[test]
@@ -968,7 +964,7 @@ mod tests {
         ];
 
         let selected = select_latest_release(&releases).expect("select");
-        assert_eq!(selected.version, "2.0.0");
+        assert_eq!(selected.version(), "2.0.0");
     }
 
     #[test]
@@ -980,7 +976,7 @@ mod tests {
         ];
 
         let selected = select_latest_release(&releases).expect("select");
-        assert_eq!(selected.version, "v2.1.0");
+        assert_eq!(selected.version(), "v2.1.0");
     }
 
     #[test]

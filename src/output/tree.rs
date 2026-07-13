@@ -9,9 +9,13 @@
 //! for premium terminal output. Otherwise, a fallback ASCII tree renderer is used.
 
 #[cfg(feature = "rich-output")]
+use rich_rust::markup::render_or_plain;
+#[cfg(feature = "rich-output")]
 use rich_rust::renderables::tree::{Tree as RichTree, TreeGuides, TreeNode as RichTreeNode};
 #[cfg(feature = "rich-output")]
 use rich_rust::style::Style;
+#[cfg(feature = "rich-output")]
+use rich_rust::text::Text as RichText;
 
 use super::theme::{BorderStyle, Theme};
 use crate::evaluator::EvaluationDecision;
@@ -324,10 +328,21 @@ impl TreeNode {
     /// Convert to rich_rust TreeNode (when feature enabled).
     #[cfg(feature = "rich-output")]
     fn to_rich_node(&self) -> RichTreeNode {
-        let label = if let Some(ref style) = self.style {
-            format!("{style}{}{style_end}", self.label, style_end = "[/]")
+        // `RichTreeNode::new`/`with_icon` take `impl Into<Text>`. A bare
+        // `String`/`&str` is converted via `Text::new`, which rich_rust
+        // documents as NOT parsing console markup — so a raw
+        // "[style]label[/]" string renders the literal tag text (the `[bold]`,
+        // `[dim]`, `[green]` leakage reported in #187). Styled labels must be
+        // parsed with `markup::render_or_plain` first, exactly as the library's
+        // docs instruct.
+        //
+        // Unstyled labels are passed as-is: a plain label can legitimately hold
+        // literal brackets (e.g. `extra_packs = ["paranoid"]`), and running it
+        // through the markup parser would misread those as tags.
+        let label: RichText = if let Some(ref style) = self.style {
+            render_or_plain(&format!("{style}{}[/]", self.label))
         } else {
-            self.label.clone()
+            RichText::new(self.label.clone())
         };
 
         let mut node = if let Some(ref icon) = self.icon {
@@ -1010,15 +1025,21 @@ pub fn pack_list_tree_with_options(items: &[PackTreeItem], options: PackTreeOpti
         }
     }
 
-    root = root.child(
-        TreeNode::new("Legend")
-            .styled("[dim]")
-            .child(TreeNode::new("● = enabled"))
-            .child(TreeNode::new("○ = disabled"))
-            .child(TreeNode::new("Enable packs in ~/.config/dcg/config.toml")),
-    );
-
+    // The legend and config hint are metadata about the listing, not packs, so
+    // they are rendered as a separate footer by `pack_legend_lines` rather than
+    // hung off the tree as a fake "Legend" category (#187).
     DcgTree::new(root).guides(DcgTreeGuides::Rounded)
+}
+
+/// Footer lines shown beneath the pack tree: the enabled/disabled legend and the
+/// config-file hint. Kept out of the tree hierarchy so they don't read as a pack
+/// category with tree guides (#187).
+#[must_use]
+pub fn pack_legend_lines() -> Vec<String> {
+    vec![
+        "Legend: ● = enabled, ○ = disabled".to_string(),
+        "Enable packs in ~/.config/dcg/config.toml".to_string(),
+    ]
 }
 
 fn pack_tree_node(pack: &PackTreeItem, options: PackTreeOptions) -> TreeNode {
@@ -1310,6 +1331,41 @@ mod tests {
         assert_eq!(node.style.as_deref(), Some("[bold red]"));
     }
 
+    // Regression for #187: `dcg packs` rendered literal "[bold]"/"[dim]"/
+    // "[green]" tags instead of applying the styles. Root cause: styled labels
+    // were handed to `RichTreeNode::new` as raw "[style]label[/]" strings, which
+    // rich_rust converts via `Text::new` — documented as NOT parsing markup.
+    #[cfg(feature = "rich-output")]
+    #[test]
+    fn to_rich_node_parses_style_markup_rather_than_leaking_it() {
+        let rich = TreeNode::new("No packs to display")
+            .styled("[dim]")
+            .to_rich_node();
+
+        let plain = rich.label().plain();
+        assert_eq!(
+            plain, "No packs to display",
+            "markup tags must not appear in the rendered text: {plain:?}"
+        );
+        // Parsing must actually apply the style as a span (silently stripping the
+        // tags would look identical to plain text). `Text::style()` is the base
+        // style; markup styling lands in per-range spans, so assert on those.
+        assert!(
+            !rich.label().spans().is_empty(),
+            "expected [dim] to produce a styled span, got none"
+        );
+    }
+
+    #[cfg(feature = "rich-output")]
+    #[test]
+    fn to_rich_node_keeps_literal_brackets_in_unstyled_labels() {
+        // An unstyled label may contain real brackets (e.g. the doc example
+        // `extra_packs = ["paranoid"]`); it must not be run through the markup
+        // parser, which would treat them as tags.
+        let rich = TreeNode::new(r#"extra_packs = ["paranoid"]"#).to_rich_node();
+        assert_eq!(rich.label().plain(), r#"extra_packs = ["paranoid"]"#);
+    }
+
     #[test]
     fn test_tree_node_children_batch() {
         let children = vec![TreeNode::new("a"), TreeNode::new("b"), TreeNode::new("c")];
@@ -1580,7 +1636,12 @@ mod tests {
         assert!(output.contains("● core.git - Git"));
         assert!(output.contains("database"));
         assert!(output.contains("○ database.postgresql - PostgreSQL"));
-        assert!(output.contains("Legend"));
+        // The legend is now a separate footer, not a tree node (#187).
+        assert!(!output.contains("Legend"), "legend must not be in the tree");
+        assert!(
+            pack_legend_lines().iter().any(|l| l.contains("enabled")),
+            "legend footer must describe the enabled/disabled markers"
+        );
     }
 
     #[test]
@@ -1710,7 +1771,9 @@ mod tests {
 
         assert!(output.contains("Available Packs"));
         assert!(output.contains("No packs to display"));
-        assert!(output.contains("Legend"));
+        // Legend moved to a standalone footer (#187), so it is no longer part of
+        // the tree render.
+        assert!(!output.contains("Legend"), "legend must not be in the tree");
     }
 
     #[test]

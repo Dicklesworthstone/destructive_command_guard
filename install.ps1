@@ -545,24 +545,27 @@ function Test-DcgPlatformCommand {
   ($name -eq "dcg") -or ($name -eq "dcg.exe")
 }
 
-# Configure GitHub Copilot CLI's repo-local hook at <repo>/.github/hooks/dcg.json.
+# Configure GitHub Copilot CLI's user-level hook at
+# $COPILOT_HOME/hooks/dcg.json (or ~/.copilot/hooks/dcg.json).
 # Copilot hooks are NOT matcher-based: hooks.preToolUse[] entries carry platform-
 # keyed `bash` + `powershell` command fields (the `powershell` field is what makes
 # this work on Windows). Strips dcg from any existing entry's bash/powershell
 # fields (preserving an entry that still has a non-dcg platform field) and prepends
-# the canonical dcg entry. -RepoRoot is for tests (otherwise `git rev-parse`).
-# Returns "created" | "already" | "merged" | "no_repo".
+# the canonical dcg entry. -CopilotHome is for tests; production honors the
+# documented COPILOT_HOME override and otherwise uses ~/.copilot.
+# Returns "created" | "already" | "merged".
 function Configure-CopilotHook {
-  param([string]$DcgPath, [string]$RepoRoot)
+  param([string]$DcgPath, [string]$CopilotHome)
 
-  if ([string]::IsNullOrEmpty($RepoRoot)) {
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return "no_repo" }
-    $RepoRoot = (& git rev-parse --show-toplevel 2>$null)
-    if ([string]::IsNullOrWhiteSpace($RepoRoot)) { return "no_repo" }
-    $RepoRoot = $RepoRoot.Trim()
+  if ([string]::IsNullOrEmpty($CopilotHome)) {
+    if (-not [string]::IsNullOrWhiteSpace($env:COPILOT_HOME)) {
+      $CopilotHome = $env:COPILOT_HOME
+    } else {
+      $CopilotHome = Join-Path $HOME ".copilot"
+    }
   }
 
-  $hookDir = Join-Path (Join-Path $RepoRoot ".github") "hooks"
+  $hookDir = Join-Path $CopilotHome "hooks"
   $hookFile = Join-Path $hookDir "dcg.json"
   if (-not (Test-Path $hookDir)) { New-Item -ItemType Directory -Force -Path $hookDir | Out-Null }
 
@@ -984,9 +987,8 @@ function Detect-Agents {
   # agent display-name -> [bool] detected, in the order we configure them. Used to
   # print a "detected / will configure" summary (install.sh parity) and to decide
   # which optional agents (Grok/agy) to wire via the dcg binary under -EasyMode.
-  # RepoRoot is accepted for caller/test parity but intentionally does NOT make
-  # Copilot "detected"; otherwise running the installer from any git repo writes
-  # .github/hooks/dcg.json even when Copilot is not installed.
+  # RepoRoot is accepted for caller/test parity but intentionally does not make
+  # Copilot "detected".
   param([string]$HomeDir = $HOME, [string]$RepoRoot = "")
   $null = $RepoRoot
   function _has([string]$cmd) { [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
@@ -996,7 +998,10 @@ function Detect-Agents {
     'Codex'   = ((_dir '.codex')   -or (_has 'codex'))
     'Gemini'  = ((_dir '.gemini')  -or (_has 'gemini'))
     'Cursor'  = ((_dir '.cursor')  -or (_has 'cursor'))
-    'Copilot' = ((_dir '.copilot') -or (_has 'copilot') -or (_has 'gh-copilot'))
+    'Copilot' = ((_dir '.copilot') -or
+      (-not [string]::IsNullOrWhiteSpace($env:COPILOT_HOME) -and
+        (Test-Path $env:COPILOT_HOME -PathType Container)) -or
+      (_has 'copilot') -or (_has 'gh-copilot'))
     'Grok'    = ((_dir '.grok')    -or (-not [string]::IsNullOrEmpty($env:GROK_SESSION_ID)))
     'Agy'     = (_has 'agy')
     'Hermes'  = (_dir '.hermes')
@@ -1033,7 +1038,7 @@ Options:
 
 Configured agents (when detected, or with -Force/-EasyMode):
   Claude Code  (~/.claude/settings.json)      Codex CLI   (~/.codex/hooks.json)
-  Gemini CLI   (~/.gemini/settings.json)      Copilot CLI (<repo>/.github/hooks/dcg.json)
+  Gemini CLI   (~/.gemini/settings.json)      Copilot CLI (~/.copilot/hooks/dcg.json)
   Cursor IDE   (~/.cursor/hooks.json)         Hermes      (~/.hermes/config.yaml)
   Grok / agy   via dcg install --grok / --agy under -EasyMode when detected
 '@
@@ -1353,25 +1358,23 @@ try {
   Write-Warn "Gemini CLI auto-configuration failed: $_"
 }
 
-# Configure GitHub Copilot CLI (repo-local: <repo>/.github/hooks/dcg.json). Only
-# applies when Copilot is detected (or hook configuration is forced) and the
-# install runs from inside a git repository.
+# Configure GitHub Copilot CLI's user-level hook. This protects every workspace
+# and honors COPILOT_HOME when set (#182).
 if ($detectedAgents['Copilot'] -or $forceConfig) {
   Write-Host ""
   try {
     $copilotStatus = Configure-CopilotHook -DcgPath $dcgExe
     switch ($copilotStatus) {
-      "created" { Write-Ok "Created GitHub Copilot CLI hook at .github\hooks\dcg.json (this repo)" }
-      "merged" { Write-Ok "Added GitHub Copilot CLI hook to .github\hooks\dcg.json (this repo)" }
-      "already" { Write-Ok "GitHub Copilot CLI hook already configured (this repo)" }
-      "no_repo" { Write-Info "Not in a git repo; skipped Copilot (its hooks are repo-local - run the installer from each repo)" }
+      "created" { Write-Ok "Created user-level GitHub Copilot CLI hook" }
+      "merged" { Write-Ok "Added user-level GitHub Copilot CLI hook" }
+      "already" { Write-Ok "User-level GitHub Copilot CLI hook already configured" }
       default { Write-Warn "GitHub Copilot CLI hook status: $copilotStatus" }
     }
   } catch {
     Write-Warn "GitHub Copilot CLI auto-configuration failed: $_"
   }
 } else {
-  Write-Info "GitHub Copilot CLI not detected; re-run with -EasyMode to configure the repo-local hook anyway"
+  Write-Info "GitHub Copilot CLI not detected; re-run with -EasyMode to configure its user-level hook anyway"
 }
 
 # Configure Cursor IDE (~/.cursor/hooks.json + a PowerShell bridge) when detected

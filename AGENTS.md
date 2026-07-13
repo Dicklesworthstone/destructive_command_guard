@@ -434,9 +434,9 @@ When a command is allowed: **no output** (silent exit 0).
 
 | Code | Meaning | Agent Action |
 |------|---------|--------------|
-| `0` | Command allowed OR Claude-compatible JSON denial was emitted | Parse stdout; if empty, command was allowed |
+| `0` | Command allowed OR protocol JSON denial was emitted | Parse stdout; if empty, command was allowed |
 | `1` | Parse error or invalid input | Retry with corrected input |
-| `2` | Configuration error OR Codex hook denial | For Codex, treat non-empty stderr as the deny reason; otherwise check config file syntax |
+| `2` | Configuration error | Check config syntax and stderr diagnostics |
 
 **Detection logic for agents:**
 ```bash
@@ -448,8 +448,8 @@ else
 fi
 ```
 
-Codex CLI 0.125.0+ uses a stricter hook contract: blocked commands return exit
-code 2 with the denial reason on stderr and no stdout JSON. See
+Codex CLI uses a stricter hook parser: blocked commands return a minimal
+`hookSpecificOutput` denial on stdout with exit code 0. See
 [`docs/codex-integration.md`](docs/codex-integration.md) for the Codex-specific
 protocol notes.
 

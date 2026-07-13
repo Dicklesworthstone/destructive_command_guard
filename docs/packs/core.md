@@ -29,8 +29,8 @@ These patterns match safe commands that are always allowed:
 |--------------|----------|
 | `checkout-new-branch` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*checkout\s+-b\s+` |
 | `checkout-orphan` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*checkout\s+--orphan\s+` |
-| `restore-staged-long` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\s+--staged\s+(?!.*--worktree)(?!.*-W\b)` |
-| `restore-staged-short` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\s+-S\s+(?!.*--worktree)(?!.*-W\b)` |
+| `restore-staged-long` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\b(?=\s)(?=.*\s--staged\b)(?!.*\s(?:--worktree\|-W)\b)` |
+| `restore-staged-short` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\b(?=\s)(?=.*\s-S\b)(?!.*\s(?:--worktree\|-W)\b)` |
 | `clean-dry-run-short` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*clean\s+-[a-z]*n[a-z]*` |
 | `clean-dry-run-long` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*clean\s+--dry-run` |
 

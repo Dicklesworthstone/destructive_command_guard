@@ -161,7 +161,7 @@ pub(crate) const ENV_CONFIG_PATH: &str = "DCG_CONFIG";
 pub(crate) const REPO_ROOT_SEARCH_MAX_HOPS: usize = 50;
 
 /// Main configuration structure.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct Config {
     /// General settings.
@@ -214,6 +214,55 @@ pub struct Config {
     /// Project-specific configurations (keyed by absolute path).
     #[serde(default)]
     pub projects: std::collections::HashMap<String, ProjectConfig>,
+}
+
+/// Canonical published location of dcg's committed JSON Schema. Editors point
+/// their `config.toml` here (or at a local copy) to get autocomplete/validation.
+pub const CONFIG_SCHEMA_ID: &str = "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/config.schema.json";
+
+/// Build the JSON Schema for [`Config`] as a [`serde_json::Value`].
+///
+/// The schema is generated from the `schemars::JsonSchema` derives on `Config`
+/// and every nested config type, then annotated with `$id`, `title`, and
+/// `description` so editors (Even Better TOML / taplo) present it well. The
+/// `$schema` dialect (JSON Schema draft 2020-12) is emitted by schemars.
+#[must_use]
+pub fn config_json_schema() -> serde_json::Value {
+    let schema = schemars::schema_for!(Config);
+    let mut value = serde_json::to_value(&schema).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(map) = &mut value {
+        map.insert(
+            "$id".to_string(),
+            serde_json::Value::String(CONFIG_SCHEMA_ID.to_string()),
+        );
+        map.insert(
+            "title".to_string(),
+            serde_json::Value::String("dcg configuration".to_string()),
+        );
+        map.insert(
+            "description".to_string(),
+            serde_json::Value::String(
+                "JSON Schema for the config.toml of dcg (Destructive Command Guard). \
+                 Generated from the Rust config types via `dcg config schema`; do not \
+                 edit by hand. Regenerate after changing any config struct."
+                    .to_string(),
+            ),
+        );
+    }
+    value
+}
+
+/// Pretty-printed JSON Schema for [`Config`], with a trailing newline.
+///
+/// This is the exact byte content committed as `config.schema.json` at the repo
+/// root and asserted by the schema-drift test, so both the generator command
+/// and the drift check produce identical output.
+#[must_use]
+pub fn config_json_schema_string() -> String {
+    let mut out =
+        serde_json::to_string_pretty(&config_json_schema()).unwrap_or_else(|_| "{}".to_string());
+    out.push('\n');
+    out
 }
 
 // -----------------------------------------------------------------------------
@@ -429,7 +478,7 @@ pub(crate) fn find_repo_root(start_dir: &Path, max_hops: usize) -> Option<PathBu
 /// This configuration controls Tier 1/2/3 heredoc scanning behavior. Because the
 /// hook is performance- and UX-sensitive, defaults are conservative and fail-open
 /// on extraction/parse errors.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct HeredocConfig {
     /// Enable heredoc/inline-script scanning.
@@ -505,7 +554,7 @@ impl Default for HeredocSettings {
 /// - Pattern matching: allow heredocs containing specific patterns (optionally filtered by language)
 /// - Content hashes: allow heredocs with specific content hashes (for known-good scripts)
 /// - Project scopes: additional allowances for specific project directories
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct HeredocAllowlistConfig {
     /// Command prefixes to allowlist entirely (e.g., "./scripts/approved.sh").
@@ -526,7 +575,7 @@ pub struct HeredocAllowlistConfig {
 }
 
 /// A pattern-based heredoc allowlist entry.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AllowedHeredocPattern {
     /// Optional language filter (e.g., "python", "bash"). If None, matches any language.
     pub language: Option<String>,
@@ -537,7 +586,7 @@ pub struct AllowedHeredocPattern {
 }
 
 /// A content-hash based heredoc allowlist entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContentHashEntry {
     /// Hash of the exact heredoc content.
     ///
@@ -548,7 +597,7 @@ pub struct ContentHashEntry {
 }
 
 /// Project-specific heredoc allowlist overrides.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProjectHeredocAllowlist {
     /// Absolute path prefix for the project.
     pub path: String,
@@ -599,7 +648,7 @@ pub enum HeredocAllowlistHitKind {
 /// warn_threshold = 0.5
 /// protect_critical = true
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ConfidenceConfig {
     /// Enable confidence scoring for pattern matches.
@@ -640,7 +689,7 @@ impl Default for ConfidenceConfig {
 }
 
 /// Graduation mode controlling how responses escalate with repeated occurrences.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GraduationMode {
     Paranoid,
@@ -671,7 +720,7 @@ impl std::fmt::Display for GraduationMode {
 }
 
 /// Per-severity graduation mode override.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SeverityOverrides {
     pub critical: Option<GraduationMode>,
     pub high: Option<GraduationMode>,
@@ -705,7 +754,7 @@ impl SeverityOverrides {
 /// [`crate::evaluator::EvaluationResult::apply_graduation_with_history_db`].
 /// Paranoid / Strict / WarningOnly / Disabled modes are unaffected — they
 /// don't have escalation tiers driven by occurrence count.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ResponseConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -1131,7 +1180,7 @@ fn content_hash(content: &str) -> String {
 }
 
 /// General configuration options.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct GeneralConfig {
     /// Color output mode: "auto", "always", "never".
@@ -1235,7 +1284,7 @@ impl GeneralConfig {
 /// Output display configuration.
 ///
 /// Controls optional output enhancements like span highlighting and explanations.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct OutputConfig {
     /// Enable span highlighting in denial output.
@@ -1275,7 +1324,7 @@ impl OutputConfig {
 }
 
 /// Theme configuration for rich terminal output.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ThemeConfig {
     /// Palette name: "default" | "colorblind" | "high-contrast".
@@ -1289,7 +1338,7 @@ pub struct ThemeConfig {
 }
 
 /// Pack enablement configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct PacksConfig {
     /// List of enabled packs (e.g., `["database.postgresql", "kubernetes"]`).
@@ -1454,7 +1503,7 @@ impl PacksConfig {
 ///
 /// Defaults respect severity: Critical/High → deny, Medium → warn, Low → log.
 /// This config allows overriding the default behavior per pack or per specific rule.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct PolicyConfig {
     /// Global default mode (overrides severity-based defaults).
@@ -1474,7 +1523,11 @@ pub struct PolicyConfig {
     /// - RFC 3339: `2026-02-01T00:00:00Z`
     /// - ISO 8601 without timezone (treated as UTC): `2026-02-01T00:00:00`
     /// - Date only (treated as end of day UTC): `2026-02-01`
+    // `ObserveUntil` has a custom (string) Serialize/Deserialize impl — it is a
+    // wrapper around a timestamp string. Represent it accurately in the schema
+    // as an optional string rather than deriving JsonSchema for the wrapper.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
     pub observe_until: Option<ObserveUntil>,
 
     /// Per-pack mode overrides.
@@ -1492,7 +1545,7 @@ pub struct PolicyConfig {
 }
 
 /// Policy mode for overriding default decision behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyMode {
     /// Block the command (output JSON deny, print warning).
@@ -1585,7 +1638,7 @@ impl PolicyConfig {
 }
 
 /// Custom pattern overrides.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct OverridesConfig {
     /// Patterns to allow that would otherwise be blocked.
@@ -1620,7 +1673,7 @@ pub struct OverridesConfig {
 
 /// Settings for layered allowlist files (`.dcg/allowlist.toml`,
 /// `~/.config/dcg/allowlist.toml`, and `/etc/dcg/allowlist.toml`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct AllowlistConfig {
     /// Automatically prune expired entries during allowlist CLI operations.
@@ -1649,7 +1702,7 @@ struct AllowlistConfigLayer {
 /// to specific directories or path patterns. Rules can also have expiration
 /// settings (mutually exclusive: only one of `expires`, `ttl`, `ttl_seconds`,
 /// or `session` should be set).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AllowlistRule {
     /// The pattern to allow (regex supported).
     pub pattern: String,
@@ -2022,7 +2075,7 @@ impl AllowlistRule {
 }
 
 /// An allow override - patterns that should be permitted.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum AllowOverride {
     /// Simple pattern string.
@@ -2067,7 +2120,7 @@ impl AllowOverride {
 }
 
 /// A block override - additional patterns to block.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BlockOverride {
     /// The regex pattern to match.
     pub pattern: String,
@@ -2076,7 +2129,9 @@ pub struct BlockOverride {
 }
 
 /// Redaction mode for command history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum HistoryRedactionMode {
     /// Store commands without redaction.
@@ -2102,7 +2157,7 @@ impl std::str::FromStr for HistoryRedactionMode {
 }
 
 /// History configuration options.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct HistoryConfig {
     /// Enable command history collection.
@@ -2212,7 +2267,9 @@ impl Default for HistoryConfig {
 /// relaxed_branches = ["feature/*", "experiment/*", "sandbox/*"]
 /// relaxed_strictness = "critical"
 /// ```
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum StrictnessLevel {
     /// Only block Critical severity patterns.
@@ -2303,7 +2360,7 @@ impl std::fmt::Display for StrictnessLevel {
 /// # Show branch context in output
 /// show_branch_in_output = true
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct GitAwarenessConfig {
     /// Enable git branch-aware strictness.
@@ -2530,7 +2587,9 @@ impl GitAwarenessConfig {
 /// It does **not** directly change rule evaluation -- behavioral differences
 /// are controlled by the other [`AgentProfile`] fields (`disabled_packs`,
 /// `extra_packs`, `additional_allowlist`, `disabled_allowlist`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum TrustLevel {
     /// High trust: agent has proven reliable. Typically paired with a broader
@@ -2547,7 +2606,7 @@ pub enum TrustLevel {
 /// Agent-specific profile configuration.
 ///
 /// Defines how dcg should behave when invoked by a specific AI coding agent.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct AgentProfile {
     /// Advisory trust label for this agent (included in JSON output and logs).
@@ -2570,7 +2629,7 @@ pub struct AgentProfile {
 /// Agent-specific profiles configuration.
 ///
 /// Maps agent identifiers to their profile configurations.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct AgentsConfig {
     /// Default profile applied to all agents unless overridden.
@@ -2993,7 +3052,7 @@ impl OverridesConfig {
 }
 
 /// Project-specific configuration overrides.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ProjectConfig {
     /// Pack configuration for this project.

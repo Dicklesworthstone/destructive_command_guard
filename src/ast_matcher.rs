@@ -44,12 +44,14 @@ use std::time::{Duration, Instant};
 
 /// Hard timeout for AST operations (20ms as per ADR).
 ///
-/// Tests use a more generous budget because CI/debug builds are slower
-/// than optimised release binaries.
+/// Tests use a much more generous budget because the full suite runs thousands
+/// of AST-heavy cases in parallel.  On a loaded CI host a worker can be
+/// descheduled for hundreds of milliseconds before it parses even this tiny
+/// fixture; production builds retain the strict 20ms fail-open ceiling below.
 #[cfg(not(test))]
 const AST_TIMEOUT_MS: u64 = 20;
 #[cfg(test)]
-const AST_TIMEOUT_MS: u64 = 500;
+const AST_TIMEOUT_MS: u64 = 5_000;
 
 /// Maximum body size the AST matcher will parse directly.
 ///
@@ -396,52 +398,178 @@ pub fn scan_executing_sink_fallback(code: &str, language: ScriptLanguage) -> Opt
 /// unavailable or too close to the hook deadline.
 ///
 /// This intentionally stays narrower than the AST pattern set: it only matches
-/// Ruby `FileUtils.*` calls that start a source line and use a literal target.
-/// That avoids firing on common inert cases such as comments or strings while
-/// still catching catastrophic calls like `FileUtils.rm_rf("/")` before a
-/// fail-open timeout can turn them into false negatives.
+/// Ruby `FileUtils.*` and JavaScript/TypeScript `fs.rmSync()` calls that start a
+/// source line and use a catastrophic literal target. That avoids firing on
+/// common inert cases such as comments or strings while still catching the
+/// highest-risk deletes before a fail-open timeout can turn them into false
+/// negatives.
 #[must_use]
 pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Option<PatternMatch> {
-    if language != ScriptLanguage::Ruby {
+    let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
+
+    if language == ScriptLanguage::Ruby {
+        for caps in RUBY_FILEUTILS_LITERAL.captures_iter(code) {
+            let Some(m) = caps.get(0) else { continue };
+            let Some(path) = string_literal_from_caps(&caps) else {
+                continue;
+            };
+            let catastrophic = is_catastrophic_path(path);
+            let severity = if catastrophic {
+                Severity::Critical
+            } else {
+                Severity::Medium
+            };
+            let suffix = if catastrophic { ".catastrophic" } else { "" };
+            let fn_name = caps.name("fn").map_or("rm_rf", |s| s.as_str());
+            let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
+
+            return Some(PatternMatch {
+                rule_id: format!("heredoc.ruby.fileutils_{fn_name}{suffix}"),
+                reason: if catastrophic {
+                    format!(
+                        "FileUtils.{fn_name}() deletes files/directories (catastrophic target path)"
+                    )
+                } else {
+                    format!("FileUtils.{fn_name}() deletes files/directories")
+                },
+                matched_text_preview: truncate_preview(
+                    code.get(m.start()..m.end()).unwrap_or(""),
+                    60,
+                ),
+                start: m.start(),
+                end: m.end(),
+                line_number,
+                severity,
+                suggestion: Some("Verify target path carefully before running".to_string()),
+            });
+        }
         return None;
     }
 
-    let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
+    if matches!(
+        language,
+        ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
+    ) {
+        for caps in JS_FS_RMSYNC_LITERAL.captures_iter(code) {
+            let Some(m) = caps.get(0) else { continue };
+            if !is_javascript_executable_offset(code, m.start()) {
+                continue;
+            }
+            let Some(path) = string_literal_from_caps(&caps) else {
+                continue;
+            };
+            if !is_catastrophic_path(path) {
+                continue;
+            }
 
-    for caps in RUBY_FILEUTILS_LITERAL.captures_iter(code) {
-        let Some(m) = caps.get(0) else { continue };
-        let Some(path) = string_literal_from_caps(&caps) else {
-            continue;
-        };
-        let catastrophic = is_catastrophic_path(path);
-        let severity = if catastrophic {
-            Severity::Critical
-        } else {
-            Severity::Medium
-        };
-        let suffix = if catastrophic { ".catastrophic" } else { "" };
-        let fn_name = caps.name("fn").map_or("rm_rf", |s| s.as_str());
-        let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
-
-        return Some(PatternMatch {
-            rule_id: format!("heredoc.ruby.fileutils_{fn_name}{suffix}"),
-            reason: if catastrophic {
-                format!(
-                    "FileUtils.{fn_name}() deletes files/directories (catastrophic target path)"
-                )
+            let lang_id = if language == ScriptLanguage::TypeScript {
+                "typescript"
             } else {
-                format!("FileUtils.{fn_name}() deletes files/directories")
-            },
-            matched_text_preview: truncate_preview(code.get(m.start()..m.end()).unwrap_or(""), 60),
-            start: m.start(),
-            end: m.end(),
-            line_number,
-            severity,
-            suggestion: Some("Verify target path carefully before running".to_string()),
-        });
+                "javascript"
+            };
+            let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
+            return Some(PatternMatch {
+                rule_id: format!("heredoc.{lang_id}.fs_rmsync.catastrophic"),
+                reason: "fs.rmSync() deletes files/directories (catastrophic target path)"
+                    .to_string(),
+                matched_text_preview: truncate_preview(
+                    code.get(m.start()..m.end()).unwrap_or(""),
+                    60,
+                ),
+                start: m.start(),
+                end: m.end(),
+                line_number,
+                severity: Severity::Critical,
+                suggestion: Some("Verify target path carefully before running".to_string()),
+            });
+        }
     }
 
     None
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JavaScriptLexState {
+    Code,
+    SingleQuoted,
+    DoubleQuoted,
+    Template,
+    LineComment,
+    BlockComment,
+}
+
+/// Return true only when `offset` is in ordinary JavaScript code. The fallback
+/// deliberately treats template interpolation as inert: missing an unusual
+/// `${fs.rmSync(...)}` backstop is safer than blocking documentation text, and
+/// the primary AST matcher still handles the executable interpolation.
+fn is_javascript_executable_offset(code: &str, offset: usize) -> bool {
+    let bytes = code.as_bytes();
+    let mut state = JavaScriptLexState::Code;
+    let mut escaped = false;
+    let mut index = 0;
+
+    while index < offset.min(bytes.len()) {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+
+        match state {
+            JavaScriptLexState::Code => match (byte, next) {
+                (b'/', Some(b'/')) => {
+                    state = JavaScriptLexState::LineComment;
+                    index += 1;
+                }
+                (b'/', Some(b'*')) => {
+                    state = JavaScriptLexState::BlockComment;
+                    index += 1;
+                }
+                (b'\'', _) => state = JavaScriptLexState::SingleQuoted,
+                (b'"', _) => state = JavaScriptLexState::DoubleQuoted,
+                (b'`', _) => state = JavaScriptLexState::Template,
+                _ => {}
+            },
+            JavaScriptLexState::SingleQuoted => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'\'' {
+                    state = JavaScriptLexState::Code;
+                }
+            }
+            JavaScriptLexState::DoubleQuoted => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    state = JavaScriptLexState::Code;
+                }
+            }
+            JavaScriptLexState::Template => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'`' {
+                    state = JavaScriptLexState::Code;
+                }
+            }
+            JavaScriptLexState::LineComment => {
+                if byte == b'\n' {
+                    state = JavaScriptLexState::Code;
+                }
+            }
+            JavaScriptLexState::BlockComment => {
+                if byte == b'*' && next == Some(b'/') {
+                    state = JavaScriptLexState::Code;
+                    index += 1;
+                }
+            }
+        }
+        index += 1;
+    }
+
+    state == JavaScriptLexState::Code
 }
 
 /// Ruby-specific exec-sink backstop covering forms whose destructive payload is
@@ -544,6 +672,13 @@ static RUBY_FILEUTILS_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
         r#"(?m)^[ \t]*FileUtils\.(?P<fn>rm_rf|remove_dir|rm|remove)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
     )
     .expect("ruby FileUtils literal regex compiles")
+});
+
+static JS_FS_RMSYNC_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?m)^[ \t]*(?:await[ \t]+)?fs\.rmSync\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+    )
+    .expect("JavaScript fs.rmSync literal regex compiles")
 });
 
 static JS_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
@@ -4047,6 +4182,40 @@ def cleanup():
                 hit.is_some_and(|m| m.rule_id == "heredoc.ruby.fileutils_rm_rf.catastrophic"
                     && m.severity.blocks_by_default()),
                 "catastrophic FileUtils.rm_rf must be caught by fallback"
+            );
+        }
+
+        #[test]
+        fn filesystem_fallback_catches_javascript_rmsync_catastrophic() {
+            let code = "const fs = require('fs');\nfs.rmSync('/etc', { recursive: true });";
+            let hit = scan_filesystem_sink_fallback(code, ScriptLanguage::JavaScript);
+            assert!(
+                hit.is_some_and(|m| m.rule_id == "heredoc.javascript.fs_rmsync.catastrophic"
+                    && m.severity.blocks_by_default()),
+                "catastrophic fs.rmSync must be caught before the bounded AST pass"
+            );
+        }
+
+        #[test]
+        fn filesystem_fallback_ignores_javascript_comment_and_template_text() {
+            let comment = "/*\nfs.rmSync('/')\n*/";
+            let template = "const docs = `\nfs.rmSync('/')\n`;";
+            assert!(
+                scan_filesystem_sink_fallback(comment, ScriptLanguage::JavaScript).is_none(),
+                "commented fs.rmSync call must not fire fallback"
+            );
+            assert!(
+                scan_filesystem_sink_fallback(template, ScriptLanguage::JavaScript).is_none(),
+                "template text containing fs.rmSync must not fire fallback"
+            );
+        }
+
+        #[test]
+        fn filesystem_fallback_ignores_non_catastrophic_javascript_target() {
+            let code = "fs.rmSync('./dist', { recursive: true });";
+            assert!(
+                scan_filesystem_sink_fallback(code, ScriptLanguage::JavaScript).is_none(),
+                "non-catastrophic targets remain warn-only in the primary AST matcher"
             );
         }
 

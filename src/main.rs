@@ -171,8 +171,8 @@ fn effective_agent_for_hook_protocol(
 /// Used when dcg must emit a denial WITHOUT a parsed payload (a fail-closed
 /// parse failure, issue #160): protocol detection normally reads the payload,
 /// which is exactly what failed here, so fall back to the detected agent so the
-/// deny matches what that agent actually understands (e.g. Codex needs exit 2,
-/// not Claude's `hookSpecificOutput` JSON).
+/// deny matches what that agent actually understands (for example, Codex gets
+/// its minimal `hookSpecificOutput` JSON rather than Claude's extended fields).
 fn hook_protocol_for_agent(agent: &Agent) -> hook::HookProtocol {
     match agent {
         Agent::CodexCli => hook::HookProtocol::Codex,
@@ -225,8 +225,8 @@ fn handle_unparseable_hook_input(
             Some("parse-error"),
         );
         writer.log(entry);
-        // Flush synchronously: the deny path may std::process::exit (Codex),
-        // which skips Drop, and the fall-through path returns immediately.
+        // Flush synchronously because this parse-error path returns
+        // immediately after publishing its fail-open/fail-closed decision.
         writer.flush_sync();
     }
 
@@ -275,12 +275,6 @@ fn handle_unparseable_hook_input(
         &[],
         None,
     );
-
-    // Codex ignores stdout JSON; only exit 2 + the stderr reason makes the
-    // block stick (mirrors the normal deny path). History was already flushed.
-    if matches!(protocol, hook::HookProtocol::Codex) {
-        std::process::exit(2);
-    }
 }
 
 /// Process-wide registry of shutdown actions.
@@ -712,8 +706,8 @@ fn main() {
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
-        None, // allow_once_audit
-        None, // project_path
+        None,                // allow_once_audit
+        cwd_path.as_deref(), // project_path: scopes path-aware allowlist entries (#186)
         Some(&deadline),
     );
 
@@ -959,23 +953,9 @@ fn main() {
                 let _ = hook::log_blocked_command(log_file, &command, &info.reason, pack);
             }
 
-            // Codex 0.125.0+ ignores stdout JSON whose hookSpecificOutput
-            // contains unknown fields; its supported alternative is exit 2 +
-            // stderr reason (codex-rs/hooks/src/events/pre_tool_use.rs).
-            // The colored deny message has already been written to stderr by
-            // output_denial_for_protocol(); exit 2 here makes the block stick.
-            //
-            // process::exit() skips Rust destructors, so flush the async
-            // history writer first -- the Deny entry was just queued via
-            // writer.log() above and would otherwise be lost when the worker
-            // thread is killed by libc::exit. The other deny paths fall off
-            // the end of main and let HistoryWriter::Drop handle this.
-            if matches!(hook_protocol, hook::HookProtocol::Codex) {
-                if let Some(writer) = history_writer.as_ref() {
-                    writer.flush_sync();
-                }
-                std::process::exit(2);
-            }
+            // All deny protocols, including current Codex, return normally so
+            // buffered history is flushed by `HistoryWriter::Drop`. Codex gets
+            // a minimal stdout JSON denial from `output_denial_for_protocol`.
         }
         DecisionMode::Warn => {
             hook::output_warning_for_protocol(
@@ -1012,7 +992,7 @@ fn print_help() {
     eprintln!("  {}", "─".repeat(50).bright_black());
     eprintln!("    Runs as a pre-execution shell hook for Claude Code, Codex CLI,");
     eprintln!("    Gemini CLI, GitHub Copilot CLI, Cursor IDE, and Hermes Agent.");
-    eprintln!("    Compatible agents receive stdout JSON; Codex denials use stderr + exit 2.");
+    eprintln!("    Compatible agents, including Codex, receive protocol-specific stdout JSON.");
     eprintln!();
 
     // Configuration section

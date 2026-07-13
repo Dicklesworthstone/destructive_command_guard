@@ -1,0 +1,1424 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "dcg configuration",
+  "description": "JSON Schema for the config.toml of dcg (Destructive Command Guard). Generated from the Rust config types via `dcg config schema`; do not edit by hand. Regenerate after changing any config struct.",
+  "type": "object",
+  "properties": {
+    "general": {
+      "description": "General settings.",
+      "$ref": "#/$defs/GeneralConfig",
+      "default": {
+        "color": "auto",
+        "log_file": null,
+        "verbose": false,
+        "hook_timeout_ms": null,
+        "max_hook_input_bytes": null,
+        "max_command_bytes": null,
+        "max_findings_per_command": null,
+        "check_updates": true,
+        "self_heal_hook": true,
+        "fail_closed": false
+      }
+    },
+    "output": {
+      "description": "Output display settings.",
+      "$ref": "#/$defs/OutputConfig",
+      "default": {
+        "highlight_enabled": null,
+        "explanations_enabled": null,
+        "high_contrast": null
+      }
+    },
+    "theme": {
+      "description": "Theme configuration for rich terminal output.",
+      "$ref": "#/$defs/ThemeConfig",
+      "default": {
+        "palette": null,
+        "use_unicode": null,
+        "use_color": null
+      }
+    },
+    "packs": {
+      "description": "Pack configuration.",
+      "$ref": "#/$defs/PacksConfig",
+      "default": {
+        "enabled": [],
+        "disabled": [],
+        "custom_paths": []
+      }
+    },
+    "policy": {
+      "description": "Decision mode policy configuration.",
+      "$ref": "#/$defs/PolicyConfig",
+      "default": {}
+    },
+    "overrides": {
+      "description": "Custom overrides.",
+      "$ref": "#/$defs/OverridesConfig",
+      "default": {
+        "allow": [],
+        "block": [],
+        "allowlist": null,
+        "allowlist_rules": null
+      }
+    },
+    "allowlist": {
+      "description": "Allowlist file management settings.",
+      "$ref": "#/$defs/AllowlistConfig",
+      "default": {
+        "auto_prune_expired": false
+      }
+    },
+    "heredoc": {
+      "description": "Heredoc/inline-script scanning configuration.",
+      "$ref": "#/$defs/HeredocConfig",
+      "default": {
+        "enabled": null,
+        "timeout_ms": null,
+        "max_body_bytes": null,
+        "max_body_lines": null,
+        "max_heredocs": null,
+        "languages": null,
+        "fallback_on_parse_error": null,
+        "fallback_on_timeout": null,
+        "allowlist": null
+      }
+    },
+    "confidence": {
+      "description": "Confidence scoring configuration for ambiguous matches.",
+      "$ref": "#/$defs/ConfidenceConfig",
+      "default": {
+        "enabled": false,
+        "warn_threshold": 0.5,
+        "protect_critical": true
+      }
+    },
+    "logging": {
+      "description": "Structured logging configuration.",
+      "$ref": "#/$defs/LoggingConfig",
+      "default": {
+        "enabled": false,
+        "file": null,
+        "format": "text",
+        "redaction": {
+          "enabled": false,
+          "mode": "arguments",
+          "max_argument_len": 50
+        },
+        "events": {
+          "deny": true,
+          "warn": true,
+          "allow": false
+        }
+      }
+    },
+    "history": {
+      "description": "Command history configuration.",
+      "$ref": "#/$defs/HistoryConfig",
+      "default": {
+        "enabled": false,
+        "redaction_mode": "pattern",
+        "retention_days": 90,
+        "max_size_mb": 500,
+        "database_path": null,
+        "auto_prune": false,
+        "prune_check_interval_hours": 24,
+        "batch_size": 50,
+        "batch_flush_interval_ms": 100
+      }
+    },
+    "interactive": {
+      "description": "Interactive prompt configuration.",
+      "$ref": "#/$defs/InteractiveConfig",
+      "default": {
+        "enabled": false,
+        "verification": "code",
+        "timeout_seconds": 5,
+        "code_length": 4,
+        "max_attempts": 3,
+        "allow_non_tty_fallback": true,
+        "disable_in_ci": true,
+        "require_env": null
+      }
+    },
+    "git_awareness": {
+      "description": "Git branch-aware strictness configuration.",
+      "$ref": "#/$defs/GitAwarenessConfig",
+      "default": {
+        "enabled": false,
+        "protected_branches": [
+          "main",
+          "production",
+          "release/*"
+        ],
+        "protected_strictness": "all",
+        "relaxed_branches": [
+          "feature/*",
+          "experiment/*",
+          "sandbox/*"
+        ],
+        "relaxed_strictness": "critical",
+        "default_strictness": "high",
+        "detached_head_strictness": "all",
+        "relaxed_disabled_packs": [],
+        "show_branch_in_output": true,
+        "warn_if_not_git": false
+      }
+    },
+    "agents": {
+      "description": "Agent-specific profiles configuration.",
+      "$ref": "#/$defs/AgentsConfig",
+      "default": {
+        "default": {
+          "trust_level": "medium",
+          "disabled_packs": [],
+          "extra_packs": [],
+          "additional_allowlist": [],
+          "disabled_allowlist": false
+        }
+      }
+    },
+    "response": {
+      "description": "Graduated response system configuration.",
+      "$ref": "#/$defs/ResponseConfig",
+      "default": {
+        "enabled": false,
+        "mode": "standard",
+        "session_warning_count": 1,
+        "session_soft_block": 2,
+        "history_soft_block": 3,
+        "history_hard_block": 5,
+        "history_window": "24h",
+        "severity_overrides": {
+          "critical": null,
+          "high": null,
+          "medium": null,
+          "low": null
+        }
+      }
+    },
+    "projects": {
+      "description": "Project-specific configurations (keyed by absolute path).",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ProjectConfig"
+      },
+      "default": {}
+    }
+  },
+  "$defs": {
+    "GeneralConfig": {
+      "description": "General configuration options.",
+      "type": "object",
+      "properties": {
+        "color": {
+          "description": "Color output mode: \"auto\", \"always\", \"never\".",
+          "type": "string",
+          "default": "auto"
+        },
+        "log_file": {
+          "description": "Path to log file for blocked commands (optional).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "verbose": {
+          "description": "Whether to show verbose output.",
+          "type": "boolean",
+          "default": false
+        },
+        "hook_timeout_ms": {
+          "description": "Hook evaluation budget override in milliseconds.\nWhen set, overrides the default hook evaluation budget.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "max_hook_input_bytes": {
+          "description": "Maximum bytes to read from stdin in hook mode.\nCommands exceeding this limit are allowed (fail-open) with a warning.\nDefault: 262144 (256 KiB).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": null
+        },
+        "max_command_bytes": {
+          "description": "Maximum bytes for command string after extraction from JSON.\nCommands exceeding this limit are allowed (fail-open) with a warning.\nDefault: 65536 (64 KiB).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": null
+        },
+        "max_findings_per_command": {
+          "description": "Maximum findings to report per command.\nLimits output size and processing time for pathological inputs.\nDefault: 100.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": null
+        },
+        "check_updates": {
+          "description": "Whether to check for updates in the background.\nWhen enabled, dcg will spawn a background thread to check for updates\nand show a notice if a newer version is available.\nDefault: true. Disable with truthy `DCG_NO_UPDATE_CHECK`\nor `check_updates` = false.",
+          "type": "boolean",
+          "default": true
+        },
+        "self_heal_hook": {
+          "description": "Whether to self-heal the hook registration in settings.json.\nWhen enabled, every hook invocation checks that the dcg entry is still\npresent in `~/.claude/settings.json` and re-registers it if missing.\nThis protects against Claude Code silently overwriting settings.json\nmid-session.\nDefault: true. Disable with `DCG_NO_SELF_HEAL` or `self_heal_hook = false`.",
+          "type": "boolean",
+          "default": true
+        },
+        "fail_closed": {
+          "description": "Fail-closed mode for unparseable hook input.\n\nWhen `true`, hook input that cannot be parsed as JSON is BLOCKED\n(denied) instead of allowed. The default (`false`) is the documented\nfail-open behavior: malformed input is allowed so a transient encoding\nglitch never blocks legitimate work. Intended for high-security\nenvironments. Override at runtime with the `DCG_FAIL_CLOSED` env var\n(a truthy value forces fail-closed, a falsy value forces fail-open).",
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "OutputConfig": {
+      "description": "Output display configuration.\n\nControls optional output enhancements like span highlighting and explanations.",
+      "type": "object",
+      "properties": {
+        "highlight_enabled": {
+          "description": "Enable span highlighting in denial output.\nWhen enabled, shows caret-style markers under the matched portion.\nDefault: true",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "explanations_enabled": {
+          "description": "Enable explanations in denial output.\nWhen enabled, shows detailed explanations for why patterns are dangerous.\nDefault: true",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "high_contrast": {
+          "description": "Enable high-contrast output.\nUses ASCII borders and a black/white palette for accessibility.\nDefault: false",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        }
+      }
+    },
+    "ThemeConfig": {
+      "description": "Theme configuration for rich terminal output.",
+      "type": "object",
+      "properties": {
+        "palette": {
+          "description": "Palette name: \"default\" | \"colorblind\" | \"high-contrast\".",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "use_unicode": {
+          "description": "Whether Unicode box drawing is allowed.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "use_color": {
+          "description": "Whether colors are allowed (overrides `NO_COLOR` when set to false).",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        }
+      }
+    },
+    "PacksConfig": {
+      "description": "Pack enablement configuration.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "List of enabled packs (e.g., `[\"database.postgresql\", \"kubernetes\"]`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "disabled": {
+          "description": "List of explicitly disabled packs (for disabling sub-packs of enabled categories).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "custom_paths": {
+          "description": "Paths to custom external pack YAML files.\n\nSupports glob patterns and tilde expansion:\n- `~/.config/dcg/packs/*.yaml` - User-level packs\n- `.dcg/packs/*.yaml` - Project-level packs\n- `/etc/dcg/packs/*.yaml` - System-wide packs\n\nFiles are loaded in order; later files with the same pack ID override earlier ones.\nPack loading is fail-open: invalid files are logged as warnings but don't prevent\nloading valid packs.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      }
+    },
+    "PolicyConfig": {
+      "description": "Decision mode policy configuration.\n\nControls how matched patterns are handled: deny (block), warn (allow with warning),\nor log (silent allow with optional logging).\n\nDefaults respect severity: Critical/High → deny, Medium → warn, Low → log.\nThis config allows overriding the default behavior per pack or per specific rule.",
+      "type": "object",
+      "properties": {
+        "default_mode": {
+          "description": "Global default mode (overrides severity-based defaults).\nIf not set, severity-based defaults apply.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PolicyMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "observe_until": {
+          "description": "Optional observe-mode window end timestamp.\n\nWhen set and the current time is **before** this timestamp:\n- `default_mode` applies, but defaults to `\"warn\"` when unset.\n\nWhen set and the current time is **at/after** this timestamp:\n- `default_mode` is ignored and dcg reverts to severity-based defaults.\n\nAccepted formats:\n- RFC 3339: `2026-02-01T00:00:00Z`\n- ISO 8601 without timezone (treated as UTC): `2026-02-01T00:00:00`\n- Date only (treated as end of day UTC): `2026-02-01`",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "packs": {
+          "description": "Per-pack mode overrides.\nKey is `pack_id` (e.g., \"core.git\", \"database.postgresql\").\nValue is the mode to use for all patterns in that pack.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/PolicyMode"
+          }
+        },
+        "rules": {
+          "description": "Per-rule mode overrides.\nKey is `rule_id` (e.g., \"core.git:reset-hard\", \"core.filesystem:rm-rf-root\").\nValue is the mode to use for that specific rule.\nTakes precedence over pack-level and global overrides.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/PolicyMode"
+          }
+        }
+      }
+    },
+    "PolicyMode": {
+      "description": "Policy mode for overriding default decision behavior.",
+      "oneOf": [
+        {
+          "description": "Block the command (output JSON deny, print warning).",
+          "type": "string",
+          "const": "deny"
+        },
+        {
+          "description": "Warn but allow (print warning to stderr, no JSON deny).",
+          "type": "string",
+          "const": "warn"
+        },
+        {
+          "description": "Log only (silent allow, record for history).",
+          "type": "string",
+          "const": "log"
+        }
+      ]
+    },
+    "OverridesConfig": {
+      "description": "Custom pattern overrides.",
+      "type": "object",
+      "properties": {
+        "allow": {
+          "description": "Patterns to allow that would otherwise be blocked.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AllowOverride"
+          },
+          "default": []
+        },
+        "block": {
+          "description": "Additional patterns to block.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BlockOverride"
+          },
+          "default": []
+        },
+        "allowlist": {
+          "description": "Simple allowlist format (backward compatible).\n\nExample in TOML:\n```toml\nallowlist = [\"npm run build\", \"cargo test\"]\n```",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "default": null
+        },
+        "allowlist_rules": {
+          "description": "Extended allowlist rules with path-specific conditions.\n\nExample in TOML:\n```toml\n[[allowlist_rules]]\npattern = \"rm -rf node_modules\"\npaths = [\"/home/*/projects/*\", \"/workspace/*\"]\ncomment = \"Allow node_modules cleanup in project directories\"\n```",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/AllowlistRule"
+          },
+          "default": null
+        }
+      }
+    },
+    "AllowOverride": {
+      "description": "An allow override - patterns that should be permitted.",
+      "anyOf": [
+        {
+          "description": "Simple pattern string.",
+          "type": "string"
+        },
+        {
+          "description": "Conditional override with optional `when` clause.",
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "when": {
+              "description": "Optional condition (e.g., \"CI=true\").",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "pattern"
+          ]
+        }
+      ]
+    },
+    "BlockOverride": {
+      "description": "A block override - additional patterns to block.",
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "description": "The regex pattern to match.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Human-readable reason for blocking.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern",
+        "reason"
+      ]
+    },
+    "AllowlistRule": {
+      "description": "An extended allowlist rule with optional path conditions.\n\nThis supports context-aware allowlisting where rules can be scoped\nto specific directories or path patterns. Rules can also have expiration\nsettings (mutually exclusive: only one of `expires`, `ttl`, `ttl_seconds`,\nor `session` should be set).",
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "description": "The pattern to allow (regex supported).",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Optional path patterns where this rule applies.\n\nIf `None` or empty, the rule applies globally.\nSupports glob patterns like `/home/*/projects/*`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "default": null
+        },
+        "comment": {
+          "description": "Optional comment explaining the rule.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "expires": {
+          "description": "Optional expiration timestamp (ISO 8601 format).\n\nAfter this time, the rule is no longer active.\nExample: \"2024-06-01T00:00:00Z\"\n\nMutually exclusive with `ttl`, `ttl_seconds`, and `session`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "ttl": {
+          "description": "Optional time-to-live duration as a human-readable string.\n\nSupported formats:\n- Minutes: \"30m\", \"30min\", \"30 minutes\"\n- Hours: \"4h\", \"4hr\", \"4 hours\"\n- Days: \"7d\", \"7 days\"\n- Weeks: \"1w\", \"1 week\"\n\nTTL is computed from `created_at` timestamp.\nMutually exclusive with `expires`, `ttl_seconds`, and `session`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "ttl_seconds": {
+          "description": "Optional time-to-live duration in seconds.\n\nAlternative to `ttl` for programmatic use.\nTTL is computed from `created_at` timestamp.\nMutually exclusive with `expires`, `ttl`, and `session`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "session": {
+          "description": "Whether this is a session-only rule.\n\nSession rules are valid only within the shell session that created them.\nMutually exclusive with `expires`, `ttl`, and `ttl_seconds`.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "session_id": {
+          "description": "Session identifier this rule is bound to when `session = true`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "created_at": {
+          "description": "Timestamp when this rule was created (ISO 8601 format).\n\nRequired for TTL-based expiration. If not set when a TTL is specified,\nit will be automatically set to the current time when the rule is loaded.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "pattern"
+      ]
+    },
+    "AllowlistConfig": {
+      "description": "Settings for layered allowlist files (`.dcg/allowlist.toml`,\n`~/.config/dcg/allowlist.toml`, and `/etc/dcg/allowlist.toml`).",
+      "type": "object",
+      "properties": {
+        "auto_prune_expired": {
+          "description": "Automatically prune expired entries during allowlist CLI operations.\n\nDisabled by default so expired entries remain as audit history unless a\nuser explicitly opts in or runs `dcg allowlist prune`.",
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "HeredocConfig": {
+      "description": "Heredoc and inline-script scanning configuration.\n\nThis configuration controls Tier 1/2/3 heredoc scanning behavior. Because the\nhook is performance- and UX-sensitive, defaults are conservative and fail-open\non extraction/parse errors.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Enable heredoc/inline-script scanning.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "timeout_ms": {
+          "description": "Timeout budget for Tier 2 extraction (milliseconds).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "max_body_bytes": {
+          "description": "Maximum bytes extracted from heredoc bodies.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": null
+        },
+        "max_body_lines": {
+          "description": "Maximum number of lines extracted from heredoc bodies.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": null
+        },
+        "max_heredocs": {
+          "description": "Maximum number of heredocs to process per command.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": null
+        },
+        "languages": {
+          "description": "Optional allowlist of languages to scan.\n\nValues are case-insensitive and may include aliases:\n- bash: bash, sh, shell\n- python: python, py\n- ruby: ruby, rb\n- perl: perl, pl\n- javascript: javascript, js, node\n- typescript: typescript, ts\n- php: php\n- go: go, golang\n- unknown: unknown\n\nSpecial value \"all\" scans all languages (the default if omitted).",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "default": null
+        },
+        "fallback_on_parse_error": {
+          "description": "Fail-open when AST parsing fails for embedded code.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "fallback_on_timeout": {
+          "description": "Fail-open when extraction/parsing exceeds the timeout budget.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "allowlist": {
+          "description": "Content-based allowlist for heredocs (patterns, hashes, commands).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HeredocAllowlistConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      }
+    },
+    "HeredocAllowlistConfig": {
+      "description": "Heredoc content allowlist for known-safe patterns and content hashes.\n\nSupports multiple allowlisting mechanisms:\n- Command prefixes: allow all heredocs in commands starting with specific paths\n- Pattern matching: allow heredocs containing specific patterns (optionally filtered by language)\n- Content hashes: allow heredocs with specific content hashes (for known-good scripts)\n- Project scopes: additional allowances for specific project directories",
+      "type": "object",
+      "properties": {
+        "commands": {
+          "description": "Command prefixes to allowlist entirely (e.g., \"./scripts/approved.sh\").",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "patterns": {
+          "description": "Content patterns to allowlist.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AllowedHeredocPattern"
+          },
+          "default": []
+        },
+        "content_hashes": {
+          "description": "Content hashes to allowlist (hash of exact heredoc content).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContentHashEntry"
+          },
+          "default": []
+        },
+        "projects": {
+          "description": "Project-specific allowlist overrides.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProjectHeredocAllowlist"
+          },
+          "default": []
+        }
+      }
+    },
+    "AllowedHeredocPattern": {
+      "description": "A pattern-based heredoc allowlist entry.",
+      "type": "object",
+      "properties": {
+        "language": {
+          "description": "Optional language filter (e.g., \"python\", \"bash\"). If None, matches any language.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pattern": {
+          "description": "Substring pattern to match in heredoc content.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Human-readable reason for allowlisting.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern",
+        "reason"
+      ]
+    },
+    "ContentHashEntry": {
+      "description": "A content-hash based heredoc allowlist entry.",
+      "type": "object",
+      "properties": {
+        "hash": {
+          "description": "Hash of the exact heredoc content.\n\nThis is a stable, deterministic SHA-256 hash (lowercase hex).",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Human-readable reason for allowlisting.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "hash",
+        "reason"
+      ]
+    },
+    "ProjectHeredocAllowlist": {
+      "description": "Project-specific heredoc allowlist overrides.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "Absolute path prefix for the project.",
+          "type": "string"
+        },
+        "patterns": {
+          "description": "Additional patterns for this project.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AllowedHeredocPattern"
+          },
+          "default": []
+        },
+        "content_hashes": {
+          "description": "Additional content hashes for this project.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContentHashEntry"
+          },
+          "default": []
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "ConfidenceConfig": {
+      "description": "Confidence scoring configuration for ambiguous pattern matches.\n\nWhen enabled, confidence scoring analyzes the context of pattern matches\nto determine if they're likely true positives or false positives. Matches\nin data contexts (quoted strings, commit messages, search patterns) have\nlower confidence and may be downgraded from Deny to Warn.\n\n# Example Configuration (TOML)\n\n```toml\n[confidence]\nenabled = true\nwarn_threshold = 0.5\nprotect_critical = true\n```",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Enable confidence scoring for pattern matches.\n\nWhen enabled, the evaluator computes a confidence score for each match\nbased on execution context (is the match in executed code or data?).\nLow-confidence matches may be downgraded from Deny to Warn.\n\nDefault: false (disabled for backwards compatibility)",
+          "type": "boolean",
+          "default": false
+        },
+        "warn_threshold": {
+          "description": "Confidence threshold below which Deny is downgraded to Warn.\n\nValues range from 0.0 (always warn) to 1.0 (never warn).\nRecommended range: 0.3 - 0.7\n\nDefault: 0.5",
+          "type": "number",
+          "format": "float",
+          "default": 0.5
+        },
+        "protect_critical": {
+          "description": "Protect Critical severity patterns from confidence downgrading.\n\nWhen true, Critical severity matches always Deny regardless of\nconfidence score. This prevents catastrophic commands like `rm -rf /`\nfrom being downgraded even if they appear in data context.\n\nDefault: true",
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "LoggingConfig": {
+      "description": "Logging configuration.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether structured logging is enabled.",
+          "type": "boolean",
+          "default": false
+        },
+        "file": {
+          "description": "Path to log file. Supports ~ expansion.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "format": {
+          "description": "Output format: \"text\" or \"json\".",
+          "$ref": "#/$defs/LogFormat",
+          "default": "text"
+        },
+        "redaction": {
+          "description": "Redaction settings.",
+          "$ref": "#/$defs/RedactionConfig",
+          "default": {
+            "enabled": false,
+            "mode": "arguments",
+            "max_argument_len": 50
+          }
+        },
+        "events": {
+          "description": "Events to log.",
+          "$ref": "#/$defs/LogEventFilter",
+          "default": {
+            "deny": true,
+            "warn": true,
+            "allow": false
+          }
+        }
+      }
+    },
+    "LogFormat": {
+      "description": "Log output format.",
+      "type": "string",
+      "enum": [
+        "text",
+        "json"
+      ]
+    },
+    "RedactionConfig": {
+      "description": "Redaction configuration.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "mode": {
+          "$ref": "#/$defs/RedactionMode",
+          "default": "arguments"
+        },
+        "max_argument_len": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 50
+        }
+      }
+    },
+    "RedactionMode": {
+      "description": "Redaction mode.",
+      "type": "string",
+      "enum": [
+        "none",
+        "arguments",
+        "full"
+      ]
+    },
+    "LogEventFilter": {
+      "description": "Filter for which events to log.",
+      "type": "object",
+      "properties": {
+        "deny": {
+          "type": "boolean",
+          "default": true
+        },
+        "warn": {
+          "type": "boolean",
+          "default": true
+        },
+        "allow": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "HistoryConfig": {
+      "description": "History configuration options.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Enable command history collection.",
+          "type": "boolean",
+          "default": false
+        },
+        "redaction_mode": {
+          "description": "Redaction mode for stored commands.",
+          "$ref": "#/$defs/HistoryRedactionMode",
+          "default": "pattern"
+        },
+        "retention_days": {
+          "description": "Retention window in days.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 90
+        },
+        "max_size_mb": {
+          "description": "Maximum database size in megabytes.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 500
+        },
+        "database_path": {
+          "description": "Optional database file path override.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "auto_prune": {
+          "description": "Enable automatic pruning of old entries.",
+          "type": "boolean",
+          "default": false
+        },
+        "prune_check_interval_hours": {
+          "description": "Interval in hours between automatic prune checks.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 24
+        },
+        "batch_size": {
+          "description": "Batch size for write operations (improves performance).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 50
+        },
+        "batch_flush_interval_ms": {
+          "description": "Flush interval in milliseconds for batched writes.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 100
+        }
+      }
+    },
+    "HistoryRedactionMode": {
+      "description": "Redaction mode for command history.",
+      "oneOf": [
+        {
+          "description": "Store commands without redaction.",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "Redact sensitive values using pattern-based filters.",
+          "type": "string",
+          "const": "pattern"
+        },
+        {
+          "description": "Fully redact command contents.",
+          "type": "string",
+          "const": "full"
+        }
+      ]
+    },
+    "InteractiveConfig": {
+      "description": "Configuration for interactive mode.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether interactive mode is enabled.",
+          "type": "boolean"
+        },
+        "verification": {
+          "description": "Verification method (\"code\", \"command\", \"none\").",
+          "$ref": "#/$defs/VerificationMethod"
+        },
+        "timeout_seconds": {
+          "description": "Timeout in seconds for user response.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "code_length": {
+          "description": "Length of verification code.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_attempts": {
+          "description": "Maximum attempts before lockout.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "allow_non_tty_fallback": {
+          "description": "Whether to allow fallback when not a TTY (always block in that case).",
+          "type": "boolean"
+        },
+        "disable_in_ci": {
+          "description": "Disable interactive mode in CI environments.",
+          "type": "boolean"
+        },
+        "require_env": {
+          "description": "Require this env var to be set to enable interactive mode.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "enabled",
+        "verification",
+        "timeout_seconds",
+        "code_length",
+        "max_attempts",
+        "allow_non_tty_fallback",
+        "disable_in_ci"
+      ]
+    },
+    "VerificationMethod": {
+      "description": "Verification method for interactive prompts.",
+      "oneOf": [
+        {
+          "description": "Random verification code (default).",
+          "type": "string",
+          "const": "code"
+        },
+        {
+          "description": "Retype the full command.",
+          "type": "string",
+          "const": "command"
+        },
+        {
+          "description": "No verification (least secure).",
+          "type": "string",
+          "const": "none"
+        }
+      ]
+    },
+    "GitAwarenessConfig": {
+      "description": "Git branch-aware strictness configuration.\n\nThis allows different strictness levels based on the current git branch,\nproviding more protection on important branches and more freedom on\nexperimental branches.\n\n# Example Configuration (TOML)\n\n```toml\n[git_awareness]\nenabled = true\n\n# Protected branches get extra scrutiny\nprotected_branches = [\"main\", \"production\", \"release/*\"]\nprotected_strictness = \"all\"  # Block everything including Low severity\n\n# Feature branches get more freedom\nrelaxed_branches = [\"feature/*\", \"experiment/*\", \"sandbox/*\"]\nrelaxed_strictness = \"critical\"  # Only block Critical severity\n\n# Packs to disable on relaxed branches\nrelaxed_disabled_packs = []\n\n# Default strictness when not matching any pattern\ndefault_strictness = \"high\"  # Block Critical and High (normal behavior)\n\n# Show branch context in output\nshow_branch_in_output = true\n```",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Enable git branch-aware strictness.\nWhen disabled, normal strictness levels apply everywhere.",
+          "type": "boolean",
+          "default": false
+        },
+        "protected_branches": {
+          "description": "Branch patterns that should receive extra protection.\nSupports glob patterns (e.g., \"release/*\").",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "main",
+            "production",
+            "release/*"
+          ]
+        },
+        "protected_strictness": {
+          "description": "Strictness level for protected branches.\nDefault: `All` (block everything including Low severity)",
+          "$ref": "#/$defs/StrictnessLevel",
+          "default": "all"
+        },
+        "relaxed_branches": {
+          "description": "Branch patterns that should receive relaxed protection.\nSupports glob patterns (e.g., \"feature/*\", \"experiment/*\").",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "feature/*",
+            "experiment/*",
+            "sandbox/*"
+          ]
+        },
+        "relaxed_strictness": {
+          "description": "Strictness level for relaxed branches.\nDefault: `Critical` (only block Critical severity)",
+          "$ref": "#/$defs/StrictnessLevel",
+          "default": "critical"
+        },
+        "default_strictness": {
+          "description": "Default strictness level when not on a protected or relaxed branch.\nDefault: `High` (normal behavior)",
+          "$ref": "#/$defs/StrictnessLevel",
+          "default": "high"
+        },
+        "detached_head_strictness": {
+          "description": "Strictness level when HEAD is detached (no branch checked out).\n\nDetached HEAD typically signals a rebase, bisect, or checkout-of-tag\noperation — exactly the contexts where uncommitted work is most easily\nlost. Defaults to `All` (strictest), matching the protected-branch\nposture rather than the per-branch default. Set this to\n`default_strictness` if you want detached HEAD treated like an\nunprotected branch.",
+          "$ref": "#/$defs/StrictnessLevel",
+          "default": "all"
+        },
+        "relaxed_disabled_packs": {
+          "description": "Packs to disable on relaxed branches.\nThese packs will be skipped during evaluation when on a relaxed branch.\nDefault: empty (no packs disabled)",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "show_branch_in_output": {
+          "description": "Show the current git branch in output messages.\nWhen enabled, blocked command output will include the branch context.\nDefault: `true`",
+          "type": "boolean",
+          "default": true
+        },
+        "warn_if_not_git": {
+          "description": "Show a warning when not in a git repository.\nWhen enabled and git_awareness is enabled, a warning will be logged\nif dcg cannot detect a git repository. The command will still be\nevaluated using default strictness (graceful degradation).\nDefault: `false`",
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "StrictnessLevel": {
+      "description": "Strictness level that determines which severity levels are blocked.\n\nThis controls the sensitivity of pattern matching based on context,\nsuch as which git branch you're on.\n\n# Example Configuration (TOML)\n\n```toml\n[git_awareness]\nenabled = true\nprotected_branches = [\"main\", \"production\", \"release/*\"]\nprotected_strictness = \"all\"\nrelaxed_branches = [\"feature/*\", \"experiment/*\", \"sandbox/*\"]\nrelaxed_strictness = \"critical\"\n```",
+      "oneOf": [
+        {
+          "description": "Only block Critical severity patterns.\nMost permissive - allows High, Medium, and Low to pass.",
+          "type": "string",
+          "const": "critical"
+        },
+        {
+          "description": "Block Critical and High severity patterns.\nThis is the default behavior.",
+          "type": "string",
+          "const": "high"
+        },
+        {
+          "description": "Block Critical, High, and Medium severity patterns.",
+          "type": "string",
+          "const": "medium"
+        },
+        {
+          "description": "Block all severity levels including Low.\nMost restrictive - recommended for protected branches.",
+          "type": "string",
+          "const": "all"
+        }
+      ]
+    },
+    "AgentsConfig": {
+      "description": "Agent-specific profiles configuration.\n\nMaps agent identifiers to their profile configurations.",
+      "type": "object",
+      "properties": {
+        "default": {
+          "description": "Default profile applied to all agents unless overridden.",
+          "$ref": "#/$defs/AgentProfile",
+          "default": {
+            "trust_level": "medium",
+            "disabled_packs": [],
+            "extra_packs": [],
+            "additional_allowlist": [],
+            "disabled_allowlist": false
+          }
+        }
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/AgentProfile"
+      }
+    },
+    "AgentProfile": {
+      "description": "Agent-specific profile configuration.\n\nDefines how dcg should behave when invoked by a specific AI coding agent.",
+      "type": "object",
+      "properties": {
+        "trust_level": {
+          "description": "Advisory trust label for this agent (included in JSON output and logs).\nDoes not directly affect evaluation; see other fields for behavioral control.",
+          "$ref": "#/$defs/TrustLevel",
+          "default": "medium"
+        },
+        "disabled_packs": {
+          "description": "Packs to disable for this agent (subtracted from base config).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "extra_packs": {
+          "description": "Extra packs to enable for this agent (added to base config).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "additional_allowlist": {
+          "description": "Additional allowlist patterns for this agent.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "disabled_allowlist": {
+          "description": "If true, skip all allowlist checks for this agent (more restrictive).",
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "TrustLevel": {
+      "description": "Trust level for AI coding agents.\n\nAn advisory label that is recorded in JSON output and verbose logs.\nIt does **not** directly change rule evaluation -- behavioral differences\nare controlled by the other [`AgentProfile`] fields (`disabled_packs`,\n`extra_packs`, `additional_allowlist`, `disabled_allowlist`).",
+      "oneOf": [
+        {
+          "description": "High trust: agent has proven reliable. Typically paired with a broader\nallowlist and fewer packs in the agent profile.",
+          "type": "string",
+          "const": "high"
+        },
+        {
+          "description": "Medium trust: default behavior, standard configuration.",
+          "type": "string",
+          "const": "medium"
+        },
+        {
+          "description": "Low trust: extra caution for unknown agents. Typically paired with more\npacks and a restricted allowlist in the agent profile.",
+          "type": "string",
+          "const": "low"
+        }
+      ]
+    },
+    "ResponseConfig": {
+      "description": "Configuration for the graduated response system.\n\n`session_*` thresholds count occurrences in the current dcg process via\n[`crate::session`]. For shell hook usage (one process per `Bash` call),\nthese effectively only ever reach `1`; they do escalate for long-lived\ncallers like `dcg test`, the MCP server, or repeated CLI evaluations.\n\n`history_soft_block` / `history_hard_block` / `history_window` are the\ncross-process thresholds backed by the history database. Standard/Lenient\ngraduation modes consult them via\n[`crate::evaluator::determine_graduated_response_with_history`] /\n[`crate::evaluator::EvaluationResult::apply_graduation_with_history_db`].\nParanoid / Strict / WarningOnly / Disabled modes are unaffected — they\ndon't have escalation tiers driven by occurrence count.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "mode": {
+          "$ref": "#/$defs/GraduationMode",
+          "default": "standard"
+        },
+        "session_warning_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 1
+        },
+        "session_soft_block": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 2
+        },
+        "history_soft_block": {
+          "description": "Cross-session soft-block threshold (parsed from config; not yet wired\ninto the evaluator — see `ResponseConfig` docstring).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 3
+        },
+        "history_hard_block": {
+          "description": "Cross-session hard-block threshold (parsed from config; not yet wired\ninto the evaluator — see `ResponseConfig` docstring).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 5
+        },
+        "history_window": {
+          "description": "Lookback window for history-backed thresholds (parsed from config;\nnot yet wired into the evaluator — see `ResponseConfig` docstring).",
+          "type": "string",
+          "default": "24h"
+        },
+        "severity_overrides": {
+          "$ref": "#/$defs/SeverityOverrides",
+          "default": {
+            "critical": null,
+            "high": null,
+            "medium": null,
+            "low": null
+          }
+        }
+      }
+    },
+    "GraduationMode": {
+      "description": "Graduation mode controlling how responses escalate with repeated occurrences.",
+      "type": "string",
+      "enum": [
+        "paranoid",
+        "strict",
+        "standard",
+        "lenient",
+        "warning_only",
+        "disabled"
+      ]
+    },
+    "SeverityOverrides": {
+      "description": "Per-severity graduation mode override.",
+      "type": "object",
+      "properties": {
+        "critical": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GraduationMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "high": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GraduationMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "medium": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GraduationMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "low": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GraduationMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "ProjectConfig": {
+      "description": "Project-specific configuration overrides.",
+      "type": "object",
+      "properties": {
+        "packs": {
+          "description": "Pack configuration for this project.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PacksConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "overrides": {
+          "description": "Overrides for this project.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OverridesConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      }
+    }
+  },
+  "$id": "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/config.schema.json"
+}

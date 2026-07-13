@@ -290,19 +290,23 @@ fn fail_closed_via_config_file_blocks_unparseable() {
 }
 
 #[test]
-fn fail_closed_under_codex_protocol_exits_2() {
+fn fail_closed_under_codex_protocol_emits_minimal_json() {
     // Regression (issue #160): a fail-closed deny must use the AGENT's wire
-    // protocol. Codex ignores stdout JSON and only honors exit 2, so a Claude
-    // JSON + exit 0 would let Codex run the command.
+    // protocol. Current Codex requires its minimal hookSpecificOutput shape;
+    // a Claude-compatible payload with dcg extension fields can be rejected.
     let out = run_dcg_hook_raw(
         b"garbage not json",
         &[("CODEX_CLI", "1"), ("DCG_FAIL_CLOSED", "1")],
     );
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "fail-closed under Codex must exit 2 so the block sticks"
-    );
+    assert_eq!(out.status.code(), Some(0), "Codex deny must exit normally");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|error| panic!("Codex fail-closed stdout must be JSON: {error}"));
+    let specific = json["hookSpecificOutput"]
+        .as_object()
+        .expect("Codex hookSpecificOutput object");
+    assert_eq!(specific.len(), 3, "Codex denial must stay minimal");
+    assert_eq!(specific["hookEventName"], "PreToolUse");
+    assert_eq!(specific["permissionDecision"], "deny");
     assert!(
         !String::from_utf8_lossy(&out.stderr).trim().is_empty(),
         "Codex deny reason must be on stderr"

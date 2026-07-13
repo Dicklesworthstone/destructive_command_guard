@@ -1951,6 +1951,55 @@ const NON_EXECUTING_HEREDOC_COMMANDS: &[&str] = &[
     "read",
 ];
 
+/// No-op builtins that discard their stdin and never execute it: `:`, `true`,
+/// `false`. `: <<'EOF' … EOF` and `true <<'EOF' … EOF` are the canonical shell
+/// "block comment" idiom, so destructive-looking prose in the body is a false
+/// positive (#181).
+///
+/// Unlike the unconditional [`NON_EXECUTING_HEREDOC_COMMANDS`] sinks, these are
+/// masked *only when the heredoc delimiter is quoted* (see
+/// [`is_quoted_noop_builtin_heredoc`]). A quoted delimiter suppresses all shell
+/// expansion, guaranteeing the body is inert literal data. With an *unquoted*
+/// delimiter the body still undergoes command substitution — `true <<EOF` /
+/// `$(rm -rf …)` / `EOF` really runs the deletion — so those must keep flowing
+/// through pack matching (never a false negative).
+const NOOP_STDIN_DISCARDING_COMMANDS: &[&str] = &[":", "true", "false"];
+
+#[must_use]
+fn is_noop_stdin_discarding_command(cmd: &str) -> bool {
+    let cmd_name = cmd.rsplit('/').next().unwrap_or(cmd);
+    NOOP_STDIN_DISCARDING_COMMANDS.contains(&cmd_name)
+}
+
+/// Returns `true` when the heredoc at `heredoc_start` targets a no-op stdin
+/// discarding builtin (`:`/`true`/`false`) *and* uses a quoted delimiter, so its
+/// body is provably inert and safe to mask (#181).
+#[must_use]
+fn is_quoted_noop_builtin_heredoc(command: &str, heredoc_start: usize) -> bool {
+    if !extract_heredoc_target_command(command, heredoc_start)
+        .as_deref()
+        .is_some_and(is_noop_stdin_discarding_command)
+    {
+        return false;
+    }
+    heredoc_delimiter_is_quoted(command, heredoc_start)
+}
+
+/// Check whether the heredoc delimiter directly after `<<` at `heredoc_start` is
+/// quoted (single or double), which suppresses expansion of the body. Handles
+/// the `<<-`/`<<~` markers and interposed whitespace (`cat <<- 'EOF'`).
+#[must_use]
+fn heredoc_delimiter_is_quoted(command: &str, heredoc_start: usize) -> bool {
+    let after_op = &command[(heredoc_start + 2).min(command.len())..];
+    // Skip an optional tab/indent-strip marker adjacent to `<<`.
+    let after_marker = after_op
+        .strip_prefix('-')
+        .or_else(|| after_op.strip_prefix('~'))
+        .unwrap_or(after_op);
+    let delim = after_marker.trim_start_matches([' ', '\t']);
+    delim.starts_with('\'') || delim.starts_with('"')
+}
+
 const SHELL_WRAPPER_COMMANDS: &[&str] = &["sudo", "env", "command", "builtin", "nohup"];
 
 /// Check if a command executes its heredoc/stdin content as code.
@@ -2102,6 +2151,60 @@ fn is_git_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
     false
 }
 
+/// Check whether the command owning the heredoc is `spx session handoff`.
+///
+/// `spx session handoff` consumes its stdin as a structured handoff document;
+/// it does not execute that document as shell.  Treating the prose body as
+/// command-line tokens causes false positives such as a sentence containing
+/// "git ... restore" matching `core.git:restore-worktree` (#181).
+///
+/// This is deliberately narrower than adding `spx` to
+/// [`NON_EXECUTING_HEREDOC_COMMANDS`]: other `spx` subcommands are not covered
+/// by the stdin-data contract.  As with the git sink above, parsing is bounded
+/// to the heredoc's physical line and fails closed (leaves the body visible) on
+/// any ambiguous shape.
+fn is_spx_session_handoff_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
+    if heredoc_start == 0 {
+        return false;
+    }
+
+    let prefix = &command[..heredoc_start];
+    let line_start = prefix.rfind(['\n', '\r']).map_or(0, |i| i + 1);
+    let before = prefix[line_start..].trim_end();
+    if before.is_empty() {
+        return false;
+    }
+
+    let mut tokens = tokenize_backwards(before);
+    tokens.reverse();
+
+    let mut idx = 0;
+    while let Some(token) = tokens.get(idx) {
+        if is_shell_env_assignment(token) || SHELL_WRAPPER_COMMANDS.contains(&token.as_str()) {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+
+    let Some(program) = tokens.get(idx) else {
+        return false;
+    };
+    if program.rsplit('/').next().unwrap_or(program) != "spx" {
+        return false;
+    }
+
+    matches!(
+        tokens.get(idx + 1..idx + 3),
+        Some([session, handoff]) if session == "session" && handoff == "handoff"
+    )
+}
+
+fn is_structured_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
+    is_git_stdin_data_sink(command, heredoc_start)
+        || is_spx_session_handoff_stdin_data_sink(command, heredoc_start)
+}
+
 /// Mask heredoc content when the target command doesn't execute it.
 ///
 /// This prevents false positives where dangerous patterns in DATA (not CODE)
@@ -2132,10 +2235,11 @@ pub fn mask_non_executing_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
             if heredoc_start + 3 <= command.len() && bytes.get(heredoc_start + 2) == Some(&b'<') {
                 // Extract target command for here-string
                 let target_cmd = extract_heredoc_target_command(command, heredoc_start);
-                let should_mask_herestring = target_cmd.as_ref().is_some_and(|cmd| {
-                    is_non_executing_heredoc_command(cmd)
-                        || is_interpreter_source_heredoc_command(cmd)
-                }) || is_git_stdin_data_sink(command, heredoc_start);
+                let should_mask_herestring =
+                    target_cmd.as_ref().is_some_and(|cmd| {
+                        is_non_executing_heredoc_command(cmd)
+                            || is_interpreter_source_heredoc_command(cmd)
+                    }) || is_structured_stdin_data_sink(command, heredoc_start);
 
                 if should_mask_herestring {
                     // Mask here-string content for non-executing targets
@@ -2174,7 +2278,8 @@ pub fn mask_non_executing_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
             //     excluded so real `bash <<SH … rm -rf … SH` still blocks.
             let should_mask = target_cmd.as_ref().is_some_and(|cmd| {
                 is_non_executing_heredoc_command(cmd) || is_interpreter_source_heredoc_command(cmd)
-            }) || is_git_stdin_data_sink(command, heredoc_start);
+            }) || is_structured_stdin_data_sink(command, heredoc_start)
+                || is_quoted_noop_builtin_heredoc(command, heredoc_start);
 
             if should_mask {
                 // Parse the heredoc delimiter
@@ -4842,6 +4947,108 @@ fi"#;
         assert!(
             m8.contains(&rmrf),
             "git sentinel on a prior line must NOT mask a later bash here-string: {m8:?}"
+        );
+    }
+
+    /// #181: `spx session handoff` reads a structured handoff document from
+    /// stdin.  Prose in that body is data, while other `spx` subcommands and
+    /// later shell commands must remain visible to the raw-shell scan.
+    #[test]
+    fn mask_spx_session_handoff_stdin_data_sink_181() {
+        let reported = "spx session handoff <<'EOF'\n\
+git worktrees and active sessions restore only selected agents\n\
+EOF";
+        let masked = mask_non_executing_heredocs(reported);
+        assert!(
+            !masked.contains("restore"),
+            "handoff prose must be masked as stdin data: {masked:?}"
+        );
+        assert!(
+            masked.contains("spx session handoff"),
+            "the owning command must remain scannable: {masked:?}"
+        );
+
+        let wrapped = "env SPX_FORMAT=json /usr/local/bin/spx session handoff <<EOF\n\
+git restore --worktree .\n\
+EOF";
+        assert!(
+            !mask_non_executing_heredocs(wrapped).contains("restore"),
+            "env/path wrappers must preserve the exact handoff data-sink contract"
+        );
+
+        let other = "spx session run <<EOF\ngit restore --worktree .\nEOF";
+        assert!(
+            mask_non_executing_heredocs(other).contains("restore"),
+            "unrecognized spx subcommands must fail closed and remain scannable"
+        );
+
+        let rmrf = format!("{}{}{}", "rm", " -", "rf");
+        let later = format!("spx session handoff <<EOF\nnotes\nEOF\n{rmrf} /important");
+        assert!(
+            mask_non_executing_heredocs(&later).contains(&rmrf),
+            "commands after the handoff terminator must remain scannable"
+        );
+
+        let prior_line =
+            format!("spx session handoff notes.txt\nbash <<EOF\n{rmrf} /important\nEOF");
+        assert!(
+            mask_non_executing_heredocs(&prior_line).contains(&rmrf),
+            "a handoff command on a prior line must not mask a later shell heredoc"
+        );
+    }
+
+    /// #181: `true <<'EOF' … EOF` and `: <<'EOF' … EOF` are the shell
+    /// block-comment idiom — no-op builtins whose *quoted* heredoc body is inert
+    /// literal data. Destructive-looking prose in that body is a false positive.
+    #[test]
+    fn mask_quoted_noop_builtin_heredoc_181() {
+        // The exact reported repro: inert prose tripping core.git:restore-worktree.
+        let reported = "true <<'EOF'\n\
+git worktrees and active sessions restore only selected agents\n\
+EOF";
+        let masked = mask_non_executing_heredocs(reported);
+        assert!(
+            !masked.contains("restore"),
+            "quoted `true` heredoc prose must be masked as data: {masked:?}"
+        );
+        assert!(
+            masked.contains("true"),
+            "the owning command must stay scannable: {masked:?}"
+        );
+
+        // `:` block-comment idiom and double-quoted delimiter both count.
+        for cmd in [
+            ": <<'EOF'\ngit restore --worktree .\nEOF",
+            ": <<\"EOF\"\ngit restore --worktree .\nEOF",
+            "false <<- 'EOF'\n\tgit restore --worktree .\n\tEOF",
+        ] {
+            assert!(
+                !mask_non_executing_heredocs(cmd).contains("restore"),
+                "quoted no-op builtin heredoc must be masked: {cmd:?}"
+            );
+        }
+    }
+
+    /// #181 soundness: an *unquoted* delimiter still expands the body (command
+    /// substitution runs even though the builtin discards stdin), so the body
+    /// must NOT be masked — never trade a false positive for a false negative.
+    #[test]
+    fn unquoted_noop_builtin_heredoc_is_not_masked() {
+        let rmrf = format!("{}{}{}", "rm", " -", "rf");
+
+        // Unquoted delimiter: `$(rm -rf /etc)` in the body executes at expansion
+        // time, so the deletion must remain visible to pack matching.
+        let unquoted = format!("true <<EOF\n$({rmrf} /etc)\nEOF");
+        assert!(
+            mask_non_executing_heredocs(&unquoted).contains(&rmrf),
+            "unquoted no-op-builtin heredoc body must stay scannable: {unquoted:?}"
+        );
+
+        // Commands after the terminator are always scannable, quoted or not.
+        let after = format!("true <<'EOF'\nnotes\nEOF\n{rmrf} /important");
+        assert!(
+            mask_non_executing_heredocs(&after).contains(&rmrf),
+            "commands after the terminator must remain scannable: {after:?}"
         );
     }
 

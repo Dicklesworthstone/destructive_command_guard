@@ -1314,7 +1314,7 @@ CODEX_FAILURE_REASON=""
 GEMINI_FAILURE_REASON=""
 CURSOR_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"|"conflict"
 CURSOR_FAILURE_REASON=""
-COPILOT_STATUS="" # "created"|"merged"|"already"|"skipped"|"no_repo"|"failed"
+COPILOT_STATUS="" # "created"|"merged"|"already"|"skipped"|"failed"
 HERMES_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"
 HERMES_FAILURE_REASON=""
 CLAUDE_BACKUP=""
@@ -2289,18 +2289,21 @@ EOFSET
 }
 
 configure_copilot() {
-  # GitHub Copilot CLI supports repository-local hooks via .github/hooks/*.json.
-  # For Copilot CLI, hooks are loaded from the current working directory.
+  # GitHub Copilot CLI supports user-level hooks under COPILOT_HOME/hooks (or
+  # ~/.copilot/hooks). A destructive-command guard should protect every
+  # workspace, so install the dedicated hook globally rather than modifying the
+  # current repository (#182).
   #
   # We install/merge a dedicated file at:
-  #   <repo>/.github/hooks/dcg.json
+  #   ${COPILOT_HOME:-$HOME/.copilot}/hooks/dcg.json
   #
   # containing a preToolUse command hook that executes dcg.
 
   COPILOT_FAILURE_REASON=""
 
   local copilot_installed=0
-  if command -v copilot >/dev/null 2>&1 || [ -d "$HOME/.copilot" ]; then
+  local copilot_home="${COPILOT_HOME:-$HOME/.copilot}"
+  if command -v copilot >/dev/null 2>&1 || [ -d "$copilot_home" ]; then
     copilot_installed=1
   fi
 
@@ -2309,20 +2312,7 @@ configure_copilot() {
     return 0
   fi
 
-  # Copilot hooks are repository-local, so we need to be inside a git repository.
-  if ! command -v git >/dev/null 2>&1; then
-    COPILOT_STATUS="no_repo"
-    return 0
-  fi
-
-  local repo_root=""
-  repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
-  if [ -z "$repo_root" ]; then
-    COPILOT_STATUS="no_repo"
-    return 0
-  fi
-
-  local hook_dir="$repo_root/.github/hooks"
+  local hook_dir="$copilot_home/hooks"
   local hook_file="$hook_dir/dcg.json"
   COPILOT_HOOK_FILE="$hook_file"
 
@@ -3102,7 +3092,7 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
   # Configure Codex CLI (if installed)
   configure_codex
 
-  # Configure GitHub Copilot CLI hooks (repo-local, if installed and in a git repo)
+  # Configure GitHub Copilot CLI's user-level hook (all workspaces).
   configure_copilot
 
   # Configure Cursor IDE (if installed)
@@ -3274,10 +3264,6 @@ case "$COPILOT_STATUS" in
     ;;
   already)
     summary_lines+=("GitHub Copilot CLI: Already configured (no changes)")
-    ;;
-  no_repo)
-    summary_lines+=("GitHub Copilot CLI: Installed but current directory is not a git repository")
-    summary_lines+=("             Tip: run installer from the target repository to configure hooks")
     ;;
   skipped|"")
     summary_lines+=("GitHub Copilot CLI: Not installed (skipped)")

@@ -530,19 +530,10 @@ PYEOF
     fi
 }
 
-# Remove dcg hook from GitHub Copilot CLI repo-local hook file
-unconfigure_copilot() {
-    if ! command -v git >/dev/null 2>&1; then
-        return 0
-    fi
-
-    local repo_root=""
-    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
-    if [ -z "$repo_root" ]; then
-        return 0
-    fi
-
-    local hook_file="$repo_root/.github/hooks/dcg.json"
+# Remove dcg from one GitHub Copilot hook file while preserving coexisting
+# platform commands and hook entries.
+unconfigure_copilot_file() {
+    local hook_file="$1"
     if [ ! -f "$hook_file" ]; then
         return 0
     fi
@@ -647,6 +638,21 @@ PYEOF
     fi
 }
 
+# Remove the current user-level Copilot hook and, when uninstall is run inside
+# a repository, the legacy repo-local hook written by dcg <= 0.6.5.
+unconfigure_copilot() {
+    local copilot_home="${COPILOT_HOME:-$HOME/.copilot}"
+    unconfigure_copilot_file "$copilot_home/hooks/dcg.json"
+
+    if command -v git >/dev/null 2>&1; then
+        local repo_root=""
+        repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+        if [ -n "$repo_root" ]; then
+            unconfigure_copilot_file "$repo_root/.github/hooks/dcg.json"
+        fi
+    fi
+}
+
 # Remove dcg settings from Aider config
 unconfigure_aider() {
     local config="$HOME/.aider.conf.yml"
@@ -684,8 +690,8 @@ unconfigure_aider() {
 # Remove dcg hook from Codex CLI (~/.codex/hooks.json).
 #
 # install.sh writes a Claude-shaped PreToolUse Bash matcher block into
-# ~/.codex/hooks.json. Now that Codex 0.125.0 has stable hooks and dcg
-# emits its protocol-specific exit-2 deny path for Codex, leaving the
+# ~/.codex/hooks.json. Now that Codex has stable hooks and dcg emits its
+# protocol-specific minimal JSON denial, leaving the
 # hook entry behind after `dcg uninstall` removes the binary would cause
 # every Bash invocation to log "PreToolUse Failed" because codex would
 # spawn a path that no longer exists.
@@ -995,15 +1001,7 @@ main() {
     local claude_settings="$HOME/.claude/settings.json"
     local gemini_settings="$HOME/.gemini/settings.json"
     local aider_config="$HOME/.aider.conf.yml"
-    local copilot_hook_file=""
-
-    if command -v git >/dev/null 2>&1; then
-        local repo_root=""
-        repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
-        if [ -n "$repo_root" ]; then
-            copilot_hook_file="$repo_root/.github/hooks/dcg.json"
-        fi
-    fi
+    local copilot_hook_file="${COPILOT_HOME:-$HOME/.copilot}/hooks/dcg.json"
 
     # Show what will be removed
     log "The following will be removed:"
@@ -1026,7 +1024,7 @@ main() {
         found_anything=1
         aider_configured=1
     fi
-    if [ -n "$copilot_hook_file" ] && json_copilot_has_dcg_hook "$copilot_hook_file"; then
+    if json_copilot_has_dcg_hook "$copilot_hook_file"; then
         log "  • GitHub Copilot CLI hook ($copilot_hook_file)"
         found_anything=1
     fi
@@ -1118,7 +1116,7 @@ main() {
         ok "Removed Gemini CLI hook"
     fi
 
-    # Remove GitHub Copilot CLI hook (repo-local .github/hooks/dcg.json)
+    # Remove GitHub Copilot CLI hook (user-level plus legacy repo-local).
     if unconfigure_copilot 2>&1 | grep -q "removed"; then
         ok "Removed GitHub Copilot CLI hook"
     fi

@@ -1509,6 +1509,7 @@ EOF
 
 setup_mock_copilot_repo() {
     mkdir -p "$HOME/.copilot"
+    export COPILOT_HOME="$HOME/.copilot"
 
     COPILOT_REPO="$TEST_TMPDIR/copilot-repo"
     mkdir -p "$COPILOT_REPO"
@@ -1576,7 +1577,7 @@ if first.get("bash") != dcg_path or first.get("powershell") != dcg_path:
 PYEOF
 }
 
-@test "configure_copilot: adds hook in git repository" {
+@test "configure_copilot: adds user-level hook" {
     log_test "Testing Copilot hook creation..."
     command -v python3 &>/dev/null || skip "python3 not available"
 
@@ -1599,8 +1600,8 @@ PYEOF
     command -v python3 &>/dev/null || skip "python3 not available"
 
     setup_mock_copilot_repo
-    mkdir -p .github/hooks
-    cat > .github/hooks/dcg.json <<'EOF'
+    mkdir -p "$COPILOT_HOME/hooks"
+    cat > "$COPILOT_HOME/hooks/dcg.json" <<'EOF'
 {
   "version": 1,
   "hooks": {
@@ -1634,8 +1635,8 @@ EOF
     command -v python3 &>/dev/null || skip "python3 not available"
 
     setup_mock_copilot_repo
-    mkdir -p .github/hooks
-    cat > .github/hooks/dcg.json << EOF
+    mkdir -p "$COPILOT_HOME/hooks"
+    cat > "$COPILOT_HOME/hooks/dcg.json" << EOF
 {
   "version": 1,
   "hooks": {
@@ -1682,8 +1683,8 @@ EOF
     command -v python3 &>/dev/null || skip "python3 not available"
 
     setup_mock_copilot_repo
-    mkdir -p .github/hooks
-    cat > .github/hooks/dcg.json << EOF
+    mkdir -p "$COPILOT_HOME/hooks"
+    cat > "$COPILOT_HOME/hooks/dcg.json" << EOF
 {
   "version": 1,
   "hooks": {
@@ -1732,8 +1733,8 @@ PYEOF
     command -v python3 &>/dev/null || skip "python3 not available"
 
     setup_mock_copilot_repo
-    mkdir -p .github/hooks
-    cat > .github/hooks/dcg.json <<'EOF'
+    mkdir -p "$COPILOT_HOME/hooks"
+    cat > "$COPILOT_HOME/hooks/dcg.json" <<'EOF'
 {
   "version": 1,
   "hooks": {
@@ -1765,10 +1766,10 @@ EOF
     command -v python3 &>/dev/null || skip "python3 not available"
 
     setup_mock_copilot_repo
-    mkdir -p .github/hooks
-    printf '%s\n' '{"hooks":{"preToolUse":[' > .github/hooks/dcg.json
+    mkdir -p "$COPILOT_HOME/hooks"
+    printf '%s\n' '{"hooks":{"preToolUse":[' > "$COPILOT_HOME/hooks/dcg.json"
     local before
-    before=$(cat .github/hooks/dcg.json)
+    before=$(cat "$COPILOT_HOME/hooks/dcg.json")
 
     configure_copilot
     local rc=$?
@@ -1776,13 +1777,13 @@ EOF
     log_test "configure_copilot rc: $rc"
     log_test "COPILOT_STATUS: $COPILOT_STATUS"
     log_test "COPILOT_FAILURE_REASON: ${COPILOT_FAILURE_REASON:-}"
-    log_test "Hook content: $(cat .github/hooks/dcg.json)"
+    log_test "Hook content: $(cat "$COPILOT_HOME/hooks/dcg.json")"
 
     [ "$rc" -eq 1 ]
     [ "$COPILOT_STATUS" = "failed" ]
     [[ "$COPILOT_FAILURE_REASON" == *"invalid"* ]]
     [ -z "$COPILOT_BACKUP" ]
-    [ "$(cat .github/hooks/dcg.json)" = "$before" ]
+    [ "$(cat "$COPILOT_HOME/hooks/dcg.json")" = "$before" ]
 }
 
 @test "configure_copilot: malformed hooks object is preserved and reports failed" {
@@ -1790,15 +1791,15 @@ EOF
     command -v python3 &>/dev/null || skip "python3 not available"
 
     setup_mock_copilot_repo
-    mkdir -p .github/hooks
-    cat > .github/hooks/dcg.json <<'EOF'
+    mkdir -p "$COPILOT_HOME/hooks"
+    cat > "$COPILOT_HOME/hooks/dcg.json" <<'EOF'
 {
   "version": 1,
   "hooks": ["bad-shape"]
 }
 EOF
     local before
-    before=$(cat .github/hooks/dcg.json)
+    before=$(cat "$COPILOT_HOME/hooks/dcg.json")
 
     configure_copilot
     local rc=$?
@@ -1806,13 +1807,13 @@ EOF
     log_test "configure_copilot rc: $rc"
     log_test "COPILOT_STATUS: $COPILOT_STATUS"
     log_test "COPILOT_FAILURE_REASON: ${COPILOT_FAILURE_REASON:-}"
-    log_test "Hook content: $(cat .github/hooks/dcg.json)"
+    log_test "Hook content: $(cat "$COPILOT_HOME/hooks/dcg.json")"
 
     [ "$rc" -eq 1 ]
     [ "$COPILOT_STATUS" = "failed" ]
     [[ "$COPILOT_FAILURE_REASON" == *"invalid"* ]]
     [ -z "$COPILOT_BACKUP" ]
-    [ "$(cat .github/hooks/dcg.json)" = "$before" ]
+    [ "$(cat "$COPILOT_HOME/hooks/dcg.json")" = "$before" ]
 }
 
 # ============================================================================

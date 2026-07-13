@@ -1,8 +1,8 @@
 //! Subprocess integration tests for Codex CLI hook protocol.
 //!
 //! Verifies that the real dcg binary, spawned as a child process, correctly
-//! handles Codex 0.125.0+ payloads (exit code 2 + stderr deny) and Claude
-//! Code payloads (exit 0 + stdout JSON deny).
+//! handles current Codex payloads (exit 0 + minimal stdout JSON deny) and
+//! Claude Code payloads (exit 0 + extended stdout JSON deny).
 //!
 //! Each test is hermetic: isolated HOME, isolated TMPDIR, no shared state.
 //! Safe for parallel execution via `cargo nextest`.
@@ -42,9 +42,39 @@ impl HookOutcome {
         self.stderr_str().contains(needle)
     }
 
-    /// Codex block shape: exit 2, zero stdout bytes, non-empty stderr.
+    /// Codex block shape: exit 0, a minimal documented JSON deny, and stderr.
     pub fn is_codex_block_shape(&self) -> bool {
-        self.exit_code == 2 && self.stdout.is_empty() && !self.stderr.is_empty()
+        if self.exit_code != 0 || self.stdout.is_empty() || self.stderr.is_empty() {
+            return false;
+        }
+
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(&self.stdout) else {
+            return false;
+        };
+        let Some(root) = json.as_object() else {
+            return false;
+        };
+        let Some(specific) = root
+            .get("hookSpecificOutput")
+            .and_then(serde_json::Value::as_object)
+        else {
+            return false;
+        };
+
+        root.len() == 1
+            && specific.len() == 3
+            && specific
+                .get("hookEventName")
+                .and_then(serde_json::Value::as_str)
+                == Some("PreToolUse")
+            && specific
+                .get("permissionDecision")
+                .and_then(serde_json::Value::as_str)
+                == Some("deny")
+            && specific
+                .get("permissionDecisionReason")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|reason| !reason.is_empty())
     }
 
     /// Claude block shape: exit 0, stdout contains hookSpecificOutput JSON.
@@ -360,7 +390,7 @@ fn smoke_codex_destructive_command_blocked() {
     let outcome = run_codex_hook("git reset --hard HEAD~1");
     assert!(
         outcome.is_codex_block_shape(),
-        "destructive command via Codex should produce exit 2 + empty stdout + non-empty stderr\n{outcome}"
+        "destructive command via Codex should produce exit 0 + minimal deny JSON + non-empty stderr\n{outcome}"
     );
 }
 
@@ -388,7 +418,7 @@ fn codex_powershell_wrapped_destructive_command_blocked() {
     let outcome = run_codex_hook("powershell.exe -Command 'git reset --hard HEAD~1'");
     assert!(
         outcome.is_codex_block_shape(),
-        "PowerShell-wrapped destructive command via Codex must produce exit 2 + empty stdout + non-empty stderr\n{outcome}"
+        "PowerShell-wrapped destructive command via Codex must produce a minimal deny JSON\n{outcome}"
     );
 
     // Quoted full-path host (the literal Codex Windows command_execution shape).
@@ -438,8 +468,15 @@ fn copilot_tool_args_without_tool_name_blocks_destructive_command() {
 
     let json = outcome.stdout_json();
     assert_eq!(json["permissionDecision"], "deny", "{outcome}");
-    assert_eq!(json["ruleId"], "core.git:reset-hard", "{outcome}");
-    assert_eq!(json["continue"], false, "{outcome}");
+    assert_eq!(json.as_object().map(serde_json::Map::len), Some(2));
+    assert!(json.get("ruleId").is_none(), "{outcome}");
+    assert!(json.get("continue").is_none(), "{outcome}");
+    assert!(
+        json["permissionDecisionReason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("core.git:reset-hard")),
+        "{outcome}"
+    );
 }
 
 #[test]
@@ -465,8 +502,69 @@ fn copilot_powershell_tool_args_blocks_destructive_command() {
 
     let json = outcome.stdout_json();
     assert_eq!(json["permissionDecision"], "deny", "{outcome}");
-    assert_eq!(json["ruleId"], "core.git:reset-hard", "{outcome}");
-    assert_eq!(json["continue"], false, "{outcome}");
+    assert_eq!(json.as_object().map(serde_json::Map::len), Some(2));
+    assert!(json.get("ruleId").is_none(), "{outcome}");
+    assert!(json.get("continue").is_none(), "{outcome}");
+}
+
+#[test]
+fn vscode_copilot_terminal_tool_variants_block_destructive_commands() {
+    for tool_name in ["runTerminalCommand", "run_in_terminal", "runInTerminal"] {
+        let payload = serde_json::json!({
+            "timestamp": "2026-07-11T14:30:00Z",
+            "cwd": "/tmp/test-workdir",
+            "session_id": "vscode-session-1",
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool_name,
+            "tool_input": {
+                "command": "rm -rf ./src",
+                "explanation": "Recreate the source tree",
+                "mode": "run",
+                "timeout": 30_000,
+            },
+            "tool_use_id": "vscode-tool-1",
+        })
+        .to_string();
+
+        let outcome = run_hook_raw(payload.as_bytes(), &[]);
+        assert!(
+            outcome.is_claude_block_shape(),
+            "VS Code terminal tool {tool_name:?} must produce a hookSpecificOutput deny\n{outcome}"
+        );
+        let json = outcome.stdout_json();
+        assert_eq!(
+            json["hookSpecificOutput"]["hookEventName"].as_str(),
+            Some("PreToolUse"),
+            "{outcome}"
+        );
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny"),
+            "{outcome}"
+        );
+        assert!(
+            json["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("core.filesystem")),
+            "{outcome}"
+        );
+    }
+}
+
+#[test]
+fn vscode_copilot_terminal_tool_allows_safe_command_silently() {
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "runTerminalCommand",
+        "tool_input": { "command": "git status" },
+    })
+    .to_string();
+
+    let outcome = run_hook_raw(payload.as_bytes(), &[]);
+    assert!(
+        outcome.is_allow_shape(),
+        "safe VS Code terminal command should remain silent and allowed\n{outcome}"
+    );
 }
 
 #[test]
@@ -525,7 +623,7 @@ additional_allowlist = ["git reset --hard HEAD~1"]
 }
 
 // ---------------------------------------------------------------------------
-// P2.2 — Codex deny path: exit=2, 0 bytes stdout, non-empty stderr
+// P2.2 — Codex deny path: exit=0, minimal stdout JSON, non-empty stderr
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -539,13 +637,9 @@ fn codex_deny_multiple_destructive_commands() {
 
     for (cmd, expected_rule_fragment) in commands {
         let outcome = run_codex_hook(cmd);
-        assert_eq!(
-            outcome.exit_code, 2,
-            "Codex deny must exit 2 for '{cmd}'\n{outcome}"
-        );
         assert!(
-            outcome.stdout.is_empty(),
-            "Codex deny must produce 0 bytes stdout for '{cmd}'\n{outcome}"
+            outcome.is_codex_block_shape(),
+            "Codex deny must emit its minimal JSON block for '{cmd}'\n{outcome}"
         );
         assert!(
             !outcome.stderr.is_empty(),
@@ -560,10 +654,13 @@ fn codex_deny_multiple_destructive_commands() {
 
 #[test]
 fn codex_deny_stderr_is_not_empty_even_when_nosuggest() {
-    // exit 2 + empty stderr = Failed in Codex (catastrophic); dcg must always
-    // produce non-empty stderr on deny.
+    // The JSON decision is authoritative, while stderr must remain substantive
+    // for the operator/model explanation.
     let outcome = run_codex_hook("git reset --hard");
-    assert_eq!(outcome.exit_code, 2, "exit code 2 expected\n{outcome}");
+    assert!(
+        outcome.is_codex_block_shape(),
+        "Codex block expected\n{outcome}"
+    );
     assert!(
         outcome.stderr.len() > 10,
         "stderr must be substantive (>10 bytes), got {} bytes\n{outcome}",
@@ -618,13 +715,13 @@ fn codex_allow_git_clean_dry_run_not_blocked() {
 #[test]
 fn regression_claude_tool_use_id_bash_stays_claude_path() {
     // A Claude Code payload with tool_use_id but NO turn_id must produce
-    // Claude-shaped output (exit 0 + hookSpecificOutput JSON), NOT Codex
-    // (exit 2 + stderr). If the disambiguator keyed on tool_use_id instead
-    // of turn_id, this would fail.
+    // Claude's extended hookSpecificOutput JSON, NOT Codex's strict three-field
+    // shape. If the disambiguator keyed on tool_use_id instead of turn_id,
+    // this would fail.
     let outcome = run_claude_hook("git reset --hard HEAD~1");
     assert_eq!(
         outcome.exit_code, 0,
-        "Claude path must exit 0, not 2\n{outcome}"
+        "Claude path must exit normally\n{outcome}"
     );
     assert!(
         outcome.is_claude_block_shape(),
@@ -1008,7 +1105,7 @@ fn claude_warn_path_exits_zero_with_ask_json() {
 }
 
 #[test]
-fn copilot_warn_path_exits_zero_with_ask_json_and_continue_true() {
+fn copilot_warn_path_exits_zero_with_minimal_ask_json() {
     let payload = serde_json::json!({
         "event": "pre-tool-use",
         "toolName": "bash",
@@ -1037,9 +1134,10 @@ fn copilot_warn_path_exits_zero_with_ask_json_and_continue_true() {
         json["permissionDecision"], "ask",
         "Copilot warn must have permissionDecision='ask'\n{outcome}"
     );
-    assert_eq!(
-        json["continue"], true,
-        "Copilot warn must not emit the legacy stop signal\n{outcome}"
+    assert_eq!(json.as_object().map(serde_json::Map::len), Some(2));
+    assert!(
+        json.get("continue").is_none() && json.get("stopReason").is_none(),
+        "Copilot warn must omit legacy control fields\n{outcome}"
     );
     assert!(
         json["permissionDecisionReason"]
@@ -1145,7 +1243,7 @@ fn claude_deny_writes_history_entry() {
         "Claude deny expected\n{outcome}"
     );
 
-    // Claude exits normally (not process::exit(2)), so Drop-based flush runs.
+    // Claude returns normally, so Drop-based history flushing runs.
     assert!(
         db_path.exists(),
         "history DB must exist after Claude deny at {}\n{outcome}",
@@ -1294,9 +1392,13 @@ fn cross_protocol_deny_structural_parity() {
         "Claude block shape expected\n{claude}"
     );
 
-    // Codex: exit 2, no stdout
-    assert_eq!(codex.exit_code, 2);
-    assert!(codex.stdout.is_empty());
+    // Codex: exit 0, minimal JSON stdout
+    assert_eq!(codex.exit_code, 0);
+    let codex_json = codex.stdout_json();
+    assert_eq!(
+        codex_json["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
 
     // Claude: exit 0, JSON stdout
     assert_eq!(claude.exit_code, 0);
@@ -1568,11 +1670,10 @@ fn failopen_turn_id_wrong_type() {
 }"#;
     let outcome = run_hook_raw(payload, &[]);
     // dcg should either fail-open (if serde rejects the type) or process normally.
-    // Either way, no crash — exit 0 or 2 (if treated as valid Codex payload).
-    assert!(
-        outcome.exit_code == 0 || outcome.exit_code == 2,
-        "wrong-type turn_id must not crash (exit 0 or 2), got {}\n{outcome}",
-        outcome.exit_code
+    // Either way, no crash; every current hook outcome exits normally.
+    assert_eq!(
+        outcome.exit_code, 0,
+        "wrong-type turn_id must not crash\n{outcome}"
     );
 }
 
@@ -1682,8 +1783,8 @@ fn disable_core_git_still_blocks_due_to_core_reinsertion_codex() {
         &[("DCG_DISABLE", "core.git")],
         &[],
     );
-    assert_eq!(
-        outcome.exit_code, 2,
+    assert!(
+        outcome.is_codex_block_shape(),
         "DCG_DISABLE=core.git does NOT disable core.git with default config (known behavior)\n{outcome}"
     );
 }
@@ -1731,8 +1832,8 @@ fn packs_core_git_still_blocks_git_destructive_codex() {
     // core.git is explicitly enabled → git destructive commands still blocked
     let outcome =
         run_codex_hook_with_env("git reset --hard HEAD~1", &[("DCG_PACKS", "core.git")], &[]);
-    assert_eq!(
-        outcome.exit_code, 2,
+    assert!(
+        outcome.is_codex_block_shape(),
         "DCG_PACKS=core.git must still block git reset under Codex\n{outcome}"
     );
 }
@@ -1758,8 +1859,8 @@ fn disable_core_filesystem_still_blocks_git_codex() {
         &[("DCG_DISABLE", "core.filesystem")],
         &[],
     );
-    assert_eq!(
-        outcome.exit_code, 2,
+    assert!(
+        outcome.is_codex_block_shape(),
         "DCG_DISABLE=core.filesystem must NOT affect git blocks under Codex\n{outcome}"
     );
 }
@@ -2075,8 +2176,8 @@ reason = "Only allow reset-hard"
 "#;
     // git clean -fd is NOT in the allowlist → should still be blocked
     let outcome = run_with_user_allowlist(allowlist, "git clean -fd", true);
-    assert_eq!(
-        outcome.exit_code, 2,
+    assert!(
+        outcome.is_codex_block_shape(),
         "non-allowlisted command must still be blocked under Codex\n{outcome}"
     );
 }
@@ -2098,8 +2199,8 @@ reason = "Only allow reset-hard"
 #[test]
 fn allowlist_empty_file_still_blocks_codex() {
     let outcome = run_with_user_allowlist("", "git reset --hard HEAD~1", true);
-    assert_eq!(
-        outcome.exit_code, 2,
+    assert!(
+        outcome.is_codex_block_shape(),
         "empty allowlist must still block under Codex\n{outcome}"
     );
 }
@@ -2119,15 +2220,14 @@ reason = "Accepted risk"
 }
 
 // ===========================================================================
-// P2.6 — History entry persists across Codex's process::exit(2)
+// P2.6 — History entry persists across a normal Codex JSON denial
 //
-// The fix at src/main.rs:653-655 calls writer.flush_sync() before
-// process::exit(2). Without that flush, the async HistoryWriter's worker
-// thread gets killed by libc::exit and the deny entry is lost.
+// Returning normally lets HistoryWriter::Drop flush the queued denial without
+// the special-case process-exit path that Codex 0.144.x can treat as failure.
 // ===========================================================================
 
 #[test]
-fn codex_deny_writes_history_entry_despite_exit_2() {
+fn codex_deny_writes_history_entry_on_normal_exit() {
     let home = tempfile::tempdir().expect("tempdir");
     let db_path = home.path().join("codex-history.db");
 
@@ -2170,14 +2270,17 @@ fn codex_deny_writes_history_entry_despite_exit_2() {
         home_dir: home.path().to_path_buf(),
     };
 
-    assert_eq!(outcome.exit_code, 2, "Codex deny must exit 2\n{outcome}");
+    assert!(
+        outcome.is_codex_block_shape(),
+        "Codex deny expected\n{outcome}"
+    );
 
-    // Despite process::exit(2), flush_sync() runs first → DB exists with data.
+    // Normal return runs Drop-based history flushing, so the DB exists with data.
     // fsqlite/sqlite page size is 4096; a newly-created DB with schema + one row
     // may be exactly 4096 bytes (one page).
     assert!(
         db_path.exists(),
-        "history DB must exist after Codex deny (flush_sync before exit 2)\n{outcome}"
+        "history DB must exist after normal Codex deny shutdown\n{outcome}"
     );
     let db_size = std::fs::metadata(&db_path).expect("stat history DB").len();
     assert!(
@@ -2187,7 +2290,7 @@ fn codex_deny_writes_history_entry_despite_exit_2() {
 }
 
 #[test]
-fn codex_deny_with_history_disabled_still_exits_2() {
+fn codex_deny_with_history_disabled_still_emits_json() {
     let home = tempfile::tempdir().expect("tempdir");
     let config_dir = home.path().join(".config/dcg");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -2223,12 +2326,14 @@ fn codex_deny_with_history_disabled_still_exits_2() {
 
     assert_eq!(
         output.status.code().unwrap_or(-1),
-        2,
-        "Codex deny must still exit 2 with history disabled"
+        0,
+        "Codex deny must exit normally with history disabled"
     );
     assert!(
-        output.stdout.is_empty(),
-        "Codex deny must produce no stdout with history disabled"
+        serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .ok()
+            .is_some_and(|json| json["hookSpecificOutput"]["permissionDecision"] == "deny"),
+        "Codex deny must produce minimal JSON with history disabled"
     );
     assert!(
         !output.stderr.is_empty(),
@@ -2265,7 +2370,8 @@ fn codex_rapid_fire_denies_all_persist_to_history() {
         "git reset --hard HEAD~3",
     ];
 
-    // Sequential rapid-fire: 5 Codex denies, each process::exit(2)
+    // Sequential rapid-fire: 5 Codex denies, each returning normally after
+    // publishing its minimal JSON decision.
     for cmd in &commands {
         let payload = build_codex_payload(cmd);
         let mut child = Command::new(dcg_binary())
@@ -2291,12 +2397,18 @@ fn codex_rapid_fire_denies_all_persist_to_history() {
         let output = child.wait_with_output().unwrap();
         assert_eq!(
             output.status.code().unwrap_or(-1),
-            2,
-            "Codex deny must exit 2 for '{cmd}'"
+            0,
+            "Codex deny must exit normally for '{cmd}'"
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                .ok()
+                .is_some_and(|json| { json["hookSpecificOutput"]["permissionDecision"] == "deny" }),
+            "Codex deny must emit minimal JSON for '{cmd}'"
         );
     }
 
-    // All 5 entries should have been flushed before their respective exit(2)
+    // All 5 entries should have been flushed by normal process shutdown.
     assert!(
         db_path.exists(),
         "history DB must exist after 5 rapid-fire Codex denies"
@@ -2327,14 +2439,14 @@ fn codex_deny_history_write_protected_dir_no_panic() {
     // Make the directory read-only so DB creation fails. This premise is
     // Unix-only: on Windows the read-only *attribute* on a directory does NOT
     // prevent creating files inside it, so we skip the read-only setup there.
-    // The assertions below (exit 2, stderr present, no panic) hold whether or
+    // The assertions below (exit 0, JSON deny, stderr present, no panic) hold whether or
     // not the history write fails, so on Windows the test still exercises
     // deny-without-panic with history writes succeeding.
-    let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
     #[cfg(unix)]
     {
+        let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
         perms.set_readonly(true);
-        std::fs::set_permissions(&readonly_dir, perms.clone()).unwrap();
+        std::fs::set_permissions(&readonly_dir, perms).unwrap();
     }
 
     let payload = build_codex_payload("git reset --hard HEAD~1");
@@ -2361,11 +2473,17 @@ fn codex_deny_history_write_protected_dir_no_panic() {
     }
     let output = child.wait_with_output().unwrap();
 
-    // Must still exit 2 (deny works even if history fails)
+    // Must still return normally with a JSON denial even if history fails.
     assert_eq!(
         output.status.code().unwrap_or(-1),
-        2,
-        "Codex deny must exit 2 even when history DB creation fails"
+        0,
+        "Codex deny must exit normally even when history DB creation fails"
+    );
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .ok()
+            .is_some_and(|json| json["hookSpecificOutput"]["permissionDecision"] == "deny"),
+        "Codex deny JSON must survive history DB failure"
     );
     assert!(
         !output.stderr.is_empty(),
@@ -2382,13 +2500,10 @@ fn codex_deny_history_write_protected_dir_no_panic() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
         perms.set_mode(perms.mode() | 0o700);
+        std::fs::set_permissions(&readonly_dir, perms).unwrap();
     }
-    #[cfg(not(unix))]
-    {
-        perms.set_readonly(false);
-    }
-    std::fs::set_permissions(&readonly_dir, perms).unwrap();
 }
 
 // ===========================================================================
@@ -2479,7 +2594,7 @@ fn parallel_spawn_storm_no_cross_contamination() {
 
 #[test]
 #[allow(clippy::needless_collect)]
-fn sequential_vs_parallel_produce_same_exit_codes() {
+fn sequential_vs_parallel_codex_denies_exit_normally() {
     let cmd = "git clean -fd";
     let n = 8;
 
@@ -2494,12 +2609,12 @@ fn sequential_vs_parallel_produce_same_exit_codes() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // All must be identical (exit 2 for destructive command)
+    // All must be identical normal exits; block semantics live in stdout JSON.
     for code in &seq_codes {
-        assert_eq!(*code, 2, "sequential run must exit 2");
+        assert_eq!(*code, 0, "sequential deny must exit normally");
     }
     for code in &par_codes {
-        assert_eq!(*code, 2, "parallel run must exit 2");
+        assert_eq!(*code, 0, "parallel deny must exit normally");
     }
 }
 
@@ -2592,7 +2707,7 @@ fn parallel_mixed_protocol_storm() {
 // P2.8: Heredoc-extracted destructive command blocked under Codex
 //
 // Proves dcg's Tier 3 heredoc/inline-script analysis works identically under
-// the Codex output path (exit 2 + stderr) as under Claude (exit 0 + JSON).
+// the Codex minimal-JSON output path as under Claude's extended JSON path.
 // ==========================================================================
 
 /// Build a Codex payload with proper JSON escaping for commands containing newlines.
@@ -2624,13 +2739,31 @@ fn build_claude_payload_raw(command: &str) -> String {
 /// Run dcg with a Codex payload for a command that may contain newlines.
 fn run_codex_heredoc(command: &str) -> HookOutcome {
     let payload = build_codex_payload_raw(command);
-    run_hook_raw(payload.as_bytes(), &[])
+    // These assertions prove extraction and protocol behavior, not the
+    // production latency budget. Under the test harness, dozens of fresh dcg
+    // subprocesses start in parallel and cold AST/regex initialization can
+    // legitimately consume the 50 ms production budget before JavaScript
+    // matching begins. Give this parser proof a deterministic budget; the
+    // dedicated performance tests continue to enforce hook latency.
+    run_hook_raw(
+        payload.as_bytes(),
+        &[
+            ("DCG_HEREDOC_TIMEOUT_MS", "5000"),
+            ("DCG_HOOK_TIMEOUT_MS", "5000"),
+        ],
+    )
 }
 
 /// Run dcg with a Claude payload for a command that may contain newlines.
 fn run_claude_heredoc(command: &str) -> HookOutcome {
     let payload = build_claude_payload_raw(command);
-    run_hook_raw(payload.as_bytes(), &[])
+    run_hook_raw(
+        payload.as_bytes(),
+        &[
+            ("DCG_HEREDOC_TIMEOUT_MS", "5000"),
+            ("DCG_HOOK_TIMEOUT_MS", "5000"),
+        ],
+    )
 }
 
 #[test]

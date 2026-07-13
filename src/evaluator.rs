@@ -1381,16 +1381,27 @@ fn resolve_project_path(
     heredoc_settings: &crate::config::HeredocSettings,
     project_path: Option<&Path>,
 ) -> Option<PathBuf> {
+    // An explicit working directory is authoritative and must be honored
+    // regardless of heredoc configuration. This value scopes *all* path-aware
+    // allowlist matching (`match_rule_at_path`, `match_exact_command_at_path`,
+    // …), not just heredoc content allowlists. Gating it behind the presence of
+    // a heredoc `content_allowlist` (as this once did) meant `paths = [...]`
+    // entries silently applied globally whenever no heredoc project allowlist
+    // was configured — a real scope-escape (see #186).
+    if let Some(path) = project_path {
+        return Some(path.to_path_buf());
+    }
+
+    // No explicit path was threaded through. Only fall back to a `current_dir`
+    // syscall when a heredoc content allowlist actually needs one; otherwise
+    // preserve the historical `None` (path restrictions skipped) for callers
+    // that deliberately pass no working directory.
     if heredoc_settings
         .content_allowlist
         .as_ref()
         .is_none_or(|a| a.projects.is_empty())
     {
         return None;
-    }
-
-    if let Some(path) = project_path {
-        return Some(path.to_path_buf());
     }
 
     std::env::current_dir().ok()
@@ -2849,7 +2860,11 @@ fn evaluate_heredoc(
             if m.severity.blocks_by_default() {
                 let (pack_id, pattern_name) = split_ast_rule_id(&m.rule_id);
 
-                if let Some(hit) = context.allowlists.match_rule(&pack_id, &pattern_name) {
+                if let Some(hit) = context.allowlists.match_rule_at_path(
+                    &pack_id,
+                    &pattern_name,
+                    context.project_path,
+                ) {
                     if first_allowlist_hit.is_none() {
                         let reason =
                             format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
@@ -3016,7 +3031,11 @@ fn evaluate_heredoc(
 
             let (pack_id, pattern_name) = split_ast_rule_id(&m.rule_id);
 
-            if let Some(hit) = context.allowlists.match_rule(&pack_id, &pattern_name) {
+            if let Some(hit) =
+                context
+                    .allowlists
+                    .match_rule_at_path(&pack_id, &pattern_name, context.project_path)
+            {
                 if first_allowlist_hit.is_none() {
                     let reason =
                         format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
@@ -3086,7 +3105,11 @@ fn evaluate_heredoc(
                 if m.severity.blocks_by_default() {
                     let (pack_id, pattern_name) = split_ast_rule_id(&m.rule_id);
 
-                    if let Some(hit) = context.allowlists.match_rule(&pack_id, &pattern_name) {
+                    if let Some(hit) = context.allowlists.match_rule_at_path(
+                        &pack_id,
+                        &pattern_name,
+                        context.project_path,
+                    ) {
                         if first_allowlist_hit.is_none() {
                             let reason =
                                 format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);

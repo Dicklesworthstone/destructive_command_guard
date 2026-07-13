@@ -9,6 +9,11 @@ fn test_python_exe_bypass() {
     let mut config = Config::default();
     // Ensure heredoc scanning is enabled
     config.heredoc.enabled = Some(true);
+    // This regression isolates Windows interpreter-name parsing, not the
+    // production latency budget. A cold, highly parallel nextest run can spend
+    // the default 50 ms initializing AST/regex state before this test reaches
+    // the parser, so give the parser proof a deterministic local budget.
+    config.heredoc.timeout_ms = Some(5_000);
 
     let enabled_packs: HashSet<String> = config.enabled_pack_ids();
     let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
@@ -45,6 +50,7 @@ fn test_python_exe_bypass() {
 fn test_python_versioned_exe_bypass() {
     let mut config = Config::default();
     config.heredoc.enabled = Some(true);
+    config.heredoc.timeout_ms = Some(5_000);
 
     let enabled_packs: HashSet<String> = config.enabled_pack_ids();
     let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);

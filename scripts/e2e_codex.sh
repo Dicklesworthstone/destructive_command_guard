@@ -373,6 +373,35 @@ codex_hook_json() {
         "$(json_escape "$command")"
 }
 
+is_minimal_codex_deny_json() {
+    local json_file="$1"
+    python3 - "$json_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+expected_root = {"hookSpecificOutput"}
+expected_specific = {
+    "hookEventName",
+    "permissionDecision",
+    "permissionDecisionReason",
+}
+specific = payload.get("hookSpecificOutput")
+valid = (
+    set(payload) == expected_root
+    and isinstance(specific, dict)
+    and set(specific) == expected_specific
+    and specific.get("hookEventName") == "PreToolUse"
+    and specific.get("permissionDecision") == "deny"
+    and isinstance(specific.get("permissionDecisionReason"), str)
+    and bool(specific["permissionDecisionReason"])
+)
+raise SystemExit(0 if valid else 1)
+PY
+}
+
 require_dcg() {
     if [[ ! -x "$DCG_BINARY" ]]; then
         echo "dcg binary missing or not executable: $DCG_BINARY" >&2
@@ -398,7 +427,8 @@ require_dcg() {
     codex_hook_json "git reset --hard" | "$DCG_BINARY" >"$out_file" 2>"$err_file"
     exit_code=$?
     set -e
-    if [[ "$exit_code" -ne 2 || -s "$out_file" || ! -s "$err_file" ]]; then
+    if [[ "$exit_code" -ne 0 || ! -s "$out_file" || ! -s "$err_file" ]] || \
+       ! is_minimal_codex_deny_json "$out_file"; then
         echo "dcg deny-command Codex protocol gate failed (exit=${exit_code})" >&2
         echo "stdout: $(cat "$out_file")" >&2
         echo "stderr: $(cat "$err_file")" >&2

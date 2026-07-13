@@ -250,19 +250,13 @@ fn colorize_command_with_span(command: &str, span: Option<&WindowedSpan>) -> Str
 
 /// Format a regex pattern with syntax highlighting when color is enabled.
 ///
-/// The rich-output build tries `rich_rust::Syntax` first. If the installed
-/// syntax set does not know regex patterns, this falls back to a small manual
-/// highlighter that colors regex metacharacters while preserving the pattern
-/// text byte-for-byte.
+/// Uses a small purpose-built highlighter that colors regex metacharacters
+/// while preserving the pattern text byte-for-byte. This avoids loading a
+/// general-purpose syntax database on the hook's latency-sensitive path.
 #[must_use]
 pub fn format_regex_pattern(pattern: &str, use_color: bool) -> String {
     if !use_color || pattern.is_empty() {
         return pattern.to_string();
-    }
-
-    #[cfg(feature = "rich-output")]
-    if let Some(rendered) = render_regex_pattern_rich(pattern) {
-        return rendered;
     }
 
     format_regex_pattern_manual(pattern)
@@ -429,42 +423,6 @@ fn parse_markdown_link(
         label
     };
     Some((rendered, next_index))
-}
-
-#[cfg(feature = "rich-output")]
-fn render_regex_pattern_rich(pattern: &str) -> Option<String> {
-    use rich_rust::prelude::{Console, Syntax};
-
-    const REGEX_LANGUAGE_ALIASES: &[&str] = &["regex", "re", "Regular Expressions"];
-    const THEME_ALIASES: &[&str] = &["python-rich-default", "base16-ocean.dark", "InspiredGitHub"];
-
-    for language in REGEX_LANGUAGE_ALIASES {
-        for theme in THEME_ALIASES {
-            let syntax = Syntax::new(pattern, *language)
-                .theme(*theme)
-                .line_numbers(false)
-                .padding(0, 0);
-            let Ok(segments) = syntax.render(None) else {
-                continue;
-            };
-            let mut rendered = Vec::new();
-            if Console::new()
-                .print_segments_to(&mut rendered, &segments)
-                .is_err()
-            {
-                continue;
-            }
-            let Ok(text) = String::from_utf8(rendered) else {
-                continue;
-            };
-            let trimmed = text.trim_end_matches(['\r', '\n']).to_string();
-            if !trimmed.is_empty() {
-                return Some(trimmed);
-            }
-        }
-    }
-
-    None
 }
 
 fn format_regex_pattern_manual(pattern: &str) -> String {

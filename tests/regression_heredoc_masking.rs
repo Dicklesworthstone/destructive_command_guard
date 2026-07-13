@@ -4,6 +4,7 @@ mod tests {
     use destructive_command_guard::heredoc::{
         is_non_executing_heredoc_command, mask_non_executing_heredocs,
     };
+    use destructive_command_guard::{Config, evaluator::evaluate_detailed};
 
     #[test]
     fn test_grep_argument_masking() {
@@ -50,6 +51,41 @@ mod tests {
             !masked_bash.contains("rm -rf"),
             "Leaked dangerous content in cat with 'bash' filename: '{}'",
             masked_bash
+        );
+    }
+
+    #[test]
+    fn spx_session_handoff_masks_its_prose_body() {
+        let cmd = "spx session handoff <<'EOF'\n\
+git worktrees and active sessions restore only selected agents\n\
+EOF";
+        let masked = mask_non_executing_heredocs(cmd);
+
+        assert!(
+            !masked.contains("restore"),
+            "spx handoff body is stdin data, not shell: '{masked}'"
+        );
+        assert!(masked.contains("spx session handoff"));
+    }
+
+    #[test]
+    fn spx_session_handoff_is_allowed_but_later_shell_still_blocks() {
+        let config = Config::default();
+        let reported = "spx session handoff <<'EOF'\n\
+git worktrees and active sessions restore only selected agents\n\
+EOF";
+        let allowed = evaluate_detailed(reported, &config);
+        assert!(
+            allowed.result.is_allowed(),
+            "reported stdin prose must be allowed: {:?}",
+            allowed.result.pattern_info
+        );
+
+        let destructive_after = "spx session handoff <<'EOF'\nnotes\nEOF\ngit restore --worktree .";
+        let denied = evaluate_detailed(destructive_after, &config);
+        assert!(
+            denied.result.is_denied(),
+            "only the handoff body is data; later shell must remain protected"
         );
     }
 }

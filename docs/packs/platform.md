@@ -195,16 +195,16 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `railway-status` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+status(?:\s\|$)` |
-| `railway-project-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|ls)(?:\s\|$)` |
-| `railway-project-subcommand-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+project\s+(?:list\|ls)(?:\s\|$)` |
-| `railway-whoami` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+whoami(?:\s\|$)` |
-| `railway-logs` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+logs(?:\s\|$)` |
-| `railway-service-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+service\s+(?:list\|ls)(?:\s\|$)` |
-| `railway-function-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:function\|functions\|func\|funcs\|fn\|fns)\s+(?:list\|ls)(?:\s\|$)` |
-| `railway-environment-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:environment\|env)\s+(?:list\|ls)(?:\s\|$)` |
-| `railway-volume-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:list\|ls)(?:\s\|$)` |
-| `railway-variable-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:variable\|variables\|vars\|var)\s+(?:list\|ls)(?:\s\|$)` |
+| `railway-status` | `(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+status(?:\s\|$)` |
+| `railway-project-list` | `(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|ls)(?:\s\|$)` |
+| `railway-project-subcommand-list` | `(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+project\s+(?:list\|ls)(?:\s\|$)` |
+| `railway-whoami` | `(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+whoami(?:\s\|$)` |
+| `railway-logs` | `(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+logs(?:\s\|$)` |
+| `railway-service-list` | `(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+service\s+(?:list\|ls)(?:\s\|$)` |
+| `railway-function-list` | `(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:function\|functions\|func\|funcs\|fn\|fns)\s+(?:list\|ls)(?:\s\|$)` |
+| `railway-environment-list` | `(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:environment\|env)\s+(?:list\|ls)(?:\s\|$)` |
+| `railway-volume-list` | `(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:list\|ls)(?:\s\|$)` |
+| `railway-variable-list` | `(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:variable\|variables\|vars\|var)\s+(?:list\|ls)(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -275,20 +275,20 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `modal-volume-list` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:list\|ls)\b` |
-| `modal-volume-get` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:get\|cp\|cat)\b` |
-| `modal-volume-create` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:create\|rename)\b` |
-| `modal-app-readonly` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+app\s+(?:list\|ls\|logs\|history\|dashboard\|rollback\|rollover)\b` |
-| `modal-container-readonly` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+container\s+(?:list\|ls\|logs\|exec)\b` |
-| `modal-secret-list` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+(?:list\|ls)\b` |
-| `modal-secret-create-no-force` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+create\b(?!(?:[^;&\|\r\n]\|\\\r?\n)*(?:--force\|--overwrite)\b)` |
-| `modal-environment-list` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+environment\s+(?:list\|ls)\b` |
-| `modal-environment-mutate` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+environment\s+(?:create\|update)\b` |
-| `modal-dict-readonly` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+dict\s+(?:list\|ls\|get\|items\|create)\b` |
-| `modal-queue-readonly` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+queue\s+(?:list\|ls\|peek\|len\|create)\b` |
-| `modal-shell` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+shell\b` |
-| `modal-deploy` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:deploy\|serve\|run\|profile\|launch)\b` |
-| `modal-token` | `\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+token\s+(?:info\|new\|set)\b` |
+| `modal-volume-list` | `(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:list\|ls)\b` |
+| `modal-volume-get` | `(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:get\|cp\|cat)\b` |
+| `modal-volume-create` | `(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:create\|rename)\b` |
+| `modal-app-readonly` | `(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+app\s+(?:list\|ls\|logs\|history\|dashboard\|rollback\|rollover)\b` |
+| `modal-container-readonly` | `(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+container\s+(?:list\|ls\|logs\|exec)\b` |
+| `modal-secret-list` | `(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+(?:list\|ls)\b` |
+| `modal-secret-create-no-force` | `(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+create\b(?!(?:[^;&\|\r\n]\|\\\r?\n)*(?:--force\|--overwrite)\b)` |
+| `modal-environment-list` | `(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+environment\s+(?:list\|ls)\b` |
+| `modal-environment-mutate` | `(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+environment\s+(?:create\|update)\b` |
+| `modal-dict-readonly` | `(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+dict\s+(?:list\|ls\|get\|items\|create)\b` |
+| `modal-queue-readonly` | `(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+queue\s+(?:list\|ls\|peek\|len\|create)\b` |
+| `modal-shell` | `(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+shell\b` |
+| `modal-deploy` | `(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:deploy\|serve\|run\|profile\|launch)\b` |
+| `modal-token` | `(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+token\s+(?:info\|new\|set)\b` |
 
 ### Destructive Patterns (Blocked)
 
@@ -348,26 +348,26 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `kamal-audit` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?:\s\|$)` |
-| `kamal-details` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+details(?:\s\|$)` |
-| `kamal-config` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+config(?:\s\|$)` |
-| `kamal-secrets` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+secrets(?:\s\|$)` |
-| `kamal-deploy` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+deploy(?:\s\|$)` |
-| `kamal-redeploy` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+redeploy(?:\s\|$)` |
-| `kamal-setup` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+setup(?:\s\|$)` |
-| `kamal-build` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+build(?:\s\|$)` |
-| `kamal-rollback` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+rollback(?:\s\|$)` |
-| `kamal-upgrade` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+upgrade(?:\s\|$)` |
-| `kamal-registry` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+registry\s+(?:login\|logout)(?:\s\|$)` |
-| `kamal-lock` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+lock(?:\s\|$)` |
-| `kamal-server-bootstrap` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+server\s+bootstrap(?:\s\|$)` |
-| `kamal-init` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+init(?:\s\|$)` |
-| `kamal-docs` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+docs(?:\s\|$)` |
-| `kamal-help` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+help(?:\s\|$)` |
-| `kamal-version` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?:\s\|$)` |
-| `kamal-app-safe` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+app(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot\|start\|restart\|details\|containers\|images\|logs\|version\|stale_containers\|maintenance\|live)(?:\s\|$)` |
-| `kamal-accessory-safe` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+accessory(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot\|start\|restart\|details\|logs\|upgrade)(?:\s\|$)` |
-| `kamal-proxy-safe` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+proxy(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot\|boot_config\|start\|restart\|details\|logs)(?:\s\|$)` |
+| `kamal-audit` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?:\s\|$)` |
+| `kamal-details` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+details(?:\s\|$)` |
+| `kamal-config` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+config(?:\s\|$)` |
+| `kamal-secrets` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+secrets(?:\s\|$)` |
+| `kamal-deploy` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+deploy(?:\s\|$)` |
+| `kamal-redeploy` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+redeploy(?:\s\|$)` |
+| `kamal-setup` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+setup(?:\s\|$)` |
+| `kamal-build` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+build(?:\s\|$)` |
+| `kamal-rollback` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+rollback(?:\s\|$)` |
+| `kamal-upgrade` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+upgrade(?:\s\|$)` |
+| `kamal-registry` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+registry\s+(?:login\|logout)(?:\s\|$)` |
+| `kamal-lock` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+lock(?:\s\|$)` |
+| `kamal-server-bootstrap` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+server\s+bootstrap(?:\s\|$)` |
+| `kamal-init` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+init(?:\s\|$)` |
+| `kamal-docs` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+docs(?:\s\|$)` |
+| `kamal-help` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+help(?:\s\|$)` |
+| `kamal-version` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?:\s\|$)` |
+| `kamal-app-safe` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+app(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot\|start\|restart\|details\|containers\|images\|logs\|version\|stale_containers\|maintenance\|live)(?:\s\|$)` |
+| `kamal-accessory-safe` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+accessory(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot\|start\|restart\|details\|logs\|upgrade)(?:\s\|$)` |
+| `kamal-proxy-safe` | `(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+proxy(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot\|boot_config\|start\|restart\|details\|logs)(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 

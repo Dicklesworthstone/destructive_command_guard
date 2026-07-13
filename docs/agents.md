@@ -15,9 +15,11 @@ trust to well-behaved agents while maintaining strict controls for unknown ones.
 | Codex CLI | Environment | `CODEX_CLI=1` |
 | Gemini CLI | Environment | `GEMINI_CLI=1` |
 | GitHub Copilot CLI | Environment | `COPILOT_CLI=1` or `COPILOT_AGENT_START_TIME_SEC` |
+| VS Code Copilot Chat | Hook payload | `tool_name` is `runTerminalCommand`, `run_in_terminal`, or `runInTerminal` |
 | Cursor IDE | Environment | `CURSOR_IDE=1` (set by dcg's hook script) |
 | Hermes Agent | Environment | `HERMES_AGENT=1` or `HERMES_SESSION_ID` |
 | Grok (xAI) | Environment | `GROK_SESSION_ID`, `GROK_HOOK_EVENT`, or `GROK_WORKSPACE_ROOT` |
+| Pi | Environment | `PI_CODING_AGENT=true` |
 
 ## Detection Priority
 
@@ -94,7 +96,11 @@ the allowlist so every command is evaluated against the full rule set:
 [agents.unknown]
 trust_level = "low"
 disabled_allowlist = true
-extra_packs = ["core", "database", "filesystem"]
+# Real pack / category IDs (see `dcg packs` / docs/packs/README.md). A category
+# ID like "database" expands to every database.* sub-pack. "paranoid" is a
+# graduation mode, not a pack — use the real `strict_git` pack for stricter git
+# rules, and `core.filesystem` (not "filesystem") for the filesystem pack.
+extra_packs = ["strict_git", "database", "system"]
 ```
 
 ## Configuration
@@ -111,7 +117,7 @@ additional_allowlist = ["npm run build", "cargo test"]
 [agents.unknown]
 trust_level = "low"
 disabled_allowlist = true
-extra_packs = ["paranoid"]
+extra_packs = ["strict_git", "database"]
 
 # Default profile for unspecified agents
 [agents.default]
@@ -123,8 +129,8 @@ trust_level = "medium"
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `trust_level` | string | `"medium"` | Advisory label: `"high"`, `"medium"`, or `"low"`. Included in JSON/verbose output but does not change rule evaluation by itself. |
-| `disabled_packs` | array | `[]` | Packs to remove from evaluation for this agent (including sub-packs). |
-| `extra_packs` | array | `[]` | Additional packs to enable for this agent. |
+| `disabled_packs` | array | `[]` | Pack or category IDs to remove from evaluation for this agent (a category ID drops every matching sub-pack). |
+| `extra_packs` | array | `[]` | Additional pack or category IDs to enable for this agent (a category ID expands to all its sub-packs). |
 | `additional_allowlist` | array | `[]` | Command patterns to allowlist for this agent (added on top of the base allowlist). |
 | `disabled_allowlist` | bool | `false` | If `true`, ignore all allowlist entries for this agent (more restrictive). |
 
@@ -135,7 +141,7 @@ trust_level = "medium"
 [agents.unknown]
 trust_level = "low"
 disabled_allowlist = true
-extra_packs = ["core", "database", "filesystem"]
+extra_packs = ["strict_git", "database", "system"]
 
 [agents.claude-code]
 trust_level = "medium"
@@ -272,10 +278,10 @@ All robot-mode responses are pure JSON on stdout:
 ### Hook Mode vs Robot Mode
 
 **Hook mode** (default when no subcommand) follows the active hook protocol:
-- Claude Code, Gemini CLI, Copilot CLI, and compatible JSON-hook protocols emit
+- Claude Code, Gemini CLI, Copilot CLI, VS Code Copilot Chat, and compatible JSON-hook protocols emit
   JSON on stdout for denials and empty stdout for allows.
-- Codex CLI 0.125.0+ uses strict hook parsing, so dcg denies with exit code 2
-  and a stderr reason instead of stdout JSON.
+- Codex CLI uses strict hook parsing, so dcg emits a minimal
+  `hookSpecificOutput` denial on stdout and exits 0.
 - Rich output always goes to stderr for human visibility.
 
 **Robot mode** with subcommands uses standardized exit codes:
@@ -290,8 +296,8 @@ is the compatibility contract for rich terminal formatting.
 
 | Stream | Purpose | Hook-mode content | Robot-mode content |
 |--------|---------|-------------------|--------------------|
-| stdout | Agent and script parsing | Protocol JSON for JSON-hook denials, empty for allows, empty for Codex denies | JSON only |
-| stderr | Human-visible diagnostics | Rich or plain text warning boxes and Codex deny reasons | Silent |
+| stdout | Agent and script parsing | Protocol JSON for denials, empty for allows | JSON only |
+| stderr | Human-visible diagnostics | Rich or plain text warning boxes | Silent |
 
 Rich output is display-only. It must never be parsed by agents and must never be
 written to stdout. When dcg prints Unicode boxes, colors, highlighted commands,
@@ -324,9 +330,9 @@ dcg < hook-input.json >hook-stdout.json 2>human-warning.txt
 dcg --robot test "rm -rf /" >decision.json 2>/dev/null
 ```
 
-For Codex hook integrations, treat exit code 2 plus non-empty stderr as a deny.
-For Claude-compatible JSON hook integrations, parse stdout when it is non-empty
-and treat empty stdout as allow.
+For Codex and Claude-compatible hook integrations, parse stdout when it is
+non-empty and treat empty stdout with exit 0 as allow. Codex's denial payload is
+minimal and intentionally omits dcg-only metadata.
 
 ### Example: Agent Integration
 

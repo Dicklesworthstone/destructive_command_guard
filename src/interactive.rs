@@ -53,7 +53,7 @@ static SESSION_CODES: std::sync::OnceLock<std::sync::Mutex<VerificationCodeGener
     std::sync::OnceLock::new();
 
 /// Verification method for interactive prompts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum VerificationMethod {
     /// Random verification code (default).
@@ -198,7 +198,7 @@ impl VerificationCodeGenerator {
 }
 
 /// Configuration for interactive mode.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct InteractiveConfig {
     /// Whether interactive mode is enabled.
     pub enabled: bool,

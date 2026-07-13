@@ -427,7 +427,7 @@ fn memory_full_pipeline() {
 //=============================================================================
 // Codex Protocol Memory Tests (ovw4.6.3)
 //
-// The Codex deny path calls process::exit(2) which skips Drop.
+// The Codex deny path emits a minimal JSON decision and returns normally.
 // These tests exercise the Codex-specific code paths in-process to verify
 // no allocations leak across repeated invocations of the protocol detection,
 // evaluation, and output formatting pipeline.
@@ -581,11 +581,15 @@ fn memory_codex_deny_output_formatting() {
             black_box(&stdout_buf);
             black_box(&stderr_buf);
 
-            // Codex path: stdout should be empty (no JSON), stderr has colored message
-            debug_assert!(
-                stdout_buf.is_empty(),
-                "Codex deny should not write to stdout"
-            );
+            // Codex path: stdout is a minimal JSON denial, stderr has the
+            // human-readable message.
+            let json: serde_json::Value =
+                serde_json::from_slice(&stdout_buf).expect("Codex deny stdout should be JSON");
+            let specific = json["hookSpecificOutput"]
+                .as_object()
+                .expect("Codex hookSpecificOutput object");
+            debug_assert_eq!(specific.len(), 3);
+            debug_assert_eq!(specific["permissionDecision"], "deny");
 
             stdout_buf.clear();
             stderr_buf.clear();
@@ -762,11 +766,17 @@ fn run_codex_deny_subprocess(
     let output = child.wait_with_output().expect("wait dcg");
     assert_eq!(
         output.status.code(),
-        Some(2),
-        "Codex deny should exit 2\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        Some(0),
+        "Codex deny should exit normally"
     );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "Codex deny stdout should be JSON: {error}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
 }
 
 #[test]

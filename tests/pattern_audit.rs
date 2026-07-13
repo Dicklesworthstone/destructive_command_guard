@@ -728,14 +728,107 @@ fn test_audit_backtracking_requirements() {
             ]),
         ),
         (
-            // platform.modal uses negative lookahead on two safe patterns to
-            // express "create without --force" and "rm without -r" — the
-            // most natural way to discriminate the safe shape from the
-            // adjacent destructive shape with the same prefix. The lookaheads
-            // were added in `97e993f` (#116 follow-up: shell line-continuation
-            // fix) so this entry is intentional, not a regression.
+            // Kamal patterns deliberately use a leading negative lookbehind
+            // so embedded words such as `mykamal` cannot match, plus bounded
+            // flag-skipping groups between the CLI and subcommand.
+            "platform.kamal",
+            HashSet::from([
+                "kamal-audit",
+                "kamal-details",
+                "kamal-config",
+                "kamal-secrets",
+                "kamal-deploy",
+                "kamal-redeploy",
+                "kamal-setup",
+                "kamal-build",
+                "kamal-rollback",
+                "kamal-upgrade",
+                "kamal-registry",
+                "kamal-lock",
+                "kamal-server-bootstrap",
+                "kamal-init",
+                "kamal-docs",
+                "kamal-help",
+                "kamal-version",
+                "kamal-app-safe",
+                "kamal-accessory-safe",
+                "kamal-proxy-safe",
+                "kamal-remove",
+                "kamal-accessory-remove",
+                "kamal-app-remove",
+                "kamal-app-stop",
+                "kamal-proxy-remove",
+                "kamal-proxy-reboot",
+                "kamal-proxy-stop",
+                "kamal-accessory-reboot",
+                "kamal-accessory-stop",
+                "kamal-prune",
+            ]),
+        ),
+        (
+            // Modal patterns are command-token anchored with a negative
+            // lookbehind. Two safe patterns additionally use negative
+            // lookahead to express "create without --force" and "rm without
+            // -r". These are intentional fancy-regex patterns, not accidental
+            // backtracking regressions.
             "platform.modal",
-            HashSet::from(["modal-secret-create-no-force", "modal-volume-rm"]),
+            HashSet::from([
+                "modal-volume-list",
+                "modal-volume-get",
+                "modal-volume-create",
+                "modal-app-readonly",
+                "modal-container-readonly",
+                "modal-secret-list",
+                "modal-secret-create-no-force",
+                "modal-environment-list",
+                "modal-environment-mutate",
+                "modal-dict-readonly",
+                "modal-queue-readonly",
+                "modal-shell",
+                "modal-deploy",
+                "modal-token",
+                "modal-volume-rm",
+                "modal-environment-delete",
+                "modal-volume-delete",
+                "modal-secret-delete",
+                "modal-dict-delete",
+                "modal-queue-delete",
+                "modal-app-stop",
+                "modal-container-stop",
+                "modal-volume-rm-recursive",
+                "modal-dict-clear",
+                "modal-queue-clear",
+                "modal-secret-create-force",
+            ]),
+        ),
+        (
+            // Railway patterns share the same command-token lookbehind and
+            // bounded flag-skipping grammar as the other hosted-platform
+            // CLIs. Database-variable rules also use quote-aware lookarounds.
+            "platform.railway",
+            HashSet::from([
+                "railway-status",
+                "railway-project-list",
+                "railway-project-subcommand-list",
+                "railway-whoami",
+                "railway-logs",
+                "railway-service-list",
+                "railway-function-list",
+                "railway-environment-list",
+                "railway-volume-list",
+                "railway-variable-list",
+                "railway-project-delete",
+                "railway-project-subcommand-delete",
+                "railway-environment-delete",
+                "railway-service-delete",
+                "railway-function-delete",
+                "railway-volume-delete",
+                "railway-volume-detach",
+                "railway-variable-delete",
+                "railway-database-variable-set",
+                "railway-database-variable-legacy-set",
+                "railway-deployment-remove",
+            ]),
         ),
         (
             "remote.scp",
@@ -951,6 +1044,16 @@ fn test_audit_backtracking_requirements() {
                 "systemctl-status",
             ]),
         ),
+        (
+            "windows.filesystem",
+            HashSet::from(["whatif-preview", "remove-item-recurse-force"]),
+        ),
+        ("windows.misc", HashSet::from(["robocopy-mirror"])),
+        (
+            "windows.powershell",
+            HashSet::from(["force-stop-or-restart-computer"]),
+        ),
+        ("windows.system", HashSet::from(["diskpart"])),
     ]);
 
     let registry = PackRegistry::new();

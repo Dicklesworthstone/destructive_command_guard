@@ -472,12 +472,20 @@ pub enum Command {
         project_dir: Option<String>,
     },
 
-    /// Show current configuration
+    /// Show current configuration (or manage config tooling)
+    ///
+    /// With no subcommand, prints the effective merged configuration. The
+    /// `schema` subcommand emits the JSON Schema for `config.toml` (for editor
+    /// autocomplete/validation via Even Better TOML / taplo).
     #[command(name = "config")]
     ShowConfig {
         /// Output format (`pretty` for humans, `json` for agents/scripts)
         #[arg(long, value_enum, default_value_t = ConfigFormat::Pretty, env = "DCG_FORMAT")]
         format: ConfigFormat,
+
+        /// Config tooling subcommand (omit to show the effective configuration)
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
     },
 
     /// Scan files for destructive commands (CI/pre-commit integration)
@@ -1718,6 +1726,22 @@ pub enum AllowlistAction {
     },
 }
 
+/// Subcommands for the `config` command.
+#[derive(Subcommand, Debug)]
+pub enum ConfigAction {
+    /// Print the JSON Schema for dcg's `config.toml`
+    ///
+    /// The schema powers editor autocomplete and validation (e.g. the "Even
+    /// Better TOML" / taplo extensions). Point your `config.toml` at the
+    /// published schema, or write a local copy with `--output`.
+    #[command(name = "schema")]
+    Schema {
+        /// Write the schema to a file instead of stdout
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
+    },
+}
+
 /// Subcommands for managing allow-once entries.
 #[derive(Subcommand, Debug, Clone)]
 pub enum AllowOnceAction {
@@ -2151,14 +2175,27 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 init_config(output, force)?;
             }
         }
-        Some(Command::ShowConfig { format }) => {
-            if !verbosity.quiet {
-                match format {
-                    ConfigFormat::Json => show_config_json(&config),
-                    ConfigFormat::Pretty => show_config(&config),
+        Some(Command::ShowConfig { format, action }) => match action {
+            Some(ConfigAction::Schema { output }) => {
+                let schema = crate::config::config_json_schema_string();
+                if let Some(path) = output {
+                    std::fs::write(&path, &schema)?;
+                    if !verbosity.quiet {
+                        println!("Wrote config JSON Schema to {}", path.display());
+                    }
+                } else {
+                    print!("{schema}");
                 }
             }
-        }
+            None => {
+                if !verbosity.quiet {
+                    match format {
+                        ConfigFormat::Json => show_config_json(&config),
+                        ConfigFormat::Pretty => show_config(&config),
+                    }
+                }
+            }
+        },
         Some(Command::Allowlist { action }) => {
             handle_allowlist_command(action, config.allowlist.auto_prune_expired)?;
         }
@@ -2579,6 +2616,7 @@ fn evaluate_batch_line(
     };
 
     // Evaluate the command
+    let project_path = std::env::current_dir().ok();
     let eval_result = evaluate_command_with_pack_order_deadline_at_path(
         &command,
         enabled_keywords,
@@ -2588,8 +2626,8 @@ fn evaluate_batch_line(
         allowlists,
         heredoc_settings,
         None,
-        None,
-        None, // No deadline for batch mode
+        project_path.as_deref(), // scope path-aware allowlist entries (#186)
+        None,                    // No deadline for batch mode
     );
 
     match eval_result.decision {
@@ -2870,6 +2908,13 @@ fn list_packs_rich(pack_list: &[PackInfo], verbose: bool, expand: bool, max_patt
     crate::output::pack_list_tree_with_options(&tree_items, options)
         .with_theme(&crate::output::auto_theme())
         .render();
+
+    // Render the legend/config hint as a separate footer beneath the tree so it
+    // does not appear as a fake pack category inside the hierarchy (#187).
+    println!();
+    for line in crate::output::pack_legend_lines() {
+        println!("{line}");
+    }
 }
 
 fn markdown_single_line_for_cli(text: &str) -> String {
@@ -4035,6 +4080,7 @@ fn test_command(
     };
 
     // Use shared evaluator for consistent behavior with hook mode
+    let project_path = std::env::current_dir().ok();
     let start = Instant::now();
     let mut result = evaluate_command_with_pack_order_deadline_at_path(
         command,
@@ -4044,9 +4090,9 @@ fn test_command(
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
-        None, // allow_once_audit
-        None, // project_path
-        None, // deadline
+        None,                    // allow_once_audit
+        project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
+        None,                    // deadline
     );
 
     // NOTE: External packs from custom_paths are now checked in evaluate_command()
@@ -4566,6 +4612,7 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
     };
 
     // Evaluate the command
+    let project_path = std::env::current_dir().ok();
     let result = evaluate_command_with_pack_order_deadline_at_path(
         command,
         &enabled_keywords,
@@ -4574,9 +4621,9 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
-        None, // allow_once_audit
-        None, // project_path
-        None, // deadline
+        None,                    // allow_once_audit
+        project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
+        None,                    // deadline
     );
 
     // Map EvaluationResult to classification
