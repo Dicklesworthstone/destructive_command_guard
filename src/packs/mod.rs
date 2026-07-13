@@ -2701,31 +2701,47 @@ fn find_matching_command_substitution(cmd: &str, start: usize, end: usize) -> Op
             continue;
         }
 
+        // Nested delimiters must be matched or the whole construct is unclosed.
+        // Falling through after a failed nested match re-scans the same unclosed
+        // `$(` / `<(...)` / backtick regions from every sibling position and turns
+        // `$($($(...` into exponential work (issue #189 / agent hook fail-open).
         if b == b'`' {
-            if let Some(close) = find_matching_backtick(cmd, i + 1, end) {
-                i = close + 1;
-                continue;
+            match find_matching_backtick(cmd, i + 1, end) {
+                Some(close) => {
+                    i = close + 1;
+                    continue;
+                }
+                None => return None,
             }
         }
 
         if b == b'$' && i + 2 < end && bytes[i + 1] == b'(' && bytes[i + 2] == b'(' {
-            if let Some(close) = find_matching_arithmetic_expansion(cmd, i + 3, end) {
-                i = close + 2;
-                continue;
+            match find_matching_arithmetic_expansion(cmd, i + 3, end) {
+                Some(close) => {
+                    i = close + 2;
+                    continue;
+                }
+                None => return None,
             }
         }
 
         if b == b'$' && i + 1 < end && bytes[i + 1] == b'(' {
-            if let Some(close) = find_matching_command_substitution(cmd, i + 2, end) {
-                i = close + 1;
-                continue;
+            match find_matching_command_substitution(cmd, i + 2, end) {
+                Some(close) => {
+                    i = close + 1;
+                    continue;
+                }
+                None => return None,
             }
         }
 
         if !in_double && matches!(b, b'<' | b'>') && i + 1 < end && bytes[i + 1] == b'(' {
-            if let Some(close) = find_matching_command_substitution(cmd, i + 2, end) {
-                i = close + 1;
-                continue;
+            match find_matching_command_substitution(cmd, i + 2, end) {
+                Some(close) => {
+                    i = close + 1;
+                    continue;
+                }
+                None => return None,
             }
         }
 
@@ -2769,16 +2785,22 @@ fn find_matching_arithmetic_expansion(cmd: &str, start: usize, end: usize) -> Op
         }
 
         if b == b'`' {
-            if let Some(close) = find_matching_backtick(cmd, i + 1, end) {
-                i = close + 1;
-                continue;
+            match find_matching_backtick(cmd, i + 1, end) {
+                Some(close) => {
+                    i = close + 1;
+                    continue;
+                }
+                None => return None,
             }
         }
 
         if b == b'$' && i + 1 < end && bytes[i + 1] == b'(' {
-            if let Some(close) = find_matching_command_substitution(cmd, i + 2, end) {
-                i = close + 1;
-                continue;
+            match find_matching_command_substitution(cmd, i + 2, end) {
+                Some(close) => {
+                    i = close + 1;
+                    continue;
+                }
+                None => return None,
             }
         }
 
@@ -3216,6 +3238,28 @@ mod tests {
         assert_eq!(
             split_command_segments("echo $((rm -rf /))"),
             vec!["echo $((rm -rf /))"]
+        );
+    }
+
+    #[test]
+    fn split_command_segments_unclosed_command_substitutions_are_linear() {
+        use std::time::Instant;
+
+        // Issue #189: a chain of unclosed `$(` used to make matching exponential
+        // (n≈30 hung the hook past agent timeouts → fail-open bypass).
+        let padding = "$(".repeat(40);
+        let cmd = format!("echo hi ; {padding}");
+        let started = Instant::now();
+        let segments = split_command_segments(&cmd);
+        let elapsed = started.elapsed();
+
+        assert!(
+            segments.iter().any(|segment| segment.starts_with("echo hi")),
+            "expected the plain prefix segment to remain visible: {segments:?}"
+        );
+        assert!(
+            elapsed.as_millis() < 500,
+            "unclosed $( scanning took {elapsed:?}; expected near-linear time"
         );
     }
 
