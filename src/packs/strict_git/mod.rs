@@ -120,15 +120,18 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Block push to master. Separators include `/` so explicit refspecs
         // like `HEAD:refs/heads/master` are caught — `main` appearing after
         // `/` in `refs/heads/main` used to bypass the old `[\s:]` separator.
+        // `\+?` before the branch name catches the force-refspec shorthand
+        // (`git push origin +master`), which is semantically identical to
+        // `--force` and used to slip past both push-master and push-force-any.
         destructive_pattern!(
             "push-master",
-            r"git\s+(?:\S+\s+)*push\s+(?:.*[\s:/])?master(?:\s|$)",
+            r"git\s+(?:\S+\s+)*push\s+(?:.*[\s:/])?\+?master(?:\s|$)",
             "Direct push to master is blocked. Use a feature branch and open a Pull Request."
         ),
         // Block push to main
         destructive_pattern!(
             "push-main",
-            r"git\s+(?:\S+\s+)*push\s+(?:.*[\s:/])?main(?:\s|$)",
+            r"git\s+(?:\S+\s+)*push\s+(?:.*[\s:/])?\+?main(?:\s|$)",
             "Direct push to main is blocked. Use a feature branch and open a Pull Request."
         ),
     ]
@@ -279,5 +282,50 @@ mod tests {
             "git push origin refs/heads/master",
             "Direct push to master is blocked",
         );
+    }
+
+    #[test]
+    fn test_push_force_refspec_prefix() {
+        // Regression for #202: the `+` refspec prefix is git's shorthand for a
+        // forced (non-fast-forward) update. Semantically identical to --force.
+        // Previously bypassed both push-main/master and push-force-any.
+        let pack = create_pack();
+        assert_blocks(
+            &pack,
+            "git push origin +main",
+            "Direct push to main is blocked",
+        );
+        assert_blocks(
+            &pack,
+            "git push origin +master",
+            "Direct push to master is blocked",
+        );
+        assert_blocks(
+            &pack,
+            "git push origin +HEAD:main",
+            "Direct push to main is blocked",
+        );
+        assert_blocks(
+            &pack,
+            "git push origin +HEAD:master",
+            "Direct push to master is blocked",
+        );
+        assert_blocks(
+            &pack,
+            "git push origin +refs/heads/main",
+            "Direct push to main is blocked",
+        );
+        assert_blocks(
+            &pack,
+            "git push origin +refs/heads/master",
+            "Direct push to master is blocked",
+        );
+
+        // The `+` only counts as a refspec marker when it sits immediately
+        // before the branch token, so unrelated branch names that happen to
+        // contain the branch substring must still be allowed (guard against
+        // over-broadening the separator character class).
+        assert_allows(&pack, "git push origin feature-main");
+        assert_allows(&pack, "git push origin main-fix");
     }
 }
