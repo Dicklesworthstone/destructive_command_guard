@@ -1461,8 +1461,7 @@ pub fn resolve_path_for_matching(
 pub fn load_default_allowlists() -> LayeredAllowlist {
     let project = std::env::current_dir()
         .ok()
-        .and_then(|cwd| find_repo_root(&cwd))
-        .map(|root| root.join(".dcg").join("allowlist.toml"));
+        .map(|cwd| project_allowlist_path(&cwd));
 
     // Check XDG-style path first (~/.config/dcg/), then platform-native
     let user = dirs::home_dir()
@@ -1485,6 +1484,20 @@ pub fn load_default_allowlists() -> LayeredAllowlist {
     );
 
     LayeredAllowlist::load_from_paths(project, user, system)
+}
+
+/// Resolve the project allowlist path for `cwd`, falling back to `cwd`
+/// itself when no `.git` ancestor is found.
+///
+/// This mirrors the CLI's write-side fallback (`allowlist_path_for_layer` in
+/// cli.rs): `--project` writes to `<cwd>/.dcg/allowlist.toml` even outside a
+/// git repo. The read side must fall back the same way, or a project
+/// allowlist created outside a git repo is silently never loaded (dcg#199).
+fn project_allowlist_path(cwd: &Path) -> PathBuf {
+    find_repo_root(cwd)
+        .unwrap_or_else(|| cwd.to_path_buf())
+        .join(".dcg")
+        .join("allowlist.toml")
 }
 
 fn find_repo_root(start: &Path) -> Option<PathBuf> {
@@ -1779,6 +1792,32 @@ fn get_timestamp_string(tbl: &toml::value::Table, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- project allowlist path resolution (dcg#199) -----
+
+    #[test]
+    fn project_allowlist_path_falls_back_to_cwd_outside_git_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No `.git` anywhere under tmp, so this must resolve to tmp itself,
+        // matching what the CLI's `--project` write path already does.
+        assert_eq!(
+            project_allowlist_path(tmp.path()),
+            tmp.path().join(".dcg").join("allowlist.toml")
+        );
+    }
+
+    #[test]
+    fn project_allowlist_path_uses_repo_root_when_git_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            project_allowlist_path(&nested),
+            tmp.path().join(".dcg").join("allowlist.toml")
+        );
+    }
 
     // ----- command_prefix tail-injection regression tests -----
 
