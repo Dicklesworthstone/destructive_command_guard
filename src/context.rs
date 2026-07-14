@@ -886,6 +886,9 @@ pub static SAFE_STRING_REGISTRY: SafeStringRegistry = SafeStringRegistry {
         SafeFlagEntry::both("rg", "-e", "--regexp"),
         SafeFlagEntry::both("ag", "-e", "--pattern"), // Silver Searcher
         SafeFlagEntry::both("ack", "-e", "--pattern"), // ack search tool
+        // sed - the script is data to the shell: `>` / `|` inside a quoted
+        // script are sed syntax, not shell redirects/pipes (#198)
+        SafeFlagEntry::both("sed", "-e", "--expression"),
         // GitHub CLI - titles and bodies are documentation
         SafeFlagEntry::both("gh", "-t", "--title"),
         SafeFlagEntry::both("gh", "-b", "--body"),
@@ -922,8 +925,8 @@ static SAFE_COMMANDS_MATCHER: LazyLock<AhoCorasick> = LazyLock::new(|| {
     let commands: &[&str] = &[
         // all_args_data commands
         "echo", "printf", // Commands from flag_data_pairs
-        "git", "bd", "grep", "rg", "ag", "ack", "gh", "curl", "jq", "docker", "kubectl", "xargs",
-        "cargo", "npm",
+        "git", "bd", "grep", "rg", "ag", "ack", "sed", "gh", "curl", "jq", "docker", "kubectl",
+        "xargs", "cargo", "npm",
         // Special built-in: `command -v/-V` queries mask their arguments
         "command",
     ];
@@ -1678,7 +1681,9 @@ fn is_env_assignment(token: &str) -> bool {
 #[must_use]
 fn is_search_command(cmd: &str) -> bool {
     let base_name = cmd.rsplit('/').next().unwrap_or(cmd);
-    matches!(base_name, "rg" | "grep" | "ag" | "ack")
+    // sed is not a search tool, but it shares the shape: the first
+    // positional argument is a pattern/script (data), the rest are files.
+    matches!(base_name, "rg" | "grep" | "ag" | "ack" | "sed")
 }
 
 #[inline]
@@ -1690,6 +1695,7 @@ fn is_search_pattern_flag(cmd: &str, flag: &str) -> bool {
         "grep" => matches!(flag, "-e" | "--regexp"),
         "ag" => matches!(flag, "-e" | "--pattern"),
         "ack" => matches!(flag, "-e" | "--pattern"),
+        "sed" => matches!(flag, "-e" | "--expression"),
         _ => false,
     }
 }
@@ -3319,6 +3325,38 @@ mod tests {
         assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
         assert!(!sanitized.as_ref().contains("rm -rf"));
         assert!(sanitized.as_ref().contains("ack"));
+    }
+
+    #[test]
+    fn sanitize_strips_sed_positional_script() {
+        // #198: `>/` inside a quoted sed script is sed syntax, not a shell redirect.
+        let cmd = "echo a=b | sed -E 's/=.*/=<set>/'";
+        let sanitized = sanitize_for_pattern_matching(cmd);
+
+        assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+        assert!(!sanitized.as_ref().contains(">/"));
+        assert!(sanitized.as_ref().contains("sed -E"));
+    }
+
+    #[test]
+    fn sanitize_strips_sed_expression_flag_value() {
+        let cmd = "sed -e 's/rm -rf //' notes.txt";
+        let sanitized = sanitize_for_pattern_matching(cmd);
+
+        assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+        assert!(!sanitized.as_ref().contains("rm -rf"));
+        assert!(sanitized.as_ref().contains("sed -e"));
+        assert!(sanitized.as_ref().contains("notes.txt"));
+    }
+
+    #[test]
+    fn sanitize_sed_script_with_inline_code_stays_visible() {
+        // Command substitution in a double-quoted script IS executed by the
+        // shell before sed runs — it must never be masked.
+        let cmd = r#"sed "s/x/$(rm -rf /)/" file.txt"#;
+        let sanitized = sanitize_for_pattern_matching(cmd);
+
+        assert!(sanitized.as_ref().contains("rm -rf"));
     }
 
     #[test]

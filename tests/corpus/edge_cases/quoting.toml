@@ -171,6 +171,11 @@ description = "sed with quoted expression is safe"
 command = "sed 's/old/new/g' file.txt"
 expected = "allow"
 
+[[case]]
+description = "sed substitution containing >/ is not a shell redirect (#198)"
+command = "echo a=b | sed -E 's/=.*/=<set>/'"
+expected = "allow"
+
 # ============================================================================
 # Complex command line patterns
 # ============================================================================
