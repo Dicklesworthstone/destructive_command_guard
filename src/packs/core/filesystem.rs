@@ -667,6 +667,16 @@ fn path_is_safe_unquoted(path: &str) -> bool {
 }
 
 fn path_is_safe_double_quoted(path: &str) -> bool {
+    // Literal /tmp and /var/tmp are unchanged by double quotes (bash quoting
+    // only affects expansion and word splitting, not literal path text). Without
+    // parity with path_is_safe_unquoted, `rm -rf "/tmp/foo"` falsely trips the
+    // CRITICAL root/home rule while `rm -rf /tmp/foo` is allowed.
+    if let Some(rest) = path.strip_prefix("/tmp/") {
+        return !has_dotdot_segment(rest);
+    }
+    if let Some(rest) = path.strip_prefix("/var/tmp/") {
+        return !has_dotdot_segment(rest);
+    }
     if let Some(rest) = path.strip_prefix("$TMPDIR/") {
         return !has_dotdot_segment(rest);
     }
@@ -3451,6 +3461,26 @@ mod tests {
             r#"rm --force --recursive "${TMPDIR}/foo""#,
             RM_RECURSIVE_FORCE_NAME,
             Severity::High,
+        );
+    }
+
+    #[test]
+    fn test_rm_parser_allows_literal_tmp_double_quoted() {
+        // Regression for #201: double quotes around /tmp and /var/tmp are
+        // shell-transparent (bash quoting only affects expansion and word
+        // splitting, not literal text). `rm -rf "/tmp/foo"` must have parity
+        // with `rm -rf /tmp/foo` — previously the quoted form was falsely
+        // classified as a CRITICAL root/home deletion.
+        assert_rm_parser_allows(r#"rm -rf "/tmp/foo""#);
+        assert_rm_parser_allows(r#"rm -rf "/tmp/build/artifacts""#);
+        assert_rm_parser_allows(r#"rm -rf "/var/tmp/cache""#);
+
+        // Dot-dot traversal inside the quoted path must still deny (parity
+        // with the unquoted `has_dotdot_segment` guard).
+        assert_rm_parser_denies(
+            r#"rm -rf "/tmp/../etc""#,
+            RM_RF_ROOT_HOME_NAME,
+            Severity::Critical,
         );
     }
 
