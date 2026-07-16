@@ -78,7 +78,7 @@ risk_acknowledged = true
 
 **Pack ID:** `core.filesystem`
 
-Protects against dangerous rm -rf commands and equivalent destruction (find -delete, unlink) outside temp directories
+Protects against dangerous recursive rm commands and equivalent destruction (find -delete, unlink) outside temp directories
 
 ### Keywords
 
@@ -163,9 +163,11 @@ These patterns match potentially destructive commands:
 | `rm-rf-root-home` | rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed. Ask the user to run it manually if truly needed. | critical |
 | `rm-r-f-separate-root-home` | rm with separate -r -f flags targeting root or home is EXTREMELY DANGEROUS. | critical |
 | `rm-recursive-force-root-home` | rm --recursive --force targeting root or home is EXTREMELY DANGEROUS. | critical |
+| `rm-recursive-root-home` | rm recursive deletion targeting root or home is EXTREMELY DANGEROUS. | critical |
 | `rm-rf-general` | rm -rf is destructive and requires human approval. Explain what you want to delete and why, then ask the user to run the command manually. | high |
 | `rm-r-f-separate` | rm with separate -r -f flags is destructive and requires human approval. | high |
 | `rm-recursive-force-long` | rm --recursive --force is destructive and requires human approval. | high |
+| `rm-recursive` | rm recursive deletion can remove an entire directory tree and requires human approval. | high |
 | `find-delete-root-home` | find <sensitive-path> -delete is bytewise-equivalent to rm -rf on root/home and is EXTREMELY DANGEROUS. This command will NOT be executed. | critical |
 | `find-delete-general` | find ... -delete is destructive (bytewise-equivalent to rm -rf on the matched tree) and requires human approval. | high |
 | `unlink-root-home` | unlink on a sensitive system or home path is one-shot data destruction with no recovery. EXTREMELY DANGEROUS. | critical |

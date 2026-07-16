@@ -298,6 +298,9 @@ const RM_R_F_SEPARATE_ROOT_HOME_REASON: &str =
 const RM_RECURSIVE_FORCE_ROOT_HOME_NAME: &str = "rm-recursive-force-root-home";
 const RM_RECURSIVE_FORCE_ROOT_HOME_REASON: &str =
     "rm --recursive --force targeting root or home is EXTREMELY DANGEROUS.";
+const RM_RECURSIVE_ROOT_HOME_NAME: &str = "rm-recursive-root-home";
+const RM_RECURSIVE_ROOT_HOME_REASON: &str =
+    "rm recursive deletion targeting root or home is EXTREMELY DANGEROUS.";
 const RM_RF_GENERAL_NAME: &str = "rm-rf-general";
 const RM_RF_GENERAL_REASON: &str = "rm -rf is destructive and requires human approval. Explain what you want to delete and why, then ask the user to run the command manually.";
 const RM_R_F_SEPARATE_NAME: &str = "rm-r-f-separate";
@@ -306,6 +309,9 @@ const RM_R_F_SEPARATE_REASON: &str =
 const RM_RECURSIVE_FORCE_NAME: &str = "rm-recursive-force-long";
 const RM_RECURSIVE_FORCE_REASON: &str =
     "rm --recursive --force is destructive and requires human approval.";
+const RM_RECURSIVE_NAME: &str = "rm-recursive";
+const RM_RECURSIVE_REASON: &str =
+    "rm recursive deletion can remove an entire directory tree and requires human approval.";
 
 pub(crate) fn is_pre_rm_propagation_rule(name: Option<&str>) -> bool {
     matches!(
@@ -352,6 +358,7 @@ enum RmFlagStyle {
     Combined,
     Separate,
     Long,
+    RecursiveOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,6 +405,14 @@ impl RmFlagTracker {
             return Some(RmFlagState {
                 style: RmFlagStyle::Long,
                 span: self.recursive_span.or(self.force_span),
+                saw_terminator: self.saw_terminator,
+            });
+        }
+
+        if self.seen_r || self.seen_long_recursive {
+            return Some(RmFlagState {
+                style: RmFlagStyle::RecursiveOnly,
+                span: self.r_span.or(self.recursive_span),
                 saw_terminator: self.saw_terminator,
             });
         }
@@ -589,6 +604,11 @@ fn parse_rm_segment(
                 RM_RECURSIVE_FORCE_ROOT_HOME_REASON,
                 Severity::Critical,
             ),
+            RmFlagStyle::RecursiveOnly => (
+                RM_RECURSIVE_ROOT_HOME_NAME,
+                RM_RECURSIVE_ROOT_HOME_REASON,
+                Severity::Critical,
+            ),
         }
     } else {
         match flag_state.style {
@@ -599,6 +619,7 @@ fn parse_rm_segment(
                 RM_RECURSIVE_FORCE_REASON,
                 Severity::High,
             ),
+            RmFlagStyle::RecursiveOnly => (RM_RECURSIVE_NAME, RM_RECURSIVE_REASON, Severity::High),
         }
     };
 
@@ -1176,6 +1197,21 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              silent deletion. Run only if truly intended.",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
+        // Recursive deletion without `-f` is still silent for normal writable
+        // trees, so root/home targets deserve the same Critical treatment.
+        destructive_pattern!(
+            "rm-recursive-root-home",
+            r#"rm\s+(?:-[a-zA-Z]*[rR][a-zA-Z]*|.*--recursive)\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
+            "rm recursive deletion targeting root or home is EXTREMELY DANGEROUS.",
+            Critical,
+            "`rm -r /` or `rm --recursive /` recursively deletes the root filesystem \
+             or home directory. The absence of `-f` only preserves prompts for a subset \
+             of protected files; ordinary writable directory trees are still removed \
+             without confirmation.\n\n\
+             There is NO recovery without backups. Use a specific path and preview it \
+             before removing anything.",
+            RM_RF_ROOT_HOME_SUGGESTIONS
+        ),
         // General rm -rf (caught after safe patterns) - High because temp paths are allowed
         destructive_pattern!(
             "rm-rf-general",
@@ -1239,6 +1275,24 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Preview command:\n  \
              find /path --maxdepth 2 -ls | head -30",
             RM_RECURSIVE_FORCE_SUGGESTIONS
+        ),
+        // rm -r / rm --recursive without -f. This is less aggressive than
+        // rm -rf but still recursively deletes ordinary writable trees with
+        // no prompt, which is the issue #211 production failure mode. Keep
+        // this after the force-specific rules so those rule IDs stay stable.
+        destructive_pattern!(
+            "rm-recursive",
+            r"rm\s+(?:-[a-zA-Z]*[rR][a-zA-Z]*|.*--recursive)",
+            "rm recursive deletion can remove an entire directory tree and requires human approval.",
+            High,
+            "`rm -r <path>` and `rm --recursive <path>` recursively remove directory \
+             trees. Without `-f`, rm may still delete ordinary writable directories \
+             without any prompt; it only asks in narrower cases such as protected files.\n\n\
+             Safer alternatives:\n\
+             - Preview the tree first: `find <path> -maxdepth 2 -print | head -50`\n\
+             - Use `rm -ri <path>` for interactive confirmation\n\
+             - Move the directory to a temporary holding area before deleting",
+            RM_RF_GENERAL_SUGGESTIONS
         ),
         // ----- `find ... -delete` (Critical: root/home target) -----
         //
@@ -3234,6 +3288,33 @@ mod tests {
     }
 
     #[test]
+    fn test_rm_recursive_without_force_blocks() {
+        let pack = create_pack();
+        for cmd in [
+            "rm -r ./build",
+            "rm -R ./build",
+            "rm -rv ./build",
+            "rm --recursive ./build",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::High);
+            assert_blocks_with_pattern(&pack, cmd, "rm-recursive");
+        }
+
+        for cmd in ["rm -r /", "rm -R /etc", "rm --recursive $HOME"] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+            assert_blocks_with_pattern(&pack, cmd, "rm-recursive-root-home");
+        }
+
+        // Existing forced-recursive classifications stay stable.
+        assert_blocks_with_pattern(&pack, "rm -rf ./build", "rm-rf-general");
+        assert_blocks_with_pattern(
+            &pack,
+            "rm --recursive --force ./build",
+            "rm-recursive-force-long",
+        );
+    }
+
+    #[test]
     fn test_rm_rf_general_high() {
         let pack = create_pack();
         // Outside safe dirs, general rule catches it
@@ -3266,6 +3347,8 @@ mod tests {
             "rm -r -f /tmp/foo 2>/dev/null",
             "rm -f -r /tmp/foo 2>/dev/null",
             "rm --recursive --force /tmp/foo 2>/dev/null",
+            "rm -r /tmp/foo 2>/dev/null",
+            "rm --recursive /tmp/foo 2>/dev/null",
         ];
         for cmd in safe_cases {
             assert!(
@@ -3278,6 +3361,7 @@ mod tests {
         // sneak through. /etc still wins over the redirection.
         let unsafe_cases = [
             "rm -rf /etc 2>/dev/null",
+            "rm -r /etc 2>/dev/null",
             "rm -rf /tmp/ok /etc 2>/dev/null",
             "rm -rf / 2>/dev/null",
         ];
@@ -3294,6 +3378,8 @@ mod tests {
         let pack = create_pack();
         assert_blocks(&pack, "rm -r -f ./build", "separate -r -f flags");
         assert_blocks(&pack, "rm -f -r ./build", "separate -r -f flags");
+        assert_blocks(&pack, "rm -r ./build", "rm recursive deletion");
+        assert_blocks(&pack, "rm -R ./build", "rm recursive deletion");
         assert_blocks(
             &pack,
             "rm --recursive --force ./build",
@@ -3332,6 +3418,8 @@ mod tests {
         assert_safe_pattern_matches(&pack, "rm -fr /tmp/test");
         assert_safe_pattern_matches(&pack, "rm -r -f /tmp/test");
         assert_safe_pattern_matches(&pack, "rm --recursive --force /tmp/test");
+        assert!(pack.check("rm -r /tmp/test").is_none());
+        assert!(pack.check("rm --recursive /tmp/test").is_none());
     }
 
     #[test]
@@ -3427,6 +3515,12 @@ mod tests {
             RM_RECURSIVE_FORCE_NAME,
             Severity::High,
         );
+        assert_rm_parser_denies(r#"rm -r "$TMPDIR/foo""#, RM_RECURSIVE_NAME, Severity::High);
+        assert_rm_parser_denies(
+            r#"rm --recursive "${TMPDIR}/foo""#,
+            RM_RECURSIVE_NAME,
+            Severity::High,
+        );
         assert_rm_parser_denies(
             r#"export TMPDIR=/; rm -rf "$TMPDIR/etc""#,
             RM_RF_GENERAL_NAME,
@@ -3495,6 +3589,16 @@ mod tests {
         assert_rm_parser_denies(
             "rm --recursive --force -- /",
             RM_RECURSIVE_FORCE_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+        assert_rm_parser_denies(
+            "rm -r -- /",
+            RM_RECURSIVE_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+        assert_rm_parser_denies(
+            "rm --recursive -- /",
+            RM_RECURSIVE_ROOT_HOME_NAME,
             Severity::Critical,
         );
     }
