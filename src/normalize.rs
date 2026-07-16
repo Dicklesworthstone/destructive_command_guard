@@ -1330,6 +1330,78 @@ pub fn normalize_command_word_token(token: &str) -> Option<String> {
         }
     }
 
+    // Decode ANSI-C quoting ($'...') before internal backslash handling.
+    // Bash resolves $'\x72\x6d' to "rm", $'\n' to newline, etc. Without this
+    // decoding, hex-escaped command words bypass pattern matching entirely.
+    if out.starts_with("$'") && out.len() >= 4 && out.ends_with('\'') {
+        let inner = &out[2..out.len() - 1];
+        let inner_bytes = inner.as_bytes();
+        let mut decoded = Vec::with_capacity(inner.len());
+        let mut i = 0;
+        let len = inner_bytes.len();
+        let mut local_changed = false;
+        while i < len {
+            if inner_bytes[i] == b'\\' && i + 1 < len {
+                local_changed = true;
+                let esc = inner_bytes[i + 1];
+                i += 2;
+                match esc {
+                    b'x' | b'X' => {
+                        let mut hex_val = 0u8;
+                        let mut hex_digits = 0usize;
+                        while i < len && hex_digits < 2 && inner_bytes[i].is_ascii_hexdigit() {
+                            let b = inner_bytes[i];
+                            hex_val = hex_val * 16
+                                + if b.is_ascii_digit() {
+                                    b - b'0'
+                                } else {
+                                    b.to_ascii_lowercase() - b'a' + 10
+                                };
+                            i += 1;
+                            hex_digits += 1;
+                        }
+                        decoded.push(hex_val);
+                    }
+                    b'0'..=b'7' => {
+                        let mut octal_val = esc - b'0';
+                        let mut octal_digits = 1usize;
+                        while i < len
+                            && octal_digits < 3
+                            && inner_bytes[i] >= b'0'
+                            && inner_bytes[i] <= b'7'
+                        {
+                            octal_val = octal_val * 8 + (inner_bytes[i] - b'0');
+                            i += 1;
+                            octal_digits += 1;
+                        }
+                        decoded.push(octal_val);
+                    }
+                    b'n' => decoded.push(b'\n'),
+                    b't' => decoded.push(b'\t'),
+                    b'e' => decoded.push(0x1b),
+                    b'\\' => decoded.push(b'\\'),
+                    b'\'' => decoded.push(b'\''),
+                    _ => decoded.push(esc),
+                }
+            } else {
+                decoded.push(inner_bytes[i]);
+                i += 1;
+            }
+        }
+        let result = if local_changed {
+            String::from_utf8_lossy(&decoded).to_string()
+        } else {
+            inner.to_string()
+        };
+        let is_safe = !result.is_empty()
+            && !result.contains(|c: char| c.is_ascii_whitespace())
+            && !result.contains(|c: char| matches!(c, '|' | ';' | '&' | '(' | ')'));
+        if is_safe {
+            out = result;
+            changed = true;
+        }
+    }
+
     // Windows drive-letter paths (e.g. `C:\Windows\System32\diskpart.exe`) use the
     // backslash as a PATH SEPARATOR, not a bash escape. Stripping it would mangle
     // the path (`C:\Windows` -> `CWindows`) and defeat path normalization, so skip
