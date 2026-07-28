@@ -62,7 +62,7 @@ rayon = { version = "1.11", optional = true }
 
 # AST-based pattern matching for heredoc/inline-script content
 ast-grep-core = "0.44"
-ast-grep-language = { version = "0.44", default-features = false, features = [
+ast-grep-language = { version = "0.45", default-features = false, features = [
     "tree-sitter-bash",
     "tree-sitter-python",
     "tree-sitter-javascript",
