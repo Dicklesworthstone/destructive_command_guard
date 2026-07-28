@@ -54,7 +54,7 @@ libc = "0.2"                # Nonblocking, no-follow opens for inspected stdin f
 clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4.6"
 once_cell = "1.19"
-base64 = "0.22"              # For decision log format parsing in simulate
+base64 = "0.23"              # For decision log format parsing in simulate
 async-trait = "0.1.89"
 rust-mcp-sdk = { version = "0.9.0", default-features = false, features = ["server", "stdio", "macros"] }
 tokio = { version = "1.52", features = ["rt-multi-thread"] }
