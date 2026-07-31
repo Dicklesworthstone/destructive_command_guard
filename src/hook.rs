@@ -328,6 +328,14 @@ pub enum HookProtocol {
     /// Claude Code / Augment-compatible `hookSpecificOutput` protocol.
     /// Tolerant JSON parser; accepts dcg's full deny payload with
     /// `allowOnceCode`, `ruleId`, `severity`, `remediation`, etc.
+    ///
+    /// Posit Assistant also uses this protocol: its documented `PreToolUse`
+    /// contract is the snake_case Claude shape (`tool_name`,
+    /// `tool_input.command`, `tool_use_id`, `permission_mode`), it treats exit
+    /// code 2 as a block with stderr as the reason, and it reads
+    /// `hookSpecificOutput.permissionDecision` (`allow`/`deny`/`ask`) on exit 0.
+    /// Its documented hook env var `PA_PROJECT_DIR` keeps a Windows PowerShell
+    /// shell tool from being classified as Codex.
     ClaudeCompatible,
     /// Copilot hook protocol (top-level permission decision and reason).
     Copilot,
@@ -500,6 +508,11 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
 /// and `CLAUDE_CODE` env var), then Gemini-specific markers (tool name
 /// `"run_shell_command"` with hook event `"BeforeTool"`).
 ///
+/// Posit Assistant documents the same envelope as Claude Code, so it resolves to
+/// [`HookProtocol::ClaudeCompatible`] via the shared shell-tool names. Its
+/// documented `PA_PROJECT_DIR` hook variable is consulted only to keep a
+/// `powershell` tool name from being classified as Codex.
+///
 /// See: <https://github.com/Dicklesworthstone/destructive_command_guard/issues/77>
 #[must_use]
 pub fn detect_protocol(input: &HookInput) -> HookProtocol {
@@ -601,6 +614,22 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         .is_some_and(|s| !s.trim().is_empty());
     if is_claude_compatible_shell_tool && has_codex_turn_id {
         return HookProtocol::Codex;
+    }
+
+    // Posit Assistant's documented hook contract sets `PA_PROJECT_DIR` in the
+    // hook subprocess, and no other supported agent uses that variable. It is
+    // checked here, ahead of the Windows-shell rule below, so that a PowerShell
+    // shell tool on a Windows host still gets Posit Assistant's own contract —
+    // `hookSpecificOutput.permissionDecision` plus exit code 2 — rather than
+    // Codex's minimal deny shape, which omits dcg's ergonomics fields.
+    //
+    // This only ever redirects between two protocols dcg already emits; when the
+    // tool name is Claude-shaped the check below reaches the same conclusion.
+    let has_posit_assistant_env = std::env::var_os("PA_PROJECT_DIR").is_some();
+    if has_posit_assistant_env
+        && (hook_event_name.is_empty() || hook_event_name.eq_ignore_ascii_case("pretooluse"))
+    {
+        return HookProtocol::ClaudeCompatible;
     }
 
     // Explicit Windows-shell tool names ("powershell"/"pwsh"/"cmd"/"cmd.exe")
@@ -2492,6 +2521,106 @@ mod tests {
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(extract_command(&input), Some("git status".to_string()));
         assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+    }
+
+    // --- Posit Assistant -------------------------------------------------
+    //
+    // Posit Assistant's documented PreToolUse stdin is the snake_case Claude
+    // shape. These tests pin the classification (and command extraction) for
+    // both shell-tool names, because the wire format is close enough to Codex's
+    // that a regression would silently swap dcg onto Codex's minimal deny
+    // payload.
+
+    /// A `PreToolUse` payload matching Posit Assistant's documented contract,
+    /// for a `bash` shell tool.
+    const POSIT_ASSISTANT_BASH_PAYLOAD: &str = r#"{
+        "session_id":"01JC7X2N8QK3ABCDEF",
+        "transcript_path":null,
+        "cwd":"/home/user/project",
+        "hook_event_name":"PreToolUse",
+        "permission_mode":"normal",
+        "tool_name":"bash",
+        "tool_input":{"command":"rm -rf /","intent":"clean up"},
+        "tool_use_id":"toolu_01ABC"
+    }"#;
+
+    #[test]
+    fn test_posit_assistant_bash_payload_is_claude_compatible() {
+        let input: HookInput = serde_json::from_str(POSIT_ASSISTANT_BASH_PAYLOAD).unwrap();
+        assert_eq!(extract_command(&input), Some("rm -rf /".to_string()));
+        // No env marker needed: the `bash` tool name is already Claude-shaped.
+        assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+    }
+
+    #[test]
+    fn test_posit_assistant_payload_has_no_codex_turn_id() {
+        // Guards the disambiguator itself: if Posit Assistant ever grew a
+        // `turn_id`, the Codex branch would capture it before the checks below.
+        let input: HookInput = serde_json::from_str(POSIT_ASSISTANT_BASH_PAYLOAD).unwrap();
+        assert!(input.turn_id.is_none());
+        assert!(input.event.is_none());
+        assert!(input.tool_args.is_none());
+    }
+
+    #[test]
+    fn test_posit_assistant_powershell_payload_is_claude_compatible_via_env() {
+        // On a Windows host the shell tool can be named `powershell`, which on
+        // its own classifies as Codex. `PA_PROJECT_DIR` — set by Posit
+        // Assistant's documented hook contract — must steer it back to the
+        // Claude-compatible response.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let json = r#"{
+            "session_id":"01JC7X2N8QK3ABCDEF",
+            "cwd":"C:\\Users\\user\\project",
+            "hook_event_name":"PreToolUse",
+            "permission_mode":"normal",
+            "tool_name":"powershell",
+            "tool_input":{"command":"Remove-Item -Recurse -Force C:\\src"},
+            "tool_use_id":"toolu_01ABC"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+
+        let _no_env = EnvVarGuard::remove("PA_PROJECT_DIR");
+        assert_eq!(
+            detect_protocol(&input),
+            HookProtocol::Codex,
+            "without the marker a bare `powershell` tool stays Codex"
+        );
+
+        let _env = EnvVarGuard::set("PA_PROJECT_DIR", "/home/user/project");
+        assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+    }
+
+    #[test]
+    fn test_posit_assistant_env_does_not_hijack_other_protocols() {
+        // `PA_PROJECT_DIR` may be set for any process spawned inside a Posit
+        // Assistant workspace, so it must not override a payload that carries
+        // another agent's own wire markers.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvVarGuard::set("PA_PROJECT_DIR", "/home/user/project");
+
+        let gemini: HookInput = serde_json::from_str(
+            r#"{"hook_event_name":"BeforeTool","tool_name":"run_shell_command","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&gemini), HookProtocol::Gemini);
+
+        let copilot: HookInput =
+            serde_json::from_str(r#"{"event":"pre-tool-use","toolInput":{"command":"ls"}}"#)
+                .unwrap();
+        assert_eq!(detect_protocol(&copilot), HookProtocol::Copilot);
+
+        let hermes: HookInput = serde_json::from_str(
+            r#"{"hook_event_name":"pre_tool_call","tool_name":"terminal","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&hermes), HookProtocol::Hermes);
+
+        let codex: HookInput = serde_json::from_str(
+            r#"{"hook_event_name":"PreToolUse","tool_name":"bash","turn_id":"turn-1","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&codex), HookProtocol::Codex);
     }
 
     #[test]

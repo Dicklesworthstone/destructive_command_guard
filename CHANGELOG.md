@@ -13,6 +13,30 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+### Agent integrations
+
+- [Posit Assistant](https://positron.posit.co/assistant/) is now a supported
+  agent. `install.sh` and `install.ps1` merge a `PreToolUse` hook into the global
+  `~/.posit/assistant/settings.json`, so a single install covers every workspace.
+  `uninstall.sh` / `uninstall.ps1` remove only the dcg-owned entries and never
+  delete the file, which also holds unrelated settings. Detection accepts
+  `~/.posit/assistant`, the legacy `~/.positai`, or `pa` on `PATH`.
+- No new wire protocol: Posit Assistant's documented `PreToolUse` contract is
+  the snake_case Claude shape, exit code 2 blocks with stderr as the reason, and
+  `hookSpecificOutput.permissionDecision` is read on exit 0, so
+  `HookProtocol::ClaudeCompatible` already answers it correctly. Three details
+  do differ from the Claude entry and are pinned by tests: the matcher is
+  lowercase `"bash|powershell"` (a simple matcher is an exact match against the
+  tool name, and listing both names covers a PowerShell host), only documented
+  handler fields are emitted (so no `shell` field — the Windows command is
+  quoted instead), and `timeout` is in seconds.
+- `detect_protocol` consults `PA_PROJECT_DIR`, which the hook contract sets in
+  the hook subprocess, so a `powershell` tool name from Posit Assistant is no
+  longer classified as Codex and answered with Codex's minimal deny payload.
+- New `Agent::PositAssistant` profile target (`posit-assistant`), detected from
+  `PA_PROJECT_DIR` or the `pa` parent-process name. Agent-specific config
+  (`[agents.posit-assistant]`) works as it does for every other agent.
+
 ### Hook latency (#245, #248)
 
 - Compile the regex-family crates (`regex-automata`, `regex-syntax`, `regex`,

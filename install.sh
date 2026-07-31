@@ -185,6 +185,7 @@ CONTINUE_VERSION=""
 CURSOR_VERSION=""
 COPILOT_VERSION=""
 HERMES_VERSION=""
+POSIT_ASSISTANT_VERSION=""
 
 print_agent_scan_notice() {
   [ "$QUIET" -eq 1 ] && return 0
@@ -228,6 +229,24 @@ try_version() {
   else
     "$cmd" --version 2>/dev/null | head -1 || true
   fi
+}
+
+# Posit Assistant runs as an IDE extension as well as a terminal client, so no
+# single probe covers every install. Any one of these is enough to configure the
+# shared global settings file:
+#
+#   - ~/.posit/assistant is the config directory, created on first run.
+#   - ~/.positai is the legacy config directory some installs still have.
+#   - `pa` is the terminal client, for a fresh install that has not run yet.
+#
+# An IDE-only install that has never been launched matches none of these; those
+# users get the hook by launching Posit Assistant once, then re-running the
+# installer. (install.ps1 additionally honors -Force/-EasyMode here, matching how
+# it treats the other IDE-hosted agents.)
+posit_assistant_installed() {
+  [ -d "$HOME/.posit/assistant" ] ||
+    [ -d "$HOME/.positai" ] ||
+    command -v pa >/dev/null 2>&1
 }
 
 detect_agents() {
@@ -295,6 +314,12 @@ detect_agents() {
     DETECTED_AGENTS+=("hermes")
     HERMES_VERSION=$(try_version hermes)
   fi
+
+  # Posit Assistant (Posit Software, PBC)
+  if posit_assistant_installed; then
+    DETECTED_AGENTS+=("posit-assistant")
+    POSIT_ASSISTANT_VERSION=$(try_version pa)
+  fi
 }
 
 print_detected_agents() {
@@ -352,6 +377,11 @@ print_detected_agents() {
           [[ -n "$HERMES_VERSION" ]] && ver_info=" (${HERMES_VERSION})"
           gum style --foreground 42 "  ✓ Hermes Agent${ver_info}"
           ;;
+        posit-assistant)
+          local ver_info=""
+          [[ -n "$POSIT_ASSISTANT_VERSION" ]] && ver_info=" (${POSIT_ASSISTANT_VERSION})"
+          gum style --foreground 42 "  ✓ Posit Assistant${ver_info}"
+          ;;
       esac
     done
     echo ""
@@ -399,6 +429,11 @@ print_detected_agents() {
           local ver_info=""
           [[ -n "$HERMES_VERSION" ]] && ver_info=" (${HERMES_VERSION})"
           echo -e "  \033[0;32m✓\033[0m Hermes Agent${ver_info}"
+          ;;
+        posit-assistant)
+          local ver_info=""
+          [[ -n "$POSIT_ASSISTANT_VERSION" ]] && ver_info=" (${POSIT_ASSISTANT_VERSION})"
+          echo -e "  \033[0;32m✓\033[0m Posit Assistant${ver_info}"
           ;;
       esac
     done
@@ -1536,6 +1571,7 @@ CURSOR_HOOKS_JSON="$HOME/.cursor/hooks.json"
 CURSOR_HOOK_DIR="$HOME/.cursor/hooks"
 CURSOR_HOOK_SCRIPT="$CURSOR_HOOK_DIR/dcg-pre-shell.py"
 HERMES_CONFIG="$HOME/.hermes/config.yaml"
+POSIT_ASSISTANT_SETTINGS="$HOME/.posit/assistant/settings.json"
 AUTO_CONFIGURED=0
 
 # Detailed tracking for what was configured
@@ -1553,6 +1589,9 @@ CURSOR_FAILURE_REASON=""
 COPILOT_STATUS="" # "created"|"merged"|"already"|"skipped"|"failed"
 HERMES_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"
 HERMES_FAILURE_REASON=""
+POSIT_ASSISTANT_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"
+POSIT_ASSISTANT_FAILURE_REASON=""
+POSIT_ASSISTANT_BACKUP=""
 CLAUDE_BACKUP=""
 GEMINI_BACKUP=""
 AIDER_BACKUP=""
@@ -3267,6 +3306,316 @@ EOFSET
   fi
 }
 
+configure_posit_assistant() {
+  # Posit Assistant (Posit Software, PBC — https://positron.posit.co/assistant/)
+  # reads lifecycle hooks from ~/.posit/assistant/settings.json (global) and
+  # <workspace>/.posit/assistant/settings.json (project). We configure the global
+  # one so every workspace is covered, matching what the installer does for every
+  # other agent.
+  #
+  # Its documented hook contract is Claude-Code-compatible, so no protocol work is
+  # needed on dcg's side: `PreToolUse` fires with the command in
+  # `tool_input.command`, and exit code 2 blocks with stderr shown as the reason.
+  # dcg's existing ClaudeCompatible protocol satisfies both.
+  #
+  # Three details differ from the Claude Code entry:
+  #
+  #   1. The matcher is lowercase, not Claude's "Bash". A matcher made only of
+  #      [A-Za-z0-9_ ,|-] is an EXACT match (or "|"/","-separated list of exact
+  #      matches) against the tool name, and the documented shell tool name is
+  #      "bash" — so a matcher copied from the Claude entry would not match.
+  #   2. The matcher also lists "powershell" so one entry covers a Windows host
+  #      whose shell tool is PowerShell rather than bash. A simple matcher splits
+  #      on "|" into an exact-match list, so this costs nothing where only bash
+  #      exists.
+  #   3. `timeout` is in seconds (30, matching the documented example). It bounds
+  #      a wedged hook instead of leaving the event on its much larger default.
+  #
+  # Unlike configure_claude_code, existing matcher groups are left structurally
+  # intact rather than consolidated: hook config is additive and every group whose
+  # matcher matches contributes, so there is no need to merge a user's
+  # `matcher: "bash,edit"` group into ours. We only insert one dedicated dcg group
+  # at the front and drop stale dcg entries elsewhere.
+
+  local settings_file="${POSIT_ASSISTANT_SETTINGS}"
+  POSIT_ASSISTANT_FAILURE_REASON=""
+  POSIT_ASSISTANT_BACKUP=""
+  local settings_dir
+  settings_dir=$(dirname "$settings_file")
+  # Exact-match list: Posit Assistant splits a simple matcher on "|" and ",".
+  local pa_matcher="bash|powershell"
+
+  if ! posit_assistant_installed; then
+    POSIT_ASSISTANT_STATUS="skipped"
+    return 0
+  fi
+
+  if [ ! -d "$settings_dir" ]; then
+    mkdir -p "$settings_dir"
+  fi
+
+  if [ -f "$settings_file" ]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+      POSIT_ASSISTANT_STATUS="failed"
+      POSIT_ASSISTANT_FAILURE_REASON="python3 required to safely merge settings.json"
+      return 0
+    fi
+
+    # First pass: is the exact current dcg hook already the sole dcg entry, at
+    # the head of its own group with our matcher? Stale paths and duplicates fall
+    # through to the merge path below.
+    local pa_hook_state
+    pa_hook_state=$(python3 - "$settings_file" "$DEST/dcg" "$pa_matcher" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+settings_file = sys.argv[1]
+dcg_path = sys.argv[2]
+matcher = sys.argv[3]
+
+def is_dcg_command(cmd):
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith('.exe'):
+        name = name[:-4]
+    return name == 'dcg'
+
+try:
+    with open(settings_file, 'r') as f:
+        raw_settings = f.read()
+except IOError:
+    print("merge")
+    raise SystemExit(0)
+
+if raw_settings.strip():
+    try:
+        settings = json.loads(raw_settings)
+    except ValueError:
+        print("invalid")
+        raise SystemExit(0)
+else:
+    settings = {}
+
+if not isinstance(settings, dict):
+    print("invalid")
+    raise SystemExit(0)
+
+hooks_obj = settings.get("hooks", {})
+if not isinstance(hooks_obj, dict):
+    print("invalid")
+    raise SystemExit(0)
+
+pre_tool_use = hooks_obj.get("PreToolUse", [])
+if not isinstance(pre_tool_use, list):
+    print("invalid")
+    raise SystemExit(0)
+
+dcg_commands = []
+for entry in pre_tool_use:
+    if not isinstance(entry, dict):
+        continue
+    hooks = entry.get("hooks", [])
+    if not isinstance(hooks, list):
+        print("invalid")
+        raise SystemExit(0)
+    for hook in hooks:
+        if isinstance(hook, dict) and is_dcg_command(hook.get("command")):
+            dcg_commands.append(hook.get("command"))
+
+first = pre_tool_use[0] if pre_tool_use else None
+first_is_our_group = (
+    isinstance(first, dict)
+    and first.get("matcher") == matcher
+    and isinstance(first.get("hooks"), list)
+    and len(first["hooks"]) >= 1
+    and isinstance(first["hooks"][0], dict)
+    and first["hooks"][0].get("command") == dcg_path
+)
+
+if dcg_commands == [dcg_path] and first_is_our_group:
+    print("already")
+else:
+    print("merge")
+PYEOF
+)
+    if [ "$pa_hook_state" = "invalid" ]; then
+      POSIT_ASSISTANT_STATUS="failed"
+      POSIT_ASSISTANT_FAILURE_REASON="existing settings.json is invalid or has malformed hooks; left unchanged"
+      warn "Posit Assistant settings.json is invalid or has malformed hooks; leaving it unchanged: $settings_file"
+      return 0
+    fi
+    if [ "$pa_hook_state" = "already" ]; then
+      POSIT_ASSISTANT_STATUS="already"
+      AUTO_CONFIGURED=1
+      return 0
+    fi
+
+    POSIT_ASSISTANT_BACKUP="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$settings_file" "$POSIT_ASSISTANT_BACKUP"
+
+    if python3 - "$settings_file" "$DEST/dcg" "$pa_matcher" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+settings_file = sys.argv[1]
+dcg_path = sys.argv[2]
+matcher = sys.argv[3]
+
+def is_dcg_command(cmd):
+    """True iff `cmd` invokes the dcg binary (basename match, not substring).
+
+    A substring check would also match unrelated user tools whose path
+    contains "dcg" (/opt/dcgrep/bin/scan, ~/.local/bin/dcgworkflow, ...) and
+    would then drop or replace their hook entries.
+    """
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        # Unparseable shell command (mismatched quotes, etc.) — treat as
+        # NOT-dcg so we never drop or replace it.
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith('.exe'):
+        name = name[:-4]
+    return name == 'dcg'
+
+raw_settings = ""
+try:
+    with open(settings_file, 'r') as f:
+        raw_settings = f.read()
+except IOError:
+    settings = {}
+
+if raw_settings.strip():
+    try:
+        settings = json.loads(raw_settings)
+    except ValueError:
+        print(f"invalid Posit Assistant settings.json: {settings_file}", file=sys.stderr)
+        raise SystemExit(1)
+else:
+    settings = {}
+
+if not isinstance(settings, dict):
+    print(
+        f"Posit Assistant settings.json must contain a JSON object: {settings_file}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+if 'hooks' not in settings:
+    settings['hooks'] = {}
+elif not isinstance(settings['hooks'], dict):
+    print(
+        f"Posit Assistant settings.json hooks must contain a JSON object: {settings_file}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+if 'PreToolUse' not in settings['hooks']:
+    settings['hooks']['PreToolUse'] = []
+elif not isinstance(settings['hooks']['PreToolUse'], list):
+    print(
+        f"Posit Assistant settings.json PreToolUse must contain a list: {settings_file}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+# Strip every pre-existing dcg entry (stale binary paths, duplicates) from all
+# matcher groups, and drop groups that become empty as a result. Non-dcg hooks
+# and the group structure the user wrote are otherwise preserved verbatim.
+cleaned = []
+for entry in settings['hooks']['PreToolUse']:
+    if not isinstance(entry, dict):
+        cleaned.append(entry)
+        continue
+    hooks = entry.get('hooks')
+    if not isinstance(hooks, list):
+        if 'hooks' in entry:
+            print(
+                f"Posit Assistant matcher-group hooks must contain a list: {settings_file}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        cleaned.append(entry)
+        continue
+    kept = [
+        hook
+        for hook in hooks
+        if not (isinstance(hook, dict) and is_dcg_command(hook.get('command')))
+    ]
+    if not kept and hooks:
+        # The group existed only to run dcg; drop it rather than leave an
+        # empty group Posit Assistant would warn about.
+        continue
+    entry['hooks'] = kept
+    cleaned.append(entry)
+
+# The matcher is lowercase and covers both shell-tool names: Posit Assistant
+# exact-matches simple matcher strings case-sensitively against the registered
+# tool name, which is "bash" or "powershell" depending on the host. `timeout`
+# is in seconds (the PreToolUse default is 600s, and a timeout fails open).
+cleaned.insert(
+    0,
+    {
+        "matcher": matcher,
+        "hooks": [{"type": "command", "command": dcg_path, "timeout": 30}],
+    },
+)
+
+settings['hooks']['PreToolUse'] = cleaned
+
+with open(settings_file, 'w') as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+PYEOF
+    then
+      POSIT_ASSISTANT_STATUS="merged"
+      AUTO_CONFIGURED=1
+    else
+      mv "$POSIT_ASSISTANT_BACKUP" "$settings_file" 2>/dev/null || true
+      POSIT_ASSISTANT_STATUS="failed"
+      POSIT_ASSISTANT_FAILURE_REASON="merge failed; restored backup"
+      POSIT_ASSISTANT_BACKUP=""
+    fi
+  else
+    cat > "$settings_file" <<EOFSET
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "$pa_matcher",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$DEST/dcg",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+EOFSET
+    POSIT_ASSISTANT_STATUS="created"
+    AUTO_CONFIGURED=1
+  fi
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Run Auto-Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3340,6 +3689,9 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
 
   # Configure Hermes Agent (if installed)
   configure_hermes
+
+  # Configure Posit Assistant (if installed)
+  configure_posit_assistant
 else
   info "Skipping agent configuration (--no-configure)"
 fi
@@ -3563,6 +3915,29 @@ case "$HERMES_STATUS" in
       summary_lines+=("Hermes:      Configuration failed ($HERMES_FAILURE_REASON)")
     else
       summary_lines+=("Hermes:      Configuration failed")
+    fi
+    ;;
+esac
+
+case "$POSIT_ASSISTANT_STATUS" in
+  created)
+    summary_lines+=("Posit Assistant: Created $POSIT_ASSISTANT_SETTINGS with dcg hook")
+    ;;
+  merged)
+    summary_lines+=("Posit Assistant: Added dcg hook to existing $POSIT_ASSISTANT_SETTINGS")
+    [ -n "$POSIT_ASSISTANT_BACKUP" ] && summary_lines+=("             Backup: $POSIT_ASSISTANT_BACKUP")
+    ;;
+  already)
+    summary_lines+=("Posit Assistant: Already configured (no changes)")
+    ;;
+  skipped|"")
+    summary_lines+=("Posit Assistant: Not installed (skipped)")
+    ;;
+  failed)
+    if [ -n "$POSIT_ASSISTANT_FAILURE_REASON" ]; then
+      summary_lines+=("Posit Assistant: Configuration failed ($POSIT_ASSISTANT_FAILURE_REASON)")
+    else
+      summary_lines+=("Posit Assistant: Configuration failed")
     fi
     ;;
 esac

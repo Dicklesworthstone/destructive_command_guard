@@ -3151,3 +3151,314 @@ hooks_auto_accept: true
     log_test "unconfigure_hermes status: $status"
     [ "$status" -eq 0 ]
 }
+
+# ============================================================================
+# Posit Assistant Configuration Tests
+#
+# Posit Assistant reads Claude-Code-compatible PreToolUse hooks from
+# ~/.posit/assistant/settings.json. Three details are asserted deliberately,
+# because getting any of them wrong yields a hook that is present in the file
+# but never fires:
+#   - the matcher is lowercase "bash|powershell" (a simple matcher is an exact
+#     match against the tool name, and both shell-tool names are covered);
+#   - only documented handler fields are emitted, so there is no `shell` field;
+#   - `timeout` is in seconds.
+# ============================================================================
+
+@test "configure_posit_assistant: skips when not installed" {
+    log_test "Testing Posit Assistant skip when not installed..."
+
+    POSIT_ASSISTANT_SETTINGS="$HOME/.posit/assistant/settings.json"
+    [ ! -d "$HOME/.posit" ]
+    ! command -v pa >/dev/null 2>&1
+
+    configure_posit_assistant
+
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+    [ "$POSIT_ASSISTANT_STATUS" = "skipped" ]
+    [ ! -e "$POSIT_ASSISTANT_SETTINGS" ]
+    # A skip must not create the config directory either.
+    [ ! -d "$HOME/.posit" ]
+}
+
+@test "configure_posit_assistant: creates settings.json when ~/.posit/assistant exists" {
+    log_test "Testing Posit Assistant settings creation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+
+    configure_posit_assistant
+
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+    log_test "settings.json: $(cat "$POSIT_ASSISTANT_SETTINGS" 2>/dev/null || echo 'missing')"
+
+    [ "$POSIT_ASSISTANT_STATUS" = "created" ]
+    [ -f "$POSIT_ASSISTANT_SETTINGS" ]
+    assert_posit_assistant_settings_valid_json
+    assert_posit_assistant_settings_contains '"PreToolUse"'
+    # Lowercase matcher covering both shell-tool names.
+    assert_posit_assistant_settings_contains '"matcher": "bash|powershell"'
+    assert_posit_assistant_settings_contains "$DEST/dcg"
+    assert_posit_assistant_settings_contains '"timeout": 30'
+    # Only documented handler fields; `shell` is not one of them.
+    assert_posit_assistant_settings_not_contains '"shell"'
+    [ "$AUTO_CONFIGURED" = "1" ]
+}
+
+@test "configure_posit_assistant: detects a bare pa client on PATH" {
+    log_test "Testing Posit Assistant detection via the pa client..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    POSIT_ASSISTANT_SETTINGS="$HOME/.posit/assistant/settings.json"
+    printf '#!/bin/bash\necho "pa 0.9.5"\n' > "$TEST_TMPDIR/bin/pa"
+    chmod +x "$TEST_TMPDIR/bin/pa"
+
+    configure_posit_assistant
+
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+    [ "$POSIT_ASSISTANT_STATUS" = "created" ]
+    [ -f "$POSIT_ASSISTANT_SETTINGS" ]
+}
+
+@test "configure_posit_assistant: detects the legacy ~/.positai config dir" {
+    log_test "Testing Posit Assistant detection via the legacy config dir..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    POSIT_ASSISTANT_SETTINGS="$HOME/.posit/assistant/settings.json"
+    mkdir -p "$HOME/.positai"
+
+    configure_posit_assistant
+
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+    [ "$POSIT_ASSISTANT_STATUS" = "created" ]
+    # The hook still goes in the CURRENT location, not the legacy one.
+    [ -f "$POSIT_ASSISTANT_SETTINGS" ]
+    [ ! -e "$HOME/.positai/settings.json" ]
+}
+
+@test "configure_posit_assistant: is idempotent" {
+    log_test "Testing Posit Assistant install idempotency..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+
+    configure_posit_assistant
+    [ "$POSIT_ASSISTANT_STATUS" = "created" ]
+    local first
+    first="$(cat "$POSIT_ASSISTANT_SETTINGS")"
+
+    POSIT_ASSISTANT_STATUS=""
+    POSIT_ASSISTANT_BACKUP=""
+    configure_posit_assistant
+
+    log_test "Second-run POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+    [ "$POSIT_ASSISTANT_STATUS" = "already" ]
+    [ "$first" = "$(cat "$POSIT_ASSISTANT_SETTINGS")" ]
+    # An unchanged reinstall must not litter the directory with backups.
+    [ -z "$POSIT_ASSISTANT_BACKUP" ]
+    [ "$(posit_assistant_dcg_hook_count)" = "1" ]
+}
+
+@test "configure_posit_assistant: preserves unrelated settings, groups, and events" {
+    log_test "Testing Posit Assistant merge preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    seed_posit_assistant_settings '{
+  "model": "keep-me",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "bash,edit",
+        "hooks": [
+          { "type": "command", "command": "/usr/local/bin/audit-log" }
+        ]
+      }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "/usr/local/bin/greet" } ] }
+    ]
+  }
+}'
+
+    configure_posit_assistant
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+    log_test "settings.json: $(cat "$POSIT_ASSISTANT_SETTINGS")"
+
+    [ "$POSIT_ASSISTANT_STATUS" = "merged" ]
+    [ -f "$POSIT_ASSISTANT_BACKUP" ]
+    assert_posit_assistant_settings_contains '"model"'
+    assert_posit_assistant_settings_contains 'keep-me'
+    # The user's comma-separated matcher list is preserved verbatim rather than
+    # consolidated into ours.
+    assert_posit_assistant_settings_contains '"bash,edit"'
+    assert_posit_assistant_settings_contains 'audit-log'
+    assert_posit_assistant_settings_contains 'greet'
+    [ "$(posit_assistant_dcg_hook_count)" = "1" ]
+    # dcg's group is first so a denial short-circuits before other hooks run.
+    [ "$(posit_assistant_first_group_matcher)" = "bash|powershell" ]
+    [ "$(posit_assistant_first_group_first_command)" = "$DEST/dcg" ]
+    [ "$(posit_assistant_group_count)" = "2" ]
+}
+
+@test "configure_posit_assistant: replaces a stale dcg path without duplicating" {
+    log_test "Testing Posit Assistant stale-path repair..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    seed_posit_assistant_settings '{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "bash", "hooks": [ { "type": "command", "command": "/old/path/dcg" } ] },
+      { "matcher": "bash|powershell", "hooks": [ { "type": "command", "command": "/another/dcg" } ] }
+    ]
+  }
+}'
+
+    configure_posit_assistant
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+    log_test "settings.json: $(cat "$POSIT_ASSISTANT_SETTINGS")"
+
+    [ "$POSIT_ASSISTANT_STATUS" = "merged" ]
+    assert_posit_assistant_settings_not_contains '/old/path/dcg'
+    assert_posit_assistant_settings_not_contains '/another/dcg'
+    assert_posit_assistant_settings_contains "$DEST/dcg"
+    [ "$(posit_assistant_dcg_hook_count)" = "1" ]
+    # Groups that existed only to run dcg are pruned, not left empty.
+    [ "$(posit_assistant_group_count)" = "1" ]
+}
+
+@test "configure_posit_assistant: preserves a lookalike tool whose name contains dcg" {
+    log_test "Testing Posit Assistant basename matching..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    seed_posit_assistant_settings '{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "bash",
+        "hooks": [
+          { "type": "command", "command": "/opt/dcgrep/bin/dcgworkflow --scan" }
+        ]
+      }
+    ]
+  }
+}'
+
+    configure_posit_assistant
+    log_test "settings.json: $(cat "$POSIT_ASSISTANT_SETTINGS")"
+
+    [ "$POSIT_ASSISTANT_STATUS" = "merged" ]
+    assert_posit_assistant_settings_contains 'dcgworkflow'
+    # Only the real dcg counts.
+    [ "$(posit_assistant_dcg_hook_count)" = "1" ]
+}
+
+@test "configure_posit_assistant: leaves invalid JSON untouched" {
+    log_test "Testing Posit Assistant invalid-JSON refusal..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    seed_posit_assistant_settings '{ this is not json'
+
+    configure_posit_assistant
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+
+    [ "$POSIT_ASSISTANT_STATUS" = "failed" ]
+    assert_posit_assistant_settings_unchanged
+    # A refusal must not leave a backup file behind.
+    [ -z "$POSIT_ASSISTANT_BACKUP" ]
+}
+
+@test "configure_posit_assistant: leaves a malformed PreToolUse shape untouched" {
+    log_test "Testing Posit Assistant malformed-shape refusal..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    seed_posit_assistant_settings '{"hooks": {"PreToolUse": "not-a-list"}}'
+
+    configure_posit_assistant
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+
+    [ "$POSIT_ASSISTANT_STATUS" = "failed" ]
+    assert_posit_assistant_settings_unchanged
+}
+
+@test "detect_agents: reports posit-assistant when the config dir exists" {
+    log_test "Testing Posit Assistant agent detection..."
+
+    setup_mock_posit_assistant
+
+    detect_agents
+    log_test "DETECTED_AGENTS: ${DETECTED_AGENTS[*]}"
+
+    is_agent_detected posit-assistant
+}
+
+@test "unconfigure_posit_assistant: removes only dcg and leaves siblings intact" {
+    log_test "Testing Posit Assistant uninstall..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    # Install through the real code path so the seeded shape cannot drift from
+    # what the installer actually writes, then add a sibling to preserve.
+    configure_posit_assistant
+    [ "$POSIT_ASSISTANT_STATUS" = "created" ]
+    posit_assistant_add_sibling_hooks
+
+    run unconfigure_posit_assistant
+    log_test "unconfigure_posit_assistant status: $status"
+    log_test "settings.json after uninstall: $(cat "$POSIT_ASSISTANT_SETTINGS" 2>/dev/null || echo 'missing')"
+
+    [ "$status" -eq 0 ]
+    [ -f "$POSIT_ASSISTANT_SETTINGS" ]
+    assert_posit_assistant_settings_not_contains "$DEST/dcg"
+    assert_posit_assistant_settings_contains 'audit-log'
+    assert_posit_assistant_settings_contains 'greet'
+    [ "$(posit_assistant_dcg_hook_count)" = "0" ]
+}
+
+@test "unconfigure_posit_assistant: keeps the file when dcg was the only hook" {
+    log_test "Testing Posit Assistant uninstall of a dcg-only config..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    configure_posit_assistant
+    [ "$POSIT_ASSISTANT_STATUS" = "created" ]
+
+    run unconfigure_posit_assistant
+    log_test "unconfigure_posit_assistant status: $status"
+
+    [ "$status" -eq 0 ]
+    # Posit Assistant keeps unrelated settings in this file, so it is never
+    # deleted — only the emptied PreToolUse key is dropped.
+    [ -f "$POSIT_ASSISTANT_SETTINGS" ]
+    assert_posit_assistant_settings_valid_json
+    assert_posit_assistant_settings_not_contains '"PreToolUse"'
+}
+
+@test "unconfigure_posit_assistant: does not touch a config without dcg" {
+    log_test "Testing Posit Assistant uninstall no-op..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    seed_posit_assistant_settings '{"hooks":{"PreToolUse":[{"matcher":"bash","hooks":[{"type":"command","command":"/opt/dcgrep/bin/dcgworkflow"}]}]}}'
+
+    run unconfigure_posit_assistant
+    log_test "unconfigure_posit_assistant status: $status"
+
+    [ "$status" -eq 0 ]
+    assert_posit_assistant_settings_unchanged
+}
+
+@test "unconfigure_posit_assistant: noop on missing settings" {
+    log_test "Testing Posit Assistant uninstall with no settings file..."
+
+    POSIT_ASSISTANT_SETTINGS="$HOME/.posit/assistant/settings.json"
+    [ ! -f "$POSIT_ASSISTANT_SETTINGS" ]
+
+    run unconfigure_posit_assistant
+    log_test "unconfigure_posit_assistant status: $status"
+    [ "$status" -eq 0 ]
+}

@@ -1115,6 +1115,49 @@ function Configure-HermesHook {
   "merged"
 }
 
+# Configure Posit Assistant's PreToolUse hook in ~/.posit/assistant/settings.json.
+#
+# Posit Assistant's documented hook contract is Claude-Code-compatible
+# (PreToolUse, tool_input.command, exit code 2 blocks with stderr as the reason),
+# so dcg needs no protocol work — but three details differ from
+# Configure-ClaudeHook:
+#
+#   1. The matcher is lowercase. A simple matcher string is an EXACT match (or
+#      "|"/","-separated list of exact matches) against the tool name, so
+#      Claude's "Bash|PowerShell" would match neither shell tool.
+#      "bash|powershell" covers a bash host and a PowerShell host alike.
+#   2. Only documented handler fields are emitted: `type`, `command`, `timeout`.
+#      In particular there is no `shell` field (which the Claude entry uses), so
+#      the command is quoted instead — Windows runs shell-form hooks through
+#      cmd.exe, and quoting keeps an install path containing spaces resolvable.
+#   3. `timeout` is in seconds (30, matching the documented example).
+#
+# Returns "created" | "already" | "merged" | "skipped".
+function Configure-PositAssistantHook {
+  param([string]$DcgPath, [switch]$Force, [string]$HomeDir = $HOME)
+
+  $positDir = Join-Path (Join-Path $HomeDir ".posit") "assistant"
+  $settingsFile = Join-Path $positDir "settings.json"
+  # ~/.posit/assistant is created lazily on first run, so also accept the legacy
+  # config dir and the `pa` client on PATH.
+  $positInstalled = (Test-Path $positDir -PathType Container) -or
+    (Test-Path (Join-Path $HomeDir ".positai") -PathType Container) -or
+    ($null -ne (Get-Command pa -ErrorAction SilentlyContinue))
+
+  if (-not $positInstalled -and -not $Force) { return "skipped" }
+
+  if (-not (Test-Path $positDir -PathType Container)) {
+    New-Item -ItemType Directory -Force -Path $positDir | Out-Null
+  }
+
+  $dcgHook = [pscustomobject][ordered]@{
+    type = "command"
+    command = '"' + $DcgPath + '"'
+    timeout = 30
+  }
+  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -Event "PreToolUse" -Matcher "bash|powershell" -Label "Posit Assistant settings.json"
+}
+
 function Resolve-LocalSourcePath {
   # If $Source names a local artifact (a `file://` URI or an existing local path,
   # absolute or relative), return its filesystem path; otherwise return $null,
@@ -1595,6 +1638,8 @@ function Detect-Agents {
     'Grok'    = ((_dir '.grok')    -or (-not [string]::IsNullOrEmpty($env:GROK_SESSION_ID)))
     'Agy'     = (_has 'agy')
     'Hermes'  = (_dir '.hermes')
+    'Posit'   = ((Test-Path (Join-Path (Join-Path $HomeDir '.posit') 'assistant') -PathType Container) -or
+      (_dir '.positai') -or (_has 'pa'))
   }
 }
 
@@ -1602,7 +1647,7 @@ function Get-DetectedAgentNames {
   # The display-names of agents Detect-Agents flagged as present, in order.
   param($Agents)
   @(
-    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes')) {
+    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit')) {
       if ($Agents[$name]) { $name }
     }
   )
@@ -1636,6 +1681,7 @@ Configured agents (when detected, or with -Force/-EasyMode):
   Claude Code  (~/.claude/settings.json)      Codex CLI   (~/.codex/hooks.json)
   Gemini CLI   (~/.gemini/settings.json)      Copilot CLI (~/.copilot/hooks/dcg.json)
   Cursor IDE   (~/.cursor/hooks.json)         Hermes      (~/.hermes/config.yaml)
+  Posit Assistant (~/.posit/assistant/settings.json)
   Grok / agy   via dcg install --grok / --agy under -EasyMode when detected
 '@
   exit 0
@@ -2016,6 +2062,24 @@ if ($detectedAgents['Hermes'] -or $forceConfig) {
     }
   } catch {
     Write-Warn "Hermes auto-configuration failed: $_"
+  }
+}
+
+# Configure Posit Assistant (~/.posit/assistant/settings.json) when detected
+# (or -EasyMode). One entry covers the Positron/RStudio extension, the standalone
+# server, and the `pa` terminal client — they all read this file.
+if ($detectedAgents['Posit'] -or $forceConfig) {
+  Write-Host ""
+  try {
+    switch (Configure-PositAssistantHook -DcgPath $dcgExe -Force:$forceConfig) {
+      "created" { Write-Ok "Created Posit Assistant hook at $HOME\.posit\assistant\settings.json" }
+      "merged" { Write-Ok "Added Posit Assistant hook to $HOME\.posit\assistant\settings.json" }
+      "already" { Write-Ok "Posit Assistant hook already configured" }
+      "skipped" { Write-Info "Posit Assistant not detected; re-run with -EasyMode to configure it anyway" }
+      default { Write-Warn "Posit Assistant hook status unknown" }
+    }
+  } catch {
+    Write-Warn "Posit Assistant auto-configuration failed: $_"
   }
 }
 

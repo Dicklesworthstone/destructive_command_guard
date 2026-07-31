@@ -20,6 +20,7 @@ trust to well-behaved agents while maintaining strict controls for unknown ones.
 | Hermes Agent | Environment | `HERMES_AGENT=1` or `HERMES_SESSION_ID` |
 | Grok (xAI) | Environment | `GROK_SESSION_ID`, `GROK_HOOK_EVENT`, or `GROK_WORKSPACE_ROOT` |
 | Pi | Environment | `PI_CODING_AGENT=true` |
+| Posit Assistant | Environment | `PA_PROJECT_DIR` (set in hook subprocesses) |
 
 ## Detection Priority
 

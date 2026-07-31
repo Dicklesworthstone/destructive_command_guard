@@ -31,6 +31,10 @@
 //!   symlinked to it for backward compatibility).
 //! - Pi (earendil-works `pi` coding agent): `PI_CODING_AGENT=true` env var (set
 //!   by `pi` into the environment of the subprocesses it spawns).
+//! - Posit Assistant: `PA_PROJECT_DIR` env var, which its documented hook
+//!   contract sets to the workspace root in every hook subprocess. Posit
+//!   Assistant reads Claude-Code-compatible `PreToolUse` hooks from
+//!   `~/.posit/assistant/settings.json`.
 //!
 //! # Usage
 //!
@@ -87,6 +91,11 @@ pub enum Agent {
     /// earendil-works Pi coding agent (`pi`). Injects `PI_CODING_AGENT=true`
     /// into the environment of the subprocesses it spawns.
     Pi,
+    /// Posit Assistant (Posit Software, PBC). Reads Claude-Code-compatible
+    /// `PreToolUse` hooks from `~/.posit/assistant/settings.json` and sets
+    /// `PA_PROJECT_DIR` in the hook subprocess.
+    /// See <https://positron.posit.co/assistant/>.
+    PositAssistant,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -113,6 +122,7 @@ impl Agent {
             Self::Grok => "grok",
             Self::Antigravity => "antigravity",
             Self::Pi => "pi",
+            Self::PositAssistant => "posit-assistant",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -135,6 +145,7 @@ impl Agent {
                 | Self::Grok
                 | Self::Antigravity
                 | Self::Pi
+                | Self::PositAssistant
         )
     }
 
@@ -157,6 +168,7 @@ impl Agent {
     /// - `"codex"`, `"codex-cli"`, `"codex_cli"` -> `CodexCli`
     /// - `"gemini"`, `"gemini-cli"`, `"gemini_cli"` -> `GeminiCli`
     /// - `"cursor"`, `"cursor-ide"`, `"cursor_ide"` -> `CursorIde`
+    /// - `"posit-assistant"`, `"posit_assistant"`, `"posit"`, `"pa"` -> `PositAssistant`
     /// - `"unknown"` -> `Unknown`
     /// - Any other value -> `Custom(value)`
     #[must_use]
@@ -175,6 +187,7 @@ impl Agent {
             "grok" | "grokcli" | "grokbuild" | "xai" | "xaigrok" => Self::Grok,
             "agy" | "antigravity" | "antigravitycli" => Self::Antigravity,
             "pi" | "picli" | "picodingagent" => Self::Pi,
+            "positassistant" | "posit" | "pa" => Self::PositAssistant,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -196,6 +209,7 @@ impl fmt::Display for Agent {
             Self::Grok => write!(f, "Grok (xAI)"),
             Self::Antigravity => write!(f, "Antigravity CLI"),
             Self::Pi => write!(f, "Pi"),
+            Self::PositAssistant => write!(f, "Posit Assistant"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -575,6 +589,20 @@ fn detect_from_environment() -> Option<DetectionResult> {
         ));
     }
 
+    // Posit Assistant detection. Its documented hook contract sets
+    // `PA_PROJECT_DIR=<workspace root>` in the hook subprocess, so this is the
+    // marker dcg sees when it runs as a `PreToolUse` hook. Presence-only, like
+    // every other env marker above. Checked last so an agent that identifies
+    // itself explicitly wins when dcg happens to run inside a Posit Assistant
+    // workspace.
+    if std::env::var("PA_PROJECT_DIR").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::PositAssistant,
+            DetectionMethod::Environment,
+            Some("PA_PROJECT_DIR".to_string()),
+        ));
+    }
+
     None
 }
 
@@ -792,6 +820,7 @@ fn agent_for_basename(basename: &str) -> Option<Agent> {
         "grok" | "grok-cli" | "grok-build" => Some(Agent::Grok),
         "agy" | "antigravity" | "antigravity-cli" => Some(Agent::Antigravity),
         "pi" | "pi-cli" => Some(Agent::Pi),
+        "pa" | "posit-assistant" => Some(Agent::PositAssistant),
         _ => None,
     }
 }
@@ -839,6 +868,7 @@ mod tests {
         assert_eq!(Agent::Grok.config_key(), "grok");
         assert_eq!(Agent::Antigravity.config_key(), "antigravity");
         assert_eq!(Agent::Pi.config_key(), "pi");
+        assert_eq!(Agent::PositAssistant.config_key(), "posit-assistant");
         assert_eq!(Agent::Unknown.config_key(), "unknown");
         assert_eq!(
             Agent::Custom("my-agent".to_string()).config_key(),
@@ -892,6 +922,11 @@ mod tests {
         assert_eq!(Agent::from_name("pi-cli"), Agent::Pi);
         assert_eq!(Agent::from_name("pi_cli"), Agent::Pi);
         assert_eq!(Agent::from_name("PI_CODING_AGENT"), Agent::Pi);
+        assert_eq!(Agent::from_name("posit-assistant"), Agent::PositAssistant);
+        assert_eq!(Agent::from_name("posit_assistant"), Agent::PositAssistant);
+        assert_eq!(Agent::from_name("PositAssistant"), Agent::PositAssistant);
+        assert_eq!(Agent::from_name("posit"), Agent::PositAssistant);
+        assert_eq!(Agent::from_name("pa"), Agent::PositAssistant);
 
         // Custom agents
         assert_eq!(
@@ -914,6 +949,7 @@ mod tests {
         assert_eq!(format!("{}", Agent::Grok), "Grok (xAI)");
         assert_eq!(format!("{}", Agent::Antigravity), "Antigravity CLI");
         assert_eq!(format!("{}", Agent::Pi), "Pi");
+        assert_eq!(format!("{}", Agent::PositAssistant), "Posit Assistant");
         assert_eq!(format!("{}", Agent::Unknown), "Unknown");
         assert_eq!(
             format!("{}", Agent::Custom("MyAgent".to_string())),
@@ -932,6 +968,7 @@ mod tests {
         assert!(Agent::Grok.is_known());
         assert!(Agent::Antigravity.is_known());
         assert!(Agent::Pi.is_known());
+        assert!(Agent::PositAssistant.is_known());
         assert!(!Agent::Unknown.is_known());
         assert!(!Agent::Custom("x".to_string()).is_known());
     }
@@ -1015,6 +1052,16 @@ mod tests {
             agent_from_process_name("/home/user/.local/bin/pi"),
             Some(Agent::Pi)
         );
+        assert_eq!(agent_from_process_name("pa"), Some(Agent::PositAssistant));
+        assert_eq!(
+            agent_from_process_name("/usr/local/bin/pa"),
+            Some(Agent::PositAssistant)
+        );
+        // Wrapper-style invocation, as a Node-based client is launched.
+        assert_eq!(
+            agent_from_process_name("node /usr/local/lib/node_modules/pa"),
+            Some(Agent::PositAssistant)
+        );
     }
 
     #[test]
@@ -1067,6 +1114,14 @@ mod tests {
         assert_eq!(agent_from_process_name("pip3"), None);
         assert_eq!(agent_from_process_name("xpi"), None);
         assert_eq!(agent_from_process_name("pi-helper"), None);
+        // "pa" is short and must be exact. `pacman`, `pass`, `patch`, and the
+        // PulseAudio tools all start with it.
+        assert_eq!(agent_from_process_name("pacman"), None);
+        assert_eq!(agent_from_process_name("pactl"), None);
+        assert_eq!(agent_from_process_name("pass"), None);
+        assert_eq!(agent_from_process_name("patch"), None);
+        assert_eq!(agent_from_process_name("pa-helper"), None);
+        assert_eq!(agent_from_process_name("xpa"), None);
     }
 
     #[test]
@@ -1226,6 +1281,7 @@ mod env_tests {
         "GROK_WORKSPACE_ROOT",
         "ANTIGRAVITY_CONVERSATION_ID",
         "PI_CODING_AGENT",
+        "PA_PROJECT_DIR",
     ];
 
     fn with_env_var<F, R>(key: &str, value: &str, f: F) -> R
@@ -1450,6 +1506,54 @@ mod env_tests {
             assert_eq!(result.method, DetectionMethod::Environment);
             assert_eq!(result.matched_value, Some("PI_CODING_AGENT".to_string()));
         });
+    }
+
+    #[test]
+    fn test_detect_posit_assistant_project_dir_env() {
+        // `PA_PROJECT_DIR` is what dcg actually sees: Posit Assistant's hook
+        // contract sets it in the hook subprocess.
+        with_env_var("PA_PROJECT_DIR", "/home/user/project", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::PositAssistant);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value, Some("PA_PROJECT_DIR".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_posit_assistant_env_loses_to_more_specific_agents() {
+        // A dcg invocation can sit inside a Posit Assistant workspace while
+        // another agent is the actual caller (for example a Claude Code hook run
+        // from a terminal Posit Assistant spawned). The agent whose own marker is
+        // present must win, so Posit Assistant is checked last.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let saved: Vec<_> = AGENT_ENV_VARS
+            .iter()
+            .map(|&k| (k, std::env::var(k).ok()))
+            .collect();
+        clear_cache();
+        // SAFETY: ENV_LOCK is held for the duration of this test.
+        unsafe {
+            for &k in AGENT_ENV_VARS {
+                std::env::remove_var(k);
+            }
+            std::env::set_var("PA_PROJECT_DIR", "/home/user/project");
+            std::env::set_var("CLAUDE_CODE", "1");
+        }
+
+        let result = detect_agent_with_details();
+        assert_eq!(result.agent, Agent::ClaudeCode);
+
+        // SAFETY: ENV_LOCK is held for the duration of this test.
+        unsafe {
+            for (k, v) in saved {
+                match v {
+                    Some(value) => std::env::set_var(k, value),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        clear_cache();
     }
 
     #[test]

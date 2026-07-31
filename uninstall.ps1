@@ -534,6 +534,14 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
 # Hermes Agent (~/.hermes/config.yaml).
 if (Unconfigure-HermesHook) { Write-Ok "Removed Hermes hook" }
 
+# Posit Assistant (~/.posit/assistant/settings.json). Claude-Code-shaped, so the
+# generic remover applies. The file is NOT deleted when it empties out: Posit
+# Assistant keeps unrelated settings (model, permissions, providers) here.
+$positAssistantSettings = Join-Path (Join-Path (Join-Path $HOME ".posit") "assistant") "settings.json"
+if (Remove-DcgHooksFromJsonFile -Path $positAssistantSettings) {
+  Write-Ok "Removed Posit Assistant hook"
+}
+
 # Grok (xAI): ~/.grok/hooks/dcg.json is a dcg-OWNED file — delete it outright
 # (user-level and any project-local copy).
 foreach ($grokHook in @((Join-Path (Join-Path (Join-Path $HOME ".grok") "hooks") "dcg.json"),

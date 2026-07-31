@@ -25,6 +25,7 @@ rustc-ice-*.txt
 .aider.input.history
 .aider.tags.cache.v3/
 .claude/
+.posit/
 
 # bv (beads viewer) local config and caches
 .bv/

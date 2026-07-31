@@ -260,6 +260,176 @@ print(sum(1 for e in ptc if isinstance(e, dict) and is_dcg(e.get("command"))))
 PYEOF
 }
 
+# Create mock Posit Assistant installation. All hosts (the Positron/RStudio
+# extension, the standalone server, and the `pa` client) share this directory.
+setup_mock_posit_assistant() {
+    mkdir -p "$HOME/.posit/assistant"
+    POSIT_ASSISTANT_SETTINGS="$HOME/.posit/assistant/settings.json"
+    export POSIT_ASSISTANT_SETTINGS
+}
+
+posit_assistant_settings_file() {
+    echo "${POSIT_ASSISTANT_SETTINGS:-$HOME/.posit/assistant/settings.json}"
+}
+
+seed_posit_assistant_settings() {
+    local settings
+    settings="$(posit_assistant_settings_file)"
+    mkdir -p "$(dirname "$settings")"
+    printf '%s\n' "$1" > "$settings"
+    cp "$settings" "$TEST_TMPDIR/posit_assistant_snapshot.json"
+    log_test "Seeded Posit Assistant settings: $(cat "$settings")"
+}
+
+assert_posit_assistant_settings_contains() {
+    local settings
+    settings="$(posit_assistant_settings_file)"
+    grep -qF "$1" "$settings"
+}
+
+assert_posit_assistant_settings_not_contains() {
+    local settings
+    settings="$(posit_assistant_settings_file)"
+    ! grep -qF "$1" "$settings"
+}
+
+assert_posit_assistant_settings_unchanged() {
+    local settings
+    settings="$(posit_assistant_settings_file)"
+    if [ -f "$TEST_TMPDIR/posit_assistant_snapshot.json" ]; then
+        cmp -s "$TEST_TMPDIR/posit_assistant_snapshot.json" "$settings"
+    else
+        [ ! -e "$settings" ]
+    fi
+}
+
+assert_posit_assistant_settings_valid_json() {
+    local settings
+    settings="$(posit_assistant_settings_file)"
+    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$settings"
+}
+
+# Add hooks that must survive uninstall: a second PreToolUse matcher group and an
+# unrelated event. Written with the JSON library so the file stays canonical.
+posit_assistant_add_sibling_hooks() {
+    local settings
+    settings="$(posit_assistant_settings_file)"
+    python3 - "$settings" <<'PYEOF'
+import json, sys
+
+path = sys.argv[1]
+with open(path) as f:
+    settings = json.load(f)
+
+settings.setdefault("hooks", {}).setdefault("PreToolUse", []).append({
+    "matcher": "bash,edit",
+    "hooks": [{"type": "command", "command": "/usr/local/bin/audit-log"}],
+})
+settings["hooks"]["SessionStart"] = [
+    {"hooks": [{"type": "command", "command": "/usr/local/bin/greet"}]}
+]
+
+with open(path, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+PYEOF
+}
+
+posit_assistant_group_count() {
+    posit_assistant_report count
+}
+
+posit_assistant_first_group_matcher() {
+    posit_assistant_report first-matcher
+}
+
+posit_assistant_first_group_first_command() {
+    posit_assistant_report first-command
+}
+
+# Report one fact about the PreToolUse matcher groups. A missing or malformed
+# hooks section reports as zero groups / empty strings rather than failing, so a
+# caller's assertion (not a helper crash) is what surfaces the problem.
+posit_assistant_report() {
+    local settings
+    settings="$(posit_assistant_settings_file)"
+    python3 - "$settings" "$1" <<'PYEOF'
+import json, sys
+
+try:
+    with open(sys.argv[1]) as f:
+        settings = json.load(f)
+except Exception:
+    settings = {}
+
+hooks = settings.get("hooks") if isinstance(settings, dict) else None
+groups = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
+if not isinstance(groups, list):
+    groups = []
+
+first = groups[0] if groups and isinstance(groups[0], dict) else {}
+first_hooks = first.get("hooks") if isinstance(first.get("hooks"), list) else []
+first_hook = first_hooks[0] if first_hooks and isinstance(first_hooks[0], dict) else {}
+
+what = sys.argv[2]
+if what == "count":
+    print(len(groups))
+elif what == "first-matcher":
+    print(first.get("matcher", ""))
+elif what == "first-command":
+    print(first_hook.get("command", ""))
+else:
+    print(f"unknown query: {what}", file=sys.stderr)
+    raise SystemExit(2)
+PYEOF
+}
+
+# Count dcg hooks across every PreToolUse matcher group (basename match, so a
+# lookalike tool such as `dcgworkflow` is not counted).
+posit_assistant_dcg_hook_count() {
+    local settings
+    settings="$(posit_assistant_settings_file)"
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "?"
+        return 0
+    fi
+    python3 - "$settings" <<'PYEOF'
+import json, os, shlex, sys
+
+def is_dcg(cmd):
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    name = os.path.basename(parts[0])
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name == "dcg"
+
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+except Exception:
+    print(0); sys.exit(0)
+
+hooks = (data or {}).get("hooks") or {}
+groups = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
+if not isinstance(groups, list):
+    print(0); sys.exit(0)
+print(sum(
+    1
+    for g in groups
+    if isinstance(g, dict) and isinstance(g.get("hooks"), list)
+    for h in g["hooks"]
+    if isinstance(h, dict) and is_dcg(h.get("command"))
+))
+PYEOF
+}
+
 # Create a test file with known content and checksum
 create_test_file_with_checksum() {
     local content="$1"
