@@ -18878,6 +18878,14 @@ fn filesystem_redirect_pattern(name: Option<&str>) -> bool {
     )
 }
 
+fn filesystem_redirect_pattern_without_dynamic(name: Option<&str>) -> bool {
+    name == Some("redirect-truncate-root-home")
+}
+
+fn filesystem_pre_rm_pattern_without_dynamic(name: Option<&str>) -> bool {
+    filesystem_pre_rm_pattern(name) && name != Some("redirect-truncate-dynamic-path")
+}
+
 fn filesystem_non_pre_rm_pattern(name: Option<&str>) -> bool {
     !filesystem_pre_rm_pattern(name)
 }
@@ -18989,6 +18997,270 @@ fn filesystem_redirection_matching_view(command: &str, dialect: ShellDialect) ->
     Cow::Owned(String::from_utf8(view).expect("ASCII mask plus UTF-8 suffix remains valid UTF-8"))
 }
 
+fn trailing_redirect_syntax_is_fd_only(trailing: &str) -> bool {
+    trailing.split_ascii_whitespace().all(|token| {
+        if token == "&" {
+            return true;
+        }
+        let Some((from, to)) = token.split_once(">&") else {
+            return false;
+        };
+        !from.is_empty()
+            && !to.is_empty()
+            && from.bytes().all(|byte| byte.is_ascii_digit())
+            && to.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn exact_redirect_variable(segment: &str, dialect: ShellDialect) -> Option<&str> {
+    if !matches!(dialect, ShellDialect::Unknown | ShellDialect::Posix) {
+        return None;
+    }
+    let redirect = first_unquoted_output_redirect(segment, ShellDialect::Posix)?;
+    let mut target = segment.get(redirect + 1..)?.trim_start();
+    if let Some(rest) = target.strip_prefix('|') {
+        target = rest.trim_start();
+    }
+
+    let (token, trailing) = if let Some(rest) = target.strip_prefix('"') {
+        let end = rest.find('"')?;
+        let token = rest.get(..end)?;
+        let trailing = rest.get(end + 1..)?;
+        if !trailing.is_empty()
+            && !trailing.as_bytes().first().is_some_and(|byte| {
+                byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&')
+            })
+        {
+            return None;
+        }
+        (token, trailing)
+    } else {
+        let end = target
+            .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ';' | '|' | '&'))
+            .unwrap_or(target.len());
+        (target.get(..end)?, target.get(end..)?)
+    };
+    if first_unquoted_output_redirect(trailing, ShellDialect::Posix).is_some()
+        && !trailing_redirect_syntax_is_fd_only(trailing)
+    {
+        return None;
+    }
+
+    let name = token
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .or_else(|| token.strip_prefix('$'))?;
+    (!name.is_empty()
+        && name.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
+        }))
+    .then_some(name)
+}
+
+fn literal_assignment_value(segment: &str, variable: &str) -> Option<String> {
+    let segment = segment.trim();
+    let raw = segment.strip_prefix(variable)?.strip_prefix('=')?;
+    if raw.is_empty() {
+        return None;
+    }
+
+    let value = if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
+        raw.get(1..raw.len() - 1)?.to_string()
+    } else if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
+        let inner = raw.get(1..raw.len() - 1)?;
+        if inner.contains(['$', '`', '\\']) {
+            return None;
+        }
+        inner.to_string()
+    } else {
+        if !raw.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':')
+        }) {
+            return None;
+        }
+        raw.to_string()
+    };
+
+    (!value.is_empty()
+        && !value.starts_with('~')
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || byte.is_ascii_whitespace()
+                || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':')
+        }))
+    .then_some(value)
+}
+
+fn is_literal_redirect_initializer(segment: &str, variable: &str) -> bool {
+    let Some(redirect) = first_unquoted_output_redirect(segment, ShellDialect::Posix) else {
+        return false;
+    };
+    segment
+        .get(..redirect)
+        .is_some_and(|prefix| prefix.trim() == ":")
+        && exact_redirect_variable(segment, ShellDialect::Posix) == Some(variable)
+}
+
+fn prior_literal_assignment(
+    command: &str,
+    segment_ranges: &[(usize, usize)],
+    redirect_segment_start: usize,
+    variable: &str,
+) -> Option<String> {
+    let mut assignment = None;
+    for &(start, end) in segment_ranges {
+        if end > redirect_segment_start {
+            continue;
+        }
+        let segment = command.get(start..end)?.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        if let Some(rest) = segment.strip_prefix(variable)
+            && rest.starts_with('=')
+        {
+            if assignment.is_some() {
+                return None;
+            }
+            assignment = Some(literal_assignment_value(segment, variable)?);
+        } else if assignment.is_some() && !is_literal_redirect_initializer(segment, variable) {
+            // Shell functions and builtins can mutate variables in the parent
+            // shell. Apart from a no-op initializer redirect to the same
+            // proven target, keep the proof local to the assignment.
+            return None;
+        }
+    }
+    assignment
+}
+
+fn target_has_sensitive_absolute_prefix(path: &Path) -> bool {
+    let mut components = path.components();
+    if !matches!(components.next(), Some(std::path::Component::RootDir)) {
+        return false;
+    }
+    let Some(std::path::Component::Normal(first)) = components.next() else {
+        return true;
+    };
+    if first == "tmp" {
+        return false;
+    }
+    matches!(
+        first.to_str(),
+        Some(
+            "etc"
+                | "usr"
+                | "bin"
+                | "sbin"
+                | "root"
+                | "boot"
+                | "lib"
+                | "lib64"
+                | "var"
+                | "home"
+                | "sys"
+                | "proc"
+                | "dev"
+                | "opt"
+        )
+    )
+}
+
+fn fixed_redirect_target_is_safe(value: &str, project_path: Option<&Path>) -> bool {
+    let value_path = Path::new(value);
+    if value_path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) || target_has_sensitive_absolute_prefix(value_path)
+    {
+        return false;
+    }
+
+    let base = project_path
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
+    let Some(path) = (if value_path.is_absolute() {
+        Some(value_path.to_path_buf())
+    } else {
+        base.as_ref().map(|base| base.join(value_path))
+    }) else {
+        return false;
+    };
+
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(unix)]
+    let Some(expected_uid) = std::fs::metadata("/proc/self")
+        .ok()
+        .map(|metadata| metadata.uid())
+    else {
+        // Without a safe effective-UID source, retain the dynamic-path denial.
+        return false;
+    };
+
+    let mut current = std::path::PathBuf::new();
+    let components: Vec<_> = path.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        let is_target = index + 1 == components.len();
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if is_target {
+                    break;
+                }
+                continue;
+            }
+            Err(_) => return false,
+        };
+        if metadata.file_type().is_symlink()
+            || (is_target && !metadata.file_type().is_file())
+            || (!is_target && !metadata.file_type().is_dir())
+        {
+            return false;
+        }
+        #[cfg(unix)]
+        if is_target && metadata.uid() != expected_uid {
+            return false;
+        }
+    }
+
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(parent_metadata) = std::fs::symlink_metadata(parent) else {
+        return false;
+    };
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.file_type().is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    let sticky_world_writable = parent_metadata.mode() & 0o1002 == 0o1002;
+    if parent_metadata.uid() != expected_uid && !sticky_world_writable {
+        return false;
+    }
+    true
+}
+
+fn redirect_target_has_proven_literal_assignment(
+    command: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    segment: &str,
+    dialect: ShellDialect,
+    project_path: Option<&Path>,
+) -> bool {
+    let Some(variable) = exact_redirect_variable(segment, dialect) else {
+        return false;
+    };
+    let Some(value) = prior_literal_assignment(command, segment_ranges, segment_start, variable)
+    else {
+        return false;
+    };
+    fixed_redirect_target_is_safe(&value, project_path)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_core_filesystem_pack(
     pack_id: &str,
@@ -19029,6 +19301,14 @@ fn evaluate_core_filesystem_pack(
         }
     }
 
+    let original_ranges = (original_command.len() == command_for_packs.len())
+        .then(|| command_segment_ranges_in_dialect(original_command, shell_dialect));
+    let (assignment_source, assignment_ranges) = original_ranges
+        .as_deref()
+        .map_or((command_for_packs, segment_ranges), |ranges| {
+            (original_command, ranges)
+        });
+
     for &(segment_start, segment_end) in segment_ranges {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
             return Some(EvaluationResult::indeterminate_due_to_budget());
@@ -19066,6 +19346,26 @@ fn evaluate_core_filesystem_pack(
                     && !(nested_start == segment_start && nested_end == segment_end)
             })
             .collect();
+        let target_has_proven_literal_assignment = redirect_target_has_proven_literal_assignment(
+            assignment_source,
+            assignment_ranges,
+            segment_start,
+            dialect_segment,
+            shell_dialect,
+            project_path,
+        );
+        let redirect_pattern_filter: fn(Option<&str>) -> bool =
+            if target_has_proven_literal_assignment {
+                filesystem_redirect_pattern_without_dynamic
+            } else {
+                filesystem_redirect_pattern
+            };
+        let pre_rm_pattern_filter: fn(Option<&str>) -> bool =
+            if target_has_proven_literal_assignment {
+                filesystem_pre_rm_pattern_without_dynamic
+            } else {
+                filesystem_pre_rm_pattern
+            };
 
         // Redirect operators are shell syntax, not argv. Legacy callers with
         // no proven dialect retain the full sanitized command so the generic
@@ -19086,7 +19386,7 @@ fn evaluate_core_filesystem_pack(
                 first_allowlist_hit,
                 deadline,
                 &nested_segment_ranges,
-                Some(filesystem_redirect_pattern),
+                Some(redirect_pattern_filter),
             ) {
                 return Some(result);
             }
@@ -19111,7 +19411,7 @@ fn evaluate_core_filesystem_pack(
                 first_allowlist_hit,
                 deadline,
                 &nested_segment_ranges,
-                Some(filesystem_redirect_pattern),
+                Some(redirect_pattern_filter),
             ) {
                 return Some(result);
             }
@@ -19151,7 +19451,7 @@ fn evaluate_core_filesystem_pack(
             first_allowlist_hit,
             deadline,
             &nested_segment_ranges,
-            Some(filesystem_pre_rm_pattern),
+            Some(pre_rm_pattern_filter),
         ) {
             return Some(result);
         }

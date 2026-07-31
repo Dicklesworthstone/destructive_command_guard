@@ -1,6 +1,6 @@
 # DCG redirection false-positive hardening
 
-Status: design gate; no evaluator or policy code changed yet
+Status: first evaluator slice implemented on the feature branch; not installed
 Branch: `fix/shell-redirection-false-positives`
 Date: 2026-07-31
 
@@ -49,12 +49,12 @@ Add a narrow POSIX-shell resolver for redirects whose target is exactly `$NAME`,
 - a preceding top-level segment in the same submitted command assigns `NAME` once;
 - the assignment value is one literal shell word after quote removal;
 - the value contains no parameter expansion, command/process substitution, glob, brace expansion, tilde-user expansion, backslash-obfuscated traversal, `eval`, or control operator;
-- no intervening segment mutates, exports dynamically, unsets, or indirectly references the variable;
-- the redirect has no concatenated dynamic prefix or suffix in the first slice.
+- no intervening executable segment exists, except a no-op `:` initializer redirect to the same proven target;
+- the redirect has no concatenated dynamic prefix or suffix, additional path redirect, or dynamic file-descriptor target.
 
 The resolved target must then pass the same sensitive-path classification as a direct literal redirect. `/etc`, root/home/system targets remain denied. Relative literals and literal `/tmp` or `/var/tmp` paths retain the existing direct-literal policy; this PR must not invent a broader writable-path allowlist.
 
-For a path that already exists, the resolver should fail closed when `symlink_metadata` reports a symlink or a non-regular file. For a missing target, inspect the nearest existing parent without following a final target component and reject a symlinked parent chain. On Unix, an existing target must be owned by the invoking user. These checks reduce obvious symlink substitution but cannot eliminate the time-of-check/time-of-use race created by the shell's later `O_TRUNC`; documentation must state that a private `0700` run directory is stronger than a shared `/tmp` basename.
+For a path that already exists, the resolver fails closed when `symlink_metadata` reports a symlink or a non-regular file. A missing target requires an existing, checked parent; every existing path component is inspected without following symlinks. On Unix, an existing target must be owned by the invoking effective user, and the parent must have that owner unless it is a sticky world-writable directory such as `/tmp`. These checks reduce obvious symlink substitution but cannot eliminate the time-of-check/time-of-use race created by the shell's later `O_TRUNC`; a private `0700` run directory remains stronger than a shared `/tmp` basename.
 
 If any proof is missing, preserve today's `redirect-truncate-dynamic-path` denial. Do not guess from variable names such as `LOG`, and do not add a blanket `/tmp` bypass.
 
