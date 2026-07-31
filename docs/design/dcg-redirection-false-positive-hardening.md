@@ -44,7 +44,7 @@ The first PR should remain inside evaluator semantics and regression tests. It m
 
 ## Proposed first PR: literal redirect-target resolution
 
-Add a narrow POSIX-shell resolver for redirects whose target is exactly `$NAME`, `${NAME}`, `"$NAME"`, or `"${NAME}"`. It may resolve a value only when all of these are true:
+Add a narrow Linux POSIX-shell resolver for redirects whose target is exactly `$NAME`, `${NAME}`, `"$NAME"`, or `"${NAME}"`. Non-Linux platforms retain the existing fail-closed decision until they have an equally trustworthy effective-user identity source. It may resolve a value only when all of these are true:
 
 - a preceding top-level segment in the same submitted command assigns `NAME` once;
 - the assignment value is one literal shell word after quote removal;

@@ -48,6 +48,7 @@ fn denied(cmd: &str, cwd: &Path) {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn prior_single_literal_assignment_resolves_the_redirect_target() {
     let cwd = tempfile::tempdir().unwrap();
@@ -102,7 +103,7 @@ fn sensitive_literal_assignment_remains_denied() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn symlink_and_non_regular_targets_remain_denied() {
     use std::os::unix::fs::symlink;

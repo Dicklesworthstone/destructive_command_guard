@@ -19251,6 +19251,9 @@ fn redirect_target_has_proven_literal_assignment(
     dialect: ShellDialect,
     project_path: Option<&Path>,
 ) -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
     let Some(variable) = exact_redirect_variable(segment, dialect) else {
         return false;
     };
