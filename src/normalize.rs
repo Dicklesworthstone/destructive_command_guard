@@ -1270,7 +1270,18 @@ fn busybox_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Op
 pub(crate) fn mise_option_takes_separate_value(word: &str) -> bool {
     matches!(
         word,
-        "-C" | "--cd" | "-E" | "--env" | "-j" | "--jobs" | "-P" | "--profile" | "--allow-net"
+        "-C" | "--cd"
+            | "-E"
+            | "--env"
+            | "-j"
+            | "--jobs"
+            | "-P"
+            | "--profile"
+            | "--allow-net"
+            | "--allow-env"
+            | "--allow-read"
+            | "--allow-write"
+            | "--log-level"
     )
 }
 
@@ -1297,6 +1308,9 @@ pub(crate) fn mise_flag_consumes_nothing(word: &str) -> bool {
                 | "--trace"
                 | "--deny-net"
                 | "--deny-all"
+                | "--deny-env"
+                | "--deny-read"
+                | "--deny-write"
                 | "--no-deps"
                 | "--fresh-env"
         )

@@ -31601,6 +31601,70 @@ mod tests {
     }
 
     #[test]
+    fn mise_exec_command_payloads_are_recursively_evaluated() {
+        // Issue #259: `mise exec -c/--command "<shell string>"` executes an
+        // inline shell string, so the payload must be extracted and recursively
+        // evaluated exactly like `sh -c`. A quoted destructive payload riding
+        // through as argv data must be denied on both the all-dialect and the
+        // live Posix hook-path evaluation routes.
+        let packs = ["core.git", "core.filesystem"];
+        let destructive = [
+            r#"mise exec -c "rm -rf /""#,
+            "mise exec -c 'git reset --hard'",
+            r#"mise exec --command="git reset --hard""#,
+            r#"mise exec --command "rm -rf /""#,
+            "mise x -c 'rm -rf /'",
+            "mise x --command='git clean -fd'",
+            r#"mise exec node@20 -c "git reset --hard""#,
+            r#"mise exec --cd /tmp -c "rm -rf /""#,
+            "mise -v exec -c 'git reset --hard'",
+            r#"mise exec -c"rm -rf /""#,
+        ];
+        for command in destructive {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+                assert!(
+                    result.is_denied(),
+                    "destructive mise exec -c payload must be denied \
+                     ({dialect:?}): {command:?}: {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+        // Scope guard: benign inline payloads keep flowing through recursive
+        // evaluation and stay allowed.
+        let benign = [
+            r#"mise exec -c "npm run build""#,
+            r#"mise exec -c "echo hi""#,
+            r#"mise exec --command="npm run build""#,
+            "mise exec -c 'git status'",
+        ];
+        for command in benign {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+                assert!(
+                    result.is_allowed(),
+                    "benign mise exec -c payload must stay allowed ({dialect:?}): \
+                     {command:?}: {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+        // Data contexts quoting a mise payload must not be denied.
+        for command in [
+            r#"git commit -m "mise exec -c 'rm -rf /'""#,
+            r#"echo "mise exec -c 'rm -rf /'""#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_allowed(),
+                "mise payload quoted as data must stay allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
     fn literal_assignment_redirect_proof_survives_loop_narrowing() {
         // The pre-existing #249 assignment proof must keep working alongside
         // the loop-binding proof.
