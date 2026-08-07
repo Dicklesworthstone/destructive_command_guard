@@ -73,9 +73,13 @@ fn create_safe_patterns() -> Vec<SafePattern> {
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
         // chmod 777 (world writable)
+        // All patterns in this pack bound their gap-matchers to [^;&|]* so a
+        // flag or path in a *different* segment of a chained command (`chmod
+        // 600 f && grep -rn …`) can never satisfy the other half of a rule
+        // (issue #287).
         destructive_pattern!(
             "chmod-777",
-            r#"chmod\s+(?:.*\s+)?["'=]?0*777(?:[\s"']|$)"#,
+            r#"chmod\s+(?:[^;&|]*\s+)?["'=]?0*777(?:[\s"']|$)"#,
             "chmod 777 makes files world-writable. This is a security risk.",
             High,
             "chmod 777 grants read/write/execute to everyone. This can expose sensitive \
@@ -88,7 +92,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `chmod -R "/etc"` are caught — the shell unquotes to `/etc`.
         destructive_pattern!(
             "chmod-recursive-root",
-            r#"chmod\s+(?:.*(?:-[rR]|--recursive)).*\s+['"]?/(?:$|bin|boot|dev|etc|lib|lib64|opt|proc|root|run|sbin|srv|sys|usr|var)\b"#,
+            r#"chmod\s+(?:[^;&|]*(?:-[rR]|--recursive))[^;&|]*\s+['"]?/(?:$|bin|boot|dev|etc|lib|lib64|opt|proc|root|run|sbin|srv|sys|usr|var)\b"#,
             "chmod -R on system directories can break system permissions.",
             Critical,
             "Recursively changing permissions on system directories can render the system \
@@ -101,7 +105,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chown -R on root or system directories
         destructive_pattern!(
             "chown-recursive-root",
-            r#"chown\s+(?:.*(?:-[rR]|--recursive)).*\s+['"]?/(?:$|bin|boot|dev|etc|lib|lib64|opt|proc|root|run|sbin|srv|sys|usr|var)\b"#,
+            r#"chown\s+(?:[^;&|]*(?:-[rR]|--recursive))[^;&|]*\s+['"]?/(?:$|bin|boot|dev|etc|lib|lib64|opt|proc|root|run|sbin|srv|sys|usr|var)\b"#,
             "chown -R on system directories can break system ownership.",
             High,
             "Recursive ownership changes on system directories can disrupt services, \
@@ -112,7 +116,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chmod u+s (setuid)
         destructive_pattern!(
             "chmod-setuid",
-            r"chmod\s+.*u\+s|chmod\s+[4-7]\d{3}",
+            r"chmod\s+[^;&|]*u\+s|chmod\s+[4-7]\d{3}",
             "Setting setuid bit (chmod u+s) is a security-sensitive operation.",
             High,
             "The setuid bit causes a program to run with the file owner's privileges \
@@ -126,7 +130,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chmod g+s (setgid)
         destructive_pattern!(
             "chmod-setgid",
-            r"chmod\s+.*g\+s|chmod\s+[2367]\d{3}",
+            r"chmod\s+[^;&|]*g\+s|chmod\s+[2367]\d{3}",
             "Setting setgid bit (chmod g+s) is a security-sensitive operation.",
             High,
             "The setgid bit on an executable causes it to run with the file group's \
@@ -140,7 +144,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chown to root
         destructive_pattern!(
             "chown-to-root",
-            r"chown\s+.*root[:\s]",
+            r"chown\s+[^;&|]*root[:\s]",
             "Changing ownership to root should be done carefully.",
             High,
             "Transferring file ownership to root makes the files inaccessible to normal \
@@ -154,7 +158,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // setfacl with dangerous patterns
         destructive_pattern!(
             "setfacl-all",
-            r#"setfacl\s+.*-[rR].*\s+['"]?/(?:$|bin|boot|dev|etc|lib|lib64|opt|proc|root|run|sbin|srv|sys|usr|var)\b"#,
+            r#"setfacl\s+[^;&|]*-[rR][^;&|]*\s+['"]?/(?:$|bin|boot|dev|etc|lib|lib64|opt|proc|root|run|sbin|srv|sys|usr|var)\b"#,
             "setfacl -R on system directories can modify access control across the filesystem.",
             Critical,
             "Recursively modifying ACLs on system directories changes fine-grained access \
@@ -236,5 +240,31 @@ mod tests {
         let pack = create_pack();
         assert_no_match(&pack, "git status");
         assert_no_match(&pack, "echo hello");
+    }
+
+    /// Issue #287: a rule's tokens must all come from the same command
+    /// segment. A recursive flag on a *different* command in the chain must
+    /// not turn a non-recursive chmod/chown into a recursive-root match.
+    #[test]
+    fn cross_segment_tokens_do_not_combine_issue_287() {
+        let pack = create_pack();
+        // The -r belongs to grep, not chmod.
+        assert_no_match(&pack, "chmod 600 /root/.ssh/x && grep -rn foo /etc/ssh/");
+        assert_no_match(
+            &pack,
+            "sudo chmod 600 /root/.ssh/authorized_keys && sudo grep -rn PermitRootLogin /etc/ssh/sshd_config",
+        );
+        // Same shape for chown, setfacl, 777, setuid/setgid, chown-to-root.
+        assert_no_match(&pack, "chown user /var/log/app.log; cp -R src /opt/app");
+        assert_no_match(&pack, "setfacl -m u:app:r /srv/f | ls -R /etc");
+        assert_allows(&pack, "chmod u+x build.sh && echo 777");
+        assert_allows(&pack, "chmod 644 f.txt && tar -c u+something");
+        assert_no_match(&pack, "chown alice /tmp/f && sudo -u root: true");
+        // Within one segment the rules still fire.
+        assert_blocks_with_pattern(&pack, "chmod -R 755 /etc", "chmod-recursive-root");
+        assert_blocks_with_pattern(&pack, "true && chmod -R 755 /etc", "chmod-recursive-root");
+        assert_blocks_with_pattern(&pack, "chown -R user:group /var", "chown-recursive-root");
+        assert_blocks_with_pattern(&pack, "setfacl -R -m u:app:rwx /etc", "setfacl-all");
+        assert_blocks_with_pattern(&pack, "echo done && chmod 777 /tmp/f", "chmod-777");
     }
 }
