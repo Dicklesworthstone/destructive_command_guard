@@ -2440,6 +2440,15 @@ fn parse_rm_segment_with_option_scanning(
         ),
     };
 
+    // Rule-scoped target exemption (#284). The rule that would fire is now
+    // known, so its configured `exempt_target_globs` get their one chance
+    // here. Only this rule stands down: a different rm spelling resolves to a
+    // different rule id and is unaffected, and every non-rm rule still sees the
+    // whole command.
+    if rm_targets_exempted_for_rule(pattern_name, &paths) {
+        return RmParseDecision::Allow;
+    }
+
     let span = flag_state
         .span
         .or(flag_state.recursive_span)
@@ -2579,6 +2588,40 @@ fn strip_outer_quotes(token: &str) -> (QuoteKind, &str) {
         }
     }
     (QuoteKind::None, token)
+}
+
+/// Whether every `rm` target is covered by `pattern_name`'s configured
+/// `exempt_target_globs` (#284).
+///
+/// All-or-nothing on purpose: `rm -rf ~/scratch/a /etc` must stay denied, so a
+/// single unexempted target keeps the rule firing. Single-quoted targets are
+/// never eligible — the shell does not expand `~` inside them, so the literal
+/// spelling names a different path than the glob's author meant.
+fn rm_targets_exempted_for_rule(pattern_name: &str, paths: &[PathToken<'_>]) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    let rule_id = format!("core.filesystem:{pattern_name}");
+    if !crate::config::rule_has_target_exemptions(&rule_id) {
+        return false;
+    }
+
+    let mut matched: Vec<(&str, String)> = Vec::with_capacity(paths.len());
+    for path in paths {
+        // A double-quoted path keeps its literal text; the shared normalizer
+        // rejects any remaining expansion syntax either way.
+        if path.quote == QuoteKind::Single {
+            return false;
+        }
+        let Some(glob) = crate::config::rule_target_exemption(&rule_id, path.unquoted) else {
+            return false;
+        };
+        matched.push((path.unquoted, glob));
+    }
+    for (target, glob) in &matched {
+        crate::config::note_rule_target_suppression(&rule_id, glob, target);
+    }
+    true
 }
 
 fn path_is_safe_for_style(path: &PathToken<'_>, style: RmFlagStyle) -> bool {

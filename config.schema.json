@@ -204,6 +204,14 @@
         "$ref": "#/$defs/ProjectConfig"
       },
       "default": {}
+    },
+    "rules": {
+      "description": "Per-rule settings keyed by `\"<pack_id>:<pattern_name>\"` (#284).\n\nCurrently carries `exempt_target_globs`, the rule-scoped target-path\nexemption. See [`RuleConfig`].",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/RuleConfig"
+      },
+      "default": {}
     }
   },
   "$defs": {
@@ -1422,6 +1430,19 @@
             }
           ],
           "default": null
+        }
+      }
+    },
+    "RuleConfig": {
+      "description": "Per-rule settings, keyed by `\"<pack_id>:<pattern_name>\"` in a\n`[rules.\"core.filesystem:rm-rf-general\"]` table.\n\nThis is the rule-scoped sibling of `[policy.rules]`: `[policy.rules]` picks\nthe *mode* a rule decides with, `[rules]` narrows the *targets* the rule\ndecides about.",
+      "type": "object",
+      "properties": {
+        "exempt_target_globs": {
+          "description": "Glob patterns naming target paths this rule must not fire on.\n\nThe exemption is evaluated inside the rule's own target check, not as a\ncommand-level bypass: every other rule still sees the whole command, so\n`echo x > ~/.claude/jobs/a/tmp/log && git reset --hard` is still denied\nby `core.git:reset-hard`.\n\nOnly a **statically literal** target is ever eligible. A target built\nfrom a variable, command substitution, glob, or quote splice is never\nexempted — `core.filesystem:redirect-truncate-dynamic-path` exists for\nexactly those and deliberately supports no exemptions.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     }

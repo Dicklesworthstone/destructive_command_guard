@@ -467,6 +467,13 @@ pub struct Config {
     /// Project-specific configurations (keyed by absolute path).
     #[serde(default)]
     pub projects: std::collections::HashMap<String, ProjectConfig>,
+
+    /// Per-rule settings keyed by `"<pack_id>:<pattern_name>"` (#284).
+    ///
+    /// Currently carries `exempt_target_globs`, the rule-scoped target-path
+    /// exemption. See [`RuleConfig`].
+    #[serde(default)]
+    pub rules: std::collections::HashMap<String, RuleConfig>,
 }
 
 /// Identity of a file-backed configuration layer.
@@ -664,6 +671,7 @@ struct ConfigLayer {
     agents: Option<AgentsConfig>,
     response: Option<ResponseConfigLayer>,
     projects: Option<std::collections::HashMap<String, ProjectConfig>>,
+    rules: Option<std::collections::HashMap<String, RuleConfig>>,
 }
 
 impl ConfigLayer {
@@ -767,6 +775,11 @@ impl ConfigLayer {
             })
         });
 
+        // `rules` (per-rule `exempt_target_globs`, #284) is intentionally
+        // absent from the reconstruction below. A target exemption reduces
+        // coverage, so a repository must never be able to grant itself one;
+        // the setting is honored only from the system, user, and explicit
+        // `DCG_CONFIG` layers.
         Self {
             general,
             packs,
@@ -2271,6 +2284,464 @@ const fn constrain_critical_policy(
     } else {
         mode
     }
+}
+
+// -----------------------------------------------------------------------------
+// Per-rule target-path exemptions (#284)
+// -----------------------------------------------------------------------------
+
+/// Per-rule settings, keyed by `"<pack_id>:<pattern_name>"` in a
+/// `[rules."core.filesystem:rm-rf-general"]` table.
+///
+/// This is the rule-scoped sibling of `[policy.rules]`: `[policy.rules]` picks
+/// the *mode* a rule decides with, `[rules]` narrows the *targets* the rule
+/// decides about.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct RuleConfig {
+    /// Glob patterns naming target paths this rule must not fire on.
+    ///
+    /// The exemption is evaluated inside the rule's own target check, not as a
+    /// command-level bypass: every other rule still sees the whole command, so
+    /// `echo x > ~/.claude/jobs/a/tmp/log && git reset --hard` is still denied
+    /// by `core.git:reset-hard`.
+    ///
+    /// Only a **statically literal** target is ever eligible. A target built
+    /// from a variable, command substitution, glob, or quote splice is never
+    /// exempted — `core.filesystem:redirect-truncate-dynamic-path` exists for
+    /// exactly those and deliberately supports no exemptions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exempt_target_globs: Vec<String>,
+}
+
+/// Rule ids whose target is resolvable to a static literal path, and which
+/// therefore honor `exempt_target_globs`.
+///
+/// Keep this list explicit. A rule that is not listed here silently ignores
+/// the setting, which would leave the user still denied with no explanation —
+/// [`Config::rule_target_exemption_warnings`] reports that case instead.
+pub const RULE_TARGET_EXEMPTION_SUPPORTED_RULES: &[&str] = &[
+    "core.filesystem:redirect-truncate-root-home",
+    "core.filesystem:rm-rf-general",
+    "core.filesystem:rm-rf-root-home",
+    "core.filesystem:rm-r-f-separate",
+    "core.filesystem:rm-r-f-separate-root-home",
+    "core.filesystem:rm-recursive-force",
+    "core.filesystem:rm-recursive-force-root-home",
+    "core.filesystem:rm-recursive-general",
+    "core.filesystem:rm-recursive-root-home",
+];
+
+/// Match options for `exempt_target_globs`.
+///
+/// `require_literal_separator` gives the documented semantics: `*` stops at a
+/// path separator, `**` crosses them. Matching is case-sensitive on every
+/// platform, matching the scan include/exclude globs.
+const RULE_TARGET_GLOB_MATCH_OPTIONS: glob::MatchOptions = glob::MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
+
+/// A compiled `[rules]` target-exemption table.
+///
+/// Compilation is done once per process (globs are user-supplied and must not
+/// be re-parsed per command).
+#[derive(Debug, Clone, Default)]
+pub struct RuleTargetExemptions {
+    rules: std::collections::HashMap<String, Vec<CompiledTargetGlob>>,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledTargetGlob {
+    /// The glob exactly as the user wrote it, for audit output.
+    source: String,
+    pattern: glob::Pattern,
+}
+
+impl RuleTargetExemptions {
+    /// Whether any rule configured a target exemption.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    /// Resolve `raw_target` for `rule_id` and return the glob that exempts it.
+    ///
+    /// Returns `None` when the rule has no exemptions, when the target is not
+    /// a static literal path, when it contains a `..` component, or when no
+    /// glob matches.
+    #[must_use]
+    pub fn matching_glob(&self, rule_id: &str, raw_target: &str) -> Option<&str> {
+        let globs = self.rules.get(rule_id)?;
+        let target = normalize_literal_target_path(raw_target)?;
+        globs
+            .iter()
+            .find(|glob| {
+                glob.pattern
+                    .matches_with(&target, RULE_TARGET_GLOB_MATCH_OPTIONS)
+            })
+            .map(|glob| glob.source.as_str())
+    }
+}
+
+/// Lexically normalize a candidate target path for glob matching.
+///
+/// This is deliberately filesystem-free: no `stat`, no symlink resolution, no
+/// canonicalization. A symlinked path is therefore matched by its literal
+/// spelling, exactly as written on the command line.
+///
+/// Returns `None` unless the text is a static literal path:
+/// - any shell expansion, quoting, or glob byte disqualifies it;
+/// - a leading `~` / `~/` expands to the user's home directory (any other
+///   tilde form, including `~user`, is rejected);
+/// - a `..` component is rejected outright rather than resolved, so
+///   `~/.claude/jobs/x/tmp/../../../Documents` can never match a glob rooted
+///   at the scratch directory;
+/// - `.` components and duplicate separators are collapsed.
+#[must_use]
+pub(crate) fn normalize_literal_target_path(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Expansion, quoting, and glob syntax all mean the runtime target is not
+    // the text dcg is looking at.
+    if raw.bytes().any(|byte| {
+        matches!(
+            byte,
+            b'$' | b'`'
+                | b'\''
+                | b'"'
+                | b'*'
+                | b'?'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+                | b'%'
+                | b'!'
+                | b'('
+                | b')'
+                | b'\n'
+                | b'\r'
+        ) || byte.is_ascii_control()
+    }) {
+        return None;
+    }
+    // On Unix a backslash is a shell escape, never a separator.
+    #[cfg(not(windows))]
+    if raw.contains('\\') {
+        return None;
+    }
+
+    let expanded = if raw == "~" {
+        dirs::home_dir()?.to_string_lossy().into_owned()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        let home = dirs::home_dir()?;
+        format!("{}/{rest}", home.to_string_lossy().trim_end_matches('/'))
+    } else if raw.starts_with('~') {
+        // `~user` needs the passwd database to resolve; never guess.
+        return None;
+    } else {
+        raw.to_string()
+    };
+
+    #[cfg(windows)]
+    let expanded = expanded.replace('\\', "/");
+
+    let rooted = expanded.starts_with('/');
+    let mut components: Vec<&str> = Vec::new();
+    for component in expanded.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => return None,
+            other => components.push(other),
+        }
+    }
+    if components.is_empty() {
+        return rooted.then(|| "/".to_string());
+    }
+    let joined = components.join("/");
+    Some(if rooted { format!("/{joined}") } else { joined })
+}
+
+/// Normalize the glob text itself so it is compared against the same shape
+/// [`normalize_literal_target_path`] produces (`~` expanded, `.` and duplicate
+/// separators collapsed). Glob metacharacters are preserved.
+fn normalize_target_glob(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("glob must not be empty".to_string());
+    }
+    if trimmed.split('/').any(|component| component == "..") {
+        return Err("glob must not contain a `..` component".to_string());
+    }
+
+    let expanded = if trimmed == "~" {
+        dirs::home_dir()
+            .ok_or_else(|| "`~` cannot be expanded: no home directory".to_string())?
+            .to_string_lossy()
+            .into_owned()
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        let home = dirs::home_dir()
+            .ok_or_else(|| "`~` cannot be expanded: no home directory".to_string())?;
+        format!("{}/{rest}", home.to_string_lossy().trim_end_matches('/'))
+    } else if trimmed.starts_with('~') {
+        return Err("only `~` and `~/` are expanded; `~user` is not supported".to_string());
+    } else {
+        trimmed.to_string()
+    };
+
+    let rooted = expanded.starts_with('/');
+    let components: Vec<&str> = expanded
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect();
+    let joined = components.join("/");
+    Ok(if rooted { format!("/{joined}") } else { joined })
+}
+
+impl Config {
+    /// Compile the `[rules]` target-exemption globs.
+    ///
+    /// Invalid or empty globs are dropped here; they are reported separately by
+    /// [`Config::rule_target_exemption_warnings`] so a typo never silently
+    /// widens or narrows enforcement.
+    #[must_use]
+    pub fn rule_target_exemptions(&self) -> RuleTargetExemptions {
+        let mut rules = std::collections::HashMap::new();
+        for (rule_id, rule) in &self.rules {
+            if !RULE_TARGET_EXEMPTION_SUPPORTED_RULES.contains(&rule_id.as_str()) {
+                continue;
+            }
+            let compiled: Vec<CompiledTargetGlob> = rule
+                .exempt_target_globs
+                .iter()
+                .filter_map(|raw| {
+                    let normalized = normalize_target_glob(raw).ok()?;
+                    let pattern = glob::Pattern::new(&normalized).ok()?;
+                    Some(CompiledTargetGlob {
+                        source: raw.clone(),
+                        pattern,
+                    })
+                })
+                .collect();
+            if !compiled.is_empty() {
+                rules.insert(rule_id.clone(), compiled);
+            }
+        }
+        RuleTargetExemptions { rules }
+    }
+
+    /// Human-readable problems with the effective `[rules]` tables.
+    ///
+    /// Every entry here means the user configured an exemption that will NOT
+    /// take effect, so they keep getting the denial they tried to remove.
+    #[must_use]
+    pub fn rule_target_exemption_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let mut rule_ids: Vec<&String> = self.rules.keys().collect();
+        rule_ids.sort_unstable();
+        for rule_id in rule_ids {
+            let rule = &self.rules[rule_id];
+            if rule.exempt_target_globs.is_empty() {
+                continue;
+            }
+            if !RULE_TARGET_EXEMPTION_SUPPORTED_RULES.contains(&rule_id.as_str()) {
+                warnings.push(format!(
+                    "[rules.\"{rule_id}\"] exempt_target_globs is ignored: \
+                     that rule does not support target exemptions (supported: {})",
+                    RULE_TARGET_EXEMPTION_SUPPORTED_RULES.join(", ")
+                ));
+                continue;
+            }
+            for raw in &rule.exempt_target_globs {
+                match normalize_target_glob(raw) {
+                    Err(error) => warnings.push(format!(
+                        "[rules.\"{rule_id}\"] exempt_target_globs entry {raw:?} is invalid: {error}"
+                    )),
+                    Ok(normalized) => {
+                        if let Err(error) = glob::Pattern::new(&normalized) {
+                            warnings.push(format!(
+                                "[rules.\"{rule_id}\"] exempt_target_globs entry {raw:?} \
+                                 is not a valid glob: {error}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        warnings
+    }
+}
+
+/// A rule firing that a configured target exemption suppressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleTargetSuppression {
+    /// `"<pack_id>:<pattern_name>"` of the rule that matched.
+    pub rule_id: String,
+    /// The glob, exactly as configured, that exempted the target.
+    pub glob: String,
+    /// The target path as it appeared on the command line.
+    pub target: String,
+}
+
+#[derive(Clone, Default)]
+struct ActiveRuleTargetExemptions {
+    exemptions: std::sync::Arc<RuleTargetExemptions>,
+    verbose: bool,
+}
+
+/// Exemptions from the most recently loaded [`Config`].
+///
+/// The hook's hot path evaluates through `evaluate_command_with_pack_order_*`,
+/// which deliberately takes no `&Config`. Publishing the compiled table when a
+/// config is loaded keeps that path served without threading a parameter
+/// through every pack matcher. A repository `.dcg.toml` is already reduced to
+/// enforcement-only settings before it reaches here, so nothing published from
+/// this point can carry a repository-authored exemption.
+static PROCESS_RULE_TARGET_EXEMPTIONS: std::sync::RwLock<Option<ActiveRuleTargetExemptions>> =
+    std::sync::RwLock::new(None);
+
+thread_local! {
+    /// Exemptions explicitly scoped to the evaluation running on this thread.
+    ///
+    /// The pack matchers that own a rule's target check sit ten-plus frames
+    /// below the last function that holds a `&Config`, and several of them are
+    /// shared with the rm parser in `packs::core::filesystem`. A thread-local
+    /// scope keeps the plumbing out of those signatures while staying isolated
+    /// between parallel test threads, and takes precedence over the process
+    /// default above.
+    static RULE_TARGET_EXEMPTION_OVERRIDE: std::cell::RefCell<Option<ActiveRuleTargetExemptions>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// Suppressions recorded during the evaluation running on this thread.
+    static RULE_TARGET_SUPPRESSIONS: std::cell::RefCell<Vec<RuleTargetSuppression>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn active_rule_target_exemptions() -> Option<ActiveRuleTargetExemptions> {
+    if let Some(active) = RULE_TARGET_EXEMPTION_OVERRIDE.with(|state| state.borrow().clone()) {
+        return Some(active);
+    }
+    PROCESS_RULE_TARGET_EXEMPTIONS
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+/// Publish `config`'s compiled `[rules]` exemptions as the process default.
+///
+/// Called once per loaded config. Idempotent and cheap to repeat.
+pub(crate) fn publish_rule_target_exemptions(config: &Config) {
+    let active = ActiveRuleTargetExemptions {
+        exemptions: std::sync::Arc::new(config.rule_target_exemptions()),
+        verbose: config.general.verbose,
+    };
+    if let Ok(mut guard) = PROCESS_RULE_TARGET_EXEMPTIONS.write() {
+        *guard = Some(active);
+    }
+}
+
+/// RAII guard installing a config's target exemptions for the current thread.
+///
+/// Restores the previous thread scope on drop, so nested evaluations are safe.
+/// This is the entry point for callers that hold a `&Config` directly (library
+/// API users and tests); the hook relies on the process default published at
+/// config load.
+pub struct RuleTargetExemptionScope {
+    previous: Option<ActiveRuleTargetExemptions>,
+}
+
+impl RuleTargetExemptionScope {
+    /// Install `config`'s compiled `[rules]` exemptions for this thread.
+    #[must_use]
+    pub fn install(config: &Config) -> Self {
+        let next = ActiveRuleTargetExemptions {
+            exemptions: std::sync::Arc::new(config.rule_target_exemptions()),
+            verbose: config.general.verbose,
+        };
+        let previous = RULE_TARGET_EXEMPTION_OVERRIDE.with(|state| state.replace(Some(next)));
+        Self { previous }
+    }
+}
+
+impl Drop for RuleTargetExemptionScope {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        RULE_TARGET_EXEMPTION_OVERRIDE.with(|state| {
+            *state.borrow_mut() = previous;
+        });
+    }
+}
+
+/// Whether `rule_id` has any target exemption configured for this evaluation.
+///
+/// Cheap gate so the supported rules skip target extraction entirely on the
+/// overwhelmingly common unconfigured path.
+#[must_use]
+pub fn rule_has_target_exemptions(rule_id: &str) -> bool {
+    active_rule_target_exemptions()
+        .is_some_and(|active| active.exemptions.rules.contains_key(rule_id))
+}
+
+/// Whether `rule_id`'s configured target exemptions cover `raw_target`.
+///
+/// This is the shared helper every supported rule calls at the point where its
+/// own target is already known. It returns the matching glob so callers can
+/// report *why* the rule did not fire.
+///
+/// The lookup is pure: an operation with several targets must prove *every*
+/// target exempt before it suppresses anything, so recording is a separate
+/// step ([`note_rule_target_suppression`]).
+#[must_use]
+pub fn rule_target_exemption(rule_id: &str, raw_target: &str) -> Option<String> {
+    let active = active_rule_target_exemptions()?;
+    if active.exemptions.is_empty() {
+        return None;
+    }
+    active
+        .exemptions
+        .matching_glob(rule_id, raw_target)
+        .map(ToString::to_string)
+}
+
+/// Boolean form of [`rule_target_exemption`].
+#[must_use]
+pub fn rule_target_exempted(rule_id: &str, raw_target: &str) -> bool {
+    rule_target_exemption(rule_id, raw_target).is_some()
+}
+
+/// Record that `rule_id` matched but did not fire because `glob` exempted
+/// `target`.
+///
+/// A suppressed rule is an allow, and an allow that came from configuration
+/// must be visible: the suppression is retained for the audit trail (see
+/// [`take_rule_target_suppressions`]) and echoed to stderr in verbose mode.
+pub fn note_rule_target_suppression(rule_id: &str, glob: &str, target: &str) {
+    if active_rule_target_exemptions().is_some_and(|active| active.verbose) {
+        eprintln!(
+            "dcg: rule {rule_id} matched but target {target:?} is exempted by \
+             [rules.\"{rule_id}\"] exempt_target_globs entry {glob:?}"
+        );
+    }
+    RULE_TARGET_SUPPRESSIONS.with(|state| {
+        state.borrow_mut().push(RuleTargetSuppression {
+            rule_id: rule_id.to_string(),
+            glob: glob.to_string(),
+            target: target.to_string(),
+        });
+    });
+}
+
+/// Drain the target-exemption suppressions recorded during this evaluation.
+///
+/// Callers that render an audit trail (history rows, `dcg explain`) use this to
+/// state which rule matched and which glob suppressed it.
+#[must_use]
+pub fn take_rule_target_suppressions() -> Vec<RuleTargetSuppression> {
+    RULE_TARGET_SUPPRESSIONS.with(|state| std::mem::take(&mut *state.borrow_mut()))
 }
 
 /// Custom pattern overrides.
@@ -3920,6 +4391,11 @@ impl Config {
             );
         }
 
+        // Publish the rule-scoped target exemptions (#284) so the pack matchers
+        // can consult them without a `&Config` parameter. The automatic project
+        // layer was already reduced above, so nothing here is repo-authored.
+        publish_rule_target_exemptions(&config);
+
         (config, sources)
     }
 
@@ -4187,6 +4663,12 @@ impl Config {
         // Merge project configs
         if let Some(projects) = other.projects {
             self.projects.extend(projects);
+        }
+
+        // Per-rule settings merge by rule id; a higher layer replaces the whole
+        // table for a rule it names (#284).
+        if let Some(rules) = other.rules {
+            self.rules.extend(rules);
         }
     }
 
@@ -5044,6 +5526,7 @@ impl Config {
             agents: AgentsConfig::default(),
             response: ResponseConfig::default(),
             projects: std::collections::HashMap::new(),
+            rules: std::collections::HashMap::new(),
             interactive: crate::interactive::InteractiveConfig::default(),
         }
     }
@@ -9854,6 +10337,183 @@ low = "disabled"
                 ConfigSource::AutoProject
             )
             .is_none()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Per-rule target-path exemptions (#284)
+    // -------------------------------------------------------------------------
+
+    fn exemptions_from(toml_text: &str) -> RuleTargetExemptions {
+        let config: Config = toml::from_str(toml_text).expect("parse rules config");
+        config.rule_target_exemptions()
+    }
+
+    #[test]
+    fn rule_target_glob_matches_literal_subpath() {
+        let exemptions = exemptions_from(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/*/tmp/**"]
+"#,
+        );
+        assert_eq!(
+            exemptions.matching_glob("core.filesystem:rm-rf-general", "/srv/jobs/abc/tmp/scratch"),
+            Some("/srv/jobs/*/tmp/**")
+        );
+    }
+
+    #[test]
+    fn rule_target_glob_is_scoped_to_its_own_rule() {
+        let exemptions = exemptions_from(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/*/tmp/**"]
+"#,
+        );
+        assert_eq!(
+            exemptions.matching_glob(
+                "core.filesystem:redirect-truncate-root-home",
+                "/srv/jobs/abc/tmp/scratch"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rule_target_single_star_does_not_cross_a_separator() {
+        let exemptions = exemptions_from(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/*/tmp/**"]
+"#,
+        );
+        assert_eq!(
+            exemptions.matching_glob("core.filesystem:rm-rf-general", "/srv/jobs/a/b/tmp/scratch"),
+            None
+        );
+    }
+
+    #[test]
+    fn rule_target_rejects_dotdot_traversal() {
+        let exemptions = exemptions_from(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/*/tmp/**"]
+"#,
+        );
+        assert_eq!(
+            exemptions.matching_glob(
+                "core.filesystem:rm-rf-general",
+                "/srv/jobs/abc/tmp/../../../Documents"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rule_target_rejects_expansion_and_glob_syntax() {
+        let exemptions = exemptions_from(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/*/tmp/**"]
+"#,
+        );
+        for dynamic in [
+            "$DIR/tmp/scratch",
+            "/srv/jobs/${ID}/tmp/scratch",
+            "/srv/jobs/`id`/tmp/scratch",
+            "/srv/jobs/*/tmp/scratch",
+            "%TEMP%/scratch",
+        ] {
+            assert_eq!(
+                exemptions.matching_glob("core.filesystem:rm-rf-general", dynamic),
+                None,
+                "dynamic target {dynamic} must never be exempted"
+            );
+        }
+    }
+
+    #[test]
+    fn rule_target_normalizes_dot_and_duplicate_separators() {
+        let exemptions = exemptions_from(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/*/tmp/**"]
+"#,
+        );
+        assert_eq!(
+            exemptions.matching_glob(
+                "core.filesystem:rm-rf-general",
+                "/srv//jobs/abc/./tmp/scratch"
+            ),
+            Some("/srv/jobs/*/tmp/**")
+        );
+    }
+
+    #[test]
+    fn rule_target_exemption_ignored_for_unsupported_rule() {
+        let config: Config = toml::from_str(
+            r#"
+[rules."core.git:reset-hard"]
+exempt_target_globs = ["/srv/**"]
+"#,
+        )
+        .expect("parse rules config");
+        assert!(config.rule_target_exemptions().is_empty());
+        let warnings = config.rule_target_exemption_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("does not support target exemptions"));
+    }
+
+    #[test]
+    fn rule_target_empty_and_invalid_globs_are_reported() {
+        let config: Config = toml::from_str(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["", "/srv/a**b/**"]
+"#,
+        )
+        .expect("parse rules config");
+        let warnings = config.rule_target_exemption_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("must not be empty")));
+        assert!(config.rule_target_exemptions().is_empty());
+    }
+
+    #[test]
+    fn rule_target_glob_with_dotdot_is_rejected_at_load() {
+        let config: Config = toml::from_str(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/../**"]
+"#,
+        )
+        .expect("parse rules config");
+        assert!(config.rule_target_exemptions().is_empty());
+        assert!(
+            config
+                .rule_target_exemption_warnings()
+                .iter()
+                .any(|w| w.contains("`..`"))
+        );
+    }
+
+    #[test]
+    fn automatic_project_config_cannot_grant_a_target_exemption() {
+        // #284: `exempt_target_globs` reduces coverage, so a repository-authored
+        // `.dcg.toml` must never contribute one.
+        let layer: ConfigLayer = toml::from_str(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/**"]
+"#,
+        )
+        .expect("parse project config layer");
+        assert!(layer.rules.is_some(), "layer should parse the table");
+        assert!(
+            layer.into_restricted_project_policy().rules.is_none(),
+            "an automatically discovered .dcg.toml must not carry [rules] exemptions"
         );
     }
 }
