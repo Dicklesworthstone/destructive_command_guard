@@ -630,6 +630,16 @@ impl SymbolicPosixWord {
         self.text.contains(POSIX_DYNAMIC_QUOTED) || self.text.contains(POSIX_DYNAMIC_UNQUOTED)
     }
 
+    /// Whether the word carries any literal bytes at all. A word made up
+    /// entirely of substitution sentinels could expand to anything, so it
+    /// provides no evidence that this command involves Git (#281).
+    fn has_literal_fragment(&self) -> bool {
+        self.text
+            .replace(POSIX_DYNAMIC_QUOTED, POSIX_DYNAMIC_UNQUOTED)
+            .split(POSIX_DYNAMIC_UNQUOTED)
+            .any(|fragment| !fragment.is_empty())
+    }
+
     fn may_equal(&self, candidate: &str) -> bool {
         if !self.is_dynamic() {
             return self.text == candidate;
@@ -1438,6 +1448,18 @@ fn git_symbolic_word_may_equal(
         offset += relative + fragment.len();
     }
     offset <= candidate.len().saturating_sub(last.len())
+}
+
+/// Whether a dynamic word consists solely of expansions with no literal bytes.
+/// Such a word could expand to anything, so it supplies no evidence that the
+/// command involves Git; per the #273 precedent (`"$X" "$Y"` is an unknown
+/// program), an unquoted `$X $Y` must not be attributed to a `core.git` rule
+/// on its own (#281).
+fn git_semantic_word_is_unbounded(word: &GitSemanticWord, dialect: ShellDialect) -> bool {
+    word.dynamic
+        && git_dynamic_fragments(&word.decoded, dialect)
+            .iter()
+            .all(String::is_empty)
 }
 
 fn git_semantic_executable_may_equal(
@@ -3481,10 +3503,19 @@ fn dynamic_git_branch_may_mutate(command: &str, dialect: ShellDialect) -> bool {
     let Some(executable) = words.get(index) else {
         return false;
     };
+    // #281: an executable word with no literal bytes (`$cmd`) supplies no
+    // evidence of Git. It must not become `git-branch` on its own, and later
+    // dynamic words must not stand in for the literal `branch` subcommand —
+    // two unknowns are not evidence. Literal branch syntax after it (e.g.
+    // `$(producer) branch -d feature`) still fails closed below.
+    let executable_unbounded =
+        !powershell_expression && git_semantic_word_is_unbounded(executable, dialect);
     let dashed_branch = !powershell_expression
+        && !executable_unbounded
         && (git_semantic_executable_may_equal(executable, dialect, "git-branch")
             || git_semantic_executable_may_equal(executable, dialect, "git-branch.exe"));
     let may_execute_git = powershell_expression
+        || executable_unbounded
         || git_semantic_executable_may_equal(executable, dialect, "git")
         || git_semantic_executable_may_equal(executable, dialect, "git.exe")
         || dashed_branch;
@@ -3501,7 +3532,8 @@ fn dynamic_git_branch_may_mutate(command: &str, dialect: ShellDialect) -> bool {
             return false;
         };
         if word.dynamic {
-            if git_symbolic_word_may_equal(word, dialect, "branch", false)
+            if !executable_unbounded
+                && git_symbolic_word_may_equal(word, dialect, "branch", false)
                 && semantic_branch_argv_may_mutate(&words[index + 1..], dialect)
             {
                 return true;
@@ -3717,6 +3749,7 @@ fn symbolic_posix_branch_decision(command: &str) -> Option<BranchCommandDecision
     let mut words = symbolic_posix_words(&view).ok()?;
     let mut environment = HashMap::new();
     let mut executable_index = 0usize;
+    let mut executable_unbounded = false;
     let dashed_branch;
 
     loop {
@@ -3745,7 +3778,15 @@ fn symbolic_posix_branch_decision(command: &str) -> Option<BranchCommandDecision
         };
         if basename.may_equal("git") || basename.may_equal("git.exe") {
             if basename.unquoted_dynamic {
-                return Some(BranchCommandDecision::DestructiveDynamic);
+                // #281: a substitution with no literal bytes could expand to
+                // anything and supplies no Git evidence; keep parsing so only
+                // literal branch syntax after it (e.g. `$(producer) branch -d
+                // feature`) can fail closed. A partially literal word such as
+                // `gi$(x)` retains the conservative treatment.
+                if basename.has_literal_fragment() {
+                    return Some(BranchCommandDecision::DestructiveDynamic);
+                }
+                executable_unbounded = true;
             }
             dashed_branch = false;
             break;
@@ -3769,6 +3810,12 @@ fn symbolic_posix_branch_decision(command: &str) -> Option<BranchCommandDecision
                 return Some(BranchCommandDecision::NotBranch);
             };
             if word.is_dynamic() {
+                if executable_unbounded {
+                    // #281: two unknowns are not evidence — a dynamic word
+                    // cannot stand in for `branch` when the executable is
+                    // itself an unbounded expansion.
+                    return Some(BranchCommandDecision::NotBranch);
+                }
                 if word.may_equal("branch") {
                     if word.unquoted_dynamic {
                         return Some(BranchCommandDecision::DestructiveDynamic);
@@ -3908,7 +3955,7 @@ fn symbolic_posix_branch_decision(command: &str) -> Option<BranchCommandDecision
         }
         let token = word.exact()?;
         if matches!(token, "--" | "--end-of-options") {
-            return Some(mutation.decision());
+            return Some(symbolic_scan_decision(mutation, executable_unbounded));
         }
         if token.starts_with("--") {
             if matches!(token, "--help" | "--help-all") {
@@ -3993,7 +4040,25 @@ fn symbolic_posix_branch_decision(command: &str) -> Option<BranchCommandDecision
         index += 1;
     }
 
-    Some(mutation.decision())
+    Some(symbolic_scan_decision(mutation, executable_unbounded))
+}
+
+/// Map a completed symbolic branch-argv scan to a decision. When the
+/// executable word was an unbounded expansion (#281), a proven mutation is
+/// attributed to the dynamic-token rule (the unresolved word is part of the
+/// proof) and anything weaker stays unattributed to Git entirely.
+const fn symbolic_scan_decision(
+    mutation: BranchMutationState,
+    executable_unbounded: bool,
+) -> BranchCommandDecision {
+    let decision = mutation.decision();
+    if !executable_unbounded {
+        return decision;
+    }
+    match decision {
+        BranchCommandDecision::Destructive => BranchCommandDecision::DestructiveDynamic,
+        _ => BranchCommandDecision::NotBranch,
+    }
 }
 
 /// Return whether this command segment invokes Git as its executable in a
@@ -5286,29 +5351,88 @@ mod tests {
 
     /// The reported #273 shapes must not be denied on the all-dialect route
     /// either: the quoted dynamic executable is an unknown program in every
-    /// dialect. The unquoted `$X $Y` form stays fail-closed via the POSIX
-    /// dialect, where field splitting genuinely can synthesize `git branch -D`.
+    /// dialect. Since #281, the unquoted `$X $Y` form agrees with the quoted
+    /// one — an executable with no literal bytes supplies no Git evidence, so
+    /// quoted and unquoted spellings must not disagree.
     #[test]
     fn quoted_dynamic_executable_with_dynamic_argument_is_unknown_program() {
-        for command in ["\"$X\" \"$Y\"", "\"$BIN\" run \"$ARG\""] {
+        for command in ["\"$X\" \"$Y\"", "\"$BIN\" run \"$ARG\"", "$X $Y"] {
             for dialect in [
                 ShellDialect::Posix,
                 ShellDialect::PowerShell,
                 ShellDialect::Cmd,
                 ShellDialect::Unknown,
             ] {
-                assert_ne!(
-                    branch_command_decision_in_dialect(command, dialect),
-                    BranchCommandDecision::Destructive,
-                    "quoted dynamic executable must not be branch-destructive: {command} ({dialect:?})"
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    !matches!(
+                        decision,
+                        BranchCommandDecision::Destructive
+                            | BranchCommandDecision::DestructiveDynamic
+                    ),
+                    "dynamic executable without git evidence must not be branch-destructive: {command} ({dialect:?}) -> {decision:?}"
                 );
             }
         }
-        assert_eq!(
-            branch_command_decision_in_dialect("$X $Y", ShellDialect::Posix),
-            BranchCommandDecision::DestructiveDynamic,
-            "unquoted POSIX expansion may field-split into git branch -D and stays fail-closed"
-        );
+    }
+
+    // =========================================================================
+    // Unbounded dynamic executables carry no git evidence (#281)
+    // =========================================================================
+
+    /// A command whose executable resolves to an unbounded expansion — a
+    /// backtick pair surfaced by Unknown-dialect quote stripping, or a bare
+    /// `$cmd` — must not be attributed to `core.git:branch-dynamic-token`
+    /// when nothing literal ties the command to Git (#281).
+    #[test]
+    fn unbounded_dynamic_executable_without_git_evidence_is_not_branch() {
+        for command in [
+            // Reported shape 1: backticks inside a single-quoted string in an
+            // assignment value; Unknown-dialect normalization strips the
+            // quotes and the substitution lands in the executable slot.
+            "s=s.replace('a `x` b', 'c')",
+            // The exact normalized slice the evaluator scans for it.
+            "s=s.replace(a `x` b, c)",
+            // Reported shape 2: dynamic executable plus dynamic argument.
+            "$cmd $arg",
+            // Reporter-verified boundary facts that already allow.
+            "s=s.replace('a $(x) b', 'c')",
+            "s=`echo hi`",
+            "print('a `x` b', 'c')",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    !matches!(
+                        decision,
+                        BranchCommandDecision::Destructive
+                            | BranchCommandDecision::DestructiveDynamic
+                    ),
+                    "no git evidence, must not deny as git branch: {command} ({dialect:?}) -> {decision:?}"
+                );
+            }
+        }
+    }
+
+    /// Planted negatives for #281: literal branch evidence keeps every one of
+    /// these fail-closed under the dynamic-token attribution.
+    #[test]
+    fn literal_branch_evidence_stays_fail_closed_281() {
+        for command in [
+            "git branch $(cat f)",
+            "git branch -D $BR",
+            // An unbounded executable followed by literal branch syntax keeps
+            // the conservative treatment: the literal words are the evidence.
+            "$(producer) branch -d feature",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                assert_eq!(
+                    branch_command_decision_in_dialect(command, dialect),
+                    BranchCommandDecision::DestructiveDynamic,
+                    "literal branch evidence must stay denied: {command} ({dialect:?})"
+                );
+            }
+        }
     }
 
     // =========================================================================
