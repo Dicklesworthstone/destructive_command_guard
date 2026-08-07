@@ -21416,14 +21416,29 @@ fn evaluate_heredoc(
         // Commands like `cat`, `tee`, `grep`, etc. just output the heredoc content
         // as data - they don't execute it as code. This prevents false positives
         // where documentation text containing dangerous command examples is blocked.
-        if content.target_command.as_ref().is_some_and(|cmd| {
-            crate::heredoc::is_non_executing_heredoc_command(cmd)
-                && !crate::heredoc::stdin_data_sink_may_be_overridden(
-                    command,
-                    content.byte_range.start,
-                    cmd,
-                )
-        }) {
+        let target_not_overridden = |cmd: &str| {
+            !crate::heredoc::stdin_data_sink_may_be_overridden(
+                command,
+                content.byte_range.start,
+                cmd,
+            )
+        };
+        let non_executing_target = content.target_command.as_deref().is_some_and(|cmd| {
+            crate::heredoc::is_non_executing_heredoc_command(cmd) && target_not_overridden(cmd)
+        });
+        // Structured stdin data sinks (`git commit -F - <<'EOF'`, `spx session
+        // handoff <<EOF`) likewise consume the body as DATA — a commit message
+        // is read by git, never executed (#277). Mirror the masking path's
+        // gate: only heredoc/here-string bodies are stdin-bound (inline `-c`
+        // scripts are not), and any PATH/alias override of the target keeps
+        // the body scannable (fail-closed).
+        let structured_stdin_sink = content.heredoc_type.is_some()
+            && crate::heredoc::is_structured_stdin_data_sink(command, content.byte_range.start)
+            && content
+                .target_command
+                .as_deref()
+                .is_none_or(target_not_overridden);
+        if non_executing_target || structured_stdin_sink {
             tracing::trace!(
                 target_command = ?content.target_command,
                 "Skipping heredoc content analysis for non-executing target"
@@ -21800,10 +21815,18 @@ fn check_fallback_patterns(command: &str) -> Option<EvaluationResult> {
         .expect("fallback patterns must compile")
     });
 
+    // Heredoc bodies bound to a non-executing or structured stdin data sink
+    // (`cat <<EOF`, `git commit -F - <<'EOF'`, …) are DATA the target never
+    // executes; mask them exactly like the main raw-shell rescan does (#277).
+    // Executing sinks (`bash <<EOF`, `python3 - <<'PY'`) are never masked, so
+    // the fallback stays fail-closed for real embedded shell/interpreter code.
+    // Bare body content (no `<<` operator) passes through unchanged.
+    let masked = crate::heredoc::mask_non_executing_heredocs(command);
+
     // Sanitize the command first to mask comments and safe arguments (e.g. commit messages).
     // This prevents false positives where a destructive command is mentioned in a comment
     // inside a large heredoc.
-    let sanitized = sanitize_for_pattern_matching(command);
+    let sanitized = sanitize_for_pattern_matching(masked.as_ref());
     let check_target = sanitized.as_ref();
 
     if FALLBACK_PATTERNS.is_match(check_target) {
