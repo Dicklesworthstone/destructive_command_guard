@@ -522,7 +522,17 @@ pub enum HookReadError {
     /// Failed to read from stdin.
     Io(io::Error),
     /// Input exceeded the configured size limit.
-    InputTooLarge(usize),
+    ///
+    /// Carries the bytes that WERE read (the truncated prefix) so the caller
+    /// can still make a best-effort attempt to evaluate the command embedded
+    /// in an oversized payload instead of failing open blind (issue #290).
+    InputTooLarge {
+        /// Number of bytes read before the limit tripped (the read stops at
+        /// `max_bytes + 1`, so this understates the true payload size).
+        len: usize,
+        /// The truncated raw input prefix.
+        prefix: String,
+    },
     /// Failed to parse JSON input.
     Json(serde_json::Error),
 }
@@ -546,7 +556,10 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
     }
 
     if input.len() > max_bytes {
-        return Err(HookReadError::InputTooLarge(input.len()));
+        return Err(HookReadError::InputTooLarge {
+            len: input.len(),
+            prefix: input,
+        });
     }
 
     // Strip a leading UTF-8 BOM (U+FEFF) before parsing. Some text tools prepend
@@ -557,6 +570,98 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
     let to_parse = input.strip_prefix('\u{feff}').unwrap_or(input.as_str());
 
     serde_json::from_str(to_parse).map_err(HookReadError::Json)
+}
+
+/// Best-effort extraction of a shell command from a truncated JSON prefix
+/// (issue #290).
+///
+/// An oversized hook payload is rejected before JSON parsing, but the prefix
+/// that WAS read usually still contains the `tool_input.command` string —
+/// padding a destructive command past `max_hook_input_bytes` must not skip
+/// evaluation entirely. This scanner locates the first `"command"` key in the
+/// raw prefix and decodes its JSON string value, tolerating truncation
+/// mid-string (the decoded prefix of the command is returned).
+///
+/// The scan is deliberately conservative: its result is only used to justify
+/// DENYING (a destructive command prefix is proof enough), so any structure it
+/// does not trust — malformed escapes, raw control characters inside the
+/// string — yields `None` and the caller keeps its historic fail-open
+/// behavior. Escaped occurrences of the key inside string values (`\"command\"`)
+/// never match because the scan requires the unescaped `"command"` byte
+/// sequence.
+#[must_use]
+pub fn extract_command_from_truncated_json(prefix: &str) -> Option<String> {
+    const KEY: &str = "\"command\"";
+
+    let mut search_from = 0;
+    while let Some(found) = prefix[search_from..].find(KEY) {
+        let key_start = search_from + found;
+        search_from = key_start + 1;
+
+        let rest = prefix[key_start + KEY.len()..].trim_start();
+        let Some(after_colon) = rest.strip_prefix(':') else {
+            continue;
+        };
+        let Some(string_body) = after_colon.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        return decode_json_string_prefix(string_body);
+    }
+    None
+}
+
+/// Decode a JSON string body (content after the opening quote) up to the
+/// closing unescaped quote OR the end of the buffer (truncation), returning
+/// the decoded prefix. Returns `None` on structure that cannot be a JSON
+/// string (malformed escape, raw control character) — see
+/// [`extract_command_from_truncated_json`] for why distrust must fail open.
+fn decode_json_string_prefix(body: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => {
+                let Some(esc) = chars.next() else {
+                    // Truncated mid-escape: keep what decoded cleanly.
+                    return Some(out);
+                };
+                match esc {
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    '/' => out.push('/'),
+                    'b' => out.push('\u{0008}'),
+                    'f' => out.push('\u{000C}'),
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    'u' => {
+                        let hex: String = chars.by_ref().take(4).collect();
+                        if hex.len() < 4 {
+                            // Truncated mid-escape: keep what decoded cleanly.
+                            return Some(out);
+                        }
+                        let Ok(code_point) = u32::from_str_radix(&hex, 16) else {
+                            return None;
+                        };
+                        match char::from_u32(code_point) {
+                            Some(ch) => out.push(ch),
+                            // Surrogate half (e.g. emoji pair): stop here and
+                            // keep the cleanly decoded prefix rather than
+                            // implementing pair reassembly for a best-effort
+                            // scan.
+                            None => return Some(out),
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            c if (c as u32) < 0x20 => return None,
+            c => out.push(c),
+        }
+    }
+    // Truncated before the closing quote — the decoded prefix is the value.
+    Some(out)
 }
 
 /// Detect which hook protocol should be used for output formatting.
@@ -4549,5 +4654,91 @@ mod tests {
         }"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+    }
+
+    // =========================================================================
+    // Issue #290: lenient command extraction from a truncated JSON prefix
+    // =========================================================================
+
+    #[test]
+    fn test_290_extract_command_complete_string() {
+        let prefix = r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
+        assert_eq!(
+            extract_command_from_truncated_json(prefix).as_deref(),
+            Some("git status")
+        );
+    }
+
+    #[test]
+    fn test_290_extract_command_truncated_mid_value() {
+        // Oversized payload cut off inside the command string: the decoded
+        // prefix is returned so a destructive PREFIX can still deny.
+        let prefix =
+            r#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard && echo AAAA"#;
+        assert_eq!(
+            extract_command_from_truncated_json(prefix).as_deref(),
+            Some("git reset --hard && echo AAAA")
+        );
+    }
+
+    #[test]
+    fn test_290_extract_command_decodes_escapes() {
+        let prefix = r#"{"tool_input":{"command":"echo \"hi\"\tdone \\ ok"#;
+        assert_eq!(
+            extract_command_from_truncated_json(prefix).as_deref(),
+            Some("echo \"hi\"\tdone \\ ok")
+        );
+    }
+
+    #[test]
+    fn test_290_extract_command_truncated_mid_escape_keeps_clean_prefix() {
+        let prefix = r#"{"tool_input":{"command":"git clean -fdx \"#;
+        assert_eq!(
+            extract_command_from_truncated_json(prefix).as_deref(),
+            Some("git clean -fdx ")
+        );
+    }
+
+    #[test]
+    fn test_290_extract_command_unicode_escape() {
+        let prefix = r#"{"tool_input":{"command":"echo \u0041B"}}"#;
+        assert_eq!(
+            extract_command_from_truncated_json(prefix).as_deref(),
+            Some("echo AB")
+        );
+    }
+
+    #[test]
+    fn test_290_extract_no_command_key_is_none() {
+        let prefix = r#"{"tool_name":"Bash","tool_input":{"cmd":"ls"}}"#;
+        assert_eq!(extract_command_from_truncated_json(prefix), None);
+    }
+
+    #[test]
+    fn test_290_extract_escaped_key_inside_string_value_is_skipped() {
+        // `\"command\"` inside a string value is escaped bytes, not the raw
+        // `"command"` key sequence, so it must not match.
+        let prefix = r#"{"note":"the \"command\": here is prose"}"#;
+        assert_eq!(extract_command_from_truncated_json(prefix), None);
+    }
+
+    #[test]
+    fn test_290_extract_key_without_string_value_is_skipped() {
+        // A `"command"` key whose value is not a string (or prose mention
+        // followed by no colon) must not produce garbage.
+        let prefix = r#"{"command": 42, "other": true}"#;
+        assert_eq!(extract_command_from_truncated_json(prefix), None);
+    }
+
+    #[test]
+    fn test_290_extract_malformed_escape_is_none() {
+        let prefix = r#"{"tool_input":{"command":"echo \q oops"}}"#;
+        assert_eq!(extract_command_from_truncated_json(prefix), None);
+    }
+
+    #[test]
+    fn test_290_extract_raw_control_char_is_none() {
+        let prefix = "{\"tool_input\":{\"command\":\"echo hi\nrm -rf /\"}}";
+        assert_eq!(extract_command_from_truncated_json(prefix), None);
     }
 }

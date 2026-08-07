@@ -200,6 +200,12 @@ pub enum PackParseError {
     /// IO error reading the file.
     Io(io::Error),
 
+    /// Pack file exceeds the size cap (issue #293).
+    ///
+    /// External packs load on every hook invocation; a runaway file must not
+    /// be read (let alone YAML-parsed) inside the hook budget.
+    FileTooLarge { size: u64, max: u64 },
+
     /// YAML parsing error.
     Yaml(serde_yaml::Error),
 
@@ -236,6 +242,9 @@ impl fmt::Display for PackParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(e) => write!(f, "IO error: {e}"),
+            Self::FileTooLarge { size, max } => {
+                write!(f, "Pack file is {size} bytes; exceeds {max}-byte cap")
+            }
             Self::Yaml(e) => write!(f, "YAML parse error: {e}"),
             Self::InvalidId { id, reason } => {
                 write!(f, "Invalid pack ID '{id}': {reason}")
@@ -307,8 +316,27 @@ impl From<serde_yaml::Error> for PackParseError {
 /// - The YAML is malformed
 /// - The pack fails validation (invalid ID, version, patterns, etc.)
 pub fn parse_pack_file(path: &Path) -> Result<ExternalPack, PackParseError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = read_pack_file_capped(path)?;
     parse_pack_string(&content)
+}
+
+/// Maximum size of a single external pack YAML file (issue #293).
+///
+/// Real pack files are a few KiB; 1 MiB leaves generous headroom while
+/// keeping a mistakenly-globbed large file from being read and YAML-parsed
+/// inside the hook budget on every command.
+pub const MAX_PACK_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Read a pack file, refusing files over [`MAX_PACK_FILE_BYTES`].
+fn read_pack_file_capped(path: &Path) -> Result<String, PackParseError> {
+    let size = std::fs::metadata(path)?.len();
+    if size > MAX_PACK_FILE_BYTES {
+        return Err(PackParseError::FileTooLarge {
+            size,
+            max: MAX_PACK_FILE_BYTES,
+        });
+    }
+    Ok(std::fs::read_to_string(path)?)
 }
 
 /// Parse an external pack from a YAML string.
@@ -467,7 +495,7 @@ pub fn validate_pack_with_collision_check(pack: &ExternalPack) -> Result<(), Pac
 /// - The pack fails validation
 /// - The pack ID collides with a built-in pack
 pub fn parse_pack_file_checked(path: &Path) -> Result<ExternalPack, PackParseError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = read_pack_file_capped(path)?;
     parse_pack_string_checked(&content)
 }
 

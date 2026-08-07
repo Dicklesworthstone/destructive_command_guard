@@ -405,6 +405,14 @@ pub(crate) const ENV_CONFIG_PATH: &str = "DCG_CONFIG";
 /// This bounds filesystem work in deeply nested directories.
 pub(crate) const REPO_ROOT_SEARCH_MAX_HOPS: usize = 50;
 
+/// Maximum number of external pack files a `packs.custom_paths` glob
+/// expansion may yield (issue #293).
+///
+/// External packs load on every hook invocation, so an over-broad glob must
+/// not turn each Bash command into an unbounded file-parsing pass. Files
+/// beyond the cap are skipped with a stderr warning.
+pub const MAX_CUSTOM_PACK_FILES: usize = 64;
+
 /// Main configuration structure.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -2010,6 +2018,23 @@ impl PacksConfig {
     pub fn expand_custom_paths_from(&self, cwd: Option<&Path>) -> Vec<String> {
         let mut result = Vec::new();
         let mut repo_root: Option<Option<PathBuf>> = None; // memoize across patterns
+        let mut cap_warned = false;
+
+        // Bound the expansion so a pathological glob (e.g. `~/**/*.yaml`)
+        // cannot make every hook invocation open an unbounded number of
+        // files (issue #293). Files beyond the cap are skipped with a
+        // warning; each pack file itself is size-capped at parse time.
+        let mut push_capped = |result: &mut Vec<String>, path: String| {
+            if result.len() < MAX_CUSTOM_PACK_FILES {
+                result.push(path);
+            } else if !cap_warned {
+                cap_warned = true;
+                eprintln!(
+                    "[dcg] Warning: packs.custom_paths expanded to more than \
+                     {MAX_CUSTOM_PACK_FILES} files; ignoring the rest (issue #293 cap)"
+                );
+            }
+        };
 
         for pattern in &self.custom_paths {
             // Expand ${repo_root} first — if unresolved, skip the entry.
@@ -2047,7 +2072,7 @@ impl PacksConfig {
                 Ok(paths) => {
                     for entry in paths.flatten() {
                         if entry.is_file() {
-                            result.push(entry.to_string_lossy().into_owned());
+                            push_capped(&mut result, entry.to_string_lossy().into_owned());
                         }
                     }
                 }
@@ -2055,7 +2080,7 @@ impl PacksConfig {
                     // Invalid glob pattern - treat as literal path
                     let path = std::path::Path::new(&expanded);
                     if path.is_file() {
-                        result.push(expanded);
+                        push_capped(&mut result, expanded);
                     }
                 }
             }

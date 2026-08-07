@@ -1225,3 +1225,128 @@ safe_patterns:
         assert_eq!(pack.destructive_patterns.len(), 1);
     }
 }
+
+// =============================================================================
+// Issue #293: bounded external pack loading + surfaced load failures
+// =============================================================================
+
+mod issue_293_bounded_loading {
+    use super::*;
+    use destructive_command_guard::config::{MAX_CUSTOM_PACK_FILES, PacksConfig};
+    use destructive_command_guard::packs::external::{MAX_PACK_FILE_BYTES, parse_pack_file};
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+
+    /// A syntactically broken pack file is skipped and surfaced as a warning
+    /// by the loader (the hook prints these unconditionally to stderr).
+    #[test]
+    fn broken_pack_yaml_is_skipped_with_warning() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("broken.yaml");
+        std::fs::write(&path, "id: [unclosed\nname: {{{{").unwrap();
+
+        let loader = ExternalPackLoader::from_paths(&[path.to_string_lossy().to_string()]);
+        let result = loader.load_all_deduped();
+
+        assert!(result.packs.is_empty(), "broken pack must not load");
+        assert_eq!(result.warnings.len(), 1, "must surface exactly one warning");
+        assert_eq!(result.warnings[0].path, path);
+    }
+
+    /// A pack file over the size cap is refused before being read/parsed.
+    #[test]
+    fn oversized_pack_file_is_refused() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("huge.yaml");
+        let size = usize::try_from(MAX_PACK_FILE_BYTES).unwrap() + 1;
+        std::fs::write(&path, "#".repeat(size)).unwrap();
+
+        let err = parse_pack_file(&path).expect_err("oversized pack must be refused");
+        assert!(
+            matches!(err, PackParseError::FileTooLarge { .. }),
+            "expected FileTooLarge, got: {err:?}"
+        );
+        assert!(err.to_string().contains("byte cap"), "got: {err}");
+    }
+
+    /// The custom_paths glob expansion is capped so a pathological glob
+    /// cannot make every hook invocation open an unbounded number of files.
+    #[test]
+    fn glob_expansion_is_capped() {
+        let temp = TempDir::new().unwrap();
+        for i in 0..(MAX_CUSTOM_PACK_FILES + 10) {
+            std::fs::write(temp.path().join(format!("pack{i:03}.yaml")), "id: x.y").unwrap();
+        }
+
+        let packs = PacksConfig {
+            custom_paths: vec![format!("{}/*.yaml", temp.path().to_string_lossy())],
+            ..Default::default()
+        };
+        let expanded = packs.expand_custom_paths_from(Some(temp.path()));
+        assert_eq!(
+            expanded.len(),
+            MAX_CUSTOM_PACK_FILES,
+            "expansion must stop at the cap"
+        );
+    }
+
+    /// Path to the DCG binary (uses same target directory as the test binary).
+    fn dcg_binary() -> PathBuf {
+        let mut path = std::env::current_exe().unwrap();
+        path.pop(); // Remove test binary name
+        path.pop(); // Remove deps/
+        path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
+        path
+    }
+
+    /// End-to-end: a broken custom pack file must warn on stderr WITHOUT
+    /// `verbose` — a silently dropped pack is silently dropped coverage.
+    #[test]
+    fn hook_warns_unconditionally_on_broken_pack() {
+        let temp = TempDir::new().unwrap();
+        let home_dir = temp.path().join("home");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let pack_path = temp.path().join("broken.yaml");
+        std::fs::write(&pack_path, "id: [unclosed\nname: {{{{").unwrap();
+
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[packs]\ncustom_paths = [\"{}\"]\n",
+                pack_path.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+
+        let mut child = Command::new(dcg_binary())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("HOME", &home_dir)
+            .env("XDG_CONFIG_HOME", temp.path().join("xdg_config"))
+            .env("DCG_CONFIG", &config_path)
+            .spawn()
+            .expect("failed to spawn dcg");
+
+        {
+            let stdin = child.stdin.as_mut().expect("stdin");
+            stdin
+                .write_all(br#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#)
+                .expect("write hook input");
+        }
+        let output = child.wait_with_output().expect("wait for dcg");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+        assert!(
+            stderr.contains("Failed to load external pack"),
+            "broken pack must warn without verbose, stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("broken.yaml"),
+            "warning must name the file, stderr: {stderr:?}"
+        );
+    }
+}

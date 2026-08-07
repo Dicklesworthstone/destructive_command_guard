@@ -163,6 +163,23 @@ impl PendingExceptionRecord {
     }
 }
 
+/// Persistence budget for the hook deny path (issue #291).
+///
+/// Recording a block used to acquire the store's exclusive lock with an
+/// unbounded blocking wait BEFORE the protocol denial was emitted, so a
+/// contended or wedged store could delay the denial past the agent's hook
+/// window (cf. #183). Callers on the deny path pass this budget instead:
+/// lock acquisition is bounded by `lock_wait`, and store maintenance
+/// (prune rewrites / archive rotation) is skipped when `allow_maintenance`
+/// is false because the evaluation deadline is nearly exhausted.
+#[derive(Debug, Clone, Copy)]
+pub struct PersistBudget {
+    /// Maximum time to wait for the exclusive store lock.
+    pub lock_wait: std::time::Duration,
+    /// Whether prune/rotate rewrites may run this invocation.
+    pub allow_maintenance: bool,
+}
+
 /// Maintenance stats produced while loading/pruning.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct PendingMaintenance {
@@ -245,28 +262,112 @@ impl PendingExceptionStore {
         source: Option<String>,
         allow_once_audit: Option<&AllowOnceAuditConfig<'_>>,
     ) -> io::Result<(PendingExceptionRecord, PendingMaintenance)> {
+        let file = open_locked(&self.path)?;
+        Self::record_block_locked(
+            file,
+            &self.path,
+            command,
+            cwd,
+            reason,
+            redaction,
+            single_use,
+            source,
+            allow_once_audit,
+            true,
+        )
+    }
+
+    /// Bounded-latency variant of [`Self::record_block`] for the hook deny
+    /// path (issue #291).
+    ///
+    /// The exclusive store lock is acquired with a bounded wait
+    /// (`budget.lock_wait`) instead of blocking indefinitely, and maintenance
+    /// rewrites are skipped when `budget.allow_maintenance` is false. Returns
+    /// `Ok(None)` when the lock stayed contended past the bound — the caller
+    /// emits its denial WITHOUT an allow-once code rather than delaying it.
+    ///
+    /// # Errors
+    ///
+    /// Returns any I/O errors encountered while opening or writing the store
+    /// file (lock contention is `Ok(None)`, not an error).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_block_bounded(
+        &self,
+        command: &str,
+        cwd: &str,
+        reason: &str,
+        redaction: &RedactionConfig,
+        single_use: bool,
+        source: Option<String>,
+        allow_once_audit: Option<&AllowOnceAuditConfig<'_>>,
+        budget: PersistBudget,
+    ) -> io::Result<Option<(PendingExceptionRecord, PendingMaintenance)>> {
+        let Some(file) = open_locked_bounded(&self.path, budget.lock_wait)? else {
+            return Ok(None);
+        };
+        Self::record_block_locked(
+            file,
+            &self.path,
+            command,
+            cwd,
+            reason,
+            redaction,
+            single_use,
+            source,
+            allow_once_audit,
+            budget.allow_maintenance,
+        )
+        .map(Some)
+    }
+
+    /// Shared body of [`Self::record_block`] / [`Self::record_block_bounded`]:
+    /// caller has already opened AND locked the store file.
+    #[allow(clippy::too_many_arguments)]
+    fn record_block_locked(
+        mut file: File,
+        path: &Path,
+        command: &str,
+        cwd: &str,
+        reason: &str,
+        redaction: &RedactionConfig,
+        single_use: bool,
+        source: Option<String>,
+        allow_once_audit: Option<&AllowOnceAuditConfig<'_>>,
+        allow_maintenance: bool,
+    ) -> io::Result<(PendingExceptionRecord, PendingMaintenance)> {
         let now = Utc::now();
         let record =
             PendingExceptionRecord::new(now, cwd, command, reason, redaction, single_use, source);
 
-        let mut file = open_locked(&self.path)?;
-        let (active, maintenance) = load_active_from_file(&mut file, now, allow_once_audit);
+        // Maintenance (full-store scan, prune rewrite, archive rotation) runs
+        // only when the caller's deadline budget allows it. When
+        // `allow_maintenance` is false (issue #291: hook deny path with the
+        // budget nearly exhausted) the store is not even scanned — pruning is
+        // deferred to the next uncontended invocation and the append below
+        // stays O(1).
+        let maintenance = if allow_maintenance {
+            let (active, maintenance) = load_active_from_file(&mut file, now, allow_once_audit);
 
-        // Rotate before deciding how to write. If the active set is over the
-        // cap, archive the oldest portion to `pending.jsonl.1` and only
-        // retain the newest half in the live file. This keeps every future
-        // record_block call O(MAX_PENDING_LINES / 2) instead of unbounded.
-        let did_prune = maintenance.pruned_expired > 0 || maintenance.pruned_consumed > 0;
-        let pre_rotate_len = active.len();
-        let active_after_rotate = if active.len() > MAX_PENDING_LINES {
-            rotate_overflow(&active, &self.path)?
+            // Rotate before deciding how to write. If the active set is over
+            // the cap, archive the oldest portion to `pending.jsonl.1` and
+            // only retain the newest half in the live file. This keeps every
+            // future record_block call O(MAX_PENDING_LINES / 2) instead of
+            // unbounded.
+            let did_prune = maintenance.pruned_expired > 0 || maintenance.pruned_consumed > 0;
+            let pre_rotate_len = active.len();
+            let active_after_rotate = if active.len() > MAX_PENDING_LINES {
+                rotate_overflow(&active, path)?
+            } else {
+                active
+            };
+            let did_rotate = active_after_rotate.len() != pre_rotate_len;
+            if did_prune || did_rotate {
+                rewrite_records(&mut file, &active_after_rotate)?;
+            }
+            maintenance
         } else {
-            active
+            PendingMaintenance::default()
         };
-        let did_rotate = active_after_rotate.len() != pre_rotate_len;
-        if did_prune || did_rotate {
-            rewrite_records(&mut file, &active_after_rotate)?;
-        }
 
         // Final hard cap: if the live file is somehow still over the byte
         // cap (e.g. a single record is enormous), refuse the new entry
@@ -1100,6 +1201,39 @@ fn open_locked(path: &Path) -> io::Result<File> {
         .open(path)?;
     file.lock_exclusive()?;
     Ok(file)
+}
+
+/// Bounded-wait variant of [`open_locked`] (issue #291): poll
+/// `try_lock_exclusive` with short sleeps instead of blocking indefinitely,
+/// so a contended or wedged store cannot stall the hook deny path. Returns
+/// `Ok(None)` when the lock stayed contended past `max_wait`.
+fn open_locked_bounded(path: &Path, max_wait: std::time::Duration) -> io::Result<Option<File>> {
+    const RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(5);
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+
+    let started = std::time::Instant::now();
+    loop {
+        // Treat any lock failure (WouldBlock or otherwise) as contention: the
+        // caller degrades to a code-less denial rather than surfacing an
+        // error, mirroring the self-heal lock idiom in cli.rs.
+        if file.try_lock_exclusive().is_ok() {
+            return Ok(Some(file));
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= max_wait {
+            return Ok(None);
+        }
+        std::thread::sleep(RETRY_SLEEP.min(max_wait.saturating_sub(elapsed)));
+    }
 }
 
 fn load_active_from_file(
@@ -2428,5 +2562,136 @@ mod tests {
             !archive.exists(),
             "below-cap activity must not create pending.jsonl.1"
         );
+    }
+
+    // =========================================================================
+    // Issue #291: bounded persistence for the hook deny path
+    // =========================================================================
+
+    fn small_budget() -> PersistBudget {
+        PersistBudget {
+            lock_wait: std::time::Duration::from_millis(40),
+            allow_maintenance: true,
+        }
+    }
+
+    #[test]
+    fn test_291_record_block_bounded_uncontended_issues_record() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("pending.jsonl");
+        let store = PendingExceptionStore::new(path.clone());
+
+        let result = store
+            .record_block_bounded(
+                "git reset --hard",
+                "/repo",
+                "blocked",
+                &redaction_config(),
+                false,
+                None,
+                None,
+                small_budget(),
+            )
+            .expect("record_block_bounded");
+
+        let (record, _maintenance) = result.expect("uncontended store must issue a record");
+        assert!(!record.short_code.is_empty());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains(&record.short_code));
+    }
+
+    #[test]
+    fn test_291_record_block_bounded_contended_returns_none_within_bound() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("pending.jsonl");
+        let store = PendingExceptionStore::new(path.clone());
+
+        // Hold the exclusive lock from a second handle (flock is per open
+        // file description, so this contends even within one process).
+        let holder = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .expect("open lock holder");
+        holder.lock_exclusive().expect("hold lock");
+
+        let started = std::time::Instant::now();
+        let result = store
+            .record_block_bounded(
+                "git reset --hard",
+                "/repo",
+                "blocked",
+                &redaction_config(),
+                false,
+                None,
+                None,
+                small_budget(),
+            )
+            .expect("contention is Ok(None), not an error");
+        let elapsed = started.elapsed();
+
+        assert!(result.is_none(), "contended store must not issue a code");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "bounded wait must give up promptly, took {elapsed:?}"
+        );
+        FileExt::unlock(&holder).expect("unlock");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.is_empty(),
+            "no record may be appended on contention"
+        );
+    }
+
+    #[test]
+    fn test_291_record_block_bounded_skips_maintenance_when_budget_low() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("pending.jsonl");
+        let store = PendingExceptionStore::new(path.clone());
+
+        // Seed an EXPIRED record directly so maintenance would prune it.
+        let expired = PendingExceptionRecord::new(
+            Utc::now() - Duration::hours(EXPIRY_HOURS * 2),
+            "/repo",
+            "git push --force",
+            "blocked",
+            &redaction_config(),
+            false,
+            None,
+        );
+        let line = serde_json::to_string(&expired).unwrap();
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let no_maintenance = PersistBudget {
+            lock_wait: std::time::Duration::from_millis(40),
+            allow_maintenance: false,
+        };
+        let (_record, maintenance) = store
+            .record_block_bounded(
+                "git reset --hard",
+                "/repo",
+                "blocked",
+                &redaction_config(),
+                false,
+                None,
+                None,
+                no_maintenance,
+            )
+            .expect("record_block_bounded")
+            .expect("uncontended store must issue a record");
+
+        assert!(
+            maintenance.is_empty(),
+            "maintenance must be skipped when the budget is low"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains(&expired.short_code),
+            "expired record must survive (pruning deferred), content: {content}"
+        );
+        assert_eq!(content.lines().count(), 2, "append still happened");
     }
 }
