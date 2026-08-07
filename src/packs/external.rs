@@ -117,6 +117,15 @@ pub struct ExternalDestructivePattern {
     /// Safer command alternatives to suggest when this pattern matches.
     #[serde(default)]
     pub suggestions: Vec<ExternalSuggestion>,
+
+    /// Executables this rule is about (issue #289).
+    ///
+    /// Omit the key (or leave it empty) to keep the rule unscoped. When
+    /// present, the rule only fires on command segments whose resolved argv0
+    /// is one of these names — written lowercase, without a path or a
+    /// `.exe`/`.cmd`/`.bat`/`.com` extension.
+    #[serde(default)]
+    pub executables: Option<Vec<String>>,
 }
 
 /// A safer command suggestion from an external pack file.
@@ -587,6 +596,19 @@ impl ExternalPack {
                     Box::leak(suggestion_vec.into_boxed_slice())
                 };
 
+                // An empty list would scope the rule to nothing, which is a
+                // silently dead rule; treat it as "unscoped" instead.
+                let executables: Option<&'static [&'static str]> = p
+                    .executables
+                    .filter(|names| !names.is_empty())
+                    .map(|names| {
+                        let leaked: Vec<&'static str> = names
+                            .into_iter()
+                            .map(|n| Box::leak(n.into_boxed_str()) as &'static str)
+                            .collect();
+                        Box::leak(leaked.into_boxed_slice()) as &'static [&'static str]
+                    });
+
                 DestructivePattern {
                     regex: LazyCompiledRegex::new(Box::leak(p.pattern.into_boxed_str())),
                     reason,
@@ -594,6 +616,7 @@ impl ExternalPack {
                     severity: p.severity.into(),
                     explanation,
                     suggestions,
+                    executables,
                 }
             })
             .collect();

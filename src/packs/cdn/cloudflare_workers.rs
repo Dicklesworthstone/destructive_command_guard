@@ -2172,6 +2172,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 "Review the fully expanded Wrangler executable and command path before allowing execution. Dynamic shell values and commands beyond the semantic parser's bounds can hide destructive Worker, KV, R2, D1, or deployment operations.",
             ),
             suggestions: &[],
+            executables: None,
         },
         // Worker deletion
         destructive_pattern!(

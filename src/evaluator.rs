@@ -19266,6 +19266,21 @@ fn evaluate_packs_with_allowlists_at_depth(
                 continue;
             };
 
+            // Executable scoping (issue #289). Same rule as the per-segment
+            // pass: a rule declaring `executables` fires only when its match
+            // span starts inside a segment whose resolved argv0 is one of the
+            // declared executables.
+            if let Some(executables) = pattern.executables
+                && !span_starts_in_executable_segment(
+                    span,
+                    command_for_packs,
+                    &segment_ranges,
+                    executables,
+                )
+            {
+                continue;
+            }
+
             // A `>` inside quoted argument data is a literal byte, not a shell
             // redirect operator; skip the `core.filesystem` redirect rules when
             // the operator offset lies inside an inert quoted span (#225). The
@@ -21298,6 +21313,79 @@ fn find_actionable_command_pattern_span(
     }
 }
 
+/// Resolve the executable name a command segment invokes, for `executables=`
+/// rule scoping (issue #289).
+///
+/// Wrapper prefixes (`sudo`, `env`, `command`, leading `VAR=value`
+/// assignments, …) are stripped with the shared normalizer, then the leading
+/// word is reduced to a path basename with any `.exe`/`.cmd`/`.bat`/`.com`
+/// extension removed and lowercased.
+///
+/// Returns `None` when the segment has no leading word, or when that word is
+/// *dynamic* — it contains a shell expansion (`$…`, backtick, `%VAR%`), so the
+/// executable is not statically known. A dynamic argv0 never satisfies an
+/// `executables=` rule; this tranche deliberately adds no new fail-closed
+/// finding for that case.
+fn segment_executable_name(segment: &str) -> Option<String> {
+    let stripped = crate::normalize::strip_wrapper_prefixes(segment);
+    let word = stripped.normalized.split_whitespace().next()?;
+    if word.contains(['$', '`', '%']) {
+        return None;
+    }
+    // Quotes around (or inside) argv0 are removed by the shell before exec:
+    // `"chmod"` and `ch"mod"` both run chmod.
+    let unquoted: String = word.chars().filter(|ch| !matches!(ch, '\'' | '"')).collect();
+    let basename = unquoted
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(unquoted.as_str());
+    if basename.is_empty() {
+        return None;
+    }
+    let lowered = basename.to_ascii_lowercase();
+    for extension in [".exe", ".cmd", ".bat", ".com"] {
+        if let Some(base) = lowered.strip_suffix(extension)
+            && !base.is_empty()
+        {
+            return Some(base.to_string());
+        }
+    }
+    Some(lowered)
+}
+
+/// Whether a segment's resolved argv0 is one of the rule's declared executables.
+fn segment_invokes_executable(segment: &str, executables: &[&str]) -> bool {
+    segment_executable_name(segment).is_some_and(|argv0| {
+        executables
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&argv0))
+    })
+}
+
+/// Whole-command gate for `executables=` rules (issue #289).
+///
+/// Exact rule: the match fires only when its span **starts** inside a segment
+/// whose resolved argv0 is one of the declared executables. A span that starts
+/// outside every known segment (or inside a segment run by some other program)
+/// is not governed by this rule.
+fn span_starts_in_executable_segment(
+    span: MatchSpan,
+    command: &str,
+    segment_ranges: &[(usize, usize)],
+    executables: &[&str],
+) -> bool {
+    if segment_ranges.is_empty() {
+        return segment_invokes_executable(command, executables);
+    }
+    segment_ranges.iter().any(|&(start, end)| {
+        span.start >= start
+            && (span.start < end || start == end)
+            && command
+                .get(start..end)
+                .is_some_and(|segment| segment_invokes_executable(segment, executables))
+    })
+}
+
 fn evaluate_pack_destructive_patterns(
     pack_id: &str,
     pack: &crate::packs::Pack,
@@ -21374,6 +21462,24 @@ fn evaluate_pack_destructive_patterns(
     let decoded_without_source_map = shell_dialect != crate::normalize::ShellDialect::Unknown
         && pattern_command != command_slice;
 
+    // Executable-scoped rules (issue #289). Resolve each top-level segment of
+    // this slice once, in the same coordinate space as `matched_span`
+    // (slice-local + `slice_offset`). Per-segment callers hand us a single
+    // segment, so this collapses to that segment's argv0; whole-command
+    // callers get one entry per segment. Only computed when some rule in the
+    // pack actually declares `executables`, so unscoped packs pay nothing.
+    let executable_segments: Option<Vec<(usize, usize)>> = pack
+        .destructive_patterns
+        .iter()
+        .any(|pattern| pattern.executables.is_some())
+        .then(|| {
+            let mut ranges = command_segment_ranges_in_dialect(command_slice, shell_dialect);
+            if ranges.is_empty() {
+                ranges.push((0, command_slice.len()));
+            }
+            ranges
+        });
+
     for pattern in &pack.destructive_patterns {
         if pattern_filter.is_some_and(|include| !include(pattern.name)) {
             continue;
@@ -21426,6 +21532,36 @@ fn evaluate_pack_destructive_patterns(
             decoded_without_source_map && pattern.regex.is_match(pattern_command);
         if !semantic_branch_match && !decoded_regex_match && matched_span.is_none() {
             continue;
+        }
+
+        // Executable scoping (issue #289). Exact rule: a rule declaring
+        // `executables` fires only when the match span **starts** inside a
+        // segment of this slice whose resolved argv0 is one of those
+        // executables. A match carrying no span (semantic or decoded-view
+        // rules) instead requires *some* segment of this slice to be run by a
+        // declared executable — the coarsest sound reading, since there is no
+        // position to attribute. A dynamic argv0 never satisfies the rule.
+        if let Some(executables) = pattern.executables {
+            let segments = executable_segments.as_deref().unwrap_or(&[]);
+            let governed = match matched_span.as_ref() {
+                Some(span) => span_starts_in_executable_segment(
+                    MatchSpan {
+                        start: span.start.saturating_sub(slice_offset),
+                        end: span.end.saturating_sub(slice_offset),
+                    },
+                    command_slice,
+                    segments,
+                    executables,
+                ),
+                None => segments.iter().any(|&(start, end)| {
+                    command_slice
+                        .get(start..end)
+                        .is_some_and(|segment| segment_invokes_executable(segment, executables))
+                }),
+            };
+            if !governed {
+                continue;
+            }
         }
 
         if matched_span
