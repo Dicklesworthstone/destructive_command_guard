@@ -28,6 +28,44 @@ try {
     [void][System.Management.Automation.Language.Parser]::ParseInput($content, [ref]$null, [ref]$perr)
     Check (($null -eq $perr) -or ($perr.Count -eq 0)) "appended profile parses as valid PowerShell"
 
+    # --- Detection-expression coverage (issue #282) ---
+    # The profile block must recognize every command shape dcg's installers
+    # write, including the PowerShell quoted-invocation form `& '...' [args]`.
+    # $detect mirrors the block's detection lines verbatim; the Contains checks
+    # below pin the shipped block to this copy so they cannot drift apart.
+    $detect = {
+        param([string]$command)
+        $dcgCmd = $command.Trim()
+        if ($dcgCmd -match '^&\s*[''"](.+?)[''"]') { $dcgExe = $Matches[1] }
+        else { $dcgExe = (($dcgCmd -split '\s+')[0]).Trim('"').Trim("'") }
+        ((($dcgExe -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg')
+    }
+    Check ($content.Contains('if ($dcgCmd -match ''^&\s*[''''"](.+?)[''''"]'') { $dcgExe = $Matches[1] }')) "profile block contains quoted-invocation branch"
+    Check ($content.Contains('else { $dcgExe = (($dcgCmd -split ''\s+'')[0]).Trim(''"'').Trim("''") }')) "profile block contains bare-token branch"
+    Check ($content.Contains('if ((($dcgExe -split ''[\\/]'')[-1]) -replace ''\.exe$'','''' -ieq ''dcg'') { $dcgHas = $true }')) "profile block contains leaf comparison"
+
+    foreach ($case in @(
+        "& 'C:\Users\x\.local\bin\dcg.exe' hook",
+        "& 'C:\Users\x\.local\bin\dcg.exe'",
+        '& "C:\Users\x\.local\bin\dcg.exe" hook',
+        'C:\Users\x\.local\bin\dcg.exe',
+        '/home/u/.local/bin/dcg',
+        '"/home/u/.local/bin/dcg"',
+        'dcg',
+        'dcg.exe',
+        'DCG.EXE'
+    )) {
+        Check (& $detect $case) "detects dcg hook command: $case"
+    }
+    foreach ($case in @(
+        "& 'C:\tools\other.exe' hook",
+        'notdcg.exe',
+        '/usr/bin/notdcg',
+        ''
+    )) {
+        Check (-not (& $detect $case)) "rejects non-dcg command: $case"
+    }
+
     $s2 = Add-DcgProfileCheck -ProfilePath $profilePath
     Check ($s2 -eq 'already') "second run returns 'already' (got '$s2')"
 
