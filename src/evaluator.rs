@@ -1395,6 +1395,10 @@ pub fn evaluate_detailed_with_allowlists(
     let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
     let heredoc_settings = config.heredoc_settings();
     let compiled_overrides = config.overrides.compile();
+    // Scope this config's rule-scoped target exemptions (#284) to the
+    // evaluation below, so a library caller passing a `Config` in hand is
+    // served the same as the hook.
+    let _rule_target_scope = crate::config::RuleTargetExemptionScope::install(config);
 
     // Get normalized command for diagnostics
     let stripped = strip_wrapper_prefixes(command);
@@ -11144,6 +11148,8 @@ pub fn evaluate_command_with_deadline(
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
     let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
     let heredoc_settings = config.heredoc_settings();
+    // Rule-scoped target exemptions (#284) come from this caller's config.
+    let _rule_target_scope = crate::config::RuleTargetExemptionScope::install(config);
     evaluate_command_with_pack_order_deadline(
         command,
         enabled_keywords,
@@ -11432,6 +11438,35 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     if crate::allowlist::is_dcg_self_inspection_call(command) {
         return EvaluationResult::allowed();
     }
+
+    // Step 2b: Segment-level self-inspection masking (dcg#289 C2).
+    //
+    // Step 2 exempts a command that is *entirely* a dcg diagnostic. A compound
+    // command that merely *contains* one (`for c in a b; do dcg test rm -rf /;
+    // done`, `dcg explain <cmd> && echo ok`) fell through to ordinary
+    // evaluation, and the inert candidate text inside the diagnostic tripped
+    // packs — the report the user was trying to read became the block (#287,
+    // #288). Here the diagnostic segment's text is blanked (length-preserving,
+    // same masking style as `sanitize_for_pattern_matching`) so the remaining
+    // segments still evaluate against real text at unchanged offsets.
+    //
+    // Placement: this runs *before* heredoc scanning, semantic-pack force
+    // flags, sanitizing, and both pack passes, so every downstream layer —
+    // including the bounded fallback paths that forget the other maskers
+    // (#289 §4) — inherits the mask for free instead of each call site having
+    // to remember it. Step 1's config block overrides deliberately stay ahead
+    // of it: an explicit user block still wins on the raw text.
+    //
+    // Depth cap: top-level segmentation only. Recursive evaluation of heredoc
+    // bodies, launcher payloads, and substitutions passes a deeper depth and
+    // does not get this exemption; a dcg diagnostic that really is the whole
+    // body still hits the Step 2 whole-command exemption on its own.
+    let dcg_masked = if nested_command_depth == 0 {
+        mask_dcg_self_inspection_segments(command)
+    } else {
+        Cow::Borrowed(command)
+    };
+    let command: &str = dcg_masked.as_ref();
 
     // A standalone PowerShell string or script-block literal is an expression
     // value, not an invocation. This distinction is especially important for
@@ -11990,6 +12025,126 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     }
 
     result
+}
+
+/// Shell reserved words that may precede the command word inside a compound
+/// construct's segment (dcg#289 C2).
+///
+/// `split_command_segments` splits on operators only, so the body of a loop or
+/// conditional arrives as `do dcg test …` / `then dcg explain …`. These words
+/// are reserved in the grammar — bash cannot execute a program named `do` in
+/// that position — so skipping them cannot let a real executable be mistaken
+/// for dcg. The keyword itself is left unmasked so constructs that reason
+/// about loop/branch shape still see it.
+const SEGMENT_LEADING_SHELL_KEYWORDS: &[&str] =
+    &["do", "then", "else", "elif", "if", "while", "until", "{"];
+
+/// Upper bound on stacked reserved words before a command word (`then { dcg …`).
+const MAX_SEGMENT_LEADING_KEYWORDS: usize = 4;
+
+/// Blank out the text of every top-level segment that is itself a dcg
+/// self-inspection call (dcg#289 C2).
+///
+/// Masking is length-preserving (spaces, matching
+/// [`crate::context::sanitize_for_pattern_matching`]) so every match span,
+/// highlight offset, and per-segment range computed downstream stays valid.
+///
+/// Three restrictions keep this an exemption and not a bypass:
+///
+/// 1. **Whole-segment match only.** The segment (after any leading reserved
+///    word) must satisfy [`crate::allowlist::is_dcg_self_inspection_segment`],
+///    which requires a dcg executable, a diagnostic subcommand, and no
+///    redirect, substitution, backtick, or subshell anywhere inside it.
+/// 2. **Top-level only.** Segments that `split_command_segments` emitted from
+///    inside a command/process substitution are contained in an enclosing
+///    segment's range and are skipped, so `x=$(dcg test 'rm -rf /')` is left
+///    entirely alone; the substitution body reaches the Step 2 whole-command
+///    exemption on its own when it is recursively evaluated.
+/// 3. **Never inside a pipeline.** `dcg test <cmd> | sh` feeds the diagnostic's
+///    output to an executing consumer; masking the left side would hide that
+///    from the pipeline-consumer rules, so a segment adjacent to a `|` (but not
+///    `||`) is not masked.
+fn mask_dcg_self_inspection_segments(command: &str) -> Cow<'_, str> {
+    // Cheap gate: skip the split work unless the binary name appears.
+    if !command.contains("dcg") && !command.contains("destructive_command_guard") {
+        return Cow::Borrowed(command);
+    }
+
+    let ranges = command_segment_ranges(command);
+    if ranges.len() < 2 {
+        // A single segment is either the whole-command exemption (already
+        // handled) or not a diagnostic at all.
+        return Cow::Borrowed(command);
+    }
+
+    let mut masked: Option<String> = None;
+    for (index, &(start, end)) in ranges.iter().enumerate() {
+        // Restriction 2: skip segments nested inside another segment's range.
+        if ranges
+            .iter()
+            .enumerate()
+            .any(|(other, &(other_start, other_end))| {
+                other != index && other_start <= start && end <= other_end
+            })
+        {
+            continue;
+        }
+        // Restriction 3: never mask a member of a pipeline.
+        if segment_is_pipeline_member(command, start, end) {
+            continue;
+        }
+        // Restriction 1: whole-segment dcg diagnostic.
+        let Some(offset) = dcg_inspection_offset_in_segment(&command[start..end]) else {
+            continue;
+        };
+        let mask_start = start + offset;
+        let buffer = masked.get_or_insert_with(|| command.to_string());
+        buffer.replace_range(mask_start..end, &" ".repeat(end - mask_start));
+    }
+
+    masked.map_or(Cow::Borrowed(command), Cow::Owned)
+}
+
+/// Returns the byte offset within `segment` at which a dcg self-inspection call
+/// starts, skipping any leading shell reserved words, or `None` when the
+/// segment is not one.
+fn dcg_inspection_offset_in_segment(segment: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for _ in 0..=MAX_SEGMENT_LEADING_KEYWORDS {
+        let rest = &segment[offset..];
+        if crate::allowlist::is_dcg_self_inspection_segment(rest) {
+            return Some(offset);
+        }
+        let leading_space = rest.len() - rest.trim_start().len();
+        let trimmed = &rest[leading_space..];
+        let word_end = trimmed.find(char::is_whitespace)?;
+        if !SEGMENT_LEADING_SHELL_KEYWORDS.contains(&&trimmed[..word_end]) {
+            return None;
+        }
+        offset += leading_space + word_end;
+    }
+    None
+}
+
+/// Returns `true` when the segment at `start..end` is on either side of a `|`
+/// pipe (as opposed to a `||` logical-or), i.e. its output feeds — or its input
+/// comes from — another executing command.
+fn segment_is_pipeline_member(command: &str, start: usize, end: usize) -> bool {
+    let bytes = command.as_bytes();
+
+    let mut after = end;
+    while bytes.get(after).is_some_and(u8::is_ascii_whitespace) {
+        after += 1;
+    }
+    if bytes.get(after) == Some(&b'|') && bytes.get(after + 1) != Some(&b'|') {
+        return true;
+    }
+
+    let mut before = start;
+    while before > 0 && bytes[before - 1].is_ascii_whitespace() {
+        before -= 1;
+    }
+    before > 0 && bytes[before - 1] == b'|' && (before < 2 || bytes[before - 2] != b'|')
 }
 
 const MAX_INDIRECT_INPUT_BYTES: u64 = 256 * 1024;
@@ -18896,6 +19051,16 @@ fn evaluate_packs_with_allowlists_at_depth(
                 continue;
             }
 
+            // The rule matched a real redirect operator. Its target is now
+            // known, so apply the rule-scoped target exemption (#284). Only
+            // this rule stands down; every other pattern still sees the whole
+            // command.
+            if is_core_filesystem_redirect_rule(pack_id, pattern.name)
+                && redirect_rule_target_exempted(pattern.name, command_for_packs, shell_dialect)
+            {
+                continue;
+            }
+
             // Non-filesystem packs already checked each segment above, so skip
             // duplicate full-command matches that sit wholly inside one segment.
             // core.filesystem uses its specialized rm parser instead of that
@@ -20345,6 +20510,85 @@ fn first_unquoted_output_redirect(command: &str, dialect: ShellDialect) -> Optio
     None
 }
 
+/// Collect every unquoted output-redirect target in `command` as written.
+///
+/// Returns `None` unless the command's redirect targets can all be read as
+/// plain path tokens. File-descriptor duplications (`2>&1`, `>&2`) are skipped:
+/// they name a descriptor, not a file. Anything else that is not a bare token —
+/// a quoted target, an empty target, `>&file` — disqualifies the whole command.
+///
+/// The all-or-nothing shape is deliberate. A target exemption must never let a
+/// second redirect in the same command ride along, so `> ~/scratch/log >
+/// /etc/passwd` yields both targets and the caller requires both to be exempt.
+fn unquoted_output_redirect_targets(command: &str, dialect: ShellDialect) -> Option<Vec<String>> {
+    let mut targets: Vec<String> = Vec::new();
+    let mut rest = command;
+    while let Some(index) = first_unquoted_output_redirect(rest, dialect) {
+        let after = rest.get(index + 1..)?;
+        // `>>` (append) and `>|` (force clobber) extend the operator itself.
+        let after = after.strip_prefix('>').unwrap_or(after);
+        let after = after.strip_prefix('|').unwrap_or(after);
+        let trimmed = after.trim_start_matches([' ', '\t']);
+        if let Some(dup) = trimmed.strip_prefix('&') {
+            let digits = dup.chars().take_while(char::is_ascii_digit).count();
+            if digits == 0 {
+                return None;
+            }
+            rest = &dup[digits..];
+            continue;
+        }
+        let end = trimmed
+            .find(|c: char| c.is_ascii_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>'))
+            .unwrap_or(trimmed.len());
+        let token = &trimmed[..end];
+        if token.is_empty() {
+            return None;
+        }
+        targets.push(token.to_string());
+        rest = &trimmed[end..];
+    }
+    (!targets.is_empty()).then_some(targets)
+}
+
+/// Whether a matched `core.filesystem` redirect rule is suppressed by a
+/// configured `[rules."core.filesystem:<name>"] exempt_target_globs` (#284).
+///
+/// `redirect-truncate-dynamic-path` never participates: that rule exists
+/// precisely because the runtime target cannot be proven, and a glob over an
+/// unprovable path would be a bypass rather than an exemption.
+fn redirect_rule_target_exempted(
+    pattern_name: Option<&str>,
+    command: &str,
+    dialect: ShellDialect,
+) -> bool {
+    let Some(name) = pattern_name else {
+        return false;
+    };
+    if name == "redirect-truncate-dynamic-path" {
+        return false;
+    }
+    let rule_id = format!("core.filesystem:{name}");
+    if !crate::config::rule_has_target_exemptions(&rule_id) {
+        return false;
+    }
+    let Some(targets) = unquoted_output_redirect_targets(command, dialect) else {
+        return false;
+    };
+    let matched: Option<Vec<(String, String)>> = targets
+        .into_iter()
+        .map(|target| {
+            crate::config::rule_target_exemption(&rule_id, &target).map(|glob| (target, glob))
+        })
+        .collect();
+    let Some(matched) = matched else {
+        return false;
+    };
+    for (target, glob) in &matched {
+        crate::config::note_rule_target_suppression(&rule_id, glob, target);
+    }
+    true
+}
+
 fn output_redirect_operator_start(command: &str, redirect: usize) -> usize {
     let bytes = command.as_bytes();
     let mut start = redirect;
@@ -20981,6 +21225,12 @@ fn evaluate_pack_destructive_patterns(
                 if crate::context::offset_is_quoted_data(pattern_command, raw_start) {
                     continue;
                 }
+            }
+            // Rule-scoped target exemption (#284): the redirect target is
+            // resolvable here, so a configured glob stands this rule down
+            // without touching any other rule's view of the command.
+            if redirect_rule_target_exempted(pattern.name, redirect_syntax_command, shell_dialect) {
+                continue;
             }
         }
 
@@ -32961,5 +33211,194 @@ mod tests {
             substitute_posix_variable("mv $foo d/", "f", "a"),
             "mv $foo d/"
         );
+    }
+
+    // ========================================================================
+    // #289 C2: segment-level dcg self-inspection masking
+    // ========================================================================
+
+    /// Default-ish pack set for the wrapped-diagnostic tests.
+    const ISSUE_289_PACKS: &[&str] = &["core.filesystem", "core.git", "system.disk", "heredoc"];
+
+    fn evaluate_issue_289(command: &str) -> EvaluationResult {
+        evaluate_with_pack_ids_in_dialect(command, ISSUE_289_PACKS, ShellDialect::Posix)
+    }
+
+    #[test]
+    fn issue_289_c2_masks_only_the_diagnostic_segment() {
+        let command = "dcg test rm -rf / && echo ok";
+        let masked = mask_dcg_self_inspection_segments(command);
+        // Length-preserving: every downstream span stays valid.
+        assert_eq!(masked.len(), command.len());
+        // Only the diagnostic segment is blanked.
+        assert_eq!(masked.trim(), "&& echo ok");
+    }
+
+    #[test]
+    fn issue_289_c2_keeps_leading_shell_keyword_visible() {
+        let command = "for c in a b; do dcg test rm -rf /; done";
+        let masked = mask_dcg_self_inspection_segments(command);
+        assert_eq!(masked.len(), command.len());
+        assert!(masked.starts_with("for c in a b; do "), "masked: {masked}");
+        assert!(masked.ends_with("; done"), "masked: {masked}");
+        assert!(!masked.contains("dcg"), "masked: {masked}");
+        assert!(!masked.contains("rm"), "masked: {masked}");
+    }
+
+    #[test]
+    fn issue_289_c2_wrapped_diagnostic_calls_are_allowed() {
+        for command in [
+            "dcg test rm -rf / && echo ok",
+            "dcg explain shred -u secrets.txt && echo ok",
+            "for c in a b; do dcg test rm -rf /; done",
+            "if dcg test rm -rf /; then echo ok; fi",
+            "while dcg test rm -rf /; do echo ok; done",
+            "dcg test rm -rf / & echo ok",
+            "dcg test rm -rf /; dcg explain shred -u x",
+            "/usr/local/bin/dcg test rm -rf / && echo ok",
+        ] {
+            assert_eq!(
+                evaluate_issue_289(command).decision,
+                EvaluationDecision::Allow,
+                "wrapped dcg diagnostic must not be blocked by its own argument: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_289_c2_non_diagnostic_segments_still_evaluate() {
+        // Planted negative: the git segment is real and must still deny.
+        let result = evaluate_issue_289("dcg test rm -rf /x && git reset --hard");
+        assert_eq!(result.decision, EvaluationDecision::Deny);
+        assert_eq!(
+            result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pack_id.clone()),
+            Some("core.git".to_string())
+        );
+    }
+
+    #[test]
+    fn issue_289_c2_requires_dcg_in_executable_position() {
+        for command in [
+            // dcg is an argument, not the executable.
+            "foo dcg test rm -rf / && echo ok",
+            // Lookalike binary names.
+            "mydcg test rm -rf / && echo ok",
+            "dcgwrapper test rm -rf / && echo ok",
+            // Not a diagnostic subcommand.
+            "dcg testfoo rm -rf / && echo ok",
+            "dcg hook rm -rf / && echo ok",
+            // Wrapper prefixes are not peeled (same contract as the
+            // whole-command exemption).
+            "sudo dcg test rm -rf / && echo ok",
+        ] {
+            assert_eq!(
+                evaluate_issue_289(command).decision,
+                EvaluationDecision::Deny,
+                "must stay evaluated as ordinary shell: {command}"
+            );
+            assert_eq!(
+                mask_dcg_self_inspection_segments(command).as_ref(),
+                command,
+                "must not be masked: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_289_c2_pipelines_are_never_masked() {
+        // The diagnostic's output feeds an executing consumer; masking the
+        // left-hand side would hide that from the pipeline rules.
+        for command in ["dcg test rm -rf / | sh", "cat cmd | dcg test rm -rf /"] {
+            assert_eq!(
+                mask_dcg_self_inspection_segments(command).as_ref(),
+                command,
+                "pipeline member must not be masked: {command}"
+            );
+            assert_eq!(
+                evaluate_issue_289(command).decision,
+                EvaluationDecision::Deny,
+                "pipeline member must stay evaluated: {command}"
+            );
+        }
+        // `||` is a logical or, not a pipe, and is masked normally.
+        assert_eq!(
+            mask_dcg_self_inspection_segments("dcg test rm -rf / || echo ok").trim(),
+            "|| echo ok"
+        );
+    }
+
+    #[test]
+    fn issue_289_c2_redirects_and_substitutions_refuse_the_exemption() {
+        for command in [
+            // Redirect target could be clobbered by the diagnostic's output.
+            "dcg test rm -rf / > /etc/passwd && echo ok",
+            // A double-quoted substitution tokenizes as inert argument data but
+            // the shell still executes it: masking the segment would erase a
+            // real command.
+            "dcg test \"$(rm -rf /)\" && echo ok",
+            "dcg explain \"`rm -rf /`\" && echo ok",
+        ] {
+            assert_eq!(
+                mask_dcg_self_inspection_segments(command).as_ref(),
+                command,
+                "must not be masked: {command}"
+            );
+            assert_eq!(
+                evaluate_issue_289(command).decision,
+                EvaluationDecision::Deny,
+                "must stay evaluated: {command}"
+            );
+        }
+
+        // Command substitutions are left alone entirely (restriction 2): the
+        // enclosing segment is an assignment carrying a substitution, and the
+        // substituted body is evaluated on its own recursive pass. Verified
+        // behavior is fail-closed — the exemption does not reach in there.
+        let command = "x=$(dcg test rm -rf /)";
+        assert_eq!(
+            mask_dcg_self_inspection_segments(command).as_ref(),
+            command,
+            "substitutions are outside the top-level masking pass"
+        );
+        assert_eq!(
+            evaluate_issue_289(command).decision,
+            EvaluationDecision::Deny
+        );
+    }
+
+    #[test]
+    fn issue_289_c2_whole_command_exemption_is_unchanged() {
+        // Single-segment diagnostics never reach the masker; Step 2 handles
+        // them and the masker leaves them byte-identical.
+        let command = "dcg test rm -rf /";
+        assert_eq!(mask_dcg_self_inspection_segments(command).as_ref(), command);
+        assert_eq!(
+            evaluate_issue_289(command).decision,
+            EvaluationDecision::Allow
+        );
+    }
+
+    #[test]
+    fn issue_289_c2_commands_without_dcg_are_borrowed_unchanged() {
+        let command = "git reset --hard && rm -rf /";
+        assert!(matches!(
+            mask_dcg_self_inspection_segments(command),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn issue_289_c2_pipeline_member_detection() {
+        // "a | b": the left segment ends before a bare pipe.
+        assert!(segment_is_pipeline_member("a | b", 0, 1));
+        assert!(segment_is_pipeline_member("a | b", 4, 5));
+        assert!(segment_is_pipeline_member("a |& b", 0, 1));
+        // "||" is a logical or on both sides.
+        assert!(!segment_is_pipeline_member("a || b", 0, 1));
+        assert!(!segment_is_pipeline_member("a || b", 5, 6));
+        assert!(!segment_is_pipeline_member("a && b", 0, 1));
     }
 }

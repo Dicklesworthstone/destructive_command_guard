@@ -688,6 +688,43 @@ pub fn is_dcg_self_inspection_call(command: &str) -> bool {
             .all(|segment| segment_is_dcg_inspection_call(segment))
 }
 
+/// Segment-scoped form of [`is_dcg_self_inspection_call`] (dcg#289).
+///
+/// [`is_dcg_self_inspection_call`] answers "is this *whole command* a dcg
+/// diagnostic?"; this answers the same question for one already shell-split
+/// segment, so a compound command can exempt the diagnostic segment alone
+/// while every other segment is still evaluated normally (see
+/// `evaluator::mask_dcg_self_inspection_segments`).
+///
+/// The safety contract is unchanged and comes from the same
+/// [`parse_simple_command_argv`] gate: the segment's executable must be dcg,
+/// the first non-flag token must be a diagnostic subcommand, and any
+/// redirection, command/process substitution, backtick, or subshell inside the
+/// segment refuses the answer.
+///
+/// One guard is *stricter* here than in the whole-command form. A double-quoted
+/// substitution (`dcg test "$(rm -rf /)"`) tokenizes as inert argument data,
+/// and [`is_dcg_self_inspection_call`] can rely on the splitter emitting the
+/// substituted command as a separate segment that fails its all-segments test.
+/// A segment-scoped caller has no such backstop — masking that segment would
+/// erase a command the shell really does execute — so any substitution or
+/// backtick anywhere in the segment, quoted or not, refuses the answer.
+#[must_use]
+pub fn is_dcg_self_inspection_segment(segment: &str) -> bool {
+    // Cheap gate: skip the tokenize work unless the binary name appears.
+    if !segment.contains("dcg") && !segment.contains("destructive_command_guard") {
+        return false;
+    }
+    if segment.contains("$(")
+        || segment.contains('`')
+        || segment.contains("<(")
+        || segment.contains(">(")
+    {
+        return false;
+    }
+    segment_is_dcg_inspection_call(segment)
+}
+
 /// Returns `true` when a single (already shell-split) segment is a bare
 /// `dcg <test|explain|classify> ...` invocation with no redirection.
 fn segment_is_dcg_inspection_call(segment: &str) -> bool {
@@ -3378,5 +3415,37 @@ mod tests {
         assert!(!is_dcg_self_inspection_call(
             "dcg test \"rm -rf /\" && dcg install"
         ));
+    }
+
+    #[test]
+    fn issue_289_dcg_self_inspection_segment_matches_a_single_segment() {
+        assert!(is_dcg_self_inspection_segment("dcg test rm -rf /"));
+        assert!(is_dcg_self_inspection_segment("dcg explain \"rm -rf /\""));
+        assert!(is_dcg_self_inspection_segment(
+            "/usr/local/bin/dcg --robot classify 'rm -rf /'"
+        ));
+        // Leading whitespace is ordinary word separation.
+        assert!(is_dcg_self_inspection_segment("  dcg test rm -rf /"));
+    }
+
+    #[test]
+    fn issue_289_dcg_self_inspection_segment_keeps_the_whole_command_guards() {
+        // Not dcg in executable position.
+        assert!(!is_dcg_self_inspection_segment("foo dcg test rm -rf /"));
+        assert!(!is_dcg_self_inspection_segment("mydcg test rm -rf /"));
+        assert!(!is_dcg_self_inspection_segment("sudo dcg test rm -rf /"));
+        // Not a diagnostic subcommand.
+        assert!(!is_dcg_self_inspection_segment("dcg hook rm -rf /"));
+        assert!(!is_dcg_self_inspection_segment("dcg testfoo rm -rf /"));
+        // Substitutions, backticks, subshells, and redirects refuse it.
+        assert!(!is_dcg_self_inspection_segment("dcg test \"$(rm -rf /)\""));
+        assert!(!is_dcg_self_inspection_segment(
+            "dcg explain \"`rm -rf /`\""
+        ));
+        assert!(!is_dcg_self_inspection_segment("dcg test <(rm -rf /)"));
+        assert!(!is_dcg_self_inspection_segment("dcg test x > /etc/passwd"));
+        // Shell reserved words are the caller's problem, not this predicate's.
+        assert!(!is_dcg_self_inspection_segment("do dcg test rm -rf /"));
+        assert!(!is_dcg_self_inspection_segment(""));
     }
 }

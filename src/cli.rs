@@ -986,6 +986,20 @@ pub struct TestOutput {
     /// Detected agent information
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentInfo>,
+    /// Dialect-divergence metadata (#289): present only when the command was
+    /// evaluated under the default all-dialect (`unknown`) analysis and that
+    /// analysis denied it. Additive field — absent means "not checked".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dialect_divergence: Option<DialectDivergence>,
+}
+
+/// Whether the posix dialect alone — the dialect the live Bash hook uses —
+/// would allow a command the all-dialect analysis denied (#289).
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct DialectDivergence {
+    /// `true` when posix alone allows: the denial is a diagnostics-only
+    /// verdict that the Bash hook would never produce.
+    pub posix_would_allow: bool,
 }
 
 /// Allowlist override information in test output
@@ -4138,6 +4152,95 @@ fn read_test_command_from_stdin(max_command_bytes: usize) -> std::io::Result<Str
     Ok(command)
 }
 
+/// Re-evaluate a blocked command under the posix dialect to detect a
+/// diagnostics-only denial (#289 C1).
+///
+/// `dcg test` / `dcg explain` default to [`ShellDialect::Unknown`], which is a
+/// fail-closed union over every dialect. The live Bash hook resolves a single
+/// dialect — posix — from the tool name, so a denial that only the union
+/// produces is a decision no Bash hook would ever make. Users filed false
+/// positives against that gap (#273) and could not reproduce real hook blocks.
+///
+/// Returns `Some` only when there is something to report — the defaulted
+/// dialect denied and posix alone allows. `None` covers "check did not apply"
+/// (allowed command, caller-chosen dialect) and "checked, no divergence"
+/// alike, which keeps the JSON payload free of a field that says nothing.
+/// Cost: exactly one extra evaluation, and only on the deny path of a
+/// defaulted dialect.
+#[allow(clippy::too_many_arguments)]
+fn cli_dialect_divergence(
+    dialect: DialectArg,
+    decision: EvaluationDecision,
+    command: &str,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &crate::allowlist::LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    project_path: Option<&std::path::Path>,
+) -> Option<DialectDivergence> {
+    // `--dialect unknown` is the same analysis as the default, so the note is
+    // equally true there; any other explicit dialect is the user's own choice
+    // and must be reported as-is.
+    if dialect != DialectArg::Unknown {
+        return None;
+    }
+    // Only a blocking decision can diverge in the direction that matters (a
+    // denial the hook would not produce). Indeterminate results are budget
+    // artifacts, not dialect disagreements.
+    if decision != EvaluationDecision::Deny {
+        return None;
+    }
+
+    let posix = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+        command,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        None, // allow_once_audit
+        project_path,
+        None, // deadline
+        crate::normalize::ShellDialect::Posix,
+    );
+
+    (posix.decision == EvaluationDecision::Allow).then_some(DialectDivergence {
+        posix_would_allow: true,
+    })
+}
+
+/// Build the human-readable dialect-divergence note (#289 C1).
+///
+/// Returns `None` unless the all-dialect analysis denied a command that posix
+/// alone would allow.
+fn dialect_divergence_note(divergence: Option<DialectDivergence>, command: &str) -> Option<String> {
+    if !divergence.is_some_and(|d| d.posix_would_allow) {
+        return None;
+    }
+    Some(format!(
+        "Note: this denial comes from the all-dialect analysis (the CLI default, --dialect unknown).\n\
+         \x20     The Bash hook (posix dialect) would ALLOW this command.\n\
+         \x20     Reproduce the hook's decision with: dcg test --dialect posix {}",
+        single_quote_for_shell(command)
+    ))
+}
+
+/// Print the dialect-divergence note when one applies (#289 C1).
+fn print_dialect_divergence_note(divergence: Option<DialectDivergence>, command: &str) {
+    if let Some(note) = dialect_divergence_note(divergence, command) {
+        println!();
+        println!("{note}");
+    }
+}
+
+/// Wrap `command` in single quotes for a copy-pasteable POSIX shell example.
+fn single_quote_for_shell(command: &str) -> String {
+    format!("'{}'", command.replace('\'', r"'\''"))
+}
+
 /// Test a command against the configured packs using the shared evaluator.
 ///
 /// This ensures parity with hook mode by using the same evaluation logic:
@@ -4312,6 +4415,22 @@ fn test_command(
         return policy_blocks_cli_execution(result.decision, resolved_mode);
     }
 
+    // #289 C1: a denial under the defaulted all-dialect analysis may be one the
+    // Bash hook (posix only) would never produce. Computed after the quiet
+    // early-return so the extra evaluation is only paid for when it is reported.
+    let dialect_divergence = cli_dialect_divergence(
+        dialect,
+        result.decision,
+        command,
+        &enabled_keywords,
+        &ordered_packs,
+        keyword_index.as_ref(),
+        &compiled_overrides,
+        &allowlists,
+        &heredoc_settings,
+        project_path.as_deref(),
+    );
+
     // Handle structured output (JSON/TOON)
     if format.is_structured() {
         let output = match result.decision {
@@ -4341,6 +4460,7 @@ fn test_command(
                     severity: None,
                     allowlist,
                     agent: Some(agent_info.clone()),
+                    dialect_divergence,
                 }
             }
             EvaluationDecision::Deny => {
@@ -4409,6 +4529,7 @@ fn test_command(
                     severity,
                     allowlist: None,
                     agent: Some(agent_info.clone()),
+                    dialect_divergence,
                 }
             }
             EvaluationDecision::Indeterminate => TestOutput {
@@ -4431,6 +4552,7 @@ fn test_command(
                 severity: None,
                 allowlist: None,
                 agent: Some(agent_info.clone()),
+                dialect_divergence,
             },
         };
         match format {
@@ -4749,6 +4871,12 @@ fn test_command(
             println!("Result: INDETERMINATE (BLOCKED)");
             println!("Reason: {INDETERMINATE_REASON}");
         }
+    }
+
+    // #289 C1: point the user at the dialect the live Bash hook actually uses
+    // when the all-dialect union is the only thing producing this denial.
+    if !interactive_allowed {
+        print_dialect_divergence_note(dialect_divergence, command);
     }
 
     if verbosity.is_verbose() {
@@ -7111,6 +7239,22 @@ fn handle_explain(
     );
     collector.set_budget_skip(result.skipped_due_to_budget);
 
+    // #289 C1: same divergence check as `dcg test` — an explain trace that
+    // blames the all-dialect union must say so, or the reader will chase a
+    // denial the Bash hook never makes.
+    let dialect_divergence = cli_dialect_divergence(
+        dialect,
+        result.decision,
+        command,
+        &enabled_keywords,
+        &ordered_packs,
+        keyword_index.as_ref(),
+        &compiled_overrides,
+        &allowlists,
+        &heredoc_settings,
+        None, // project_path: matches the evaluation above
+    );
+
     // Add match info if present
     if let Some(ref pattern) = result.pattern_info {
         let rule_id = pattern
@@ -7135,6 +7279,10 @@ fn handle_explain(
     // Finish and get trace
     let trace = collector.finish(result.decision);
 
+    // A rule that matched but was stood down by a configured target exemption
+    // is an allow that came from configuration, so explain must say so (#284).
+    let target_suppressions = crate::config::take_rule_target_suppressions();
+
     // Format and print based on selected format
     match format {
         ExplainFormat::Pretty => {
@@ -7150,16 +7298,36 @@ fn handle_explain(
             {
                 print_explain_pretty_plain(&trace);
             }
+            print_dialect_divergence_note(dialect_divergence, command);
+            print_rule_target_suppression_notes(&target_suppressions);
         }
         ExplainFormat::Compact => {
             println!("{}", trace.format_compact(None));
+            print_dialect_divergence_note(dialect_divergence, command);
+            print_rule_target_suppression_notes(&target_suppressions);
         }
         ExplainFormat::Json => {
-            let json_output = trace.to_json_output();
+            let mut json_output = trace.to_json_output();
+            json_output.dialect_divergence = dialect_divergence;
             let json = serde_json::to_string_pretty(&json_output)
                 .unwrap_or_else(|e| format!("{{\"error\": \"JSON serialization failed: {e}\"}}"));
             println!("{json}");
         }
+    }
+}
+
+/// Report rules that matched but were stood down by a configured target
+/// exemption (#284).
+///
+/// The decision trace records what *decided* the command; this note records
+/// what *stopped deciding* it, so an allow is never silent about the config
+/// that produced it.
+fn print_rule_target_suppression_notes(suppressions: &[crate::config::RuleTargetSuppression]) {
+    for suppression in suppressions {
+        println!(
+            "Note: rule {} matched but target \"{}\" was exempted by [rules.\"{}\"] exempt_target_globs entry \"{}\"",
+            suppression.rule_id, suppression.target, suppression.rule_id, suppression.glob
+        );
     }
 }
 
@@ -9920,6 +10088,16 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             }
             println!("  → Fix the regex patterns in the trusted config source");
         }
+        if !config_diag.rule_target_exemption_warnings.is_empty() {
+            println!("  Inert rule target exemptions:");
+            for warning in &config_diag.rule_target_exemption_warnings {
+                println!("    - {warning}");
+            }
+            println!(
+                "  → See the \"Per-rule target-path exemptions\" section of the README \
+                 for the supported rules"
+            );
+        }
     } else {
         println!(
             "{} ({} file source{})",
@@ -10395,6 +10573,7 @@ fn collect_doctor_report(
                 config_diag.invalid_override_patterns.len()
             ));
         }
+        details.extend(config_diag.rule_target_exemption_warnings.iter().cloned());
         (
             DoctorCheckStatus::Warning,
             format!(
@@ -12870,6 +13049,8 @@ struct ConfigDiagnostics {
     unknown_packs: Vec<String>,
     /// Override patterns that failed to compile
     invalid_override_patterns: Vec<(String, String)>, // (pattern, error)
+    /// `[rules]` target exemptions that will not take effect (#284)
+    rule_target_exemption_warnings: Vec<String>,
 }
 
 impl ConfigDiagnostics {
@@ -12881,6 +13062,7 @@ impl ConfigDiagnostics {
         !self.source_warnings.is_empty()
             || !self.unknown_packs.is_empty()
             || !self.invalid_override_patterns.is_empty()
+            || !self.rule_target_exemption_warnings.is_empty()
     }
 }
 
@@ -12949,6 +13131,11 @@ fn validate_config_diagnostics(
         diag.invalid_override_patterns
             .push((ip.pattern.clone(), ip.error.clone()));
     }
+
+    // A `[rules]` target exemption on an unsupported rule, or with an unusable
+    // glob, is silently inert: the user keeps getting the denial they tried to
+    // carve out. Surface it rather than leaving them unserved (#284).
+    diag.rule_target_exemption_warnings = config.rule_target_exemption_warnings();
 
     diag
 }
@@ -18639,6 +18826,7 @@ exclude = ["target/**"]
                 trust_level: "medium".to_string(),
                 detection_method: "none".to_string(),
             }),
+            dialect_divergence: None,
         };
 
         let json = serde_json::to_value(&payload).expect("serialize payload to json");
@@ -20130,5 +20318,112 @@ exclude = ["target/**"]
             .filter_map(Result::ok)
             .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
         assert!(!leftover_tmp, "no temp file should be left behind");
+    }
+
+    // ========================================================================
+    // #289 C1: dialect-divergence hint for `dcg test` / `dcg explain`
+    // ========================================================================
+
+    /// Evaluate `command` the way the CLI does, then run the #289 C1
+    /// divergence check against that decision.
+    fn divergence_for(
+        command: &str,
+        dialect: DialectArg,
+        extra_packs: &[&str],
+    ) -> Option<DialectDivergence> {
+        let mut config = Config::default();
+        config
+            .packs
+            .enabled
+            .extend(extra_packs.iter().map(|id| (*id).to_string()));
+        let compiled_overrides = config.overrides.compile();
+        let allowlists = crate::allowlist::LayeredAllowlist::default();
+        let heredoc_settings = config.heredoc_settings();
+        let enabled_packs = config.enabled_pack_ids();
+        let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+        let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+        let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
+
+        let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            command,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled_overrides,
+            &allowlists,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+            dialect.into(),
+        );
+
+        cli_dialect_divergence(
+            dialect,
+            result.decision,
+            command,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled_overrides,
+            &allowlists,
+            &heredoc_settings,
+            None,
+        )
+    }
+
+    #[test]
+    fn issue_289_c1_unknown_dialect_denial_that_posix_allows_reports_divergence() {
+        // `rd /s /q` is Cmd syntax: only the all-dialect union denies it.
+        let command = r"rd /s /q C:\x";
+        let divergence = divergence_for(command, DialectArg::Unknown, &["windows.filesystem"])
+            .expect("deny under the default dialect must run the posix check");
+        assert!(divergence.posix_would_allow);
+
+        let note = dialect_divergence_note(Some(divergence), command).expect("note");
+        assert!(note.contains("all-dialect analysis"), "note: {note}");
+        assert!(note.contains("would ALLOW this command"), "note: {note}");
+        assert!(
+            note.contains(r"dcg test --dialect posix 'rd /s /q C:\x'"),
+            "note must be copy-pasteable: {note}"
+        );
+    }
+
+    #[test]
+    fn issue_289_c1_posix_denied_command_shows_no_note() {
+        // The Bash hook denies this too, so there is no divergence to report
+        // and nothing is added to the human or JSON output.
+        let command = "git reset --hard HEAD~1";
+        let divergence = divergence_for(command, DialectArg::Unknown, &[]);
+        assert!(divergence.is_none());
+        assert!(dialect_divergence_note(divergence, command).is_none());
+    }
+
+    #[test]
+    fn issue_289_c1_explicit_dialect_never_reports_divergence() {
+        let command = r"rd /s /q C:\x";
+        for dialect in [DialectArg::Posix, DialectArg::Cmd, DialectArg::Ps] {
+            assert!(
+                divergence_for(command, dialect, &["windows.filesystem"]).is_none(),
+                "explicit --dialect {dialect:?} must report its own verdict as-is"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_289_c1_allowed_command_skips_the_second_evaluation() {
+        assert!(divergence_for("ls -la", DialectArg::Unknown, &[]).is_none());
+    }
+
+    #[test]
+    fn issue_289_c1_note_single_quotes_are_escaped() {
+        let note = dialect_divergence_note(
+            Some(DialectDivergence {
+                posix_would_allow: true,
+            }),
+            "echo 'hi'",
+        )
+        .expect("note");
+        assert!(note.contains(r"'echo '\''hi'\'''"), "note: {note}");
     }
 }

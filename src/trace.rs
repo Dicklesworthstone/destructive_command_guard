@@ -709,6 +709,10 @@ impl ExplainTrace {
             } else {
                 Some(suggestions)
             },
+            // #289: filled in by the `dcg explain` CLI path, which owns the
+            // dialect the evaluation ran under. The trace itself does not
+            // re-evaluate.
+            dialect_divergence: None,
         }
     }
 }
@@ -751,6 +755,11 @@ pub struct ExplainJsonOutput {
     /// Actionable suggestions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggestions: Option<Vec<JsonSuggestion>>,
+    /// Dialect-divergence metadata (#289): present only when the command was
+    /// evaluated under the default all-dialect (`unknown`) analysis and that
+    /// analysis denied it. Additive field — absent means "not checked".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dialect_divergence: Option<crate::cli::DialectDivergence>,
 }
 
 /// JSON representation of a trace step.
