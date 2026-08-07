@@ -12449,29 +12449,139 @@ pub fn ensure_hook_registered() {
 /// Inner implementation for `ensure_hook_registered` that returns errors
 /// so the outer function can swallow them for fail-open behavior.
 fn ensure_hook_registered_inner() -> Result<(), Box<dyn std::error::Error>> {
-    let settings_path = claude_settings_path();
+    ensure_hook_registered_at(&claude_settings_path(), &self_heal_lock_path())
+}
+
+/// Path to the advisory lock file that serializes concurrent self-heal
+/// writers.
+///
+/// Lives in dcg's own config directory rather than `~/.claude` so dcg does
+/// not litter Claude Code's directory with extra files.
+fn self_heal_lock_path() -> std::path::PathBuf {
+    config_dir().join("selfheal.lock")
+}
+
+/// True if `settings` already contains the exact desired dcg hook entry for
+/// the Claude shell matcher.
+fn settings_has_exact_dcg_hook(
+    settings: &serde_json::Value,
+    desired_hook: &serde_json::Value,
+) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|h| h.get("PreToolUse"))
+        .and_then(|arr| arr.as_array())
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                is_exact_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER, desired_hook)
+            })
+        })
+}
+
+/// Try to take an exclusive advisory lock on `lock_path` with a small bounded
+/// wait (same `fs2::FileExt` mechanism as the pending-exceptions store).
+///
+/// Returns `Ok(Some(file))` while holding the lock (released when the file is
+/// dropped), or `Ok(None)` if the lock stayed contended past the bounded wait
+/// — the caller should skip self-heal for this invocation rather than block
+/// the hook pipeline; it reruns on the next invocation.
+fn try_acquire_self_heal_lock(
+    lock_path: &std::path::Path,
+) -> Result<Option<std::fs::File>, Box<dyn std::error::Error>> {
+    use fs2::FileExt;
+
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+
+    const ATTEMPTS: u32 = 5;
+    for attempt in 0..ATTEMPTS {
+        // Treat any lock failure (WouldBlock or otherwise) as contention:
+        // self-heal is best-effort and must never block command evaluation.
+        if file.try_lock_exclusive().is_ok() {
+            return Ok(Some(file));
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    Ok(None)
+}
+
+/// Atomically replace `path` with `content` using the same temp-file, fsync,
+/// then rename idiom as `write_allowlist`: the temp file lives in the
+/// target's own directory so the rename never crosses filesystems, and a
+/// crash mid-write leaves the original file intact instead of
+/// truncated/invalid JSON (which would make Claude Code silently drop ALL
+/// hooks).
+fn write_settings_atomic(
+    path: &std::path::Path,
+    content: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let temp_name = format!(".dcg-settings-{}.tmp", std::process::id());
+    let temp_path = parent.join(&temp_name);
+
+    {
+        let mut temp_file = std::fs::File::create(&temp_path)?;
+        temp_file.write_all(content.as_bytes())?;
+        temp_file.sync_all()?; // Ensure data is flushed to disk
+    }
+
+    // Atomic rename (on Unix this is atomic; on Windows `std::fs::rename`
+    // replaces the existing file via MOVEFILE_REPLACE_EXISTING).
+    if let Err(rename_err) = std::fs::rename(&temp_path, path) {
+        // Clean up our own temp file so failed attempts don't accumulate.
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(rename_err.into());
+    }
+
+    Ok(())
+}
+
+/// Path-parameterized core of `ensure_hook_registered_inner` (separated for
+/// testability against an isolated settings/lock location).
+fn ensure_hook_registered_at(
+    settings_path: &std::path::Path,
+    lock_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !settings_path.exists() {
         // No settings.json at all — nothing to heal. The user hasn't run
         // `dcg install` yet, or Claude Code hasn't been configured.
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&settings_path)?;
-    let mut settings: serde_json::Value = serde_json::from_str(&content)?;
     let desired_hook = claude_dcg_hook()?;
 
-    let is_registered = settings
-        .get("hooks")
-        .and_then(|h| h.get("PreToolUse"))
-        .and_then(|arr| arr.as_array())
-        .is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                is_exact_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER, &desired_hook)
-            })
-        });
+    // Fast path (lock-free): if the hook is present, nothing to do. This is
+    // the common case on every hook invocation, so it stays a read + parse.
+    let content = std::fs::read_to_string(settings_path)?;
+    let settings: serde_json::Value = serde_json::from_str(&content)?;
+    if settings_has_exact_dcg_hook(&settings, &desired_hook) {
+        return Ok(());
+    }
 
-    if is_registered {
-        // Fast path: hook is present, nothing to do.
+    // Repair needed — serialize concurrent self-healers so two dcg hook
+    // processes cannot interleave read-modify-write and lose each other's
+    // changes. If the lock stays contended, skip: another process is healing
+    // right now, and this check reruns on the next hook invocation.
+    let Some(_lock) = try_acquire_self_heal_lock(lock_path)? else {
+        return Ok(());
+    };
+
+    // Re-read under the lock so the modification applies to the freshest
+    // snapshot (a concurrent healer may have already repaired the file).
+    let content = std::fs::read_to_string(settings_path)?;
+    let mut settings: serde_json::Value = serde_json::from_str(&content)?;
+    if settings_has_exact_dcg_hook(&settings, &desired_hook) {
         return Ok(());
     }
 
@@ -12479,7 +12589,7 @@ fn ensure_hook_registered_inner() -> Result<(), Box<dyn std::error::Error>> {
     let changed = install_dcg_hook_into_settings(&mut settings, false)?;
     if changed {
         let new_content = serde_json::to_string_pretty(&settings)?;
-        std::fs::write(&settings_path, new_content)?;
+        write_settings_atomic(settings_path, &new_content)?;
         eprintln!(
             "[dcg] \x1b[1;33mWarning: DCG hook was missing or stale in {} — repaired automatically.\x1b[0m",
             settings_path.display()
@@ -19612,5 +19722,153 @@ exclude = ["target/**"]
             settings.get("permissions").is_some(),
             "existing keys should be preserved"
         );
+    }
+
+    #[test]
+    fn self_heal_at_repairs_isolated_settings_end_to_end() {
+        // End-to-end through the real repair path (lock + atomic replace)
+        // against an isolated settings/lock location.
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let lock_path = dir.path().join("selfheal.lock");
+        let settings = serde_json::json!({
+            "permissions": { "allow": ["Bash(*)"] },
+            "hooks": { "PreToolUse": [] }
+        });
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+
+        // The repaired file must be valid JSON with the hook registered and
+        // unrelated keys preserved.
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        let healed: serde_json::Value =
+            serde_json::from_str(&content).expect("settings must remain valid JSON after repair");
+        let is_registered = healed
+            .get("hooks")
+            .and_then(|h| h.get("PreToolUse"))
+            .and_then(|arr| arr.as_array())
+            .is_some_and(|a| a.iter().any(is_dcg_hook_entry));
+        assert!(is_registered, "hook should be registered after self-heal");
+        assert!(
+            healed.get("permissions").is_some(),
+            "existing keys should be preserved"
+        );
+
+        // The atomic replace must not leave its temp file behind.
+        let leftover_tmp = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover_tmp, "no temp file should be left behind");
+
+        // Second run hits the lock-free fast path and changes nothing.
+        ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+        let content_after = std::fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(content, content_after, "second run should be a no-op");
+    }
+
+    #[test]
+    fn self_heal_at_skips_when_lock_held() {
+        use fs2::FileExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let lock_path = dir.path().join("selfheal.lock");
+        let original = serde_json::to_string_pretty(&serde_json::json!({
+            "hooks": { "PreToolUse": [] }
+        }))
+        .unwrap();
+        std::fs::write(&settings_path, &original).unwrap();
+
+        // Hold the exclusive lock on an independent handle, exactly as a
+        // concurrent self-healing dcg process would (flock/LockFileEx
+        // conflict across separate handles even within one process).
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        holder.lock_exclusive().unwrap();
+
+        // Contended lock must mean skip-not-block: Ok, quickly, no changes.
+        let start = std::time::Instant::now();
+        ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "contended self-heal must return promptly, not block"
+        );
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(
+            content, original,
+            "settings must be untouched when the lock is contended"
+        );
+
+        holder.unlock().unwrap();
+
+        // Once the lock is free, the same call repairs the hook.
+        ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+        let healed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let is_registered = healed
+            .get("hooks")
+            .and_then(|h| h.get("PreToolUse"))
+            .and_then(|arr| arr.as_array())
+            .is_some_and(|a| a.iter().any(is_dcg_hook_entry));
+        assert!(is_registered, "hook should be repaired once lock is free");
+    }
+
+    #[test]
+    fn self_heal_at_leaves_corrupt_settings_untouched() {
+        // Planted negative: invalid JSON must error out (the caller warns and
+        // fails open) and the corrupt file must be left byte-for-byte intact.
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let lock_path = dir.path().join("selfheal.lock");
+        let corrupt = "{ \"hooks\": { \"PreToolUse\": [ TRUNCATED";
+        std::fs::write(&settings_path, corrupt).unwrap();
+
+        let result = ensure_hook_registered_at(&settings_path, &lock_path);
+        assert!(result.is_err(), "corrupt settings should surface an error");
+
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(
+            content, corrupt,
+            "corrupt settings must not be modified or truncated"
+        );
+    }
+
+    #[test]
+    fn self_heal_at_noop_when_settings_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let lock_path = dir.path().join("selfheal.lock");
+
+        ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+        assert!(
+            !settings_path.exists(),
+            "self-heal must not create settings.json from nothing"
+        );
+    }
+
+    #[test]
+    fn write_settings_atomic_replaces_existing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{\"old\": true}").unwrap();
+
+        write_settings_atomic(&path, "{\"new\": true}").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"new\": true}");
+        let leftover_tmp = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover_tmp, "no temp file should be left behind");
     }
 }
