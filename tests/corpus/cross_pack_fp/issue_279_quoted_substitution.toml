@@ -1,0 +1,57 @@
+# Cross-pack false positives: #279 — expansion + space + $() inside one word
+#
+# Every boundary-table row from issue #279 that was wrongly denied. The
+# extractor merged the leading `$(` into the command_substitution node, so a
+# benign `echo "$s $(true)"` was read as an unparseable substitution and failed
+# closed. These are POSIX/unknown-dialect shapes.
+#
+# Source: 61591e2 (fix(heredoc): #279), tests/repro_279_quoted_expansion_substitution.rs
+
+[[case]]
+description = "expansion, space, benign substitution in one double-quoted word"
+command = "echo \"$s $(true)\""
+expected = "allow"
+issue = 279
+dialects = ["posix", "unknown"]
+
+[[case]]
+description = "braced expansion form"
+command = "echo \"${s} $(true)\""
+expected = "allow"
+issue = 279
+dialects = ["posix", "unknown"]
+
+[[case]]
+description = "positional parameter form"
+command = "echo \"$1 $(true)\""
+expected = "allow"
+issue = 279
+dialects = ["posix", "unknown"]
+
+[[case]]
+description = "literal prefix before the expansion"
+command = "echo \"a$s $(true)\""
+expected = "allow"
+issue = 279
+dialects = ["posix", "unknown"]
+
+[[case]]
+description = "two spaces between expansion and substitution"
+command = "echo \"$s  $(true)\""
+expected = "allow"
+issue = 279
+dialects = ["posix", "unknown"]
+
+[[case]]
+description = "printf with HOME and a date substitution"
+command = "printf %s \"$HOME $(date)\""
+expected = "allow"
+issue = 279
+dialects = ["posix", "unknown"]
+
+[[case]]
+description = "for-loop body with a quoted basename substitution"
+command = "for d in */; do s=ok; echo \"$s $(basename \"$d\")\"; done"
+expected = "allow"
+issue = 279
+dialects = ["posix", "unknown"]

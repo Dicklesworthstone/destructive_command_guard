@@ -1,0 +1,175 @@
+# Cross-pack TRUE-POSITIVE controls
+#
+# The false-positive files in this directory only prove that nothing denies.
+# On their own they would pass trivially if every pack were disabled, so this
+# file pins the other direction: with all packs force-enabled these shapes MUST
+# still deny, with the named rule. Each control is the planted negative from
+# the same issue as the false-positive file it guards.
+
+# ============================================================================
+# #287 — separators inside quotes or $() must not break genuine matches
+# ============================================================================
+#
+# Controls whose destructiveness depends on `$(...)` being POSIX command
+# substitution are scoped to the posix/unknown dialects: under Cmd `$(...)` is
+# inert literal text, and under PowerShell it is a subexpression with different
+# grammar, so a deny there would be asserting something the shape does not mean.
+
+[[case]]
+description = "chmod -R against /etc, plainly"
+command = "chmod -R 755 /etc"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 287
+
+[[case]]
+description = "chmod -R against /etc with a pipe inside a substitution"
+command = "chmod -R $(cat modes.txt | head -1) /etc"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 287
+dialects = ["posix", "unknown"]
+
+[[case]]
+description = "chmod -R against /etc with an ampersand inside a quoted value"
+command = "chmod -R --reference=\"/opt/a&b\" /etc"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 287
+
+[[case]]
+description = "chown -R against /etc with a semicolon inside a quoted owner"
+command = "chown -R \"u;g\" /etc"
+expected = "deny"
+rule_id = "system.permissions:chown-recursive-root"
+issue = 287
+
+[[case]]
+description = "setfacl -R against /etc"
+command = "setfacl -R -m u:app:rwx /etc"
+expected = "deny"
+rule_id = "system.permissions:setfacl-all"
+issue = 287
+
+# ============================================================================
+# #281 / #273 — literal branch evidence stays fail-closed
+# ============================================================================
+
+[[case]]
+description = "git branch with a dynamic argument"
+command = "git branch $(cat f)"
+expected = "deny"
+issue = 281
+dialects = ["posix", "ps", "unknown"]
+
+[[case]]
+description = "git branch -D with a dynamic branch name"
+command = "git branch -D $BR"
+expected = "deny"
+issue = 281
+
+[[case]]
+description = "dynamic producer followed by literal branch deletion syntax"
+command = "$(producer) branch -d feature"
+expected = "deny"
+issue = 281
+dialects = ["posix", "ps", "unknown"]
+
+# ============================================================================
+# #279 / #277 — genuine code inside substitutions and heredocs
+# ============================================================================
+
+[[case]]
+description = "destructive command inside the quoted substitution"
+command = "echo \"$s $(rm -rf /home/user)\""
+expected = "deny"
+issue = 279
+dialects = ["posix", "unknown"]
+
+[[case]]
+description = "unterminated substitution fails closed"
+command = "echo \"$s $(true\""
+expected = "deny"
+issue = 279
+dialects = ["posix"]
+
+[[case]]
+description = "unquoted heredoc delimiter expands the substitution"
+command = "git commit -F - <<EOF\n$(rm -rf /tmp/x)\nEOF"
+expected = "deny"
+issue = 277
+dialects = ["posix", "unknown"]
+
+[[case]]
+description = "bash heredoc body is code, not commit prose"
+command = "bash <<'EOF'\nrm -rf /home/user\nEOF"
+expected = "deny"
+issue = 277
+dialects = ["posix", "unknown"]
+
+# ============================================================================
+# #285 — the Windows temp carve-out stays bounded
+# ============================================================================
+
+[[case]]
+description = "the per-user Temp root itself is not a subpath"
+command = "rm -rf C:\\Users\\u\\AppData\\Local\\Temp"
+expected = "deny"
+issue = 285
+
+[[case]]
+description = "Tempx is not Temp"
+command = "rm -rf /c/Users/u/AppData/Local/Tempx/y"
+expected = "deny"
+issue = 285
+
+[[case]]
+description = "traversal out of the carve-out"
+command = "rm -rf C:\\Users\\u\\AppData\\Local\\Temp\\..\\..\\Documents"
+expected = "deny"
+issue = 285
+
+[[case]]
+description = "a second target outside the carve-out"
+command = "rm -rf C:\\Users\\u\\AppData\\Local\\Temp\\x /etc"
+expected = "deny"
+issue = 285
+
+[[case]]
+description = "the machine-wide C:\\Windows\\Temp is deliberately not carved out"
+command = "rm -rf C:\\Windows\\Temp\\x"
+expected = "deny"
+issue = 285
+
+[[case]]
+description = "caller-controlled $TEMP root stays blocked"
+command = "rm -rf \"$TEMP/some/subdir/file\""
+expected = "deny"
+issue = 285
+
+# ============================================================================
+# #283 — genuine wrangler destruction behind a wrapper
+# ============================================================================
+
+[[case]]
+description = "time wrapper does not launder a wrangler delete"
+command = "time wrangler delete worker"
+expected = "deny"
+issue = 283
+
+# ============================================================================
+# Baseline: the canonical destructive shapes must deny under all packs
+# ============================================================================
+
+[[case]]
+description = "rm -rf outside any temp directory"
+command = "rm -rf /home/user"
+expected = "deny"
+issue = 0
+
+[[case]]
+description = "git reset --hard discards uncommitted work"
+command = "git reset --hard"
+expected = "deny"
+rule_id = "core.git:reset-hard"
+issue = 0

@@ -1,0 +1,58 @@
+# Cross-pack false positives: #287 — segment-scoped permission patterns
+#
+# A recursive flag (or 777/u+s/root token) belonging to a *different* command
+# in a chained line must not pair with a chmod/chown/setfacl elsewhere in the
+# string. The fix landed in system.permissions; this file re-asks every other
+# pack the same question, in every dialect.
+#
+# Source: c1f0dca / eee2bdc (fix(permissions): #287)
+
+[[case]]
+description = "chmod 600 then grep -rn: the -rn belongs to grep"
+command = "chmod 600 /root/.ssh/x && grep -rn foo /etc/ssh/"
+expected = "allow"
+issue = 287
+
+[[case]]
+description = "chmod 600 then grep -rn across a newline, not a separator"
+command = "chmod 600 /root/.ssh/authorized_keys\ngrep -rn PermitRootLogin /etc/ssh/sshd_config"
+expected = "allow"
+issue = 287
+
+[[case]]
+description = "chown then grep -R across a newline"
+command = "chown app /var/log/x\ngrep -R foo /etc/passwd"
+expected = "allow"
+issue = 287
+
+# KNOWN FAILURE (found by this suite): the #287 fix drops a full-command match
+# for a segment-scoped pack when the matched span crosses a segment boundary —
+# but the Cmd dialect does not treat `;` as a command separator, so there is no
+# boundary to cross and the full-command match survives. The fix is therefore
+# dialect-dependent in a way its own tests (unknown dialect only) could not see.
+[[case]]
+description = "chown then cp -R after a semicolon"
+command = "chown user /var/log/app.log; cp -R src /opt/app"
+expected = "allow"
+issue = 287
+known_failing = true
+known_failing_dialects = ["cmd"]
+known_failing_reason = "system.permissions:chown-recursive-root still fires under the cmd dialect, where `;` is not a segment separator so the #287 segment-scope check never triggers"
+
+[[case]]
+description = "setfacl piped into ls -R: the -R belongs to ls"
+command = "setfacl -m u:app:r /srv/f | ls -R /etc"
+expected = "allow"
+issue = 287
+
+[[case]]
+description = "chmod u+x then an echo of the literal 777"
+command = "chmod u+x build.sh && echo 777"
+expected = "allow"
+issue = 287
+
+[[case]]
+description = "chown alice in /tmp then a sudo -u root: in the next segment"
+command = "chown alice /tmp/f && sudo -u root: true"
+expected = "allow"
+issue = 287

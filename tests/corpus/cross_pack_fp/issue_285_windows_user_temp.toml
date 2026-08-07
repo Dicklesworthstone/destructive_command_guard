@@ -1,0 +1,114 @@
+# Cross-pack false positives: #285 — literal per-user Windows temp subpaths
+#
+# A literal path under C:\Users\<u>\AppData\Local\Temp\<sub> is the Windows
+# equivalent of /tmp on Unix, in both native and Git Bash spellings. This is
+# the file that actually needs the cross-pack sweep: windows.* packs are
+# cfg-gated out of the default set on unix, so nothing here was ever exercised
+# on unix CI.
+#
+# Source: e28c414 (fix(windows): #285 per-user temp carve-out)
+
+# ============================================================================
+# core rm classifier (POSIX-ish spellings of Windows paths)
+# ============================================================================
+
+[[case]]
+description = "git bash spelling of a per-user temp subpath"
+command = "rm -rf /c/Users/u/AppData/Local/Temp/some/subdir/file"
+expected = "allow"
+issue = 285
+
+[[case]]
+description = "git bash spelling, mixed case"
+command = "rm -rf /C/users/U/appdata/local/temp/x"
+expected = "allow"
+issue = 285
+
+[[case]]
+description = "native backslash spelling"
+command = "rm -rf C:\\Users\\u\\AppData\\Local\\Temp\\some\\file"
+expected = "allow"
+issue = 285
+
+[[case]]
+description = "native backslash spelling with uppercase TEMP"
+command = "rm -rf C:\\Users\\u\\AppData\\Local\\TEMP\\build"
+expected = "allow"
+issue = 285
+
+[[case]]
+description = "quoted native path"
+command = "rm -rf \"C:\\Users\\u\\AppData\\Local\\Temp\\x\""
+expected = "allow"
+issue = 285
+
+[[case]]
+description = "split short flags"
+command = "rm -fr /c/Users/u/AppData/Local/Temp/build"
+expected = "allow"
+issue = 285
+
+# KNOWN FAILURE (found by this suite): the #285 carve-out landed in the core rm
+# classifier, the core PS Remove-Item parser and the windows.filesystem Cmd/PS
+# scanners — but windows.filesystem also reads bare `rm` as the PowerShell
+# Remove-Item alias, and on that route the forward-slash drive spelling with
+# split `-r -f` flags misses the carve-out. Only reachable with windows.* packs
+# enabled, which is why unix CI never saw it.
+[[case]]
+description = "separate -r -f with forward-slash drive spelling"
+command = "rm -r -f C:/Users/u/AppData/Local/Temp/scratch"
+expected = "allow"
+issue = 285
+known_failing = true
+known_failing_dialects = ["unknown"]
+known_failing_reason = "windows.filesystem:remove-item-recurse-force treats `rm -r -f` as the Remove-Item alias under the unknown dialect and misses the per-user temp carve-out for the C:/ forward-slash spelling"
+
+# ============================================================================
+# PowerShell Remove-Item
+# ============================================================================
+
+[[case]]
+description = "Remove-Item recursive force on a literal temp subpath"
+command = "Remove-Item -Recurse -Force C:\\Users\\u\\AppData\\Local\\Temp\\some\\subdir\\file"
+expected = "allow"
+issue = 285
+dialects = ["ps", "unknown"]
+
+[[case]]
+description = "Remove-Item recursive, lowercase drive and user"
+command = "Remove-Item -Recurse c:\\users\\u\\appdata\\local\\TEMP\\x"
+expected = "allow"
+issue = 285
+dialects = ["ps", "unknown"]
+
+[[case]]
+description = "Remove-Item with a single-quoted literal path"
+command = "Remove-Item -Recurse -Force 'C:\\Users\\u\\AppData\\Local\\Temp\\x'"
+expected = "allow"
+issue = 285
+dialects = ["ps", "unknown"]
+
+[[case]]
+description = "Remove-Item with colon-bound -Path:"
+command = "Remove-Item -Recurse -Force -Path:C:\\Users\\u\\AppData\\Local\\Temp\\x"
+expected = "allow"
+issue = 285
+dialects = ["ps", "unknown"]
+
+# ============================================================================
+# Cmd rd / del (also under the PowerShell dialect per #280)
+# ============================================================================
+
+[[case]]
+description = "rd /s /q on a literal temp subpath"
+command = "rd /s /q C:\\Users\\u\\AppData\\Local\\Temp\\sub"
+expected = "allow"
+issue = 285
+dialects = ["cmd", "ps"]
+
+[[case]]
+description = "del /s /q on a literal temp subpath"
+command = "del /s /q C:\\Users\\u\\AppData\\Local\\Temp\\build"
+expected = "allow"
+issue = 285
+dialects = ["cmd", "ps"]

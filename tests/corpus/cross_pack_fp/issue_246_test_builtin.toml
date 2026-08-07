@@ -1,0 +1,79 @@
+# Cross-pack false positives: #246 — the POSIX `[` / `test` builtin
+#
+# A lone `[` (or `[[`) is the literal POSIX test builtin: an unclosed bracket
+# cannot glob-expand into any tool name, so `-d`/`-f`/`-M`/`-C`/`-r` operators
+# after it are test operators, not flags for a destructive tool. Also covers
+# the newline-bridge variant, where a benign read-only line must not lend its
+# prefix to a dash token on a later line.
+#
+# Source: src/packs/core/git.rs posix_test_brackets_are_not_branch_mutations,
+#         branch_regex_walkers_do_not_bridge_newlines
+
+[[case]]
+description = "test for a regular file"
+command = "[ -f x ]"
+expected = "allow"
+issue = 246
+
+[[case]]
+description = "test for a directory"
+command = "[ -d x ]"
+expected = "allow"
+issue = 246
+
+[[case]]
+description = "test for a .git directory"
+command = "[ -d /some/dir/.git ]"
+expected = "allow"
+issue = 246
+
+[[case]]
+description = "test for a .git directory under an expansion"
+command = "[ -d \"$p/.git\" ]"
+expected = "allow"
+issue = 246
+
+[[case]]
+description = "bash double-bracket file test"
+command = "[[ -f x ]]"
+expected = "allow"
+issue = 246
+
+[[case]]
+description = "bash double-bracket .git test under an expansion"
+command = "[[ -d \"$repo/.git\" ]]"
+expected = "allow"
+issue = 246
+
+[[case]]
+description = "test for a literal .git/config"
+command = "[ -f .git/config ]"
+expected = "allow"
+issue = 246
+
+[[case]]
+description = "the test builtin spelled out"
+command = "test -d \"$p/.git\""
+expected = "allow"
+issue = 246
+
+[[case]]
+description = "benign git branch --list then a test on the next line"
+command = "git branch --list\n[ -d \"$p/.git\" ] && echo x"
+expected = "allow"
+issue = 246
+dialects = ["posix", "unknown"]
+
+[[case]]
+description = "benign git branch --show-current then a test on the next line"
+command = "git branch --show-current\ntest -d \"$p/.git\""
+expected = "allow"
+issue = 246
+dialects = ["posix", "unknown"]
+
+[[case]]
+description = "benign git branch then cat -d on the next line"
+command = "git branch\ncat -d file"
+expected = "allow"
+issue = 246
+dialects = ["posix", "unknown"]

@@ -1,0 +1,70 @@
+# Cross-pack false positives: #281 / #273 — dynamic executables without evidence
+#
+# An executable word that is a fully-dynamic expansion with zero literal bytes
+# carries no evidence for any tool. core.git attributed these to
+# `core.git:branch-dynamic-token`; the quoted-form precedent from #273 says the
+# quoted and unquoted spellings must agree. Every pack gets asked here.
+#
+# Source: ba7cbfa (fix(git): #281), earlier #273 precedent
+
+[[case]]
+description = "backticks inside a single-quoted assignment value"
+command = "s=s.replace('a `x` b', 'c')"
+expected = "allow"
+issue = 281
+
+[[case]]
+description = "the normalized slice the evaluator actually scans for it"
+command = "s=s.replace(a `x` b, c)"
+expected = "allow"
+issue = 281
+
+# FOUND BY THIS SUITE, NOW FIXED: core.git learned in #281/#273 that an
+# executable with zero literal bytes carries no evidence, but nobody had
+# re-asked cdn.cloudflare_workers. Its semantic fallback denied every
+# fully-dynamic executable as wrangler-semantic-unverified with no wrangler
+# token anywhere in the command — the same defect #283 fixed for bare wrapper
+# words, one shape class over. The wrangler resolver now requires positive
+# wrangler evidence (or a destructive wrangler argv) behind an unbounded
+# executable word.
+[[case]]
+description = "dynamic executable plus dynamic argument, unquoted"
+command = "$cmd $arg"
+expected = "allow"
+issue = 281
+
+[[case]]
+description = "command substitution inside a single-quoted assignment value"
+command = "s=s.replace('a $(x) b', 'c')"
+expected = "allow"
+issue = 281
+
+[[case]]
+description = "backtick substitution assigned to a variable"
+command = "s=`echo hi`"
+expected = "allow"
+issue = 281
+
+[[case]]
+description = "a python-looking call with backticks in its arguments"
+command = "print('a `x` b', 'c')"
+expected = "allow"
+issue = 281
+
+[[case]]
+description = "quoted dynamic executable with a quoted dynamic argument (#273)"
+command = "\"$X\" \"$Y\""
+expected = "allow"
+issue = 273
+
+[[case]]
+description = "quoted dynamic executable with a literal run subcommand (#273)"
+command = "\"$BIN\" run \"$ARG\""
+expected = "allow"
+issue = 273
+
+[[case]]
+description = "unquoted dynamic executable and argument agree with the quoted form"
+command = "$X $Y"
+expected = "allow"
+issue = 273

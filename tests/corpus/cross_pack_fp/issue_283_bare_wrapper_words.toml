@@ -1,0 +1,57 @@
+# Cross-pack false positives: #283 / #257 — bare wrapper words
+#
+# `command -v foo`, `env`, `time foo` and the POSIX `[` test builtin carry no
+# evidence for any tool-specific resolver. cdn.cloudflare_workers denied all
+# four as "wrangler-semantic-unverified" with no wrangler token anywhere in the
+# command; #257 had already taught the *sanitizer* about `time` without anyone
+# re-asking the wrangler resolver. This file asks every pack.
+#
+# Source: d0f9d1d (fix(cloudflare): #283), 6225661 (#257)
+
+[[case]]
+description = "command -v is a query, not an execution"
+command = "command -v foo"
+expected = "allow"
+issue = 283
+
+[[case]]
+description = "bare env prints the environment"
+command = "env"
+expected = "allow"
+issue = 283
+
+[[case]]
+description = "time wrapper over an unknown program"
+command = "time foo"
+expected = "allow"
+issue = 283
+
+[[case]]
+description = "POSIX test builtin guarding an echo"
+command = "[ -f x ] && echo yes"
+expected = "allow"
+issue = 283
+
+[[case]]
+description = "time wrapper over a plainly benign program"
+command = "time ls -la"
+expected = "allow"
+issue = 283
+
+# FOUND BY THIS SUITE, NOW FIXED: #283 taught the wrangler resolver that a
+# surviving bare wrapper word yields Unverified only when the remaining words
+# may actually name wrangler. When the remaining word IS `wrangler` the wrapper
+# handling has to notice that `command -v` is a *query*, not an execution — and
+# under the Cmd dialect it did not, so a lookup denied. The resolver now treats
+# `command -v` / `command -V` as a lookup under every dialect.
+[[case]]
+description = "command -v over a tool-named word is still a query"
+command = "command -v wrangler"
+expected = "allow"
+issue = 283
+
+[[case]]
+description = "nohup wrapper over an unknown program"
+command = "nohup foo"
+expected = "allow"
+issue = 283

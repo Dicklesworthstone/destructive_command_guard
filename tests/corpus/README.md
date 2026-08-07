@@ -27,7 +27,58 @@ corpus/
     multi_segment.toml      # pipes, &&, ||, ;, subshells, $()
     unicode.toml            # UTF-8 edge cases
     regex_worst_case.toml   # Potential ReDoS patterns
+  cross_pack_fp/            # Cross-pack replay (separate runner, see below)
+    issue_246_test_builtin.toml
+    issue_277_stdin_sink_prose.toml
+    issue_279_quoted_substitution.toml
+    issue_281_dynamic_executables.toml
+    issue_283_bare_wrapper_words.toml
+    issue_285_windows_user_temp.toml
+    issue_287_permission_chains.toml
+    controls_true_positives.toml
 ```
+
+## Cross-Pack Corpus (`cross_pack_fp/`)
+
+The four categories above evaluate against the **default-enabled,
+platform-dependent** pack set. `cross_pack_fp/` closes the three holes that
+leaves: opt-in packs are never exercised, `windows.*` cases never run on unix
+CI, and per-issue regressions live as inline unit tests next to the one rule
+that was patched — so a shape that false-positived under one rule is never
+re-asked of the others.
+
+`cross_pack_fp/` is loaded by its own runner, `tests/cross_pack_corpus.rs`,
+which force-enables **every** registry pack and replays each case across the
+`posix`, `ps`, `cmd` and `unknown` dialects:
+
+```bash
+cargo test --test cross_pack_corpus
+DCG_CROSS_PACK_DUMP=1 cargo test --test cross_pack_corpus -- --nocapture
+```
+
+It uses a superset of the schema below:
+
+```toml
+[[case]]
+description = "chmod 600 then grep -rn: the -rn belongs to grep"
+command = "chmod 600 /root/.ssh/x && grep -rn foo /etc/ssh/"
+expected = "allow"               # "deny" marks a true-positive control
+issue = 287                      # source issue (0 = no single issue)
+rule_id = "core.git:reset-hard"  # optional; asserted on deny cases
+dialects = ["posix", "unknown"]  # optional; default = all four
+known_failing = true             # optional; reported but tolerated
+known_failing_reason = "..."     # required when known_failing = true
+known_failing_dialects = ["ps"]  # optional; narrows the tolerance
+```
+
+`known_failing` records false positives this suite has **found**: a benign
+shape that still denies under some pack is a bug owned by that pack, not
+something the corpus may weaken away. Marked cases are printed prominently, and
+if one starts passing the suite fails so the marker gets removed.
+
+`load_corpus_dir` only walks the four fixed category directories, so
+`cross_pack_fp/` is invisible to `regression_corpus.rs` — the two suites do not
+interfere.
 
 ## File Format (TOML)
 

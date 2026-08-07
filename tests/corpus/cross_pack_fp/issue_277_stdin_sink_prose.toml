@@ -1,0 +1,34 @@
+# Cross-pack false positives: #277 — structured stdin-sink heredoc bodies
+#
+# `git commit -F -` consumes its heredoc as a commit *message*. Destructive
+# prose inside that body is data, not code, on every fallback path. Every pack
+# is re-asked whether it can find a rule in the prose.
+#
+# Source: 02e364e (fix(evaluator): #277), tests/repro_277_git_stdin_sink_fallback.rs
+
+[[case]]
+description = "commit message prose mentioning rm -rf"
+command = "git commit -F - <<'EOF'\ndocs: note that rm -rf /tmp/x is denied\nEOF"
+expected = "allow"
+issue = 277
+dialects = ["posix", "unknown"]
+
+[[case]]
+description = "commit message prose mentioning git branch -d"
+command = "git commit -F - <<'EOF'\ndocs: note that git branch -d is denied\nEOF"
+expected = "allow"
+issue = 277
+dialects = ["posix", "unknown"]
+
+[[case]]
+description = "commit message prose with backticked ls -la"
+command = "git commit -F - <<'EOF'\nsee `ls -la` for details\nEOF"
+expected = "allow"
+issue = 277
+dialects = ["posix", "unknown"]
+
+[[case]]
+description = "the same prose as a -m argument"
+command = "git commit -m \"docs: note that rm -rf /tmp/x is denied\""
+expected = "allow"
+issue = 277
