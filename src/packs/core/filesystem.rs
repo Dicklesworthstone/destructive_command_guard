@@ -1369,6 +1369,9 @@ fn parse_powershell_remove_item_segment(command: &str, automated_stdin: bool) ->
     let mut recurse = false;
     let mut what_if = false;
     let mut has_target = automated_stdin;
+    // Pipeline-fed targets are invisible here, so they can never all be
+    // proven literal temp subpaths (#285).
+    let mut targets_are_literal_temp = !automated_stdin;
     let mut index = command_index + 1;
     while let Some(token) = tokens.get(index) {
         if token.kind == NormalizeTokenKind::Separator {
@@ -1377,7 +1380,10 @@ fn parse_powershell_remove_item_segment(command: &str, automated_stdin: bool) ->
             if separator == "(" {
                 // Parenthesized PowerShell expressions are evaluated and
                 // supplied as a real argument (`-Path (Resolve-Path ...)`).
+                // Their runtime value cannot be proven to stay inside a
+                // literal temp directory.
                 has_target = true;
+                targets_are_literal_temp = false;
                 continue;
             }
             if separator == ")" {
@@ -1430,21 +1436,29 @@ fn parse_powershell_remove_item_segment(command: &str, automated_stdin: bool) ->
             continue;
         }
         if word.starts_with('-') {
-            if word.split_once(':').is_some_and(|(name, value)| {
+            if let Some((_, value)) = word.split_once(':').filter(|(name, value)| {
                 matches!(name.to_ascii_lowercase().as_str(), "-path" | "-literalpath")
                     && !value.is_empty()
             }) {
                 has_target = true;
+                targets_are_literal_temp &= windows_literal_user_temp_subpath(value);
             }
             continue;
         }
         has_target = true;
+        targets_are_literal_temp &= windows_literal_user_temp_subpath(word);
     }
 
     if !recurse || !has_target {
         return RmParseDecision::NoMatch;
     }
     if what_if {
+        return RmParseDecision::Allow;
+    }
+    if targets_are_literal_temp {
+        // #285: every proven target is a literal per-user Windows temp
+        // subpath — the same carve-out `rm -rf /tmp/<subpath>` gets. Dynamic
+        // spellings such as `$env:TEMP\x` keep the `$TMPDIR` review policy.
         return RmParseDecision::Allow;
     }
 
@@ -2589,6 +2603,7 @@ fn path_is_safe_unquoted(path: &str) -> bool {
         .iter()
         .find_map(|prefix| path.strip_prefix(prefix))
         .is_some_and(temp_path_suffix_is_static_unquoted)
+        || windows_literal_user_temp_subpath(path)
 }
 
 fn path_is_safe_double_quoted(path: &str) -> bool {
@@ -2599,6 +2614,78 @@ fn path_is_safe_double_quoted(path: &str) -> bool {
         .iter()
         .find_map(|prefix| path.strip_prefix(prefix))
         .is_some_and(temp_path_suffix_is_static_double_quoted)
+        || windows_literal_user_temp_subpath(path)
+}
+
+/// Literal per-user Windows temp subpaths (#285), the Windows counterpart of
+/// the `/tmp/<subpath>` carve-out above. Recognizes the native
+/// `C:\Users\<user>\AppData\Local\Temp\<subpath>` spelling (either separator,
+/// any drive letter) and the Git Bash / MSYS2
+/// `/c/Users/<user>/AppData/Local/Temp/<subpath>` form that Claude Code's Bash
+/// tool emits on Windows. Windows path resolution is case-insensitive, so the
+/// component comparison is too.
+///
+/// Deliberately excluded, mirroring the `$TMPDIR` policy documented in the
+/// README ("Dynamic temp roots ... Blocked for review"):
+/// - dynamic spellings (`$TEMP`, `$env:TEMP`, `%TEMP%`): the variable is
+///   caller-controlled and can point anywhere;
+/// - the machine-wide `C:\Windows\Temp`: shared with services and other users;
+/// - the temp root itself with no subpath, like `/tmp` without a component.
+pub(crate) fn windows_literal_user_temp_subpath(path: &str) -> bool {
+    // Expansion syntax, quote characters, and cmd/PowerShell multi-argument
+    // separators are never part of one static literal path.
+    if path.bytes().any(|byte| {
+        matches!(
+            byte,
+            b'$' | b'`' | b'%' | b'{' | b'}' | b'\'' | b'"' | b',' | b';'
+        )
+    }) {
+        return false;
+    }
+
+    let bytes = path.as_bytes();
+    let rest = if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        // Native drive form `X:\...` / `X:/...`.
+        &path[3..]
+    } else if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b'/'
+    {
+        // Git Bash / MSYS2 drive form `/x/...`.
+        &path[3..]
+    } else {
+        return false;
+    };
+    // A second drive designator (`C:\...Temp\x,D:` style smuggling) cannot be
+    // part of the temp subtree.
+    if rest.contains(':') {
+        return false;
+    }
+
+    let mut components: Vec<&str> = rest.split(['/', '\\']).collect();
+    while components.last() == Some(&"") {
+        components.pop();
+    }
+    // `Users`, `<user>`, `AppData`, `Local`, `Temp`, plus at least one real
+    // component under the temp root (deleting the root itself stays reviewed).
+    if components.len() < 6 {
+        return false;
+    }
+    if components
+        .iter()
+        .any(|component| component.is_empty() || *component == "." || *component == "..")
+    {
+        return false;
+    }
+    components[0].eq_ignore_ascii_case("Users")
+        && components[2].eq_ignore_ascii_case("AppData")
+        && components[3].eq_ignore_ascii_case("Local")
+        && components[4].eq_ignore_ascii_case("Temp")
 }
 
 fn temp_path_suffix_is_static_unquoted(path: &str) -> bool {
@@ -5230,6 +5317,87 @@ mod tests {
         // Traversal out of the private tmp tree stays blocked.
         assert!(pack.check("rm -rf /private/tmp/../etc").is_some());
         assert!(pack.check("rm -rf /private/etc").is_some());
+    }
+
+    #[test]
+    fn windows_user_temp_subpaths_are_equivalent_to_tmp() {
+        // Regression for #285: the per-user Windows temp directory is the
+        // platform's /tmp, in both the native drive spelling and the Git
+        // Bash / MSYS2 spelling Claude Code's Bash tool emits on Windows.
+        // Windows paths are case-insensitive.
+        let pack = create_pack();
+        for cmd in [
+            r"rm -rf /c/Users/u/AppData/Local/Temp/some/subdir/file",
+            r"rm -rf /C/users/U/appdata/local/temp/x",
+            r"rm -rf C:\Users\u\AppData\Local\Temp\some\file",
+            r"rm -rf C:\Users\u\AppData\Local\TEMP\build",
+            r#"rm -rf "C:\Users\u\AppData\Local\Temp\x""#,
+            r"rm -fr /c/Users/u/AppData/Local/Temp/build",
+            r"rm -r -f C:/Users/u/AppData/Local/Temp/scratch",
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "literal per-user Windows temp subpath must be allowed: {cmd}"
+            );
+        }
+        // The carve-out must stay bounded: the temp root itself, non-temp
+        // user paths, prefix confusion, traversal, multi-target smuggling,
+        // the machine-wide C:\Windows\Temp, and dynamic roots (the $TMPDIR
+        // policy) all stay blocked.
+        for cmd in [
+            r"rm -rf C:\Users\u\AppData\Local\Temp",
+            r"rm -rf /c/Users/u/Documents/x",
+            r"rm -rf /c/Users/u/AppData/Local/Tempx/y",
+            r"rm -rf C:\Users\u\AppData\Local\Temp\..\..\Documents",
+            r"rm -rf C:\Users\u\AppData\Local\Temp\x /etc",
+            r"rm -rf C:\Windows\Temp\x",
+            r#"rm -rf "$TEMP/some/subdir/file""#,
+            r"rm -rf $TMP/build",
+            r"rm -rf $env:TEMP\x",
+        ] {
+            assert!(
+                pack.check(cmd).is_some(),
+                "Windows temp carve-out must stay bounded: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_remove_item_literal_user_temp_subpath_is_allowed() {
+        // #285, PowerShell dialect: Remove-Item with every proven target a
+        // literal per-user temp subpath is temp cleanup, like rm -rf /tmp/x.
+        for cmd in [
+            r"Remove-Item -Recurse -Force C:\Users\u\AppData\Local\Temp\some\subdir\file",
+            r"Remove-Item -Recurse c:\users\u\appdata\local\TEMP\x",
+            r"Remove-Item -Recurse -Force 'C:\Users\u\AppData\Local\Temp\x'",
+            r"Remove-Item -Recurse -Force -Path:C:\Users\u\AppData\Local\Temp\x",
+        ] {
+            assert!(
+                matches!(
+                    parse_powershell_remove_item_segment(cmd, false),
+                    RmParseDecision::Allow
+                ),
+                "literal temp Remove-Item must be allowed: {cmd}"
+            );
+        }
+        // Dynamic roots keep the $TMPDIR review policy, and non-temp or
+        // mixed targets stay denied.
+        for cmd in [
+            r"Remove-Item -Recurse -Force $env:TEMP\some\subdir\file",
+            r"Remove-Item -Recurse -Force C:\Users\u",
+            r"Remove-Item -Recurse -Force C:\Users\u\AppData\Local\Temp",
+            r"Remove-Item -Recurse -Force C:\Users\u\AppData\Local\Temp\x C:\Windows\System32",
+            r"Remove-Item -Recurse -Force C:\Users\u\AppData\Local\Temp\x,C:\Windows",
+            r"Remove-Item -Recurse -Force C:\Windows\Temp\x",
+        ] {
+            assert!(
+                matches!(
+                    parse_powershell_remove_item_segment(cmd, false),
+                    RmParseDecision::Deny(_)
+                ),
+                "Remove-Item outside the literal temp carve-out must stay denied: {cmd}"
+            );
+        }
     }
 
     #[test]

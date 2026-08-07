@@ -770,6 +770,8 @@ fn cmd_segment_semantic_decision(segment: &str) -> WindowsFilesystemSemanticDeci
     let mut recursive = PossibleSwitch::default();
     let mut help = false;
     let mut drive_target = PossibleSwitch::default();
+    let mut literal_temp_targets = 0usize;
+    let mut non_temp_target = false;
     for raw in raw_words {
         let Some(decoded) = decode_syntax_word(&mut decoder, raw, ShellDialect::Cmd) else {
             return WindowsFilesystemSemanticDecision::Unverified;
@@ -785,16 +787,31 @@ fn cmd_segment_semantic_decision(segment: &str) -> WindowsFilesystemSemanticDeci
             if decoded.dynamic && !decoded.decoded.starts_with('/') {
                 drive_target.possible = true;
             }
+            // A runtime expansion can also resolve to a target outside the
+            // temp tree, so it disqualifies the literal-temp carve-out.
+            non_temp_target |= decoded.dynamic;
         } else {
             // Deterministic Cmd quoting/carets are shell syntax even for a
             // target.  Decode them before recognizing a quoted drive such as
             // `"C:"`, while never reinterpreting runtime expansions as exact.
             drive_target.exact |= cmd_drive_target(&decoded.decoded);
             drive_target.possible |= drive_target.exact;
+            if crate::packs::core::filesystem::windows_literal_user_temp_subpath(&decoded.decoded) {
+                literal_temp_targets += 1;
+            } else {
+                non_temp_target = true;
+            }
         }
     }
 
     if help && !recursive.possible {
+        return WindowsFilesystemSemanticDecision::Safe;
+    }
+    // #285: recursive deletes whose every target is a literal per-user temp
+    // subpath (`C:\Users\<user>\AppData\Local\Temp\<subpath>`) get the same
+    // carve-out as `rm -rf /tmp/<subpath>`. `%TEMP%`-style dynamic roots and
+    // the machine-wide `C:\Windows\Temp` remain reviewed.
+    if (exact_del || exact_rd) && recursive.exact && literal_temp_targets > 0 && !non_temp_target {
         return WindowsFilesystemSemanticDecision::Safe;
     }
     if exact_del && recursive.exact {
@@ -827,6 +844,40 @@ fn cmd_segment_semantic_decision(segment: &str) -> WindowsFilesystemSemanticDeci
 
 fn powershell_wholly_quoted(raw: &str) -> bool {
     matches!(raw.as_bytes().first(), Some(b'\'' | b'"'))
+}
+
+/// Return whether a raw PowerShell target word is provably one literal
+/// per-user Windows temp subpath (#285).
+///
+/// Single quotes are fully literal in PowerShell; double-quoted and bare
+/// spellings stay literal only without expansion syntax (`$`, backtick). The
+/// path-shape policy itself lives in
+/// [`crate::packs::core::filesystem::windows_literal_user_temp_subpath`].
+fn powershell_literal_target_is_user_temp(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let literal = if bytes.len() >= 2 && bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'' {
+        Some(&raw[1..raw.len() - 1])
+    } else if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+        let inner = &raw[1..raw.len() - 1];
+        (!inner.contains(['$', '`', '"'])).then_some(inner)
+    } else {
+        (!raw.contains(['$', '`', '\'', '"'])).then_some(raw)
+    };
+    literal.is_some_and(crate::packs::core::filesystem::windows_literal_user_temp_subpath)
+}
+
+/// Return whether a statically resolved Remove-Item value parameter names
+/// deletion targets (`-Path`/`-LiteralPath`, including the `lp`/`PSPath`
+/// aliases). The caller has already proven the spelling unambiguous via
+/// [`resolve_remove_item_parameter`].
+fn remove_item_value_parameter_binds_path(decoded: &str) -> bool {
+    decoded.strip_prefix('-').is_some_and(|name| {
+        let name = name.to_ascii_lowercase();
+        !name.is_empty()
+            && (matches!(name.as_str(), "lp" | "pspath")
+                || "path".starts_with(name.as_str())
+                || "literalpath".starts_with(name.as_str()))
+    })
 }
 
 /// Return whether a raw PowerShell word is exactly one variable expression.
@@ -1109,6 +1160,16 @@ fn powershell_segment_semantic_decision(
         .as_deref()
         .is_some_and(|name| matches!(name, "clear-content" | "clc"));
     let is_clear_recycle_bin = exact_name.as_deref() == Some("clear-recyclebin");
+    // cmd.exe deletion words typed at a PowerShell prompt (#280). PowerShell
+    // resolves them to Remove-Item aliases, where `/s` is a literal path
+    // argument, so the classification below keys on the cmd-style `/s` switch
+    // separately from genuine Remove-Item parameter binding.
+    let cmd_style_rule = exact_name.as_deref().and_then(|name| match name {
+        "rd" | "rmdir" => Some("rd-recursive"),
+        "del" | "erase" => Some("del-recursive"),
+        _ => None,
+    });
+    let mut cmd_style_recursive = false;
 
     let mut recurse = PossibleSwitch::default();
     let mut force = PossibleSwitch::default();
@@ -1117,17 +1178,36 @@ fn powershell_segment_semantic_decision(
     let mut invalid_static_remove_parameter = false;
     let mut splatted_options = false;
     let mut stop_parsing = false;
+    let mut literal_temp_targets = 0usize;
+    let mut non_temp_target = false;
     let mut index = 1usize;
     while index < raw_words.len() {
         let raw = raw_words[index];
         index += 1;
         if stop_parsing {
+            // Words past `--%` or a failed decode are unproven; they may name
+            // targets outside the temp tree.
+            non_temp_target = true;
             continue;
         }
         let syntax_role = powershell_parameter_dash_width(raw).is_some()
             || raw.starts_with('@')
             || matches!(raw, "--%" | "'--%'" | "\"--%\"");
         if !syntax_role {
+            if cmd_style_rule.is_some()
+                && (raw.eq_ignore_ascii_case("/s") || raw.eq_ignore_ascii_case("/q"))
+            {
+                // A bare cmd-style switch, not a deletion target (#280).
+                cmd_style_recursive |= raw.eq_ignore_ascii_case("/s");
+                continue;
+            }
+            // Positional word: a deletion target. Track whether every proven
+            // target stays inside a literal per-user temp subtree (#285).
+            if powershell_literal_target_is_user_temp(raw) {
+                literal_temp_targets += 1;
+            } else {
+                non_temp_target = true;
+            }
             continue;
         }
 
@@ -1199,8 +1279,21 @@ fn powershell_segment_semantic_decision(
                         record_powershell_switch(&mut what_if, switch_value, true);
                 }
                 RemoveItemParameter::Value => {
+                    // `-Path`/`-LiteralPath` values are deletion targets and
+                    // join the literal-temp accounting; other value-taking
+                    // parameters (-Include, -ErrorAction, ...) select within
+                    // or beside the targets and do not name new ones.
+                    let binds_target = remove_item_value_parameter_binds_path(&parameter.decoded);
                     if colon.is_some() {
-                        if raw_value.is_none() {
+                        if let Some(value) = raw_value {
+                            if binds_target {
+                                if powershell_literal_target_is_user_temp(value) {
+                                    literal_temp_targets += 1;
+                                } else {
+                                    non_temp_target = true;
+                                }
+                            }
+                        } else {
                             invalid_static_remove_parameter = true;
                         }
                     } else {
@@ -1209,7 +1302,17 @@ fn powershell_segment_semantic_decision(
                             .copied()
                             .map(powershell_value_lookahead)
                         {
-                            Some(PowerShellValueLookahead::Data) => index += 1,
+                            Some(PowerShellValueLookahead::Data) => {
+                                if binds_target {
+                                    let value = raw_words.get(index).copied().unwrap_or_default();
+                                    if powershell_literal_target_is_user_temp(value) {
+                                        literal_temp_targets += 1;
+                                    } else {
+                                        non_temp_target = true;
+                                    }
+                                }
+                                index += 1;
+                            }
                             Some(PowerShellValueLookahead::NamedParameter) | None => {
                                 // A recognized or ambiguous named parameter
                                 // starts a new binding; the current value-taking
@@ -1228,6 +1331,9 @@ fn powershell_segment_semantic_decision(
                                 if raw_words.get(index).is_some() {
                                     index += 1;
                                     stop_parsing = true;
+                                    // The word past `--` bound to this
+                                    // parameter is unexamined data.
+                                    non_temp_target = true;
                                 } else {
                                     invalid_static_remove_parameter = true;
                                 }
@@ -1284,10 +1390,36 @@ fn powershell_segment_semantic_decision(
     if is_clear_recycle_bin {
         return WindowsFilesystemSemanticDecision::Destructive("clear-recyclebin");
     }
+    // #280: `rd /s /q X` (and `del`/`erase`/`rmdir` `/s`) under the PowerShell
+    // dialect. PowerShell would only report an error (the switches bind as
+    // path arguments to the Remove-Item alias), but the author almost
+    // certainly intended cmd.exe semantics, so classify exactly like the Cmd
+    // scanner. Literal per-user temp targets keep the #285 carve-out for
+    // parity with that scanner.
+    if let Some(rule) = cmd_style_rule
+        && cmd_style_recursive
+    {
+        if literal_temp_targets > 0
+            && !non_temp_target
+            && !unresolved_remove_binding
+            && !splatted_options
+        {
+            return WindowsFilesystemSemanticDecision::Safe;
+        }
+        return WindowsFilesystemSemanticDecision::Destructive(rule);
+    }
     if is_remove_item && recurse.possible && (unresolved_remove_binding || splatted_options) {
         return WindowsFilesystemSemanticDecision::Unverified;
     }
     if is_remove_item && recurse.exact {
+        // #285: recursive deletes whose every proven target is a literal
+        // per-user temp subpath (`C:\Users\<user>\AppData\Local\Temp\<x>`)
+        // get the same carve-out as `rm -rf /tmp/<subpath>`. `$env:TEMP`
+        // spellings stay reviewed like `$TMPDIR` (caller-controlled), and
+        // the machine-wide `C:\Windows\Temp` is not carved out.
+        if literal_temp_targets > 0 && !non_temp_target {
+            return WindowsFilesystemSemanticDecision::Safe;
+        }
         return WindowsFilesystemSemanticDecision::Destructive(if force.exact {
             "remove-item-recurse-force"
         } else {
@@ -2320,6 +2452,138 @@ mod tests {
             assert!(
                 pack.check(command).is_some(),
                 "recursive temp cleanup must require review: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_style_slash_s_deletes_are_blocked_under_the_powershell_dialect() {
+        // Regression for #280: the hook maps the PowerShell tool to the ps
+        // dialect, where `rd`/`del` alias Remove-Item and `/s` is a literal
+        // path argument. The author almost certainly intended cmd.exe
+        // semantics (PowerShell itself would only error), so the ps scanner
+        // must classify exactly like the Cmd scanner.
+        let destructive = [
+            (
+                r"rd /s /q C:\Users\test\Projekte\testordner",
+                "rd-recursive",
+            ),
+            (r"RD /S /Q C:\src", "rd-recursive"),
+            (r"rmdir /s C:\build", "rd-recursive"),
+            (r"del /s /q C:\x", "del-recursive"),
+            (r"erase /s C:\data", "del-recursive"),
+            (r"rd /s /q $env:TEMP\x", "rd-recursive"),
+        ];
+        for (command, expected) in destructive {
+            for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+                assert_eq!(
+                    windows_filesystem_semantic_decision_in_dialect(command, dialect),
+                    WindowsFilesystemSemanticDecision::Destructive(expected),
+                    "{dialect:?} must classify {command}"
+                );
+            }
+        }
+        // Genuine PowerShell spellings without a cmd-style `/s` keep their
+        // current classification.
+        for command in [r"rd .\builddir", r"rd /q C:\builddir", r"del C:\file.txt"] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell),
+                WindowsFilesystemSemanticDecision::NoMatch,
+                "non-/s PowerShell spelling must stay unmatched: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_user_temp_subpath_deletes_are_carved_out() {
+        // Regression for #285: recursive deletes whose every proven target is
+        // a literal per-user temp subpath are temp cleanup, exactly like
+        // `rm -rf /tmp/<subpath>` on Unix. Windows paths compare
+        // case-insensitively.
+        let safe = [
+            (
+                r"Remove-Item -Recurse -Force C:\Users\u\AppData\Local\Temp\some\subdir\file",
+                ShellDialect::PowerShell,
+            ),
+            (
+                r"Remove-Item -Recurse c:\users\u\appdata\local\TEMP\x",
+                ShellDialect::PowerShell,
+            ),
+            (
+                r"rd /s /q C:\Users\u\AppData\Local\Temp\sub",
+                ShellDialect::PowerShell,
+            ),
+            (
+                r"rd /s /q C:\Users\u\AppData\Local\Temp\sub",
+                ShellDialect::Cmd,
+            ),
+            (
+                r"del /s /q C:\Users\u\AppData\Local\Temp\build",
+                ShellDialect::Cmd,
+            ),
+        ];
+        for (command, dialect) in safe {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, dialect),
+                WindowsFilesystemSemanticDecision::Safe,
+                "{dialect:?} must carve out literal temp cleanup: {command}"
+            );
+        }
+        // The carve-out must stay bounded: the temp root itself, non-temp
+        // paths, prefix confusion, traversal, comma/multi-target smuggling,
+        // the machine-wide C:\Windows\Temp, and dynamic roots stay denied.
+        let destructive = [
+            (
+                r"Remove-Item -Recurse -Force C:\Users\u\AppData\Local\Temp",
+                ShellDialect::PowerShell,
+                "remove-item-recurse-force",
+            ),
+            (
+                r"Remove-Item -Recurse -Force C:\Users\u",
+                ShellDialect::PowerShell,
+                "remove-item-recurse-force",
+            ),
+            (
+                r"Remove-Item -Recurse -Force C:\Users\u\AppData\Local\Tempx\y",
+                ShellDialect::PowerShell,
+                "remove-item-recurse-force",
+            ),
+            (
+                r"Remove-Item -Recurse -Force C:\Users\u\AppData\Local\Temp\x C:\Windows\System32",
+                ShellDialect::PowerShell,
+                "remove-item-recurse-force",
+            ),
+            (
+                r"Remove-Item -Recurse -Force C:\Users\u\AppData\Local\Temp\x,C:\Windows",
+                ShellDialect::PowerShell,
+                "remove-item-recurse-force",
+            ),
+            (
+                r"Remove-Item -Recurse -Force C:\Windows\Temp\x",
+                ShellDialect::PowerShell,
+                "remove-item-recurse-force",
+            ),
+            (
+                r"rd /s /q C:\Users\u\AppData\Local\Temp\..\x",
+                ShellDialect::Cmd,
+                "rd-recursive",
+            ),
+            (
+                r"rd /s /q C:\Users\u\AppData\Local\Temp\x C:\src",
+                ShellDialect::Cmd,
+                "rd-recursive",
+            ),
+            (
+                r"rd /s /q C:\Windows\Temp\stale",
+                ShellDialect::Cmd,
+                "rd-recursive",
+            ),
+        ];
+        for (command, dialect, expected) in destructive {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, dialect),
+                WindowsFilesystemSemanticDecision::Destructive(expected),
+                "{dialect:?} carve-out must stay bounded: {command}"
             );
         }
     }
