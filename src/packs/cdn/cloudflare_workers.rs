@@ -460,6 +460,20 @@ fn npm_exec_runner_start(
     WranglerExecutableDecision::NoMatch
 }
 
+/// Whether argv still literally spells a runner shell-source option.
+///
+/// Used only where the executable itself is unbounded: the expansion carries no
+/// runner evidence, but a literal `-c` / `--call` payload is a real embedded
+/// shell seam and stays fail-closed.
+fn argv_spells_runner_shell_call(words: &[WranglerWord]) -> bool {
+    words.iter().any(|word| {
+        !word.dynamic
+            && (matches!(word.decoded.as_str(), "-c" | "--call")
+                || word.decoded.starts_with("--call=")
+                || word.decoded.starts_with("-c="))
+    })
+}
+
 fn runner_shell_payload_segment_decision(
     segment: &str,
     dialect: ShellDialect,
@@ -479,6 +493,16 @@ fn runner_shell_payload_segment_decision(
     let Some(executable) = decoded.words.get(index) else {
         return WranglerRunnerShellDecision::NoMatch;
     };
+    if wrangler_word_is_unbounded(executable, dialect) {
+        // An executable with zero literal bytes is no more `npx` than it is any
+        // other program (#281). Only a literal runner shell-source option keeps
+        // this seam fail-closed; `$cmd $arg` is simply an unknown command.
+        return if argv_spells_runner_shell_call(&decoded.words[index + 1..]) {
+            WranglerRunnerShellDecision::Unverified
+        } else {
+            WranglerRunnerShellDecision::NoMatch
+        };
+    }
     if executable.dynamic {
         return if ["npx", "npm"]
             .iter()
@@ -730,6 +754,45 @@ fn literal_word_names_wrangler_executable(word: &WranglerWord, dialect: ShellDia
     executable_basename(decoded).eq_ignore_ascii_case("wrangler")
 }
 
+/// A word that is a pure expansion with zero literal bytes: it may expand to
+/// anything, so it names nothing in particular and carries no Wrangler evidence
+/// on its own (#281, mirroring `git_semantic_word_is_unbounded`). A partially
+/// literal expansion such as `wran$X` keeps its conservative treatment.
+fn wrangler_word_is_unbounded(word: &WranglerWord, dialect: ShellDialect) -> bool {
+    if !word.dynamic {
+        return false;
+    }
+    let decoded = if dialect == ShellDialect::Cmd {
+        word.decoded.trim_start_matches('@')
+    } else {
+        word.decoded.as_str()
+    };
+    let basename = decoded.rsplit(['/', '\\']).next().unwrap_or(decoded);
+    dynamic_fragments(basename, dialect)
+        .iter()
+        .all(String::is_empty)
+}
+
+/// Positive Wrangler evidence in `words[index..]`, ignoring unbounded words.
+///
+/// This is [`remaining_words_may_name_wrangler`] restricted to words that can
+/// actually testify: an unbounded expansion matches every candidate, so letting
+/// it satisfy the evidence gate would re-admit the whole `$X $Y` class (#281).
+fn remaining_words_carry_wrangler_evidence(
+    words: &[WranglerWord],
+    index: usize,
+    dialect: ShellDialect,
+) -> bool {
+    words[index..].iter().any(|word| {
+        !wrangler_word_is_unbounded(word, dialect)
+            && (symbolic_executable_may_equal(word, dialect, "wrangler")
+                || (!word.dynamic
+                    && (word.decoded.starts_with("wrangler@")
+                        || literal_word_names_wrangler_executable(word, dialect)
+                        || is_wrangler_script_path(&word.decoded))))
+    })
+}
+
 fn remaining_words_may_name_wrangler(
     words: &[WranglerWord],
     index: usize,
@@ -858,6 +921,30 @@ fn trailing_argv_is_destructive_wrangler_shape(
         wrangler_segment_semantic_decision(&synthetic, ShellDialect::Posix),
         WranglerSemanticDecision::Destructive(_) | WranglerSemanticDecision::Unverified
     )
+}
+
+/// Destructive Wrangler argv behind an *unbounded* executable word.
+///
+/// Same question as [`trailing_argv_is_destructive_wrangler_shape`], except an
+/// unbounded trailing word may not supply the `delete`/`rollback` evidence:
+/// otherwise `$X $Y` would deny on the strength of two words that name nothing
+/// (#281). Literal argv (`$W r2 bucket delete x`) still denies.
+fn unbounded_executable_argv_is_destructive_wrangler_shape(
+    words: &[WranglerWord],
+    index: usize,
+    dialect: ShellDialect,
+) -> bool {
+    let trailing = &words[index..];
+    if trailing.is_empty() {
+        return false;
+    }
+    if trailing.iter().any(|word| word.dynamic) {
+        return trailing.iter().any(|word| {
+            !wrangler_word_is_unbounded(word, dialect)
+                && (word.may_equal("delete", dialect) || word.may_equal("rollback", dialect))
+        });
+    }
+    trailing_argv_is_destructive_wrangler_shape(words, index, dialect)
 }
 
 fn runtime_script_candidate_decision(
@@ -1063,6 +1150,42 @@ fn javascript_runtime_wrangler_script_index(
     WranglerExecutableDecision::NoMatch
 }
 
+/// Whether the options after the `command` builtin select its query form.
+///
+/// POSIX spells it `command [-p] -v|-V name`: `-v`/`-V` print how `name` would
+/// resolve instead of running it. Option clustering (`-pv`) counts; a dynamic
+/// or non-option word ends the scan without a query.
+fn command_builtin_is_lookup_query(
+    words: &[WranglerWord],
+    mut index: usize,
+    dialect: ShellDialect,
+) -> bool {
+    while let Some(word) = words.get(index) {
+        if word.dynamic {
+            return false;
+        }
+        let text = if dialect == ShellDialect::Cmd {
+            word.decoded.trim_start_matches('@')
+        } else {
+            word.decoded.as_str()
+        };
+        let Some(flags) = text.strip_prefix('-') else {
+            return false;
+        };
+        if flags.is_empty() || flags.starts_with('-') {
+            return false;
+        }
+        if flags.contains(['v', 'V']) {
+            return true;
+        }
+        if !flags.chars().all(|ch| ch == 'p') {
+            return false;
+        }
+        index += 1;
+    }
+    false
+}
+
 fn find_wrangler_index(
     words: &[WranglerWord],
     dialect: ShellDialect,
@@ -1103,6 +1226,21 @@ fn find_wrangler_index(
     if first.eq_ignore_ascii_case("wrangler") {
         return WranglerExecutableDecision::Found(index);
     }
+    if wrangler_word_is_unbounded(first_word, dialect) {
+        // An executable word with zero literal bytes may expand to anything, so
+        // it is evidence for nothing: `$cmd $arg` and `"$X" "$Y"` are unknown
+        // commands, not unverified Wrangler invocations (#281, #273). Fail
+        // closed only when the rest of the segment carries positive Wrangler
+        // evidence, or spells a destructive Wrangler argv the expansion would
+        // complete (`$W r2 bucket delete x`).
+        return if remaining_words_carry_wrangler_evidence(words, index + 1, dialect)
+            || unbounded_executable_argv_is_destructive_wrangler_shape(words, index + 1, dialect)
+        {
+            WranglerExecutableDecision::Unverified
+        } else {
+            WranglerExecutableDecision::NoMatch
+        };
+    }
     if first_word.dynamic {
         return if symbolic_executable_may_equal(first_word, dialect, "wrangler")
             || symbolic_executable_may_equal(first_word, dialect, "wrangler.exe")
@@ -1114,6 +1252,16 @@ fn find_wrangler_index(
         } else {
             WranglerExecutableDecision::NoMatch
         };
+    }
+
+    if first.eq_ignore_ascii_case("command")
+        && command_builtin_is_lookup_query(words, index + 1, dialect)
+    {
+        // `command -v NAME` / `command -V NAME` *looks NAME up* and executes
+        // nothing, which is why the normalizer refuses to peel it (#289 §3).
+        // The suffix naming Wrangler is therefore not a Wrangler invocation
+        // under any dialect; `command wrangler ...` (no -v) still runs it.
+        return WranglerExecutableDecision::NoMatch;
     }
 
     if ["sudo", "env", "command", "exec", "nohup", "time", "!"]
@@ -2698,6 +2846,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn unbounded_dynamic_executables_carry_no_wrangler_evidence_issue_281() {
+        // #281/#273: an executable word that is a pure expansion with zero
+        // literal bytes may become anything, so it is evidence for nothing.
+        // Every dialect must agree, quoted and unquoted alike.
+        for dialect in [
+            ShellDialect::Posix,
+            ShellDialect::Unknown,
+            ShellDialect::PowerShell,
+            ShellDialect::Cmd,
+        ] {
+            for command in [
+                "$cmd $arg",
+                "$X $Y",
+                r#""$X" "$Y""#,
+                r#""$BIN" run "$ARG""#,
+                "$SCRIPT --version",
+            ] {
+                assert_eq!(
+                    wrangler_semantic_decision_in_dialect(command, dialect),
+                    WranglerSemanticDecision::NoMatch,
+                    "{dialect:?}: {command}"
+                );
+                assert_eq!(
+                    wrangler_runner_shell_decision_in_dialect(command, dialect),
+                    WranglerRunnerShellDecision::NoMatch,
+                    "{dialect:?}: {command}"
+                );
+            }
+        }
+
+        // Evidence elsewhere in the segment still reaches the fail-closed rule:
+        // a literal Wrangler token, a destructive Wrangler argv the expansion
+        // would complete, a partially literal executable, or a runner shell
+        // payload option.
+        for command in [
+            "$X wrangler r2 bucket delete assets",
+            "$W r2 bucket delete x",
+            "$W r2 bucket delete $NAME",
+            "wran$X kv namespace delete cache",
+            r#"$X -c "wrangler delete worker""#,
+        ] {
+            assert_eq!(
+                wrangler_semantic_decision_in_dialect(command, ShellDialect::Posix),
+                WranglerSemanticDecision::Unverified,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_builtin_lookup_form_is_a_query_not_an_invocation_issue_283() {
+        // `command -v NAME` resolves a name and executes nothing, so a literal
+        // `wrangler` behind it is not a Wrangler invocation under any dialect.
+        for dialect in [
+            ShellDialect::Posix,
+            ShellDialect::Unknown,
+            ShellDialect::PowerShell,
+            ShellDialect::Cmd,
+        ] {
+            for command in [
+                "command -v wrangler",
+                "command -V wrangler",
+                "command -p -v wrangler",
+                "command -pv wrangler.exe",
+            ] {
+                assert_eq!(
+                    wrangler_semantic_decision_in_dialect(command, dialect),
+                    WranglerSemanticDecision::NoMatch,
+                    "{dialect:?}: {command}"
+                );
+            }
+        }
+
+        // Without `-v`, `command` really runs its suffix.
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Cmd] {
+            assert_eq!(
+                wrangler_semantic_decision_in_dialect(
+                    "command wrangler r2 bucket delete assets",
+                    dialect,
+                ),
+                WranglerSemanticDecision::Unverified,
+                "{dialect:?}"
+            );
+        }
+        assert_eq!(
+            wrangler_semantic_decision_in_dialect(
+                "command wrangler r2 bucket delete assets",
+                ShellDialect::Posix,
+            ),
+            WranglerSemanticDecision::Destructive("wrangler-r2-bucket-delete"),
+        );
     }
 
     #[test]
