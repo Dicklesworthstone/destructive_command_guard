@@ -1,0 +1,54 @@
+# #294 — the unknown-dialect fan-out may only ADD denials
+#
+# `unknown` now replays an allowing evaluation under Cmd and PowerShell so a
+# payload that is inert under POSIX quoting but destructive under those dialects
+# stops passing every regex pack (see controls_true_positives.toml, #294
+# section). The replay must stay deny-wins in the narrow sense: it may not drag
+# another dialect's *false* positives into the view generic adapters get.
+#
+# The Cmd replay is therefore scoped to parses that expose an extra command
+# segment. cmd.exe reading quoted bytes as ordinary argv text inside one segment
+# cannot execute anything the POSIX view missed — it only makes argument data
+# look like command text, which is exactly the shape of the two cmd-only false
+# positives below.
+
+[[case]]
+description = "benign quoted ampersand prose"
+command = "echo 'hello & goodbye'"
+expected = "allow"
+issue = 294
+
+[[case]]
+description = "commit message mentioning a destructive command"
+command = "git commit -m \"merge & cleanup\""
+expected = "allow"
+issue = 294
+
+# Cmd-only false positives: `'` is an ordinary argv byte under cmd.exe, so the
+# quoted prose is visible as command text there. Neither shape gains a command
+# segment under cmd, so neither may reach the unknown dialect.
+
+[[case]]
+description = "commit message quoting rm -rf must not be imported from the cmd view"
+command = "git commit -m 'fix: do not rm -rf root'"
+expected = "allow"
+issue = 294
+dialects = ["posix", "ps", "unknown"]
+
+[[case]]
+description = "sed substitution containing >/ must not be imported from the cmd view"
+command = "echo a=b | sed -E 's/=.*/=<set>/'"
+expected = "allow"
+issue = 294
+dialects = ["posix", "ps", "unknown"]
+
+# cmd.exe also splits on `(`/`)` grouping, so a quoted `$(...)` looks like an
+# extra command segment on segment count alone. The replay therefore requires
+# the new segment to begin after a `&` or `|` separator.
+
+[[case]]
+description = "quoted substitution text must not be imported from the cmd view"
+command = "echo '$(rm -r ./tree)'"
+expected = "allow"
+issue = 294
+dialects = ["posix", "ps", "unknown"]

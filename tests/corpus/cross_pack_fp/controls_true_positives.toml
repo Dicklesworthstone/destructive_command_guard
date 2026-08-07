@@ -158,6 +158,51 @@ expected = "deny"
 issue = 283
 
 # ============================================================================
+# #294 — the unknown dialect is a union, not a synonym for posix
+# ============================================================================
+#
+# `unknown` is what every generic terminal adapter and the CLI default supply.
+# It used to give the regex packs a single POSIX-normalized view, so a payload
+# that is inert under POSIX quoting but destructive under cmd.exe or PowerShell
+# parsing passed every regex pack; only the hand-written semantic decoders ran
+# a per-dialect deny-wins union. The evaluator now replays an allowing
+# unknown-dialect evaluation under Cmd and PowerShell, so each control below is
+# scoped to the dialect that really executes the payload *plus* `unknown`. The
+# posix column stays out on purpose: under POSIX quoting these shapes are data.
+
+[[case]]
+description = "unclosed single quote hides a cmd.exe command separator"
+command = "echo 'ok & docker system prune -af"
+expected = "deny"
+rule_id = "containers.docker:system-prune"
+issue = 294
+dialects = ["cmd", "unknown"]
+
+[[case]]
+description = "a POSIX backslash escape does not neutralize cmd.exe's separator"
+command = "echo ok \\& docker system prune -af"
+expected = "deny"
+rule_id = "containers.docker:system-prune"
+issue = 294
+dialects = ["cmd", "unknown"]
+
+[[case]]
+description = "PowerShell Invoke-Expression executes a string POSIX pipes as data"
+command = "'git reset --hard' | iex"
+expected = "deny"
+rule_id = "core.git:reset-hard"
+issue = 294
+dialects = ["ps", "unknown"]
+
+[[case]]
+description = "PowerShell Invoke-Expression spelled out"
+command = "\"git reset --hard\" | Invoke-Expression"
+expected = "deny"
+rule_id = "core.git:reset-hard"
+issue = 294
+dialects = ["ps", "unknown"]
+
+# ============================================================================
 # Baseline: the canonical destructive shapes must deny under all packs
 # ============================================================================
 

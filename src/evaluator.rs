@@ -11369,9 +11369,236 @@ pub fn evaluate_command_with_pack_order_deadline_at_path_in_dialect(
     )
 }
 
+/// Bytes whose shell meaning differs between the dialects dcg models, and which
+/// can therefore make one dialect's parse of a command structurally different
+/// from another's (dcg#294).
+///
+/// * `'` / `"` — POSIX and PowerShell quoting vs. cmd.exe, where `'` is an
+///   ordinary argv byte and an unbalanced quote does not swallow the rest of
+///   the line.
+/// * `^` — cmd.exe's escape character; inert elsewhere.
+/// * `` ` `` — PowerShell's escape character and POSIX command substitution.
+/// * `%` — cmd.exe variable expansion.
+/// * `&` / `|` — command separators whose reach depends on which quoting rules
+///   delimit them, and which a POSIX backslash escape neutralizes while cmd.exe
+///   and PowerShell keep them live.
+///
+/// `;` is deliberately absent. POSIX and PowerShell both split on it and
+/// cmd.exe does not, so relative to the POSIX view the only structural effect a
+/// bare `;` can have is to *merge* segments under Cmd — which can manufacture
+/// cross-segment false positives but can never expose a command the POSIX view
+/// masked. A `;` that is dialect-relevant because it sits next to quoting is
+/// already covered by the quote bytes.
+const DIALECT_DIVERGENT_BYTES: [u8; 7] = *b"'\"^`%&|";
+
+/// Cheap pre-signal for the unknown-dialect fan-out (dcg#294).
+///
+/// Returns `true` only when a second dialect's parse could plausibly differ
+/// from the POSIX one *and* the raw command still mentions an enabled-pack
+/// keyword. Both halves are byte scans over the raw string: the fast path
+/// (a benign command with no quoting or separators, or one that names nothing
+/// any enabled pack protects) never pays for the extra views.
+///
+/// The keyword half is deliberately evaluated against the *raw* command rather
+/// than any normalized view: masking and normalization are exactly the
+/// dialect-dependent steps the fan-out exists to re-run, so gating on their
+/// output would re-introduce the bug. When no keyword index is available the
+/// keyword half is skipped (fail-closed: the fan-out still runs).
+fn unknown_dialect_fanout_candidate(
+    command: &str,
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+) -> bool {
+    if !command
+        .as_bytes()
+        .iter()
+        .any(|byte| DIALECT_DIVERGENT_BYTES.contains(byte))
+    {
+        return false;
+    }
+    keyword_index.is_none_or(|index| index.has_any_keyword(command))
+}
+
+/// Whether `view`'s parse of `command` exposes command segments the POSIX parse
+/// does not (dcg#294).
+///
+/// This is the divergence that can actually hide an execution: POSIX quoting or
+/// escaping swallowing a separator the other dialect honors, so
+/// `echo 'ok & docker system prune -af` is one `echo` under POSIX but two
+/// commands under cmd.exe.
+///
+/// The complementary direction is deliberately *not* a trigger. A dialect
+/// reading quoted bytes as ordinary argv text inside a single segment cannot
+/// execute anything the POSIX view failed to see as a command; it only makes
+/// argument data look like command text, which is the false-positive direction
+/// (`git commit -m 'fix: do not rm -rf root'` is one `git commit` in every
+/// dialect). Likewise `;`, which cmd.exe merges rather than splits.
+///
+/// The new segment must additionally start right after a `&` or `|` separator.
+/// cmd.exe also splits on `(`/`)` grouping, and a quoted `$(...)` or `(...)`
+/// that POSIX keeps inside one word would otherwise look like an exposed
+/// command when it is still argument text.
+fn view_exposes_extra_command_segments(command: &str, view: ShellDialect) -> bool {
+    let segment_starts = |dialect| -> Vec<usize> {
+        crate::packs::split_command_segments_in_dialect(command, dialect)
+            .iter()
+            .map(|segment| (segment.as_ptr() as usize).saturating_sub(command.as_ptr() as usize))
+            .collect()
+    };
+    let posix_starts = segment_starts(ShellDialect::Posix);
+    segment_starts(view).into_iter().any(|start| {
+        !posix_starts.contains(&start) && command[..start].trim_end().ends_with(['&', '|'])
+    })
+}
+
+/// PowerShell cmdlets (and their default aliases) that execute a string value
+/// as code. They have no POSIX or cmd.exe analogue, so a command naming one is
+/// worth replaying under PowerShell even when its segmentation matches POSIX's:
+/// `'git reset --hard' | iex` is inert data piped to an unknown program
+/// everywhere else and a real `git reset --hard` under PowerShell.
+const POWERSHELL_STRING_EXECUTION_SINKS: [&str; 4] =
+    ["iex", "invoke-expression", "icm", "invoke-command"];
+
+/// Whether `command` names a PowerShell string-execution sink as a whole word.
+fn names_powershell_string_execution_sink(command: &str) -> bool {
+    let lowered = command.to_ascii_lowercase();
+    lowered
+        .split(|byte: char| !(byte.is_ascii_alphanumeric() || byte == '-' || byte == '_'))
+        .any(|word| POWERSHELL_STRING_EXECUTION_SINKS.contains(&word))
+}
+
+/// Whether replaying `command` under `view` can expose an execution the POSIX
+/// view structurally could not see (dcg#294).
+///
+/// Residual gap, stated plainly: an intra-segment dialect-only rewrite — cmd.exe
+/// caret de-escaping (`doc^ker …`), `%VAR%` expansion, or a PowerShell backtick
+/// escape reconstructing an executable word without adding a separator — is not
+/// covered by this replay, and neither is a PowerShell execution sink outside
+/// the small list above. Closing those needs the per-dialect `CommandModel` of
+/// #289 §A rather than a fan-out: replaying every command unconditionally under
+/// every dialect imports each dialect view's own false positives (quoted commit
+/// prose read as command text, `rm` resolved as the `Remove-Item` alias) into
+/// the view that generic adapters actually get.
+fn dialect_view_may_expose_hidden_execution(command: &str, view: ShellDialect) -> bool {
+    if view_exposes_extra_command_segments(command, view) {
+        return true;
+    }
+    view == ShellDialect::PowerShell && names_powershell_string_execution_sink(command)
+}
+
+/// Evaluate a command, fanning out across dialects when the caller could not
+/// prove one (dcg#294).
+///
+/// Under [`ShellDialect::Unknown`] — what every generic terminal adapter and the
+/// CLI default supply — the regex packs used to see a single POSIX-normalized
+/// view, so a payload that is inert under POSIX quoting but destructive under
+/// cmd.exe or PowerShell quoting passed every pack. The per-dialect union with
+/// deny-wins combination existed only inside the hand-written semantic decoders.
+///
+/// The fan-out here restores fail-closed behavior for the generic path: when the
+/// POSIX-shaped view of an unknown-dialect command allows, the same evaluation is
+/// replayed under the concrete Cmd and PowerShell dialects and a deny or warn
+/// from either is adopted. Polarity is deny-wins only — the extra views can add
+/// a finding but can never clear one, and a POSIX deny short-circuits before
+/// they run. Each replay is a full evaluation at the replayed dialect, so a
+/// finding carries exactly the rule id `--dialect cmd` / `--dialect ps` would
+/// report for the same command.
+///
+/// Two guards keep the cost bounded and the polarity honest:
+/// [`unknown_dialect_fanout_candidate`] requires a dialect-divergent byte plus a
+/// live enabled-pack keyword before any replay runs at all, and each replay
+/// additionally requires [`dialect_view_may_expose_hidden_execution`] so that a
+/// dialect's quote-blindness can only add a deny when its parse exposes an
+/// execution POSIX could not see, never when it merely reveals quoted argument
+/// text as command-shaped bytes.
+///
+/// Recursion is impossible: the replays pass a concrete dialect, and the
+/// fan-out is confined to top-level evaluation (`nested_command_depth == 0`).
+/// Nested envelopes — launcher payloads, heredoc bodies, command
+/// substitutions — keep their existing single-view behavior under whichever
+/// dialect the enclosing view established.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_command_with_pack_order_deadline_at_path_inner(
+    command: &str,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+    shell_dialect: crate::normalize::ShellDialect,
+    nested_command_depth: usize,
+    inherited_automated_stdin: bool,
+) -> EvaluationResult {
+    let primary = evaluate_command_in_single_dialect_view(
+        command,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        allow_once_audit,
+        project_path,
+        deadline,
+        shell_dialect,
+        nested_command_depth,
+        inherited_automated_stdin,
+    );
+
+    if shell_dialect != ShellDialect::Unknown
+        || nested_command_depth != 0
+        || primary.decision != EvaluationDecision::Allow
+        || !unknown_dialect_fanout_candidate(command, keyword_index)
+    {
+        return primary;
+    }
+
+    for view in [ShellDialect::Cmd, ShellDialect::PowerShell] {
+        if !dialect_view_may_expose_hidden_execution(command, view) {
+            continue;
+        }
+        // An exhausted budget is never proof that the un-run views are clean.
+        if deadline_exceeded(deadline) {
+            return EvaluationResult::indeterminate_due_to_budget();
+        }
+        let alternate = evaluate_command_in_single_dialect_view(
+            command,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            view,
+            nested_command_depth,
+            inherited_automated_stdin,
+        );
+        // Deny-wins union. An incomplete alternate view is fail-closed for the
+        // same reason an incomplete primary view is. A warn is adopted only
+        // when the primary view found nothing at all, so an alternate view can
+        // never overwrite the primary's own attribution with a weaker one.
+        match alternate.decision {
+            EvaluationDecision::Deny | EvaluationDecision::Indeterminate => return alternate,
+            EvaluationDecision::Allow => {
+                if primary.effective_mode.is_none() && alternate.effective_mode.is_some() {
+                    return alternate;
+                }
+            }
+        }
+    }
+
+    primary
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
-fn evaluate_command_with_pack_order_deadline_at_path_inner(
+fn evaluate_command_in_single_dialect_view(
     command: &str,
     enabled_keywords: &[&str],
     ordered_packs: &[String],
@@ -33400,5 +33627,133 @@ mod tests {
         assert!(!segment_is_pipeline_member("a || b", 0, 1));
         assert!(!segment_is_pipeline_member("a || b", 5, 6));
         assert!(!segment_is_pipeline_member("a && b", 0, 1));
+    }
+
+    /// dcg#294: the unknown-dialect fan-out must never fire on the fast path.
+    #[test]
+    fn issue_294_fanout_gate_rejects_the_fast_path() {
+        let ordered = crate::packs::REGISTRY
+            .expand_enabled_ordered(&["containers.docker".to_string()].into());
+        let index = crate::packs::REGISTRY
+            .build_enabled_keyword_index(&ordered)
+            .expect("keyword index should build");
+
+        // No dialect-divergent byte: no replay, whatever the keywords say.
+        for command in [
+            "echo hello",
+            "ls -la",
+            "docker system prune -af",
+            "git status",
+        ] {
+            assert!(
+                !unknown_dialect_fanout_candidate(command, Some(&index)),
+                "{command:?} has no dialect-divergent byte and must not fan out"
+            );
+        }
+
+        // Divergent bytes but no enabled-pack keyword: still no replay.
+        for command in ["echo 'hello & goodbye'", "grep -n 'a|b' notes.txt"] {
+            assert!(
+                !unknown_dialect_fanout_candidate(command, Some(&index)),
+                "{command:?} names nothing an enabled pack protects and must not fan out"
+            );
+        }
+
+        // Both halves satisfied: the replay is allowed to run.
+        assert!(unknown_dialect_fanout_candidate(
+            "echo 'ok & docker system prune -af",
+            Some(&index)
+        ));
+
+        // Without a keyword index the gate keeps only the byte half (fail-closed).
+        assert!(unknown_dialect_fanout_candidate(
+            "echo 'hello & goodbye'",
+            None
+        ));
+        assert!(!unknown_dialect_fanout_candidate("echo hello", None));
+    }
+
+    /// dcg#294: a replay is scoped to parses that expose a real extra command
+    /// segment (or, under PowerShell, a string-execution sink) — never to a
+    /// dialect merely reading quoted bytes as argv.
+    #[test]
+    fn issue_294_replay_requires_hidden_execution_evidence() {
+        for command in [
+            "echo 'ok & docker system prune -af",
+            "echo ok \\& docker system prune -af",
+        ] {
+            assert!(
+                dialect_view_may_expose_hidden_execution(command, ShellDialect::Cmd),
+                "{command:?} runs a second command under cmd.exe only"
+            );
+        }
+        for command in [
+            "'git reset --hard' | iex",
+            "\"git reset --hard\" | Invoke-Expression",
+        ] {
+            assert!(
+                dialect_view_may_expose_hidden_execution(command, ShellDialect::PowerShell),
+                "{command:?} executes its string argument under PowerShell only"
+            );
+        }
+        // Shapes whose destructive-looking text is quoted argument data in
+        // every dialect: no replay, so no dialect view's own false positive can
+        // reach the unknown dialect.
+        for (command, view) in [
+            ("git commit -m 'fix: do not rm -rf root'", ShellDialect::Cmd),
+            ("echo a=b | sed -E 's/=.*/=<set>/'", ShellDialect::Cmd),
+            (
+                "chown user /var/log/app.log; cp -R src /opt/app",
+                ShellDialect::Cmd,
+            ),
+            ("echo '$(rm -r ./tree)'", ShellDialect::PowerShell),
+            (
+                "rm -r \"/tmp/unlink /etc/passwd\"",
+                ShellDialect::PowerShell,
+            ),
+            ("echo hello", ShellDialect::Cmd),
+        ] {
+            assert!(
+                !dialect_view_may_expose_hidden_execution(command, view),
+                "{command:?} exposes no hidden execution under {view:?}"
+            );
+        }
+    }
+
+    /// dcg#294: the headline repro, at the evaluator seam.
+    #[test]
+    fn issue_294_unknown_dialect_denies_cmd_quoted_docker_prune() {
+        let command = "echo 'ok & docker system prune -af";
+        assert!(
+            evaluate_with_pack_ids_in_dialect(command, &["containers.docker"], ShellDialect::Posix)
+                .is_allowed()
+        );
+        let unknown = evaluate_with_pack_ids_in_dialect(
+            command,
+            &["containers.docker"],
+            ShellDialect::Unknown,
+        );
+        assert!(unknown.is_denied(), "expected deny, got {unknown:?}");
+        assert_eq!(
+            unknown
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some("system-prune")
+        );
+    }
+
+    /// dcg#294: a proven dialect never fans out, so `--dialect posix` and every
+    /// nested evaluation keep their existing single-view behavior.
+    #[test]
+    fn issue_294_proven_dialects_do_not_fan_out() {
+        let command = "echo 'ok & docker system prune -af";
+        for dialect in [ShellDialect::Posix, ShellDialect::PowerShell] {
+            assert!(
+                evaluate_with_pack_ids_in_dialect(command, &["containers.docker"], dialect)
+                    .is_allowed(),
+                "{dialect:?} must be unaffected by the unknown-dialect fan-out"
+            );
+        }
     }
 }
