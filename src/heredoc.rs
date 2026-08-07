@@ -2962,7 +2962,11 @@ fn is_spx_session_handoff_stdin_data_sink(command: &str, heredoc_start: usize) -
     )
 }
 
-fn is_structured_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
+/// Check whether the heredoc/here-string at `heredoc_start` feeds a command
+/// with a documented structured-stdin DATA contract (`git commit -F -` and
+/// friends, `spx session handoff`). Such bodies are consumed as data (a commit
+/// message, a handoff document), never executed as shell (#277).
+pub(crate) fn is_structured_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
     is_git_stdin_data_sink(command, heredoc_start)
         || is_spx_session_handoff_stdin_data_sink(command, heredoc_start)
 }
@@ -3643,6 +3647,15 @@ fn collect_command_substitutions_recursive<D: ast_grep_core::Doc>(
     } else if kind == "command_substitution" {
         let text = node.text();
         let text = text.as_ref();
+        // Inside a double-quoted string, tree-sitter-bash 0.25 folds the
+        // whitespace separating a preceding expansion from `$(` into the
+        // substitution node itself: `"$s $(true)"` yields a
+        // `command_substitution` whose text is ` $(true)` (issue #279). The
+        // construct is well formed, so trim that leading whitespace and shift
+        // the reported start past it; any other unexpected prefix still fails
+        // closed below.
+        let leading_whitespace = text.len() - text.trim_start().len();
+        let text = &text[leading_whitespace..];
         let body = text
             .strip_prefix("$(")
             .and_then(|inner| inner.strip_suffix(')'))
@@ -3657,7 +3670,7 @@ fn collect_command_substitutions_recursive<D: ast_grep_core::Doc>(
             let range = node.range();
             substitutions.push(PosixCommandSubstitution {
                 body: body.replace("\\`", "`"),
-                start: range.start,
+                start: range.start + leading_whitespace,
                 end: range.end,
             });
         } else {
