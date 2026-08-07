@@ -18907,6 +18907,22 @@ fn evaluate_packs_with_allowlists_at_depth(
                 continue;
             }
 
+            // Segment-scoped packs pair an executable with its flags and
+            // target; those tokens never legitimately span a segment boundary,
+            // so a full-command match that crosses segments is a cross-command
+            // pairing (`chmod 600 f && grep -rn … /etc`, issue #287). The
+            // quote/substitution-aware per-segment pass above is authoritative
+            // for these packs; drop the cross-segment full-command match. A
+            // character-class bound in the patterns themselves is not a
+            // substitute: it would match newlines and break on separators
+            // inside quotes or $().
+            if has_compound_segments
+                && SEGMENT_SCOPED_PACKS.contains(&pack_id.as_str())
+                && !span_is_inside_any_segment(span, &segment_ranges)
+            {
+                continue;
+            }
+
             let reason = pattern.reason;
             let mapped_span = map_span_with_offset(span, normalized_offset, original_len);
             let preview = mapped_span
@@ -19107,6 +19123,12 @@ fn command_segment_ranges_in_dialect(
         })
         .collect()
 }
+
+/// Packs whose destructive rules pair an executable with flags/targets that
+/// must all come from the same command segment. Full-command matches spanning
+/// a segment boundary are discarded for these packs (issue #287); the
+/// per-segment pass is authoritative.
+const SEGMENT_SCOPED_PACKS: &[&str] = &["system.permissions"];
 
 fn span_is_inside_any_segment(span: MatchSpan, segment_ranges: &[(usize, usize)]) -> bool {
     segment_ranges
@@ -28898,6 +28920,60 @@ mod tests {
             assert!(
                 result.is_denied(),
                 "execution wrapper must not hide opt-in rules: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// Issue #287: `system.permissions` is segment-scoped — a recursive flag
+    /// (or 777/u+s/root token) on a *different* command in a chained or
+    /// multi-line input must not pair with a chmod/chown elsewhere in the
+    /// string. Separators inside quotes or `$()` are not boundaries.
+    #[test]
+    fn segment_scoped_pack_matches_do_not_cross_segments_issue_287() {
+        for command in [
+            // The -r/-R belongs to grep/cp/ls, not chmod/chown/setfacl.
+            "chmod 600 /root/.ssh/x && grep -rn foo /etc/ssh/",
+            "sudo chmod 600 /root/.ssh/authorized_keys && sudo grep -rn PermitRootLogin /etc/ssh/sshd_config",
+            // Newlines separate commands exactly like `&&` (review finding on
+            // the first #287 fix: a char-class bound matched right across them).
+            "chmod 600 /root/.ssh/authorized_keys\ngrep -rn PermitRootLogin /etc/ssh/sshd_config",
+            "chown app /var/log/x\ngrep -R foo /etc/passwd",
+            "chown user /var/log/app.log; cp -R src /opt/app",
+            "setfacl -m u:app:r /srv/f | ls -R /etc",
+            "chmod u+x build.sh && echo 777",
+            "chown alice /tmp/f && sudo -u root: true",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["system.permissions"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                !result.is_denied(),
+                "cross-segment tokens must not combine: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        for command in [
+            // Genuine matches within one segment still deny, including when a
+            // separator byte hides inside quotes or a command substitution.
+            "chmod -R 755 /etc",
+            "true && chmod -R 755 /etc",
+            "chmod -R $(cat modes.txt | head -1) /etc",
+            "chown -R \"u;g\" /etc",
+            "setfacl -R -m u:app:rwx /etc",
+            "echo done && chmod 777 /tmp/f",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["system.permissions"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "single-segment match must still deny: {command:?}: {:?}",
                 result.pattern_info
             );
         }
