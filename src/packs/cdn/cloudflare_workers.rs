@@ -1105,8 +1105,15 @@ fn find_wrangler_index(
     {
         // The shared normalizer deliberately caps recursive wrappers. If a
         // wrapper remains at this seam, suffix execution is real but lies
-        // beyond our bounded peel depth.
-        return WranglerExecutableDecision::Unverified;
+        // beyond our bounded peel depth. Fail closed only when the suffix
+        // carries positive Wrangler evidence; a bare wrapper word whose
+        // suffix is absent or provably unrelated (`command -v foo`, `env`,
+        // `time foo`) is not a Wrangler invocation (#283).
+        return if remaining_words_may_name_wrangler(words, index + 1, dialect) {
+            WranglerExecutableDecision::Unverified
+        } else {
+            WranglerExecutableDecision::NoMatch
+        };
     }
 
     if first.eq_ignore_ascii_case("npx") || first.eq_ignore_ascii_case("bunx") {
@@ -1299,9 +1306,15 @@ fn dynamic_fragments(decoded: &str, dialect: ShellDialect) -> Vec<String> {
     let mut dynamic = false;
     while index < chars.len() {
         let start_dynamic = match dialect {
-            ShellDialect::Posix | ShellDialect::Unknown => {
-                matches!(chars[index], '$' | '`' | '*' | '?' | '[' | '{')
-            }
+            ShellDialect::Posix | ShellDialect::Unknown => match chars[index] {
+                '$' | '`' | '*' | '?' | '{' => true,
+                // POSIX globbing only activates a bracket expression that
+                // closes; an unmatched `[` stays a literal character, so the
+                // bare test builtin `[` must not read as "may be any
+                // executable" (#283).
+                '[' => chars[index + 1..].contains(&']'),
+                _ => false,
+            },
             ShellDialect::PowerShell => {
                 chars[index] == '$' || chars[index] == '@' && chars.get(index + 1) == Some(&'(')
             }
@@ -2587,6 +2600,53 @@ mod tests {
             "node ./helper.js --version",
             ShellDialect::Posix,
         ));
+    }
+
+    #[test]
+    fn semantic_scan_needs_wrangler_evidence_past_wrapper_words_issue_283() {
+        // #283: a generic wrapper word (or the `[` test builtin) whose suffix
+        // carries no Wrangler evidence must not force the pack in and deny as
+        // Unverified.
+        for dialect in [
+            ShellDialect::Posix,
+            ShellDialect::Unknown,
+            ShellDialect::PowerShell,
+            ShellDialect::Cmd,
+        ] {
+            for command in ["command -v foo", "env", "[ -f x ] && echo yes", "time foo"] {
+                assert_eq!(
+                    wrangler_semantic_decision_in_dialect(command, dialect),
+                    WranglerSemanticDecision::NoMatch,
+                    "{dialect:?}: {command}"
+                );
+                assert!(
+                    !cloudflare_workers_semantic_scan_required(command, dialect),
+                    "{dialect:?}: {command}"
+                );
+            }
+        }
+
+        // Wrapper suffixes with positive Wrangler evidence keep failing closed
+        // or resolve to the genuine destructive rule.
+        assert_eq!(
+            wrangler_semantic_decision_in_dialect(
+                "sudo wrangler kv key delete --binding=FOO key",
+                ShellDialect::Posix,
+            ),
+            WranglerSemanticDecision::Destructive("wrangler-kv-key-delete"),
+        );
+        for command in [
+            // Cmd never peels POSIX wrappers, so the wrapper word survives to
+            // the resolver seam with a literal Wrangler suffix behind it.
+            "time wrangler delete worker",
+            "command wrangler r2 bucket delete assets",
+        ] {
+            assert_eq!(
+                wrangler_semantic_decision_in_dialect(command, ShellDialect::Cmd),
+                WranglerSemanticDecision::Unverified,
+                "{command}"
+            );
+        }
     }
 
     #[test]
