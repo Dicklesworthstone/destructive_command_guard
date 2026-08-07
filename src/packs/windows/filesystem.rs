@@ -2495,6 +2495,42 @@ mod tests {
     }
 
     #[test]
+    fn powershell_dialect_whatif_precedes_cmd_style_slash_s_classification() {
+        // Under the ps dialect `rd`/`del` are Remove-Item aliases, so a bound
+        // `-WhatIf` makes the invocation a preview no matter what the
+        // cmd-style `/s` suggests. The #280 classification must stay behind
+        // the pack's existing -WhatIf handling.
+        for command in [
+            r"rd /s /q C:\src -WhatIf",
+            r"del /s /q C:\src -WhatIf",
+            r"rmdir /s C:\build -whatif",
+            r"rd /s /q C:\src -WhatIf:$true",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell),
+                WindowsFilesystemSemanticDecision::Safe,
+                "-WhatIf must preview, not delete: {command}"
+            );
+        }
+        // Without -WhatIf, and in cmd.exe (which has no such switch), the
+        // #280 classification is unchanged.
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                r"rd /s /q C:\src",
+                ShellDialect::PowerShell
+            ),
+            WindowsFilesystemSemanticDecision::Destructive("rd-recursive"),
+        );
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                r"rd /s /q C:\src -WhatIf",
+                ShellDialect::Cmd
+            ),
+            WindowsFilesystemSemanticDecision::Destructive("rd-recursive"),
+        );
+    }
+
+    #[test]
     fn literal_user_temp_subpath_deletes_are_carved_out() {
         // Regression for #285: recursive deletes whose every proven target is
         // a literal per-user temp subpath are temp cleanup, exactly like

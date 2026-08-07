@@ -714,6 +714,22 @@ fn package_runner_attached_option(runner: PackageRunner, option: &str) -> bool {
         .any(|prefix| option.starts_with(prefix) && option.len() > prefix.len())
 }
 
+/// Literal word whose executable basename is `wrangler` once Windows program
+/// suffixes are stripped, mirroring the main resolver's `executable_basename`
+/// treatment so `wrangler.exe` / `wrangler.cmd` (and their path forms) carry
+/// the same evidence weight at the wrapper seam (#283).
+fn literal_word_names_wrangler_executable(word: &WranglerWord, dialect: ShellDialect) -> bool {
+    if word.dynamic {
+        return false;
+    }
+    let decoded = if dialect == ShellDialect::Cmd {
+        word.decoded.trim_start_matches('@')
+    } else {
+        word.decoded.as_str()
+    };
+    executable_basename(decoded).eq_ignore_ascii_case("wrangler")
+}
+
 fn remaining_words_may_name_wrangler(
     words: &[WranglerWord],
     index: usize,
@@ -723,6 +739,7 @@ fn remaining_words_may_name_wrangler(
         symbolic_executable_may_equal(word, dialect, "wrangler")
             || (!word.dynamic
                 && (word.decoded.starts_with("wrangler@")
+                    || literal_word_names_wrangler_executable(word, dialect)
                     || is_wrangler_script_path(&word.decoded)))
     })
 }
@@ -2646,6 +2663,40 @@ mod tests {
                 WranglerSemanticDecision::Unverified,
                 "{command}"
             );
+        }
+    }
+
+    #[test]
+    fn wrapper_seam_evidence_accepts_windows_wrangler_program_suffixes_issue_283() {
+        // The #283 evidence gate must strip Windows program suffixes exactly
+        // like the main resolver's `executable_basename`. Under PowerShell and
+        // Cmd no POSIX wrapper is ever peeled, so `wrangler.exe`/`wrangler.cmd`
+        // reaches the seam as the wrapper's suffix and must still fail closed.
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Cmd] {
+            for command in [
+                "time wrangler.exe d1 delete mydb",
+                "sudo wrangler.exe r2 bucket delete assets",
+                "env FOO=1 wrangler.cmd r2 bucket delete assets",
+                "command node_modules/.bin/wrangler.cmd r2 bucket delete assets",
+            ] {
+                assert_eq!(
+                    wrangler_semantic_decision_in_dialect(command, dialect),
+                    WranglerSemanticDecision::Unverified,
+                    "{dialect:?}: {command}"
+                );
+                assert!(
+                    cloudflare_workers_semantic_scan_required(command, dialect),
+                    "{dialect:?}: {command}"
+                );
+            }
+            // Wrapper suffixes that are still provably unrelated stay out.
+            for command in ["command -v foo", "time foo.exe", "env"] {
+                assert_eq!(
+                    wrangler_semantic_decision_in_dialect(command, dialect),
+                    WranglerSemanticDecision::NoMatch,
+                    "{dialect:?}: {command}"
+                );
+            }
         }
     }
 

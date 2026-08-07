@@ -2676,10 +2676,17 @@ pub(crate) fn windows_literal_user_temp_subpath(path: &str) -> bool {
     if components.len() < 6 {
         return false;
     }
-    if components
-        .iter()
-        .any(|component| component.is_empty() || *component == "." || *component == "..")
-    {
+    if components.iter().any(|component| {
+        // Dot-only components (`.`, `..`, and cmd's `...` and longer, which
+        // resolve as repeated parent traversal in some contexts) can leave the
+        // temp subtree, and Win32 strips trailing dots and spaces from a
+        // component, so `Temp.` / `Temp ` would name a different directory
+        // than the one proven here.
+        component.is_empty()
+            || component.bytes().all(|byte| byte == b'.')
+            || component.ends_with('.')
+            || component.ends_with(' ')
+    }) {
         return false;
     }
     components[0].eq_ignore_ascii_case("Users")
@@ -5360,6 +5367,59 @@ mod tests {
                 "Windows temp carve-out must stay bounded: {cmd}"
             );
         }
+    }
+
+    #[test]
+    fn windows_user_temp_carve_out_rejects_dot_and_trailing_dot_components() {
+        // The component filter must reject every dot-only component, not just
+        // `.` and `..`: cmd resolves `...` as repeated parent traversal in
+        // some contexts, so it can leave the temp subtree. Win32 also strips
+        // trailing dots and spaces from a component, so `Temp.` and `Temp `
+        // name a different directory than the one the carve-out proved.
+        for path in [
+            r"C:\Users\u\AppData\Local\Temp\...\...\...\...\Windows\System32",
+            r"C:\Users\u\AppData\Local\Temp\....\x",
+            r"/c/Users/u/AppData/Local/Temp/.../.../.../.../Windows/System32",
+            r"C:\Users\u\AppData\Local\Temp.\x",
+            r"C:\Users\u\AppData\Local\Temp \x",
+            r"C:\Users\u\AppData\Local\Temp\sub.\x",
+            r"C:\Users\u\AppData\Local\Temp\sub \x",
+            r"C:\Users.\u\AppData\Local\Temp\x",
+        ] {
+            assert!(
+                !windows_literal_user_temp_subpath(path),
+                "dot-only or trailing dot/space component must not be carved out: {path}"
+            );
+        }
+        // A dot inside a component is ordinary and stays carved out.
+        for path in [
+            r"C:\Users\u\AppData\Local\Temp\build.tmp\x",
+            r"/c/Users/u/AppData/Local/Temp/a.b/c",
+        ] {
+            assert!(
+                windows_literal_user_temp_subpath(path),
+                "an interior dot must keep the carve-out: {path}"
+            );
+        }
+
+        let pack = create_pack();
+        for cmd in [
+            r"rm -rf C:\Users\u\AppData\Local\Temp\...\...\...\...\Windows\System32",
+            r"rm -rf /c/Users/u/AppData/Local/Temp/.../.../.../.../Windows/System32",
+            r"rm -rf C:\Users\u\AppData\Local\Temp\sub.\x",
+        ] {
+            assert!(
+                pack.check(cmd).is_some(),
+                "dot-component temp path must stay blocked: {cmd}"
+            );
+        }
+        assert!(matches!(
+            parse_powershell_remove_item_segment(
+                r"Remove-Item -Recurse -Force C:\Users\u\AppData\Local\Temp\...\...\...\...\Windows\System32",
+                false,
+            ),
+            RmParseDecision::Deny(_)
+        ));
     }
 
     #[test]

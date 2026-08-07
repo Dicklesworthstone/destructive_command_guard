@@ -697,6 +697,60 @@ fn symbolic_branch_option_may_mutate(word: &SymbolicPosixWord) -> bool {
         .any(|candidate| word.may_equal(candidate))
 }
 
+/// Whether the literal words of a symbolic argv tail prove a branch
+/// delete/force mutation. Used when unknown expansions occupy the executable
+/// and subcommand slots (#281): the unknowns supply no Git evidence, but a
+/// literal `-D` / `--delete` / `--force` after them still names a destructive
+/// branch operation in plain sight, so it must not be discarded (#283-review).
+fn literal_argv_proves_branch_mutation(words: &[SymbolicPosixWord]) -> bool {
+    literal_branch_tokens_prove_mutation(words.iter().map(SymbolicPosixWord::exact))
+}
+
+/// Shared literal-evidence scan behind [`literal_argv_proves_branch_mutation`]
+/// and its `GitSemanticWord` counterpart. `None` marks a dynamic word, which
+/// contributes no evidence but does not stop the scan.
+fn literal_branch_tokens_prove_mutation<'a>(tokens: impl Iterator<Item = Option<&'a str>>) -> bool {
+    let mut mutation = BranchMutationState::default();
+    for token in tokens {
+        let Some(token) = token else {
+            continue;
+        };
+        if matches!(token, "--" | "--end-of-options") {
+            break;
+        }
+        if token.starts_with("--") {
+            let Some(resolved) = resolve_branch_long_option(token) else {
+                continue;
+            };
+            if resolved.inline_value && matches!(resolved.arity, BranchLongOptionArity::None) {
+                continue;
+            }
+            match resolved.name {
+                "delete" if resolved.negated => mutation.delete_bits &= !1,
+                "delete" => mutation.delete_bits |= 1,
+                "force" => mutation.force = !resolved.negated,
+                _ => {}
+            }
+            continue;
+        }
+        if let Some(flags) = token.strip_prefix('-').filter(|flags| !flags.is_empty()) {
+            for flag in flags.chars() {
+                match flag {
+                    'd' => mutation.delete_bits |= 1,
+                    'D' => mutation.delete_bits |= 2,
+                    'f' => mutation.force = true,
+                    'M' | 'C' => mutation.forced_move_or_copy = true,
+                    // `-u<upstream>` and `-t<start>` consume their attached
+                    // remainder as data, not as further short flags.
+                    'u' | 't' => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+    matches!(mutation.decision(), BranchCommandDecision::Destructive)
+}
+
 fn sole_posix_branch_name_query(command: &str) -> bool {
     let command = command.trim();
     let body = if let Some(body) = command
@@ -3538,6 +3592,19 @@ fn dynamic_git_branch_may_mutate(command: &str, dialect: ShellDialect) -> bool {
             {
                 return true;
             }
+            if executable_unbounded
+                && literal_branch_tokens_prove_mutation(
+                    words[index + 1..]
+                        .iter()
+                        .map(|word| (!word.dynamic).then_some(word.decoded.as_str())),
+                )
+            {
+                // #281 keeps two unknowns from standing in for `git branch`,
+                // but literal argv after them is still evidence: `$g $sub -D
+                // main` shows a proven branch deletion in plain sight, and the
+                // short-flag spelling must not fare better than `--delete`.
+                return true;
+            }
             // A dynamic global prefix can disappear or expand to a valid Git
             // option. Continue looking for a literal branch subcommand.
             index += 1;
@@ -3813,8 +3880,18 @@ fn symbolic_posix_branch_decision(command: &str) -> Option<BranchCommandDecision
                 if executable_unbounded {
                     // #281: two unknowns are not evidence — a dynamic word
                     // cannot stand in for `branch` when the executable is
-                    // itself an unbounded expansion.
-                    return Some(BranchCommandDecision::NotBranch);
+                    // itself an unbounded expansion. Literal argv after the
+                    // unknowns is evidence, though: `$g $sub -D main` still
+                    // carries a proven branch deletion in plain sight, so the
+                    // scan continues past the dynamic word rather than
+                    // discarding what follows it.
+                    return Some(
+                        if literal_argv_proves_branch_mutation(&words[index + 1..]) {
+                            BranchCommandDecision::DestructiveDynamic
+                        } else {
+                            BranchCommandDecision::NotBranch
+                        },
+                    );
                 }
                 if word.may_equal("branch") {
                     if word.unquoted_dynamic {
@@ -5430,6 +5507,52 @@ mod tests {
                     branch_command_decision_in_dialect(command, dialect),
                     BranchCommandDecision::DestructiveDynamic,
                     "literal branch evidence must stay denied: {command} ({dialect:?})"
+                );
+            }
+        }
+    }
+
+    /// #281 must not discard literal argv that follows the unknowns. A short
+    /// delete/force flag proves the mutation exactly like the long spelling
+    /// that already fails closed, so both must deny.
+    #[test]
+    fn literal_short_flags_after_unbounded_dynamics_stay_fail_closed_281() {
+        for command in [
+            "$g $sub -D main",
+            "$g $sub -d feature",
+            "$g ${sub} -D main",
+            "$g $sub -M old new",
+            "$g $sub -f main origin/main",
+            "$g $sub --delete --force main",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                assert_eq!(
+                    branch_command_decision_in_dialect(command, dialect),
+                    BranchCommandDecision::DestructiveDynamic,
+                    "literal mutation evidence must stay denied: {command} ({dialect:?})"
+                );
+            }
+        }
+
+        // Literal evidence that is not a branch mutation keeps the #281 allow.
+        for command in [
+            "$cmd $arg",
+            "\"$cmd\" \"$arg\"",
+            "$cmd literal",
+            "$g $sub main",
+            "$g $sub -v",
+            "$g $sub --list",
+            "ls $arg",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    !matches!(
+                        decision,
+                        BranchCommandDecision::Destructive
+                            | BranchCommandDecision::DestructiveDynamic
+                    ),
+                    "no branch mutation evidence, must not deny: {command} ({dialect:?}) -> {decision:?}"
                 );
             }
         }
