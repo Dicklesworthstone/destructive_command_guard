@@ -44,7 +44,7 @@ use destructive_command_guard::packs::load_external_packs;
 use destructive_command_guard::packs::pack_aware_quick_reject;
 use destructive_command_guard::packs::{DecisionMode, EnabledKeywordIndex, REGISTRY};
 use destructive_command_guard::pending_exceptions::{
-    PendingExceptionStore, PersistBudget, log_maintenance,
+    MaintenanceRecheck, PendingExceptionStore, PersistBudget, log_maintenance,
 };
 use destructive_command_guard::perf::{Deadline, HOOK_EVALUATION_BUDGET};
 // Import HookInput for parsing stdin JSON in hook mode
@@ -175,6 +175,15 @@ const ALLOW_ONCE_LOCK_WAIT: Duration = Duration::from_millis(150);
 /// pending-exceptions store run maintenance (full scan + prune/archive
 /// rewrite) while recording a block (issue #291).
 const ALLOW_ONCE_MAINTENANCE_MIN_BUDGET: Duration = Duration::from_millis(250);
+
+/// Minimum remaining deadline budget required before hook mode runs the
+/// settings.json self-heal check (issue #293).
+///
+/// Sized just above the self-heal advisory lock's own bounded wait (5 attempts
+/// × 10ms) plus the read/parse/rename it guards, so a deliberately tight
+/// `general.hook_timeout_ms` spends its budget on evaluation rather than on
+/// housekeeping. Self-heal is idempotent and reruns on the next invocation.
+const SELF_HEAL_MIN_BUDGET: Duration = Duration::from_millis(60);
 
 const INDETERMINATE_HISTORY_PACK: &str = "dcg.internal";
 const INDETERMINATE_HISTORY_PATTERN: &str = "evaluation-deadline";
@@ -361,6 +370,58 @@ fn handle_unparseable_hook_input(
     );
 }
 
+/// Overlap between consecutive scan windows of an over-limit command, so a
+/// destructive command that straddles a window boundary is still wholly
+/// contained in the next window. 4 KiB comfortably exceeds any realistic
+/// single shell command.
+const OVERSIZED_SCAN_WINDOW_OVERLAP: usize = 4 * 1024;
+
+/// Hard cap on the number of scan windows produced from one extracted
+/// command. With the 4 MiB scan buffer and the 64 KiB default command limit
+/// this is never reached; it exists so an exotic configuration cannot turn
+/// the fail-open path into an unbounded loop.
+const OVERSIZED_SCAN_MAX_WINDOWS: usize = 128;
+
+/// Slice `command` into evaluable, overlapping windows and append them to
+/// `out`.
+///
+/// A command within the limit contributes itself unchanged. Empty windows are
+/// dropped. Windows always start and end on char boundaries.
+fn push_oversized_scan_windows(out: &mut Vec<String>, command: &str, max_command_bytes: usize) {
+    if command.is_empty() || max_command_bytes == 0 {
+        return;
+    }
+    if command.len() <= max_command_bytes {
+        out.push(command.to_string());
+        return;
+    }
+
+    let stride = max_command_bytes
+        .saturating_sub(OVERSIZED_SCAN_WINDOW_OVERLAP)
+        .max(1);
+    let mut start = 0usize;
+    for _ in 0..OVERSIZED_SCAN_MAX_WINDOWS {
+        if start >= command.len() {
+            break;
+        }
+        let mut begin = start;
+        while begin < command.len() && !command.is_char_boundary(begin) {
+            begin += 1;
+        }
+        let mut end = (begin + max_command_bytes).min(command.len());
+        while end > begin && !command.is_char_boundary(end) {
+            end -= 1;
+        }
+        if begin < end {
+            out.push(command[begin..end].to_string());
+        }
+        if end >= command.len() {
+            break;
+        }
+        start += stride;
+    }
+}
+
 /// Best-effort evaluation of an oversized hook payload's truncated prefix
 /// (issue #290).
 ///
@@ -373,6 +434,17 @@ fn handle_unparseable_hook_input(
 /// extractable, benign command, warn/log match, deadline exhausted — returns
 /// `false` so the caller keeps the historic fail-open warning path.
 ///
+/// Two attribution rules keep this from over-denying and from under-scanning:
+/// - The prefix must name a recognized SHELL tool (`tool_name`/`toolName`).
+///   An oversized `Write`/`Read` envelope that happens to carry a
+///   command-shaped field is not a shell request and must fail open; so does
+///   a prefix with no tool name at all — dcg never denies what it cannot
+///   attribute to a shell.
+/// - EVERY `"command"` occurrence in the prefix is evaluated, not just the
+///   first: `serde_json` is last-wins on duplicate keys and an earlier
+///   unrelated object can carry a decoy, so judging one occurrence would let
+///   a benign decoy suppress the real command.
+///
 /// Only called under fail-open; fail-closed oversized input still denies
 /// unconditionally in `handle_unparseable_hook_input` (issue #160).
 fn try_deny_oversized_input(
@@ -384,24 +456,24 @@ fn try_deny_oversized_input(
     heredoc_settings: &HeredocSettings,
     external_store: &destructive_command_guard::packs::ExternalPackStore,
 ) -> bool {
-    let Some(mut command) = hook::extract_command_from_truncated_json(prefix) else {
+    // Attribute the payload to a shell tool before evaluating anything. The
+    // dialect comes from the same mapping the normal parsed path uses.
+    let Some((_tool_name, shell_dialect)) = hook::shell_tool_from_truncated_json(prefix) else {
         return false;
     };
 
     // The padding may live INSIDE the command string (the issue's repro
-    // shape). Evaluating an over-limit command would be refused as oversized,
-    // so keep only the evaluable prefix: finding a destructive prefix is
-    // enough to justify denying, and a truncated benign command simply falls
-    // back to fail-open.
+    // shape), either before or after the destructive part. Evaluating an
+    // over-limit command outright would be refused as oversized, so slice it
+    // into overlapping evaluable windows instead of keeping only the leading
+    // prefix: padding-then-destructive is exactly as easy to write as
+    // destructive-then-padding.
     let max_command_bytes = config.general.max_command_bytes();
-    if command.len() > max_command_bytes {
-        let mut cut = max_command_bytes;
-        while cut > 0 && !command.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        command.truncate(cut);
+    let mut commands: Vec<String> = Vec::new();
+    for command in hook::extract_commands_from_truncated_json(prefix) {
+        push_oversized_scan_windows(&mut commands, &command, max_command_bytes);
     }
-    if command.is_empty() {
+    if commands.is_empty() {
         return false;
     }
 
@@ -458,28 +530,41 @@ fn try_deny_oversized_input(
     // records its own audit row in `handle_unparseable_hook_input`, and a
     // refused payload must not provoke history-writer construction (worker
     // thread + database) unless a denial is actually published.
-    let outcome = resolve_hook_command(&eval_context, &command, ShellDialect::Posix, None);
-    match outcome {
-        ResolvedCommandOutcome::DenyFamily(resolved)
-            if matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask) =>
-        {
-            let mut history_writer = if config.history.enabled {
-                let mut writer =
-                    HistoryWriter::new(history_db_path(&config.history), &config.history);
-                writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
-                Some(writer)
-            } else {
-                None
-            };
-            publish_decisive_response(
-                &eval_context,
-                ResolvedCommandOutcome::DenyFamily(resolved),
-                &mut history_writer,
-            );
-            true
+    // Deny if ANY extracted occurrence (or scan window) resolves decisively;
+    // a benign decoy ahead of the real command must not be able to end the
+    // scan. Bail out as soon as the deadline is gone — an exhausted budget
+    // means fail-open, exactly as before.
+    for command in &commands {
+        if deadline.is_exceeded() {
+            break;
         }
-        _ => false,
+        // Windows made of pure padding carry no enabled keyword; skipping
+        // them keeps the multi-window scan a substring search per megabyte
+        // rather than a full evaluation per window.
+        if destructive_command_guard::packs::pack_aware_quick_reject(command, &enabled_keywords) {
+            continue;
+        }
+        let outcome = resolve_hook_command(&eval_context, command, shell_dialect, None);
+        if let ResolvedCommandOutcome::DenyFamily(resolved) = outcome {
+            if matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask) {
+                let mut history_writer = if config.history.enabled {
+                    let mut writer =
+                        HistoryWriter::new(history_db_path(&config.history), &config.history);
+                    writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
+                    Some(writer)
+                } else {
+                    None
+                };
+                publish_decisive_response(
+                    &eval_context,
+                    ResolvedCommandOutcome::DenyFamily(resolved),
+                    &mut history_writer,
+                );
+                return true;
+            }
+        }
     }
+    false
 }
 
 /// Process-wide registry of shutdown actions.
@@ -1009,8 +1094,15 @@ fn publish_decisive_response(
                 let budget = PersistBudget {
                     lock_wait: remaining.min(ALLOW_ONCE_LOCK_WAIT),
                     allow_maintenance: remaining > ALLOW_ONCE_MAINTENANCE_MIN_BUDGET,
+                    // `remaining` was measured BEFORE a lock wait of up to
+                    // ALLOW_ONCE_LOCK_WAIT; re-derive the decision from the
+                    // live deadline once the lock is actually held.
+                    maintenance_recheck: Some(MaintenanceRecheck {
+                        deadline: *ctx.deadline,
+                        min_budget: ALLOW_ONCE_MAINTENANCE_MIN_BUDGET,
+                    }),
                 };
-                if let Ok(Some((record, maintenance))) = store.record_block_bounded(
+                match store.record_block_bounded(
                     &command,
                     ctx.working_dir,
                     &reason,
@@ -1020,12 +1112,24 @@ fn publish_decisive_response(
                     None,
                     budget,
                 ) {
-                    allow_once_info = Some(hook::AllowOnceInfo {
-                        code: record.short_code,
-                        full_hash: record.full_hash,
-                    });
-                    if let Some(log_file) = ctx.config.general.log_file.as_deref() {
-                        let _ = log_maintenance(log_file, maintenance, "record_block");
+                    Ok(Some((record, maintenance))) => {
+                        allow_once_info = Some(hook::AllowOnceInfo {
+                            code: record.short_code,
+                            full_hash: record.full_hash,
+                        });
+                        if let Some(log_file) = ctx.config.general.log_file.as_deref() {
+                            let _ = log_maintenance(log_file, maintenance, "record_block");
+                        }
+                    }
+                    // Lock stayed contended: denial is emitted without a code.
+                    Ok(None) => {}
+                    // A store error (notably the MAX_PENDING_BYTES hard cap)
+                    // used to be swallowed, so allow-once issuance could stop
+                    // silently and permanently. The block still stands; say so.
+                    Err(e) => {
+                        eprintln!(
+                            "[dcg] Warning: could not record an allow-once code for this block ({e}); the block still stands."
+                        );
                     }
                 }
             }
@@ -1252,8 +1356,19 @@ fn main() {
     // Self-heal: verify the DCG hook is still registered in settings.json.
     // Claude Code can silently overwrite settings.json mid-session, removing the hook.
     // This re-registers it automatically (fail-open: errors are logged, never fatal).
-    // Skipped when the deadline is already exhausted — it reruns next invocation.
-    if config.general.self_heal_hook && !deadline.is_exceeded() {
+    //
+    // Skipped when the whole budget is smaller than self-heal's own worst case
+    // (SELF_HEAL_MIN_BUDGET): a repair can spend up to the advisory lock's
+    // bounded wait before it even writes, so running it under a tighter
+    // deadline would spend the entire evaluation window on housekeeping. The
+    // deadline is never already *exhausted* here — it starts a few statements
+    // above and MIN_HOOK_TIMEOUT_MS clamps it above zero — so the guard is a
+    // budget floor, not an exhaustion check. Skipping is safe: the check
+    // reruns on the next invocation.
+    let self_heal_budget_ok = deadline
+        .remaining()
+        .is_none_or(|remaining| remaining >= SELF_HEAL_MIN_BUDGET);
+    if config.general.self_heal_hook && self_heal_budget_ok {
         cli::ensure_hook_registered();
     }
 

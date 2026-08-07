@@ -177,8 +177,52 @@ pub struct PersistBudget {
     /// Maximum time to wait for the exclusive store lock.
     pub lock_wait: std::time::Duration,
     /// Whether prune/rotate rewrites may run this invocation.
+    ///
+    /// This is the caller's estimate taken BEFORE the (up to `lock_wait`)
+    /// lock acquisition. Supply `maintenance_recheck` so the decision is
+    /// re-derived from the live deadline once the lock is actually held —
+    /// otherwise a budget measured before a 150ms wait can authorize a
+    /// full-store rewrite with nothing left to pay for it.
     pub allow_maintenance: bool,
+    /// Re-evaluation of `allow_maintenance` against the caller's deadline,
+    /// applied after the store lock is acquired.
+    pub maintenance_recheck: Option<MaintenanceRecheck>,
 }
+
+/// Deadline-driven re-evaluation of [`PersistBudget::allow_maintenance`].
+///
+/// Maintenance is permitted only while the deadline still has at least
+/// `min_budget` left at the moment the store lock is held.
+#[derive(Debug, Clone, Copy)]
+pub struct MaintenanceRecheck {
+    /// The caller's evaluation deadline.
+    pub deadline: crate::perf::Deadline,
+    /// Remaining budget required for maintenance to be worth starting.
+    pub min_budget: std::time::Duration,
+}
+
+impl MaintenanceRecheck {
+    /// Whether maintenance still fits in the remaining budget.
+    #[must_use]
+    pub fn allows_maintenance(&self) -> bool {
+        self.deadline
+            .remaining()
+            .is_some_and(|remaining| remaining > self.min_budget)
+    }
+}
+
+/// Soft watermark above which store maintenance runs regardless of the
+/// caller's deadline budget.
+///
+/// Rotation/pruning only ever runs from a `record_block*` call, and the hook
+/// deny path — the only production caller — routinely arrives with too little
+/// budget to authorize it (issue #291). Left alone, a store under sustained
+/// deny pressure would never rotate, grow to `MAX_PENDING_BYTES`, and then
+/// silently stop issuing allow-once codes forever (the hard cap refuses every
+/// new entry). Above this watermark maintenance is therefore forced: paying
+/// one bounded rewrite occasionally is strictly better than losing allow-once
+/// issuance permanently.
+pub(crate) const PENDING_MAINTENANCE_WATERMARK_BYTES: u64 = MAX_PENDING_BYTES / 2;
 
 /// Maintenance stats produced while loading/pruning.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -305,6 +349,12 @@ impl PendingExceptionStore {
         let Some(file) = open_locked_bounded(&self.path, budget.lock_wait)? else {
             return Ok(None);
         };
+        // Re-derive the maintenance decision now that the lock is held: the
+        // caller's estimate was taken before a wait of up to `lock_wait`.
+        let allow_maintenance = match budget.maintenance_recheck {
+            Some(recheck) => budget.allow_maintenance && recheck.allows_maintenance(),
+            None => budget.allow_maintenance,
+        };
         Self::record_block_locked(
             file,
             &self.path,
@@ -315,7 +365,7 @@ impl PendingExceptionStore {
             single_use,
             source,
             allow_once_audit,
-            budget.allow_maintenance,
+            allow_maintenance,
         )
         .map(Some)
     }
@@ -345,6 +395,19 @@ impl PendingExceptionStore {
         // budget nearly exhausted) the store is not even scanned — pruning is
         // deferred to the next uncontended invocation and the append below
         // stays O(1).
+        //
+        // Anti-starvation override: once the live file is past the soft
+        // watermark, maintenance runs regardless of budget. Deferring forever
+        // is not a valid outcome — it ends at the hard cap below, where every
+        // future allow-once code issuance fails silently.
+        let over_watermark = file.metadata()?.len() > PENDING_MAINTENANCE_WATERMARK_BYTES;
+        if over_watermark && !allow_maintenance {
+            eprintln!(
+                "[dcg] Warning: pending-exceptions store is above the {PENDING_MAINTENANCE_WATERMARK_BYTES}-byte \
+                 maintenance watermark; running a prune/rotate pass despite the low deadline budget."
+            );
+        }
+        let allow_maintenance = allow_maintenance || over_watermark;
         let maintenance = if allow_maintenance {
             let (active, maintenance) = load_active_from_file(&mut file, now, allow_once_audit);
 
@@ -2572,6 +2635,7 @@ mod tests {
         PersistBudget {
             lock_wait: std::time::Duration::from_millis(40),
             allow_maintenance: true,
+            maintenance_recheck: None,
         }
     }
 
@@ -2668,6 +2732,7 @@ mod tests {
         let no_maintenance = PersistBudget {
             lock_wait: std::time::Duration::from_millis(40),
             allow_maintenance: false,
+            maintenance_recheck: None,
         };
         let (_record, maintenance) = store
             .record_block_bounded(
@@ -2693,5 +2758,126 @@ mod tests {
             "expired record must survive (pruning deferred), content: {content}"
         );
         assert_eq!(content.lines().count(), 2, "append still happened");
+    }
+
+    #[test]
+    fn test_292_maintenance_recheck_reflects_the_post_lock_deadline() {
+        // The caller's `allow_maintenance` is measured BEFORE a lock wait of
+        // up to 150ms. An already-exhausted deadline at lock time must veto
+        // the stale `true`.
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("pending.jsonl");
+        let store = PendingExceptionStore::new(path.clone());
+
+        let expired = PendingExceptionRecord::new(
+            Utc::now() - Duration::hours(EXPIRY_HOURS * 2),
+            "/repo",
+            "git push --force",
+            "blocked",
+            &redaction_config(),
+            false,
+            None,
+        );
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&expired).unwrap()),
+        )
+        .unwrap();
+
+        let stale_budget = PersistBudget {
+            lock_wait: std::time::Duration::from_millis(40),
+            // Stale pre-lock estimate.
+            allow_maintenance: true,
+            maintenance_recheck: Some(MaintenanceRecheck {
+                deadline: crate::perf::Deadline::new(std::time::Duration::ZERO),
+                min_budget: std::time::Duration::from_millis(250),
+            }),
+        };
+        let (_record, maintenance) = store
+            .record_block_bounded(
+                "git reset --hard",
+                "/repo",
+                "blocked",
+                &redaction_config(),
+                false,
+                None,
+                None,
+                stale_budget,
+            )
+            .expect("record_block_bounded")
+            .expect("uncontended store must issue a record");
+
+        assert!(
+            maintenance.is_empty(),
+            "exhausted deadline at lock time must veto the stale allow_maintenance"
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains(&expired.short_code),
+            "pruning must have been deferred"
+        );
+    }
+
+    #[test]
+    fn test_292_watermark_forces_maintenance_despite_low_budget() {
+        // Starvation guard: the hook deny path is the only production caller
+        // and routinely has too little budget for maintenance, so without a
+        // watermark override a busy store would grow to MAX_PENDING_BYTES and
+        // then refuse every future allow-once code, silently and forever.
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("pending.jsonl");
+        let store = PendingExceptionStore::new(path.clone());
+
+        let expired = PendingExceptionRecord::new(
+            Utc::now() - Duration::hours(EXPIRY_HOURS * 2),
+            "/repo",
+            "git push --force",
+            "blocked",
+            &redaction_config(),
+            false,
+            None,
+        );
+        let line = format!("{}\n", serde_json::to_string(&expired).unwrap());
+        let copies = (PENDING_MAINTENANCE_WATERMARK_BYTES as usize / line.len()) + 16;
+        std::fs::write(&path, line.repeat(copies)).unwrap();
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > PENDING_MAINTENANCE_WATERMARK_BYTES,
+            "store must start above the watermark"
+        );
+
+        let no_maintenance = PersistBudget {
+            lock_wait: std::time::Duration::from_millis(200),
+            allow_maintenance: false,
+            maintenance_recheck: None,
+        };
+        let (record, maintenance) = store
+            .record_block_bounded(
+                "git reset --hard",
+                "/repo",
+                "blocked",
+                &redaction_config(),
+                false,
+                None,
+                None,
+                no_maintenance,
+            )
+            .expect("record_block_bounded must not hit the hard cap")
+            .expect("uncontended store must issue a record");
+
+        assert!(
+            maintenance.pruned_expired > 0,
+            "maintenance must run above the watermark even with no budget"
+        );
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            after < PENDING_MAINTENANCE_WATERMARK_BYTES,
+            "the forced pass must bring the store back under the watermark, got {after}"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains(&record.short_code),
+            "the new record must still be appended"
+        );
     }
 }

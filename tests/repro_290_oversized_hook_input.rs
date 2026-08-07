@@ -134,6 +134,149 @@ fn issue_290_padded_benign_command_still_fails_open() {
     );
 }
 
+/// Duplicate `"command"` key: `serde_json` is last-wins, so a first-wins
+/// scanner would judge the benign decoy and fail open.
+fn duplicate_key_decoy_envelope() -> String {
+    // Hand-built because serde_json::json! cannot emit a duplicate key.
+    format!(
+        r#"{{"tool_name":"Bash","tool_input":{{"command":"echo hello","command":"git reset --hard"}},"padding":"{}"}}"#,
+        "A".repeat(PADDING_BYTES)
+    )
+}
+
+/// Decoy `"command"` in an EARLIER unrelated object, ahead of the real one.
+fn decoy_object_envelope() -> String {
+    format!(
+        r#"{{"context":{{"command":"echo hello"}},"tool_name":"Bash","tool_input":{{"command":"git reset --hard"}},"padding":"{}"}}"#,
+        "A".repeat(PADDING_BYTES)
+    )
+}
+
+/// Oversized NON-shell envelope: a `Write` tool call carrying a
+/// command-shaped field. Not a shell request; must not be denied as one.
+fn oversized_non_shell_envelope() -> String {
+    serde_json::json!({
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": "/tmp/notes.txt",
+            "command": "git reset --hard",
+            "content": "A".repeat(PADDING_BYTES)
+        }
+    })
+    .to_string()
+}
+
+/// Pad-first evasion: megabytes of padding in a sibling key written BEFORE
+/// `tool_input`, so the destructive command begins past the 256 KiB read cap
+/// but stays inside the 4 MiB scan cap.
+fn pad_before_tool_input_envelope() -> String {
+    serde_json::json!({
+        "padding": "A".repeat(2 * 1024 * 1024),
+        "tool_name": "Bash",
+        "tool_input": { "command": "git reset --hard" }
+    })
+    .to_string()
+}
+
+/// Pad-first evasion inside the command string itself: the destructive part
+/// comes AFTER 2 MiB of in-command padding.
+fn pad_inside_command_envelope() -> String {
+    let command = format!("echo {} ; git reset --hard", "A".repeat(2 * 1024 * 1024));
+    serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": command }
+    })
+    .to_string()
+}
+
+/// Assert that an oversized payload produced the normal protocol denial.
+fn assert_denied(label: &str, input: &str) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    assert!(input.len() > 256 * 1024, "{label}: must exceed the limit");
+
+    let (stdout, stderr, exit_code) = run_hook_raw(input, temp.path());
+
+    assert_eq!(exit_code, 0, "{label}: hook mode exits 0\nstderr: {stderr}");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("{label}: expected deny JSON ({e}); stdout: {stdout:?}\nstderr: {stderr}")
+    });
+    assert_eq!(
+        json["hookSpecificOutput"]["permissionDecision"]
+            .as_str()
+            .unwrap_or_default(),
+        "deny",
+        "{label}: must deny, got: {stdout:?}"
+    );
+}
+
+/// A benign `"command"` decoy in front of the real one (duplicate key, which
+/// serde_json resolves last-wins) must not defeat the #290 scanner.
+#[test]
+fn issue_290_duplicate_command_key_decoy_is_denied() {
+    assert_denied("duplicate key", &duplicate_key_decoy_envelope());
+}
+
+/// Same, with the decoy in an earlier unrelated object.
+#[test]
+fn issue_290_earlier_decoy_object_is_denied() {
+    assert_denied("decoy object", &decoy_object_envelope());
+}
+
+/// Pad-first evasion: the command begins beyond the read cap but within the
+/// 4 MiB scan cap, in a sibling key written before `tool_input`.
+#[test]
+fn issue_290_padding_before_tool_input_is_denied() {
+    assert_denied("pad before tool_input", &pad_before_tool_input_envelope());
+}
+
+/// Pad-first evasion inside the command string.
+#[test]
+fn issue_290_padding_inside_command_before_destructive_part_is_denied() {
+    assert_denied("pad inside command", &pad_inside_command_envelope());
+}
+
+/// An oversized NON-shell envelope must keep fail-open behavior: dcg never
+/// denies a payload it cannot attribute to a shell tool.
+#[test]
+fn issue_290_oversized_non_shell_envelope_is_not_denied() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let input = oversized_non_shell_envelope();
+    assert!(input.len() > 256 * 1024, "envelope must exceed the limit");
+
+    let (stdout, stderr, exit_code) = run_hook_raw(&input, temp.path());
+
+    assert_eq!(exit_code, 0, "fail-open allows\nstderr: {stderr}");
+    assert!(
+        stdout.trim().is_empty(),
+        "a non-shell tool envelope must not be denied, got: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("exceeds limit"),
+        "fail-open must keep the oversized-input warning, got: {stderr:?}"
+    );
+}
+
+/// An oversized envelope with NO tool name at all is equally unattributable.
+#[test]
+fn issue_290_oversized_envelope_without_tool_name_is_not_denied() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": format!("git reset --hard && {}", "A".repeat(PADDING_BYTES))
+        }
+    })
+    .to_string();
+    assert!(input.len() > 256 * 1024, "envelope must exceed the limit");
+
+    let (stdout, _stderr, exit_code) = run_hook_raw(&input, temp.path());
+
+    assert_eq!(exit_code, 0, "fail-open allows");
+    assert!(
+        stdout.trim().is_empty(),
+        "an unattributable envelope must not be denied, got: {stdout:?}"
+    );
+}
+
 /// Normal-size destructive flow is unchanged by the truncated-prefix path.
 #[test]
 fn issue_290_normal_size_deny_unchanged() {

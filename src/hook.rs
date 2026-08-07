@@ -526,16 +526,42 @@ pub enum HookReadError {
     /// Carries the bytes that WERE read (the truncated prefix) so the caller
     /// can still make a best-effort attempt to evaluate the command embedded
     /// in an oversized payload instead of failing open blind (issue #290).
+    ///
+    /// The prefix is drained past `max_bytes` up to
+    /// [`MAX_OVERSIZED_SCAN_BYTES`] so a payload that puts its padding BEFORE
+    /// the command (pad-first evasion) is still visible to the scanner. The
+    /// envelope itself remains oversized/unparseable for the normal path —
+    /// only the best-effort scanner ever sees the extended buffer.
     InputTooLarge {
-        /// Number of bytes read before the limit tripped (the read stops at
-        /// `max_bytes + 1`, so this understates the true payload size).
+        /// Number of bytes drained into the scan buffer. This is capped at
+        /// [`MAX_OVERSIZED_SCAN_BYTES`], so for a larger payload it
+        /// understates the true size.
         len: usize,
-        /// The truncated raw input prefix.
+        /// The raw input prefix that was read (up to the scan cap).
         prefix: String,
     },
     /// Failed to parse JSON input.
     Json(serde_json::Error),
 }
+
+/// Hard cap on how much stdin is drained into the best-effort scan buffer once
+/// a payload has already been ruled oversized (issue #290, pad-first evasion).
+///
+/// The size limit itself stays at `general.max_hook_input_bytes`: an oversized
+/// envelope is never parsed or evaluated through the normal path. But stopping
+/// the *read* at that limit meant a destructive command that begins beyond it —
+/// e.g. megabytes of padding in a sibling key written before `tool_input`, or
+/// inside the command string ahead of the destructive part — was invisible to
+/// the truncated-prefix scanner and failed open blind.
+///
+/// 4 MiB is chosen because it (a) keeps the worst-case scan allocation bounded
+/// and small relative to any agent's memory, (b) covers realistic padded
+/// envelopes, which are sized just past the 256 KiB default rather than
+/// megabytes past it, and (c) costs nothing on the normal path, which never
+/// reaches this constant. A payload that hides its command beyond 4 MiB is a
+/// documented residual: it still fails open in the default posture and still
+/// denies unconditionally under `fail_closed`.
+pub const MAX_OVERSIZED_SCAN_BYTES: usize = 4 * 1024 * 1024;
 
 /// Read and parse hook input from stdin.
 ///
@@ -545,22 +571,36 @@ pub enum HookReadError {
 /// if the input is not valid hook JSON, or [`HookReadError::InputTooLarge`] if
 /// the input exceeds `max_bytes`.
 pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
-    let mut input = String::with_capacity(256);
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
     {
         let stdin = io::stdin();
         // Read up to limit + 1 to detect overflow
         let mut handle = stdin.lock().take(max_bytes as u64 + 1);
-        handle
-            .read_to_string(&mut input)
-            .map_err(HookReadError::Io)?;
+        handle.read_to_end(&mut buf).map_err(HookReadError::Io)?;
     }
 
-    if input.len() > max_bytes {
+    if buf.len() > max_bytes {
+        // Keep draining into the scan buffer up to the hard cap so a
+        // pad-first payload cannot hide its command behind the size limit.
+        // Best-effort: a read error here just shortens the scan buffer, it
+        // never changes the (already decided) oversized verdict.
+        if buf.len() < MAX_OVERSIZED_SCAN_BYTES {
+            let remaining = (MAX_OVERSIZED_SCAN_BYTES - buf.len()) as u64;
+            let stdin = io::stdin();
+            let mut handle = stdin.lock().take(remaining);
+            let _ = handle.read_to_end(&mut buf);
+        }
+        let len = buf.len();
+        // Lossy: the cap can land mid-codepoint, and the scanner distrusts
+        // anything it cannot decode cleanly anyway.
         return Err(HookReadError::InputTooLarge {
-            len: input.len(),
-            prefix: input,
+            len,
+            prefix: String::from_utf8_lossy(&buf).into_owned(),
         });
     }
+
+    let input = String::from_utf8(buf)
+        .map_err(|e| HookReadError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
 
     // Strip a leading UTF-8 BOM (U+FEFF) before parsing. Some text tools prepend
     // a BOM; without this, BOM-prefixed but otherwise-valid hook input would
@@ -578,43 +618,98 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
 /// An oversized hook payload is rejected before JSON parsing, but the prefix
 /// that WAS read usually still contains the `tool_input.command` string —
 /// padding a destructive command past `max_hook_input_bytes` must not skip
-/// evaluation entirely. This scanner locates the first `"command"` key in the
-/// raw prefix and decodes its JSON string value, tolerating truncation
-/// mid-string (the decoded prefix of the command is returned).
+/// evaluation entirely. This scanner locates EVERY `"command"` key in the raw
+/// prefix and decodes each JSON string value, tolerating truncation mid-string
+/// (the decoded prefix of the command is returned).
+///
+/// Every occurrence is returned, not just the first: `serde_json` resolves a
+/// duplicate key last-wins, and an unrelated earlier object can carry a decoy
+/// `"command"`. Judging only the first match would let an attacker put a
+/// benign command in front of the real one and fail open. The caller must
+/// deny if ANY returned command resolves to Deny/Ask.
 ///
 /// The scan is deliberately conservative: its result is only used to justify
-/// DENYING (a destructive command prefix is proof enough), so any structure it
-/// does not trust — malformed escapes, raw control characters inside the
-/// string — yields `None` and the caller keeps its historic fail-open
-/// behavior. Escaped occurrences of the key inside string values (`\"command\"`)
-/// never match because the scan requires the unescaped `"command"` byte
-/// sequence.
+/// DENYING (a destructive command prefix is proof enough), so any occurrence
+/// whose structure it does not trust — malformed escapes, raw control
+/// characters inside the string, a non-string value — is dropped rather than
+/// guessed at, and an empty result keeps the caller's historic fail-open
+/// behavior. Escaped occurrences of the key inside string values
+/// (`\"command\"`) never match because the scan requires the unescaped
+/// `"command"` byte sequence.
 #[must_use]
-pub fn extract_command_from_truncated_json(prefix: &str) -> Option<String> {
-    const KEY: &str = "\"command\"";
+pub fn extract_commands_from_truncated_json(prefix: &str) -> Vec<String> {
+    extract_string_values_for_key(prefix, "\"command\"")
+}
+
+/// Best-effort extraction of the hook envelope's tool name(s) from a truncated
+/// JSON prefix.
+///
+/// Companion to [`extract_commands_from_truncated_json`]: an oversized
+/// non-shell envelope (a `Write`/`Read` tool call with a command-ish field)
+/// must not be denied as if it were a shell request. Both the snake_case
+/// `tool_name` and the camelCase `toolName` spelling are scanned because
+/// [`HookInput`] accepts both on the normal path.
+///
+/// Same conservatism and same all-occurrences rule as the command scan: a
+/// decoy tool name must not be able to hide the real one.
+#[must_use]
+pub fn extract_tool_names_from_truncated_json(prefix: &str) -> Vec<String> {
+    let mut names = extract_string_values_for_key(prefix, "\"tool_name\"");
+    names.extend(extract_string_values_for_key(prefix, "\"toolName\""));
+    names
+}
+
+/// Resolve the shell tool a truncated oversized prefix belongs to, if any.
+///
+/// Returns the recognized shell tool name and the dialect it implies, using
+/// exactly the same recognition and dialect mapping as the normal parsed path
+/// ([`is_supported_shell_tool`] / [`shell_dialect_for_tool_name`]). Returns
+/// `None` when the prefix carries no tool name at all, or only tool names that
+/// are not shell tools — the caller must then fail open rather than deny a
+/// payload it cannot attribute to a shell.
+///
+/// The first *recognized* name wins, so a decoy non-shell tool name planted
+/// ahead of the real one cannot suppress evaluation.
+#[must_use]
+pub fn shell_tool_from_truncated_json(prefix: &str) -> Option<(String, ShellDialect)> {
+    extract_tool_names_from_truncated_json(prefix)
+        .into_iter()
+        .find(|name| is_supported_shell_tool(Some(name)))
+        .map(|name| {
+            let dialect = shell_dialect_for_tool_name(Some(&name));
+            (name, dialect)
+        })
+}
+
+/// Collect every cleanly decodable string value for a raw JSON `key` (given
+/// with its surrounding quotes) in a possibly-truncated prefix.
+fn extract_string_values_for_key(prefix: &str, key: &str) -> Vec<String> {
+    let mut values = Vec::new();
 
     let mut search_from = 0;
-    while let Some(found) = prefix[search_from..].find(KEY) {
+    while let Some(found) = prefix[search_from..].find(key) {
         let key_start = search_from + found;
         search_from = key_start + 1;
 
-        let rest = prefix[key_start + KEY.len()..].trim_start();
+        let rest = prefix[key_start + key.len()..].trim_start();
         let Some(after_colon) = rest.strip_prefix(':') else {
             continue;
         };
         let Some(string_body) = after_colon.trim_start().strip_prefix('"') else {
             continue;
         };
-        return decode_json_string_prefix(string_body);
+        if let Some(decoded) = decode_json_string_prefix(string_body) {
+            values.push(decoded);
+        }
     }
-    None
+    values
 }
 
 /// Decode a JSON string body (content after the opening quote) up to the
 /// closing unescaped quote OR the end of the buffer (truncation), returning
 /// the decoded prefix. Returns `None` on structure that cannot be a JSON
 /// string (malformed escape, raw control character) — see
-/// [`extract_command_from_truncated_json`] for why distrust must fail open.
+/// [`extract_commands_from_truncated_json`] for why distrust must fail open.
 fn decode_json_string_prefix(body: &str) -> Option<String> {
     let mut out = String::new();
     let mut chars = body.chars();
@@ -4660,13 +4755,21 @@ mod tests {
     // Issue #290: lenient command extraction from a truncated JSON prefix
     // =========================================================================
 
+    /// Helper: the historic single-command assertion shape, now expressed
+    /// over the all-occurrences scanner.
+    fn only_command(prefix: &str) -> Option<String> {
+        let mut commands = extract_commands_from_truncated_json(prefix);
+        assert!(
+            commands.len() <= 1,
+            "expected at most one command occurrence, got {commands:?}"
+        );
+        commands.pop()
+    }
+
     #[test]
     fn test_290_extract_command_complete_string() {
         let prefix = r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
-        assert_eq!(
-            extract_command_from_truncated_json(prefix).as_deref(),
-            Some("git status")
-        );
+        assert_eq!(only_command(prefix).as_deref(), Some("git status"));
     }
 
     #[test]
@@ -4676,7 +4779,7 @@ mod tests {
         let prefix =
             r#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard && echo AAAA"#;
         assert_eq!(
-            extract_command_from_truncated_json(prefix).as_deref(),
+            only_command(prefix).as_deref(),
             Some("git reset --hard && echo AAAA")
         );
     }
@@ -4685,7 +4788,7 @@ mod tests {
     fn test_290_extract_command_decodes_escapes() {
         let prefix = r#"{"tool_input":{"command":"echo \"hi\"\tdone \\ ok"#;
         assert_eq!(
-            extract_command_from_truncated_json(prefix).as_deref(),
+            only_command(prefix).as_deref(),
             Some("echo \"hi\"\tdone \\ ok")
         );
     }
@@ -4693,25 +4796,19 @@ mod tests {
     #[test]
     fn test_290_extract_command_truncated_mid_escape_keeps_clean_prefix() {
         let prefix = r#"{"tool_input":{"command":"git clean -fdx \"#;
-        assert_eq!(
-            extract_command_from_truncated_json(prefix).as_deref(),
-            Some("git clean -fdx ")
-        );
+        assert_eq!(only_command(prefix).as_deref(), Some("git clean -fdx "));
     }
 
     #[test]
     fn test_290_extract_command_unicode_escape() {
         let prefix = r#"{"tool_input":{"command":"echo \u0041B"}}"#;
-        assert_eq!(
-            extract_command_from_truncated_json(prefix).as_deref(),
-            Some("echo AB")
-        );
+        assert_eq!(only_command(prefix).as_deref(), Some("echo AB"));
     }
 
     #[test]
     fn test_290_extract_no_command_key_is_none() {
         let prefix = r#"{"tool_name":"Bash","tool_input":{"cmd":"ls"}}"#;
-        assert_eq!(extract_command_from_truncated_json(prefix), None);
+        assert!(extract_commands_from_truncated_json(prefix).is_empty());
     }
 
     #[test]
@@ -4719,7 +4816,7 @@ mod tests {
         // `\"command\"` inside a string value is escaped bytes, not the raw
         // `"command"` key sequence, so it must not match.
         let prefix = r#"{"note":"the \"command\": here is prose"}"#;
-        assert_eq!(extract_command_from_truncated_json(prefix), None);
+        assert!(extract_commands_from_truncated_json(prefix).is_empty());
     }
 
     #[test]
@@ -4727,18 +4824,114 @@ mod tests {
         // A `"command"` key whose value is not a string (or prose mention
         // followed by no colon) must not produce garbage.
         let prefix = r#"{"command": 42, "other": true}"#;
-        assert_eq!(extract_command_from_truncated_json(prefix), None);
+        assert!(extract_commands_from_truncated_json(prefix).is_empty());
     }
 
     #[test]
     fn test_290_extract_malformed_escape_is_none() {
         let prefix = r#"{"tool_input":{"command":"echo \q oops"}}"#;
-        assert_eq!(extract_command_from_truncated_json(prefix), None);
+        assert!(extract_commands_from_truncated_json(prefix).is_empty());
     }
 
     #[test]
     fn test_290_extract_raw_control_char_is_none() {
         let prefix = "{\"tool_input\":{\"command\":\"echo hi\nrm -rf /\"}}";
-        assert_eq!(extract_command_from_truncated_json(prefix), None);
+        assert!(extract_commands_from_truncated_json(prefix).is_empty());
+    }
+
+    #[test]
+    fn test_290_extract_returns_every_command_occurrence() {
+        // serde_json resolves duplicate keys last-wins, so a first-wins
+        // scanner would judge the decoy and fail open. Every occurrence must
+        // come back so the caller can deny on ANY of them.
+        let prefix = r#"{"tool_name":"Bash","tool_input":{"command":"echo ok","command":"git reset --hard"}}"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(prefix),
+            vec!["echo ok".to_string(), "git reset --hard".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_290_extract_skips_decoy_object_before_real_command() {
+        // A benign `"command"` in an earlier unrelated object must not hide
+        // the real tool_input command.
+        let prefix = r#"{"context":{"command":"ls -la"},"tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/x"}}"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(prefix),
+            vec!["ls -la".to_string(), "rm -rf /tmp/x".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_290_extract_untrusted_occurrence_does_not_drop_the_rest() {
+        // One occurrence the scanner distrusts (malformed escape) is dropped
+        // without discarding the occurrences it CAN decode.
+        let prefix =
+            r#"{"a":{"command":"echo \q oops"},"tool_input":{"command":"git clean -fdx"}}"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(prefix),
+            vec!["git clean -fdx".to_string()]
+        );
+    }
+
+    // =========================================================================
+    // Issue #290 follow-up: tool-name attribution for oversized prefixes
+    // =========================================================================
+
+    #[test]
+    fn test_290_tool_name_scan_recognizes_snake_and_camel_case() {
+        for prefix in [
+            r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+            r#"{"toolName":"Bash","toolArgs":{"command":"ls"}}"#,
+        ] {
+            let (name, dialect) =
+                shell_tool_from_truncated_json(prefix).expect("shell tool must be recognized");
+            assert_eq!(name, "Bash");
+            assert_eq!(dialect, ShellDialect::Posix);
+        }
+    }
+
+    #[test]
+    fn test_290_tool_name_scan_maps_dialect_like_the_normal_path() {
+        for (tool, expected) in [
+            ("bash", ShellDialect::Posix),
+            ("pwsh", ShellDialect::PowerShell),
+            ("cmd.exe", ShellDialect::Cmd),
+            ("run_shell_command", ShellDialect::Unknown),
+        ] {
+            let prefix = format!(r#"{{"tool_name":"{tool}","tool_input":{{"command":"ls"}}}}"#);
+            let (_, dialect) =
+                shell_tool_from_truncated_json(&prefix).expect("shell tool must be recognized");
+            assert_eq!(
+                dialect,
+                shell_dialect_for_tool_name(Some(tool)),
+                "dialect must match the normal parsed path for {tool:?}"
+            );
+            assert_eq!(dialect, expected);
+        }
+    }
+
+    #[test]
+    fn test_290_tool_name_scan_rejects_non_shell_tools() {
+        for prefix in [
+            r#"{"tool_name":"Write","tool_input":{"file_path":"/x","command":"rm -rf /"}}"#,
+            r#"{"tool_name":"Read","tool_input":{"command":"rm -rf /"}}"#,
+            // No tool name at all: nothing to attribute, must fail open.
+            r#"{"tool_input":{"command":"rm -rf /"}}"#,
+        ] {
+            assert!(
+                shell_tool_from_truncated_json(prefix).is_none(),
+                "must not attribute {prefix:?} to a shell tool"
+            );
+        }
+    }
+
+    #[test]
+    fn test_290_tool_name_scan_sees_past_a_non_shell_decoy() {
+        let prefix = r#"{"tool_name":"Write","padding":"AAA","tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#;
+        let (name, dialect) =
+            shell_tool_from_truncated_json(prefix).expect("real shell tool must still be found");
+        assert_eq!(name, "Bash");
+        assert_eq!(dialect, ShellDialect::Posix);
     }
 }

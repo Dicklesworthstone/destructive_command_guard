@@ -4224,10 +4224,16 @@ fn test_command(
         },
     };
 
-    // Hook mode starts its deadline after config-derived setup, agent detection,
-    // external-pack loading, and hook-input reading. The CLI already has the
-    // candidate command, so begin at the equivalent boundary: pack expansion,
-    // allowlist loading, and evaluation consume the effective wall-clock budget.
+    // Hook mode starts its deadline right after the stdin read, so its budget
+    // covers self-heal, external-pack loading, and evaluation (issue #293).
+    // The CLI deliberately diverges: it starts the deadline HERE, after
+    // config-derived setup, agent detection, and external-pack loading, so
+    // only pack expansion, allowlist loading, and evaluation consume the
+    // budget. `--enforce-budget` exists to reproduce hook-mode *evaluation*
+    // latency from the command line, and the CLI's own startup is not part of
+    // any agent's hook window — charging it here would make the flag report a
+    // budget the hook never spends. Timing the loading stages is what
+    // `dcg doctor`/`--timing` are for.
     let evaluation_deadline = enforce_budget.then(|| {
         Deadline::new(Duration::from_millis(
             effective_config.effective_hook_timeout_ms(),
@@ -12449,16 +12455,39 @@ pub fn ensure_hook_registered() {
 /// Inner implementation for `ensure_hook_registered` that returns errors
 /// so the outer function can swallow them for fail-open behavior.
 fn ensure_hook_registered_inner() -> Result<(), Box<dyn std::error::Error>> {
-    ensure_hook_registered_at(&claude_settings_path(), &self_heal_lock_path())
+    let settings_path = claude_settings_path();
+    let lock_path = self_heal_lock_path(&settings_path);
+    ensure_hook_registered_at(&settings_path, &lock_path)
 }
 
 /// Path to the advisory lock file that serializes concurrent self-heal
-/// writers.
+/// writers of `settings_path`.
 ///
 /// Lives in dcg's own config directory rather than `~/.claude` so dcg does
-/// not litter Claude Code's directory with extra files.
-fn self_heal_lock_path() -> std::path::PathBuf {
-    config_dir().join("selfheal.lock")
+/// not litter Claude Code's directory with extra files — but the *name* is
+/// derived from the protected file, not from the config directory. The config
+/// directory moves with `XDG_CONFIG_HOME`/`DCG_CONFIG_DIR`, so a fixed
+/// `selfheal.lock` let two processes with different environments heal the
+/// same `settings.json` under two different locks and interleave their
+/// read-modify-write. Keying the name to a stable hash of the canonicalized
+/// settings path makes the lock follow the file it protects.
+fn self_heal_lock_path(settings_path: &std::path::Path) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+
+    // Canonicalize so `~/.claude/settings.json` and a symlink/`..`-laden
+    // spelling of the same file hash identically. A not-yet-existing path
+    // falls back to its literal form (self-heal no-ops on it anyway).
+    let canonical = std::fs::canonicalize(settings_path)
+        .unwrap_or_else(|_| settings_path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let digest = Sha256::digest(canonical.as_bytes());
+    let mut hex8 = String::with_capacity(8);
+    for byte in digest.iter().take(4) {
+        use std::fmt::Write as _;
+        let _ = write!(hex8, "{byte:02x}");
+    }
+    config_dir().join(format!("selfheal-{hex8}.lock"))
 }
 
 /// True if `settings` already contains the exact desired dcg hook entry for
@@ -12520,30 +12549,80 @@ fn try_acquire_self_heal_lock(
 /// crash mid-write leaves the original file intact instead of
 /// truncated/invalid JSON (which would make Claude Code silently drop ALL
 /// hooks).
+///
+/// Two properties the naive temp+rename does NOT have, and that self-heal
+/// must not silently take away from a user:
+/// - **Symlinks are followed, not replaced.** `~/.claude/settings.json` is
+///   very often a symlink into a dotfile manager (chezmoi, GNU stow, Nix home
+///   manager). Renaming over the link would orphan the managed target and
+///   silently detach the file from the user's source of truth, so the write
+///   resolves the link first and replaces the real file.
+/// - **Permissions are preserved.** settings.json can hold API keys in `env`
+///   blocks; a `chmod 600` file must not come back world-readable 0644 just
+///   because dcg repaired a hook entry.
 fn write_settings_atomic(
     path: &std::path::Path,
     content: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    // Resolve symlinks so the rename lands on the real file, and so the temp
+    // file shares its filesystem. A path that cannot be canonicalized (does
+    // not exist yet) keeps its literal form.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
     let temp_name = format!(".dcg-settings-{}.tmp", std::process::id());
     let temp_path = parent.join(&temp_name);
 
-    {
-        let mut temp_file = std::fs::File::create(&temp_path)?;
-        temp_file.write_all(content.as_bytes())?;
-        temp_file.sync_all()?; // Ensure data is flushed to disk
-    }
+    // Every failure after this point must remove the temp file: a failed
+    // write/sync used to leave `.dcg-settings-<pid>.tmp` behind forever.
+    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        {
+            let mut temp_file = std::fs::File::create(&temp_path)?;
+            temp_file.write_all(content.as_bytes())?;
+            temp_file.sync_all()?; // Ensure data is flushed to disk
+        }
 
-    // Atomic rename (on Unix this is atomic; on Windows `std::fs::rename`
-    // replaces the existing file via MOVEFILE_REPLACE_EXISTING).
-    if let Err(rename_err) = std::fs::rename(&temp_path, path) {
+        copy_file_permissions(&target, &temp_path)?;
+
+        // Atomic rename (on Unix this is atomic; on Windows `std::fs::rename`
+        // replaces the existing file via MOVEFILE_REPLACE_EXISTING).
+        std::fs::rename(&temp_path, &target)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
         // Clean up our own temp file so failed attempts don't accumulate.
         let _ = std::fs::remove_file(&temp_path);
-        return Err(rename_err.into());
     }
 
+    write_result
+}
+
+/// Copy `from`'s permission bits onto `to` so an atomic temp+rename replace
+/// does not silently widen a restrictive mode (e.g. a `chmod 600`
+/// settings.json or allowlist).
+///
+/// A missing/unreadable source is not an error: there is nothing to preserve,
+/// and the temp file's default mode is the correct outcome. On non-Unix this
+/// is a no-op — Windows permissions live in ACLs that `std::fs` cannot carry
+/// across, and `rename` does not reset them the way a fresh file would.
+#[allow(clippy::unnecessary_wraps)] // the non-unix arm still needs the Result shape
+fn copy_file_permissions(
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        if let Ok(metadata) = std::fs::metadata(from) {
+            std::fs::set_permissions(to, metadata.permissions())?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (from, to);
+    }
     Ok(())
 }
 
@@ -14664,6 +14743,11 @@ fn write_allowlist(
             format!("Generated TOML failed validation (this is a bug): {parse_err}").into(),
         );
     }
+
+    // Preserve the existing file's permissions: a temp+rename replace
+    // otherwise resets a deliberately restrictive mode (e.g. `chmod 600`) to
+    // the process umask default.
+    copy_file_permissions(path, &temp_path)?;
 
     // Create a backup before replacing the file so we can recover from write failures.
     let backup_path = backup_allowlist_file(path)?;
@@ -19853,6 +19937,182 @@ exclude = ["target/**"]
         assert!(
             !settings_path.exists(),
             "self-heal must not create settings.json from nothing"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_settings_atomic_preserves_a_symlinked_settings_file() {
+        // ~/.claude/settings.json is very often a symlink into a dotfile
+        // manager (chezmoi / stow / home-manager). A temp+rename replace that
+        // does not resolve the link would silently orphan the managed target.
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("dotfiles");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real_path = real_dir.join("claude-settings.json");
+        std::fs::write(&real_path, "{\"old\": true}").unwrap();
+
+        let link_path = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
+
+        write_settings_atomic(&link_path, "{\"new\": true}").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "settings.json must still be a symlink after self-heal"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real_path).unwrap(),
+            "{\"new\": true}",
+            "the write must land on the symlink's target"
+        );
+        // No temp file left in either directory.
+        for probe in [dir.path(), real_dir.as_path()] {
+            let leftover_tmp = std::fs::read_dir(probe)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+            assert!(!leftover_tmp, "no temp file should be left in {probe:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_settings_atomic_preserves_restrictive_mode() {
+        // settings.json can hold API keys in `env` blocks: a `chmod 600` file
+        // must not come back 0644 because dcg repaired a hook entry.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{\"old\": true}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_settings_atomic(&path, "{\"new\": true}").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "restrictive mode must survive the atomic write"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"new\": true}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_allowlist_preserves_restrictive_mode() {
+        // Same defect, same fix, in the pre-existing allowlist atomic write.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist.toml");
+        std::fs::write(&path, "[commands]\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let doc: toml_edit::DocumentMut = "[commands]\nfoo = \"bar\"\n".parse().unwrap();
+        write_allowlist(&path, &doc).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "restrictive mode must survive the atomic write"
+        );
+        assert!(std::fs::read_to_string(&path).unwrap().contains("foo"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn self_heal_at_repairs_through_a_symlink() {
+        // End-to-end: the whole repair path must keep the symlink intact.
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("dotfiles");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real_path = real_dir.join("claude-settings.json");
+        std::fs::write(
+            &real_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": { "PreToolUse": [] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let link_path = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
+        let lock_path = dir.path().join("selfheal.lock");
+
+        ensure_hook_registered_at(&link_path, &lock_path).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "self-heal must not replace the symlink with a regular file"
+        );
+        let healed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&real_path).unwrap()).unwrap();
+        let is_registered = healed
+            .get("hooks")
+            .and_then(|h| h.get("PreToolUse"))
+            .and_then(|arr| arr.as_array())
+            .is_some_and(|a| a.iter().any(is_dcg_hook_entry));
+        assert!(is_registered, "hook must be repaired in the link target");
+    }
+
+    #[test]
+    fn self_heal_lock_path_is_keyed_to_the_protected_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("settings.json");
+        let b = dir.path().join("other-settings.json");
+        std::fs::write(&a, "{}").unwrap();
+        std::fs::write(&b, "{}").unwrap();
+
+        // Stable for the same file...
+        assert_eq!(self_heal_lock_path(&a), self_heal_lock_path(&a));
+        // ...and distinct for a different one.
+        assert_ne!(self_heal_lock_path(&a), self_heal_lock_path(&b));
+
+        // Shape: <config dir>/selfheal-<8 hex>.lock
+        let name = self_heal_lock_path(&a)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let hex = name
+            .strip_prefix("selfheal-")
+            .and_then(|rest| rest.strip_suffix(".lock"))
+            .expect("lock file name must be selfheal-<hex>.lock");
+        assert_eq!(hex.len(), 8, "expected an 8-char hex key, got {name:?}");
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn self_heal_lock_path_is_identical_for_aliases_of_one_file() {
+        // Two processes reaching the same settings.json by different
+        // spellings (symlink, `..` hop) must contend on ONE lock.
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("dotfiles");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real_path = real_dir.join("claude-settings.json");
+        std::fs::write(&real_path, "{}").unwrap();
+        let link_path = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
+        let dotted = real_dir
+            .join("..")
+            .join("dotfiles")
+            .join(real_path.file_name().map(std::path::PathBuf::from).unwrap());
+
+        assert_eq!(
+            self_heal_lock_path(&real_path),
+            self_heal_lock_path(&link_path)
+        );
+        assert_eq!(
+            self_heal_lock_path(&real_path),
+            self_heal_lock_path(&dotted)
         );
     }
 

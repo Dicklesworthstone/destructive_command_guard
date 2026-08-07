@@ -1349,4 +1349,71 @@ mod issue_293_bounded_loading {
             "warning must name the file, stderr: {stderr:?}"
         );
     }
+
+    /// The 64-file cap is CUMULATIVE across patterns, so the operator cannot
+    /// tell from the config which entry lost its files. The warning must name
+    /// the pattern(s) whose matches were dropped and how many were skipped.
+    #[test]
+    fn cap_warning_names_the_patterns_whose_files_were_dropped() {
+        let temp = TempDir::new().unwrap();
+        let home_dir = temp.path().join("home");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        // A greedy first pattern eats the entire budget...
+        let greedy_dir = temp.path().join("greedy");
+        std::fs::create_dir_all(&greedy_dir).unwrap();
+        for i in 0..(MAX_CUSTOM_PACK_FILES + 5) {
+            std::fs::write(greedy_dir.join(format!("pack{i:03}.yaml")), "id: x.y").unwrap();
+        }
+        // ...so this innocent second pattern silently contributes nothing.
+        let starved_dir = temp.path().join("starved");
+        std::fs::create_dir_all(&starved_dir).unwrap();
+        for i in 0..3 {
+            std::fs::write(starved_dir.join(format!("mine{i}.yaml")), "id: x.y").unwrap();
+        }
+
+        let greedy_pattern = format!("{}/*.yaml", greedy_dir.to_string_lossy().replace('\\', "/"));
+        let starved_pattern = format!(
+            "{}/*.yaml",
+            starved_dir.to_string_lossy().replace('\\', "/")
+        );
+
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[packs]\ncustom_paths = [\"{greedy_pattern}\", \"{starved_pattern}\"]\n"),
+        )
+        .unwrap();
+
+        let mut child = Command::new(dcg_binary())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("HOME", &home_dir)
+            .env("XDG_CONFIG_HOME", temp.path().join("xdg_config"))
+            .env("DCG_CONFIG", &config_path)
+            .spawn()
+            .expect("failed to spawn dcg");
+        {
+            let stdin = child.stdin.as_mut().expect("stdin");
+            stdin
+                .write_all(br#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#)
+                .expect("write hook input");
+        }
+        let output = child.wait_with_output().expect("wait for dcg");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            stderr.contains(&greedy_pattern),
+            "warning must name the pattern that tripped the cap, stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains(&starved_pattern),
+            "warning must name the starved pattern too, stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("(3 skipped)"),
+            "warning must say how many files each pattern lost, stderr: {stderr:?}"
+        );
+    }
 }

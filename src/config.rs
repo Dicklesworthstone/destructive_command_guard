@@ -2018,25 +2018,28 @@ impl PacksConfig {
     pub fn expand_custom_paths_from(&self, cwd: Option<&Path>) -> Vec<String> {
         let mut result = Vec::new();
         let mut repo_root: Option<Option<PathBuf>> = None; // memoize across patterns
-        let mut cap_warned = false;
 
         // Bound the expansion so a pathological glob (e.g. `~/**/*.yaml`)
         // cannot make every hook invocation open an unbounded number of
-        // files (issue #293). Files beyond the cap are skipped with a
-        // warning; each pack file itself is size-capped at parse time.
-        let mut push_capped = |result: &mut Vec<String>, path: String| {
+        // files (issue #293). Files beyond the cap are skipped; each pack
+        // file itself is size-capped at parse time.
+        //
+        // The cap is CUMULATIVE across patterns, so the pattern that trips it
+        // is usually not the pattern the operator would blame — an early
+        // greedy glob can consume the whole budget and silently drop every
+        // later entry. Skips are therefore tallied per pattern and reported
+        // by name after expansion, instead of one anonymous warning.
+        let mut skipped_by_pattern: Vec<(String, usize)> = Vec::new();
+        let push_capped = |result: &mut Vec<String>, skipped: &mut usize, path: String| {
             if result.len() < MAX_CUSTOM_PACK_FILES {
                 result.push(path);
-            } else if !cap_warned {
-                cap_warned = true;
-                eprintln!(
-                    "[dcg] Warning: packs.custom_paths expanded to more than \
-                     {MAX_CUSTOM_PACK_FILES} files; ignoring the rest (issue #293 cap)"
-                );
+            } else {
+                *skipped += 1;
             }
         };
 
         for pattern in &self.custom_paths {
+            let mut skipped = 0usize;
             // Expand ${repo_root} first — if unresolved, skip the entry.
             let after_repo_root = if pattern.contains("${repo_root}") {
                 let resolved = repo_root.get_or_insert_with(|| {
@@ -2072,7 +2075,11 @@ impl PacksConfig {
                 Ok(paths) => {
                     for entry in paths.flatten() {
                         if entry.is_file() {
-                            push_capped(&mut result, entry.to_string_lossy().into_owned());
+                            push_capped(
+                                &mut result,
+                                &mut skipped,
+                                entry.to_string_lossy().into_owned(),
+                            );
                         }
                     }
                 }
@@ -2080,10 +2087,27 @@ impl PacksConfig {
                     // Invalid glob pattern - treat as literal path
                     let path = std::path::Path::new(&expanded);
                     if path.is_file() {
-                        push_capped(&mut result, expanded);
+                        push_capped(&mut result, &mut skipped, expanded);
                     }
                 }
             }
+
+            if skipped > 0 {
+                skipped_by_pattern.push((pattern.clone(), skipped));
+            }
+        }
+
+        if !skipped_by_pattern.is_empty() {
+            let total: usize = skipped_by_pattern.iter().map(|(_, n)| n).sum();
+            let detail = skipped_by_pattern
+                .iter()
+                .map(|(pattern, n)| format!("{pattern} ({n} skipped)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "[dcg] Warning: packs.custom_paths hit the cumulative {MAX_CUSTOM_PACK_FILES}-file cap \
+                 (issue #293); {total} matching file(s) were NOT loaded from: {detail}"
+            );
         }
 
         result
