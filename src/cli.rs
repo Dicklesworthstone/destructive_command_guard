@@ -12370,7 +12370,7 @@ fn launch_windows_update_worker_direct(
         let mut breakaway = runner_command(runner_path);
         breakaway.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
         match breakaway.spawn() {
-            Ok(_) => return Ok(()),
+            Ok(_) => Ok(()),
             Err(breakaway_error) => {
                 let mut detached = runner_command(runner_path);
                 detached.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
@@ -12380,7 +12380,7 @@ fn launch_windows_update_worker_direct(
                          detached worker failed ({detached_error})"
                     )
                 })?;
-                return Ok(());
+                Ok(())
             }
         }
     }
@@ -16936,7 +16936,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let runner = temp.path().join("run-update-after-exit.ps1");
         std::fs::write(&runner, WINDOWS_UPDATE_RUNNER).unwrap();
-        let parser_probe = r#"$tokens = $null
+        let parser_probe = r"$tokens = $null
 $errors = $null
 [Management.Automation.Language.Parser]::ParseFile(
   $env:DCG_UPDATE_RUNNER_PARSE_PATH,
@@ -16946,7 +16946,7 @@ $errors = $null
 if ($errors.Count -ne 0) {
   $errors | ForEach-Object { Write-Error ([string]$_) }
   exit 1
-}"#;
+}";
         let output = std::process::Command::new("powershell.exe")
             .arg("-NoProfile")
             .arg("-NonInteractive")
