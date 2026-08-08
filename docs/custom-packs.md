@@ -36,6 +36,8 @@ destructive_patterns:                # Patterns that block/warn
     description: Short denial reason
     explanation: |                   # Optional detailed explanation
       Longer help text with alternatives.
+    executables:                     # Optional: only match under these programs
+      - mycommand
 
 safe_patterns:                       # Patterns that explicitly allow
   - name: safe-pattern-id
@@ -72,6 +74,40 @@ safe_patterns:                       # Patterns that explicitly allow
 | `severity` | string | no | `critical`, `high` (default), `medium`, `low` |
 | `description` | string | no | Short reason shown on denial |
 | `explanation` | string | no | Detailed explanation for verbose output |
+| `executables` | array | no | Restrict the rule to segments run by these programs (see below) |
+
+### Scoping a Rule to Its Executables
+
+A regex like `mytool\s+.*--force` can pair the word `mytool` in one command
+with `--force` from a completely different one. Listing `executables` tells dcg
+which programs the rule is actually about, and the rule then only fires when
+the match starts inside a command segment that runs one of them:
+
+```yaml
+destructive_patterns:
+  - name: mytool-force-wipe
+    pattern: mytool\s+.*--force
+    executables:
+      - mytool
+```
+
+With that key present, `grep -R "mytool --force" .` no longer matches: the
+segment runs `grep`, not `mytool`.
+
+How dcg resolves a segment's program:
+
+- Wrapper prefixes are stripped first, so `sudo mytool`, `env mytool`, and
+  `FOO=bar mytool` all resolve to `mytool`.
+- A path is reduced to its basename, so `/usr/local/bin/mytool` resolves to
+  `mytool`.
+- A trailing `.exe`, `.cmd`, `.bat`, or `.com` is removed.
+- Comparison is ASCII case-insensitive. Write the names lowercase, without a
+  path or extension.
+- If the program name is dynamic (it contains `$`, a backtick, or `%VAR%`),
+  dcg cannot know what will run, and the rule does **not** fire.
+
+Omit the key — or give an empty list — to leave the rule unscoped, matching
+anywhere in the command as before.
 
 ### Safe Pattern Fields
 

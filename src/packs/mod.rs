@@ -3702,6 +3702,60 @@ mod tests {
         );
     }
 
+    /// Issue #289: the optional `executables = [...]` clause is accepted on
+    /// every `destructive_pattern!` form and stores the list verbatim; every
+    /// form without it keeps `executables: None`.
+    #[test]
+    fn destructive_pattern_macro_records_optional_executables_issue_289() {
+        let scoped = [
+            crate::destructive_pattern!("re", "reason", executables = ["chmod"]),
+            crate::destructive_pattern!("name", "re", "reason", executables = ["chmod"]),
+            crate::destructive_pattern!("name", "re", "reason", Critical, executables = ["chmod"]),
+            crate::destructive_pattern!(
+                "name",
+                "re",
+                "reason",
+                Critical,
+                "explanation",
+                executables = ["chmod"]
+            ),
+            crate::destructive_pattern!(
+                "name",
+                "re",
+                "reason",
+                Critical,
+                "explanation",
+                &[],
+                executables = ["chmod"]
+            ),
+        ];
+        for pattern in &scoped {
+            assert_eq!(pattern.executables, Some(&["chmod"][..]));
+        }
+
+        // Multiple names and a trailing comma both parse.
+        let multi = crate::destructive_pattern!(
+            "name",
+            "re",
+            "reason",
+            High,
+            "explanation",
+            executables = ["chmod", "chown",]
+        );
+        assert_eq!(multi.executables, Some(&["chmod", "chown"][..]));
+
+        let unscoped = [
+            crate::destructive_pattern!("re", "reason"),
+            crate::destructive_pattern!("name", "re", "reason"),
+            crate::destructive_pattern!("name", "re", "reason", Critical),
+            crate::destructive_pattern!("name", "re", "reason", Critical, "explanation"),
+            crate::destructive_pattern!("name", "re", "reason", Critical, "explanation", &[]),
+        ];
+        for pattern in &unscoped {
+            assert!(pattern.executables.is_none());
+        }
+    }
+
     #[test]
     fn pack_aware_quick_reject_ignores_inert_quoted_payloads_near_shell_syntax() {
         let keywords: Vec<&str> = vec!["git", "rm", ">/", "> /"];

@@ -89,7 +89,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "chmod 777 grants read/write/execute to everyone. This can expose sensitive \
              files and allow unauthorized modification. Prefer least-privilege permissions \
              that only grant the specific access needed.",
-            CHMOD_777_SUGGESTIONS
+            CHMOD_777_SUGGESTIONS,
+            executables = ["chmod"]
         ),
         // chmod -R on root or system directories
         // `['"]?` before the leading `/` so quoted variants like
@@ -104,7 +105,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              system files require specific permission bits to function correctly.\n\n\
              Check current permissions first:\n  \
              ls -la /path/to/directory\n\n\
-             Apply changes to a specific subdirectory instead of the whole tree."
+             Apply changes to a specific subdirectory instead of the whole tree.",
+            executables = ["chmod"]
         ),
         // chown -R on root or system directories
         destructive_pattern!(
@@ -115,7 +117,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "Recursive ownership changes on system directories can disrupt services, \
              break package-managed files, and be difficult to undo. Start with a single \
              path or a shallow find before applying broader changes.",
-            CHOWN_RECURSIVE_SUGGESTIONS
+            CHOWN_RECURSIVE_SUGGESTIONS,
+            executables = ["chown"]
         ),
         // chmod u+s (setuid)
         destructive_pattern!(
@@ -129,7 +132,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Verify the file and owner first:\n  \
              ls -la <file>\n\n\
              Find existing setuid files:\n  \
-             find / -perm -4000 -type f 2>/dev/null"
+             find / -perm -4000 -type f 2>/dev/null",
+            executables = ["chmod"]
         ),
         // chmod g+s (setgid)
         destructive_pattern!(
@@ -143,7 +147,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Check current group ownership:\n  \
              ls -la <file>\n\n\
              Find existing setgid files:\n  \
-             find / -perm -2000 -type f 2>/dev/null"
+             find / -perm -2000 -type f 2>/dev/null",
+            executables = ["chmod"]
         ),
         // chown to root
         destructive_pattern!(
@@ -157,7 +162,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Check who currently owns the file:\n  \
              ls -la <path>\n\n\
              Consider using group ownership instead:\n  \
-             chgrp <group> <path>"
+             chgrp <group> <path>",
+            executables = ["chown"]
         ),
         // setfacl with dangerous patterns
         destructive_pattern!(
@@ -172,7 +178,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Review current ACLs first:\n  \
              getfacl <path>\n\n\
              Apply to a specific file instead of recursively:\n  \
-             setfacl -m u:<user>:rwx <specific-file>"
+             setfacl -m u:<user>:rwx <specific-file>",
+            executables = ["setfacl"]
         ),
     ]
 }
@@ -217,6 +224,29 @@ mod tests {
         assert_blocks(&pack, "chmod g+s /shared", "setgid");
         assert_blocks(&pack, "chown root: /tmp/myfile", "root");
         assert_blocks(&pack, "setfacl -R -m u:app:rwx /etc", "setfacl");
+    }
+
+    /// Issue #289: every rule in this pack names the utility it is about, so
+    /// the evaluator can refuse to apply it to a segment run by anything else.
+    #[test]
+    fn every_rule_declares_its_executable_issue_289() {
+        let pack = create_pack();
+        for pattern in &pack.destructive_patterns {
+            let expected: &[&str] = match pattern.name {
+                Some("chmod-777" | "chmod-recursive-root" | "chmod-setuid" | "chmod-setgid") => {
+                    &["chmod"]
+                }
+                Some("chown-recursive-root" | "chown-to-root") => &["chown"],
+                Some("setfacl-all") => &["setfacl"],
+                other => panic!("unhandled permissions rule {other:?} — declare its executable"),
+            };
+            assert_eq!(
+                pattern.executables,
+                Some(expected),
+                "executables for {:?}",
+                pattern.name
+            );
+        }
     }
 
     #[test]

@@ -1136,6 +1136,46 @@ safe_patterns:
         assert_eq!(pack.destructive_patterns[0].severity, Severity::Critical);
     }
 
+    /// Issue #289: an external pack may scope a rule to the executables it is
+    /// about. Omitting the key — or giving an empty list, which would scope the
+    /// rule to nothing — leaves the rule unscoped.
+    #[test]
+    fn external_executables_round_trip_issue_289() {
+        let yaml = r#"
+id: test.executables
+name: Executable Scoped
+version: 1.0.0
+description: Testing executable scoping
+keywords:
+  - chmod
+destructive_patterns:
+  - name: scoped
+    pattern: dangerous
+    executables:
+      - chmod
+      - Chown.exe
+  - name: unscoped
+    pattern: dangerous
+  - name: empty-list
+    pattern: dangerous
+    executables: []
+"#;
+        let external = parse_pack_string(yaml).unwrap();
+        assert_eq!(
+            external.destructive_patterns[0].executables.as_deref(),
+            Some(&["chmod".to_string(), "Chown.exe".to_string()][..])
+        );
+        assert!(external.destructive_patterns[1].executables.is_none());
+
+        let pack = external.into_pack();
+        assert_eq!(
+            pack.destructive_patterns[0].executables,
+            Some(&["chmod", "Chown.exe"][..])
+        );
+        assert!(pack.destructive_patterns[1].executables.is_none());
+        assert!(pack.destructive_patterns[2].executables.is_none());
+    }
+
     #[test]
     fn test_yaml_parse_error() {
         let yaml = "invalid: yaml: content: [";
