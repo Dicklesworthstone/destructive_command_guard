@@ -1,0 +1,235 @@
+# #289 follow-up — `executables=` scoping must survive compound-command syntax
+#
+# `executables = Some(list)` (#289-B) fires a rule only against a segment whose
+# resolved argv0 is in the list. argv0 was the leading whitespace-delimited word
+# of the raw segment, so every grouping character and reserved word that may
+# precede a simple command became the "executable" and the scoped rule went
+# silent: `if true; then chmod -R 755 /etc; fi` resolved `then`, `(chmod …)`
+# resolved `(chmod`. That is a deny→allow false negative on a security rule.
+#
+# These are true-positive *controls*: each one really does run chmod/chown/
+# setfacl against a system path and must deny in every dialect. The companion
+# false-positive shapes live in issue_287_permission_chains.toml — the two files
+# together pin both sides of the boundary.
+
+[[case]]
+description = "subshell around chmod -R on /etc"
+command = "(chmod -R 755 /etc)"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+
+[[case]]
+description = "spaced subshell around chmod -R on /etc"
+command = "( chmod -R 755 /etc )"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+
+[[case]]
+description = "nested subshells around chmod -R on /etc"
+command = "( (chmod -R 755 /etc) )"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+
+[[case]]
+description = "brace group around chmod -R on /etc"
+command = "{ chmod -R 755 /etc; }"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+known_failing = true
+known_failing_dialects = ["ps"]
+known_failing_reason = """
+Pre-existing and unrelated to argv0 resolution: under a caller-proven PowerShell \
+dialect a balanced `{ ... }` is treated as an unexecuted script block, so no pack \
+sees its body. `{ chmod -R 755 /etc` (unbalanced) denies under ps, and the whole \
+shape denies under posix/cmd/unknown. Owned by the PowerShell script-block \
+model, not by #289."""
+
+[[case]]
+description = "if/then guarding chmod -R on /etc"
+command = "if true; then chmod -R 755 /etc; fi"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+
+[[case]]
+description = "if/else guarding chmod -R on /etc"
+command = "if false; then true; else chmod -R 755 /etc; fi"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+
+[[case]]
+description = "elif branch guarding chmod -R on /etc"
+command = "if false; then true; elif true; then chmod -R 755 /etc; fi"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+
+[[case]]
+description = "for loop body running chmod -R on /etc"
+command = "for f in a; do chmod -R 755 /etc; done"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+
+[[case]]
+description = "while loop body running chmod -R on /etc"
+command = "while true; do chmod -R 755 /etc; done"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+
+[[case]]
+description = "until loop body running chmod -R on /etc"
+command = "until false; do chmod -R 755 /etc; done"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+
+[[case]]
+description = "case arm running chmod -R on /etc"
+command = "case x in *) chmod -R 755 /etc;; esac"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+
+[[case]]
+description = "negation prefix before chmod -R on /etc"
+command = "! chmod -R 755 /etc"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+
+[[case]]
+description = "subshell after an && separator"
+command = "true && (chmod -R 755 /etc)"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+
+[[case]]
+description = "subshell piped into another command"
+command = "(chmod -R 755 /etc) | cat"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+
+[[case]]
+description = "time keyword before chmod -R on /etc"
+command = "time chmod -R 755 /etc"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+
+[[case]]
+description = "subshell around chown -R on /etc"
+command = "(chown -R u:g /etc)"
+expected = "deny"
+rule_id = "system.permissions:chown-recursive-root"
+issue = 289
+
+[[case]]
+description = "if/then guarding chown -R on /etc"
+command = "if true; then chown -R u:g /etc; fi"
+expected = "deny"
+rule_id = "system.permissions:chown-recursive-root"
+issue = 289
+
+[[case]]
+description = "while loop body running chown -R on /etc"
+command = "while true; do chown -R u:g /etc; done"
+expected = "deny"
+rule_id = "system.permissions:chown-recursive-root"
+issue = 289
+
+[[case]]
+description = "brace group around setfacl -R on /etc"
+command = "{ setfacl -R -m u:x:rwx /etc; }"
+expected = "deny"
+issue = 289
+known_failing = true
+known_failing_dialects = ["ps"]
+known_failing_reason = """
+Same pre-existing PowerShell script-block gap as the chmod brace group above."""
+
+[[case]]
+description = "for loop body running setfacl -R on /etc"
+command = "for f in a; do setfacl -R -m u:x:rwx /etc; done"
+expected = "deny"
+issue = 289
+
+[[case]]
+description = "if/then guarding chmod 777 on a system file"
+command = "if true; then chmod 777 /etc/passwd; fi"
+expected = "deny"
+issue = 289
+
+[[case]]
+description = "subshell around a setuid chmod"
+command = "(chmod u+s /usr/bin/foo)"
+expected = "deny"
+issue = 289
+
+# Findings 2 and 3: under Cmd the whole `;`-joined line is one segment, so a
+# greedy full-command match straddled a POSIX `;` (and was dropped by the #287
+# cross-boundary guard with no per-segment retry), while argv0 came from the
+# line's leading token instead of the token that runs chmod. Segment-scoped
+# packs are now evaluated against POSIX segments under Cmd/PowerShell.
+
+[[case]]
+description = "two chmod -R commands joined by a semicolon"
+command = "chmod -R 755 /etc; chmod -R 755 /usr"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 287
+
+[[case]]
+description = "chmod -R on /etc followed by a cd"
+command = "chmod -R 755 /etc; cd /var"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 287
+
+[[case]]
+description = "two chown -R commands joined by a semicolon"
+command = "chown -R u:g /etc; chown -R u:g /usr"
+expected = "deny"
+rule_id = "system.permissions:chown-recursive-root"
+issue = 287
+
+[[case]]
+description = "two setfacl -R commands joined by a semicolon"
+command = "setfacl -R -m u:x:rwx /etc; setfacl -R -m u:x:rwx /usr"
+expected = "deny"
+issue = 287
+
+[[case]]
+description = "two chmod 777 commands joined by a semicolon"
+command = "chmod 777 /etc/a; chmod 777 /etc/b"
+expected = "deny"
+issue = 287
+
+[[case]]
+description = "leading separator before chmod -R on /etc"
+command = "; chmod -R 755 /etc"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+
+[[case]]
+description = "two earlier commands before chmod -R on /etc"
+command = "a; b; chmod -R 755 /etc"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289
+
+[[case]]
+description = "assignment-only segment before chmod -R on /etc"
+command = "VAR=1; chmod -R 755 /etc"
+expected = "deny"
+rule_id = "system.permissions:chmod-recursive-root"
+issue = 289

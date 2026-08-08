@@ -2332,6 +2332,126 @@ fn decode_cmd_pattern_view(command: &str) -> Cow<'_, str> {
     }
 }
 
+/// Remove the PowerShell backtick escapes that only hid ordinary bytes of a
+/// command name (dcg#294).
+///
+/// PowerShell strips a backtick escape before it resolves the command name, so
+/// ``doc`ker system prune -af`` really runs `docker`. The regex packs match on
+/// the normalized view, so a word whose executable identity a backtick was
+/// splitting has to be reconstructed there.
+///
+/// Only escapes of ordinary word bytes are removed. A backtick before a quote,
+/// a separator, `$`, or whitespace is escape syntax whose removal would change
+/// the structure a later tokenizer sees — the same reason
+/// [`decode_cmd_pattern_piece`] retains `^&` and friends — so those keep the
+/// backtick verbatim. Verbatim single-quoted spans are left alone entirely:
+/// PowerShell does not process escapes inside them.
+fn decode_powershell_executable_backticks(word: &str) -> Cow<'_, str> {
+    if !word.contains('`') {
+        return Cow::Borrowed(word);
+    }
+
+    let mut output = String::with_capacity(word.len());
+    let mut chars = word.chars();
+    let mut in_single_quotes = false;
+    let mut changed = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' => {
+                in_single_quotes = !in_single_quotes;
+                output.push(ch);
+            }
+            '`' if !in_single_quotes => {
+                let Some(escaped) = chars.next() else {
+                    // A trailing backtick is incomplete syntax; do not guess.
+                    return Cow::Borrowed(word);
+                };
+                if escaped.is_ascii_alphanumeric()
+                    || matches!(escaped, '-' | '_' | '.' | '/' | '\\' | ':')
+                {
+                    output.push(escaped);
+                    changed = true;
+                } else {
+                    output.push('`');
+                    output.push(escaped);
+                }
+            }
+            other => output.push(other),
+        }
+    }
+
+    if in_single_quotes {
+        // Do not reinterpret malformed/incomplete quoting.
+        return Cow::Borrowed(word);
+    }
+
+    if changed {
+        Cow::Owned(output)
+    } else {
+        Cow::Borrowed(word)
+    }
+}
+
+/// Build the PowerShell matching view by de-escaping executable-position words.
+///
+/// Scope is deliberately narrower than the Cmd caret view: only the first word
+/// of each command segment is decoded. A backtick inside an *argument* is data
+/// (`git commit -m 'a`b'`) and revealing it would manufacture false positives,
+/// whereas a backtick inside the command name is the only thing standing
+/// between the raw text and a real execution.
+fn decode_powershell_pattern_view(command: &str) -> Cow<'_, str> {
+    if !command.contains('`') {
+        return Cow::Borrowed(command);
+    }
+
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
+    if tokens.is_empty() {
+        return Cow::Borrowed(command);
+    }
+
+    let mut replacements: Vec<(Range<usize>, String)> = Vec::new();
+    let mut segment_has_command = false;
+    for token in &tokens {
+        if token.kind == NormalizeTokenKind::Separator {
+            segment_has_command = false;
+            continue;
+        }
+        if segment_has_command {
+            continue;
+        }
+        let Some(raw) = token.text(command) else {
+            return Cow::Borrowed(command);
+        };
+        segment_has_command = true;
+        if !raw.contains('`') {
+            continue;
+        }
+        let decoded = decode_powershell_executable_backticks(raw);
+        if decoded.as_ref() != raw {
+            replacements.push((token.byte_range.clone(), decoded.into_owned()));
+        }
+    }
+
+    if replacements.is_empty() {
+        return Cow::Borrowed(command);
+    }
+
+    let mut output = String::with_capacity(command.len());
+    let mut last = 0usize;
+    for (range, replacement) in replacements {
+        if range.start > last {
+            output.push_str(&command[last..range.start]);
+        }
+        output.push_str(&replacement);
+        last = range.end;
+    }
+    if last < command.len() {
+        output.push_str(&command[last..]);
+    }
+    Cow::Owned(output)
+}
+
 /// Return the executable right-hand side of a simple PowerShell variable
 /// assignment.
 ///
@@ -3660,13 +3780,23 @@ fn decode_segment_command_words_in_dialect(command: &str, dialect: ShellDialect)
     // `$'...'` is a strong, self-identifying POSIX/Bash syntax signal, so CLI
     // inspection commands without a proven dialect may decode it. A caret is
     // ordinary data outside Cmd, so it is decoded only when the hook envelope
-    // proves Cmd syntax. PowerShell remains unchanged here; its executable
-    // reconstruction paths have their own semantic parsers.
+    // proves Cmd syntax. PowerShell's backtick is handled the same way and,
+    // like the Cmd caret, only once the envelope proves the dialect; its
+    // semantic decoders cover the executable-reconstruction paths they parse,
+    // but the regex packs still need the escape removed from the command name
+    // (dcg#294).
     let decode_dialect = match dialect {
         ShellDialect::Posix | ShellDialect::Unknown if command.contains("$'") => {
             ShellDialect::Posix
         }
         ShellDialect::Cmd if command.contains('^') => return decode_cmd_pattern_view(command),
+        // A backtick is ordinary data outside PowerShell (and POSIX command
+        // substitution syntax), so this decode runs only when the caller
+        // proved PowerShell syntax. Unlike the Cmd view it touches executable
+        // positions only — see `decode_powershell_pattern_view`.
+        ShellDialect::PowerShell if command.contains('`') => {
+            return decode_powershell_pattern_view(command);
+        }
         ShellDialect::Posix
         | ShellDialect::PowerShell
         | ShellDialect::Cmd

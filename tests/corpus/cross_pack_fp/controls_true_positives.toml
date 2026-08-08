@@ -187,6 +187,14 @@ issue = 294
 dialects = ["cmd", "unknown"]
 
 [[case]]
+description = "an unquoted cmd.exe caret reconstructs the executable word"
+command = "doc^ker system prune -af"
+expected = "deny"
+rule_id = "containers.docker:system-prune"
+issue = 294
+dialects = ["cmd", "unknown"]
+
+[[case]]
 description = "PowerShell Invoke-Expression executes a string POSIX pipes as data"
 command = "'git reset --hard' | iex"
 expected = "deny"

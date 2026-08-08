@@ -52,3 +52,24 @@ command = "echo '$(rm -r ./tree)'"
 expected = "allow"
 issue = 294
 dialects = ["posix", "ps", "unknown"]
+
+# The intra-segment half of the gate (a caret/backtick that reconstructs an
+# executable word the raw text never names) has the same rule: the escape must
+# sit in an *executable* position. A caret inside single-quoted printf/echo data
+# is an inert byte under POSIX quoting, so it may not manufacture the keyword
+# that sends the command to the cmd replay. Under a caller-proven cmd dialect
+# `'` is not a quote at all, which is a separate, pre-existing cmd-view issue.
+
+[[case]]
+description = "caret inside single-quoted printf data must not trigger the cmd replay"
+command = "printf '%s\\n' 'doc^ker system prune -af'"
+expected = "allow"
+issue = 294
+dialects = ["posix", "ps", "unknown"]
+
+[[case]]
+description = "caret inside single-quoted echo data must not trigger the cmd replay"
+command = "echo 'doc^ker system prune -af'"
+expected = "allow"
+issue = 294
+dialects = ["posix", "ps", "unknown"]

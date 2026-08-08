@@ -17224,9 +17224,14 @@ if ($errors.Count -ne 0) {
         let results = process_batch_lines(&lines);
 
         let decisions: Vec<&str> = results.iter().map(|result| result.decision).collect();
+        // The last line has no proven dialect (`runTerminalCommand`), so it is
+        // evaluated under `Unknown` and the #294 fan-out replays the cmd view
+        // that de-escapes `g^it branch ^-d` into a real `git branch -d`. The
+        // Bash line before it stays allowed: POSIX has no backtick escape, so
+        // that command really is not git.
         assert_eq!(
             decisions,
-            ["deny", "allow", "deny", "allow", "allow", "allow"]
+            ["deny", "allow", "deny", "allow", "allow", "deny"]
         );
     }
 

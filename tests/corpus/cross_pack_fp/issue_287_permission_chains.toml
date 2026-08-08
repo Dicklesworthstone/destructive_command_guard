@@ -25,19 +25,17 @@ command = "chown app /var/log/x\ngrep -R foo /etc/passwd"
 expected = "allow"
 issue = 287
 
-# KNOWN FAILURE (found by this suite): the #287 fix drops a full-command match
-# for a segment-scoped pack when the matched span crosses a segment boundary —
-# but the Cmd dialect does not treat `;` as a command separator, so there is no
-# boundary to cross and the full-command match survives. The fix is therefore
-# dialect-dependent in a way its own tests (unknown dialect only) could not see.
+# Found by this suite, fixed afterwards: the #287 suppression used only the
+# evaluated dialect's segmentation, and Cmd does not treat `;` as a command
+# separator — so under `--dialect cmd` the whole line was one segment, nothing
+# crossed a boundary, and the full-command match survived. chmod/chown/setfacl
+# are POSIX utilities, so the evaluator now also consults the POSIX segment
+# view for `SEGMENT_SCOPED_PACKS` under Cmd and PowerShell.
 [[case]]
 description = "chown then cp -R after a semicolon"
 command = "chown user /var/log/app.log; cp -R src /opt/app"
 expected = "allow"
 issue = 287
-known_failing = true
-known_failing_dialects = ["cmd"]
-known_failing_reason = "system.permissions:chown-recursive-root still fires under the cmd dialect, where `;` is not a segment separator so the #287 segment-scope check never triggers"
 
 [[case]]
 description = "setfacl piped into ls -R: the -R belongs to ls"

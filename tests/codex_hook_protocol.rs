@@ -614,8 +614,21 @@ fn explicit_cmd_tool_decodes_carets_only_in_shell_syntax() {
     );
 }
 
+/// A *proven* Bash dialect must never reinterpret Windows escape syntax: a
+/// backtick or caret in the middle of a word is an ordinary byte to POSIX, so
+/// `` g`it … `` is not git.
+///
+/// The unknown dialect is a different question. Since #294 it is a deny-wins
+/// *union* rather than a synonym for POSIX: a generic terminal adapter has not
+/// proven which shell will run the command, so a payload that reconstructs a
+/// protected executable under cmd.exe or PowerShell must be blocked. The
+/// assertion below therefore flipped when #294's decoded-view keyword gate
+/// landed — the same flip already recorded for `g^it branch ^-d` in
+/// `src/cli.rs`'s batch test. The escape here is unquoted and so sits in an
+/// executable position; a caret inside quoted data does *not* reach the replay
+/// (see `tests/repro_294_unknown_dialect_pack_fanout.rs`).
 #[test]
-fn bash_and_unknown_tools_do_not_guess_windows_escape_syntax() {
+fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
     for command in ["g`it branch -`d feature", "g^it branch ^-d feature"] {
         let bash_payload = serde_json::json!({
             "turn_id": "turn-bash-dialect",
@@ -642,8 +655,9 @@ fn bash_and_unknown_tools_do_not_guess_windows_escape_syntax() {
             &[("DCG_HOOK_TIMEOUT_MS", "5000")],
         );
         assert!(
-            unknown_outcome.is_allow_shape(),
-            "a generic terminal adapter must retain Unknown dialect for {command:?}\n{unknown_outcome}"
+            unknown_outcome.is_claude_block_shape(),
+            "#294: an unproven dialect must adopt the cmd/PowerShell reading that \
+             reconstructs `git branch -d` in {command:?}\n{unknown_outcome}"
         );
     }
 }

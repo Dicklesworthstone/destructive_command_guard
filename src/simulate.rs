@@ -1480,8 +1480,12 @@ echo hello
         .expect("simulation should parse both commands");
 
         assert_eq!(result.summary.total_commands, 2);
-        assert_eq!(result.summary.deny_count, 1);
-        assert_eq!(result.summary.allow_count, 1);
+        // The hook line proves PowerShell. The bare line proves nothing, so it
+        // is evaluated under `Unknown`, where the #294 fan-out replays the
+        // PowerShell view that de-escapes ``g`it branch -`d`` into a real
+        // `git branch -d` — the same deny `--dialect ps` reports.
+        assert_eq!(result.summary.deny_count, 2);
+        assert_eq!(result.summary.allow_count, 0);
     }
 
     #[test]
