@@ -12478,6 +12478,7 @@ fn protected_database_pack_for_executable(executable: &str) -> Option<&'static s
         "mongo" | "mongosh" => Some("database.mongodb"),
         "sqlite3" => Some("database.sqlite"),
         "snow" => Some("database.snowflake"),
+        "bq" => Some("database.bigquery"),
         _ => None,
     }
 }
@@ -12491,6 +12492,7 @@ fn is_indirect_database_pack(pack_id: &str) -> bool {
             | "database.mongodb"
             | "database.sqlite"
             | "database.snowflake"
+            | "database.bigquery"
     )
 }
 
@@ -13355,6 +13357,7 @@ fn has_database_cli_hint(command: &str) -> bool {
         "mongosh",
         "sqlite3",
         "snow",
+        "bq",
     ]
     .iter()
     .any(|executable| lower.contains(executable))
@@ -13681,6 +13684,9 @@ fn pipe_consumer_pack(command: &str) -> Option<&'static str> {
                 .reads_stdin_as_code =>
         {
             Some("database.snowflake")
+        }
+        "bq" if crate::packs::database::bigquery::analyze_bq_args(&args).reads_stdin_as_code => {
+            Some("database.bigquery")
         }
         "nsupdate" if analyze_nsupdate_args(&args).reads_stdin_as_code => Some("dns.generic"),
         _ => None,
@@ -16684,6 +16690,14 @@ fn code_argument_slots<'a>(executable: &str, args: &'a [String]) -> Vec<(&'stati
             .query_values
             .into_iter()
             .map(|value| ("database.snowflake", value))
+            .collect(),
+        // `bq` exposes no file-bearing SQL option (no `-f`, no `.read`), so it
+        // appears here but not in `file_argument_slots` or
+        // `unverified_embedded_file_source`.
+        "bq" => crate::packs::database::bigquery::analyze_bq_args(args)
+            .code_values
+            .into_iter()
+            .map(|value| ("database.bigquery", value))
             .collect(),
         _ => Vec::new(),
     }

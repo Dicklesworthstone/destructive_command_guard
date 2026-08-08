@@ -10,6 +10,7 @@ This document describes packs in the `database` category.
 - [Redis](#databaseredis)
 - [SQLite](#databasesqlite)
 - [Snowflake CLI](#databasesnowflake)
+- [BigQuery](#databasebigquery)
 - [Supabase](#databasesupabase)
 
 ---
@@ -458,6 +459,99 @@ To allowlist all rules from this pack (use with caution):
 ```toml
 [[allow]]
 rule = "database.snowflake:*"
+reason = "Your reason here"
+risk_acknowledged = true
+```
+
+---
+
+## BigQuery
+
+**Pack ID:** `database.bigquery`
+
+Protects against destructive BigQuery operations like bq rm -r, --replace loads, DROP SCHEMA/TABLE, DELETE ... WHERE TRUE, and shrinking the time-travel recovery window
+
+### Keywords
+
+Commands containing these keywords are checked against this pack:
+
+- `bq`
+- `bigquery`
+- `DROP`
+- `TRUNCATE`
+- `DELETE`
+- `UPDATE`
+- `ALTER`
+- `OVERWRITE`
+- `OR REPLACE`
+- `NOT MATCHED`
+
+### Safe Patterns (Allowed)
+
+These patterns match safe commands that are always allowed:
+
+| Pattern Name | Pattern |
+|--------------|----------|
+| `bq-read-only-subcommand` | `(?i)\bbq\s+(?:-{1,2}[^\s'"]+\s+)*(?:ls\|show\|head\|version\|help)\b[^'"\n]*(?:\n\|$)` |
+| `bq-query-dry-run` | `(?i)\bbq\s+[^'"\n]*--dry_run\b` |
+| `bq-extract` | `(?i)\bbq\s+(?:-{1,2}[^\s'"]+\s+)*extract\b` |
+| `select-query` | `(?i)^\s*SELECT\s+` |
+
+### Destructive Patterns (Blocked)
+
+These patterns match potentially destructive commands:
+
+| Pattern Name | Reason | Severity |
+|--------------|--------|----------|
+| `stdin-unverified` | bq receives indirect input that dcg cannot statically verify. | high |
+| `bq-rm-recursive` | bq rm -r deletes the dataset and every table, view, model, and routine inside it. | critical |
+| `bq-rm-force` | bq rm -f deletes the resource with no confirmation prompt. | high |
+| `bq-rm-transfer-config` | bq rm --transfer_config deletes a scheduled query or data transfer and its run history. | high |
+| `bq-rm-reservation` | bq rm on a reservation or capacity commitment changes query capacity and billing. | high |
+| `bq-rm` | bq rm deletes a BigQuery dataset, table, view, model, or routine. | high |
+| `bq-load-replace` | bq load --replace overwrites the destination table, discarding all existing rows. | high |
+| `bq-query-replace` | bq query --replace overwrites the destination table with the query result. | high |
+| `bq-cp-force` | bq cp -f overwrites the destination table without confirmation. | high |
+| `bq-mk-force` | bq mk -f recreates an existing table, discarding its data. | high |
+| `bq-update-time-travel` | Lowering --max_time_travel_hours shortens the window in which deleted BigQuery data can be recovered. | high |
+| `bq-update-expiration` | Setting an expiration schedules automatic deletion of tables or partitions. | medium |
+| `bq-cancel` | bq cancel stops a running job; partially written results may be left behind. | medium |
+| `drop-schema` | DROP SCHEMA deletes a BigQuery dataset (even with IF EXISTS). With CASCADE it takes every table with it. | critical |
+| `drop-snapshot-table` | DROP SNAPSHOT TABLE deletes a point-in-time backup of a table. | critical |
+| `drop-routine` | DROP removes a stored routine, model, or row-level access policy. | medium |
+| `drop-all-row-access-policies` | DROP ALL ROW ACCESS POLICIES exposes every previously filtered row to anyone with table access. | high |
+| `drop-search-index` | DROP SEARCH/VECTOR INDEX discards an index that can take hours and real cost to rebuild. | medium |
+| `drop-capacity-or-reservation` | Dropping a capacity commitment, reservation, or assignment changes query capacity and billing. | high |
+| `drop-table` | DROP TABLE permanently deletes the table (even with IF EXISTS). Verify and snapshot first. | high |
+| `drop-view` | DROP VIEW removes the view definition; dependent queries and dashboards break. | medium |
+| `truncate-table` | TRUNCATE TABLE deletes every row in the table. | high |
+| `delete-all-rows` | DELETE ... WHERE TRUE deletes every row in the table. | high |
+| `delete-without-where` | DELETE without a WHERE clause targets every row. | high |
+| `update-all-rows` | UPDATE ... WHERE TRUE rewrites every row in the table. | high |
+| `create-or-replace-table` | CREATE OR REPLACE TABLE atomically discards the existing table's data. | high |
+| `create-or-replace-routine` | CREATE OR REPLACE overwrites an existing view, routine, model, or access policy definition. | medium |
+| `load-data-overwrite` | LOAD DATA OVERWRITE replaces the whole table with the loaded file's contents. | high |
+| `export-data-overwrite` | EXPORT DATA with overwrite=true deletes existing files at the destination URI. | medium |
+| `alter-set-expiration` | ALTER ... SET OPTIONS with an expiration or time-travel option schedules deletion or shrinks the undo window. | high |
+| `alter-table-drop-column` | ALTER TABLE ... DROP COLUMN removes the column and its data. | medium |
+| `alter-table-rename` | ALTER ... RENAME TO breaks every query, view, and scheduled job referencing the old name. | medium |
+| `merge-delete-not-matched-by-source` | MERGE ... WHEN NOT MATCHED BY SOURCE THEN DELETE removes every target row the source does not contain. | high |
+
+### Allowlist Guidance
+
+To allowlist a specific rule from this pack, add to your allowlist:
+
+```toml
+[[allow]]
+rule = "database.bigquery:<pattern-name>"
+reason = "Your reason here"
+```
+
+To allowlist all rules from this pack (use with caution):
+
+```toml
+[[allow]]
+rule = "database.bigquery:*"
 reason = "Your reason here"
 risk_acknowledged = true
 ```

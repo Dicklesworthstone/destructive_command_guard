@@ -5594,6 +5594,16 @@ fn detect_database_packs_from_deps(
                 "snowflake-sqlalchemy",
             ],
         ),
+        (
+            "database.bigquery",
+            &[
+                "google-cloud-bigquery",
+                "@google-cloud/bigquery",
+                "bigquery",
+                "pandas-gbq",
+                "sqlalchemy-bigquery",
+            ],
+        ),
         ("database.supabase", &["supabase", "@supabase/supabase-js"]),
     ];
 

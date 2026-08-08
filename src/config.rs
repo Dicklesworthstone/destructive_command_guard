@@ -5610,6 +5610,7 @@ verbose = false
 #   database.redis        - Redis FLUSH commands
 #   database.sqlite       - SQLite destructive commands
 #   database.snowflake    - Snowflake CLI SQL and account operations
+#   database.bigquery     - BigQuery `bq` CLI and GoogleSQL destructive operations
 #   containers.docker     - Docker destructive commands
 #   containers.compose    - Docker Compose destructive commands
 #   containers.podman     - Podman destructive commands

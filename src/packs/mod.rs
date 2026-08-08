@@ -1227,6 +1227,7 @@ const CAREFUL_COMPANY_PRESET_MEMBERS: &[&str] = &[
     "database.redis",
     "database.sqlite",
     "database.snowflake",
+    "database.bigquery",
     "database.supabase",
     // Object stores and remote copy.
     "storage.s3",
@@ -1266,7 +1267,7 @@ pub fn preset_members(id: &str) -> Option<&'static [&'static str]> {
 
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 98] = [
+static PACK_ENTRIES: [PackEntry; 99] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new(
         "core.filesystem",
@@ -1722,6 +1723,22 @@ static PACK_ENTRIES: [PackEntry; 98] = [
             "OVERWRITE",
         ],
         database::snowflake::create_pack,
+    ),
+    PackEntry::new(
+        "database.bigquery",
+        &[
+            "bq",
+            "bigquery",
+            "DROP",
+            "TRUNCATE",
+            "DELETE",
+            "UPDATE",
+            "ALTER",
+            "OVERWRITE",
+            "OR REPLACE",
+            "NOT MATCHED",
+        ],
+        database::bigquery::create_pack,
     ),
     PackEntry::new(
         "database.supabase",
@@ -5536,7 +5553,7 @@ mod tests {
             // full, so no member can be dropped without this failing.
             assert_eq!(
                 CAREFUL_COMPANY_PRESET_MEMBERS.len(),
-                29,
+                30,
                 "preset membership changed size; update the docs and this count together"
             );
             for category in [

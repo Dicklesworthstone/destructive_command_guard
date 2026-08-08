@@ -1296,6 +1296,13 @@ test_command_with_packs "psql -c 'SELECT 1;'" "allow" "database.postgresql" "psq
 test_command_with_packs "sqlite3 my.db 'DROP TABLE IF EXISTS users;'" "block" "database.sqlite" "sqlite3 DROP TABLE IF EXISTS (sqlite pack enabled)"
 test_command_with_packs "sqlite3 my.db 'SELECT 1;'" "allow" "database.sqlite" "sqlite3 SELECT (sqlite pack enabled, safe command)"
 
+# BigQuery pack tests
+test_command_with_packs "bq rm -r -f analytics_prod" "block" "database.bigquery" "bq rm -r (bigquery pack enabled)"
+test_command_with_packs "bq query 'DROP SCHEMA mydataset CASCADE'" "block" "database.bigquery" "bq query DROP SCHEMA (bigquery pack enabled)"
+test_command_with_packs "bq query 'DELETE FROM mydataset.mytable WHERE TRUE'" "block" "database.bigquery" "bq query DELETE WHERE TRUE (bigquery pack enabled)"
+test_command_with_packs "bq ls mydataset" "allow" "database.bigquery" "bq ls (bigquery pack enabled, safe command)"
+test_command_with_packs "bq query 'SELECT COUNT(*) FROM mydataset.mytable'" "allow" "database.bigquery" "bq query SELECT (bigquery pack enabled, safe command)"
+
 # Redis pack tests
 test_command_with_packs "redis-cli FLUSHALL" "block" "database.redis" "redis-cli FLUSHALL (redis pack enabled)"
 test_command_with_packs "redis-cli GET key" "allow" "database.redis" "redis-cli GET (redis pack enabled, safe command)"

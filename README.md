@@ -232,6 +232,7 @@ it to `[packs] enabled` — see [Enable More Protection](#enable-more-protection
 - `database.redis` - Protects against destructive Redis operations like FLUSHALL, FLUSHDB, and mass key deletion.
 - `database.sqlite` - Protects against destructive SQLite operations like DROP TABLE, DELETE without WHERE, and accidental data loss.
 - `database.snowflake` - Protects modern `snow sql` inline queries, files, stdin, nested sources, destructive data operations, pipelines, warehouses, and account privileges.
+- `database.bigquery` - Protects against destructive BigQuery operations like bq rm -r, --replace loads, DROP SCHEMA/TABLE, DELETE ... WHERE TRUE, and shrinking the time-travel recovery window.
 - `database.supabase` - Protects against destructive Supabase CLI operations including database resets, migration rollbacks, function/secret/storage deletion, project removal, and infrastructure changes.
 
 ### Container Packs
