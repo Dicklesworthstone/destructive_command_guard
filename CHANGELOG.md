@@ -11,6 +11,99 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.10.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.10.0) -- 2026-08-07 [Release]
+
+A large correctness, feature, and hardening release from a full issue-triage
+pass followed by an adversarial fresh-eyes review of that same work (which
+caught, and this release fixes, four false-negatives the first pass had
+introduced). It closes eighteen tracker issues, adds two new configuration and
+pack-authoring surfaces, and lands the first two parts of the segment-scoped
+evaluation design (#289). The evaluation hot path is unchanged for ordinary
+commands; the new all-dialect fan-out and per-rule scoping only do extra work
+when a command actually carries dialect-divergent syntax or an executable-scoped
+pack is enabled.
+
+### Added
+
+- **Per-rule target-path exemptions (#284).** A new `[rules."<pack>:<pattern>"]`
+  config table with `exempt_target_globs` lets a specific rule stand down when
+  its operation targets a statically-literal path under an allowed glob (e.g.
+  `~/.claude/jobs/*/tmp/**` for the `redirect-truncate`/`rm` rules that agent
+  job-scratch directories collide with). Every other rule still evaluates the
+  full command, so a destructive suffix is still caught — unlike an `[overrides]
+  allow`, which is a whole-command bypass. Literal targets only (dynamic-path
+  rules are deliberately unsupported); `..` traversal is rejected; the setting
+  reduces coverage, so it is ignored from an automatically-discovered `.dcg.toml`
+  and honored only from user/system/`DCG_CONFIG`. `dcg doctor` warns when it is
+  configured on a rule that does not support it.
+- **Rules can declare their executables (#289 part B).** Destructive patterns
+  (built-in and external YAML packs, via a new `executables:` key) may name the
+  executables they apply to; the engine then only evaluates such a rule against a
+  command segment whose resolved `argv0` matches. `system.permissions` is the
+  first migrated pack, so a `chmod` rule no longer fires on a `grep -r` elsewhere
+  in the line. `executables` omitted preserves prior behavior exactly.
+- **Diagnostics honesty (#289 part C).** `dcg test`/`dcg explain` now report when
+  a denial comes only from the all-dialect analysis and the Bash hook (posix
+  dialect) would allow — with the `--dialect posix` reproduction line and an
+  additive `dialect_divergence` JSON field. `dcg test`/`dcg explain` invocations
+  wrapped in loops, conditionals, or `&&` chains are no longer blocked on their
+  own quoted argument.
+- **Cross-pack regression corpus (#289 part D).** False-positive shapes from the
+  closed issues are now replayed against every registered pack across all shell
+  dialects on each test run, so a shape fixed under one rule is re-checked against
+  the others. It found four new false positives on its first run (all fixed
+  here).
+
+### Security
+
+- **Unknown-dialect evaluation no longer under-matches regex packs (#294).** A
+  command inert under POSIX quoting but destructive under `cmd.exe`/PowerShell
+  quoting (`echo 'ok & docker system prune -af`) is now caught under the default
+  all-dialect analysis via a deny-wins fan-out, including caret- and
+  backtick-obfuscated executables (`doc^ker`). The extra views run only when the
+  command carries a dialect-divergent byte and an enabled-pack keyword.
+- **Oversized hook input no longer silently skips evaluation (#290).** Padding a
+  destructive command past `max_hook_input_bytes` previously failed open by
+  default; the already-read buffer (drained up to a bounded cap) is now scanned
+  for every embedded command and a destructive one is denied. The default
+  fail-open posture for genuinely benign oversized input is unchanged.
+- **The protocol denial is emitted before pending-exception persistence (#291),**
+  so a slow or contended allow-once store can no longer delay or suppress a
+  block.
+
+### Fixed
+
+- **False positives:** `chmod`/`chown`/`setfacl` no longer pair their flags with
+  a different command in the same line, in any dialect (#287); the Cloudflare
+  Wrangler semantic fallback requires actual Wrangler evidence, so `command -v
+  foo`, `env`, and `time foo` are no longer denied (#283), and fully-dynamic
+  executables (`$cmd $arg`) are no longer misattributed to it either;
+  `core.git:branch-dynamic-token` no longer fires on non-git commands (#281); a
+  variable expansion followed by a command substitution inside one double-quoted
+  word parses correctly (#279); `git commit -F -` message bodies are treated as
+  data on every scanning path (#277); literal paths under the per-user Windows
+  temp directory are exempted like `/tmp` (#285).
+- **Windows enforcement:** `rd /s` / `del /s` are blocked through the live
+  PowerShell hook path, not only in `dcg test`/`explain` (#280).
+- **Self-heal robustness (#292):** `~/.claude/settings.json` is now rewritten
+  atomically (temp + fsync + rename) under a bounded lock, preserving symlinks
+  and file mode, so a crash or a concurrent writer can no longer truncate it or
+  drop its permissions.
+- **External pack loading (#293)** is bounded by the hook deadline, caps glob
+  matches and per-file size, and surfaces load failures without `--verbose`.
+- **Installer:** the PowerShell profile check no longer prints a spurious "hook
+  missing" warning when the hook command is present in its quoted-invocation form
+  (#282).
+
+### Internal
+
+- The evaluation body was factored so the unknown-dialect path can replay it per
+  dialect (#294); `argv0` resolution now walks the tokenizer and skips grouping
+  punctuation, reserved words, `case` pattern lists, assignments, and wrappers so
+  executable-scoped rules see the real command word inside compound constructs.
+- Design decisions #289 A/B are staged: the corpus (D) is the regression net and
+  `executables=` (B) migrates pack-by-pack; #288/#289 remain open as the anchors.
+
 ## [v0.9.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.4) -- 2026-08-05 [Release]
 
 A correctness and hardening release from a full issue-triage pass. It closes a
