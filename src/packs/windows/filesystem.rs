@@ -1379,6 +1379,23 @@ fn powershell_segment_semantic_decision(
     }
 
     if is_remove_item && invalid_static_remove_parameter {
+        // #285: an alias spelling such as `rm -r -f <path>` pairs a parameter
+        // PowerShell resolves (`-r` => -Recurse) with one it rejects as
+        // ambiguous (`-F` collides between -Filter and -Force), so the cmdlet
+        // never runs; read as POSIX `rm`, the same words are a recursive
+        // forced delete. When every proven target is a literal per-user temp
+        // subpath both readings are the carved-out temp cleanup, so report
+        // that proof rather than NoMatch: under the unknown dialect NoMatch
+        // hands the command to this pack's raw `remove-item-recurse-force`
+        // regex, which has no carve-out of its own and denies the FP.
+        if recurse.possible
+            && literal_temp_targets > 0
+            && !non_temp_target
+            && !unresolved_remove_binding
+            && !splatted_options
+        {
+            return WindowsFilesystemSemanticDecision::Safe;
+        }
         return WindowsFilesystemSemanticDecision::NoMatch;
     }
     if (is_remove_item || is_clear_content || is_clear_recycle_bin) && what_if.exact {
@@ -2621,6 +2638,73 @@ mod tests {
                 windows_filesystem_semantic_decision_in_dialect(command, dialect),
                 WindowsFilesystemSemanticDecision::Destructive(expected),
                 "{dialect:?} carve-out must stay bounded: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_rm_with_split_recurse_force_flags_keeps_the_temp_carve_out() {
+        // Regression for #285, found by the cross-pack FP corpus: the bare-`rm`
+        // Remove-Item alias route reached NoMatch for `rm -r -f <path>` because
+        // `-F` is an ambiguous PowerShell parameter prefix. Under the unknown
+        // dialect NoMatch falls through to the raw
+        // `remove-item-recurse-force` regex, which denied literal per-user temp
+        // cleanup in both separator spellings.
+        let safe = [
+            "rm -r -f C:/Users/u/AppData/Local/Temp/scratch",
+            r"rm -r -f C:\Users\u\AppData\Local\Temp\scratch",
+            "rm -R -F c:/users/U/appdata/local/TEMP/scratch",
+            r"rm -r -f 'C:\Users\u\AppData\Local\Temp\scratch'",
+            "del -r -f C:/Users/u/AppData/Local/Temp/scratch",
+        ];
+        for command in safe {
+            for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+                assert_eq!(
+                    windows_filesystem_semantic_decision_in_dialect(command, dialect),
+                    WindowsFilesystemSemanticDecision::Safe,
+                    "{dialect:?} must carve out split-flag temp cleanup: {command}"
+                );
+            }
+        }
+
+        // The combined spelling was already allowed (the raw regex requires a
+        // standalone `-r`), and the ambiguous `-rf` parameter still keeps the
+        // cmdlet from running, so it must not become a proven-safe verdict.
+        for command in [
+            "rm -rf C:/Users/u/AppData/Local/Temp/scratch",
+            r"rm -rf C:\Users\u\AppData\Local\Temp\scratch",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::Unknown),
+                WindowsFilesystemSemanticDecision::NoMatch,
+                "combined flags stay unmatched by the Windows pack: {command}"
+            );
+        }
+
+        // The carve-out stays bounded: a non-temp target, the temp root
+        // itself, traversal out of the temp tree, a second non-temp target,
+        // and a dynamic root must never reach Safe, so the unknown-dialect
+        // regex fallback keeps denying them.
+        for command in [
+            "rm -r -f C:/Users/u/Documents/x",
+            "rm -r -f C:/Users/u/AppData/Local/Temp",
+            "rm -r -f C:/Users/u/AppData/Local/Temp/../x",
+            "rm -r -f C:/Users/u/AppData/Local/Temp/x C:/src",
+            "rm -r -f $env:TEMP/x",
+        ] {
+            assert_ne!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell),
+                WindowsFilesystemSemanticDecision::Safe,
+                "split-flag carve-out must stay bounded: {command}"
+            );
+            assert!(
+                matches!(
+                    windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::Unknown),
+                    WindowsFilesystemSemanticDecision::NoMatch
+                        | WindowsFilesystemSemanticDecision::Destructive(_)
+                        | WindowsFilesystemSemanticDecision::Unverified
+                ),
+                "split-flag carve-out must stay bounded under unknown: {command}"
             );
         }
     }

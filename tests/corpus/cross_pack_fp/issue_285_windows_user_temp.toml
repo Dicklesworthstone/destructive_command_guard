@@ -48,20 +48,26 @@ command = "rm -fr /c/Users/u/AppData/Local/Temp/build"
 expected = "allow"
 issue = 285
 
-# KNOWN FAILURE (found by this suite): the #285 carve-out landed in the core rm
+# Found by this suite, now fixed: the #285 carve-out landed in the core rm
 # classifier, the core PS Remove-Item parser and the windows.filesystem Cmd/PS
 # scanners — but windows.filesystem also reads bare `rm` as the PowerShell
-# Remove-Item alias, and on that route the forward-slash drive spelling with
-# split `-r -f` flags misses the carve-out. Only reachable with windows.* packs
-# enabled, which is why unix CI never saw it.
+# Remove-Item alias, and on that route split `-r -f` flags left the segment
+# unclassified (PowerShell rejects `-F` as ambiguous between -Filter and
+# -Force), so the unknown dialect fell through to the raw
+# `remove-item-recurse-force` regex, which has no carve-out of its own. The PS
+# scanner now reports the temp proof for that shape. Only reachable with
+# windows.* packs enabled, which is why unix CI never saw it.
 [[case]]
 description = "separate -r -f with forward-slash drive spelling"
 command = "rm -r -f C:/Users/u/AppData/Local/Temp/scratch"
 expected = "allow"
 issue = 285
-known_failing = true
-known_failing_dialects = ["unknown"]
-known_failing_reason = "windows.filesystem:remove-item-recurse-force treats `rm -r -f` as the Remove-Item alias under the unknown dialect and misses the per-user temp carve-out for the C:/ forward-slash spelling"
+
+[[case]]
+description = "separate -r -f with native backslash spelling"
+command = "rm -r -f C:\\Users\\u\\AppData\\Local\\Temp\\scratch"
+expected = "allow"
+issue = 285
 
 # ============================================================================
 # PowerShell Remove-Item
