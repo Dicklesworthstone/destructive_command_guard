@@ -83,7 +83,7 @@
       "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": "BLOCKED by dcg\n\nTip: dcg explain \"git reset --hard HEAD~5\"\n\nReason: git reset --hard destroys uncommitted changes\n\nRule: core.git:reset-hard\n\nCommand: git reset --hard HEAD~5",
+        "permissionDecisionReason": "BLOCKED by dcg\n\nTip: dcg explain \"git reset --hard HEAD~5\"\n\nReason: git reset --hard destroys uncommitted changes\n\nRule: core.git:reset-hard",
         "ruleId": "core.git:reset-hard",
         "packId": "core.git",
         "severity": "critical",

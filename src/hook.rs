@@ -1436,13 +1436,18 @@ fn format_matched_message(
         |rule| format!("Rule: {rule}\n\n"),
     );
 
+    // The command deliberately appears ONCE, inside the `Tip:` line. A hook
+    // decision lands in the agent's transcript and is replayed on every
+    // subsequent turn, so a second verbatim echo is paid for repeatedly and
+    // tells the reader nothing the first did not — the agent just wrote this
+    // command and has it in context. Keeping the `Tip:` copy rather than a
+    // bare `Command:` line preserves the one form that is also actionable.
     format!(
         "{heading}\n\n\
          {explain_hint}\n\n\
          Reason: {reason}\n\n\
          {explanation_block}\n\n\
          {rule_line}\
-         Command: {command}\n\n\
          {instruction}"
     )
 }
@@ -3192,6 +3197,30 @@ mod tests {
         assert!(message.contains("Explanation: This is irreversible."));
         assert!(message.contains("Rule: core.git:reset-hard"));
         assert!(message.contains("Tip: dcg explain"));
+    }
+
+    /// A hook decision is replayed in the agent transcript on every later
+    /// turn, so the command must be echoed exactly ONCE. Guards against a
+    /// second echo (e.g. a `Command:` line) creeping back in.
+    #[test]
+    fn test_block_message_echoes_the_command_exactly_once() {
+        let command = "rm -rf /Users/example/dev/UNIQUEMARKER12345";
+
+        for message in [
+            format_denial_message(command, "destructive", None, Some("core.filesystem"), Some("rm-rf")),
+            format_review_message(command, "needs review", None, Some("core.filesystem"), Some("rm-rf")),
+        ] {
+            assert_eq!(
+                message.matches("UNIQUEMARKER12345").count(),
+                1,
+                "command echoed more than once in: {message}"
+            );
+            assert!(message.contains("Tip: dcg explain"));
+            assert!(
+                !message.contains("\nCommand: "),
+                "the bare Command: echo is redundant with the Tip: line"
+            );
+        }
     }
 
     #[test]
