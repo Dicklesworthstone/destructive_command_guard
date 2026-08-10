@@ -204,6 +204,10 @@ pub enum Command {
         #[arg(long)]
         fix: bool,
 
+        /// Exit non-zero when checks fail (for `dcg doctor || handle_failure`)
+        #[arg(long)]
+        strict: bool,
+
         /// Output format (pretty or json)
         #[arg(long, short, value_enum, default_value_t = DoctorFormat::Pretty, env = "DCG_FORMAT")]
         format: DoctorFormat,
@@ -2138,8 +2142,12 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     maybe_show_update_notice(&cli, &config, verbosity);
 
     match cli.command {
-        Some(Command::Doctor { fix, format }) => {
-            doctor(
+        Some(Command::Doctor {
+            fix,
+            strict,
+            format,
+        }) => {
+            let ok = doctor(
                 fix,
                 format,
                 &config,
@@ -2147,6 +2155,12 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .as_deref()
                     .expect("doctor requested config source tracing"),
             );
+            // Opt-in, matching `pack validate --strict`. Exiting non-zero by
+            // default would be a behaviour change for everyone already calling
+            // doctor in a pipeline.
+            if strict && !ok {
+                std::process::exit(EXIT_DENIED);
+            }
         }
         Some(Command::Hook(cmd)) => {
             // `dcg hook` returns the process exit code (deny -> 1, parse halt
@@ -9792,26 +9806,31 @@ fn format_corpus_pretty(output: &CorpusOutput) -> String {
     result
 }
 
-/// Check installation, configuration, and hook registration
+/// Check installation, configuration, and hook registration.
+///
+/// Returns the same verdict the report carries in its `ok` field, so the
+/// caller can make the exit status agree with the diagnosis. Without this a
+/// `dcg doctor || handle_failure` guard is dead code: the tool would report
+/// that the guard is not guarding and still exit 0.
 fn doctor(
     fix: bool,
     format: DoctorFormat,
     config: &Config,
     config_sources: &[ConfigSourceOutcome],
-) {
+) -> bool {
     match format {
         DoctorFormat::Pretty => {
             #[cfg(feature = "rich-output")]
             {
                 if crate::output::should_use_rich_output() {
-                    doctor_rich(fix, config, config_sources);
+                    doctor_rich(fix, config, config_sources)
                 } else {
-                    doctor_pretty(fix, config, config_sources);
+                    doctor_pretty(fix, config, config_sources)
                 }
             }
             #[cfg(not(feature = "rich-output"))]
             {
-                doctor_pretty(fix, config, config_sources);
+                doctor_pretty(fix, config, config_sources)
             }
         }
         DoctorFormat::Json => doctor_json(fix, config, config_sources),
@@ -9820,7 +9839,7 @@ fn doctor(
 
 /// Human-readable doctor output (colored crate, non-rich fallback).
 #[allow(clippy::too_many_lines, clippy::unnecessary_unwrap)]
-fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome]) {
+fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome]) -> bool {
     use colored::Colorize;
 
     println!("{}", "dcg doctor".green().bold());
@@ -9828,6 +9847,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
 
     let mut issues = 0;
     let mut fixed = 0;
+    let mut wired_to_an_agent = true;
 
     // Check 1: Binary in PATH
     print!("Checking binary in PATH... ");
@@ -9849,6 +9869,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         println!("{}", "NOT FOUND".yellow());
         println!("  ~/.claude/settings.json not found");
         println!("  This is normal if Claude Code hasn't been configured yet");
+        wired_to_an_agent = false;
     }
 
     // Check 3: Hook wiring (expanded diagnostics)
@@ -10246,7 +10267,12 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
 
     println!();
     if issues == 0 {
-        println!("{}", "All checks passed!".green().bold());
+        let summary = if wired_to_an_agent {
+            "All checks passed!"
+        } else {
+            "All checks passed (guard not wired to any agent)"
+        };
+        println!("{}", summary.green().bold());
     } else if fix && fixed == issues {
         println!("{}", "All issues fixed!".green().bold());
     } else {
@@ -10260,19 +10286,21 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             }
         );
     }
+    issues == 0 || (fix && fixed == issues)
 }
 
 const DOCTOR_SCHEMA_VERSION: u32 = 1;
 
-fn doctor_json(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome]) {
+fn doctor_json(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome]) -> bool {
     let report = collect_doctor_report(fix, config, config_sources);
     let json = serde_json::to_string_pretty(&report).expect("serialize doctor report");
     println!("{json}");
+    report.ok
 }
 
 /// Rich terminal doctor output using DcgConsole and markup.
 #[cfg(feature = "rich-output")]
-fn doctor_rich(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome]) {
+fn doctor_rich(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome]) -> bool {
     use crate::output::console::console;
 
     let report = collect_doctor_report(fix, config, config_sources);
@@ -10312,7 +10340,7 @@ fn doctor_rich(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome
     // Summary
     con.print("");
     if report.ok {
-        con.print("[green bold]All checks passed![/]");
+        con.print(&format!("[green bold]{}[/]", doctor_pass_summary(&report)));
     } else if report.fixed > 0 && report.fixed == report.issues {
         con.print("[green bold]All issues fixed![/]");
     } else {
@@ -10325,6 +10353,24 @@ fn doctor_rich(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome
                 String::new()
             }
         ));
+    }
+    report.ok
+}
+
+/// The pass-line for a clean report.
+///
+/// `warning`-status checks do not count toward `issues`, so a machine with dcg
+/// installed but wired into no agent at all reports `ok: true`. That is
+/// defensible — dcg is usable standalone — but a bare "All checks passed!"
+/// claims coverage that was never established. Say which of the two it is.
+fn doctor_pass_summary(report: &DoctorReport) -> &'static str {
+    let wired = report.checks.iter().all(|check| {
+        !(check.id == "claude_settings" && check.status == DoctorCheckStatus::Warning)
+    });
+    if wired {
+        "All checks passed!"
+    } else {
+        "All checks passed (guard not wired to any agent)"
     }
 }
 

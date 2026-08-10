@@ -1947,6 +1947,53 @@ mod config_tests {
             "expected binary_path check in JSON output"
         );
     }
+
+    /// `dcg doctor || handle_failure` must not be dead code: when doctor
+    /// itself reports `ok: false`, `--strict` has to carry that verdict into
+    /// the exit status. Without the flag the default stays 0 for everyone
+    /// already calling doctor in a pipeline.
+    #[test]
+    fn doctor_strict_exit_code_agrees_with_the_reported_verdict() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
+
+        // Empty PATH reproduces the #240 condition the binary_path check
+        // exists to detect: the guard is not reachable from a non-interactive
+        // shell, so doctor reports an error.
+        let run = |args: &[&str]| {
+            Command::new(dcg_binary())
+                .env_clear()
+                .env("HOME", &home_dir)
+                .env("USERPROFILE", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                .env("PATH", "")
+                .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                .current_dir(temp.path())
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("run dcg doctor")
+        };
+
+        let plain = run(&["doctor", "--format", "json"]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&plain.stdout))
+                .expect("doctor JSON output should parse");
+        let reported_ok = parsed["ok"].as_bool().expect("ok field");
+
+        assert!(
+            plain.status.success(),
+            "without --strict doctor keeps its historical exit 0"
+        );
+
+        let strict = run(&["doctor", "--format", "json", "--strict"]);
+        assert_eq!(
+            strict.status.success(),
+            reported_ok,
+            "--strict exit status must match the reported ok field (ok={reported_ok})"
+        );
+    }
 }
 
 // ============================================================================
