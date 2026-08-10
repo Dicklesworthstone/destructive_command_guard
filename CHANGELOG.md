@@ -11,6 +11,25 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **False positives:** `pwsh -File <script.ps1>` (and its abbreviation `-f`) is
+  no longer denied as an unverifiable launcher envelope. `-File` was missing
+  from the PowerShell host-option table entirely, so it resolved to `Unknown`
+  and hit the fail-closed branch for unrecognized dash tokens — while the
+  positional `pwsh <script.ps1>` form, which is the same operation, and
+  `-Command`, which is strictly more dangerous, were both allowed. `-File` is
+  now a first-class option that ends host-option parsing (later tokens are
+  script arguments, not host options). `-File -` still refuses, because a
+  script read from stdin is no more inspectable than `-Command -`. Routing it
+  through the shared option table also means `pwsh -f -` is now recognized as
+  reading a script from stdin, which the previous exact-match `-file` check in
+  the pipeline analyzer missed.
+
+---
+
 ## [v0.10.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.10.0) -- 2026-08-07 [Release]
 
 A large correctness, feature, and hardening release from a full issue-triage

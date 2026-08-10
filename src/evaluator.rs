@@ -31834,6 +31834,24 @@ mod tests {
             PowerShellHostOption::Value
         );
         assert_eq!(
+            powershell_host_option("-File", ShellDialect::PowerShell),
+            PowerShellHostOption::File
+        );
+        assert_eq!(
+            powershell_host_option("-file", ShellDialect::PowerShell),
+            PowerShellHostOption::File,
+            "host options are case-insensitive"
+        );
+        assert_eq!(
+            powershell_host_option("-Fi", ShellDialect::PowerShell),
+            PowerShellHostOption::File
+        );
+        assert_eq!(
+            powershell_host_option("-f", ShellDialect::PowerShell),
+            PowerShellHostOption::File,
+            "no other host option starts with f, so -f resolves to -File"
+        );
+        assert_eq!(
             powershell_host_option("-NoP", ShellDialect::PowerShell),
             PowerShellHostOption::Unknown,
             "NoProfile and NoProfileLoadTime make -NoP ambiguous"
@@ -32027,6 +32045,27 @@ mod tests {
                 ShellDialect::Unknown,
                 format!("powershell -EncodedCommand {benign_encoded}"),
             ),
+            // `-File <path>` is the safer spelling of the positional
+            // `pwsh <path>` form: a script file carries no inline payload, so
+            // it must not be treated as an unverifiable launcher envelope.
+            (
+                ShellDialect::Unknown,
+                "pwsh -File /tmp/deploy.ps1".to_string(),
+            ),
+            (
+                ShellDialect::PowerShell,
+                "pwsh -NoProfile -File C:\\ops\\deploy.ps1".to_string(),
+            ),
+            (
+                ShellDialect::Unknown,
+                "pwsh -f /tmp/deploy.ps1".to_string(),
+            ),
+            // Host-option parsing ENDS at -File; later tokens are script
+            // arguments, so a `-Command`-looking argument is inert data.
+            (
+                ShellDialect::Unknown,
+                "pwsh -File /tmp/deploy.ps1 -Command 'git branch --format -d'".to_string(),
+            ),
             (
                 ShellDialect::Posix,
                 "command -v pwsh && echo$(producer) ok".to_string(),
@@ -32140,6 +32179,11 @@ mod tests {
             "@%DCG_DYNAMIC%".to_string(),
             "powershell -NoP -Command 'Write-Output ok'".to_string(),
             "powershell -DefinitelyUnknown 'Write-Output ok'".to_string(),
+            // A script read from stdin is no more inspectable than
+            // `-Command -`; only `-File <path>` is allowed.
+            "pwsh -File -".to_string(),
+            "pwsh -f -".to_string(),
+            "pwsh -File".to_string(),
             "cmd /z echo ok".to_string(),
         ];
 
