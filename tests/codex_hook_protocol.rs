@@ -2146,9 +2146,9 @@ fn allow_once_path(home: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Apply both store overrides to a spawned dcg invocation.
-fn pin_exception_stores(cmd: &mut Command, home: &std::path::Path) -> &mut Command {
+fn pin_exception_stores(cmd: &mut Command, home: &std::path::Path) {
     cmd.env("DCG_PENDING_EXCEPTIONS_PATH", pending_exceptions_path(home))
-        .env("DCG_ALLOW_ONCE_PATH", allow_once_path(home))
+        .env("DCG_ALLOW_ONCE_PATH", allow_once_path(home));
 }
 
 fn extract_allow_once_code_from_pending_store(home: &std::path::Path) -> Option<String> {
