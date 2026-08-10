@@ -3880,6 +3880,9 @@ enum WindowsLauncherParse {
 enum PowerShellHostOption {
     Command,
     EncodedCommand,
+    /// `-File <path>`: runs a script FILE. Terminates host-option parsing —
+    /// every later token is an argument to the script, not a host option.
+    File,
     NoValue,
     Value,
     Unknown,
@@ -3986,6 +3989,17 @@ fn powershell_host_option(raw: &str, outer_dialect: ShellDialect) -> PowerShellH
         return PowerShellHostOption::Value;
     }
 
+    // `-File` takes a value like the VALUE options but ENDS host-option
+    // parsing, so it needs its own category. It resolves through the same
+    // unique-prefix pool below rather than an unconditional
+    // `"file".starts_with(name)` arm: `-f` is unambiguous only for as long as
+    // no other f-prefixed host option exists, and that is the pool's job to
+    // decide, not this function's to assume.
+    const FILE: &[&str] = &["file"];
+    if FILE.iter().any(|option| *option == name) {
+        return PowerShellHostOption::File;
+    }
+
     // Native PowerShell host parameters accept case-insensitive unique
     // prefixes. Count names rather than result categories: for example,
     // `-NoP` is ambiguous between NoProfile and NoProfileLoadTime in current
@@ -3998,6 +4012,7 @@ fn powershell_host_option(raw: &str, outer_dialect: ShellDialect) -> PowerShellH
                 .iter()
                 .map(|name| (*name, PowerShellHostOption::Value)),
         )
+        .chain(FILE.iter().map(|name| (*name, PowerShellHostOption::File)))
         .filter(|(option, _)| option.starts_with(name.as_str()));
     let Some((_, option)) = matches.next() else {
         return PowerShellHostOption::Unknown;
@@ -4411,6 +4426,29 @@ fn parse_powershell_launcher(
                     }),
                     Err(reason) => WindowsLauncherParse::Unverified(reason),
                 };
+            }
+            PowerShellHostOption::File => {
+                let Some(path) = words
+                    .get(index + 1)
+                    .and_then(|raw| shell_word_value(raw, outer_dialect))
+                else {
+                    return WindowsLauncherParse::Unverified(format!(
+                        "PowerShell host option {raw:?} is missing its script path"
+                    ));
+                };
+                if path == "-" {
+                    return WindowsLauncherParse::Unverified(
+                        "PowerShell -File - executes a script read dynamically from stdin"
+                            .to_string(),
+                    );
+                }
+                // `-File <path>` carries no inline payload to inspect, and it
+                // ends host-option parsing: everything after the path is an
+                // argument to the script. It is the same operation as the
+                // already-allowed positional `pwsh <path>` form, so treating it
+                // as an unverifiable envelope would deny the safer spelling of
+                // a command dcg permits.
+                return WindowsLauncherParse::NotLauncher;
             }
             PowerShellHostOption::NoValue => index += 1,
             PowerShellHostOption::Value => {
@@ -6975,6 +7013,24 @@ fn appended_code_input_mode(
                 PowerShellHostOption::EncodedCommand => {
                     return PipelineShellInputMode::Unverified;
                 }
+                PowerShellHostOption::File => {
+                    // A script FILE is the source; the pipeline is not. Only
+                    // `-File -` takes the script itself from stdin. A missing
+                    // path is a pwsh usage error, so refuse to guess.
+                    let Some(path) = args.get(index + 1) else {
+                        return PipelineShellInputMode::Unverified;
+                    };
+                    return if path == "-" {
+                        let kind = if join_windows_argv {
+                            PipelineSourceKind::PowerShell.joined_records(delimiter)
+                        } else {
+                            PipelineSourceKind::PowerShell.records(delimiter)
+                        };
+                        PipelineShellInputMode::ReadsStdin(kind)
+                    } else {
+                        PipelineShellInputMode::DoesNotReadStdin
+                    };
+                }
                 PowerShellHostOption::NoValue => index += 1,
                 PowerShellHostOption::Value => {
                     if args.get(index + 1).is_none() {
@@ -7864,18 +7920,20 @@ fn python_pipeline_input_mode(
 fn powershell_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
     let mut index = 0usize;
     while let Some(argument) = args.get(index) {
-        let normalized = argument.to_ascii_lowercase();
-        if normalized == "-file" {
-            let Some(path) = args.get(index + 1) else {
-                return PipelineShellInputMode::Unverified;
-            };
-            return if path == "-" {
-                PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PowerShell)
-            } else {
-                PipelineShellInputMode::DoesNotReadStdin
-            };
-        }
         match powershell_host_option(argument, ShellDialect::Posix) {
+            // Resolved through the shared option table rather than an exact
+            // `-file` string match, so abbreviations such as `pwsh -f -` are
+            // recognized as reading a script from stdin.
+            PowerShellHostOption::File => {
+                let Some(path) = args.get(index + 1) else {
+                    return PipelineShellInputMode::Unverified;
+                };
+                return if path == "-" {
+                    PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PowerShell)
+                } else {
+                    PipelineShellInputMode::DoesNotReadStdin
+                };
+            }
             PowerShellHostOption::Command => {
                 return if args.get(index + 1).is_some_and(|source| source == "-") {
                     PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PowerShell)
