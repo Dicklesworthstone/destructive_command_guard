@@ -708,6 +708,7 @@ fn test_audit_backtracking_requirements() {
                 "gh-api-delete-actions-secret",
                 "gh-api-delete-actions-variable",
                 "gh-api-delete-deploy-key",
+                "gh-api-delete-generic",
                 "gh-api-delete-hook",
                 "gh-api-delete-release",
                 "gh-api-delete-repo",

@@ -13,7 +13,44 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## [Unreleased]
 
+### Added
+
+- **`dcg doctor --strict` (#296).** `doctor` exited `0` unconditionally, including
+  when it had just reported `"ok": false` — so `dcg doctor || handle_failure` was
+  dead code and a provisioning run got a green signal from a guard doctor itself
+  had classified as broken. `--strict` makes the exit status carry the verdict.
+  It is opt-in, matching `pack validate --strict`; the default stays `0` for
+  anyone already calling doctor in a pipeline.
+
+### Changed
+
+- **The block message no longer echoes the command twice (#299).** The command
+  appeared in both the `Tip: dcg explain "<cmd>"` line and a `Command: <cmd>`
+  line, making `len(permissionDecisionReason) = 2*len(command) + 499` exactly. A
+  hook decision lands in the agent's transcript and is replayed on every later
+  turn, so the second echo was paid for repeatedly while telling the reader
+  nothing the first did not — the agent just wrote that command. The `Tip:` copy
+  is kept because it is also actionable. No verdict changes.
+- **`platform.github` rules now carry explanations and suggestions (#300).** All
+  sixteen destructive rules were built with the 3-arg macro form, so every
+  denial rendered as "No additional explanation is available yet. See pack
+  documentation for details." Each rule now explains what is actually lost and
+  names the safer spelling — for the raw-API catch-all, that includes pointing at
+  the first-class `gh issue edit --remove-parent` / `--remove-sub-issue` verbs,
+  which dcg allows outright. A new pack test enforces this going forward.
+
 ### Fixed
+
+- **`gh-api-delete-repo` is no longer a misnamed catch-all (#300).** The rule
+  matched *any* `gh api ... DELETE`, not repository deletion, while its name is
+  what surfaces as `rule_id` in the history DB, `dcg stats`, `dcg
+  suggest-allowlist`, and allowlist entries. The catch-all is now
+  `gh-api-delete-generic`, and `gh-api-delete-repo` matches what its name says:
+  `DELETE /repos/{owner}/{repo}`. Both are still denied, so no command changes
+  verdict. **Breaking for persisted state:** an allowlist or `[rules]` entry for
+  `platform.github:gh-api-delete-repo` now permits only repository deletion
+  rather than every raw-API DELETE — a tightening — and history rows written
+  before this release keep the old `rule_id`.
 
 - **False positives:** `pwsh -File <script.ps1>` (and its abbreviation `-f`) is
   no longer denied as an unverifiable launcher envelope. `-File` was missing
