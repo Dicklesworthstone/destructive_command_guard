@@ -2126,8 +2126,33 @@ fn disable_core_filesystem_still_blocks_git_claude() {
 
 /// Extract the allow-once short_code from the pending_exceptions.jsonl
 /// in the hermetic HOME directory.
+/// Where these tests pin the pending-exception store.
+///
+/// `src/pending_exceptions.rs` prefers `$HOME/.config/dcg/` only when that
+/// directory ALREADY exists, and otherwise falls back to `dirs::config_dir()`
+/// — `~/.config` on Linux but `~/Library/Application Support` on macOS. These
+/// tests use a fresh tempdir HOME where `.config/dcg` does not pre-exist, so
+/// without pinning the store lands where the assertions do not look: the tests
+/// passed on CI (ubuntu) and failed on macOS. Pin the path explicitly rather
+/// than teaching the helper to search both locations, which would let a real
+/// misconfiguration pass unnoticed.
+fn pending_exceptions_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".config/dcg/pending_exceptions.jsonl")
+}
+
+/// Companion store for redeemed allow-once entries; same rationale.
+fn allow_once_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".config/dcg/allow_once.jsonl")
+}
+
+/// Apply both store overrides to a spawned dcg invocation.
+fn pin_exception_stores(cmd: &mut Command, home: &std::path::Path) -> &mut Command {
+    cmd.env("DCG_PENDING_EXCEPTIONS_PATH", pending_exceptions_path(home))
+        .env("DCG_ALLOW_ONCE_PATH", allow_once_path(home))
+}
+
 fn extract_allow_once_code_from_pending_store(home: &std::path::Path) -> Option<String> {
-    let pending_path = home.join(".config/dcg/pending_exceptions.jsonl");
+    let pending_path = pending_exceptions_path(home);
     let content = std::fs::read_to_string(&pending_path).ok()?;
     for line in content.lines() {
         let line = line.trim();
@@ -2166,6 +2191,7 @@ fn codex_deny_creates_pending_exception_with_code() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    pin_exception_stores(&mut cmd, &home_path);
 
     let mut child = cmd.spawn().expect("spawn");
     {
@@ -2216,6 +2242,7 @@ fn codex_allow_once_round_trip() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    pin_exception_stores(&mut cmd, &home_path);
 
     let mut child = cmd.spawn().expect("spawn deny");
     {
@@ -2241,7 +2268,8 @@ fn codex_allow_once_round_trip() {
         .unwrap_or_else(|| panic!("pending store must contain short_code\n{deny_outcome}"));
 
     // Step 2: Redeem the allow-once code
-    let redeem_output = Command::new(dcg_binary())
+    let mut redeem_cmd = Command::new(dcg_binary());
+    redeem_cmd
         .arg("allow-once")
         .arg(&allow_code)
         .arg("--yes")
@@ -2252,7 +2280,9 @@ fn codex_allow_once_round_trip() {
         .env("TMPDIR", home_path.join("tmp"))
         .env("TEMP", home_path.join("tmp"))
         .env("TMP", home_path.join("tmp"))
-        .env("NO_COLOR", "1")
+        .env("NO_COLOR", "1");
+    pin_exception_stores(&mut redeem_cmd, &home_path);
+    let redeem_output = redeem_cmd
         .output()
         .expect("failed to run allow-once redeem");
 
@@ -2279,6 +2309,7 @@ fn codex_allow_once_round_trip() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    pin_exception_stores(&mut cmd, &home_path);
 
     let mut child = cmd.spawn().expect("spawn retry");
     {
