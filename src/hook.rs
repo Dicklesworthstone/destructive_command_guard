@@ -3207,8 +3207,20 @@ mod tests {
         let command = "rm -rf /Users/example/dev/UNIQUEMARKER12345";
 
         for message in [
-            format_denial_message(command, "destructive", None, Some("core.filesystem"), Some("rm-rf")),
-            format_review_message(command, "needs review", None, Some("core.filesystem"), Some("rm-rf")),
+            format_denial_message(
+                command,
+                "destructive",
+                None,
+                Some("core.filesystem"),
+                Some("rm-rf"),
+            ),
+            format_review_message(
+                command,
+                "needs review",
+                None,
+                Some("core.filesystem"),
+                Some("rm-rf"),
+            ),
         ] {
             assert_eq!(
                 message.matches("UNIQUEMARKER12345").count(),

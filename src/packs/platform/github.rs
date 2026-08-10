@@ -650,7 +650,9 @@ mod tests {
         for pattern in &pack.destructive_patterns {
             let name = pattern.name.expect("every github rule is named");
             assert!(
-                pattern.explanation.is_some_and(|text| !text.trim().is_empty()),
+                pattern
+                    .explanation
+                    .is_some_and(|text| !text.trim().is_empty()),
                 "{name} has no explanation, so its denial renders as \
                  \"No additional explanation is available yet\""
             );

@@ -32056,10 +32056,7 @@ mod tests {
                 ShellDialect::PowerShell,
                 "pwsh -NoProfile -File C:\\ops\\deploy.ps1".to_string(),
             ),
-            (
-                ShellDialect::Unknown,
-                "pwsh -f /tmp/deploy.ps1".to_string(),
-            ),
+            (ShellDialect::Unknown, "pwsh -f /tmp/deploy.ps1".to_string()),
             // Host-option parsing ENDS at -File; later tokens are script
             // arguments, so a `-Command`-looking argument is inert data.
             (
