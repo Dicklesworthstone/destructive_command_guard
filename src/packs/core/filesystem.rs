@@ -3338,6 +3338,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - rm -f -r path\n\
              - rm -r -f -v path (verbose but still forced)\n\n\
              All carry the same risks as rm -rf: immediate, silent, irreversible deletion.\n\n\
+             This rule matches the -r/-f flag PAIR, not a filesystem path, so it also \
+             fires when `rm` is another tool's subcommand (`git rm -r -f`, \
+             `bq rm -r -f`). The recursive-force semantics still apply, but to that \
+             tool's objects — tracked files and index entries for git, a dataset and \
+             everything in it for bq — not to a directory tree. Enable that tool's pack \
+             for guidance written for it; this rule is the backstop when it is not.\n\n\
              Safer approach for temporary directories:\n\
              - rm -r -f /tmp/mydir    # Allowed - temp directories are safe\n\
              - Resolve and inspect $TMPDIR before using it as a deletion root\n\n\
@@ -3882,6 +3888,42 @@ mod tests {
     use super::*;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    /// The `-r`/`-f` rules match the FLAG PAIR, not an argv0, so they also
+    /// cover `rm` used as another tool's subcommand. That is deliberate and
+    /// load-bearing: `core.filesystem` is always on, whereas the packs that
+    /// would otherwise own these commands are opt-in (`database.bigquery`) or
+    /// nonexistent (there is no `git rm` rule in `core.git`). Scoping these
+    /// rules to `executables = ["rm"]` would read as a clean attribution fix
+    /// and silently turn all three of these into ALLOW.
+    ///
+    /// If you are here because you want that scoping (bead bd-pwvp), first add
+    /// the replacement coverage — otherwise this test is the record that you
+    /// removed a backstop.
+    #[test]
+    fn subcommand_rm_stays_covered_by_the_flag_pair_rules() {
+        let pack = create_pack();
+        for command in [
+            "rm -r -f /var/data/old",
+            "git rm -r -f src/legacy",
+            "bq rm -r -f my_project:my_dataset",
+        ] {
+            assert!(
+                pack.check(command).is_some(),
+                "core.filesystem must keep covering `{command}` — it is the \
+                 always-on backstop for recursive-force deletion"
+            );
+        }
+
+        // NOTE on layering: these regexes are `rm\s+...` with no argv0 anchor,
+        // so at the PACK level they also match inside a longer word —
+        // `pack.check("charm -r -f build")` returns Some. End to end those are
+        // correctly ALLOWED, because the evaluator resolves argv0 before the
+        // denial stands. Asserting `is_none()` here would therefore be
+        // testing the wrong layer, which is exactly the mistake that produced
+        // a false positive in the bigquery pack until its regexes were
+        // anchored. Tracked separately as a defense-in-depth cleanup.
+    }
 
     #[test]
     fn test_pack_creation() {
