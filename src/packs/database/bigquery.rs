@@ -34,10 +34,13 @@ use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct BqCliAnalysis<'a> {
     /// SQL supplied as a positional operand to `bq query`.
+    ///
+    /// There is deliberately no `file_values` sibling: unlike `snow sql -f`,
+    /// `bq query` has no flag that names a SQL file. Reading SQL from a file
+    /// is spelled `bq query < file.sql`, a shell redirect, which arrives here
+    /// as `reads_stdin_as_code`. An always-empty field would read as coverage
+    /// while providing none.
     pub query_values: Vec<&'a str>,
-    /// Files whose contents are executed (`bq query < file` is a shell
-    /// redirect, so this covers only explicit file-bearing flags).
-    pub file_values: Vec<&'a str>,
     /// Whether stdin carries executable SQL.
     pub reads_stdin_as_code: bool,
     /// Why argv analysis must fail closed, if option arity was ambiguous.
@@ -57,7 +60,6 @@ impl BqCliAnalysis<'_> {
     #[must_use]
     pub fn is_sql_command(&self) -> bool {
         !self.query_values.is_empty()
-            || !self.file_values.is_empty()
             || self.reads_stdin_as_code
             || self.unverified_reason.is_some()
     }
@@ -103,8 +105,14 @@ const VALUE_OPTIONS: &[&str] = &[
     "transfer_config",
     "reservation_id",
     "slots",
-    "headless",
     "external_table_definition",
+    // `--apilog <file>` takes a path. `--headless` is boolean and lives in
+    // FLAG_OPTIONS; swapping the two made phase 1 eat the `query` subcommand
+    // as an operand and return an inert analysis.
+    "apilog",
+    "flagfile",
+    // Documented short options that take a value.
+    "n",
 ];
 
 /// `bq` options that take no value.
@@ -122,10 +130,12 @@ const FLAG_OPTIONS: &[&str] = &[
     "nosync",
     "rpc",
     "debug_mode",
-    "apilog",
+    "headless",
     "fingerprint_job_id",
     "require_partition_filter",
     "norequire_partition_filter",
+    // Documented short options that take no value.
+    "q",
 ];
 
 /// How many operands a `--long` option consumes.
@@ -162,6 +172,22 @@ fn classify_long_option(name: &str) -> LongOption {
     LongOption::Unknown
 }
 
+/// Split an option token into its name and any `=`-attached value.
+///
+/// bq uses absl flags, which accept `-flag` and `--flag` interchangeably, so
+/// one leading dash is stripped the same as two. Returns `None` for a token
+/// that is not an option (including a bare `-`, which is a stdin operand).
+fn split_option_token(arg: &str) -> Option<(&str, Option<&str>)> {
+    let body = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'))?;
+    if body.is_empty() {
+        return None;
+    }
+    Some(
+        body.split_once('=')
+            .map_or((body, None), |(name, value)| (name, Some(value))),
+    )
+}
+
 /// Parse arguments after the `bq` executable and identify executable SQL.
 ///
 /// Unknown options fail closed: their arity can hide a later SQL operand, so
@@ -181,8 +207,7 @@ pub fn analyze_bq_args(args: &[String]) -> BqCliAnalysis<'_> {
     //
     // `-v` is deliberately NOT treated as `--version` here: several CLIs spell
     // verbose that way, and guessing wrong would return an inert analysis for
-    // a command that does carry SQL. An unrecognized short option fails closed
-    // instead.
+    // a command that does carry SQL. An unrecognized option fails closed.
     let mut index = 0usize;
     let subcommand_index = loop {
         let Some(arg) = args.get(index) else {
@@ -191,10 +216,7 @@ pub fn analyze_bq_args(args: &[String]) -> BqCliAnalysis<'_> {
         if matches!(arg.as_str(), "--help" | "-h" | "--version") {
             return BqCliAnalysis::default();
         }
-        if let Some(long) = arg.strip_prefix("--") {
-            let (name, attached) = long
-                .split_once('=')
-                .map_or((long, None), |(name, value)| (name, Some(value)));
+        if let Some((name, attached)) = split_option_token(arg) {
             match classify_long_option(name) {
                 LongOption::Flag => index += 1,
                 LongOption::Value => {
@@ -217,10 +239,6 @@ pub fn analyze_bq_args(args: &[String]) -> BqCliAnalysis<'_> {
             }
             continue;
         }
-        if arg.starts_with('-') && arg.len() > 1 {
-            fail_closed(&mut analysis);
-            return analysis;
-        }
         break index;
     };
 
@@ -236,12 +254,20 @@ pub fn analyze_bq_args(args: &[String]) -> BqCliAnalysis<'_> {
     while index < args.len() {
         let arg = &args[index];
         if matches!(arg.as_str(), "--help" | "-h") {
-            return BqCliAnalysis::default();
+            // Never discard SQL already proven present: `bq query "DROP ..."
+            // --help` still put the statement on the command line.
+            if analysis.query_values.is_empty() && !analysis.reads_stdin_as_code {
+                return BqCliAnalysis::default();
+            }
+            return analysis;
         }
-        if let Some(long) = arg.strip_prefix("--") {
-            let (name, attached) = long
-                .split_once('=')
-                .map_or((long, None), |(name, value)| (name, Some(value)));
+        if arg == "-" {
+            analysis.reads_stdin_as_code = true;
+            explicit_source = true;
+            index += 1;
+            continue;
+        }
+        if let Some((name, attached)) = split_option_token(arg) {
             match classify_long_option(name) {
                 LongOption::Flag => index += 1,
                 LongOption::Value => {
@@ -261,16 +287,6 @@ pub fn analyze_bq_args(args: &[String]) -> BqCliAnalysis<'_> {
                 }
             }
             continue;
-        }
-        if arg == "-" {
-            analysis.reads_stdin_as_code = true;
-            explicit_source = true;
-            index += 1;
-            continue;
-        }
-        if arg.starts_with('-') && arg.len() > 1 {
-            fail_closed(&mut analysis);
-            return analysis;
         }
         // A bare positional operand to `bq query` is the SQL text.
         analysis.query_values.push(arg.as_str());
@@ -354,7 +370,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // ---------------------------------------------------------------
         destructive_pattern!(
             "bq-rm-recursive",
-            r"(?:^|[\s;&|(])bq(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+rm\b(?:\s+[^\s;&|]+)*\s+(?:-r\b|-{1,2}recursive\b)",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?bq(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+rm\b(?:\s+[^\s;&|]+)*\s+(?:-r\b|-{1,2}recursive\b)",
             "bq rm -r deletes a dataset and every table, view, and routine inside it.",
             Critical,
             "Recursive removal deletes the dataset together with all of its contents in one \
@@ -378,7 +394,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "bq-rm-transfer-config",
-            r"(?:^|[\s;&|(])bq(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+rm\b(?:\s+[^\s;&|]+)*\s+-{1,2}transfer_config\b",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?bq(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+rm\b(?:\s+[^\s;&|]+)*\s+-{1,2}transfer_config\b",
             "bq rm --transfer_config deletes a scheduled query or data transfer.",
             High,
             "Removing a transfer config stops the scheduled load or query silently — the \
@@ -396,7 +412,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "bq-rm-reservation",
-            r"(?:^|[\s;&|(])bq(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+rm\b(?:\s+[^\s;&|]+)*\s+-{1,2}(?:reservation|capacity_commitment|reservation_assignment)\b",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?bq(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+rm\b(?:\s+[^\s;&|]+)*\s+-{1,2}(?:reservation|capacity_commitment|reservation_assignment)\b",
             "bq rm --reservation removes purchased capacity and can change query cost and performance.",
             High,
             "Reservations and capacity commitments are billing objects. Removing one moves \
@@ -414,7 +430,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "bq-rm",
-            r"(?:^|[\s;&|(])bq(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+rm\b",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?bq(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+rm\b",
             "bq rm deletes a table, view, model, or dataset.",
             High,
             "Deletion is immediate. A table may be recoverable from time travel within the \
@@ -428,7 +444,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "bq-load-replace",
-            r"(?:^|[\s;&|(])bq(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+load\b(?:\s+[^\s;&|]+)*\s+-{1,2}replace\b",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?bq(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+load\b(?:\s+[^\s;&|]+)*\s+-{1,2}replace\b",
             "bq load --replace overwrites all existing data in the destination table.",
             High,
             "`--replace` truncates the destination table before loading. If the source file \
@@ -453,7 +469,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "bq-query-replace",
-            r"(?:^|[\s;&|(])bq(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+query\b(?:\s+[^\s;&|]+)*\s+-{1,2}replace\b",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?bq(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+query\b(?:\s+[^\s;&|]+)*\s+-{1,2}replace\b",
             "bq query --replace overwrites the destination table with the query result.",
             High,
             "`--replace` discards the destination table's current contents before writing \
@@ -478,7 +494,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "bq-cp-force",
-            r"(?:^|[\s;&|(])bq(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+cp\b(?:\s+[^\s;&|]+)*\s+(?:-f\b|-{1,2}force\b)",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?bq(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+cp\b(?:\s+[^\s;&|]+)*\s+(?:-f\b|-{1,2}force\b)",
             "bq cp -f overwrites the destination table without prompting.",
             High,
             "`-f` suppresses the overwrite confirmation, so an existing destination table is \
@@ -491,7 +507,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "bq-mk-force",
-            r"(?:^|[\s;&|(])bq(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+mk\b(?:\s+[^\s;&|]+)*\s+(?:-f\b|-{1,2}force\b)",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?bq(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+mk\b(?:\s+[^\s;&|]+)*\s+(?:-f\b|-{1,2}force\b)",
             "bq mk -f overwrites an existing table definition.",
             Medium,
             "`bq mk -f` succeeds when the object already exists, replacing its definition \
@@ -508,7 +524,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "bq-update-time-travel",
-            r"(?:^|[\s;&|(])bq(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+update\b(?:\s+[^\s;&|]+)*\s+-{1,2}max_time_travel_hours\b",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?bq(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+update\b(?:\s+[^\s;&|]+)*\s+-{1,2}max_time_travel_hours\b",
             "bq update --max_time_travel_hours shortens the only window in which deleted BigQuery data can be recovered.",
             High,
             "Time travel (48-168 hours) is BigQuery's only undo. Lowering it discards \
@@ -522,7 +538,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "bq-update-expiration",
-            r"(?:^|[\s;&|(])bq(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+update\b(?:\s+[^\s;&|]+)*\s+-{1,2}(?:expiration|default_table_expiration|default_partition_expiration)\b",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?bq(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+update\b(?:\s+[^\s;&|]+)*\s+-{1,2}(?:expiration|default_table_expiration|default_partition_expiration)\b",
             "bq update --expiration schedules automatic deletion of tables or partitions.",
             High,
             "An expiration is a deferred delete. Setting one on a dataset applies to tables \
@@ -540,7 +556,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "bq-cancel",
-            r"(?:^|[\s;&|(])bq(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+cancel\b",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?bq(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+cancel\b",
             "bq cancel stops a running job, which may leave a partial load or export.",
             Medium,
             "Cancelling a load or export mid-flight can leave the destination in a partial \
@@ -626,9 +642,27 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             }
         ),
         destructive_pattern!(
+            "drop-model",
+            r"(?i)\bDROP\s+MODEL\b",
+            "DROP MODEL deletes a trained BigQuery ML model.",
+            High,
+            "A model is not covered by time travel and cannot be restored — rebuilding it \
+             means re-running training over the original data, which costs both money and \
+             hours, and reproduces the result only if that training data still exists in \
+             the same form.\n\n\
+             Copy it first:\n  \
+             bq cp <dataset>.<model> <dataset>.<model>_backup",
+            &const {
+                [PatternSuggestion::new(
+                    "bq cp <dataset>.<model> <dataset>.<model>_backup",
+                    "Copy the trained model before dropping it",
+                )]
+            }
+        ),
+        destructive_pattern!(
             "drop-all-row-access-policies",
-            r"(?i)\bDROP\s+ALL\s+ROW\s+ACCESS\s+POLICIES\b",
-            "DROP ALL ROW ACCESS POLICIES removes row-level security from a table.",
+            r"(?i)\bDROP\s+(?:ALL\s+ROW\s+ACCESS\s+POLICIES|ROW\s+ACCESS\s+POLICY)\b",
+            "DROP ROW ACCESS POLICY removes row-level security from a table.",
             High,
             "This does not delete data — it exposes it. Every row previously filtered by a \
              policy becomes visible to anyone with table access, which is a disclosure event \
@@ -739,7 +773,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "create-or-replace-routine",
-            r"(?i)\bCREATE\s+OR\s+REPLACE\s+(?:TABLE\s+FUNCTION|FUNCTION|PROCEDURE)\b",
+            r"(?i)\bCREATE\s+OR\s+REPLACE\s+(?:TABLE\s+FUNCTION|FUNCTION|PROCEDURE|MODEL)\b",
             "CREATE OR REPLACE FUNCTION/PROCEDURE overwrites an existing routine definition.",
             Medium,
             "The previous definition is discarded with no version history. If the new body is \
@@ -753,7 +787,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "create-or-replace-table",
-            r"(?i)\bCREATE\s+OR\s+REPLACE\s+(?:MATERIALIZED\s+VIEW|EXTERNAL\s+TABLE|SNAPSHOT\s+TABLE|TABLE|VIEW)\b",
+            r"(?i)\bCREATE\s+OR\s+REPLACE\s+(?:MATERIALIZED\s+VIEW|EXTERNAL\s+TABLE|SNAPSHOT\s+TABLE|TEMP(?:ORARY)?\s+TABLE|TABLE|VIEW)\b",
             "CREATE OR REPLACE TABLE discards the existing table and its data.",
             High,
             "This is a drop and recreate in one statement: the old rows are gone before the \
@@ -808,7 +842,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // missing-WHERE shape would never fire here.
         destructive_pattern!(
             "delete-all-rows",
-            r"(?i)\bDELETE\s+(?:FROM\s+)?[^\s;]+\s+WHERE\s+(?:TRUE|1\s*=\s*1)\b",
+            r"(?i)\bDELETE\s+(?:FROM\s+)?[^\s;]+(?:\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_]*)?\s+WHERE\s+(?:TRUE|1\s*=\s*1)\b",
             "DELETE ... WHERE TRUE removes every row in the table.",
             High,
             "In GoogleSQL a WHERE clause is mandatory on DELETE, so `WHERE TRUE` is the \
@@ -820,7 +854,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "update-all-rows",
-            r"(?i)\bUPDATE\s+[^\s;]+\s+SET\b[^;]{0,400}?\bWHERE\s+(?:TRUE|1\s*=\s*1)\b",
+            r"(?i)\bUPDATE\s+[^\s;]+(?:\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_]*)?\s+SET\b[^;]{0,4000}?\bWHERE\s+(?:TRUE|1\s*=\s*1)\b",
             "UPDATE ... WHERE TRUE rewrites every row in the table.",
             High,
             "`WHERE TRUE` is the idiomatic full-table spelling in GoogleSQL, where the WHERE \
@@ -832,7 +866,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "merge-delete-not-matched-by-source",
-            r"(?i)\bMERGE\b[^;]{0,600}?\bWHEN\s+NOT\s+MATCHED\s+BY\s+SOURCE\b[^;]{0,200}?\bTHEN\s+DELETE\b",
+            r"(?i)\bMERGE\b[^;]{0,4000}?\bWHEN\s+NOT\s+MATCHED\s+BY\s+SOURCE\b[^;]{0,400}?\bTHEN\s+DELETE\b",
             "MERGE ... WHEN NOT MATCHED BY SOURCE THEN DELETE removes every target row absent from the source.",
             High,
             "The delete is driven by what the source query returns. If the source is empty, \
@@ -1017,6 +1051,65 @@ mod tests {
         assert_blocks_with_severity(&pack, "bq rm -r my_dataset", Severity::Critical);
     }
 
+    /// Regression: the CLI rules were anchored on a bare `bq`, so any
+    /// path-qualified or extension-suffixed spelling missed entirely — and
+    /// unlike the GoogleSQL rules these have no raw-SQL fallback, so
+    /// `./bq rm -r prod` was a total miss of a Critical rule.
+    #[test]
+    fn path_qualified_bq_still_matches() {
+        let pack = create_pack();
+        for command in [
+            "bq rm -r prod_dataset",
+            "./bq rm -r prod_dataset",
+            "/usr/bin/bq rm -r prod_dataset",
+            "/opt/google-cloud-sdk/bin/bq rm -r prod_dataset",
+            "bq.exe rm -r prod_dataset",
+            r"C:\gcloud\bin\bq.exe rm -r prod_dataset",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "bq-rm-recursive");
+        }
+    }
+
+    /// Regression: GoogleSQL allows a table alias, and generated SQL uses it.
+    /// `[^\s;]+\s+WHERE` assumed the table was followed IMMEDIATELY by WHERE,
+    /// so an alias bypassed both full-table DML rules.
+    #[test]
+    fn aliased_tables_do_not_bypass_full_table_dml() {
+        let pack = create_pack();
+        for command in [
+            "DELETE FROM ds.events WHERE TRUE",
+            "DELETE FROM `proj.ds.events` AS e WHERE TRUE",
+            "DELETE FROM ds.events e WHERE TRUE",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "delete-all-rows");
+        }
+        for command in [
+            "UPDATE ds.events SET x = 1 WHERE TRUE",
+            "UPDATE `proj.ds.events` AS e SET e.x = 1 WHERE TRUE",
+            "UPDATE ds.events e SET e.x = 1 WHERE TRUE",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "update-all-rows");
+        }
+    }
+
+    /// BigQuery ML models are not covered by time travel and cost real money
+    /// and hours to retrain, so they need their own rule.
+    #[test]
+    fn bigquery_ml_models_are_covered() {
+        let pack = create_pack();
+        assert_blocks_with_pattern(&pack, "DROP MODEL `proj.ds.churn`", "drop-model");
+        assert_blocks_with_pattern(
+            &pack,
+            "CREATE OR REPLACE MODEL `proj.ds.churn` OPTIONS(model_type='linear_reg') AS SELECT 1",
+            "create-or-replace-routine",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "DROP ROW ACCESS POLICY apac_filter ON ds.events",
+            "drop-all-row-access-policies",
+        );
+    }
+
     /// `bq` is a two-letter token that appears in prose and other commands.
     /// The CLI rules are `executables = ["bq"]`-scoped precisely so they can
     /// never fire on a command that merely contains those letters.
@@ -1148,6 +1241,59 @@ mod tests {
         let analysis = analyze_bq_args(&args);
         assert!(analysis.unverified_reason.is_some());
         assert!(analysis.reads_stdin_as_code);
+    }
+
+    /// bq uses absl flags: `-flag` and `--flag` are interchangeable, and there
+    /// are real short options. Treating every single-dash token as unknown
+    /// turned documented read-only invocations into unverified envelopes.
+    #[test]
+    fn analyze_accepts_absl_single_dash_and_short_options() {
+        for args in [
+            argv(&["-q", "query", "SELECT 1"]),
+            argv(&["-project_id=my-proj", "query", "SELECT 1"]),
+            argv(&["--project_id=my-proj", "query", "SELECT 1"]),
+        ] {
+            let analysis = analyze_bq_args(&args);
+            assert!(
+                analysis.unverified_reason.is_none(),
+                "documented flag spelling must not fail closed: {args:?}"
+            );
+            assert_eq!(analysis.query_values, vec!["SELECT 1"], "{args:?}");
+        }
+
+        // `-n` takes a value, so the SQL is the token AFTER the count.
+        let args = argv(&["query", "-n", "100", "SELECT 1"]);
+        let analysis = analyze_bq_args(&args);
+        assert!(analysis.unverified_reason.is_none());
+        assert_eq!(analysis.query_values, vec!["SELECT 1"]);
+    }
+
+    /// Regression: `--headless` is boolean and `--apilog` takes a path. With
+    /// the two swapped, phase 1 consumed `query` as `--headless`'s operand and
+    /// returned the INERT default — a known option with the wrong arity was
+    /// failing open, unlike an unknown one.
+    #[test]
+    fn analyze_has_correct_arity_for_headless_and_apilog() {
+        assert_eq!(classify_long_option("headless"), LongOption::Flag);
+        assert_eq!(classify_long_option("apilog"), LongOption::Value);
+
+        let args = argv(&["--headless", "query", "DROP TABLE d.t"]);
+        let analysis = analyze_bq_args(&args);
+        assert_eq!(
+            analysis.query_values,
+            vec!["DROP TABLE d.t"],
+            "--headless must not swallow the query subcommand"
+        );
+
+        let args = argv(&["--apilog", "/tmp/bq.log", "query", "DROP TABLE d.t"]);
+        assert_eq!(analyze_bq_args(&args).query_values, vec!["DROP TABLE d.t"]);
+    }
+
+    /// A trailing `--help` must not discard SQL already proven present.
+    #[test]
+    fn analyze_keeps_sql_collected_before_a_trailing_help() {
+        let args = argv(&["query", "DROP TABLE d.t", "--help"]);
+        assert_eq!(analyze_bq_args(&args).query_values, vec!["DROP TABLE d.t"]);
     }
 
     #[test]

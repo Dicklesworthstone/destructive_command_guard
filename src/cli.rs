@@ -10029,6 +10029,14 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             );
         } else {
             println!("{}", "NOT REGISTERED".yellow());
+            // Reached only when Grok is in use AND neither the native hook nor
+            // the Claude-compat path is wired — the guard is not guarding.
+            // This branch already incremented `fixed` on a successful repair;
+            // without the matching `issues` increment the summary verdict
+            // (`issues == 0 || (fix && fixed == issues)`) was corrupted in
+            // both directions: an unrelated unfixed issue could be masked, and
+            // a fully repaired machine could still report failure.
+            issues += 1;
             if fix {
                 println!("  Attempting native install...");
                 if install_grok_hook(false, false).is_ok() {
@@ -10083,6 +10091,12 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                         fixed += 1;
                     }
                     Err(e) => {
+                        // Must count: `collect_doctor_report` counts the same
+                        // failure, and --strict now derives the exit status
+                        // from this counter. Leaving it uncounted made
+                        // `doctor --fix --strict` exit 0 on an unwritable
+                        // config dir while `--format json` exited non-zero.
+                        issues += 1;
                         println!("  {} Failed to create config: {e}", "Error".red());
                     }
                 }

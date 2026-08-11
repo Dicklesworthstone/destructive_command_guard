@@ -16802,11 +16802,9 @@ fn file_argument_slots<'a>(executable: &str, args: &'a [String]) -> Vec<(&'stati
             .into_iter()
             .map(|value| ("database.snowflake", value))
             .collect(),
-        "bq" => crate::packs::database::bigquery::analyze_bq_args(args)
-            .file_values
-            .into_iter()
-            .map(|value| ("database.bigquery", value))
-            .collect(),
+        // No `bq` arm: `bq query` has no flag that names a SQL file — that is
+        // spelled `bq query < file.sql`, a shell redirect, which reaches the
+        // evaluator through the stdin path instead.
         "nsupdate" => analyze_nsupdate_args(args)
             .file_value
             .into_iter()
