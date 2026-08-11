@@ -2225,6 +2225,30 @@ mod hook_mode_tests {
         }
     }
 
+    /// The cwd spelling dcg will actually observe at runtime.
+    ///
+    /// dcg resolves its working directory with `std::env::current_dir()` on
+    /// every path that touches allow-once — recording a block
+    /// (`src/main.rs`), matching an entry (`src/evaluator.rs`), and redeeming
+    /// a code (`src/cli.rs`). `current_dir()` returns the *symlink-resolved*
+    /// path, so on macOS a `/var/folders/...` tempdir is seen as
+    /// `/private/var/folders/...`. `AllowOnceEntry::matches_scope` compares
+    /// paths for exact equality, so an entry written with the raw tempdir path
+    /// could never match, and these tests failed on macOS while passing on
+    /// Linux (where `/var` is not a symlink).
+    ///
+    /// This is a test-fidelity fix, not a product fix: all three production
+    /// paths derive the cwd the same way, so they agree with each other.
+    fn observed_cwd(path: &std::path::Path) -> std::path::PathBuf {
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        // `canonicalize` yields a `\\?\`-prefixed verbatim path on Windows,
+        // which `current_dir()` never produces; strip it so both agree.
+        match resolved.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+            Some(stripped) => std::path::PathBuf::from(stripped),
+            None => resolved,
+        }
+    }
+
     fn write_allow_once_entry(
         allow_once_path: &std::path::Path,
         cwd: &std::path::Path,
@@ -2233,7 +2257,7 @@ mod hook_mode_tests {
     ) {
         let now = fixed_timestamp();
         let redaction = redaction_config();
-        let cwd_str = cwd.to_string_lossy().into_owned();
+        let cwd_str = observed_cwd(cwd).to_string_lossy().into_owned();
 
         let pending = PendingExceptionRecord::new(
             now,
