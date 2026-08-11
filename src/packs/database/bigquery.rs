@@ -276,7 +276,11 @@ pub fn analyze_bq_args(args: &[String]) -> BqCliAnalysis<'_> {
             }
             return analysis;
         }
-        if !options_terminated && arg == "-" {
+        // Deliberately NOT gated on `options_terminated`: `--` ends OPTION
+        // parsing, but a bare `-` is bq's stdin operand either way, so
+        // `bq query -- -` still reads the statement from stdin rather than
+        // executing the literal string "-".
+        if arg == "-" {
             analysis.reads_stdin_as_code = true;
             explicit_source = true;
             index += 1;
@@ -1338,6 +1342,20 @@ mod tests {
             vec!["--not-an-option"],
             "after -- nothing is parsed as an option"
         );
+
+        // `--` ends OPTION parsing, but `-` is still the stdin operand, so
+        // `echo 'DROP ...' | bq query -- -` must stay attributable.
+        let args = argv(&["query", "--", "-"]);
+        let analysis = analyze_bq_args(&args);
+        assert!(
+            analysis.reads_stdin_as_code,
+            "a bare - after -- is still bq's stdin operand, not literal SQL"
+        );
+        assert!(analysis.query_values.is_empty());
+
+        // Terminator with nothing after it still leaves stdin as the source.
+        let args = argv(&["query", "--"]);
+        assert!(analyze_bq_args(&args).reads_stdin_as_code);
     }
 
     #[test]
