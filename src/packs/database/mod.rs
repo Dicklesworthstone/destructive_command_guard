@@ -8,7 +8,9 @@
 //! - `SQLite` (`sqlite3`)
 //! - Snowflake (modern `snow sql` CLI)
 //! - `Supabase` (`supabase db`, `supabase migration`, `supabase projects`)
+//! - `BigQuery` (`bq` CLI and `GoogleSQL`)
 
+pub mod bigquery;
 pub mod mongodb;
 pub mod mysql;
 pub mod postgresql;

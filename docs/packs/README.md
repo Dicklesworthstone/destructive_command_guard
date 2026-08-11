@@ -23,7 +23,7 @@ enabled = ["kubernetes", "database", "containers"]
 | [cloud](cloud.md) | 3 | AWS CLI, Google Cloud SDK, Azure CLI |
 | [containers](containers.md) | 3 | Docker, Docker Compose, Podman |
 | [core](core.md) | 2 | Core Git, Core Filesystem |
-| [database](database.md) | 7 | PostgreSQL, MySQL/MariaDB, MongoDB, ... |
+| [database](database.md) | 8 | PostgreSQL, MySQL/MariaDB, MongoDB, ... |
 | [dns](dns.md) | 3 | Cloudflare DNS, AWS Route53, Generic DNS Tools |
 | [email](email.md) | 4 | AWS SES, SendGrid, Mailgun, ... |
 | [featureflags](featureflags.md) | 4 | Flipt, LaunchDarkly, Split.io, ... |
@@ -107,6 +107,7 @@ enabled = ["kubernetes", "database", "containers"]
 - [`database.mongodb`](database.md#databasemongodb)
 - [`database.redis`](database.md#databaseredis)
 - [`database.sqlite`](database.md#databasesqlite)
+- [`database.bigquery`](database.md#databasebigquery)
 - [`database.snowflake`](database.md#databasesnowflake)
 - [`database.supabase`](database.md#databasesupabase)
 - [`containers.docker`](containers.md#containersdocker)

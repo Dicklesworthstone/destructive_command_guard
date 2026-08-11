@@ -1,0 +1,60 @@
+# database.bigquery cross-pack attribution.
+#
+# BigQuery's GoogleSQL rules are unscoped regexes and `database.bigquery`
+# sorts FIRST within tier 7 — ahead of every other database.* pack. Without
+# `bq` wired into protected_database_pack_for_executable and
+# is_indirect_database_pack, those rules would match the SQL text inside
+# another client's invocation and steal attribution before the owning pack is
+# consulted. These cases pin both directions.
+#
+# Analysis mined from PR #295 (closed per the no-outside-merges policy).
+
+[[case]]
+description = "snow sql keeps its own SQL: bigquery must not claim the payload"
+command = "snow sql -q \"DROP TABLE prod.positions\""
+expected = "deny"
+rule_id = "database.snowflake:drop-table"
+issue = 295
+
+[[case]]
+description = "psql keeps its own SQL against bigquery's unscoped DROP TABLE"
+command = "psql -c \"DROP TABLE prod.positions\""
+expected = "deny"
+rule_id = "database.postgresql:drop-table"
+issue = 295
+
+[[case]]
+description = "bq CLI rules are executables-scoped: a file named bq_notes is inert"
+command = "cat bq_notes.txt"
+expected = "allow"
+issue = 295
+
+[[case]]
+description = "the two-letter token bq must not fire on an unrelated executable"
+command = "sbq --status"
+expected = "allow"
+issue = 295
+
+[[case]]
+description = "git rm is not bq rm"
+command = "git rm --cached old_file.txt"
+expected = "allow"
+issue = 295
+
+[[case]]
+description = "read-only bq work stays allowed"
+command = "bq ls my_project:my_dataset"
+expected = "allow"
+issue = 295
+
+[[case]]
+description = "bq show is read-only"
+command = "bq show --format=prettyjson my_dataset.my_table"
+expected = "allow"
+issue = 295
+
+[[case]]
+description = "a dry-run query writes nothing"
+command = "bq query --dry_run 'SELECT 1'"
+expected = "allow"
+issue = 295

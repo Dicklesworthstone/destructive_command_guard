@@ -12536,6 +12536,7 @@ fn protected_database_pack_for_executable(executable: &str) -> Option<&'static s
         "mongo" | "mongosh" => Some("database.mongodb"),
         "sqlite3" => Some("database.sqlite"),
         "snow" => Some("database.snowflake"),
+        "bq" => Some("database.bigquery"),
         _ => None,
     }
 }
@@ -12549,6 +12550,13 @@ fn is_indirect_database_pack(pack_id: &str) -> bool {
             | "database.mongodb"
             | "database.sqlite"
             | "database.snowflake"
+            // BigQuery's GoogleSQL rules are unscoped regexes, and
+            // `database.bigquery` sorts first within tier 7 — ahead of every
+            // other database pack. Without membership here it would match the
+            // SQL text inside another client's invocation (for example
+            // `snow sql -q "DROP TABLE ..."`) and win attribution before the
+            // owning pack is consulted.
+            | "database.bigquery"
     )
 }
 
@@ -13416,6 +13424,12 @@ fn has_database_cli_hint(command: &str) -> bool {
     ]
     .iter()
     .any(|executable| lower.contains(executable))
+        // `bq` is only two letters, so a bare substring test would fire on
+        // `sbq`, `bq_notes.txt`, and any base64 blob that happens to contain
+        // the pair. Require token boundaries for this one.
+        || lower
+            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+            .any(|token| token == "bq")
 }
 
 fn has_indirect_input_cli_hint(command: &str) -> bool {
@@ -13739,6 +13753,9 @@ fn pipe_consumer_pack(command: &str) -> Option<&'static str> {
                 .reads_stdin_as_code =>
         {
             Some("database.snowflake")
+        }
+        "bq" if crate::packs::database::bigquery::analyze_bq_args(&args).reads_stdin_as_code => {
+            Some("database.bigquery")
         }
         "nsupdate" if analyze_nsupdate_args(&args).reads_stdin_as_code => Some("dns.generic"),
         _ => None,
@@ -16448,6 +16465,7 @@ fn command_argument_payloads(
             "mongo" | "mongosh" => "database.mongodb",
             "sqlite3" => "database.sqlite",
             "snow" => "database.snowflake",
+            "bq" => "database.bigquery",
             _ => return Ok(flows),
         };
         flows.push(IndirectInputFlow {
@@ -16743,6 +16761,11 @@ fn code_argument_slots<'a>(executable: &str, args: &'a [String]) -> Vec<(&'stati
             .into_iter()
             .map(|value| ("database.snowflake", value))
             .collect(),
+        "bq" => crate::packs::database::bigquery::analyze_bq_args(args)
+            .query_values
+            .into_iter()
+            .map(|value| ("database.bigquery", value))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -16779,6 +16802,11 @@ fn file_argument_slots<'a>(executable: &str, args: &'a [String]) -> Vec<(&'stati
             .into_iter()
             .map(|value| ("database.snowflake", value))
             .collect(),
+        "bq" => crate::packs::database::bigquery::analyze_bq_args(args)
+            .file_values
+            .into_iter()
+            .map(|value| ("database.bigquery", value))
+            .collect(),
         "nsupdate" => analyze_nsupdate_args(args)
             .file_value
             .into_iter()
@@ -16795,6 +16823,9 @@ fn unverified_embedded_file_source(executable: &str, args: &[String]) -> bool {
         "mongo" | "mongosh" => analyze_mongo_cli_args(args).has_unverified_file_source,
         "sqlite3" => analyze_sqlite_cli_args(args).has_unverified_file_source,
         "snow" => crate::packs::database::snowflake::analyze_snow_sql_args(args)
+            .unverified_reason
+            .is_some(),
+        "bq" => crate::packs::database::bigquery::analyze_bq_args(args)
             .unverified_reason
             .is_some(),
         _ => false,
