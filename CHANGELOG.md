@@ -83,6 +83,18 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   `issues`, corrupting the `issues == 0 || (fix && fixed == issues)`
   arithmetic in both directions: masking a genuinely unfixed issue, and
   reporting failure on a fully repaired machine.
+- **`doctor --fix` could buy off a problem it could not fix.** Creating the
+  default config counted a `fixed` with no matching `issues` (a missing config
+  is a *warning*, not an issue), so that one success cancelled a genuinely
+  unfixed issue through the `fixed == issues` equality: on a machine whose hook
+  was misconfigured and unwritable, `dcg doctor --fix --strict` reported "All
+  issues fixed!" and exited 0. Both renderers now count the issue each repair
+  resolves, and a test asserts `fixed <= issues`.
+- **`doctor --strict` gave different answers per `--format`.** The Grok
+  registration check existed only in the pretty renderer, so a machine with
+  Grok present and unwired exited 1 with `dcg doctor --strict` and 0 with
+  `--format json`. The check now lives in the shared report (`grok_hook`) and a
+  test pins that both renderers agree.
 - **`gh repo delete` recommended a command dcg itself blocks.** Its first
   suggested alternative was `gh repo archive`, which the same pack denies, so
   the agent bounced between two denials. The suggestions now lead with a

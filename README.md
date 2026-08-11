@@ -2675,6 +2675,18 @@ Every other rule still evaluates the complete command, so
 `echo x > ~/.claude/jobs/abc/tmp/log && git reset --hard` is still denied — by
 `core.git:reset-hard`, on its own merits.
 
+**Wiring doctor into automation.** `dcg doctor` exits `0` by default, even when
+it reports `"ok": false` — so `dcg doctor || handle_failure` is dead code unless
+you ask for the verdict. Use `--strict` to make the exit status carry it:
+
+```bash
+dcg doctor --strict            # non-zero when checks fail
+dcg doctor --format json --strict
+```
+
+The default is unchanged so existing pipelines keep working, and both output
+formats answer identically.
+
 **Supported rules.** Target exemptions apply only where a literal target is
 actually resolvable. Configuring them anywhere else is inert, and
 `dcg doctor` warns about it rather than leaving you quietly unserved:
