@@ -10045,6 +10045,10 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             // (`issues == 0 || (fix && fixed == issues)`) was corrupted in
             // both directions: an unrelated unfixed issue could be masked, and
             // a fully repaired machine could still report failure.
+            //
+            // `collect_doctor_report` carries the same check (id `grok_hook`)
+            // so `--strict` cannot give one answer for `--format json` and a
+            // different one here.
             issues += 1;
             if fix {
                 println!("  Attempting native install...");
@@ -10097,6 +10101,11 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 match std::fs::write(&config_path, Config::generate_sample_config()) {
                     Ok(()) => {
                         println!("  {} Created: {}", "Fixed!".green(), config_path.display());
+                        // Count the issue this repair resolves — see the
+                        // matching comment in `collect_doctor_report`. An
+                        // uncounted `fixed` cancels a real unfixed issue in
+                        // the `fixed == issues` verdict.
+                        issues += 1;
                         fixed += 1;
                     }
                     Err(e) => {
@@ -10603,6 +10612,15 @@ fn collect_doctor_report(
             } else {
                 match write_default_config() {
                     Ok(path) => {
+                        // Count the issue this repair resolves. The verdict is
+                        // `issues == 0 || (fix && fixed == issues)`, so a
+                        // `fixed` with no matching `issues` inflates the
+                        // counter and lets THIS success cancel a genuinely
+                        // unfixed issue elsewhere — `--fix --strict` would exit
+                        // 0 on a machine whose hook is still misconfigured.
+                        // Only counted under `--fix`; without it, a missing
+                        // config stays a Warning, so no new false alarm.
+                        issues += 1;
                         fixed += 1;
                         config_fixed = true;
                         (
@@ -10863,6 +10881,70 @@ fn collect_doctor_report(
                 fixed: false,
             });
         }
+    }
+
+    // Grok hook registration.
+    //
+    // This check used to exist only in `doctor_pretty`. That was tolerable
+    // while doctor's exit status was always 0, but `--strict` derives the exit
+    // status from whichever renderer ran — and the pretty one is what runs in
+    // CI, since rich output is disabled without a TTY. Without this, the same
+    // machine answered the same question two ways: `dcg doctor --strict`
+    // exited 1 while `dcg doctor --strict --format json` exited 0.
+    let grok_session_present = std::env::var_os("GROK_SESSION_ID").is_some()
+        || std::env::var_os("GROK_HOOK_EVENT").is_some()
+        || std::env::var_os("GROK_WORKSPACE_ROOT").is_some();
+    let grok_home = dirs::home_dir().map(|h| h.join(".grok"));
+    let grok_home_exists = grok_home.as_ref().is_some_and(|p| p.exists() && p.is_dir());
+    if grok_session_present || grok_home_exists {
+        let user_hook = grok_user_hook_path();
+        let claude_compat_exists = claude_settings_path().exists();
+        let mut grok_fixed = false;
+        let (status, message, remediation) = if user_hook.exists() {
+            (
+                DoctorCheckStatus::Ok,
+                format!("Native Grok hook found at {}", user_hook.display()),
+                None,
+            )
+        } else if claude_compat_exists && hook_diag.dcg_hook_count >= 1 {
+            // Wired via the Claude compatibility layer. Deliberately not an
+            // error: users who rely on compat should not be pestered.
+            (
+                DoctorCheckStatus::Ok,
+                "No native ~/.grok/hooks/dcg.json; Grok picks up dcg from the Claude \
+                 compatibility layer"
+                    .to_string(),
+                Some("Run 'dcg install --grok' for a native hook".to_string()),
+            )
+        } else {
+            // Grok is in use and the guard is wired NOWHERE for it.
+            issues += 1;
+            if fix && install_grok_hook(false, false).is_ok() {
+                fixed += 1;
+                grok_fixed = true;
+                (
+                    DoctorCheckStatus::Ok,
+                    format!("Installed native Grok hook at {}", user_hook.display()),
+                    None,
+                )
+            } else {
+                (
+                    DoctorCheckStatus::Error,
+                    "Grok is in use but dcg is registered neither natively nor via the \
+                     Claude compatibility layer"
+                        .to_string(),
+                    Some("Run 'dcg install --grok'".to_string()),
+                )
+            }
+        };
+        checks.push(DoctorCheck {
+            id: "grok_hook",
+            name: "Grok hook registration",
+            status,
+            message,
+            remediation,
+            fixed: grok_fixed,
+        });
     }
 
     DoctorReport {

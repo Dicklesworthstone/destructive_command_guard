@@ -1993,6 +1993,64 @@ mod config_tests {
             reported_ok,
             "--strict exit status must match the reported ok field (ok={reported_ok})"
         );
+
+        // The pretty renderer keeps its own check set, and it is the one that
+        // runs in CI (rich output is disabled without a TTY). Both renderers
+        // must answer the same question the same way, or `--strict` means
+        // something different depending on --format.
+        let strict_pretty = run(&["doctor", "--strict"]);
+        assert_eq!(
+            strict_pretty.status.success(),
+            strict.status.success(),
+            "--strict must agree between the pretty and json renderers\npretty stdout:\n{}\njson stdout:\n{}",
+            String::from_utf8_lossy(&strict_pretty.stdout),
+            String::from_utf8_lossy(&strict.stdout),
+        );
+    }
+
+    /// `--fix` must not let a repair of one problem cancel a DIFFERENT problem
+    /// it could not fix. The verdict is `issues == 0 || (fix && fixed ==
+    /// issues)`, so any `fixed` increment without a matching `issues`
+    /// increment silently buys off a real failure.
+    #[test]
+    fn doctor_fix_does_not_mask_an_unfixed_issue() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
+
+        // Empty PATH keeps `binary_path` broken and unfixable, while the
+        // missing user config is repairable — the two must not net out.
+        let output = Command::new(dcg_binary())
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("PATH", "")
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .current_dir(temp.path())
+            .args(["doctor", "--fix", "--format", "json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run dcg doctor --fix");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+                .expect("doctor JSON output should parse");
+        let issues = parsed["issues"].as_u64().expect("issues");
+        let fixed = parsed["fixed"].as_u64().expect("fixed");
+        let ok = parsed["ok"].as_bool().expect("ok");
+
+        assert!(
+            fixed <= issues,
+            "`fixed` must never exceed `issues`; a repair with no counted issue \
+             inflates the counter (issues={issues}, fixed={fixed})"
+        );
+        if ok {
+            assert_eq!(
+                fixed, issues,
+                "ok=true under --fix requires every counted issue to have been fixed"
+            );
+        }
     }
 }
 
