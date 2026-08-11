@@ -10363,6 +10363,11 @@ fn doctor_rich(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome
 /// installed but wired into no agent at all reports `ok: true`. That is
 /// defensible — dcg is usable standalone — but a bare "All checks passed!"
 /// claims coverage that was never established. Say which of the two it is.
+///
+/// Only `doctor_rich` consumes this; `doctor_pretty` computes the same
+/// distinction from its own inline check state. Gated to match its single
+/// caller so a `--no-default-features` build does not see dead code.
+#[cfg(feature = "rich-output")]
 fn doctor_pass_summary(report: &DoctorReport) -> &'static str {
     let wired = report.checks.iter().all(|check| {
         !(check.id == "claude_settings" && check.status == DoctorCheckStatus::Warning)

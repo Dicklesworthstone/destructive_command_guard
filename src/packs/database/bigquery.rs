@@ -17,6 +17,15 @@
 //! only fire when the resolved argv0 really is `bq`. The `GoogleSQL` rules are
 //! unscoped because SQL reaches us through files, pipes, and heredocs as well
 //! as `bq query` arguments.
+//!
+//! **Scope note.** Snowflake additionally carries a dialect-aware argv
+//! recovery layer (`collect_dialect_snowflake_flows`: PowerShell call
+//! operators, dynamic executable spellings, CLI size budgets). That is not
+//! ported here. The consequence is bounded: destructive `GoogleSQL` still
+//! blocks, because those rules match the raw command text regardless of how
+//! argv was spelled — what is missing is the extra depth of recovering `bq`
+//! argv under exotic dialect forms, which would refine attribution rather
+//! than change a verdict.
 
 use crate::destructive_pattern;
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
@@ -37,6 +46,14 @@ pub struct BqCliAnalysis<'a> {
 
 impl BqCliAnalysis<'_> {
     /// True when the argv vector is a SQL-bearing `bq` invocation.
+    ///
+    /// Part of the analysis contract, mirroring `SnowSqlCliAnalysis`. Snowflake
+    /// additionally consumes its version from a dialect-aware argv recovery
+    /// layer (PowerShell call operators, dynamic executables, CLI size
+    /// budgets) that is deliberately NOT ported here — see the module note on
+    /// scope. Without that layer bq SQL is still scanned, because the
+    /// `GoogleSQL` rules match the raw command text; what is missing is only
+    /// the extra depth of recovering argv under exotic dialect spellings.
     #[must_use]
     pub fn is_sql_command(&self) -> bool {
         !self.query_values.is_empty()
@@ -111,6 +128,40 @@ const FLAG_OPTIONS: &[&str] = &[
     "norequire_partition_filter",
 ];
 
+/// How many operands a `--long` option consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LongOption {
+    /// Consumes no operand.
+    Flag,
+    /// Consumes the following token (unless attached with `=`).
+    Value,
+    /// Arity unknown — callers must fail closed.
+    Unknown,
+}
+
+/// Classify one `--long` option name (the part before any `=`).
+///
+/// Flags are checked BEFORE values, and the `no` prefix is only stripped when
+/// the remainder is itself a known flag. Getting this backwards is a
+/// fail-open bug: reading `--nolocation` as `--location <value>` would consume
+/// the following token, and that token can be the SQL.
+fn classify_long_option(name: &str) -> LongOption {
+    if FLAG_OPTIONS.contains(&name) {
+        return LongOption::Flag;
+    }
+    // bq spells a boolean's negative as `--noFLAG` (`--nosync`,
+    // `--nouse_legacy_sql`). Only a known flag may be un-negated this way.
+    if let Some(rest) = name.strip_prefix("no")
+        && FLAG_OPTIONS.contains(&rest)
+    {
+        return LongOption::Flag;
+    }
+    if VALUE_OPTIONS.contains(&name) {
+        return LongOption::Value;
+    }
+    LongOption::Unknown
+}
+
 /// Parse arguments after the `bq` executable and identify executable SQL.
 ///
 /// Unknown options fail closed: their arity can hide a later SQL operand, so
@@ -120,35 +171,54 @@ const FLAG_OPTIONS: &[&str] = &[
 pub fn analyze_bq_args(args: &[String]) -> BqCliAnalysis<'_> {
     let mut analysis = BqCliAnalysis::default();
 
+    // Both phases share this so they cannot drift apart.
+    let fail_closed = |analysis: &mut BqCliAnalysis<'_>| {
+        analysis.unverified_reason = Some(AMBIGUOUS_OPTION_REASON);
+        analysis.reads_stdin_as_code = true;
+    };
+
     // Phase 1: walk global options until the subcommand word.
+    //
+    // `-v` is deliberately NOT treated as `--version` here: several CLIs spell
+    // verbose that way, and guessing wrong would return an inert analysis for
+    // a command that does carry SQL. An unrecognized short option fails closed
+    // instead.
     let mut index = 0usize;
     let subcommand_index = loop {
         let Some(arg) = args.get(index) else {
             return BqCliAnalysis::default();
         };
-        if matches!(arg.as_str(), "--help" | "-h" | "--version" | "-v") {
+        if matches!(arg.as_str(), "--help" | "-h" | "--version") {
             return BqCliAnalysis::default();
         }
         if let Some(long) = arg.strip_prefix("--") {
             let (name, attached) = long
                 .split_once('=')
                 .map_or((long, None), |(name, value)| (name, Some(value)));
-            let name = name.trim_start_matches("no");
-            if VALUE_OPTIONS.contains(&name) {
-                index += if attached.is_some() { 1 } else { 2 };
-                continue;
+            match classify_long_option(name) {
+                LongOption::Flag => index += 1,
+                LongOption::Value => {
+                    if attached.is_some() {
+                        index += 1;
+                    } else {
+                        // A value option with no operand left cannot be
+                        // proven inert either.
+                        if args.get(index + 1).is_none() {
+                            fail_closed(&mut analysis);
+                            return analysis;
+                        }
+                        index += 2;
+                    }
+                }
+                LongOption::Unknown => {
+                    fail_closed(&mut analysis);
+                    return analysis;
+                }
             }
-            if FLAG_OPTIONS.contains(&long) || FLAG_OPTIONS.contains(&name) {
-                index += 1;
-                continue;
-            }
-            analysis.unverified_reason = Some(AMBIGUOUS_OPTION_REASON);
-            analysis.reads_stdin_as_code = true;
-            return analysis;
+            continue;
         }
         if arg.starts_with('-') && arg.len() > 1 {
-            analysis.unverified_reason = Some(AMBIGUOUS_OPTION_REASON);
-            analysis.reads_stdin_as_code = true;
+            fail_closed(&mut analysis);
             return analysis;
         }
         break index;
@@ -172,23 +242,25 @@ pub fn analyze_bq_args(args: &[String]) -> BqCliAnalysis<'_> {
             let (name, attached) = long
                 .split_once('=')
                 .map_or((long, None), |(name, value)| (name, Some(value)));
-            let bare = name.trim_start_matches("no");
-            if VALUE_OPTIONS.contains(&bare) {
-                if attached.is_none() && args.get(index + 1).is_none() {
-                    analysis.unverified_reason = Some(AMBIGUOUS_OPTION_REASON);
-                    analysis.reads_stdin_as_code = true;
+            match classify_long_option(name) {
+                LongOption::Flag => index += 1,
+                LongOption::Value => {
+                    if attached.is_some() {
+                        index += 1;
+                    } else {
+                        if args.get(index + 1).is_none() {
+                            fail_closed(&mut analysis);
+                            return analysis;
+                        }
+                        index += 2;
+                    }
+                }
+                LongOption::Unknown => {
+                    fail_closed(&mut analysis);
                     return analysis;
                 }
-                index += if attached.is_some() { 1 } else { 2 };
-                continue;
             }
-            if FLAG_OPTIONS.contains(&long) || FLAG_OPTIONS.contains(&bare) {
-                index += 1;
-                continue;
-            }
-            analysis.unverified_reason = Some(AMBIGUOUS_OPTION_REASON);
-            analysis.reads_stdin_as_code = true;
-            return analysis;
+            continue;
         }
         if arg == "-" {
             analysis.reads_stdin_as_code = true;
@@ -197,8 +269,7 @@ pub fn analyze_bq_args(args: &[String]) -> BqCliAnalysis<'_> {
             continue;
         }
         if arg.starts_with('-') && arg.len() > 1 {
-            analysis.unverified_reason = Some(AMBIGUOUS_OPTION_REASON);
-            analysis.reads_stdin_as_code = true;
+            fail_closed(&mut analysis);
             return analysis;
         }
         // A bare positional operand to `bq query` is the SQL text.
@@ -523,7 +594,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             }
         ),
         destructive_pattern!(
-            "drop-external-or-snapshot-guard",
+            "drop-materialized-view-or-external-table",
             r"(?i)\bDROP\s+(?:MATERIALIZED\s+VIEW|EXTERNAL\s+TABLE)\b",
             "DROP MATERIALIZED VIEW / EXTERNAL TABLE removes a derived or federated object.",
             Medium,
@@ -629,7 +700,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "alter-table-drop-column",
-            r"(?i)\bALTER\s+TABLE\b[\s\S]{0,200}?\bDROP\s+COLUMN\b",
+            r"(?i)\bALTER\s+TABLE\b[^;]{0,200}?\bDROP\s+COLUMN\b",
             "ALTER TABLE DROP COLUMN removes a column and its data.",
             High,
             "Dropping a column deletes its values. Time travel recovers the whole table to a \
@@ -639,7 +710,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "alter-set-expiration",
-            r"(?i)\bALTER\s+(?:TABLE|SCHEMA|MATERIALIZED\s+VIEW)\b[\s\S]{0,200}?\bSET\s+OPTIONS\b[\s\S]{0,200}?\bexpiration_timestamp\b",
+            r"(?i)\bALTER\s+(?:TABLE|SCHEMA|MATERIALIZED\s+VIEW)\b[^;]{0,200}?\bSET\s+OPTIONS\b[^;]{0,200}?\bexpiration_timestamp\b",
             "SET OPTIONS(expiration_timestamp) schedules automatic deletion.",
             High,
             "An expiration timestamp is a deferred delete: the object disappears at that time \
@@ -653,7 +724,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "alter-table-rename",
-            r"(?i)\bALTER\s+TABLE\b[\s\S]{0,200}?\bRENAME\s+TO\b",
+            r"(?i)\bALTER\s+TABLE\b[^;]{0,200}?\bRENAME\s+TO\b",
             "ALTER TABLE RENAME TO breaks every reference to the old table name.",
             Medium,
             "Renaming is not itself data loss, but views, scheduled queries, and downstream \
@@ -711,7 +782,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "export-data-overwrite",
-            r"(?i)\bEXPORT\s+DATA\b[\s\S]{0,200}?\boverwrite\s*=\s*true",
+            r"(?i)\bEXPORT\s+DATA\b[^;]{0,200}?\boverwrite\s*=\s*true",
             "EXPORT DATA with overwrite=true replaces files at the destination URI.",
             Medium,
             "Existing objects under the destination prefix in Cloud Storage are replaced. If \
@@ -749,7 +820,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "update-all-rows",
-            r"(?i)\bUPDATE\s+[^\s;]+\s+SET\b[\s\S]{0,400}?\bWHERE\s+(?:TRUE|1\s*=\s*1)\b",
+            r"(?i)\bUPDATE\s+[^\s;]+\s+SET\b[^;]{0,400}?\bWHERE\s+(?:TRUE|1\s*=\s*1)\b",
             "UPDATE ... WHERE TRUE rewrites every row in the table.",
             High,
             "`WHERE TRUE` is the idiomatic full-table spelling in GoogleSQL, where the WHERE \
@@ -761,7 +832,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "merge-delete-not-matched-by-source",
-            r"(?i)\bMERGE\b[\s\S]{0,600}?\bWHEN\s+NOT\s+MATCHED\s+BY\s+SOURCE\b[\s\S]{0,200}?\bTHEN\s+DELETE\b",
+            r"(?i)\bMERGE\b[^;]{0,600}?\bWHEN\s+NOT\s+MATCHED\s+BY\s+SOURCE\b[^;]{0,200}?\bTHEN\s+DELETE\b",
             "MERGE ... WHEN NOT MATCHED BY SOURCE THEN DELETE removes every target row absent from the source.",
             High,
             "The delete is driven by what the source query returns. If the source is empty, \
@@ -860,7 +931,7 @@ mod tests {
             ("DROP VIEW d.v", "drop-view"),
             (
                 "DROP MATERIALIZED VIEW d.mv",
-                "drop-external-or-snapshot-guard",
+                "drop-materialized-view-or-external-table",
             ),
             ("DROP TABLE d.t", "drop-table"),
             ("ALTER TABLE d.t DROP COLUMN c", "alter-table-drop-column"),
@@ -900,6 +971,31 @@ mod tests {
             &pack,
             "bq update --max_time_travel_hours 48 my_dataset",
             Severity::High,
+        );
+    }
+
+    /// Two-part SQL rules are bounded by `[^;]`, so the halves must come from
+    /// the SAME statement. An unbounded `[\s\S]` span would let a harmless
+    /// `ALTER TABLE` in one statement pair with a `DROP COLUMN` in another and
+    /// report a rule that describes neither.
+    #[test]
+    fn two_part_sql_rules_do_not_span_statements() {
+        let pack = create_pack();
+
+        // Same statement: matches.
+        assert_blocks_with_pattern(
+            &pack,
+            "ALTER TABLE d.t DROP COLUMN c",
+            "alter-table-drop-column",
+        );
+
+        // Split across statements: alter-table-drop-column must NOT claim it.
+        let split = "ALTER TABLE d.t SET OPTIONS(description='x'); SELECT 1; UPDATE other SET DROP COLUMN_LIKE = 1 WHERE id = 2";
+        let matched = pack.check(split).and_then(|m| m.name);
+        assert_ne!(
+            matched,
+            Some("alter-table-drop-column"),
+            "a DROP COLUMN in a later statement must not pair with an earlier ALTER TABLE"
         );
     }
 
@@ -1002,6 +1098,56 @@ mod tests {
         assert!(analysis.unverified_reason.is_some());
         assert!(analysis.reads_stdin_as_code);
         assert!(analysis.is_sql_command());
+    }
+
+    /// Regression: `--noX` must only be un-negated when `X` is a known FLAG.
+    /// Stripping `no` before the VALUE lookup made `--nolocation` read as
+    /// `--location <value>`, which consumed the following token — and that
+    /// token can be the SQL. Fail closed instead.
+    #[test]
+    fn analyze_does_not_treat_negated_names_as_value_options() {
+        assert_eq!(classify_long_option("nosync"), LongOption::Flag);
+        assert_eq!(classify_long_option("nouse_legacy_sql"), LongOption::Flag);
+        assert_eq!(classify_long_option("location"), LongOption::Value);
+        assert_eq!(
+            classify_long_option("nolocation"),
+            LongOption::Unknown,
+            "must not resolve to the VALUE option `location` and eat the next token"
+        );
+
+        let args = argv(&["query", "--nolocation", "DROP TABLE d.t"]);
+        let analysis = analyze_bq_args(&args);
+        assert!(
+            analysis.unverified_reason.is_some(),
+            "an unknown negated option must fail closed, not swallow the SQL"
+        );
+        assert!(analysis.query_values.is_empty());
+    }
+
+    /// A value option with no operand left cannot be proven inert in either
+    /// phase; both must fail closed rather than stepping past the end.
+    #[test]
+    fn analyze_fails_closed_on_dangling_value_option() {
+        for args in [
+            argv(&["--project_id"]),
+            argv(&["query", "--destination_table"]),
+        ] {
+            let analysis = analyze_bq_args(&args);
+            assert!(
+                analysis.unverified_reason.is_some(),
+                "dangling value option must fail closed: {args:?}"
+            );
+        }
+    }
+
+    /// `-v` is verbose in several CLIs. Guessing it means `--version` would
+    /// return an inert analysis for a command that does carry SQL.
+    #[test]
+    fn analyze_fails_closed_on_unknown_short_options() {
+        let args = argv(&["-v", "query", "DROP TABLE d.t"]);
+        let analysis = analyze_bq_args(&args);
+        assert!(analysis.unverified_reason.is_some());
+        assert!(analysis.reads_stdin_as_code);
     }
 
     #[test]

@@ -96,17 +96,18 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              only within 90 days, only if the name has not been reused, and only via \
              support — it is not a self-service undo.\n\n\
              Safer alternatives:\n\
-             - gh repo archive: makes it read-only while keeping everything visible\n\
+             - gh repo archive: makes it read-only while keeping everything visible \
+             (dcg gates this one too, but it is reversible)\n\
              - gh repo edit --visibility private: hides it without destroying it",
             &const {
                 [
                     PatternSuggestion::new(
-                        "gh repo archive <owner>/<repo>",
-                        "Make it read-only instead of deleting it",
+                        "gh repo edit <owner>/<repo> --visibility private",
+                        "Hide the repository without destroying it",
                     ),
                     PatternSuggestion::new(
-                        "gh repo edit <owner>/<repo> --visibility private",
-                        "Hide the repository while keeping its contents",
+                        "gh repo archive <owner>/<repo>",
+                        "Read-only instead of deleted (also gated, but reversible)",
                     ),
                     PatternSuggestion::new(
                         "gh repo view <owner>/<repo> --json name,isPrivate,pushedAt",
@@ -424,12 +425,13 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              can restore a deleted repository only within 90 days, only if the name has \
              not been reused, and only via support.\n\n\
              Safer alternatives:\n\
-             - gh repo archive: makes it read-only while keeping everything visible\n\
-             - gh api -X PATCH repos/<owner>/<repo> -F archived=true: same, via the API",
+             - gh api -X PATCH repos/<owner>/<repo> -F archived=true: read-only, via the API\n\
+             - gh repo archive: the same thing via the first-class verb (dcg gates \
+             that one too, but archiving is reversible)",
             &const {
                 [
                     PatternSuggestion::new(
-                        "gh repo archive <owner>/<repo>",
+                        "gh api -X PATCH repos/<owner>/<repo> -F archived=true",
                         "Make it read-only instead of deleting it",
                     ),
                     PatternSuggestion::new(
@@ -723,5 +725,47 @@ mod tests {
         let pack = create_pack();
         assert_no_match(&pack, "git status");
         assert_no_match(&pack, "echo hello");
+    }
+
+    /// A denial that recommends a command this same pack blocks is a dead end
+    /// — the agent bounces between two blocks and learns nothing. The FIRST
+    /// suggestion in particular must be something it can actually run.
+    ///
+    /// `gh repo archive` is deliberately excused: it is the right advice when
+    /// the alternative is deletion, it is reversible, and both rules that
+    /// offer it say in the same breath that it is gated too.
+    #[test]
+    fn first_suggestion_is_never_blocked_by_this_pack() {
+        let pack = create_pack();
+
+        for pattern in &pack.destructive_patterns {
+            let name = pattern.name.expect("every github rule is named");
+            let Some(first) = pattern.suggestions.first() else {
+                continue;
+            };
+            // Placeholders are illustrative, not runnable; substitute
+            // something concrete so the regexes see a realistic command.
+            let command = first
+                .command
+                .replace("<owner>/<repo>", "acme/widgets")
+                .replace("<resource-name>", "abc")
+                .replace("<location>", "US")
+                .replace("<tag>", "v1.2.3")
+                .replace("<number>", "42")
+                .replace("<id>", "123")
+                .replace("<NAME>", "MY_SECRET")
+                .replace("<endpoint>", "repos/acme/widgets/issues")
+                .replace("<run-id>", "999")
+                .replace("<child>", "7");
+
+            if command.contains("gh repo archive") {
+                continue;
+            }
+            assert!(
+                pack.check(&command).is_none(),
+                "{name}'s first suggestion is blocked by this same pack, so the \
+                 denial is a dead end: {command}"
+            );
+        }
     }
 }

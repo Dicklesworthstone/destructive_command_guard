@@ -393,7 +393,7 @@ These patterns match potentially destructive commands:
 | `bq-cancel` | bq cancel stops a running job, which may leave a partial load or export. | medium |
 | `drop-schema` | DROP SCHEMA removes a BigQuery dataset and everything inside it. | critical |
 | `drop-snapshot-table` | DROP SNAPSHOT TABLE destroys a point-in-time backup. | critical |
-| `drop-external-or-snapshot-guard` | DROP MATERIALIZED VIEW / EXTERNAL TABLE removes a derived or federated object. | medium |
+| `drop-materialized-view-or-external-table` | DROP MATERIALIZED VIEW / EXTERNAL TABLE removes a derived or federated object. | medium |
 | `drop-routine` | DROP FUNCTION/PROCEDURE/TABLE FUNCTION removes a routine other queries may depend on. | high |
 | `drop-all-row-access-policies` | DROP ALL ROW ACCESS POLICIES removes row-level security from a table. | high |
 | `drop-search-index` | DROP SEARCH INDEX removes an index that must be fully rebuilt. | medium |
