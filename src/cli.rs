@@ -5609,6 +5609,15 @@ fn detect_database_packs_from_deps(
             ],
         ),
         ("database.supabase", &["supabase", "@supabase/supabase-js"]),
+        (
+            "database.bigquery",
+            &[
+                "google-cloud-bigquery",
+                "@google-cloud/bigquery",
+                "pandas-gbq",
+                "sqlalchemy-bigquery",
+            ],
+        ),
     ];
 
     // Scan multiple dependency files

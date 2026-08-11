@@ -15,6 +15,32 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Added
 
+- **`database.bigquery` pack — the `bq` CLI and GoogleSQL.** 11 CLI rules and
+  21 GoogleSQL rules. Three BigQuery specifics drive them, and each one makes a
+  naive port of the PostgreSQL/Snowflake packs wrong: a *dataset* is a `SCHEMA`
+  in GoogleSQL, so `DROP SCHEMA` is the dataset-level catastrophe rather than a
+  namespace tidy-up (Critical); GoogleSQL **requires** a `WHERE` clause on
+  `DELETE`/`UPDATE`, so `WHERE TRUE` is the idiomatic full-table spelling and a
+  `delete-without-where` rule modelled on PostgreSQL would never fire; and time
+  travel (2–7 days) is the only undo, so `--max_time_travel_hours` and
+  `SET OPTIONS(expiration_timestamp)` destroy the recovery path itself and are
+  destructive in their own right. BigQuery ML models get their own rule —
+  they are not covered by time travel and cost hours of training to rebuild.
+  CLI rules are scoped with `executables = ["bq"]` *and* a `bq`-anchored regex,
+  because `executables` is enforced in the evaluator rather than in
+  `Pack::check`. Opt-in like every other `database.*` pack; joins the
+  `careful_company_running_windows` preset; recommended automatically when a
+  project depends on `google-cloud-bigquery`, `@google-cloud/bigquery`,
+  `pandas-gbq`, or `sqlalchemy-bigquery`.
+
+  Evaluator wiring makes the pack *indirect*, so its unscoped GoogleSQL rules
+  cannot claim the SQL inside another client's invocation: `database.bigquery`
+  sorts first within tier 7, so without it `snow sql -q "DROP TABLE ..."` would
+  have been reported as a BigQuery rule. Regression cases pin both directions.
+
+  Implemented independently from the analysis in closed PR #295, per the
+  project's no-outside-merges policy.
+
 - **`dcg doctor --strict` (#296).** `doctor` exited `0` unconditionally, including
   when it had just reported `"ok": false` — so `dcg doctor || handle_failure` was
   dead code and a provisioning run got a green signal from a guard doctor itself
@@ -41,6 +67,27 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Fixed
 
+- **A pathological `gh` command line could fail OPEN.** The shared option-prefix
+  in `platform.github` used `\S+` for an option's value, which also matches a
+  flag token — so in `gh -a -b -c …` each token could parse either as a new
+  option or as the previous one's value, giving exponentially many parses.
+  These patterns carry a lookahead and therefore run on the backtracking
+  engine, where `CompiledRegex::is_match` maps a backtrack-limit error to
+  `false`. Adopted the unambiguous shape the database packs already use
+  (`[^-\s;&|][^\s;&|]*`).
+- **`dcg doctor`'s pretty renderer computed a wrong verdict**, which now
+  matters because `--strict` derives the exit status from it — and pretty is
+  what runs in CI, since rich output is disabled without a TTY. A failed
+  config write printed an error without counting it, and the Grok
+  "NOT REGISTERED" branch incremented `fixed` without ever incrementing
+  `issues`, corrupting the `issues == 0 || (fix && fixed == issues)`
+  arithmetic in both directions: masking a genuinely unfixed issue, and
+  reporting failure on a fully repaired machine.
+- **`gh repo delete` recommended a command dcg itself blocks.** Its first
+  suggested alternative was `gh repo archive`, which the same pack denies, so
+  the agent bounced between two denials. The suggestions now lead with a
+  runnable command and say plainly that archiving is gated too. A pack test
+  asserts no rule's first suggestion is blocked by its own pack.
 - **`gh-api-delete-repo` is no longer a misnamed catch-all (#300).** The rule
   matched *any* `gh api ... DELETE`, not repository deletion, while its name is
   what surfaces as `rule_id` in the history DB, `dcg stats`, `dcg

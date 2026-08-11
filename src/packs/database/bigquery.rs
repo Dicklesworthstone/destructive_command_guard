@@ -216,6 +216,14 @@ pub fn analyze_bq_args(args: &[String]) -> BqCliAnalysis<'_> {
         if matches!(arg.as_str(), "--help" | "-h" | "--version") {
             return BqCliAnalysis::default();
         }
+        // A bare `--` before any subcommand is a malformed invocation whose
+        // remaining shape cannot be proven. `split_option_token` returns None
+        // for it, which would otherwise make it break out as the "subcommand"
+        // and yield an inert analysis.
+        if arg == "--" {
+            fail_closed(&mut analysis);
+            return analysis;
+        }
         if let Some((name, attached)) = split_option_token(arg) {
             match classify_long_option(name) {
                 LongOption::Flag => index += 1,
@@ -250,10 +258,17 @@ pub fn analyze_bq_args(args: &[String]) -> BqCliAnalysis<'_> {
 
     // Phase 2: walk `query` options collecting SQL operands.
     let mut explicit_source = false;
+    // After a bare `--`, every remaining token is an operand, never an option.
+    let mut options_terminated = false;
     index = subcommand_index + 1;
     while index < args.len() {
         let arg = &args[index];
-        if matches!(arg.as_str(), "--help" | "-h") {
+        if !options_terminated && arg == "--" {
+            options_terminated = true;
+            index += 1;
+            continue;
+        }
+        if !options_terminated && matches!(arg.as_str(), "--help" | "-h") {
             // Never discard SQL already proven present: `bq query "DROP ..."
             // --help` still put the statement on the command line.
             if analysis.query_values.is_empty() && !analysis.reads_stdin_as_code {
@@ -261,13 +276,13 @@ pub fn analyze_bq_args(args: &[String]) -> BqCliAnalysis<'_> {
             }
             return analysis;
         }
-        if arg == "-" {
+        if !options_terminated && arg == "-" {
             analysis.reads_stdin_as_code = true;
             explicit_source = true;
             index += 1;
             continue;
         }
-        if let Some((name, attached)) = split_option_token(arg) {
+        if let Some((name, attached)) = split_option_token(arg).filter(|_| !options_terminated) {
             match classify_long_option(name) {
                 LongOption::Flag => index += 1,
                 LongOption::Value => {
@@ -1294,6 +1309,35 @@ mod tests {
     fn analyze_keeps_sql_collected_before_a_trailing_help() {
         let args = argv(&["query", "DROP TABLE d.t", "--help"]);
         assert_eq!(analyze_bq_args(&args).query_values, vec!["DROP TABLE d.t"]);
+    }
+
+    /// The `--` option terminator. `split_option_token` returns None for it,
+    /// so without explicit handling phase 1 broke out treating `--` as the
+    /// subcommand and returned the INERT default instead of failing closed.
+    #[test]
+    fn analyze_handles_the_option_terminator() {
+        // Before a subcommand: malformed, unprovable, fail closed.
+        let args = argv(&["--", "query", "DROP TABLE d.t"]);
+        let analysis = analyze_bq_args(&args);
+        assert!(
+            analysis.unverified_reason.is_some(),
+            "a bare -- before the subcommand must fail closed, not read as inert"
+        );
+
+        // After `query`: everything following is an operand, and the `--` is
+        // not itself SQL.
+        let args = argv(&["query", "--", "DROP TABLE d.t"]);
+        let analysis = analyze_bq_args(&args);
+        assert_eq!(analysis.query_values, vec!["DROP TABLE d.t"]);
+        assert!(analysis.unverified_reason.is_none());
+
+        // A token that merely looks like an option is an operand after `--`.
+        let args = argv(&["query", "--", "--not-an-option"]);
+        assert_eq!(
+            analyze_bq_args(&args).query_values,
+            vec!["--not-an-option"],
+            "after -- nothing is parsed as an option"
+        );
     }
 
     #[test]
