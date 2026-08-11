@@ -395,7 +395,8 @@ These patterns match potentially destructive commands:
 | `drop-snapshot-table` | DROP SNAPSHOT TABLE destroys a point-in-time backup. | critical |
 | `drop-materialized-view-or-external-table` | DROP MATERIALIZED VIEW / EXTERNAL TABLE removes a derived or federated object. | medium |
 | `drop-routine` | DROP FUNCTION/PROCEDURE/TABLE FUNCTION removes a routine other queries may depend on. | high |
-| `drop-all-row-access-policies` | DROP ALL ROW ACCESS POLICIES removes row-level security from a table. | high |
+| `drop-model` | DROP MODEL deletes a trained BigQuery ML model. | high |
+| `drop-all-row-access-policies` | DROP ROW ACCESS POLICY removes row-level security from a table. | high |
 | `drop-search-index` | DROP SEARCH INDEX removes an index that must be fully rebuilt. | medium |
 | `drop-capacity-or-reservation` | DROP CAPACITY/RESERVATION/ASSIGNMENT changes billing and query capacity. | high |
 | `drop-view` | DROP VIEW removes a view definition. | medium |
