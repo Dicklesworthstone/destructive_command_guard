@@ -2300,7 +2300,12 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     no_heredoc_scan,
                     heredoc_timeout_ms,
                     heredoc_languages,
-                    enforce_budget,
+                    // Robot test mode is an agent integration boundary. Its
+                    // configured hook timeout must therefore be enforced even
+                    // when the caller omits the human-facing
+                    // `--enforce-budget` diagnostic flag; otherwise a parent
+                    // process can kill dcg before it emits indeterminate JSON.
+                    enforce_budget || robot_mode,
                     force,
                     dialect,
                 );
