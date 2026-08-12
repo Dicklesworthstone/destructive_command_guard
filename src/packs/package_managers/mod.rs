@@ -6,8 +6,71 @@
 //! - apt/yum remove critical packages
 //! - cargo publish
 
+use crate::normalize::{NormalizeTokenKind, ShellDialect, ShellTokenDecoder, ShellTokenRole};
 use crate::packs::{DestructivePattern, Pack, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
+
+/// Whether a shell segment invokes pnpm's `publish` subcommand.
+///
+/// pnpm accepts both boolean and value-taking global options before its
+/// subcommand, so a regex cannot find the boundary without either missing
+/// valid forms (`--silent publish`) or maintaining a version-fragile option
+/// inventory. Instead, parse shell words and treat option-adjacent positional
+/// words as possible option values. A bare `publish` is the subcommand only
+/// when no earlier unambiguous positional word already established another
+/// command such as `run`; quoted `publish` remains argument data.
+#[must_use]
+pub(crate) fn invokes_pnpm_publish(command: &str) -> bool {
+    crate::packs::split_command_segments(command)
+        .into_iter()
+        .any(segment_invokes_pnpm_publish)
+}
+
+fn segment_invokes_pnpm_publish(segment: &str) -> bool {
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+    let words: Vec<(String, bool)> =
+        crate::normalize::tokenize_for_shell_dialect(segment, ShellDialect::Posix)
+            .iter()
+            .filter(|token| token.kind == NormalizeTokenKind::Word)
+            .filter_map(|token| {
+                let raw = token.text(segment)?;
+                let decoded = decoder.decode(raw, ShellTokenRole::Syntax)?;
+                let was_unquoted = decoded.as_ref() == raw;
+                Some((decoded.into_owned(), was_unquoted))
+            })
+            .collect();
+    let Some(pnpm_index) = words.iter().position(|(word, _)| is_pnpm_executable(word)) else {
+        return false;
+    };
+
+    let mut preceding_positional = false;
+    for index in pnpm_index + 1..words.len() {
+        let (word, was_unquoted) = &words[index];
+        if word == "publish" && *was_unquoted {
+            return !preceding_positional;
+        }
+        if word.starts_with('-') {
+            continue;
+        }
+        let follows_option = index > pnpm_index + 1 && words[index - 1].0.starts_with('-');
+        if !follows_option {
+            preceding_positional = true;
+        }
+    }
+    false
+}
+
+fn is_pnpm_executable(word: &str) -> bool {
+    std::path::Path::new(word)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("pnpm")
+                || ["pnpm.cmd", "pnpm.exe", "pnpm.com"]
+                    .iter()
+                    .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        })
+}
 
 /// Create the Package Managers pack.
 #[must_use]
@@ -94,7 +157,10 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // as previews; false-valued flags must not mask publish rules.
         safe_pattern!("npm-dry-run", r"\bnpm\b.*--dry-run(?:=true)?(?:\s|$)"),
         safe_pattern!("yarn-dry-run", r"\byarn\b.*--dry-run(?:=true)?(?:\s|$)"),
-        safe_pattern!("pnpm-dry-run", r"\bpnpm\b.*--dry-run(?:=true)?(?:\s|$)"),
+        safe_pattern!(
+            "pnpm-dry-run",
+            r"\bpnpm\b[^|;&]*--dry-run(?:=true)?(?:\s|$)"
+        ),
         safe_pattern!("cargo-dry-run", r"\bcargo\b.*--dry-run(?:=true)?(?:\s|$)"),
         safe_pattern!("poetry-dry-run", r"\bpoetry\b.*--dry-run(?:=true)?(?:\s|$)"),
     ]
@@ -115,8 +181,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "pnpm-publish",
-            r"\bpnpm\b.*?\bpublish\b(?!.*--dry-run(?:=true)?(?:\s|$))",
-            "pnpm publish releases a package publicly."
+            r"\bpnpm\b[^|;&]*?\bpublish(?=\s|$)(?![^|;&]*--dry-run(?:=true)?(?:\s|$))",
+            "pnpm publish releases a package publicly.",
+            executables = ["pnpm"]
         ),
         // npm unpublish. The `(?=\s|$)` trailing anchor ensures the
         // subcommand token ends at whitespace or end-of-string — otherwise
@@ -308,6 +375,31 @@ mod tests {
         ] {
             assert_blocks_with_pattern(&pack, command, pattern);
             assert_no_safe_match(&pack, command);
+        }
+    }
+
+    #[test]
+    fn pnpm_publish_is_a_subcommand_not_argument_data() {
+        let pack = create_pack();
+
+        for command in [
+            "pnpm run build; bun ./publish-snapshot.ts",
+            "pnpm run build --reporter 'publish'",
+            "pnpm --reporter 'publish'",
+            "pnpm run build publish",
+        ] {
+            assert_allows(&pack, command);
+        }
+
+        for command in [
+            "pnpm publish",
+            "pnpm -r publish",
+            "pnpm --filter workspace publish",
+            "pnpm --silent publish",
+            "pnpm --reporter append-only publish",
+            "pnpm.cmd --silent publish",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "pnpm-publish");
         }
     }
 

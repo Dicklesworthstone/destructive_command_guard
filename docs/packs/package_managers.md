@@ -56,7 +56,7 @@ These patterns match safe commands that are always allowed:
 | `apt-get-list` | `\bapt-get\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:update\|upgrade)(?!\s+.*-y)` |
 | `npm-dry-run` | `\bnpm\b.*--dry-run(?:=true)?(?:\s\|$)` |
 | `yarn-dry-run` | `\byarn\b.*--dry-run(?:=true)?(?:\s\|$)` |
-| `pnpm-dry-run` | `\bpnpm\b.*--dry-run(?:=true)?(?:\s\|$)` |
+| `pnpm-dry-run` | `\bpnpm\b[^\|;&]*--dry-run(?:=true)?(?:\s\|$)` |
 | `cargo-dry-run` | `\bcargo\b.*--dry-run(?:=true)?(?:\s\|$)` |
 | `poetry-dry-run` | `\bpoetry\b.*--dry-run(?:=true)?(?:\s\|$)` |
 

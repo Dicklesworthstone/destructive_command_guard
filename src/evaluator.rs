@@ -19492,6 +19492,12 @@ fn evaluate_packs_with_allowlists_at_depth(
             {
                 return EvaluationResult::indeterminate_due_to_budget();
             }
+            if pack_id == "package_managers"
+                && pattern.name == Some("pnpm-publish")
+                && !crate::packs::package_managers::invokes_pnpm_publish(original_command)
+            {
+                continue;
+            }
             if has_compound_segments
                 && pack_id == "core.git"
                 && pattern.name == Some("branch-force-delete")
@@ -21882,6 +21888,12 @@ fn evaluate_pack_destructive_patterns(
 
     for pattern in &pack.destructive_patterns {
         if pattern_filter.is_some_and(|include| !include(pattern.name)) {
+            continue;
+        }
+        if pack_id == "package_managers"
+            && pattern.name == Some("pnpm-publish")
+            && !crate::packs::package_managers::invokes_pnpm_publish(original_command)
+        {
             continue;
         }
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
@@ -33805,6 +33817,45 @@ mod tests {
             assert!(
                 result.is_denied(),
                 "name-shaped alias boundary must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn pnpm_publish_subcommand_boundary_survives_normalization() {
+        for command in [
+            "pnpm --silent publish",
+            "pnpm --reporter append-only publish",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["package_managers"],
+                ShellDialect::Unknown,
+            );
+            assert!(result.is_denied(), "publication must deny: {command}");
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some("pnpm-publish")
+            );
+        }
+
+        for command in [
+            "pnpm run build; bun ./publish-snapshot.ts",
+            "pnpm --reporter 'publish'",
+            "pnpm run build publish",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["package_managers"],
+                ShellDialect::Unknown,
+            );
+            assert!(
+                result.is_allowed(),
+                "argument data must allow: {command}: {:?}",
                 result.pattern_info
             );
         }
