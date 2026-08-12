@@ -18626,8 +18626,13 @@ exclude = ["target/**"]
     // ========================================================================
 
     fn init_temp_git_repo(dir: &std::path::Path) {
+        let isolated_global_config = dir.join("isolated-global.gitconfig");
+        std::fs::write(&isolated_global_config, "").expect("write isolated git config");
+
         let output = std::process::Command::new("git")
             .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", isolated_global_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .args(["init", "-q"])
             .output()
             .expect("git init");

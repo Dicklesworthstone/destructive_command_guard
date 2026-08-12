@@ -377,19 +377,10 @@ fn golden_json_severity_values() {
 
 /// Run dcg in robot mode via test subcommand
 fn run_robot_mode(command: &str) -> Option<Value> {
-    use std::process::Command;
-
-    let output = Command::new(env!("CARGO_BIN_EXE_dcg"))
-        .args(["--robot", "test", command])
-        .output()
-        .expect("Failed to run dcg");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.trim().is_empty() {
-        return None;
-    }
-
-    serde_json::from_str(&stdout).ok()
+    E2ETestContext::builder("golden_robot_mode")
+        .build()
+        .run_dcg(&["--robot", "test", command])
+        .json
 }
 
 #[test]
