@@ -51,6 +51,52 @@ fn run_dcg_with_env(args: &[&str], envs: &[(&str, &str)]) -> std::process::Outpu
     cmd.output().expect("failed to execute dcg")
 }
 
+#[test]
+fn robot_stdin_enforces_budget_for_bounded_inspection() {
+    let command = r#"set -e
+printf '%s\n' '== OpenClaw plugin config (non-secret paths only) =='
+python3 - <<'PY'
+import json
+p='/Users/gfw/.openclaw/openclaw.json'
+d=json.load(open(p))
+print(json.dumps(d.get('plugins', {}), indent=2))
+PY
+printf '%s\n' '== managed plugin projects =='
+for p in /Users/gfw/.openclaw/npm/projects/*/package.json; do echo "--- $p"; cat "$p"; done
+printf '%s\n' '== plugin package metadata =='
+for p in /Users/gfw/.openclaw/npm/projects/*/node_modules/@openclaw/codex/package.json /Users/gfw/.openclaw/npm/node_modules/@openclaw/codex/package.json; do test -f "$p" && { echo "--- $p"; cat "$p"; }; done
+printf '%s\n' '== targeted API references =='
+rg -n 'openSyncKeyedStore|syncKeyedStore|api\.runtime|register' /Users/gfw/.openclaw/npm/projects/*/node_modules/@openclaw/codex/dist /Users/gfw/Library/pnpm/global/v11/184a1-19fc835dab7/node_modules/openclaw/dist 2>/dev/null | head -240
+printf '%s\n' '== installed host package metadata =='
+cat /Users/gfw/Library/pnpm/global/v11/184a1-19fc835dab7/node_modules/openclaw/package.json | sed -n '1,120p'"#;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut child = Command::new(dcg_binary())
+        .args(["--robot", "test", "--stdin"])
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("USERPROFILE", temp.path())
+        .env("XDG_CONFIG_HOME", temp.path())
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_HOOK_TIMEOUT_MS", "10")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn robot test");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(command.as_bytes())
+        .expect("write command");
+    let output = child.wait_with_output().expect("robot output");
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("robot JSON");
+    assert_eq!(json["decision"], "indeterminate");
+    assert_eq!(json["source"], "analysis_budget");
+}
+
 #[derive(Debug)]
 struct HookRunOutput {
     command: String,
