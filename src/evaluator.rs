@@ -20824,6 +20824,14 @@ fn filesystem_non_pre_rm_non_redirect_pattern_excluding_mv_dynamic(name: Option<
     filesystem_non_pre_rm_non_redirect_pattern(name) && name != Some("mv-dynamic-path")
 }
 
+fn filesystem_non_pre_rm_non_redirect_pattern_excluding_proven_backup(name: Option<&str>) -> bool {
+    filesystem_non_pre_rm_non_redirect_pattern(name)
+        && !matches!(
+            name,
+            Some("mv-dynamic-path" | "mv-sensitive-source-root-home")
+        )
+}
+
 /// Parse the variable reference starting at a `$`, returning the name and
 /// the byte length of the whole reference (`$NAME` or `${NAME}`).
 fn parse_leading_posix_variable(token: &str) -> Option<(&str, usize)> {
@@ -20902,6 +20910,131 @@ fn substitute_posix_variable(segment: &str, name: &str, value: &str) -> String {
         index += ch.len_utf8();
     }
     result
+}
+
+fn posix_assignment(segment: &str) -> Option<(&str, &str)> {
+    let (name, value) = segment.trim().split_once('=')?;
+    let valid_name = !name.is_empty()
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    valid_name.then_some((name, value.trim()))
+}
+
+fn double_quoted_word(raw: &str) -> Option<&str> {
+    raw.strip_prefix('"')?.strip_suffix('"')
+}
+
+fn exact_posix_variable(raw: &str) -> Option<&str> {
+    let (name, consumed) = parse_leading_posix_variable(raw)?;
+    (consumed == raw.len()).then_some(name)
+}
+
+fn inspectable_skill_directory(source: &str) -> Option<PathBuf> {
+    if source.contains(['`', '\\', '\'', '"', '*', '?', '[']) || source.contains("$(") {
+        return None;
+    }
+    let path = if let Some(relative) = source
+        .strip_prefix("$HOME/")
+        .or_else(|| source.strip_prefix("${HOME}/"))
+    {
+        if relative.contains('$') {
+            return None;
+        }
+        PathBuf::from(std::env::var_os("HOME")?).join(relative)
+    } else {
+        if source.contains('$') {
+            return None;
+        }
+        PathBuf::from(source)
+    };
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let parent = path.parent()?;
+    if parent.file_name().and_then(|name| name.to_str()) != Some("skills")
+        || path.file_name().is_none()
+        || !parent.is_dir()
+        || !path.is_dir()
+    {
+        return None;
+    }
+    Some(path)
+}
+
+/// Prove the reversible skill migration shape used by cross-harness installs:
+/// a fixed-width `date` stamp, a sibling `<source>.backup-$STAMP` destination,
+/// and an exact two-operand `mv` of an existing directory directly under a
+/// `skills` directory. The filesystem checks are load-bearing: this exception
+/// must not turn arbitrary dynamic paths or moves of sensitive roots into an
+/// allow.
+fn statically_safe_timestamped_skill_backup_mv(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    dialect_segment: &str,
+    dialect: ShellDialect,
+) -> bool {
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return false;
+    }
+
+    let words: Vec<&str> = tokenize_for_shell_dialect(dialect_segment, ShellDialect::Posix)
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| token.text(dialect_segment))
+        .collect();
+    if words.len() != 3 || words[0] != "mv" {
+        return false;
+    }
+    let Some(source_template) = double_quoted_word(words[1]) else {
+        return false;
+    };
+    let Some(backup_name) = double_quoted_word(words[2]).and_then(exact_posix_variable) else {
+        return false;
+    };
+
+    let preceding: Vec<&str> = segment_ranges
+        .iter()
+        .copied()
+        .filter(|&(start, end)| {
+            end <= segment_start && !segment_range_is_nested(segment_ranges, start, end)
+        })
+        .filter_map(|(start, end)| source.get(start..end).map(str::trim))
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if preceding.len() != 2 {
+        return false;
+    }
+
+    let Some((stamp_name, stamp_value)) = posix_assignment(preceding[0]) else {
+        return false;
+    };
+    if stamp_value != "$(date +%Y%m%d%H%M%S)" {
+        return false;
+    }
+    let Some((assigned_backup_name, backup_value)) = posix_assignment(preceding[1]) else {
+        return false;
+    };
+    if assigned_backup_name != backup_name {
+        return false;
+    }
+    let Some(backup_template) = double_quoted_word(backup_value) else {
+        return false;
+    };
+    let expected_backup = format!("{source_template}.backup-${stamp_name}");
+    if backup_template != expected_backup {
+        return false;
+    }
+
+    inspectable_skill_directory(source_template).is_some()
 }
 
 /// Statically prove that every value a `$VAR` operand can take keeps this
@@ -21430,7 +21563,16 @@ fn evaluate_core_filesystem_pack(
         // A `$VAR` mv operand whose every provable value (literal assignment
         // or fully literal `for` list) re-evaluates to an allowed segment is
         // exempt from the dynamic-path rule only (issue #242).
-        let final_filter: fn(Option<&str>) -> bool = if statically_safe_loop_variable_mv(
+        let proven_timestamped_skill_backup = statically_safe_timestamped_skill_backup_mv(
+            redirect_source,
+            segment_ranges,
+            segment_start,
+            dialect_segment,
+            shell_dialect,
+        );
+        let final_filter: fn(Option<&str>) -> bool = if proven_timestamped_skill_backup {
+            filesystem_non_pre_rm_non_redirect_pattern_excluding_proven_backup
+        } else if statically_safe_loop_variable_mv(
             redirect_source,
             segment_ranges,
             segment_start,
@@ -21486,6 +21628,13 @@ fn command_pattern_match_is_inert_quoted_data(
     span: MatchSpan,
     source_context: Option<(&str, usize)>,
 ) -> bool {
+    if pack_id == "core.filesystem"
+        && pattern_name == Some("mv-dynamic-path")
+        && mv_dynamic_markers_are_single_quoted(command)
+    {
+        return true;
+    }
+
     if !matches!(pack_id, "core.git" | "core.filesystem")
         || is_core_filesystem_redirect_rule(pack_id, pattern_name)
     {
@@ -21533,6 +21682,29 @@ fn command_pattern_match_is_inert_quoted_data(
                 source_base..source_base.saturating_add(command.len()),
             ))
     })
+}
+
+/// A dollar sign, backtick, or backslash inside a POSIX single-quoted word is
+/// a literal filename byte, not shell expansion evidence. The dynamic-mv rule
+/// may stand down only when every marker it relies on is inside such a span;
+/// one active marker anywhere in the command keeps the fail-closed decision.
+fn mv_dynamic_markers_are_single_quoted(command: &str) -> bool {
+    let spans = crate::context::classify_command(command);
+    let mut found_marker = false;
+
+    for (offset, ch) in command.char_indices() {
+        if !matches!(ch, '$' | '`' | '\\') {
+            continue;
+        }
+        found_marker = true;
+        if !spans.spans().iter().any(|span| {
+            span.kind == crate::context::SpanKind::Data && span.byte_range.contains(&offset)
+        }) {
+            return false;
+        }
+    }
+
+    found_marker
 }
 
 fn offset_is_in_conservatively_scanned_interpreter_input(command: &str, offset: usize) -> bool {
@@ -33864,6 +34036,104 @@ mod tests {
     // =========================================================================
     // Issue #242: for-loop literal narrowing for mv (and loop-bound redirects)
     // =========================================================================
+
+    #[test]
+    fn single_quoted_dollar_in_mv_path_is_literal() {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            let literal = evaluate_with_pack_ids_in_dialect(
+                "mv './$ROOT' '/tmp/dcg-repro-destination'",
+                &["core.filesystem"],
+                dialect,
+            );
+            assert!(
+                literal.is_allowed(),
+                "single-quoted dollar path must be literal under {dialect:?}: {:?}",
+                literal.pattern_info
+            );
+        }
+
+        for command in [
+            "mv \"./$ROOT\" '/tmp/dcg-repro-destination'",
+            "mv './$ROOT' \"$DEST\"",
+        ] {
+            let dynamic = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                dynamic.is_denied(),
+                "active expansion must remain denied: {command:?}"
+            );
+            assert_eq!(
+                dynamic
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some("mv-dynamic-path")
+            );
+        }
+    }
+
+    #[test]
+    fn timestamped_existing_skill_directory_backup_is_allowed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skill = temp.path().join("skills/example");
+        std::fs::create_dir_all(&skill).expect("create skill directory");
+        let source = skill.display();
+        let command = format!(
+            "STAMP=$(date +%Y%m%d%H%M%S); BACKUP=\"{source}.backup-$STAMP\"; mv \"{source}\" \"$BACKUP\""
+        );
+
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            let result = evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
+            assert!(
+                result.is_allowed(),
+                "bounded timestamped backup must allow under {dialect:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn unbounded_or_destructive_timestamped_moves_stay_denied() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skill = temp.path().join("skills/example");
+        let other = temp.path().join("projects/example");
+        std::fs::create_dir_all(&skill).expect("create skill directory");
+        std::fs::create_dir_all(&other).expect("create non-skill directory");
+        let skill = skill.display();
+        let other = other.display();
+        let commands = [
+            format!(
+                "STAMP=$(curl example.test); BACKUP=\"{skill}.backup-$STAMP\"; mv \"{skill}\" \"$BACKUP\""
+            ),
+            format!(
+                "STAMP=$(date +%Y%m%d%H%M%S); BACKUP=\"{other}.backup-$STAMP\"; mv \"{skill}\" \"$BACKUP\""
+            ),
+            format!(
+                "STAMP=$(date +%Y%m%d%H%M%S); BACKUP=\"{other}.backup-$STAMP\"; mv \"{other}\" \"$BACKUP\""
+            ),
+            format!(
+                "STAMP=$(date +%Y%m%d%H%M%S); BACKUP=\"{skill}.backup-$STAMP\"; mv -f \"{skill}\" \"$BACKUP\""
+            ),
+            "STAMP=$(date +%Y%m%d%H%M%S); BACKUP=\"/etc.backup-$STAMP\"; mv \"/etc\" \"$BACKUP\""
+                .to_string(),
+            format!("DEST=$(date +%s); mv \"{skill}\" \"$DEST\""),
+        ];
+
+        for command in commands {
+            let result = evaluate_with_pack_ids_in_dialect(
+                &command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "unbounded or destructive move must deny: {command:?}"
+            );
+        }
+    }
 
     #[test]
     fn literal_for_loop_binding_proves_mv_operands() {
