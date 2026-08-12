@@ -746,8 +746,11 @@ impl Pack {
                     .matches_destructive_named_by(cmd, |name| name != Some("branch-force-delete"));
             }
         }
+        let pnpm_publish_is_actionable = self.id != "package_managers"
+            || crate::packs::package_managers::invokes_pnpm_publish(cmd);
         self.destructive_patterns
             .iter()
+            .filter(|pattern| pattern.name != Some("pnpm-publish") || pnpm_publish_is_actionable)
             .find(|p| p.regex.is_match(cmd))
             .map(|p| DestructiveMatch {
                 reason: p.reason,
