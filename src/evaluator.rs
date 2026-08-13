@@ -20548,6 +20548,132 @@ fn statically_safe_variable_redirect(
         .all(|value| resolved_redirect_target_is_benign(&format!("{value}{suffix}")))
 }
 
+/// Prove the narrow cleanup companion to the scoped `mktemp -d` redirect
+/// proof: a fresh root may be removed only after the same command uses it as
+/// the output directory for one direct `bun build` invocation.
+///
+/// This deliberately does not make a minted root generally removable. The
+/// consumer shape is the reported build command, and every other flow keeps
+/// the ordinary `rm -rf` review requirement.
+fn statically_safe_scoped_mktemp_cleanup(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    dialect_segment: &str,
+    dialect: ShellDialect,
+) -> bool {
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return false;
+    }
+    let Some(root_name) = exact_scoped_mktemp_cleanup_root(dialect_segment) else {
+        return false;
+    };
+    let Some(root_assignment) =
+        single_top_level_assignment_value(source, segment_ranges, segment_start, root_name)
+    else {
+        return false;
+    };
+    if mktemp_directory_scratch_assignment_value(root_assignment).is_none()
+        || scoped_mktemp_constructor_environment_is_mutated(
+            source,
+            segment_ranges,
+            segment_start,
+            root_name,
+        )
+    {
+        return false;
+    }
+
+    scoped_mktemp_cleanup_is_exact_serial_flow(source, segment_start, root_name)
+}
+
+/// The cleanup proof only applies to one current-shell sequence. In
+/// particular, `&&` keeps the assignment, build, and cleanup serial; `;`,
+/// `||`, `|`, `&`, and a bare newline do not establish that ordering.
+fn scoped_mktemp_cleanup_is_exact_serial_flow(
+    source: &str,
+    cleanup_start: usize,
+    root_name: &str,
+) -> bool {
+    let top_level = top_level_segment_ranges(source);
+    let [
+        (assignment_start, assignment_end),
+        (build_start, build_end),
+        (cleanup_range_start, cleanup_end),
+    ] = top_level.as_slice()
+    else {
+        return false;
+    };
+    if *cleanup_range_start != cleanup_start {
+        return false;
+    }
+    let Some(assignment) = source
+        .get(*assignment_start..*assignment_end)
+        .map(str::trim)
+    else {
+        return false;
+    };
+    let Some(build) = source.get(*build_start..*build_end).map(str::trim) else {
+        return false;
+    };
+    let Some(cleanup) = source
+        .get(*cleanup_range_start..*cleanup_end)
+        .map(str::trim)
+    else {
+        return false;
+    };
+    assignment
+        .strip_prefix(root_name)
+        .is_some_and(|rest| rest.starts_with('='))
+        && is_scoped_mktemp_bun_build(build, root_name)
+        && exact_scoped_mktemp_cleanup_root(cleanup) == Some(root_name)
+        && source
+            .get(..*assignment_start)
+            .is_some_and(|prefix| prefix.trim().is_empty())
+        && source
+            .get(*assignment_end..*build_start)
+            .is_some_and(|separator| separator.trim() == "&&")
+        && source
+            .get(*build_end..*cleanup_range_start)
+            .is_some_and(|separator| separator.trim() == "&&")
+        && source
+            .get(*cleanup_end..)
+            .is_some_and(|suffix| suffix.trim().is_empty())
+}
+
+/// Accept only the literal cleanup target. Quoting prevents glob expansion,
+/// and rejecting suffixes, parent paths, and braces keeps the proof tied to
+/// the exact binding rather than a path derived from it.
+fn exact_scoped_mktemp_cleanup_root(statement: &str) -> Option<&str> {
+    let statement = statement.trim();
+    let body = statement.strip_prefix("rm -rf \"")?.strip_suffix('"')?;
+    let name = body.strip_prefix('$')?;
+    valid_posix_variable_name(name).then_some(name)
+}
+
+/// The bounded consumer from the reported command. It must use the quoted
+/// minted root as `bun build`'s exact `--outdir` argument; shell wrappers,
+/// substitutions, and alternate output paths are not evidence for cleanup.
+fn is_scoped_mktemp_bun_build(statement: &str, root_name: &str) -> bool {
+    let mut words = statement.split_ascii_whitespace();
+    matches!(
+        (words.next(), words.next(), words.next(), words.next()),
+        (Some("bun"), Some("build"), Some("--outdir"), Some(target))
+            if target == format!("\"${root_name}\"")
+    )
+}
+
+fn valid_posix_variable_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
 /// Accept only static fd duplications (`2>&1`, `>&2`) after the proven target.
 fn trailing_redirects_are_fd_duplications(mut rest: &str) -> bool {
     while let Some(index) = first_unquoted_output_redirect(rest, ShellDialect::Posix) {
@@ -21812,7 +21938,7 @@ fn evaluate_core_filesystem_pack(
             }
         }
 
-        let rm_decision = crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
+        let mut rm_decision = crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
             dialect_segment,
             inherited_automated_stdin
                 || crate::packs::core::filesystem::rm_segment_receives_automated_stdin(
@@ -21822,6 +21948,18 @@ fn evaluate_core_filesystem_pack(
                 ),
             shell_dialect,
         );
+        if matches!(
+            rm_decision,
+            crate::packs::core::filesystem::RmParseDecision::Deny(_)
+        ) && statically_safe_scoped_mktemp_cleanup(
+            redirect_source,
+            segment_ranges,
+            segment_start,
+            dialect_segment,
+            shell_dialect,
+        ) {
+            rm_decision = crate::packs::core::filesystem::RmParseDecision::Allow;
+        }
         let rm_was_semantically_handled = !matches!(
             &rm_decision,
             crate::packs::core::filesystem::RmParseDecision::NoMatch
@@ -29951,6 +30089,30 @@ mod tests {
     }
 
     #[test]
+    fn read_only_command_substitution_is_not_a_dynamic_redirect() {
+        let command = r#"rg -n "Statfs" $(go env GOPATH)/pkg/mod/..."#;
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+            assert!(
+                result.is_allowed(),
+                "a read-only substitution must not be classified as a redirect ({dialect:?}): {:?}",
+                result.pattern_info
+            );
+        }
+
+        let result = evaluate_with_pack_ids_in_dialect(
+            r#"go env GOPATH >/tmp/$(date +%s)"#,
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            result.is_denied(),
+            "a dynamic redirect target must remain denied: {:?}",
+            result.pattern_info
+        );
+    }
+
+    #[test]
     fn mktemp_scratch_roots_prove_variable_redirect_targets() {
         // #275: a variable bound to `$(mktemp)` / `$(mktemp -d)` in the same
         // command is a freshly minted, caller-owned temp path — redirects into
@@ -34735,6 +34897,67 @@ done"#;
             assert!(
                 result.is_denied(),
                 "unproven fresh-temp flow must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_mktemp_bun_build_cleanup_allows_only_the_exact_minted_root() {
+        for allowed in [
+            r#"TASK_BUILD_DIR=$(mktemp -d) && bun build --outdir "$TASK_BUILD_DIR" extensions/codegraph/index.ts && rm -rf "$TASK_BUILD_DIR""#,
+            "TASK_BUILD_DIR=$(mktemp -d) &&\n  bun build --outdir \"$TASK_BUILD_DIR\" entry.ts &&\n  rm -rf \"$TASK_BUILD_DIR\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                allowed,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "the reported fresh-temp build cleanup must be allowed: {:?}",
+                result.pattern_info
+            );
+        }
+
+        for command in [
+            // Reassignment makes the cleanup target ambiguous.
+            r#"TASK_BUILD_DIR=$(mktemp -d) && bun build --outdir "$TASK_BUILD_DIR" entry.ts && TASK_BUILD_DIR=/etc && rm -rf "$TASK_BUILD_DIR""#,
+            // An ambient or caller-controlled temp root is not minted here.
+            r#"TASK_BUILD_DIR="$TMPDIR" && bun build --outdir "$TASK_BUILD_DIR" entry.ts && rm -rf "$TASK_BUILD_DIR""#,
+            // The constructor must be the exact mktemp binary with its safe
+            // directory-producing flags.
+            r#"mktemp() { echo /; }; TASK_BUILD_DIR=$(mktemp -d) && bun build --outdir "$TASK_BUILD_DIR" entry.ts && rm -rf "$TASK_BUILD_DIR""#,
+            // The cleanup cannot precede the proof-producing assignment.
+            r#"rm -rf "$TASK_BUILD_DIR" && TASK_BUILD_DIR=$(mktemp -d) && bun build --outdir "$TASK_BUILD_DIR" entry.ts"#,
+            // Derived deletion targets, including the parent and a suffix,
+            // are not the exact minted root.
+            r#"TASK_BUILD_DIR=$(mktemp -d) && bun build --outdir "$TASK_BUILD_DIR" entry.ts && rm -rf "${TASK_BUILD_DIR}""#,
+            r#"TASK_BUILD_DIR=$(mktemp -d) && bun build --outdir "$TASK_BUILD_DIR" entry.ts && rm -rf "$TASK_BUILD_DIR/child""#,
+            r#"TASK_BUILD_DIR=$(mktemp -d) && bun build --outdir "$TASK_BUILD_DIR" entry.ts && rm -rf "$TASK_BUILD_DIR/..""#,
+            // Wrappers, functions, and traps make the flow unmodeled.
+            r#"TASK_BUILD_DIR=$(mktemp -d) && runner=bun && "$runner" build --outdir "$TASK_BUILD_DIR" entry.ts && rm -rf "$TASK_BUILD_DIR""#,
+            r#"TASK_BUILD_DIR=$(mktemp -d) && eval 'bun build --outdir "$TASK_BUILD_DIR" entry.ts' && rm -rf "$TASK_BUILD_DIR""#,
+            r#"TASK_BUILD_DIR=$(mktemp -d) && build() { bun build --outdir "$TASK_BUILD_DIR" entry.ts; } && build && rm -rf "$TASK_BUILD_DIR""#,
+            r#"TASK_BUILD_DIR=$(mktemp -d) && trap 'rm -rf -- "$TASK_BUILD_DIR"' EXIT && bun build --outdir "$TASK_BUILD_DIR" entry.ts && rm -rf "$TASK_BUILD_DIR""#,
+            // Only explicit `&&` sequencing is evidence that the build and
+            // cleanup run serially in the current shell.
+            r#"TASK_BUILD_DIR=$(mktemp -d); bun build --outdir "$TASK_BUILD_DIR" entry.ts; rm -rf "$TASK_BUILD_DIR""#,
+            r#"TASK_BUILD_DIR=$(mktemp -d) || bun build --outdir "$TASK_BUILD_DIR" entry.ts && rm -rf "$TASK_BUILD_DIR""#,
+            r#"TASK_BUILD_DIR=$(mktemp -d) && bun build --outdir "$TASK_BUILD_DIR" entry.ts || rm -rf "$TASK_BUILD_DIR""#,
+            r#"TASK_BUILD_DIR=$(mktemp -d) & bun build --outdir "$TASK_BUILD_DIR" entry.ts && rm -rf "$TASK_BUILD_DIR""#,
+            r#"TASK_BUILD_DIR=$(mktemp -d) && bun build --outdir "$TASK_BUILD_DIR" entry.ts & rm -rf "$TASK_BUILD_DIR""#,
+            r#"TASK_BUILD_DIR=$(mktemp -d) && bun build --outdir "$TASK_BUILD_DIR" entry.ts | cat && rm -rf "$TASK_BUILD_DIR""#,
+            "TASK_BUILD_DIR=$(mktemp -d)\nbun build --outdir \"$TASK_BUILD_DIR\" entry.ts\nrm -rf \"$TASK_BUILD_DIR\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "unproven fresh-temp cleanup must stay denied: {command:?}: {:?}",
                 result.pattern_info
             );
         }
