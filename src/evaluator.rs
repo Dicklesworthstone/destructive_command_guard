@@ -20395,6 +20395,9 @@ fn statically_safe_variable_redirect(
     if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
         return false;
     }
+    if variable_flow_has_untrusted_dispatch(dialect_segment) {
+        return false;
+    }
     let Some(redirect) = first_unquoted_output_redirect(dialect_segment, ShellDialect::Posix)
     else {
         return false;
@@ -20444,16 +20447,27 @@ fn statically_safe_variable_redirect(
         return false;
     };
     let suffix = format!("{inner_suffix}{outer_suffix}");
-    let Some(values) = resolved_variable_values(source, segment_ranges, segment_start, name) else {
+    let values =
+        resolved_variable_values(source, segment_ranges, segment_start, name).or_else(|| {
+            target_was_quoted.then(|| {
+                resolved_scoped_mktemp_descendant_values(
+                    source,
+                    segment_ranges,
+                    segment_start,
+                    name,
+                )
+            })?
+        });
+    let Some(values) = values else {
         return false;
     };
     // An unquoted target lets a glob-bearing value expand further at run
     // time (shell-dependent), which the literal benign-path check cannot
     // cover; double-quoted targets never glob.
     if !target_was_quoted
-        && values
-            .iter()
-            .any(|value| value_expands_when_unquoted(value))
+        && values.iter().any(|value| {
+            value_expands_when_unquoted(value) || value.contains(MKTEMP_SCRATCH_STAND_IN)
+        })
     {
         return false;
     }
@@ -20590,6 +20604,7 @@ fn resolved_variable_values(
         // A changed IFS alters how an unquoted use word-splits, which the
         // substitution proof cannot reproduce (v0.9.1 review).
         if may_mutate_shell_variables
+            || variable_flow_has_untrusted_dispatch(segment)
             || segment_text_may_assign(segment, name)
             || segment_text_may_assign(segment, "IFS")
         {
@@ -20597,6 +20612,141 @@ fn resolved_variable_values(
         }
     }
     values
+}
+
+/// Prove one double-quoted `$ROOT/$SUFFIX` assignment where `ROOT` is exactly
+/// one fresh `mktemp -d` binding in this command and `SUFFIX` is either a
+/// literal descendant or a fully literal `for`-loop value. Other derived
+/// assignments keep the ordinary dynamic-path denial.
+fn resolved_scoped_mktemp_descendant_values(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    name: &str,
+) -> Option<Vec<String>> {
+    let assignment =
+        single_top_level_assignment_value(source, segment_ranges, segment_start, name)?;
+    let (root_name, suffix) = parse_scoped_mktemp_descendant_assignment(assignment)?;
+    let root_assignment =
+        single_top_level_assignment_value(source, segment_ranges, segment_start, root_name)?;
+    if scoped_mktemp_flow_has_unmodeled_mutation(source, segment_ranges, segment_start, root_name)
+        || scoped_mktemp_constructor_environment_is_mutated(
+            source,
+            segment_ranges,
+            segment_start,
+            root_name,
+        )
+    {
+        return None;
+    }
+    mktemp_directory_scratch_assignment_value(root_assignment)?;
+    let roots = resolved_variable_values(source, segment_ranges, segment_start, root_name)?;
+    if roots.len() != 1 || roots[0] != MKTEMP_SCRATCH_STAND_IN {
+        return None;
+    }
+
+    let suffixes = match suffix {
+        ScopedMktempSuffix::Literal(value) => vec![value.to_string()],
+        ScopedMktempSuffix::Variable(name) => {
+            resolved_variable_values(source, segment_ranges, segment_start, name)?
+        }
+    };
+    // A loop executes every enumerated value. Keeping only the safe members
+    // would bless a redirect that the escaping iteration still performs.
+    suffixes
+        .iter()
+        .all(|suffix| scoped_mktemp_descendant_suffix_is_safe(suffix))
+        .then(|| {
+            suffixes
+                .into_iter()
+                .map(|suffix| format!("{MKTEMP_SCRATCH_STAND_IN}/{suffix}"))
+                .collect()
+        })
+}
+
+/// A target assignment may have one preceding top-level binding only. The
+/// normal variable resolver separately checks reassignment and dispatch
+/// hazards for every name in the accepted flow.
+fn single_top_level_assignment_value<'a>(
+    source: &'a str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    name: &str,
+) -> Option<&'a str> {
+    let mut assignment = None;
+    for &(start, end) in segment_ranges {
+        if end > segment_start || segment_range_is_nested(segment_ranges, start, end) {
+            continue;
+        }
+        let segment = source.get(start..end)?.trim();
+        if posix_for_loop_binds(segment, name) {
+            return None;
+        }
+        let Some(value) = segment
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('='))
+        else {
+            continue;
+        };
+        if assignment.replace(value).is_some() {
+            return None;
+        }
+    }
+    assignment
+}
+
+enum ScopedMktempSuffix<'a> {
+    Literal(&'a str),
+    Variable(&'a str),
+}
+
+/// Parse exactly `"$ROOT/<literal>"` or `"$ROOT/$LOOP_VALUE"`. The whole
+/// assignment is double-quoted and neither side admits substitutions, globs,
+/// parameter operators, or additional concatenation.
+fn parse_scoped_mktemp_descendant_assignment(raw: &str) -> Option<(&str, ScopedMktempSuffix<'_>)> {
+    let body = raw.trim().strip_prefix('"')?.strip_suffix('"')?;
+    let (root, remainder) = split_posix_variable_reference(body)?;
+    let suffix = remainder.strip_prefix('/')?;
+    if suffix.is_empty() {
+        return None;
+    }
+    if suffix.starts_with('$') {
+        let (name, trailing) = split_posix_variable_reference(suffix)?;
+        return trailing
+            .is_empty()
+            .then_some((root, ScopedMktempSuffix::Variable(name)));
+    }
+    (!suffix.contains('$')).then_some((root, ScopedMktempSuffix::Literal(suffix)))
+}
+
+fn split_posix_variable_reference(raw: &str) -> Option<(&str, &str)> {
+    let raw = raw.strip_prefix('$')?;
+    let (name, trailing) = if let Some(body) = raw.strip_prefix('{') {
+        let close = body.find('}')?;
+        (&body[..close], &body[close + 1..])
+    } else {
+        let end = raw
+            .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .unwrap_or(raw.len());
+        (&raw[..end], &raw[end..])
+    };
+    let valid_name = !name.is_empty()
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    valid_name.then_some((name, trailing))
+}
+
+fn scoped_mktemp_descendant_suffix_is_safe(suffix: &str) -> bool {
+    !suffix.starts_with('/')
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/'))
+        && !suffix.split('/').any(|component| component == "..")
 }
 
 /// First word of a segment with command-position prefixes stripped:
@@ -20616,6 +20766,137 @@ fn hazard_first_word(segment: &str) -> &str {
             None => return "",
         }
     }
+}
+
+/// Shell functions, aliases, and dynamically-dispatched wrappers can mutate a
+/// previously proven variable before a later redirect. Their syntax is
+/// unmodeled by the ordinary literal-variable proof, so reject it there.
+fn variable_flow_has_untrusted_dispatch(segment: &str) -> bool {
+    segment.split([';', '|', '&']).any(|statement| {
+        let statement = strip_command_prefix_reserved_words(statement);
+        let mut words = statement.split_ascii_whitespace();
+        let Some(first) = words.next() else {
+            return false;
+        };
+        matches!(
+            first,
+            "eval" | "source" | "." | "alias" | "unalias" | "function"
+        ) || first.ends_with("()")
+            || words.clone().next() == Some("()")
+            || first.starts_with(['$', '`'])
+            || matches!(first, "command" | "builtin" | "exec")
+                && words
+                    .next()
+                    .is_some_and(|word| word.trim_matches(['\'', '"']).starts_with(['$', '`']))
+    })
+}
+
+/// The scoped-mktemp exception additionally refuses every command it cannot
+/// prove incapable of changing a target variable in the parent shell. This
+/// boundary is intentionally limited to the new exception: ordinary literal
+/// variable proofs continue to accept external commands as before.
+fn scoped_mktemp_flow_has_unmodeled_mutation(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    root_name: &str,
+) -> bool {
+    segment_ranges.iter().any(|&(start, end)| {
+        end <= segment_start
+            && source
+                .get(start..end)
+                .is_some_and(|segment| variable_flow_has_unmodeled_mutation(segment, root_name))
+    })
+}
+
+/// Environment assignments before `$(mktemp -d)` can change its lookup or
+/// runtime behavior. This exception therefore requires the constructor to run
+/// before any assignment, except its own binding; later derived-path bindings
+/// are handled by the flow proof above.
+fn scoped_mktemp_constructor_environment_is_mutated(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    root_name: &str,
+) -> bool {
+    let Some(constructor_start) = segment_ranges.iter().find_map(|&(start, end)| {
+        (end <= segment_start && !segment_range_is_nested(segment_ranges, start, end))
+            .then(|| source.get(start..end).map(str::trim))
+            .flatten()?
+            .strip_prefix(root_name)
+            .filter(|rest| rest.starts_with('='))
+            .map(|_| start)
+    }) else {
+        return true;
+    };
+    segment_ranges.iter().any(|&(start, end)| {
+        end <= constructor_start
+            && !segment_range_is_nested(segment_ranges, start, end)
+            && source.get(start..end).is_some_and(|segment| {
+                let segment = segment.trim();
+                statement_is_assignment(segment)
+                    && !segment
+                        .strip_prefix(root_name)
+                        .is_some_and(|rest| rest.starts_with('='))
+            })
+    })
+}
+
+/// Reject a flow segment unless it is syntax, a pure assignment, or one of the
+/// few commands this proof models as unable to replace a bound shell variable.
+/// This deliberately treats unknown command words as possible functions: a
+/// function may mutate the target in the current shell. It also catches
+/// function/alias definitions and wrapper dispatch before `mktemp` is trusted.
+fn variable_flow_has_unmodeled_mutation(segment: &str, root_name: &str) -> bool {
+    segment.split([';', '|', '&']).any(|statement| {
+        let statement = strip_command_prefix_reserved_words(statement);
+        let mut words = statement.split_ascii_whitespace();
+        let Some(first) = words.next() else {
+            return false;
+        };
+        if statement_is_assignment(first) || matches!(first, "for" | "done" | "fi" | "esac") {
+            return false;
+        }
+        if first == "trap" {
+            return !statement_is_scoped_mktemp_cleanup_trap(statement, root_name);
+        }
+        if matches!(
+            first,
+            "eval" | "source" | "." | "alias" | "unalias" | "function"
+        ) || first.ends_with("()")
+            || words.clone().next() == Some("()")
+            || first.starts_with(['$', '`'])
+        {
+            return true;
+        }
+        if matches!(first, "command" | "builtin" | "exec") {
+            // Quote removal still expands `command "$runner"`; wrappers are
+            // dispatch, not evidence that the named binary will run.
+            return true;
+        }
+        !matches!(
+            first,
+            ":" | "true" | "false" | "set" | "mkdir" | "printf" | "mktemp"
+        )
+    })
+}
+
+fn statement_is_scoped_mktemp_cleanup_trap(statement: &str, root_name: &str) -> bool {
+    statement.trim() == format!("trap 'rm -rf -- \"${root_name}\"' EXIT")
+}
+
+fn statement_is_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 /// Whether a segment range is nested inside another extracted segment (the
@@ -20744,6 +21025,20 @@ const MKTEMP_SCRATCH_STAND_IN: &str = "/tmp/dcg.mktemp.scratch";
 /// `$TMPDIR`), and `-u`/`--dry-run` returns a name without creating it, so all
 /// of those keep the fail-closed treatment.
 fn mktemp_scratch_assignment_value(raw: &str) -> Option<String> {
+    mktemp_scratch_assignment_value_with_directory_requirement(raw, false)
+}
+
+/// Recognize the directory-creating subset used by the scoped descendant
+/// proof. A plain `mktemp` creates a file, so it cannot establish a root that
+/// may safely receive derived child paths.
+fn mktemp_directory_scratch_assignment_value(raw: &str) -> Option<String> {
+    mktemp_scratch_assignment_value_with_directory_requirement(raw, true)
+}
+
+fn mktemp_scratch_assignment_value_with_directory_requirement(
+    raw: &str,
+    require_directory: bool,
+) -> Option<String> {
     let raw = raw.trim();
     let raw = raw
         .strip_prefix('"')
@@ -20757,10 +21052,15 @@ fn mktemp_scratch_assignment_value(raw: &str) -> Option<String> {
     if words.next()? != "mktemp" {
         return None;
     }
-    if !words.all(|word| matches!(word, "-d" | "--directory" | "-q" | "--quiet")) {
-        return None;
+    let mut directory = false;
+    for word in words {
+        match word {
+            "-d" | "--directory" => directory = true,
+            "-q" | "--quiet" => {}
+            _ => return None,
+        }
     }
-    Some(MKTEMP_SCRATCH_STAND_IN.to_string())
+    (!require_directory || directory).then(|| MKTEMP_SCRATCH_STAND_IN.to_string())
 }
 
 /// A whole-segment assignment value that is one literal shell word.
@@ -34240,6 +34540,147 @@ mod tests {
                      (expected one of {expected_rules:?})"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn fresh_mktemp_directory_flow_allows_only_literal_scoped_descendants() {
+        let allowed = r#"set -euo pipefail
+tmp="$(mktemp -d)"
+trap 'rm -rf -- "$tmp"' EXIT
+for mode in legacy empty; do
+  dir="$tmp/$mode"
+  mkdir -p "$dir"
+  printf '%s\n' hi >"$dir/out"
+done"#;
+        let result =
+            evaluate_with_pack_ids_in_dialect(allowed, &["core.filesystem"], ShellDialect::Posix);
+        assert!(
+            result.is_allowed(),
+            "fresh mktemp descendants with literal loop values must be allowed: {:?}",
+            result.pattern_info
+        );
+
+        for command in [
+            // Ambient input cannot establish a scratch root.
+            concat!("tmp=\"${TMPDIR", ":?}\"; printf '%s\\n' hi >\"$tmp/out\""),
+            // A later binding makes the root ambiguous.
+            r#"tmp=$(mktemp -d); tmp=/etc; printf '%s\n' hi >"$tmp/out""#,
+            // Only the exact, fresh mktemp constructor is trusted.
+            r#"tmp=$(mktemp -d; printf /etc); printf '%s\n' hi >"$tmp/out""#,
+            // Loop values must be statically enumerable.
+            r#"tmp=$(mktemp -d); for mode in "$@"; do dir="$tmp/$mode"; printf '%s\n' hi >"$dir/out"; done"#,
+            // A composed path may not escape the minted root.
+            r#"tmp=$(mktemp -d); for mode in legacy; do dir="$tmp/$mode/../../etc"; printf '%s\n' hi >"$dir/out"; done"#,
+            // A redirect outside the root cannot inherit its proof.
+            r#"tmp=$(mktemp -d); for mode in legacy; do dir="/etc/$mode"; printf '%s\n' hi >"$dir/out"; done"#,
+            // Runtime dispatch can mutate the root before the redirect.
+            r#"tmp=$(mktemp -d); runner=printf; $runner '%s\n' hi >"$tmp/out""#,
+            r#"tmp=$(mktemp -d); eval 'tmp=/etc'; printf '%s\n' hi >"$tmp/out""#,
+            r#"tmp=$(mktemp -d); source config.sh; printf '%s\n' hi >"$tmp/out""#,
+            r#"tmp=$(mktemp -d); rewrite() { tmp=/etc; }; rewrite; printf '%s\n' hi >"$tmp/out""#,
+            r#"tmp=$(mktemp -d); alias runner=printf; runner '%s\n' hi >"$tmp/out""#,
+            // An unquoted expansion is not a bounded redirect target.
+            r"tmp=$(mktemp -d); printf '%s\n' hi >$tmp/out",
+            // A fresh temp assignment must not bless cleanup of another path.
+            r#"tmp=$(mktemp -d); repo=$PWD; rm -rf -- "$repo""#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "unproven fresh-temp flow must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_mktemp_redirect_proof_rejects_dispatch_and_unsafe_loop_members() {
+        let deny_cases = [
+            // A same-command definition can replace the exact mktemp binary;
+            // both compact and POSIX-whitespace forms must refuse the root.
+            "mktemp() { echo /; }\ntmp=\"$(mktemp -d)\"\ndir=\"$tmp/etc\"\nprintf x >\"$dir/passwd\"",
+            "mktemp () { echo /; }\ntmp=\"$(mktemp -d)\"\ndir=\"$tmp/etc\"\nprintf x >\"$dir/passwd\"",
+            "function mktemp { echo /; }\ntmp=\"$(mktemp -d)\"\ndir=\"$tmp/etc\"\nprintf x >\"$dir/passwd\"",
+            "alias mktemp='echo /'\ntmp=\"$(mktemp -d)\"\ndir=\"$tmp/etc\"\nprintf x >\"$dir/passwd\"",
+            // Wrapper operands expand after quote removal. `runner=eval`
+            // therefore changes dir before the redirect.
+            "tmp=\"$(mktemp -d)\"\ndir=\"$tmp/x\"\nrunner=eval\ncommand \"$runner\" \"dir=/etc\"\nprintf x >\"$dir/passwd\"",
+            "tmp=\"$(mktemp -d)\"\ndir=\"$tmp/x\"\nrunner=eval\nbuiltin \"$runner\" \"dir=/etc\"\nprintf x >\"$dir/passwd\"",
+            "tmp=\"$(mktemp -d)\"\ndir=\"$tmp/x\"\nrunner=eval\nexec \"$runner\" \"dir=/etc\"\nprintf x >\"$dir/passwd\"",
+            // An otherwise unmodeled command can be a shell function that
+            // mutates the parent-shell target variable.
+            "tmp=\"$(mktemp -d)\"\ndir=\"$tmp/x\"\nmutate\nprintf x >\"$dir/passwd\"",
+            // Every literal loop value must remain a descendant, not just
+            // the first safe value.
+            "set -euo pipefail\ntmp=\"$(mktemp -d)\"\ntrap 'rm -rf -- \"$tmp\"' EXIT\nfor mode in legacy ../../../../etc; do\n  dir=\"$tmp/$mode\"\n  mkdir -p \"$dir\"\n  printf '%s\\n' hi >\"$dir/passwd\"\ndone",
+            // Mixed ordering must be equally fail-closed.
+            "tmp=\"$(mktemp -d)\"\nfor mode in ../../../../etc legacy; do dir=\"$tmp/$mode\"; printf x >\"$dir/passwd\"; done",
+        ];
+
+        for command in deny_cases {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "scoped mktemp proof must fail closed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_mktemp_redirect_proof_rejects_traps_and_constructor_environment() {
+        let exact_cleanup = evaluate_with_pack_ids_in_dialect(
+            "tmp=\"$(mktemp -d)\"\ndir=\"$tmp/x\"\ntrap 'rm -rf -- \"$tmp\"' EXIT\nprintf x >\"$dir/passwd\"",
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            exact_cleanup.is_allowed(),
+            "only the exact minted-root EXIT cleanup may retain the scoped proof: {:?}",
+            exact_cleanup.pattern_info
+        );
+
+        let deny_cases = [
+            // A DEBUG trap runs before the redirecting command and can
+            // rewrite the proven target in the parent shell.
+            "tmp=\"$(mktemp -d)\"\ndir=\"$tmp/x\"\ntrap 'dir=/etc' DEBUG\nprintf x >\"$dir/passwd\"",
+            "tmp=\"$(mktemp -d)\"\ndir=\"$tmp/x\"\ntrap 'dir=/etc' RETURN\nprintf x >\"$dir/passwd\"",
+            "tmp=\"$(mktemp -d)\"\ndir=\"$tmp/x\"\ntrap 'dir=/etc' ERR\nprintf x >\"$dir/passwd\"",
+            "tmp=\"$(mktemp -d)\"\ndir=\"$tmp/x\"\ntrap 'dir=/etc' HUP\nprintf x >\"$dir/passwd\"",
+            // Even EXIT is safe only for the literal cleanup of this exact
+            // minted root; other bodies or roots are not part of the proof.
+            "tmp=\"$(mktemp -d)\"\ndir=\"$tmp/x\"\ntrap 'dir=/etc' EXIT\nprintf x >\"$dir/passwd\"",
+            "tmp=\"$(mktemp -d)\"\ndir=\"$tmp/x\"\ntrap 'rm -rf -- \"$dir\"' EXIT\nprintf x >\"$dir/passwd\"",
+            // Command-resolution and execution environment must be stable
+            // when the exact mktemp constructor is invoked, in either order.
+            "PATH=/tmp/dcg-user-bin\ntmp=\"$(mktemp -d)\"\ndir=\"$tmp/etc\"\nprintf x >\"$dir/passwd\"",
+            "IFS=:; PATH=/tmp/dcg-user-bin\ntmp=\"$(mktemp -d)\"\ndir=\"$tmp/etc\"\nprintf x >\"$dir/passwd\"",
+            "BASH_ENV=/tmp/dcg-user-bin/init\ntmp=\"$(mktemp -d)\"\ndir=\"$tmp/etc\"\nprintf x >\"$dir/passwd\"",
+            "ENV=/tmp/dcg-user-bin/init\ntmp=\"$(mktemp -d)\"\ndir=\"$tmp/etc\"\nprintf x >\"$dir/passwd\"",
+            "CDPATH=/tmp/dcg-user-bin\ntmp=\"$(mktemp -d)\"\ndir=\"$tmp/etc\"\nprintf x >\"$dir/passwd\"",
+            "PATH=/tmp/dcg-user-bin; tmp=\"$(mktemp -d)\"; dir=\"$tmp/etc\"; printf x >\"$dir/passwd\"",
+        ];
+
+        for command in deny_cases {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "scoped mktemp proof must reject trap/environment hazards: {command:?}: {:?}",
+                result.pattern_info
+            );
         }
     }
 
