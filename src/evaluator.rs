@@ -10841,6 +10841,74 @@ fn evaluate_command_substitutions(
     None
 }
 
+/// Whether a raw POSIX word contains expansion syntax that changes an
+/// executable at runtime. Single-quoted dollars and backticks are literal.
+fn posix_executable_word_has_runtime_expansion(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut index = 0usize;
+    let mut single_quoted = false;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if !single_quoted => index += 2,
+            b'\'' => {
+                single_quoted = !single_quoted;
+                index += 1;
+            }
+            b'$' | b'`' if !single_quoted => return true,
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+/// Keep dynamic execution constructs inside POSIX `for` bodies fail-closed.
+/// The wrapper path uses the normalizer's option and assignment handling, then
+/// examines the actual executable selected by `command` or `env`. This avoids
+/// treating a safe substitution in an ordinary argument as executable syntax.
+fn reject_dynamic_posix_for_body(command: &str, dialect: ShellDialect) -> Option<EvaluationResult> {
+    if dialect != ShellDialect::Posix {
+        return None;
+    }
+    if !command.trim_start().starts_with("for ") {
+        return None;
+    }
+
+    let dynamic_execution = crate::packs::split_command_segments_in_dialect(command, dialect)
+        .into_iter()
+        .any(|segment| {
+            let segment = strip_command_prefix_reserved_words(segment);
+            let words = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+            let first = words
+                .iter()
+                .find(|token| token.kind == NormalizeTokenKind::Word)
+                .and_then(|token| token.text(segment));
+            let direct_dynamic = first.is_some_and(posix_executable_word_has_runtime_expansion);
+            let direct_execution = first
+                .is_some_and(|word| matches!(word, "eval" | "alias" | "unalias" | "source" | "."));
+            let stripped = strip_wrapper_prefixes(segment);
+            let selected_by_wrapper = stripped
+                .stripped_wrappers
+                .iter()
+                .any(|wrapper| matches!(wrapper.wrapper_type, "command" | "env"))
+                && tokenize_for_shell_dialect(
+                    stripped.normalized.trim_start(),
+                    ShellDialect::Posix,
+                )
+                .iter()
+                .find(|token| token.kind == NormalizeTokenKind::Word)
+                .and_then(|token| token.text(stripped.normalized.trim_start()))
+                .is_some_and(posix_executable_word_has_runtime_expansion);
+            direct_dynamic || direct_execution || selected_by_wrapper
+        });
+
+    dynamic_execution.then(|| {
+        EvaluationResult::denied_by_legacy(
+            "POSIX for loop contains dynamic execution that cannot be statically inspected",
+        )
+    })
+}
+
 /// Mask outer-shell data bytes after every POSIX command substitution body has
 /// already been recursively evaluated.
 ///
@@ -12030,6 +12098,10 @@ fn evaluate_command_in_single_dialect_view(
         &mut heredoc_allowlist_hit,
         inherited_automated_stdin,
     ) {
+        return blocked;
+    }
+
+    if let Some(blocked) = reject_dynamic_posix_for_body(command, shell_dialect) {
         return blocked;
     }
 
@@ -23992,6 +24064,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn posix_fixed_word_for_loop_and_dynamic_adversaries_are_classified() {
+        let packs = ["core.git", "core.filesystem"];
+        let static_loop = "for id in bd-1 bd-2; do bd show \"$id\" --json; done";
+        assert!(
+            evaluate_with_pack_ids_in_dialect(static_loop, &packs, ShellDialect::Posix)
+                .is_allowed(),
+            "literal loop with a static read-only body must remain inspectable"
+        );
+
+        for command in [
+            "for id in $ids; do git reset --hard -- \"$id\"; done",
+            "for id in bd-1; do git reset --hard -- \"$id\"; done",
+            "for id in git; do \"$id\" reset --hard; done",
+            "for id in bd-1; do eval 'git reset --hard'; done",
+            "for id in bd-1; do git config alias.bd 'reset --hard'; git bd; done",
+            "for id in bd-1; do git $(printf reset) --hard; done",
+            "for cmd in git; do command \"$cmd\" reset --hard; done",
+            "for cmd in git; do command -p \"${cmd}\" reset --hard; done",
+            "for cmd in git; do env X=1 \"${cmd}\" reset --hard; done",
+            "for cmd in git; do env -i X=1 \"${cmd}\" reset --hard; done",
+            "for outer in one; do for cmd in git; do command \"$cmd\" reset --hard; done; done",
+            "for cmd in git\ndo\n  env -u PATH \"$cmd\" reset --hard\ndone",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "dynamic loop adversary must remain denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        for command in [
+            "for id in bd-1; do printf '%s\\n' \"$(pwd)\"; done",
+            "for id in bd-1; do printf '%s\\n' \"`pwd`\"; done",
+            "for id in bd-1; do command printf '%s\\n' \"$id\"; done",
+            "for id in bd-1; do env X=1 printf '%s\\n' \"$id\"; done",
+        ] {
+            assert!(
+                evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix)
+                    .is_allowed(),
+                "safe loop form must remain allowed: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zsh_array_exclusion_uses_the_proven_posix_dialect() {
+        let packs = ["core.git", "core.filesystem"];
+        let command = r"files=(test/**/*.test.js); files=(${files:#test/company-research/recovery.test.js}); node --test $files";
+
+        assert!(
+            evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix).is_allowed(),
+            "a caller-proven POSIX/zsh command must not be parsed as PowerShell"
+        );
+        assert!(
+            evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Unknown).is_denied(),
+            "without a proven dialect, the PowerShell interpretation remains fail-closed"
+        );
+        assert!(
+            evaluate_with_pack_ids_in_dialect(
+                "Write-Output $($x = 1 +# ) comment\n rm -r ./tree)",
+                &packs,
+                ShellDialect::PowerShell,
+            )
+            .is_denied(),
+            "ambiguous PowerShell substitution must remain fail-closed"
+        );
     }
 
     #[test]
