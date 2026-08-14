@@ -21829,10 +21829,21 @@ fn shell_inline_payload_offset_is_quoted_data(command: &str, offset: usize) -> O
         if content.language != crate::heredoc::ScriptLanguage::Bash {
             return None;
         }
-        // Heredoc bodies have their own scanning tiers; this re-derivation is
-        // only for inline `-c` payloads, whose bytes sit verbatim in the
-        // outer command string.
+        // The payload bytes sit verbatim in the outer command string (both for
+        // inline `-c` args and for executing-interpreter heredoc bodies).
         let payload = command.get(range.clone())?;
+        // A shallow quote check on the payload is only sound for a SINGLE
+        // simple command: a payload with a pipe, separator, or command
+        // substitution can route apparently-quoted "data" into an execution
+        // sink (`echo "rm -rf /" | sh`, `x="rm -rf /"; eval "$x"`), where
+        // treating the match as inert would be a bypass. Restrict the
+        // re-derivation to single-segment payloads; multi-segment payloads
+        // keep the conservative whole-command classification (a pre-existing
+        // safe-direction false positive), and their destructive forms are
+        // caught by the recursive launcher / pipeline-consumer analysis.
+        if crate::packs::split_command_segments(payload).len() != 1 {
+            return None;
+        }
         return Some(crate::context::offset_is_quoted_data(
             payload,
             offset - range.start,
@@ -34179,6 +34190,9 @@ mod tests {
             }
             for command in [
                 "pnpm publish",
+                // A double-quoted subcommand is quoting in every dialect, so
+                // it must not evade the guard anywhere.
+                "pnpm \"publish\"",
                 "pnpm --silent publish",
                 "pnpm --reporter append-only publish",
                 "npm --registry https://r.example publish",
@@ -34192,6 +34206,30 @@ mod tests {
                 );
             }
         }
+
+        // A single-quoted subcommand publishes under shells where single
+        // quotes are quoting (posix/unknown/powershell) and must be caught;
+        // under cmd.exe single quotes are literal argv bytes, so `pnpm
+        // 'publish'` is not the publish subcommand and correctly stays allowed.
+        for dialect in [
+            ShellDialect::Posix,
+            ShellDialect::Unknown,
+            ShellDialect::PowerShell,
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect("pnpm 'publish'", &["package_managers"], dialect);
+            assert!(
+                result.is_denied(),
+                "single-quoted subcommand must deny under {dialect:?}: pnpm 'publish'"
+            );
+        }
+        let cmd_single =
+            evaluate_with_pack_ids_in_dialect("pnpm 'publish'", &["package_managers"], ShellDialect::Cmd);
+        assert!(
+            !cmd_single.is_denied(),
+            "under cmd, single quotes are literal so `pnpm 'publish'` is not a publish: {:?}",
+            cmd_single.pattern_info
+        );
     }
 
     // =========================================================================
@@ -34317,6 +34355,76 @@ mod tests {
                 result.is_denied(),
                 "executed payload destruction must stay denied: {command:?}"
             );
+        }
+    }
+
+    /// Bypass guard for the #288 follow-up: re-classifying an inline payload's
+    /// match against the payload's own quoting must NOT let quoted-data-then-
+    /// execute indirection through. The re-classification only marks the outer
+    /// whole-command regex match inert; the recursive payload evaluation still
+    /// denies genuine destruction (here via the dynamic-eval fail-closed
+    /// rule), so the command as a whole is denied.
+    #[test]
+    fn inline_payload_quote_context_is_not_an_eval_bypass_issue_288() {
+        for command in [
+            // rm-rf sits in a double-quoted assignment value (data), then eval
+            // executes the variable — the eval-dynamic rule fails closed.
+            r#"bash -c 'x="rm -rf /"; eval "$x"'"#,
+            r#"sh -lc 'CMD="rm -rf ~"; eval "$CMD"'"#,
+            // Executing heredoc whose body runs rm -rf directly.
+            "bash <<'EOF'\nrm -rf /\nEOF",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+                assert!(
+                    result.is_denied(),
+                    "indirect payload destruction must stay denied under {dialect:?}: {command:?} -> {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+
+        // An executing heredoc whose body is a genuine grep of quoted data is
+        // still allowed — parity with the bare command.
+        for command in ["bash <<'EOF'\ngrep -n \"rm -rf /\" notes.md\nEOF"] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], ShellDialect::Posix);
+            assert!(
+                !result.is_denied(),
+                "quoted grep in an executing heredoc body is data: {command:?} -> {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// The #288 re-classification must not change a payload's verdict relative
+    /// to running the same payload bare: wrapping a command in `bash -c '…'`
+    /// yields the same allow/deny as the bare command. This pins the invariant
+    /// even where the bare verdict is itself a known gap (`echo … | sh` into a
+    /// non-REPL consumer, documented under #191), so #288 cannot silently make
+    /// any such case worse.
+    #[test]
+    fn inline_payload_matches_bare_command_verdict_issue_288() {
+        for payload in [
+            r#"grep -n "rm -rf /" notes.md"#,
+            r#"echo "rm -rf /" | sh"#,
+            r#"x="rm -rf /"; eval "$x""#,
+            "rm -rf /",
+        ] {
+            let wrapped = format!("bash -c '{payload}'");
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let bare = evaluate_with_pack_ids_in_dialect(payload, &["core.filesystem"], dialect);
+                let via_c =
+                    evaluate_with_pack_ids_in_dialect(&wrapped, &["core.filesystem"], dialect);
+                assert_eq!(
+                    bare.is_denied(),
+                    via_c.is_denied(),
+                    "wrapping must not change the verdict under {dialect:?}: payload {payload:?} bare={:?} wrapped={:?}",
+                    bare.pattern_info,
+                    via_c.pattern_info
+                );
+            }
         }
     }
 

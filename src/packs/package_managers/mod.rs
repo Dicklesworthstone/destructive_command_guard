@@ -109,9 +109,18 @@ fn segment_invokes_publish(segment: &str, exe: PublishExe) -> bool {
             continue;
         }
         let (word, was_unquoted) = &words[index];
-        // An unquoted `publish` is the subcommand unless an earlier bare
-        // positional already established a different one.
-        if word == "publish" && *was_unquoted {
+        // A bare word that does not immediately follow an option establishes a
+        // subcommand; a word after an option might be that option's value.
+        let follows_option = index > exe_index + 1 && words[index - 1].0.starts_with('-');
+        if word == "publish" {
+            // Quoting demotes `publish` to data ONLY in option-value position
+            // (`--reporter "publish"`): keep scanning for a real subcommand.
+            // In subcommand position, `publish` is the subcommand regardless
+            // of quoting — `pnpm 'publish'` still publishes — and an unquoted
+            // `publish` after an option stays fail-closed.
+            if follows_option && !was_unquoted {
+                continue;
+            }
             return !preceding_positional;
         }
         if word.starts_with('-') {
@@ -123,9 +132,6 @@ fn segment_invokes_publish(segment: &str, exe: PublishExe) -> bool {
             }
             continue;
         }
-        // A bare word that does not immediately follow an option establishes
-        // a subcommand; a word after an option might be that option's value.
-        let follows_option = index > exe_index + 1 && words[index - 1].0.starts_with('-');
         if !follows_option {
             preceding_positional = true;
         }
@@ -397,10 +403,15 @@ mod tests {
             ("pnpm --reporter publish", Pnpm, true), // unquoted value → fail closed
             ("cd pkg && pnpm publish", Pnpm, true),
             ("pnpm.cmd publish", Pnpm, true),
-            // Quoted publish is a value, never the subcommand.
+            // Quoting the subcommand does NOT demote it: `pnpm 'publish'` still
+            // publishes and must be caught (regression guard).
+            ("pnpm 'publish'", Pnpm, true),
+            ("pnpm \"publish\"", Pnpm, true),
+            // Quoted publish is a value only in OPTION-VALUE position.
             ("pnpm --reporter \"publish\"", Pnpm, false),
             ("pnpm --reporter 'publish'", Pnpm, false),
             ("pnpm run build --reporter \"publish\"", Pnpm, false),
+            ("pnpm --reporter \"publish\" run build", Pnpm, false),
             // A prior positional established a different subcommand.
             ("pnpm run build publish", Pnpm, false),
             ("pnpm run publish", Pnpm, false),
