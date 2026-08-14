@@ -32,7 +32,7 @@ jobs:
             exit 1
           fi
 
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-06-06
           components: rustfmt, clippy
@@ -116,7 +116,7 @@ jobs:
         # x86_64-darwin got an arm64 binary; #174). Install the SAME pinned
         # nightly here and add the target std to it. Keep this channel in sync
         # with rust-toolchain.toml.
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-06-06
           targets: ${{ matrix.target }}
