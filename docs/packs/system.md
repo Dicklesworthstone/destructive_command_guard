@@ -76,7 +76,7 @@ These patterns match safe commands that are always allowed:
 | `dmsetup-deps` | `dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+deps(?=\s\|$)` |
 | `nbd-client-list` | `nbd-client\s+-l\b` |
 | `nbd-client-check` | `nbd-client\s+.*-check\b` |
-| `diskutil-readonly` | `(?i)diskutil\s+(?:list\|info\|information\|activity\|listFilesystems\|apfs\s+list(?:Snapshots\|Users)?)\b[^;&\|]*$` |
+| `diskutil-readonly` | `(?i)diskutil\s+(?:list\|info\|information\|activity\|listFilesystems\|apfs\s+list(?:Snapshots\|Users)?)\b[^;&\|\r\n]*$` |
 | `lvm-list` | `\b(?:lvs\|vgs\|pvs)\b` |
 | `lvm-display` | `\b(?:lvdisplay\|vgdisplay\|pvdisplay)\b` |
 | `lvm-scan` | `\b(?:lvscan\|vgscan\|pvscan)\b` |

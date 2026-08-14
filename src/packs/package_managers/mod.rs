@@ -94,7 +94,10 @@ fn segment_invokes_publish(segment: &str, exe: PublishExe) -> bool {
             })
             .collect();
 
-    let Some(exe_index) = words.iter().position(|(word, _)| exe.matches_executable(word)) else {
+    let Some(exe_index) = words
+        .iter()
+        .position(|(word, _)| exe.matches_executable(word))
+    else {
         return false;
     };
 

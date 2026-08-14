@@ -169,12 +169,13 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!("nbd-client-check", r"nbd-client\s+.*-check\b"),
         // --- macOS diskutil safe patterns (read-only) ---
         // Verbs are matched case-insensitively because diskutil itself accepts
-        // any casing. End-bounded with [^;&|]* so a read-only verb cannot mask
-        // a chained destructive command later on the same line (conservative:
+        // any casing. End-bounded with [^;&|\r\n]* so a read-only verb cannot
+        // mask a chained destructive command in a later segment — every shell
+        // separator, newline included, ends the whitelisted span (conservative:
         // failing to match here just falls through to the destructive check).
         safe_pattern!(
             "diskutil-readonly",
-            r"(?i)diskutil\s+(?:list|info|information|activity|listFilesystems|apfs\s+list(?:Snapshots|Users)?)\b[^;&|]*$"
+            r"(?i)diskutil\s+(?:list|info|information|activity|listFilesystems|apfs\s+list(?:Snapshots|Users)?)\b[^;&|\r\n]*$"
         ),
         // --- LVM safe patterns (read-only) ---
         // lvs, vgs, pvs (list commands)
