@@ -381,7 +381,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // stays allowed (issue #313).
         destructive_pattern!(
             "agent-hook-config-overwrite",
-            r"(?i)\b(?:copy-item|copy|xcopy|robocopy)\b(?:[^|&;\r\n]*?-destination[:\s]+[\x22']?(?:(?!\s+[-/])[^|&;\r\n])*?|(?:\s+[-/][^\s|&;]+)*\s+(?!-)[^\s|&;]+\s+(?:[^|&;\r\n]*?[\s\x22'=\\/])?)\.(?:claude|codex|cursor|gemini|copilot|grok|hermes)[\\/][^|&;\r\n]*\.(?:json|toml|ya?ml)(?![\w.-])",
+            r"(?i)\b(?:copy-item|copy|xcopy|robocopy)\b(?:[^|&;\r\n]*?-destination[:\s]+[\x22']?(?:(?!\s+[-/])[^|&;\r\n])*?|(?:\s+[-/][^\s|&;]+)*\s+(?!-)[^\s|&;]+\s+(?![-/])(?:[^|&;\r\n\s]|\s+(?![-/]))*?)[\s\x22'=\\/]?\.(?:claude|codex|cursor|gemini|copilot|grok|hermes)[\\/][^|&;\r\n]*\.(?:json|toml|ya?ml)(?![\w.-])",
             "Copying a file ONTO the agent's hook configuration replaces it and can silently remove dcg's protection.",
             High,
             "A copy whose DESTINATION is a hook-configuration file (like \
