@@ -98,9 +98,13 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Bare `/` gets its own alternative (`['"]?(?:\s|$)`): the named-dir
         // alternatives end in `\b`, which can never match after a bare `/`
         // at end-of-string because both sides are non-word (issue #301).
+        // `/home` is scoped to the home root or a whole single-user home
+        // (`home(?:/user)?`, where `~/.ssh` lives) — NOT deeper paths, so a
+        // routine `chmod -R /home/user/project` stays allowed while
+        // `chmod -R /home` (locks out every account) is blocked (issue #301).
         destructive_pattern!(
             "chmod-recursive-root",
-            r#"chmod\s+(?:.*(?:-[rR]|--recursive)).*\s+['"]?/(?:(?:bin|boot|dev|etc|home|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|['"]?(?:\s|$))"#,
+            r#"chmod\s+(?:.*(?:-[rR]|--recursive)).*\s+['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|home(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))"#,
             "chmod -R on system directories can break system permissions.",
             Critical,
             "Recursively changing permissions on system directories can render the system \
@@ -114,7 +118,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chown -R on root or system directories
         destructive_pattern!(
             "chown-recursive-root",
-            r#"chown\s+(?:.*(?:-[rR]|--recursive)).*\s+['"]?/(?:(?:bin|boot|dev|etc|home|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|['"]?(?:\s|$))"#,
+            r#"chown\s+(?:.*(?:-[rR]|--recursive)).*\s+['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|home(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))"#,
             "chown -R on system directories can break system ownership.",
             High,
             "Recursive ownership changes on system directories can disrupt services, \
@@ -171,7 +175,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // setfacl with dangerous patterns
         destructive_pattern!(
             "setfacl-all",
-            r#"setfacl\s+.*-[rR].*\s+['"]?/(?:(?:bin|boot|dev|etc|home|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|['"]?(?:\s|$))"#,
+            r#"setfacl\s+.*-[rR].*\s+['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|home(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))"#,
             "setfacl -R on system directories can modify access control across the filesystem.",
             Critical,
             "Recursively modifying ACLs on system directories changes fine-grained access \
@@ -275,6 +279,24 @@ mod tests {
             "chown -R deploy:deploy /home",
             "chown-recursive-root",
         );
+        // A whole single-user home (≤1 level, where ~/.ssh lives) is blocked,
+        // but a routine chmod on a project directory two-or-more levels deep
+        // stays allowed — `/home` is scoped, not a blanket prefix (issue #301).
+        let chmod = pack
+            .destructive_patterns
+            .iter()
+            .find(|p| p.name == Some("chmod-recursive-root"))
+            .expect("chmod rule");
+        for allowed in [
+            "chmod -R 755 /home/user/project",
+            "chmod -R 755 /home/alice/code/src",
+            "chmod -R 755 \"/home/bob/app\"",
+        ] {
+            assert!(
+                !chmod.regex.is_match(allowed),
+                "deep home project path must be allowed: {allowed}"
+            );
+        }
     }
 
     /// Issue #301 boundaries: paths that merely share a prefix with a

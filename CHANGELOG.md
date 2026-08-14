@@ -103,7 +103,11 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   regex tail `(?:$|bin|...)\b` could never match a bare `/` (the `\b` after
   the end-anchor has no word character to bound), and `/home` was missing
   from the protected list entirely. `chmod-777` had masked the 777 case,
-  which is why the gap survived the obvious test.
+  which is why the gap survived the obvious test. `/home` is scoped to the
+  home root or a whole single-user home (`/home`, `/home/user` — where
+  `~/.ssh` lives), so a routine `chmod -R /home/user/project` on a project
+  directory stays allowed while `chmod -R /home` (which locks out every
+  account) is blocked.
 - **`pnpm`/`npm`/`yarn` publish rules require subcommand position (#306).**
   `pnpm run build; bun ./publish-snapshot.ts`, `pnpm run build --reporter
   "publish"`, and `pnpm run build publish` no longer deny: `publish` must be
