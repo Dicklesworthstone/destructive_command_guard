@@ -92,30 +92,47 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         // dry-run flags. Treat only bare `--dry-run` or explicit true
         // as previews; false-valued flags must not mask publish rules.
-        safe_pattern!("npm-dry-run", r"\bnpm\b.*--dry-run(?:=true)?(?:\s|$)"),
-        safe_pattern!("yarn-dry-run", r"\byarn\b.*--dry-run(?:=true)?(?:\s|$)"),
-        safe_pattern!("pnpm-dry-run", r"\bpnpm\b.*--dry-run(?:=true)?(?:\s|$)"),
-        safe_pattern!("cargo-dry-run", r"\bcargo\b.*--dry-run(?:=true)?(?:\s|$)"),
-        safe_pattern!("poetry-dry-run", r"\bpoetry\b.*--dry-run(?:=true)?(?:\s|$)"),
+        // Segment-bounded ([^;|&\n]*) so a dry-run in one shell segment
+        // cannot mask a real command in a later segment (issue #306).
+        safe_pattern!("npm-dry-run", r"\bnpm\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"),
+        safe_pattern!("yarn-dry-run", r"\byarn\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"),
+        safe_pattern!("pnpm-dry-run", r"\bpnpm\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"),
+        safe_pattern!("cargo-dry-run", r"\bcargo\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"),
+        safe_pattern!("poetry-dry-run", r"\bpoetry\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"),
     ]
 }
 
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
-        // npm/yarn/pnpm publish
+        // npm/yarn/pnpm publish.
+        //
+        // `publish` must be in SUBCOMMAND position: only option tokens (and
+        // each option's possible value word) may sit between the executable
+        // and `publish`. An earlier bare positional word (`run`, `exec`, …)
+        // establishes a different subcommand, so a later `publish` is
+        // argument data, and an unbounded `.*?` gap would also cross shell
+        // segment boundaries (`pnpm run build; bun ./publish-snapshot.ts`) —
+        // both were false positives in issue #306. An option value may not
+        // itself be a bare `publish` (fail-closed: `pnpm --reporter publish`
+        // still denies; the clearly-data quoted form `--reporter "publish"`
+        // does not). The trailing lookahead keeps `--dry-run` previews
+        // allowed within the same segment only.
         destructive_pattern!(
             "npm-publish",
-            r"\bnpm\b.*?\bpublish\b(?!.*--dry-run(?:=true)?(?:\s|$))",
+            r"\bnpm(?:\.(?:cmd|exe|com))?\b(?:\s+--?[^\s;|&]+(?:\s+(?!publish(?:[\s;|&]|$))[^-\s;|&][^\s;|&]*)?)*\s+publish(?=[\s;|&]|$)(?![^;|&\n]*--dry-run(?:=true)?(?:\s|$))",
             "npm publish releases a package publicly. Use --dry-run first."
         ),
+        // yarn also reaches publish through the positional `workspace <name>`
+        // and Berry's `npm` prefix, so those two shapes stay denied.
         destructive_pattern!(
             "yarn-publish",
-            r"\byarn\b.*?\bpublish\b(?!.*--dry-run(?:=true)?(?:\s|$))",
+            r"\byarn(?:\.(?:cmd|exe|com))?\b(?:\s+(?:--?[^\s;|&]+(?:\s+(?!publish(?:[\s;|&]|$))[^-\s;|&][^\s;|&]*)?|workspace\s+[^\s;|&]+|npm\b))*\s+publish(?=[\s;|&]|$)(?![^;|&\n]*--dry-run(?:=true)?(?:\s|$))",
             "yarn publish releases a package publicly. Verify package.json first."
         ),
+        // pnpm's positional `recursive` prefix is `-r` spelled out.
         destructive_pattern!(
             "pnpm-publish",
-            r"\bpnpm\b.*?\bpublish\b(?!.*--dry-run(?:=true)?(?:\s|$))",
+            r"\bpnpm(?:\.(?:cmd|exe|com))?\b(?:\s+(?:--?[^\s;|&]+(?:\s+(?!publish(?:[\s;|&]|$))[^-\s;|&][^\s;|&]*)?|recursive\b))*\s+publish(?=[\s;|&]|$)(?![^;|&\n]*--dry-run(?:=true)?(?:\s|$))",
             "pnpm publish releases a package publicly."
         ),
         // npm unpublish. The `(?=\s|$)` trailing anchor ensures the
@@ -223,6 +240,71 @@ mod tests {
         assert_allows, assert_blocks, assert_blocks_with_pattern, assert_no_safe_match,
         assert_safe_pattern_matches,
     };
+
+    /// Issue #306: `publish` is only pnpm's subcommand when it sits in
+    /// subcommand position; argument data and later shell segments are not
+    /// publication.
+    #[test]
+    fn publish_is_a_subcommand_not_argument_data_issue_306() {
+        let pack = create_pack();
+
+        // Argument data / different segment: allowed.
+        for command in [
+            "pnpm run build; bun ./publish-snapshot.ts",
+            "pnpm run build --reporter \"publish\"",
+            "pnpm --reporter \"publish\"",
+            "pnpm run build publish",
+            "npm run build && node ./publish.js",
+            "yarn run build publish",
+            "pnpm --silent publish-tool",
+        ] {
+            assert_allows(&pack, command);
+        }
+
+        // Real publication forms: still denied.
+        for (command, rule) in [
+            ("pnpm publish", "pnpm-publish"),
+            ("pnpm -r publish", "pnpm-publish"),
+            ("pnpm recursive publish", "pnpm-publish"),
+            ("pnpm --filter workspace publish", "pnpm-publish"),
+            ("pnpm --silent publish", "pnpm-publish"),
+            ("pnpm --reporter append-only publish", "pnpm-publish"),
+            // Unquoted option value named `publish` stays fail-closed.
+            ("pnpm --reporter publish", "pnpm-publish"),
+            ("pnpm.cmd --silent publish", "pnpm-publish"),
+            ("npm publish", "npm-publish"),
+            ("npm --registry https://r.example publish", "npm-publish"),
+            ("yarn publish", "yarn-publish"),
+            ("yarn workspace pkg-a publish", "yarn-publish"),
+            // (`yarn npm publish` also denies, attributed to npm-publish
+            // because that rule is listed first — asserted separately below.)
+            ("cd pkg && pnpm publish", "pnpm-publish"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+
+        // Berry's `yarn npm publish` must deny; attribution may land on
+        // either publish rule.
+        assert_blocks(&pack, "yarn npm publish", "publish");
+    }
+
+    /// Issue #306: a `--dry-run` belonging to a DIFFERENT tool in a later
+    /// segment must not connect back to `pnpm` across the separator and mask
+    /// a real publish. (A dry-run on a pnpm invocation in a later segment
+    /// still safe-matches that invocation — command-level masking is the
+    /// evaluator's segment-scoping concern, not this regex's.)
+    #[test]
+    fn dry_run_is_segment_bounded_issue_306() {
+        let pack = create_pack();
+        assert_no_safe_match(&pack, "pnpm publish; rsync -a --dry-run src/ dst/");
+        assert_blocks_with_pattern(
+            &pack,
+            "pnpm publish; rsync -a --dry-run src/ dst/",
+            "pnpm-publish",
+        );
+        // Same-segment dry-run remains a preview.
+        assert_safe_pattern_matches(&pack, "pnpm publish --dry-run");
+    }
 
     #[test]
     fn package_manager_patterns_match_with_global_flags() {
