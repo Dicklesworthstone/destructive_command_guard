@@ -522,12 +522,24 @@ mod tests {
             "diskutil eraseDisk APFS PROBE /dev/disk999",
             "diskutil-erase",
         );
-        assert_blocks_with_pattern(&pack, "diskutil eraseVolume free none disk3s2", "diskutil-erase");
+        assert_blocks_with_pattern(
+            &pack,
+            "diskutil eraseVolume free none disk3s2",
+            "diskutil-erase",
+        );
         assert_blocks_with_pattern(&pack, "diskutil reformat disk3s2", "diskutil-erase");
         assert_blocks_with_pattern(&pack, "diskutil zeroDisk /dev/disk999", "diskutil-erase");
-        assert_blocks_with_pattern(&pack, "diskutil secureErase 0 /dev/disk999", "diskutil-erase");
+        assert_blocks_with_pattern(
+            &pack,
+            "diskutil secureErase 0 /dev/disk999",
+            "diskutil-erase",
+        );
         // Verb casing is not load-bearing: diskutil accepts any casing.
-        assert_blocks_with_pattern(&pack, "diskutil erasedisk APFS X /dev/disk999", "diskutil-erase");
+        assert_blocks_with_pattern(
+            &pack,
+            "diskutil erasedisk APFS X /dev/disk999",
+            "diskutil-erase",
+        );
         assert_blocks_with_pattern(
             &pack,
             "diskutil partitionDisk /dev/disk999 GPT APFS PROBE 100%",

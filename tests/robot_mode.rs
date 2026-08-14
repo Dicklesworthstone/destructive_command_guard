@@ -410,11 +410,13 @@ fn test_robot_stdin_enforces_hook_budget_without_flag() {
     // A synthetic multi-construct command large enough that full evaluation
     // cannot complete inside the 10ms floor budget on any realistic machine:
     // many segments, each with an inline-python trigger and a pipeline.
+    use std::fmt::Write as _;
     let mut command = String::from("set -e\n");
     for i in 0..200 {
-        command.push_str(&format!(
-            "python3 -c 'print({i})' | head -1; for p in /tmp/probe-{i}/*/x.json; do cat \"$p\"; done\n"
-        ));
+        let _ = writeln!(
+            command,
+            "python3 -c 'print({i})' | head -1; for p in /tmp/probe-{i}/*/x.json; do cat \"$p\"; done"
+        );
     }
 
     let temp = tempfile::tempdir().expect("tempdir");

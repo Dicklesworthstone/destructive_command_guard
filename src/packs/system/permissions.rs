@@ -270,7 +270,11 @@ mod tests {
         assert_blocks_with_pattern(&pack, "setfacl -R -m u:app:rwx /home", "setfacl-all");
         // `chmod-777` also fires on the 777 case; the recursive-root rule must
         // stand on its own for non-777 modes (the masking noted in #301).
-        assert_blocks_with_pattern(&pack, "chown -R deploy:deploy /home", "chown-recursive-root");
+        assert_blocks_with_pattern(
+            &pack,
+            "chown -R deploy:deploy /home",
+            "chown-recursive-root",
+        );
     }
 
     /// Issue #301 boundaries: paths that merely share a prefix with a

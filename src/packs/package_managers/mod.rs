@@ -94,11 +94,26 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // as previews; false-valued flags must not mask publish rules.
         // Segment-bounded ([^;|&\n]*) so a dry-run in one shell segment
         // cannot mask a real command in a later segment (issue #306).
-        safe_pattern!("npm-dry-run", r"\bnpm\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"),
-        safe_pattern!("yarn-dry-run", r"\byarn\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"),
-        safe_pattern!("pnpm-dry-run", r"\bpnpm\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"),
-        safe_pattern!("cargo-dry-run", r"\bcargo\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"),
-        safe_pattern!("poetry-dry-run", r"\bpoetry\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"),
+        safe_pattern!(
+            "npm-dry-run",
+            r"\bnpm\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"
+        ),
+        safe_pattern!(
+            "yarn-dry-run",
+            r"\byarn\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"
+        ),
+        safe_pattern!(
+            "pnpm-dry-run",
+            r"\bpnpm\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"
+        ),
+        safe_pattern!(
+            "cargo-dry-run",
+            r"\bcargo\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"
+        ),
+        safe_pattern!(
+            "poetry-dry-run",
+            r"\bpoetry\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"
+        ),
     ]
 }
 
