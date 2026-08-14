@@ -1103,6 +1103,9 @@ pub(crate) fn filesystem_keyword_candidate(command: &str) -> bool {
     ];
 
     command.contains('>')
+        // Shell function-definition operator: the fork-bomb rule's evidence
+        // (issue #302).
+        || command.contains("()")
         || COMMAND_WORDS
             .iter()
             .any(|word| contains_ascii_command_word(command, word))

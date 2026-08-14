@@ -15,6 +15,37 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Added
 
+- **macOS `diskutil` coverage in `system.disk` (#305).** `diskutil eraseDisk`,
+  `eraseVolume`, `reformat`, `zeroDisk`, `randomDisk`, and `secureErase` deny
+  as `diskutil-erase`; `partitionDisk`, `splitPartition`, `mergePartitions`,
+  and `resetFusion` as `diskutil-partition`; and `apfs
+  deleteContainer/deleteVolume/eraseVolume/deleteSnapshot` as
+  `diskutil-apfs-delete` — all Critical, all case-insensitive because diskutil
+  accepts any verb casing. Read-only verbs (`list`, `info`, `activity`,
+  `apfs list`/`listSnapshots`) stay allowed, and a read-only verb cannot mask
+  a chained destructive verb on the same line.
+- **The canonical fork bomb is blocked (#302).** `:(){ :|:& };:` and
+  word-named variants deny as `core.filesystem:fork-bomb` (Critical). The
+  regex uses backreferences to require the same identifier in all three
+  positions, so ordinary function definitions that pipe two *different*
+  commands do not match. Because the shape necessarily spans `|`, `&`, and
+  `;`, the rule joins the whole-command cross-segment pass, and the shell
+  function-definition operator `()` (pure syntax, invisible to span-based
+  keyword gating) is now a recognized quick-reject signal for the pack.
+  Differently shaped bombs (`while true; do (x) & done`) remain out of scope —
+  the regex family cannot enforce those without unbounded false positives.
+- **Proven timestamped sibling-backup `mv` is allowed (#308).** The exact
+  cross-harness installer shape — `STAMP=$(date +%Y%m%d%H%M%S);
+  BACKUP="<src>.backup-$STAMP"; mv "<src>" "$BACKUP"` — is a reversible
+  sibling rename: the destination is proven to be the source plus a
+  digits-only suffix, and the two assignments must be the segments
+  immediately before the `mv` so nothing can mutate them in between. Only
+  `mv-dynamic-path` and `mv-sensitive-source-root-home` are narrowed; any
+  deviation (a different substitution, non-sibling destination, mv options,
+  extra operands, an intervening segment, traversal, globs, unquoted
+  destination) keeps the fail-closed deny.
+
+
 - **`database.bigquery` pack — the `bq` CLI and GoogleSQL.** 11 CLI rules and
   21 GoogleSQL rules. Three BigQuery specifics drive them, and each one makes a
   naive port of the PostgreSQL/Snowflake packs wrong: a *dataset* is a `SCHEMA`
@@ -66,6 +97,58 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   which dcg allows outright. A new pack test enforces this going forward.
 
 ### Fixed
+
+- **`chown -R`/`chmod -R`/`setfacl -R` on bare `/` and `/home` now deny
+  (#301).** Two independent bugs in `system.permissions`: the protected-path
+  regex tail `(?:$|bin|...)\b` could never match a bare `/` (the `\b` after
+  the end-anchor has no word character to bound), and `/home` was missing
+  from the protected list entirely. `chmod-777` had masked the 777 case,
+  which is why the gap survived the obvious test.
+- **`pnpm`/`npm`/`yarn` publish rules require subcommand position (#306).**
+  `pnpm run build; bun ./publish-snapshot.ts`, `pnpm run build --reporter
+  "publish"`, and `pnpm run build publish` no longer deny: `publish` must be
+  reachable through option tokens only, so argument data and later shell
+  segments are not publication. Real forms (`pnpm -r publish`,
+  `pnpm recursive publish`, `--filter <ws> publish`, `yarn workspace <ws>
+  publish`, `yarn npm publish`, `pnpm.cmd`) still deny, and an unquoted
+  option value named `publish` stays fail-closed. The `*-dry-run` safe
+  patterns are segment-bounded so a dry-run in one segment cannot mask a
+  later one.
+- **Single-quoted `$`/backtick/backslash in `mv` paths are literal (#307).**
+  `mv './$ROOT' /tmp/x` is data, not expansion: `mv-dynamic-path` stands
+  down only when *every* dynamic marker in the command is inside a POSIX
+  single-quoted span. One active marker anywhere — double quotes, unquoted
+  variables, a quote-manipulating backslash — keeps the deny.
+- **`dcg --robot test` honors the hook evaluation budget (#309).** Robot mode
+  is an agent-integration boundary, so it now enforces the configured
+  timeout and answers with bounded `{"decision":"indeterminate",
+  "source":"analysis_budget"}` JSON without requiring the human-facing
+  `--enforce-budget` diagnostic flag (which stays opt-in for interactive
+  `dcg test`).
+- **`pwsh --version`/`--help` and read-only `-c` variable expressions are
+  allowed (#304).** pwsh accepts exactly two GNU-style spellings, both
+  print-and-exit; they no longer land in the unknown-host-option refusal.
+  And a `-Command` payload that is exactly one variable read with property
+  accesses (`$PSVersionTable.PSVersion`, `$env:PATH`) invokes nothing, so it
+  no longer trips the runtime-expansion refusal — invoking, indexing,
+  subexpressions, or any second statement stays fail-closed. (`-File` was
+  already fixed on main; `SP=…; pwsh -c "…"` likewise.)
+- **Backing up the agent's hook config is a read, not tampering (#313).**
+  `Copy-Item ~/.claude/settings.json <backup>` no longer denies:
+  copy-family verbs moved out of `agent-hook-config-tamper` into a new
+  `agent-hook-config-overwrite` rule that fires only when the config path is
+  the *write* side (`-Destination` or positional destination). Deleting,
+  rewriting, moving, or renaming the live config still denies, as does
+  copying anything onto it.
+- **`bash -c` payloads keep their own quote context (#288 follow-up).**
+  `bash -lc 'grep -n "rm -rf /" notes.md'` was denied while the bare inner
+  command was correctly allowed: the match landed inside the inline payload,
+  whose `InlineCode` classification dropped the payload's internal quoting.
+  A core-rule match inside a POSIX-shell inline payload is now re-classified
+  against the payload itself, so it resolves exactly like the bare inner
+  command — and `bash -c 'rm -rf /'` still denies, because the payload
+  classifies it as live code.
+
 
 - **A pathological `gh` command line could fail OPEN.** The shared option-prefix
   in `platform.github` used `\S+` for an option's value, which also matches a

@@ -3039,6 +3039,18 @@ fn syntax_outside_executable_spans_matches_keyword(
         return true;
     }
 
+    // A shell function-definition operator is syntax, not an executable word,
+    // so span-based keyword gating never sees it. The `()` keyword exists for
+    // the fork-bomb rule (issue #302), whose evidence is precisely that
+    // operator; an unquoted `()` must therefore reach full pack evaluation.
+    if enabled_keywords.contains(&"()")
+        && contains_unquoted_shell_operator(normalized, |byte, next| {
+            byte == b'(' && next == Some(b')')
+        })
+    {
+        return true;
+    }
+
     pipeline_text_may_be_executed(normalized)
         && span_matches_any_keyword(normalized, enabled_keywords)
 }
