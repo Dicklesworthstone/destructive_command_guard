@@ -34223,8 +34223,11 @@ mod tests {
                 "single-quoted subcommand must deny under {dialect:?}: pnpm 'publish'"
             );
         }
-        let cmd_single =
-            evaluate_with_pack_ids_in_dialect("pnpm 'publish'", &["package_managers"], ShellDialect::Cmd);
+        let cmd_single = evaluate_with_pack_ids_in_dialect(
+            "pnpm 'publish'",
+            &["package_managers"],
+            ShellDialect::Cmd,
+        );
         assert!(
             !cmd_single.is_denied(),
             "under cmd, single quotes are literal so `pnpm 'publish'` is not a publish: {:?}",
@@ -34287,7 +34290,12 @@ mod tests {
     /// not the per-segment loop.
     #[test]
     fn fork_bomb_denies_through_full_pipeline_issue_302() {
-        for command in [":(){ :|:& };:", "bomb(){ bomb|bomb& };bomb"] {
+        for command in [
+            ":(){ :|:& };:",
+            "bomb(){ bomb|bomb& };bomb",
+            // Spaced paren pair reaches the pack via the force check.
+            ":( ){ :|:& };:",
+        ] {
             for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
                 let result =
                     evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
@@ -34387,15 +34395,17 @@ mod tests {
 
         // An executing heredoc whose body is a genuine grep of quoted data is
         // still allowed — parity with the bare command.
-        for command in ["bash <<'EOF'\ngrep -n \"rm -rf /\" notes.md\nEOF"] {
-            let result =
-                evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], ShellDialect::Posix);
-            assert!(
-                !result.is_denied(),
-                "quoted grep in an executing heredoc body is data: {command:?} -> {:?}",
-                result.pattern_info
-            );
-        }
+        let heredoc_grep = "bash <<'EOF'\ngrep -n \"rm -rf /\" notes.md\nEOF";
+        let result = evaluate_with_pack_ids_in_dialect(
+            heredoc_grep,
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            !result.is_denied(),
+            "quoted grep in an executing heredoc body is data: {heredoc_grep:?} -> {:?}",
+            result.pattern_info
+        );
     }
 
     /// The #288 re-classification must not change a payload's verdict relative
@@ -34414,7 +34424,8 @@ mod tests {
         ] {
             let wrapped = format!("bash -c '{payload}'");
             for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
-                let bare = evaluate_with_pack_ids_in_dialect(payload, &["core.filesystem"], dialect);
+                let bare =
+                    evaluate_with_pack_ids_in_dialect(payload, &["core.filesystem"], dialect);
                 let via_c =
                     evaluate_with_pack_ids_in_dialect(&wrapped, &["core.filesystem"], dialect);
                 assert_eq!(

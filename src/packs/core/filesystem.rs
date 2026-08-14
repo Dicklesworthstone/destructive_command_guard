@@ -1086,6 +1086,33 @@ pub(crate) fn filesystem_semantic_scan_required(command: &str, dialect: ShellDia
         || (dialect == ShellDialect::Cmd
             && command.contains('>')
             && command.contains(['%', '!', '^']))
+        // Fork-bomb reachability (issue #302): the `fork-bomb` rule matches a
+        // shell function-definition shape (`name() { … }`). The paren pair is
+        // pure syntax that keyword-based quick-reject cannot see, and POSIX
+        // permits whitespace inside it (`name ( )`), so a literal `()` keyword
+        // both costs a keyword slot and misses the spaced form. A space-
+        // tolerant scan here forces core.filesystem to run whenever an empty
+        // paren pair is present; the regex then does the precise matching.
+        || command_contains_empty_paren_pair(command)
+}
+
+/// True when the command contains `(` followed by only ASCII whitespace and
+/// then `)` — the empty parameter list of a shell function definition, the one
+/// piece of the fork-bomb shape that carries no executable keyword.
+fn command_contains_empty_paren_pair(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    while let Some(open) = bytes[index..].iter().position(|&b| b == b'(') {
+        let mut cursor = index + open + 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b')') {
+            return true;
+        }
+        index = index + open + 1;
+    }
+    false
 }
 
 /// Refine the global substring index's candidate signal for core.filesystem.
@@ -1103,9 +1130,6 @@ pub(crate) fn filesystem_keyword_candidate(command: &str) -> bool {
     ];
 
     command.contains('>')
-        // Shell function-definition operator: the fork-bomb rule's evidence
-        // (issue #302).
-        || command.contains("()")
         || COMMAND_WORDS
             .iter()
             .any(|word| contains_ascii_command_word(command, word))
@@ -2859,10 +2883,6 @@ pub fn create_pack() -> Pack {
             "rm", "find", "unlink", "truncate", "shred", "tar", "dd", "mv", "cp", "ln", "rsync",
             ">/", "> /", ">~", "> ~", ">$", "> $", ">\"", "> \"", ">'", "> '", "&>", ">&", ">|",
             "1>", "2>", ">%", "> %", ">!", "> !", ">^", "> ^",
-            // Shell function definition marker — reachability for the
-            // fork-bomb rule (issue #302). `:(){ …` and `bomb() { …` both
-            // contain the two-byte `()` substring.
-            "()",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -3920,21 +3940,39 @@ mod tests {
 
     /// Issue #302: the canonical fork bomb and word-named variants are
     /// blocked; ordinary function definitions that merely pipe two different
-    /// commands are not.
+    /// commands are not. Evaluator-level reachability is handled by
+    /// `filesystem_semantic_scan_required` (an empty paren pair forces the
+    /// pack), not by a pack keyword — see the empty_paren_pair tests and the
+    /// evaluator's `fork_bomb_denies_through_full_pipeline_issue_302`.
     #[test]
     fn fork_bomb_is_blocked_issue_302() {
         let pack = create_pack();
+        // The fork-bomb rule spans shell separators, so it is matched
+        // whole-command (never through `Pack::check`, which is keyword-gated
+        // and per-segment). Test the compiled regex and the force check
+        // directly; the end-to-end deny is in the evaluator test.
+        let fork_bomb = pack
+            .destructive_patterns
+            .iter()
+            .find(|p| p.name == Some("fork-bomb"))
+            .expect("fork-bomb rule must exist");
         for bomb in [
             ":(){ :|:& };:",
             "bomb(){ bomb|bomb& };bomb",
             ": () { : | : & ; } ; :",
             "b(){ b|b&;};b",
+            // Spaced paren pair — the literal `()` keyword missed this; the
+            // space-tolerant force check reaches it.
+            ":( ){ :|:& };:",
         ] {
             assert!(
-                pack.might_match(bomb),
-                "fork bomb must be reachable via pack keywords: {bomb}"
+                filesystem_semantic_scan_required(bomb, ShellDialect::Posix),
+                "fork bomb must force the pack via semantic scan: {bomb}"
             );
-            assert_blocks_with_pattern(&pack, bomb, "fork-bomb");
+            assert!(
+                fork_bomb.regex.is_match(bomb),
+                "fork-bomb regex must match: {bomb}"
+            );
         }
         // Same-shape functions piping two DIFFERENT commands are not bombs.
         for benign in [
@@ -3942,11 +3980,29 @@ mod tests {
             "f(){ a|b& };f",
             "retry(){ curl -s x|jq . ; };retry",
         ] {
-            let matched = pack.check(benign);
-            assert_ne!(
-                matched.as_ref().and_then(|m| m.name),
-                Some("fork-bomb"),
+            assert!(
+                !fork_bomb.regex.is_match(benign),
                 "non-self-referential function must not match fork-bomb: {benign}"
+            );
+        }
+    }
+
+    /// The space-tolerant empty-paren detector that gives the fork-bomb rule
+    /// its evaluator reachability (issue #302).
+    #[test]
+    fn empty_paren_pair_detection_issue_302() {
+        for present in [":(){ :;}", "foo() {}", ":( ){ }", "x(  )", "arr=()", "$()"] {
+            assert!(
+                command_contains_empty_paren_pair(present),
+                "empty paren pair expected: {present}"
+            );
+        }
+        for absent in [
+            "echo hi", "(ls)", "foo(bar)", "$(date)", "$((1+1))", "a || b",
+        ] {
+            assert!(
+                !command_contains_empty_paren_pair(absent),
+                "no empty paren pair expected: {absent}"
             );
         }
     }
