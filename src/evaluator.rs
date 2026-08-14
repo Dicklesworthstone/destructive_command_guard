@@ -3948,6 +3948,16 @@ fn powershell_host_option(raw: &str, outer_dialect: ShellDialect) -> PowerShellH
     let Some(name) = decoded.strip_prefix('-') else {
         return PowerShellHostOption::Unknown;
     };
+    // pwsh additionally accepts exactly two GNU-style spellings, both
+    // print-and-exit informational flags (issue #304). Any other
+    // double-dash token is not a pwsh host option.
+    if let Some(gnu) = name.strip_prefix('-') {
+        return if gnu.eq_ignore_ascii_case("version") || gnu.eq_ignore_ascii_case("help") {
+            PowerShellHostOption::NoValue
+        } else {
+            PowerShellHostOption::Unknown
+        };
+    }
     let name = name.to_ascii_lowercase();
     if !name.is_empty() && "command".starts_with(&name) {
         return PowerShellHostOption::Command;
@@ -4314,11 +4324,47 @@ fn validate_launcher_payload(
         ShellDialect::Posix | ShellDialect::Unknown => false,
     };
     if dynamic {
+        // A payload that is exactly one variable read with property accesses
+        // (`$PSVersionTable.PSVersion`, `$env:PATH`) invokes nothing: there
+        // is no command word, no call operator, no subexpression, and no
+        // argument position for one. pwsh evaluates it and prints the value.
+        // Everything else keeps the fail-closed refusal (issue #304).
+        if dialect == ShellDialect::PowerShell
+            && powershell_payload_is_readonly_variable_expression(&command)
+        {
+            return Ok(command);
+        }
         return Err(format!(
             "embedded {dialect:?} launcher command contains runtime expansion that dcg cannot statically verify"
         ));
     }
     Ok(command)
+}
+
+/// True when the payload is exactly `$name`, `$scope:name`, or either
+/// followed by `.property` accesses — an expression that reads and prints a
+/// value without invoking anything. Whitespace, operators, parentheses,
+/// subexpressions, indexing, and statement separators all fail the shape.
+fn powershell_payload_is_readonly_variable_expression(payload: &str) -> bool {
+    fn is_ident(part: &str) -> bool {
+        let mut chars = part.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+    let Some(body) = payload.trim().strip_prefix('$') else {
+        return false;
+    };
+    let mut parts = body.split('.');
+    let Some(head) = parts.next() else {
+        return false;
+    };
+    let head_ok = match head.split_once(':') {
+        Some((scope, name)) => is_ident(scope) && is_ident(name),
+        None => is_ident(head),
+    };
+    head_ok && parts.all(is_ident)
 }
 
 fn decode_powershell_encoded_payload(
@@ -21486,6 +21532,20 @@ fn command_pattern_match_is_inert_quoted_data(
         return false;
     }
 
+    // `mv-dynamic-path`'s entire evidence is the presence of a `$`, backtick,
+    // or backslash after `mv`. Under POSIX quoting those are literal filename
+    // bytes when single-quoted, so the rule stands down when EVERY such
+    // marker in the command is single-quoted data — one active marker
+    // anywhere keeps the fail-closed deny (issue #307). Reconstructed
+    // interpreter stdin keeps the conservative treatment (#136 class).
+    if pack_id == "core.filesystem"
+        && pattern_name == Some("mv-dynamic-path")
+        && !offset_is_in_conservatively_scanned_interpreter_input(command, span.start)
+        && mv_dynamic_markers_are_single_quoted_literals(command)
+    {
+        return true;
+    }
+
     // Command-oriented core patterns begin with a punctuation/whitespace
     // boundary followed by an executable keyword (`git`, `rm`, `mv`, ...).
     // Check the first word byte rather than `span.start`: the regex is allowed
@@ -21527,6 +21587,30 @@ fn command_pattern_match_is_inert_quoted_data(
                 source_base..source_base.saturating_add(command.len()),
             ))
     })
+}
+
+/// True when the command contains at least one dynamic-path marker
+/// (`$`, backtick, backslash) and every one of them lies inside a POSIX
+/// single-quoted span (`SpanKind::Data` — the one span kind the shell cannot
+/// interpolate). Double-quoted spans keep their markers active, and a
+/// backslash OUTSIDE quotes (including one manipulating the quotes
+/// themselves) keeps the command fail-closed.
+fn mv_dynamic_markers_are_single_quoted_literals(command: &str) -> bool {
+    let spans = crate::context::classify_command(command);
+    let mut saw_marker = false;
+    for (offset, ch) in command.char_indices() {
+        if !matches!(ch, '$' | '`' | '\\') {
+            continue;
+        }
+        saw_marker = true;
+        let single_quoted = spans.spans().iter().any(|span| {
+            span.kind == crate::context::SpanKind::Data && span.byte_range.contains(&offset)
+        });
+        if !single_quoted {
+            return false;
+        }
+    }
+    saw_marker
 }
 
 fn offset_is_in_conservatively_scanned_interpreter_input(command: &str, offset: usize) -> bool {
@@ -32120,6 +32204,20 @@ mod tests {
                 ShellDialect::PowerShell,
                 r#"& pwsh -Command "{ git branch -d victim }""#.to_string(),
             ),
+            // Issue #304: pwsh accepts the GNU spellings --version/--help as
+            // print-and-exit informational flags.
+            (ShellDialect::Unknown, "pwsh --version".to_string()),
+            (ShellDialect::Posix, "pwsh --help".to_string()),
+            // Issue #304: a payload that is exactly one variable read (with
+            // property accesses) invokes nothing — pwsh prints the value.
+            (
+                ShellDialect::Posix,
+                "pwsh -NoProfile -c '$PSVersionTable.PSVersion'".to_string(),
+            ),
+            (
+                ShellDialect::Posix,
+                "pwsh -NoProfile -Command '$env:PATH'".to_string(),
+            ),
         ];
 
         for (dialect, command) in safe {
@@ -32195,7 +32293,13 @@ mod tests {
             format!("powershell -EncodedCommand {odd_utf16}"),
             format!("powershell -EncodedCommand {lone_surrogate}"),
             format!("powershell -EncodedCommand {oversized}"),
-            "pwsh -Command '$payload'".to_string(),
+            // A bare `$name` read is allowed (issue #304), but the moment the
+            // variable is INVOKED, indexed into a call, or combined with any
+            // other statement, the payload is dynamic again.
+            "pwsh -Command '& $payload'".to_string(),
+            "pwsh -Command '$payload; Write-Output x'".to_string(),
+            "pwsh -Command '$payload.Invoke()'".to_string(),
+            "pwsh -Command '$(payload)'".to_string(),
             "pwsh -Command -".to_string(),
             "printf 'Write-Output safe' | pwsh -NoProfile -NonInteractive -Command -".to_string(),
             "p$(producer)wsh -Command 'Write-Output safe'".to_string(),
@@ -33806,6 +33910,52 @@ mod tests {
                 result.is_denied(),
                 "name-shaped alias boundary must stay denied: {command:?}: {:?}",
                 result.pattern_info
+            );
+        }
+    }
+
+    // =========================================================================
+    // Issue #307: single-quoted dynamic markers in mv paths are literal data
+    // =========================================================================
+
+    /// A `$` (or backtick/backslash) inside a POSIX single-quoted mv operand
+    /// is a literal filename byte, not expansion evidence.
+    #[test]
+    fn single_quoted_dollar_in_mv_path_is_literal_issue_307() {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                "mv './$ROOT' /tmp/dcg-repro-destination",
+                &["core.filesystem"],
+                dialect,
+            );
+            assert!(
+                !result.is_denied(),
+                "single-quoted dollar is literal data under {dialect:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// One active marker anywhere keeps the fail-closed deny: double-quoted
+    /// operands interpolate, unquoted variables expand, and a backslash
+    /// outside quotes can manipulate the quoting itself.
+    #[test]
+    fn active_mv_expansion_markers_stay_denied_issue_307() {
+        for command in [
+            "mv \"./$ROOT\" /tmp/dcg-repro-destination",
+            "mv './$ROOT' \"$DEST\"",
+            "mv './$ROOT' $DEST",
+            "mv './$ROOT' /tmp/`hostname`",
+            "mv \\''$X' /tmp/x",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "active expansion must remain denied: {command:?}"
             );
         }
     }
