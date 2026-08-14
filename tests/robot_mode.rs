@@ -393,3 +393,60 @@ fn test_robot_flag_and_env_produce_same_result() {
         "decision should match between flag and env var"
     );
 }
+
+// =============================================================================
+// Budget Enforcement (issue #309)
+// =============================================================================
+
+/// Issue #309: robot mode is an agent integration boundary, so it must honor
+/// the configured hook evaluation budget WITHOUT the human-facing
+/// `--enforce-budget` diagnostic flag. Otherwise a parent process's own
+/// timeout can kill dcg before it emits a bounded JSON verdict.
+#[test]
+fn test_robot_stdin_enforces_hook_budget_without_flag() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    // A synthetic multi-construct command large enough that full evaluation
+    // cannot complete inside the 10ms floor budget on any realistic machine:
+    // many segments, each with an inline-python trigger and a pipeline.
+    let mut command = String::from("set -e\n");
+    for i in 0..200 {
+        command.push_str(&format!(
+            "python3 -c 'print({i})' | head -1; for p in /tmp/probe-{i}/*/x.json; do cat \"$p\"; done\n"
+        ));
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().to_str().expect("utf8 home");
+    let mut child = std::process::Command::new(dcg_binary())
+        .args(["--robot", "test", "--stdin"])
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("XDG_CONFIG_HOME", home)
+        .env_remove("DCG_CONFIG")
+        .env("DCG_HOOK_TIMEOUT_MS", "10")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dcg --robot test --stdin");
+    child
+        .stdin
+        .take()
+        .expect("stdin handle")
+        .write_all(command.as_bytes())
+        .expect("write candidate command");
+    let output = child.wait_with_output().expect("collect output");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "budget exhaustion must exit non-zero; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("robot mode must emit JSON");
+    assert_eq!(json["decision"], "indeterminate");
+    assert_eq!(json["source"], "analysis_budget");
+}
