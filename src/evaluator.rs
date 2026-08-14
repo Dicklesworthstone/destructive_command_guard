@@ -20382,6 +20382,10 @@ fn filesystem_cross_segment_pattern(name: Option<&str>) -> bool {
             "cp-sensitive-then-delete"
                 | "ln-symlink-sensitive-then-delete"
                 | "rsync-sensitive-then-delete"
+                // The fork bomb's function body and invocation necessarily
+                // span `|`, `&`, and `;`, so the rule can only match the
+                // complete command (issue #302).
+                | "fork-bomb"
         )
     )
 }
@@ -20864,6 +20868,146 @@ fn filesystem_non_pre_rm_non_redirect_pattern_excluding_mv_dynamic(name: Option<
     filesystem_non_pre_rm_non_redirect_pattern(name) && name != Some("mv-dynamic-path")
 }
 
+fn filesystem_non_pre_rm_non_redirect_pattern_excluding_proven_backup(name: Option<&str>) -> bool {
+    filesystem_non_pre_rm_non_redirect_pattern(name)
+        && !matches!(
+            name,
+            Some("mv-dynamic-path" | "mv-sensitive-source-root-home")
+        )
+}
+
+/// Parse `NAME=value` where NAME is a valid POSIX identifier, returning the
+/// trimmed value text.
+fn posix_scalar_assignment(segment: &str) -> Option<(&str, &str)> {
+    let (name, value) = segment.trim().split_once('=')?;
+    let valid_name = !name.is_empty()
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    valid_name.then_some((name, value.trim()))
+}
+
+fn double_quoted_body(raw: &str) -> Option<&str> {
+    raw.strip_prefix('"')?.strip_suffix('"')
+}
+
+/// The variable name when `raw` is EXACTLY one `$NAME` / `${NAME}` reference.
+fn exact_variable_reference(raw: &str) -> Option<&str> {
+    let (name, consumed) = parse_leading_posix_variable(raw)?;
+    (consumed == raw.len()).then_some(name)
+}
+
+/// A literal mv-source template: optionally `$HOME/`-rooted, otherwise fully
+/// literal — no quoting, expansion, glob, whitespace, or tilde bytes, no
+/// `..` components, and a real final component.
+fn literal_backup_source_template(template: &str) -> bool {
+    let rest = template
+        .strip_prefix("$HOME/")
+        .or_else(|| template.strip_prefix("${HOME}/"))
+        .unwrap_or(template);
+    if rest.is_empty()
+        || rest.contains([
+            '$', '`', '\'', '"', '\\', '*', '?', '[', '{', '~', ' ', '\t', '\n',
+        ])
+    {
+        return false;
+    }
+    if template.split('/').any(|component| component == "..") {
+        return false;
+    }
+    !rest.ends_with('/')
+        && rest
+            .split('/')
+            .next_back()
+            .is_some_and(|component| !component.is_empty() && component != ".")
+}
+
+/// Statically prove the reversible timestamped sibling-backup shape used by
+/// cross-harness skill installers (issue #308):
+///
+/// ```text
+/// STAMP=$(date +%Y%m%d%H%M%S)
+/// BACKUP="<src>.backup-$STAMP"
+/// mv "<src>" "$BACKUP"
+/// ```
+///
+/// The two assignments must be the top-level segments IMMEDIATELY before the
+/// `mv`, so nothing can mutate either variable in between. The stamp value is
+/// the exact `date` substitution above (its output is digits only), so the
+/// destination is exactly `<src>.backup-<digits>` — a sibling rename of the
+/// source itself, which destroys nothing and is undone by moving the entry
+/// back. Any other command shape, source template, destination template,
+/// extra operand, or mv option refuses the proof, and only the two mv rules
+/// whose sole evidence this shape trips (`mv-dynamic-path`,
+/// `mv-sensitive-source-root-home`) are narrowed by it.
+fn statically_safe_timestamped_backup_mv(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    dialect_segment: &str,
+    dialect: ShellDialect,
+) -> bool {
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return false;
+    }
+    let tokens = tokenize_for_shell_dialect(dialect_segment, ShellDialect::Posix);
+    let words: Vec<&str> = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| token.text(dialect_segment))
+        .collect();
+    let [command_word, source_word, destination_word] = words.as_slice() else {
+        return false;
+    };
+    if *command_word != "mv" {
+        return false;
+    }
+    let source_template = double_quoted_body(source_word).unwrap_or(source_word);
+    if !literal_backup_source_template(source_template) {
+        return false;
+    }
+    let Some(backup_name) = double_quoted_body(destination_word).and_then(exact_variable_reference)
+    else {
+        return false;
+    };
+
+    let mut preceding: Vec<&str> = segment_ranges
+        .iter()
+        .copied()
+        .filter(|&(start, end)| {
+            end <= segment_start && !segment_range_is_nested(segment_ranges, start, end)
+        })
+        .filter_map(|(start, end)| source.get(start..end).map(str::trim))
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let Some(backup_assignment) = preceding.pop() else {
+        return false;
+    };
+    let Some(stamp_assignment) = preceding.pop() else {
+        return false;
+    };
+
+    let Some((stamp_name, stamp_value)) = posix_scalar_assignment(stamp_assignment) else {
+        return false;
+    };
+    if stamp_value != "$(date +%Y%m%d%H%M%S)" && stamp_value != "\"$(date +%Y%m%d%H%M%S)\"" {
+        return false;
+    }
+    let Some((assigned_name, backup_value)) = posix_scalar_assignment(backup_assignment) else {
+        return false;
+    };
+    if assigned_name != backup_name || stamp_name == backup_name {
+        return false;
+    }
+    let Some(backup_template) = double_quoted_body(backup_value) else {
+        return false;
+    };
+    backup_template == format!("{source_template}.backup-${stamp_name}")
+        || backup_template == format!("{source_template}.backup-${{{stamp_name}}}")
+}
+
 /// Parse the variable reference starting at a `$`, returning the name and
 /// the byte length of the whole reference (`$NAME` or `${NAME}`).
 fn parse_leading_posix_variable(token: &str) -> Option<(&str, usize)> {
@@ -21207,9 +21351,9 @@ fn evaluate_core_filesystem_pack(
     deadline: Option<&Deadline>,
     inherited_automated_stdin: bool,
 ) -> Option<EvaluationResult> {
-    // These three rules intentionally span shell separators. Evaluate them
-    // once against the complete command before any safe per-invocation rm
-    // decision can hide the propagation chain.
+    // These rules intentionally span shell separators (the propagation
+    // chains and the fork bomb). Evaluate them once against the complete
+    // command before any safe per-invocation rm decision can hide them.
     if segment_ranges.len() > 1 {
         if let Some(result) = evaluate_pack_destructive_patterns(
             pack_id,
@@ -21467,10 +21611,20 @@ fn evaluate_core_filesystem_pack(
             continue;
         }
 
-        // A `$VAR` mv operand whose every provable value (literal assignment
-        // or fully literal `for` list) re-evaluates to an allowed segment is
-        // exempt from the dynamic-path rule only (issue #242).
-        let final_filter: fn(Option<&str>) -> bool = if statically_safe_loop_variable_mv(
+        // A proven timestamped sibling-backup mv (issue #308) is exempt from
+        // the two mv rules that shape trips; a `$VAR` mv operand whose every
+        // provable value (literal assignment or fully literal `for` list)
+        // re-evaluates to an allowed segment is exempt from the dynamic-path
+        // rule only (issue #242).
+        let final_filter: fn(Option<&str>) -> bool = if statically_safe_timestamped_backup_mv(
+            redirect_source,
+            segment_ranges,
+            segment_start,
+            dialect_segment,
+            shell_dialect,
+        ) {
+            filesystem_non_pre_rm_non_redirect_pattern_excluding_proven_backup
+        } else if statically_safe_loop_variable_mv(
             redirect_source,
             segment_ranges,
             segment_start,
@@ -21564,6 +21718,15 @@ fn command_pattern_match_is_inert_quoted_data(
         return false;
     };
 
+    // A match inside a POSIX-shell inline payload (`bash -lc '…'`) keeps the
+    // quote context the payload itself defines: the payload IS shell source,
+    // so `bash -lc 'grep -n "rm -rf /" notes.md'` classifies its match
+    // exactly like the bare `grep -n "rm -rf /" notes.md` does (#288
+    // follow-up). Non-shell payloads keep the conservative treatment below.
+    if let Some(inert) = shell_inline_payload_offset_is_quoted_data(command, keyword_offset) {
+        return inert;
+    }
+
     if !crate::context::offset_is_quoted_data(command, keyword_offset) {
         return false;
     }
@@ -21618,6 +21781,49 @@ fn offset_is_in_conservatively_scanned_interpreter_input(command: &str, offset: 
         command,
         offset..offset.saturating_add(1),
     )
+}
+
+/// When `offset` falls inside a POSIX-shell inline payload (`bash -c '…'`,
+/// `sh -lc "…"`), re-derive quote context FROM THE PAYLOAD: the payload is
+/// shell source, so its own quoting decides whether the matched text is
+/// executed code or argument data. Returns `Some(true)` when the payload
+/// classifies the offset as quoted data (inert), `Some(false)` when the
+/// payload classifies it as live code (the deny stands, exactly as for the
+/// bare inner command), and `None` when the offset is not inside a shell
+/// inline payload — non-shell interpreter payloads deliberately return
+/// `None` so the conservative #136 treatment keeps applying to them.
+fn shell_inline_payload_offset_is_quoted_data(command: &str, offset: usize) -> Option<bool> {
+    // Tier-1 gate keeps this off the hot path: extraction only runs when the
+    // command carries an inline-script or heredoc indicator, and only after a
+    // core rule has already matched.
+    if crate::heredoc::check_triggers(command) == crate::heredoc::TriggerResult::NoTrigger {
+        return None;
+    }
+    let crate::heredoc::ExtractionResult::Extracted(contents) =
+        crate::heredoc::extract_content(command, &crate::heredoc::ExtractionLimits::default())
+    else {
+        return None;
+    };
+    for content in &contents {
+        let Some(range) = content.content_range.as_ref() else {
+            continue;
+        };
+        if !(range.start <= offset && offset < range.end) {
+            continue;
+        }
+        if content.language != crate::heredoc::ScriptLanguage::Bash {
+            return None;
+        }
+        // Heredoc bodies have their own scanning tiers; this re-derivation is
+        // only for inline `-c` payloads, whose bytes sit verbatim in the
+        // outer command string.
+        let payload = command.get(range.clone())?;
+        return Some(crate::context::offset_is_quoted_data(
+            payload,
+            offset - range.start,
+        ));
+    }
+    None
 }
 
 fn range_intersects_conservatively_scanned_interpreter_input(
@@ -33956,6 +34162,150 @@ mod tests {
             assert!(
                 result.is_denied(),
                 "active expansion must remain denied: {command:?}"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Issue #302: fork bombs span segment separators
+    // =========================================================================
+
+    /// The fork bomb's body and invocation necessarily cross `|`, `&`, and
+    /// `;`, so it must be caught by the whole-command cross-segment pass,
+    /// not the per-segment loop.
+    #[test]
+    fn fork_bomb_denies_through_full_pipeline_issue_302() {
+        for command in [":(){ :|:& };:", "bomb(){ bomb|bomb& };bomb"] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+                assert!(
+                    result.is_denied(),
+                    "fork bomb must deny under {dialect:?}: {command:?}"
+                );
+                assert_eq!(
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref()),
+                    Some("fork-bomb")
+                );
+            }
+        }
+        // A pipeline of two DIFFERENT commands with a function is not a bomb.
+        let result = evaluate_with_pack_ids_in_dialect(
+            "f(){ a|b& };f",
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(!result.is_denied(), "{:?}", result.pattern_info);
+    }
+
+    // =========================================================================
+    // Issue #288 follow-up: inline shell payloads keep their own quote context
+    // =========================================================================
+
+    /// `bash -lc '<cmd>'` must classify quoted text inside the payload the
+    /// same way the bare `<cmd>` does: grep's quoted pattern is data, not an
+    /// executed `rm`.
+    #[test]
+    fn shell_inline_payload_keeps_inner_quote_context_issue_288() {
+        for command in [
+            r#"grep -n "rm -rf /" notes.md"#,
+            r#"bash -lc 'grep -n "rm -rf /" notes.md'"#,
+            r#"bash -c 'grep -n "rm -rf /" notes.md'"#,
+            r#"sh -c 'grep -n "rm -rf /" notes.md'"#,
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+                assert!(
+                    !result.is_denied(),
+                    "quoted grep pattern is data under {dialect:?}: {command:?} -> {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+
+        // Unquoted destruction inside the payload is still live code.
+        for command in [
+            r"bash -c 'rm -rf /'",
+            r"sh -lc 'rm -rf ~'",
+            // A QUOTED command word in payload command position still runs.
+            r#"bash -c '"rm" -rf /'"#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "executed payload destruction must stay denied: {command:?}"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Issue #308: proven timestamped sibling-backup mv
+    // =========================================================================
+
+    /// The exact assignment-and-move shape is a reversible sibling rename:
+    /// `STAMP=$(date +%Y%m%d%H%M%S); BACKUP="<src>.backup-$STAMP";
+    /// mv "<src>" "$BACKUP"`.
+    #[test]
+    fn timestamped_sibling_backup_mv_is_allowed_issue_308() {
+        let commands = [
+            "STAMP=$(date +%Y%m%d%H%M%S); BACKUP=\"$HOME/.agents/skills/example.backup-$STAMP\"; mv \"$HOME/.agents/skills/example\" \"$BACKUP\"",
+            "STAMP=$(date +%Y%m%d%H%M%S); BACKUP=\"/opt/agents/skills/example.backup-$STAMP\"; mv \"/opt/agents/skills/example\" \"$BACKUP\"",
+            "TS=$(date +%Y%m%d%H%M%S); DEST=\"${HOME}/.agents/skills/demo.backup-$TS\"; mv \"${HOME}/.agents/skills/demo\" \"$DEST\"",
+        ];
+        for command in commands {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+                assert!(
+                    !result.is_denied(),
+                    "proven sibling backup must be allowed under {dialect:?}: {command:?} -> {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+    }
+
+    /// Every deviation from the proven shape keeps the fail-closed deny:
+    /// a different substitution, a non-sibling destination, mv options, an
+    /// intervening segment, parent traversal, or an unquoted destination.
+    #[test]
+    fn altered_backup_shapes_stay_denied_issue_308() {
+        let commands = [
+            // Arbitrary command substitution in the stamp.
+            "STAMP=$(curl example.test); BACKUP=\"$HOME/.agents/skills/example.backup-$STAMP\"; mv \"$HOME/.agents/skills/example\" \"$BACKUP\"",
+            // Destination template is not a sibling of the source.
+            "STAMP=$(date +%Y%m%d%H%M%S); BACKUP=\"$HOME/other.backup-$STAMP\"; mv \"$HOME/.agents/skills/example\" \"$BACKUP\"",
+            // mv option changes semantics.
+            "STAMP=$(date +%Y%m%d%H%M%S); BACKUP=\"$HOME/.agents/skills/example.backup-$STAMP\"; mv -f \"$HOME/.agents/skills/example\" \"$BACKUP\"",
+            // Extra operand.
+            "STAMP=$(date +%Y%m%d%H%M%S); BACKUP=\"$HOME/.agents/skills/example.backup-$STAMP\"; mv \"$HOME/.agents/skills/example\" \"$HOME/.ssh\" \"$BACKUP\"",
+            // A segment between the assignments and the mv could mutate the
+            // variables.
+            "STAMP=$(date +%Y%m%d%H%M%S); BACKUP=\"$HOME/.agents/skills/example.backup-$STAMP\"; eval x; mv \"$HOME/.agents/skills/example\" \"$BACKUP\"",
+            // Parent traversal in the source template.
+            "STAMP=$(date +%Y%m%d%H%M%S); BACKUP=\"$HOME/.agents/skills/../../../etc.backup-$STAMP\"; mv \"$HOME/.agents/skills/../../../etc\" \"$BACKUP\"",
+            // Unquoted destination could word-split or glob.
+            "STAMP=$(date +%Y%m%d%H%M%S); BACKUP=\"$HOME/.agents/skills/example.backup-$STAMP\"; mv \"$HOME/.agents/skills/example\" $BACKUP",
+            // Glob in the source template.
+            "STAMP=$(date +%Y%m%d%H%M%S); BACKUP=\"$HOME/.agents/skills/*.backup-$STAMP\"; mv \"$HOME/.agents/skills/*\" \"$BACKUP\"",
+        ];
+        for command in commands {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "altered backup shape must stay denied: {command:?}"
             );
         }
     }
