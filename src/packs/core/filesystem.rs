@@ -2856,6 +2856,10 @@ pub fn create_pack() -> Pack {
             "rm", "find", "unlink", "truncate", "shred", "tar", "dd", "mv", "cp", "ln", "rsync",
             ">/", "> /", ">~", "> ~", ">$", "> $", ">\"", "> \"", ">'", "> '", "&>", ">&", ">|",
             "1>", "2>", ">%", "> %", ">!", "> !", ">^", "> ^",
+            // Shell function definition marker — reachability for the
+            // fork-bomb rule (issue #302). `:(){ …` and `bomb() { …` both
+            // contain the two-byte `()` substring.
+            "()",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -3880,6 +3884,28 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Use append (`>>`) when preserving existing content is acceptable.",
             REDIRECT_TRUNCATE_SUGGESTIONS
         ),
+        // Classic fork bomb: a no-argument function whose body pipes itself
+        // into itself in the background, immediately invoked
+        // (`:(){ :|:& };:` and word-named variants). The backreferences
+        // enforce that all three identifiers are the same, which is what
+        // separates a fork bomb from an ordinary function definition — this
+        // deliberately selects the backtracking engine. Differently shaped
+        // bombs (`while true; do (x) & done`) are out of scope: the regex
+        // crate family cannot enforce those without unbounded false
+        // positives, and the canonical form is the one agents actually
+        // reproduce (issue #302).
+        destructive_pattern!(
+            "fork-bomb",
+            r"([A-Za-z0-9_:]+)\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&\s*;?\s*\}\s*;\s*\1",
+            "This is a fork bomb: it recursively spawns processes until the system is unusable.",
+            Critical,
+            "A fork bomb defines a function that pipes itself into itself in the \
+             background and then calls it. Process count grows exponentially until \
+             the kernel can no longer schedule anything; the machine typically \
+             needs a hard reboot, losing all unsaved work in every application.\n\n\
+             There is no legitimate reason to run this shape. If you are testing \
+             process limits, use `ulimit -u` in a disposable VM or container."
+        ),
     ]
 }
 
@@ -3888,6 +3914,39 @@ mod tests {
     use super::*;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    /// Issue #302: the canonical fork bomb and word-named variants are
+    /// blocked; ordinary function definitions that merely pipe two different
+    /// commands are not.
+    #[test]
+    fn fork_bomb_is_blocked_issue_302() {
+        let pack = create_pack();
+        for bomb in [
+            ":(){ :|:& };:",
+            "bomb(){ bomb|bomb& };bomb",
+            ": () { : | : & ; } ; :",
+            "b(){ b|b&;};b",
+        ] {
+            assert!(
+                pack.might_match(bomb),
+                "fork bomb must be reachable via pack keywords: {bomb}"
+            );
+            assert_blocks_with_pattern(&pack, bomb, "fork-bomb");
+        }
+        // Same-shape functions piping two DIFFERENT commands are not bombs.
+        for benign in [
+            "serve(){ python|tee & };logs",
+            "f(){ a|b& };f",
+            "retry(){ curl -s x|jq . ; };retry",
+        ] {
+            let matched = pack.check(benign);
+            assert_ne!(
+                matched.as_ref().and_then(|m| m.name),
+                Some("fork-bomb"),
+                "non-self-referential function must not match fork-bomb: {benign}"
+            );
+        }
+    }
 
     /// The `-r`/`-f` rules match the FLAG PAIR, not an argv0, so they also
     /// cover `rm` used as another tool's subcommand. That is deliberate and

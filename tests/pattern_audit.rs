@@ -337,6 +337,9 @@ fn test_audit_backtracking_requirements() {
                 "unlink-tmpdir",
                 "unlink-tmpdir-brace",
                 "unlink-var-tmp",
+                // Backreferences enforce that the fork-bomb's three
+                // identifiers are the same token (issue #302).
+                "fork-bomb",
             ]),
         ),
         (
