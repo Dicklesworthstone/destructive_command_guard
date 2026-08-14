@@ -13,6 +13,8 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## [Unreleased]
 
+## [v0.11.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.11.0) -- 2026-08-14 [Release]
+
 ### Added
 
 - **macOS `diskutil` coverage in `system.disk` (#305).** `diskutil eraseDisk`,
