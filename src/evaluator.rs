@@ -34257,6 +34257,30 @@ mod tests {
         }
     }
 
+    /// The #307 suppression is scoped to `mv-dynamic-path` only: an mv whose
+    /// operand is single-quoted (so the dynamic rule stands down) but names a
+    /// sensitive literal path is still denied by the sensitive-source rule.
+    #[test]
+    fn single_quoted_marker_does_not_bypass_sensitive_mv_issue_307() {
+        for command in [
+            "mv './$X' '/etc'",
+            "mv '/etc/$X' /tmp/y",
+            "mv './$X' '/etc/passwd'",
+            "mv '$HOME' /tmp/z",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "single-quoted marker must not shield a sensitive path: {command:?} -> {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
     /// One active marker anywhere keeps the fail-closed deny: double-quoted
     /// operands interpolate, unquoted variables expand, and a backslash
     /// outside quotes can manipulate the quoting itself.
