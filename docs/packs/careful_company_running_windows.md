@@ -342,6 +342,7 @@ These patterns match potentially destructive commands:
 | `dcg-bypass-or-uninstall` | Bypassing or uninstalling dcg removes the guard that is supervising this session. | critical |
 | `dcg-policy-self-weakening` | Granting an allowlist exception or overriding pack/policy config lets the agent clear its own path. | critical |
 | `agent-hook-config-tamper` | Editing or deleting the agent's hook configuration can silently remove dcg's protection. | high |
+| `agent-hook-config-overwrite` | Copying a file ONTO the agent's hook configuration replaces it and can silently remove dcg's protection. | high |
 | `download-and-execute` | Fetching code and piping it straight into Invoke-Expression runs unreviewed remote code. | critical |
 | `powershell-encoded-command` | powershell -EncodedCommand hides the command being run behind base64. | critical |
 | `lolbin-remote-execution` | mshta/regsvr32/rundll32 pointed at a remote payload execute code from the internet. | critical |

@@ -14,13 +14,14 @@ This document describes packs in the `system` category.
 
 **Pack ID:** `system.disk`
 
-Protects against destructive disk operations like dd to devices, mkfs, partition table modifications, RAID management, btrfs/LVM/device-mapper operations, and network block devices
+Protects against destructive disk operations like dd to devices, mkfs, partition table modifications, RAID management, btrfs/LVM/device-mapper operations, network block devices, and macOS diskutil erase/partition/APFS deletion
 
 ### Keywords
 
 Commands containing these keywords are checked against this pack:
 
 - `dd`
+- `diskutil`
 - `fdisk`
 - `mkfs`
 - `mkswap`
@@ -75,6 +76,7 @@ These patterns match safe commands that are always allowed:
 | `dmsetup-deps` | `dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+deps(?=\s\|$)` |
 | `nbd-client-list` | `nbd-client\s+-l\b` |
 | `nbd-client-check` | `nbd-client\s+.*-check\b` |
+| `diskutil-readonly` | `(?i)diskutil\s+(?:list\|info\|information\|activity\|listFilesystems\|apfs\s+list(?:Snapshots\|Users)?)\b[^;&\|]*$` |
 | `lvm-list` | `\b(?:lvs\|vgs\|pvs)\b` |
 | `lvm-display` | `\b(?:lvdisplay\|vgdisplay\|pvdisplay)\b` |
 | `lvm-scan` | `\b(?:lvscan\|vgscan\|pvscan)\b` |
@@ -124,6 +126,9 @@ These patterns match potentially destructive commands:
 | `lvresize-shrink` | lvresize with negative size SHRINKS the volume. Resize filesystem first or lose data! | high |
 | `pvmove` | pvmove migrates data between physical volumes. Do NOT interrupt or data may be lost. | high |
 | `lvconvert-merge` | lvconvert --merge reverts LV to snapshot state, discarding changes since snapshot. | high |
+| `diskutil-erase` | diskutil erase operations DESTROY all data on the target disk or volume. | critical |
+| `diskutil-partition` | diskutil partitioning operations rewrite the partition map and erase data. | critical |
+| `diskutil-apfs-delete` | diskutil apfs delete/erase operations permanently remove APFS containers, volumes, or snapshots. | critical |
 
 ### Allowlist Guidance
 
