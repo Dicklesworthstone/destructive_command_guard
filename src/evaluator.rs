@@ -19549,6 +19549,21 @@ fn evaluate_packs_with_allowlists_at_depth(
                 continue;
             }
 
+            // A package-manager `publish` regex matches on the sanitized view,
+            // which has lost the quoting that separates `--reporter "publish"`
+            // (a value) from the `publish` subcommand. Confirm against the
+            // original command that publication is genuinely invoked (#306).
+            if pack_id == "package_managers"
+                && let Some(exe) =
+                    crate::packs::package_managers::PublishExe::from_rule(pattern.name)
+                && !crate::packs::package_managers::invokes_publish_subcommand(
+                    original_command,
+                    exe,
+                )
+            {
+                continue;
+            }
+
             // All severity levels are now evaluated. The policy layer in main.rs
             // determines whether to deny, warn, or log based on severity and config.
 
@@ -22176,6 +22191,18 @@ fn evaluate_pack_destructive_patterns(
         }
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
             return Some(EvaluationResult::indeterminate_due_to_budget());
+        }
+
+        // A package-manager `publish` regex matches on the sanitized view,
+        // which has lost the quoting that separates an option value like
+        // `--reporter "publish"` from the `publish` subcommand. Confirm
+        // against the original command that publication is genuinely invoked
+        // (#306).
+        if pack_id == "package_managers"
+            && let Some(exe) = crate::packs::package_managers::PublishExe::from_rule(pattern.name)
+            && !crate::packs::package_managers::invokes_publish_subcommand(original_command, exe)
+        {
+            continue;
         }
 
         let semantic_branch_rule = match branch_decision {
@@ -34117,6 +34144,53 @@ mod tests {
                 "name-shaped alias boundary must stay denied: {command:?}: {:?}",
                 result.pattern_info
             );
+        }
+    }
+
+    // =========================================================================
+    // Issue #306: pnpm/npm/yarn publish survives sanitization end-to-end
+    // =========================================================================
+
+    /// The pack regexes run on the sanitized command, which strips the quotes
+    /// that tell `pnpm --reporter "publish"` (a value) apart from
+    /// `pnpm --reporter publish`. The evaluator gate must keep the quoted form
+    /// allowed and real publications denied, in every dialect.
+    #[test]
+    fn pnpm_publish_gate_survives_sanitization_issue_306() {
+        for dialect in [
+            ShellDialect::Posix,
+            ShellDialect::Unknown,
+            ShellDialect::Cmd,
+            ShellDialect::PowerShell,
+        ] {
+            for command in [
+                "pnpm --reporter \"publish\"",
+                "pnpm --reporter 'publish'",
+                "pnpm run build --reporter \"publish\"",
+                "grep \"pnpm publish\" notes.md",
+            ] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(command, &["package_managers"], dialect);
+                assert!(
+                    !result.is_denied(),
+                    "quoted/value publish must allow under {dialect:?}: {command:?} -> {:?}",
+                    result.pattern_info
+                );
+            }
+            for command in [
+                "pnpm publish",
+                "pnpm --silent publish",
+                "pnpm --reporter append-only publish",
+                "npm --registry https://r.example publish",
+                "yarn workspace pkg-a publish",
+            ] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(command, &["package_managers"], dialect);
+                assert!(
+                    result.is_denied(),
+                    "real publication must deny under {dialect:?}: {command:?}"
+                );
+            }
         }
     }
 

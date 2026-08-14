@@ -6,8 +6,129 @@
 //! - apt/yum remove critical packages
 //! - cargo publish
 
+use crate::normalize::{NormalizeTokenKind, ShellDialect, ShellTokenDecoder, ShellTokenRole};
 use crate::packs::{DestructivePattern, Pack, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
+
+/// Which package manager a `*-publish` rule guards, with the positional
+/// subcommand-prefix keywords that tool accepts before `publish`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublishExe {
+    Npm,
+    Yarn,
+    Pnpm,
+}
+
+impl PublishExe {
+    /// Map a destructive-rule name to the executable it guards.
+    pub(crate) fn from_rule(name: Option<&str>) -> Option<Self> {
+        match name {
+            Some("npm-publish") => Some(Self::Npm),
+            Some("yarn-publish") => Some(Self::Yarn),
+            Some("pnpm-publish") => Some(Self::Pnpm),
+            _ => None,
+        }
+    }
+
+    fn matches_executable(self, word: &str) -> bool {
+        let base = std::path::Path::new(word)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(word);
+        let stem = base
+            .strip_suffix(".cmd")
+            .or_else(|| base.strip_suffix(".exe"))
+            .or_else(|| base.strip_suffix(".com"))
+            .unwrap_or(base);
+        let name = match self {
+            Self::Npm => "npm",
+            Self::Yarn => "yarn",
+            Self::Pnpm => "pnpm",
+        };
+        stem.eq_ignore_ascii_case(name)
+    }
+
+    /// A positional word that stands between the executable and `publish`
+    /// without establishing a different subcommand (yarn's `workspace <name>`
+    /// and Berry's `npm` prefix; pnpm's spelled-out `recursive`).
+    fn is_transparent_prefix(self, word: &str) -> bool {
+        match self {
+            Self::Npm => false,
+            Self::Yarn => word == "workspace" || word == "npm",
+            Self::Pnpm => word == "recursive",
+        }
+    }
+
+    fn prefix_consumes_next_word(self, word: &str) -> bool {
+        matches!(self, Self::Yarn) && word == "workspace"
+    }
+}
+
+/// Whether `command` genuinely invokes the given package manager's `publish`
+/// subcommand. This inspects the ORIGINAL (unsanitized) command so quoting is
+/// intact: an unquoted `publish` in subcommand position is publication, while
+/// a quoted `publish` — or one sitting in option-value position — is argument
+/// data. The pack regexes run on the sanitized view, which has already lost
+/// the quotes that distinguish `pnpm --reporter "publish"` (a reporter value)
+/// from `pnpm --reporter publish`, so this gate is what keeps the former
+/// allowed while the latter fails closed (issue #306).
+#[must_use]
+pub(crate) fn invokes_publish_subcommand(command: &str, exe: PublishExe) -> bool {
+    crate::packs::split_command_segments(command)
+        .into_iter()
+        .any(|segment| segment_invokes_publish(segment, exe))
+}
+
+fn segment_invokes_publish(segment: &str, exe: PublishExe) -> bool {
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+    // (decoded value, was_unquoted) for each word token, in order.
+    let words: Vec<(String, bool)> =
+        crate::normalize::tokenize_for_shell_dialect(segment, ShellDialect::Posix)
+            .iter()
+            .filter(|token| token.kind == NormalizeTokenKind::Word)
+            .filter_map(|token| {
+                let raw = token.text(segment)?;
+                let decoded = decoder.decode(raw, ShellTokenRole::Syntax)?;
+                let was_unquoted = decoded.as_ref() == raw;
+                Some((decoded.into_owned(), was_unquoted))
+            })
+            .collect();
+
+    let Some(exe_index) = words.iter().position(|(word, _)| exe.matches_executable(word)) else {
+        return false;
+    };
+
+    let mut preceding_positional = false;
+    let mut skip_next = false;
+    for index in exe_index + 1..words.len() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        let (word, was_unquoted) = &words[index];
+        // An unquoted `publish` is the subcommand unless an earlier bare
+        // positional already established a different one.
+        if word == "publish" && *was_unquoted {
+            return !preceding_positional;
+        }
+        if word.starts_with('-') {
+            continue;
+        }
+        if exe.is_transparent_prefix(word) {
+            if exe.prefix_consumes_next_word(word) {
+                skip_next = true;
+            }
+            continue;
+        }
+        // A bare word that does not immediately follow an option establishes
+        // a subcommand; a word after an option might be that option's value.
+        let follows_option = index > exe_index + 1 && words[index - 1].0.starts_with('-');
+        if !follows_option {
+            preceding_positional = true;
+        }
+    }
+    false
+}
 
 /// Create the Package Managers pack.
 #[must_use]
@@ -255,6 +376,52 @@ mod tests {
         assert_allows, assert_blocks, assert_blocks_with_pattern, assert_no_safe_match,
         assert_safe_pattern_matches,
     };
+
+    /// Issue #306: the quoting-aware gate distinguishes a `publish` option
+    /// value (quoted, or in value position) from the `publish` subcommand,
+    /// inspecting the ORIGINAL command where quoting survives.
+    #[test]
+    fn invokes_publish_subcommand_gate_issue_306() {
+        use PublishExe::{Npm, Pnpm, Yarn};
+        // (command, exe, expected-invokes-publish)
+        let cases: &[(&str, PublishExe, bool)] = &[
+            ("pnpm publish", Pnpm, true),
+            ("pnpm -r publish", Pnpm, true),
+            ("pnpm recursive publish", Pnpm, true),
+            ("pnpm --filter workspace publish", Pnpm, true),
+            ("pnpm --silent publish", Pnpm, true),
+            ("pnpm --reporter append-only publish", Pnpm, true),
+            ("pnpm --reporter publish", Pnpm, true), // unquoted value → fail closed
+            ("cd pkg && pnpm publish", Pnpm, true),
+            ("pnpm.cmd publish", Pnpm, true),
+            // Quoted publish is a value, never the subcommand.
+            ("pnpm --reporter \"publish\"", Pnpm, false),
+            ("pnpm --reporter 'publish'", Pnpm, false),
+            ("pnpm run build --reporter \"publish\"", Pnpm, false),
+            // A prior positional established a different subcommand.
+            ("pnpm run build publish", Pnpm, false),
+            ("pnpm run publish", Pnpm, false),
+            ("pnpm install publish", Pnpm, false),
+            // No pnpm executable at all (a pnpm inside quoted data).
+            ("grep \"pnpm publish\" notes.md", Pnpm, false),
+            ("pnpm run build; bun ./publish-snapshot.ts", Pnpm, false),
+            // npm / yarn
+            ("npm publish", Npm, true),
+            ("npm --registry https://r.example publish", Npm, true),
+            ("npm run build && node ./publish.js", Npm, false),
+            ("yarn publish", Yarn, true),
+            ("yarn workspace pkg-a publish", Yarn, true),
+            ("yarn npm publish", Yarn, true),
+            ("yarn run build publish", Yarn, false),
+        ];
+        for &(command, exe, expected) in cases {
+            assert_eq!(
+                invokes_publish_subcommand(command, exe),
+                expected,
+                "invokes_publish_subcommand({command:?}, {exe:?})"
+            );
+        }
+    }
 
     /// Issue #306: `publish` is only pnpm's subcommand when it sits in
     /// subcommand position; argument data and later shell segments are not
