@@ -108,12 +108,17 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   `pnpm run build; bun ./publish-snapshot.ts`, `pnpm run build --reporter
   "publish"`, and `pnpm run build publish` no longer deny: `publish` must be
   reachable through option tokens only, so argument data and later shell
-  segments are not publication. Real forms (`pnpm -r publish`,
+  segments are not publication. Because the pack regexes run on the sanitized
+  command — which has already stripped the quotes that distinguish
+  `pnpm --reporter "publish"` (a value) from `pnpm --reporter publish` — a
+  match is confirmed against the **original** command by a quoting-aware gate
+  (`invokes_publish_subcommand`): an unquoted `publish` in subcommand position
+  is publication, a quoted one is data. Real forms (`pnpm -r publish`,
   `pnpm recursive publish`, `--filter <ws> publish`, `yarn workspace <ws>
   publish`, `yarn npm publish`, `pnpm.cmd`) still deny, and an unquoted
-  option value named `publish` stays fail-closed. The `*-dry-run` safe
-  patterns are segment-bounded so a dry-run in one segment cannot mask a
-  later one.
+  option value named `publish` stays fail-closed, in every dialect. The
+  `*-dry-run` safe patterns are segment-bounded so a dry-run in one segment
+  cannot mask a later one.
 - **Single-quoted `$`/backtick/backslash in `mv` paths are literal (#307).**
   `mv './$ROOT' /tmp/x` is data, not expansion: `mv-dynamic-path` stands
   down only when *every* dynamic marker in the command is inside a POSIX
