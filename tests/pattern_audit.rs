@@ -1095,7 +1095,13 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "careful_company_running_windows.guardrails",
-            HashSet::from(["read-only-data-context"]),
+            HashSet::from([
+                "read-only-data-context",
+                // Destination-position detection needs lookaheads to keep a
+                // named -Destination value from running into later
+                // parameters (issue #313).
+                "agent-hook-config-overwrite",
+            ]),
         ),
         (
             "careful_company_running_windows.tunnel",
