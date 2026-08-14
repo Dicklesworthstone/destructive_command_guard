@@ -607,6 +607,19 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         "core.filesystem:redirect-truncate-dynamic-path",
         rm_rf_suggestions,
     );
+    m.insert(
+        "core.filesystem:fork-bomb",
+        vec![
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "There is no safe variant of a fork bomb; do not run it",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "To test process limits, use `ulimit -u` inside a disposable VM or container",
+            ),
+        ],
+    );
 }
 
 /// Register suggestions for heredoc pattern rules.

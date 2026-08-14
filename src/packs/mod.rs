@@ -1362,6 +1362,10 @@ static PACK_ENTRIES: [PackEntry; 99] = [
             ">|",
             "1>",
             "2>",
+            // Shell function-definition marker: reachability for the
+            // fork-bomb rule (issue #302). `:(){ …` and `bomb() { …` both
+            // contain the two-byte `()` substring.
+            "()",
         ],
         core::filesystem::create_pack,
     ),
@@ -1847,6 +1851,7 @@ static PACK_ENTRIES: [PackEntry; 99] = [
         "system.disk",
         &[
             "dd",
+            "diskutil",
             "mkfs",
             "mkswap",
             "fdisk",

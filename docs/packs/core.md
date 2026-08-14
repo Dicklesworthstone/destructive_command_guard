@@ -118,6 +118,7 @@ Commands containing these keywords are checked against this pack:
 - `> !`
 - `>^`
 - `> ^`
+- `()`
 
 ### Safe Patterns (Allowed)
 
@@ -192,6 +193,7 @@ These patterns match potentially destructive commands:
 | `mv-dynamic-path` | mv with a shell-expanded or escaped path cannot be verified before execution. | high |
 | `redirect-truncate-root-home` | shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to a sensitive system or home path destroys the previous file contents. EXTREMELY DANGEROUS. | critical |
 | `redirect-truncate-dynamic-path` | shell redirect to a dynamic or escaped path may truncate a sensitive file and requires human approval. | high |
+| `fork-bomb` | This is a fork bomb: it recursively spawns processes until the system is unusable. | critical |
 
 ### Allowlist Guidance
 
