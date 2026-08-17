@@ -13,6 +13,42 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## [Unreleased]
 
+### Fixed
+
+- **Quoted `>` bytes inside an inline interpreter payload no longer read as
+  redirect syntax when the segment carries a real redirect (#317).** `sh -c
+  "echo 'a => %s'" 2>&1` (and the `2>/dev/null` / literal `/tmp` target /
+  `python3 -c` / `node -e` variants) allowed: the `redirect-truncate-*` match
+  offset is now re-derived against the payload's own quoting, extending the
+  6f1aa5a treatment from `$`/backtick to the redirect operator. A live `>`
+  inside the payload (`bash -c "cat x > $T"`), a dynamic or sensitive target
+  outside it, and multi-segment payloads all keep the fail-closed deny.
+- **PowerShell `2>$null` is the null device, not a dynamic path (#321).**
+  Under a proven PowerShell dialect, a command whose every redirect target is
+  the read-only `$null` automatic variable (case-insensitive, `${null}`
+  included) no longer denies as `redirect-truncate-dynamic-path`. `$nullFile`,
+  `$none`, mixed targets, and POSIX/Unknown dialects — where `null` is an
+  ordinary assignable variable — stay denied.
+- **Grok Build's documented shell tool name is accepted (#319).** Grok's hooks
+  guide names the shell tool `run_terminal_command`; dcg only accepted the
+  abbreviated `run_terminal_cmd`, so the documented envelope was answered with
+  a "skip" — a silent fail-open on the exact path Grok uses. Both spellings now
+  classify as the Grok protocol and evaluate the command.
+- **`redirect-truncate-*` denials now carry redirect-specific suggestions
+  (#316/#317).** The suggestion registry previously served the recursive-rm
+  set (`ls -la` preview / `rm -ri` / move-to-trash) for redirect rules — a non
+  sequitur on a redirect denial. The rules now suggest inspecting the resolved
+  target, appending instead of truncating, redirecting to a literal temp path,
+  and backing up first. The `rm-rf-root-home` explanation also no longer
+  recommends `rm -rf /path/to/specific/directory` — a command dcg itself
+  denies — and points at the literal-temp and interactive (`rm -ri`) forms it
+  actually allows (#316).
+
+### Dependencies
+
+- Applied dependabot #315 directly: `async-trait` 0.1.92, `ast-grep-core` /
+  `ast-grep-language` 0.45.1, `rusqlite` 0.40.2 (+ `libsqlite3-sys` 0.38.2).
+
 ## [v0.11.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.11.0) -- 2026-08-14 [Release]
 
 ### Added
