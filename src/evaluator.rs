@@ -19603,9 +19603,38 @@ fn evaluate_packs_with_allowlists_at_depth(
             // the operator offset lies inside an inert quoted span (#225). The
             // anti-bypass forms keep the operator outside the quotes, so they
             // still match here.
+            //
+            // A match inside an inline interpreter payload (`sh -c "echo
+            // 'a => %s'"`, `python3 -c "print('a => %s')"`) re-derives quote
+            // context FROM THE PAYLOAD, exactly as the command-oriented rules
+            // do post-6f1aa5a: a `>` that the payload's own quoting proves to
+            // be string-literal bytes is not shell redirect syntax, and a
+            // real redirect elsewhere in the segment (`2>&1`) must not strip
+            // the payload of that context (issue #317). A live `>` inside the
+            // payload (`bash -c "cat x > $T"`) classifies as code there and
+            // keeps the deny; a real redirect OUTSIDE the payload is covered
+            // both here (its own offset is unquoted) and by the per-segment
+            // redirect-view pass, which masks the payload and evaluates only
+            // the segment's true redirect syntax.
             if is_core_filesystem_redirect_rule(pack_id, pattern.name)
                 && (crate::context::offset_is_quoted_data(command_for_packs, span.start)
-                    || first_unquoted_output_redirect(command_for_packs, shell_dialect).is_none())
+                    || first_unquoted_output_redirect(command_for_packs, shell_dialect).is_none()
+                    || inline_payload_offset_is_quoted_redirect_data(command_for_packs, span.start))
+            {
+                continue;
+            }
+
+            // PowerShell's `$null` automatic variable is the null device —
+            // `2>$null` is the idiomatic `2>/dev/null` and never opens a
+            // file, and `$null` is a read-only constant that cannot be
+            // reassigned to a path. When the dialect is proven PowerShell and
+            // every redirect target in the command is `$null`, the
+            // dynamic-path rule stands down (issue #321). Any other variable
+            // (`$nullFile`, `$none`) and any non-PowerShell dialect keep the
+            // fail-closed denial.
+            if pattern.name == Some("redirect-truncate-dynamic-path")
+                && pack_id == "core.filesystem"
+                && powershell_null_device_redirects_only(command_for_packs, shell_dialect)
             {
                 continue;
             }
@@ -21289,6 +21318,30 @@ fn unquoted_output_redirect_targets(command: &str, dialect: ShellDialect) -> Opt
     (!targets.is_empty()).then_some(targets)
 }
 
+/// True when the dialect is proven PowerShell and every unquoted output
+/// redirect target in `command` is the `$null` automatic variable (issue
+/// #321).
+///
+/// In PowerShell `2>$null` / `*>$null` is the idiomatic null-device redirect
+/// (`2>/dev/null`): no file is opened, nothing can be truncated, and `$null`
+/// is a read-only constant the language refuses to reassign, so the target
+/// cannot be redirected to a real path. The check is deliberately narrow:
+/// only the exact `$null` spelling (case-insensitive, `${null}` included)
+/// qualifies — `$nullFile`, `$none`, and every other variable stay
+/// fail-closed, as does every non-PowerShell dialect, where `$null` is an
+/// ordinary (assignable) variable.
+fn powershell_null_device_redirects_only(command: &str, dialect: ShellDialect) -> bool {
+    if dialect != ShellDialect::PowerShell {
+        return false;
+    }
+    let Some(targets) = unquoted_output_redirect_targets(command, dialect) else {
+        return false;
+    };
+    targets.iter().all(|target| {
+        target.eq_ignore_ascii_case("$null") || target.eq_ignore_ascii_case("${null}")
+    })
+}
+
 /// Whether a matched `core.filesystem` redirect rule is suppressed by a
 /// configured `[rules."core.filesystem:<name>"] exempt_target_globs` (#284).
 ///
@@ -21444,7 +21497,7 @@ fn evaluate_core_filesystem_pack(
             segment_start,
             dialect_segment,
             shell_dialect,
-        );
+        ) || powershell_null_device_redirects_only(dialect_segment, shell_dialect);
         let redirect_filter: fn(Option<&str>) -> bool = if proven_variable_redirect {
             filesystem_redirect_pattern_excluding_dynamic
         } else {
@@ -21850,6 +21903,51 @@ fn shell_inline_payload_offset_is_quoted_data(command: &str, offset: usize) -> O
         ));
     }
     None
+}
+
+/// Redirect-rule variant of [`shell_inline_payload_offset_is_quoted_data`]
+/// (issue #317): when a `core.filesystem` redirect rule's match offset falls
+/// inside an inline interpreter payload, decide from the payload's own
+/// quoting whether the matched `>` is string-literal bytes or live syntax.
+///
+/// Unlike the command-oriented helper this one is NOT limited to Bash
+/// payloads: the redirect rules judge OUTER-shell redirect syntax, and inside
+/// a `python3 -c '…'` / `node -e '…'` payload a quoted `>` is data in every
+/// language whose string literals use POSIX-style quotes. The #136
+/// conservative treatment does not apply here — that class is about quoted
+/// COMMAND strings flowing to execution sinks, which the command-oriented
+/// rules and the recursive launcher analysis keep covering. An UNQUOTED `>`
+/// in any payload still returns false (fail closed): for shell payloads it is
+/// a real redirect, and for other languages the conservative deny is the
+/// safe direction. Multi-segment payloads keep the conservative
+/// classification for the same reason as the Bash helper (`eval` routing).
+fn inline_payload_offset_is_quoted_redirect_data(command: &str, offset: usize) -> bool {
+    if crate::heredoc::check_triggers(command) == crate::heredoc::TriggerResult::NoTrigger {
+        return false;
+    }
+    let crate::heredoc::ExtractionResult::Extracted(contents) =
+        crate::heredoc::extract_content(command, &crate::heredoc::ExtractionLimits::default())
+    else {
+        return false;
+    };
+    for content in &contents {
+        let Some(range) = content.content_range.as_ref() else {
+            continue;
+        };
+        if !(range.start <= offset && offset < range.end) {
+            continue;
+        }
+        // The payload bytes sit verbatim in the outer command string (both
+        // for inline `-c` args and for executing-interpreter heredoc bodies).
+        let Some(payload) = command.get(range.clone()) else {
+            return false;
+        };
+        if crate::packs::split_command_segments(payload).len() != 1 {
+            return false;
+        }
+        return crate::context::offset_is_quoted_data(payload, offset - range.start);
+    }
+    false
 }
 
 fn range_intersects_conservatively_scanned_interpreter_input(
@@ -22316,6 +22414,27 @@ fn evaluate_pack_destructive_patterns(
                 if crate::context::offset_is_quoted_data(pattern_command, raw_start) {
                     continue;
                 }
+                // A match inside an inline interpreter payload keeps the
+                // quote context the payload itself defines: `sh -c "echo
+                // 'a => %s'" 2>&1` matches on the `>` inside `'a => %s'`,
+                // which the payload's own single quotes prove to be literal
+                // bytes, not redirect syntax (issue #317). A live `>` in the
+                // payload (`bash -c "cat x > $T"`) classifies as code there
+                // and keeps the deny.
+                if inline_payload_offset_is_quoted_redirect_data(redirect_syntax_command, raw_start)
+                {
+                    continue;
+                }
+            }
+            // PowerShell's read-only `$null` automatic variable is the null
+            // device: `2>$null` opens no file and cannot truncate anything
+            // (issue #321). Only the exact `$null` spelling under a proven
+            // PowerShell dialect qualifies; see
+            // `powershell_null_device_redirects_only`.
+            if pattern.name == Some("redirect-truncate-dynamic-path")
+                && powershell_null_device_redirects_only(redirect_syntax_command, shell_dialect)
+            {
+                continue;
             }
             // Rule-scoped target exemption (#284): the redirect target is
             // resolvable here, so a configured glob stands this rule down
@@ -29647,6 +29766,107 @@ mod tests {
             assert!(
                 result.is_denied(),
                 "unproven or sensitive redirect target must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_redirect_bytes_inside_inline_shell_payload_stay_inert() {
+        // #317 (post-6f1aa5a residue of #288): a `>` that is literal bytes
+        // inside a quoted string one level down in an inline-shell payload is
+        // not a redirect operator, and a real redirect elsewhere in the
+        // segment (`2>&1`, `2>/dev/null`, a literal /tmp target) must not
+        // strip the payload of its own quote context.
+        for command in [
+            "sh -c \"echo 'a => %s'\" 2>&1",
+            "sh -c \"echo 'a => %s'\" 2>/dev/null",
+            "sh -c \"echo 'a => %s'\" > /tmp/out.txt",
+            "bash -c \"echo 'a => %s'\" 2>&1",
+            "python3 -c \"print('a => %s')\" 2>&1",
+            "node -e \"console.log('a => %s')\" 2>&1",
+            "docker exec c sh -c \"echo 'a => %s'\" 2>&1",
+            "sh -c \"printf '%-20s -> %s\\n' a b\" 2>/dev/null",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "quoted payload bytes must stay inert next to a real redirect: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Controls: a LIVE redirect inside the payload, or a dynamic /
+        // sensitive redirect outside it, keeps the fail-closed denial.
+        for command in [
+            "bash -c \"cat x > $T\"",
+            "bash -c 'cat x > $T'",
+            "sh -c \"echo hi > ~/.ssh/authorized_keys\"",
+            "sh -c 'echo hi > ~/.ssh/authorized_keys'",
+            "echo hi > \"$TARGET\"",
+            "echo hi > ~/data.txt",
+            "cat x > $HOME/y",
+            // Real dynamic redirect OUTSIDE the payload must stay caught even
+            // though the payload also contains quoted `>` bytes.
+            "sh -c \"echo 'a => b'\" > $TARGET",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "live redirect must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_null_device_redirect_is_not_a_dynamic_path() {
+        // #321: PowerShell's `$null` automatic variable is the null device —
+        // `2>$null` is the idiomatic `2>/dev/null`, opens no file, and
+        // `$null` is a read-only constant that cannot name a real path.
+        for command in [
+            "echo hi 2>$null",
+            "echo hi 2>$NULL",
+            "echo hi 2>${null}",
+            "python scan.py --json 2>$null",
+            "Get-ChildItem -Recurse *>$null",
+            "echo hi >$null 2>$null",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::PowerShell,
+            );
+            assert!(
+                result.is_allowed(),
+                "PowerShell $null redirect must be allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Any other variable, a mixed dynamic target, or a non-PowerShell
+        // dialect keeps the fail-closed denial: in POSIX shells `null` is an
+        // ordinary assignable variable.
+        for (command, dialect) in [
+            ("echo hi 2>$nullFile", ShellDialect::PowerShell),
+            ("echo hi 2>$none", ShellDialect::PowerShell),
+            ("echo hi >$log 2>$null", ShellDialect::PowerShell),
+            ("echo hi 2>$null", ShellDialect::Posix),
+            ("echo hi 2>$null", ShellDialect::Unknown),
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+            assert!(
+                result.is_denied(),
+                "non-null-device dynamic redirect must stay denied: {command:?} ({dialect:?}): {:?}",
                 result.pattern_info
             );
         }
