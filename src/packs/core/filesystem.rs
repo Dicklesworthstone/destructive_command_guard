@@ -3272,10 +3272,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Boot files, making the system unbootable\n\n\
              There is NO recovery without backups. Even with backups, full restoration \
              takes hours to days.\n\n\
-             If you need to delete specific files, use explicit paths:\n  \
-             rm -rf /path/to/specific/directory\n\n\
-             Always preview what would be deleted first:\n  \
-             find /path/to/directory -type f | head -20",
+             dcg auto-allows recursive deletion only for literal temp paths:\n  \
+             rm -rf /tmp/<subdir>/scratch\n\n\
+             For any other directory, preview first and then delete interactively \
+             (dcg allows the interactive form):\n  \
+             find /path/to/directory -type f | head -20\n  \
+             rm -ri /path/to/directory",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // Same root/home catastrophe but with SEPARATE flags (`rm -r -f /`,
