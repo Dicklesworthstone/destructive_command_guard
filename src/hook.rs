@@ -858,7 +858,9 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     //     Claude uses PascalCase "PreToolUse", Copilot uses hyphenated
     //     "pre-tool-use" but only via the `event` field — never via
     //     `hookEventName`).
-    //   - toolName="run_terminal_cmd" (Grok's internal shell tool name).
+    //   - toolName="run_terminal_cmd" / "run_terminal_command" (Grok's
+    //     internal shell tool name; older builds use the abbreviated form,
+    //     current Grok Build documents the full spelling — issue #319).
     // Either signal alone is a strong Grok indicator. We deliberately do
     // NOT add a GROK_* env-var fallback: real Grok hook invocations always
     // emit both fields, so the wire-level check is sufficient, and an
@@ -866,7 +868,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // a shell that happens to live inside a Grok session (e.g. running
     // `cargo test` from a Grok-spawned terminal).
     let is_grok_event = hook_event_name == "pre_tool_use";
-    let is_grok_tool = tool_name == "run_terminal_cmd";
+    let is_grok_tool = tool_name == "run_terminal_cmd" || tool_name == "run_terminal_command";
     if (is_grok_event || is_grok_tool) && input.event.is_none() && input.tool_args.is_none() {
         return HookProtocol::Grok;
     }
@@ -1050,10 +1052,14 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             // wrapper script which translates upstream to "Bash" before
             // invoking dcg, so the only path here is genuine Hermes input.
             | "terminal"
-            // Grok (xAI) shell tool. Grok aliases Claude-style "Bash" to its
-            // internal name `run_terminal_cmd` before invoking hooks, so the
-            // toolName field on the wire is always this canonical form.
+            // Grok (xAI) shell tool. Grok aliases Claude-style "Bash" to an
+            // internal terminal tool before invoking hooks. Older builds put
+            // `run_terminal_cmd` on the wire; current Grok Build documents
+            // `run_terminal_command` (issue #319). Accept both spellings —
+            // missing either one makes the hook silently fail open on the
+            // exact path Grok uses.
             | "run_terminal_cmd"
+            | "run_terminal_command"
         )
 }
 
@@ -3528,6 +3534,37 @@ mod tests {
         // Grok.
         let json = r#"{
             "toolName":"run_terminal_cmd",
+            "toolInput":{"command":"echo hi"}
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Grok);
+    }
+
+    #[test]
+    fn test_grok_run_terminal_command_full_spelling_is_supported() {
+        // Grok Build's own hooks guide documents the shell tool as
+        // `run_terminal_command` (full spelling), not the abbreviated
+        // `run_terminal_cmd` dcg originally shipped with. Before issue #319
+        // this envelope was answered with a "skip" — a silent fail-open on
+        // the exact path Grok uses. Both spellings must classify as Grok,
+        // count as a supported shell tool, and yield the command.
+        let json = r#"{
+            "hookEventName":"pre_tool_use",
+            "toolName":"run_terminal_command",
+            "toolInput":{"command":"git reset --hard HEAD"},
+            "cwd":"/home/user/proj",
+            "workspaceRoot":"/home/user/proj"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Grok);
+        assert!(is_supported_shell_tool(Some("run_terminal_command")));
+        let extracted = extract_command_with_context(&input).expect("shell command");
+        assert_eq!(extracted.command, "git reset --hard HEAD");
+        assert_eq!(extracted.protocol, HookProtocol::Grok);
+
+        // Tool name alone (no event marker) must also route to Grok.
+        let json = r#"{
+            "toolName":"run_terminal_command",
             "toolInput":{"command":"echo hi"}
         }"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
