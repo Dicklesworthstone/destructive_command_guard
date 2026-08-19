@@ -30285,6 +30285,17 @@ mod tests {
             "allowlisting the launcher rule must not unlock destruction elsewhere in the command: {:?}",
             result.pattern_info
         );
+        // The denial must come from ordinary pack evaluation of the chained
+        // segment — proving the grant WAS honored (launcher check skipped)
+        // and did not become a whole-command allow.
+        assert_eq!(
+            result
+                .pattern_info
+                .as_ref()
+                .and_then(|i| i.pack_id.as_deref()),
+            Some("core.filesystem"),
+            "chained rm -rf must be denied by the filesystem pack, not the granted launcher rule"
+        );
 
         // Same property for the POSIX inline-launcher grant.
         let allowlists = project_allowlists_for_rule(
@@ -30301,6 +30312,14 @@ mod tests {
             result.is_denied(),
             "allowlisting the inline-launcher rule must not unlock destruction elsewhere in the command: {:?}",
             result.pattern_info
+        );
+        assert_eq!(
+            result
+                .pattern_info
+                .as_ref()
+                .and_then(|i| i.pack_id.as_deref()),
+            Some("core.filesystem"),
+            "chained rm -rf must be denied by the filesystem pack, not the granted launcher rule"
         );
 
         // A launcher shape that is NOT allowlisted still fails closed even

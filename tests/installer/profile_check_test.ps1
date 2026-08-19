@@ -16,7 +16,7 @@ New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
     $profilePath = Join-Path $tmp 'sub\Microsoft.PowerShell_profile.ps1'  # parent dir must be created
 
-    $s1 = Add-DcgProfileCheck -ProfilePath $profilePath
+    $s1 = Add-DcgProfileCheck -ProfilePath $profilePath -AlsoRepairPaths @()
     Check ($s1 -eq 'added') "first run returns 'added' (got '$s1')"
     Check (Test-Path $profilePath) "profile created (incl. parent dir)"
 
@@ -66,7 +66,7 @@ try {
         Check (-not (& $detect $case)) "rejects non-dcg command: $case"
     }
 
-    $s2 = Add-DcgProfileCheck -ProfilePath $profilePath
+    $s2 = Add-DcgProfileCheck -ProfilePath $profilePath -AlsoRepairPaths @()
     Check ($s2 -eq 'already') "second run returns 'already' (got '$s2')"
 
     $count = ([regex]::Matches((Get-Content -Raw $profilePath), [regex]::Escape('# dcg: warn if the Claude Code hook'))).Count
@@ -93,7 +93,7 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     $stalePath = Join-Path $tmp 'stale_profile.ps1'
     Set-Content -Path $stalePath -Value ("# user stuff before`n" + $staleBlock + "`n# user stuff after")
 
-    $s3 = Add-DcgProfileCheck -ProfilePath $stalePath
+    $s3 = Add-DcgProfileCheck -ProfilePath $stalePath -AlsoRepairPaths @()
     Check ($s3 -eq 'updated') "stale pre-#282 block is replaced, returns 'updated' (got '$s3')"
 
     $staleContent = Get-Content -Raw $stalePath
@@ -107,7 +107,7 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     [void][System.Management.Automation.Language.Parser]::ParseInput($staleContent, [ref]$null, [ref]$perr2)
     Check (($null -eq $perr2) -or ($perr2.Count -eq 0)) "repaired profile parses as valid PowerShell"
 
-    $s4 = Add-DcgProfileCheck -ProfilePath $stalePath
+    $s4 = Add-DcgProfileCheck -ProfilePath $stalePath -AlsoRepairPaths @()
     Check ($s4 -eq 'already') "repaired profile is stable on the next run (got '$s4')"
 
     # --- Line-ending insensitivity ---
@@ -117,19 +117,19 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     $currentCrlf = Join-Path $tmp 'current_crlf_profile.ps1'
     [System.IO.File]::WriteAllText($currentCrlf,
         ("# before`n" + $script:DcgProfileCheckMarker + "`n" + $script:DcgProfileCheckBlock + "`n# after`n").Replace("`r`n", "`n").Replace("`n", "`r`n"))
-    $s6 = Add-DcgProfileCheck -ProfilePath $currentCrlf
+    $s6 = Add-DcgProfileCheck -ProfilePath $currentCrlf -AlsoRepairPaths @()
     Check ($s6 -eq 'already') "current block with CRLF endings is 'already', not rewritten (got '$s6')"
 
     $staleCrlf = Join-Path $tmp 'stale_crlf_profile.ps1'
     [System.IO.File]::WriteAllText($staleCrlf, $staleBlock.Replace("`r`n", "`n").Replace("`n", "`r`n"))
-    $s7 = Add-DcgProfileCheck -ProfilePath $staleCrlf
+    $s7 = Add-DcgProfileCheck -ProfilePath $staleCrlf -AlsoRepairPaths @()
     Check ($s7 -eq 'updated') "stale block with CRLF endings is repaired (got '$s7')"
     $staleCrlfContent = Get-Content -Raw $staleCrlf
     Check ($staleCrlfContent.Contains('if ($dcgCmd -match ''^&\s*[''''"](.+?)[''''"]'') { $dcgExe = $Matches[1] }')) "CRLF stale profile now contains current detection"
     $perr3 = $null
     [void][System.Management.Automation.Language.Parser]::ParseInput($staleCrlfContent, [ref]$null, [ref]$perr3)
     Check (($null -eq $perr3) -or ($perr3.Count -eq 0)) "repaired CRLF profile parses as valid PowerShell"
-    $s8 = Add-DcgProfileCheck -ProfilePath $staleCrlf
+    $s8 = Add-DcgProfileCheck -ProfilePath $staleCrlf -AlsoRepairPaths @()
     Check ($s8 -eq 'already') "repaired CRLF profile is stable on the next run (got '$s8')"
 
     # --- Cross-host repair ---
@@ -145,6 +145,15 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     $otherContent = Get-Content -Raw $otherStale
     Check ($otherContent.Contains('if ($dcgCmd -match ''^&\s*[''''"](.+?)[''''"]'') { $dcgExe = $Matches[1] }')) "other host's stale block repaired"
     Check (-not (Test-Path $missingOther)) "non-existent other profile is not created"
+
+    # A current main profile plus a stale other-host profile reports "updated"
+    # (something changed), not "already".
+    $otherStale2 = Join-Path $tmp 'other_host_profile2.ps1'
+    Set-Content -Path $otherStale2 -Value $staleBlock
+    $s9 = Add-DcgProfileCheck -ProfilePath $mainPath2 -AlsoRepairPaths @($otherStale2)
+    Check ($s9 -eq 'updated') "current main + stale other host reports 'updated' (got '$s9')"
+    $s10 = Add-DcgProfileCheck -ProfilePath $mainPath2 -AlsoRepairPaths @($otherStale2)
+    Check ($s10 -eq 'already') "main + other host both current reports 'already' (got '$s10')"
 } finally { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
