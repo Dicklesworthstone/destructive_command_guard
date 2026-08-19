@@ -837,6 +837,12 @@ function Add-DcgProfileCheck {
 
   $marker = $script:DcgProfileCheckMarker
   $block = $script:DcgProfileCheckBlock
+  # Line-ending-insensitive "is the current block already present" test: the
+  # block's own newlines depend on how this script was fetched (LF via irm,
+  # CRLF via a CRLF checkout) and profiles get re-saved by editors either way.
+  # Without normalization a current block that differs only in EOLs would be
+  # rewritten on every run.
+  $normBlock = $block.Replace("`r`n", "`n")
   try {
     if ($null -eq $AlsoRepairPaths) {
       # Both hosts' CurrentUserAllHosts profiles, wherever Documents lives
@@ -855,7 +861,7 @@ function Add-DcgProfileCheck {
     if (Test-Path $ProfilePath -PathType Leaf) {
       $content = Get-Content -Raw -Path $ProfilePath
       if ($content -and $content.Contains($marker)) {
-        if ($content.Contains($block)) {
+        if ($content.Replace("`r`n", "`n").Contains($normBlock)) {
           $status = "already"
         } else {
           $repaired = Repair-DcgProfileCheckContent -Content $content
@@ -889,7 +895,7 @@ function Add-DcgProfileCheck {
         if (-not (Test-Path $other -PathType Leaf)) { continue }
         $otherContent = Get-Content -Raw -Path $other
         if (-not ($otherContent -and $otherContent.Contains($marker))) { continue }
-        if ($otherContent.Contains($block)) { continue }
+        if ($otherContent.Replace("`r`n", "`n").Contains($normBlock)) { continue }
         $repaired = Repair-DcgProfileCheckContent -Content $otherContent
         if ($null -ne $repaired) {
           Set-Content -Path $other -Value $repaired -NoNewline

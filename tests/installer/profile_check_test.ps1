@@ -110,6 +110,28 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     $s4 = Add-DcgProfileCheck -ProfilePath $stalePath
     Check ($s4 -eq 'already') "repaired profile is stable on the next run (got '$s4')"
 
+    # --- Line-ending insensitivity ---
+    # A profile holding the CURRENT block but with CRLF endings (git autocrlf
+    # checkout, editor re-save) must be recognized as up to date, not rewritten
+    # on every run; a STALE block with CRLF endings must still be repaired.
+    $currentCrlf = Join-Path $tmp 'current_crlf_profile.ps1'
+    [System.IO.File]::WriteAllText($currentCrlf,
+        ("# before`n" + $script:DcgProfileCheckMarker + "`n" + $script:DcgProfileCheckBlock + "`n# after`n").Replace("`r`n", "`n").Replace("`n", "`r`n"))
+    $s6 = Add-DcgProfileCheck -ProfilePath $currentCrlf
+    Check ($s6 -eq 'already') "current block with CRLF endings is 'already', not rewritten (got '$s6')"
+
+    $staleCrlf = Join-Path $tmp 'stale_crlf_profile.ps1'
+    [System.IO.File]::WriteAllText($staleCrlf, $staleBlock.Replace("`r`n", "`n").Replace("`n", "`r`n"))
+    $s7 = Add-DcgProfileCheck -ProfilePath $staleCrlf
+    Check ($s7 -eq 'updated') "stale block with CRLF endings is repaired (got '$s7')"
+    $staleCrlfContent = Get-Content -Raw $staleCrlf
+    Check ($staleCrlfContent.Contains('if ($dcgCmd -match ''^&\s*[''''"](.+?)[''''"]'') { $dcgExe = $Matches[1] }')) "CRLF stale profile now contains current detection"
+    $perr3 = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($staleCrlfContent, [ref]$null, [ref]$perr3)
+    Check (($null -eq $perr3) -or ($perr3.Count -eq 0)) "repaired CRLF profile parses as valid PowerShell"
+    $s8 = Add-DcgProfileCheck -ProfilePath $staleCrlf
+    Check ($s8 -eq 'already') "repaired CRLF profile is stable on the next run (got '$s8')"
+
     # --- Cross-host repair ---
     # A stale block in the OTHER host's profile (e.g. WindowsPowerShell 5.1's
     # profile.ps1 while installing under pwsh 7) is repaired, but a profile
