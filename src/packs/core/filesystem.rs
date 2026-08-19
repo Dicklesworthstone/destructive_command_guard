@@ -24,8 +24,12 @@ const RM_RF_ROOT_HOME_SUGGESTIONS: &[PatternSuggestion] = &[
         "List directory contents to verify the path",
     ),
     PatternSuggestion::new(
-        "rm -rf /path/to/specific/subdirectory",
-        "Use explicit, specific paths instead of root or home",
+        "rm -rf /tmp/<subdir>",
+        "Scope deletion to a disposable temp path — dcg allows literal /tmp targets without confirmation",
+    ),
+    PatternSuggestion::gated(
+        "rm -rf <specific-subdirectory>",
+        "A specific non-temp path is safer than root/home but still a recursive delete, so it needs approval",
     ),
 ];
 

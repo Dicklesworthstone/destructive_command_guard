@@ -30229,7 +30229,7 @@ mod tests {
         // those route to the Windows-launcher scan first (which carries the
         // heredoc.shell id asserted above).
         let result = evaluate_with_pack_ids_in_dialect(
-            "$(select_tool) -c 'echo safe'",
+            "$tool -c 'echo safe'",
             &["core.filesystem"],
             ShellDialect::Posix,
         );
@@ -30246,7 +30246,7 @@ mod tests {
             "reviewed inline launcher",
         );
         let result = evaluate_with_pack_ids_and_allowlists_at_path(
-            "$(select_tool) -c 'echo safe'",
+            "$tool -c 'echo safe'",
             &["core.filesystem"],
             &allowlists,
             None,

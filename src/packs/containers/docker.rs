@@ -39,9 +39,9 @@ const VOLUME_PRUNE_SUGGESTIONS: &[PatternSuggestion] = &[
         "docker volume ls -q -f dangling=true",
         "List unused volumes first to review what would be deleted",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "docker volume rm {volume-name}",
-        "Remove specific volumes by name instead of all unused",
+        "Removes named volumes instead of all unused — still deletes volume data, so dcg gates it too",
     ),
     PatternSuggestion::new(
         "docker volume inspect {volume-name}",
@@ -91,9 +91,9 @@ const RM_FORCE_SUGGESTIONS: &[PatternSuggestion] = &[
         "docker stop {container} && docker rm {container}",
         "Graceful shutdown with SIGTERM before removal",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "docker container prune",
-        "Remove stopped containers with confirmation prompt",
+        "Removes only stopped containers — still a prune, so dcg gates it too",
     ),
     PatternSuggestion::new(
         "docker ps -a | grep {container}",
@@ -107,9 +107,9 @@ const RMI_FORCE_SUGGESTIONS: &[PatternSuggestion] = &[
         "docker rmi {image}",
         "Remove without force - fails safely if image is in use",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "docker image prune",
-        "Remove only dangling (untagged) images",
+        "Removes only dangling images — still a prune, so dcg gates it too",
     ),
     PatternSuggestion::new(
         "docker ps -a --filter ancestor={image}",

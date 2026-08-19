@@ -5079,9 +5079,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                         "git reset --mixed HEAD~1",
                         "Undo commit, unstage changes, but keep working directory",
                     ),
-                    PatternSuggestion::new(
+                    PatternSuggestion::gated(
                         "git checkout -- {file}",
-                        "Reset a specific file only, preserving other changes",
+                        "Discards changes in one file only — still destructive, so dcg gates it too",
                     ),
                 ]
             }
@@ -5352,9 +5352,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                git fsck --unreachable | grep commit",
             &const {
                 [
-                    PatternSuggestion::new(
+                    PatternSuggestion::gated(
                         "git stash drop stash@{n}",
-                        "Remove one specific stash at a time",
+                        "Drops one stash at a time instead of all — still deletes stashed work, so dcg gates it too",
                     ),
                     PatternSuggestion::new("git stash list", "Review all stashes before clearing"),
                     PatternSuggestion::new(

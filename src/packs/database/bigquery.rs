@@ -403,9 +403,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                         "bq ls <project>:<dataset>",
                         "List what the recursive delete would take with it",
                     ),
-                    PatternSuggestion::new(
+                    PatternSuggestion::gated(
                         "bq rm <project>:<dataset>.<table>",
-                        "Remove one table at a time instead",
+                        "Removes one table at a time instead of the whole dataset — still a delete, so dcg gates it too",
                     ),
                 ]
             },
