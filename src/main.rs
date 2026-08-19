@@ -547,7 +547,13 @@ fn try_deny_oversized_input(
         if destructive_command_guard::packs::pack_aware_quick_reject(command, &enabled_keywords) {
             continue;
         }
-        let outcome = resolve_hook_command(&eval_context, command, shell_dialect, None);
+        // Down-trust a `Bash`-labeled dialect when this window is unmistakably
+        // PowerShell/cmd, exactly as the normal parsed path does (#322). Without
+        // this, padding a mislabeled PowerShell payload past `max_command_bytes`
+        // routed it here with an unrefined Posix dialect, where a cmdlet is an
+        // inert unknown binary — reopening the #322 hole on the oversized path.
+        let refined_dialect = hook::refine_shell_dialect(command, shell_dialect);
+        let outcome = resolve_hook_command(&eval_context, command, refined_dialect, None);
         if let ResolvedCommandOutcome::DenyFamily(resolved) = outcome {
             if matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask) {
                 let mut history_writer = if config.history.enabled {

@@ -1213,13 +1213,94 @@ fn is_powershell_cmdlet_token(token: &str) -> bool {
         .any(|approved| verb.eq_ignore_ascii_case(approved))
 }
 
-/// Return whether any statement/pipeline segment of `command` starts with a
-/// PowerShell cmdlet-shaped token (`Remove-Item …`, `… ; Clear-Content …`).
+/// Windows destructive commands whose *bare name* collides with POSIX (`rm`,
+/// `del`) or is simply unknown to POSIX (`rd`, `ri`). The name alone is
+/// ambiguous, so widening additionally requires a Windows-shell-only argument
+/// shape (see [`segment_is_windows_alias_invocation`]).
+const WINDOWS_DESTRUCTIVE_ALIASES: &[&str] = &["rm", "ri", "del", "rd", "rmdir", "erase"];
+
+/// PowerShell `Remove-Item` parameter names used as the discriminator. A
+/// single-dash token whose name is a >=3-character prefix of one of these is
+/// unmistakably PowerShell: POSIX/GNU `rm` never accepts a single-dash
+/// multi-letter *word* (`-rf` is a short-flag cluster, not `-recurse`), and
+/// GNU long options use a double dash (`--recursive`). The 3-char floor keeps
+/// `-r`/`-f`/`-rf` (POSIX) from ever matching.
+const REMOVE_ITEM_PS_PARAM_WORDS: &[&str] = &[
+    "recurse",
+    "force",
+    "path",
+    "literalpath",
+    "include",
+    "exclude",
+    "filter",
+    "confirm",
+    "whatif",
+];
+
+/// Return whether `token` is a single-dash PowerShell parameter (`-Recurse`,
+/// `-Force`, `-Path`, …) rather than a POSIX short-flag cluster. Requires a
+/// single leading `-`, an all-alphabetic name of length >= 3, and that name to
+/// be a prefix of a known `Remove-Item` parameter.
+fn is_powershell_parameter_token(token: &str) -> bool {
+    let Some(name) = token.strip_prefix('-') else {
+        return false;
+    };
+    // A second dash means a GNU long option (`--recursive`), not PowerShell.
+    if name.starts_with('-') || name.len() < 3 || !name.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    REMOVE_ITEM_PS_PARAM_WORDS
+        .iter()
+        .any(|word| word.starts_with(&lower))
+}
+
+/// Return whether `token` is the cmd.exe recursion switch `/s` (alone or
+/// stuck to `/q`). `/s` is the switch that makes `del`/`rd` catastrophic, and
+/// it is the unmistakable cmd signal — POSIX never spells an option `/s`
+/// (it would be an absolute path). Bare `/q`/`/f` do not recurse, so they are
+/// not treated as a widening trigger on their own.
+fn is_cmd_switch_token(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "/s" | "/s/q" | "/q/s"
+    )
+}
+
+/// Return whether a single statement segment is a Windows-shell invocation of
+/// a destructive alias — either PowerShell (`rm -Recurse -Force …`) or cmd
+/// (`del /s /q …`, `rd /s …`). The bare alias is never enough; a
+/// Windows-shell-only argument shape must accompany it so a plain POSIX
+/// `rm -rf ./build` keeps the Posix dialect.
+fn segment_is_windows_alias_invocation(segment: &str) -> bool {
+    let mut tokens = segment.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let name = first
+        .to_ascii_lowercase()
+        .strip_suffix(".exe")
+        .map_or_else(|| first.to_ascii_lowercase(), str::to_string);
+    if !WINDOWS_DESTRUCTIVE_ALIASES.contains(&name.as_str()) {
+        return false;
+    }
+    tokens.any(|token| is_powershell_parameter_token(token) || is_cmd_switch_token(token))
+}
+
+/// Return whether any statement/pipeline segment of `command` is unmistakably
+/// Windows shell: a PowerShell cmdlet-shaped leading token (`Remove-Item …`,
+/// `… ; Clear-Content …`) or a destructive alias carrying a Windows-shell-only
+/// argument (`rm -Recurse -Force …`, `del /s /q …`).
 fn command_has_powershell_shape(command: &str) -> bool {
     command
         .split(['|', ';', '&', '\n', '\r', '(', '{'])
-        .filter_map(|segment| segment.split_whitespace().next())
-        .any(is_powershell_cmdlet_token)
+        .any(|segment| {
+            segment
+                .split_whitespace()
+                .next()
+                .is_some_and(is_powershell_cmdlet_token)
+                || segment_is_windows_alias_invocation(segment)
+        })
 }
 
 /// Down-trust a `Bash`-labeled dialect when the command itself is
@@ -1235,7 +1316,7 @@ fn command_has_powershell_shape(command: &str) -> bool {
 /// `powershell`/`pwsh`/`cmd` labels are never widened (they already evaluate
 /// the dialect the command will run under), and non-cmdlet POSIX commands are
 /// unaffected.
-pub(crate) fn refine_shell_dialect(command: &str, labeled: ShellDialect) -> ShellDialect {
+pub fn refine_shell_dialect(command: &str, labeled: ShellDialect) -> ShellDialect {
     if labeled == ShellDialect::Posix && command_has_powershell_shape(command) {
         ShellDialect::Unknown
     } else {
@@ -2869,6 +2950,47 @@ mod tests {
                 refine_shell_dialect(command, ShellDialect::Posix),
                 ShellDialect::Posix,
                 "must not widen plain POSIX command {command:?}"
+            );
+        }
+
+        // Destructive PowerShell/cmd ALIASES with a Windows-shell-only
+        // argument widen too (fresh-eyes follow-up to #322): the alias name
+        // alone is ambiguous with POSIX, but `-Recurse`/`-Force`/`/s` are not.
+        for command in [
+            "rm -Recurse -Force .\\pipelines",
+            "rm -Force -Recurse .\\pipelines",
+            "ri -Recurse C:\\build",
+            "del /s /q C:\\src",
+            "rd /s C:\\dir",
+            "rmdir /s /q .\\out",
+            "erase /q /s C:\\tmp",
+            "cd build; rm -Recurse -Force .\\dist",
+            "Del.exe /S /Q C:\\src",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "Windows alias invocation must widen: {command:?}"
+            );
+        }
+
+        // But a plain POSIX invocation of the same aliases must NOT widen —
+        // `-rf`/`-r`/`-f` are short-flag clusters, not `-Recurse`, and a
+        // GNU long option uses a double dash.
+        for command in [
+            "rm -rf ./build",
+            "rm -r -f ./build",
+            "rm -fr /tmp/x",
+            "rm --recursive --force ./build",
+            "rm -rf --no-preserve-root /x",
+            "del file.txt",
+            "rm file.txt",
+            "rmdir emptydir",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "plain POSIX alias usage must not widen: {command:?}"
             );
         }
 
