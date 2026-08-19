@@ -11,7 +11,7 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## [Unreleased]
+## [v0.11.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.11.1) -- 2026-08-19 [Release]
 
 ### Fixed
 
