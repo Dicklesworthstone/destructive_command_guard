@@ -769,10 +769,16 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "An expiration timestamp is a deferred delete: the object disappears at that time \
              with no further prompt. Setting it in the past deletes immediately.",
             &const {
-                [PatternSuggestion::new(
-                    "ALTER TABLE `<t>` SET OPTIONS(expiration_timestamp = NULL)",
-                    "Clear an expiration instead of setting one",
-                )]
+                [
+                    PatternSuggestion::new(
+                        "SELECT option_value FROM `<dataset>`.INFORMATION_SCHEMA.TABLE_OPTIONS WHERE table_name = '<t>' AND option_name = 'expiration_timestamp'",
+                        "Inspect the current expiration before changing it",
+                    ),
+                    PatternSuggestion::gated(
+                        "ALTER TABLE `<t>` SET OPTIONS(expiration_timestamp = NULL)",
+                        "Clear an expiration instead of setting one (this rule matches any expiration_timestamp change, so clearing it needs approval too)",
+                    ),
+                ]
             }
         ),
         destructive_pattern!(

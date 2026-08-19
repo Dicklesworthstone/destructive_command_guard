@@ -70,7 +70,7 @@ const DCG_SUGGESTIONS: &[PatternSuggestion] = &[
         "dcg explain \"<command>\"",
         "If dcg is blocking something needed, find out why rather than disabling the guard",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "Ask the operator to run: dcg allowlist add <ruleId> -r \"<approved reason>\"",
         "Allowlisting is an operator action — an agent that can widen its own allowlist is not guarded",
     ),

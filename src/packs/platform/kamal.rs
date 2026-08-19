@@ -58,6 +58,10 @@ const PROXY_SUGGESTIONS: &[PatternSuggestion] = &[
         "Inspect the proxy without removing or rebooting it",
     ),
     PatternSuggestion::new(
+        "kamal proxy restart",
+        "Cycle the existing proxy without removing it, where a restart suffices",
+    ),
+    PatternSuggestion::gated(
         "kamal proxy reboot --rolling",
         "If a proxy cycle is truly required, --rolling staggers it to reduce the outage",
     ),
@@ -267,7 +271,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              prompt for `remove`.\n\n\
              Safer alternatives:\n\
              - kamal proxy details / kamal proxy logs: diagnose the proxy without removing it\n\
-             - kamal proxy reboot --rolling: if a cycle is required, stagger it to limit the outage",
+             - kamal proxy reboot --rolling: if a cycle is required, stagger it to limit the \
+             outage (dcg gates proxy reboots too, so this form still needs approval)",
             PROXY_SUGGESTIONS
         ),
         destructive_pattern!(
@@ -279,8 +284,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              to cause a small outage on each server. While it prompts interactively, a non-interactive \
              agent run with `-y` skips that prompt.\n\n\
              Safer alternatives:\n\
-             - kamal proxy reboot --rolling: stagger the restart across servers to reduce the outage\n\
-             - kamal proxy restart: a lighter restart of the existing proxy where applicable",
+             - kamal proxy restart: a lighter restart of the existing proxy where applicable\n\
+             - kamal proxy reboot --rolling: stagger the restart across servers to reduce the \
+             outage (still a reboot, so dcg gates this form too — it needs approval)",
             PROXY_SUGGESTIONS
         ),
         destructive_pattern!(

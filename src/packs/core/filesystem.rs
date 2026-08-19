@@ -111,7 +111,7 @@ const FIND_DELETE_SUGGESTIONS: &[PatternSuggestion] = &[
         "find /tmp/{subdir} -delete",
         "Safe temp directory deletion (allowed without confirmation)",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "find {path} -print -delete",
         "If you must proceed: use -print to log every deletion",
     ),
@@ -123,7 +123,7 @@ const FIND_DELETE_SUGGESTIONS: &[PatternSuggestion] = &[
 /// destruction with no recovery.
 const UNLINK_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new("ls -la {path}", "Verify the path before unlinking"),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "cp {path} {path}.bak && unlink {path}",
         "Make a backup first if you really must remove the original",
     ),
@@ -143,7 +143,7 @@ const UNLINK_SUGGESTIONS: &[PatternSuggestion] = &[
 /// shrinks the file by N bytes (data loss). Both are recoverable only
 /// from backups.
 const TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "cp {path} {path}.bak && truncate -s 0 {path}",
         "Make a backup before zeroing the file",
     ),
@@ -167,7 +167,7 @@ const SHRED_SUGGESTIONS: &[PatternSuggestion] = &[
         "ls -la {path}",
         "Verify the path before shredding (no recovery)",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "cp {path} {path}.bak && shred -u {path}",
         "Make a backup first if you might need the data",
     ),
@@ -175,7 +175,7 @@ const SHRED_SUGGESTIONS: &[PatternSuggestion] = &[
         "shred -u /tmp/{subdir}/scratch",
         "Safe temp-directory shred (allowed without confirmation)",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "shred -n 1 -u {path}",
         "Single-pass shred is faster (and on SSDs, multi-pass adds little)",
     ),
@@ -214,7 +214,7 @@ const DD_OVERWRITE_SUGGESTIONS: &[PatternSuggestion] = &[
         "ls -la {path}",
         "Verify the path before overwriting (no recovery)",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "cp {path} {path}.bak && dd if=/dev/zero of={path} bs=1M count=10",
         "Make a backup first if you might need the data",
     ),

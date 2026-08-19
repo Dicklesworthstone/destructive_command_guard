@@ -19,9 +19,9 @@ const DELETE_NAMESPACE_SUGGESTIONS: &[PatternSuggestion] = &[
         "kubectl get all -n {ns}",
         "See all resources in the namespace before deleting",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "kubectl delete ns {ns} --grace-period=60",
-        "Allow graceful shutdown with 60-second grace period",
+        "Allow graceful shutdown with a 60-second grace period — still a namespace delete, so it is gated as well",
     ),
 ];
 

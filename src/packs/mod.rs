@@ -228,6 +228,17 @@ pub struct PatternSuggestion {
     /// Platform this suggestion applies to.
     /// `Platform::All` (default) means it works everywhere.
     pub platform: Platform,
+
+    /// Whether dcg itself also gates this suggestion (issue #316).
+    ///
+    /// A gated suggestion is a *less* destructive form of the blocked
+    /// operation, not a freely runnable alternative: dcg will deny it too and
+    /// the user must approve it (allowlist, allow-once, or run it manually).
+    /// Rendering appends an explicit "dcg gates this too" marker so an agent
+    /// reading the block message does not retry it expecting an allow. The
+    /// suggestion self-consistency test treats gated entries as
+    /// expected-denied instead of failures.
+    pub gated: bool,
 }
 
 impl PatternSuggestion {
@@ -238,6 +249,7 @@ impl PatternSuggestion {
             command,
             description,
             platform: Platform::All,
+            gated: false,
         }
     }
 
@@ -252,6 +264,18 @@ impl PatternSuggestion {
             command,
             description,
             platform,
+            gated: false,
+        }
+    }
+
+    /// Create a suggestion that dcg itself also gates (see the `gated` field).
+    #[must_use]
+    pub const fn gated(command: &'static str, description: &'static str) -> Self {
+        Self {
+            command,
+            description,
+            platform: Platform::All,
+            gated: true,
         }
     }
 }

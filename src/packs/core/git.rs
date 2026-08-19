@@ -4891,20 +4891,28 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                  expanded and field-split by the shell before git parses it, so its output can \
                  inject `-D`, `-f`, `-M`, or `-C` and turn a branch creation into a deletion or \
                  forced ref update. dcg cannot statically bound the expansion's output.\n\n\
-                 Safe spellings dcg allows without any exception:\n\
+                 The reliable fix is to resolve the dynamic value first and rerun the command \
+                 with the literal branch name.\n\n\
+                 For a branch *creation*, these spellings are safe without any exception:\n\
                  - Quote the name so it stays one word: git branch \"backup-$(date +%s)\"\n\
                  - End option parsing first: git branch -- backup-$(date +%s)\n\n\
-                 Both guarantee the expansion cannot become a flag.",
+                 Both guarantee the expansion cannot become a flag. They do not unlock a command \
+                 that already carries a literal deletion/force flag (`-D`, `-d`, `-f`, `-M`, \
+                 `-C`) — branch deletion stays gated on its own merits.",
             ),
             suggestions: &const {
                 [
                     PatternSuggestion::new(
+                        "Resolve the dynamic value first, then rerun with the literal branch name",
+                        "The expansion is the problem; a literal name is evaluated on its own merits",
+                    ),
+                    PatternSuggestion::new(
                         "git branch \"{name}\"",
-                        "Quote the branch name so the expansion stays a single non-flag word",
+                        "For a creation: quote the branch name so the expansion stays a single non-flag word",
                     ),
                     PatternSuggestion::new(
                         "git branch -- {name}",
-                        "`--` ends option parsing, so expanded output cannot become a flag",
+                        "For a creation: `--` ends option parsing, so expanded output cannot become a flag",
                     ),
                 ]
             },

@@ -57,12 +57,12 @@ const TRUNCATE_TABLE_SUGGESTIONS: &[PatternSuggestion] = &[
         "Check how many rows would be deleted",
     ),
     PatternSuggestion::new(
-        "DELETE FROM {tablename}",
-        "Use DELETE for transactional, recoverable deletion",
-    ),
-    PatternSuggestion::new(
         "CREATE TABLE {tablename}_backup AS SELECT * FROM {tablename}",
         "Backup data to temporary table before truncating",
+    ),
+    PatternSuggestion::gated(
+        "DELETE FROM {tablename}",
+        "Transactional, recoverable deletion — but an unfiltered DELETE is gated as well",
     ),
 ];
 
@@ -76,9 +76,9 @@ const DELETE_WITHOUT_WHERE_SUGGESTIONS: &[PatternSuggestion] = &[
         "SELECT COUNT(*) FROM {tablename}",
         "Check how many rows exist before deletion",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "TRUNCATE TABLE {tablename}",
-        "Use TRUNCATE if you truly want to delete all rows (faster)",
+        "Faster if you truly want all rows gone — but TRUNCATE is gated as well",
     ),
     PatternSuggestion::new(
         "SELECT * FROM {tablename} LIMIT 10",
@@ -287,7 +287,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Check row count first:\n  \
              SELECT COUNT(*) FROM tablename;\n\n\
              If you need rollback capability, use:\n  \
-             DELETE FROM tablename;  -- Slower but transactional",
+             DELETE FROM tablename;  -- Slower but transactional (dcg gates an \
+             unfiltered DELETE too, so this form also needs approval)",
             TRUNCATE_TABLE_SUGGESTIONS
         ),
         // DELETE without WHERE
@@ -303,7 +304,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Does NOT reset AUTO_INCREMENT counter\n\
              - Much slower than TRUNCATE for large tables\n\n\
              If you meant to delete all rows:\n\
-             - TRUNCATE is faster (but non-transactional)\n\
+             - TRUNCATE is faster (but non-transactional, and dcg gates it too)\n\
              - DELETE in transaction allows rollback\n\n\
              Otherwise, add a WHERE clause:\n  \
              DELETE FROM tablename WHERE condition;\n\n\
