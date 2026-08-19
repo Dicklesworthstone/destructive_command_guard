@@ -128,6 +128,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends ${{ matrix.apt_install }}
 
       - name: Build release binary
+        # DCG_RELEASE_BUILD marks release-pipeline provenance (#320): the
+        # binary can then prove it is a published release rather than a local
+        # build ahead of its tag, even when the CI checkout's git metadata is
+        # shallow. Read at compile time via option_env! in src/update.rs.
+        env:
+          DCG_RELEASE_BUILD: "1"
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Verify Linux x86_64 musl binary has no glibc symbols

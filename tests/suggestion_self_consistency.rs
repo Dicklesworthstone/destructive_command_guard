@@ -115,7 +115,7 @@ fn non_gated_suggestions_are_not_denied_by_their_own_pack() {
                          denies via {pack_id}:{} — either fix the suggestion or mark it \
                          PatternSuggestion::gated",
                         suggestion.command,
-                        hit.pattern_name.unwrap_or("unnamed"),
+                        hit.name.unwrap_or("unnamed"),
                     ));
                 }
             }

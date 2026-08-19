@@ -13,6 +13,69 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## [v0.11.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.11.1) -- 2026-08-19 [Release]
 
+### Added
+
+- **First-party OpenCode support (#318).** `dcg install --opencode` writes a
+  native `tool.execute.before` plugin to
+  `~/.config/opencode/plugins/dcg-guard.js` (`--project` for
+  `<repo>/.opencode/plugins/`). The plugin routes every OpenCode `bash` tool
+  call through dcg's Claude-compatible hook protocol — spawning the absolute
+  dcg path embedded at install time with `OPENCODE=1` so the agent is
+  identified — and aborts the tool call by throwing on a `deny` (an `ask`
+  verdict also fails closed; OpenCode has no operator-review state).
+  Infrastructure failures (dcg missing) fail open with a stderr notice. The
+  file carries a `dcg-opencode-plugin` ownership marker: the installer refuses
+  to overwrite a user-owned file of that name even with `--force`, and
+  `uninstall.sh` deletes only marker-carrying files. `install.sh` configures
+  OpenCode automatically when detected, `dcg doctor` gains an
+  `opencode_plugin` check (an error + `--fix`able when OpenCode is in use but
+  unguarded — there is no Claude-compat fallback), and `Agent::OpenCode` is
+  detected from the plugin's `OPENCODE=1`. New
+  `docs/opencode-integration.md`. Motivated by a real shared-environment
+  outage where a green doctor coexisted with an entirely unguarded OpenCode
+  install.
+- **`dcg update` can no longer silently replace a local build that is ahead of
+  its release (#320).** Build provenance (`git describe --tags --dirty`, plus
+  an explicit `DCG_RELEASE_BUILD=1` marker exported by dist.yml and the DSR
+  runbook) is embedded at compile time and shown as a `Commit:` line in
+  `dcg --version`. `dcg update` now refuses — before any network or installer
+  work — when the installed binary is a local build ahead of its release tag,
+  or when the install is pinned via the new `general.update_pin` config
+  (`DCG_UPDATE_PIN` env). The explicit escape hatch is
+  `dcg update --replace-local-build`. Pinned installs also suppress the
+  background "update available" nudge, and a new warning-only doctor check
+  (`build_provenance`) flags the unpinned-local-ahead state that is one
+  routine update away from silent coverage loss.
+- **Suggestions dcg itself gates are now labeled, machine-checked, and
+  consistent (#316).** `PatternSuggestion` gained a `gated` flag: a gated
+  suggestion is a *less* destructive form of the blocked operation that still
+  requires approval, and every renderer now says so explicitly ("dcg gates
+  this too — it needs explicit approval" in block output, `[gated: ...]` in
+  `dcg packs`/classify text, a `gated` field in JSON) so an agent reading the
+  block message stops retrying suggestions dcg will deny. The 14 remaining
+  self-denied suggestions from the #316 sweep are either fixed or marked
+  gated: the MySQL `TRUNCATE`⇄`DELETE` mutual-referral loop is broken (backup
+  suggestion first, gated cross-references labeled), the kamal proxy rules
+  gained `kamal proxy restart` as a runnable first alternative,
+  `core.git:branch-dynamic-token` now leads with the workflow fix that
+  actually works and clarifies that quoting protects a *creation* while a
+  literal `-D` stays gated, and the docker/kubectl/postgres/bigquery/
+  guardrails/github rows carry accurate gated markers. Two registry-wide
+  tests enforce the invariant in both directions (every non-gated suggestion
+  is allowed by its own pack; every gated marker is real), replacing the
+  first-suggestion-only check. External YAML packs can declare
+  `gated: true` per suggestion.
+- **The fail-closed launcher-verifier family now carries stable, allowlistable
+  rule ids (#316, #304, #313).** "Embedded shell launcher cannot be statically
+  verified" and "Inline interpreter launcher cannot be statically verified"
+  denials previously reported `"rule_id": null` with `source:
+  "legacy_pattern"` — nothing to `dcg allowlist add`, nothing for
+  `[policy.rules]`. They are now `heredoc.shell:launcher-unverified` and
+  `heredoc.posix:inline-launcher-unverified`: reviewable, allowlistable
+  (an allowlist grant skips only the fail-closed launcher check — the rest of
+  the command is still evaluated on its own merits), and policy-addressable
+  like the #261 family.
+
 ### Fixed
 
 - **The keyword pre-filter treats `_` as a boundary, not a word character
