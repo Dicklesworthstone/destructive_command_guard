@@ -5428,6 +5428,42 @@ fn windows_launcher_envelopes(
     Ok((envelopes, all_segments_are_envelopes))
 }
 
+/// Deny an unverifiable launcher under a stable rule id, honoring an
+/// allowlist grant for that rule first (mirrors the
+/// `ExecutableTextSink::Unverified` handling). Returns `None` when the rule
+/// is allowlisted — the caller falls back to ordinary evaluation — recording
+/// the hit for audit output.
+fn launcher_unverified_denial(
+    rule: &str,
+    reason: &str,
+    allowlists: &LayeredAllowlist,
+    project_path: Option<&Path>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    let (pack_id, pattern_name) = split_ast_rule_id(rule);
+    if let Some(hit) = allowlists.match_rule_at_path(&pack_id, &pattern_name, project_path) {
+        if first_allowlist_hit.is_none() {
+            *first_allowlist_hit = Some((
+                PatternMatch {
+                    pack_id: Some(pack_id),
+                    pattern_name: Some(pattern_name),
+                    severity: Some(crate::packs::Severity::High),
+                    reason: reason.to_string(),
+                    source: MatchSource::HeredocAst,
+                    matched_span: None,
+                    matched_text_preview: None,
+                    explanation: None,
+                    suggestions: &[],
+                },
+                hit.layer,
+                hit.entry.reason.clone(),
+            ));
+        }
+        return None;
+    }
+    Some(EvaluationResult::denied_by_embedded_sink(rule, reason))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_windows_launcher_envelopes(
     command: &str,
@@ -5509,9 +5545,15 @@ fn evaluate_windows_launcher_envelopes(
     ) {
         Ok(scan) => scan,
         Err(reason) => {
-            return Some(EvaluationResult::denied_by_legacy(&format!(
-                "Embedded shell launcher cannot be statically verified: {reason}"
-            )));
+            // Allowlisting the rule falls back to ordinary evaluation of the
+            // command; the launcher envelope itself contributes no decision.
+            return launcher_unverified_denial(
+                WINDOWS_LAUNCHER_UNVERIFIED_RULE,
+                &format!("Embedded shell launcher cannot be statically verified: {reason}"),
+                allowlists,
+                project_path,
+                first_allowlist_hit,
+            );
         }
     };
 
@@ -5874,9 +5916,20 @@ fn evaluate_obfuscated_posix_inline_launchers(
             match parse_obfuscated_posix_inline_launcher_segment(segment, max_payload_bytes) {
                 PosixInlineLauncherParse::NotLauncher => continue,
                 PosixInlineLauncherParse::Unverified(reason) => {
-                    return Some(EvaluationResult::denied_by_legacy(&format!(
-                        "Inline interpreter launcher cannot be statically verified: {reason}"
-                    )));
+                    if let Some(denial) = launcher_unverified_denial(
+                        POSIX_INLINE_LAUNCHER_UNVERIFIED_RULE,
+                        &format!(
+                            "Inline interpreter launcher cannot be statically verified: {reason}"
+                        ),
+                        allowlists,
+                        project_path,
+                        first_allowlist_hit,
+                    ) {
+                        return Some(denial);
+                    }
+                    // Allowlisted: this segment's launcher contributes no
+                    // decision; keep scanning the remaining segments.
+                    continue;
                 }
                 PosixInlineLauncherParse::Envelope(envelope) => envelope,
             };
@@ -6353,6 +6406,14 @@ const PROCESS_SUBSTITUTION_RULE: &str = "heredoc.posix.process-substitution";
 const SINK_ANALYSIS_BOUNDS_RULE: &str = "heredoc.shell.analysis-bounds";
 const POWERSHELL_IEX_RULE: &str = "heredoc.powershell.invoke-expression-dynamic";
 const POWERSHELL_SCRIPTBLOCK_RULE: &str = "heredoc.powershell.scriptblock-dynamic";
+/// A PowerShell/cmd launcher assembled through escaping, control prefixes, or
+/// dynamic expansion that the envelope parser cannot statically verify
+/// (#316/bd-l9jf: previously an unattributed `MatchSource::LegacyPattern`
+/// denial with `rule_id: null`, which nothing could allowlist or tune).
+const WINDOWS_LAUNCHER_UNVERIFIED_RULE: &str = "heredoc.shell.launcher-unverified";
+/// A POSIX inline interpreter launcher (`sh -c`, `python -c`, …) whose payload
+/// is assembled dynamically and cannot be statically verified (#316/bd-l9jf).
+const POSIX_INLINE_LAUNCHER_UNVERIFIED_RULE: &str = "heredoc.posix.inline-launcher-unverified";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExecutableTextSink {
@@ -30130,6 +30191,89 @@ mod tests {
     }
 
     #[test]
+    fn launcher_unverified_denials_carry_stable_allowlistable_rule_ids() {
+        // #316/bd-l9jf: the fail-closed launcher-verifier family previously
+        // denied as MatchSource::LegacyPattern with `rule_id: null`, so the
+        // operator had nothing to review, allowlist, or tune. Both families
+        // now carry stable heredoc.* rule ids and honor allowlist grants.
+
+        // Windows-shell launcher assembly that cannot be statically verified.
+        let result = evaluate_with_pack_ids_in_dialect(
+            "powershell -EncodedCommand %%%",
+            &["core.filesystem"],
+            ShellDialect::Unknown,
+        );
+        assert!(result.is_denied());
+        let info = result.pattern_info.expect("denial carries pattern info");
+        assert_eq!(info.pack_id.as_deref(), Some("heredoc.shell"));
+        assert_eq!(info.pattern_name.as_deref(), Some("launcher-unverified"));
+
+        let allowlists = project_allowlists_for_rule(
+            "heredoc.shell:launcher-unverified",
+            "reviewed launcher shape",
+        );
+        let result = evaluate_with_pack_ids_and_allowlists_at_path(
+            "powershell -EncodedCommand %%%",
+            &["core.filesystem"],
+            &allowlists,
+            None,
+        );
+        assert!(
+            result.is_allowed(),
+            "allowlisting the stable launcher rule id must permit the command: {:?}",
+            result.pattern_info
+        );
+
+        // POSIX inline interpreter launcher with a dynamic executable.
+        let result = evaluate_with_pack_ids_in_dialect(
+            "$(select_shell) -c 'echo safe'",
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(result.is_denied());
+        let info = result.pattern_info.expect("denial carries pattern info");
+        assert_eq!(info.pack_id.as_deref(), Some("heredoc.posix"));
+        assert_eq!(
+            info.pattern_name.as_deref(),
+            Some("inline-launcher-unverified")
+        );
+
+        let allowlists = project_allowlists_for_rule(
+            "heredoc.posix:inline-launcher-unverified",
+            "reviewed inline launcher",
+        );
+        let result = evaluate_with_pack_ids_and_allowlists_at_path(
+            "$(select_shell) -c 'echo safe'",
+            &["core.filesystem"],
+            &allowlists,
+            None,
+        );
+        assert!(
+            result.is_allowed(),
+            "allowlisting the stable inline-launcher rule id must permit a safe payload: {:?}",
+            result.pattern_info
+        );
+
+        // The allowlist grant only skips the launcher fail-closed check; the
+        // rest of the command is still evaluated and denied on its own merits.
+        let allowlists = project_allowlists_for_rule(
+            "heredoc.shell:launcher-unverified",
+            "reviewed launcher shape",
+        );
+        let result = evaluate_with_pack_ids_and_allowlists_at_path(
+            "powershell -EncodedCommand %%% ; rm -rf /",
+            &["core.filesystem"],
+            &allowlists,
+            None,
+        );
+        assert!(
+            result.is_denied(),
+            "allowlisting the launcher rule must not unlock destruction elsewhere in the command: {:?}",
+            result.pattern_info
+        );
+    }
+
+    #[test]
     fn init_idiom_warning_promotes_back_to_deny_by_policy() {
         // Posture promotion per the issue: [policy.rules]
         // "heredoc.posix:eval-init-idiom" = "deny" restores the hard block.
@@ -32800,7 +32944,15 @@ mod tests {
                 "unverifiable launcher payload must fail closed: {command:?}"
             );
             let info = result.pattern_info.expect("fail-closed denial metadata");
-            assert_eq!(info.source, MatchSource::LegacyPattern, "{command:?}");
+            // #316/bd-l9jf: the fail-closed launcher family carries a stable,
+            // allowlistable rule id instead of an unattributed legacy denial.
+            assert_eq!(info.source, MatchSource::HeredocAst, "{command:?}");
+            assert_eq!(info.pack_id.as_deref(), Some("heredoc.shell"), "{command:?}");
+            assert_eq!(
+                info.pattern_name.as_deref(),
+                Some("launcher-unverified"),
+                "{command:?}"
+            );
             assert!(info.matched_span.is_none(), "{command:?}");
         }
 

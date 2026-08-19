@@ -1764,7 +1764,16 @@ fn pattern_suggestion_alternatives(
         .iter()
         .filter(|suggestion| suggestion.platform.matches_current())
         .take(MAX_SUGGESTIONS)
-        .map(|suggestion| format!("{}: {}", suggestion.description, suggestion.command))
+        .map(|suggestion| {
+            if suggestion.gated {
+                format!(
+                    "{}: {}  (dcg gates this too — it needs explicit approval)",
+                    suggestion.description, suggestion.command
+                )
+            } else {
+                format!("{}: {}", suggestion.description, suggestion.command)
+            }
+        })
         .collect();
 
     if alternatives.is_empty() {

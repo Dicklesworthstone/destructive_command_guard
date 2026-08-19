@@ -293,7 +293,8 @@ pub enum Command {
         ttl: Option<u64>,
     },
 
-    /// Install the hook into Claude Code settings (or Grok with `--grok`)
+    /// Install the hook into Claude Code settings (or another agent with
+    /// `--grok`, `--agy`, or `--opencode`)
     #[command(name = "install")]
     Install {
         /// Force overwrite existing hook configuration
@@ -320,6 +321,16 @@ pub enum Command {
         /// its `run_command` shell tool when dcg returns a block decision.
         #[arg(long)]
         agy: bool,
+
+        /// Install a native OpenCode plugin at
+        /// `~/.config/opencode/plugins/dcg-guard.js` (user-level, covering
+        /// every project) or `<repo>/.opencode/plugins/dcg-guard.js` (with
+        /// `--project`). The plugin implements OpenCode's
+        /// `tool.execute.before` hook: every bash tool call is routed through
+        /// dcg's Claude-compatible hook protocol, and a deny aborts the tool
+        /// call with dcg's reason. Restart OpenCode after installing (#318).
+        #[arg(long)]
+        opencode: bool,
     },
 
     /// Full setup: install hook + add shell startup check
@@ -1463,6 +1474,17 @@ pub struct UpdateCommand {
     /// re-inject the shell startup check.
     #[arg(long, visible_alias = "binary-only", conflicts_with_all = ["check", "rollback", "list_versions"])]
     pub no_configure: bool,
+
+    /// Replace the installed binary even when it is a pinned or local build.
+    ///
+    /// `dcg update` refuses to overwrite a binary that is pinned
+    /// (`general.update_pin = true` / `DCG_UPDATE_PIN=1`) or that was built
+    /// locally ahead of its release tag, because replacing it can silently
+    /// downgrade guard coverage (#320). This flag is the explicit escape
+    /// hatch: it acknowledges that the published release should replace the
+    /// local build.
+    #[arg(long, conflicts_with_all = ["check", "rollback", "list_versions"])]
+    pub replace_local_build: bool,
 }
 
 /// Output format for update --check command.
@@ -2090,7 +2112,9 @@ impl Verbosity {
 }
 
 fn maybe_show_update_notice(cli: &Cli, config: &Config, verbosity: Verbosity) {
-    if verbosity.quiet || !config.general.check_updates {
+    // A pinned install (#320) refuses `dcg update`, so advertising the update
+    // would only nag about an action dcg will then decline to perform.
+    if verbosity.quiet || !config.general.check_updates || config.general.update_pin {
         return;
     }
 
@@ -2176,11 +2200,14 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             project,
             grok,
             agy,
+            opencode,
         }) => {
             if grok {
                 install_grok_hook(force, project)?;
             } else if agy {
                 install_antigravity_hook(force, project)?;
+            } else if opencode {
+                install_opencode_plugin(force, project)?;
             } else {
                 install_hook(force, project)?;
             }
@@ -2196,7 +2223,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             uninstall_hook(purge)?;
         }
         Some(Command::Update(update)) => {
-            self_update(update)?;
+            self_update(update, config.general.update_pin)?;
         }
         Some(Command::Completions { shell }) => {
             write_completions(shell)?;
@@ -3190,6 +3217,8 @@ fn pack_info(
         struct SuggestionJson {
             command: String,
             description: String,
+            /// dcg also gates this suggestion; it needs explicit approval (#316).
+            gated: bool,
         }
 
         let safe_patterns = if show_patterns {
@@ -3222,6 +3251,7 @@ fn pack_info(
                             .map(|s| SuggestionJson {
                                 command: s.command.to_string(),
                                 description: s.description.to_string(),
+                                gated: s.gated,
                             })
                             .collect(),
                     })
@@ -3279,8 +3309,13 @@ fn pack_info(
                 print_markdown_field("Explanation", explanation, "    ", use_color);
             }
             for suggestion in pattern.suggestions {
+                let gated_marker = if suggestion.gated {
+                    " [gated: dcg also requires approval for this]"
+                } else {
+                    ""
+                };
                 println!(
-                    "    Suggestion: {} - {}",
+                    "    Suggestion: {} - {}{gated_marker}",
                     suggestion.command, suggestion.description
                 );
             }
@@ -5056,10 +5091,15 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
                         .iter()
                         .filter(|s| s.platform.matches_current())
                         .map(|s| {
-                            if s.description.is_empty() {
-                                s.command.to_string()
+                            let gated_marker = if s.gated {
+                                " [gated: dcg also requires approval for this]"
                             } else {
-                                format!("{} ({})", s.command, s.description)
+                                ""
+                            };
+                            if s.description.is_empty() {
+                                format!("{}{gated_marker}", s.command)
+                            } else {
+                                format!("{} ({}){gated_marker}", s.command, s.description)
                             }
                         })
                         .collect::<Vec<_>>()
@@ -10074,6 +10114,59 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         }
     }
 
+    // Check 3c: OpenCode plugin registration (#318). Only surfaced when
+    // OpenCode is plausibly in use. Unlike Grok, OpenCode has NO Claude
+    // compatibility layer: without the native plugin its shell calls never
+    // reach dcg, so a missing plugin is an error, not a nudge.
+    //
+    // `collect_doctor_report` carries the same check (id `opencode_plugin`)
+    // so `--strict` and `--format json` agree.
+    if opencode_appears_in_use() {
+        print!("Checking OpenCode plugin registration... ");
+        let plugin_path = opencode_user_plugin_path();
+        if opencode_plugin_is_dcg_owned(&plugin_path) {
+            println!("{}", "OK".green());
+            println!("  Found: {}", plugin_path.display());
+        } else {
+            println!("{}", "NOT REGISTERED".yellow());
+            issues += 1;
+            if fix {
+                println!("  Attempting plugin install...");
+                if install_opencode_plugin(false, false).is_ok() {
+                    println!("  {}", "Fixed!".green());
+                    fixed += 1;
+                } else {
+                    println!("  {}", "Failed to fix".red());
+                }
+            } else {
+                println!("  → Run 'dcg install --opencode' to install the native plugin");
+                println!("    (OpenCode shell commands are NOT guarded until it is installed)");
+            }
+        }
+    }
+
+    // Check 3d: Build provenance / update pin (#320). Warning-only: it never
+    // increments `issues`, so it cannot fail `--strict` — it flags the state
+    // that is one routine `dcg update` away from silently replacing a local
+    // build. `collect_doctor_report` carries the same check.
+    {
+        print!("Checking build provenance... ");
+        let (status, message, remediation) = build_provenance_doctor_parts(config);
+        match status {
+            DoctorCheckStatus::Warning => {
+                println!("{}", "WARNING".yellow());
+                println!("  {message}");
+                if let Some(remediation) = remediation {
+                    println!("  → {remediation}");
+                }
+            }
+            _ => {
+                println!("{}", "OK".green());
+                println!("  {message}");
+            }
+        }
+    }
+
     // Check 4: Config validation (expanded diagnostics)
     print!("Checking configuration... ");
     let config_diag = validate_config_diagnostics(config, config_sources);
@@ -10953,6 +11046,67 @@ fn collect_doctor_report(
         });
     }
 
+    // OpenCode plugin registration (#318). Mirrored in `doctor_pretty` — see
+    // the renderer-parity note above the Grok block.
+    if opencode_appears_in_use() {
+        let plugin_path = opencode_user_plugin_path();
+        let mut opencode_fixed = false;
+        let (status, message, remediation) = if opencode_plugin_is_dcg_owned(&plugin_path) {
+            (
+                DoctorCheckStatus::Ok,
+                format!("Native OpenCode plugin found at {}", plugin_path.display()),
+                None,
+            )
+        } else {
+            // OpenCode has no Claude-compatibility fallback: without the
+            // plugin, its shell calls never reach dcg at all.
+            issues += 1;
+            if fix && install_opencode_plugin(false, false).is_ok() {
+                fixed += 1;
+                opencode_fixed = true;
+                (
+                    DoctorCheckStatus::Ok,
+                    format!(
+                        "Installed native OpenCode plugin at {}",
+                        plugin_path.display()
+                    ),
+                    None,
+                )
+            } else {
+                (
+                    DoctorCheckStatus::Error,
+                    "OpenCode is in use but has no dcg plugin — its shell commands are not \
+                     guarded"
+                        .to_string(),
+                    Some("Run 'dcg install --opencode'".to_string()),
+                )
+            }
+        };
+        checks.push(DoctorCheck {
+            id: "opencode_plugin",
+            name: "OpenCode plugin registration",
+            status,
+            message,
+            remediation,
+            fixed: opencode_fixed,
+        });
+    }
+
+    // Build provenance vs. `dcg update` (#320). Warning-only: it never fails
+    // `--strict`, it flags the state that is one routine `dcg update` away
+    // from silently replacing a local build. Mirrored in `doctor_pretty`.
+    {
+        let (status, message, remediation) = build_provenance_doctor_parts(config);
+        checks.push(DoctorCheck {
+            id: "build_provenance",
+            name: "Build provenance / update pin",
+            status,
+            message,
+            remediation,
+            fixed: false,
+        });
+    }
+
     DoctorReport {
         schema_version: DOCTOR_SCHEMA_VERSION,
         checks,
@@ -11754,6 +11908,228 @@ fn project_antigravity_hooks_path() -> Result<std::path::PathBuf, Box<dyn std::e
     Ok(repo_root.join(".gemini").join("config").join("hooks.json"))
 }
 
+/// Ownership marker embedded in the generated OpenCode plugin (#318).
+///
+/// The installer refuses to overwrite a plugin file that lacks this marker
+/// (it belongs to the user, not dcg), and the uninstallers delete only files
+/// that carry it.
+pub(crate) const OPENCODE_PLUGIN_MARKER: &str = "dcg-opencode-plugin";
+
+/// User-level OpenCode plugin path: `~/.config/opencode/plugins/dcg-guard.js`
+/// (OpenCode reads its global config from `$XDG_CONFIG_HOME/opencode`,
+/// falling back to `~/.config/opencode`, on every platform).
+fn opencode_user_plugin_path() -> std::path::PathBuf {
+    let config_root = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map_or_else(
+            || dirs::home_dir().unwrap_or_default().join(".config"),
+            std::path::PathBuf::from,
+        );
+    config_root
+        .join("opencode")
+        .join("plugins")
+        .join("dcg-guard.js")
+}
+
+/// Project-level OpenCode plugin path: `<repo>/.opencode/plugins/dcg-guard.js`.
+fn project_opencode_plugin_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let repo_root = find_repo_root_from_cwd()
+        .ok_or("Not inside a git repository — cannot determine project root")?;
+    Ok(repo_root
+        .join(".opencode")
+        .join("plugins")
+        .join("dcg-guard.js"))
+}
+
+/// Generate the OpenCode `tool.execute.before` plugin source (#318).
+///
+/// The plugin routes every OpenCode `bash` tool call through dcg's
+/// Claude-compatible hook protocol: an empty stdout means allow; a
+/// `hookSpecificOutput.permissionDecision` of `deny` (or `ask`, since
+/// OpenCode has no operator-review state) aborts the tool call by throwing,
+/// which is OpenCode's documented veto mechanism. Infrastructure failures
+/// (dcg missing/unrunnable) fail open with a stderr notice, matching the
+/// hook-envelope failure policy; the *evaluation* itself stays fail-closed
+/// inside dcg.
+///
+/// The dcg binary path is embedded as a JSON string literal (valid JSON
+/// strings are valid JS string literals), NOT shell-quoted — the plugin
+/// spawns dcg directly without a shell.
+fn build_opencode_plugin_source(executable: &std::path::Path) -> std::io::Result<String> {
+    let path_literal = serde_json::to_string(&executable.to_string_lossy()).map_err(|e| {
+        std::io::Error::other(format!("cannot encode dcg path as a JS literal: {e}"))
+    })?;
+    Ok(format!(
+        r#"// {OPENCODE_PLUGIN_MARKER}: generated by `dcg install --opencode` — do not edit.
+// Routes every OpenCode bash tool call through dcg (Destructive Command
+// Guard) before execution. Remove with `uninstall.sh` or by deleting this
+// file. Docs: https://github.com/Dicklesworthstone/destructive_command_guard
+const DCG_BIN = {path_literal};
+
+export const DcgGuard = async () => {{
+  return {{
+    "tool.execute.before": async (input, output) => {{
+      if (!input || input.tool !== "bash") return;
+      const command = output?.args?.command;
+      if (typeof command !== "string" || command.length === 0) return;
+
+      let stdoutText;
+      try {{
+        const proc = Bun.spawn([process.env.DCG_BIN || DCG_BIN], {{
+          stdin: new TextEncoder().encode(
+            JSON.stringify({{ tool_name: "Bash", tool_input: {{ command }} }})
+          ),
+          stdout: "pipe",
+          stderr: "ignore",
+          env: {{ ...process.env, OPENCODE: "1" }},
+        }});
+        stdoutText = await new Response(proc.stdout).text();
+        await proc.exited;
+      }} catch (err) {{
+        // dcg missing or unrunnable is an infrastructure failure, not a
+        // safety verdict: fail open, but say so.
+        console.error(`[dcg] OpenCode guard could not run dcg: ${{err}}`);
+        return;
+      }}
+
+      const text = (stdoutText || "").trim();
+      if (!text) return; // empty stdout = allow
+
+      let decision;
+      try {{
+        decision = JSON.parse(text);
+      }} catch {{
+        return; // non-JSON stdout: treat as allow (matches other harnesses)
+      }}
+      const hso = decision.hookSpecificOutput;
+      const verdict = hso && hso.permissionDecision;
+      if (verdict === "deny" || verdict === "ask") {{
+        // OpenCode has no operator-review state, so `ask` fails closed.
+        throw new Error(hso.permissionDecisionReason || "Blocked by dcg");
+      }}
+    }},
+  }};
+}};
+"#
+    ))
+}
+
+/// Whether this machine appears to run OpenCode: its config directory
+/// exists, an `OPENCODE*` env var is present, or the current session was
+/// spawned by it. Used to gate the doctor check so machines without OpenCode
+/// are not pestered.
+fn opencode_appears_in_use() -> bool {
+    if std::env::vars_os().any(|(k, _)| k.to_string_lossy().starts_with("OPENCODE")) {
+        return true;
+    }
+    opencode_user_plugin_path()
+        .parent()
+        .and_then(std::path::Path::parent)
+        .is_some_and(|opencode_dir| opencode_dir.is_dir())
+}
+
+/// Whether `path` holds a dcg-generated OpenCode plugin.
+fn opencode_plugin_is_dcg_owned(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|content| content.contains(OPENCODE_PLUGIN_MARKER))
+        .unwrap_or(false)
+}
+
+/// Shared doctor verdict for the build-provenance / update-pin check (#320),
+/// used by both renderers so `--strict` and `--format json` agree.
+fn build_provenance_doctor_parts(
+    config: &Config,
+) -> (DoctorCheckStatus, String, Option<String>) {
+    let pinned = config.general.update_pin;
+    match crate::update::build_provenance() {
+        crate::update::BuildProvenance::Release => (
+            DoctorCheckStatus::Ok,
+            "Binary matches its release tag; `dcg update` is safe".to_string(),
+            None,
+        ),
+        crate::update::BuildProvenance::LocalAheadOfRelease { describe } => {
+            if pinned {
+                (
+                    DoctorCheckStatus::Ok,
+                    format!(
+                        "Local build ahead of its release tag ({describe}); pinned against \
+                         `dcg update` via general.update_pin"
+                    ),
+                    None,
+                )
+            } else {
+                (
+                    DoctorCheckStatus::Warning,
+                    format!(
+                        "Local build ahead of its release tag ({describe}); a routine `dcg \
+                         update` would silently replace it with the published release"
+                    ),
+                    Some(
+                        "Set `general.update_pin = true` in ~/.config/dcg/config.toml to pin \
+                         this build (escape hatch: `dcg update --replace-local-build`)"
+                            .to_string(),
+                    ),
+                )
+            }
+        }
+        crate::update::BuildProvenance::Unknown => (
+            DoctorCheckStatus::Ok,
+            "No build provenance embedded (non-git build); update-pin checks rely on \
+             general.update_pin only"
+                .to_string(),
+            None,
+        ),
+    }
+}
+
+/// Install the native OpenCode plugin (#318).
+fn install_opencode_plugin(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let plugin_path = if project {
+        project_opencode_plugin_path()?
+    } else {
+        opencode_user_plugin_path()
+    };
+
+    if plugin_path.exists() {
+        let existing = std::fs::read_to_string(&plugin_path).unwrap_or_default();
+        if !existing.contains(OPENCODE_PLUGIN_MARKER) {
+            return Err(format!(
+                "{} exists but was not generated by dcg (missing the '{OPENCODE_PLUGIN_MARKER}' \
+                 marker). Refusing to overwrite a user-owned plugin — move it aside or merge \
+                 the dcg guard into it manually.",
+                plugin_path.display()
+            )
+            .into());
+        }
+        if !force {
+            println!("{}", "Plugin already installed!".yellow());
+            println!("Use --force to reinstall");
+            return Ok(());
+        }
+    }
+
+    let executable = current_dcg_executable()?;
+    let source = build_opencode_plugin_source(&executable)?;
+
+    if let Some(parent) = plugin_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&plugin_path, source)?;
+
+    let level = if project { "project" } else { "user" };
+    println!(
+        "{}",
+        "OpenCode plugin installed successfully!".green().bold()
+    );
+    println!("Plugin written ({level}): {}", plugin_path.display());
+    println!();
+    println!(
+        "{}",
+        "Restart OpenCode (start a new session) for the plugin to load.".yellow()
+    );
+    Ok(())
+}
+
 /// The shell snippet that checks whether the DCG hook is still present in
 /// Claude Code settings on every new shell session. Runs in milliseconds,
 /// silent when the hook is present, yellow warning when missing.
@@ -12019,7 +12395,10 @@ fn uninstall_hook(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Update dcg by re-running the platform installer.
-fn self_update(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
+fn self_update(
+    update: UpdateCommand,
+    update_pinned: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Handle --list-versions flag: show available backup versions
     if update.list_versions {
         return handle_list_versions();
@@ -12033,6 +12412,40 @@ fn self_update(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> 
     // Handle --check flag: just check for updates without installing
     if update.check {
         return handle_version_check(update.refresh, update.format);
+    }
+
+    // #320: refuse to replace a pinned install or a local build that is
+    // ahead of its release tag BEFORE any network or installer work — a
+    // half-completed update on a guard is worse than a clean refusal.
+    if !update.replace_local_build {
+        if update_pinned {
+            return Err(format!(
+                "dcg update is pinned: this install set `general.update_pin = true` (or \
+                 `DCG_UPDATE_PIN=1`), so `dcg update` refuses to replace the binary.\n\
+                 Installed: dcg v{}{}\n\
+                 To update anyway, rerun with `dcg update --replace-local-build`, or remove \
+                 the pin first.",
+                crate::update::current_version(),
+                crate::update::GIT_SHA.map_or_else(String::new, |sha| format!(" ({sha})")),
+            )
+            .into());
+        }
+        if let crate::update::BuildProvenance::LocalAheadOfRelease { describe } =
+            crate::update::build_provenance()
+        {
+            return Err(format!(
+                "this dcg binary is a local build ahead of its release tag (git describe: \
+                 {describe}).\n\
+                 Replacing it with the published release would silently discard that local \
+                 delta — for a guard, that can mean downgrading coverage you depend on. \
+                 Refusing before any download or install work.\n\
+                 - To keep the local build and stop update nudges: set \
+                 `general.update_pin = true` in ~/.config/dcg/config.toml\n\
+                 - To replace it with the published release anyway: \
+                 `dcg update --replace-local-build`",
+            )
+            .into());
+        }
     }
 
     if cfg!(windows) {
