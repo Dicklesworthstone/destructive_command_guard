@@ -3213,7 +3213,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chain can be classified.
         destructive_pattern!(
             "cp-sensitive-then-delete",
-            r#"\bcp\b[^|;&]*(?:\s(?:-[A-Za-z]*a[A-Za-z]*|--archive)\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
+            r#"\bcp\b[^|;&]*(?:\s(?:-[A-Za-z]*a[A-Za-z]*|--archive)\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
             "archive copy of a sensitive path into temp followed by forced recursive deletion is a cross-segment data-loss bypass. EXTREMELY DANGEROUS.",
             Critical,
             "`cp -al /etc /tmp/x && rm -rf /tmp/x` is a propagation variant of the \
@@ -3228,7 +3228,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "ln-symlink-sensitive-then-delete",
-            r#"\bln\b[^|;&]*\s-[A-Za-z]*s[A-Za-z]*[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
+            r#"\bln\b[^|;&]*\s-[A-Za-z]*s[A-Za-z]*[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
             "symlink from a sensitive path into temp followed by forced recursive deletion can traverse and destroy the target. EXTREMELY DANGEROUS.",
             Critical,
             "`ln -s /etc /tmp/x && rm -rf /tmp/x/.` can turn an apparently safe temp \
@@ -3242,7 +3242,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "rsync-sensitive-then-delete",
-            r#"\brsync\b[^|;&]*(?:\s(?:-[A-Za-z]*a[A-Za-z]*|--archive)\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
+            r#"\brsync\b[^|;&]*(?:\s(?:-[A-Za-z]*a[A-Za-z]*|--archive)\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
             "rsync archive of a sensitive path into temp followed by forced recursive deletion is a cross-segment data-loss bypass. EXTREMELY DANGEROUS.",
             Critical,
             "`rsync -a /etc/ /tmp/dest/ && rm -rf /tmp/dest` is the rsync form of the \
@@ -3428,7 +3428,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // `(find /etc -delete)` and `find /etc -delete | tee log`
             // both fire. Without `)` in the set, subshell forms
             // silently bypass.
-            r#"\bfind\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s-delete(?:\s|$|[;&|)\n])"#,
+            r#"\bfind\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s-delete(?:\s|$|[;&|)\n])"#,
             "find <sensitive-path> -delete is bytewise-equivalent to rm -rf on root/home and is EXTREMELY DANGEROUS. This command will NOT be executed.",
             Critical,
             "`find <path> -delete` is the bytewise-equivalent of `rm -rf <path>`: \
@@ -3492,7 +3492,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // standard.
         destructive_pattern!(
             "unlink-root-home",
-            r#"\bunlink\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
+            r#"\bunlink\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
             "unlink on a sensitive system or home path is one-shot data destruction with no recovery. EXTREMELY DANGEROUS.",
             Critical,
             "`unlink <file>` is the raw POSIX unlink(2) primitive: it removes a single \
@@ -3540,7 +3540,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `truncate-grow` safe pattern above.
         destructive_pattern!(
             "truncate-zero-root-home",
-            r#"\btruncate\b[^|;&]*?(?:\s-s\s+(?!\+)\S+|\s--size=(?!\+)\S+)[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
+            r#"\btruncate\b[^|;&]*?(?:\s-s\s+(?!\+)\S+|\s--size=(?!\+)\S+)[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
             "truncate with a potentially shrinking size on a sensitive system or home path destroys data. EXTREMELY DANGEROUS.",
             Critical,
             "`truncate -s 0 <file>` zeros a file in place. `truncate -s -<N> <file>` \
@@ -3583,7 +3583,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // sensitive paths.
         destructive_pattern!(
             "shred-root-home",
-            r#"\bshred\b[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
+            r#"\bshred\b[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
             "shred on a sensitive system or home path destroys data beyond forensic recovery. EXTREMELY DANGEROUS.",
             Critical,
             "`shred` overwrites file content with random data (DoD-style multi-pass by \
@@ -3649,7 +3649,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // latent gap; closing it pack-wide is tracked separately.
         destructive_pattern!(
             "tar-remove-files-root-home",
-            r#"\btar\b[^|;&]*?\s--remove-files\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)|\btar\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?\s--remove-files\b"#,
+            r#"\btar\b[^|;&]*?\s--remove-files\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)|\btar\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?\s--remove-files\b"#,
             "tar --remove-files on a sensitive system or home path is recursive deletion masquerading as an archive operation. EXTREMELY DANGEROUS.",
             Critical,
             "`tar --remove-files -cf <archive> <source>` first archives the source paths \
@@ -3707,7 +3707,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `(dd if=/dev/zero of=/etc/passwd)` still classify as Critical.
         destructive_pattern!(
             "dd-overwrite-root-home",
-            r#"\bdd\b[^|;&]*?\bof=['"\\]?(?!/dev/)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            r#"\bdd\b[^|;&]*?\bof=['"\\]?(?!/dev/)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
             "dd of=<sensitive-path> overwrites file contents in place. EXTREMELY DANGEROUS on a system or home file.",
             Critical,
             "`dd if=/dev/zero of=<file>` and `dd if=/dev/urandom of=<file>` overwrite the \
@@ -3790,7 +3790,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // tier to fall back on.
         destructive_pattern!(
             "mv-sensitive-source-root-home",
-            r#"\bmv\b[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            r#"\bmv\b[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
             "mv touching a sensitive system or home path is the cross-segment recursive-force-delete bypass. EXTREMELY DANGEROUS.",
             Critical,
             "`mv /etc /tmp/x && rm -rf /tmp/x` is the canonical cross-segment bypass: \
@@ -3864,12 +3864,17 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // pain we can add a safe pattern later.
         // Two carve-outs in the regex below worth understanding:
         //
-        //   1. `(?!/dev/(?:null|zero|full)\b)` — never fire on the
-        //      universal "discard output" sinks. `cmd > /dev/null` and
-        //      `cmd 2>&1 > /dev/null` are the most common shell idioms
-        //      in existence; without this carve-out the `dev` element
-        //      of the sensitive set would block essentially every
-        //      script that suppresses output.
+        //   1. `(?!/dev/(?:null|zero|full|stdout|stderr|tty|fd/[0-2])\b)` —
+        //      never fire on the write-safe character devices. `cmd >
+        //      /dev/null` and `cmd 2>&1 > /dev/null` are the most common
+        //      shell idioms in existence; `> /dev/stdout`, `> /dev/stderr`,
+        //      `> /dev/tty`, and the `/dev/fd/[0-2]` std-stream aliases are
+        //      equally truncate-proof — opening a character device with
+        //      O_TRUNC cannot destroy persistent data (#324). Higher
+        //      `/dev/fd/N` deliberately stays blocked: N can dup a
+        //      regular-file fd, where O_TRUNC truncates a real file. The
+        //      `\b` also keeps `/dev/tty0`..`/dev/ttyN` (consoles / other
+        //      terminals) and multi-digit `/dev/fd/1x` blocked.
         //
         //   2. `(?:['"\\]|\$['"])?` — extends the historical optional
         //      single-char quote prefix to also accept the two-byte
@@ -3878,7 +3883,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //      bypass with `> $'/etc/passwd'` or `> $"/etc/passwd"`.
         destructive_pattern!(
             "redirect-truncate-root-home",
-            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full|stdout|stderr|tty|fd/[0-2])\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
             "shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to a sensitive system or home path destroys the previous file contents. EXTREMELY DANGEROUS.",
             Critical,
             "`> /etc/passwd` (or `: > /etc/passwd`, `echo > /etc/passwd`, etc.) opens \
@@ -5385,17 +5390,105 @@ mod tests {
 
     #[test]
     fn redirect_to_dev_devices_still_blocks() {
-        // The /dev/{null,zero,full} carve-out must NOT relax actual
-        // device destruction (`> /dev/sda` etc.) — only the safe sinks.
+        // The write-safe-device carve-out must NOT relax actual device
+        // destruction (`> /dev/sda` etc.) — only the safe sinks. This
+        // includes near-misses of the #324 carve-out: `/dev/st0` is a
+        // TAPE device (truncate-adjacent name, real data), `/dev/tty0`
+        // and `/dev/ttys002` are other terminals/consoles, and
+        // `/dev/fd/N` for N > 2 can dup a regular-file descriptor where
+        // O_TRUNC truncates a real file.
         let pack = create_pack();
         for cmd in [
             "> /dev/sda",
             "echo zero > /dev/sda1",
             "command > /dev/sdb",
             "echo > /dev/nvme0n1",
+            "echo > /dev/st0",
+            "echo > /dev/tty0",
+            "echo > /dev/ttys002",
+            "echo x > /dev/fd/3",
+            "echo x > /dev/fd/7",
+            "echo x > /dev/fd/12",
+            "echo x > /dev/stdouts",
         ] {
             assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
         }
+    }
+
+    #[test]
+    fn redirect_to_std_stream_devices_is_allowed() {
+        // #324: /dev/stdout, /dev/stderr, /dev/tty, and the
+        // /dev/fd/[0-2] std-stream aliases are write-safe character
+        // devices — opening them with O_TRUNC cannot destroy persistent
+        // data, exactly the property behind the /dev/null carve-out.
+        // Agents emit `> /dev/stdout` routinely; each false block costs
+        // a human round-trip.
+        let pack = create_pack();
+        for cmd in [
+            "gh pr view 204 --json number,title > /dev/stdout",
+            "command > /dev/stdout",
+            "command >/dev/stdout",
+            "command > /dev/stderr",
+            "echo warn 1> /dev/stderr",
+            "echo warn 2> /dev/stdout",
+            "command &> /dev/stdout",
+            "echo prompt > /dev/tty",
+            "read -p x < /dev/tty > /dev/tty",
+            "echo x > /dev/fd/0",
+            "echo x > /dev/fd/1",
+            "echo x >/dev/fd/2",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_truncate_macos_home_spelling_blocks() {
+        // #325: tools hand agents absolute resolved paths, so the macOS
+        // home spelling `/Users/<user>/...` is what a truncating
+        // redirect actually names in practice. The rm family already
+        // treated /Users as sensitive; the redirect rule must agree
+        // with it or the guard blocks the uncertain form
+        // (`> $D/.zshrc`) while allowing the exactly-named one.
+        let pack = create_pack();
+        for cmd in [
+            "echo x > /Users/jemanuel/.zshrc",
+            "echo x >/Users/jemanuel/.zshrc",
+            ": > /Users/jemanuel/.zshrc",
+            "echo x >| /Users/jemanuel/.zshrc",
+            "echo x 2> /Users/jemanuel/.zshrc",
+            "echo x &> /Users/jemanuel/.zshrc",
+            "printf x > /Users/jemanuel/.ssh/config",
+            "echo x > \"/Users/jemanuel/.zshrc\"",
+            "echo x > /Users",
+            "echo x > /Users/Shared/notes.txt",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+
+        // `/Users` must only match as a complete path component.
+        for cmd in ["echo x > /Usersland/file.txt", "echo x > ./Users/file.txt"] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn mv_sensitive_source_macos_home_spelling_blocks() {
+        // #325 sibling: mv-sensitive-source-root-home shares the
+        // sensitive-path alternation and must carry the macOS spelling
+        // too (platform parity with the Linux `/home` posture).
+        let pack = create_pack();
+        assert_blocks_with_pattern(
+            &pack,
+            "mv /Users/jemanuel/.zshrc /tmp/x",
+            "mv-sensitive-source-root-home",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "mv /home/user/.zshrc /tmp/x",
+            "mv-sensitive-source-root-home",
+        );
     }
 
     #[test]

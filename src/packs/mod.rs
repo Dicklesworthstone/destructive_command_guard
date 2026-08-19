@@ -1681,7 +1681,18 @@ static PACK_ENTRIES: [PackEntry; 99] = [
     ),
     PackEntry::new(
         "database.mysql",
-        &["mysql", "mysqldump", "DROP", "TRUNCATE", "DELETE"],
+        // `mariadb` is the renamed client binary (the `mysql` symlink is not
+        // guaranteed to exist); "RESET MASTER" admits the reset-master rule
+        // when the statement reaches the shell without a `mysql` token (#323).
+        &[
+            "mysql",
+            "mysqldump",
+            "mariadb",
+            "RESET MASTER",
+            "DROP",
+            "TRUNCATE",
+            "DELETE",
+        ],
         database::mysql::create_pack,
     ),
     PackEntry::new(
@@ -1698,7 +1709,17 @@ static PACK_ENTRIES: [PackEntry; 99] = [
     ),
     PackEntry::new(
         "database.redis",
-        &["redis-cli", "FLUSHALL", "FLUSHDB", "DEBUG"],
+        // `valkey` / `keydb` cover the protocol-compatible client renames
+        // (`valkey-cli`, `keydb-cli`); without them every rule in this pack
+        // silently stopped firing on those binaries (#323).
+        &[
+            "redis-cli",
+            "valkey",
+            "keydb",
+            "FLUSHALL",
+            "FLUSHDB",
+            "DEBUG",
+        ],
         database::redis::create_pack,
     ),
     PackEntry::new(
@@ -1853,6 +1874,9 @@ static PACK_ENTRIES: [PackEntry; 99] = [
             "fdisk",
             "parted",
             "wipefs",
+            // Without `umount` the umount-force rule was dead: no other
+            // keyword in this list appears in `umount -f /mnt/x` (#323).
+            "umount",
             "mdadm",
             "btrfs",
             "dmsetup",
@@ -2695,9 +2719,19 @@ static GIT_FINDER: LazyLock<memmem::Finder<'static>> = LazyLock::new(|| memmem::
 #[allow(dead_code)]
 static RM_FINDER: LazyLock<memmem::Finder<'static>> = LazyLock::new(|| memmem::Finder::new("rm"));
 
+/// Word-character class for keyword pre-filter boundaries.
+///
+/// Deliberately EXCLUDES `_`, unlike regex `\w` (#323). Underscore-joined
+/// names are how real commands embed the very literals packs gate on —
+/// `DCG_DISABLE=1`, `cloudflare_record.www`, `WEBHOOK_SECRET` — and treating
+/// `_` as a word character made every such occurrence invisible to the
+/// pre-filter: the pack's regex was correct but never ran (a silent
+/// fail-open). Treating `_` as a boundary can only ADMIT more commands to
+/// full evaluation; the pack regexes still decide the verdict, so this is
+/// fail-closed with a negligible evaluation-frequency cost.
 #[inline]
 const fn is_word_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
+    byte.is_ascii_alphanumeric()
 }
 
 #[inline]
@@ -3671,6 +3705,38 @@ mod tests {
         assert!(
             pack_aware_quick_reject("echo digit", &keywords),
             "substring in a larger token should not trigger keyword gating"
+        );
+    }
+
+    #[test]
+    fn pack_aware_quick_reject_treats_underscore_as_boundary() {
+        // #323: underscore-joined names are how real commands embed the
+        // literals packs gate on. `_` must be a keyword boundary, or the
+        // pre-filter quick-rejects `DCG_DISABLE=1` / `cloudflare_record`
+        // and the pack regex — however correct — never runs.
+        let keywords: Vec<&str> = vec!["secret", "dcg", "cloudflare", "webhook"];
+
+        assert!(
+            !pack_aware_quick_reject("export SCW_SECRET_KEY=x", &keywords),
+            "underscore-joined credential name must admit keyword `secret`"
+        );
+        assert!(
+            !pack_aware_quick_reject("export DCG_DISABLE=1", &keywords),
+            "dcg self-weakening env var must admit keyword `dcg`"
+        );
+        assert!(
+            !pack_aware_quick_reject("terraform destroy -target=cloudflare_record.www", &keywords),
+            "terraform resource type must admit keyword `cloudflare`"
+        );
+        assert!(
+            !pack_aware_quick_reject("export WEBHOOK_SECRET=x", &keywords),
+            "UPPER_SNAKE env var must admit keyword `webhook`"
+        );
+
+        // Alphanumeric continuation is still NOT a boundary.
+        assert!(
+            pack_aware_quick_reject("echo dcgx", &keywords),
+            "keyword embedded in a longer alphanumeric token must still quick-reject"
         );
     }
 

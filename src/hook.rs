@@ -1083,6 +1083,166 @@ pub(crate) fn shell_dialect_for_tool_name(tool_name: Option<&str>) -> ShellDiale
     }
 }
 
+/// PowerShell approved verbs (the `Verb-Noun` cmdlet naming standard).
+///
+/// Compared case-insensitively against the verb half of a candidate cmdlet
+/// token. This is the full Microsoft approved-verb list rather than a
+/// destructive subset: the list only ever WIDENS a dialect to `Unknown`
+/// (fail-closed union), so an over-broad match costs one extra dialect's
+/// evaluation, while an omission re-opens the #322 hole for cmdlets built on
+/// that verb.
+const POWERSHELL_APPROVED_VERBS: &[&str] = &[
+    "add",
+    "approve",
+    "assert",
+    "backup",
+    "block",
+    "build",
+    "checkpoint",
+    "clear",
+    "close",
+    "compare",
+    "complete",
+    "compress",
+    "confirm",
+    "connect",
+    "convert",
+    "convertfrom",
+    "convertto",
+    "copy",
+    "debug",
+    "deny",
+    "deploy",
+    "disable",
+    "disconnect",
+    "dismount",
+    "edit",
+    "enable",
+    "enter",
+    "exit",
+    "expand",
+    "export",
+    "find",
+    "format",
+    "get",
+    "grant",
+    "group",
+    "hide",
+    "import",
+    "initialize",
+    "install",
+    "invoke",
+    "join",
+    "limit",
+    "lock",
+    "measure",
+    "merge",
+    "mount",
+    "move",
+    "new",
+    "open",
+    "optimize",
+    "out",
+    "ping",
+    "pop",
+    "protect",
+    "publish",
+    "push",
+    "read",
+    "receive",
+    "redo",
+    "register",
+    "remove",
+    "rename",
+    "repair",
+    "request",
+    "reset",
+    "resize",
+    "resolve",
+    "restart",
+    "restore",
+    "resume",
+    "revoke",
+    "save",
+    "search",
+    "select",
+    "send",
+    "set",
+    "show",
+    "skip",
+    "split",
+    "start",
+    "step",
+    "stop",
+    "submit",
+    "suspend",
+    "switch",
+    "sync",
+    "test",
+    "trace",
+    "unblock",
+    "undo",
+    "uninstall",
+    "unlock",
+    "unprotect",
+    "unpublish",
+    "unregister",
+    "update",
+    "use",
+    "wait",
+    "watch",
+    "write",
+];
+
+/// Return whether `token` has the shape of a PowerShell cmdlet invocation:
+/// `Verb-Noun` where the verb is on the approved-verb list and the noun is a
+/// single alphanumeric word.
+fn is_powershell_cmdlet_token(token: &str) -> bool {
+    let Some((verb, noun)) = token.split_once('-') else {
+        return false;
+    };
+    if verb.is_empty()
+        || noun.is_empty()
+        || !verb.bytes().all(|b| b.is_ascii_alphabetic())
+        || !noun.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        return false;
+    }
+    POWERSHELL_APPROVED_VERBS
+        .iter()
+        .any(|approved| verb.eq_ignore_ascii_case(approved))
+}
+
+/// Return whether any statement/pipeline segment of `command` starts with a
+/// PowerShell cmdlet-shaped token (`Remove-Item …`, `… ; Clear-Content …`).
+fn command_has_powershell_shape(command: &str) -> bool {
+    command
+        .split(['|', ';', '&', '\n', '\r', '(', '{'])
+        .filter_map(|segment| segment.split_whitespace().next())
+        .any(is_powershell_cmdlet_token)
+}
+
+/// Down-trust a `Bash`-labeled dialect when the command itself is
+/// unmistakably PowerShell.
+///
+/// VS Code's Agent Host transforms PowerShell tool calls before invoking
+/// PreToolUse hooks and puts `tool_name: "Bash"` on the wire (#322, #252), so
+/// dcg evaluated `Remove-Item -Recurse -Force` under the POSIX dialect —
+/// where a cmdlet is just an unknown binary — and failed open. The tool-name
+/// label is host-controlled and demonstrably wrong in the wild; when the
+/// command's own shape contradicts it, the honest dialect is `Unknown`, which
+/// evaluates the fail-closed union of every dialect. Explicit
+/// `powershell`/`pwsh`/`cmd` labels are never widened (they already evaluate
+/// the dialect the command will run under), and non-cmdlet POSIX commands are
+/// unaffected.
+pub(crate) fn refine_shell_dialect(command: &str, labeled: ShellDialect) -> ShellDialect {
+    if labeled == ShellDialect::Posix && command_has_powershell_shape(command) {
+        ShellDialect::Unknown
+    } else {
+        labeled
+    }
+}
+
 pub(crate) fn is_shell_hook_candidate(input: &HookInput) -> bool {
     if is_supported_shell_tool(input.tool_name.as_deref()) {
         return true;
@@ -1227,12 +1387,17 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
                 continue;
             }
             if let Some(command) = call.args.as_ref().and_then(extract_command_from_tool_args) {
-                commands.push((command, shell_dialect_for_tool_name(call.name.as_deref())));
+                let entry_dialect = refine_shell_dialect(
+                    &command,
+                    shell_dialect_for_tool_name(call.name.as_deref()),
+                );
+                commands.push((command, entry_dialect));
             }
         }
         if let Some(tool_call) = input.tool_call.as_ref() {
             if let Some(command) = extract_command_from_tool_call(tool_call) {
-                commands.push((command, dialect));
+                let entry_dialect = refine_shell_dialect(&command, dialect);
+                commands.push((command, entry_dialect));
             }
         }
         if let Some(command) = input
@@ -1240,14 +1405,16 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
             .as_ref()
             .and_then(extract_command_from_tool_input)
         {
-            commands.push((command, dialect));
+            let entry_dialect = refine_shell_dialect(&command, dialect);
+            commands.push((command, entry_dialect));
         }
         if let Some(command) = input
             .tool_args
             .as_ref()
             .and_then(extract_command_from_tool_args)
         {
-            commands.push((command, dialect));
+            let entry_dialect = refine_shell_dialect(&command, dialect);
+            commands.push((command, entry_dialect));
         }
         let mut entries = commands.into_iter();
         if let Some((command, primary_dialect)) = entries.next() {
@@ -1263,6 +1430,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
     // Antigravity CLI (`agy`) nests the command under `toolCall.args.CommandLine`.
     if let Some(tool_call) = input.tool_call.as_ref() {
         if let Some(command) = extract_command_from_tool_call(tool_call) {
+            let dialect = refine_shell_dialect(&command, dialect);
             return Some(ExtractedHookCommand {
                 command,
                 protocol,
@@ -1274,6 +1442,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
 
     if let Some(tool_input) = input.tool_input.as_ref() {
         if let Some(command) = extract_command_from_tool_input(tool_input) {
+            let dialect = refine_shell_dialect(&command, dialect);
             return Some(ExtractedHookCommand {
                 command,
                 protocol,
@@ -1285,6 +1454,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
 
     if let Some(tool_args) = input.tool_args.as_ref() {
         if let Some(command) = extract_command_from_tool_args(tool_args) {
+            let dialect = refine_shell_dialect(&command, dialect);
             return Some(ExtractedHookCommand {
                 command,
                 protocol,
@@ -2654,6 +2824,94 @@ mod tests {
             assert_eq!(extracted.command, "git status");
             assert_eq!(extracted.protocol, expected_protocol);
             assert_eq!(extracted.dialect, expected_dialect);
+        }
+    }
+
+    #[test]
+    fn test_322_powershell_shaped_command_widens_mislabeled_bash_dialect() {
+        // VS Code Agent Host transforms PowerShell tool calls and puts
+        // `tool_name: "Bash"` on the wire (#322/#252). A Posix-labeled
+        // command that is unmistakably PowerShell must evaluate as
+        // `Unknown` (fail-closed union of all dialects), not as Posix
+        // where a cmdlet is an inert unknown binary.
+        let json = r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"Remove-Item -LiteralPath .\\pipelines -Recurse -Force"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        let extracted = extract_command_with_context(&input).expect("shell command");
+        assert_eq!(extracted.dialect, ShellDialect::Unknown);
+
+        // Cmdlet later in a statement list still widens.
+        let json = r#"{"tool_name":"Bash","tool_input":{"command":"cd pipelines; Clear-Content secrets.txt"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        let extracted = extract_command_with_context(&input).expect("shell command");
+        assert_eq!(extracted.dialect, ShellDialect::Unknown);
+
+        // Ordinary POSIX commands keep the Posix dialect...
+        for command in [
+            "git status",
+            "ls -la",
+            "apt-get install jq",
+            "docker-compose up -d",
+            "add-apt-repository ppa:x/y",
+            "start-stop-daemon --stop --name foo",
+            "./remove-item",
+            "echo Remove-Item is a cmdlet | cat",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "must not widen plain POSIX command {command:?}"
+            );
+        }
+
+        // ...and explicit shell labels are never second-guessed.
+        assert_eq!(
+            refine_shell_dialect("Remove-Item x", ShellDialect::PowerShell),
+            ShellDialect::PowerShell
+        );
+        assert_eq!(
+            refine_shell_dialect("Remove-Item x", ShellDialect::Cmd),
+            ShellDialect::Cmd
+        );
+        assert_eq!(
+            refine_shell_dialect("Remove-Item x", ShellDialect::Unknown),
+            ShellDialect::Unknown
+        );
+    }
+
+    #[test]
+    fn test_322_cmdlet_token_shape() {
+        for token in [
+            "Remove-Item",
+            "remove-item",
+            "REMOVE-ITEM",
+            "Clear-Content",
+            "Set-ExecutionPolicy",
+            "Stop-Process",
+            "Format-Volume",
+            "Invoke-Expression",
+        ] {
+            assert!(
+                is_powershell_cmdlet_token(token),
+                "{token:?} must be recognized as a cmdlet"
+            );
+        }
+        for token in [
+            "apt-get",
+            "docker-compose",
+            "git-crypt",
+            "add-apt-repository",
+            "start-stop-daemon",
+            "-Recurse",
+            "remove-",
+            "-item",
+            "get-pip.py",
+            "remove_item",
+            "rm",
+        ] {
+            assert!(
+                !is_powershell_cmdlet_token(token),
+                "{token:?} must NOT be recognized as a cmdlet"
+            );
         }
     }
 

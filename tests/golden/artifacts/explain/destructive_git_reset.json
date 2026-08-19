@@ -63,6 +63,7 @@
           "shred",
           "tar",
           "truncate",
+          "umount",
           "unlink",
           "vgreduce",
           "vgremove",

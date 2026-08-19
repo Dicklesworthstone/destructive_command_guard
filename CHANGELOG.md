@@ -15,6 +15,51 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Fixed
 
+- **The keyword pre-filter treats `_` as a boundary, not a word character
+  (#323).** Underscore was in the pre-filter's word class, so underscore-joined
+  names never admitted a pack: `export DCG_DISABLE=1` quick-rejected past the
+  guardrails pack's own self-weakening rule, `terraform destroy
+  -target=cloudflare_record.www` past `dns.cloudflare`, and `WEBHOOK_SECRET` /
+  `SCW_SECRET_KEY` past every credential rule — the regexes were correct but
+  never ran (silent fail-open, invisible to tests written against hyphenated
+  decoys). `_` is now a boundary in the pre-filter only; pack regexes still
+  decide the verdict, so the change can only admit more commands to full
+  evaluation. Alphanumeric continuations (`dcgx`) still quick-reject.
+- **Dead-gated rules re-armed by fixing their packs' keyword lists (#323).**
+  `system.disk` gained `umount` (the `umount-force` rule was unreachable — no
+  keyword in the list occurs in `umount -f`), `database.redis` gained `valkey`
+  and `keydb` (the protocol-compatible client renames; every rule silently
+  stopped firing on those binaries), and `database.mysql` gained `mariadb` and
+  `RESET MASTER` (the renamed client, and the reset-master statement when it
+  reaches the shell without a `mysql` token).
+- **A `Bash`-labeled command that is unmistakably PowerShell now evaluates as
+  the fail-closed union of all dialects (#322).** VS Code Agent Host
+  transforms PowerShell tool calls and puts `tool_name: "Bash"` on the wire,
+  so `Remove-Item -LiteralPath .\pipelines -Recurse -Force` was evaluated
+  under the POSIX dialect — where a cmdlet is an inert unknown binary — and
+  executed. When any statement segment starts with an approved-verb
+  `Verb-Noun` cmdlet token, the hook now widens the dialect to `Unknown`,
+  which fails closed across every dialect. Explicit `powershell`/`pwsh`/`cmd`
+  labels are never second-guessed, and hyphenated POSIX commands (`apt-get`,
+  `docker-compose`, `start-stop-daemon`) do not widen.
+- **`redirect-truncate-root-home` knows the macOS home spelling (#325).**
+  The sensitive-path alternation carried `/home` but not `/Users`, so `echo x
+  > /Users/<user>/.zshrc` — the absolute form tools actually hand agents —
+  was allowed while `> ~/.zshrc`, `> $HOME/.zshrc`, and even the *less*
+  certain `> $D/.zshrc` were blocked. `/Users` now sits in the shared
+  alternation of every rule that uses it (`redirect-truncate-root-home`,
+  `mv-sensitive-source-root-home`, `find -delete`, `unlink`, `truncate`,
+  `shred`, `tar --remove-files`, `dd of=`, and the cp/ln/rsync
+  copy-then-delete chains), matching the platform parity the `rm` rules
+  already had (#247).
+- **Write-safe character devices no longer deny as truncating redirects
+  (#324).** `> /dev/stdout`, `> /dev/stderr`, `> /dev/tty`, and the
+  `/dev/fd/[0-2]` std-stream aliases joined the `/dev/null|zero|full`
+  carve-out: opening a character device with `O_TRUNC` cannot destroy
+  persistent data, and each false block cost a human round-trip. `/dev/st0`
+  (tape), `/dev/tty0`/`/dev/ttysNNN` (other terminals), and `/dev/fd/N` for
+  N > 2 (may dup a regular-file fd) stay blocked.
+
 - **Quoted `>` bytes inside an inline interpreter payload no longer read as
   redirect syntax when the segment carries a real redirect (#317).** `sh -c
   "echo 'a => %s'" 2>&1` (and the `2>/dev/null` / literal `/tmp` target /

@@ -21491,13 +21491,14 @@ fn evaluate_core_filesystem_pack(
             } else {
                 command_for_packs
             };
-        let proven_variable_redirect = statically_safe_variable_redirect(
-            redirect_source,
-            segment_ranges,
-            segment_start,
-            dialect_segment,
-            shell_dialect,
-        ) || powershell_null_device_redirects_only(dialect_segment, shell_dialect);
+        let proven_variable_redirect =
+            statically_safe_variable_redirect(
+                redirect_source,
+                segment_ranges,
+                segment_start,
+                dialect_segment,
+                shell_dialect,
+            ) || powershell_null_device_redirects_only(dialect_segment, shell_dialect);
         let redirect_filter: fn(Option<&str>) -> bool = if proven_variable_redirect {
             filesystem_redirect_pattern_excluding_dynamic
         } else {
@@ -29862,8 +29863,7 @@ mod tests {
             ("echo hi 2>$null", ShellDialect::Posix),
             ("echo hi 2>$null", ShellDialect::Unknown),
         ] {
-            let result =
-                evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+            let result = evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
             assert!(
                 result.is_denied(),
                 "non-null-device dynamic redirect must stay denied: {command:?} ({dialect:?}): {:?}",
