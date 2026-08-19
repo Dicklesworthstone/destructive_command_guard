@@ -1468,7 +1468,13 @@ native build:
 2. Verify that checkout's `HEAD` equals `TAG_SHA` and that its worktree is
    clean.
 3. Temporarily point DSR's host source mapping at that fresh checkout.
-4. Use a brand-new output path and run the build with `--no-sync`:
+4. Export `DCG_RELEASE_BUILD=1` in the build environment (#320). The binary
+   embeds this marker at compile time so `dcg update` and `dcg doctor` can
+   prove release provenance; a DSR build without it is classified from git
+   metadata alone, which requires the checkout to sit exactly at the release
+   tag with a clean worktree (step 2 already guarantees that, so the marker is
+   belt-and-suspenders — set it anyway).
+5. Use a brand-new output path and run the build with `--no-sync`:
 
    ```bash
    dsr build destructive_command_guard \
@@ -1478,7 +1484,7 @@ native build:
      --output-dir <brand-new-output-directory>
    ```
 
-5. Restore the previous DSR host mapping immediately after collection, even
+6. Restore the previous DSR host mapping immediately after collection, even
    when the build or artifact collection fails.
 
 Do not remove the staged checkout or output directory without the user's

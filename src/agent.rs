@@ -29,6 +29,9 @@
 //!   subprocesses). `agy` reads Claude-Code-compatible `PreToolUse` hooks from
 //!   `~/.gemini/config/hooks.json` (with `~/.gemini/antigravity-cli/hooks.json`
 //!   symlinked to it for backward compatibility).
+//! - OpenCode: `OPENCODE=1` env var, set by dcg's generated OpenCode plugin
+//!   (`dcg install --opencode`, a `tool.execute.before` plugin at
+//!   `~/.config/opencode/plugins/dcg-guard.js`) when it spawns dcg (#318).
 //! - Pi (earendil-works `pi` coding agent): `PI_CODING_AGENT=true` env var (set
 //!   by `pi` into the environment of the subprocesses it spawns).
 //! - Posit Assistant: `PA_PROJECT_DIR=<workspace root>` env var, set in every
@@ -1532,6 +1535,29 @@ mod env_tests {
                 Some("ANTIGRAVITY_CONVERSATION_ID".to_string())
             );
         });
+    }
+
+    #[test]
+    fn test_detect_opencode_env() {
+        // #318: dcg's generated OpenCode plugin spawns dcg with OPENCODE=1.
+        with_env_var("OPENCODE", "1", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::OpenCode);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value, Some("OPENCODE".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_opencode_identity_mappings() {
+        assert_eq!(Agent::OpenCode.config_key(), "opencode");
+        assert!(Agent::OpenCode.is_known());
+        assert_eq!(Agent::from_name("opencode"), Agent::OpenCode);
+        assert_eq!(Agent::from_name("OpenCode"), Agent::OpenCode);
+        assert_eq!(format!("{}", Agent::OpenCode), "OpenCode");
+        assert_eq!(agent_from_process_name("opencode"), Some(Agent::OpenCode));
+        // Near-misses must not match the exact-name table.
+        assert_eq!(agent_from_process_name("opencoder"), None);
     }
 
     #[test]

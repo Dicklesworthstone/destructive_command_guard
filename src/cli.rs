@@ -12025,7 +12025,7 @@ fn opencode_appears_in_use() -> bool {
     opencode_user_plugin_path()
         .parent()
         .and_then(std::path::Path::parent)
-        .is_some_and(|opencode_dir| opencode_dir.is_dir())
+        .is_some_and(std::path::Path::is_dir)
 }
 
 /// Whether `path` holds a dcg-generated OpenCode plugin.
@@ -12084,6 +12084,8 @@ fn build_provenance_doctor_parts(
 
 /// Install the native OpenCode plugin (#318).
 fn install_opencode_plugin(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
     let plugin_path = if project {
         project_opencode_plugin_path()?
     } else {
@@ -17589,12 +17591,14 @@ if ($errors.Count -ne 0) {
             project,
             grok,
             agy,
+            opencode,
         }) = cli.command
         {
             assert!(!force);
             assert!(project);
             assert!(!grok);
             assert!(!agy);
+            assert!(!opencode);
         } else {
             unreachable!("Expected Install command");
         }
@@ -17608,12 +17612,14 @@ if ($errors.Count -ne 0) {
             project,
             grok,
             agy,
+            opencode,
         }) = cli.command
         {
             assert!(force);
             assert!(project);
             assert!(!grok);
             assert!(!agy);
+            assert!(!opencode);
         } else {
             unreachable!("Expected Install command");
         }
@@ -17627,12 +17633,14 @@ if ($errors.Count -ne 0) {
             project,
             grok,
             agy,
+            opencode,
         }) = cli.command
         {
             assert!(!force);
             assert!(!project);
             assert!(grok);
             assert!(!agy);
+            assert!(!opencode);
         } else {
             unreachable!("Expected Install command");
         }
@@ -17646,12 +17654,14 @@ if ($errors.Count -ne 0) {
             project,
             grok,
             agy,
+            opencode,
         }) = cli.command
         {
             assert!(!force);
             assert!(project);
             assert!(grok);
             assert!(!agy);
+            assert!(!opencode);
         } else {
             unreachable!("Expected Install command");
         }
@@ -17665,12 +17675,14 @@ if ($errors.Count -ne 0) {
             project,
             grok,
             agy,
+            opencode,
         }) = cli.command
         {
             assert!(!force);
             assert!(!project);
             assert!(!grok);
             assert!(agy);
+            assert!(!opencode);
         } else {
             unreachable!("Expected Install command");
         }
@@ -17684,15 +17696,92 @@ if ($errors.Count -ne 0) {
             project,
             grok,
             agy,
+            opencode,
         }) = cli.command
         {
             assert!(!force);
             assert!(project);
             assert!(!grok);
             assert!(agy);
+            assert!(!opencode);
         } else {
             unreachable!("Expected Install command");
         }
+    }
+
+    #[test]
+    fn test_cli_parse_install_opencode() {
+        let cli = Cli::parse_from(["dcg", "install", "--opencode"]);
+        if let Some(Command::Install {
+            force,
+            project,
+            grok,
+            agy,
+            opencode,
+        }) = cli.command
+        {
+            assert!(!force);
+            assert!(!project);
+            assert!(!grok);
+            assert!(!agy);
+            assert!(opencode);
+        } else {
+            unreachable!("Expected Install command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_install_opencode_with_force() {
+        let cli = Cli::parse_from(["dcg", "install", "--opencode", "--force"]);
+        if let Some(Command::Install {
+            force,
+            project,
+            grok,
+            agy,
+            opencode,
+        }) = cli.command
+        {
+            assert!(force);
+            assert!(!project);
+            assert!(!grok);
+            assert!(!agy);
+            assert!(opencode);
+        } else {
+            unreachable!("Expected Install command");
+        }
+    }
+
+    /// #318: the generated OpenCode plugin embeds the absolute dcg path as a
+    /// JSON string literal (never a bare PATH lookup, never shell-quoted) and
+    /// carries the ownership marker the installer/uninstaller key on.
+    #[test]
+    fn opencode_plugin_source_embeds_absolute_path_and_marker() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_opencode_plugin_source(&executable).expect("plugin generation");
+
+        assert!(
+            source.contains(OPENCODE_PLUGIN_MARKER),
+            "generated plugin must carry the ownership marker"
+        );
+        assert!(
+            source.contains("\"tool.execute.before\""),
+            "plugin must register OpenCode's tool.execute.before hook"
+        );
+
+        // Extract the embedded literal and prove it round-trips to the exact
+        // executable path through a JSON parser (JS string semantics).
+        let line = source
+            .lines()
+            .find(|l| l.starts_with("const DCG_BIN = "))
+            .expect("plugin embeds DCG_BIN");
+        let literal = line
+            .trim_start_matches("const DCG_BIN = ")
+            .trim_end_matches(';');
+        let parsed: String = serde_json::from_str(literal).expect("valid JSON string literal");
+        assert_eq!(std::path::Path::new(&parsed), executable);
+        assert_ne!(parsed, "dcg", "never a bare PATH lookup");
+        // An `ask` verdict must fail closed (OpenCode has no review UI).
+        assert!(source.contains("verdict === \"deny\" || verdict === \"ask\""));
     }
 
     #[test]

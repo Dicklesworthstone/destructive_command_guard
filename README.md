@@ -13,7 +13,7 @@
 
 A high-performance hook for AI coding agents that blocks destructive commands before they execute, protecting your work from accidental deletion across Claude Code, Codex CLI, Gemini CLI, Copilot CLI, VS Code Copilot Chat, Cursor, Hermes Agent, Grok (xAI), Posit Assistant, and related tools.
 
-**Supported:** [Claude Code](https://claude.ai/code), [Codex CLI 0.125.0+](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-hooks), [VS Code Copilot Chat](https://code.visualstudio.com/docs/agent-customization/hooks), [Cursor IDE](https://cursor.com), [Hermes Agent](https://github.com/NousResearch/hermes-agent), [Posit Assistant](https://positron.posit.co/assistant/) (Positron/RStudio extension, standalone server, and `pa` terminal client), [Grok (xAI)](https://x.ai/news/grok-build-cli) (native `~/.grok/hooks/` plus Claude compatibility layer), [Antigravity CLI (`agy`)](https://antigravity.google) (native `~/.gemini/config/hooks.json` via `dcg install --agy`), [OpenCode](https://opencode.ai) (via [community plugin](https://github.com/aspiers/ai-config/blob/main/.config/opencode/plugins/dcg-guard.js)), [Pi](https://github.com/earendil-works/pi) (via [extension recipe](docs/pi-integration.md)), [Aider](https://aider.chat/) (limited—git hooks only), [Continue](https://continue.dev) (detection only)
+**Supported:** [Claude Code](https://claude.ai/code), [Codex CLI 0.125.0+](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-hooks), [VS Code Copilot Chat](https://code.visualstudio.com/docs/agent-customization/hooks), [Cursor IDE](https://cursor.com), [Hermes Agent](https://github.com/NousResearch/hermes-agent), [Posit Assistant](https://positron.posit.co/assistant/) (Positron/RStudio extension, standalone server, and `pa` terminal client), [Grok (xAI)](https://x.ai/news/grok-build-cli) (native `~/.grok/hooks/` plus Claude compatibility layer), [Antigravity CLI (`agy`)](https://antigravity.google) (native `~/.gemini/config/hooks.json` via `dcg install --agy`), [OpenCode](https://opencode.ai) (native `tool.execute.before` plugin via `dcg install --opencode` — see [docs/opencode-integration.md](docs/opencode-integration.md)), [Pi](https://github.com/earendil-works/pi) (via [extension recipe](docs/pi-integration.md)), [Aider](https://aider.chat/) (limited—git hooks only), [Continue](https://continue.dev) (detection only)
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -670,6 +670,10 @@ Environment variables override config files (highest priority):
 - `DCG_HOOK_TIMEOUT_MS=<milliseconds>`: explicit hook evaluation timeout
   (ordinary default: 1000; automatic
   `careful_company_running_windows` preset default: 3000)
+- `DCG_UPDATE_PIN=1`: pin this install against `dcg update` (#320) — the
+  updater refuses before any network/installer work unless
+  `--replace-local-build` is passed, and the "update available" nudge is
+  suppressed. Same as `general.update_pin = true` in config.
 
 ### Output Formats and `DCG_FORMAT`
 
@@ -980,7 +984,7 @@ present.
 - **Grok (xAI):** [Grok Build / Grok CLI](https://x.ai/news/grok-build-cli) auto-discovers every `*.json` under `~/.grok/hooks/`. `dcg install --grok` writes a self-contained `~/.grok/hooks/dcg.json` with a `PreToolUse` / `matcher: "Bash"` entry — Grok internally aliases Claude-style `"Bash"` to its own `run_terminal_cmd` tool, so a single rule covers every shell command. dcg detects Grok at runtime from the camelCase wire shape (`hookEventName: "pre_tool_use"`, `toolName: "run_terminal_cmd"`) or from the `GROK_SESSION_ID` / `GROK_HOOK_EVENT` / `GROK_WORKSPACE_ROOT` environment variables, and switches its output to Grok's JSON contract: `{"decision":"deny","reason":...}` (note `"deny"`, not Hermes' `"block"`). Grok also picks up dcg automatically through its `~/.claude/settings.json` compatibility layer, so existing Claude Code users get protection with no additional install step. Add `--project` to write `<repo>/.grok/hooks/dcg.json` for a per-repo install (Grok requires `/hooks-trust` the first time it opens a repo with hooks).
 - **Antigravity CLI (`agy`):** [Google Antigravity's `agy` CLI](https://antigravity.google) ships a Claude-Code-compatible hooks system. `dcg install --agy` merges a `PreToolUse` / `matcher: "Bash"` entry into `~/.gemini/config/hooks.json` (the canonical path; `agy` migrates the legacy `~/.gemini/antigravity-cli/hooks.json` here and symlinks the old path to it). `agy` runs the hook before its `run_command` shell tool; dcg detects `agy` at runtime from the distinctive nested `toolCall` envelope (`{"toolCall":{"name":"run_command","args":{"CommandLine":"…"}},"conversationId":…,"stepIdx":…}`) — the shell command is read from `toolCall.args.CommandLine` — or from the `ANTIGRAVITY_CONVERSATION_ID` environment variable / `agy` parent-process name. dcg switches its output to `agy`'s JSON contract: `{"decision":"block","reason":…}` with exit code 0 (verified: `agy` honors both `"block"` and `"deny"` and aborts the tool; a non-zero exit code is only logged and does NOT reliably block, so dcg always emits exit 0 + JSON). Add `--project` to write `<repo>/.gemini/config/hooks.json` for a per-repo install. Restart `agy` (start a new session) after installing.
 - **Posit Assistant:** [Posit Assistant](https://positron.posit.co/assistant/) reads Claude-Code-compatible lifecycle hooks from `~/.posit/assistant/settings.json` (global) and `<workspace>/.posit/assistant/settings.json` (project). The installer merges one `PreToolUse` entry into the **global** file, so a single install covers the Positron/RStudio extension, the standalone server, and the `pa` terminal client across every workspace. No protocol work was needed on dcg's side: the `PreToolUse` stdin is the snake_case Claude shape (`tool_name`, `tool_input.command`, `tool_use_id`, `permission_mode`), exit code 2 blocks with stderr shown as the reason, and `hookSpecificOutput.permissionDecision` (`allow`/`deny`/`ask`) is read on exit 0 — dcg's existing Claude-compatible response answers all of it. Three details differ from the Claude Code entry: the matcher is **lowercase** `"bash|powershell"` (a simple matcher string is an *exact* match — or a `|`/`,`-separated list of exact matches — against the tool name, so a copied Claude `"Bash"` matcher would never fire; listing both names covers a Windows PowerShell host with one entry); only documented handler fields are written (`type`, `command`, `timeout`), so there is **no `shell` field** — the command path is quoted instead, since shell-form hooks run through `cmd.exe` on Windows; and `timeout` is in **seconds**. dcg identifies the agent at runtime from `PA_PROJECT_DIR`, which the hook contract sets in the hook subprocess (also used to keep a `powershell` tool name from being answered with Codex's minimal deny shape). Existing matcher groups are left structurally intact rather than consolidated — hook config is additive, so a user's `matcher: "bash,edit"` group keeps working untouched — and `unconfigure_posit_assistant` in `uninstall.sh` removes only dcg-owned entries and never deletes the settings file, since unrelated settings live there too. Note: Posit's hooks documentation is not public yet; this contract was verified empirically and is pinned by tests in `src/hook.rs`.
-- **OpenCode:** Not auto-configured. Requires a Bun-based plugin with `"tool.execute.before"` hook key. A working community plugin: [aspiers/ai-config/dcg-guard.js](https://github.com/aspiers/ai-config/blob/main/.config/opencode/plugins/dcg-guard.js).
+- **OpenCode:** First-party plugin support (#318). `dcg install --opencode` writes a native `tool.execute.before` plugin to `~/.config/opencode/plugins/dcg-guard.js` (add `--project` for `<repo>/.opencode/plugins/dcg-guard.js`). The plugin routes every OpenCode `bash` tool call through dcg's Claude-compatible hook protocol — spawning the absolute dcg binary path embedded at install time with `OPENCODE=1` in the environment — and aborts the tool call by throwing when dcg denies (an `ask` verdict also fails closed, since OpenCode has no operator-review state). Infrastructure failures (dcg missing) fail open with a stderr notice. The file carries a `dcg-opencode-plugin` ownership marker: the installer refuses to overwrite a user-owned file of the same name, and the uninstaller deletes only marker-carrying files. `install.sh` configures it automatically when OpenCode is detected; `dcg doctor` reports an `opencode_plugin` check (error + `--fix`able when OpenCode is in use but unguarded, since there is no Claude-compat fallback). Restart OpenCode after installing. See [docs/opencode-integration.md](docs/opencode-integration.md). An earlier [community plugin](https://github.com/aspiers/ai-config/blob/main/.config/opencode/plugins/dcg-guard.js) by aspiers pioneered this approach.
 - **Pi:** Not auto-configured. [Pi](https://github.com/earendil-works/pi) intercepts shell commands through user-authored TypeScript extensions (`pi.on("tool_call", …)`, auto-loaded from `~/.pi/agent/extensions/*.ts` or `<repo>/.pi/extensions/*.ts`). A ready-to-use `dcg-guard.ts` extension that routes each `bash` command through `dcg --robot test` (exit 1 = deny) and blocks with the dcg reason is documented in [docs/pi-integration.md](docs/pi-integration.md).
 
 </details>
@@ -1029,6 +1033,31 @@ dcg update --verify --no-configure  # binary only; preserve existing hook wiring
 ```
 
 You can always re-run `install.sh` / `install.ps1` directly if preferred.
+
+### Local builds, pinning, and update refusal (#320)
+
+For most tools, being overwritten by the official release is the right
+outcome. For a guard it is not necessarily: a locally built binary may carry
+coverage the published release does not have yet, and replacing it silently
+downgrades protection. dcg therefore embeds **build provenance** at compile
+time (`git describe --tags --dirty`, shown as a `Commit:` line in
+`dcg --version`; release pipelines additionally set an explicit
+`DCG_RELEASE_BUILD=1` marker) and uses it three ways:
+
+- **`dcg update` refuses early** — before any network or installer work — when
+  the installed binary is a local build ahead of its release tag, or when the
+  install is pinned. The explicit escape hatch is
+  `dcg update --replace-local-build`.
+- **An opt-in pin**: `general.update_pin = true` (or `DCG_UPDATE_PIN=1`) makes
+  the refusal unconditional and also suppresses the background
+  "update available" nudge, so dcg stops advertising an action it will then
+  refuse.
+- **A doctor check** (`build_provenance`, warning-only): flags an *unpinned*
+  local build ahead of its release tag — precisely the state that is one
+  routine `dcg update` away from silent loss — and recommends the pin.
+
+Builds without git metadata (e.g. `cargo install` from a registry tarball)
+have unknown provenance; only the pin applies to them.
 
 ### Prebuilt Binaries
 

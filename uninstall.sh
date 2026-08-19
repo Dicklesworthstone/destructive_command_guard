@@ -1106,6 +1106,27 @@ PYEOF
     return $?
 }
 
+unconfigure_opencode() {
+    # OpenCode plugin (#318): a standalone generated file. Delete it ONLY when
+    # it carries the dcg ownership marker — never remove a user-authored
+    # plugin that happens to share the name. Both the user-level and any
+    # repo-local (./.opencode/plugins) copy in the current directory are
+    # covered.
+    local removed=0
+    local plugin
+    for plugin in \
+        "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/dcg-guard.js" \
+        ".opencode/plugins/dcg-guard.js"; do
+        if [ -f "$plugin" ] && grep -q 'dcg-opencode-plugin' "$plugin" 2>/dev/null; then
+            rm -f "$plugin" 2>/dev/null && removed=1
+        fi
+    done
+    if [ "$removed" -eq 1 ]; then
+        echo "removed" >&2
+    fi
+    return 0
+}
+
 # Run an unconfigure function and report the outcome. The old call pattern
 # (`unconfigure_x 2>&1 | grep -q removed`) swallowed every human-visible line
 # the function printed — most importantly the `warn` fallback messages on
@@ -1308,6 +1329,7 @@ main() {
     report_unconfigure "Codex CLI hook" unconfigure_codex
     report_unconfigure "Hermes Agent hook" unconfigure_hermes
     report_unconfigure "Posit Assistant hook" unconfigure_posit_assistant
+    report_unconfigure "OpenCode plugin" unconfigure_opencode
 
     # Remove Aider config
     if [ "$aider_configured" -eq 1 ] && unconfigure_aider; then

@@ -1604,6 +1604,100 @@ mod config_tests {
         (home_dir, xdg_config_dir, bin_dir)
     }
 
+    /// #320: a pinned install refuses `dcg update` before any network or
+    /// installer work, with an actionable message naming the escape hatch.
+    #[test]
+    fn update_refuses_when_pinned() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
+
+        let output = std::process::Command::new(dcg_binary())
+            .args(["update"])
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("DCG_UPDATE_PIN", "1")
+            .current_dir(temp.path())
+            .output()
+            .expect("run dcg update");
+
+        assert!(
+            !output.status.success(),
+            "pinned update must exit non-zero; stdout: {} stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("pinned"),
+            "refusal names the pin: {stderr}"
+        );
+        assert!(
+            stderr.contains("--replace-local-build"),
+            "refusal names the escape hatch: {stderr}"
+        );
+    }
+
+    /// #318: `dcg install --opencode` writes a marker-carrying plugin under
+    /// $XDG_CONFIG_HOME/opencode/plugins, is idempotent without --force, and
+    /// refuses to overwrite a user-owned file of the same name.
+    #[test]
+    fn install_opencode_writes_owned_plugin_and_respects_foreign_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
+        let plugin_path = xdg_config_dir
+            .join("opencode")
+            .join("plugins")
+            .join("dcg-guard.js");
+
+        let run = |args: &[&str]| {
+            std::process::Command::new(dcg_binary())
+                .args(args)
+                .env_clear()
+                .env("HOME", &home_dir)
+                .env("USERPROFILE", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                .current_dir(temp.path())
+                .output()
+                .expect("run dcg")
+        };
+
+        // First install writes the plugin.
+        let output = run(&["install", "--opencode"]);
+        assert!(
+            output.status.success(),
+            "install --opencode: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let written = std::fs::read_to_string(&plugin_path).expect("plugin written");
+        assert!(written.contains("dcg-opencode-plugin"), "ownership marker");
+        assert!(written.contains("tool.execute.before"), "hook key");
+
+        // Second install without --force is a no-op that reports "already".
+        let output = run(&["install", "--opencode"]);
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("already installed"),
+            "idempotent reinstall: {stdout}"
+        );
+
+        // A user-owned file (no marker) is never overwritten, even with --force.
+        std::fs::write(&plugin_path, "export const Mine = async () => ({});")
+            .expect("plant user plugin");
+        let output = run(&["install", "--opencode", "--force"]);
+        assert!(
+            !output.status.success(),
+            "must refuse to clobber a user-owned plugin"
+        );
+        let contents = std::fs::read_to_string(&plugin_path).expect("plugin intact");
+        assert!(
+            contents.contains("Mine"),
+            "user-owned plugin left untouched"
+        );
+    }
+
     #[test]
     fn config_show_produces_output() {
         let output = run_dcg(&["config"]);
