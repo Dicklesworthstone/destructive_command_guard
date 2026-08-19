@@ -12037,9 +12037,7 @@ fn opencode_plugin_is_dcg_owned(path: &std::path::Path) -> bool {
 
 /// Shared doctor verdict for the build-provenance / update-pin check (#320),
 /// used by both renderers so `--strict` and `--format json` agree.
-fn build_provenance_doctor_parts(
-    config: &Config,
-) -> (DoctorCheckStatus, String, Option<String>) {
+fn build_provenance_doctor_parts(config: &Config) -> (DoctorCheckStatus, String, Option<String>) {
     let pinned = config.general.update_pin;
     match crate::update::build_provenance() {
         crate::update::BuildProvenance::Release => (

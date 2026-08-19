@@ -17,7 +17,8 @@
         "max_findings_per_command": null,
         "check_updates": true,
         "self_heal_hook": true,
-        "fail_closed": false
+        "fail_closed": false,
+        "update_pin": false
       }
     },
     "output": {
@@ -289,6 +290,11 @@
         },
         "fail_closed": {
           "description": "Fail-closed mode for unparseable hook input.\n\nWhen `true`, hook input that cannot be parsed as JSON is BLOCKED\n(denied) instead of allowed. The default (`false`) is the documented\nfail-open behavior: malformed input is allowed so a transient encoding\nglitch never blocks legitimate work. Intended for high-security\nenvironments. Override at runtime with the `DCG_FAIL_CLOSED` env var\n(a truthy value forces fail-closed, a falsy value forces fail-open).",
+          "type": "boolean",
+          "default": false
+        },
+        "update_pin": {
+          "description": "Pin the installed binary against `dcg update` (#320).\n\nWhen `true`, `dcg update` refuses to replace the installed binary\n(before any network or installer work) unless `--replace-local-build`\nis passed, and the background \"update available\" nudge is suppressed.\nIntended for operators running a local build that is ahead of the\npublished release, where a routine update would silently downgrade\nguard coverage. Override at runtime with `DCG_UPDATE_PIN`.\nDefault: false.",
           "type": "boolean",
           "default": false
         }

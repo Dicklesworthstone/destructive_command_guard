@@ -1629,10 +1629,7 @@ mod config_tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("pinned"),
-            "refusal names the pin: {stderr}"
-        );
+        assert!(stderr.contains("pinned"), "refusal names the pin: {stderr}");
         assert!(
             stderr.contains("--replace-local-build"),
             "refusal names the escape hatch: {stderr}"

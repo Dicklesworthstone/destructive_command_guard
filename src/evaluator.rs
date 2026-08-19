@@ -30224,9 +30224,12 @@ mod tests {
             result.pattern_info
         );
 
-        // POSIX inline interpreter launcher with a dynamic executable.
+        // POSIX inline interpreter launcher with a dynamic executable. The
+        // producer name deliberately avoids `shell`/`cmd`/`pwsh` substrings:
+        // those route to the Windows-launcher scan first (which carries the
+        // heredoc.shell id asserted above).
         let result = evaluate_with_pack_ids_in_dialect(
-            "$(select_shell) -c 'echo safe'",
+            "$(select_tool) -c 'echo safe'",
             &["core.filesystem"],
             ShellDialect::Posix,
         );
@@ -30243,7 +30246,7 @@ mod tests {
             "reviewed inline launcher",
         );
         let result = evaluate_with_pack_ids_and_allowlists_at_path(
-            "$(select_shell) -c 'echo safe'",
+            "$(select_tool) -c 'echo safe'",
             &["core.filesystem"],
             &allowlists,
             None,
@@ -32947,7 +32950,11 @@ mod tests {
             // #316/bd-l9jf: the fail-closed launcher family carries a stable,
             // allowlistable rule id instead of an unattributed legacy denial.
             assert_eq!(info.source, MatchSource::HeredocAst, "{command:?}");
-            assert_eq!(info.pack_id.as_deref(), Some("heredoc.shell"), "{command:?}");
+            assert_eq!(
+                info.pack_id.as_deref(),
+                Some("heredoc.shell"),
+                "{command:?}"
+            );
             assert_eq!(
                 info.pattern_name.as_deref(),
                 Some("launcher-unverified"),
