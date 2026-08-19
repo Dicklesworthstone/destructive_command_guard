@@ -779,30 +779,14 @@ function Remove-DcgPredecessor {
   $removed
 }
 
-# Append a guarded check to the user's PowerShell profile that warns, on each new
-# session, if the dcg PreToolUse hook has gone missing from ~/.claude/settings.json
-# (Claude Code can silently drop it when it rewrites settings). Idempotent
-# (marker-guarded). The PowerShell analog of `dcg setup`'s Unix shell-RC check.
-# Returns "added" | "already" | "failed".
-function Add-DcgProfileCheck {
-  param([string]$ProfilePath = $PROFILE.CurrentUserAllHosts)
-
-  $marker = "# dcg: warn if the Claude Code hook was silently removed"
-  try {
-    if (Test-Path $ProfilePath -PathType Leaf) {
-      $content = Get-Content -Raw -Path $ProfilePath
-      if ($content -and $content.Contains($marker)) { return "already" }
-    } else {
-      $dir = Split-Path -Parent $ProfilePath
-      if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-    }
-
-    # Single-quoted here-string: written verbatim into the profile (no expansion now).
-    # Detection must accept every command shape the installers write: bare `dcg`,
-    # an absolute Unix or Windows path, and the PowerShell quoted-invocation form
-    # `& 'C:\...\dcg.exe' [args]` (issue #282: naively splitting that on [\\/]
-    # leaves a trailing quote + args, so the hook looked missing every session).
-    $block = @'
+# The startup-check block written into PowerShell profiles. Single-quoted
+# here-string: written verbatim into the profile (no expansion at install time).
+# Detection must accept every command shape the installers write: bare `dcg`,
+# an absolute Unix or Windows path, and the PowerShell quoted-invocation form
+# `& 'C:\...\dcg.exe' [args]` (issue #282: naively splitting that on [\\/]
+# leaves a trailing quote + args, so the hook looked missing every session).
+$script:DcgProfileCheckMarker = "# dcg: warn if the Claude Code hook was silently removed"
+$script:DcgProfileCheckBlock = @'
 if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
   try {
     $dcgCfg = Get-Content -Raw "$HOME\.claude\settings.json" | ConvertFrom-Json
@@ -820,8 +804,101 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
 }
 '@
 
-    Add-Content -Path $ProfilePath -Value ("`n" + $marker + "`n" + $block)
-    return "added"
+# Replace a stale dcg startup-check block (marker line through the first
+# column-0 closing brace) in $Content with the current marker + block.
+# Returns the updated content, or $null if the managed region could not be
+# located (hand-mangled block).
+function Repair-DcgProfileCheckContent {
+  param([string]$Content)
+  $pattern = '(?ms)^[ \t]*' + [regex]::Escape($script:DcgProfileCheckMarker) + '[ \t]*\r?\n.*?^\}[ \t]*(\r?\n|\z)'
+  $rx = [regex]$pattern
+  if (-not $rx.IsMatch($Content)) { return $null }
+  # Escape '$' in the replacement so block text like $dcgCfg is inserted verbatim.
+  $repl = ($script:DcgProfileCheckMarker + "`n" + $script:DcgProfileCheckBlock + "`n").Replace('$', '$$')
+  $rx.Replace($Content, $repl, 1)
+}
+
+# Append a guarded check to the user's PowerShell profile that warns, on each new
+# session, if the dcg PreToolUse hook has gone missing from ~/.claude/settings.json
+# (Claude Code can silently drop it when it rewrites settings). Idempotent
+# (marker-guarded), and self-repairing: a marker whose block text differs from
+# the current one (e.g. the pre-#282 naive path split that warned on every
+# session) is rewritten in place — re-running the installer really does fix a
+# stale check. Also repairs stale blocks in the *other* host's profile
+# (Windows PowerShell 5.1 and pwsh 7 keep separate profile.ps1 files), since
+# the warning may fire in a different host than the one running the installer.
+# The PowerShell analog of `dcg setup`'s Unix shell-RC check.
+# Returns "added" | "already" | "updated" | "failed".
+function Add-DcgProfileCheck {
+  param(
+    [string]$ProfilePath = $PROFILE.CurrentUserAllHosts,
+    [string[]]$AlsoRepairPaths = $null
+  )
+
+  $marker = $script:DcgProfileCheckMarker
+  $block = $script:DcgProfileCheckBlock
+  try {
+    if ($null -eq $AlsoRepairPaths) {
+      # Both hosts' CurrentUserAllHosts profiles, wherever Documents lives
+      # (OneDrive redirection included). Non-existent paths are skipped below.
+      $AlsoRepairPaths = @()
+      $docs = [Environment]::GetFolderPath('MyDocuments')
+      if ($docs) {
+        $AlsoRepairPaths = @(
+          (Join-Path $docs 'WindowsPowerShell\profile.ps1'),
+          (Join-Path $docs 'PowerShell\profile.ps1')
+        )
+      }
+    }
+
+    $status = $null
+    if (Test-Path $ProfilePath -PathType Leaf) {
+      $content = Get-Content -Raw -Path $ProfilePath
+      if ($content -and $content.Contains($marker)) {
+        if ($content.Contains($block)) {
+          $status = "already"
+        } else {
+          $repaired = Repair-DcgProfileCheckContent -Content $content
+          if ($null -ne $repaired) {
+            Set-Content -Path $ProfilePath -Value $repaired -NoNewline
+          } else {
+            # Marker present but the block boundary is unrecognizable; append a
+            # fresh block so at least the current check runs.
+            Add-Content -Path $ProfilePath -Value ("`n" + $marker + "`n" + $block)
+          }
+          $status = "updated"
+        }
+      }
+    } else {
+      $dir = Split-Path -Parent $ProfilePath
+      if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    }
+
+    if ($null -eq $status) {
+      Add-Content -Path $ProfilePath -Value ("`n" + $marker + "`n" + $block)
+      $status = "added"
+    }
+
+    # Best-effort repair of stale blocks in other profiles (never adds new ones).
+    foreach ($other in $AlsoRepairPaths) {
+      if (-not $other) { continue }
+      try {
+        $otherFull = [System.IO.Path]::GetFullPath($other)
+        $mainFull = [System.IO.Path]::GetFullPath($ProfilePath)
+        if ($otherFull -eq $mainFull) { continue }
+        if (-not (Test-Path $other -PathType Leaf)) { continue }
+        $otherContent = Get-Content -Raw -Path $other
+        if (-not ($otherContent -and $otherContent.Contains($marker))) { continue }
+        if ($otherContent.Contains($block)) { continue }
+        $repaired = Repair-DcgProfileCheckContent -Content $otherContent
+        if ($null -ne $repaired) {
+          Set-Content -Path $other -Value $repaired -NoNewline
+          if ($status -eq "already") { $status = "updated" }
+        }
+      } catch { }
+    }
+
+    return $status
   } catch {
     return "failed"
   }
@@ -2204,6 +2281,7 @@ if ($EasyMode) {
   try {
     switch (Add-DcgProfileCheck) {
       "added" { Write-Ok "Added a PowerShell `$PROFILE check that warns if the Claude hook goes missing" }
+      "updated" { Write-Ok "Replaced a stale PowerShell `$PROFILE hook-check with the current version" }
       "already" { Write-Info "PowerShell `$PROFILE hook-check already present" }
       default { Write-Warn "Could not add the PowerShell `$PROFILE hook-check" }
     }
