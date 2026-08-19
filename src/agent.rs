@@ -98,6 +98,10 @@ pub enum Agent {
     /// `PA_PROJECT_DIR=<workspace root>` in hook subprocesses.
     /// See <https://positron.posit.co/assistant/>.
     PositAssistant,
+    /// OpenCode (opencode.ai). Guarded through a dcg-generated
+    /// `tool.execute.before` plugin (`dcg install --opencode`), which spawns
+    /// dcg with `OPENCODE=1` in the environment (#318).
+    OpenCode,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -125,6 +129,7 @@ impl Agent {
             Self::Antigravity => "antigravity",
             Self::Pi => "pi",
             Self::PositAssistant => "posit-assistant",
+            Self::OpenCode => "opencode",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -148,6 +153,7 @@ impl Agent {
                 | Self::Antigravity
                 | Self::Pi
                 | Self::PositAssistant
+                | Self::OpenCode
         )
     }
 
@@ -190,6 +196,7 @@ impl Agent {
             "agy" | "antigravity" | "antigravitycli" => Self::Antigravity,
             "pi" | "picli" | "picodingagent" => Self::Pi,
             "positassistant" | "posit" | "pa" => Self::PositAssistant,
+            "opencode" | "opencodecli" => Self::OpenCode,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -212,6 +219,7 @@ impl fmt::Display for Agent {
             Self::Antigravity => write!(f, "Antigravity CLI"),
             Self::Pi => write!(f, "Pi"),
             Self::PositAssistant => write!(f, "Posit Assistant"),
+            Self::OpenCode => write!(f, "OpenCode"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -579,6 +587,17 @@ fn detect_from_environment() -> Option<DetectionResult> {
         ));
     }
 
+    // OpenCode detection. dcg's generated OpenCode plugin
+    // (`dcg install --opencode`) spawns dcg with `OPENCODE=1` (#318).
+    // Presence-only, like the markers above.
+    if std::env::var("OPENCODE").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::OpenCode,
+            DetectionMethod::Environment,
+            Some("OPENCODE".to_string()),
+        ));
+    }
+
     // Pi (earendil-works) detection. The `pi` coding agent injects
     // `PI_CODING_AGENT=true` into the environment of the subprocesses it
     // spawns. As with the other env markers we only check for the variable's
@@ -823,6 +842,7 @@ fn agent_for_basename(basename: &str) -> Option<Agent> {
         "grok" | "grok-cli" | "grok-build" => Some(Agent::Grok),
         "agy" | "antigravity" | "antigravity-cli" => Some(Agent::Antigravity),
         "pi" | "pi-cli" => Some(Agent::Pi),
+        "opencode" => Some(Agent::OpenCode),
         // "pa" is a dangerous prefix (pacman, pactl, pass, patch, ...); the
         // exact-match table is what keeps those from misclassifying.
         "pa" | "posit-assistant" => Some(Agent::PositAssistant),
@@ -1297,6 +1317,7 @@ mod env_tests {
         "GROK_HOOK_EVENT",
         "GROK_WORKSPACE_ROOT",
         "ANTIGRAVITY_CONVERSATION_ID",
+        "OPENCODE",
         "PI_CODING_AGENT",
         "PA_PROJECT_DIR",
     ];
