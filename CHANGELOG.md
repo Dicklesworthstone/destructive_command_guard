@@ -124,6 +124,20 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   which fails closed across every dialect. Explicit `powershell`/`pwsh`/`cmd`
   labels are never second-guessed, and hyphenated POSIX commands (`apt-get`,
   `docker-compose`, `start-stop-daemon`) do not widen.
+  **Two follow-up gaps closed (fresh-eyes review):** (1) the widening only
+  fired on `Verb-Noun` cmdlet tokens, so the PowerShell/cmd *aliases* agents
+  emit most — `rm -Recurse -Force .\pipelines`, `del /s /q C:\src`,
+  `rd /s C:\dir` — still evaluated as POSIX and failed open. The hook now also
+  widens when a segment leads with a destructive alias (`rm`/`ri`/`del`/`rd`/
+  `rmdir`/`erase`) **and** carries a Windows-shell-only argument — a
+  single-dash PowerShell parameter word (`-Recurse`/`-Force`/`-Path`/…, a
+  ≥3-char prefix that POSIX `rm` never accepts) or a cmd switch (`/s`, `/q`).
+  A plain POSIX `rm -rf ./build` has neither and keeps the Posix dialect.
+  (2) The oversized-input fail-closed path (`try_deny_oversized_input`, taken
+  when a payload exceeds `max_command_bytes`) resolved each scan window with an
+  *unrefined* dialect, so padding a mislabeled PowerShell payload past the
+  limit reopened the same hole. That path now applies the identical
+  `refine_shell_dialect` widening per window.
 - **`redirect-truncate-root-home` knows the macOS home spelling (#325).**
   The sensitive-path alternation carried `/home` but not `/Users`, so `echo x
   > /Users/<user>/.zshrc` — the absolute form tools actually hand agents —
@@ -135,12 +149,18 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   copy-then-delete chains), matching the platform parity the `rm` rules
   already had (#247).
 - **Write-safe character devices no longer deny as truncating redirects
-  (#324).** `> /dev/stdout`, `> /dev/stderr`, `> /dev/tty`, and the
-  `/dev/fd/[0-2]` std-stream aliases joined the `/dev/null|zero|full`
-  carve-out: opening a character device with `O_TRUNC` cannot destroy
-  persistent data, and each false block cost a human round-trip. `/dev/st0`
-  (tape), `/dev/tty0`/`/dev/ttysNNN` (other terminals), and `/dev/fd/N` for
-  N > 2 (may dup a regular-file fd) stay blocked.
+  (#324).** `> /dev/null`, `> /dev/zero`, `> /dev/full`, and `> /dev/tty`
+  are carved out of `redirect-truncate-*`: these are always character
+  devices, so opening them with `O_TRUNC` cannot destroy persistent data,
+  and each false block cost a human round-trip. `/dev/st0` (tape) and
+  `/dev/tty0`/`/dev/ttysNNN` (other terminals) stay blocked.
+  **Correction (fresh-eyes review):** the carve-out originally also covered
+  `/dev/stdout`, `/dev/stderr`, and `/dev/fd/[0-2]`, on the false premise that
+  they too are character devices. They are symlinks to whatever fd 0/1/2
+  currently point at, which may be a regular file (after `exec > logfile` or
+  an inherited redirect) — where `O_TRUNC` truncates that real file. Those
+  three are no longer carved out; the guard blocks them under its
+  zero-false-negatives posture.
 
 - **Quoted `>` bytes inside an inline interpreter payload no longer read as
   redirect syntax when the segment carries a real redirect (#317).** `sh -c
