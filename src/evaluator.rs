@@ -12499,7 +12499,13 @@ fn evaluate_command_in_single_dialect_view(
         Some(&nested_context),
         inherited_automated_stdin,
     );
-    if result.allowlist_override.is_none() {
+    // Attribute an ALLOW outcome to the recorded heredoc/launcher allowlist
+    // grant — but never let that attribution replace a pack denial or an
+    // indeterminate verdict. A grant scoped to e.g.
+    // `heredoc.shell:launcher-unverified` skips only that fail-closed check;
+    // `powershell -EncodedCommand … ; rm -rf /` must still be denied by the
+    // packs on its own merits (bd-l9jf whole-command leg).
+    if result.is_allowed() && result.allowlist_override.is_none() {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
@@ -22780,7 +22786,10 @@ where
         None,
         None, // project_path: legacy function, path-aware allowlisting unavailable
     );
-    if result.allowlist_override.is_none() {
+    // Same guard as the dialect-view path: a recorded heredoc/launcher
+    // allowlist grant may attribute an ALLOW, never overwrite a pack denial
+    // or indeterminate verdict (bd-l9jf whole-command leg).
+    if result.is_allowed() && result.allowlist_override.is_none() {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
@@ -30258,7 +30267,9 @@ mod tests {
         );
 
         // The allowlist grant only skips the launcher fail-closed check; the
-        // rest of the command is still evaluated and denied on its own merits.
+        // rest of the command is still evaluated and denied on its own merits
+        // (bd-l9jf whole-command leg: the grant must never become a
+        // whole-command allow).
         let allowlists = project_allowlists_for_rule(
             "heredoc.shell:launcher-unverified",
             "reviewed launcher shape",
@@ -30272,6 +30283,42 @@ mod tests {
         assert!(
             result.is_denied(),
             "allowlisting the launcher rule must not unlock destruction elsewhere in the command: {:?}",
+            result.pattern_info
+        );
+
+        // Same property for the POSIX inline-launcher grant.
+        let allowlists = project_allowlists_for_rule(
+            "heredoc.posix:inline-launcher-unverified",
+            "reviewed inline launcher",
+        );
+        let result = evaluate_with_pack_ids_and_allowlists_at_path(
+            "$tool -c 'echo safe' ; rm -rf /",
+            &["core.filesystem"],
+            &allowlists,
+            None,
+        );
+        assert!(
+            result.is_denied(),
+            "allowlisting the inline-launcher rule must not unlock destruction elsewhere in the command: {:?}",
+            result.pattern_info
+        );
+
+        // A launcher shape that is NOT allowlisted still fails closed even
+        // when a different launcher rule is: the grant is scoped to its own
+        // rule id, exactly like the #261 embedded-sink allowlist entries.
+        let allowlists = project_allowlists_for_rule(
+            "heredoc.posix:inline-launcher-unverified",
+            "reviewed inline launcher",
+        );
+        let result = evaluate_with_pack_ids_and_allowlists_at_path(
+            "powershell -EncodedCommand %%%",
+            &["core.filesystem"],
+            &allowlists,
+            None,
+        );
+        assert!(
+            result.is_denied(),
+            "an inline-launcher allowlist grant must not unlock the distinct windows-launcher rule: {:?}",
             result.pattern_info
         );
     }
