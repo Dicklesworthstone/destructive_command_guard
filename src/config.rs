@@ -802,6 +802,7 @@ struct GeneralConfigLayer {
     max_command_bytes: Option<usize>,
     max_findings_per_command: Option<usize>,
     fail_closed: Option<bool>,
+    update_pin: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -1770,6 +1771,17 @@ pub struct GeneralConfig {
     /// environments. Override at runtime with the `DCG_FAIL_CLOSED` env var
     /// (a truthy value forces fail-closed, a falsy value forces fail-open).
     pub fail_closed: bool,
+
+    /// Pin the installed binary against `dcg update` (#320).
+    ///
+    /// When `true`, `dcg update` refuses to replace the installed binary
+    /// (before any network or installer work) unless `--replace-local-build`
+    /// is passed, and the background "update available" nudge is suppressed.
+    /// Intended for operators running a local build that is ahead of the
+    /// published release, where a routine update would silently downgrade
+    /// guard coverage. Override at runtime with `DCG_UPDATE_PIN`.
+    /// Default: false.
+    pub update_pin: bool,
 }
 
 /// Default limits for input size (used when not configured).
@@ -1790,6 +1802,7 @@ impl Default for GeneralConfig {
             check_updates: true,
             self_heal_hook: true,
             fail_closed: false,
+            update_pin: false,
         }
     }
 }
@@ -4703,6 +4716,9 @@ impl Config {
         if let Some(fail_closed) = general.fail_closed {
             self.general.fail_closed = fail_closed;
         }
+        if let Some(update_pin) = general.update_pin {
+            self.general.update_pin = update_pin;
+        }
     }
 
     const fn merge_output_layer(&mut self, output: OutputConfigLayer) {
@@ -5010,6 +5026,13 @@ impl Config {
         if let Some(disable) = get_env("DCG_NO_UPDATE_CHECK") {
             if env_disable_flag_enabled(&disable) {
                 self.general.check_updates = false;
+            }
+        }
+
+        // DCG_UPDATE_PIN=true|false|1|0 (#320)
+        if let Some(update_pin) = get_env(&format!("{ENV_PREFIX}_UPDATE_PIN")) {
+            if let Some(parsed) = parse_env_bool(&update_pin) {
+                self.general.update_pin = parsed;
             }
         }
 

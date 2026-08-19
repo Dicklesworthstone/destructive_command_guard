@@ -594,6 +594,75 @@ pub const fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// `git describe --tags --dirty` captured at compile time by `build.rs`
+/// (#320). Absent outside a git checkout (registry tarball installs).
+const GIT_DESCRIBE: Option<&str> = option_env!("VERGEN_GIT_DESCRIBE");
+
+/// Short commit SHA captured at compile time by `build.rs`.
+pub const GIT_SHA: Option<&str> = option_env!("VERGEN_GIT_SHA");
+
+/// Explicit release-pipeline marker (#320): dist.yml and the DSR runbook
+/// export `DCG_RELEASE_BUILD=1` around `cargo build`, so a published binary
+/// can prove its provenance even when the build environment's git metadata is
+/// unavailable (shallow CI checkouts).
+const RELEASE_BUILD_MARKER: Option<&str> = option_env!("DCG_RELEASE_BUILD");
+
+/// Where this binary came from, as far as compile-time metadata can prove
+/// (#320).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildProvenance {
+    /// Built by a release pipeline, or from a clean checkout exactly at this
+    /// version's release tag. Replacing it with the published release of the
+    /// same or newer version loses nothing.
+    Release,
+    /// Built from a git checkout that is ahead of (or dirty relative to) the
+    /// release tag for this version. Replacing it with the published release
+    /// silently discards the local delta — for a guard, that can mean
+    /// downgrading coverage the operator depends on.
+    LocalAheadOfRelease {
+        /// The compile-time `git describe --tags --dirty` output.
+        describe: String,
+    },
+    /// No usable provenance: no git metadata was available at build time
+    /// (e.g. `cargo install` from a registry tarball).
+    Unknown,
+}
+
+/// Classify this binary's build provenance (#320).
+#[must_use]
+pub fn build_provenance() -> BuildProvenance {
+    classify_provenance(GIT_DESCRIBE, RELEASE_BUILD_MARKER, current_version())
+}
+
+/// Pure classification seam for [`build_provenance`], unit-testable without
+/// rebuilding under different environments.
+fn classify_provenance(
+    describe: Option<&str>,
+    release_marker: Option<&str>,
+    version: &str,
+) -> BuildProvenance {
+    if release_marker.is_some_and(|v| !v.is_empty() && v != "0") {
+        return BuildProvenance::Release;
+    }
+    let Some(describe) = describe else {
+        return BuildProvenance::Unknown;
+    };
+    // vergen substitutes a fixed placeholder when git metadata could not be
+    // gathered; treat it (and empty output) as no provenance at all.
+    if describe.is_empty() || describe == "VERGEN_IDEMPOTENT_OUTPUT" {
+        return BuildProvenance::Unknown;
+    }
+    if describe == format!("v{version}") {
+        return BuildProvenance::Release;
+    }
+    // Anything else — `v0.11.0-7-gabc1234`, a `-dirty` suffix, or a describe
+    // rooted at an older tag — is a local build whose bytes are not those of
+    // this version's release tag.
+    BuildProvenance::LocalAheadOfRelease {
+        describe: describe.to_string(),
+    }
+}
+
 /// Check for updates, using cache if available.
 ///
 /// Returns the version check result, either from cache or from a fresh API call.
@@ -882,6 +951,55 @@ fn disable_env_flag_enabled(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #320: provenance classification distinguishes release builds, local
+    /// builds ahead of the tag, and metadata-free builds.
+    #[test]
+    fn classify_provenance_covers_release_local_and_unknown() {
+        // Explicit release marker wins regardless of git state.
+        assert_eq!(
+            classify_provenance(Some("v0.11.0-7-gabc1234"), Some("1"), "0.11.0"),
+            BuildProvenance::Release
+        );
+        // A falsy/empty marker does not count as a release marker.
+        assert_eq!(
+            classify_provenance(None, Some("0"), "0.11.0"),
+            BuildProvenance::Unknown
+        );
+        assert_eq!(
+            classify_provenance(None, Some(""), "0.11.0"),
+            BuildProvenance::Unknown
+        );
+        // Clean checkout exactly at the version's tag.
+        assert_eq!(
+            classify_provenance(Some("v0.11.0"), None, "0.11.0"),
+            BuildProvenance::Release
+        );
+        // Commits past the tag, dirty worktrees, and describes rooted at an
+        // older tag are all local builds.
+        for describe in ["v0.11.0-7-gabc1234", "v0.11.0-dirty", "v0.10.0-40-gdeadbee"] {
+            assert_eq!(
+                classify_provenance(Some(describe), None, "0.11.0"),
+                BuildProvenance::LocalAheadOfRelease {
+                    describe: describe.to_string()
+                },
+                "{describe}"
+            );
+        }
+        // No metadata (registry tarball) and the vergen placeholder.
+        assert_eq!(
+            classify_provenance(None, None, "0.11.0"),
+            BuildProvenance::Unknown
+        );
+        assert_eq!(
+            classify_provenance(Some("VERGEN_IDEMPOTENT_OUTPUT"), None, "0.11.0"),
+            BuildProvenance::Unknown
+        );
+        assert_eq!(
+            classify_provenance(Some(""), None, "0.11.0"),
+            BuildProvenance::Unknown
+        );
+    }
 
     /// win-test-rollback-bom: the Windows rename-then-copy executable swap must
     /// replace the binary on success and restore the original on failure (the
