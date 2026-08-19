@@ -78,6 +78,25 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Fixed
 
+- **Heredoc/launcher allowlist grants no longer override pack denials.** A
+  grant for a fail-closed heredoc-family rule (e.g.
+  `heredoc.shell:launcher-unverified`) was converted into a whole-command
+  allow at the end of evaluation even when the pack pass had denied the
+  command — an unverifiable encoded-launcher segment chained with `rm -rf /`
+  was allowed in full under the grant. Both terminal conversion sites now
+  attribute the grant only to an ALLOW outcome; pack denials and indeterminate
+  verdicts pass through untouched, so a grant skips exactly the fail-closed
+  check it names and nothing else (bd-l9jf whole-command leg).
+- **Windows installer repairs a stale `$PROFILE` hook-check (#282).** The
+  earlier #282 fix corrected the startup-check block's detection text, but the
+  installer skipped any profile already containing the marker line — which was
+  identical across versions — so pre-fix installs kept warning
+  `[dcg] Hook missing from ~/.claude/settings.json` on every new terminal no
+  matter how often dcg was reinstalled or updated. `Add-DcgProfileCheck` now
+  rewrites the managed block in place when its content is stale (line-ending
+  differences don't count as stale), and best-effort repairs the *other*
+  PowerShell host's `profile.ps1` (Windows PowerShell 5.1 vs pwsh 7) without
+  ever creating one.
 - **The keyword pre-filter treats `_` as a boundary, not a word character
   (#323).** Underscore was in the pre-filter's word class, so underscore-joined
   names never admitted a pack: `export DCG_DISABLE=1` quick-rejected past the
