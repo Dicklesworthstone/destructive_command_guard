@@ -3868,17 +3868,22 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // pain we can add a safe pattern later.
         // Two carve-outs in the regex below worth understanding:
         //
-        //   1. `(?!/dev/(?:null|zero|full|stdout|stderr|tty|fd/[0-2])\b)` —
-        //      never fire on the write-safe character devices. `cmd >
-        //      /dev/null` and `cmd 2>&1 > /dev/null` are the most common
-        //      shell idioms in existence; `> /dev/stdout`, `> /dev/stderr`,
-        //      `> /dev/tty`, and the `/dev/fd/[0-2]` std-stream aliases are
-        //      equally truncate-proof — opening a character device with
-        //      O_TRUNC cannot destroy persistent data (#324). Higher
-        //      `/dev/fd/N` deliberately stays blocked: N can dup a
-        //      regular-file fd, where O_TRUNC truncates a real file. The
-        //      `\b` also keeps `/dev/tty0`..`/dev/ttyN` (consoles / other
-        //      terminals) and multi-digit `/dev/fd/1x` blocked.
+        //   1. `(?!/dev/(?:null|zero|full|tty)\b)` — never fire on the
+        //      genuinely write-safe character devices. `cmd > /dev/null` and
+        //      `cmd 2>&1 > /dev/null` are the most common shell idioms in
+        //      existence, and `/dev/null`, `/dev/zero`, `/dev/full`, and the
+        //      controlling terminal `/dev/tty` are ALWAYS character devices —
+        //      opening them with O_TRUNC cannot destroy persistent data
+        //      (#324). `/dev/stdout`, `/dev/stderr`, and `/dev/fd/N` are
+        //      deliberately NOT carved out: they are symlinks to whatever fd
+        //      0/1/2/N currently point at, which may be a regular file (e.g.
+        //      after `exec > logfile` or an inherited redirect), where
+        //      O_TRUNC truncates that real file. The #324 carve-out for them
+        //      rested on a false premise (that they are always character
+        //      devices) and reopened a data-loss path; the guard's
+        //      zero-false-negatives posture blocks them instead. The `\b`
+        //      keeps `/dev/tty0`..`/dev/ttyN` (consoles / other terminals)
+        //      blocked as before.
         //
         //   2. `(?:['"\\]|\$['"])?` — extends the historical optional
         //      single-char quote prefix to also accept the two-byte
@@ -3887,7 +3892,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //      bypass with `> $'/etc/passwd'` or `> $"/etc/passwd"`.
         destructive_pattern!(
             "redirect-truncate-root-home",
-            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full|stdout|stderr|tty|fd/[0-2])\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full|tty)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
             "shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to a sensitive system or home path destroys the previous file contents. EXTREMELY DANGEROUS.",
             Critical,
             "`> /etc/passwd` (or `: > /etc/passwd`, `echo > /etc/passwd`, etc.) opens \
@@ -5420,13 +5425,31 @@ mod tests {
     }
 
     #[test]
-    fn redirect_to_std_stream_devices_is_allowed() {
-        // #324: /dev/stdout, /dev/stderr, /dev/tty, and the
-        // /dev/fd/[0-2] std-stream aliases are write-safe character
-        // devices — opening them with O_TRUNC cannot destroy persistent
-        // data, exactly the property behind the /dev/null carve-out.
-        // Agents emit `> /dev/stdout` routinely; each false block costs
-        // a human round-trip.
+    fn redirect_to_controlling_terminal_is_allowed() {
+        // `/dev/tty` is the controlling terminal — always a character
+        // device, never a regular file — so opening it with O_TRUNC cannot
+        // destroy persistent data. It stays carved out alongside
+        // /dev/null|zero|full.
+        let pack = create_pack();
+        for cmd in [
+            "echo prompt > /dev/tty",
+            "read -p x < /dev/tty > /dev/tty",
+            "echo x > /dev/null",
+            "echo x > /dev/zero",
+            "echo x > /dev/full",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_to_std_stream_symlinks_blocks() {
+        // `/dev/stdout`, `/dev/stderr`, and `/dev/fd/N` are symlinks to
+        // whatever fd 0/1/2/N currently point at — which may be a regular
+        // file (after `exec > logfile`, or an inherited redirect). Opening
+        // them with O_TRUNC then truncates that real file, so the #324
+        // carve-out for them was unsound and is removed: the guard blocks
+        // them under its zero-false-negatives posture.
         let pack = create_pack();
         for cmd in [
             "gh pr view 204 --json number,title > /dev/stdout",
@@ -5436,13 +5459,11 @@ mod tests {
             "echo warn 1> /dev/stderr",
             "echo warn 2> /dev/stdout",
             "command &> /dev/stdout",
-            "echo prompt > /dev/tty",
-            "read -p x < /dev/tty > /dev/tty",
             "echo x > /dev/fd/0",
             "echo x > /dev/fd/1",
             "echo x >/dev/fd/2",
         ] {
-            assert_no_match(&pack, cmd);
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
         }
     }
 
