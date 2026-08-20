@@ -868,6 +868,26 @@ maybe_add_path() {
 
 DCG_SHELL_CHECK_MARKER="# dcg: warn if hook was silently removed"
 
+# Replace the managed dcg shell-check region (the marker line through the
+# first column-0 `fi`) in an RC file with the current snippet body. Used when
+# a marker is present but the block text is stale (issue #282's second act:
+# marker-only idempotence pinned users to the first snippet they ever got).
+# $1 = rc file, $2 = replacement text (snippet without its leading blank line).
+repair_shell_check_region() {
+  local rc="$1" body="$2" start end tmp
+  start=$( { grep -nF "$DCG_SHELL_CHECK_MARKER" "$rc" | head -n 1 | cut -d: -f1; } 2>/dev/null || true)
+  [ -n "$start" ] || return 1
+  end=$(awk -v s="$start" 'NR >= s && /^fi[ \t]*$/ { print NR; exit }' "$rc" 2>/dev/null || true)
+  [ -n "$end" ] || return 1
+  tmp=$(mktemp) || return 1
+  {
+    head -n $((start - 1)) "$rc"
+    printf '%s\n' "$body"
+    tail -n +"$((end + 1))" "$rc"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  cat "$tmp" > "$rc" && rm -f "$tmp"
+}
+
 maybe_add_shell_check() {
   # Add a shell startup check that warns if the DCG hook has been silently
   # removed from ~/.claude/settings.json. Silent when present, fast (ms),
@@ -885,12 +905,28 @@ if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
 fi
 EOFSNIPPET
   )
+  # The snippet minus its leading blank line: what a managed region should
+  # contain, used both as the is-current test and the repair replacement.
+  local body="${snippet#?}"
 
   local added=0
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
     if [ -e "$rc" ] && [ -w "$rc" ]; then
       if grep -qF "$DCG_SHELL_CHECK_MARKER" "$rc" 2>/dev/null; then
-        added=1  # Already present — don't trigger fallback
+        added=1  # Present — repair in place if the block text is stale
+        case "$(cat "$rc")" in
+          *"$body"*) ;;
+          *)
+            if repair_shell_check_region "$rc" "$body"; then
+              ok "Updated stale shell startup check in $rc"
+            else
+              # Region boundary unrecognizable — append a current block so at
+              # least the up-to-date check runs.
+              printf '%s\n' "$snippet" >> "$rc"
+              ok "Appended current shell startup check to $rc (old block not auto-removable)"
+            fi
+          ;;
+        esac
         continue
       fi
       printf '%s\n' "$snippet" >> "$rc"

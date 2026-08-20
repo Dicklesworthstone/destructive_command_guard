@@ -12162,25 +12162,87 @@ fn rc_has_dcg_check(path: &std::path::Path) -> bool {
     }
 }
 
-/// Append the DCG shell startup check to a shell RC file.
-///
-/// Returns `Ok(true)` if the snippet was added, `Ok(false)` if it was already
-/// present.
+/// Outcome of [`inject_shell_check`].
 #[cfg(unix)]
-fn inject_shell_check(path: &std::path::Path) -> Result<bool, Box<dyn std::error::Error>> {
-    if rc_has_dcg_check(path) {
-        return Ok(false);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellCheckOutcome {
+    /// The snippet was appended to an RC file that had none.
+    Added,
+    /// The RC file already carries the current snippet text.
+    AlreadyCurrent,
+    /// A stale marker-guarded block was replaced (or, if its boundary was
+    /// unrecognizable, a current block was appended alongside it).
+    Updated,
+}
+
+/// Replace the managed dcg shell-check region (the marker line through the
+/// first column-0 `fi`) with the current snippet. Returns `None` when the
+/// region boundary cannot be located (hand-mangled block).
+///
+/// The column-0 requirement is deliberate: the snippet's only unindented `fi`
+/// is its final line, so an indent-tolerant match would truncate the block at
+/// its interior `  fi` and corrupt the RC file.
+#[cfg(unix)]
+fn repair_shell_check_region(content: &str) -> Option<String> {
+    let mut region_start: Option<usize> = None;
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        if region_start.is_none() {
+            if line.trim_start().starts_with(DCG_SHELL_CHECK_MARKER) {
+                region_start = Some(offset);
+            }
+        } else if line.trim_end() == "fi" && line.starts_with('f') {
+            let region_end = offset + line.len();
+            let mut repaired = String::with_capacity(content.len() + DCG_SHELL_CHECK_SNIPPET.len());
+            repaired.push_str(&content[..region_start?]);
+            repaired.push_str(DCG_SHELL_CHECK_SNIPPET.trim_start_matches('\n'));
+            repaired.push_str(&content[region_end..]);
+            return Some(repaired);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Add the DCG shell startup check to a shell RC file, or repair a stale one.
+///
+/// A marker whose block text differs from the current snippet is rewritten in
+/// place (issue #282's second act on the PowerShell side: marker-only
+/// idempotence pinned users to the first snippet version they ever received).
+#[cfg(unix)]
+fn inject_shell_check(
+    path: &std::path::Path,
+) -> Result<ShellCheckOutcome, Box<dyn std::error::Error>> {
+    if let Ok(content) = std::fs::read_to_string(path) {
+        if content.contains(DCG_SHELL_CHECK_MARKER) {
+            if content.contains(DCG_SHELL_CHECK_SNIPPET.trim_start_matches('\n')) {
+                return Ok(ShellCheckOutcome::AlreadyCurrent);
+            }
+            if let Some(repaired) = repair_shell_check_region(&content) {
+                std::fs::write(path, repaired)?;
+            } else {
+                // Boundary unrecognizable — append a current block so at
+                // least the up-to-date check runs.
+                append_shell_check(path)?;
+            }
+            return Ok(ShellCheckOutcome::Updated);
+        }
     }
 
+    append_shell_check(path)?;
+    Ok(ShellCheckOutcome::Added)
+}
+
+#[cfg(unix)]
+fn append_shell_check(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
 
     use std::io::Write;
-    write!(file, "{}", DCG_SHELL_CHECK_SNIPPET)?;
-
-    Ok(true)
+    write!(file, "{DCG_SHELL_CHECK_SNIPPET}")?;
+    Ok(())
 }
 
 /// Full setup: install the hook and optionally add the shell startup check.
@@ -12314,10 +12376,17 @@ fn run_shell_check_setup(
     if should_inject {
         for rc_path in &rc_files {
             match inject_shell_check(rc_path) {
-                Ok(true) => {
+                Ok(ShellCheckOutcome::Added) => {
                     println!("{} {}", "Added shell check to".green(), rc_path.display());
                 }
-                Ok(false) => {
+                Ok(ShellCheckOutcome::Updated) => {
+                    println!(
+                        "{} {}",
+                        "Updated stale shell check in".green(),
+                        rc_path.display()
+                    );
+                }
+                Ok(ShellCheckOutcome::AlreadyCurrent) => {
                     println!("{} {}", "Already present in".yellow(), rc_path.display());
                 }
                 Err(e) => {
@@ -16635,6 +16704,119 @@ fn dev_generate_fixtures(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shell startup check self-repairs a stale marker-guarded block
+    /// instead of skipping it (the Unix analog of install.ps1's #282 fix).
+    #[cfg(unix)]
+    mod shell_check_repair {
+        use super::super::{
+            DCG_SHELL_CHECK_MARKER, DCG_SHELL_CHECK_SNIPPET, ShellCheckOutcome, inject_shell_check,
+            repair_shell_check_region,
+        };
+
+        const STALE_BLOCK: &str = "\n# dcg: warn if hook was silently removed from Claude Code settings\nif command -v dcg >/dev/null && command -v jq >/dev/null; then\n  if jq -e 'OLD_STALE_EXPRESSION' \"$HOME/.claude/settings.json\" >/dev/null; then\n    echo OLD-WARNING\n  fi\nfi\n";
+
+        #[test]
+        fn fresh_rc_gets_snippet_appended() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let rc = dir.path().join(".zshrc");
+            std::fs::write(&rc, "# fresh rc\n").unwrap();
+            let outcome = inject_shell_check(&rc).expect("inject");
+            assert_eq!(outcome, ShellCheckOutcome::Added);
+            let content = std::fs::read_to_string(&rc).unwrap();
+            assert!(content.contains(DCG_SHELL_CHECK_MARKER));
+            assert!(content.contains("# fresh rc"));
+        }
+
+        #[test]
+        fn current_snippet_is_left_untouched() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let rc = dir.path().join(".zshrc");
+            std::fs::write(&rc, format!("# before\n{DCG_SHELL_CHECK_SNIPPET}")).unwrap();
+            let before = std::fs::read_to_string(&rc).unwrap();
+            let outcome = inject_shell_check(&rc).expect("inject");
+            assert_eq!(outcome, ShellCheckOutcome::AlreadyCurrent);
+            assert_eq!(
+                std::fs::read_to_string(&rc).unwrap(),
+                before,
+                "an up-to-date RC file must be byte-identical after a re-run"
+            );
+        }
+
+        #[test]
+        fn stale_block_is_replaced_in_place() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let rc = dir.path().join(".zshrc");
+            std::fs::write(
+                &rc,
+                format!("alias ll='ls -la'\n{STALE_BLOCK}\nafter_marker() {{ echo hi; }}\n"),
+            )
+            .unwrap();
+            let outcome = inject_shell_check(&rc).expect("inject");
+            assert_eq!(outcome, ShellCheckOutcome::Updated);
+            let content = std::fs::read_to_string(&rc).unwrap();
+            assert!(
+                !content.contains("OLD_STALE_EXPRESSION"),
+                "stale block text removed"
+            );
+            assert!(
+                content.contains(DCG_SHELL_CHECK_SNIPPET.trim_start_matches('\n')),
+                "current snippet present"
+            );
+            assert!(content.contains("alias ll"), "content before preserved");
+            assert!(content.contains("after_marker"), "content after preserved");
+            assert_eq!(
+                content.matches(DCG_SHELL_CHECK_MARKER).count(),
+                1,
+                "marker appears exactly once after repair"
+            );
+
+            // And the repaired file is stable on the next run.
+            let outcome = inject_shell_check(&rc).expect("inject");
+            assert_eq!(outcome, ShellCheckOutcome::AlreadyCurrent);
+        }
+
+        #[test]
+        fn mangled_block_falls_back_to_append() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let rc = dir.path().join(".zshrc");
+            // Marker present but no column-0 `fi` — boundary unrecognizable.
+            std::fs::write(
+                &rc,
+                "# dcg: warn if hook was silently removed from Claude Code settings\nif true; then\n  echo mangled\n",
+            )
+            .unwrap();
+            let outcome = inject_shell_check(&rc).expect("inject");
+            assert_eq!(outcome, ShellCheckOutcome::Updated);
+            let content = std::fs::read_to_string(&rc).unwrap();
+            assert!(
+                content.contains(DCG_SHELL_CHECK_SNIPPET.trim_start_matches('\n')),
+                "current snippet appended"
+            );
+            assert!(
+                content.contains("echo mangled"),
+                "remnant left, not corrupted"
+            );
+        }
+
+        #[test]
+        fn repair_region_rejects_interior_indented_fi() {
+            // The interior `  fi` must NOT terminate the region — only the
+            // column-0 `fi` does. A repair that stopped early would leave
+            // trailing junk that breaks the RC file.
+            let content = format!("{STALE_BLOCK}# after\n");
+            let repaired = repair_shell_check_region(&content).expect("region found");
+            assert!(!repaired.contains("OLD_STALE_EXPRESSION"));
+            assert!(repaired.contains("# after"));
+            assert!(!repaired.contains("echo OLD-WARNING"));
+        }
+
+        #[test]
+        fn repair_region_returns_none_without_terminator() {
+            let content = "# dcg: warn if hook was silently removed\nif true; then\n  echo x\n";
+            assert!(repair_shell_check_region(content).is_none());
+        }
+    }
 
     struct BatchEvalContext {
         enabled_keywords: Vec<&'static str>,
