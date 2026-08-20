@@ -5934,6 +5934,18 @@ fn show_config(config: &Config, sources: &[ConfigSourceOutcome]) {
     } else {
         println!("  Languages: all");
     }
+
+    // Removed config keys (#327): a key that parses but is never enforced is
+    // indistinguishable from one that simply didn't match, so say it here —
+    // the command a user actually runs to check their configuration.
+    let removed_key_warnings = config.overrides.removed_key_warnings();
+    if !removed_key_warnings.is_empty() {
+        println!();
+        println!("Warnings:");
+        for warning in &removed_key_warnings {
+            println!("  - {warning}");
+        }
+    }
 }
 
 /// Emit the current configuration as JSON for agents/scripts (issue #159).
@@ -5974,6 +5986,25 @@ fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
     let mut enabled_packs: Vec<String> = config.enabled_pack_ids().into_iter().collect();
     enabled_packs.sort();
 
+    // Echo the enforcement-relevant sections so an automated check can assert
+    // what is actually loaded (#327): before this, `jq '.overrides'` returned
+    // null whether a section was enforcing or absent, and `dcg test` was the
+    // only observable. HashMap-backed sections go through BTreeMap views for
+    // deterministic output.
+    let rules_view: std::collections::BTreeMap<&String, &crate::config::RuleConfig> =
+        config.rules.iter().collect();
+    let policy_rules_view: std::collections::BTreeMap<&String, _> =
+        config.policy.rules.iter().collect();
+    let policy_packs_view: std::collections::BTreeMap<&String, _> =
+        config.policy.packs.iter().collect();
+    let mut removed_keys_present: Vec<&str> = Vec::new();
+    if config.overrides.allowlist.is_some() {
+        removed_keys_present.push("overrides.allowlist");
+    }
+    if config.overrides.allowlist_rules.is_some() {
+        removed_keys_present.push("overrides.allowlist_rules");
+    }
+
     let output = serde_json::json!({
         "dcg_version": env!("CARGO_PKG_VERSION"),
         "config_sources": config_sources_json(sources),
@@ -6000,6 +6031,18 @@ fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
             "fail_open_on_timeout": heredoc.fallback_on_timeout,
             "languages": languages,
         },
+        "overrides": {
+            "allow": config.overrides.allow,
+            "block": config.overrides.block,
+            "removed_keys_present": removed_keys_present,
+        },
+        "rules": rules_view,
+        "policy": {
+            "default_mode": config.policy.default_mode,
+            "packs": policy_packs_view,
+            "rules": policy_rules_view,
+        },
+        "warnings": config.overrides.removed_key_warnings(),
     });
 
     println!(
@@ -10250,6 +10293,12 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                  for the supported rules"
             );
         }
+        if !config_diag.removed_key_warnings.is_empty() {
+            println!("  Removed config keys present (not enforced):");
+            for warning in &config_diag.removed_key_warnings {
+                println!("    - {warning}");
+            }
+        }
     } else {
         println!(
             "{} ({} file source{})",
@@ -10765,6 +10814,7 @@ fn collect_doctor_report(
             ));
         }
         details.extend(config_diag.rule_target_exemption_warnings.iter().cloned());
+        details.extend(config_diag.removed_key_warnings.iter().cloned());
         (
             DoctorCheckStatus::Warning,
             format!(
@@ -13695,6 +13745,9 @@ struct ConfigDiagnostics {
     invalid_override_patterns: Vec<(String, String)>, // (pattern, error)
     /// `[rules]` target exemptions that will not take effect (#284)
     rule_target_exemption_warnings: Vec<String>,
+    /// Config keys that parse but were removed from the schema and are never
+    /// enforced (#327: `overrides.allowlist`, `overrides.allowlist_rules`)
+    removed_key_warnings: Vec<String>,
 }
 
 impl ConfigDiagnostics {
@@ -13707,6 +13760,7 @@ impl ConfigDiagnostics {
             || !self.unknown_packs.is_empty()
             || !self.invalid_override_patterns.is_empty()
             || !self.rule_target_exemption_warnings.is_empty()
+            || !self.removed_key_warnings.is_empty()
     }
 }
 
@@ -13780,6 +13834,11 @@ fn validate_config_diagnostics(
     // glob, is silently inert: the user keeps getting the denial they tried to
     // carve out. Surface it rather than leaving them unserved (#284).
     diag.rule_target_exemption_warnings = config.rule_target_exemption_warnings();
+
+    // Removed config keys that still parse are indistinguishable from working
+    // ones without a warning; surface them the same way inert exemptions are
+    // (#327).
+    diag.removed_key_warnings = config.overrides.removed_key_warnings();
 
     diag
 }
