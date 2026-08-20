@@ -11,6 +11,34 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+### Fixed
+
+- **`redirect-truncate-root-home` no longer recommends an alternative it then
+  denies (#316 follow-up).** The rule's "Make a backup" suggestion —
+  `cp <file> <file>.bak && echo data > <file>` — still ends in a truncating
+  redirect onto the same home/system path, so an agent that instantiated it
+  from the triggering command was denied again by the same rule. The
+  suggestion (block-message prose and the structured `PatternSuggestion`) now
+  routes the write through a temp file: `cp <file> <file>.bak &&
+  echo data > /tmp/<subdir>/out && cp -f /tmp/<subdir>/out <file>`, which the
+  hook allows end-to-end even for home targets. Two sibling rows with the
+  same latent trap were fixed in the same pass: the `truncate` rules'
+  "keep the first N bytes" suggestion (`head -c N <file> > <file>.head` —
+  a home-path redirect) now writes the head through `/tmp` and `cp -f`s it
+  into place, and `mv-sensitive-source-root-home`'s in-place-rename
+  suggestion (`mv <file> <file>.deleted-YYYYMMDD` — itself an mv touching a
+  sensitive path) is now marked gated, so it renders with the explicit
+  "dcg gates this too — it needs explicit approval" marker
+  (`mv-dynamic-path` got its own suggestion set where the literal rename
+  stays ungated, since a resolved literal rename is exactly the escape from
+  that denial). The #316 suggestion self-consistency sweep now instantiates
+  `{path}` with a home path (in addition to the relative path) for every rule
+  whose name carries `root-home`/`sensitive` — the configuration the original
+  sweep never exercised, which is why this row survived it — and requires
+  gated suggestions to be denied in at least one applicable profile.
+
 ## [v0.11.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.11.1) -- 2026-08-19 [Release]
 
 ### Added

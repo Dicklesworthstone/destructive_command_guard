@@ -157,8 +157,8 @@ const TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
         "Safe temp-directory truncate (allowed without confirmation)",
     ),
     PatternSuggestion::new(
-        "head -c <N> {path} > {path}.head && mv {path}.head {path}",
-        "Keep the first N bytes instead of dropping data blindly",
+        "head -c <N> {path} > /tmp/{subdir}/head && cp -f /tmp/{subdir}/head {path}",
+        "Keep the first N bytes instead of dropping data blindly (write via a temp file)",
     ),
 ];
 
@@ -242,9 +242,32 @@ const MV_SENSITIVE_SUGGESTIONS: &[PatternSuggestion] = &[
         "cp -a {path} {path}.bak",
         "Copy first (preserves the original) — verify the copy, then remove only after confirmation",
     ),
+    PatternSuggestion::gated(
+        "mv {path} {path}.deleted-YYYYMMDD",
+        "In-place rename for soft-delete (no cross-segment hop, easy to undo) — any mv touching a sensitive path is still gated",
+    ),
+    PatternSuggestion::new(
+        "mv /tmp/{subdir}/foo /tmp/{subdir}/bar",
+        "Safe temp-directory rename (allowed without confirmation)",
+    ),
+];
+
+/// Suggestions for `mv-dynamic-path`. Same shape as the sensitive-path set,
+/// but the in-place rename stays ungated: with a *literal* path it is exactly
+/// the escape from the dynamic-path denial (a literal non-sensitive rename is
+/// allowed), so the gate marker would be wrong here.
+const MV_DYNAMIC_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "ls -la {path}",
+        "Resolve and verify the expanded path before any move",
+    ),
+    PatternSuggestion::new(
+        "cp -a {path} {path}.bak",
+        "Copy first (preserves the original) — verify the copy, then remove only after confirmation",
+    ),
     PatternSuggestion::new(
         "mv {path} {path}.deleted-YYYYMMDD",
-        "In-place rename for soft-delete (no cross-segment hop, easy to undo)",
+        "Use resolved literal paths for an in-place soft-delete rename",
     ),
     PatternSuggestion::new(
         "mv /tmp/{subdir}/foo /tmp/{subdir}/bar",
@@ -281,8 +304,8 @@ const SENSITIVE_PROPAGATION_DELETE_SUGGESTIONS: &[PatternSuggestion] = &[
 const REDIRECT_TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new("ls -la {path}", "Verify the path before any redirect"),
     PatternSuggestion::new(
-        "cp {path} {path}.bak && echo data > {path}",
-        "Make a backup first if you might need the previous content",
+        "cp {path} {path}.bak && echo data > /tmp/{subdir}/out && cp -f /tmp/{subdir}/out {path}",
+        "Back up the target, write the new content to a temp file, then copy it into place",
     ),
     PatternSuggestion::new(
         "echo data >> {path}",
@@ -3826,7 +3849,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Resolve and inspect every path before moving it.\n\
              - Use an explicit literal `/tmp/<subdir>` or `/var/tmp/<subdir>` path.\n\
              - Use `dcg allow-once` only after verifying the resolved source and destination.",
-            MV_SENSITIVE_SUGGESTIONS
+            MV_DYNAMIC_SUGGESTIONS
         ),
         // ----- `> <sensitive>` (Critical: shell redirect truncate) -----
         //
@@ -3903,7 +3926,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              There is NO recovery without backups.\n\n\
              Safer alternatives:\n\
              - Use append (`>>`) to preserve existing content: `echo line >> <file>`.\n\
-             - Make a backup: `cp <file> <file>.bak && echo data > <file>`.\n\
+             - Make a backup, then write via a temp file:\n  \
+               `cp <file> <file>.bak && echo data > /tmp/<subdir>/out && cp -f /tmp/<subdir>/out <file>`\n  \
+               (a truncating redirect straight back onto a home/system path is denied \
+               by this same rule).\n\
              - For temp scratch: `> /tmp/<subdir>/scratch` is allowed.\n\
              - Read redirects (`< <file>`) are not affected — they don't truncate.",
             REDIRECT_TRUNCATE_SUGGESTIONS

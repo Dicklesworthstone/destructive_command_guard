@@ -15,17 +15,40 @@
 
 use destructive_command_guard::packs::PackRegistry;
 
+/// A placeholder-substitution profile: the concrete value `{path}` / `{file}`
+/// take when a suggestion is instantiated. Rules that fire *because* the
+/// target is a root/home/sensitive path show their suggestions in that
+/// context, so their suggestions must also be evaluated with a home-path
+/// instantiation — issue #316's follow-up report was exactly a suggestion
+/// that passed with a relative path but was denied by its own rule once the
+/// user substituted the home path from the triggering command.
+const RELATIVE_PATH: &str = "./build/scratch.txt";
+const HOME_PATH: &str = "~/notes/scratch.txt";
+
+/// Profiles a rule's suggestions must survive. Every rule is checked with a
+/// benign relative path. Rules whose trigger domain is a sensitive/home path
+/// (their names carry `root-home` or `sensitive`) are additionally checked
+/// with a home path, mirroring how a user would instantiate the suggestion
+/// from the command that was just denied.
+fn applicable_paths(rule: &str) -> &'static [&'static str] {
+    if rule.contains("root-home") || rule.contains("sensitive") {
+        &[RELATIVE_PATH, HOME_PATH]
+    } else {
+        &[RELATIVE_PATH]
+    }
+}
+
 /// Substitute the placeholder vocabulary used across pack suggestions with
 /// concrete illustrative values. Any leftover `<...>` / `{...}` token is
 /// replaced with a benign literal so partially-known placeholders cannot make
 /// a suggestion accidentally unevaluable. Docker's `{{.Field}}` format
 /// strings are preserved.
-fn substitute_placeholders(command: &str) -> String {
+fn substitute_placeholders(command: &str, concrete_path: &str) -> String {
     let mut out = command.to_string();
     for (from, to) in [
         ("<owner>/<repo>", "acme/widgets"),
-        ("{path}", "./build/scratch.txt"),
-        ("{file}", "./build/scratch.txt"),
+        ("{path}", concrete_path),
+        ("{file}", concrete_path),
         ("{subdir}", "scratch"),
         ("{tablename}", "orders"),
         ("{schema_name}", "analytics"),
@@ -93,8 +116,9 @@ fn substitute_placeholders(command: &str) -> String {
 }
 
 /// Every non-gated suggestion, applied with concrete placeholder values, must
-/// be allowed by the pack that offered it. Gated suggestions are exempt: they
-/// are rendered with an explicit "dcg gates this too" marker (#316).
+/// be allowed by the pack that offered it — under *every* path profile the
+/// offering rule can fire in. Gated suggestions are exempt: they are rendered
+/// with an explicit "dcg gates this too" marker (#316).
 #[test]
 fn non_gated_suggestions_are_not_denied_by_their_own_pack() {
     let registry = PackRegistry::new();
@@ -108,15 +132,17 @@ fn non_gated_suggestions_are_not_denied_by_their_own_pack() {
                 if suggestion.gated {
                     continue;
                 }
-                let command = substitute_placeholders(suggestion.command);
-                if let Some(hit) = pack.check(&command) {
-                    failures.push(format!(
-                        "{pack_id}:{rule} suggests {:?} (as {command:?}), which the same pack \
-                         denies via {pack_id}:{} — either fix the suggestion or mark it \
-                         PatternSuggestion::gated",
-                        suggestion.command,
-                        hit.name.unwrap_or("unnamed"),
-                    ));
+                for concrete_path in applicable_paths(rule) {
+                    let command = substitute_placeholders(suggestion.command, concrete_path);
+                    if let Some(hit) = pack.check(&command) {
+                        failures.push(format!(
+                            "{pack_id}:{rule} suggests {:?} (as {command:?}), which the same pack \
+                             denies via {pack_id}:{} — either fix the suggestion or mark it \
+                             PatternSuggestion::gated",
+                            suggestion.command,
+                            hit.name.unwrap_or("unnamed"),
+                        ));
+                    }
                 }
             }
         }
@@ -130,8 +156,9 @@ fn non_gated_suggestions_are_not_denied_by_their_own_pack() {
 }
 
 /// The inverse guard: a suggestion marked `gated` should actually be gated by
-/// its own pack. A stale flag would append a scary approval marker to a
-/// command dcg happily allows. Only same-pack gating is asserted; a suggestion
+/// its own pack in at least one path profile the offering rule can fire in.
+/// A stale flag would append a scary approval marker to a command dcg happily
+/// allows in every context. Only same-pack gating is asserted; a suggestion
 /// gated by a *different* pack (or by evaluator-level analysis) is recorded in
 /// its description instead.
 #[test]
@@ -147,11 +174,15 @@ fn gated_suggestions_are_actually_denied_by_their_own_pack() {
                 if !suggestion.gated {
                     continue;
                 }
-                let command = substitute_placeholders(suggestion.command);
-                if pack.check(&command).is_none() {
+                let denied_somewhere = applicable_paths(rule).iter().any(|concrete_path| {
+                    let command = substitute_placeholders(suggestion.command, concrete_path);
+                    pack.check(&command).is_some()
+                });
+                if !denied_somewhere {
                     failures.push(format!(
-                        "{pack_id}:{rule} marks {:?} (as {command:?}) as gated, but this pack \
-                         allows it — drop the gated marker or fix the suggestion",
+                        "{pack_id}:{rule} marks {:?} as gated, but this pack allows it in \
+                         every applicable path profile — drop the gated marker or fix the \
+                         suggestion",
                         suggestion.command,
                     ));
                 }
