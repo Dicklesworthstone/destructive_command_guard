@@ -11,9 +11,48 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## Unreleased
+## [v0.12.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.12.0) -- 2026-08-20 [Release]
+
+### Added
+
+- **`ssh <host> '<command>'` remote payloads are scanned (#326).** ssh
+  concatenates every argv word after the destination and hands the result to
+  the remote login shell — an inline-shell wrapper exactly like `sh -c`, minus
+  the flag. dcg treated the quoted payload as opaque argv data, so
+  `ssh host 'dropdb mydb'` rode through while the unquoted spelling was
+  denied — a false negative in precisely the remote-execution direction. The
+  heredoc pipeline now extracts the payload (walking the modeled OpenSSH
+  option grammar to locate the destination: bundled flags, attached values
+  like `-p2222`, separate values like `-o X=y`, and `--`) and recursively
+  evaluates it, so quoted and unquoted spellings reach the same decision and
+  every enabled pack applies to the remote command. Read-only remote
+  diagnostics (`uptime`, `df -h`, `journalctl …`) stay allowed, the payload's
+  own quoting still classifies remote data as data
+  (`ssh h 'echo "dropdb mydb"'` passes), `echo`/`grep`/commit-message
+  mentions of ssh stay inert, and an unmodeled ssh option makes extraction
+  bail to the previous behavior rather than guess at the destination (a real
+  ssh refuses unknown options anyway). The opt-in `remote.ssh` pack is
+  unchanged and still adds its curated remote-execution rules on top.
 
 ### Fixed
+
+- **The dead `overrides.allowlist` / `overrides.allowlist_rules` config keys
+  are removed and loudly reported (#327).** Both keys parsed, appeared in
+  `dcg config schema` with worked examples, and were never consulted: the
+  config layer merge only carried `overrides.allow`/`block`, so the
+  documented path-scoped allowlisting silently had no effect (and the dead
+  compile path behind it ignored `paths` anyway — wiring it up as parsed
+  would have granted path-scoped configs *global* allowances). The keys are
+  gone from the schema (`config.schema.json` regenerated); a config still
+  carrying them parses, grants nothing, and is now named explicitly by
+  `dcg config` (a `Warnings:` section), `dcg config --format json` (a
+  `warnings` array plus `overrides.removed_keys_present`), and `dcg doctor`'s
+  configuration check, each pointing at the surfaces that work:
+  `overrides.allow`, per-rule `exempt_target_globs`, and `dcg allowlist add`.
+  Closing the report's observability gap, `dcg config --format json` now also
+  echoes the enforcement-relevant `overrides`, `rules`, and `policy` sections
+  (deterministically ordered), so CI can assert what is actually loaded
+  instead of inferring it from `dcg test` decisions.
 
 - **`redirect-truncate-root-home` no longer recommends an alternative it then
   denies (#316 follow-up).** The rule's "Make a backup" suggestion —
