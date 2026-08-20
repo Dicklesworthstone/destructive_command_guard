@@ -4720,6 +4720,26 @@ mod tests {
     }
 
     #[test]
+    fn test_pattern_suggestion_alternatives_marks_gated_entries() {
+        let suggestions = [
+            PatternSuggestion::new("ls -la ~/x", "Verify the path"),
+            PatternSuggestion::gated("mv ~/x ~/x.deleted", "Soft-delete rename"),
+        ];
+
+        let alternatives = pattern_suggestion_alternatives("mv ~/x /tmp/y", true, &suggestions);
+
+        assert_eq!(
+            alternatives,
+            vec![
+                "Verify the path: ls -la ~/x".to_string(),
+                "Soft-delete rename: mv ~/x ~/x.deleted  \
+                 (dcg gates this too — it needs explicit approval)"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn test_pattern_suggestion_alternatives_respects_disable_flag() {
         let suggestions = [PatternSuggestion::new(
             "git stash",
