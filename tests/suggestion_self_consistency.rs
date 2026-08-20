@@ -15,13 +15,13 @@
 
 use destructive_command_guard::packs::PackRegistry;
 
-/// A placeholder-substitution profile: the concrete value `{path}` / `{file}`
-/// take when a suggestion is instantiated. Rules that fire *because* the
-/// target is a root/home/sensitive path show their suggestions in that
-/// context, so their suggestions must also be evaluated with a home-path
-/// instantiation — issue #316's follow-up report was exactly a suggestion
-/// that passed with a relative path but was denied by its own rule once the
-/// user substituted the home path from the triggering command.
+/// The concrete values `{path}` / `{file}` take when a suggestion is
+/// instantiated. Rules that fire *because* the target is a root/home/sensitive
+/// path show their suggestions in that context, so their suggestions must also
+/// be evaluated with a home-path instantiation — issue #316's follow-up report
+/// was exactly a suggestion that passed with a relative path but was denied by
+/// its own rule once the user substituted the home path from the triggering
+/// command.
 const RELATIVE_PATH: &str = "./build/scratch.txt";
 const HOME_PATH: &str = "~/notes/scratch.txt";
 
