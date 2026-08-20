@@ -97,6 +97,14 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   differences don't count as stale), and best-effort repairs the *other*
   PowerShell host's `profile.ps1` (Windows PowerShell 5.1 vs pwsh 7) without
   ever creating one.
+- **Unix shell startup checks self-repair too.** `install.sh` and
+  `dcg setup --shell-check` had the same marker-only idempotence trap on the
+  bash/zsh RC snippet: once the marker line existed, no re-run would ever
+  replace the block, pinning users to the first snippet version they received.
+  The Unix snippet has never changed, so nobody was bitten — this closes the
+  trap before the first time it does. Both injectors now rewrite a stale
+  managed region (marker line through the first column-0 `fi`) in place; an
+  unrecognizable boundary falls back to appending a current block.
 - **The keyword pre-filter treats `_` as a boundary, not a word character
   (#323).** Underscore was in the pre-filter's word class, so underscore-joined
   names never admitted a pack: `export DCG_DISABLE=1` quick-rejected past the
