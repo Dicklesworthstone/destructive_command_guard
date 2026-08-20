@@ -1256,15 +1256,15 @@ fn is_powershell_parameter_token(token: &str) -> bool {
 }
 
 /// Return whether `token` is the cmd.exe recursion switch `/s` (alone or
-/// stuck to `/q`). `/s` is the switch that makes `del`/`rd` catastrophic, and
-/// it is the unmistakable cmd signal — POSIX never spells an option `/s`
-/// (it would be an absolute path). Bare `/q`/`/f` do not recurse, so they are
-/// not treated as a widening trigger on their own.
+/// stuck to `/q`). `/s` is the switch that makes `del`/`rd` catastrophic. A
+/// literal `/s` *can* be a POSIX absolute path, so this is only consulted
+/// after the segment already leads with a destructive alias, and widening to
+/// `Unknown` is the fail-closed direction: the worst case is that a bizarre
+/// POSIX `rm /s` gets the union-of-dialects evaluation (still allowed — no
+/// windows rule matches a bare `rm` with a `/s` operand), never a fail-open.
+/// Bare `/q`/`/f` do not recurse, so they are not widening triggers alone.
 fn is_cmd_switch_token(token: &str) -> bool {
-    matches!(
-        token.to_ascii_lowercase().as_str(),
-        "/s" | "/s/q" | "/q/s"
-    )
+    matches!(token.to_ascii_lowercase().as_str(), "/s" | "/s/q" | "/q/s")
 }
 
 /// Return whether a single statement segment is a Windows-shell invocation of
@@ -1272,6 +1272,12 @@ fn is_cmd_switch_token(token: &str) -> bool {
 /// (`del /s /q …`, `rd /s …`). The bare alias is never enough; a
 /// Windows-shell-only argument shape must accompany it so a plain POSIX
 /// `rm -rf ./build` keeps the Posix dialect.
+///
+/// A bare `--` ends the scan: it is POSIX end-of-options, after which
+/// `-Recurse`/`/s` are filenames, not flags. PowerShell never spells options
+/// with `--`, so stopping there cannot miss a real PowerShell command while
+/// it does stop `rm -- -Recurse` (deleting a file literally named
+/// `-Recurse`) from being mis-widened.
 fn segment_is_windows_alias_invocation(segment: &str) -> bool {
     let mut tokens = segment.split_whitespace();
     let Some(first) = tokens.next() else {
@@ -1284,7 +1290,9 @@ fn segment_is_windows_alias_invocation(segment: &str) -> bool {
     if !WINDOWS_DESTRUCTIVE_ALIASES.contains(&name.as_str()) {
         return false;
     }
-    tokens.any(|token| is_powershell_parameter_token(token) || is_cmd_switch_token(token))
+    tokens
+        .take_while(|token| *token != "--")
+        .any(|token| is_powershell_parameter_token(token) || is_cmd_switch_token(token))
 }
 
 /// Return whether any statement/pipeline segment of `command` is unmistakably
@@ -2986,6 +2994,10 @@ mod tests {
             "del file.txt",
             "rm file.txt",
             "rmdir emptydir",
+            // POSIX end-of-options: `-Recurse` here is a filename, not a flag,
+            // and PowerShell never spells options with `--`.
+            "rm -- -Recurse",
+            "rm -- -Force ./weird-file",
         ] {
             assert_eq!(
                 refine_shell_dialect(command, ShellDialect::Posix),
