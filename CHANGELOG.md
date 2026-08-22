@@ -11,6 +11,65 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+### Fixed
+
+- **`dcg hook` now honours `[policy]` mode overrides (#330).** The JSONL
+  subcommand evaluated commands without resolving the active policy, so a
+  rule downgraded to `warn` or `log` via `[policy] default_mode`,
+  `[policy.packs]`, or `[policy.rules]` still produced `{"decision":"deny"}`
+  — while `dcg test` reported `WARN (policy allows)` for the same config.
+  `dcg hook` now runs the same resolver as bare `dcg` and `dcg test`:
+  `warn`/`log` matches report `"decision":"allow"` (warn also announces the
+  relaxed rule on stderr), `ask` stays `deny` because the protocol has no
+  review channel, and a new additive `"mode"` field names the resolved mode
+  on every matched line. Explicit `[overrides].block` entries, the
+  critical-severity floor on broad policies, and severity-default modes
+  (`git stash drop` warns by default) behave identically in both entry
+  points, pinned by a parity suite.
+- **Rebase recovery probes the repository the command actually reaches
+  (#331).** The auto-allow for an in-progress rebase and the
+  `dcg rebase-recover` permit were resolved against the hook's cwd, so the
+  common `cd <worktree> && git restore --ours -- f` phrasing was denied (and
+  a freshly minted permit left unconsumed) exactly when the documented
+  recovery flow was being followed. The probe now starts from the
+  harness-reported `cwd` (falling back to the hook process cwd) and follows
+  a leading static `cd` / `pushd` and a `git -C <literal>` on the guarded
+  segment. Anything dcg cannot attribute statically — expansions,
+  subshells, `cd -`, `popd`, `--git-dir`/`--work-tree`, a directory that
+  does not exist — keeps the deny.
+- **A recovery signal unlocks the recovery rules, never the whole line.**
+  Found while reviewing #331: the first recovery-eligible match converted
+  the deny into an allow without re-checking the rest of the command, so
+  `git restore -- f; git reset --hard` ran unguarded inside a rebasing repo,
+  and a second `git restore` after a further `cd` ran in a repository the
+  probe never looked at. The command is now re-evaluated with exactly the
+  four recovery rules granted; any other finding keeps its own verdict, the
+  permit is spent only when the line actually runs, and a trailing command
+  that could move the shell (a script, `bash -c`, `eval`, `xargs`, …)
+  closes the window for that line. The block text now says the retry must
+  be the recovery command on its own line (a leading `cd <repo> &&` is
+  fine).
+- **Windows binaries carry a VERSIONINFO resource and application manifest
+  (#303).** `dcg.exe` shipped unsigned, stripped, size-optimized, and with
+  no version resource at all — close to a worst-case input for Defender's
+  `!ml` heuristics (`Trojan:Win32/Bearfoos.B!ml`) and anonymous in Explorer
+  and AV submissions. `build.rs` now embeds product/company/description/
+  version metadata and an `asInvoker` manifest (long-path and UTF-8 aware)
+  on Windows targets; a missing resource compiler degrades to a cargo
+  warning, never a failed build. Metadata only — no code path changes.
+  Authenticode signing remains the durable fix and is tracked separately.
+
+### Changed
+
+- The prose-through-a-data-sink posture from #329 is pinned by tests:
+  `cat > notes.md <<'EOF' … EOF` bodies are data in every spelling, executing
+  sinks (`bash <<EOF`, `… | bash`) still block, and inline interpreter
+  literals (`python3 -c "print(\"rm -rf\")"`) deliberately stay on the
+  conservative raw-shell scan (#136 / #278). No behavior change: the
+  reported block (against 0.11.1) does not reproduce on current `main`.
+
 ## [v0.12.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.12.0) -- 2026-08-20 [Release]
 
 ### Added
