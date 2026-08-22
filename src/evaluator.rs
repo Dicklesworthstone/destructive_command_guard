@@ -8989,11 +8989,38 @@ fn collect_posix_pipeline_executable_sinks(command: &str, sinks: &mut Vec<Execut
     let mut pending = vec![ast.root()];
     while let Some(node) = pending.pop() {
         if node.kind().as_ref() == "pipeline" {
-            let stages: Vec<String> = node
+            let mut stages: Vec<String> = node
                 .children()
                 .filter(|child| !matches!(child.kind().as_ref(), "comment" | "|" | "|&"))
                 .map(|child| child.text().to_string())
                 .collect();
+            // tree-sitter-bash attaches the pipeline of a heredoc-carrying
+            // statement to the heredoc itself:
+            // `cat <<'EOF' | bash … EOF` parses as
+            // `redirected_statement(command cat, heredoc_redirect(<<, 'EOF',
+            // pipeline(| bash), body, EOF))`, so the pipeline node starts with
+            // the `|` operator and has no producer stage of its own. Without
+            // this, the consumer loop below never ran for that shape and a
+            // heredoc piped into a shell or interpreter bypassed every rule.
+            // The producer is the enclosing statement with the pipeline
+            // spliced out, i.e. `cat <<'EOF'\n…\nEOF`.
+            let leading_pipe = node
+                .children()
+                .next()
+                .is_some_and(|child| matches!(child.kind().as_ref(), "|" | "|&"));
+            if leading_pipe {
+                match heredoc_pipeline_producer(command, &node) {
+                    Some(producer) => stages.insert(0, producer),
+                    None => {
+                        sinks.push(ExecutableTextSink::Unverified {
+                            rule: PIPELINE_CONSUMER_RULE,
+                            reason: "pipeline attached to a heredoc has no attributable producer",
+                        });
+                        pending.extend(node.children());
+                        continue;
+                    }
+                }
+            }
             for consumer_index in 1..stages.len() {
                 let consumer = &stages[consumer_index];
                 if input_redirect(consumer).is_some() {
@@ -9033,6 +9060,42 @@ fn collect_posix_pipeline_executable_sinks(command: &str, sinks: &mut Vec<Execut
             return;
         }
     }
+}
+
+/// The producer of a pipeline that tree-sitter-bash nested inside a
+/// `heredoc_redirect`: the enclosing `redirected_statement` with the pipeline's
+/// own bytes spliced out, so `cat <<'EOF' | bash\nbody\nEOF` yields
+/// `cat <<'EOF'\nbody\nEOF`. Returns `None` when the tree does not have that
+/// exact shape, which the caller treats as an unverifiable consumer.
+fn heredoc_pipeline_producer<D: Doc>(
+    command: &str,
+    pipeline: &ast_grep_core::Node<'_, D>,
+) -> Option<String> {
+    let redirect = pipeline.parent()?;
+    if redirect.kind().as_ref() != "heredoc_redirect" {
+        return None;
+    }
+    let statement = redirect.parent()?;
+    if statement.kind().as_ref() != "redirected_statement" {
+        return None;
+    }
+    let statement_range = statement.range();
+    let pipeline_range = pipeline.range();
+    if pipeline_range.start < statement_range.start
+        || pipeline_range.end > statement_range.end
+        || pipeline_range.start > pipeline_range.end
+    {
+        return None;
+    }
+    let head = command.get(statement_range.start..pipeline_range.start)?;
+    let tail = command.get(pipeline_range.end..statement_range.end)?;
+    let mut producer = String::with_capacity(head.len() + tail.len() + 1);
+    producer.push_str(head.trim_end());
+    if !tail.starts_with('\n') {
+        producer.push('\n');
+    }
+    producer.push_str(tail);
+    Some(producer)
 }
 
 fn powershell_word_equals(raw: &str, candidate: &str) -> bool {
@@ -15382,14 +15445,28 @@ fn literal_heredoc_producer_source(command: &str) -> Option<IndirectInputSource>
         }
         ExtractionResult::NoContent => return None,
     };
-    let mut cat_inputs = extracted.into_iter().filter(|content| {
-        content.heredoc_type.is_some()
-            && content
-                .target_command
-                .as_deref()
-                .is_some_and(|target| target.eq_ignore_ascii_case("cat"))
+    let heredocs: Vec<_> = extracted
+        .into_iter()
+        .filter(|content| content.heredoc_type.is_some())
+        .collect();
+    let heredoc_count = heredocs.len();
+    let mut cat_inputs = heredocs.into_iter().filter(|content| {
+        content
+            .target_command
+            .as_deref()
+            .is_some_and(|target| target.eq_ignore_ascii_case("cat"))
     });
-    let content = cat_inputs.next()?;
+    let Some(content) = cat_inputs.next() else {
+        // A heredoc fed to something other than `cat` (`tee`, `sed`, an
+        // unknown tool) still reaches the pipeline consumer, transformed in
+        // ways dcg does not model. That is an unverifiable source, not "no
+        // heredoc here".
+        return (heredoc_count > 0).then(|| {
+            IndirectInputSource::Unverified(
+                "heredoc pipeline producer is not a literal cat".to_string(),
+            )
+        });
+    };
     if cat_inputs.next().is_some() {
         return Some(IndirectInputSource::Unverified(
             "pipeline producer contains multiple heredoc inputs".to_string(),

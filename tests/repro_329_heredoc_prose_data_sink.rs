@@ -114,14 +114,18 @@ fn shell_argument_mentions_stay_allowed() {
 
 #[test]
 fn executing_heredoc_sinks_still_block() {
-    // Planted negatives: the body reaches a shell, so it is code.
-    assert_denied("bash <<'EOF'\nrm -rf /tmp/x\nEOF");
-    assert_denied("sh <<EOF\nrm -rf /tmp/x\nEOF");
-    assert_denied("cat <<'EOF' | bash\nrm -rf /tmp/x\nEOF");
-    assert_denied("bash > out.log <<'EOF'\nrm -rf /tmp/x\nEOF");
+    // Planted negatives: the body reaches a shell, so it is code. The path
+    // is a real project directory, not the literal `/tmp` carve-out that the
+    // rm rules deliberately allow.
+    assert_denied("bash <<'EOF'\nrm -rf ./src\nEOF");
+    assert_denied("sh <<EOF\nrm -rf ./src\nEOF");
+    // The pipeline form was a shipped bypass (see
+    // tests/repro_heredoc_pipeline_producer_bypass.rs).
+    assert_denied("cat <<'EOF' | bash\nrm -rf ./src\nEOF");
+    assert_denied("bash > out.log <<'EOF'\nrm -rf ./src\nEOF");
     // A data sink followed by an executing sink on the same line: the
     // executing one owns the heredoc.
-    assert_denied("cat notes.md; bash <<'EOF'\nrm -rf /tmp/x\nEOF");
+    assert_denied("cat notes.md; bash <<'EOF'\nrm -rf ./src\nEOF");
 }
 
 #[test]
