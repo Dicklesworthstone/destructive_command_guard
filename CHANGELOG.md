@@ -13,6 +13,36 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+### Security
+
+- **A heredoc piped into a shell or interpreter bypassed every rule
+  (shipped in v0.11.0 – v0.12.0).** `cat <<'EOF' | bash … EOF` (also `| sh`,
+  `| bash -s`, `| python3`, `| sudo bash`, `| env bash`) executed its body
+  unguarded: tree-sitter-bash attaches the pipeline of a heredoc-carrying
+  statement to the `heredoc_redirect` node, so the `pipeline` node begins
+  with the `|` operator and has no producer stage, and the executable-sink
+  collector — which only inspected consumers at index ≥ 1 of a pipeline's
+  stages — never saw the consumer at all, while the data-sink masking
+  treated the `cat` heredoc as inert prose. The producer is now synthesized
+  from the enclosing statement and the body is evaluated as the consumer's
+  source exactly like `echo … | bash`; a heredoc fed to a shell through a
+  non-`cat` producer (`tee x <<EOF | bash`, `sed … <<EOF | bash`) fails
+  closed as `heredoc.posix:pipeline-consumer`. Data consumers are
+  untouched (`cat <<'EOF' | grep -c rm`, `| wc -l`, `| tee notes.md`).
+  Regression suite: `tests/repro_heredoc_pipeline_producer_bypass.rs`.
+- **`dcg hook` batched envelopes resolve every entry before one speaks.**
+  Follow-up to the #330 fix: the VS Code Agent Host `toolCalls[]` loop
+  stopped at the first evaluator-level non-allow entry, which `[policy]`
+  could now turn into a `warn`/`log` allow — so a destructive entry later in
+  the same batch was never evaluated. Every entry is now resolved (verdict
+  and policy mode) and the highest-ranked one speaks for the line:
+  deny > indeterminate > ask > warn > log > allow. This mirrors the
+  resolve-all-then-rank flow bare `dcg` already used.
+- **Rebase recovery re-checks the rest of the line (see Fixed, #331).**
+  `git restore -- f; git reset --hard` and cross-repository
+  `cd <rebasing> && git restore -- f && cd <other> && git restore -- g` were
+  allowed outright during an in-progress rebase on v0.12.0.
+
 ### Fixed
 
 - **`dcg hook` now honours `[policy]` mode overrides (#330).** The JSONL
