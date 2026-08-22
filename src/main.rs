@@ -522,6 +522,9 @@ fn try_deny_oversized_input(
         allowlists: &allowlists,
         heredoc_settings,
         cwd_path: cwd_path.as_deref(),
+        // Only the truncated prefix of an oversized payload is available
+        // here; its envelope fields were never parsed.
+        hook_cwd: None,
         working_dir: &working_dir,
         deadline,
         hook_protocol,
@@ -808,6 +811,12 @@ struct HookEvalContext<'a> {
     allowlists: &'a LayeredAllowlist,
     heredoc_settings: &'a HeredocSettings,
     cwd_path: Option<&'a Path>,
+    /// Working directory reported by the harness in the hook payload (`cwd`),
+    /// when present. This is where the command will run, which can differ
+    /// from the hook process's own cwd; rebase-recovery resolution prefers
+    /// it (#331). Allow-once and history keep using `cwd_path`, the path the
+    /// matching CLI commands resolve from.
+    hook_cwd: Option<&'a Path>,
     working_dir: &'a str,
     deadline: &'a Deadline,
     hook_protocol: hook::HookProtocol,
@@ -945,8 +954,26 @@ fn resolve_hook_command(
     // Outside this narrow window the original deny path is unchanged. The
     // conversion leaves stdout untouched, so later batch entries are still
     // evaluated.
+    //
+    // The signal is probed in the repository the command will actually run
+    // in (#331): the harness-reported `cwd` when present (else the hook
+    // process cwd), moved by any leading `cd <literal> &&` / `pushd` and a
+    // `git -C <literal>` on the matched segment. Anything dcg cannot
+    // attribute statically resolves to `None` and keeps the deny.
     if matches!(mode, DecisionMode::Deny) {
-        if let Some(cwd_ref) = ctx.cwd_path {
+        let recovery_base = ctx
+            .hook_cwd
+            .filter(|path| path.is_absolute() && path.is_dir())
+            .or(ctx.cwd_path);
+        let recovery_cwd = recovery_base.and_then(|base| {
+            destructive_command_guard::rebase_recovery::resolve_recovery_cwd(
+                base,
+                command,
+                info.matched_span.as_ref().map(|span| span.start),
+                shell_dialect,
+            )
+        });
+        if let Some(cwd_ref) = recovery_cwd.as_deref() {
             if let Some(reason) = destructive_command_guard::rebase_recovery::should_allow_recovery(
                 cwd_ref, pack, pattern,
             ) {
@@ -1538,6 +1565,8 @@ fn main() {
         }
     }
 
+    let hook_cwd = hook_input.cwd.as_deref().map(Path::new);
+
     let eval_context = HookEvalContext {
         config: &config,
         enabled_keywords: &enabled_keywords,
@@ -1547,6 +1576,7 @@ fn main() {
         allowlists: &allowlists,
         heredoc_settings: &heredoc_settings,
         cwd_path: cwd_path.as_deref(),
+        hook_cwd,
         working_dir: &working_dir,
         deadline: &deadline,
         hook_protocol,
