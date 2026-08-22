@@ -1453,7 +1453,8 @@ $ git stash pop            # leaves messy worktree
 $ git checkout -- .
 BLOCKED by dcg  (core.git:checkout-discard)
   ... Recovering from a failed `git pull --rebase`?
-  ... Run `dcg rebase-recover` in this repo, then retry the command.
+  ... Run `dcg rebase-recover` in this repo, then retry the command on its own line
+  ... (a leading `cd <repo> &&` is fine; nothing else may share the line).
 $ dcg rebase-recover
 dcg rebase-recovery permit issued ...
 $ git checkout -- .        # now allowed, permit consumed

@@ -266,7 +266,7 @@ fn embedded_cd_does_not_unlock_non_recovery_rules() {
     // Critical safety test: following the cd only moves the probe. Rules
     // outside the narrow recovery set stay blocked inside a rebasing repo.
     let lab = Lab::new("scope");
-    for guarded in ["git reset --hard", "git clean -fd", "git stash drop"] {
+    for guarded in ["git reset --hard", "git clean -fd", "git push --force"] {
         let command = format!("cd {} && {guarded}", lab.rebasing().display());
         let (stdout, stderr) = lab.hook(&lab.clean(), Some(&lab.clean()), &command);
         assert!(
@@ -331,5 +331,179 @@ fn permit_in_the_hook_cwd_is_not_consumed_by_a_command_that_cds_elsewhere() {
     assert!(
         permit.exists(),
         "a denied command must leave the unrelated permit untouched"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A recovery signal unlocks the recovery RULES, never the whole command line.
+//
+// Found while reviewing #331: the first recovery-eligible match converted the
+// deny into an allow without re-checking the rest of the line, so
+// `git restore -- f; git reset --hard` ran unguarded inside a rebasing repo
+// and a second `git restore` after a further `cd` ran in a repository the
+// probe never looked at.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recovery_does_not_unlock_a_second_destructive_operation_on_the_line() {
+    let lab = Lab::new("residual");
+    let rebasing = lab.rebasing();
+    let cases = [
+        ("git restore -- f.txt; git reset --hard", "reset-hard"),
+        ("git restore -- f.txt && git reset --hard", "reset-hard"),
+        ("git checkout -- . && git clean -fd", "clean-force"),
+        ("git restore -- f.txt || git push --force", "push-force"),
+        ("git reset --hard; git restore -- f.txt", "reset-hard"),
+        ("git restore -- f.txt && rm -rf ./src", "rm-rf-general"),
+    ];
+    for (command, rule) in &cases {
+        let out = lab.hook(&rebasing, Some(&rebasing), command);
+        assert_denied(&out, rule, command);
+        assert!(
+            !out.1.contains("Allowing"),
+            "{command}: nothing may be announced as allowed:\n{}",
+            out.1
+        );
+    }
+
+    // The same shapes reached through an embedded cd.
+    for (guarded, rule) in &cases[..4] {
+        let command = format!("cd {} && {guarded}", rebasing.display());
+        let out = lab.hook(&lab.clean(), Some(&lab.clean()), &command);
+        assert_denied(&out, rule, &command);
+    }
+}
+
+#[test]
+fn recovery_still_allows_a_line_made_only_of_recovery_rules() {
+    // Two recovery operations in the same repo are the documented flow.
+    let lab = Lab::new("residual-ok");
+    let rebasing = lab.rebasing();
+    for command in [
+        "git restore -- f.txt; git checkout -- .",
+        "git restore --worktree -- a.txt && git restore -- b.txt",
+        "git status && git restore -- f.txt && git status",
+    ] {
+        let out = lab.hook(&rebasing, Some(&rebasing), command);
+        assert_allowed_by_recovery(&out, command);
+    }
+}
+
+#[test]
+fn recovery_denies_a_second_guarded_call_in_another_repository() {
+    let lab = Lab::new("residual-repo");
+    let rebasing = lab.rebasing();
+    let clean = lab.clean();
+    let cases = [
+        format!(
+            "cd {} && git restore -- f.txt && cd {} && git restore -- g.txt",
+            rebasing.display(),
+            clean.display()
+        ),
+        format!(
+            "git restore -- f.txt && git -C {} restore -- g.txt",
+            clean.display()
+        ),
+        format!(
+            "git restore -- f.txt && (cd {} && git restore -- g.txt)",
+            clean.display()
+        ),
+        format!(
+            "git restore -- f.txt; pushd {} && git checkout -- .",
+            clean.display()
+        ),
+        "git restore -- f.txt && bash -c 'cd ../clean && git restore -- g.txt'".to_string(),
+        "bash -c 'cd ../clean && git restore -- g.txt' && git restore -- f.txt".to_string(),
+        "eval 'cd ../clean' && git restore -- f.txt".to_string(),
+    ];
+    for command in &cases {
+        let out = lab.hook(&rebasing, Some(&rebasing), command);
+        assert_denied(&out, "restore-worktree", command);
+        assert!(
+            !out.1.contains("Allowing"),
+            "{command}: nothing may be announced as allowed:\n{}",
+            out.1
+        );
+    }
+}
+
+#[test]
+fn permit_is_not_consumed_when_a_residual_finding_keeps_the_deny() {
+    let lab = Lab::new("permit-residual");
+    let target = lab.clean();
+    lab.rebase_recover(&target);
+    let permit = target.join(".dcg").join("rebase-recovery-permit");
+    assert!(permit.exists());
+
+    let out = lab.hook(
+        &target,
+        Some(&target),
+        "git checkout -- . && git reset --hard",
+    );
+    assert_denied(&out, "reset-hard", "permit + residual reset --hard");
+    assert!(
+        permit.exists(),
+        "a command that did not run must not spend the permit"
+    );
+
+    // The permit is still good for the documented single-rule retry.
+    let out = lab.hook(&target, Some(&target), "git checkout -- .");
+    assert_allowed_by_recovery(&out, "retry with only the recovery rule");
+    assert!(
+        !permit.exists(),
+        "consumed by the command that actually ran"
+    );
+}
+
+#[test]
+fn permit_is_consumed_when_the_residual_finding_only_warns() {
+    // `git stash drop` is warn-by-default: the residual finding lets the
+    // line run, so the recovery command executes and the single-shot permit
+    // must be spent — it must not survive to unlock a later command.
+    let lab = Lab::new("permit-residual-warn");
+    let target = lab.clean();
+    lab.rebase_recover(&target);
+    let permit = target.join(".dcg").join("rebase-recovery-permit");
+    assert!(permit.exists());
+
+    let (stdout, stderr) = lab.hook(
+        &target,
+        Some(&target),
+        "git checkout -- . && git stash drop",
+    );
+    assert!(
+        !stdout.contains("deny"),
+        "warn-level residual must not deny:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("stash-drop") || stdout.contains("stash-drop"),
+        "the warn must name the residual rule:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        !permit.exists(),
+        "the line ran, so the permit must be consumed"
+    );
+
+    // Nothing left to unlock the next discard.
+    let out = lab.hook(&target, Some(&target), "git checkout -- .");
+    assert_denied(&out, "checkout-discard", "after a warn-level residual run");
+}
+
+#[test]
+fn embedded_cd_with_an_unrelated_trailing_command_keeps_the_deny() {
+    // The documented flow is one command per line. A trailing unrelated
+    // command could carry a directory change dcg cannot see (a script, a
+    // nested shell), so the window stays closed — and the block text now
+    // says so.
+    let lab = Lab::new("trailing");
+    let command = format!(
+        "cd {} && git checkout -- . && npm install",
+        lab.rebasing().display()
+    );
+    let (stdout, stderr) = lab.hook(&lab.clean(), Some(&lab.clean()), &command);
+    assert!(stdout.contains("deny"), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("on its own line"),
+        "block text must explain the single-line requirement:\n{stdout}"
     );
 }

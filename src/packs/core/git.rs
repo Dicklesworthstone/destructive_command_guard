@@ -4932,8 +4932,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - git diff <path>: Review what would be lost before discarding\n\n\
              Preview changes first:\n  git diff -- <path>\n\n\
              Recovering from a failed `git pull --rebase`?\n\
-             Run `dcg rebase-recover` in this repo, then retry the command. This issues a \
-             short-lived, single-shot permit that unblocks this rule only. A rebase already \
+             Run `dcg rebase-recover` in this repo, then retry the command on its own line \
+             (a leading `cd <repo> &&` is fine; nothing else may share the line). This \
+             issues a short-lived, single-shot permit that unblocks this rule only. A rebase already \
              in progress (`.git/rebase-merge/` or `.git/rebase-apply/` present) auto-allows \
              the same rule without a permit.",
             &const {
@@ -4997,8 +4998,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - git diff <path>: Review what would be lost\n\n\
              Preview changes first:\n  git diff <path>\n\n\
              Recovering from a failed `git pull --rebase`?\n\
-             Run `dcg rebase-recover` in this repo, then retry the command. This issues a \
-             short-lived, single-shot permit that unblocks this rule only. A rebase already \
+             Run `dcg rebase-recover` in this repo, then retry the command on its own line \
+             (a leading `cd <repo> &&` is fine; nothing else may share the line). This \
+             issues a short-lived, single-shot permit that unblocks this rule only. A rebase already \
              in progress (`.git/rebase-merge/` or `.git/rebase-apply/` present) auto-allows \
              the same rule without a permit.",
             &const {

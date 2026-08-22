@@ -82,6 +82,14 @@ impl RecoveryReason {
     }
 }
 
+/// Whether `pack_id:pattern_name` is one of the rules rebase recovery may
+/// unlock. Only `core.git` patterns participate.
+#[must_use]
+pub fn is_recovery_rule(pack_id: Option<&str>, pattern_name: Option<&str>) -> bool {
+    pack_id == Some("core.git")
+        && pattern_name.is_some_and(|name| RECOVERY_PATTERNS.contains(&name))
+}
+
 /// Check whether a recovery unblock should fire for this pack/pattern in this cwd.
 ///
 /// Returns `Some(RecoveryReason)` if the given `pack_id`/`pattern_name` is
@@ -93,12 +101,7 @@ pub fn should_allow_recovery(
     pack_id: Option<&str>,
     pattern_name: Option<&str>,
 ) -> Option<RecoveryReason> {
-    // Only `core.git` patterns participate.
-    if pack_id != Some("core.git") {
-        return None;
-    }
-    let name = pattern_name?;
-    if !RECOVERY_PATTERNS.contains(&name) {
+    if !is_recovery_rule(pack_id, pattern_name) {
         return None;
     }
 
@@ -132,12 +135,18 @@ pub fn should_allow_recovery(
 /// on the matched segment. It deliberately gives up — returning `None`, which
 /// keeps the original deny — whenever the target cannot be known without
 /// running the shell: expansions (`$DIR`, `$(...)`, backticks), globs,
-/// `~user`, `cd -`, `popd`, any subshell or group (`(`, `{`) ahead of the
-/// match, unbalanced quotes, or a directory that does not exist. When the
+/// `~user`, `cd -`, `popd`, any subshell or group (`(`, `{`) anywhere on the
+/// line, unbalanced quotes, or a directory that does not exist. A directory
+/// change or `git -C` *after* the matched segment also resolves to `None`:
+/// the whole line runs once it is allowed, and a second guarded call could
+/// otherwise land in a repository this resolution never probed. When the
 /// match offset is unknown the matched segment is taken to be the single
 /// top-level `git` segment; with two or more, or none, a command containing a
 /// directory change resolves to `None`, so a change dcg cannot attribute can
 /// never unlock recovery against the wrong repository.
+///
+/// This answers *where* the probe runs. Whether the rest of the line is
+/// safe is a separate question — see [`relaxed_allowlist`].
 ///
 /// Only POSIX-style shells are modelled; PowerShell and cmd resolve to `base`
 /// unchanged (today's behavior). A command with no directory change at all
@@ -178,11 +187,18 @@ fn resolve_recovery_cwd_with_home(
         return Some(base.to_path_buf());
     }
 
+    // Subshells and groups anywhere on the line are not modelled: a `cd`
+    // inside `( … )` does not reach the outer shell, a match inside `( … )`
+    // may run in a directory the walk below would not see, and a group after
+    // the match can move a second guarded call elsewhere.
+    if has_unquoted_grouping(command) {
+        return None;
+    }
+
     // Classify every top-level segment once. An unparseable segment or one
     // whose executable is only known at run time (`$DO_CD repo`) could be a
     // directory change dcg cannot see, so resolution fails closed on it.
     let mut leading: Vec<Option<(String, Vec<ShellWord>)>> = Vec::with_capacity(segments.len());
-    let mut any_directory_change = false;
     for &(start, end) in &segments {
         let words = shell_words(&command[start..end])?;
         match leading_word(&words) {
@@ -190,9 +206,6 @@ fn resolve_recovery_cwd_with_home(
             Leading::Empty => leading.push(None),
             Leading::Executable(index) => {
                 let name = words[index].text.clone();
-                if matches!(name.as_str(), "cd" | "pushd" | "popd") {
-                    any_directory_change = true;
-                }
                 let rest = words.into_iter().skip(index + 1).collect();
                 leading.push(Some((name, rest)));
             }
@@ -202,7 +215,7 @@ fn resolve_recovery_cwd_with_home(
     // Locate the segment that owns the matched rule text.
     let matched_index = match match_start {
         // A match that sits between segments (e.g. on a separator) cannot be
-        // attributed and falls through to the fail-closed branch below.
+        // attributed.
         Some(offset) => segments
             .iter()
             .position(|&(start, end)| offset >= start && offset < end),
@@ -220,57 +233,84 @@ fn resolve_recovery_cwd_with_home(
         }
     };
 
-    let Some(matched_index) = matched_index else {
-        // Unattributable match: the base is right only when nothing moves.
-        return if any_directory_change {
-            None
-        } else {
-            Some(base.to_path_buf())
-        };
-    };
+    // The match must land on a segment whose executable is `git`. A span
+    // offset is computed against the normalized command and mapped back with
+    // a constant shift, so a mis-mapped offset could otherwise land on a
+    // `cd` segment and have the walk below apply only the moves before it.
+    // Anything else (an inline shell payload, a separator byte) is
+    // unattributable: with no attributed segment, no directory change at all
+    // can be placed before or after the guarded call.
+    let matched_index = matched_index.filter(|&index| {
+        leading[index]
+            .as_ref()
+            .is_some_and(|(name, _)| name == "git")
+    });
 
-    let matched_start = segments[matched_index].0;
-
-    // Subshells and groups ahead of the match are not modelled: a `cd` inside
-    // `( … )` does not reach the outer shell, and a match inside `( … )` may
-    // run in a directory the walk below would not see.
-    if has_unquoted_grouping(&command[..matched_start]) {
-        return None;
-    }
-
+    // The whole line runs once the command is allowed, and the re-evaluation
+    // that follows grants the recovery rules wherever they appear — including
+    // inside a nested shell, whose own `cd` this walk cannot see. So every
+    // other segment may only be a static `cd`/`pushd` ahead of the match, a
+    // plain `git` call (no `-C`), or an inert builtin. Anything that can run
+    // further commands (`bash -c '…'`, `xargs`, `eval`, `source`, a script)
+    // or move the shell after the match could put a second guarded call in a
+    // repository this resolution never probed, so the window stays closed for
+    // the whole line; the documented flow is one command.
     let mut cwd = base.to_path_buf();
     let mut changed = false;
 
-    for entry in &leading[..matched_index] {
+    for (index, entry) in leading.iter().enumerate() {
+        if Some(index) == matched_index {
+            continue;
+        }
         let Some((name, rest)) = entry else {
             continue;
         };
         match name.as_str() {
-            "cd" | "pushd" => {
+            "cd" | "pushd" if matched_index.is_some_and(|matched| index < matched) => {
                 let target = directory_change_target(rest, home)?;
                 cwd = join_directory(&cwd, &target);
                 changed = true;
             }
-            // A directory stack is not modelled.
-            "popd" => return None,
-            _ => {}
+            "git"
+                if rest
+                    .iter()
+                    .all(|word| !git_option_moves_repository(&word.text)) => {}
+            "echo" | "printf" | "true" | "false" | ":" | "exit" | "pwd" | "test" | "[" => {}
+            _ => return None,
         }
     }
 
-    // `git -C <path>` on the matched segment moves the repository the same way.
-    if let Some((name, rest)) = &leading[matched_index] {
-        if name == "git" {
-            let mut args = rest.iter();
-            while let Some(word) = args.next() {
-                if word.text != "-C" || word.dynamic {
-                    break;
+    // `git -C <path>` on the matched segment moves the repository the same
+    // way. Walk git's global options up to the subcommand: `-C` may sit
+    // after other options (`git --no-pager -C other restore`), so stopping
+    // at the first non-`-C` word would probe the wrong repository.
+    if let Some((name, rest)) = matched_index.and_then(|index| leading[index].as_ref())
+        && name == "git"
+    {
+        let mut args = rest.iter();
+        while let Some(word) = args.next() {
+            if word.dynamic {
+                return None;
+            }
+            match word.text.as_str() {
+                "-C" => {
+                    let path = args.next()?;
+                    if path.dynamic || path.text.is_empty() {
+                        return None;
+                    }
+                    cwd = join_directory(&cwd, Path::new(&path.text));
+                    changed = true;
                 }
-                let path = args.next()?;
-                if path.dynamic || path.text.is_empty() {
-                    return None;
+                // `-c key=value` takes a separate value; never a path.
+                "-c" => {
+                    args.next()?;
                 }
-                cwd = join_directory(&cwd, Path::new(&path.text));
-                changed = true;
+                // `--git-dir` / `--work-tree` / `--namespace` re-point git
+                // without moving the shell; not modelled, fail closed.
+                text if git_option_moves_repository(text) => return None,
+                text if text.starts_with('-') => {}
+                // The subcommand: global options end here.
+                _ => break,
             }
         }
     }
@@ -282,6 +322,37 @@ fn resolve_recovery_cwd_with_home(
     // A target that does not exist has nothing to recover; canonicalizing
     // also collapses `..` segments the way the shell's `cd -P` would.
     fs::canonicalize(&cwd).ok().filter(|path| path.is_dir())
+}
+
+/// Whether a `git` global option changes which repository or worktree the
+/// invocation operates on. `-C` is followed by the resolver on the matched
+/// segment; everything else here is unmodelled and fails closed.
+fn git_option_moves_repository(option: &str) -> bool {
+    option == "-C"
+        || option.starts_with("--git-dir")
+        || option.starts_with("--work-tree")
+        || option.starts_with("--namespace")
+}
+
+/// The allowlist to re-evaluate a command under once a recovery signal has
+/// been confirmed for it.
+///
+/// A recovery signal unlocks only the [`RECOVERY_PATTERNS`] — nothing about
+/// an in-progress rebase makes `git reset --hard` or a `git restore` in a
+/// second repository safe. The hook therefore re-runs the full evaluation
+/// with exactly those rules granted and lets every other finding on the line
+/// keep its own verdict: `git restore -- f; git reset --hard` is still denied
+/// by `reset-hard`, and the permit is left unconsumed because the command did
+/// not run.
+#[must_use]
+pub fn relaxed_allowlist(
+    base: &crate::allowlist::LayeredAllowlist,
+) -> crate::allowlist::LayeredAllowlist {
+    let rules: Vec<(&str, &str)> = RECOVERY_PATTERNS
+        .iter()
+        .map(|pattern| ("core.git", *pattern))
+        .collect();
+    base.with_rule_grants(&rules, "rebase-recovery re-evaluation", "rebase-recovery")
 }
 
 /// One shell word with the information the cwd walk needs: its unquoted text
@@ -340,10 +411,7 @@ fn shell_words(segment: &str) -> Option<Vec<ShellWord>> {
             }
             '\\' => {
                 in_word = true;
-                match chars.next() {
-                    Some(escaped) => current.push(escaped),
-                    None => return None,
-                }
+                current.push(chars.next()?);
             }
             c if c.is_whitespace() => {
                 if in_word {
@@ -383,8 +451,10 @@ fn shell_words(segment: &str) -> Option<Vec<ShellWord>> {
     Some(words)
 }
 
-/// What a segment starts with, once `VAR=value` assignments and the
-/// transparent `command` / `builtin` wrappers are skipped.
+/// What a segment starts with, once `VAR=value` assignments and the bare
+/// transparent wrappers (`command`, `builtin`, `exec`, `sudo`, `env`, `nice`,
+/// `nohup`, `time`) are skipped. A wrapper option (`sudo -u bob git …`) is not
+/// modelled and reads as an unknown executable, which fails closed.
 enum Leading {
     /// Nothing executable (assignments only, or an empty segment).
     Empty,
@@ -404,7 +474,10 @@ fn leading_word(words: &[ShellWord]) -> Leading {
         if word.dynamic {
             return Leading::Dynamic;
         }
-        if matches!(word.text.as_str(), "command" | "builtin") {
+        if matches!(
+            word.text.as_str(),
+            "command" | "builtin" | "exec" | "sudo" | "env" | "nice" | "nohup" | "time"
+        ) {
             index += 1;
             continue;
         }
@@ -1021,30 +1094,66 @@ mod tests {
             Some(repo.join("sub"))
         );
         let absolute = format!("git -C {} restore -- f", repo.display());
-        assert_eq!(resolve(&tree, &tree.path("other"), &absolute), Some(repo));
+        assert_eq!(
+            resolve(&tree, &tree.path("other"), &absolute),
+            Some(repo.clone())
+        );
+        // `-C` after other global options still moves the probe.
+        assert_eq!(
+            resolve(
+                &tree,
+                &tree.root,
+                "git --no-pager -c core.pager=cat -C repo restore -- f"
+            ),
+            Some(repo.clone())
+        );
         // Only a literal path is followed.
         assert_eq!(
             resolve(&tree, &tree.root, "git -C \"$REPO\" restore -- f"),
             None
         );
+        // Re-pointing git without moving the shell is not modelled.
+        for command in [
+            "git --git-dir=repo/.git restore -- f",
+            "git --work-tree repo restore -- f",
+            "git --namespace=x restore -- f",
+            "git $OPT -C repo restore -- f",
+            "git -c",
+            "git -C",
+            "git restore -- f && git --work-tree=other status",
+        ] {
+            assert_eq!(resolve(&tree, &tree.root, command), None, "{command}");
+        }
+        // Options after the subcommand are arguments, not repository moves.
+        assert_eq!(
+            resolve(
+                &tree,
+                &tree.path("other"),
+                "git restore --source=HEAD -- f && git log --no-pager"
+            ),
+            Some(tree.path("other"))
+        );
     }
 
     #[test]
-    fn recovery_cwd_ignores_directory_changes_after_the_match() {
+    fn recovery_cwd_directory_change_after_the_match_is_not_a_probe_location() {
+        // A cd after the match never moves the probe (it runs after the
+        // guarded call) — and because the whole line runs once allowed, it
+        // closes the window entirely rather than being ignored; see
+        // `recovery_cwd_directory_change_after_the_match_fails_closed`.
         let tree = Tree::new("cd-after");
         let base = tree.path("other");
-        assert_eq!(
+        assert_ne!(
             resolve(&tree, &base, "git restore -- f.txt && cd ../repo"),
-            Some(base)
+            Some(tree.path("repo"))
         );
-        // A cd before the match still applies; one after it does not.
-        assert_eq!(
+        assert_ne!(
             resolve(
                 &tree,
                 &tree.root,
                 "cd repo && git restore -- f && cd ../other"
             ),
-            Some(tree.path("repo"))
+            Some(tree.path("other"))
         );
     }
 
@@ -1167,6 +1276,142 @@ mod tests {
                 ),
                 Some(base.clone()),
                 "dialect {dialect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_cwd_directory_change_after_the_match_fails_closed() {
+        // The whole line runs once allowed; a later move could carry a
+        // second guarded call into a repository the probe never saw.
+        let tree = Tree::new("trailing-move");
+        for command in [
+            "cd repo && git restore -- f && cd ../other && git restore -- g",
+            "git restore -- f && cd other",
+            "git restore -- f; pushd other",
+            "git restore -- f && popd",
+            "git restore -- f && git -C other restore -- g",
+            "git restore -- f && git --no-pager -C other status",
+            // Anything that can run further commands may carry its own cd,
+            // before or after the match.
+            "git restore -- f && bash -c 'cd other && git restore -- g'",
+            "bash -c 'cd other && git restore -- g' && git restore -- f",
+            "git restore -- f | xargs -I{} git -C other restore -- {}",
+            "eval 'cd other' && git restore -- f",
+            "source ./enter-other.sh && git restore -- f",
+            ". ./enter-other.sh && git restore -- f",
+            "git restore -- f && ./finish.sh",
+            "git restore -- f && make",
+        ] {
+            assert_eq!(resolve(&tree, &tree.root, command), None, "{command}");
+        }
+        // Later segments that do not move are fine.
+        assert_eq!(
+            resolve(
+                &tree,
+                &tree.root,
+                "cd repo && git restore -- f && git status"
+            ),
+            Some(tree.path("repo"))
+        );
+    }
+
+    #[test]
+    fn recovery_cwd_grouping_anywhere_fails_closed() {
+        let tree = Tree::new("trailing-group");
+        for command in [
+            "git restore -- f && (cd other && git restore -- g)",
+            "git restore -- f; { cd other; git restore -- g; }",
+        ] {
+            assert_eq!(resolve(&tree, &tree.root, command), None, "{command}");
+        }
+        // Quoted or escaped parens are data, not grouping.
+        assert_eq!(
+            resolve(
+                &tree,
+                &tree.root,
+                "git restore -- 'f (1).txt' && echo \\(done\\)"
+            ),
+            Some(tree.root.clone())
+        );
+    }
+
+    #[test]
+    fn recovery_cwd_match_on_a_non_git_segment_is_unattributable() {
+        // A mis-mapped span offset landing on the cd segment must not apply
+        // the moves before it and then probe there.
+        let tree = Tree::new("non-git-segment");
+        let command = "cd repo && cd ../other && git restore -- f";
+        let home = tree.home();
+        let on_second_cd = command.find("cd ../other").unwrap();
+        assert_eq!(
+            resolve_recovery_cwd_with_home(
+                &tree.root,
+                command,
+                Some(on_second_cd),
+                ShellDialect::Posix,
+                Some(&home)
+            ),
+            None
+        );
+        // Bare transparent wrappers are seen through; an unknown wrapper is
+        // an unknown executable and fails closed even when nothing moves.
+        assert_eq!(
+            resolve_recovery_cwd_with_home(
+                &tree.path("other"),
+                "sudo git restore -- f",
+                Some(0),
+                ShellDialect::Posix,
+                Some(&home)
+            ),
+            Some(tree.path("other"))
+        );
+        assert_eq!(
+            resolve_recovery_cwd_with_home(
+                &tree.root,
+                "cd repo && env GIT_TRACE=1 git restore -- f",
+                Some(11),
+                ShellDialect::Posix,
+                Some(&home)
+            ),
+            Some(tree.path("repo"))
+        );
+        for command in ["doas git restore -- f", "sudo -u bob git restore -- f"] {
+            assert_eq!(
+                resolve_recovery_cwd_with_home(
+                    &tree.path("other"),
+                    command,
+                    Some(0),
+                    ShellDialect::Posix,
+                    Some(&home)
+                ),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn relaxed_allowlist_grants_exactly_the_recovery_rules() {
+        use crate::allowlist::LayeredAllowlist;
+        let relaxed = relaxed_allowlist(&LayeredAllowlist::default());
+        for pattern in RECOVERY_PATTERNS {
+            assert!(
+                relaxed
+                    .match_rule_at_path("core.git", pattern, None)
+                    .is_some(),
+                "{pattern} must be granted"
+            );
+        }
+        for (pack, pattern) in [
+            ("core.git", "reset-hard"),
+            ("core.git", "clean-force"),
+            ("core.git", "stash-drop"),
+            ("core.filesystem", "rm-rf-general"),
+        ] {
+            assert!(
+                relaxed.match_rule_at_path(pack, pattern, None).is_none(),
+                "{pack}:{pattern} must NOT be granted"
             );
         }
     }
