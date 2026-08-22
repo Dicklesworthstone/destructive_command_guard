@@ -121,8 +121,84 @@ fn heredoc_piped_into_a_shell_is_evaluated_as_that_shells_source() {
             "cat <<'EOF' | bash\nrm -rf /tmp/x\nEOF\nrm -rf ./src",
             "rm-rf-general",
         ),
+        // Redirects on the consuming shell do not stop it reading the pipe.
+        // These were a second, adjacent bypass: a redirect token was read as
+        // a script-file operand, flipping the consumer to "does not read
+        // stdin" and allowing the body.
+        (
+            "cat <<'EOF' | bash 2>/dev/null\nrm -rf ./src\nEOF",
+            "rm-rf-general",
+        ),
+        (
+            "cat <<'EOF' | bash > log\ngit reset --hard\nEOF",
+            "reset-hard",
+        ),
+        (
+            "cat <<'EOF' | bash >log 2>&1\ngit push --force\nEOF",
+            "push-force",
+        ),
+        // Reading the pipe as a file through the stdin device.
+        (
+            "cat <<'EOF' | bash /dev/stdin\nrm -rf ./src\nEOF",
+            "rm-rf-general",
+        ),
+        (
+            "cat <<'EOF' | bash /dev/fd/0\ngit reset --hard\nEOF",
+            "reset-hard",
+        ),
+        // Force-clobber pipe operator.
+        ("cat <<'EOF' |& bash\nrm -rf ./src\nEOF", "rm-rf-general"),
     ] {
         lab.assert_denied(command, rule);
+    }
+}
+
+#[test]
+fn a_redirect_stealing_stdout_from_the_producer_is_genuinely_safe() {
+    // `cat <<EOF >log … EOF | bash` sends the heredoc body to `log`, so the
+    // pipe delivers nothing to bash. This is a true allow, not a miss — the
+    // body never reaches an executor. (Contrast with `bash 2>/dev/null`,
+    // where only stderr is redirected and stdin still feeds the shell.)
+    //
+    // The mirror form `cat >log <<EOF | bash` (redirect *before* the heredoc
+    // operator) is identical in bash but dcg denies it conservatively rather
+    // than proving the stdout steal across that token order — a tolerable
+    // false positive in the safe direction, never a false negative.
+    let lab = Lab::new("stdout-stolen");
+    lab.assert_allowed("cat <<'EOF' >log | bash\nrm -rf ./src\nEOF");
+}
+
+#[test]
+fn process_substitution_into_a_shell_is_not_defeated_by_a_redirect() {
+    // Same redirect-classifier root cause, different mechanism: `bash <(…)`
+    // runs the substitution as a script, and a redirect on the consuming
+    // shell (`bash 2>/dev/null <(…)`) must not read that redirect token as
+    // the script-file operand and conclude the shell runs nothing.
+    let lab = Lab::new("procsub");
+    for command in [
+        "bash <(echo 'rm -rf ./src')",
+        "bash 2>/dev/null <(echo 'git reset --hard')",
+        "bash >log <(echo 'git push --force')",
+        "sh 2>/dev/null <(printf 'rm -rf ./src')",
+    ] {
+        let (stdout, stderr) = lab.hook(command);
+        assert!(
+            stdout.contains("deny"),
+            "expected DENY for:\n{command}\n--- stdout:\n{stdout}\n--- stderr:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn legit_pipelines_whose_consumer_runs_a_script_file_stay_allowed() {
+    // False-positive guard for the redirect/stdin-device classifier: a shell
+    // consumer with a real script-file operand runs that file, not the pipe.
+    let lab = Lab::new("scriptfile");
+    for command in [
+        "cat <<'EOF' | bash deploy.sh\nrm -rf ./src\nEOF",
+        "cat <<'EOF' | bash build.sh 2>/dev/null\ngit reset --hard\nEOF",
+    ] {
+        lab.assert_allowed(command);
     }
 }
 

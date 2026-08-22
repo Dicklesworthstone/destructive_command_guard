@@ -11,6 +11,32 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+### Security
+
+- **A redirect or stdin device on a piped/substituted shell defeated the
+  executable-source analysis.** Found in an adversarial sweep of the v0.12.1
+  heredoc-pipeline fix. A shell consuming piped or process-substituted source
+  reads its program from stdin (or the substitution file), but a redirection
+  operator on that consumer was mistaken for a script-file operand and
+  flipped the verdict to "the shell runs nothing", allowing the payload:
+  - `… | bash 2>/dev/null` / `… | bash >log 2>&1` — an output redirect on the
+    piped shell;
+  - `… | bash /dev/stdin` / `bash /dev/fd/0` — the shell reads the pipe as a
+    file through the stdin device;
+  - `bash 2>/dev/null <(echo …)` — the same on a process-substitution
+    consumer (bash and interpreter forms).
+  Redirection operators are now classified (`classify_shell_positional`) and
+  skipped when scanning a consumer's arguments; stdin-device operands are
+  recognized as reading the pipe, and a genuine stdin *reassignment*
+  (`bash < file`) fails closed. Legit pipelines whose consumer runs a real
+  script file (`… | bash deploy.sh`) or a data tool (`… | grep`, `… | wc`)
+  are unchanged. Regression suite:
+  `tests/repro_heredoc_pipeline_producer_bypass.rs`.
+
+---
+
 ## [v0.12.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.12.1) -- 2026-08-22 [Release]
 
 ### Security

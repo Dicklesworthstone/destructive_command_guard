@@ -8201,6 +8201,36 @@ fn pipeline_shell_input_mode(command: &str) -> PipelineShellInputMode {
             index += 1;
             continue;
         }
+        // A positional token. `shell_words` keeps redirection operators as plain
+        // tokens (it does not model the shell's redirect grammar), so before
+        // concluding "this is a script file, the shell does not read stdin"
+        // (which ALLOWS the piped producer), classify the token:
+        //   * a stdin-reassigning redirect (`<file`, `0<file`) cuts the pipe
+        //     off from the shell and feeds it a source dcg cannot verify ->
+        //     fail closed;
+        //   * any other redirect (`2>/dev/null`, `>log`, `2>&1`, `&>x`) leaves
+        //     the pipe feeding the shell -> skip it (and a standalone target
+        //     token) and keep scanning;
+        //   * a stdin *device* positional (`/dev/stdin`, `/dev/fd/0`,
+        //     `/proc/self/fd/0`) makes the shell run the piped bytes -> reads
+        //     stdin;
+        //   * anything else is a real script file -> does not read stdin.
+        // Without this, `… | bash 2>/dev/null` and `… | bash /dev/stdin` both
+        // read the redirect/device token as a script file and wrongly ALLOW.
+        let class = classify_shell_positional(argument);
+        if matches!(class, ShellPositional::StdinReassignRedirect { .. }) {
+            // stdin is reassigned away from the pipe to a source dcg cannot
+            // statically verify -> fail closed.
+            return PipelineShellInputMode::Unverified;
+        }
+        if let Some(next) = skip_redirect_token(class, index, args.len()) {
+            index = next;
+            continue;
+        }
+        if class == ShellPositional::StdinDevice {
+            return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell);
+        }
+        // A genuine script-file operand: the shell runs that file, not the pipe.
         return if force_stdin {
             PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell)
         } else {
@@ -8209,6 +8239,99 @@ fn pipeline_shell_input_mode(command: &str) -> PipelineShellInputMode {
     }
 
     PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell)
+}
+
+/// How a positional token of a shell consumer affects whether the shell reads
+/// its program from stdin / a process-substitution file. `shell_words` keeps
+/// redirection operators as plain tokens, so a redirect must not be mistaken
+/// for a script-file operand. See [`pipeline_shell_input_mode`] and
+/// [`process_substitution_file_input_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellPositional {
+    /// `<file` / `0<file` / `<>file`: stdin is reassigned. The bool is whether
+    /// the redirect is *bare* (its target is the following token).
+    StdinReassignRedirect { bare: bool },
+    /// `2>/dev/null`, `>log`, `2>&1`, `&>x`: a redirect with its target glued
+    /// to the operator; consume this one token.
+    OtherRedirectGlued,
+    /// `>`, `2>`, `<`, `>&`, `&>` with the target in the next token.
+    OtherRedirectBare,
+    /// `/dev/stdin`, `/dev/fd/0`, `/proc/self/fd/0`: names stdin as a file.
+    StdinDevice,
+    /// A genuine script-file operand: the shell runs that file.
+    ScriptFile,
+}
+
+impl ShellPositional {
+    /// For a redirect token, whether it is bare (`Some(true)` — its target is
+    /// the next token) or self-contained (`Some(false)`). `None` for
+    /// non-redirect positionals (`StdinDevice`, `ScriptFile`).
+    const fn redirect_is_bare(self) -> Option<bool> {
+        match self {
+            Self::StdinReassignRedirect { bare } => Some(bare),
+            Self::OtherRedirectBare => Some(true),
+            Self::OtherRedirectGlued => Some(false),
+            Self::StdinDevice | Self::ScriptFile => None,
+        }
+    }
+}
+
+fn classify_shell_positional(token: &str) -> ShellPositional {
+    if matches!(
+        token,
+        "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0" | "/proc/self/fd/00"
+    ) {
+        return ShellPositional::StdinDevice;
+    }
+    // Strip an optional leading file-descriptor number: `2>`, `0<`, `10>`.
+    let digits = token.bytes().take_while(u8::is_ascii_digit).count();
+    let fd = &token[..digits];
+    let rest = &token[digits..];
+    let bare = |op: &str| -> bool { rest == op };
+    let glued = |op: &str| -> bool { rest.len() > op.len() && rest.starts_with(op) };
+
+    // stdin reassignment: `<`, `<>`, `<&` on fd 0 (or an unspecified fd, which
+    // defaults to 0). A `2<…` reassigns fd 2, not stdin.
+    let targets_stdin = fd.is_empty() || fd == "0";
+    if targets_stdin && rest.starts_with('<') {
+        let is_bare = matches!(rest, "<" | "<>" | "<&");
+        return ShellPositional::StdinReassignRedirect { bare: is_bare };
+    }
+
+    // `&>` / `&>>` merge stdout+stderr; the leading `&` is not an fd.
+    if digits == 0 && token.starts_with("&>") {
+        return if token.len() > "&>".len() && token != "&>>" {
+            ShellPositional::OtherRedirectGlued
+        } else {
+            ShellPositional::OtherRedirectBare
+        };
+    }
+
+    // Non-stdin output/dup redirects: `>`, `>>`, `>|`, `>&`, `<&` (fd != 0),
+    // `<>` (fd != 0). Bare when nothing follows the operator, glued otherwise.
+    for op in [">>", ">|", ">&", "<&", "<>", ">", "<"] {
+        if bare(op) {
+            return ShellPositional::OtherRedirectBare;
+        }
+        if glued(op) {
+            return ShellPositional::OtherRedirectGlued;
+        }
+    }
+
+    ShellPositional::ScriptFile
+}
+
+/// Advance `index` past a redirect token classified as `class` (skipping its
+/// standalone target for a bare operator) and return the new index. Returns
+/// `None` when `class` is not a redirect.
+fn skip_redirect_token(class: ShellPositional, index: usize, arg_count: usize) -> Option<usize> {
+    class.redirect_is_bare().map(|is_bare| {
+        if is_bare && index + 1 < arg_count {
+            index + 2
+        } else {
+            index + 1
+        }
+    })
 }
 
 fn interpreter_pipeline_heredoc(
@@ -8637,6 +8760,17 @@ fn process_substitution_file_input_mode(command: &str, marker: &str) -> Pipeline
                 index += 1;
                 continue;
             }
+            // A redirect token is not the script operand: skip it (and a
+            // standalone target) so `bash 2>/dev/null <(…)` still finds the
+            // process-substitution marker rather than reading the redirect as
+            // a script file and wrongly concluding the shell runs nothing.
+            let class = classify_shell_positional(argument);
+            if argument != marker
+                && let Some(next) = skip_redirect_token(class, index, args.len())
+            {
+                index = next;
+                continue;
+            }
             return if argument == marker {
                 PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell)
             } else {
@@ -8680,6 +8814,13 @@ fn process_substitution_file_input_mode(command: &str, marker: &str) -> Pipeline
             }
             if argument.starts_with('-') {
                 index += 1;
+                continue;
+            }
+            let class = classify_shell_positional(argument);
+            if argument != marker
+                && let Some(next) = skip_redirect_token(class, index, args.len())
+            {
+                index = next;
                 continue;
             }
             return if argument == marker {
@@ -23875,6 +24016,75 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn classify_shell_positional_covers_redirects_and_stdin_devices() {
+        use ShellPositional::{
+            OtherRedirectBare, OtherRedirectGlued, ScriptFile, StdinDevice, StdinReassignRedirect,
+        };
+        let reassign_bare = StdinReassignRedirect { bare: true };
+        let reassign_glued = StdinReassignRedirect { bare: false };
+        for (tok, want) in [
+            ("/dev/stdin", StdinDevice),
+            ("/dev/fd/0", StdinDevice),
+            ("/proc/self/fd/0", StdinDevice),
+            ("script.sh", ScriptFile),
+            ("./run", ScriptFile),
+            ("2>/dev/null", OtherRedirectGlued),
+            (">log", OtherRedirectGlued),
+            (">>log", OtherRedirectGlued),
+            ("2>&1", OtherRedirectGlued),
+            (">&2", OtherRedirectGlued),
+            ("&>all", OtherRedirectGlued),
+            (">", OtherRedirectBare),
+            (">>", OtherRedirectBare),
+            ("2>", OtherRedirectBare),
+            (">&", OtherRedirectBare),
+            ("&>", OtherRedirectBare),
+            ("&>>", OtherRedirectBare),
+            ("<in", reassign_glued),
+            ("<", reassign_bare),
+            ("0<in", reassign_glued),
+            ("<>rw", reassign_glued),
+            ("<>", reassign_bare),
+            ("2<other", OtherRedirectGlued),
+        ] {
+            assert_eq!(classify_shell_positional(tok), want, "token {tok:?}");
+        }
+    }
+
+    #[test]
+    fn piped_shell_reads_stdin_through_output_redirects_and_stdin_devices() {
+        use std::mem::discriminant;
+        let reads = discriminant(&PipelineShellInputMode::ReadsStdin(
+            PipelineSourceKind::PosixShell,
+        ));
+        let unverified = discriminant(&PipelineShellInputMode::Unverified);
+        for cmd in [
+            "bash 2>/dev/null",
+            "bash > log",
+            "bash >log 2>&1",
+            "bash /dev/stdin",
+            "bash /dev/fd/0",
+            "sh 2>/dev/null",
+        ] {
+            assert_eq!(
+                discriminant(&pipeline_shell_input_mode(cmd)),
+                reads,
+                "{cmd} must read stdin"
+            );
+        }
+        // stdin reassignment cuts the pipe off -> fail closed, not allow.
+        assert_eq!(
+            discriminant(&pipeline_shell_input_mode("bash < script")),
+            unverified
+        );
+        // A genuine script-file operand runs the file, not the pipe.
+        assert_eq!(
+            discriminant(&pipeline_shell_input_mode("bash script.sh")),
+            discriminant(&PipelineShellInputMode::DoesNotReadStdin)
+        );
+    }
 
     fn default_config() -> Config {
         Config::default()
