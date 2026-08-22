@@ -2837,10 +2837,14 @@ fn evaluate_batch_line(
         };
     };
     // Batched envelopes (VS Code Agent Host `toolCalls`) carry additional
-    // shell commands that must each be evaluated independently; the first
-    // non-allow decision speaks for the whole line (issue #252).
+    // shell commands that must each be evaluated independently (issue #252).
+    // Every entry is resolved — evaluation AND policy mode — before one is
+    // chosen to speak for the line, by rank: deny > indeterminate > ask >
+    // warn > log > allow. Stopping at the first evaluator-level non-allow was
+    // a fail-open once `[policy]` could turn that entry into a warn/log
+    // `allow` (#330): the entries after it were never evaluated.
     let project_path = std::env::current_dir().ok();
-    let mut eval_result = None;
+    let mut decisive: Option<BatchEntryOutcome> = None;
     for (command, dialect) in
         std::iter::once((extracted_command.command, extracted_command.dialect))
             .chain(extracted_command.additional_commands)
@@ -2858,25 +2862,83 @@ fn evaluate_batch_line(
             None,                    // No deadline for batch mode
             dialect,
         );
-        let decisive = !matches!(result.decision, EvaluationDecision::Allow);
-        eval_result = Some((command, result));
-        if decisive {
+        let outcome = resolve_batch_entry(config, &command, result);
+        if decisive
+            .as_ref()
+            .is_none_or(|current| outcome.rank() > current.rank())
+        {
+            decisive = Some(outcome);
+        }
+        if decisive
+            .as_ref()
+            .is_some_and(|current| current.rank() == BatchEntryOutcome::MAX_RANK)
+        {
             break;
         }
     }
-    let (command, eval_result) = eval_result.expect("the primary command is always evaluated");
+    let decisive = decisive.expect("the primary command is always evaluated");
+    BatchHookOutput {
+        index: 0,
+        decision: decisive.decision,
+        mode: decisive.mode,
+        rule_id: decisive.rule_id,
+        pack_id: decisive.pack_id,
+        error: decisive.error,
+    }
+}
 
+/// One resolved entry of a `dcg hook` line: the evaluator's verdict with the
+/// active `[policy]` applied, plus the precedence used to pick the entry that
+/// speaks for a batched line.
+struct BatchEntryOutcome {
+    decision: &'static str,
+    mode: Option<&'static str>,
+    rule_id: Option<String>,
+    pack_id: Option<String>,
+    error: Option<String>,
+    rank: u8,
+}
+
+impl BatchEntryOutcome {
+    /// Rank of a hard deny — nothing outranks it, so scanning can stop.
+    const MAX_RANK: u8 = 5;
+
+    const fn rank(&self) -> u8 {
+        self.rank
+    }
+}
+
+/// Apply the active `[policy]` to one evaluated batch entry.
+///
+/// The evaluator reports the rule's default decision; the active `[policy]`
+/// (and confidence scoring) decide what that match means. Bare `dcg` and
+/// `dcg test` already resolve this; `dcg hook` skipped it and enforced `deny`
+/// for rules the user had downgraded to warn/log, disagreeing with `dcg test`
+/// on the same config (#330). Explicit `[overrides].block` and legacy
+/// fail-closed findings stay deny inside the resolver.
+fn resolve_batch_entry(
+    config: &Config,
+    command: &str,
+    eval_result: crate::evaluator::EvaluationResult,
+) -> BatchEntryOutcome {
     match eval_result.decision {
-        EvaluationDecision::Allow => BatchHookOutput {
-            index: 0,
+        EvaluationDecision::Allow => BatchEntryOutcome {
             decision: "allow",
             mode: None,
             rule_id: None,
             pack_id: None,
             error: None,
+            rank: 0,
+        },
+        EvaluationDecision::Indeterminate => BatchEntryOutcome {
+            decision: "indeterminate",
+            mode: None,
+            rule_id: None,
+            pack_id: None,
+            error: Some(INDETERMINATE_REASON.to_string()),
+            rank: 4,
         },
         EvaluationDecision::Deny => {
-            // Extract pattern info for matched rules
             let (rule_id, pack_id) =
                 eval_result
                     .pattern_info
@@ -2890,22 +2952,15 @@ fn evaluate_batch_line(
                         (rule_id, info.pack_id.clone())
                     });
 
-            // The evaluator reports the rule's default decision; the active
-            // `[policy]` (and confidence scoring) decide what that match
-            // means. Bare `dcg` and `dcg test` already resolve this; `dcg
-            // hook` skipped it and enforced `deny` for rules the user had
-            // downgraded to warn/log, disagreeing with `dcg test` on the same
-            // config (#330). Explicit `[overrides].block` and legacy
-            // fail-closed findings stay deny inside the resolver.
-            let mode = crate::evaluator::resolve_effective_mode(config, &command, &eval_result)
+            let mode = crate::evaluator::resolve_effective_mode(config, command, &eval_result)
                 .unwrap_or(DecisionMode::Deny);
-            let (decision, mode_label) = match mode {
-                DecisionMode::Deny => ("deny", "deny"),
+            let (decision, mode_label, rank) = match mode {
+                DecisionMode::Deny => ("deny", "deny", BatchEntryOutcome::MAX_RANK),
                 // No review channel on this protocol: block, like every
                 // non-review-capable hook and `dcg test`.
-                DecisionMode::Ask => ("deny", "ask"),
-                DecisionMode::Warn => ("allow", "warn"),
-                DecisionMode::Log => ("allow", "log"),
+                DecisionMode::Ask => ("deny", "ask", 3),
+                DecisionMode::Warn => ("allow", "warn", 2),
+                DecisionMode::Log => ("allow", "log", 1),
             };
             if mode == DecisionMode::Warn {
                 let reason = eval_result
@@ -2918,23 +2973,15 @@ fn evaluate_batch_line(
                 );
             }
 
-            BatchHookOutput {
-                index: 0,
+            BatchEntryOutcome {
                 decision,
                 mode: Some(mode_label),
                 rule_id,
                 pack_id,
                 error: None,
+                rank,
             }
         }
-        EvaluationDecision::Indeterminate => BatchHookOutput {
-            index: 0,
-            decision: "indeterminate",
-            mode: None,
-            rule_id: None,
-            pack_id: None,
-            error: Some(INDETERMINATE_REASON.to_string()),
-        },
     }
 }
 

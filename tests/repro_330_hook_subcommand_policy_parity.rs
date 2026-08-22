@@ -231,7 +231,7 @@ fn hook_subcommand_agrees_with_dcg_test_on_every_policy_surface() {
 
         // The exit-code contract follows the resolved decision: only a real
         // block (deny, or ask without a review channel) is non-zero.
-        let expected_exit = if case.hook_decision == "deny" { 1 } else { 0 };
+        let expected_exit = i32::from(case.hook_decision == "deny");
         assert_eq!(
             hook.exit_code,
             Some(expected_exit),
@@ -273,7 +273,7 @@ fn rule_override_does_not_relax_other_rules() {
     let lab = Lab::new("[policy.rules]\n\"core.git:branch-force-delete\" = \"warn\"\n");
 
     for command in [
-        "git stash drop",
+        "git push --force origin main",
         "git reset --hard HEAD~1",
         "rm -rf ./build",
     ] {
@@ -295,6 +295,30 @@ fn rule_override_does_not_relax_other_rules() {
 }
 
 #[test]
+fn severity_default_warn_is_reported_as_warn_in_both_entry_points() {
+    // `git stash drop` is a Medium-severity rule, which warns by default with
+    // NO policy configured at all. That is the rule's posture, not a
+    // relaxation; both entry points must say so identically.
+    let lab = Lab::new("");
+    let hook = lab.hook("git stash drop");
+    assert_eq!(hook.decision(), "allow", "{}", hook.json);
+    assert_eq!(hook.mode(), Some("warn"), "{}", hook.json);
+    assert_eq!(hook.rule_id(), Some("core.git:stash-drop"), "{}", hook.json);
+    assert_eq!(hook.exit_code, Some(0));
+    assert_eq!(
+        lab.test_result_line("git stash drop"),
+        "Result: WARN (policy allows)"
+    );
+
+    // …and an explicit per-rule `deny` promotes it in both.
+    let strict = Lab::new("[policy.rules]\n\"core.git:stash-drop\" = \"deny\"\n");
+    let hook = strict.hook("git stash drop");
+    assert_eq!(hook.decision(), "deny", "{}", hook.json);
+    assert_eq!(hook.mode(), Some("deny"), "{}", hook.json);
+    assert_eq!(strict.test_result_line("git stash drop"), "Result: BLOCKED");
+}
+
+#[test]
 fn broad_warn_policy_cannot_relax_critical_rules() {
     // `default_mode = "warn"` is constrained for critical-severity rules in
     // the shared resolver; `dcg hook` must inherit that guard, not bypass it.
@@ -309,12 +333,120 @@ fn broad_warn_policy_cannot_relax_critical_rules() {
 fn explicit_block_override_stays_deny_under_warn_policy() {
     // `[overrides].block` is an explicit user block; policy modes only apply
     // to pack rules. Parity with bare `dcg` / `dcg test`.
-    let lab =
-        Lab::new("[policy]\ndefault_mode = \"log\"\n[overrides]\nblock = ['^echo forbidden$']\n");
-    let hook = lab.hook("echo forbidden");
+    // `[overrides].block` entries are `{ pattern, reason }` tables — a bare
+    // string fails to parse, and an unparseable DCG_CONFIG falls back to
+    // defaults (with a stderr warning), which would make this test pass
+    // for the wrong reason.
+    let lab = Lab::new(
+        "[policy]\ndefault_mode = \"log\"\n[[overrides.block]]\npattern = '^git status --porcelain$'\nreason = \"planted\"\n",
+    );
+    let hook = lab.hook("git status --porcelain");
     assert_eq!(hook.decision(), "deny", "{}", hook.json);
     assert_eq!(hook.mode(), Some("deny"), "{}", hook.json);
-    assert_eq!(lab.test_result_line("echo forbidden"), "Result: BLOCKED");
+    assert_eq!(hook.exit_code, Some(1));
+    assert_eq!(
+        lab.test_result_line("git status --porcelain"),
+        "Result: BLOCKED"
+    );
+
+    // A block pattern on a command carrying no enabled-pack keyword is
+    // subject to the keyword quick-reject in the shared evaluator. Whatever
+    // that answer is, the two entry points must give the same one.
+    let keywordless =
+        Lab::new("[[overrides.block]]\npattern = '^echo forbidden$'\nreason = \"planted\"\n");
+    let hook = keywordless.hook("echo forbidden");
+    let test_line = keywordless.test_result_line("echo forbidden");
+    let expected = if test_line == "Result: BLOCKED" {
+        "deny"
+    } else {
+        "allow"
+    };
+    assert_eq!(
+        hook.decision(),
+        expected,
+        "dcg hook ({}) and dcg test ({test_line}) disagree on a keyword-less block override",
+        hook.json
+    );
+}
+
+/// Run `dcg hook` on a VS Code Agent Host `toolCalls[]` batch envelope.
+fn hook_batch_envelope(lab: &Lab, commands: &[&str]) -> HookResult {
+    let tool_calls: Vec<serde_json::Value> = commands
+        .iter()
+        .map(|command| {
+            serde_json::json!({
+                "name": "bash",
+                "args": serde_json::json!({ "command": command }).to_string(),
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "sessionId": "s",
+        "cwd": lab.dir.path(),
+        "toolCalls": tool_calls,
+    });
+    let mut child = lab
+        .command(&["hook"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn dcg hook");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{payload}").unwrap();
+    }
+    let output = child.wait_with_output().expect("wait dcg hook");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let line = stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_else(|| panic!("dcg hook produced no output line\nstderr:\n{stderr}"));
+    let json: serde_json::Value = serde_json::from_str(line)
+        .unwrap_or_else(|e| panic!("dcg hook output is not JSON ({e}): {line}"));
+    HookResult {
+        json,
+        stderr,
+        exit_code: output.status.code(),
+    }
+}
+
+#[test]
+fn batched_envelope_resolves_every_entry_before_a_warn_entry_can_speak() {
+    // Fail-open guard: under a warn policy the FIRST entry resolves to
+    // `allow` (warn). The batch used to stop at the first evaluator-level
+    // non-allow entry, so a destructive SECOND entry was never evaluated.
+    let lab = Lab::new(&format!("[policy.rules]\n\"{RULE}\" = \"warn\"\n"));
+    let hook = hook_batch_envelope(&lab, &[BRANCH_DELETE, "git reset --hard"]);
+    assert_eq!(hook.decision(), "deny", "{}", hook.json);
+    assert_eq!(hook.mode(), Some("deny"), "{}", hook.json);
+    assert_eq!(hook.rule_id(), Some("core.git:reset-hard"), "{}", hook.json);
+    assert_eq!(hook.exit_code, Some(1));
+    // The warn entry still announces itself.
+    assert!(
+        hook.stderr.contains("policy mode is warn"),
+        "{}",
+        hook.stderr
+    );
+
+    // Order-independent: deny first, warn second.
+    let hook = hook_batch_envelope(&lab, &["git reset --hard", BRANCH_DELETE]);
+    assert_eq!(hook.decision(), "deny", "{}", hook.json);
+    assert_eq!(hook.rule_id(), Some("core.git:reset-hard"), "{}", hook.json);
+
+    // All-warn batch: allow, reported as warn.
+    let hook = hook_batch_envelope(&lab, &[BRANCH_DELETE, "echo hi", BRANCH_DELETE]);
+    assert_eq!(hook.decision(), "allow", "{}", hook.json);
+    assert_eq!(hook.mode(), Some("warn"), "{}", hook.json);
+    assert_eq!(hook.exit_code, Some(0));
+
+    // Ask outranks warn but not deny, and still blocks on this protocol.
+    let ask_lab = Lab::new(&format!(
+        "[policy.rules]\n\"{RULE}\" = \"warn\"\n\"core.git:stash-drop\" = \"ask\"\n"
+    ));
+    let hook = hook_batch_envelope(&ask_lab, &[BRANCH_DELETE, "git stash drop"]);
+    assert_eq!(hook.decision(), "deny", "{}", hook.json);
+    assert_eq!(hook.mode(), Some("ask"), "{}", hook.json);
+    assert_eq!(hook.rule_id(), Some("core.git:stash-drop"), "{}", hook.json);
 }
 
 #[test]
