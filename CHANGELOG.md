@@ -11,6 +11,47 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.12.5](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.12.5) -- 2026-08-23 [Release]
+
+### Security
+
+- **Shell long options no longer hide a piped or process-substituted
+  payload.** A shell consumer carrying an unrecognized no-value long option
+  (`bash --norc`, `--posix`, `--login`, `--noprofile`, and `sh` equivalents)
+  was read as if the option were a script-file operand, so
+  `echo 'rm -rf ~' | bash --norc` and `bash --norc <(echo 'rm -rf ~')` were
+  **allowed**. The shell still reads its program from stdin / the substitution,
+  so the payload is now scanned. Value-taking (`--rcfile`, `--init-file`) and
+  terminal (`--`, `--help`, `--version`, `--command`) long options are
+  classified precisely.
+- **`--rcfile` / `--init-file` process substitutions are treated as executing
+  sinks.** An interactive shell sources its init file at startup, and that file
+  may be a process substitution: `bash --init-file <(…) -i` runs the
+  substitution's output (verified on macOS and Linux). The marker was swallowed
+  as an inert option value, allowing the payload; it is now evaluated as the
+  shell's source. `-o` / `-O` still consume their set-option/shopt name (which
+  bash rejects rather than executes).
+
+### Fixed
+
+- **Rebase-recovery no longer unlocks a `git` command against the wrong
+  repository.** The recovery-mode `cwd` resolver now fails closed when a `cd`
+  cannot reach the `git` segment through a subshell separator
+  (`cd repo & git restore`, `cd repo | git restore`), when git-repo-redirecting
+  environment assignments (`GIT_DIR=`, `GIT_WORK_TREE=`, …) re-point git, and
+  on `pushd -n` / bare `pushd`, which do not change the working directory the
+  way the walk assumed.
+- **Denials name the allow-once remedy.** The `permissionDecisionReason` now
+  states the scoped `dcg allow-once <code>` command for harnesses that surface
+  only the reason string, and the operator banner lists it above
+  `dcg allowlist add` (GH #332).
+
+### Added
+
+- **New `database.databricks` pack.** Guards destructive Databricks CLI
+  operations (executable-scoped), included in the `careful_company` preset
+  (GH #333).
+
 ## [v0.12.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.12.4) -- 2026-08-23 [Release]
 
 ### Security
