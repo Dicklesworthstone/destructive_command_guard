@@ -2373,21 +2373,31 @@ fn parse_rm_segment_with_option_scanning(
             continue;
         }
 
+        // Option tokens are always executed shell syntax (never data), so a
+        // quote embedded in the option cluster is concatenation the shell has
+        // already resolved: `rm -r'f' /`, `rm -'r'f /`, and `rm '-r'f /` all
+        // run `rm -rf /`. Collapse balanced quotes to read the true flags
+        // (bd-5xgt). Operands keep their own quote handling below, so a quoted
+        // data path is unaffected. An *unbalanced* quote is a shell syntax
+        // error that never runs rm, so it stays opaque and matches nothing.
+        let dequoted = dequote_rm_flag_token(text);
+        let flag_text = dequoted.as_ref();
+
         if !options_ended {
-            if text == "--" {
+            if flag_text == "--" {
                 options_ended = true;
                 flags.saw_terminator = true;
                 continue;
             }
 
-            if text.starts_with('-') && text != "-" {
+            if flag_text.starts_with('-') && flag_text != "-" {
                 let option_decision = if option_scanning
                     == RmOptionScanning::AppleStopAtFirstOperand
-                    && !apple_rm_option_token_is_valid(text)
+                    && !apple_rm_option_token_is_valid(flag_text)
                 {
                     RmOptionDecision::Invalid
                 } else {
-                    apply_rm_option(text, token.byte_range.clone(), &mut flags)
+                    apply_rm_option(flag_text, token.byte_range.clone(), &mut flags)
                 };
                 match option_decision {
                     RmOptionDecision::Continue => {}
@@ -2630,6 +2640,73 @@ fn apply_rm_long_option(
     }
 
     RmOptionDecision::Continue
+}
+
+/// Collapse balanced shell quotes and backslash escapes within an `rm` option
+/// token so the true flag letters are read (`-r'f'` -> `-rf`, `-r"f"` -> `-rf`,
+/// `'-r'f` -> `-rf`). Only applied to option-position tokens, which are always
+/// executed syntax rather than data.
+///
+/// Returns the token unchanged (borrowed) when it has no quotes/escapes, or
+/// when a quote is *unbalanced* — an unterminated quote is a shell syntax error
+/// that never runs `rm`, so it must stay opaque and match no flag rather than
+/// be silently "repaired" into a destructive one.
+fn dequote_rm_flag_token(token: &str) -> std::borrow::Cow<'_, str> {
+    if !token.bytes().any(|b| matches!(b, b'\'' | b'"' | b'\\')) {
+        return std::borrow::Cow::Borrowed(token);
+    }
+    let mut out = String::with_capacity(token.len());
+    let mut chars = token.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // Single quotes: everything until the next `'` is literal.
+            '\'' => {
+                let mut closed = false;
+                for inner in chars.by_ref() {
+                    if inner == '\'' {
+                        closed = true;
+                        break;
+                    }
+                    out.push(inner);
+                }
+                if !closed {
+                    return std::borrow::Cow::Borrowed(token);
+                }
+            }
+            // Double quotes: literal, except backslash escapes `"`, `\`, `$`,
+            // and backtick (POSIX double-quote semantics).
+            '"' => {
+                let mut closed = false;
+                while let Some(inner) = chars.next() {
+                    match inner {
+                        '"' => {
+                            closed = true;
+                            break;
+                        }
+                        '\\' => match chars.next() {
+                            Some(esc @ ('"' | '\\' | '$' | '`')) => out.push(esc),
+                            Some(other) => {
+                                out.push('\\');
+                                out.push(other);
+                            }
+                            None => return std::borrow::Cow::Borrowed(token),
+                        },
+                        other => out.push(other),
+                    }
+                }
+                if !closed {
+                    return std::borrow::Cow::Borrowed(token);
+                }
+            }
+            // A backslash outside quotes escapes the next character.
+            '\\' => match chars.next() {
+                Some(escaped) => out.push(escaped),
+                None => return std::borrow::Cow::Borrowed(token),
+            },
+            other => out.push(other),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 fn strip_outer_quotes(token: &str) -> (QuoteKind, &str) {
