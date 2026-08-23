@@ -1640,6 +1640,14 @@ fn format_explanation_block(explanation: &str) -> String {
 }
 
 /// Format the denial message for the JSON output (plain text).
+///
+/// When an allow-once code was minted for this denial, the message names the
+/// scoped `dcg allow-once <code>` remedy (GH#332): harnesses commonly surface
+/// only `permissionDecisionReason` to the model and drop the sibling JSON
+/// fields, so a code that appears only in `allowOnceCode`/`remediation` is
+/// emitted but never read. The wording keeps the human in the loop: the user
+/// approves the single command, which is strictly safer than the fallback of
+/// having them run the destructive command by hand.
 #[must_use]
 pub fn format_denial_message(
     command: &str,
@@ -1647,8 +1655,9 @@ pub fn format_denial_message(
     explanation: Option<&str>,
     pack: Option<&str>,
     pattern: Option<&str>,
+    allow_once_code: Option<&str>,
 ) -> String {
-    format_matched_message(
+    let mut message = format_matched_message(
         "BLOCKED by dcg",
         command,
         reason,
@@ -1656,7 +1665,15 @@ pub fn format_denial_message(
         pack,
         pattern,
         "If this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
-    )
+    );
+    if let Some(code) = allow_once_code {
+        use std::fmt::Write as _;
+        let _ = write!(
+            message,
+            "\n\nTo permit this single command once, the user can approve it with: dcg allow-once {code}"
+        );
+    }
+    message
 }
 
 /// Format a native-review request for a matched destructive command.
@@ -1805,6 +1822,12 @@ pub(crate) fn print_colorful_warning_to(
         WarningAudience::HumanOperator => {
             let _ = writeln!(writer, "{footer_style}Learn more:{reset}");
             let _ = writeln!(writer, "  $ {cyan}{explain_cmd}{reset}");
+
+            // Advertise the scoped single-command remedy ahead of the
+            // persistent allowlist widening (GH#332).
+            if let Some(code) = allow_once_code {
+                let _ = writeln!(writer, "  $ {cyan}dcg allow-once {code}{reset}");
+            }
 
             if let Some(ref rule) = rule_id {
                 let _ = writeln!(writer, "  $ {cyan}dcg allowlist add {rule} --user{reset}");
@@ -1993,7 +2016,23 @@ pub fn write_denial_to(
         warning_audience,
     );
 
-    let message = format_denial_message(command, reason, explanation, pack, pattern);
+    // GH#332: name the allow-once remedy in the reason text for protocols
+    // whose JSON already carries the code. Codex is excluded on purpose — its
+    // output deliberately strips all allow-once metadata (see the Codex arm
+    // below and `WarningAudience::CodexModel`), and the reason string must
+    // not reintroduce what the protocol's design withholds.
+    let reason_allow_once_code = match protocol {
+        HookProtocol::Codex => None,
+        _ => allow_once_code,
+    };
+    let message = format_denial_message(
+        command,
+        reason,
+        explanation,
+        pack,
+        pattern,
+        reason_allow_once_code,
+    );
     let rule_id = build_rule_id(pack, pattern);
     let remediation = allow_once.map(|info| {
         let explanation_text = format_explanation_text(explanation, rule_id.as_deref(), pack);
@@ -3598,12 +3637,56 @@ mod tests {
             Some("This is irreversible."),
             Some("core.git"),
             Some("reset-hard"),
+            None,
         );
 
         assert!(message.contains("Reason: destructive"));
         assert!(message.contains("Explanation: This is irreversible."));
         assert!(message.contains("Rule: core.git:reset-hard"));
         assert!(message.contains("Tip: dcg explain"));
+    }
+
+    /// GH#332: harnesses surface only `permissionDecisionReason` to the model,
+    /// so a minted allow-once code must be named in the reason text itself.
+    #[test]
+    fn test_format_denial_message_names_allow_once_code_when_minted() {
+        let message = format_denial_message(
+            "rm -rf /Users/example/project",
+            "destructive",
+            None,
+            Some("core.filesystem"),
+            Some("rm-rf"),
+            Some("137527"),
+        );
+
+        assert!(
+            message.contains("dcg allow-once 137527"),
+            "reason must name the scoped remedy: {message}"
+        );
+        // The scoped remedy stays human-in-the-loop.
+        assert!(
+            message.contains("the user can approve it"),
+            "allow-once line must keep the user in the loop: {message}"
+        );
+    }
+
+    /// GH#332 planted negative: with no code minted, the reason must not
+    /// dangle a nonexistent allow-once remedy.
+    #[test]
+    fn test_format_denial_message_omits_allow_once_when_absent() {
+        let message = format_denial_message(
+            "git reset --hard",
+            "destructive",
+            None,
+            Some("core.git"),
+            Some("reset-hard"),
+            None,
+        );
+
+        assert!(
+            !message.contains("allow-once"),
+            "no code minted, so no allow-once mention: {message}"
+        );
     }
 
     /// A hook decision is replayed in the agent transcript on every later
@@ -3620,6 +3703,7 @@ mod tests {
                 None,
                 Some("core.filesystem"),
                 Some("rm-rf"),
+                None,
             ),
             format_review_message(
                 command,

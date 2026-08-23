@@ -1,17 +1,17 @@
 {
   "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "BLOCKED by dcg\n\nTip: dcg explain \"git push --force origin main\"\n\nReason: Force push can destroy remote history. Use --force-with-lease if necessary.\n\nExplanation: git push --force overwrites remote history with your local history. This can permanently destroy commits that others have already pulled, causing data loss for your entire team. Collaborators may lose work, and recovering requires manual intervention from everyone affected.\n             \n             What can go wrong:\n             - Commits others pushed are deleted from remote\n             - Team members get diverged histories\n             - CI/CD pipelines may reference deleted commits\n             \n             Safer alternative:\n             - git push --force-with-lease: Only forces if remote matches your last fetch\n             \n             Check remote state first:\n               git fetch && git log origin/<branch>..HEAD\n\nRule: core.git:push-force-long\n\nIf this operation is truly needed, ask the user for explicit permission and have them run the command manually.\n\nTo permit this single command once, the user can approve it with: dcg allow-once <DYNAMIC>",
     "allowOnceCode": "<DYNAMIC>",
     "allowOnceFullHash": "<DYNAMIC>",
-    "hookEventName": "PreToolUse",
-    "packId": "core.git",
-    "permissionDecision": "deny",
-    "permissionDecisionReason": "BLOCKED by dcg\n\nTip: dcg explain \"git push --force origin main\"\n\nReason: Force push can destroy remote history. Use --force-with-lease if necessary.\n\nExplanation: git push --force overwrites remote history with your local history. This can permanently destroy commits that others have already pulled, causing data loss for your entire team. Collaborators may lose work, and recovering requires manual intervention from everyone affected.\n             \n             What can go wrong:\n             - Commits others pushed are deleted from remote\n             - Team members get diverged histories\n             - CI/CD pipelines may reference deleted commits\n             \n             Safer alternative:\n             - git push --force-with-lease: Only forces if remote matches your last fetch\n             \n             Check remote state first:\n               git fetch && git log origin/<branch>..HEAD\n\nRule: core.git:push-force-long\n\nIf this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
-    "remediation": {
-      "allowOnceCommand": "dcg allow-once <DYNAMIC>",
-      "explanation": "git push --force overwrites remote history with your local history. This can permanently destroy commits that others have already pulled, causing data loss for your entire team. Collaborators may lose work, and recovering requires manual intervention from everyone affected.\n\nWhat can go wrong:\n- Commits others pushed are deleted from remote\n- Team members get diverged histories\n- CI/CD pipelines may reference deleted commits\n\nSafer alternative:\n- git push --force-with-lease: Only forces if remote matches your last fetch\n\nCheck remote state first:\n  git fetch && git log origin/<branch>..HEAD",
-      "safeAlternative": "Consider using '--force-with-lease' for safer force pushing."
-    },
     "ruleId": "core.git:push-force-long",
-    "severity": "critical"
+    "packId": "core.git",
+    "severity": "critical",
+    "remediation": {
+      "safeAlternative": "Consider using '--force-with-lease' for safer force pushing.",
+      "explanation": "git push --force overwrites remote history with your local history. This can permanently destroy commits that others have already pulled, causing data loss for your entire team. Collaborators may lose work, and recovering requires manual intervention from everyone affected.\n\nWhat can go wrong:\n- Commits others pushed are deleted from remote\n- Team members get diverged histories\n- CI/CD pipelines may reference deleted commits\n\nSafer alternative:\n- git push --force-with-lease: Only forces if remote matches your last fetch\n\nCheck remote state first:\n  git fetch && git log origin/<branch>..HEAD",
+      "allowOnceCommand": "dcg allow-once <DYNAMIC>"
+    }
   }
 }

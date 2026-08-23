@@ -1,17 +1,17 @@
 {
   "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "BLOCKED by dcg\n\nTip: dcg explain \"rm -rf /\"\n\nReason: rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed. Ask the user to run it manually if truly needed.\n\nExplanation: Matched destructive pattern core.filesystem:rm-rf-root-home. No additional explanation is available yet. See pack documentation for details.\n\nRule: core.filesystem:rm-rf-root-home\n\nIf this operation is truly needed, ask the user for explicit permission and have them run the command manually.\n\nTo permit this single command once, the user can approve it with: dcg allow-once <DYNAMIC>",
     "allowOnceCode": "<DYNAMIC>",
     "allowOnceFullHash": "<DYNAMIC>",
-    "hookEventName": "PreToolUse",
-    "packId": "core.filesystem",
-    "permissionDecision": "deny",
-    "permissionDecisionReason": "BLOCKED by dcg\n\nTip: dcg explain \"rm -rf /\"\n\nReason: rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed. Ask the user to run it manually if truly needed.\n\nExplanation: Matched destructive pattern core.filesystem:rm-rf-root-home. No additional explanation is available yet. See pack documentation for details.\n\nRule: core.filesystem:rm-rf-root-home\n\nIf this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
-    "remediation": {
-      "allowOnceCommand": "dcg allow-once <DYNAMIC>",
-      "explanation": "Matched destructive pattern core.filesystem:rm-rf-root-home. No additional explanation is available yet. See pack documentation for details.",
-      "safeAlternative": "Verify the path carefully before running rm -rf manually."
-    },
     "ruleId": "core.filesystem:rm-rf-root-home",
-    "severity": "critical"
+    "packId": "core.filesystem",
+    "severity": "critical",
+    "remediation": {
+      "safeAlternative": "Verify the path carefully before running rm -rf manually.",
+      "explanation": "Matched destructive pattern core.filesystem:rm-rf-root-home. No additional explanation is available yet. See pack documentation for details.",
+      "allowOnceCommand": "dcg allow-once <DYNAMIC>"
+    }
   }
 }
