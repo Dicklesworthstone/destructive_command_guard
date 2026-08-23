@@ -1253,6 +1253,9 @@ const CAREFUL_COMPANY_PRESET_MEMBERS: &[&str] = &[
     "database.snowflake",
     "database.supabase",
     "database.bigquery",
+    // Databricks is the same class of data-platform control plane as
+    // Snowflake/BigQuery above; added deliberately with the pack (GH#333).
+    "database.databricks",
     // Object stores and remote copy.
     "storage.s3",
     "storage.gcs",
@@ -1291,7 +1294,7 @@ pub fn preset_members(id: &str) -> Option<&'static [&'static str]> {
 
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 99] = [
+static PACK_ENTRIES: [PackEntry; 100] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new(
         "core.filesystem",
@@ -1766,6 +1769,18 @@ static PACK_ENTRIES: [PackEntry; 99] = [
             "NOT MATCHED",
         ],
         database::bigquery::create_pack,
+    ),
+    PackEntry::new(
+        "database.databricks",
+        &[
+            "databricks",
+            "bundle destroy",
+            "permanent-delete",
+            "delete-scope",
+            "delete-secret",
+            "delete-acl",
+        ],
+        database::databricks::create_pack,
     ),
     PackEntry::new(
         "database.snowflake",
@@ -5644,7 +5659,7 @@ mod tests {
             // full, so no member can be dropped without this failing.
             assert_eq!(
                 CAREFUL_COMPANY_PRESET_MEMBERS.len(),
-                30,
+                31,
                 "preset membership changed size; update the docs and this count together"
             );
             for category in [
