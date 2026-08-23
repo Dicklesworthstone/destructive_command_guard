@@ -4057,6 +4057,43 @@ mod tests {
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
 
+    #[test]
+    fn dequote_rm_flag_token_collapses_balanced_quotes() {
+        // bd-5xgt: balanced quotes inside a flag are shell concatenation.
+        for (input, want) in [
+            ("-r'f'", "-rf"),
+            ("-'r'f", "-rf"),
+            ("-r\"f\"", "-rf"),
+            ("'-r'f", "-rf"),
+            ("'-rf'", "-rf"),
+            ("-rf''", "-rf"),
+            ("'-'r'f'", "-rf"),
+            ("-r\\f", "-rf"),
+            ("--recursive", "--recursive"),
+            ("-rf", "-rf"),
+        ] {
+            assert_eq!(
+                dequote_rm_flag_token(input).as_ref(),
+                want,
+                "input {input:?}"
+            );
+        }
+        // An unbalanced quote is a syntax error: leave it opaque so it matches
+        // no flag (never "repair" it into a destructive one).
+        for opaque in ["-r'f", "-r\"f", "-rf\\"] {
+            assert_eq!(
+                dequote_rm_flag_token(opaque).as_ref(),
+                opaque,
+                "unbalanced {opaque:?} must stay opaque"
+            );
+        }
+        // A token with no quotes is borrowed unchanged.
+        assert!(matches!(
+            dequote_rm_flag_token("-rf"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
     /// Issue #302: the canonical fork bomb and word-named variants are
     /// blocked; ordinary function definitions that merely pipe two different
     /// commands are not. Evaluator-level reachability is handled by
