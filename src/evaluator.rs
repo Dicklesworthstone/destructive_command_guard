@@ -9293,6 +9293,157 @@ fn strip_powershell_iex_command_parameter(arguments: &str) -> Result<&str, ()> {
         .unwrap_or_default())
 }
 
+/// Decoded argv (`Word` tokens) of the stage in `range`, taken from an
+/// already-computed token stream (avoids re-tokenizing per stage).
+fn dialect_stage_argv(
+    command: &str,
+    tokens: &crate::normalize::NormalizeTokens,
+    decoder: &mut crate::normalize::ShellTokenDecoder,
+    range: &std::ops::Range<usize>,
+) -> Vec<String> {
+    tokens
+        .iter()
+        .filter(|token| {
+            token.kind == crate::normalize::NormalizeTokenKind::Word
+                && token.byte_range.start >= range.start
+                && token.byte_range.end <= range.end
+        })
+        .filter_map(|token| {
+            token
+                .text(command)
+                .and_then(|raw| decoder.decode(raw, crate::normalize::ShellTokenRole::Syntax))
+                .map(std::borrow::Cow::into_owned)
+        })
+        .collect()
+}
+
+/// Split a stage's decoded argv into its non-redirect words and whether it
+/// carries a stdin (`<`) redirect. The cmd/PowerShell tokenizer keeps
+/// redirection operators as ordinary words, so `cmd < payload.bat` tokenizes as
+/// `[cmd, <, payload.bat]`; the redirect operator and its target must not be
+/// mistaken for the shell's own arguments.
+fn partition_stage_argv(argv: &[String]) -> (Vec<String>, bool) {
+    let mut clean = Vec::with_capacity(argv.len());
+    let mut has_stdin_redirect = false;
+    let mut index = 0usize;
+    while index < argv.len() {
+        let class = classify_shell_positional(&argv[index]);
+        if matches!(class, ShellPositional::StdinReassignRedirect { .. }) {
+            has_stdin_redirect = true;
+        }
+        if let Some(is_bare) = class.redirect_is_bare() {
+            index += usize::from(is_bare && index + 1 < argv.len()) + 1;
+            continue;
+        }
+        clean.push(argv[index].clone());
+        index += 1;
+    }
+    (clean, has_stdin_redirect)
+}
+
+/// If the argv of a consumer names a bare stdin-reading Windows shell
+/// (`cmd`, `powershell`, `pwsh` with no `/c`, `-Command`, `-File`, script, …),
+/// return the source kind it would execute its stdin as.
+fn dialect_stdin_reading_shell(argv: &[String]) -> Option<PipelineShellInputMode> {
+    let exe = cmd_executable_basename(argv.first()?);
+    let rest = &argv[1..];
+    match exe.as_str() {
+        "cmd" => Some(cmd_pipeline_input_mode(rest)),
+        "powershell" | "pwsh" => Some(powershell_pipeline_input_mode(rest)),
+        _ => None,
+    }
+}
+
+/// Executing-sink coverage for the cmd and PowerShell dialects that mirrors the
+/// POSIX `collect_posix_pipeline_executable_sinks`: a statically-known producer
+/// piped into a bare stdin-reading shell (`echo del /s /q C:\x | cmd`,
+/// `echo "Remove-Item …" | pwsh`) runs the piped bytes as commands. The POSIX
+/// collector never sees these because it parses bash; the consumer-mode helpers
+/// (`cmd_pipeline_input_mode` / `powershell_pipeline_input_mode`) exist but were
+/// only reached through the bash-parsed path (bd-1o5h). A `<`-redirected stdin
+/// into such a shell (`cmd < payload.bat`) reads an unverifiable file and fails
+/// closed. Non-shell consumers (`| findstr`, `| Where-Object`, `| Out-File`)
+/// produce no sink, so ordinary pipelines are untouched.
+fn collect_dialect_pipeline_stdin_sinks(
+    command: &str,
+    dialect: ShellDialect,
+    sinks: &mut Vec<ExecutableTextSink>,
+) {
+    if !matches!(dialect, ShellDialect::Cmd | ShellDialect::PowerShell) {
+        return;
+    }
+    let tokens = tokenize_for_shell_dialect(command, dialect);
+
+    // Split into command stages, tracking whether each stage was reached across
+    // a single `|` pipe (whose producer stdout feeds the stage's stdin).
+    let mut stages: Vec<(std::ops::Range<usize>, bool)> = Vec::new();
+    let mut stage_start = 0usize;
+    let mut preceded_by_pipe = false;
+    for token in &tokens {
+        if token.kind != crate::normalize::NormalizeTokenKind::Separator {
+            continue;
+        }
+        let sep = token.text(command).unwrap_or("").trim();
+        stages.push((stage_start..token.byte_range.start, preceded_by_pipe));
+        preceded_by_pipe = sep == "|";
+        stage_start = token.byte_range.end;
+    }
+    stages.push((stage_start..command.len(), preceded_by_pipe));
+
+    // Bound the work: a pathological command with thousands of `|` stages must
+    // not turn into a hot-path blowup. A stdin-reading shell hidden past this
+    // many stages is an obscure evasion the deadline would also catch.
+    const MAX_PIPELINE_STAGES: usize = 128;
+    let mut decoder = crate::normalize::ShellTokenDecoder::new(dialect);
+    for index in 0..stages.len().min(MAX_PIPELINE_STAGES) {
+        if sinks.len() >= MAX_EXECUTABLE_TEXT_SINKS {
+            sinks.push(ExecutableTextSink::Unverified {
+                rule: SINK_ANALYSIS_BOUNDS_RULE,
+                reason: "command contains too many executable text sinks for bounded analysis",
+            });
+            return;
+        }
+        let (range, from_pipe) = stages[index].clone();
+        let (argv, has_stdin_redirect) =
+            partition_stage_argv(&dialect_stage_argv(command, &tokens, &mut decoder, &range));
+        let Some(mode) = dialect_stdin_reading_shell(&argv) else {
+            continue;
+        };
+        // `cmd < payload.bat` / `pwsh < script.ps1`: a bare stdin-reading shell
+        // whose stdin is a redirected file reads its program from a file dcg
+        // cannot verify without a race — fail closed, like the POSIX
+        // file-source rule. This wins over the piped-producer branch.
+        if has_stdin_redirect && matches!(mode, PipelineShellInputMode::ReadsStdin(_)) {
+            sinks.push(ExecutableTextSink::Unverified {
+                rule: PIPELINE_FILE_SOURCE_RULE,
+                reason: "a stdin-reading shell reads its program from a redirected file dcg cannot verify without a race",
+            });
+            continue;
+        }
+        if !from_pipe {
+            continue;
+        }
+        match mode {
+            PipelineShellInputMode::ReadsStdin(kind) => {
+                let producer = command
+                    .get(stages[index - 1].0.clone())
+                    .map(str::trim)
+                    .unwrap_or_default();
+                push_executable_input_source(static_producer_source(producer), kind, sinks);
+            }
+            PipelineShellInputMode::Unverified => {
+                sinks.push(ExecutableTextSink::Unverified {
+                    rule: PIPELINE_CONSUMER_RULE,
+                    reason: "a piped shell consumer's options cannot be statically verified",
+                });
+            }
+            PipelineShellInputMode::FixedTemplate(_)
+            | PipelineShellInputMode::NotShell
+            | PipelineShellInputMode::DoesNotReadStdin => {}
+        }
+    }
+}
+
 fn collect_powershell_iex_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
     let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
     for (token_index, command_token) in tokens.iter().enumerate() {
@@ -10785,6 +10936,13 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
     if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown) {
         collect_powershell_iex_sinks(command, &mut sinks);
         collect_powershell_scriptblock_sinks(command, &mut sinks);
+    }
+    // Native cmd/PowerShell pipeline stdin-consumer coverage (bd-1o5h): a
+    // statically-known producer piped into a bare stdin-reading `cmd`/`pwsh`
+    // runs the piped bytes as commands. Only meaningful on the Windows
+    // dialects; the POSIX/Unknown pipe path is the bash-AST collector above.
+    if matches!(dialect, ShellDialect::Cmd | ShellDialect::PowerShell) {
+        collect_dialect_pipeline_stdin_sinks(command, dialect, &mut sinks);
     }
     sinks
 }

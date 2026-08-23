@@ -11,6 +11,28 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+### Security
+
+- **Bare `cmd`/`pwsh` reading piped or redirected stdin as commands is now
+  guarded on the cmd/PowerShell dialects (bd-1o5h).** A shell consuming piped
+  source runs its program from stdin, but the executing-sink pipeline analysis
+  was bash-AST/POSIX-only, so `echo del /s /q C:\x | cmd`, `echo "Remove-Item …"
+  | pwsh`, `type payload.txt | cmd`, and the `cmd < payload.bat` /
+  `pwsh < script.ps1` redirect forms ran the payload unguarded — while
+  `cmd /c "…"`, `powershell -`, and the whole POSIX `| bash` side already
+  denied. A native cmd/PowerShell pipeline collector now reuses the existing
+  `cmd_pipeline_input_mode` / `powershell_pipeline_input_mode` consumer helpers:
+  a statically-known producer piped into a bare stdin-reading shell is
+  evaluated as that shell's source, and a `<`-redirected file into such a shell
+  fails closed. Only a bare stdin-reading shell consumer triggers a sink, so
+  ordinary pipelines (`| findstr`, `| Where-Object`, `| Out-File`, `| clip`,
+  `cmd /c …`, `pwsh -File …`) are untouched. Found in the v0.12.2 adversarial
+  sweep; regression suite `tests/repro_1o5h_cmd_pwsh_stdin_consumer.rs`.
+
+---
+
 ## [v0.12.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.12.2) -- 2026-08-22 [Release]
 
 ### Security
