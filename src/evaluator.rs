@@ -8201,6 +8201,19 @@ fn pipeline_shell_input_mode(command: &str) -> PipelineShellInputMode {
             index += 1;
             continue;
         }
+        // An unrecognized long option (`--norc`, `--posix`, `--login`,
+        // `--noprofile`, …). The value-taking and terminal long options
+        // (`--`, `--help`, `--version`, `--command`, `--init-file`,
+        // `--rcfile`) are all handled above; anything else prefixed with `--`
+        // takes no value and does not change the program source, so the shell
+        // still reads its script from stdin. Skipping it — rather than letting
+        // it fall through to `classify_shell_positional` as a "script file",
+        // which would ALLOW `echo '<destructive>' | bash --norc` — keeps the
+        // piped payload scanned.
+        if argument.starts_with("--") {
+            index += 1;
+            continue;
+        }
         // A positional token. `shell_words` keeps redirection operators as plain
         // tokens (it does not model the shell's redirect grammar), so before
         // concluding "this is a script file, the shell does not read stdin"
@@ -8757,6 +8770,14 @@ fn process_substitution_file_input_mode(command: &str, marker: &str) -> Pipeline
                         PipelineShellInputMode::DoesNotReadStdin
                     };
                 }
+                index += 1;
+                continue;
+            }
+            // An unrecognized no-value long option (`--norc`, `--posix`, …)
+            // does not change the program source, so the shell still runs the
+            // process-substitution file. Skip it — rather than treating it as a
+            // script file — so `bash --norc <(…)` still reaches the marker.
+            if argument.starts_with("--") && argument != marker {
                 index += 1;
                 continue;
             }

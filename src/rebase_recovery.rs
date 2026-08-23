@@ -195,12 +195,33 @@ fn resolve_recovery_cwd_with_home(
         return None;
     }
 
+    // A background `&` or a pipe `|` runs the segment on one side in a
+    // subshell, so a `cd` there never reaches the shell that runs the guarded
+    // git command. The segment walk below assumes every separator preserves
+    // the working directory (true for `&&`, `||`, `;`, newline), so fail
+    // closed when a subshell separator is present rather than resolve to a
+    // directory the git call does not actually run in.
+    if command_has_subshell_separator(command) {
+        return None;
+    }
+
     // Classify every top-level segment once. An unparseable segment or one
     // whose executable is only known at run time (`$DO_CD repo`) could be a
     // directory change dcg cannot see, so resolution fails closed on it.
     let mut leading: Vec<Option<(String, Vec<ShellWord>)>> = Vec::with_capacity(segments.len());
     for &(start, end) in &segments {
         let words = shell_words(&command[start..end])?;
+        // `GIT_DIR=…` / `GIT_WORK_TREE=…` re-point git at another repository
+        // exactly like the `--git-dir` / `--work-tree` options do (which the
+        // matched-segment walk fails closed on). A leading assignment is
+        // otherwise skipped as inert, so catch these here on any segment.
+        if words
+            .iter()
+            .take_while(|word| is_assignment_word(&word.text))
+            .any(|word| is_git_repo_redirecting_assignment(&word.text))
+        {
+            return None;
+        }
         match leading_word(&words) {
             Leading::Dynamic => return None,
             Leading::Empty => leading.push(None),
@@ -267,7 +288,7 @@ fn resolve_recovery_cwd_with_home(
         };
         match name.as_str() {
             "cd" | "pushd" if matched_index.is_some_and(|matched| index < matched) => {
-                let target = directory_change_target(rest, home)?;
+                let target = directory_change_target(name, rest, home)?;
                 cwd = join_directory(&cwd, &target);
                 changed = true;
             }
@@ -322,6 +343,75 @@ fn resolve_recovery_cwd_with_home(
     // A target that does not exist has nothing to recover; canonicalizing
     // also collapses `..` segments the way the shell's `cd -P` would.
     fs::canonicalize(&cwd).ok().filter(|path| path.is_dir())
+}
+
+/// Whether `command` contains an unquoted subshell-creating separator: a
+/// background `&` or a pipe `|`/`|&`. `&&`, `||`, `;`, newline, and the `&` of
+/// a redirection (`2>&1`, `<&0`, `&>file`) preserve the shell's working
+/// directory and are not flagged.
+fn command_has_subshell_separator(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'\\' && !in_single {
+            i += 2;
+            continue;
+        }
+        match byte {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'|' if !in_single && !in_double => {
+                // `||` preserves cwd; a lone `|` (or `|&`) is a pipe.
+                if bytes.get(i + 1) == Some(&b'|') {
+                    i += 2;
+                    continue;
+                }
+                return true;
+            }
+            b'&' if !in_single && !in_double => {
+                // `&&` preserves cwd; `&>` is a redirection; a `&` right after
+                // a redirect byte is a file-descriptor duplication (`2>&1`,
+                // `<&0`). Anything else is backgrounding.
+                if bytes.get(i + 1) == Some(&b'&') {
+                    i += 2;
+                    continue;
+                }
+                let next_is_redirect = bytes.get(i + 1) == Some(&b'>');
+                let prev_is_redirect = i
+                    .checked_sub(1)
+                    .is_some_and(|p| matches!(bytes[p], b'>' | b'<'));
+                if next_is_redirect || prev_is_redirect {
+                    i += 1;
+                    continue;
+                }
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether a leading `NAME=value` word re-points git at another repository or
+/// worktree. These are the environment equivalents of `--git-dir` /
+/// `--work-tree` and must fail closed exactly like those options do.
+fn is_git_repo_redirecting_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    matches!(
+        name,
+        "GIT_DIR"
+            | "GIT_WORK_TREE"
+            | "GIT_COMMON_DIR"
+            | "GIT_OBJECT_DIRECTORY"
+            | "GIT_NAMESPACE"
+            | "GIT_INDEX_FILE"
+    )
 }
 
 /// Whether a `git` global option changes which repository or worktree the
@@ -500,7 +590,16 @@ fn is_assignment_word(word: &str) -> bool {
 /// The literal target of a `cd` / `pushd` argument list, or `None` when it
 /// depends on run-time state (`cd -`, expansions, `~user`, missing `HOME`,
 /// two operands — bash's `cd old new` substitution form).
-fn directory_change_target(args: &[ShellWord], home: Option<&Path>) -> Option<PathBuf> {
+///
+/// `pushd` differs from `cd` in two ways that must fail closed: `pushd -n
+/// <dir>` pushes onto the directory stack *without* changing directory, and a
+/// bare `pushd` swaps the top two stack entries (it does not go `HOME`).
+fn directory_change_target(
+    command_name: &str,
+    args: &[ShellWord],
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let is_pushd = command_name == "pushd";
     let mut operands: Vec<&ShellWord> = Vec::new();
     let mut options_done = false;
     for word in args {
@@ -510,12 +609,19 @@ fn directory_change_target(args: &[ShellWord], home: Option<&Path>) -> Option<Pa
         }
         // Options (`-P`, `-L`, `-e`, pushd's `-n`); a lone `-` is an operand.
         if !options_done && word.text.len() > 1 && word.text.starts_with('-') {
+            // `pushd -n` pushes without changing directory — unmodelled.
+            if is_pushd && !word.dynamic && word.text == "-n" {
+                return None;
+            }
             continue;
         }
         operands.push(word);
     }
 
     match operands.as_slice() {
+        // Bare `cd` goes HOME; bare `pushd` swaps the stack (no attributable
+        // move).
+        [] if is_pushd => None,
         [] => home.map(Path::to_path_buf),
         [operand] => {
             if operand.dynamic || operand.text == "-" || operand.text.is_empty() {
