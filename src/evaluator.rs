@@ -8743,10 +8743,41 @@ fn process_substitution_file_input_mode(command: &str, marker: &str) -> Pipeline
                     PipelineShellInputMode::DoesNotReadStdin
                 };
             }
-            if matches!(
-                argument.as_str(),
-                "-o" | "+o" | "-O" | "+O" | "--init-file" | "--rcfile"
-            ) {
+            // `--init-file <file>` / `--rcfile <file>`: an *interactive* shell
+            // sources this file at startup (`bash --init-file <(…) -i` runs the
+            // producer's output — verified on macOS and Linux). When that file
+            // is the process substitution, the marker is an executing sink, not
+            // an inert option value: evaluate the producer as the shell's source
+            // instead of swallowing it (which returned DoesNotReadStdin -> ALLOW,
+            // the same class as `bash <(…)`). Both token orders are covered
+            // because the check does not depend on where `-i` sits.
+            if matches!(argument.as_str(), "--init-file" | "--rcfile") {
+                let Some(value) = args.get(index + 1) else {
+                    return PipelineShellInputMode::Unverified;
+                };
+                if value == marker {
+                    return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell);
+                }
+                index += 2;
+                continue;
+            }
+            // `--init-file=<marker>` / `--rcfile=<marker>` (glued form): same
+            // executing sink through the inline spelling.
+            if let Some(value) = argument
+                .strip_prefix("--init-file=")
+                .or_else(|| argument.strip_prefix("--rcfile="))
+            {
+                if value == marker {
+                    return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell);
+                }
+                index += 1;
+                continue;
+            }
+            // `-o`/`+o`/`-O`/`+O` take a set-option / shopt *name*. A process
+            // substitution there is not a filename bash executes — bash rejects
+            // it as an invalid option name and runs nothing — so consuming the
+            // value (marker included) and continuing is correct.
+            if matches!(argument.as_str(), "-o" | "+o" | "-O" | "+O") {
                 if args.get(index + 1).is_none() {
                     return PipelineShellInputMode::Unverified;
                 }

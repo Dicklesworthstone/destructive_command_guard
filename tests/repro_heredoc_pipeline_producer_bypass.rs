@@ -217,6 +217,37 @@ fn process_substitution_into_a_shell_is_not_defeated_by_a_redirect() {
 }
 
 #[test]
+fn an_rcfile_process_substitution_into_an_interactive_shell_is_evaluated() {
+    // Sibling of the long-option fix, found by adversarially sweeping it: an
+    // *interactive* shell sources its `--rcfile`/`--init-file` at startup, and
+    // that file may be a process substitution — `bash --init-file <(…) -i` runs
+    // the producer's output (verified on macOS and Linux). The value-taking
+    // option must not swallow the marker as an inert option argument and
+    // conclude the shell runs nothing (which ALLOWED the payload); the producer
+    // is the shell's source. Both token orders and the glued `=` spelling.
+    let lab = Lab::new("rcfile");
+    for command in [
+        "bash --init-file <(echo 'rm -rf ./src') -i",
+        "bash --rcfile <(echo 'git reset --hard') -i",
+        "bash -i --rcfile <(printf 'rm -rf ./src')",
+        "bash --init-file=<(echo 'rm -rf ./src') -i",
+        "bash --rcfile=<(echo 'git reset --hard') -i",
+    ] {
+        let (stdout, stderr) = lab.hook(command);
+        assert!(
+            stdout.contains("deny"),
+            "expected DENY for:\n{command}\n--- stdout:\n{stdout}\n--- stderr:\n{stderr}"
+        );
+    }
+    // Controls: a real-file rcfile value (not the marker) leaves the marker as
+    // the benign script the shell runs, and `-o`/`-O` take a shopt *name* bash
+    // rejects rather than executes — both stay allowed.
+    lab.assert_allowed("bash --rcfile init.sh <(echo 'echo hi')");
+    lab.assert_allowed("bash --init-file cfg.sh <(echo 'echo done')");
+    lab.assert_allowed("bash -o errexit <(echo 'echo ok')");
+}
+
+#[test]
 fn legit_pipelines_whose_consumer_runs_a_script_file_stay_allowed() {
     // False-positive guard for the redirect/stdin-device classifier: a shell
     // consumer with a real script-file operand runs that file, not the pipe.
