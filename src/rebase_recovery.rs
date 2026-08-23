@@ -1264,6 +1264,69 @@ mod tests {
     }
 
     #[test]
+    fn recovery_cwd_fails_closed_on_subshell_separators() {
+        // A background `&` or a pipe `|` runs the `cd` side in a subshell, so
+        // it never reaches the shell that runs the guarded git command. These
+        // must not resolve to the `cd` target (which would open recovery
+        // against a repo the git call does not run in).
+        let tree = Tree::new("subshell");
+        for command in [
+            "cd repo & git restore -- f",
+            "cd repo | git restore -- f",
+            "cd repo |& git restore -- f",
+            "true | cd repo && git restore -- f",
+            "git restore -- f | tee log",
+        ] {
+            assert_eq!(resolve(&tree, &tree.root, command), None, "{command}");
+        }
+        // `&&`, `||`, `;`, and the `&` of a redirection stay resolvable.
+        assert_eq!(
+            resolve(&tree, &tree.root, "cd repo 2>&1 && git restore -- f"),
+            Some(tree.path("repo"))
+        );
+    }
+
+    #[test]
+    fn recovery_cwd_fails_closed_on_git_repo_env_assignments() {
+        // GIT_DIR / GIT_WORK_TREE re-point git at another repository exactly
+        // like --git-dir / --work-tree, so they must fail closed.
+        let tree = Tree::new("git-env");
+        for command in [
+            "GIT_DIR=/other/.git git restore -- f",
+            "GIT_WORK_TREE=/other git restore -- f",
+            "GIT_DIR=/other/.git GIT_WORK_TREE=/other git restore -- f",
+            "cd repo && GIT_DIR=/other/.git git restore -- f",
+            "git restore -- f && GIT_DIR=/other/.git git restore -- g",
+        ] {
+            assert_eq!(resolve(&tree, &tree.root, command), None, "{command}");
+        }
+        // An ordinary env assignment (not repo-redirecting) still resolves.
+        assert_eq!(
+            resolve(&tree, &tree.root, "GIT_TRACE=1 cd repo && git restore -- f"),
+            Some(tree.path("repo"))
+        );
+    }
+
+    #[test]
+    fn recovery_cwd_fails_closed_on_pushd_without_a_directory_change() {
+        // `pushd -n <dir>` pushes without changing directory; a bare `pushd`
+        // swaps the stack. Neither is an attributable cwd move.
+        let tree = Tree::new("pushd");
+        for command in [
+            "pushd -n repo && git restore -- f",
+            "pushd && git restore -- f",
+            "pushd -n -- repo && git restore -- f",
+        ] {
+            assert_eq!(resolve(&tree, &tree.root, command), None, "{command}");
+        }
+        // A plain `pushd <dir>` is a real move and still resolves.
+        assert_eq!(
+            resolve(&tree, &tree.root, "pushd repo && git restore -- f"),
+            Some(tree.path("repo"))
+        );
+    }
+
+    #[test]
     fn recovery_cwd_fails_closed_on_unknowable_targets() {
         let tree = Tree::new("dynamic");
         for command in [
