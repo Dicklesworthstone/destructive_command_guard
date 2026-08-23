@@ -154,6 +154,33 @@ fn heredoc_piped_into_a_shell_is_evaluated_as_that_shells_source() {
 }
 
 #[test]
+fn an_unrecognized_shell_long_option_does_not_hide_the_piped_payload() {
+    // A no-value long option (`--norc`, `--posix`, `--login`, `--noprofile`)
+    // does not change the program source: the shell still runs its script from
+    // stdin. It must not be read as a script-file operand (which would ALLOW
+    // the payload). Found in the session's fresh-eyes review.
+    let lab = Lab::new("longopt");
+    for command in [
+        "echo 'rm -rf ~' | bash --norc",
+        "echo 'rm -rf ~' | bash --posix",
+        "echo 'git reset --hard' | bash --login",
+        "echo 'rm -rf ~' | sh --noprofile",
+        "bash --norc <(echo 'rm -rf ~')",
+        "bash --posix <(echo 'git reset --hard')",
+    ] {
+        let (stdout, stderr) = lab.hook(command);
+        assert!(
+            stdout.contains("deny"),
+            "expected DENY for:\n{command}\n--- stdout:\n{stdout}\n--- stderr:\n{stderr}"
+        );
+    }
+    // A benign payload through a long-option shell stays allowed, and a `-c`
+    // long form still means the shell does not read stdin.
+    lab.assert_allowed("echo hi | bash --norc");
+    lab.assert_allowed("cat data | bash --rcfile x -c 'echo ok'");
+}
+
+#[test]
 fn a_redirect_stealing_stdout_from_the_producer_is_genuinely_safe() {
     // `cat <<EOF >log … EOF | bash` sends the heredoc body to `log`, so the
     // pipe delivers nothing to bash. This is a true allow, not a miss — the

@@ -1279,9 +1279,29 @@ mod tests {
         ] {
             assert_eq!(resolve(&tree, &tree.root, command), None, "{command}");
         }
-        // `&&`, `||`, `;`, and the `&` of a redirection stay resolvable.
+        // `&&`, `||`, `;`, and the `&` of a redirection are NOT subshell
+        // separators, so the detector leaves them resolvable.
+        for ok in [
+            "cd repo && git restore -- f",
+            "cd repo || exit; git restore -- f",
+            "git restore -- f 2>&1",
+            "git restore -- f >out 2>&1",
+            "git restore -- f <&0",
+        ] {
+            assert!(
+                !command_has_subshell_separator(ok),
+                "must not be flagged as a subshell separator: {ok}"
+            );
+        }
+        for flagged in ["a | b", "a |& b", "a & b", "cd x & git y"] {
+            assert!(
+                command_has_subshell_separator(flagged),
+                "must be flagged: {flagged}"
+            );
+        }
+        // `&&` isolated (not a lone `&`) plus a redirect `&` resolves normally.
         assert_eq!(
-            resolve(&tree, &tree.root, "cd repo 2>&1 && git restore -- f"),
+            resolve(&tree, &tree.root, "cd repo && git restore -- f 2>&1"),
             Some(tree.path("repo"))
         );
     }
