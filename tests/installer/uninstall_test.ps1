@@ -378,6 +378,66 @@ try {
     Set-Item -LiteralPath 'Function:\Write-Warn' -Value $savedWriteWarn
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h17 -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+Write-Host "Test 18: Oh My Pi suppresses only exact stale profile-derived agent dirs"
+$h18 = New-Tmp
+$env:PI_CONFIG_DIR = '.custom-omp'
+$configRoot18 = Join-Path $h18 '.custom-omp'
+$defaultAgent18 = Join-Path $configRoot18 'agent'
+$derivedAgent18 = Join-Path (Join-Path (Join-Path $configRoot18 'profiles') 'work') 'agent'
+$env:PI_PROFILE = 'work'
+foreach ($defaultSelector in @('', 'default')) {
+    $env:OMP_PROFILE = $defaultSelector
+    $env:PI_CODING_AGENT_DIR = $derivedAgent18
+    $resolved = Get-OmpAgentDir -HomeDir $h18
+    Check ([string]::Equals($resolved, $defaultAgent18, [System.StringComparison]::Ordinal)) "OMP: '$defaultSelector' suppresses exact stale derivation"
+}
+
+$separator18 = [System.IO.Path]::DirectorySeparatorChar
+$nearMatches18 = @(
+    (Join-Path (Join-Path (Join-Path $configRoot18 'profiles') 'work') 'agent-sibling'),
+    (Join-Path (Join-Path (Join-Path $configRoot18 'profiles') 'Work') 'agent'),
+    ($configRoot18 + $separator18 + 'profiles' + $separator18 + '.' + $separator18 + 'work' + $separator18 + 'agent'),
+    ($configRoot18 + $separator18 + 'profiles' + $separator18 + $separator18 + 'work' + $separator18 + 'agent'),
+    ($derivedAgent18 + $separator18)
+)
+foreach ($nearMatch in $nearMatches18) {
+    $env:OMP_PROFILE = 'default'
+    $env:PI_PROFILE = 'work'
+    $env:PI_CODING_AGENT_DIR = $nearMatch
+    $resolved = Get-OmpAgentDir -HomeDir $h18
+    Check ([string]::Equals($resolved, $nearMatch, [System.StringComparison]::Ordinal)) "OMP: near-match override remains custom: $nearMatch"
+}
+
+$env:OMP_PROFILE = 'default'
+$env:PI_PROFILE = 'Upper'
+$upperAgent18 = Join-Path (Join-Path (Join-Path $configRoot18 'profiles') 'Upper') 'agent'
+$env:PI_CODING_AGENT_DIR = $upperAgent18
+$resolved = Get-OmpAgentDir -HomeDir $h18
+Check ([string]::Equals($resolved, $upperAgent18, [System.StringComparison]::Ordinal)) "OMP: invalid losing profile supplies no stale provenance"
+
+Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Env:PI_PROFILE' -ErrorAction SilentlyContinue
+$env:PI_CODING_AGENT_DIR = $derivedAgent18
+$resolved = Get-OmpAgentDir -HomeDir $h18
+Check ([string]::Equals($resolved, $derivedAgent18, [System.StringComparison]::Ordinal)) "OMP: profile-shaped override without provenance survives"
+
+$env:OMP_PROFILE = 'invalid/profile'
+$env:PI_PROFILE = 'work'
+$env:PI_CODING_AGENT_DIR = $derivedAgent18
+$resolved = Get-OmpAgentDir -HomeDir $h18
+Check ([string]::Equals($resolved, $derivedAgent18, [System.StringComparison]::Ordinal)) "OMP: invalid active selector is not treated as default provenance"
+
+$env:OMP_PROFILE = 'work'
+$env:PI_PROFILE = 'other'
+$env:PI_CODING_AGENT_DIR = (Join-Path $h18 'ignored-custom-agent')
+$resolved = Get-OmpAgentDir -HomeDir $h18
+Check ([string]::Equals($resolved, $derivedAgent18, [System.StringComparison]::Ordinal)) "OMP: named active profile ignores the override"
+
+$env:OMP_PROFILE = ''
+Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Env:PI_PROFILE' -ErrorAction SilentlyContinue
+Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Env:PI_CODING_AGENT_DIR' -ErrorAction SilentlyContinue
+$resolved = Get-OmpAgentDir -HomeDir $h18
+Check ([string]::Equals($resolved, $defaultAgent18, [System.StringComparison]::Ordinal)) "OMP: empty override resolves to default agent dir"
 } finally {
     foreach ($name in $ompSelectorNames) {
         if ($null -eq $savedOmpSelectors[$name]) {

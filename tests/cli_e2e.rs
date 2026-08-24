@@ -1993,7 +1993,11 @@ mod config_tests {
         // default sentinels.
         for (label, omp_profile) in [("empty", ""), ("default", "default")] {
             let home = temp.path().join(format!("stale-{label}-home"));
-            let derived_agent = home.join(config_name).join("profiles/work/agent");
+            let derived_agent = home
+                .join(config_name)
+                .join("profiles")
+                .join("work")
+                .join("agent");
             let output = run_install(&home, omp_profile, "work", &derived_agent);
             assert!(
                 output.status.success(),
@@ -2028,7 +2032,9 @@ mod config_tests {
         let sibling_home = temp.path().join("sibling-home");
         let sibling_agent = sibling_home
             .join(config_name)
-            .join("profiles/work/agent-sibling");
+            .join("profiles")
+            .join("work")
+            .join("agent-sibling");
         let sibling = run_install(&sibling_home, "default", "work", &sibling_agent);
         assert!(
             sibling.status.success(),
@@ -2043,7 +2049,9 @@ mod config_tests {
         let invalid_home = temp.path().join("invalid-loser-home");
         let invalid_profile_agent = invalid_home
             .join(config_name)
-            .join("profiles/Upper/agent");
+            .join("profiles")
+            .join("Upper")
+            .join("agent");
         let invalid_loser = run_install(&invalid_home, "", "Upper", &invalid_profile_agent);
         assert!(
             invalid_loser.status.success(),

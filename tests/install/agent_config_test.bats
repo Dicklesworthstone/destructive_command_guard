@@ -3952,9 +3952,23 @@ MOCKEOF
     [ "$status" -eq 0 ]
     [ "$output" = "$derived_agent" ]
 
+    export OMP_PROFILE="invalid/profile"
+    export PI_PROFILE="work"
+    export PI_CODING_AGENT_DIR="$derived_agent"
+    run resolve_omp_agent_dir
+    [ "$status" -eq 0 ]
+    [ "$output" = "$derived_agent" ]
+
     export OMP_PROFILE="work"
     export PI_PROFILE="other"
     export PI_CODING_AGENT_DIR="$TEST_TMPDIR/ignored-custom-agent"
+    run resolve_omp_agent_dir
+    [ "$status" -eq 0 ]
+    [ "$output" = "$derived_agent" ]
+
+    unset OMP_PROFILE
+    export PI_PROFILE="work"
+    export PI_CODING_AGENT_DIR="$TEST_TMPDIR/ignored-legacy-custom-agent"
     run resolve_omp_agent_dir
     [ "$status" -eq 0 ]
     [ "$output" = "$derived_agent" ]

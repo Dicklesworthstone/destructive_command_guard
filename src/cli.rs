@@ -19711,10 +19711,7 @@ console.log(JSON.stringify({
     fn omp_default_agent_dir_suppresses_only_profile_derived_overrides() {
         let config_root = std::path::Path::new("/test-home/.custom-omp");
         let default_agent = config_root.join("agent");
-        let derived_work_agent = config_root
-            .join("profiles")
-            .join("work")
-            .join("agent");
+        let derived_work_agent = config_root.join("profiles").join("work").join("agent");
         let custom_agent = std::path::Path::new("/srv/omp-agent");
 
         assert_eq!(
@@ -19727,11 +19724,7 @@ console.log(JSON.stringify({
             "an exact lower-profile derivation is stale in default mode"
         );
         assert_eq!(
-            omp_default_agent_dir_from(
-                config_root,
-                Some(derived_work_agent.as_os_str()),
-                None
-            ),
+            omp_default_agent_dir_from(config_root, Some(derived_work_agent.as_os_str()), None),
             derived_work_agent,
             "the same path without validated profile provenance is a custom override"
         );
@@ -19746,10 +19739,7 @@ console.log(JSON.stringify({
                 .join("profiles")
                 .join("work")
                 .join("agent-sibling"),
-            config_root
-                .join("profiles")
-                .join("work2")
-                .join("agent"),
+            config_root.join("profiles").join("work2").join("agent"),
             config_root
                 .join("profiles")
                 .join("work")
@@ -19760,16 +19750,10 @@ console.log(JSON.stringify({
                 .join(".")
                 .join("work")
                 .join("agent"),
-            config_root
-                .join("profiles")
-                .join("Work")
-                .join("agent"),
+            config_root.join("profiles").join("Work").join("agent"),
         ] {
-            let resolved = omp_default_agent_dir_from(
-                config_root,
-                Some(near_match.as_os_str()),
-                Some("work"),
-            );
+            let resolved =
+                omp_default_agent_dir_from(config_root, Some(near_match.as_os_str()), Some("work"));
             assert_eq!(
                 resolved.as_os_str(),
                 near_match.as_os_str(),
@@ -19777,10 +19761,7 @@ console.log(JSON.stringify({
             );
         }
 
-        let mut repeated_separator = config_root
-            .join("profiles")
-            .join("work")
-            .into_os_string();
+        let mut repeated_separator = config_root.join("profiles").join("work").into_os_string();
         repeated_separator.push(std::path::MAIN_SEPARATOR_STR);
         repeated_separator.push(std::path::MAIN_SEPARATOR_STR);
         repeated_separator.push("agent");
