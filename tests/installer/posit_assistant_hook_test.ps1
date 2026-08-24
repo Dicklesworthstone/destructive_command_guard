@@ -55,9 +55,15 @@ foreach ($name in $ompSelectorNames) {
 }
 
 try {
-    . (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
+    $unclearedOmpSelectors = @($ompSelectorNames | Where-Object {
+        Test-Path -LiteralPath "Env:$_"
+    })
+    if ($unclearedOmpSelectors.Count -ne 0) {
+        throw "OMP test selector fence failed: $($unclearedOmpSelectors -join ', ')"
+    }
+    Check $true "OMP path/profile selectors are scrubbed before loading installer functions"
 
-    Check (@($ompSelectorNames | Where-Object { Test-Path -LiteralPath "Env:$_" }).Count -eq 0) "OMP path/profile selectors are scrubbed from the test process"
+    . (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
 
 # --- Test 1: create + idempotent + no BOM + wire shape ---
 Write-Host "Test 1: create / idempotent / no-BOM / wire shape"

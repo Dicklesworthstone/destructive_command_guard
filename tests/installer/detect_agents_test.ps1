@@ -34,12 +34,15 @@ foreach ($name in $ompSelectorNames) {
     [Environment]::SetEnvironmentVariable($name, $null, 'Process')
 }
 try {
-    . (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
-
     $unclearedOmpSelectors = @($ompSelectorNames | Where-Object {
         Test-Path -LiteralPath "Env:$_"
     })
-    Check ($unclearedOmpSelectors.Count -eq 0) "OMP path/profile selectors are scrubbed from the test process"
+    if ($unclearedOmpSelectors.Count -ne 0) {
+        throw "OMP test selector fence failed: $($unclearedOmpSelectors -join ', ')"
+    }
+    Check $true "OMP path/profile selectors are scrubbed before loading installer functions"
+
+    . (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
 
     $env:PATH = ''                 # no CLI probing leaks
     $env:GROK_SESSION_ID = $null

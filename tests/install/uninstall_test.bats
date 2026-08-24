@@ -57,6 +57,7 @@ teardown() {
         PI_CONFIG_DIR=ambient-config \
         PI_CODING_AGENT_DIR="$outside_agent" \
         DCG_TEST_HELPER="$PROJECT_ROOT/tests/install/test_helper.bash" \
+        DCG_OUTSIDE_AGENT="$outside_agent" \
         DCG_OUTSIDE_PROJECT="$outside_project" \
         DCG_AGENT_EXTENSION="$agent_extension" \
         DCG_AGENT_SNAPSHOT="$agent_snapshot" \
@@ -87,6 +88,14 @@ teardown() {
             unconfigure_omp
             cmp -s "$DCG_AGENT_SNAPSHOT" "$DCG_AGENT_EXTENSION"
             cmp -s "$DCG_PROJECT_SNAPSHOT" "$DCG_PROJECT_EXTENSION"
+
+            teardown_isolated_home
+            trap - EXIT
+            [ "$PWD" = "$DCG_OUTSIDE_PROJECT" ]
+            [ "$OMP_PROFILE" = ambient-profile ]
+            [ "$PI_PROFILE" = ambient-legacy-profile ]
+            [ "$PI_CONFIG_DIR" = ambient-config ]
+            [ "$PI_CODING_AGENT_DIR" = "$DCG_OUTSIDE_AGENT" ]
         '
 
     [ "$status" -eq 0 ]
