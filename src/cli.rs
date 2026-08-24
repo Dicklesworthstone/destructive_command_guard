@@ -18875,8 +18875,19 @@ if ($errors.Count -ne 0) {
       typeof stdoutText === "string" ? stdoutText : "",
     );"#
         ));
+        assert_eq!(
+            source.matches("classifyDcgChild(").count(),
+            2,
+            "the generated module must contain only the pure classifier and its stdout-fed call"
+        );
+        let classifier = &source[source
+            .find("export function classifyDcgChild(")
+            .expect("classifier declaration")
+            ..source
+                .find("function childOutcomeFromExitCode(")
+                .expect("classifier boundary")];
         assert!(
-            !source.contains("classifyDcgChild(childOutcomeFromExitCode(exitCode), stderrText"),
+            !classifier.contains("stderr"),
             "stderr JSON is diagnostic text, never a decision input"
         );
         assert!(source.contains(
