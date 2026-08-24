@@ -11,6 +11,75 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.13.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.0) -- 2026-08-24 [Release]
+
+Minor bump: this release adds first-class support for a new agent host (Oh My Pi)
+across detection, install, uninstall and doctor, and closes a config-override
+bypass that could allow an unexamined command.
+
+### Security
+
+- **An `[overrides] allow` entry no longer speaks for the rest of a compound
+  command.** Allow patterns are substring-matched, and the allow check runs
+  *before* pack evaluation, so a single entry matching one segment returned
+  `allowed` for text that was never examined — an entry naming a scratch path
+  also allowed whatever followed the `&&`. A safe segment silencing a
+  destructive one is the same bypass class `split_command_segments` already
+  closes for pack patterns, so allow overrides now clear each segment on its
+  own terms: a single-segment command keeps the previous whole-string
+  semantics, and a compound command is allowed only when every segment is
+  itself allowed. Anything uncovered falls through to normal evaluation.
+  Command substitutions are segments too, so a safe outer command cannot
+  carry a destructive inner one past the check.
+
+  As a side effect, anchored entries now compose across a chain for the first
+  time: `^a$` and `^b$` previously allowed neither half of `a && b`, because
+  neither matched the whole string. ([#340])
+
+### Added
+
+- **First-class Oh My Pi (`omp`) agent support** in detection, CLI, and
+  `dcg doctor`, with easy-mode installers and uninstallers taught about it and
+  a symmetric uninstall path. The generated OMP extension bridge carries schema
+  validation and health checks, monotonic child-transition handling, refined
+  timeout and process-signal handling, and dynamic shell-dialect selection for
+  eligible local PTYs. Agent coverage in the installer was expanded alongside
+  it. ([#335])
+
+### Fixed
+
+- **`dcg doctor` no longer undercounts enabled packs.** It counted the raw
+  enabled-pack set, which carries the bare `core` category marker, while
+  `dcg packs --enabled` lists the two registry leaves that marker expands into
+  (`core.filesystem`, `core.git`). The two numbers disagreed by exactly one in
+  every configuration. Doctor now counts registry leaf packs, so both agree.
+  No protection was missing; only the reported count was wrong. ([#335])
+- **A block message no longer grows with the command it is reporting on.** The
+  message becomes the hook's `permissionDecisionReason`, which lands in an
+  agent's context and is replayed on every later turn, and it embedded the
+  command verbatim: a 10 KB heredoc write produced a ~10.8 KB reason and a
+  50 KB one produced ~50.8 KB, while the stderr box stayed a constant ~2 KB.
+  The echoed command is now capped and the reason reports how many bytes were
+  elided, which is the useful signal. Ordinary commands are untouched and stay
+  copy-pasteable. ([#339])
+- **OMP hardening:** invalid profile environments are rejected, commands are
+  evaluated in the effective cwd, agent policy is applied in robot mode, the
+  installer conflict summary is preserved, project extensions are anchored to
+  cwd, and `PI_CONFIG_DIR` is honored when detecting OMP. PowerShell installer
+  and uninstaller handle Windows OMP config paths correctly.
+- **Install path:** the OpenCode plugin and OMP extension are written
+  atomically, a non-UTF-8 `dcg` path is refused rather than embedded in
+  generated JavaScript, and the native-integration install flags are mutually
+  exclusive.
+- **E2E harness:** the matrix no longer swallows failures inside `&&` / `||`
+  chains.
+
+[#335]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/335
+[#339]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/339
+[#340]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/340
+
+---
+
 ## [v0.12.5](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.12.5) -- 2026-08-23 [Release]
 
 ### Security
