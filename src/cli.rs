@@ -12502,6 +12502,11 @@ type DcgChildOutcome = "spawn-throw" | "exit-0" | "exit-1" | "exit-2" | "exit-ot
 type DcgParsedVerdict = "empty" | "malformed" | "allow" | "deny" | "ask" | "indeterminate" | "unknown";
 type DcgBridgeAction = "allow" | "block" | "infrastructure";
 type DcgParsedOutput = {{ verdict: DcgParsedVerdict; reason?: string; ruleId?: string }};
+type OmpBashToolInput = {{ command?: unknown; cwd?: unknown; async?: unknown; pty?: unknown }};
+type OmpToolCallClassification =
+  | {{ kind: "other-tool" }}
+  | {{ kind: "invalid-bash" }}
+  | {{ kind: "bash"; input: OmpBashToolInput; command: string }};
 
 const BLOCKING_DECISIONS: ReadonlySet<DcgParsedVerdict> = new Set<DcgParsedVerdict>(["deny", "ask", "indeterminate"]);
 // Bun exposes no stdout when spawn itself throws. That runtime catch remains a
@@ -12514,6 +12519,21 @@ const DCG_CHILD_TRANSITIONS: Record<DcgChildOutcome, Record<DcgParsedVerdict, Dc
   "exit-2": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
   "exit-other": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
 }};
+
+// OMP's agent loop schema-validates built-in bash arguments before emitting
+// tool_call, but direct/non-loop wrapper dispatch is also public. Preserve the
+// exact tool-name boundary and fail closed only when an identifiable bash call
+// violates the required object-with-string-command shape.
+export function classifyOmpToolCall(event: unknown): OmpToolCallClassification {{
+  if (typeof event !== "object" || event === null || Array.isArray(event)) return {{ kind: "other-tool" }};
+  const record = event as Record<string, unknown>;
+  if (record.toolName !== "bash") return {{ kind: "other-tool" }};
+  const input = record.input;
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return {{ kind: "invalid-bash" }};
+  const toolInput = input as OmpBashToolInput;
+  if (typeof toolInput.command !== "string") return {{ kind: "invalid-bash" }};
+  return {{ kind: "bash", input: toolInput, command: toolInput.command }};
+}}
 
 function parseDcgOutput(stdoutText: string): DcgParsedOutput {{
   const text = stdoutText.trim();
@@ -12562,10 +12582,19 @@ function childOutcomeFromExitCode(exitCode: unknown): DcgChildOutcome {{
 
 export default function dcgGuard(pi: ExtensionAPI): void {{
   pi.on("tool_call", async (event, ctx) => {{
-    if (event.toolName !== "bash") return;
-    const toolInput = event.input as {{ command?: unknown; cwd?: unknown; async?: unknown; pty?: unknown }} | undefined;
-    const command = toolInput?.command;
-    if (typeof command !== "string" || !command) return;
+    const toolCall = classifyOmpToolCall(event);
+    if (toolCall.kind === "other-tool") return;
+    if (toolCall.kind === "invalid-bash") {{
+      return {{
+        block: true,
+        reason: "[dcg] OMP guard received malformed bash input (expected an object with a string command)",
+      }};
+    }}
+    const {{ input: toolInput, command }} = toolCall;
+    // OMP's schema permits the empty string and its BashTool treats it as a
+    // no-op. Preserve that exact case; every non-empty string, including
+    // whitespace, still crosses the dcg decision boundary.
+    if (command.length === 0) return;
 
     // Match OMP's BashTool filesystem-cwd derivation. Structured cwd wins;
     // when it is absent OMP extracts only its conservative
@@ -18809,6 +18838,62 @@ if ($errors.Count -ne 0) {
         let parsed: String = serde_json::from_str(literal).expect("valid JSON string literal");
         assert_eq!(std::path::Path::new(&parsed), executable);
         assert_ne!(parsed, "dcg", "never a bare PATH lookup");
+    }
+
+    /// OMP's ordinary agent-loop path validates BashToolInput before emitting
+    /// `tool_call`, but the extension wrapper also supports direct/non-loop
+    /// dispatch. Keep the generated boundary total over adversarial runtime
+    /// shapes: ignore other tools, block an identifiable malformed bash call,
+    /// preserve OMP's valid empty-string no-op, and evaluate every non-empty
+    /// string (including whitespace) without trimming it into an exemption.
+    #[test]
+    fn omp_extension_source_structurally_classifies_tool_calls() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        assert!(source.contains("type OmpToolCallClassification ="));
+        assert!(source.contains(
+            "export function classifyOmpToolCall(event: unknown): OmpToolCallClassification"
+        ));
+        assert!(source.contains(
+            r#"if (typeof event !== "object" || event === null || Array.isArray(event)) return { kind: "other-tool" };"#
+        ));
+        assert!(
+            source.contains(r#"if (record.toolName !== "bash") return { kind: "other-tool" };"#)
+        );
+        assert!(source.contains(
+            r#"if (typeof input !== "object" || input === null || Array.isArray(input)) return { kind: "invalid-bash" };"#
+        ));
+        assert!(source.contains(
+            r#"if (typeof toolInput.command !== "string") return { kind: "invalid-bash" };"#
+        ));
+        assert!(
+            source.contains(
+                r#"return { kind: "bash", input: toolInput, command: toolInput.command };"#
+            )
+        );
+        assert!(source.contains("const toolCall = classifyOmpToolCall(event);"));
+        assert!(source.contains("if (toolCall.kind === \"other-tool\") return;"));
+        assert!(source.contains("if (toolCall.kind === \"invalid-bash\") {"));
+        assert!(source.contains("const { input: toolInput, command } = toolCall;"));
+        assert!(source.contains("if (command.length === 0) return;"));
+        assert!(
+            !source.contains("command.trim()"),
+            "whitespace is a non-empty OMP command and must still reach dcg"
+        );
+        assert!(
+            !source.contains("typeof command !== \"string\" || !command"),
+            "malformed bash input must block instead of sharing the empty-command no-op"
+        );
+
+        let classify = source
+            .find("const toolCall = classifyOmpToolCall(event);")
+            .expect("structural classification call");
+        let spawn = source.find("const proc = Bun.spawn").expect("dcg spawn");
+        assert!(
+            classify < spawn,
+            "the structural boundary must classify the event before dcg is spawned"
+        );
     }
 
     /// A machine-readable safety verdict must be monotone across the child
