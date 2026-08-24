@@ -438,6 +438,88 @@ reason = "robot profile regression fixture"
     assert_eq!(json["agent"]["detected"], "codex-cli");
 }
 
+/// The process cwd is the authority used by dcg's project-config discovery.
+/// This models the generated bridge spawning dcg in a bash call's effective
+/// cwd rather than in OMP's ambient process directory.
+#[cfg(unix)]
+#[test]
+fn test_omp_robot_boundary_uses_execution_cwd_project_policy() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let xdg = temp.path().join("xdg");
+    let scratch = temp.path().join("tmp");
+    let session_cwd = temp.path().join("session-project");
+    let tool_cwd = temp.path().join("tool-project");
+    for directory in [&home, &xdg, &scratch, &session_cwd, &tool_cwd] {
+        std::fs::create_dir_all(directory).expect("hermetic OMP boundary directory");
+    }
+    std::fs::create_dir_all(tool_cwd.join(".git")).expect("tool project marker");
+    std::fs::write(
+        tool_cwd.join(".dcg.toml"),
+        "[packs]\nenabled = [\"containers.docker\"]\n",
+    )
+    .expect("tool-cwd project policy");
+
+    let run = |cwd: &std::path::Path| {
+        let mut child = Command::new(dcg_binary())
+            .args([
+                "--robot",
+                "test",
+                "--stdin",
+                "--agent",
+                "omp",
+                "--dialect",
+                "posix",
+            ])
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("TMPDIR", &scratch)
+            .env("TEMP", &scratch)
+            .env("TMP", &scratch)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn OMP robot cwd boundary");
+        child
+            .stdin
+            .take()
+            .expect("OMP robot stdin")
+            .write_all(b"docker system prune")
+            .expect("write OMP command");
+        child
+            .wait_with_output()
+            .expect("collect OMP cwd boundary output")
+    };
+
+    let session = run(&session_cwd);
+    assert_eq!(
+        session.status.code(),
+        Some(0),
+        "session policy deliberately leaves Docker disabled: {}",
+        String::from_utf8_lossy(&session.stderr)
+    );
+    let session_json: serde_json::Value =
+        serde_json::from_slice(&session.stdout).expect("session-cwd robot JSON");
+    assert_eq!(session_json["decision"], "allow");
+
+    let tool = run(&tool_cwd);
+    assert_eq!(
+        tool.status.code(),
+        Some(1),
+        "tool-cwd project policy must block Docker: {}",
+        String::from_utf8_lossy(&tool.stderr)
+    );
+    let tool_json: serde_json::Value =
+        serde_json::from_slice(&tool.stdout).expect("tool-cwd robot JSON");
+    assert_eq!(tool_json["decision"], "deny");
+    assert_eq!(tool_json["pack_id"], "containers.docker");
+}
+
 // =============================================================================
 // Exit Code Tests
 // =============================================================================

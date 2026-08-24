@@ -12446,15 +12446,40 @@ fn build_omp_extension_source(executable: &std::path::Path) -> std::io::Result<S
 // Routes every Oh My Pi bash tool call through dcg (Destructive Command Guard)
 // before execution. Docs: https://github.com/Dicklesworthstone/destructive_command_guard
 import type {{ ExtensionAPI }} from "@oh-my-pi/pi-coding-agent";
+import {{ resolveToCwd }} from "@oh-my-pi/pi-coding-agent/tools/path-utils";
+import {{ extractLeadingCdTarget }} from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 
 const DCG_BIN = {path_literal};
 const BLOCKING_DECISIONS = new Set(["deny", "ask", "indeterminate"]);
 
 export default function dcgGuard(pi: ExtensionAPI): void {{
-  pi.on("tool_call", async (event) => {{
+  pi.on("tool_call", async (event, ctx) => {{
     if (event.toolName !== "bash") return;
-    const command = (event.input as {{ command?: unknown }} | undefined)?.command;
+    const toolInput = event.input as {{ command?: unknown; cwd?: unknown }} | undefined;
+    const command = toolInput?.command;
     if (typeof command !== "string" || !command) return;
+
+    // Match OMP's BashTool filesystem-cwd derivation. Structured cwd wins;
+    // when it is absent OMP extracts only its conservative
+    // `cd <path> && ...` prefix. Reusing OMP's exported helpers keeps tilde,
+    // absolute, relative, Windows-drive-alias, and bare-root semantics
+    // synchronized upstream.
+    // An internal protocol URL is expanded only later by BashTool, with state
+    // this callback does not expose. resolveToCwd rejects it here, and the
+    // catch fails closed rather than evaluating under an unrelated policy.
+    let commandCwd: string;
+    try {{
+      const structuredCwd = typeof toolInput?.cwd === "string" && toolInput.cwd
+        ? toolInput.cwd
+        : undefined;
+      const requestedCwd = structuredCwd || extractLeadingCdTarget(command)?.path;
+      commandCwd = requestedCwd ? resolveToCwd(requestedCwd, ctx.cwd) : ctx.cwd;
+    }} catch (err) {{
+      return {{
+        block: true,
+        reason: `[dcg] OMP guard could not resolve the bash working directory safely: ${{err}}`,
+      }};
+    }}
 
     let stdoutText;
     let stderrText;
@@ -12464,6 +12489,7 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
         process.env.DCG_BIN || DCG_BIN,
         "--robot", "test", "--stdin", "--agent", "omp", "--dialect", "posix",
       ], {{
+        cwd: commandCwd,
         stdin: new TextEncoder().encode(command),
         stdout: "pipe",
         stderr: "pipe",
@@ -18600,6 +18626,38 @@ if ($errors.Count -ne 0) {
         assert!(source.contains("\"deny\", \"ask\", \"indeterminate\""));
         assert!(source.contains("return { block: true, reason:"));
         assert!(source.contains("exitCode !== 1"));
+        assert!(
+            source.contains(
+                "import { resolveToCwd } from \"@oh-my-pi/pi-coding-agent/tools/path-utils\";"
+            ),
+            "the bridge must use OMP's own cwd resolver so tilde, absolute, relative, and workspace-root aliases match bash execution"
+        );
+        assert!(
+            source.contains(
+                "import { extractLeadingCdTarget } from \"@oh-my-pi/pi-coding-agent/tools/shell-tokenize\";"
+            ),
+            "OMP also derives cwd from a leading cd prefix when the structured cwd is absent"
+        );
+        assert!(
+            source.contains("pi.on(\"tool_call\", async (event, ctx) =>"),
+            "the callback context carries OMP's session cwd"
+        );
+        assert!(
+            source.contains(
+                "const requestedCwd = structuredCwd || extractLeadingCdTarget(command)?.path;"
+            ),
+            "the structured cwd must win, with OMP's exact leading-cd derivation as fallback"
+        );
+        assert!(
+            source.contains(
+                "commandCwd = requestedCwd ? resolveToCwd(requestedCwd, ctx.cwd) : ctx.cwd;"
+            ),
+            "each effective bash cwd must be resolved against the callback's session cwd"
+        );
+        assert!(
+            source.contains("cwd: commandCwd,"),
+            "dcg must run in the same effective cwd as the guarded bash call"
+        );
 
         let line = source
             .lines()
