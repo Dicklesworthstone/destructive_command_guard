@@ -1146,21 +1146,75 @@ unconfigure_opencode() {
     return 0
 }
 
+# Mirror Node's POSIX `path.join(HOME, PI_CONFIG_DIR || ".omp")` lexically.
+# Backslashes are ordinary POSIX filename bytes; only `/` separates components.
+resolve_omp_uninstall_config_root() {
+    local config_name="${PI_CONFIG_DIR:-.omp}"
+    local remaining="$HOME/$config_name"
+    local absolute=0
+    local segment
+    local component
+    local result=""
+    local count
+    local last
+    local -a components=()
+
+    case "$remaining" in
+        /*) absolute=1 ;;
+    esac
+
+    while [ -n "$remaining" ]; do
+        case "$remaining" in
+            */*)
+                segment="${remaining%%/*}"
+                remaining="${remaining#*/}"
+                ;;
+            *)
+                segment="$remaining"
+                remaining=""
+                ;;
+        esac
+        case "$segment" in
+            "" | .) ;;
+            ..)
+                count=${#components[@]}
+                if [ "$count" -gt 0 ]; then
+                    last=$((count - 1))
+                    if [ "${components[$last]}" != ".." ]; then
+                        unset "components[$last]"
+                    elif [ "$absolute" -eq 0 ]; then
+                        components[${#components[@]}]=".."
+                    fi
+                elif [ "$absolute" -eq 0 ]; then
+                    components[0]=".."
+                fi
+                ;;
+            *) components[${#components[@]}]="$segment" ;;
+        esac
+    done
+
+    [ "$absolute" -eq 1 ] && result="/"
+    for component in ${components[@]+"${components[@]}"}; do
+        if [ "$result" = "/" ]; then
+            result="/$component"
+        elif [ -z "$result" ]; then
+            result="$component"
+        else
+            result="$result/$component"
+        fi
+    done
+    [ -n "$result" ] || result="."
+    printf '%s\n' "$result"
+}
+
 unconfigure_omp() {
     # Oh My Pi extension: remove only marker-owned files. Cover the active
     # profile, every named profile under the default/current config roots, the
     # legacy agent-dir override, and the current working directory's project
     # install. OMP's native extension discovery is cwd-only; it does not walk
     # to a Git ancestor.
-    local config_name="${PI_CONFIG_DIR:-.omp}"
-    while true; do
-        case "$config_name" in
-            /*) config_name="${config_name#/}" ;;
-            \\*) config_name="${config_name#\\}" ;;
-            *) break ;;
-        esac
-    done
-    local config_root="$HOME/$config_name"
+    local config_root
+    config_root=$(resolve_omp_uninstall_config_root)
     local agent_dir="$config_root/agent"
     local profile=""
     if [ "${OMP_PROFILE+x}" = "x" ]; then

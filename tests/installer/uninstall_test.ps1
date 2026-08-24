@@ -346,6 +346,55 @@ try {
     $env:PI_CONFIG_DIR = $savedPiConfigDir
 }
 
+Write-Host "Test 16a: Oh My Pi config root follows native Node path-join classes"
+$savedPiConfigDir = $env:PI_CONFIG_DIR
+try {
+    $nativeWindows = [System.IO.Path]::DirectorySeparatorChar -eq '\'
+    $oracleHome = if ($nativeWindows) { 'C:\Users\u' } else { '/home/u' }
+    $cases = if ($nativeWindows) {
+        @(
+            [pscustomobject]@{ Name = '.omp'; Agent = 'C:\Users\u\.omp\agent' },
+            [pscustomobject]@{ Name = 'default'; Agent = 'C:\Users\u\default\agent' },
+            [pscustomobject]@{ Name = '\.omp'; Agent = 'C:\Users\u\.omp\agent' },
+            [pscustomobject]@{ Name = '/.omp'; Agent = 'C:\Users\u\.omp\agent' },
+            [pscustomobject]@{ Name = 'a//b'; Agent = 'C:\Users\u\a\b\agent' },
+            [pscustomobject]@{ Name = 'a/./b'; Agent = 'C:\Users\u\a\b\agent' },
+            [pscustomobject]@{ Name = 'a/../b'; Agent = 'C:\Users\u\b\agent' },
+            [pscustomobject]@{ Name = 'a/../../b'; Agent = 'C:\Users\b\agent' },
+            [pscustomobject]@{ Name = '../../../../../../../../../../../../x'; Agent = 'C:\x\agent' },
+            [pscustomobject]@{ Name = 'a/'; Agent = 'C:\Users\u\a\agent' },
+            [pscustomobject]@{ Name = '/'; Agent = 'C:\Users\u\agent' },
+            [pscustomobject]@{ Name = '.'; Agent = 'C:\Users\u\agent' },
+            [pscustomobject]@{ Name = '..'; Agent = 'C:\Users\agent' }
+        )
+    } else {
+        @(
+            [pscustomobject]@{ Name = '.omp'; Agent = '/home/u/.omp/agent' },
+            [pscustomobject]@{ Name = 'default'; Agent = '/home/u/default/agent' },
+            [pscustomobject]@{ Name = '\.omp'; Agent = '/home/u/\.omp/agent' },
+            [pscustomobject]@{ Name = '/.omp'; Agent = '/home/u/.omp/agent' },
+            [pscustomobject]@{ Name = 'a//b'; Agent = '/home/u/a/b/agent' },
+            [pscustomobject]@{ Name = 'a/./b'; Agent = '/home/u/a/b/agent' },
+            [pscustomobject]@{ Name = 'a/../b'; Agent = '/home/u/b/agent' },
+            [pscustomobject]@{ Name = 'a/../../b'; Agent = '/home/b/agent' },
+            [pscustomobject]@{ Name = '../../../../../../../../../../../../x'; Agent = '/x/agent' },
+            [pscustomobject]@{ Name = 'a/'; Agent = '/home/u/a/agent' },
+            [pscustomobject]@{ Name = '/'; Agent = '/home/u/agent' },
+            [pscustomobject]@{ Name = '.'; Agent = '/home/u/agent' },
+            [pscustomobject]@{ Name = '..'; Agent = '/home/agent' },
+            [pscustomobject]@{ Name = 'C:\omp'; Agent = '/home/u/C:\omp/agent' }
+        )
+    }
+    foreach ($case in $cases) {
+        $env:PI_CONFIG_DIR = $case.Name
+        $root = Get-OmpConfigRoot -HomeDir $oracleHome -WindowsSemantics $nativeWindows
+        $agent = Join-Path $root 'agent'
+        Check ([string]::Equals($agent, $case.Agent, [System.StringComparison]::Ordinal)) "OMP: PI_CONFIG_DIR '$($case.Name)' resolves to '$($case.Agent)'"
+    }
+} finally {
+    $env:PI_CONFIG_DIR = $savedPiConfigDir
+}
+
 Write-Host "Test 17: Oh My Pi cleanup identifies marker inspection failures"
 $h17 = New-Tmp
 $savedWriteWarn = (Get-Command Write-Warn).ScriptBlock
@@ -392,6 +441,17 @@ foreach ($defaultSelector in @('', 'default')) {
     $resolved = Get-OmpAgentDir -HomeDir $h18
     Check ([string]::Equals($resolved, $defaultAgent18, [System.StringComparison]::Ordinal)) "OMP: '$defaultSelector' suppresses exact stale derivation"
 }
+
+$env:PI_CONFIG_DIR = 'outer/../normalized-omp'
+$normalizedRoot18 = Join-Path $h18 'normalized-omp'
+$normalizedDefault18 = Join-Path $normalizedRoot18 'agent'
+$normalizedDerived18 = Join-Path (Join-Path (Join-Path $normalizedRoot18 'profiles') 'work') 'agent'
+$env:OMP_PROFILE = 'default'
+$env:PI_PROFILE = 'work'
+$env:PI_CODING_AGENT_DIR = $normalizedDerived18
+$resolved = Get-OmpAgentDir -HomeDir $h18
+Check ([string]::Equals($resolved, $normalizedDefault18, [System.StringComparison]::Ordinal)) "OMP: normalized config root participates in exact stale provenance"
+$env:PI_CONFIG_DIR = '.custom-omp'
 
 $separator18 = [System.IO.Path]::DirectorySeparatorChar
 $nearMatches18 = @(

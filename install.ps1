@@ -1788,9 +1788,15 @@ function Get-OmpConfigRootForDetection {
     [bool]$WindowsSemantics = ([System.IO.Path]::DirectorySeparatorChar -eq '\')
   )
   $configName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
-  $configName = $configName.TrimStart([char[]]@('\', '/'))
+  $leadingSeparators = if ($WindowsSemantics) { [char[]]@('\', '/') } else { [char[]]@('/') }
+  $configName = $configName.TrimStart($leadingSeparators)
   if ($WindowsSemantics -and $configName -match '^[A-Za-z]:') { return $null }
-  Join-Path $HomeDir $configName
+  try {
+    $joined = if ($configName.Length -eq 0) { $HomeDir } else { Join-Path $HomeDir $configName }
+    [System.IO.Path]::GetFullPath($joined)
+  } catch {
+    $null
+  }
 }
 
 function Detect-Agents {

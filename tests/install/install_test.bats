@@ -446,6 +446,26 @@ MOCKEOF
     [[ " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
 }
 
+@test "detect_agents: preserves a leading backslash in POSIX PI_CONFIG_DIR" {
+    log_test "Testing Oh My Pi literal-backslash config-root detection..."
+
+    export PI_CONFIG_DIR='\.custom-omp'
+    mkdir -p "$HOME/\.custom-omp/agent"
+    detect_agents
+
+    [[ " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
+}
+
+@test "detect_agents: normalizes PI_CONFIG_DIR before probing native state" {
+    log_test "Testing Oh My Pi lexically normalized config-root detection..."
+
+    export PI_CONFIG_DIR='outer/../.custom-omp'
+    mkdir -p "$HOME/.custom-omp/agent"
+    detect_agents
+
+    [[ " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
+}
+
 @test "detect_agents: finds multiple agents" {
     log_test "Testing multiple agent detection..."
 

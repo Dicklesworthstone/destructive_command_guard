@@ -2016,6 +2016,47 @@ mod config_tests {
             );
         }
 
+        // OMP normalizes PI_CONFIG_DIR with Node path.join before exporting the
+        // derived agent path. dcg must normalize first too, otherwise the same
+        // stale child-process value looks like a custom override byte-for-byte.
+        let normalized_home = temp.path().join("normalized-config-home");
+        std::fs::create_dir_all(&normalized_home).expect("normalized HOME");
+        let normalized_root = normalized_home.join("normalized-omp");
+        let normalized_derived = normalized_root
+            .join("profiles")
+            .join("work")
+            .join("agent");
+        let normalized = Command::new(dcg_binary())
+            .args(["install", "--omp"])
+            .env_clear()
+            .env("HOME", &normalized_home)
+            .env("USERPROFILE", &normalized_home)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("PI_CONFIG_DIR", "outer/../normalized-omp")
+            .env("OMP_PROFILE", "default")
+            .env("PI_PROFILE", "work")
+            .env("PI_CODING_AGENT_DIR", &normalized_derived)
+            .current_dir(temp.path())
+            .output()
+            .expect("install OMP extension with normalized stale provenance");
+        assert!(
+            normalized.status.success(),
+            "normalized stale-derived install: {}",
+            String::from_utf8_lossy(&normalized.stderr)
+        );
+        assert!(
+            normalized_root
+                .join("agent/extensions/dcg-guard.ts")
+                .is_file(),
+            "the normalized default agent directory receives the extension"
+        );
+        assert!(
+            !normalized_derived
+                .join("extensions/dcg-guard.ts")
+                .exists(),
+            "the normalized exact profile derivation must be suppressed"
+        );
+
         let custom_home = temp.path().join("custom-home");
         let custom_agent = temp.path().join("operator-custom-agent");
         let custom = run_install(&custom_home, "", "work", &custom_agent);

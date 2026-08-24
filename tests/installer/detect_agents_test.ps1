@@ -121,6 +121,23 @@ try {
     Write-Host "Test 1h: Windows drive-qualified PI_CONFIG_DIR cannot escape HOME"
     $env:PI_CONFIG_DIR = 'C:\omp-outside-home'
     Check ($null -eq (Get-OmpConfigRootForDetection -HomeDir $h1g -WindowsSemantics $true)) "drive-qualified OMP config root rejected for Windows detection"
+
+    Write-Host "Test 1i: OMP detection config root follows native Node path joining"
+    $nativeWindows = [System.IO.Path]::DirectorySeparatorChar -eq '\'
+    $oracleHome = if ($nativeWindows) { 'C:\Users\u' } else { '/home/u' }
+    $env:PI_CONFIG_DIR = 'outer/../normalized-omp'
+    $normalizedRoot = Get-OmpConfigRootForDetection -HomeDir $oracleHome -WindowsSemantics $nativeWindows
+    $expectedNormalizedRoot = if ($nativeWindows) { 'C:\Users\u\normalized-omp' } else { '/home/u/normalized-omp' }
+    Check ([string]::Equals($normalizedRoot, $expectedNormalizedRoot, [System.StringComparison]::Ordinal)) "detection normalizes dot and parent components"
+    $env:PI_CONFIG_DIR = '../../../../../../../../../../../../x'
+    $clampedRoot = Get-OmpConfigRootForDetection -HomeDir $oracleHome -WindowsSemantics $nativeWindows
+    $expectedClampedRoot = if ($nativeWindows) { 'C:\x' } else { '/x' }
+    Check ([string]::Equals($clampedRoot, $expectedClampedRoot, [System.StringComparison]::Ordinal)) "detection clamps excess parent components at the filesystem root"
+    if (-not $nativeWindows) {
+        $env:PI_CONFIG_DIR = '\.literal-backslash'
+        $backslashRoot = Get-OmpConfigRootForDetection -HomeDir $oracleHome -WindowsSemantics $false
+        Check ([string]::Equals($backslashRoot, '/home/u/\.literal-backslash', [System.StringComparison]::Ordinal)) "POSIX detection preserves leading backslash literally"
+    }
     $env:PI_CONFIG_DIR = $null
     $names1g = Get-DetectedAgentNames $a1g
     Check (($names1g -join ',') -eq 'Omp') "bracketed HOME summary lists only Omp (got '$($names1g -join ',')')"

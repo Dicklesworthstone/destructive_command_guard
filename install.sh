@@ -302,6 +302,69 @@ posit_assistant_installed() {
     command -v pa >/dev/null 2>&1
 }
 
+# Mirror Node's POSIX `path.join(HOME, PI_CONFIG_DIR || ".omp")` without
+# requiring Node to be installed. This is lexical by design: repeated `/`, `.`
+# and `..` components are normalized, extra parents stop at `/`, and a leading
+# backslash remains an ordinary filename byte on POSIX.
+resolve_omp_config_root() {
+  local config_name="${PI_CONFIG_DIR:-.omp}"
+  local remaining="$HOME/$config_name"
+  local absolute=0
+  local segment
+  local component
+  local result=""
+  local count
+  local last
+  local -a components=()
+
+  case "$remaining" in
+    /*) absolute=1 ;;
+  esac
+
+  while [ -n "$remaining" ]; do
+    case "$remaining" in
+      */*)
+        segment="${remaining%%/*}"
+        remaining="${remaining#*/}"
+        ;;
+      *)
+        segment="$remaining"
+        remaining=""
+        ;;
+    esac
+    case "$segment" in
+      "" | .) ;;
+      ..)
+        count=${#components[@]}
+        if [ "$count" -gt 0 ]; then
+          last=$((count - 1))
+          if [ "${components[$last]}" != ".." ]; then
+            unset "components[$last]"
+          elif [ "$absolute" -eq 0 ]; then
+            components[${#components[@]}]=".."
+          fi
+        elif [ "$absolute" -eq 0 ]; then
+          components[0]=".."
+        fi
+        ;;
+      *) components[${#components[@]}]="$segment" ;;
+    esac
+  done
+
+  [ "$absolute" -eq 1 ] && result="/"
+  for component in ${components[@]+"${components[@]}"}; do
+    if [ "$result" = "/" ]; then
+      result="/$component"
+    elif [ -z "$result" ]; then
+      result="$component"
+    else
+      result="$result/$component"
+    fi
+  done
+  [ -n "$result" ] || result="."
+  printf '%s\n' "$result"
+}
+
 detect_agents() {
   DETECTED_AGENTS=()
 
@@ -384,15 +447,9 @@ detect_agents() {
 
   # Oh My Pi (`omp`) — native state under the configured root/agent override,
   # an active profile environment, or an `omp` CLI on PATH.
-  local omp_config_name="${PI_CONFIG_DIR:-.omp}"
-  while true; do
-    case "$omp_config_name" in
-      /*) omp_config_name="${omp_config_name#/}" ;;
-      \\*) omp_config_name="${omp_config_name#\\}" ;;
-      *) break ;;
-    esac
-  done
-  if [[ -d "$HOME/$omp_config_name" ]] ||
+  local omp_config_root
+  omp_config_root=$(resolve_omp_config_root)
+  if [[ -d "$omp_config_root" ]] ||
      [[ -n "${PI_CODING_AGENT_DIR:-}" && -d "$PI_CODING_AGENT_DIR" ]] ||
      [[ "${OMP_PROFILE+x}" = "x" ]] ||
      command -v omp &>/dev/null; then
@@ -3865,15 +3922,8 @@ resolve_omp_agent_dir() {
   # Keep the shell installer's status probe in lock-step with OMP/dcg's active
   # profile resolver. In particular, named profiles ignore the legacy
   # PI_CODING_AGENT_DIR override and OMP_PROFILE (even empty) wins PI_PROFILE.
-  local config_name="${PI_CONFIG_DIR:-.omp}"
-  while true; do
-    case "$config_name" in
-      /*) config_name="${config_name#/}" ;;
-      \\*) config_name="${config_name#\\}" ;;
-      *) break ;;
-    esac
-  done
-  local config_root="$HOME/$config_name"
+  local config_root
+  config_root=$(resolve_omp_config_root)
   local profile=""
   if [ "${OMP_PROFILE+x}" = "x" ]; then
     profile="$OMP_PROFILE"

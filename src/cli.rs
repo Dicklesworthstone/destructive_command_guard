@@ -12417,12 +12417,50 @@ fn omp_active_profile() -> std::io::Result<Option<String>> {
 /// Rust's `Path::join` would instead replace `home` and target `C:\\omp`.
 /// Reject that malformed Windows-only value so dcg never writes somewhere OMP
 /// itself would not load from.
+fn lexically_normalize_omp_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut normalized = std::path::PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let can_pop = normalized
+                    .components()
+                    .next_back()
+                    .is_some_and(|last| matches!(last, std::path::Component::Normal(_)));
+                if can_pop {
+                    normalized.pop();
+                } else if !normalized.has_root() {
+                    normalized.push("..");
+                }
+            }
+            std::path::Component::Normal(value) => normalized.push(value),
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        normalized.push(".");
+    }
+    normalized
+}
+
 fn omp_config_root_from(
     home: &std::path::Path,
     config_name: &str,
     windows_semantics: bool,
 ) -> std::io::Result<std::path::PathBuf> {
-    let relative = config_name.trim_start_matches(['/', '\\']);
+    // `path.join(home, name)` keeps a leading backslash as an ordinary byte on
+    // POSIX, while win32 treats both slash kinds as separators. Strip only the
+    // separators for the selected host before applying Node's lexical `.` / `..`
+    // normalization to the complete joined path.
+    let relative = if windows_semantics {
+        config_name.trim_start_matches(['/', '\\'])
+    } else {
+        config_name.trim_start_matches('/')
+    };
     let bytes = relative.as_bytes();
     let drive_qualified = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
     if windows_semantics && drive_qualified {
@@ -12434,7 +12472,7 @@ fn omp_config_root_from(
             ),
         ));
     }
-    Ok(home.join(relative))
+    Ok(lexically_normalize_omp_path(&home.join(relative)))
 }
 
 /// Select the default-profile agent directory from a possible legacy
@@ -19704,6 +19742,85 @@ console.log(JSON.stringify({
         assert_eq!(
             omp_config_root_from(home, r"C:\omp", false).expect("valid POSIX child name"),
             home.join(r"C:\omp")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn omp_config_root_matches_node_posix_join_oracle() {
+        let home = std::path::Path::new("/home/u");
+        let cases = [
+            (".omp", "/home/u/.omp/agent"),
+            ("default", "/home/u/default/agent"),
+            (r"\.omp", r"/home/u/\.omp/agent"),
+            ("/.omp", "/home/u/.omp/agent"),
+            ("//.omp", "/home/u/.omp/agent"),
+            ("a//b", "/home/u/a/b/agent"),
+            ("a/./b", "/home/u/a/b/agent"),
+            ("a/../b", "/home/u/b/agent"),
+            ("a/../../b", "/home/b/agent"),
+            ("../../../../../x", "/x/agent"),
+            ("a/", "/home/u/a/agent"),
+            ("/", "/home/u/agent"),
+            (".", "/home/u/agent"),
+            ("..", "/home/agent"),
+            (r"C:\omp", r"/home/u/C:\omp/agent"),
+        ];
+
+        for (config_name, expected_agent) in cases {
+            let root = omp_config_root_from(home, config_name, false).expect(config_name);
+            assert_eq!(root.join("agent"), std::path::Path::new(expected_agent));
+        }
+
+        let normalized = omp_config_root_from(home, "a/../b", false).expect("normalized root");
+        let upstream_derived = std::path::Path::new("/home/u/b/profiles/work/agent");
+        assert_eq!(
+            omp_default_agent_dir_from(
+                &normalized,
+                Some(upstream_derived.as_os_str()),
+                Some("work")
+            ),
+            std::path::Path::new("/home/u/b/agent"),
+            "stale provenance must be derived from Node's normalized config root"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn omp_config_root_matches_node_win32_join_oracle() {
+        let home = std::path::Path::new(r"C:\Users\u");
+        let cases = [
+            (".omp", r"C:\Users\u\.omp\agent"),
+            ("default", r"C:\Users\u\default\agent"),
+            (r"\.omp", r"C:\Users\u\.omp\agent"),
+            ("/.omp", r"C:\Users\u\.omp\agent"),
+            ("a//b", r"C:\Users\u\a\b\agent"),
+            ("a/./b", r"C:\Users\u\a\b\agent"),
+            ("a/../b", r"C:\Users\u\b\agent"),
+            ("a/../../b", r"C:\Users\b\agent"),
+            ("../../../../../x", r"C:\x\agent"),
+            ("a/", r"C:\Users\u\a\agent"),
+            ("/", r"C:\Users\u\agent"),
+            (".", r"C:\Users\u\agent"),
+            ("..", r"C:\Users\agent"),
+            (r"\\srv\share\omp", r"C:\Users\u\srv\share\omp\agent"),
+        ];
+
+        for (config_name, expected_agent) in cases {
+            let root = omp_config_root_from(home, config_name, true).expect(config_name);
+            assert_eq!(root.join("agent"), std::path::Path::new(expected_agent));
+        }
+
+        let normalized = omp_config_root_from(home, "a/../b", true).expect("normalized root");
+        let upstream_derived = std::path::Path::new(r"C:\Users\u\b\profiles\work\agent");
+        assert_eq!(
+            omp_default_agent_dir_from(
+                &normalized,
+                Some(upstream_derived.as_os_str()),
+                Some("work")
+            ),
+            std::path::Path::new(r"C:\Users\u\b\agent"),
+            "stale provenance must be derived from Node's normalized config root"
         );
     }
 

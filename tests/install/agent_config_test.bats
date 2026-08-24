@@ -3908,6 +3908,70 @@ MOCKEOF
     chmod +x "$DEST/dcg"
 }
 
+@test "resolve_omp_config_root: matches Node POSIX path-join classes" {
+    unset PI_CONFIG_DIR
+    run resolve_omp_config_root
+    [ "$status" -eq 0 ]
+    [ "$output" = "$HOME/.omp" ]
+
+    export PI_CONFIG_DIR=""
+    run resolve_omp_config_root
+    [ "$status" -eq 0 ]
+    [ "$output" = "$HOME/.omp" ]
+
+    local -a config_names=(
+        "default"
+        '\.omp'
+        "/.omp"
+        "//.omp"
+        "a//b"
+        "a/./b"
+        "a/../b"
+        "a/../../b"
+        "../../../../../../../../../../../../../../../../../../../../x"
+        "a/"
+        "/"
+        "."
+        ".."
+        'C:\omp'
+    )
+    local -a expected_roots=(
+        "$HOME/default"
+        "$HOME/\.omp"
+        "$HOME/.omp"
+        "$HOME/.omp"
+        "$HOME/a/b"
+        "$HOME/a/b"
+        "$HOME/b"
+        "$(dirname "$HOME")/b"
+        "/x"
+        "$HOME/a"
+        "$HOME"
+        "$HOME"
+        "$(dirname "$HOME")"
+        "$HOME/C:\omp"
+    )
+    local index
+    for ((index = 0; index < ${#config_names[@]}; index++)); do
+        export PI_CONFIG_DIR="${config_names[$index]}"
+        run resolve_omp_config_root
+        [ "$status" -eq 0 ]
+        [ "$output" = "${expected_roots[$index]}" ]
+    done
+}
+
+@test "resolve_omp_agent_dir: normalizes config root before stale provenance" {
+    export PI_CONFIG_DIR="outer/../normalized-omp"
+    export OMP_PROFILE="default"
+    export PI_PROFILE="work"
+    export PI_CODING_AGENT_DIR="$HOME/normalized-omp/profiles/work/agent"
+
+    run resolve_omp_agent_dir
+
+    [ "$status" -eq 0 ]
+    [ "$output" = "$HOME/normalized-omp/agent" ]
+}
+
 @test "resolve_omp_agent_dir: suppresses only an exact validated stale profile derivation" {
     export PI_CONFIG_DIR=".custom-omp"
     local config_root="$HOME/.custom-omp"
@@ -4006,6 +4070,25 @@ MOCKEOF
     [ "$status" -eq 0 ]
     [ "$(sed -n '1p' "$removal_log")" = "$default_extension" ]
     [ "$(sed -n '2p' "$removal_log")" = "$stale_extension" ]
+}
+
+@test "unconfigure_omp: config-root resolver matches Node POSIX normalization" {
+    extract_uninstall_functions
+
+    export PI_CONFIG_DIR='outer/../normalized-omp'
+    run resolve_omp_uninstall_config_root
+    [ "$status" -eq 0 ]
+    [ "$output" = "$HOME/normalized-omp" ]
+
+    export PI_CONFIG_DIR='\.literal-backslash'
+    run resolve_omp_uninstall_config_root
+    [ "$status" -eq 0 ]
+    [ "$output" = "$HOME/\.literal-backslash" ]
+
+    export PI_CONFIG_DIR='../../../../../../../../../../../../../../../../../../../../x'
+    run resolve_omp_uninstall_config_root
+    [ "$status" -eq 0 ]
+    [ "$output" = "/x" ]
 }
 
 @test "configure_omp: skipped when OMP not detected" {

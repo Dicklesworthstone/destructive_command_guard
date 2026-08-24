@@ -544,11 +544,17 @@ function Get-OmpConfigRoot {
     [bool]$WindowsSemantics = ([System.IO.Path]::DirectorySeparatorChar -eq '\')
   )
   $configName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
-  $configName = $configName.TrimStart([char[]]@('\', '/'))
+  $leadingSeparators = if ($WindowsSemantics) { [char[]]@('\', '/') } else { [char[]]@('/') }
+  $configName = $configName.TrimStart($leadingSeparators)
   if ($WindowsSemantics -and $configName -match '^[A-Za-z]:') {
     throw "PI_CONFIG_DIR must be a directory name relative to HOME on Windows, not drive-qualified path '$($env:PI_CONFIG_DIR)'"
   }
-  Join-Path $HomeDir $configName
+  try {
+    $joined = if ($configName.Length -eq 0) { $HomeDir } else { Join-Path $HomeDir $configName }
+    [System.IO.Path]::GetFullPath($joined)
+  } catch {
+    throw "Could not resolve PI_CONFIG_DIR '$($env:PI_CONFIG_DIR)' beneath HOME '$HomeDir': $($_.Exception.Message)"
+  }
 }
 
 function Get-OmpAgentDir {
