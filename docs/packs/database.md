@@ -10,6 +10,7 @@ This document describes packs in the `database` category.
 - [Redis](#databaseredis)
 - [SQLite](#databasesqlite)
 - [BigQuery](#databasebigquery)
+- [Databricks CLI](#databasedatabricks)
 - [Snowflake CLI](#databasesnowflake)
 - [Supabase](#databasesupabase)
 
@@ -428,6 +429,62 @@ To allowlist all rules from this pack (use with caution):
 ```toml
 [[allow]]
 rule = "database.bigquery:*"
+reason = "Your reason here"
+risk_acknowledged = true
+```
+
+---
+
+## Databricks CLI
+
+**Pack ID:** `database.databricks`
+
+Protects against destructive Databricks CLI operations like account workspaces delete, bundle destroy, recursive workspace/fs deletion, permanent cluster deletion, secret-scope removal, arbitrary REST DELETE calls, and high-impact resource deletes
+
+### Keywords
+
+Commands containing these keywords are checked against this pack:
+
+- `databricks`
+- `bundle`
+- `permanent-delete`
+- `delete-scope`
+- `delete-secret`
+- `delete-acl`
+
+### Destructive Patterns (Blocked)
+
+These patterns match potentially destructive commands:
+
+| Pattern Name | Reason | Severity |
+|--------------|--------|----------|
+| `databricks-account-workspaces-delete` | databricks account workspaces delete removes an ENTIRE workspace. | critical |
+| `databricks-bundle-destroy` | databricks bundle destroy permanently deletes every resource the bundle deployed. | critical |
+| `databricks-workspace-delete-recursive` | databricks workspace delete --recursive removes a whole workspace directory tree. | critical |
+| `databricks-workspace-delete` | databricks workspace delete removes a workspace object; deletion cannot be undone. | high |
+| `databricks-fs-rm-recursive` | databricks fs rm -r recursively deletes data in DBFS or Unity Catalog Volumes. | critical |
+| `databricks-fs-rm` | databricks fs rm deletes a file in DBFS or a Unity Catalog Volume. | high |
+| `databricks-clusters-permanent-delete` | databricks clusters permanent-delete removes a cluster rather than terminating it. | critical |
+| `databricks-secrets-delete-scope` | databricks secrets delete-scope removes the scope with ALL its secrets and ACLs. | critical |
+| `databricks-secrets-delete` | databricks secrets delete-secret/delete-acl removes a secret or its access control. | high |
+| `databricks-api-delete` | databricks api delete performs an arbitrary REST DELETE against the workspace or account API. | high |
+| `databricks-resource-delete` | databricks resource delete removes a job, pipeline, repo, policy, pool, warehouse, or token. | high |
+
+### Allowlist Guidance
+
+To allowlist a specific rule from this pack, add to your allowlist:
+
+```toml
+[[allow]]
+rule = "database.databricks:<pattern-name>"
+reason = "Your reason here"
+```
+
+To allowlist all rules from this pack (use with caution):
+
+```toml
+[[allow]]
+rule = "database.databricks:*"
 reason = "Your reason here"
 risk_acknowledged = true
 ```
