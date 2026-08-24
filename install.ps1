@@ -1859,7 +1859,7 @@ Configured agents (when detected, or with -Force/-EasyMode):
   Gemini CLI   (~/.gemini/settings.json)      Copilot CLI (~/.copilot/hooks/dcg.json)
   Cursor IDE   (~/.cursor/hooks.json)         Hermes      (HERMES_HOME, else %LOCALAPPDATA%\hermes\config.yaml)
   Posit Assistant (~/.posit/assistant/settings.json)
-  Oh My Pi     (~/.omp/agent/extensions/dcg-guard.ts via dcg install --omp)
+  Oh My Pi     (active profile's extensions/dcg-guard.ts via dcg install --omp)
   Grok / agy   via dcg install --grok / --agy under -EasyMode when detected
 '@
   exit 0
