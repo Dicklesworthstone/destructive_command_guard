@@ -10474,7 +10474,12 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     // Check 5: Pattern packs
     print!("Checking pattern packs... ");
     let enabled = config.enabled_pack_ids();
-    println!("{} ({} enabled)", "OK".green(), enabled.len());
+    // Count the leaf packs the registry actually loads, which is what
+    // `dcg packs --enabled` lists. `enabled_pack_ids` deliberately keeps the
+    // bare `core` category marker for registry callers to expand, so counting
+    // the raw set reported one fewer pack than the listing every time (#335).
+    let enabled_leaf_count = REGISTRY.expand_enabled_ordered(&enabled).len();
+    println!("{} ({} enabled)", "OK".green(), enabled_leaf_count);
     println!(
         "  Hook evaluation budget: {} ms ({})",
         config.effective_hook_timeout_ms(),
@@ -11001,13 +11006,17 @@ fn collect_doctor_report(
 
     // Check 5: Pattern packs
     let enabled = config.enabled_pack_ids();
+    // See the interactive doctor: count registry leaf packs so this agrees
+    // with `dcg packs --enabled` instead of undercounting by the `core`
+    // category marker (#335).
+    let enabled_leaf_count = REGISTRY.expand_enabled_ordered(&enabled).len();
     checks.push(DoctorCheck {
         id: "packs",
         name: "Pattern packs",
         status: DoctorCheckStatus::Ok,
         message: format!(
             "{} packs enabled; hook evaluation budget {} ms ({})",
-            enabled.len(),
+            enabled_leaf_count,
             config.effective_hook_timeout_ms(),
             config.hook_timeout_source()
         ),
@@ -17463,6 +17472,38 @@ fn dev_generate_fixtures(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #335: `dcg doctor` counted the raw enabled-pack set, which carries the
+    /// bare `core` category marker, while `dcg packs --enabled` lists the two
+    /// registry leaves it expands into. The two numbers must agree.
+    #[test]
+    fn doctor_pack_count_matches_packs_enabled_listing() {
+        let config = crate::config::Config::default();
+        let enabled = config.enabled_pack_ids();
+
+        let doctor_count = REGISTRY.expand_enabled_ordered(&enabled).len();
+        let listing_count = REGISTRY
+            .list_packs(&enabled)
+            .iter()
+            .filter(|info| info.enabled)
+            .count();
+
+        assert_eq!(
+            doctor_count, listing_count,
+            "doctor's pack count must match what `dcg packs --enabled` lists"
+        );
+
+        // The marker is why the raw set was the wrong thing to count: it is
+        // present, is not a registry pack, and stands in for two that are.
+        assert!(
+            enabled.contains("core"),
+            "core marker is expected in the raw set"
+        );
+        assert!(
+            REGISTRY.get_entry("core").is_none(),
+            "core is a category marker, not a registry pack"
+        );
+    }
 
     /// The shell startup check self-repairs a stale marker-guarded block
     /// instead of skipping it (the Unix analog of install.ps1's #282 fix).

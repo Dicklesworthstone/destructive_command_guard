@@ -3635,10 +3635,37 @@ pub enum PatternKind {
 
 impl CompiledOverrides {
     /// Check allow overrides. Returns true if command should be allowed.
+    ///
+    /// Allow patterns are substring-matched, and this check runs *before* pack
+    /// evaluation, so on a compound command a single matching entry used to
+    /// return `allowed` for text it never examined: an entry naming a scratch
+    /// path allowed that path plus whatever followed the `&&` (#340). A
+    /// safe segment silencing a destructive one is the same bypass class
+    /// `split_command_segments` already closes for pack patterns, so allow
+    /// overrides now clear each segment on its own terms.
+    ///
+    /// A single-segment command keeps the historical whole-string semantics.
+    /// A compound command is allowed only when every segment is itself
+    /// allowed; an entry that covers one segment no longer speaks for the
+    /// rest, and anything uncovered falls through to normal evaluation.
+    /// Anchored entries compose across a chain for the first time as a
+    /// result — previously `^a$` and `^b$` allowed neither half of `a && b`.
     #[inline]
     #[must_use]
     pub fn check_allow(&self, command: &str) -> bool {
-        self.allow.iter().any(|o| o.matches(command))
+        if self.allow.is_empty() {
+            return false;
+        }
+
+        let segments = crate::packs::split_command_segments(command);
+        if segments.len() <= 1 {
+            return self.allow.iter().any(|o| o.matches(command));
+        }
+
+        segments.iter().all(|segment| {
+            let segment = segment.trim();
+            segment.is_empty() || self.allow.iter().any(|o| o.matches(segment))
+        })
     }
 
     /// Check block overrides. Returns the reason if command should be blocked.
@@ -7566,6 +7593,73 @@ enabled = false
         assert!(compiled.invalid_patterns.is_empty());
         assert!(compiled.check_allow("git reset --hard"));
         assert!(!compiled.check_allow("git status"));
+    }
+
+    /// #340: an unanchored allow entry is substring-matched against the whole
+    /// command, and `check_allow` short-circuits before pack evaluation. One
+    /// matching segment therefore used to carry every other segment with it.
+    #[test]
+    fn unanchored_allow_override_does_not_launder_later_segments() {
+        let overrides = OverridesConfig {
+            allow: vec![AllowOverride::Simple(
+                "git stash list /srv/scratch/build".to_string(),
+            )],
+            block: vec![],
+            ..Default::default()
+        };
+        let compiled = overrides.compile();
+
+        // The entry still allows exactly what it names.
+        assert!(compiled.check_allow("git stash list /srv/scratch/build"));
+
+        // But it no longer speaks for a second segment it never matched.
+        for command in [
+            "git stash list /srv/scratch/build && git reset --hard",
+            "git stash list /srv/scratch/build; git reset --hard",
+            "git stash list /srv/scratch/build || git reset --hard",
+            "git stash list /srv/scratch/build | git reset --hard",
+        ] {
+            assert!(
+                !compiled.check_allow(command),
+                "allow entry laundered a trailing segment: {command}"
+            );
+        }
+    }
+
+    /// A command substitution is returned as its own segment, so a safe outer
+    /// command cannot carry a destructive inner one past the allow check.
+    #[test]
+    fn allow_override_does_not_launder_command_substitution() {
+        let overrides = OverridesConfig {
+            allow: vec![AllowOverride::Simple("echo".to_string())],
+            block: vec![],
+            ..Default::default()
+        };
+        let compiled = overrides.compile();
+
+        assert!(compiled.check_allow("echo hello"));
+        assert!(!compiled.check_allow("echo $(git reset --hard)"));
+    }
+
+    /// Every segment being independently allowed is still allowed, and anchored
+    /// entries now compose across a chain (previously neither half matched the
+    /// whole string, so the compound was denied).
+    #[test]
+    fn allow_override_permits_fully_covered_compound() {
+        let overrides = OverridesConfig {
+            allow: vec![
+                AllowOverride::Simple("^git stash list$".to_string()),
+                AllowOverride::Simple("^git status$".to_string()),
+            ],
+            block: vec![],
+            ..Default::default()
+        };
+        let compiled = overrides.compile();
+
+        assert!(compiled.check_allow("git stash list"));
+        assert!(compiled.check_allow("git stash list && git status"));
+        assert!(compiled.check_allow("git status; git stash list"));
+        assert!(!compiled.check_allow("git stash list && git reset --hard"));
     }
 
     #[test]
