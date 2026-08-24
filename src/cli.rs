@@ -19187,11 +19187,14 @@ let activeChild: ChildCase = {};
 let callback: ((event: unknown, ctx: unknown) => Promise<unknown>) | undefined;
 let spawnRecords: SpawnRecord[] = [];
 let diagnostics: string[] = [];
+let observedExecutable: string | undefined;
 const originalSpawn = Bun.spawn;
 const originalConsoleError = console.error;
 
 (Bun as unknown as { spawn: typeof Bun.spawn }).spawn = ((argv: string[], options: { cwd: string; stdin: Uint8Array }) => {
   if (activeChild.spawnError) throw new Error(activeChild.spawnError);
+  if (observedExecutable === undefined) observedExecutable = argv[0];
+  equal(argv[0], observedExecutable, "callback/spawn/executable-stability");
   spawnRecords.push({
     argv: [...argv],
     cwd: options.cwd,
@@ -19317,6 +19320,7 @@ console.log(JSON.stringify({
   toolCaseIds,
   transitionCaseIds,
   callbackCaseIds,
+  spawnExecutable: observedExecutable,
   stubExports: [
     "@oh-my-pi/pi-coding-agent/config/settings:settings",
     "@oh-my-pi/pi-coding-agent/tools/path-utils:resolveToCwd",
@@ -19339,6 +19343,7 @@ console.log(JSON.stringify({
         std::process::Command::new(bun)
             .args(["run", "./runner.ts"])
             .current_dir(root)
+            .env_remove("DCG_BIN")
             .env_remove("PI_NO_PTY")
             .output()
             .expect("launch Bun OMP bridge replay")
@@ -19347,7 +19352,7 @@ console.log(JSON.stringify({
     /// Translation-validates the exact generated module in Bun. This is an
     /// explicit opt-in gate because the Rust project does not otherwise depend
     /// on Bun: invoke it with
-    /// `cargo test omp_generated_extension_executes_replay_certificate -- --ignored --exact`.
+    /// `cargo test --lib cli::tests::omp_generated_extension_executes_replay_certificate -- --ignored --exact --nocapture`.
     /// The same corpus must reject a one-cell transition mutant, which proves
     /// the replay is sensitive to the safety behavior it certifies.
     #[test]
@@ -19405,6 +19410,13 @@ console.log(JSON.stringify({
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|version| !version.is_empty()),
             "certificate must identify the Bun runtime"
+        );
+        assert_eq!(
+            certificate
+                .get("spawnExecutable")
+                .and_then(serde_json::Value::as_str),
+            Some(executable.to_string_lossy().as_ref()),
+            "the hermetic replay must exercise the generator's embedded executable, not an ambient DCG_BIN override"
         );
 
         let string_array = |field: &str| {
