@@ -12482,9 +12482,9 @@ fn project_omp_extension_path() -> std::io::Result<std::path::PathBuf> {
 
 /// Generate an OMP ExtensionAPI module that gates every `bash` tool call on
 /// dcg's robot-mode evaluator. The command is sent on stdin and dcg is spawned
-/// directly (never through a shell). Exit 1 is a safety block; infrastructure
-/// failures fail open with a visible diagnostic, consistent with dcg's other
-/// generated integration bridges.
+/// directly (never through a shell). A deny-like JSON verdict or exit 1 is a
+/// safety block; status-only infrastructure failures fail open with a visible
+/// diagnostic, consistent with dcg's other generated integration bridges.
 fn build_omp_extension_source(executable: &std::path::Path) -> std::io::Result<String> {
     let path_literal = executable_javascript_literal(executable)?;
     Ok(format!(
@@ -12504,7 +12504,7 @@ type DcgBridgeAction = "allow" | "block" | "infrastructure";
 type DcgParsedOutput = {{ verdict: DcgParsedVerdict; reason?: string; ruleId?: string }};
 
 const DCG_MAX_JSON_CHARS = 1_048_576;
-const BLOCKING_DECISIONS: ReadonlySet<DcgParsedVerdict> = new Set(["deny", "ask", "indeterminate"]);
+const BLOCKING_DECISIONS: ReadonlySet<DcgParsedVerdict> = new Set<DcgParsedVerdict>(["deny", "ask", "indeterminate"]);
 const DCG_CHILD_TRANSITIONS: Record<DcgChildOutcome, Record<DcgParsedVerdict, DcgBridgeAction>> = {{
   "spawn-throw": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
   "exit-0": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
@@ -12531,8 +12531,11 @@ function parseDcgOutput(stdoutText: string): DcgParsedOutput {{
   const record = raw as Record<string, unknown>;
   const decision = record.decision;
   const verdict: DcgParsedVerdict =
-    decision === "allow" || BLOCKING_DECISIONS.has(decision as DcgParsedVerdict)
-      ? (decision as DcgParsedVerdict)
+    decision === "allow" ||
+    decision === "deny" ||
+    decision === "ask" ||
+    decision === "indeterminate"
+      ? decision
       : "unknown";
   return {{
     verdict,
@@ -12541,7 +12544,7 @@ function parseDcgOutput(stdoutText: string): DcgParsedOutput {{
   }};
 }}
 
-function classifyDcgChild(
+export function classifyDcgChild(
   outcome: DcgChildOutcome,
   stdoutText: string,
 ): {{ action: DcgBridgeAction; output: DcgParsedOutput }} {{
@@ -12625,30 +12628,30 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
         proc.exited,
       ]);
     }} catch (err) {{
+      const classification = classifyDcgChild("spawn-throw", "");
+      if (classification.action !== "infrastructure") {{
+        return {{ block: true, reason: "Blocked by dcg after an invalid child transition" }};
+      }}
       console.error(`[dcg] OMP guard could not run dcg: ${{err}}`);
       return;
     }}
 
-    if (exitCode === 0 || exitCode === 2) return;
-    if (exitCode !== 1) {{
+    const classification = classifyDcgChild(
+      childOutcomeFromExitCode(exitCode),
+      typeof stdoutText === "string" ? stdoutText : "",
+    );
+    if (classification.action === "allow") return;
+    if (classification.action === "infrastructure") {{
       const detail = String(stderrText || "").trim();
       console.error(`[dcg] OMP guard infrastructure failure (exit ${{exitCode}})${{detail ? `: ${{detail}}` : ""}}`);
       return;
     }}
 
-    let result: {{ decision?: string; reason?: string; rule_id?: string }} = {{}};
-    try {{
-      result = JSON.parse(String(stdoutText || ""));
-    }} catch {{
-      // Exit 1 is dcg's deny/indeterminate contract. Preserve the block even
-      // if a future or damaged binary emits an unreadable payload.
-    }}
-
-    const decision = String(result.decision || "deny");
-    const reason = BLOCKING_DECISIONS.has(decision)
-      ? String(result.reason || "Blocked by dcg")
-      : "Blocked by dcg (exit 1 without a recognized decision)";
-    const rule = result.rule_id ? `\n\nRule: ${{result.rule_id}}` : "";
+    const output = classification.output;
+    const reason = BLOCKING_DECISIONS.has(output.verdict)
+      ? output.reason || "Blocked by dcg"
+      : "Blocked by dcg (exit 1 without a blocking decision)";
+    const rule = output.ruleId ? `\n\nRule: ${{output.ruleId}}` : "";
     return {{ block: true, reason: `${{reason}}${{rule}}` }};
   }});
 }}
@@ -18762,7 +18765,7 @@ if ($errors.Count -ne 0) {
         assert!(source.contains("\"--agent\", \"omp\""));
         assert!(source.contains("\"deny\", \"ask\", \"indeterminate\""));
         assert!(source.contains("return { block: true, reason:"));
-        assert!(source.contains("exitCode !== 1"));
+        assert!(source.contains("classifyDcgChild("));
         assert!(
             source.contains(
                 "import { resolveToCwd } from \"@oh-my-pi/pi-coding-agent/tools/path-utils\";"
