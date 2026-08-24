@@ -19400,6 +19400,7 @@ console.log(JSON.stringify({
     #[ignore = "requires Bun to execute the generated OMP TypeScript bridge"]
     fn omp_generated_extension_executes_replay_certificate() {
         use sha2::Digest as _;
+        use std::fmt::Write as _;
 
         let bun = which_executable("bun").expect(
             "Bun is required for the OMP bridge replay certificate; install Bun or run this gate on an OMP-capable host",
@@ -19437,7 +19438,11 @@ console.log(JSON.stringify({
             Some(true),
             "a runner that dies before the complete corpus must not certify the bridge"
         );
-        let expected_digest = format!("{:x}", sha2::Sha256::digest(source.as_bytes()));
+        let digest = sha2::Sha256::digest(source.as_bytes());
+        let mut expected_digest = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            let _ = write!(expected_digest, "{byte:02x}");
+        }
         assert_eq!(
             certificate
                 .get("bridgeSha256")
