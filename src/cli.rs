@@ -18830,7 +18830,11 @@ if ($errors.Count -ne 0) {
 
         assert!(source.contains(OMP_EXTENSION_MARKER));
         assert!(source.contains("pi.on(\"tool_call\""));
-        assert!(source.contains("event.toolName !== \"bash\""));
+        // The bridge reads the tool name off the normalized `record`, not the
+        // raw `event`. The generator moved to that spelling when schema
+        // validation landed (fe2cb7b) and this assertion was left on the old
+        // one, so it has been failing against the source it checks ever since.
+        assert!(source.contains("record.toolName !== \"bash\""));
         assert!(source.contains("\"--robot\", \"test\", \"--stdin\""));
         assert!(source.contains("\"--agent\", \"omp\""));
         assert!(source.contains("\"deny\", \"ask\", \"indeterminate\""));
