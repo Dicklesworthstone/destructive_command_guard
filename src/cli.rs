@@ -12637,12 +12637,13 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
       childOutcomeFromExitCode(exitCode),
       typeof stdoutText === "string" ? stdoutText : "",
     );
-    if (classification.action === "allow") return;
+    const stderrDetail = typeof stderrText === "string" ? stderrText.trim() : "";
     if (classification.action === "infrastructure") {{
-      const detail = String(stderrText || "").trim();
-      console.error(`[dcg] OMP guard infrastructure failure (exit ${{exitCode}})${{detail ? `: ${{detail}}` : ""}}`);
+      console.error(`[dcg] OMP guard infrastructure failure (exit ${{exitCode}})${{stderrDetail ? `: ${{stderrDetail}}` : ""}}`);
       return;
     }}
+    if (stderrDetail) console.error(`[dcg] OMP guard dcg stderr: ${{stderrDetail}}`);
+    if (classification.action === "allow") return;
 
     const output = classification.output;
     const reason = BLOCKING_DECISIONS.has(output.verdict)
@@ -18880,16 +18881,27 @@ if ($errors.Count -ne 0) {
             r#"const stderrDetail = typeof stderrText === "string" ? stderrText.trim() : "";"#
         ));
         assert_eq!(
-            source.matches("if (stderrDetail) console.error(stderrDetail);").count(),
+            source
+                .matches(
+                    "if (stderrDetail) console.error(`[dcg] OMP guard dcg stderr: ${stderrDetail}`);"
+                )
+                .count(),
             1,
             "allow and block must share one non-infrastructure stderr forwarding point"
+        );
+        assert_eq!(
+            source.matches(
+                "console.error(`[dcg] OMP guard infrastructure failure (exit ${exitCode})${stderrDetail ? `: ${stderrDetail}` : \"\"}`);"
+            ).count(),
+            1,
+            "the infrastructure diagnostic must include child stderr exactly once"
         );
 
         let infrastructure = source
             .find("if (classification.action === \"infrastructure\")")
             .expect("infrastructure outcome branch");
         let forward = source
-            .find("if (stderrDetail) console.error(stderrDetail);")
+            .find("if (stderrDetail) console.error(`[dcg] OMP guard dcg stderr: ${stderrDetail}`);")
             .expect("non-infrastructure stderr forwarding");
         let allow = source
             .find("if (classification.action === \"allow\") return;")
