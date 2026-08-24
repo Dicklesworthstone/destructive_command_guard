@@ -4056,7 +4056,10 @@ MOCKEOF
     printf '// dcg-omp-extension: generated\n' > "$default_extension"
     printf '// dcg-omp-extension: generated\n' > "$profile_extension"
     rm() {
-        [ "${2:-}" != "$profile_extension" ] || return 1
+        local arg
+        local target=""
+        for arg in "$@"; do target="$arg"; done
+        [ "$target" != "$profile_extension" ] || return 1
         command rm "$@"
     }
 
@@ -4067,5 +4070,56 @@ MOCKEOF
     [ ! -f "$default_extension" ]
     [ -f "$profile_extension" ]
     [[ "$output" == *"Could not remove Oh My Pi extension at $profile_extension"* ]]
+    local warning_count
+    warning_count=$(printf '%s\n' "$output" | grep -cF "Could not remove Oh My Pi extension at $profile_extension")
+    [ "$warning_count" -eq 1 ]
+    [[ $'\n'"$output"$'\n' != *$'\nremoved\n'* ]]
+}
+
+@test "unconfigure_omp: warns and withholds the removed marker when marker inspection fails" {
+    extract_uninstall_functions
+    local default_extension="$HOME/.omp/agent/extensions/dcg-guard.ts"
+    local profile_extension="$HOME/.omp/profiles/work/agent/extensions/dcg-guard.ts"
+    mkdir -p "$(dirname "$default_extension")" "$(dirname "$profile_extension")"
+    printf '// dcg-omp-extension: generated\n' > "$default_extension"
+    printf '// dcg-omp-extension: generated\n' > "$profile_extension"
+    grep() {
+        local arg
+        for arg in "$@"; do
+            [ "$arg" != "$profile_extension" ] || return 2
+        done
+        command grep "$@"
+    }
+
+    run unconfigure_omp
+    unset -f grep
+
+    [ "$status" -eq 0 ]
+    [ ! -f "$default_extension" ]
+    [ -f "$profile_extension" ]
+    [[ "$output" == *"Could not inspect Oh My Pi extension at $profile_extension"* ]]
+    [[ $'\n'"$output"$'\n' != *$'\nremoved\n'* ]]
+}
+
+@test "unconfigure_omp: warns and withholds the removed marker when profile enumeration fails" {
+    extract_uninstall_functions
+    local default_extension="$HOME/.omp/agent/extensions/dcg-guard.ts"
+    local profile_extension="$HOME/.omp/profiles/work/agent/extensions/dcg-guard.ts"
+    local profiles_root="$HOME/.omp/profiles"
+    mkdir -p "$(dirname "$default_extension")" "$(dirname "$profile_extension")"
+    printf '// dcg-omp-extension: generated\n' > "$default_extension"
+    printf '// dcg-omp-extension: generated\n' > "$profile_extension"
+    find() {
+        [ "${1:-}" != "$profiles_root" ] || return 1
+        command find "$@"
+    }
+
+    run unconfigure_omp
+    unset -f find
+
+    [ "$status" -eq 0 ]
+    [ ! -f "$default_extension" ]
+    [ -f "$profile_extension" ]
+    [[ "$output" == *"Could not inspect Oh My Pi profiles under $profiles_root"* ]]
     [[ $'\n'"$output"$'\n' != *$'\nremoved\n'* ]]
 }

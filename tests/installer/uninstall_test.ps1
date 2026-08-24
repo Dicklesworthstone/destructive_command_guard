@@ -283,5 +283,79 @@ try {
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h14 -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+Write-Host "Test 15: Oh My Pi cleanup does not claim success when profile enumeration fails"
+$h15 = New-Tmp
+try {
+    $defaultExtension = Join-Path $h15 '.omp/agent/extensions/dcg-guard.ts'
+    $profileExtension = Join-Path $h15 '.omp/profiles/work/agent/extensions/dcg-guard.ts'
+    $profilesRoot = Join-Path $h15 '.omp/profiles'
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $defaultExtension))
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $profileExtension))
+    [System.IO.File]::WriteAllText($defaultExtension, '// dcg-omp-extension: generated')
+    [System.IO.File]::WriteAllText($profileExtension, '// dcg-omp-extension: generated')
+
+    function Get-ChildItem {
+        [CmdletBinding()]
+        param([string]$LiteralPath, [switch]$Directory)
+        if ($LiteralPath -eq $profilesRoot) { throw "simulated unreadable profiles directory: $LiteralPath" }
+        Microsoft.PowerShell.Management\Get-ChildItem -LiteralPath $LiteralPath -Directory:$Directory -ErrorAction Stop
+    }
+
+    Check ((Unconfigure-OmpExtension -HomeDir $h15 -RepoRoot $h15) -eq $false) "OMP: profile enumeration failure is not reported as complete"
+    Check (-not (Test-Path -LiteralPath $defaultExtension)) "OMP: known default extension is still cleaned up"
+    Check (Test-Path -LiteralPath $profileExtension) "OMP: unenumerated profile extension remains in place"
+} finally {
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Function:\Get-ChildItem' -Force -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h15 -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "Test 16: Oh My Pi config root rejects Windows drive-qualified overrides"
+$savedPiConfigDir = $env:PI_CONFIG_DIR
+try {
+    $env:PI_CONFIG_DIR = 'C:\omp-outside-home'
+    $threw = $false
+    try {
+        [void](Get-OmpConfigRoot -HomeDir 'C:\Users\tester' -WindowsSemantics $true)
+    } catch {
+        $threw = $true
+    }
+    Check $threw "OMP: drive-qualified PI_CONFIG_DIR is rejected under Windows semantics"
+} finally {
+    $env:PI_CONFIG_DIR = $savedPiConfigDir
+}
+
+Write-Host "Test 17: Oh My Pi cleanup identifies marker inspection failures"
+$h17 = New-Tmp
+$savedWriteWarn = (Get-Command Write-Warn).ScriptBlock
+try {
+    $defaultExtension = Join-Path $h17 '.omp/agent/extensions/dcg-guard.ts'
+    $profileExtension = Join-Path $h17 '.omp/profiles/work/agent/extensions/dcg-guard.ts'
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $defaultExtension))
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $profileExtension))
+    [System.IO.File]::WriteAllText($defaultExtension, '// dcg-omp-extension: generated')
+    [System.IO.File]::WriteAllText($profileExtension, '// dcg-omp-extension: generated')
+    $script:ompInspectionWarning = ''
+
+    function Get-Content {
+        [CmdletBinding()]
+        param([switch]$Raw, [string]$LiteralPath)
+        if ($LiteralPath -eq $profileExtension) { throw "simulated unreadable marker: $LiteralPath" }
+        Microsoft.PowerShell.Management\Get-Content -Raw:$Raw -LiteralPath $LiteralPath -ErrorAction Stop
+    }
+    function Write-Warn {
+        param([string]$Message)
+        $script:ompInspectionWarning = $Message
+    }
+
+    Check ((Unconfigure-OmpExtension -HomeDir $h17 -RepoRoot $h17) -eq $false) "OMP: marker inspection failure is not reported as complete"
+    Check (-not (Test-Path -LiteralPath $defaultExtension)) "OMP: marker-readable extension is still cleaned up"
+    Check (Test-Path -LiteralPath $profileExtension) "OMP: unreadable extension remains in place"
+    Check ($script:ompInspectionWarning -like "Could not inspect Oh My Pi extension at ${profileExtension}:*") "OMP: warning distinguishes inspection from deletion failure"
+} finally {
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Function:\Get-Content' -Force -ErrorAction SilentlyContinue
+    Set-Item -LiteralPath 'Function:\Write-Warn' -Value $savedWriteWarn
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h17 -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
 Write-Host "All uninstall parity tests passed." -ForegroundColor Green

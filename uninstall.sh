@@ -1182,49 +1182,81 @@ unconfigure_omp() {
         agent_dir="$PI_CODING_AGENT_DIR"
     fi
 
-    local removed=0
-    local failed=0
-    local extension
     local repo_root
     repo_root=$(current_repo_root)
-    for extension in \
-        "$agent_dir/extensions/dcg-guard.ts" \
-        "$config_root/agent/extensions/dcg-guard.ts" \
-        "$HOME/.omp/agent/extensions/dcg-guard.ts" \
-        "$repo_root/.omp/extensions/dcg-guard.ts" \
-        ".omp/extensions/dcg-guard.ts"; do
-        if [ -f "$extension" ] && grep -q 'dcg-omp-extension' "$extension" 2>/dev/null; then
-            if rm -f "$extension" 2>/dev/null; then
-                removed=1
-            else
-                failed=1
-                warn "Could not remove Oh My Pi extension at $extension"
-            fi
-        fi
-    done
+    local removed=0
+    local failed=0
+    local -a extensions=(
+        "$agent_dir/extensions/dcg-guard.ts"
+        "$config_root/agent/extensions/dcg-guard.ts"
+        "$HOME/.omp/agent/extensions/dcg-guard.ts"
+        "$repo_root/.omp/extensions/dcg-guard.ts"
+        ".omp/extensions/dcg-guard.ts"
+    )
     if [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
-        extension="$PI_CODING_AGENT_DIR/extensions/dcg-guard.ts"
-        if [ -f "$extension" ] && grep -q 'dcg-omp-extension' "$extension" 2>/dev/null; then
-            if rm -f "$extension" 2>/dev/null; then
+        extensions+=("$PI_CODING_AGENT_DIR/extensions/dcg-guard.ts")
+    fi
+    local -a profile_roots=(
+        "$HOME/.omp/profiles"
+        "$config_root/profiles"
+    )
+    local -a seen_profile_roots=()
+    local profiles_root
+    local seen_profile_root
+    local profile_agent_dir
+    local duplicate
+    for profiles_root in ${profile_roots[@]+"${profile_roots[@]}"}; do
+        duplicate=0
+        for seen_profile_root in ${seen_profile_roots[@]+"${seen_profile_roots[@]}"}; do
+            if [ "$profiles_root" = "$seen_profile_root" ]; then
+                duplicate=1
+                break
+            fi
+        done
+        [ "$duplicate" -eq 0 ] || continue
+        seen_profile_roots+=("$profiles_root")
+        [ -d "$profiles_root" ] || continue
+
+        if ! find "$profiles_root" -mindepth 1 -maxdepth 1 -type d -print \
+            >/dev/null 2>&1; then
+            failed=1
+            warn "Could not inspect Oh My Pi profiles under $profiles_root"
+            continue
+        fi
+        for profile_agent_dir in "$profiles_root"/*/agent; do
+            [ -d "$profile_agent_dir" ] || continue
+            extensions+=("$profile_agent_dir/extensions/dcg-guard.ts")
+        done
+    done
+
+    local -a seen_extensions=()
+    local extension
+    local seen_extension
+    local grep_status
+    for extension in ${extensions[@]+"${extensions[@]}"}; do
+        duplicate=0
+        for seen_extension in ${seen_extensions[@]+"${seen_extensions[@]}"}; do
+            if [ "$extension" = "$seen_extension" ]; then
+                duplicate=1
+                break
+            fi
+        done
+        [ "$duplicate" -eq 0 ] || continue
+        seen_extensions+=("$extension")
+
+        [ -f "$extension" ] || continue
+        if grep -q -- 'dcg-omp-extension' "$extension" 2>/dev/null; then
+            if rm -f -- "$extension" 2>/dev/null; then
                 removed=1
             else
                 failed=1
                 warn "Could not remove Oh My Pi extension at $extension"
             fi
-        fi
-    fi
-    local profile_agent_dir
-    for profile_agent_dir in \
-        "$HOME/.omp"/profiles/*/agent \
-        "$config_root"/profiles/*/agent; do
-        [ -d "$profile_agent_dir" ] || continue
-        extension="$profile_agent_dir/extensions/dcg-guard.ts"
-        if [ -f "$extension" ] && grep -q 'dcg-omp-extension' "$extension" 2>/dev/null; then
-            if rm -f "$extension" 2>/dev/null; then
-                removed=1
-            else
+        else
+            grep_status=$?
+            if [ "$grep_status" -gt 1 ]; then
                 failed=1
-                warn "Could not remove Oh My Pi extension at $extension"
+                warn "Could not inspect Oh My Pi extension at $extension"
             fi
         fi
     done

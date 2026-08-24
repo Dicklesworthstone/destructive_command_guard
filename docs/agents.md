@@ -43,9 +43,11 @@ dcg install --omp
 The default user path is `~/.omp/agent/extensions/dcg-guard.ts`. OMP named
 profiles use `~/.omp/profiles/<name>/agent/extensions/dcg-guard.ts`; dcg follows
 OMP's `OMP_PROFILE`-before-`PI_PROFILE` precedence and honors
-`PI_CONFIG_DIR` for the config root plus `PI_CODING_AGENT_DIR` for the default
-profile. Use `dcg install --omp --project` to install
-`<repo>/.omp/extensions/dcg-guard.ts` instead.
+`PI_CONFIG_DIR` for a config directory name relative to the user's home plus
+`PI_CODING_AGENT_DIR` for the default profile. Drive-qualified
+`PI_CONFIG_DIR` values are rejected on Windows so installation cannot escape
+the home-relative location OMP expects. Use `dcg install --omp --project` to
+install `<repo>/.omp/extensions/dcg-guard.ts` instead.
 
 The extension uses OMP's pre-execution `tool_call` event and sends each `bash`
 command to `dcg --robot test --stdin --agent omp --dialect posix`. A dcg deny,

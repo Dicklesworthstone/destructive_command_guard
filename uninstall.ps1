@@ -539,9 +539,15 @@ function Get-DcgRepositoryRoot {
 }
 
 function Get-OmpConfigRoot {
-  param([string]$HomeDir = $HOME)
+  param(
+    [string]$HomeDir = $HOME,
+    [bool]$WindowsSemantics = ([System.IO.Path]::DirectorySeparatorChar -eq '\')
+  )
   $configName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
   $configName = $configName.TrimStart([char[]]@('\', '/'))
+  if ($WindowsSemantics -and $configName -match '^[A-Za-z]:') {
+    throw "PI_CONFIG_DIR must be a directory name relative to HOME on Windows, not drive-qualified path '$($env:PI_CONFIG_DIR)'"
+  }
   Join-Path $HomeDir $configName
 }
 
@@ -576,32 +582,55 @@ function Unconfigure-OmpExtension {
   if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
     $RepoRoot = Get-DcgRepositoryRoot
   }
-  $configRoots = @(
-    (Join-Path $HomeDir '.omp'),
-    (Get-OmpConfigRoot -HomeDir $HomeDir)
-  ) | Select-Object -Unique
-  $paths = @(
-    (Join-Path (Join-Path (Get-OmpAgentDir -HomeDir $HomeDir) 'extensions') 'dcg-guard.ts'),
-    (Join-Path (Join-Path (Join-Path $RepoRoot '.omp') 'extensions') 'dcg-guard.ts')
-  )
+  $removed = $false
+  $failed = $false
+  $configRoots = @((Join-Path $HomeDir '.omp'))
+  $currentConfigRoot = $null
+  try {
+    $currentConfigRoot = Get-OmpConfigRoot -HomeDir $HomeDir
+    $configRoots += $currentConfigRoot
+  } catch {
+    $failed = $true
+    Write-Warn "Could not resolve the Oh My Pi config root: $($_.Exception.Message)"
+  }
+  $configRoots = @($configRoots | Select-Object -Unique)
+  $paths = @((Join-Path (Join-Path (Join-Path $RepoRoot '.omp') 'extensions') 'dcg-guard.ts'))
+  if ($null -ne $currentConfigRoot) {
+    try {
+      $paths += Join-Path (Join-Path (Get-OmpAgentDir -HomeDir $HomeDir) 'extensions') 'dcg-guard.ts'
+    } catch {
+      $failed = $true
+      Write-Warn "Could not resolve the active Oh My Pi agent directory: $($_.Exception.Message)"
+    }
+  }
   if (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR)) {
     $paths += Join-Path (Join-Path $env:PI_CODING_AGENT_DIR 'extensions') 'dcg-guard.ts'
   }
   foreach ($configRoot in $configRoots) {
     $paths += Join-Path (Join-Path (Join-Path $configRoot 'agent') 'extensions') 'dcg-guard.ts'
     $profilesRoot = Join-Path $configRoot 'profiles'
-    if (-not (Test-Path -LiteralPath $profilesRoot -PathType Container)) { continue }
-    foreach ($profileDir in Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction SilentlyContinue) {
-      $paths += Join-Path (Join-Path (Join-Path $profileDir.FullName 'agent') 'extensions') 'dcg-guard.ts'
+    try {
+      if (-not (Test-Path -LiteralPath $profilesRoot -PathType Container -ErrorAction Stop)) { continue }
+      foreach ($profileDir in Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction Stop) {
+        $paths += Join-Path (Join-Path (Join-Path $profileDir.FullName 'agent') 'extensions') 'dcg-guard.ts'
+      }
+    } catch {
+      $failed = $true
+      Write-Warn "Could not inspect Oh My Pi profiles under ${profilesRoot}: $($_.Exception.Message)"
     }
   }
   $paths = @($paths | Select-Object -Unique)
-  $removed = $false
-  $failed = $false
   foreach ($extension in $paths) {
-    if (-not (Test-Path -LiteralPath $extension -PathType Leaf)) { continue }
     try {
-      if ((Get-Content -Raw -LiteralPath $extension -ErrorAction Stop) -notmatch 'dcg-omp-extension') { continue }
+      if (-not (Test-Path -LiteralPath $extension -PathType Leaf -ErrorAction Stop)) { continue }
+      $content = Get-Content -Raw -LiteralPath $extension -ErrorAction Stop
+    } catch {
+      $failed = $true
+      Write-Warn "Could not inspect Oh My Pi extension at ${extension}: $($_.Exception.Message)"
+      continue
+    }
+    if ($content -notmatch 'dcg-omp-extension') { continue }
+    try {
       Remove-Item -Force -LiteralPath $extension -ErrorAction Stop
       $removed = $true
     } catch {

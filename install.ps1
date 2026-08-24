@@ -1782,6 +1782,17 @@ function Resolve-ChecksumToken {
   throw "no valid SHA-256 found for $artifactLeaf (per-file .sha256, SHA256SUMS.txt, SHA256SUMS all failed)"
 }
 
+function Get-OmpConfigRootForDetection {
+  param(
+    [string]$HomeDir = $HOME,
+    [bool]$WindowsSemantics = ([System.IO.Path]::DirectorySeparatorChar -eq '\')
+  )
+  $configName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
+  $configName = $configName.TrimStart([char[]]@('\', '/'))
+  if ($WindowsSemantics -and $configName -match '^[A-Za-z]:') { return $null }
+  Join-Path $HomeDir $configName
+}
+
 function Detect-Agents {
   # Probe for installed coding agents (config dir under $HomeDir, or the agent's
   # CLI on PATH). Returns an [ordered] map of
@@ -1793,10 +1804,10 @@ function Detect-Agents {
   param([string]$HomeDir = $HOME, [string]$RepoRoot = "")
   $null = $RepoRoot
   function _has([string]$cmd) { [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
-  function _dir([string]$name) { Test-Path -LiteralPath (Join-Path $HomeDir $name) -PathType Container }
-  $ompConfigName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
-  $ompConfigName = $ompConfigName.TrimStart([char[]]@('\', '/'))
-  $ompConfigRoot = Join-Path $HomeDir $ompConfigName
+  function _dir([string]$name) {
+    Test-Path -LiteralPath (Join-Path $HomeDir $name) -PathType Container -ErrorAction SilentlyContinue
+  }
+  $ompConfigRoot = Get-OmpConfigRootForDetection -HomeDir $HomeDir
   [ordered]@{
     'Claude'  = ((_dir '.claude')  -or (_has 'claude'))
     'Codex'   = ((_dir '.codex')   -or (_has 'codex'))
@@ -1804,18 +1815,19 @@ function Detect-Agents {
     'Cursor'  = ((_dir '.cursor')  -or (_has 'cursor'))
     'Copilot' = ((_dir '.copilot') -or
       (-not [string]::IsNullOrWhiteSpace($env:COPILOT_HOME) -and
-        (Test-Path -LiteralPath $env:COPILOT_HOME -PathType Container)) -or
+        (Test-Path -LiteralPath $env:COPILOT_HOME -PathType Container -ErrorAction SilentlyContinue)) -or
       (_has 'copilot') -or (_has 'gh-copilot'))
     'Grok'    = ((_dir '.grok')    -or (-not [string]::IsNullOrEmpty($env:GROK_SESSION_ID)))
     'Agy'     = (_has 'agy')
     'Hermes'  = ((_dir '.hermes') -or (_has 'hermes') -or
-      (Test-Path -LiteralPath (Get-HermesConfigDir -HomeDir $HomeDir) -PathType Container))
+      (Test-Path -LiteralPath (Get-HermesConfigDir -HomeDir $HomeDir) -PathType Container -ErrorAction SilentlyContinue))
     # A bare ~/.posit is not enough — other Posit tools share that directory.
-    'Posit'   = ((Test-Path -LiteralPath (Join-Path (Join-Path $HomeDir '.posit') 'assistant') -PathType Container) -or
+    'Posit'   = ((Test-Path -LiteralPath (Join-Path (Join-Path $HomeDir '.posit') 'assistant') -PathType Container -ErrorAction SilentlyContinue) -or
       (_dir '.positai') -or (_has 'pa'))
-    'Omp'     = ((Test-Path -LiteralPath $ompConfigRoot -PathType Container) -or
+    'Omp'     = (($null -ne $ompConfigRoot -and
+        (Test-Path -LiteralPath $ompConfigRoot -PathType Container -ErrorAction SilentlyContinue)) -or
       (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR) -and
-        (Test-Path -LiteralPath $env:PI_CODING_AGENT_DIR -PathType Container)) -or
+        (Test-Path -LiteralPath $env:PI_CODING_AGENT_DIR -PathType Container -ErrorAction SilentlyContinue)) -or
       (Test-Path Env:OMP_PROFILE) -or (_has 'omp'))
   }
 }
