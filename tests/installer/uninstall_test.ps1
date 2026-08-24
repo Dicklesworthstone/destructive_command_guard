@@ -190,5 +190,20 @@ try {
     Check (@($entries | Where-Object { $_.bash -eq 'linter' }).Count -eq 1) "coexisting non-dcg entry survives"
 } finally { Remove-Item -Recurse -Force $h10 -ErrorAction SilentlyContinue }
 
+Write-Host "Test 11: Oh My Pi marker-owned extension removed, user extension preserved"
+$h11 = New-Tmp
+try {
+    $extDir = Join-Path (Join-Path (Join-Path $h11 '.omp') 'agent') 'extensions'
+    New-Item -ItemType Directory -Path $extDir -Force | Out-Null
+    $extension = Join-Path $extDir 'dcg-guard.ts'
+    Set-Content -Path $extension -Value '// dcg-omp-extension: generated'
+    Check ((Unconfigure-OmpExtension -HomeDir $h11 -RepoRoot $h11) -eq $true) "OMP: marker-owned extension removed"
+    Check (-not (Test-Path $extension)) "OMP: generated extension no longer exists"
+
+    Set-Content -Path $extension -Value 'export default function mine() {}'
+    Check ((Unconfigure-OmpExtension -HomeDir $h11 -RepoRoot $h11) -eq $false) "OMP: user extension not claimed"
+    Check (Test-Path $extension) "OMP: user-authored extension preserved"
+} finally { Remove-Item -Recurse -Force $h11 -ErrorAction SilentlyContinue }
+
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
 Write-Host "All uninstall parity tests passed." -ForegroundColor Green

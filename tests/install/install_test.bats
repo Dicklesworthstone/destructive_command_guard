@@ -426,6 +426,16 @@ MOCKEOF
     [[ " ${DETECTED_AGENTS[*]} " =~ " continue " ]]
 }
 
+@test "detect_agents: finds Oh My Pi when native state exists" {
+    log_test "Testing Oh My Pi detection..."
+
+    mkdir -p "$HOME/.omp/agent"
+    detect_agents
+    log_test "Detected agents: ${DETECTED_AGENTS[*]:-none}"
+
+    [[ " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
+}
+
 @test "detect_agents: finds multiple agents" {
     log_test "Testing multiple agent detection..."
 

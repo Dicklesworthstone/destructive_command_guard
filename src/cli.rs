@@ -294,7 +294,7 @@ pub enum Command {
     },
 
     /// Install the hook into Claude Code settings (or another agent with
-    /// `--grok`, `--agy`, or `--opencode`)
+    /// `--grok`, `--agy`, `--opencode`, or `--omp`)
     #[command(name = "install")]
     Install {
         /// Force overwrite existing hook configuration
@@ -331,6 +331,14 @@ pub enum Command {
         /// call with dcg's reason. Restart OpenCode after installing (#318).
         #[arg(long)]
         opencode: bool,
+
+        /// Install a native Oh My Pi (`omp`) `tool_call` extension at the
+        /// active user profile's `extensions/dcg-guard.ts` path (normally
+        /// `~/.omp/agent/extensions/dcg-guard.ts`) or
+        /// `<repo>/.omp/extensions/dcg-guard.ts` (with `--project`). Every OMP
+        /// bash tool call is routed through dcg before execution.
+        #[arg(long)]
+        omp: bool,
     },
 
     /// Full setup: install hook + add shell startup check
@@ -2209,6 +2217,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             grok,
             agy,
             opencode,
+            omp,
         }) => {
             if grok {
                 install_grok_hook(force, project)?;
@@ -2216,6 +2225,8 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 install_antigravity_hook(force, project)?;
             } else if opencode {
                 install_opencode_plugin(force, project)?;
+            } else if omp {
+                install_omp_extension(force, project)?;
             } else {
                 install_hook(force, project)?;
             }
@@ -10282,7 +10293,34 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         }
     }
 
-    // Check 3d: Build provenance / update pin (#320). Warning-only: it never
+    // Check 3d: Oh My Pi extension registration. OMP has no Claude-compatible
+    // fallback: without its native ExtensionAPI module, bash calls do not reach
+    // dcg at all.
+    if omp_appears_in_use() {
+        print!("Checking Oh My Pi extension registration... ");
+        let extension_path = omp_user_extension_path();
+        if omp_extension_is_dcg_owned(&extension_path) {
+            println!("{}", "OK".green());
+            println!("  Found: {}", extension_path.display());
+        } else {
+            println!("{}", "NOT REGISTERED".yellow());
+            issues += 1;
+            if fix {
+                println!("  Attempting extension install...");
+                if install_omp_extension(false, false).is_ok() {
+                    println!("  {}", "Fixed!".green());
+                    fixed += 1;
+                } else {
+                    println!("  {}", "Failed to fix".red());
+                }
+            } else {
+                println!("  → Run 'dcg install --omp' to install the native extension");
+                println!("    (OMP bash commands are NOT guarded until it is installed)");
+            }
+        }
+    }
+
+    // Check 3e: Build provenance / update pin (#320). Warning-only: it never
     // increments `issues`, so it cannot fail `--strict` — it flags the state
     // that is one routine `dcg update` away from silently replacing a local
     // build. `collect_doctor_report` carries the same check.
@@ -11236,6 +11274,53 @@ fn collect_doctor_report(
         });
     }
 
+    // Oh My Pi extension registration. Mirrored in `doctor_pretty` so strict,
+    // pretty, and JSON doctor output agree.
+    if omp_appears_in_use() {
+        let extension_path = omp_user_extension_path();
+        let mut omp_fixed = false;
+        let (status, message, remediation) = if omp_extension_is_dcg_owned(&extension_path) {
+            (
+                DoctorCheckStatus::Ok,
+                format!(
+                    "Native Oh My Pi extension found at {}",
+                    extension_path.display()
+                ),
+                None,
+            )
+        } else {
+            issues += 1;
+            if fix && install_omp_extension(false, false).is_ok() {
+                fixed += 1;
+                omp_fixed = true;
+                (
+                    DoctorCheckStatus::Ok,
+                    format!(
+                        "Installed native Oh My Pi extension at {}",
+                        extension_path.display()
+                    ),
+                    None,
+                )
+            } else {
+                (
+                    DoctorCheckStatus::Error,
+                    "Oh My Pi is in use but has no dcg extension — its bash commands are not \
+                     guarded"
+                        .to_string(),
+                    Some("Run 'dcg install --omp'".to_string()),
+                )
+            }
+        };
+        checks.push(DoctorCheck {
+            id: "omp_extension",
+            name: "Oh My Pi extension registration",
+            status,
+            message,
+            remediation,
+            fixed: omp_fixed,
+        });
+    }
+
     // Build provenance vs. `dcg update` (#320). Warning-only: it never fails
     // `--strict`, it flags the state that is one routine `dcg update` away
     // from silently replacing a local build. Mirrored in `doctor_pretty`.
@@ -12179,6 +12264,185 @@ fn opencode_plugin_is_dcg_owned(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Ownership marker embedded in the generated Oh My Pi extension.
+///
+/// Installation refuses to overwrite a file without this marker, and the
+/// uninstallers use it to distinguish dcg-owned output from user code.
+pub(crate) const OMP_EXTENSION_MARKER: &str = "dcg-omp-extension";
+
+/// Normalize an OMP profile name using the OMP v18 profile-name contract.
+/// Empty and `default` select the default profile; invalid names also fall
+/// back to the default, matching OMP's safe module-load behavior.
+fn normalize_omp_profile_name(profile: &str) -> Option<String> {
+    let name = profile.trim();
+    if name.is_empty()
+        || name == "default"
+        || name == "."
+        || name == ".."
+        || name.ends_with('.')
+        || name.len() > 64
+    {
+        return None;
+    }
+
+    let mut chars = name.chars();
+    if !chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
+    {
+        return None;
+    }
+
+    let base = name.split('.').next().unwrap_or(name);
+    let upper = base.to_ascii_uppercase();
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit());
+    (!reserved).then(|| name.to_string())
+}
+
+/// Resolve OMP's active named profile. `OMP_PROFILE` takes precedence whenever
+/// it is set, including when it is explicitly empty; `PI_PROFILE` is the
+/// legacy fallback used only when `OMP_PROFILE` is absent.
+fn omp_active_profile() -> Option<String> {
+    match std::env::var("OMP_PROFILE") {
+        Ok(profile) => normalize_omp_profile_name(&profile),
+        Err(_) => std::env::var("PI_PROFILE")
+            .ok()
+            .and_then(|profile| normalize_omp_profile_name(&profile)),
+    }
+}
+
+/// OMP's active user agent directory. The default is `~/.omp/agent`; named
+/// profiles live under `~/.omp/profiles/<name>/agent`. OMP ignores the legacy
+/// `PI_CODING_AGENT_DIR` override when a named profile is active, so dcg does
+/// the same.
+fn omp_user_agent_dir() -> std::path::PathBuf {
+    let home = dirs::home_dir().unwrap_or_default();
+    let config_name = std::env::var("PI_CONFIG_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ".omp".to_string());
+    let config_root = home.join(config_name.trim_start_matches(['/', '\\']));
+
+    if let Some(profile) = omp_active_profile() {
+        return config_root.join("profiles").join(profile).join("agent");
+    }
+
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| config_root.join("agent"), std::path::PathBuf::from)
+}
+
+/// User-level OMP extension path for the active profile.
+fn omp_user_extension_path() -> std::path::PathBuf {
+    omp_user_agent_dir().join("extensions").join("dcg-guard.ts")
+}
+
+/// Project-level OMP extension path: `<repo>/.omp/extensions/dcg-guard.ts`.
+fn project_omp_extension_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let repo_root = find_repo_root_from_cwd()
+        .ok_or("Not inside a git repository — cannot determine project root")?;
+    Ok(repo_root
+        .join(".omp")
+        .join("extensions")
+        .join("dcg-guard.ts"))
+}
+
+/// Generate an OMP ExtensionAPI module that gates every `bash` tool call on
+/// dcg's robot-mode evaluator. The command is sent on stdin and dcg is spawned
+/// directly (never through a shell). Exit 1 is a safety block; infrastructure
+/// failures fail open with a visible diagnostic, consistent with dcg's other
+/// generated integration bridges.
+fn build_omp_extension_source(executable: &std::path::Path) -> std::io::Result<String> {
+    let path_literal = serde_json::to_string(&executable.to_string_lossy()).map_err(|e| {
+        std::io::Error::other(format!("cannot encode dcg path as a JS literal: {e}"))
+    })?;
+    Ok(format!(
+        r#"// {OMP_EXTENSION_MARKER}: generated by `dcg install --omp` — do not edit.
+// Routes every Oh My Pi bash tool call through dcg (Destructive Command Guard)
+// before execution. Docs: https://github.com/Dicklesworthstone/destructive_command_guard
+import type {{ ExtensionAPI }} from "@oh-my-pi/pi-coding-agent";
+
+const DCG_BIN = {path_literal};
+const BLOCKING_DECISIONS = new Set(["deny", "ask", "indeterminate"]);
+
+export default function dcgGuard(pi: ExtensionAPI): void {{
+  pi.on("tool_call", async (event) => {{
+    if (event.toolName !== "bash") return;
+    const command = String((event.input as {{ command?: unknown }}).command ?? "");
+    if (!command) return;
+
+    let stdoutText;
+    let stderrText;
+    let exitCode;
+    try {{
+      const proc = Bun.spawn([
+        process.env.DCG_BIN || DCG_BIN,
+        "--robot", "test", "--stdin", "--agent", "omp", "--dialect", "posix",
+      ], {{
+        stdin: new TextEncoder().encode(command),
+        stdout: "pipe",
+        stderr: "pipe",
+      }});
+      [stdoutText, stderrText, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+    }} catch (err) {{
+      console.error(`[dcg] OMP guard could not run dcg: ${{err}}`);
+      return;
+    }}
+
+    if (exitCode === 0 || exitCode === 2) return;
+    if (exitCode !== 1) {{
+      const detail = String(stderrText || "").trim();
+      console.error(`[dcg] OMP guard infrastructure failure (exit ${{exitCode}})${{detail ? `: ${{detail}}` : ""}}`);
+      return;
+    }}
+
+    let result: {{ decision?: string; reason?: string; rule_id?: string }} = {{}};
+    try {{
+      result = JSON.parse(String(stdoutText || ""));
+    }} catch {{
+      // Exit 1 is dcg's deny/indeterminate contract. Preserve the block even
+      // if a future or damaged binary emits an unreadable payload.
+    }}
+
+    const decision = String(result.decision || "deny");
+    const reason = BLOCKING_DECISIONS.has(decision)
+      ? String(result.reason || "Blocked by dcg")
+      : "Blocked by dcg (exit 1 without a recognized decision)";
+    const rule = result.rule_id ? `\n\nRule: ${{result.rule_id}}` : "";
+    return {{ block: true, reason: `${{reason}}${{rule}}` }};
+  }});
+}}
+"#
+    ))
+}
+
+/// Whether this machine plausibly uses OMP. This gates doctor output so users
+/// without OMP are not prompted to install an irrelevant extension.
+fn omp_appears_in_use() -> bool {
+    if std::env::var_os("OMP_PROFILE").is_some() {
+        return true;
+    }
+    let default_root = dirs::home_dir().unwrap_or_default().join(".omp");
+    default_root.is_dir() || omp_user_agent_dir().is_dir()
+}
+
+/// Whether `path` holds a dcg-generated OMP extension.
+fn omp_extension_is_dcg_owned(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|content| content.contains(OMP_EXTENSION_MARKER))
+        .unwrap_or(false)
+}
+
 /// Shared doctor verdict for the build-provenance / update-pin check (#320),
 /// used by both renderers so `--strict` and `--format json` agree.
 fn build_provenance_doctor_parts(config: &Config) -> (DoctorCheckStatus, String, Option<String>) {
@@ -12270,6 +12534,52 @@ fn install_opencode_plugin(force: bool, project: bool) -> Result<(), Box<dyn std
     println!(
         "{}",
         "Restart OpenCode (start a new session) for the plugin to load.".yellow()
+    );
+    Ok(())
+}
+
+/// Install the native Oh My Pi ExtensionAPI guard.
+fn install_omp_extension(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let extension_path = if project {
+        project_omp_extension_path()?
+    } else {
+        omp_user_extension_path()
+    };
+
+    if extension_path.exists() {
+        let existing = std::fs::read_to_string(&extension_path).unwrap_or_default();
+        if !existing.contains(OMP_EXTENSION_MARKER) {
+            return Err(format!(
+                "{} exists but was not generated by dcg (missing the '{OMP_EXTENSION_MARKER}' \
+                 marker). Refusing to overwrite a user-owned extension — move it aside or merge \
+                 the dcg guard into it manually.",
+                extension_path.display()
+            )
+            .into());
+        }
+        if !force {
+            println!("{}", "OMP extension already installed!".yellow());
+            println!("Use --force to reinstall");
+            return Ok(());
+        }
+    }
+
+    let executable = current_dcg_executable()?;
+    let source = build_omp_extension_source(&executable)?;
+    if let Some(parent) = extension_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&extension_path, source)?;
+
+    let level = if project { "project" } else { "user/profile" };
+    println!("{}", "OMP extension installed successfully!".green().bold());
+    println!("Extension written ({level}): {}", extension_path.display());
+    println!();
+    println!(
+        "{}",
+        "Restart Oh My Pi (start a new session) for the extension to load.".yellow()
     );
     Ok(())
 }
@@ -17928,6 +18238,7 @@ if ($errors.Count -ne 0) {
             grok,
             agy,
             opencode,
+            omp,
         }) = cli.command
         {
             assert!(!force);
@@ -17935,6 +18246,7 @@ if ($errors.Count -ne 0) {
             assert!(!grok);
             assert!(!agy);
             assert!(!opencode);
+            assert!(!omp);
         } else {
             unreachable!("Expected Install command");
         }
@@ -17949,6 +18261,7 @@ if ($errors.Count -ne 0) {
             grok,
             agy,
             opencode,
+            omp,
         }) = cli.command
         {
             assert!(force);
@@ -17956,6 +18269,7 @@ if ($errors.Count -ne 0) {
             assert!(!grok);
             assert!(!agy);
             assert!(!opencode);
+            assert!(!omp);
         } else {
             unreachable!("Expected Install command");
         }
@@ -17970,6 +18284,7 @@ if ($errors.Count -ne 0) {
             grok,
             agy,
             opencode,
+            omp,
         }) = cli.command
         {
             assert!(!force);
@@ -17977,6 +18292,7 @@ if ($errors.Count -ne 0) {
             assert!(grok);
             assert!(!agy);
             assert!(!opencode);
+            assert!(!omp);
         } else {
             unreachable!("Expected Install command");
         }
@@ -17991,6 +18307,7 @@ if ($errors.Count -ne 0) {
             grok,
             agy,
             opencode,
+            omp,
         }) = cli.command
         {
             assert!(!force);
@@ -17998,6 +18315,7 @@ if ($errors.Count -ne 0) {
             assert!(grok);
             assert!(!agy);
             assert!(!opencode);
+            assert!(!omp);
         } else {
             unreachable!("Expected Install command");
         }
@@ -18012,6 +18330,7 @@ if ($errors.Count -ne 0) {
             grok,
             agy,
             opencode,
+            omp,
         }) = cli.command
         {
             assert!(!force);
@@ -18019,6 +18338,7 @@ if ($errors.Count -ne 0) {
             assert!(!grok);
             assert!(agy);
             assert!(!opencode);
+            assert!(!omp);
         } else {
             unreachable!("Expected Install command");
         }
@@ -18033,6 +18353,7 @@ if ($errors.Count -ne 0) {
             grok,
             agy,
             opencode,
+            omp,
         }) = cli.command
         {
             assert!(!force);
@@ -18040,6 +18361,7 @@ if ($errors.Count -ne 0) {
             assert!(!grok);
             assert!(agy);
             assert!(!opencode);
+            assert!(!omp);
         } else {
             unreachable!("Expected Install command");
         }
@@ -18054,6 +18376,7 @@ if ($errors.Count -ne 0) {
             grok,
             agy,
             opencode,
+            omp,
         }) = cli.command
         {
             assert!(!force);
@@ -18061,6 +18384,7 @@ if ($errors.Count -ne 0) {
             assert!(!grok);
             assert!(!agy);
             assert!(opencode);
+            assert!(!omp);
         } else {
             unreachable!("Expected Install command");
         }
@@ -18075,6 +18399,7 @@ if ($errors.Count -ne 0) {
             grok,
             agy,
             opencode,
+            omp,
         }) = cli.command
         {
             assert!(force);
@@ -18082,6 +18407,30 @@ if ($errors.Count -ne 0) {
             assert!(!grok);
             assert!(!agy);
             assert!(opencode);
+            assert!(!omp);
+        } else {
+            unreachable!("Expected Install command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_install_omp_with_project_and_force() {
+        let cli = Cli::parse_from(["dcg", "install", "--omp", "--project", "--force"]);
+        if let Some(Command::Install {
+            force,
+            project,
+            grok,
+            agy,
+            opencode,
+            omp,
+        }) = cli.command
+        {
+            assert!(force);
+            assert!(project);
+            assert!(!grok);
+            assert!(!agy);
+            assert!(!opencode);
+            assert!(omp);
         } else {
             unreachable!("Expected Install command");
         }
@@ -18118,6 +18467,44 @@ if ($errors.Count -ne 0) {
         assert_ne!(parsed, "dcg", "never a bare PATH lookup");
         // An `ask` verdict must fail closed (OpenCode has no review UI).
         assert!(source.contains("verdict === \"deny\" || verdict === \"ask\""));
+    }
+
+    #[test]
+    fn omp_extension_source_has_native_blocking_contract() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        assert!(source.contains(OMP_EXTENSION_MARKER));
+        assert!(source.contains("pi.on(\"tool_call\""));
+        assert!(source.contains("event.toolName !== \"bash\""));
+        assert!(source.contains("\"--robot\", \"test\", \"--stdin\""));
+        assert!(source.contains("\"--agent\", \"omp\""));
+        assert!(source.contains("\"deny\", \"ask\", \"indeterminate\""));
+        assert!(source.contains("return { block: true, reason:"));
+        assert!(source.contains("exitCode !== 1"));
+
+        let line = source
+            .lines()
+            .find(|line| line.starts_with("const DCG_BIN = "))
+            .expect("extension embeds DCG_BIN");
+        let literal = line
+            .trim_start_matches("const DCG_BIN = ")
+            .trim_end_matches(';');
+        let parsed: String = serde_json::from_str(literal).expect("valid JSON string literal");
+        assert_eq!(std::path::Path::new(&parsed), executable);
+        assert_ne!(parsed, "dcg", "never a bare PATH lookup");
+    }
+
+    #[test]
+    fn omp_profile_names_follow_upstream_safety_contract() {
+        assert_eq!(normalize_omp_profile_name("work"), Some("work".to_string()));
+        assert_eq!(
+            normalize_omp_profile_name("team-1.dev"),
+            Some("team-1.dev".to_string())
+        );
+        for invalid in ["", "default", ".", "..", "Upper", "../escape", "NUL"] {
+            assert_eq!(normalize_omp_profile_name(invalid), None, "{invalid}");
+        }
     }
 
     #[test]

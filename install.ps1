@@ -1810,6 +1810,7 @@ function Detect-Agents {
     # A bare ~/.posit is not enough — other Posit tools share that directory.
     'Posit'   = ((Test-Path (Join-Path (Join-Path $HomeDir '.posit') 'assistant') -PathType Container) -or
       (_dir '.positai') -or (_has 'pa'))
+    'Omp'     = ((_dir '.omp') -or (_has 'omp'))
   }
 }
 
@@ -1817,7 +1818,7 @@ function Get-DetectedAgentNames {
   # The display-names of agents Detect-Agents flagged as present, in order.
   param($Agents)
   @(
-    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit')) {
+    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit', 'Omp')) {
       if ($Agents[$name]) { $name }
     }
   )
@@ -1852,6 +1853,7 @@ Configured agents (when detected, or with -Force/-EasyMode):
   Gemini CLI   (~/.gemini/settings.json)      Copilot CLI (~/.copilot/hooks/dcg.json)
   Cursor IDE   (~/.cursor/hooks.json)         Hermes      (HERMES_HOME, else %LOCALAPPDATA%\hermes\config.yaml)
   Posit Assistant (~/.posit/assistant/settings.json)
+  Oh My Pi     (~/.omp/agent/extensions/dcg-guard.ts via dcg install --omp)
   Grok / agy   via dcg install --grok / --agy under -EasyMode when detected
 '@
   exit 0
@@ -2253,6 +2255,22 @@ if ($detectedAgents['Posit'] -or $forceConfig) {
   } catch {
     Write-Warn "Posit Assistant auto-configuration failed: $_"
   }
+}
+
+# Configure Oh My Pi through dcg's generated native ExtensionAPI module. The
+# Rust installer is the single source of truth for active-profile resolution,
+# marker ownership, and the embedded absolute dcg.exe path.
+if ($detectedAgents['Omp'] -or $forceConfig) {
+  Write-Host ""
+  try {
+    & $dcgExe install --omp --force | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Ok "Configured Oh My Pi extension via 'dcg install --omp'" }
+    else { Write-Warn "'dcg install --omp' exited with code $LASTEXITCODE" }
+  } catch {
+    Write-Warn "Oh My Pi extension configuration failed: $_"
+  }
+} else {
+  Write-Info "Oh My Pi not detected; re-run with -EasyMode to configure its extension anyway"
 }
 
 # Grok (xAI) and Antigravity (agy): configured via the dcg binary itself rather

@@ -45,6 +45,7 @@ try {
     Check ($a['Agy'] -eq $false) "Agy NOT detected (no agy on PATH)"
     Check ($a['Hermes'] -eq $false) "Hermes NOT detected"
     Check ($a['Posit'] -eq $false) "Posit Assistant NOT detected"
+    Check ($a['Omp'] -eq $false) "Oh My Pi NOT detected"
     $names = Get-DetectedAgentNames $a
     Check (($names -join ',') -eq 'Claude,Gemini,Grok') "summary lists detected agents in config order (got '$($names -join ',')')"
     Remove-Item -Recurse -Force $h1 -ErrorAction SilentlyContinue
@@ -71,6 +72,15 @@ try {
     $a1d = Detect-Agents -HomeDir $h1d
     Check ($a1d['Posit'] -eq $true) "Posit detected via legacy ~/.positai"
     Remove-Item -Recurse -Force $h1d -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1e: Oh My Pi detected from ~/.omp"
+    $h1e = New-TempHome
+    New-Item -ItemType Directory -Force -Path (Join-Path $h1e '.omp') | Out-Null
+    $a1e = Detect-Agents -HomeDir $h1e
+    Check ($a1e['Omp'] -eq $true) "Oh My Pi detected via ~/.omp"
+    $names1e = Get-DetectedAgentNames $a1e
+    Check (($names1e -join ',') -eq 'Omp') "summary lists only Omp (got '$($names1e -join ',')')"
+    Remove-Item -Recurse -Force $h1e -ErrorAction SilentlyContinue
 
     Write-Host "Test 2: empty home -> nothing detected"
     $h2 = New-TempHome

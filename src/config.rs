@@ -8694,6 +8694,14 @@ enabled = false
                 ..Default::default()
             },
         );
+        config.profiles.insert(
+            "oh-my-pi".to_string(),
+            AgentProfile {
+                trust_level: TrustLevel::High,
+                additional_allowlist: vec!["cargo test".to_string()],
+                ..Default::default()
+            },
+        );
 
         let codex_profile = config.profile_for_agent(&Agent::CodexCli);
         assert_eq!(codex_profile.trust_level, TrustLevel::High);
@@ -8706,6 +8714,14 @@ enabled = false
         let claude_profile = config.profile_for("claude-code");
         assert_eq!(claude_profile.trust_level, TrustLevel::Low);
         assert!(claude_profile.disabled_allowlist);
+
+        let omp_profile = config.profile_for_agent(&Agent::Omp);
+        assert_eq!(omp_profile.trust_level, TrustLevel::High);
+        assert!(
+            omp_profile
+                .additional_allowlist
+                .contains(&"cargo test".to_string())
+        );
     }
 
     #[test]

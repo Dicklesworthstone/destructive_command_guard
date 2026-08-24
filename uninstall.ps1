@@ -524,6 +524,49 @@ function Unconfigure-HermesHook {
   $removedAny
 }
 
+function Get-OmpAgentDir {
+  # Mirror OMP's active-profile directory resolution closely enough for safe,
+  # marker-owned extension cleanup.
+  param([string]$HomeDir = $HOME)
+  $configName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
+  $configName = $configName.TrimStart([char[]]@('\', '/'))
+  $configRoot = Join-Path $HomeDir $configName
+
+  $profile = $null
+  if (Test-Path Env:OMP_PROFILE) { $profile = $env:OMP_PROFILE }
+  elseif (Test-Path Env:PI_PROFILE) { $profile = $env:PI_PROFILE }
+  if ($null -ne $profile) { $profile = $profile.Trim() }
+  $validProfile = (-not [string]::IsNullOrEmpty($profile)) -and
+    ($profile -ne 'default') -and ($profile.Length -le 64) -and
+    ($profile -match '^[a-z0-9][a-z0-9._-]*$') -and (-not $profile.EndsWith('.')) -and
+    ($profile -notmatch '^(?i:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\.|$)')
+  if ($validProfile) {
+    return (Join-Path (Join-Path (Join-Path $configRoot 'profiles') $profile) 'agent')
+  }
+  if (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR)) {
+    return $env:PI_CODING_AGENT_DIR
+  }
+  Join-Path $configRoot 'agent'
+}
+
+function Unconfigure-OmpExtension {
+  # Remove only marker-owned dcg-guard.ts files; preserve any user-authored
+  # extension with the same filename.
+  param([string]$HomeDir = $HOME, [string]$RepoRoot = (Get-Location).Path)
+  $paths = @(
+    (Join-Path (Join-Path (Get-OmpAgentDir -HomeDir $HomeDir) 'extensions') 'dcg-guard.ts'),
+    (Join-Path (Join-Path (Join-Path $RepoRoot '.omp') 'extensions') 'dcg-guard.ts')
+  ) | Select-Object -Unique
+  $removed = $false
+  foreach ($extension in $paths) {
+    if (-not (Test-Path $extension -PathType Leaf)) { continue }
+    if ((Get-Content -Raw -LiteralPath $extension) -notmatch 'dcg-omp-extension') { continue }
+    Remove-Item -Force -LiteralPath $extension -ErrorAction SilentlyContinue
+    $removed = $true
+  }
+  $removed
+}
+
 # Testing entrypoint: when dot-sourced with -LoadFunctionsOnly, stop here so the
 # functions above are available without running the uninstall body below.
 if ($LoadFunctionsOnly) { return }
@@ -601,6 +644,8 @@ $agyHooks = Join-Path (Join-Path (Join-Path $HOME ".gemini") "config") "hooks.js
 if (Remove-DcgHooksFromJsonFile -Path $agyHooks -DeleteEmptyFile) {
   Write-Ok "Removed Antigravity (agy) hook"
 }
+
+if (Unconfigure-OmpExtension) { Write-Ok "Removed Oh My Pi extension" }
 
 if (Test-Path $binary -PathType Leaf) {
   Remove-Item -Force -Path $binary

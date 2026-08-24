@@ -1695,6 +1695,61 @@ mod config_tests {
         );
     }
 
+    /// `dcg install --omp` writes OMP's native ExtensionAPI module under the
+    /// active user agent directory, is idempotent, and never overwrites a
+    /// user-owned extension with the same filename.
+    #[test]
+    fn install_omp_writes_owned_extension_and_respects_foreign_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
+        let extension_path = home_dir
+            .join(".omp")
+            .join("agent")
+            .join("extensions")
+            .join("dcg-guard.ts");
+
+        let run = |args: &[&str]| {
+            std::process::Command::new(dcg_binary())
+                .args(args)
+                .env_clear()
+                .env("HOME", &home_dir)
+                .env("USERPROFILE", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                .current_dir(temp.path())
+                .output()
+                .expect("run dcg")
+        };
+
+        let output = run(&["install", "--omp"]);
+        assert!(
+            output.status.success(),
+            "install --omp: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let written = std::fs::read_to_string(&extension_path).expect("extension written");
+        assert!(written.contains("dcg-omp-extension"), "ownership marker");
+        assert!(written.contains("pi.on(\"tool_call\""), "OMP hook event");
+        assert!(written.contains("\"--agent\", \"omp\""), "OMP profile");
+
+        let output = run(&["install", "--omp"]);
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("already installed"),
+            "idempotent reinstall: {stdout}"
+        );
+
+        std::fs::write(&extension_path, "export default function mine() {}")
+            .expect("plant user extension");
+        let output = run(&["install", "--omp", "--force"]);
+        assert!(
+            !output.status.success(),
+            "must refuse to clobber a user-owned OMP extension"
+        );
+        let contents = std::fs::read_to_string(&extension_path).expect("extension intact");
+        assert!(contents.contains("mine"), "user extension left untouched");
+    }
+
     #[test]
     fn config_show_produces_output() {
         let output = run_dcg(&["config"]);

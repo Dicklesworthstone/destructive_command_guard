@@ -1127,6 +1127,42 @@ unconfigure_opencode() {
     return 0
 }
 
+unconfigure_omp() {
+    # Oh My Pi extension: remove only marker-owned files. Resolve the same
+    # active-profile path as OMP/dcg install, plus the current repo-local path.
+    local config_name="${PI_CONFIG_DIR:-.omp}"
+    config_name="${config_name#/}"
+    config_name="${config_name#\\}"
+    local agent_dir="$HOME/$config_name/agent"
+    local profile=""
+    if [ "${OMP_PROFILE+x}" = "x" ]; then
+        profile="$OMP_PROFILE"
+    elif [ "${PI_PROFILE+x}" = "x" ]; then
+        profile="$PI_PROFILE"
+    fi
+    profile=$(printf '%s' "$profile" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [ -n "$profile" ] && [ "$profile" != "default" ] &&
+        printf '%s' "$profile" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$'; then
+        agent_dir="$HOME/$config_name/profiles/$profile/agent"
+    elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
+        agent_dir="$PI_CODING_AGENT_DIR"
+    fi
+
+    local removed=0
+    local extension
+    for extension in \
+        "$agent_dir/extensions/dcg-guard.ts" \
+        ".omp/extensions/dcg-guard.ts"; do
+        if [ -f "$extension" ] && grep -q 'dcg-omp-extension' "$extension" 2>/dev/null; then
+            rm -f "$extension" 2>/dev/null && removed=1
+        fi
+    done
+    if [ "$removed" -eq 1 ]; then
+        echo "removed" >&2
+    fi
+    return 0
+}
+
 # Run an unconfigure function and report the outcome. The old call pattern
 # (`unconfigure_x 2>&1 | grep -q removed`) swallowed every human-visible line
 # the function printed — most importantly the `warn` fallback messages on
@@ -1330,6 +1366,7 @@ main() {
     report_unconfigure "Hermes Agent hook" unconfigure_hermes
     report_unconfigure "Posit Assistant hook" unconfigure_posit_assistant
     report_unconfigure "OpenCode plugin" unconfigure_opencode
+    report_unconfigure "Oh My Pi extension" unconfigure_omp
 
     # Remove Aider config
     if [ "$aider_configured" -eq 1 ] && unconfigure_aider; then
