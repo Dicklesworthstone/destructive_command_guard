@@ -1141,7 +1141,13 @@ unconfigure_omp() {
         profile="$PI_PROFILE"
     fi
     profile=$(printf '%s' "$profile" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    local profile_base="${profile%%.*}"
+    local profile_reserved=0
+    case "$profile_base" in
+        con|prn|aux|nul|com[0-9]|lpt[0-9]) profile_reserved=1 ;;
+    esac
     if [ -n "$profile" ] && [ "$profile" != "default" ] &&
+        [ "${profile%.}" = "$profile" ] && [ "$profile_reserved" -eq 0 ] &&
         printf '%s' "$profile" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$'; then
         agent_dir="$HOME/$config_name/profiles/$profile/agent"
     elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then

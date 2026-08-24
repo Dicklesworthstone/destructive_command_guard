@@ -3951,6 +3951,33 @@ MOCKEOF
     [ ! -f "$HOME/.omp/agent/extensions/dcg-guard.ts" ]
 }
 
+@test "unconfigure_omp: resolves the active named profile" {
+    extract_uninstall_functions
+    export OMP_PROFILE="work"
+    local extension="$HOME/.omp/profiles/work/agent/extensions/dcg-guard.ts"
+    mkdir -p "$(dirname "$extension")"
+    printf '// dcg-omp-extension: generated\n' > "$extension"
+
+    run unconfigure_omp
+
+    [ "$status" -eq 0 ]
+    [ ! -f "$extension" ]
+}
+
+@test "unconfigure_omp: invalid profile safely uses the default agent override" {
+    extract_uninstall_functions
+    export OMP_PROFILE="con"
+    export PI_CODING_AGENT_DIR="$HOME/custom-omp-agent"
+    local extension="$PI_CODING_AGENT_DIR/extensions/dcg-guard.ts"
+    mkdir -p "$(dirname "$extension")"
+    printf '// dcg-omp-extension: generated\n' > "$extension"
+
+    run unconfigure_omp
+
+    [ "$status" -eq 0 ]
+    [ ! -f "$extension" ]
+}
+
 @test "unconfigure_omp: preserves a user-owned extension" {
     extract_uninstall_functions
     mkdir -p "$HOME/.omp/agent/extensions"

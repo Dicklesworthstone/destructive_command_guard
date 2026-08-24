@@ -12374,8 +12374,8 @@ const BLOCKING_DECISIONS = new Set(["deny", "ask", "indeterminate"]);
 export default function dcgGuard(pi: ExtensionAPI): void {{
   pi.on("tool_call", async (event) => {{
     if (event.toolName !== "bash") return;
-    const command = String((event.input as {{ command?: unknown }}).command ?? "");
-    if (!command) return;
+    const command = (event.input as {{ command?: unknown }} | undefined)?.command;
+    if (typeof command !== "string" || !command) return;
 
     let stdoutText;
     let stderrText;

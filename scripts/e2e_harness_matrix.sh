@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # e2e_harness_matrix.sh — real-binary, no-mock conformance for every shipped
-# agent hook protocol.
+# agent hook protocol or native extension bridge.
 #
 # WHY THIS EXISTS
 # ---------------
@@ -197,6 +197,40 @@ assert_field_absent() {
   fi
 }
 
+# Assert the robot-mode contract used by native in-process extension bridges
+# such as Oh My Pi. These agents do not send a JSON hook envelope; their
+# extension passes the raw command on stdin and maps dcg's exit status/JSON back
+# to the host's blocking API.
+assert_robot_bridge_case() {
+  local harness="$1" case_name="$2" command="$3" expected_rc="$4" expected_decision="$5"
+  local stdout_file="$SANDBOX/${harness}-${case_name}.stdout"
+  local stderr_file="$SANDBOX/${harness}-${case_name}.stderr"
+  local start end
+  start="$(now_ms)"
+  printf '%s' "$command" | run_dcg_cli --robot test --stdin \
+    --agent omp --dialect posix >"$stdout_file" 2>"$stderr_file"
+  local rc=$?
+  end="$(now_ms)"
+  CASE_MS=""
+  [[ -n "$start" && -n "$end" ]] && CASE_MS=$((end - start))
+
+  local decision agent method
+  decision="$(jq -r '.decision // empty' "$stdout_file" 2>/dev/null)"
+  agent="$(jq -r '.agent.detected // empty' "$stdout_file" 2>/dev/null)"
+  method="$(jq -r '.agent.detection_method // empty' "$stdout_file" 2>/dev/null)"
+  if [[ $rc -ne $expected_rc ]]; then
+    report fail "$harness" "$case_name" "exit $rc, want $expected_rc"
+  elif [[ "$decision" != "$expected_decision" ]]; then
+    report fail "$harness" "$case_name" "decision '$decision', want '$expected_decision'"
+  elif [[ "$agent" != "omp" || "$method" != "explicit" ]]; then
+    report fail "$harness" "$case_name" "agent attribution '$agent'/'$method', want omp/explicit"
+  elif [[ -s "$stderr_file" ]]; then
+    report fail "$harness" "$case_name" "robot bridge polluted stderr"
+  else
+    report pass "$harness" "$case_name"
+  fi
+}
+
 DENY_CMD='git reset --hard'
 ALLOW_CMD='git status'
 
@@ -306,6 +340,11 @@ AGY_ALLOW=$(jq -nc --arg c "$ALLOW_CMD" \
   '{toolCall:{name:"run_command",args:{CommandLine:$c}},conversationId:"conv_e2e",stepIdx:2}')
 assert_case agy deny "$AGY_DENY" deny '.decision' block
 assert_case agy allow "$AGY_ALLOW" allow '.' ''
+
+# --- Oh My Pi: native ExtensionAPI bridge over robot stdin ------------------
+$JSON_OUTPUT || echo "Oh My Pi (omp)"
+assert_robot_bridge_case omp deny "$DENY_CMD" 1 deny
+assert_robot_bridge_case omp allow "$ALLOW_CMD" 0 allow
 
 # --- Cross-cutting invariants ----------------------------------------------
 $JSON_OUTPUT || echo "Cross-cutting invariants"

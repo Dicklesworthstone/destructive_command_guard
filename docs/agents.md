@@ -19,6 +19,7 @@ trust to well-behaved agents while maintaining strict controls for unknown ones.
 | Cursor IDE | Environment | `CURSOR_IDE=1` (set by dcg's hook script) |
 | Hermes Agent | Environment | `HERMES_AGENT=1` or `HERMES_SESSION_ID` |
 | Grok (xAI) | Environment | `GROK_SESSION_ID`, `GROK_HOOK_EVENT`, or `GROK_WORKSPACE_ROOT` |
+| Oh My Pi (`omp`) | Explicit bridge / process | Generated extension passes `--agent omp`; exact `omp` and `oh-my-pi` process names are fallback matches |
 | Pi | Environment | `PI_CODING_AGENT=true` |
 | Posit Assistant | Environment | `PA_PROJECT_DIR` (set in hook subprocesses; checked last among environment markers so agents with their own markers win — environment detection still precedes parent-process detection) |
 
@@ -30,6 +31,27 @@ Agent detection follows this priority order:
 2. **Environment variables**: Most agents set identifying env vars
 3. **Parent process inspection**: Fallback check of process tree
 4. **Unknown**: Default when no agent is detected
+
+### Oh My Pi (`omp`)
+
+Install dcg's native OMP ExtensionAPI module with:
+
+```bash
+dcg install --omp
+```
+
+The default user path is `~/.omp/agent/extensions/dcg-guard.ts`. OMP named
+profiles use `~/.omp/profiles/<name>/agent/extensions/dcg-guard.ts`; dcg follows
+OMP's `OMP_PROFILE`-before-`PI_PROFILE` precedence and honors
+`PI_CODING_AGENT_DIR` for the default profile. Use `dcg install --omp --project`
+to install `<repo>/.omp/extensions/dcg-guard.ts` instead.
+
+The extension uses OMP's pre-execution `tool_call` event and sends each `bash`
+command to `dcg --robot test --stdin --agent omp --dialect posix`. A dcg deny,
+ask, or indeterminate result returns `{ block: true, reason }` to OMP. Because
+the bridge supplies `--agent omp` explicitly, OMP remains distinct from legacy
+Pi even when OMP exposes Pi-family compatibility variables. The canonical
+profile key is `agents.omp`; `oh-my-pi` is accepted as an alias.
 
 ## Trust Levels
 
@@ -113,6 +135,10 @@ Configure agent profiles in your `config.toml`:
 [agents.claude-code]
 trust_level = "high"
 additional_allowlist = ["npm run build", "cargo test"]
+
+[agents.omp]
+trust_level = "medium"
+extra_packs = ["strict_git"]
 
 # Restrict unknown agents
 [agents.unknown]

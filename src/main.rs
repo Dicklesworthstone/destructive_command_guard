@@ -1769,7 +1769,8 @@ fn print_help() {
     eprintln!("  {}", "USAGE".yellow().bold());
     eprintln!("  {}", "─".repeat(50).bright_black());
     eprintln!("    Runs as a pre-execution shell hook for Claude Code, Codex CLI,");
-    eprintln!("    Gemini CLI, GitHub Copilot CLI, Cursor IDE, and Hermes Agent.");
+    eprintln!("    Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent,");
+    eprintln!("    OpenCode, and Oh My Pi (omp).");
     eprintln!("    Compatible agents, including Codex, receive protocol-specific stdout JSON.");
     eprintln!();
 

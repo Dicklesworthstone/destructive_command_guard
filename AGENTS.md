@@ -250,12 +250,12 @@ three must be green before any release.
 
 | Suite | Catches | Why unit tests can't |
 |-------|---------|----------------------|
-| `scripts/e2e_harness_matrix.sh` | Wire-protocol breakage for **every** agent (Claude Code, Codex, Gemini, Copilot, Hermes, Grok, agy) | Unit tests call Rust functions; harnesses parse **bytes**. Asserts decision field + exit code + stdout/stderr separation per protocol against the real binary. |
+| `scripts/e2e_harness_matrix.sh` | Wire/bridge breakage for **every** agent (Claude Code, Codex, Gemini, Copilot, Hermes, Grok, agy, OMP) | Unit tests call Rust functions; harnesses parse **bytes**. Asserts decision field + exit code + stdout/stderr separation per protocol against the real binary. |
 | `scripts/perf_baseline.py --assert-budget-ms` | **#245**: per-invocation cost silently eating the fixed hook deadline | The perf job is a *relative* ratchet — a uniform slowdown just gets re-baselined. This gate asserts cold p95 against the **shipped** `HOOK_EVALUATION_BUDGET_MS` with a hermetic HOME and scrubbed `DCG_*`. |
 | `scripts/e2e_fleet_install.sh` | Published artifact missing/unrunnable per platform; installer picking the wrong triple; checksum/signature verification silently skipped; hook config non-idempotent | Nothing in-tree proves the **public download path** works on real Linux/macOS/Windows hardware. |
 
 ```bash
-# Protocol conformance for all 7 harnesses (needs a release binary + jq)
+# Protocol/bridge conformance for all 8 harnesses (needs a release binary + jq)
 ./scripts/e2e_harness_matrix.sh --binary target/release/dcg
 
 # Absolute latency gate — the #245 guard. Budget MUST come from src/perf.rs.
