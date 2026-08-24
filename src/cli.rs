@@ -12633,6 +12633,8 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
       return;
     }}
 
+    // Treat the two child streams as separate capabilities: stdout alone may
+    // carry the robot decision; stderr is diagnostic-only but never discarded.
     const classification = classifyDcgChild(
       childOutcomeFromExitCode(exitCode),
       typeof stdoutText === "string" ? stdoutText : "",
