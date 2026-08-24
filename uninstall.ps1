@@ -622,7 +622,11 @@ function Read-OmpExtensionText {
 
 function Remove-OmpExtensionFile {
   param([string]$Path)
-  [System.IO.File]::Delete($Path)
+  if ([System.IO.Path]::DirectorySeparatorChar -eq '\') {
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+  } else {
+    [System.IO.File]::Delete($Path)
+  }
 }
 
 function Test-OmpMissingPathException {

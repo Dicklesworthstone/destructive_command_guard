@@ -307,6 +307,29 @@ if ([System.IO.Path]::DirectorySeparatorChar -ne '\') {
     }
 }
 
+if ([System.IO.Path]::DirectorySeparatorChar -eq '\') {
+    Write-Host "Test 13b: Oh My Pi cleanup removes read-only generated extensions on Windows"
+    $h13b = New-Tmp
+    $readOnlyExtension = [System.IO.Path]::Combine([string[]]@($h13b, '.omp', 'agent', 'extensions', 'dcg-guard.ts'))
+    try {
+        [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($readOnlyExtension))
+        [System.IO.File]::WriteAllText($readOnlyExtension, '// dcg-omp-extension: generated')
+        $attributes = [System.IO.File]::GetAttributes($readOnlyExtension)
+        [System.IO.File]::SetAttributes(
+            $readOnlyExtension,
+            [System.IO.FileAttributes]($attributes -bor [System.IO.FileAttributes]::ReadOnly)
+        )
+
+        Check ((Unconfigure-OmpExtension -HomeDir $h13b -RepoRoot $h13b) -eq $true) "OMP: read-only Windows extension is cleaned"
+        Check (-not [System.IO.File]::Exists($readOnlyExtension)) "OMP: read-only Windows extension is removed"
+    } finally {
+        if ([System.IO.File]::Exists($readOnlyExtension)) {
+            [System.IO.File]::SetAttributes($readOnlyExtension, [System.IO.FileAttributes]::Normal)
+        }
+        Remove-Item -LiteralPath $h13b -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Write-Host "Test 14: Oh My Pi cleanup does not claim a failed deletion"
 $h14 = New-Tmp
 $savedRemoveOmpExtensionFile = (Get-Command Remove-OmpExtensionFile).ScriptBlock
