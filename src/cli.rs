@@ -19411,11 +19411,12 @@ console.log(JSON.stringify({
                 .is_some_and(|version| !version.is_empty()),
             "certificate must identify the Bun runtime"
         );
+        let executable_text = executable.to_string_lossy();
         assert_eq!(
             certificate
                 .get("spawnExecutable")
                 .and_then(serde_json::Value::as_str),
-            Some(executable.to_string_lossy().as_ref()),
+            Some(executable_text.as_ref()),
             "the hermetic replay must exercise the generator's embedded executable, not an ambient DCG_BIN override"
         );
 
