@@ -23,12 +23,14 @@ $savedGrok = $env:GROK_SESSION_ID
 $savedHermesHome = $env:HERMES_HOME
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedOs = $env:OS
+$savedPiConfigDir = $env:PI_CONFIG_DIR
 try {
     $env:PATH = ''                 # no CLI probing leaks
     $env:GROK_SESSION_ID = $null
     $env:HERMES_HOME = $null       # no Hermes home-resolution leaks (issue #270)
     $env:LOCALAPPDATA = $null
     $env:OS = $null
+    $env:PI_CONFIG_DIR = $null
 
     Write-Host "Test 1: detects only the agents whose config dir is present"
     $h1 = New-TempHome
@@ -45,6 +47,7 @@ try {
     Check ($a['Agy'] -eq $false) "Agy NOT detected (no agy on PATH)"
     Check ($a['Hermes'] -eq $false) "Hermes NOT detected"
     Check ($a['Posit'] -eq $false) "Posit Assistant NOT detected"
+    Check ($a['Omp'] -eq $false) "Oh My Pi NOT detected"
     $names = Get-DetectedAgentNames $a
     Check (($names -join ',') -eq 'Claude,Gemini,Grok') "summary lists detected agents in config order (got '$($names -join ',')')"
     Remove-Item -Recurse -Force $h1 -ErrorAction SilentlyContinue
@@ -71,6 +74,33 @@ try {
     $a1d = Detect-Agents -HomeDir $h1d
     Check ($a1d['Posit'] -eq $true) "Posit detected via legacy ~/.positai"
     Remove-Item -Recurse -Force $h1d -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1e: Oh My Pi detected from ~/.omp"
+    $h1e = New-TempHome
+    New-Item -ItemType Directory -Force -Path (Join-Path $h1e '.omp') | Out-Null
+    $a1e = Detect-Agents -HomeDir $h1e
+    Check ($a1e['Omp'] -eq $true) "Oh My Pi detected via ~/.omp"
+    $names1e = Get-DetectedAgentNames $a1e
+    Check (($names1e -join ',') -eq 'Omp') "summary lists only Omp (got '$($names1e -join ',')')"
+    Remove-Item -Recurse -Force $h1e -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1f: Oh My Pi detected from PI_CONFIG_DIR"
+    $h1f = New-TempHome
+    $env:PI_CONFIG_DIR = '.custom-omp'
+    New-Item -ItemType Directory -Force -Path (Join-Path $h1f '.custom-omp') | Out-Null
+    $a1f = Detect-Agents -HomeDir $h1f
+    Check ($a1f['Omp'] -eq $true) "Oh My Pi detected via PI_CONFIG_DIR"
+    $env:PI_CONFIG_DIR = $null
+    Remove-Item -Recurse -Force $h1f -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1g: Oh My Pi detection treats wildcard characters in HOME literally"
+    $h1g = Join-Path ([System.IO.Path]::GetTempPath()) ("dcg_detect_[omp]_" + [Guid]::NewGuid().ToString('N'))
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $h1g '.omp'))
+    $a1g = Detect-Agents -HomeDir $h1g
+    Check ($a1g['Omp'] -eq $true) "Oh My Pi detected when HOME contains brackets"
+    $names1g = Get-DetectedAgentNames $a1g
+    Check (($names1g -join ',') -eq 'Omp') "bracketed HOME summary lists only Omp (got '$($names1g -join ',')')"
+    Remove-Item -LiteralPath $h1g -Recurse -Force -ErrorAction SilentlyContinue
 
     Write-Host "Test 2: empty home -> nothing detected"
     $h2 = New-TempHome
@@ -115,6 +145,7 @@ try {
     $env:HERMES_HOME = $savedHermesHome
     $env:LOCALAPPDATA = $savedLocalAppData
     $env:OS = $savedOs
+    $env:PI_CONFIG_DIR = $savedPiConfigDir
 }
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }

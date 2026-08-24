@@ -817,6 +817,7 @@ unconfigure_cursor() {
     local hook_script="$HOME/.cursor/hooks/dcg-pre-shell.py"
 
     local removed=0
+    local failed=0
 
     # Remove the hook script
     if [ -f "$hook_script" ] && grep -q 'dcg-cursor-hook' "$hook_script" 2>/dev/null; then
@@ -1106,22 +1107,127 @@ PYEOF
     return $?
 }
 
+current_repo_root() {
+    local start
+    start=$(pwd -P)
+    local root="$start"
+    while true; do
+        if [ -e "$root/.git" ]; then
+            printf '%s\n' "$root"
+            return 0
+        fi
+        [ "$root" = "/" ] && break
+        root="${root%/*}"
+        [ -n "$root" ] || root="/"
+    done
+    printf '%s\n' "$start"
+}
+
 unconfigure_opencode() {
     # OpenCode plugin (#318): a standalone generated file. Delete it ONLY when
     # it carries the dcg ownership marker — never remove a user-authored
     # plugin that happens to share the name. Both the user-level and any
-    # repo-local (./.opencode/plugins) copy in the current directory are
-    # covered.
+    # repo-local copy are covered, including when uninstall runs in a nested
+    # working directory.
     local removed=0
     local plugin
+    local repo_root
+    repo_root=$(current_repo_root)
     for plugin in \
         "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/dcg-guard.js" \
+        "$repo_root/.opencode/plugins/dcg-guard.js" \
         ".opencode/plugins/dcg-guard.js"; do
         if [ -f "$plugin" ] && grep -q 'dcg-opencode-plugin' "$plugin" 2>/dev/null; then
             rm -f "$plugin" 2>/dev/null && removed=1
         fi
     done
     if [ "$removed" -eq 1 ]; then
+        echo "removed" >&2
+    fi
+    return 0
+}
+
+unconfigure_omp() {
+    # Oh My Pi extension: remove only marker-owned files. Cover the active
+    # profile, every named profile under the default/current config roots, the
+    # legacy agent-dir override, and the current repository's project install.
+    local config_name="${PI_CONFIG_DIR:-.omp}"
+    while true; do
+        case "$config_name" in
+            /*) config_name="${config_name#/}" ;;
+            \\*) config_name="${config_name#\\}" ;;
+            *) break ;;
+        esac
+    done
+    local config_root="$HOME/$config_name"
+    local agent_dir="$config_root/agent"
+    local profile=""
+    if [ "${OMP_PROFILE+x}" = "x" ]; then
+        profile="$OMP_PROFILE"
+    elif [ "${PI_PROFILE+x}" = "x" ]; then
+        profile="$PI_PROFILE"
+    fi
+    profile=$(printf '%s' "$profile" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    local profile_base="${profile%%.*}"
+    local profile_reserved=0
+    case "$profile_base" in
+        con|prn|aux|nul|com[0-9]|lpt[0-9]) profile_reserved=1 ;;
+    esac
+    if [ -n "$profile" ] && [ "$profile" != "default" ] &&
+        [ "${profile%.}" = "$profile" ] && [ "$profile_reserved" -eq 0 ] &&
+        [ "${#profile}" -le 64 ] &&
+        printf '%s' "$profile" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$'; then
+        agent_dir="$config_root/profiles/$profile/agent"
+    elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
+        agent_dir="$PI_CODING_AGENT_DIR"
+    fi
+
+    local removed=0
+    local extension
+    local repo_root
+    repo_root=$(current_repo_root)
+    for extension in \
+        "$agent_dir/extensions/dcg-guard.ts" \
+        "$config_root/agent/extensions/dcg-guard.ts" \
+        "$HOME/.omp/agent/extensions/dcg-guard.ts" \
+        "$repo_root/.omp/extensions/dcg-guard.ts" \
+        ".omp/extensions/dcg-guard.ts"; do
+        if [ -f "$extension" ] && grep -q 'dcg-omp-extension' "$extension" 2>/dev/null; then
+            if rm -f "$extension" 2>/dev/null; then
+                removed=1
+            else
+                failed=1
+                warn "Could not remove Oh My Pi extension at $extension"
+            fi
+        fi
+    done
+    if [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
+        extension="$PI_CODING_AGENT_DIR/extensions/dcg-guard.ts"
+        if [ -f "$extension" ] && grep -q 'dcg-omp-extension' "$extension" 2>/dev/null; then
+            if rm -f "$extension" 2>/dev/null; then
+                removed=1
+            else
+                failed=1
+                warn "Could not remove Oh My Pi extension at $extension"
+            fi
+        fi
+    fi
+    local profile_agent_dir
+    for profile_agent_dir in \
+        "$HOME/.omp"/profiles/*/agent \
+        "$config_root"/profiles/*/agent; do
+        [ -d "$profile_agent_dir" ] || continue
+        extension="$profile_agent_dir/extensions/dcg-guard.ts"
+        if [ -f "$extension" ] && grep -q 'dcg-omp-extension' "$extension" 2>/dev/null; then
+            if rm -f "$extension" 2>/dev/null; then
+                removed=1
+            else
+                failed=1
+                warn "Could not remove Oh My Pi extension at $extension"
+            fi
+        fi
+    done
+    if [ "$removed" -eq 1 ] && [ "$failed" -eq 0 ]; then
         echo "removed" >&2
     fi
     return 0
@@ -1330,6 +1436,7 @@ main() {
     report_unconfigure "Hermes Agent hook" unconfigure_hermes
     report_unconfigure "Posit Assistant hook" unconfigure_posit_assistant
     report_unconfigure "OpenCode plugin" unconfigure_opencode
+    report_unconfigure "Oh My Pi extension" unconfigure_omp
 
     # Remove Aider config
     if [ "$aider_configured" -eq 1 ] && unconfigure_aider; then

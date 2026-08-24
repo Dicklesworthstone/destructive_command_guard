@@ -524,6 +524,94 @@ function Unconfigure-HermesHook {
   $removedAny
 }
 
+function Get-DcgRepositoryRoot {
+  param([string]$StartDir = (Get-Location).Path)
+  try {
+    $current = Get-Item -LiteralPath $StartDir -ErrorAction Stop
+    while ($null -ne $current) {
+      if (Test-Path -LiteralPath (Join-Path $current.FullName '.git')) { return $current.FullName }
+      $current = $current.Parent
+    }
+    return [System.IO.Path]::GetFullPath($StartDir)
+  } catch {
+    return $StartDir
+  }
+}
+
+function Get-OmpConfigRoot {
+  param([string]$HomeDir = $HOME)
+  $configName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
+  $configName = $configName.TrimStart([char[]]@('\', '/'))
+  Join-Path $HomeDir $configName
+}
+
+function Get-OmpAgentDir {
+  # Mirror OMP's active-profile directory resolution closely enough for safe,
+  # marker-owned extension cleanup.
+  param([string]$HomeDir = $HOME)
+  $configRoot = Get-OmpConfigRoot -HomeDir $HomeDir
+
+  $profile = $null
+  if (Test-Path Env:OMP_PROFILE) { $profile = $env:OMP_PROFILE }
+  elseif (Test-Path Env:PI_PROFILE) { $profile = $env:PI_PROFILE }
+  if ($null -ne $profile) { $profile = $profile.Trim() }
+  $validProfile = (-not [string]::IsNullOrEmpty($profile)) -and
+    ($profile -ne 'default') -and ($profile.Length -le 64) -and
+    ($profile -match '^[a-z0-9][a-z0-9._-]*$') -and (-not $profile.EndsWith('.')) -and
+    ($profile -notmatch '^(?i:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\.|$)')
+  if ($validProfile) {
+    return (Join-Path (Join-Path (Join-Path $configRoot 'profiles') $profile) 'agent')
+  }
+  if (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR)) {
+    return $env:PI_CODING_AGENT_DIR
+  }
+  Join-Path $configRoot 'agent'
+}
+
+function Unconfigure-OmpExtension {
+  # Remove only marker-owned dcg-guard.ts files; preserve user-authored files.
+  # Sweep all profiles under the default/current config roots so changing
+  # profiles after installation cannot leave a live extension behind.
+  param([string]$HomeDir = $HOME, [string]$RepoRoot = '')
+  if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $RepoRoot = Get-DcgRepositoryRoot
+  }
+  $configRoots = @(
+    (Join-Path $HomeDir '.omp'),
+    (Get-OmpConfigRoot -HomeDir $HomeDir)
+  ) | Select-Object -Unique
+  $paths = @(
+    (Join-Path (Join-Path (Get-OmpAgentDir -HomeDir $HomeDir) 'extensions') 'dcg-guard.ts'),
+    (Join-Path (Join-Path (Join-Path $RepoRoot '.omp') 'extensions') 'dcg-guard.ts')
+  )
+  if (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR)) {
+    $paths += Join-Path (Join-Path $env:PI_CODING_AGENT_DIR 'extensions') 'dcg-guard.ts'
+  }
+  foreach ($configRoot in $configRoots) {
+    $paths += Join-Path (Join-Path (Join-Path $configRoot 'agent') 'extensions') 'dcg-guard.ts'
+    $profilesRoot = Join-Path $configRoot 'profiles'
+    if (-not (Test-Path -LiteralPath $profilesRoot -PathType Container)) { continue }
+    foreach ($profileDir in Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction SilentlyContinue) {
+      $paths += Join-Path (Join-Path (Join-Path $profileDir.FullName 'agent') 'extensions') 'dcg-guard.ts'
+    }
+  }
+  $paths = @($paths | Select-Object -Unique)
+  $removed = $false
+  $failed = $false
+  foreach ($extension in $paths) {
+    if (-not (Test-Path -LiteralPath $extension -PathType Leaf)) { continue }
+    try {
+      if ((Get-Content -Raw -LiteralPath $extension -ErrorAction Stop) -notmatch 'dcg-omp-extension') { continue }
+      Remove-Item -Force -LiteralPath $extension -ErrorAction Stop
+      $removed = $true
+    } catch {
+      $failed = $true
+      Write-Warn "Could not remove Oh My Pi extension at ${extension}: $($_.Exception.Message)"
+    }
+  }
+  $removed -and (-not $failed)
+}
+
 # Testing entrypoint: when dot-sourced with -LoadFunctionsOnly, stop here so the
 # functions above are available without running the uninstall body below.
 if ($LoadFunctionsOnly) { return }
@@ -601,6 +689,8 @@ $agyHooks = Join-Path (Join-Path (Join-Path $HOME ".gemini") "config") "hooks.js
 if (Remove-DcgHooksFromJsonFile -Path $agyHooks -DeleteEmptyFile) {
   Write-Ok "Removed Antigravity (agy) hook"
 }
+
+if (Unconfigure-OmpExtension) { Write-Ok "Removed Oh My Pi extension" }
 
 if (Test-Path $binary -PathType Leaf) {
   Remove-Item -Force -Path $binary
