@@ -274,8 +274,11 @@ for field in ruleId packId severity; do
   else report fail claude-code "metadata:$field" "missing $field in denial (agents key allowlists on it)"; fi
 done
 got="$(printf '%s' "$CLAUDE_DENY" | run_dcg 2>/dev/null | jq -r '.hookSpecificOutput.hookEventName // empty')"
-[[ "$got" == "PreToolUse" ]] && report pass claude-code hookEventName \
-  || report fail claude-code hookEventName "want PreToolUse, got '$got'"
+if [[ "$got" == "PreToolUse" ]]; then
+  report pass claude-code hookEventName
+else
+  report fail claude-code hookEventName "want PreToolUse, got '$got'"
+fi
 
 # --- Codex CLI (strict parser: rejects unknown fields) ----------------------
 $JSON_OUTPUT || echo "Codex CLI"
@@ -320,8 +323,11 @@ assert_case hermes deny "$HERMES_DENY" deny '.decision' block
 assert_case hermes allow "$HERMES_ALLOW" allow '.' ''
 # Hermes cross-version alternate keys must both be present.
 got="$(printf '%s' "$HERMES_DENY" | run_dcg 2>/dev/null | jq -r '.action // empty')"
-[[ "$got" == "block" ]] && report pass hermes alt-action-key \
-  || report fail hermes alt-action-key "want action=block, got '$got'"
+if [[ "$got" == "block" ]]; then
+  report pass hermes alt-action-key
+else
+  report fail hermes alt-action-key "want action=block, got '$got'"
+fi
 
 # --- Grok (xAI): decision:"deny", camelCase wire shape ---------------------
 $JSON_OUTPUT || echo "Grok (xAI)"
@@ -356,11 +362,17 @@ assert_case all non-shell-tool-ignored \
 # Unparseable input fails OPEN by default (documented contract), and the
 # fail-closed opt-in must actually deny.
 out="$(printf 'not json at all' | run_dcg 2>/dev/null)"; rc=$?
-[[ $rc -eq 0 && -z "$out" ]] && report pass all malformed-fails-open \
-  || report fail all malformed-fails-open "want silent allow, rc=$rc out='${out:0:80}'"
+if [[ $rc -eq 0 && -z "$out" ]]; then
+  report pass all malformed-fails-open
+else
+  report fail all malformed-fails-open "want silent allow, rc=$rc out='${out:0:80}'"
+fi
 out="$(printf 'not json at all' | run_dcg DCG_FAIL_CLOSED=1 2>/dev/null)"
-[[ -n "$out" ]] && report pass all malformed-fail-closed-opt-in \
-  || report fail all malformed-fail-closed-opt-in "DCG_FAIL_CLOSED=1 produced no denial"
+if [[ -n "$out" ]]; then
+  report pass all malformed-fail-closed-opt-in
+else
+  report fail all malformed-fail-closed-opt-in "DCG_FAIL_CLOSED=1 produced no denial"
+fi
 
 # BOM-prefixed valid input must still be evaluated (issue #160).
 BOM_PAYLOAD="$(printf '\xef\xbb\xbf%s' "$CLAUDE_DENY")"
