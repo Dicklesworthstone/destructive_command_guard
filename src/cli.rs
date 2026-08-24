@@ -12437,6 +12437,35 @@ fn omp_config_root_from(
     Ok(home.join(relative))
 }
 
+/// Select the default-profile agent directory from a possible legacy
+/// `PI_CODING_AGENT_DIR` override.
+///
+/// OMP's `setProfile()` exports the active profile's derived agent directory to
+/// child processes through `PI_CODING_AGENT_DIR`. When a higher-priority
+/// `OMP_PROFILE` explicitly selects the default profile, a lower-priority
+/// `PI_PROFILE` can therefore remain alongside that now-stale derived value.
+/// Upstream suppresses the value only when both pieces of provenance agree
+/// exactly. Every other non-empty value remains an operator override.
+fn omp_default_agent_dir_from(
+    config_root: &std::path::Path,
+    agent_dir_override: Option<&std::ffi::OsStr>,
+    legacy_profile: Option<&str>,
+) -> std::path::PathBuf {
+    let default_agent_dir = config_root.join("agent");
+    let Some(agent_dir_override) = agent_dir_override.filter(|value| !value.is_empty()) else {
+        return default_agent_dir;
+    };
+
+    if legacy_profile.is_some_and(|profile| {
+        let derived_agent_dir = config_root.join("profiles").join(profile).join("agent");
+        agent_dir_override == derived_agent_dir.as_os_str()
+    }) {
+        return default_agent_dir;
+    }
+
+    std::path::PathBuf::from(agent_dir_override)
+}
+
 /// OMP's active user agent directory. The default is `~/.omp/agent`; named
 /// profiles live under `~/.omp/profiles/<name>/agent`. OMP ignores the legacy
 /// `PI_CODING_AGENT_DIR` override when a named profile is active, so dcg does
@@ -12464,9 +12493,21 @@ fn omp_user_agent_dir() -> std::io::Result<std::path::PathBuf> {
         return Ok(config_root.join("profiles").join(profile).join("agent"));
     }
 
-    Ok(std::env::var_os("PI_CODING_AGENT_DIR")
-        .filter(|value| !value.is_empty())
-        .map_or_else(|| config_root.join("agent"), std::path::PathBuf::from))
+    // `OMP_PROFILE` may have explicitly selected default mode while a
+    // lower-priority `PI_PROFILE` and the agent dir derived from it remain in
+    // the inherited environment. Validate that losing profile independently:
+    // invalid/non-Unicode values carry no provenance and must not suppress a
+    // genuine custom override.
+    let legacy_profile = match omp_profile_env_value("PI_PROFILE") {
+        Ok(OmpProfileEnvValue::Named(profile)) => Some(profile),
+        Ok(OmpProfileEnvValue::Absent | OmpProfileEnvValue::Default) | Err(_) => None,
+    };
+    let agent_dir_override = std::env::var_os("PI_CODING_AGENT_DIR");
+    Ok(omp_default_agent_dir_from(
+        &config_root,
+        agent_dir_override.as_deref(),
+        legacy_profile.as_deref(),
+    ))
 }
 
 /// User-level OMP extension path for the active profile.
@@ -19114,10 +19155,10 @@ export function resolveToCwd(requested: string, cwd: string): string {
         .expect("write cwd resolver stub");
         std::fs::write(
             coding_agent.join("tools/shell-tokenize.ts"),
-            r#"export function extractLeadingCdTarget(_command: string): undefined {
+            r"export function extractLeadingCdTarget(_command: string): undefined {
   return undefined;
 }
-"#,
+",
         )
         .expect("write shell-tokenizer stub");
         std::fs::write(
@@ -19131,7 +19172,7 @@ export function resolveToCwd(requested: string, cwd: string): string {
         .expect("write pi-utils stub package manifest");
         std::fs::write(
             pi_utils.join("index.ts"),
-            r#"export const procmgr = {
+            r"export const procmgr = {
   isCmdShell(shell: string): boolean {
     return /(?:^|[/\\])cmd(?:\.exe)?$/i.test(shell);
   },
@@ -19139,13 +19180,13 @@ export function resolveToCwd(requested: string, cwd: string): string {
     return /(?:^|[/\\])(?:pwsh|powershell)(?:\.exe)?$/i.test(shell);
   },
 };
-"#,
+",
         )
         .expect("write process-manager stub");
 
         std::fs::write(
             root.join("runner.ts"),
-            r###"import dcgGuard, {
+            r#"import dcgGuard, {
   classifyDcgChild,
   classifyOmpToolCall,
 } from "./dcg-guard.ts";
@@ -19374,7 +19415,7 @@ console.log(JSON.stringify({
   ],
   probeComplete: true,
 }));
-"###,
+"#,
         )
         .expect("write Bun replay runner");
     }
@@ -19663,6 +19704,119 @@ console.log(JSON.stringify({
         assert_eq!(
             omp_config_root_from(home, r"C:\omp", false).expect("valid POSIX child name"),
             home.join(r"C:\omp")
+        );
+    }
+
+    #[test]
+    fn omp_default_agent_dir_suppresses_only_profile_derived_overrides() {
+        let config_root = std::path::Path::new("/test-home/.custom-omp");
+        let default_agent = config_root.join("agent");
+        let derived_work_agent = config_root
+            .join("profiles")
+            .join("work")
+            .join("agent");
+        let custom_agent = std::path::Path::new("/srv/omp-agent");
+
+        assert_eq!(
+            omp_default_agent_dir_from(
+                config_root,
+                Some(derived_work_agent.as_os_str()),
+                Some("work")
+            ),
+            default_agent,
+            "an exact lower-profile derivation is stale in default mode"
+        );
+        assert_eq!(
+            omp_default_agent_dir_from(
+                config_root,
+                Some(derived_work_agent.as_os_str()),
+                None
+            ),
+            derived_work_agent,
+            "the same path without validated profile provenance is a custom override"
+        );
+        assert_eq!(
+            omp_default_agent_dir_from(config_root, Some(custom_agent.as_os_str()), Some("work")),
+            custom_agent,
+            "a genuine custom override survives lower-profile provenance"
+        );
+
+        for near_match in [
+            config_root
+                .join("profiles")
+                .join("work")
+                .join("agent-sibling"),
+            config_root
+                .join("profiles")
+                .join("work2")
+                .join("agent"),
+            config_root
+                .join("profiles")
+                .join("work")
+                .join("agent")
+                .join("child"),
+            config_root
+                .join("profiles")
+                .join(".")
+                .join("work")
+                .join("agent"),
+            config_root
+                .join("profiles")
+                .join("Work")
+                .join("agent"),
+        ] {
+            let resolved = omp_default_agent_dir_from(
+                config_root,
+                Some(near_match.as_os_str()),
+                Some("work"),
+            );
+            assert_eq!(
+                resolved.as_os_str(),
+                near_match.as_os_str(),
+                "only exact profile-derived bytes may be suppressed"
+            );
+        }
+
+        let mut repeated_separator = config_root
+            .join("profiles")
+            .join("work")
+            .into_os_string();
+        repeated_separator.push(std::path::MAIN_SEPARATOR_STR);
+        repeated_separator.push(std::path::MAIN_SEPARATOR_STR);
+        repeated_separator.push("agent");
+        let repeated_separator = std::path::PathBuf::from(repeated_separator);
+        let resolved = omp_default_agent_dir_from(
+            config_root,
+            Some(repeated_separator.as_os_str()),
+            Some("work"),
+        );
+        assert_eq!(
+            resolved.as_os_str(),
+            repeated_separator.as_os_str(),
+            "component-equivalent spelling is not exact JS string provenance"
+        );
+
+        let mut trailing_separator = derived_work_agent.clone().into_os_string();
+        trailing_separator.push(std::path::MAIN_SEPARATOR_STR);
+        let trailing_separator = std::path::PathBuf::from(trailing_separator);
+        let resolved = omp_default_agent_dir_from(
+            config_root,
+            Some(trailing_separator.as_os_str()),
+            Some("work"),
+        );
+        assert_eq!(
+            resolved.as_os_str(),
+            trailing_separator.as_os_str(),
+            "a trailing separator is not exact JS string provenance"
+        );
+
+        assert_eq!(
+            omp_default_agent_dir_from(config_root, None, Some("work")),
+            default_agent
+        );
+        assert_eq!(
+            omp_default_agent_dir_from(config_root, Some(std::ffi::OsStr::new("")), Some("work")),
+            default_agent
         );
     }
 

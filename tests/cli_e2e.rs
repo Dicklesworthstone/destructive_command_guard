@@ -1961,6 +1961,104 @@ mod config_tests {
     }
 
     #[test]
+    fn install_omp_suppresses_only_stale_profile_derived_agent_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let xdg_config_dir = temp.path().join("xdg-config");
+        std::fs::create_dir_all(&xdg_config_dir).expect("XDG config dir");
+        let config_name = ".custom-omp";
+
+        let run_install = |home: &std::path::Path,
+                           omp_profile: &str,
+                           pi_profile: &str,
+                           agent_dir: &std::path::Path| {
+            std::fs::create_dir_all(home).expect("isolated HOME");
+            Command::new(dcg_binary())
+                .args(["install", "--omp"])
+                .env_clear()
+                .env("HOME", home)
+                .env("USERPROFILE", home)
+                .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                .env("PI_CONFIG_DIR", config_name)
+                .env("OMP_PROFILE", omp_profile)
+                .env("PI_PROFILE", pi_profile)
+                .env("PI_CODING_AGENT_DIR", agent_dir)
+                .current_dir(temp.path())
+                .output()
+                .expect("install OMP extension for provenance fixture")
+        };
+
+        // This is the exact environment a child can inherit after its parent
+        // selected `work`, followed by a higher-priority explicit default
+        // selection. OMP treats the inherited agent dir as stale for both
+        // default sentinels.
+        for (label, omp_profile) in [("empty", ""), ("default", "default")] {
+            let home = temp.path().join(format!("stale-{label}-home"));
+            let derived_agent = home.join(config_name).join("profiles/work/agent");
+            let output = run_install(&home, omp_profile, "work", &derived_agent);
+            assert!(
+                output.status.success(),
+                "stale-derived {label} install: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                home.join(config_name)
+                    .join("agent/extensions/dcg-guard.ts")
+                    .is_file(),
+                "{label} selects the default agent directory"
+            );
+            assert!(
+                !derived_agent.join("extensions/dcg-guard.ts").exists(),
+                "the exact profile-derived override must be suppressed"
+            );
+        }
+
+        let custom_home = temp.path().join("custom-home");
+        let custom_agent = temp.path().join("operator-custom-agent");
+        let custom = run_install(&custom_home, "", "work", &custom_agent);
+        assert!(
+            custom.status.success(),
+            "custom override install: {}",
+            String::from_utf8_lossy(&custom.stderr)
+        );
+        assert!(
+            custom_agent.join("extensions/dcg-guard.ts").is_file(),
+            "a genuine operator override survives"
+        );
+
+        let sibling_home = temp.path().join("sibling-home");
+        let sibling_agent = sibling_home
+            .join(config_name)
+            .join("profiles/work/agent-sibling");
+        let sibling = run_install(&sibling_home, "default", "work", &sibling_agent);
+        assert!(
+            sibling.status.success(),
+            "sibling override install: {}",
+            String::from_utf8_lossy(&sibling.stderr)
+        );
+        assert!(
+            sibling_agent.join("extensions/dcg-guard.ts").is_file(),
+            "a near-match must not be mistaken for derived provenance"
+        );
+
+        let invalid_home = temp.path().join("invalid-loser-home");
+        let invalid_profile_agent = invalid_home
+            .join(config_name)
+            .join("profiles/Upper/agent");
+        let invalid_loser = run_install(&invalid_home, "", "Upper", &invalid_profile_agent);
+        assert!(
+            invalid_loser.status.success(),
+            "invalid losing profile remains ignored: {}",
+            String::from_utf8_lossy(&invalid_loser.stderr)
+        );
+        assert!(
+            invalid_profile_agent
+                .join("extensions/dcg-guard.ts")
+                .is_file(),
+            "an invalid lower-priority profile supplies no stale-path provenance"
+        );
+    }
+
+    #[test]
     fn install_omp_rejects_invalid_explicit_profiles_without_writing() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
