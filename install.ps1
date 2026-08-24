@@ -1793,7 +1793,7 @@ function Detect-Agents {
   param([string]$HomeDir = $HOME, [string]$RepoRoot = "")
   $null = $RepoRoot
   function _has([string]$cmd) { [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
-  function _dir([string]$name) { Test-Path (Join-Path $HomeDir $name) -PathType Container }
+  function _dir([string]$name) { Test-Path -LiteralPath (Join-Path $HomeDir $name) -PathType Container }
   $ompConfigName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
   $ompConfigName = $ompConfigName.TrimStart([char[]]@('\', '/'))
   $ompConfigRoot = Join-Path $HomeDir $ompConfigName
@@ -1804,18 +1804,18 @@ function Detect-Agents {
     'Cursor'  = ((_dir '.cursor')  -or (_has 'cursor'))
     'Copilot' = ((_dir '.copilot') -or
       (-not [string]::IsNullOrWhiteSpace($env:COPILOT_HOME) -and
-        (Test-Path $env:COPILOT_HOME -PathType Container)) -or
+        (Test-Path -LiteralPath $env:COPILOT_HOME -PathType Container)) -or
       (_has 'copilot') -or (_has 'gh-copilot'))
     'Grok'    = ((_dir '.grok')    -or (-not [string]::IsNullOrEmpty($env:GROK_SESSION_ID)))
     'Agy'     = (_has 'agy')
     'Hermes'  = ((_dir '.hermes') -or (_has 'hermes') -or
-      (Test-Path (Get-HermesConfigDir -HomeDir $HomeDir) -PathType Container))
+      (Test-Path -LiteralPath (Get-HermesConfigDir -HomeDir $HomeDir) -PathType Container))
     # A bare ~/.posit is not enough — other Posit tools share that directory.
-    'Posit'   = ((Test-Path (Join-Path (Join-Path $HomeDir '.posit') 'assistant') -PathType Container) -or
+    'Posit'   = ((Test-Path -LiteralPath (Join-Path (Join-Path $HomeDir '.posit') 'assistant') -PathType Container) -or
       (_dir '.positai') -or (_has 'pa'))
-    'Omp'     = ((Test-Path $ompConfigRoot -PathType Container) -or
+    'Omp'     = ((Test-Path -LiteralPath $ompConfigRoot -PathType Container) -or
       (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR) -and
-        (Test-Path $env:PI_CODING_AGENT_DIR -PathType Container)) -or
+        (Test-Path -LiteralPath $env:PI_CODING_AGENT_DIR -PathType Container)) -or
       (Test-Path Env:OMP_PROFILE) -or (_has 'omp'))
   }
 }

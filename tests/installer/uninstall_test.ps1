@@ -225,7 +225,7 @@ try {
     }
     Set-Content -Path $userExtension -Value 'export default function mine() {}'
 
-    Set-Location $nested
+    Set-Location -LiteralPath $nested
     Check ((Unconfigure-OmpExtension -HomeDir $h12) -eq $true) "OMP: profile/project sweep removed generated extensions"
     Check (-not (Test-Path $defaultExtension)) "OMP: default extension removed"
     Check (-not (Test-Path $workExtension)) "OMP: inactive work profile removed"
@@ -235,6 +235,52 @@ try {
 } finally {
     Set-Location $savedLocation
     Remove-Item -Recurse -Force $h12 -ErrorAction SilentlyContinue
+}
+
+Write-Host "Test 13: Oh My Pi project cleanup treats wildcard characters literally"
+$h13 = New-Tmp
+$savedLocation = (Get-Location).Path
+try {
+    $repo = Join-Path $h13 'repo[one]'
+    $nested = Join-Path $repo 'nested'
+    $projectExtension = Join-Path $repo '.omp/extensions/dcg-guard.ts'
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $repo '.git'))
+    [void][System.IO.Directory]::CreateDirectory($nested)
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $projectExtension))
+    [System.IO.File]::WriteAllText($projectExtension, '// dcg-omp-extension: generated')
+
+    Set-Location -LiteralPath $nested
+    Check ((Get-DcgRepositoryRoot) -eq $repo) "OMP: repository root with brackets is discovered literally"
+    Check ((Unconfigure-OmpExtension -HomeDir $h13) -eq $true) "OMP: bracketed project extension is removed"
+    Check (-not (Test-Path -LiteralPath $projectExtension)) "OMP: no project extension remains"
+} finally {
+    Set-Location $savedLocation
+    Remove-Item -Recurse -Force $h13 -ErrorAction SilentlyContinue
+}
+
+Write-Host "Test 14: Oh My Pi cleanup does not claim a failed deletion"
+$h14 = New-Tmp
+try {
+    $defaultExtension = Join-Path $h14 '.omp/agent/extensions/dcg-guard.ts'
+    $profileExtension = Join-Path $h14 '.omp/profiles/work/agent/extensions/dcg-guard.ts'
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $defaultExtension))
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $profileExtension))
+    [System.IO.File]::WriteAllText($defaultExtension, '// dcg-omp-extension: generated')
+    [System.IO.File]::WriteAllText($profileExtension, '// dcg-omp-extension: generated')
+
+    function Remove-Item {
+        [CmdletBinding()]
+        param([string]$LiteralPath, [switch]$Force)
+        if ($LiteralPath -eq $profileExtension) { throw "simulated locked file: $LiteralPath" }
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $LiteralPath -Force:$Force
+    }
+
+    Check ((Unconfigure-OmpExtension -HomeDir $h14 -RepoRoot $h14) -eq $false) "OMP: partial deletion is not reported as complete"
+    Check (-not (Test-Path -LiteralPath $defaultExtension)) "OMP: removable extension is still cleaned up"
+    Check (Test-Path -LiteralPath $profileExtension) "OMP: failed deletion leaves the extension in place"
+} finally {
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Function:\Remove-Item' -Force -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h14 -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }

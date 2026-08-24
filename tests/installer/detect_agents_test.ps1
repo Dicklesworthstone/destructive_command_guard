@@ -93,6 +93,15 @@ try {
     $env:PI_CONFIG_DIR = $null
     Remove-Item -Recurse -Force $h1f -ErrorAction SilentlyContinue
 
+    Write-Host "Test 1g: Oh My Pi detection treats wildcard characters in HOME literally"
+    $h1g = Join-Path ([System.IO.Path]::GetTempPath()) ("dcg_detect_[omp]_" + [Guid]::NewGuid().ToString('N'))
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $h1g '.omp'))
+    $a1g = Detect-Agents -HomeDir $h1g
+    Check ($a1g['Omp'] -eq $true) "Oh My Pi detected when HOME contains brackets"
+    $names1g = Get-DetectedAgentNames $a1g
+    Check (($names1g -join ',') -eq 'Omp') "bracketed HOME summary lists only Omp (got '$($names1g -join ',')')"
+    Remove-Item -LiteralPath $h1g -Recurse -Force -ErrorAction SilentlyContinue
+
     Write-Host "Test 2: empty home -> nothing detected"
     $h2 = New-TempHome
     $a2 = Detect-Agents -HomeDir $h2

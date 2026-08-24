@@ -2462,11 +2462,15 @@ try {
     exit 3
   }
 }
+exit 0
 '
 
     log_test "pwsh install.ps1 status: $status"
     log_test "pwsh install.ps1 output: $output"
 
+    if [ "$status" -ne 0 ]; then
+        printf 'PowerShell probe failed with status %s:\n%s\n' "$status" "$output" >&3
+    fi
     [ "$status" -eq 0 ]
     assert_codex_hooks_unchanged
 }
@@ -4042,4 +4046,26 @@ MOCKEOF
 
     [ "$status" -eq 0 ]
     grep -q 'mine' "$HOME/.omp/agent/extensions/dcg-guard.ts"
+}
+
+@test "unconfigure_omp: warns and withholds the removed marker when deletion fails" {
+    extract_uninstall_functions
+    local default_extension="$HOME/.omp/agent/extensions/dcg-guard.ts"
+    local profile_extension="$HOME/.omp/profiles/work/agent/extensions/dcg-guard.ts"
+    mkdir -p "$(dirname "$default_extension")" "$(dirname "$profile_extension")"
+    printf '// dcg-omp-extension: generated\n' > "$default_extension"
+    printf '// dcg-omp-extension: generated\n' > "$profile_extension"
+    rm() {
+        [ "${2:-}" != "$profile_extension" ] || return 1
+        command rm "$@"
+    }
+
+    run unconfigure_omp
+    unset -f rm
+
+    [ "$status" -eq 0 ]
+    [ ! -f "$default_extension" ]
+    [ -f "$profile_extension" ]
+    [[ "$output" == *"Could not remove Oh My Pi extension at $profile_extension"* ]]
+    [[ $'\n'"$output"$'\n' != *$'\nremoved\n'* ]]
 }

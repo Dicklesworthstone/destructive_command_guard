@@ -1182,6 +1182,7 @@ unconfigure_omp() {
     fi
 
     local removed=0
+    local failed=0
     local extension
     local repo_root
     repo_root=$(current_repo_root)
@@ -1192,13 +1193,23 @@ unconfigure_omp() {
         "$repo_root/.omp/extensions/dcg-guard.ts" \
         ".omp/extensions/dcg-guard.ts"; do
         if [ -f "$extension" ] && grep -q 'dcg-omp-extension' "$extension" 2>/dev/null; then
-            rm -f "$extension" 2>/dev/null && removed=1
+            if rm -f "$extension" 2>/dev/null; then
+                removed=1
+            else
+                failed=1
+                warn "Could not remove Oh My Pi extension at $extension"
+            fi
         fi
     done
     if [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
         extension="$PI_CODING_AGENT_DIR/extensions/dcg-guard.ts"
         if [ -f "$extension" ] && grep -q 'dcg-omp-extension' "$extension" 2>/dev/null; then
-            rm -f "$extension" 2>/dev/null && removed=1
+            if rm -f "$extension" 2>/dev/null; then
+                removed=1
+            else
+                failed=1
+                warn "Could not remove Oh My Pi extension at $extension"
+            fi
         fi
     fi
     local profile_agent_dir
@@ -1208,10 +1219,15 @@ unconfigure_omp() {
         [ -d "$profile_agent_dir" ] || continue
         extension="$profile_agent_dir/extensions/dcg-guard.ts"
         if [ -f "$extension" ] && grep -q 'dcg-omp-extension' "$extension" 2>/dev/null; then
-            rm -f "$extension" 2>/dev/null && removed=1
+            if rm -f "$extension" 2>/dev/null; then
+                removed=1
+            else
+                failed=1
+                warn "Could not remove Oh My Pi extension at $extension"
+            fi
         fi
     done
-    if [ "$removed" -eq 1 ]; then
+    if [ "$removed" -eq 1 ] && [ "$failed" -eq 0 ]; then
         echo "removed" >&2
     fi
     return 0

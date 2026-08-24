@@ -529,7 +529,7 @@ function Get-DcgRepositoryRoot {
   try {
     $current = Get-Item -LiteralPath $StartDir -ErrorAction Stop
     while ($null -ne $current) {
-      if (Test-Path (Join-Path $current.FullName '.git')) { return $current.FullName }
+      if (Test-Path -LiteralPath (Join-Path $current.FullName '.git')) { return $current.FullName }
       $current = $current.Parent
     }
     return [System.IO.Path]::GetFullPath($StartDir)
@@ -590,20 +590,26 @@ function Unconfigure-OmpExtension {
   foreach ($configRoot in $configRoots) {
     $paths += Join-Path (Join-Path (Join-Path $configRoot 'agent') 'extensions') 'dcg-guard.ts'
     $profilesRoot = Join-Path $configRoot 'profiles'
-    if (-not (Test-Path $profilesRoot -PathType Container)) { continue }
+    if (-not (Test-Path -LiteralPath $profilesRoot -PathType Container)) { continue }
     foreach ($profileDir in Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction SilentlyContinue) {
       $paths += Join-Path (Join-Path (Join-Path $profileDir.FullName 'agent') 'extensions') 'dcg-guard.ts'
     }
   }
   $paths = @($paths | Select-Object -Unique)
   $removed = $false
+  $failed = $false
   foreach ($extension in $paths) {
-    if (-not (Test-Path $extension -PathType Leaf)) { continue }
-    if ((Get-Content -Raw -LiteralPath $extension) -notmatch 'dcg-omp-extension') { continue }
-    Remove-Item -Force -LiteralPath $extension -ErrorAction SilentlyContinue
-    $removed = $true
+    if (-not (Test-Path -LiteralPath $extension -PathType Leaf)) { continue }
+    try {
+      if ((Get-Content -Raw -LiteralPath $extension -ErrorAction Stop) -notmatch 'dcg-omp-extension') { continue }
+      Remove-Item -Force -LiteralPath $extension -ErrorAction Stop
+      $removed = $true
+    } catch {
+      $failed = $true
+      Write-Warn "Could not remove Oh My Pi extension at ${extension}: $($_.Exception.Message)"
+    }
   }
-  $removed
+  $removed -and (-not $failed)
 }
 
 # Testing entrypoint: when dot-sourced with -LoadFunctionsOnly, stop here so the

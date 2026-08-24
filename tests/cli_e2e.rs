@@ -1819,6 +1819,30 @@ mod config_tests {
                 .exists(),
             "legacy PI_PROFILE must not win when OMP_PROFILE is present"
         );
+
+        let third_home = temp.path().join("third-home");
+        std::fs::create_dir_all(&third_home).expect("third HOME");
+        let absolute_looking_config = Command::new(dcg_binary())
+            .args(["install", "--omp"])
+            .env_clear()
+            .env("HOME", &third_home)
+            .env("USERPROFILE", &third_home)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("PI_CONFIG_DIR", "/etc/omp-cfg")
+            .current_dir(temp.path())
+            .output()
+            .expect("install absolute-looking OMP config root");
+        assert!(
+            absolute_looking_config.status.success(),
+            "absolute-looking config install: {}",
+            String::from_utf8_lossy(&absolute_looking_config.stderr)
+        );
+        assert!(
+            third_home
+                .join("etc/omp-cfg/agent/extensions/dcg-guard.ts")
+                .is_file(),
+            "Node path.join parity keeps an absolute-looking PI_CONFIG_DIR under HOME"
+        );
     }
 
     #[test]
