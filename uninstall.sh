@@ -1174,13 +1174,32 @@ unconfigure_omp() {
     case "$profile_base" in
         con|prn|aux|nul|com[0-9]|lpt[0-9]) profile_reserved=1 ;;
     esac
+    local agent_dir_override="${PI_CODING_AGENT_DIR:-}"
+    if { [ -z "$profile" ] || [ "$profile" = "default" ]; } &&
+        [ -n "$agent_dir_override" ]; then
+        local legacy_profile="${PI_PROFILE-}"
+        legacy_profile=$(printf '%s' "$legacy_profile" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        local legacy_profile_base="${legacy_profile%%.*}"
+        local legacy_profile_reserved=0
+        case "$legacy_profile_base" in
+            con|prn|aux|nul|com[0-9]|lpt[0-9]) legacy_profile_reserved=1 ;;
+        esac
+        if [ -n "$legacy_profile" ] && [ "$legacy_profile" != "default" ] &&
+            [ "${legacy_profile%.}" = "$legacy_profile" ] &&
+            [ "$legacy_profile_reserved" -eq 0 ] &&
+            [ "${#legacy_profile}" -le 64 ] &&
+            printf '%s' "$legacy_profile" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$' &&
+            [ "$agent_dir_override" = "$config_root/profiles/$legacy_profile/agent" ]; then
+            agent_dir_override=""
+        fi
+    fi
     if [ -n "$profile" ] && [ "$profile" != "default" ] &&
         [ "${profile%.}" = "$profile" ] && [ "$profile_reserved" -eq 0 ] &&
         [ "${#profile}" -le 64 ] &&
         printf '%s' "$profile" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$'; then
         agent_dir="$config_root/profiles/$profile/agent"
-    elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
-        agent_dir="$PI_CODING_AGENT_DIR"
+    elif [ -n "$agent_dir_override" ]; then
+        agent_dir="$agent_dir_override"
     fi
 
     local removed=0

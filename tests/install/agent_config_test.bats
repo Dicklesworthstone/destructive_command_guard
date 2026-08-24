@@ -3908,6 +3908,92 @@ MOCKEOF
     chmod +x "$DEST/dcg"
 }
 
+@test "resolve_omp_agent_dir: suppresses only an exact validated stale profile derivation" {
+    export PI_CONFIG_DIR=".custom-omp"
+    local config_root="$HOME/.custom-omp"
+    local default_agent="$config_root/agent"
+    local derived_agent="$config_root/profiles/work/agent"
+
+    export OMP_PROFILE=""
+    export PI_PROFILE="work"
+    export PI_CODING_AGENT_DIR="$derived_agent"
+    run resolve_omp_agent_dir
+    [ "$status" -eq 0 ]
+    [ "$output" = "$default_agent" ]
+
+    export OMP_PROFILE="default"
+    run resolve_omp_agent_dir
+    [ "$status" -eq 0 ]
+    [ "$output" = "$default_agent" ]
+
+    local override
+    for override in \
+        "$TEST_TMPDIR/operator-custom-agent" \
+        "$config_root/profiles/work/agent-sibling" \
+        "$config_root/profiles/Work/agent" \
+        "$config_root/profiles/./work/agent" \
+        "$config_root/profiles//work/agent" \
+        "$derived_agent/"; do
+        export PI_CODING_AGENT_DIR="$override"
+        run resolve_omp_agent_dir
+        [ "$status" -eq 0 ]
+        [ "$output" = "$override" ]
+    done
+
+    export PI_PROFILE="Upper"
+    export PI_CODING_AGENT_DIR="$config_root/profiles/Upper/agent"
+    run resolve_omp_agent_dir
+    [ "$status" -eq 0 ]
+    [ "$output" = "$PI_CODING_AGENT_DIR" ]
+
+    unset PI_PROFILE
+    export PI_CODING_AGENT_DIR="$derived_agent"
+    run resolve_omp_agent_dir
+    [ "$status" -eq 0 ]
+    [ "$output" = "$derived_agent" ]
+
+    export OMP_PROFILE="work"
+    export PI_PROFILE="other"
+    export PI_CODING_AGENT_DIR="$TEST_TMPDIR/ignored-custom-agent"
+    run resolve_omp_agent_dir
+    [ "$status" -eq 0 ]
+    [ "$output" = "$derived_agent" ]
+
+    export OMP_PROFILE=""
+    unset PI_PROFILE PI_CODING_AGENT_DIR
+    run resolve_omp_agent_dir
+    [ "$status" -eq 0 ]
+    [ "$output" = "$default_agent" ]
+}
+
+@test "unconfigure_omp: active default resolves before the stale cleanup candidate" {
+    extract_uninstall_functions
+    export PI_CONFIG_DIR=".custom-omp"
+    export OMP_PROFILE="default"
+    export PI_PROFILE="work"
+    export PI_CODING_AGENT_DIR="$HOME/.custom-omp/profiles/work/agent"
+    local default_extension="$HOME/.custom-omp/agent/extensions/dcg-guard.ts"
+    local stale_extension="$PI_CODING_AGENT_DIR/extensions/dcg-guard.ts"
+    local removal_log="$TEST_TMPDIR/omp-removal-order.log"
+    mkdir -p "$(dirname "$default_extension")" "$(dirname "$stale_extension")"
+    printf '// dcg-omp-extension: generated\n' > "$default_extension"
+    printf '// dcg-omp-extension: generated\n' > "$stale_extension"
+    rm() {
+        local target=""
+        local arg
+        for arg in "$@"; do target="$arg"; done
+        printf '%s\n' "$target" >> "$removal_log"
+        return 0
+    }
+
+    run unconfigure_omp
+    unset -f rm
+
+    [ "$status" -eq 0 ]
+    [ "$(sed -n '1p' "$removal_log")" = "$default_extension" ]
+    [ "$(sed -n '2p' "$removal_log")" = "$stale_extension" ]
+}
+
 @test "configure_omp: skipped when OMP not detected" {
     DETECTED_AGENTS=()
     OMP_STATUS=""

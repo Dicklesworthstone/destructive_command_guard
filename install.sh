@@ -3892,7 +3892,28 @@ resolve_omp_agent_dir() {
      printf '%s' "$profile" | grep -Eq '^[a-z0-9][a-z0-9._-]*$'; then
     printf '%s\n' "$config_root/profiles/$profile/agent"
   elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
-    printf '%s\n' "$PI_CODING_AGENT_DIR"
+    # OMP's setProfile() exports its derived profile path through this legacy
+    # variable. If OMP_PROFILE later selects default mode, PI_PROFILE can be a
+    # lower-priority provenance tag for a now-stale value. Suppress only that
+    # exact derivation; path-shaped and near-match overrides remain custom.
+    local legacy_profile="${PI_PROFILE-}"
+    legacy_profile=$(printf '%s' "$legacy_profile" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    local legacy_profile_base="${legacy_profile%%.*}"
+    local legacy_profile_reserved=0
+    case "$legacy_profile_base" in
+      con|prn|aux|nul|com[0-9]|lpt[0-9]) legacy_profile_reserved=1 ;;
+    esac
+    if { [ -z "$profile" ] || [ "$profile" = "default" ]; } &&
+       [ -n "$legacy_profile" ] && [ "$legacy_profile" != "default" ] &&
+       [ "${legacy_profile%.}" = "$legacy_profile" ] &&
+       [ "${#legacy_profile}" -le 64 ] &&
+       [ "$legacy_profile_reserved" -eq 0 ] &&
+       printf '%s' "$legacy_profile" | grep -Eq '^[a-z0-9][a-z0-9._-]*$' &&
+       [ "$PI_CODING_AGENT_DIR" = "$config_root/profiles/$legacy_profile/agent" ]; then
+      printf '%s\n' "$config_root/agent"
+    else
+      printf '%s\n' "$PI_CODING_AGENT_DIR"
+    fi
   else
     printf '%s\n' "$config_root/agent"
   fi

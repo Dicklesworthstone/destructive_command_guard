@@ -569,6 +569,33 @@ function Get-OmpAgentDir {
     return (Join-Path (Join-Path (Join-Path $configRoot 'profiles') $profile) 'agent')
   }
   if (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR)) {
+    # setProfile() propagates a named profile's derived path through this
+    # legacy variable. A higher-priority explicit default can leave that value
+    # stale beside PI_PROFILE. Match upstream's provenance check exactly:
+    # validate the losing profile, derive its path, then compare ordinally.
+    $activeProfileIsDefault = [string]::IsNullOrEmpty($profile) -or ($profile -ceq 'default')
+    $legacyProfile = $env:PI_PROFILE
+    if ($null -ne $legacyProfile) { $legacyProfile = $legacyProfile.Trim() }
+    $validLegacyProfile = $activeProfileIsDefault -and
+      (-not [string]::IsNullOrEmpty($legacyProfile)) -and
+      ($legacyProfile -cne 'default') -and ($legacyProfile.Length -le 64) -and
+      [regex]::IsMatch($legacyProfile, '^[a-z0-9][a-z0-9._-]*$') -and
+      (-not $legacyProfile.EndsWith('.')) -and
+      (-not [regex]::IsMatch(
+        $legacyProfile,
+        '^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\.|$)',
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+      ))
+    if ($validLegacyProfile) {
+      $derivedAgentDir = Join-Path (Join-Path (Join-Path $configRoot 'profiles') $legacyProfile) 'agent'
+      if ([string]::Equals(
+        $env:PI_CODING_AGENT_DIR,
+        $derivedAgentDir,
+        [System.StringComparison]::Ordinal
+      )) {
+        return (Join-Path $configRoot 'agent')
+      }
+    }
     return $env:PI_CODING_AGENT_DIR
   }
   Join-Path $configRoot 'agent'
