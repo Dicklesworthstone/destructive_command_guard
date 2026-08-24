@@ -12538,7 +12538,7 @@ fn install_opencode_plugin(force: bool, project: bool) -> Result<(), Box<dyn std
     if let Some(parent) = plugin_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&plugin_path, source)?;
+    write_settings_atomic(&plugin_path, &source)?;
 
     let level = if project { "project" } else { "user" };
     println!(
@@ -12587,7 +12587,7 @@ fn install_omp_extension(force: bool, project: bool) -> Result<(), Box<dyn std::
     if let Some(parent) = extension_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&extension_path, source)?;
+    write_settings_atomic(&extension_path, &source)?;
 
     let level = if project { "project" } else { "user/profile" };
     println!("{}", "OMP extension installed successfully!".green().bold());
