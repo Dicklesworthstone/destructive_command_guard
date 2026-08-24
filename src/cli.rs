@@ -12492,6 +12492,8 @@ fn build_omp_extension_source(executable: &std::path::Path) -> std::io::Result<S
 // Routes every Oh My Pi bash tool call through dcg (Destructive Command Guard)
 // before execution. Docs: https://github.com/Dicklesworthstone/destructive_command_guard
 import type {{ ExtensionAPI }} from "@oh-my-pi/pi-coding-agent";
+import {{ settings }} from "@oh-my-pi/pi-coding-agent/config/settings";
+import {{ isCmdShell, isPowerShell }} from "@oh-my-pi/pi-utils/procmgr";
 import {{ resolveToCwd }} from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import {{ extractLeadingCdTarget }} from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 
@@ -12501,7 +12503,7 @@ const BLOCKING_DECISIONS = new Set(["deny", "ask", "indeterminate"]);
 export default function dcgGuard(pi: ExtensionAPI): void {{
   pi.on("tool_call", async (event, ctx) => {{
     if (event.toolName !== "bash") return;
-    const toolInput = event.input as {{ command?: unknown; cwd?: unknown }} | undefined;
+    const toolInput = event.input as {{ command?: unknown; cwd?: unknown; async?: unknown; pty?: unknown }} | undefined;
     const command = toolInput?.command;
     if (typeof command !== "string" || !command) return;
 
@@ -12527,13 +12529,34 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
       }};
     }}
 
+    // OMP executes ordinary and managed-async BashTool calls in its embedded
+    // Brush shell, including on native Windows. Only an eligible local PTY
+    // bypasses Brush for the configured external shell. Mirror OMP's route
+    // predicate exactly: async wins before PTY, and PI_NO_PTY=1 disables PTY.
+    // OMP does not expose its ClientBridge terminal capability to extensions;
+    // ACP and JSON-RPC both report ctx.mode="rpc", so never guess from mode.
+    let shellDialect: "posix" | "ps" | "cmd" = "posix";
+    const usesLocalPty =
+      toolInput?.pty === true && toolInput?.async !== true && ctx.hasUI && process.env.PI_NO_PTY !== "1";
+    if (usesLocalPty) {{
+      try {{
+        const shell = settings.getShellConfig().shell;
+        shellDialect = isCmdShell(shell) ? "cmd" : isPowerShell(shell) ? "ps" : "posix";
+      }} catch (err) {{
+        return {{
+          block: true,
+          reason: `[dcg] OMP guard could not resolve the local PTY shell dialect safely: ${{err}}`,
+        }};
+      }}
+    }}
+
     let stdoutText;
     let stderrText;
     let exitCode;
     try {{
       const proc = Bun.spawn([
         process.env.DCG_BIN || DCG_BIN,
-        "--robot", "test", "--stdin", "--agent", "omp", "--dialect", "posix",
+        "--robot", "test", "--stdin", "--agent", "omp", "--dialect", shellDialect,
       ], {{
         cwd: commandCwd,
         stdin: new TextEncoder().encode(command),
@@ -18727,6 +18750,51 @@ if ($errors.Count -ne 0) {
         let parsed: String = serde_json::from_str(literal).expect("valid JSON string literal");
         assert_eq!(std::path::Path::new(&parsed), executable);
         assert_ne!(parsed, "dcg", "never a bare PATH lookup");
+    }
+
+    /// OMP 18's ordinary and managed-async BashTool routes execute in the
+    /// embedded Brush shell even on Windows. Only an eligible local PTY uses
+    /// OMP's configured external shell, which may be cmd.exe or PowerShell.
+    /// Keep this source contract mutation-sensitive: replacing the dynamic
+    /// argument with a blanket posix/unknown dialect must fail this test.
+    #[test]
+    fn omp_extension_source_selects_dialect_only_for_eligible_local_pty() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        assert!(
+            source.contains("import type { ExtensionAPI } from \"@oh-my-pi/pi-coding-agent\";")
+        );
+        assert!(
+            source.contains(
+                "import { settings } from \"@oh-my-pi/pi-coding-agent/config/settings\";"
+            )
+        );
+        assert!(
+            source.contains(
+                "import { isCmdShell, isPowerShell } from \"@oh-my-pi/pi-utils/procmgr\";"
+            )
+        );
+        assert!(
+            source.contains("command?: unknown; cwd?: unknown; async?: unknown; pty?: unknown")
+        );
+        assert!(source.contains(
+            "toolInput?.pty === true && toolInput?.async !== true && ctx.hasUI && process.env.PI_NO_PTY !== \"1\""
+        ));
+        assert!(
+            source
+                .contains("isCmdShell(shell) ? \"cmd\" : isPowerShell(shell) ? \"ps\" : \"posix\"")
+        );
+        assert!(source.contains("settings.getShellConfig().shell"));
+        assert!(source.contains("\"--dialect\", shellDialect"));
+        assert!(
+            !source.contains("\"--dialect\", \"posix\""),
+            "a hard-coded POSIX argument leaves eligible native-Windows PTY calls open to cmd/PowerShell evasions"
+        );
+        assert!(
+            !source.contains("ctx.mode ===") && !source.contains("ctx.mode !=="),
+            "ACP and JSON-RPC both expose mode=rpc; guessing the hidden ACP terminal capability would overmatch POSIX-only RPC execution"
+        );
     }
 
     #[test]

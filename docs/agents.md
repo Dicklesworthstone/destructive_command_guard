@@ -53,11 +53,23 @@ extensions; it neither requires Git nor walks to an ancestor, so launch OMP
 from that same directory.
 
 The extension uses OMP's pre-execution `tool_call` event and sends each `bash`
-command to `dcg --robot test --stdin --agent omp --dialect posix`. A dcg deny,
-ask, or indeterminate result returns `{ block: true, reason }` to OMP. Because
-the bridge supplies `--agent omp` explicitly, OMP remains distinct from legacy
-Pi even when OMP exposes Pi-family compatibility variables. The canonical
-profile key is `agents.omp`; `oh-my-pi` is accepted as an alias.
+command to `dcg --robot test --stdin --agent omp` with the dialect selected by
+OMP's execution route. Ordinary and managed-async calls use OMP's embedded
+Brush shell and pass `--dialect posix`, including on native Windows. An eligible
+local `pty: true` call instead maps OMP's configured external shell to
+`--dialect posix`, `cmd`, or `ps`; `PI_NO_PTY=1` disables that PTY route. A dcg
+deny, ask, or indeterminate result returns `{ block: true, reason }` to OMP.
+Because the bridge supplies `--agent omp` explicitly, OMP remains distinct from
+legacy Pi even when OMP exposes Pi-family compatibility variables. The
+canonical profile key is `agents.omp`; `oh-my-pi` is accepted as an alias.
+
+OMP's public ExtensionAPI does not expose its ACP client-terminal capability or
+selected backend, and both ACP and JSON-RPC surface as `mode: "rpc"`. The bridge
+therefore does not infer a Windows dialect from mode: non-PTY RPC calls remain
+POSIX-scoped so ordinary JSON-RPC execution does not gain Cmd/PowerShell false
+positives. As a result, an ACP client-terminal call does not yet receive exact
+Cmd/PowerShell-specific coverage; closing that residual requires OMP to expose
+the actual BashTool route before the `tool_call` handler runs.
 
 ## Trust Levels
 
