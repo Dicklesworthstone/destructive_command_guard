@@ -12498,7 +12498,63 @@ import {{ resolveToCwd }} from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import {{ extractLeadingCdTarget }} from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 
 const DCG_BIN = {path_literal};
-const BLOCKING_DECISIONS = new Set(["deny", "ask", "indeterminate"]);
+type DcgChildOutcome = "spawn-throw" | "exit-0" | "exit-1" | "exit-2" | "exit-other";
+type DcgParsedVerdict = "empty" | "malformed" | "allow" | "deny" | "ask" | "indeterminate" | "unknown";
+type DcgBridgeAction = "allow" | "block" | "infrastructure";
+type DcgParsedOutput = {{ verdict: DcgParsedVerdict; reason?: string; ruleId?: string }};
+
+const DCG_MAX_JSON_CHARS = 1_048_576;
+const BLOCKING_DECISIONS: ReadonlySet<DcgParsedVerdict> = new Set(["deny", "ask", "indeterminate"]);
+const DCG_CHILD_TRANSITIONS: Record<DcgChildOutcome, Record<DcgParsedVerdict, DcgBridgeAction>> = {{
+  "spawn-throw": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
+  "exit-0": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
+  "exit-1": {{ empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }},
+  "exit-2": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
+  "exit-other": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
+}};
+
+function parseDcgOutput(stdoutText: string): DcgParsedOutput {{
+  const text = stdoutText.trim();
+  if (!text) return {{ verdict: "empty" }};
+  if (text.length > DCG_MAX_JSON_CHARS) return {{ verdict: "malformed" }};
+
+  let raw: unknown;
+  try {{
+    raw = JSON.parse(text);
+  }} catch {{
+    return {{ verdict: "malformed" }};
+  }}
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {{
+    return {{ verdict: "unknown" }};
+  }}
+
+  const record = raw as Record<string, unknown>;
+  const decision = record.decision;
+  const verdict: DcgParsedVerdict =
+    decision === "allow" || BLOCKING_DECISIONS.has(decision as DcgParsedVerdict)
+      ? (decision as DcgParsedVerdict)
+      : "unknown";
+  return {{
+    verdict,
+    reason: typeof record.reason === "string" ? record.reason : undefined,
+    ruleId: typeof record.rule_id === "string" ? record.rule_id : undefined,
+  }};
+}}
+
+function classifyDcgChild(
+  outcome: DcgChildOutcome,
+  stdoutText: string,
+): {{ action: DcgBridgeAction; output: DcgParsedOutput }} {{
+  const output = parseDcgOutput(stdoutText);
+  return {{ action: DCG_CHILD_TRANSITIONS[outcome][output.verdict], output }};
+}}
+
+function childOutcomeFromExitCode(exitCode: unknown): DcgChildOutcome {{
+  if (exitCode === 0) return "exit-0";
+  if (exitCode === 1) return "exit-1";
+  if (exitCode === 2) return "exit-2";
+  return "exit-other";
+}}
 
 export default function dcgGuard(pi: ExtensionAPI): void {{
   pi.on("tool_call", async (event, ctx) => {{
@@ -18750,6 +18806,41 @@ if ($errors.Count -ne 0) {
         let parsed: String = serde_json::from_str(literal).expect("valid JSON string literal");
         assert_eq!(std::path::Path::new(&parsed), executable);
         assert_ne!(parsed, "dcg", "never a bare PATH lookup");
+    }
+
+    /// A machine-readable safety verdict must be monotone across the child
+    /// process's data and status channels: no exit status may erase a parsed
+    /// deny-like verdict, and dcg's blocking exit status must win even when
+    /// stdout is absent, damaged, or contradictory. Keep the complete finite
+    /// state machine in generated TypeScript so pass-level executable tests can
+    /// drive the same pure classifier without reconstructing its policy.
+    #[test]
+    fn omp_extension_source_encodes_monotonic_child_transition_table() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        assert!(source.contains("type DcgChildOutcome ="));
+        assert!(source.contains("type DcgParsedVerdict ="));
+        assert!(source.contains("const DCG_CHILD_TRANSITIONS:"));
+        for row in [
+            r#""spawn-throw": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
+            r#""exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#,
+            r#""exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }"#,
+            r#""exit-2": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#,
+            r#""exit-other": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
+        ] {
+            assert!(
+                source.contains(row),
+                "generated bridge is missing transition row: {row}"
+            );
+        }
+        assert!(source.contains("function parseDcgOutput("));
+        assert!(source.contains("function classifyDcgChild("));
+        assert!(source.contains("const classification = classifyDcgChild("));
+        assert!(
+            !source.contains("if (exitCode === 0 || exitCode === 2) return;"),
+            "an early status-only allow would erase a parsed blocking verdict"
+        );
     }
 
     /// OMP 18's ordinary and managed-async BashTool routes execute in the
