@@ -280,8 +280,36 @@ try {
     Remove-Item -Recurse -Force $h13 -ErrorAction SilentlyContinue
 }
 
+if ([System.IO.Path]::DirectorySeparatorChar -ne '\') {
+    Write-Host "Test 13a: Oh My Pi cleanup preserves literal backslashes in POSIX roots"
+    $h13a = New-Tmp
+    try {
+        $literalHome = [System.IO.Path]::Combine($h13a, 'home\literal')
+        $literalRepo = [System.IO.Path]::Combine($h13a, 'repo\literal')
+        $intendedHomeExtension = [System.IO.Path]::Combine([string[]]@($literalHome, '.omp', 'agent', 'extensions', 'dcg-guard.ts'))
+        $intendedProjectExtension = [System.IO.Path]::Combine($literalRepo, '.omp', 'extensions', 'dcg-guard.ts')
+        $decoyHomeExtension = [System.IO.Path]::Combine([string[]]@($h13a, 'home', 'literal', '.omp', 'agent', 'extensions', 'dcg-guard.ts'))
+        $decoyProjectExtension = [System.IO.Path]::Combine([string[]]@($h13a, 'repo', 'literal', '.omp', 'extensions', 'dcg-guard.ts'))
+        foreach ($path in @($intendedHomeExtension, $intendedProjectExtension, $decoyHomeExtension, $decoyProjectExtension)) {
+            [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($path))
+            [System.IO.File]::WriteAllText($path, '// dcg-omp-extension: generated')
+        }
+
+        Check ((Unconfigure-OmpExtension -HomeDir $literalHome -RepoRoot $literalRepo) -eq $true) "OMP: literal-backslash roots are cleaned"
+        Check (-not [System.IO.File]::Exists($intendedHomeExtension)) "OMP: literal-backslash HOME extension is removed"
+        Check (-not [System.IO.File]::Exists($intendedProjectExtension)) "OMP: literal-backslash project extension is removed"
+        Check ([System.IO.File]::Exists($decoyHomeExtension)) "OMP: separator-normalized HOME decoy is preserved"
+        Check ([System.IO.File]::Exists($decoyProjectExtension)) "OMP: separator-normalized project decoy is preserved"
+    } finally {
+        if ([System.IO.Directory]::Exists($h13a)) {
+            [System.IO.Directory]::Delete($h13a, $true)
+        }
+    }
+}
+
 Write-Host "Test 14: Oh My Pi cleanup does not claim a failed deletion"
 $h14 = New-Tmp
+$savedRemoveOmpExtensionFile = (Get-Command Remove-OmpExtensionFile).ScriptBlock
 try {
     $defaultExtension = Join-Path $h14 '.omp/agent/extensions/dcg-guard.ts'
     $profileExtension = Join-Path $h14 '.omp/profiles/work/agent/extensions/dcg-guard.ts'
@@ -290,23 +318,24 @@ try {
     [System.IO.File]::WriteAllText($defaultExtension, '// dcg-omp-extension: generated')
     [System.IO.File]::WriteAllText($profileExtension, '// dcg-omp-extension: generated')
 
-    function Remove-Item {
+    function Remove-OmpExtensionFile {
         [CmdletBinding()]
-        param([string]$LiteralPath, [switch]$Force)
-        if ($LiteralPath -eq $profileExtension) { throw "simulated locked file: $LiteralPath" }
-        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $LiteralPath -Force:$Force
+        param([string]$Path)
+        if ($Path -eq $profileExtension) { throw "simulated locked file: $Path" }
+        [System.IO.File]::Delete($Path)
     }
 
     Check ((Unconfigure-OmpExtension -HomeDir $h14 -RepoRoot $h14) -eq $false) "OMP: partial deletion is not reported as complete"
     Check (-not (Test-Path -LiteralPath $defaultExtension)) "OMP: removable extension is still cleaned up"
     Check (Test-Path -LiteralPath $profileExtension) "OMP: failed deletion leaves the extension in place"
 } finally {
-    Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Function:\Remove-Item' -Force -ErrorAction SilentlyContinue
+    Set-Item -LiteralPath 'Function:\Remove-OmpExtensionFile' -Value $savedRemoveOmpExtensionFile
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h14 -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host "Test 15: Oh My Pi cleanup does not claim success when profile enumeration fails"
 $h15 = New-Tmp
+$savedGetOmpProfileDirectories = (Get-Command Get-OmpProfileDirectories).ScriptBlock
 try {
     $defaultExtension = Join-Path $h15 '.omp/agent/extensions/dcg-guard.ts'
     $profileExtension = Join-Path $h15 '.omp/profiles/work/agent/extensions/dcg-guard.ts'
@@ -316,18 +345,18 @@ try {
     [System.IO.File]::WriteAllText($defaultExtension, '// dcg-omp-extension: generated')
     [System.IO.File]::WriteAllText($profileExtension, '// dcg-omp-extension: generated')
 
-    function Get-ChildItem {
+    function Get-OmpProfileDirectories {
         [CmdletBinding()]
-        param([string]$LiteralPath, [switch]$Directory)
-        if ($LiteralPath -eq $profilesRoot) { throw "simulated unreadable profiles directory: $LiteralPath" }
-        Microsoft.PowerShell.Management\Get-ChildItem -LiteralPath $LiteralPath -Directory:$Directory -ErrorAction Stop
+        param([string]$Path)
+        if ($Path -eq $profilesRoot) { throw "simulated unreadable profiles directory: $Path" }
+        [System.IO.Directory]::GetDirectories($Path)
     }
 
     Check ((Unconfigure-OmpExtension -HomeDir $h15 -RepoRoot $h15) -eq $false) "OMP: profile enumeration failure is not reported as complete"
     Check (-not (Test-Path -LiteralPath $defaultExtension)) "OMP: known default extension is still cleaned up"
     Check (Test-Path -LiteralPath $profileExtension) "OMP: unenumerated profile extension remains in place"
 } finally {
-    Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Function:\Get-ChildItem' -Force -ErrorAction SilentlyContinue
+    Set-Item -LiteralPath 'Function:\Get-OmpProfileDirectories' -Value $savedGetOmpProfileDirectories
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h15 -Recurse -Force -ErrorAction SilentlyContinue
 }
 
@@ -388,8 +417,8 @@ try {
     foreach ($case in $cases) {
         $env:PI_CONFIG_DIR = $case.Name
         $root = Get-OmpConfigRoot -HomeDir $oracleHome -WindowsSemantics $nativeWindows
-        $agent = Join-Path $root 'agent'
-        Check ([string]::Equals($agent, $case.Agent, [System.StringComparison]::Ordinal)) "OMP: PI_CONFIG_DIR '$($case.Name)' resolves to '$($case.Agent)'"
+        $agent = Get-OmpAgentDir -HomeDir $oracleHome
+        Check ([string]::Equals($agent, $case.Agent, [System.StringComparison]::Ordinal)) "OMP: PI_CONFIG_DIR '$($case.Name)' resolves to '$($case.Agent)' (root '$root', got '$agent')"
     }
 } finally {
     $env:PI_CONFIG_DIR = $savedPiConfigDir
@@ -398,6 +427,7 @@ try {
 Write-Host "Test 17: Oh My Pi cleanup identifies marker inspection failures"
 $h17 = New-Tmp
 $savedWriteWarn = (Get-Command Write-Warn).ScriptBlock
+$savedReadOmpExtensionText = (Get-Command Read-OmpExtensionText).ScriptBlock
 try {
     $defaultExtension = Join-Path $h17 '.omp/agent/extensions/dcg-guard.ts'
     $profileExtension = Join-Path $h17 '.omp/profiles/work/agent/extensions/dcg-guard.ts'
@@ -407,11 +437,11 @@ try {
     [System.IO.File]::WriteAllText($profileExtension, '// dcg-omp-extension: generated')
     $script:ompInspectionWarning = ''
 
-    function Get-Content {
+    function Read-OmpExtensionText {
         [CmdletBinding()]
-        param([switch]$Raw, [string]$LiteralPath)
-        if ($LiteralPath -eq $profileExtension) { throw "simulated unreadable marker: $LiteralPath" }
-        Microsoft.PowerShell.Management\Get-Content -Raw:$Raw -LiteralPath $LiteralPath -ErrorAction Stop
+        param([string]$Path)
+        if ($Path -eq $profileExtension) { throw "simulated unreadable marker: $Path" }
+        [System.IO.File]::ReadAllText($Path)
     }
     function Write-Warn {
         param([string]$Message)
@@ -423,7 +453,7 @@ try {
     Check (Test-Path -LiteralPath $profileExtension) "OMP: unreadable extension remains in place"
     Check ($script:ompInspectionWarning -like "Could not inspect Oh My Pi extension at ${profileExtension}:*") "OMP: warning distinguishes inspection from deletion failure"
 } finally {
-    Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Function:\Get-Content' -Force -ErrorAction SilentlyContinue
+    Set-Item -LiteralPath 'Function:\Read-OmpExtensionText' -Value $savedReadOmpExtensionText
     Set-Item -LiteralPath 'Function:\Write-Warn' -Value $savedWriteWarn
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h17 -Recurse -Force -ErrorAction SilentlyContinue
 }

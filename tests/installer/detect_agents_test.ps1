@@ -136,7 +136,25 @@ try {
     if (-not $nativeWindows) {
         $env:PI_CONFIG_DIR = '\.literal-backslash'
         $backslashRoot = Get-OmpConfigRootForDetection -HomeDir $oracleHome -WindowsSemantics $false
-        Check ([string]::Equals($backslashRoot, '/home/u/\.literal-backslash', [System.StringComparison]::Ordinal)) "POSIX detection preserves leading backslash literally"
+        Check ([string]::Equals($backslashRoot, '/home/u/\.literal-backslash', [System.StringComparison]::Ordinal)) "POSIX detection preserves leading backslash literally (got '$backslashRoot')"
+
+        $backslashHome = New-TempHome
+        try {
+            $literalConfigRoot = [System.IO.Path]::Combine($backslashHome, '\.literal-backslash')
+            $normalizedDecoyRoot = [System.IO.Path]::Combine($backslashHome, '.literal-backslash')
+            [void][System.IO.Directory]::CreateDirectory($literalConfigRoot)
+            $literalAgents = Detect-Agents -HomeDir $backslashHome
+            Check ($literalAgents['Omp'] -eq $true) "POSIX detection finds the literal-backslash config root"
+
+            [System.IO.Directory]::Delete($literalConfigRoot, $true)
+            [void][System.IO.Directory]::CreateDirectory($normalizedDecoyRoot)
+            $decoyAgents = Detect-Agents -HomeDir $backslashHome
+            Check ($decoyAgents['Omp'] -eq $false) "POSIX detection does not probe a separator-normalized decoy"
+        } finally {
+            if ([System.IO.Directory]::Exists($backslashHome)) {
+                [System.IO.Directory]::Delete($backslashHome, $true)
+            }
+        }
     }
     $env:PI_CONFIG_DIR = $null
     $names1g = Get-DetectedAgentNames $a1g

@@ -544,13 +544,16 @@ function Get-OmpConfigRoot {
     [bool]$WindowsSemantics = ([System.IO.Path]::DirectorySeparatorChar -eq '\')
   )
   $configName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
-  $leadingSeparators = if ($WindowsSemantics) { [char[]]@('\', '/') } else { [char[]]@('/') }
-  $configName = $configName.TrimStart($leadingSeparators)
+  $configName = if ($WindowsSemantics) {
+    $configName.TrimStart([char[]]@('\', '/'))
+  } else {
+    $configName.TrimStart([char[]]@('/'))
+  }
   if ($WindowsSemantics -and $configName -match '^[A-Za-z]:') {
     throw "PI_CONFIG_DIR must be a directory name relative to HOME on Windows, not drive-qualified path '$($env:PI_CONFIG_DIR)'"
   }
   try {
-    $joined = if ($configName.Length -eq 0) { $HomeDir } else { Join-Path $HomeDir $configName }
+    $joined = if ($configName.Length -eq 0) { $HomeDir } else { [System.IO.Path]::Combine($HomeDir, $configName) }
     [System.IO.Path]::GetFullPath($joined)
   } catch {
     throw "Could not resolve PI_CONFIG_DIR '$($env:PI_CONFIG_DIR)' beneath HOME '$HomeDir': $($_.Exception.Message)"
@@ -572,7 +575,7 @@ function Get-OmpAgentDir {
     ($profile -match '^[a-z0-9][a-z0-9._-]*$') -and (-not $profile.EndsWith('.')) -and
     ($profile -notmatch '^(?i:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\.|$)')
   if ($validProfile) {
-    return (Join-Path (Join-Path (Join-Path $configRoot 'profiles') $profile) 'agent')
+    return [System.IO.Path]::Combine($configRoot, 'profiles', $profile, 'agent')
   }
   if (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR)) {
     # setProfile() propagates a named profile's derived path through this
@@ -593,18 +596,40 @@ function Get-OmpAgentDir {
         [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
       ))
     if ($validLegacyProfile) {
-      $derivedAgentDir = Join-Path (Join-Path (Join-Path $configRoot 'profiles') $legacyProfile) 'agent'
+      $derivedAgentDir = [System.IO.Path]::Combine($configRoot, 'profiles', $legacyProfile, 'agent')
       if ([string]::Equals(
         $env:PI_CODING_AGENT_DIR,
         $derivedAgentDir,
         [System.StringComparison]::Ordinal
       )) {
-        return (Join-Path $configRoot 'agent')
+        return [System.IO.Path]::Combine($configRoot, 'agent')
       }
     }
     return $env:PI_CODING_AGENT_DIR
   }
-  Join-Path $configRoot 'agent'
+  [System.IO.Path]::Combine($configRoot, 'agent')
+}
+
+function Get-OmpProfileDirectories {
+  param([string]$Path)
+  [System.IO.Directory]::GetDirectories($Path)
+}
+
+function Read-OmpExtensionText {
+  param([string]$Path)
+  [System.IO.File]::ReadAllText($Path)
+}
+
+function Remove-OmpExtensionFile {
+  param([string]$Path)
+  [System.IO.File]::Delete($Path)
+}
+
+function Test-OmpMissingPathException {
+  param([System.Exception]$Exception)
+  while ($null -ne $Exception.InnerException) { $Exception = $Exception.InnerException }
+  ($Exception -is [System.IO.FileNotFoundException]) -or
+    ($Exception -is [System.IO.DirectoryNotFoundException])
 }
 
 function Unconfigure-OmpExtension {
@@ -617,7 +642,7 @@ function Unconfigure-OmpExtension {
   }
   $removed = $false
   $failed = $false
-  $configRoots = @((Join-Path $HomeDir '.omp'))
+  $configRoots = @([System.IO.Path]::Combine($HomeDir, '.omp'))
   $currentConfigRoot = $null
   try {
     $currentConfigRoot = Get-OmpConfigRoot -HomeDir $HomeDir
@@ -627,27 +652,27 @@ function Unconfigure-OmpExtension {
     Write-Warn "Could not resolve the Oh My Pi config root: $($_.Exception.Message)"
   }
   $configRoots = @($configRoots | Select-Object -Unique)
-  $paths = @((Join-Path (Join-Path (Join-Path $RepoRoot '.omp') 'extensions') 'dcg-guard.ts'))
+  $paths = @([System.IO.Path]::Combine($RepoRoot, '.omp', 'extensions', 'dcg-guard.ts'))
   if ($null -ne $currentConfigRoot) {
     try {
-      $paths += Join-Path (Join-Path (Get-OmpAgentDir -HomeDir $HomeDir) 'extensions') 'dcg-guard.ts'
+      $paths += [System.IO.Path]::Combine((Get-OmpAgentDir -HomeDir $HomeDir), 'extensions', 'dcg-guard.ts')
     } catch {
       $failed = $true
       Write-Warn "Could not resolve the active Oh My Pi agent directory: $($_.Exception.Message)"
     }
   }
   if (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR)) {
-    $paths += Join-Path (Join-Path $env:PI_CODING_AGENT_DIR 'extensions') 'dcg-guard.ts'
+    $paths += [System.IO.Path]::Combine($env:PI_CODING_AGENT_DIR, 'extensions', 'dcg-guard.ts')
   }
   foreach ($configRoot in $configRoots) {
-    $paths += Join-Path (Join-Path (Join-Path $configRoot 'agent') 'extensions') 'dcg-guard.ts'
-    $profilesRoot = Join-Path $configRoot 'profiles'
+    $paths += [System.IO.Path]::Combine($configRoot, 'agent', 'extensions', 'dcg-guard.ts')
+    $profilesRoot = [System.IO.Path]::Combine($configRoot, 'profiles')
     try {
-      if (-not (Test-Path -LiteralPath $profilesRoot -PathType Container -ErrorAction Stop)) { continue }
-      foreach ($profileDir in Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction Stop) {
-        $paths += Join-Path (Join-Path (Join-Path $profileDir.FullName 'agent') 'extensions') 'dcg-guard.ts'
+      foreach ($profileDir in Get-OmpProfileDirectories -Path $profilesRoot) {
+        $paths += [System.IO.Path]::Combine($profileDir, 'agent', 'extensions', 'dcg-guard.ts')
       }
     } catch {
+      if (Test-OmpMissingPathException -Exception $_.Exception) { continue }
       $failed = $true
       Write-Warn "Could not inspect Oh My Pi profiles under ${profilesRoot}: $($_.Exception.Message)"
     }
@@ -655,16 +680,19 @@ function Unconfigure-OmpExtension {
   $paths = @($paths | Select-Object -Unique)
   foreach ($extension in $paths) {
     try {
-      if (-not (Test-Path -LiteralPath $extension -PathType Leaf -ErrorAction Stop)) { continue }
-      $content = Get-Content -Raw -LiteralPath $extension -ErrorAction Stop
+      $content = Read-OmpExtensionText -Path $extension
     } catch {
+      if (Test-OmpMissingPathException -Exception $_.Exception) { continue }
       $failed = $true
       Write-Warn "Could not inspect Oh My Pi extension at ${extension}: $($_.Exception.Message)"
       continue
     }
     if ($content -notmatch 'dcg-omp-extension') { continue }
     try {
-      Remove-Item -Force -LiteralPath $extension -ErrorAction Stop
+      Remove-OmpExtensionFile -Path $extension
+      if ([System.IO.File]::Exists($extension)) {
+        throw "file still exists after removal"
+      }
       $removed = $true
     } catch {
       $failed = $true

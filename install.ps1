@@ -1788,11 +1788,14 @@ function Get-OmpConfigRootForDetection {
     [bool]$WindowsSemantics = ([System.IO.Path]::DirectorySeparatorChar -eq '\')
   )
   $configName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
-  $leadingSeparators = if ($WindowsSemantics) { [char[]]@('\', '/') } else { [char[]]@('/') }
-  $configName = $configName.TrimStart($leadingSeparators)
+  $configName = if ($WindowsSemantics) {
+    $configName.TrimStart([char[]]@('\', '/'))
+  } else {
+    $configName.TrimStart([char[]]@('/'))
+  }
   if ($WindowsSemantics -and $configName -match '^[A-Za-z]:') { return $null }
   try {
-    $joined = if ($configName.Length -eq 0) { $HomeDir } else { Join-Path $HomeDir $configName }
+    $joined = if ($configName.Length -eq 0) { $HomeDir } else { [System.IO.Path]::Combine($HomeDir, $configName) }
     [System.IO.Path]::GetFullPath($joined)
   } catch {
     $null
@@ -1831,9 +1834,9 @@ function Detect-Agents {
     'Posit'   = ((Test-Path -LiteralPath (Join-Path (Join-Path $HomeDir '.posit') 'assistant') -PathType Container -ErrorAction SilentlyContinue) -or
       (_dir '.positai') -or (_has 'pa'))
     'Omp'     = (($null -ne $ompConfigRoot -and
-        (Test-Path -LiteralPath $ompConfigRoot -PathType Container -ErrorAction SilentlyContinue)) -or
+        [System.IO.Directory]::Exists($ompConfigRoot)) -or
       (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR) -and
-        (Test-Path -LiteralPath $env:PI_CODING_AGENT_DIR -PathType Container -ErrorAction SilentlyContinue)) -or
+        [System.IO.Directory]::Exists($env:PI_CODING_AGENT_DIR)) -or
       (Test-Path Env:OMP_PROFILE) -or (_has 'omp'))
   }
 }
