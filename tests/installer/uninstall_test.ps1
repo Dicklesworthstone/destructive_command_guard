@@ -6,7 +6,6 @@
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-. (Join-Path $repoRoot 'uninstall.ps1') -LoadFunctionsOnly
 
 $script:failures = 0
 function Check([bool]$cond, [string]$msg) {
@@ -19,6 +18,23 @@ function Test-NoBom([string]$p) {
 }
 $dcg = "C:\Users\O'Brien\.local\bin\dcg.exe"
 $escapedDcg = $dcg.Replace("'", "''")
+
+$ompSelectorNames = @('OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'PI_CODING_AGENT_DIR')
+$savedOmpSelectors = @{}
+foreach ($name in $ompSelectorNames) {
+    $savedOmpSelectors[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    # Seed first so this fence is mutation-sensitive on hosts whose ambient
+    # environment happens to be clean.
+    [Environment]::SetEnvironmentVariable($name, "dcg-test-ambient-$name", 'Process')
+}
+foreach ($name in $ompSelectorNames) {
+    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+}
+
+try {
+    . (Join-Path $repoRoot 'uninstall.ps1') -LoadFunctionsOnly
+
+    Check (@($ompSelectorNames | Where-Object { Test-Path -LiteralPath "Env:$_" }).Count -eq 0) "OMP path/profile selectors are scrubbed from the test process"
 
 Write-Host "Test 0: Claude (Bash|PowerShell wrapper) - remove dcg, keep Bash-only hook"
 $h0 = New-Tmp; New-Item -ItemType Directory -Path $h0 -Force | Out-Null
@@ -355,6 +371,11 @@ try {
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Function:\Get-Content' -Force -ErrorAction SilentlyContinue
     Set-Item -LiteralPath 'Function:\Write-Warn' -Value $savedWriteWarn
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h17 -Recurse -Force -ErrorAction SilentlyContinue
+}
+} finally {
+    foreach ($name in $ompSelectorNames) {
+        [Environment]::SetEnvironmentVariable($name, $savedOmpSelectors[$name], 'Process')
+    }
 }
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }

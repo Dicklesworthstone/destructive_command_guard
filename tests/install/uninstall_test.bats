@@ -32,6 +32,69 @@ teardown() {
 }
 
 # ============================================================================
+# Harness Capability-Fence Tests
+# ============================================================================
+
+@test "isolated setup fences inherited OMP selectors and project cwd" {
+    local outside_agent="$BATS_TEST_TMPDIR/ambient-omp-agent"
+    local outside_project="$BATS_TEST_TMPDIR/ambient-omp-project"
+    local agent_extension="$outside_agent/extensions/dcg-guard.ts"
+    local project_extension="$outside_project/.omp/extensions/dcg-guard.ts"
+    local agent_snapshot="$BATS_TEST_TMPDIR/ambient-agent.snapshot"
+    local project_snapshot="$BATS_TEST_TMPDIR/ambient-project.snapshot"
+
+    mkdir -p "$(dirname "$agent_extension")" "$(dirname "$project_extension")"
+    printf '// dcg-omp-extension: ambient agent canary\n' > "$agent_extension"
+    printf '// dcg-omp-extension: ambient project canary\n' > "$project_extension"
+    cp "$agent_extension" "$agent_snapshot"
+    cp "$project_extension" "$project_snapshot"
+
+    # Start outside the nested fixture with every OMP selector inherited. The
+    # helper must revoke those capabilities before unconfigure_omp is sourced.
+    run env \
+        OMP_PROFILE=ambient-profile \
+        PI_PROFILE=ambient-legacy-profile \
+        PI_CONFIG_DIR=ambient-config \
+        PI_CODING_AGENT_DIR="$outside_agent" \
+        DCG_TEST_HELPER="$PROJECT_ROOT/tests/install/test_helper.bash" \
+        DCG_OUTSIDE_PROJECT="$outside_project" \
+        DCG_AGENT_EXTENSION="$agent_extension" \
+        DCG_AGENT_SNAPSHOT="$agent_snapshot" \
+        DCG_PROJECT_EXTENSION="$project_extension" \
+        DCG_PROJECT_SNAPSHOT="$project_snapshot" \
+        bash -c '
+            set -e
+            cd "$DCG_OUTSIDE_PROJECT"
+            source "$DCG_TEST_HELPER"
+            setup_isolated_home
+            cleanup_fixture() {
+                local command_status=$?
+                trap - EXIT
+                if ! teardown_isolated_home && [ "$command_status" -eq 0 ]; then
+                    command_status=1
+                fi
+                exit "$command_status"
+            }
+            trap cleanup_fixture EXIT
+
+            [ "${OMP_PROFILE+x}" != x ]
+            [ "${PI_PROFILE+x}" != x ]
+            [ "${PI_CONFIG_DIR+x}" != x ]
+            [ "${PI_CODING_AGENT_DIR+x}" != x ]
+            [ "$PWD" = "$TEST_WORKDIR" ]
+
+            extract_uninstall_functions
+            unconfigure_omp
+            cmp -s "$DCG_AGENT_SNAPSHOT" "$DCG_AGENT_EXTENSION"
+            cmp -s "$DCG_PROJECT_SNAPSHOT" "$DCG_PROJECT_EXTENSION"
+        '
+
+    [ "$status" -eq 0 ]
+    cmp -s "$agent_snapshot" "$agent_extension"
+    cmp -s "$project_snapshot" "$project_extension"
+}
+
+# ============================================================================
 # Claude Code Uninstall Tests
 # ============================================================================
 

@@ -194,9 +194,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                         "databricks clusters get <CLUSTER_ID>",
                         "Capture the cluster's configuration before removing it",
                     ),
-                    PatternSuggestion::gated(
+                    // Not gated: terminate is deliberately out of this pack's
+                    // scope (see the allowed-command case below), so claiming
+                    // dcg gates it was a marker this pack never backed.
+                    PatternSuggestion::new(
                         "databricks clusters delete <CLUSTER_ID>",
-                        "Terminates (stops) the cluster but keeps its configuration — still gated as a delete",
+                        "Terminates (stops) the cluster but keeps its configuration, so it can be restarted",
                     ),
                 ]
             },

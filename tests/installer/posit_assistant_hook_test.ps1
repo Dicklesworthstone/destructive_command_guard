@@ -19,7 +19,6 @@
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-. (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
 
 $script:failures = 0
 function Check([bool]$cond, [string]$msg) {
@@ -42,6 +41,23 @@ function New-PositDir([string]$homeDir) {
 
 $dcgPath = 'C:\Users\me\.local\bin\dcg.exe'
 $expectedCommand = '"' + $dcgPath + '"'
+
+$ompSelectorNames = @('OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'PI_CODING_AGENT_DIR')
+$savedOmpSelectors = @{}
+foreach ($name in $ompSelectorNames) {
+    $savedOmpSelectors[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    # Detect-Agents is exercised below, so make its OMP isolation assertion
+    # non-vacuous even when the host starts with no OMP variables configured.
+    [Environment]::SetEnvironmentVariable($name, "dcg-test-ambient-$name", 'Process')
+}
+foreach ($name in $ompSelectorNames) {
+    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+}
+
+try {
+    . (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
+
+    Check (@($ompSelectorNames | Where-Object { Test-Path -LiteralPath "Env:$_" }).Count -eq 0) "OMP path/profile selectors are scrubbed from the test process"
 
 # --- Test 1: create + idempotent + no BOM + wire shape ---
 Write-Host "Test 1: create / idempotent / no-BOM / wire shape"
@@ -191,7 +207,13 @@ try {
     $agents = Detect-Agents -HomeDir $h8
     Check ([bool]$agents['Posit']) "Detect-Agents flags Posit when ~/.posit/assistant exists"
     Check ((Get-DetectedAgentNames $agents) -contains 'Posit') "Get-DetectedAgentNames includes Posit"
+    Check (-not [bool]$agents['Omp']) "ambient OMP selectors cannot inject Omp into the Posit fixture"
 } finally { $env:PATH = $savedPath; Remove-Item -Recurse -Force $h8 -ErrorAction SilentlyContinue }
+} finally {
+    foreach ($name in $ompSelectorNames) {
+        [Environment]::SetEnvironmentVariable($name, $savedOmpSelectors[$name], 'Process')
+    }
+}
 
 if ($script:failures -gt 0) {
     Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red

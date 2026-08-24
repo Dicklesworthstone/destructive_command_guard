@@ -6,7 +6,6 @@
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-. (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
 
 $script:failures = 0
 function Check([bool]$cond, [string]$msg) {
@@ -23,8 +22,25 @@ $savedGrok = $env:GROK_SESSION_ID
 $savedHermesHome = $env:HERMES_HOME
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedOs = $env:OS
-$savedPiConfigDir = $env:PI_CONFIG_DIR
+$ompSelectorNames = @('OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'PI_CODING_AGENT_DIR')
+$savedOmpSelectors = @{}
+foreach ($name in $ompSelectorNames) {
+    $savedOmpSelectors[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    # Seed a non-vacuous ambient value before proving the fixture fence clears
+    # it. This catches a missing scrub even on otherwise clean CI hosts.
+    [Environment]::SetEnvironmentVariable($name, "dcg-test-ambient-$name", 'Process')
+}
+foreach ($name in $ompSelectorNames) {
+    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+}
 try {
+    . (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
+
+    $unclearedOmpSelectors = @($ompSelectorNames | Where-Object {
+        Test-Path -LiteralPath "Env:$_"
+    })
+    Check ($unclearedOmpSelectors.Count -eq 0) "OMP path/profile selectors are scrubbed from the test process"
+
     $env:PATH = ''                 # no CLI probing leaks
     $env:GROK_SESSION_ID = $null
     $env:HERMES_HOME = $null       # no Hermes home-resolution leaks (issue #270)
@@ -150,7 +166,9 @@ try {
     $env:HERMES_HOME = $savedHermesHome
     $env:LOCALAPPDATA = $savedLocalAppData
     $env:OS = $savedOs
-    $env:PI_CONFIG_DIR = $savedPiConfigDir
+    foreach ($name in $ompSelectorNames) {
+        [Environment]::SetEnvironmentVariable($name, $savedOmpSelectors[$name], 'Process')
+    }
 }
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }

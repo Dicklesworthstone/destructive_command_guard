@@ -88,8 +88,32 @@ setup_isolated_home() {
     TEST_TMPDIR="$(mktemp -d)"
     export ORIGINAL_HOME="$HOME"
     export ORIGINAL_PATH="$PATH"
+    export ORIGINAL_WORKING_DIRECTORY="$PWD"
+
+    # OMP resolves extension targets from ambient process state, independently
+    # of HOME. Preserve set-vs-unset (an explicitly empty OMP_PROFILE is
+    # meaningful), then remove every supported selector before any installer or
+    # uninstaller function can observe it. Individual tests opt back in by
+    # setting the exact selector they exercise.
+    export DCG_TEST_SAVED_OMP_PROFILE_SET="${OMP_PROFILE+x}"
+    export DCG_TEST_SAVED_OMP_PROFILE="${OMP_PROFILE-}"
+    export DCG_TEST_SAVED_PI_PROFILE_SET="${PI_PROFILE+x}"
+    export DCG_TEST_SAVED_PI_PROFILE="${PI_PROFILE-}"
+    export DCG_TEST_SAVED_PI_CONFIG_DIR_SET="${PI_CONFIG_DIR+x}"
+    export DCG_TEST_SAVED_PI_CONFIG_DIR="${PI_CONFIG_DIR-}"
+    export DCG_TEST_SAVED_PI_CODING_AGENT_DIR_SET="${PI_CODING_AGENT_DIR+x}"
+    export DCG_TEST_SAVED_PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR-}"
+    unset OMP_PROFILE PI_PROFILE PI_CONFIG_DIR PI_CODING_AGENT_DIR
+
     export HOME="$TEST_TMPDIR/home"
     mkdir -p "$HOME"
+
+    # OMP project extensions are discovered from cwd, not from a Git root.
+    # Bind cwd as another filesystem capability so a full uninstaller test can
+    # never inspect a marker-owned extension in the developer's live checkout.
+    export TEST_WORKDIR="$TEST_TMPDIR/work"
+    mkdir -p "$TEST_WORKDIR"
+    cd "$TEST_WORKDIR"
 
     # Create minimal isolated PATH with only essential tools
     # This prevents detection of user-installed agents like claude, aider, etc.
@@ -114,8 +138,18 @@ EOF
 
 # Cleanup test environment
 teardown_isolated_home() {
-    if [[ -n "${TEST_TMPDIR:-}" && -d "${TEST_TMPDIR:-}" ]]; then
-        rm -rf "$TEST_TMPDIR"
+    # Leave the fixture before removing it; otherwise a test that changed into
+    # a nested fixture directory leaves the shell parked in an unlinked cwd.
+    local teardown_status=0
+    local may_remove_fixture=1
+    if [[ -n "${ORIGINAL_WORKING_DIRECTORY:-}" ]]; then
+        if ! cd "$ORIGINAL_WORKING_DIRECTORY"; then
+            teardown_status=1
+            may_remove_fixture=0
+        fi
+    fi
+    if [[ "$may_remove_fixture" -eq 1 && -n "${TEST_TMPDIR:-}" && -d "${TEST_TMPDIR:-}" ]]; then
+        rm -rf "$TEST_TMPDIR" || teardown_status=1
     fi
     if [[ -n "${ORIGINAL_HOME:-}" ]]; then
         export HOME="$ORIGINAL_HOME"
@@ -123,6 +157,28 @@ teardown_isolated_home() {
     if [[ -n "${ORIGINAL_PATH:-}" ]]; then
         export PATH="$ORIGINAL_PATH"
     fi
+
+    if [[ "${DCG_TEST_SAVED_OMP_PROFILE_SET:-}" = "x" ]]; then
+        export OMP_PROFILE="${DCG_TEST_SAVED_OMP_PROFILE-}"
+    else
+        unset OMP_PROFILE
+    fi
+    if [[ "${DCG_TEST_SAVED_PI_PROFILE_SET:-}" = "x" ]]; then
+        export PI_PROFILE="${DCG_TEST_SAVED_PI_PROFILE-}"
+    else
+        unset PI_PROFILE
+    fi
+    if [[ "${DCG_TEST_SAVED_PI_CONFIG_DIR_SET:-}" = "x" ]]; then
+        export PI_CONFIG_DIR="${DCG_TEST_SAVED_PI_CONFIG_DIR-}"
+    else
+        unset PI_CONFIG_DIR
+    fi
+    if [[ "${DCG_TEST_SAVED_PI_CODING_AGENT_DIR_SET:-}" = "x" ]]; then
+        export PI_CODING_AGENT_DIR="${DCG_TEST_SAVED_PI_CODING_AGENT_DIR-}"
+    else
+        unset PI_CODING_AGENT_DIR
+    fi
+    return "$teardown_status"
 }
 
 # Create mock Claude Code installation
