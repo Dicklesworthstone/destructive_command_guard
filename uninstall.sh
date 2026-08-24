@@ -1183,6 +1183,7 @@ unconfigure_omp() {
     fi
 
     local removed=0
+    local failed=0
     local extension
     local repo_root
     repo_root=$(current_repo_root)
