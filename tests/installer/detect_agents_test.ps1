@@ -98,6 +98,11 @@ try {
     [void][System.IO.Directory]::CreateDirectory((Join-Path $h1g '.omp'))
     $a1g = Detect-Agents -HomeDir $h1g
     Check ($a1g['Omp'] -eq $true) "Oh My Pi detected when HOME contains brackets"
+
+    Write-Host "Test 1h: Windows drive-qualified PI_CONFIG_DIR cannot escape HOME"
+    $env:PI_CONFIG_DIR = 'C:\omp-outside-home'
+    Check ($null -eq (Get-OmpConfigRootForDetection -HomeDir $h1g -WindowsSemantics $true)) "drive-qualified OMP config root rejected for Windows detection"
+    $env:PI_CONFIG_DIR = $null
     $names1g = Get-DetectedAgentNames $a1g
     Check (($names1g -join ',') -eq 'Omp') "bracketed HOME summary lists only Omp (got '$($names1g -join ',')')"
     Remove-Item -LiteralPath $h1g -Recurse -Force -ErrorAction SilentlyContinue

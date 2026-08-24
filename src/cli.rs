@@ -11298,9 +11298,7 @@ fn collect_doctor_report(
                 (
                     DoctorCheckStatus::Error,
                     format!("Cannot resolve the Oh My Pi extension path: {error}"),
-                    Some(
-                        "Fix or unset PI_CONFIG_DIR, then run 'dcg install --omp'".to_string(),
-                    ),
+                    Some("Fix or unset PI_CONFIG_DIR, then run 'dcg install --omp'".to_string()),
                 )
             } else {
                 issues += 1;

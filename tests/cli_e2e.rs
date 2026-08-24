@@ -1846,6 +1846,45 @@ mod config_tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn doctor_rejects_drive_qualified_omp_config_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, bin_dir) = setup_doctor_env(&temp);
+        let output = Command::new(dcg_binary())
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("PATH", &bin_dir)
+            .env("OMP_PROFILE", "work")
+            .env("PI_CONFIG_DIR", r"C:\dcg-invalid-omp-config-root")
+            .current_dir(temp.path())
+            .args(["doctor", "--format", "json", "--strict"])
+            .output()
+            .expect("run dcg doctor with invalid OMP config root");
+
+        assert!(
+            !output.status.success(),
+            "strict doctor must reject an OMP path that could escape HOME"
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("doctor JSON output");
+        let omp_check = report["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|check| check["id"] == "omp_extension")
+            .expect("OMP doctor check");
+        assert_eq!(omp_check["status"], "error");
+        assert!(
+            omp_check["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("PI_CONFIG_DIR")),
+            "doctor should identify the invalid config variable: {omp_check}"
+        );
+    }
+
+    #[test]
     fn config_show_produces_output() {
         let output = run_dcg(&["config"]);
 

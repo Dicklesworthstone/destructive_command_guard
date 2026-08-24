@@ -539,9 +539,15 @@ function Get-DcgRepositoryRoot {
 }
 
 function Get-OmpConfigRoot {
-  param([string]$HomeDir = $HOME)
+  param(
+    [string]$HomeDir = $HOME,
+    [bool]$WindowsSemantics = ([System.IO.Path]::DirectorySeparatorChar -eq '\')
+  )
   $configName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
   $configName = $configName.TrimStart([char[]]@('\', '/'))
+  if ($WindowsSemantics -and $configName -match '^[A-Za-z]:') {
+    throw "PI_CONFIG_DIR must be a directory name relative to HOME on Windows, not drive-qualified path '$($env:PI_CONFIG_DIR)'"
+  }
   Join-Path $HomeDir $configName
 }
 
@@ -576,16 +582,27 @@ function Unconfigure-OmpExtension {
   if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
     $RepoRoot = Get-DcgRepositoryRoot
   }
-  $configRoots = @(
-    (Join-Path $HomeDir '.omp'),
-    (Get-OmpConfigRoot -HomeDir $HomeDir)
-  ) | Select-Object -Unique
-  $paths = @(
-    (Join-Path (Join-Path (Get-OmpAgentDir -HomeDir $HomeDir) 'extensions') 'dcg-guard.ts'),
-    (Join-Path (Join-Path (Join-Path $RepoRoot '.omp') 'extensions') 'dcg-guard.ts')
-  )
   $removed = $false
   $failed = $false
+  $configRoots = @((Join-Path $HomeDir '.omp'))
+  $currentConfigRoot = $null
+  try {
+    $currentConfigRoot = Get-OmpConfigRoot -HomeDir $HomeDir
+    $configRoots += $currentConfigRoot
+  } catch {
+    $failed = $true
+    Write-Warn "Could not resolve the Oh My Pi config root: $($_.Exception.Message)"
+  }
+  $configRoots = @($configRoots | Select-Object -Unique)
+  $paths = @((Join-Path (Join-Path (Join-Path $RepoRoot '.omp') 'extensions') 'dcg-guard.ts'))
+  if ($null -ne $currentConfigRoot) {
+    try {
+      $paths += Join-Path (Join-Path (Get-OmpAgentDir -HomeDir $HomeDir) 'extensions') 'dcg-guard.ts'
+    } catch {
+      $failed = $true
+      Write-Warn "Could not resolve the active Oh My Pi agent directory: $($_.Exception.Message)"
+    }
+  }
   if (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR)) {
     $paths += Join-Path (Join-Path $env:PI_CODING_AGENT_DIR 'extensions') 'dcg-guard.ts'
   }
