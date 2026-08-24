@@ -19016,6 +19016,499 @@ if ($errors.Count -ne 0) {
         ));
     }
 
+    /// Write the exact generated OMP module plus the smallest runtime surface
+    /// needed to load it. These stubs deliberately expose only the four values
+    /// imported by the bridge; the replay is a bridge/VM certificate, not a
+    /// claim that a real OMP installation was exercised.
+    fn write_omp_bridge_bun_fixture(root: &std::path::Path, source: &str) {
+        let coding_agent = root.join("node_modules/@oh-my-pi/pi-coding-agent");
+        let pi_utils = root.join("node_modules/@oh-my-pi/pi-utils");
+        std::fs::create_dir_all(coding_agent.join("config"))
+            .expect("create coding-agent config stub directory");
+        std::fs::create_dir_all(coding_agent.join("tools"))
+            .expect("create coding-agent tools stub directory");
+        std::fs::create_dir_all(&pi_utils).expect("create pi-utils stub directory");
+
+        std::fs::write(root.join("dcg-guard.ts"), source)
+            .expect("write exact generated OMP bridge bytes");
+        std::fs::write(
+            coding_agent.join("package.json"),
+            r#"{
+  "name": "@oh-my-pi/pi-coding-agent",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./config/settings": "./config/settings.ts",
+    "./tools/path-utils": "./tools/path-utils.ts",
+    "./tools/shell-tokenize": "./tools/shell-tokenize.ts"
+  }
+}"#,
+        )
+        .expect("write coding-agent stub package manifest");
+        std::fs::write(coding_agent.join("index.ts"), "export {};\n")
+            .expect("write type-only coding-agent root stub");
+        std::fs::write(
+            coding_agent.join("config/settings.ts"),
+            r#"export const settings = {
+  getShellConfig(): { shell: string } {
+    return { shell: "/bin/bash" };
+  },
+};
+"#,
+        )
+        .expect("write settings stub");
+        std::fs::write(
+            coding_agent.join("tools/path-utils.ts"),
+            r#"import path from "node:path";
+
+export function resolveToCwd(requested: string, cwd: string): string {
+  return path.resolve(cwd, requested);
+}
+"#,
+        )
+        .expect("write cwd resolver stub");
+        std::fs::write(
+            coding_agent.join("tools/shell-tokenize.ts"),
+            r#"export function extractLeadingCdTarget(_command: string): undefined {
+  return undefined;
+}
+"#,
+        )
+        .expect("write shell-tokenizer stub");
+        std::fs::write(
+            pi_utils.join("package.json"),
+            r#"{
+  "name": "@oh-my-pi/pi-utils",
+  "type": "module",
+  "exports": { ".": "./index.ts" }
+}"#,
+        )
+        .expect("write pi-utils stub package manifest");
+        std::fs::write(
+            pi_utils.join("index.ts"),
+            r#"export const procmgr = {
+  isCmdShell(shell: string): boolean {
+    return /(?:^|[/\\])cmd(?:\.exe)?$/i.test(shell);
+  },
+  isPowerShell(shell: string): boolean {
+    return /(?:^|[/\\])(?:pwsh|powershell)(?:\.exe)?$/i.test(shell);
+  },
+};
+"#,
+        )
+        .expect("write process-manager stub");
+
+        std::fs::write(
+            root.join("runner.ts"),
+            r###"import dcgGuard, {
+  classifyDcgChild,
+  classifyOmpToolCall,
+} from "./dcg-guard.ts";
+
+function check(condition: unknown, message: string): asserts condition {
+  if (!condition) throw new Error(`replay assertion failed: ${message}`);
+}
+
+function equal(actual: unknown, expected: unknown, caseId: string): void {
+  const left = JSON.stringify(actual);
+  const right = JSON.stringify(expected);
+  check(left === right, `${caseId}: expected ${right}, received ${left}`);
+}
+
+const toolCaseIds: string[] = [];
+const toolCases: Array<[string, unknown, string, string?]> = [
+  ["tool/null-event", null, "other-tool"],
+  ["tool/array-event", [], "other-tool"],
+  ["tool/primitive-event", "bash", "other-tool"],
+  ["tool/missing-name", {}, "other-tool"],
+  ["tool/name-case", { toolName: "Bash", input: { command: "echo ok" } }, "other-tool"],
+  ["tool/other-name", { toolName: "read", input: { command: "echo ok" } }, "other-tool"],
+  ["tool/null-input", { toolName: "bash", input: null }, "invalid-bash"],
+  ["tool/array-input", { toolName: "bash", input: [] }, "invalid-bash"],
+  ["tool/missing-command", { toolName: "bash", input: {} }, "invalid-bash"],
+  ["tool/null-command", { toolName: "bash", input: { command: null } }, "invalid-bash"],
+  ["tool/numeric-command", { toolName: "bash", input: { command: 7 } }, "invalid-bash"],
+  ["tool/empty-command", { toolName: "bash", input: { command: "" } }, "bash", ""],
+  ["tool/whitespace-command", { toolName: "bash", input: { command: " \t" } }, "bash", " \t"],
+  ["tool/string-command", { toolName: "bash", input: { command: "echo ok" } }, "bash", "echo ok"],
+];
+for (const [caseId, event, expectedKind, expectedCommand] of toolCases) {
+  const classified = classifyOmpToolCall(event);
+  equal(classified.kind, expectedKind, caseId);
+  if (expectedKind === "bash") {
+    check(classified.kind === "bash", `${caseId}: missing bash classification`);
+    equal(classified.command, expectedCommand, `${caseId}/command`);
+  }
+  toolCaseIds.push(caseId);
+}
+
+const outcomes = ["spawn-throw", "exit-0", "exit-1", "exit-2", "exit-other"] as const;
+const verdictFixtures = {
+  empty: " \n\t",
+  malformed: "{",
+  allow: JSON.stringify({ decision: "allow" }),
+  deny: JSON.stringify({ decision: "deny", reason: "danger", rule_id: "core.git:test" }),
+  ask: JSON.stringify({ decision: "ask" }),
+  indeterminate: JSON.stringify({ decision: "indeterminate" }),
+  unknown: JSON.stringify({ decision: "bogus" }),
+} as const;
+const expectedActions = {
+  "spawn-throw": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
+  "exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" },
+  "exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" },
+  "exit-2": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" },
+  "exit-other": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
+} as const;
+const transitionCaseIds: string[] = [];
+for (const outcome of outcomes) {
+  for (const verdict of Object.keys(verdictFixtures) as Array<keyof typeof verdictFixtures>) {
+    const caseId = `transition/${outcome}/${verdict}`;
+    const classified = classifyDcgChild(outcome, verdictFixtures[verdict]);
+    equal(classified.output.verdict, verdict, `${caseId}/parsed-verdict`);
+    equal(classified.action, expectedActions[outcome][verdict], `${caseId}/action`);
+    transitionCaseIds.push(caseId);
+  }
+}
+const typedMetadata = classifyDcgChild(
+  "exit-0",
+  JSON.stringify({ decision: "deny", reason: 9, rule_id: ["not", "a", "string"] }),
+);
+equal(typedMetadata.output.reason, undefined, "transition/non-string-reason");
+equal(typedMetadata.output.ruleId, undefined, "transition/non-string-rule-id");
+
+type ChildCase = {
+  stdout?: string;
+  stderr?: string;
+  exitCode?: number;
+  spawnError?: string;
+};
+type SpawnRecord = { argv: string[]; cwd: string; stdin: string };
+let activeChild: ChildCase = {};
+let callback: ((event: unknown, ctx: unknown) => Promise<unknown>) | undefined;
+let spawnRecords: SpawnRecord[] = [];
+let diagnostics: string[] = [];
+const originalSpawn = Bun.spawn;
+const originalConsoleError = console.error;
+
+(Bun as unknown as { spawn: typeof Bun.spawn }).spawn = ((argv: string[], options: { cwd: string; stdin: Uint8Array }) => {
+  if (activeChild.spawnError) throw new Error(activeChild.spawnError);
+  spawnRecords.push({
+    argv: [...argv],
+    cwd: options.cwd,
+    stdin: new TextDecoder().decode(options.stdin),
+  });
+  return {
+    stdout: new Blob([activeChild.stdout ?? ""]).stream(),
+    stderr: new Blob([activeChild.stderr ?? ""]).stream(),
+    exited: Promise.resolve(activeChild.exitCode ?? 0),
+  };
+}) as typeof Bun.spawn;
+console.error = (...values: unknown[]): void => {
+  diagnostics.push(values.map(String).join(" "));
+};
+
+const callbackCaseIds: string[] = [];
+try {
+  dcgGuard({
+    on(eventName: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>): void {
+      equal(eventName, "tool_call", "callback/registration/event-name");
+      check(callback === undefined, "callback/registration/registered-more-than-once");
+      callback = handler;
+    },
+  } as never);
+  check(callback !== undefined, "callback/registration/missing-handler");
+
+  const invoke = async (caseId: string, event: unknown, child: ChildCase = {}) => {
+    activeChild = child;
+    spawnRecords = [];
+    diagnostics = [];
+    const result = await callback!(event, { cwd: process.cwd(), hasUI: false, mode: "rpc" });
+    callbackCaseIds.push(caseId);
+    return { result, spawns: [...spawnRecords], errors: [...diagnostics] };
+  };
+
+  let replay = await invoke("callback/other-tool", { toolName: "read", input: {} });
+  equal(replay.result, undefined, "callback/other-tool/result");
+  equal(replay.spawns.length, 0, "callback/other-tool/spawn-count");
+  equal(replay.errors, [], "callback/other-tool/diagnostics");
+
+  replay = await invoke("callback/malformed-bash", { toolName: "bash", input: null });
+  equal(replay.result, {
+    block: true,
+    reason: "[dcg] OMP guard received malformed bash input (expected an object with a string command)",
+  }, "callback/malformed-bash/result");
+  equal(replay.spawns.length, 0, "callback/malformed-bash/spawn-count");
+
+  replay = await invoke("callback/empty-command", { toolName: "bash", input: { command: "" } });
+  equal(replay.result, undefined, "callback/empty-command/result");
+  equal(replay.spawns.length, 0, "callback/empty-command/spawn-count");
+
+  replay = await invoke(
+    "callback/whitespace-allow",
+    { toolName: "bash", input: { command: " \t" } },
+    { stdout: JSON.stringify({ decision: "allow" }), stderr: "allow diagnostic\n", exitCode: 0 },
+  );
+  equal(replay.result, undefined, "callback/whitespace-allow/result");
+  equal(replay.spawns.length, 1, "callback/whitespace-allow/spawn-count");
+  equal(replay.spawns[0]!.stdin, " \t", "callback/whitespace-allow/stdin-bytes");
+  equal(replay.spawns[0]!.cwd, process.cwd(), "callback/whitespace-allow/cwd");
+  equal(replay.spawns[0]!.argv.slice(1), ["--robot", "test", "--stdin", "--agent", "omp", "--dialect", "posix"], "callback/whitespace-allow/argv");
+  equal(replay.errors, ["[dcg] OMP guard dcg stderr: allow diagnostic"], "callback/whitespace-allow/diagnostics");
+
+  replay = await invoke(
+    "callback/exit-zero-deny",
+    { toolName: "bash", input: { command: "git reset --hard" } },
+    { stdout: JSON.stringify({ decision: "deny", reason: "danger", rule_id: "core.git:test" }), stderr: "block diagnostic", exitCode: 0 },
+  );
+  equal(replay.result, { block: true, reason: "danger\n\nRule: core.git:test" }, "callback/exit-zero-deny/result");
+  equal(replay.errors, ["[dcg] OMP guard dcg stderr: block diagnostic"], "callback/exit-zero-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/stderr-json-is-diagnostic",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stdout: "", stderr: JSON.stringify({ decision: "deny", reason: "wrong channel" }), exitCode: 0 },
+  );
+  equal(replay.result, undefined, "callback/stderr-json-is-diagnostic/result");
+  equal(replay.errors, ["[dcg] OMP guard dcg stderr: {\"decision\":\"deny\",\"reason\":\"wrong channel\"}"], "callback/stderr-json-is-diagnostic/diagnostics");
+
+  replay = await invoke(
+    "callback/exit-one-stderr-only",
+    { toolName: "bash", input: { command: "danger" } },
+    { stdout: "", stderr: "status-only diagnostic", exitCode: 1 },
+  );
+  equal(replay.result, { block: true, reason: "Blocked by dcg (exit 1 without a blocking decision)" }, "callback/exit-one-stderr-only/result");
+  equal(replay.errors, ["[dcg] OMP guard dcg stderr: status-only diagnostic"], "callback/exit-one-stderr-only/diagnostics");
+
+  replay = await invoke(
+    "callback/exit-two-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    { stdout: JSON.stringify({ decision: "deny", reason: "deny beats status two" }), exitCode: 2 },
+  );
+  equal(replay.result, { block: true, reason: "deny beats status two" }, "callback/exit-two-deny/result");
+
+  replay = await invoke(
+    "callback/infrastructure-exit",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stdout: "", stderr: "child crash", exitCode: 9 },
+  );
+  equal(replay.result, undefined, "callback/infrastructure-exit/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 9): child crash"], "callback/infrastructure-exit/diagnostics");
+
+  replay = await invoke(
+    "callback/spawn-throw",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { spawnError: "synthetic spawn failure" },
+  );
+  equal(replay.result, undefined, "callback/spawn-throw/result");
+  equal(replay.spawns.length, 0, "callback/spawn-throw/spawn-count");
+  equal(replay.errors, ["[dcg] OMP guard could not run dcg: Error: synthetic spawn failure"], "callback/spawn-throw/diagnostics");
+} finally {
+  (Bun as unknown as { spawn: typeof Bun.spawn }).spawn = originalSpawn;
+  console.error = originalConsoleError;
+}
+
+const bridgeBytes = new Uint8Array(await Bun.file(new URL("./dcg-guard.ts", import.meta.url)).arrayBuffer());
+const digestBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", bridgeBytes));
+const bridgeSha256 = Array.from(digestBytes, byte => byte.toString(16).padStart(2, "0")).join("");
+console.log(JSON.stringify({
+  schema: "dcg-omp-bridge-replay-v1",
+  bridgeSha256,
+  bunVersion: Bun.version,
+  toolCaseIds,
+  transitionCaseIds,
+  callbackCaseIds,
+  stubExports: [
+    "@oh-my-pi/pi-coding-agent/config/settings:settings",
+    "@oh-my-pi/pi-coding-agent/tools/path-utils:resolveToCwd",
+    "@oh-my-pi/pi-coding-agent/tools/shell-tokenize:extractLeadingCdTarget",
+    "@oh-my-pi/pi-utils:procmgr",
+  ],
+  probeComplete: true,
+}));
+"###,
+        )
+        .expect("write Bun replay runner");
+    }
+
+    fn run_omp_bridge_bun_fixture(
+        bun: &std::path::Path,
+        root: &std::path::Path,
+        source: &str,
+    ) -> std::process::Output {
+        write_omp_bridge_bun_fixture(root, source);
+        std::process::Command::new(bun)
+            .args(["run", "./runner.ts"])
+            .current_dir(root)
+            .env_remove("PI_NO_PTY")
+            .output()
+            .expect("launch Bun OMP bridge replay")
+    }
+
+    /// Translation-validates the exact generated module in Bun. This is an
+    /// explicit opt-in gate because the Rust project does not otherwise depend
+    /// on Bun: invoke it with
+    /// `cargo test omp_generated_extension_executes_replay_certificate -- --ignored --exact`.
+    /// The same corpus must reject a one-cell transition mutant, which proves
+    /// the replay is sensitive to the safety behavior it certifies.
+    #[test]
+    #[ignore = "requires Bun to execute the generated OMP TypeScript bridge"]
+    fn omp_generated_extension_executes_replay_certificate() {
+        use sha2::Digest as _;
+
+        let bun = which_executable("bun").expect(
+            "Bun is required for the OMP bridge replay certificate; install Bun or run this gate on an OMP-capable host",
+        );
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+        let temp = tempfile::tempdir().expect("temporary bridge replay root");
+        let exact_root = temp.path().join("exact");
+        std::fs::create_dir_all(&exact_root).expect("create exact replay root");
+
+        let output = run_omp_bridge_bun_fixture(&bun, &exact_root, &source);
+        assert!(
+            output.status.success(),
+            "exact generated bridge replay failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "callback diagnostics must be captured inside the runner, not contaminate the certificate stream: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let certificate: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("single JSON replay certificate");
+        assert_eq!(
+            certificate
+                .get("schema")
+                .and_then(serde_json::Value::as_str),
+            Some("dcg-omp-bridge-replay-v1")
+        );
+        assert_eq!(
+            certificate
+                .get("probeComplete")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "a runner that dies before the complete corpus must not certify the bridge"
+        );
+        let expected_digest = format!("{:x}", sha2::Sha256::digest(source.as_bytes()));
+        assert_eq!(
+            certificate
+                .get("bridgeSha256")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_digest.as_str()),
+            "Bun must execute the exact bytes emitted by the Rust generator"
+        );
+        assert!(
+            certificate
+                .get("bunVersion")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|version| !version.is_empty()),
+            "certificate must identify the Bun runtime"
+        );
+
+        let string_array = |field: &str| {
+            certificate
+                .get(field)
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| panic!("certificate field {field} must be an array"))
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .unwrap_or_else(|| panic!("certificate field {field} must contain strings"))
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            string_array("toolCaseIds"),
+            [
+                "tool/null-event",
+                "tool/array-event",
+                "tool/primitive-event",
+                "tool/missing-name",
+                "tool/name-case",
+                "tool/other-name",
+                "tool/null-input",
+                "tool/array-input",
+                "tool/missing-command",
+                "tool/null-command",
+                "tool/numeric-command",
+                "tool/empty-command",
+                "tool/whitespace-command",
+                "tool/string-command",
+            ]
+            .map(str::to_string)
+        );
+        let expected_transition_ids = ["spawn-throw", "exit-0", "exit-1", "exit-2", "exit-other"]
+            .into_iter()
+            .flat_map(|outcome| {
+                [
+                    "empty",
+                    "malformed",
+                    "allow",
+                    "deny",
+                    "ask",
+                    "indeterminate",
+                    "unknown",
+                ]
+                .into_iter()
+                .map(move |verdict| format!("transition/{outcome}/{verdict}"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(string_array("transitionCaseIds"), expected_transition_ids);
+        assert_eq!(
+            string_array("callbackCaseIds"),
+            [
+                "callback/other-tool",
+                "callback/malformed-bash",
+                "callback/empty-command",
+                "callback/whitespace-allow",
+                "callback/exit-zero-deny",
+                "callback/stderr-json-is-diagnostic",
+                "callback/exit-one-stderr-only",
+                "callback/exit-two-deny",
+                "callback/infrastructure-exit",
+                "callback/spawn-throw",
+            ]
+            .map(str::to_string)
+        );
+        assert_eq!(
+            string_array("stubExports"),
+            [
+                "@oh-my-pi/pi-coding-agent/config/settings:settings",
+                "@oh-my-pi/pi-coding-agent/tools/path-utils:resolveToCwd",
+                "@oh-my-pi/pi-coding-agent/tools/shell-tokenize:extractLeadingCdTarget",
+                "@oh-my-pi/pi-utils:procmgr",
+            ]
+            .map(str::to_string)
+        );
+
+        let exit_zero_row = r#""exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#;
+        let mutated_exit_zero_row = r#""exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "allow", ask: "block", indeterminate: "block", unknown: "allow" }"#;
+        assert_eq!(
+            source.matches(exit_zero_row).count(),
+            1,
+            "mutation witness must identify exactly one production transition row"
+        );
+        let mutant = source.replacen(exit_zero_row, mutated_exit_zero_row, 1);
+        let mutant_root = temp.path().join("mutant-exit-zero-deny");
+        std::fs::create_dir_all(&mutant_root).expect("create mutant replay root");
+        let mutant_output = run_omp_bridge_bun_fixture(&bun, &mutant_root, &mutant);
+        assert!(
+            !mutant_output.status.success(),
+            "the executable corpus vacuously accepted an exit-0 deny-to-allow mutation\nstdout:\n{}",
+            String::from_utf8_lossy(&mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&mutant_output.stderr)
+                .contains("transition/exit-0/deny/action"),
+            "mutant red must identify the changed transition cell\nstderr:\n{}",
+            String::from_utf8_lossy(&mutant_output.stderr)
+        );
+    }
+
     /// OMP 18's ordinary and managed-async BashTool routes execute in the
     /// embedded Brush shell even on Windows. Only an eligible local PTY uses
     /// OMP's configured external shell, which may be cmd.exe or PowerShell.
