@@ -817,7 +817,6 @@ unconfigure_cursor() {
     local hook_script="$HOME/.cursor/hooks/dcg-pre-shell.py"
 
     local removed=0
-    local failed=0
 
     # Remove the hook script
     if [ -f "$hook_script" ] && grep -q 'dcg-cursor-hook' "$hook_script" 2>/dev/null; then
