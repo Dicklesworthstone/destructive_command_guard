@@ -32,6 +32,9 @@
 //! - OpenCode: `OPENCODE=1` env var, set by dcg's generated OpenCode plugin
 //!   (`dcg install --opencode`, a `tool.execute.before` plugin at
 //!   `~/.config/opencode/plugins/dcg-guard.js`) when it spawns dcg (#318).
+//! - Oh My Pi (`omp`): the generated OMP extension invokes dcg with the
+//!   explicit `--agent omp` flag (`dcg install --omp`). Exact `omp` and
+//!   `oh-my-pi` parent-process basenames are also recognized as a fallback.
 //! - Pi (earendil-works `pi` coding agent): `PI_CODING_AGENT=true` env var (set
 //!   by `pi` into the environment of the subprocesses it spawns).
 //! - Posit Assistant: `PA_PROJECT_DIR=<workspace root>` env var, set in every
@@ -105,6 +108,9 @@ pub enum Agent {
     /// `tool.execute.before` plugin (`dcg install --opencode`), which spawns
     /// dcg with `OPENCODE=1` in the environment (#318).
     OpenCode,
+    /// Oh My Pi (`omp`). Guarded through a dcg-generated `tool_call` extension
+    /// (`dcg install --omp`) that invokes dcg with `--agent omp`.
+    Omp,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -133,6 +139,7 @@ impl Agent {
             Self::Pi => "pi",
             Self::PositAssistant => "posit-assistant",
             Self::OpenCode => "opencode",
+            Self::Omp => "omp",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -157,6 +164,7 @@ impl Agent {
                 | Self::Pi
                 | Self::PositAssistant
                 | Self::OpenCode
+                | Self::Omp
         )
     }
 
@@ -180,6 +188,7 @@ impl Agent {
     /// - `"gemini"`, `"gemini-cli"`, `"gemini_cli"` -> `GeminiCli`
     /// - `"cursor"`, `"cursor-ide"`, `"cursor_ide"` -> `CursorIde`
     /// - `"posit-assistant"`, `"posit_assistant"`, `"posit"`, `"pa"` -> `PositAssistant`
+    /// - `"omp"`, `"oh-my-pi"` -> `Omp`
     /// - `"unknown"` -> `Unknown`
     /// - Any other value -> `Custom(value)`
     #[must_use]
@@ -200,6 +209,7 @@ impl Agent {
             "pi" | "picli" | "picodingagent" => Self::Pi,
             "positassistant" | "posit" | "pa" => Self::PositAssistant,
             "opencode" | "opencodecli" => Self::OpenCode,
+            "omp" | "ohmypi" => Self::Omp,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -223,6 +233,7 @@ impl fmt::Display for Agent {
             Self::Pi => write!(f, "Pi"),
             Self::PositAssistant => write!(f, "Posit Assistant"),
             Self::OpenCode => write!(f, "OpenCode"),
+            Self::Omp => write!(f, "Oh My Pi"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -846,6 +857,7 @@ fn agent_for_basename(basename: &str) -> Option<Agent> {
         "agy" | "antigravity" | "antigravity-cli" => Some(Agent::Antigravity),
         "pi" | "pi-cli" => Some(Agent::Pi),
         "opencode" => Some(Agent::OpenCode),
+        "omp" | "oh-my-pi" => Some(Agent::Omp),
         // "pa" is a dangerous prefix (pacman, pactl, pass, patch, ...); the
         // exact-match table is what keeps those from misclassifying.
         "pa" | "posit-assistant" => Some(Agent::PositAssistant),
@@ -897,6 +909,8 @@ mod tests {
         assert_eq!(Agent::Antigravity.config_key(), "antigravity");
         assert_eq!(Agent::Pi.config_key(), "pi");
         assert_eq!(Agent::PositAssistant.config_key(), "posit-assistant");
+        assert_eq!(Agent::OpenCode.config_key(), "opencode");
+        assert_eq!(Agent::Omp.config_key(), "omp");
         assert_eq!(Agent::Unknown.config_key(), "unknown");
         assert_eq!(
             Agent::Custom("my-agent".to_string()).config_key(),
@@ -956,6 +970,10 @@ mod tests {
         assert_eq!(Agent::from_name("posit"), Agent::PositAssistant);
         assert_eq!(Agent::from_name("pa"), Agent::PositAssistant);
         assert_eq!(Agent::from_name("PA"), Agent::PositAssistant);
+        assert_eq!(Agent::from_name("omp"), Agent::Omp);
+        assert_eq!(Agent::from_name("OMP"), Agent::Omp);
+        assert_eq!(Agent::from_name("oh-my-pi"), Agent::Omp);
+        assert_eq!(Agent::from_name("oh_my_pi"), Agent::Omp);
 
         // Custom agents
         assert_eq!(
@@ -979,6 +997,8 @@ mod tests {
         assert_eq!(format!("{}", Agent::Antigravity), "Antigravity CLI");
         assert_eq!(format!("{}", Agent::Pi), "Pi");
         assert_eq!(format!("{}", Agent::PositAssistant), "Posit Assistant");
+        assert_eq!(format!("{}", Agent::OpenCode), "OpenCode");
+        assert_eq!(format!("{}", Agent::Omp), "Oh My Pi");
         assert_eq!(format!("{}", Agent::Unknown), "Unknown");
         assert_eq!(
             format!("{}", Agent::Custom("MyAgent".to_string())),
@@ -998,6 +1018,8 @@ mod tests {
         assert!(Agent::Antigravity.is_known());
         assert!(Agent::Pi.is_known());
         assert!(Agent::PositAssistant.is_known());
+        assert!(Agent::OpenCode.is_known());
+        assert!(Agent::Omp.is_known());
         assert!(!Agent::Unknown.is_known());
         assert!(!Agent::Custom("x".to_string()).is_known());
     }
@@ -1081,6 +1103,12 @@ mod tests {
             agent_from_process_name("/home/user/.local/bin/pi"),
             Some(Agent::Pi)
         );
+        assert_eq!(agent_from_process_name("omp"), Some(Agent::Omp));
+        assert_eq!(agent_from_process_name("oh-my-pi"), Some(Agent::Omp));
+        assert_eq!(
+            agent_from_process_name("/home/user/.local/bin/omp"),
+            Some(Agent::Omp)
+        );
         assert_eq!(agent_from_process_name("pa"), Some(Agent::PositAssistant));
         assert_eq!(
             agent_from_process_name("posit-assistant"),
@@ -1151,6 +1179,9 @@ mod tests {
         assert_eq!(agent_from_process_name("pip3"), None);
         assert_eq!(agent_from_process_name("xpi"), None);
         assert_eq!(agent_from_process_name("pi-helper"), None);
+        assert_eq!(agent_from_process_name("ompi"), None);
+        assert_eq!(agent_from_process_name("omp-helper"), None);
+        assert_eq!(agent_from_process_name("oh-my-pi-helper"), None);
         // "pa" is even shorter and a common prefix; only the exact basename
         // (or "posit-assistant") may match.
         assert_eq!(agent_from_process_name("pacman"), None);
@@ -1558,6 +1589,18 @@ mod env_tests {
         assert_eq!(agent_from_process_name("opencode"), Some(Agent::OpenCode));
         // Near-misses must not match the exact-name table.
         assert_eq!(agent_from_process_name("opencoder"), None);
+    }
+
+    #[test]
+    fn test_omp_identity_mappings() {
+        assert_eq!(Agent::Omp.config_key(), "omp");
+        assert!(Agent::Omp.is_known());
+        assert_eq!(Agent::from_name("omp"), Agent::Omp);
+        assert_eq!(Agent::from_name("oh-my-pi"), Agent::Omp);
+        assert_eq!(format!("{}", Agent::Omp), "Oh My Pi");
+        assert_eq!(agent_from_process_name("omp"), Some(Agent::Omp));
+        assert_eq!(agent_from_process_name("oh-my-pi"), Some(Agent::Omp));
+        assert_eq!(agent_from_process_name("omp-helper"), None);
     }
 
     #[test]
