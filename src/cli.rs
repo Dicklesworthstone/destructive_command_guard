@@ -12335,9 +12335,13 @@ fn normalize_omp_profile_name(profile: &str) -> Option<String> {
 fn omp_active_profile() -> Option<String> {
     match std::env::var("OMP_PROFILE") {
         Ok(profile) => normalize_omp_profile_name(&profile),
-        Err(_) => std::env::var("PI_PROFILE")
+        Err(std::env::VarError::NotPresent) => std::env::var("PI_PROFILE")
             .ok()
             .and_then(|profile| normalize_omp_profile_name(&profile)),
+        // Presence still wins precedence. A non-Unicode value cannot satisfy
+        // OMP's ASCII profile-name grammar, but it must not expose the legacy
+        // PI_PROFILE fallback merely because Rust could not decode it.
+        Err(std::env::VarError::NotUnicode(_)) => None,
     }
 }
 
@@ -12374,11 +12378,22 @@ fn omp_config_root_from(
 /// `PI_CODING_AGENT_DIR` override when a named profile is active, so dcg does
 /// the same.
 fn omp_user_agent_dir() -> std::io::Result<std::path::PathBuf> {
-    let home = dirs::home_dir().unwrap_or_default();
-    let config_name = std::env::var("PI_CONFIG_DIR")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| ".omp".to_string());
+    let home = dirs::home_dir().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "could not determine the home directory for Oh My Pi",
+        )
+    })?;
+    let config_name = match std::env::var("PI_CONFIG_DIR") {
+        Ok(value) if !value.is_empty() => value,
+        Ok(_) | Err(std::env::VarError::NotPresent) => ".omp".to_string(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "PI_CONFIG_DIR must contain valid Unicode",
+            ));
+        }
+    };
     let config_root = omp_config_root_from(&home, &config_name, cfg!(windows))?;
 
     if let Some(profile) = omp_active_profile() {
@@ -12484,8 +12499,8 @@ fn omp_appears_in_use() -> bool {
     if std::env::var_os("OMP_PROFILE").is_some() || which_executable("omp").is_some() {
         return true;
     }
-    let default_root = dirs::home_dir().unwrap_or_default().join(".omp");
-    default_root.is_dir()
+    let default_root_exists = dirs::home_dir().is_some_and(|home| home.join(".omp").is_dir());
+    default_root_exists
         || omp_user_agent_dir().is_ok_and(|path| path.is_dir())
         || project_omp_extension_path()
             .ok()
