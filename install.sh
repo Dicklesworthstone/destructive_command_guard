@@ -4019,7 +4019,9 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
   configure_opencode
 
   # Configure Oh My Pi (if installed)
-  configure_omp
+  # A refusal/failure is a terminal OMP_STATUS state rendered in the summary;
+  # do not let `set -e` erase that truthful result or abort other install work.
+  configure_omp || true
 else
   info "Skipping agent configuration (--no-configure)"
 fi
