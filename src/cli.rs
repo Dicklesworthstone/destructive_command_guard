@@ -311,7 +311,7 @@ pub enum Command {
         /// (when combined with `--project`). Grok also picks up dcg from
         /// `~/.claude/settings.json` via its Claude-Code compatibility layer,
         /// but the native path gives the cleanest doctor output.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["agy", "opencode", "omp"])]
         grok: bool,
 
         /// Install the dcg PreToolUse hook for the Antigravity CLI (`agy`) at
@@ -319,7 +319,7 @@ pub enum Command {
         /// `<repo>/.gemini/config/hooks.json` (with `--project`). `agy` reads
         /// Claude-Code-compatible `PreToolUse` hooks from this file and aborts
         /// its `run_command` shell tool when dcg returns a block decision.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["grok", "opencode", "omp"])]
         agy: bool,
 
         /// Install a native OpenCode plugin at
@@ -329,7 +329,7 @@ pub enum Command {
         /// `tool.execute.before` hook: every bash tool call is routed through
         /// dcg's Claude-compatible hook protocol, and a deny aborts the tool
         /// call with dcg's reason. Restart OpenCode after installing (#318).
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "omp"])]
         opencode: bool,
 
         /// Install a native Oh My Pi (`omp`) `tool_call` extension at the
@@ -337,7 +337,7 @@ pub enum Command {
         /// `~/.omp/agent/extensions/dcg-guard.ts`) or
         /// `<repo>/.omp/extensions/dcg-guard.ts` (with `--project`). Every OMP
         /// bash tool call is routed through dcg before execution.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode"])]
         omp: bool,
     },
 
@@ -18455,6 +18455,23 @@ if ($errors.Count -ne 0) {
             assert!(omp);
         } else {
             unreachable!("Expected Install command");
+        }
+    }
+
+    #[test]
+    fn install_agent_targets_are_mutually_exclusive() {
+        for (left, right) in [
+            ("--grok", "--agy"),
+            ("--grok", "--opencode"),
+            ("--grok", "--omp"),
+            ("--agy", "--opencode"),
+            ("--agy", "--omp"),
+            ("--opencode", "--omp"),
+        ] {
+            assert!(
+                Cli::try_parse_from(["dcg", "install", left, right]).is_err(),
+                "install must reject conflicting targets {left} and {right}"
+            );
         }
     }
 
