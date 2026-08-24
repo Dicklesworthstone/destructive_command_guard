@@ -10301,6 +10301,11 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         if let Some(extension_path) = registered_omp_extension_path() {
             println!("{}", "OK".green());
             println!("  Found: {}", extension_path.display());
+        } else if let Err(error) = omp_user_extension_path() {
+            println!("{}", "MISCONFIGURED".red());
+            println!("  {error}");
+            issues += 1;
+            println!("  → Fix or unset PI_CONFIG_DIR, then run 'dcg install --omp'");
         } else {
             println!("{}", "NOT REGISTERED".yellow());
             issues += 1;
@@ -11288,16 +11293,28 @@ fn collect_doctor_report(
                     ),
                     None,
                 )
+            } else if let Err(error) = &extension_path {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    format!("Cannot resolve the Oh My Pi extension path: {error}"),
+                    Some(
+                        "Fix or unset PI_CONFIG_DIR, then run 'dcg install --omp'".to_string(),
+                    ),
+                )
             } else {
                 issues += 1;
                 if fix && install_omp_extension(false, false).is_ok() {
                     fixed += 1;
                     omp_fixed = true;
+                    let installed_path = extension_path
+                        .as_ref()
+                        .expect("validated OMP extension path before installation");
                     (
                         DoctorCheckStatus::Ok,
                         format!(
                             "Installed native Oh My Pi extension at {}",
-                            extension_path.display()
+                            installed_path.display()
                         ),
                         None,
                     )
@@ -12326,30 +12343,60 @@ fn omp_active_profile() -> Option<String> {
     }
 }
 
+/// Resolve OMP's config root without allowing Rust's Windows path semantics to
+/// turn a drive-qualified config *name* into a path outside `home`.
+///
+/// Upstream passes `PI_CONFIG_DIR` to Node's `path.join(home, name)`. On
+/// Windows, a value such as `C:\\omp` becomes an invalid child beneath `home`;
+/// Rust's `Path::join` would instead replace `home` and target `C:\\omp`.
+/// Reject that malformed Windows-only value so dcg never writes somewhere OMP
+/// itself would not load from.
+fn omp_config_root_from(
+    home: &std::path::Path,
+    config_name: &str,
+    windows_semantics: bool,
+) -> std::io::Result<std::path::PathBuf> {
+    let relative = config_name.trim_start_matches(['/', '\\']);
+    let bytes = relative.as_bytes();
+    let drive_qualified = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if windows_semantics && drive_qualified {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "PI_CONFIG_DIR must be a directory name relative to HOME on Windows, not \
+                 drive-qualified path {config_name:?}"
+            ),
+        ));
+    }
+    Ok(home.join(relative))
+}
+
 /// OMP's active user agent directory. The default is `~/.omp/agent`; named
 /// profiles live under `~/.omp/profiles/<name>/agent`. OMP ignores the legacy
 /// `PI_CODING_AGENT_DIR` override when a named profile is active, so dcg does
 /// the same.
-fn omp_user_agent_dir() -> std::path::PathBuf {
+fn omp_user_agent_dir() -> std::io::Result<std::path::PathBuf> {
     let home = dirs::home_dir().unwrap_or_default();
     let config_name = std::env::var("PI_CONFIG_DIR")
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| ".omp".to_string());
-    let config_root = home.join(config_name.trim_start_matches(['/', '\\']));
+    let config_root = omp_config_root_from(&home, &config_name, cfg!(windows))?;
 
     if let Some(profile) = omp_active_profile() {
-        return config_root.join("profiles").join(profile).join("agent");
+        return Ok(config_root.join("profiles").join(profile).join("agent"));
     }
 
-    std::env::var_os("PI_CODING_AGENT_DIR")
+    Ok(std::env::var_os("PI_CODING_AGENT_DIR")
         .filter(|value| !value.is_empty())
-        .map_or_else(|| config_root.join("agent"), std::path::PathBuf::from)
+        .map_or_else(|| config_root.join("agent"), std::path::PathBuf::from))
 }
 
 /// User-level OMP extension path for the active profile.
-fn omp_user_extension_path() -> std::path::PathBuf {
-    omp_user_agent_dir().join("extensions").join("dcg-guard.ts")
+fn omp_user_extension_path() -> std::io::Result<std::path::PathBuf> {
+    Ok(omp_user_agent_dir()?
+        .join("extensions")
+        .join("dcg-guard.ts"))
 }
 
 /// Project-level OMP extension path: `<repo>/.omp/extensions/dcg-guard.ts`.
@@ -12441,7 +12488,7 @@ fn omp_appears_in_use() -> bool {
     }
     let default_root = dirs::home_dir().unwrap_or_default().join(".omp");
     default_root.is_dir()
-        || omp_user_agent_dir().is_dir()
+        || omp_user_agent_dir().is_ok_and(|path| path.is_dir())
         || project_omp_extension_path()
             .ok()
             .is_some_and(|path| path.exists())
@@ -12461,7 +12508,7 @@ fn registered_omp_extension_path() -> Option<std::path::PathBuf> {
         .ok()
         .filter(|path| omp_extension_is_dcg_owned(path))
         .or_else(|| {
-            let path = omp_user_extension_path();
+            let path = omp_user_extension_path().ok()?;
             omp_extension_is_dcg_owned(&path).then_some(path)
         })
 }
@@ -12568,7 +12615,7 @@ fn install_omp_extension(force: bool, project: bool) -> Result<(), Box<dyn std::
     let extension_path = if project {
         project_omp_extension_path()?
     } else {
-        omp_user_extension_path()
+        omp_user_extension_path()?
     };
 
     if extension_path.exists() {
@@ -18562,6 +18609,25 @@ if ($errors.Count -ne 0) {
         for invalid in ["", "default", ".", "..", "Upper", "../escape", "NUL"] {
             assert_eq!(normalize_omp_profile_name(invalid), None, "{invalid}");
         }
+    }
+
+    #[test]
+    fn omp_config_root_rejects_windows_drive_qualified_overrides() {
+        let home = std::path::Path::new("/test-home");
+        for invalid in [r"C:\omp", "c:omp", r"\D:\profiles"] {
+            let error = omp_config_root_from(home, invalid, true)
+                .expect_err("Windows drive-qualified config names must be rejected");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+
+        assert_eq!(
+            omp_config_root_from(home, "/etc/omp-cfg", true).expect("separator-rooted name"),
+            home.join("etc/omp-cfg")
+        );
+        assert_eq!(
+            omp_config_root_from(home, r"C:\omp", false).expect("valid POSIX child name"),
+            home.join(r"C:\omp")
+        );
     }
 
     #[test]

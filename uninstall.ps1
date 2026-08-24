@@ -584,24 +584,36 @@ function Unconfigure-OmpExtension {
     (Join-Path (Join-Path (Get-OmpAgentDir -HomeDir $HomeDir) 'extensions') 'dcg-guard.ts'),
     (Join-Path (Join-Path (Join-Path $RepoRoot '.omp') 'extensions') 'dcg-guard.ts')
   )
+  $removed = $false
+  $failed = $false
   if (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR)) {
     $paths += Join-Path (Join-Path $env:PI_CODING_AGENT_DIR 'extensions') 'dcg-guard.ts'
   }
   foreach ($configRoot in $configRoots) {
     $paths += Join-Path (Join-Path (Join-Path $configRoot 'agent') 'extensions') 'dcg-guard.ts'
     $profilesRoot = Join-Path $configRoot 'profiles'
-    if (-not (Test-Path -LiteralPath $profilesRoot -PathType Container)) { continue }
-    foreach ($profileDir in Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction SilentlyContinue) {
-      $paths += Join-Path (Join-Path (Join-Path $profileDir.FullName 'agent') 'extensions') 'dcg-guard.ts'
+    try {
+      if (-not (Test-Path -LiteralPath $profilesRoot -PathType Container -ErrorAction Stop)) { continue }
+      foreach ($profileDir in Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction Stop) {
+        $paths += Join-Path (Join-Path (Join-Path $profileDir.FullName 'agent') 'extensions') 'dcg-guard.ts'
+      }
+    } catch {
+      $failed = $true
+      Write-Warn "Could not inspect Oh My Pi profiles under ${profilesRoot}: $($_.Exception.Message)"
     }
   }
   $paths = @($paths | Select-Object -Unique)
-  $removed = $false
-  $failed = $false
   foreach ($extension in $paths) {
-    if (-not (Test-Path -LiteralPath $extension -PathType Leaf)) { continue }
     try {
-      if ((Get-Content -Raw -LiteralPath $extension -ErrorAction Stop) -notmatch 'dcg-omp-extension') { continue }
+      if (-not (Test-Path -LiteralPath $extension -PathType Leaf -ErrorAction Stop)) { continue }
+      $content = Get-Content -Raw -LiteralPath $extension -ErrorAction Stop
+    } catch {
+      $failed = $true
+      Write-Warn "Could not inspect Oh My Pi extension at ${extension}: $($_.Exception.Message)"
+      continue
+    }
+    if ($content -notmatch 'dcg-omp-extension') { continue }
+    try {
       Remove-Item -Force -LiteralPath $extension -ErrorAction Stop
       $removed = $true
     } catch {

@@ -283,5 +283,31 @@ try {
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h14 -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+Write-Host "Test 15: Oh My Pi cleanup does not claim success when profile enumeration fails"
+$h15 = New-Tmp
+try {
+    $defaultExtension = Join-Path $h15 '.omp/agent/extensions/dcg-guard.ts'
+    $profileExtension = Join-Path $h15 '.omp/profiles/work/agent/extensions/dcg-guard.ts'
+    $profilesRoot = Join-Path $h15 '.omp/profiles'
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $defaultExtension))
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $profileExtension))
+    [System.IO.File]::WriteAllText($defaultExtension, '// dcg-omp-extension: generated')
+    [System.IO.File]::WriteAllText($profileExtension, '// dcg-omp-extension: generated')
+
+    function Get-ChildItem {
+        [CmdletBinding()]
+        param([string]$LiteralPath, [switch]$Directory)
+        if ($LiteralPath -eq $profilesRoot) { throw "simulated unreadable profiles directory: $LiteralPath" }
+        Microsoft.PowerShell.Management\Get-ChildItem -LiteralPath $LiteralPath -Directory:$Directory -ErrorAction Stop
+    }
+
+    Check ((Unconfigure-OmpExtension -HomeDir $h15 -RepoRoot $h15) -eq $false) "OMP: profile enumeration failure is not reported as complete"
+    Check (-not (Test-Path -LiteralPath $defaultExtension)) "OMP: known default extension is still cleaned up"
+    Check (Test-Path -LiteralPath $profileExtension) "OMP: unenumerated profile extension remains in place"
+} finally {
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Function:\Get-ChildItem' -Force -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h15 -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
 Write-Host "All uninstall parity tests passed." -ForegroundColor Green
