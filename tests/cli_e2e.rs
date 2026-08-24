@@ -2022,10 +2022,7 @@ mod config_tests {
         let normalized_home = temp.path().join("normalized-config-home");
         std::fs::create_dir_all(&normalized_home).expect("normalized HOME");
         let normalized_root = normalized_home.join("normalized-omp");
-        let normalized_derived = normalized_root
-            .join("profiles")
-            .join("work")
-            .join("agent");
+        let normalized_derived = normalized_root.join("profiles").join("work").join("agent");
         let normalized = Command::new(dcg_binary())
             .args(["install", "--omp"])
             .env_clear()
@@ -2051,9 +2048,7 @@ mod config_tests {
             "the normalized default agent directory receives the extension"
         );
         assert!(
-            !normalized_derived
-                .join("extensions/dcg-guard.ts")
-                .exists(),
+            !normalized_derived.join("extensions/dcg-guard.ts").exists(),
             "the normalized exact profile derivation must be suppressed"
         );
 
