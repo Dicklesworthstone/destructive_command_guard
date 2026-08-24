@@ -12503,8 +12503,10 @@ type DcgParsedVerdict = "empty" | "malformed" | "allow" | "deny" | "ask" | "inde
 type DcgBridgeAction = "allow" | "block" | "infrastructure";
 type DcgParsedOutput = {{ verdict: DcgParsedVerdict; reason?: string; ruleId?: string }};
 
-const DCG_MAX_JSON_CHARS = 1_048_576;
 const BLOCKING_DECISIONS: ReadonlySet<DcgParsedVerdict> = new Set<DcgParsedVerdict>(["deny", "ask", "indeterminate"]);
+// Bun exposes no stdout when spawn itself throws. That runtime catch remains a
+// visible infrastructure fail-open; this total row makes the pure classifier
+// exhaustive for replay/model tests and preserves deny-like monotonicity.
 const DCG_CHILD_TRANSITIONS: Record<DcgChildOutcome, Record<DcgParsedVerdict, DcgBridgeAction>> = {{
   "spawn-throw": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
   "exit-0": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
@@ -12516,7 +12518,6 @@ const DCG_CHILD_TRANSITIONS: Record<DcgChildOutcome, Record<DcgParsedVerdict, Dc
 function parseDcgOutput(stdoutText: string): DcgParsedOutput {{
   const text = stdoutText.trim();
   if (!text) return {{ verdict: "empty" }};
-  if (text.length > DCG_MAX_JSON_CHARS) return {{ verdict: "malformed" }};
 
   let raw: unknown;
   try {{
@@ -12628,10 +12629,6 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
         proc.exited,
       ]);
     }} catch (err) {{
-      const classification = classifyDcgChild("spawn-throw", "");
-      if (classification.action !== "infrastructure") {{
-        return {{ block: true, reason: "Blocked by dcg after an invalid child transition" }};
-      }}
       console.error(`[dcg] OMP guard could not run dcg: ${{err}}`);
       return;
     }}
@@ -18838,8 +18835,22 @@ if ($errors.Count -ne 0) {
             );
         }
         assert!(source.contains("function parseDcgOutput("));
-        assert!(source.contains("function classifyDcgChild("));
+        assert!(source.contains("export function classifyDcgChild("));
         assert!(source.contains("const classification = classifyDcgChild("));
+        assert!(
+            source.contains(
+                "reason: typeof record.reason === \"string\" ? record.reason : undefined"
+            )
+        );
+        assert!(
+            source.contains(
+                "ruleId: typeof record.rule_id === \"string\" ? record.rule_id : undefined"
+            )
+        );
+        assert!(
+            !source.contains("DCG_MAX_JSON_CHARS"),
+            "a post-buffer parse cap is not a resource bound and could erase a valid deny verdict"
+        );
         assert!(
             !source.contains("if (exitCode === 0 || exitCode === 2) return;"),
             "an early status-only allow would erase a parsed blocking verdict"
