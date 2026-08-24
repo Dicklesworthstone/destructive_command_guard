@@ -18857,6 +18857,55 @@ if ($errors.Count -ne 0) {
         );
     }
 
+    /// The robot protocol is a two-channel contract: stdout alone carries the
+    /// machine decision, while stderr carries diagnostics that must remain
+    /// visible. Keep both properties explicit so swapping the pipes cannot
+    /// either fabricate a block from diagnostic JSON or erase a blocking exit.
+    #[test]
+    fn omp_extension_source_keeps_stdout_authoritative_and_stderr_visible() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        assert!(source.contains(
+            r#"const classification = classifyDcgChild(
+      childOutcomeFromExitCode(exitCode),
+      typeof stdoutText === "string" ? stdoutText : "",
+    );"#
+        ));
+        assert!(
+            !source.contains("classifyDcgChild(childOutcomeFromExitCode(exitCode), stderrText"),
+            "stderr JSON is diagnostic text, never a decision input"
+        );
+        assert!(source.contains(
+            r#"const stderrDetail = typeof stderrText === "string" ? stderrText.trim() : "";"#
+        ));
+        assert_eq!(
+            source.matches("if (stderrDetail) console.error(stderrDetail);").count(),
+            1,
+            "allow and block must share one non-infrastructure stderr forwarding point"
+        );
+
+        let infrastructure = source
+            .find("if (classification.action === \"infrastructure\")")
+            .expect("infrastructure outcome branch");
+        let forward = source
+            .find("if (stderrDetail) console.error(stderrDetail);")
+            .expect("non-infrastructure stderr forwarding");
+        let allow = source
+            .find("if (classification.action === \"allow\") return;")
+            .expect("allow outcome branch");
+        let block = source
+            .find("return { block: true, reason: `${reason}${rule}` };")
+            .expect("block outcome return");
+        assert!(
+            infrastructure < forward && forward < allow && allow < block,
+            "stderr must be emitted once before either non-infrastructure outcome returns"
+        );
+        assert!(source.contains(
+            r#""exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }"#
+        ));
+    }
+
     /// OMP 18's ordinary and managed-async BashTool routes execute in the
     /// embedded Brush shell even on Windows. Only an eligible local PTY uses
     /// OMP's configured external shell, which may be cmd.exe or PowerShell.
