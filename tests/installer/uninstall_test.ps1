@@ -25,10 +25,10 @@ foreach ($name in $ompSelectorNames) {
     $savedOmpSelectors[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
     # Seed first so this fence is mutation-sensitive on hosts whose ambient
     # environment happens to be clean.
-    [Environment]::SetEnvironmentVariable($name, "dcg-test-ambient-$name", 'Process')
+    Microsoft.PowerShell.Management\Set-Item -LiteralPath "Env:$name" -Value "dcg-test-ambient-$name"
 }
 foreach ($name in $ompSelectorNames) {
-    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
 }
 
 try {
@@ -380,7 +380,11 @@ try {
 }
 } finally {
     foreach ($name in $ompSelectorNames) {
-        [Environment]::SetEnvironmentVariable($name, $savedOmpSelectors[$name], 'Process')
+        if ($null -eq $savedOmpSelectors[$name]) {
+            Microsoft.PowerShell.Management\Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            Microsoft.PowerShell.Management\Set-Item -LiteralPath "Env:$name" -Value $savedOmpSelectors[$name]
+        }
     }
 }
 

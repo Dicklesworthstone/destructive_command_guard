@@ -28,10 +28,10 @@ foreach ($name in $ompSelectorNames) {
     $savedOmpSelectors[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
     # Seed a non-vacuous ambient value before proving the fixture fence clears
     # it. This catches a missing scrub even on otherwise clean CI hosts.
-    [Environment]::SetEnvironmentVariable($name, "dcg-test-ambient-$name", 'Process')
+    Microsoft.PowerShell.Management\Set-Item -LiteralPath "Env:$name" -Value "dcg-test-ambient-$name"
 }
 foreach ($name in $ompSelectorNames) {
-    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
 }
 try {
     $unclearedOmpSelectors = @($ompSelectorNames | Where-Object {
@@ -170,7 +170,11 @@ try {
     $env:LOCALAPPDATA = $savedLocalAppData
     $env:OS = $savedOs
     foreach ($name in $ompSelectorNames) {
-        [Environment]::SetEnvironmentVariable($name, $savedOmpSelectors[$name], 'Process')
+        if ($null -eq $savedOmpSelectors[$name]) {
+            Microsoft.PowerShell.Management\Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            Microsoft.PowerShell.Management\Set-Item -LiteralPath "Env:$name" -Value $savedOmpSelectors[$name]
+        }
     }
 }
 

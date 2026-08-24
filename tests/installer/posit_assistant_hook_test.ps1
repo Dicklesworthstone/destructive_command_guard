@@ -48,10 +48,10 @@ foreach ($name in $ompSelectorNames) {
     $savedOmpSelectors[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
     # Detect-Agents is exercised below, so make its OMP isolation assertion
     # non-vacuous even when the host starts with no OMP variables configured.
-    [Environment]::SetEnvironmentVariable($name, "dcg-test-ambient-$name", 'Process')
+    Microsoft.PowerShell.Management\Set-Item -LiteralPath "Env:$name" -Value "dcg-test-ambient-$name"
 }
 foreach ($name in $ompSelectorNames) {
-    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
 }
 
 try {
@@ -217,7 +217,11 @@ try {
 } finally { $env:PATH = $savedPath; Remove-Item -Recurse -Force $h8 -ErrorAction SilentlyContinue }
 } finally {
     foreach ($name in $ompSelectorNames) {
-        [Environment]::SetEnvironmentVariable($name, $savedOmpSelectors[$name], 'Process')
+        if ($null -eq $savedOmpSelectors[$name]) {
+            Microsoft.PowerShell.Management\Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            Microsoft.PowerShell.Management\Set-Item -LiteralPath "Env:$name" -Value $savedOmpSelectors[$name]
+        }
     }
 }
 
