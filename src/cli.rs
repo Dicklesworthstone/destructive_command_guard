@@ -335,8 +335,9 @@ pub enum Command {
         /// Install a native Oh My Pi (`omp`) `tool_call` extension at the
         /// active user profile's `extensions/dcg-guard.ts` path (normally
         /// `~/.omp/agent/extensions/dcg-guard.ts`) or
-        /// `<repo>/.omp/extensions/dcg-guard.ts` (with `--project`). Every OMP
-        /// bash tool call is routed through dcg before execution.
+        /// `<cwd>/.omp/extensions/dcg-guard.ts` (with `--project`). OMP's
+        /// extension discovery is cwd-only and does not walk Git ancestors.
+        /// Every OMP bash tool call is routed through dcg before execution.
         #[arg(long, conflicts_with_all = ["grok", "agy", "opencode"])]
         omp: bool,
     },
@@ -12412,11 +12413,14 @@ fn omp_user_extension_path() -> std::io::Result<std::path::PathBuf> {
         .join("dcg-guard.ts"))
 }
 
-/// Project-level OMP extension path: `<repo>/.omp/extensions/dcg-guard.ts`.
-fn project_omp_extension_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    let repo_root = find_repo_root_from_cwd()
-        .ok_or("Not inside a git repository — cannot determine project root")?;
-    Ok(repo_root
+/// Project-level OMP extension path: `<cwd>/.omp/extensions/dcg-guard.ts`.
+///
+/// Unlike some of OMP's context-file providers, native extension discovery is
+/// anchored to the process working directory and never walks Git ancestors.
+/// Keep this resolver equally literal so an installed guard is one OMP will
+/// actually load, including when the cwd is not inside a Git repository.
+fn project_omp_extension_path() -> std::io::Result<std::path::PathBuf> {
+    Ok(std::env::current_dir()?
         .join(".omp")
         .join("extensions")
         .join("dcg-guard.ts"))

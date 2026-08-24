@@ -4008,7 +4008,7 @@ MOCKEOF
     grep -q 'mine' "$user_extension"
 }
 
-@test "unconfigure_omp: finds a project extension from a nested directory" {
+@test "unconfigure_omp: does not walk to a parent Git project's extension" {
     extract_uninstall_functions
     local repo="$BATS_TEST_TMPDIR/omp-project"
     local nested="$repo/a/b"
@@ -4017,6 +4017,20 @@ MOCKEOF
     printf '// dcg-omp-extension: generated\n' > "$extension"
 
     cd "$nested"
+    run unconfigure_omp
+
+    [ "$status" -eq 0 ]
+    [ -f "$extension" ]
+}
+
+@test "unconfigure_omp: removes a project extension from a non-Git cwd" {
+    extract_uninstall_functions
+    local cwd="$BATS_TEST_TMPDIR/omp-project-no-git"
+    local extension="$cwd/.omp/extensions/dcg-guard.ts"
+    mkdir -p "$(dirname "$extension")"
+    printf '// dcg-omp-extension: generated\n' > "$extension"
+
+    cd "$cwd"
     run unconfigure_omp
 
     [ "$status" -eq 0 ]

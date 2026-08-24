@@ -47,8 +47,10 @@ OMP's `OMP_PROFILE`-before-`PI_PROFILE` precedence and honors
 `PI_CODING_AGENT_DIR` for the default profile. Drive-qualified
 `PI_CONFIG_DIR` values are rejected on Windows because Rust would otherwise
 resolve them differently from OMP's home-relative `path.join` behavior. Use
-`dcg install --omp --project` to install `<repo>/.omp/extensions/dcg-guard.ts`
-instead.
+`dcg install --omp --project` to install `<cwd>/.omp/extensions/dcg-guard.ts`
+instead. OMP checks only the current working directory for native project
+extensions; it neither requires Git nor walks to an ancestor, so launch OMP
+from that same directory.
 
 The extension uses OMP's pre-execution `tool_call` event and sends each `bash`
 command to `dcg --robot test --stdin --agent omp --dialect posix`. A dcg deny,

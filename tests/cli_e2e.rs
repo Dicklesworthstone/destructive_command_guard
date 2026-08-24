@@ -1751,6 +1751,65 @@ mod config_tests {
     }
 
     #[test]
+    fn install_omp_project_is_anchored_to_a_nested_git_cwd() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
+        let nested_cwd = temp.path().join("nested").join("worktree");
+        std::fs::create_dir_all(&nested_cwd).expect("nested cwd");
+
+        let output = Command::new(dcg_binary())
+            .args(["install", "--omp", "--project"])
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .current_dir(&nested_cwd)
+            .output()
+            .expect("install project OMP extension from nested Git cwd");
+        assert!(
+            output.status.success(),
+            "nested project install: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(
+            nested_cwd.join(".omp/extensions/dcg-guard.ts").is_file(),
+            "OMP loads the extension from the exact launch cwd"
+        );
+        assert!(
+            !temp.path().join(".omp/extensions/dcg-guard.ts").exists(),
+            "project install must not walk to the enclosing Git root"
+        );
+    }
+
+    #[test]
+    fn install_omp_project_works_without_a_git_repository() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("plain-directory");
+        let home_dir = temp.path().join("home");
+        let xdg_config_dir = temp.path().join("xdg_config");
+        std::fs::create_dir_all(&cwd).expect("non-Git cwd");
+        std::fs::create_dir_all(&home_dir).expect("HOME dir");
+        std::fs::create_dir_all(&xdg_config_dir).expect("XDG_CONFIG_HOME dir");
+
+        let output = Command::new(dcg_binary())
+            .args(["install", "--omp", "--project"])
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .current_dir(&cwd)
+            .output()
+            .expect("install project OMP extension outside Git");
+        assert!(
+            output.status.success(),
+            "non-Git project install: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(cwd.join(".omp/extensions/dcg-guard.ts").is_file());
+    }
+
+    #[test]
     fn install_omp_matches_profile_and_legacy_override_precedence() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
@@ -2268,6 +2327,42 @@ mod config_tests {
                 .as_str()
                 .is_some_and(|message| message.contains(&extension.display().to_string())),
             "doctor should report the project extension it actually found: {omp_check}"
+        );
+    }
+
+    #[test]
+    fn doctor_ignores_an_ancestor_omp_extension_from_a_nested_git_cwd() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, bin_dir) = setup_doctor_env(&temp);
+        let ancestor_extension = temp.path().join(".omp/extensions/dcg-guard.ts");
+        let nested_cwd = temp.path().join("nested").join("worktree");
+        std::fs::create_dir_all(ancestor_extension.parent().expect("extension parent"))
+            .expect("ancestor OMP extension directory");
+        std::fs::create_dir_all(&nested_cwd).expect("nested cwd");
+        std::fs::write(&ancestor_extension, "// dcg-omp-extension: generated\n")
+            .expect("ancestor OMP extension");
+
+        let output = Command::new(dcg_binary())
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("PATH", &bin_dir)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .current_dir(&nested_cwd)
+            .args(["doctor", "--format", "json"])
+            .output()
+            .expect("run dcg doctor from nested cwd");
+        assert!(output.status.success());
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("doctor JSON output should parse");
+        assert!(
+            report["checks"]
+                .as_array()
+                .expect("checks array")
+                .iter()
+                .all(|check| check["id"] != "omp_extension"),
+            "doctor must not claim an ancestor extension that OMP will not load: {report}"
         );
     }
 

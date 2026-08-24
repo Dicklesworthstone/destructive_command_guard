@@ -1149,7 +1149,9 @@ unconfigure_opencode() {
 unconfigure_omp() {
     # Oh My Pi extension: remove only marker-owned files. Cover the active
     # profile, every named profile under the default/current config roots, the
-    # legacy agent-dir override, and the current repository's project install.
+    # legacy agent-dir override, and the current working directory's project
+    # install. OMP's native extension discovery is cwd-only; it does not walk
+    # to a Git ancestor.
     local config_name="${PI_CONFIG_DIR:-.omp}"
     while true; do
         case "$config_name" in
@@ -1181,15 +1183,12 @@ unconfigure_omp() {
         agent_dir="$PI_CODING_AGENT_DIR"
     fi
 
-    local repo_root
-    repo_root=$(current_repo_root)
     local removed=0
     local failed=0
     local -a extensions=(
         "$agent_dir/extensions/dcg-guard.ts"
         "$config_root/agent/extensions/dcg-guard.ts"
         "$HOME/.omp/agent/extensions/dcg-guard.ts"
-        "$repo_root/.omp/extensions/dcg-guard.ts"
         ".omp/extensions/dcg-guard.ts"
     )
     if [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
