@@ -491,7 +491,7 @@ fn try_deny_oversized_input(
     for id in external_store.pack_ids() {
         enabled_packs.insert(id.clone());
     }
-    remove_disabled_packs_for_agent(&mut enabled_packs, config, &effective_agent);
+    config.remove_disabled_packs_for_agent(&mut enabled_packs, &effective_agent);
 
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     enabled_keywords.extend(external_store.keywords().iter().copied());
@@ -681,43 +681,8 @@ fn top_level_flag_requested(args: &[String], long: &str, short: &str) -> bool {
     false
 }
 
-fn remove_disabled_packs_for_agent(
-    enabled_packs: &mut HashSet<String>,
-    config: &Config,
-    agent: &Agent,
-) {
-    let profile = config.agents.profile_for_agent(agent);
-    for disabled in &profile.disabled_packs {
-        // `Config::enabled_pack_ids_for_agent` preserves the mandatory core
-        // category after profile expansion. This second pass exists so
-        // profile exclusions also apply to auto-enabled external packs; it
-        // must not undo the core invariant while doing so.
-        if disabled == "core" || disabled.starts_with("core.") {
-            continue;
-        }
-        enabled_packs.remove(disabled);
-        enabled_packs.retain(|pack| !pack.starts_with(&format!("{disabled}.")));
-    }
-}
-
-fn apply_agent_allowlist_profile(
-    config: &Config,
-    agent: &Agent,
-    mut allowlists: LayeredAllowlist,
-) -> LayeredAllowlist {
-    if config.allowlist_disabled_for_agent(agent) {
-        return LayeredAllowlist::default();
-    }
-
-    allowlists.prepend_agent_exact_commands(
-        agent.config_key(),
-        config.additional_allowlist_for_agent(agent),
-    );
-    allowlists
-}
-
 fn load_effective_allowlists_for_agent(config: &Config, agent: &Agent) -> LayeredAllowlist {
-    apply_agent_allowlist_profile(config, agent, load_default_allowlists())
+    config.apply_agent_allowlist_profile(agent, load_default_allowlists())
 }
 
 /// A hook command whose evaluation resolved to the deny family
@@ -1635,7 +1600,7 @@ fn main() {
     for id in external_store.pack_ids() {
         enabled_packs.insert(id.clone());
     }
-    remove_disabled_packs_for_agent(&mut enabled_packs, &config, &effective_agent);
+    config.remove_disabled_packs_for_agent(&mut enabled_packs, &effective_agent);
 
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     // Merge external pack keywords into enabled keywords for quick rejection.
@@ -2545,13 +2510,13 @@ mod tests {
 
         fn evaluate_with_agent(config: &Config, agent: &Agent, command: &str) -> EvaluationResult {
             let mut enabled_packs = config.enabled_pack_ids_for_agent(agent);
-            remove_disabled_packs_for_agent(&mut enabled_packs, config, agent);
+            config.remove_disabled_packs_for_agent(&mut enabled_packs, agent);
             let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
             let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
             let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
             let compiled_overrides = config.overrides.compile();
             let allowlists =
-                apply_agent_allowlist_profile(config, agent, LayeredAllowlist::default());
+                config.apply_agent_allowlist_profile(agent, LayeredAllowlist::default());
 
             evaluate_command_with_pack_order_deadline_at_path(
                 command,
@@ -2579,8 +2544,7 @@ mod tests {
                 },
             );
 
-            let allowlists = apply_agent_allowlist_profile(
-                &config,
+            let allowlists = config.apply_agent_allowlist_profile(
                 &Agent::Unknown,
                 project_allowlist_for_rule("core.git:reset-hard"),
             );
@@ -2614,11 +2578,8 @@ mod tests {
                 },
             );
 
-            let allowlists = apply_agent_allowlist_profile(
-                &config,
-                &Agent::ClaudeCode,
-                LayeredAllowlist::default(),
-            );
+            let allowlists = config
+                .apply_agent_allowlist_profile(&Agent::ClaudeCode, LayeredAllowlist::default());
             let compiled_overrides = config.overrides.compile();
             let result = destructive_command_guard::evaluate_command(
                 "git reset --hard",

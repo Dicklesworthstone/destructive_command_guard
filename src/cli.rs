@@ -4441,12 +4441,16 @@ fn test_command(
         return false; // Explain mode doesn't track blocked status
     }
 
-    // Build effective config with extra packs if specified
-    let mut effective_config = extra_packs.map_or_else(
+    // Keep the explicit CLI contribution separate as well as reflecting it in
+    // the effective config. Agent profiles apply to configured and external
+    // packs, while an invocation-local `--with-packs` remains the final
+    // authority for the packs the caller explicitly requested.
+    let cli_extra_packs = extra_packs.as_deref().unwrap_or(&[]);
+    let mut effective_config = extra_packs.as_ref().map_or_else(
         || config.clone(),
         |packs| {
             let mut modified = config.clone();
-            modified.packs.enabled.extend(packs);
+            modified.packs.enabled.extend(packs.iter().cloned());
             modified
         },
     );
@@ -4504,18 +4508,22 @@ fn test_command(
         ))
     });
 
-    // Get enabled packs and collect keywords for quick rejection.
-    let mut enabled_packs = effective_config.enabled_pack_ids();
-    let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+    // Resolve the same agent-specific pack and allowlist policy as hook mode.
+    let mut enabled_packs = effective_config.enabled_pack_ids_for_agent(&detection.agent);
+    let allowlists =
+        effective_config.apply_agent_allowlist_profile(&detection.agent, load_default_allowlists());
 
-    // Load allowlists (project/user/system) for parity with hook mode.
-    // This is a small file read and only affects decisions when a rule matches.
-    let allowlists = load_default_allowlists();
-
-    // Auto-enable external packs and merge their keywords.
+    // Auto-enable external packs, then apply agent exclusions to those later
+    // contributions as hook mode does. Explicit `--with-packs` is re-applied
+    // last so the invocation-local override retains its established priority.
     for id in external_store.pack_ids() {
         enabled_packs.insert(id.clone());
     }
+    effective_config.remove_disabled_packs_for_agent(&mut enabled_packs, &detection.agent);
+    enabled_packs.extend(cli_extra_packs.iter().cloned());
+
+    // Collect keywords only after the final pack policy is known.
+    let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     enabled_keywords.extend(external_store.keywords().iter().copied());
 
     // Build ordered pack list AFTER external packs are loaded so they're included.

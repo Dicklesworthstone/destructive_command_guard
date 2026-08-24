@@ -4965,6 +4965,49 @@ impl Config {
         packs
     }
 
+    /// Remove an agent profile's pack exclusions from an already-expanded set.
+    ///
+    /// [`Self::enabled_pack_ids_for_agent`] applies profile exclusions to the
+    /// configured built-in packs. Callers then auto-enable external packs, so
+    /// those later contributions need the same final exclusion pass. Core
+    /// packs remain mandatory regardless of profile settings.
+    pub fn remove_disabled_packs_for_agent(
+        &self,
+        enabled_packs: &mut HashSet<String>,
+        agent: &crate::agent::Agent,
+    ) {
+        let profile = self.agents.profile_for_agent(agent);
+        for disabled in &profile.disabled_packs {
+            if disabled == "core" || disabled.starts_with("core.") {
+                continue;
+            }
+            enabled_packs.remove(disabled);
+            enabled_packs.retain(|pack| !pack.starts_with(&format!("{disabled}.")));
+        }
+    }
+
+    /// Apply an agent profile to already-loaded project/user/system allowlists.
+    ///
+    /// Disabling allowlists is deliberately absolute: it removes both the
+    /// loaded layers and the profile's own additional exact commands. When
+    /// enabled, agent commands are prepended as the highest-precedence layer.
+    #[must_use]
+    pub fn apply_agent_allowlist_profile(
+        &self,
+        agent: &crate::agent::Agent,
+        mut allowlists: crate::allowlist::LayeredAllowlist,
+    ) -> crate::allowlist::LayeredAllowlist {
+        if self.allowlist_disabled_for_agent(agent) {
+            return crate::allowlist::LayeredAllowlist::default();
+        }
+
+        allowlists.prepend_agent_exact_commands(
+            agent.config_key(),
+            self.additional_allowlist_for_agent(agent),
+        );
+        allowlists
+    }
+
     /// Get additional allowlist entries for an agent.
     ///
     /// Returns the patterns from the agent profile's `additional_allowlist`.

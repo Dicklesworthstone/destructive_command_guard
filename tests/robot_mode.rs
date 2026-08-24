@@ -11,8 +11,9 @@
 //!   - 4: Parse/input error
 //!   - 5: IO error
 
+use std::io::Write as _;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Path to the dcg binary.
 fn dcg_binary() -> PathBuf {
@@ -56,6 +57,76 @@ fn run_dcg_with_env(args: &[&str], key: &str, value: &str) -> (String, String, i
     let exit_code = output.status.code().unwrap_or(-1);
 
     (stdout, stderr, exit_code)
+}
+
+/// Run the exact robot/stdin boundary used by the generated OMP extension
+/// against a hermetic agent-profile config.
+fn run_omp_boundary_with_config(config: &str, agent: &str, command: &str) -> (String, String, i32) {
+    run_omp_boundary_with_policy(config, None, agent, None, command)
+}
+
+fn run_omp_boundary_with_policy(
+    config: &str,
+    user_allowlist: Option<&str>,
+    agent: &str,
+    with_packs: Option<&str>,
+    command: &str,
+) -> (String, String, i32) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let xdg = temp.path().join("xdg");
+    let scratch = temp.path().join("tmp");
+    std::fs::create_dir_all(xdg.join("dcg")).expect("XDG dcg directory");
+    std::fs::create_dir_all(&home).expect("HOME directory");
+    std::fs::create_dir_all(&scratch).expect("temporary directory");
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(&config_path, config).expect("profile config");
+    if let Some(allowlist) = user_allowlist {
+        std::fs::write(xdg.join("dcg/allowlist.toml"), allowlist).expect("user allowlist");
+    }
+
+    let mut process = Command::new(dcg_binary());
+    process
+        .args([
+            "--robot",
+            "test",
+            "--stdin",
+            "--agent",
+            agent,
+            "--dialect",
+            "posix",
+        ])
+        .env_clear()
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("TMPDIR", &scratch)
+        .env("TEMP", &scratch)
+        .env("TMP", &scratch)
+        .env("DCG_CONFIG", &config_path)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .current_dir(temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(pack) = with_packs {
+        process.args(["--with-packs", pack]);
+    }
+
+    let mut child = process.spawn().expect("spawn OMP robot boundary");
+    child
+        .stdin
+        .take()
+        .expect("OMP robot stdin")
+        .write_all(command.as_bytes())
+        .expect("write OMP command");
+    let output = child.wait_with_output().expect("collect OMP robot output");
+
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.code().unwrap_or(-1),
+    )
 }
 
 // =============================================================================
@@ -223,6 +294,148 @@ fn test_robot_mode_json_has_rule_id() {
             "denied commands should include pack_id"
         );
     }
+}
+
+/// The generated OMP extension selects `--agent omp`; that selector must alter
+/// evaluation policy, not merely the JSON attribution field.
+#[test]
+fn test_omp_robot_boundary_applies_profile_packs_and_allowlist() {
+    let config = r#"
+[agents.omp]
+extra_packs = ["containers.docker"]
+additional_allowlist = ["git reset --hard HEAD~1"]
+"#;
+
+    let (stdout, stderr, exit_code) =
+        run_omp_boundary_with_config(config, "omp", "docker system prune");
+    assert_eq!(exit_code, 1, "OMP extra pack must block; stderr: {stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("OMP pack JSON");
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "containers.docker");
+    assert_eq!(json["agent"]["detected"], "omp");
+
+    let (stdout, stderr, exit_code) =
+        run_omp_boundary_with_config(config, "codex", "docker system prune");
+    assert_eq!(
+        exit_code, 0,
+        "OMP pack delta must not leak to Codex; stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("Codex pack JSON");
+    assert_eq!(json["decision"], "allow");
+    assert_eq!(json["agent"]["detected"], "codex-cli");
+
+    let (stdout, stderr, exit_code) =
+        run_omp_boundary_with_config(config, "omp", "git reset --hard HEAD~1");
+    assert_eq!(
+        exit_code, 0,
+        "OMP additional allowlist must allow exact command; stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("OMP allowlist JSON");
+    assert_eq!(json["decision"], "allow");
+    assert_eq!(json["agent"]["detected"], "omp");
+
+    let (stdout, stderr, exit_code) =
+        run_omp_boundary_with_config(config, "codex", "git reset --hard HEAD~1");
+    assert_eq!(
+        exit_code, 1,
+        "OMP allowlist must not leak to Codex; stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("Codex deny JSON");
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "core.git");
+}
+
+#[test]
+fn test_omp_robot_boundary_applies_profile_disables_and_cli_pack_override() {
+    let config = r#"
+[packs]
+enabled = ["containers.docker"]
+
+[agents.omp]
+disabled_packs = ["containers"]
+additional_allowlist = ["git reset --hard HEAD~1"]
+disabled_allowlist = true
+"#;
+    let user_allowlist = r#"
+[[allow]]
+exact_command = "git reset --hard HEAD~1"
+reason = "robot profile regression fixture"
+"#;
+
+    let (stdout, stderr, exit_code) = run_omp_boundary_with_policy(
+        config,
+        Some(user_allowlist),
+        "omp",
+        None,
+        "docker system prune",
+    );
+    assert_eq!(
+        exit_code, 0,
+        "OMP disabled pack must be absent; stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("OMP disabled-pack JSON");
+    assert_eq!(json["decision"], "allow");
+
+    let (stdout, stderr, exit_code) = run_omp_boundary_with_policy(
+        config,
+        Some(user_allowlist),
+        "codex",
+        None,
+        "docker system prune",
+    );
+    assert_eq!(
+        exit_code, 1,
+        "OMP disabled pack must not leak to Codex; stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("Codex base-pack JSON");
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "containers.docker");
+
+    let (stdout, stderr, exit_code) = run_omp_boundary_with_policy(
+        config,
+        Some(user_allowlist),
+        "omp",
+        Some("containers.docker"),
+        "docker system prune",
+    );
+    assert_eq!(
+        exit_code, 1,
+        "explicit --with-packs must outrank the profile exclusion; stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("OMP CLI-pack JSON");
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "containers.docker");
+
+    let (stdout, stderr, exit_code) = run_omp_boundary_with_policy(
+        config,
+        Some(user_allowlist),
+        "omp",
+        None,
+        "git reset --hard HEAD~1",
+    );
+    assert_eq!(
+        exit_code, 1,
+        "disabled_allowlist must suppress base and agent entries; stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("OMP no-allowlist JSON");
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "core.git");
+    assert!(json["allowlist"].is_null());
+
+    let (stdout, stderr, exit_code) = run_omp_boundary_with_policy(
+        config,
+        Some(user_allowlist),
+        "codex",
+        None,
+        "git reset --hard HEAD~1",
+    );
+    assert_eq!(
+        exit_code, 0,
+        "OMP disabled_allowlist must not suppress Codex layers; stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("Codex allowlist JSON");
+    assert_eq!(json["decision"], "allow");
+    assert_eq!(json["agent"]["detected"], "codex-cli");
 }
 
 // =============================================================================
