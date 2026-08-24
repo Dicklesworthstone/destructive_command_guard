@@ -1794,6 +1794,9 @@ function Detect-Agents {
   $null = $RepoRoot
   function _has([string]$cmd) { [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
   function _dir([string]$name) { Test-Path (Join-Path $HomeDir $name) -PathType Container }
+  $ompConfigName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
+  $ompConfigName = $ompConfigName.TrimStart([char[]]@('\', '/'))
+  $ompConfigRoot = Join-Path $HomeDir $ompConfigName
   [ordered]@{
     'Claude'  = ((_dir '.claude')  -or (_has 'claude'))
     'Codex'   = ((_dir '.codex')   -or (_has 'codex'))
@@ -1810,7 +1813,10 @@ function Detect-Agents {
     # A bare ~/.posit is not enough — other Posit tools share that directory.
     'Posit'   = ((Test-Path (Join-Path (Join-Path $HomeDir '.posit') 'assistant') -PathType Container) -or
       (_dir '.positai') -or (_has 'pa'))
-    'Omp'     = ((_dir '.omp') -or (_has 'omp'))
+    'Omp'     = ((Test-Path $ompConfigRoot -PathType Container) -or
+      (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR) -and
+        (Test-Path $env:PI_CODING_AGENT_DIR -PathType Container)) -or
+      (Test-Path Env:OMP_PROFILE) -or (_has 'omp'))
   }
 }
 

@@ -524,13 +524,32 @@ function Unconfigure-HermesHook {
   $removedAny
 }
 
+function Get-DcgRepositoryRoot {
+  param([string]$StartDir = (Get-Location).Path)
+  try {
+    $current = Get-Item -LiteralPath $StartDir -ErrorAction Stop
+    while ($null -ne $current) {
+      if (Test-Path (Join-Path $current.FullName '.git')) { return $current.FullName }
+      $current = $current.Parent
+    }
+    return [System.IO.Path]::GetFullPath($StartDir)
+  } catch {
+    return $StartDir
+  }
+}
+
+function Get-OmpConfigRoot {
+  param([string]$HomeDir = $HOME)
+  $configName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
+  $configName = $configName.TrimStart([char[]]@('\', '/'))
+  Join-Path $HomeDir $configName
+}
+
 function Get-OmpAgentDir {
   # Mirror OMP's active-profile directory resolution closely enough for safe,
   # marker-owned extension cleanup.
   param([string]$HomeDir = $HOME)
-  $configName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
-  $configName = $configName.TrimStart([char[]]@('\', '/'))
-  $configRoot = Join-Path $HomeDir $configName
+  $configRoot = Get-OmpConfigRoot -HomeDir $HomeDir
 
   $profile = $null
   if (Test-Path Env:OMP_PROFILE) { $profile = $env:OMP_PROFILE }
@@ -550,13 +569,33 @@ function Get-OmpAgentDir {
 }
 
 function Unconfigure-OmpExtension {
-  # Remove only marker-owned dcg-guard.ts files; preserve any user-authored
-  # extension with the same filename.
-  param([string]$HomeDir = $HOME, [string]$RepoRoot = (Get-Location).Path)
+  # Remove only marker-owned dcg-guard.ts files; preserve user-authored files.
+  # Sweep all profiles under the default/current config roots so changing
+  # profiles after installation cannot leave a live extension behind.
+  param([string]$HomeDir = $HOME, [string]$RepoRoot = '')
+  if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $RepoRoot = Get-DcgRepositoryRoot
+  }
+  $configRoots = @(
+    (Join-Path $HomeDir '.omp'),
+    (Get-OmpConfigRoot -HomeDir $HomeDir)
+  ) | Select-Object -Unique
   $paths = @(
     (Join-Path (Join-Path (Get-OmpAgentDir -HomeDir $HomeDir) 'extensions') 'dcg-guard.ts'),
     (Join-Path (Join-Path (Join-Path $RepoRoot '.omp') 'extensions') 'dcg-guard.ts')
-  ) | Select-Object -Unique
+  )
+  if (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR)) {
+    $paths += Join-Path (Join-Path $env:PI_CODING_AGENT_DIR 'extensions') 'dcg-guard.ts'
+  }
+  foreach ($configRoot in $configRoots) {
+    $paths += Join-Path (Join-Path (Join-Path $configRoot 'agent') 'extensions') 'dcg-guard.ts'
+    $profilesRoot = Join-Path $configRoot 'profiles'
+    if (-not (Test-Path $profilesRoot -PathType Container)) { continue }
+    foreach ($profileDir in Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction SilentlyContinue) {
+      $paths += Join-Path (Join-Path (Join-Path $profileDir.FullName 'agent') 'extensions') 'dcg-guard.ts'
+    }
+  }
+  $paths = @($paths | Select-Object -Unique)
   $removed = $false
   foreach ($extension in $paths) {
     if (-not (Test-Path $extension -PathType Leaf)) { continue }

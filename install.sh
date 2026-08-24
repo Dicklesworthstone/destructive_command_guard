@@ -382,8 +382,20 @@ detect_agents() {
     OPENCODE_VERSION=$(try_version opencode)
   fi
 
-  # Oh My Pi (`omp`) — native state under ~/.omp or an `omp` CLI on PATH.
-  if [[ -d "$HOME/.omp" ]] || command -v omp &>/dev/null; then
+  # Oh My Pi (`omp`) — native state under the configured root/agent override,
+  # an active profile environment, or an `omp` CLI on PATH.
+  local omp_config_name="${PI_CONFIG_DIR:-.omp}"
+  while true; do
+    case "$omp_config_name" in
+      /*) omp_config_name="${omp_config_name#/}" ;;
+      \\*) omp_config_name="${omp_config_name#\\}" ;;
+      *) break ;;
+    esac
+  done
+  if [[ -d "$HOME/$omp_config_name" ]] ||
+     [[ -n "${PI_CODING_AGENT_DIR:-}" && -d "$PI_CODING_AGENT_DIR" ]] ||
+     [[ "${OMP_PROFILE+x}" = "x" ]] ||
+     command -v omp &>/dev/null; then
     DETECTED_AGENTS+=("omp")
     OMP_VERSION=$(try_version omp)
   fi
@@ -3849,6 +3861,43 @@ configure_opencode() {
   return 1
 }
 
+resolve_omp_agent_dir() {
+  # Keep the shell installer's status probe in lock-step with OMP/dcg's active
+  # profile resolver. In particular, named profiles ignore the legacy
+  # PI_CODING_AGENT_DIR override and OMP_PROFILE (even empty) wins PI_PROFILE.
+  local config_name="${PI_CONFIG_DIR:-.omp}"
+  while true; do
+    case "$config_name" in
+      /*) config_name="${config_name#/}" ;;
+      \\*) config_name="${config_name#\\}" ;;
+      *) break ;;
+    esac
+  done
+  local config_root="$HOME/$config_name"
+  local profile=""
+  if [ "${OMP_PROFILE+x}" = "x" ]; then
+    profile="$OMP_PROFILE"
+  elif [ "${PI_PROFILE+x}" = "x" ]; then
+    profile="$PI_PROFILE"
+  fi
+  profile=$(printf '%s' "$profile" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  local profile_base="${profile%%.*}"
+  local profile_reserved=0
+  case "$profile_base" in
+    con|prn|aux|nul|com[0-9]|lpt[0-9]) profile_reserved=1 ;;
+  esac
+  if [ -n "$profile" ] && [ "$profile" != "default" ] &&
+     [ "${profile%.}" = "$profile" ] && [ "${#profile}" -le 64 ] &&
+     [ "$profile_reserved" -eq 0 ] &&
+     printf '%s' "$profile" | grep -Eq '^[a-z0-9][a-z0-9._-]*$'; then
+    printf '%s\n' "$config_root/profiles/$profile/agent"
+  elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
+    printf '%s\n' "$PI_CODING_AGENT_DIR"
+  else
+    printf '%s\n' "$config_root/agent"
+  fi
+}
+
 configure_omp() {
   # The freshly installed dcg binary generates OMP's native ExtensionAPI
   # module. `--force` refreshes only marker-owned files, which also keeps the
@@ -3865,7 +3914,8 @@ configure_omp() {
     return 1
   fi
 
-  local agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}"
+  local agent_dir
+  agent_dir=$(resolve_omp_agent_dir)
   local extension_path="$agent_dir/extensions/dcg-guard.ts"
   local existed=0
   [ -f "$extension_path" ] && existed=1

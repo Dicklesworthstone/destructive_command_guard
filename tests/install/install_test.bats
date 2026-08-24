@@ -436,6 +436,16 @@ MOCKEOF
     [[ " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
 }
 
+@test "detect_agents: finds Oh My Pi under PI_CONFIG_DIR" {
+    log_test "Testing Oh My Pi custom config-root detection..."
+
+    export PI_CONFIG_DIR=".custom-omp"
+    mkdir -p "$HOME/.custom-omp/agent"
+    detect_agents
+
+    [[ " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
+}
+
 @test "detect_agents: finds multiple agents" {
     log_test "Testing multiple agent detection..."
 

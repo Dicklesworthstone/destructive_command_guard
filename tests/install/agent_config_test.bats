@@ -3927,6 +3927,22 @@ MOCKEOF
     grep -q 'dcg-omp-extension' "$HOME/.omp/agent/extensions/dcg-guard.ts"
 }
 
+@test "configure_omp: reports a refresh for an existing named-profile extension" {
+    DETECTED_AGENTS=("omp")
+    OMP_STATUS=""
+    AUTO_CONFIGURED=0
+    export OMP_PROFILE="work"
+    local extension="$HOME/.omp/profiles/work/agent/extensions/dcg-guard.ts"
+    mkdir -p "$(dirname "$extension")"
+    printf '// dcg-omp-extension: generated\n' > "$extension"
+    make_omp_mock_dcg ok
+
+    configure_omp
+
+    [ "$OMP_STATUS" = "merged" ]
+    [ "$AUTO_CONFIGURED" -eq 1 ]
+}
+
 @test "configure_omp: maps ownership refusal to conflict" {
     DETECTED_AGENTS=("omp")
     OMP_STATUS=""
@@ -3958,6 +3974,43 @@ MOCKEOF
     mkdir -p "$(dirname "$extension")"
     printf '// dcg-omp-extension: generated\n' > "$extension"
 
+    run unconfigure_omp
+
+    [ "$status" -eq 0 ]
+    [ ! -f "$extension" ]
+}
+
+@test "unconfigure_omp: removes marker-owned extensions from inactive profiles" {
+    extract_uninstall_functions
+    local default_extension="$HOME/.omp/agent/extensions/dcg-guard.ts"
+    local work_extension="$HOME/.omp/profiles/work/agent/extensions/dcg-guard.ts"
+    local team_extension="$HOME/.omp/profiles/team/agent/extensions/dcg-guard.ts"
+    local user_extension="$HOME/.omp/profiles/personal/agent/extensions/dcg-guard.ts"
+    mkdir -p "$(dirname "$default_extension")" "$(dirname "$work_extension")" \
+        "$(dirname "$team_extension")" "$(dirname "$user_extension")"
+    printf '// dcg-omp-extension: generated\n' > "$default_extension"
+    printf '// dcg-omp-extension: generated\n' > "$work_extension"
+    printf '// dcg-omp-extension: generated\n' > "$team_extension"
+    printf 'export default function mine() {}\n' > "$user_extension"
+
+    run unconfigure_omp
+
+    [ "$status" -eq 0 ]
+    [ ! -f "$default_extension" ]
+    [ ! -f "$work_extension" ]
+    [ ! -f "$team_extension" ]
+    grep -q 'mine' "$user_extension"
+}
+
+@test "unconfigure_omp: finds a project extension from a nested directory" {
+    extract_uninstall_functions
+    local repo="$BATS_TEST_TMPDIR/omp-project"
+    local nested="$repo/a/b"
+    local extension="$repo/.omp/extensions/dcg-guard.ts"
+    mkdir -p "$repo/.git" "$nested" "$(dirname "$extension")"
+    printf '// dcg-omp-extension: generated\n' > "$extension"
+
+    cd "$nested"
     run unconfigure_omp
 
     [ "$status" -eq 0 ]

@@ -10298,8 +10298,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     // dcg at all.
     if omp_appears_in_use() {
         print!("Checking Oh My Pi extension registration... ");
-        let extension_path = omp_user_extension_path();
-        if omp_extension_is_dcg_owned(&extension_path) {
+        if let Some(extension_path) = registered_omp_extension_path() {
             println!("{}", "OK".green());
             println!("  Found: {}", extension_path.display());
         } else {
@@ -11279,38 +11278,39 @@ fn collect_doctor_report(
     if omp_appears_in_use() {
         let extension_path = omp_user_extension_path();
         let mut omp_fixed = false;
-        let (status, message, remediation) = if omp_extension_is_dcg_owned(&extension_path) {
-            (
-                DoctorCheckStatus::Ok,
-                format!(
-                    "Native Oh My Pi extension found at {}",
-                    extension_path.display()
-                ),
-                None,
-            )
-        } else {
-            issues += 1;
-            if fix && install_omp_extension(false, false).is_ok() {
-                fixed += 1;
-                omp_fixed = true;
+        let (status, message, remediation) =
+            if let Some(registered_path) = registered_omp_extension_path() {
                 (
                     DoctorCheckStatus::Ok,
                     format!(
-                        "Installed native Oh My Pi extension at {}",
-                        extension_path.display()
+                        "Native Oh My Pi extension found at {}",
+                        registered_path.display()
                     ),
                     None,
                 )
             } else {
-                (
-                    DoctorCheckStatus::Error,
-                    "Oh My Pi is in use but has no dcg extension — its bash commands are not \
+                issues += 1;
+                if fix && install_omp_extension(false, false).is_ok() {
+                    fixed += 1;
+                    omp_fixed = true;
+                    (
+                        DoctorCheckStatus::Ok,
+                        format!(
+                            "Installed native Oh My Pi extension at {}",
+                            extension_path.display()
+                        ),
+                        None,
+                    )
+                } else {
+                    (
+                        DoctorCheckStatus::Error,
+                        "Oh My Pi is in use but has no dcg extension — its bash commands are not \
                      guarded"
-                        .to_string(),
-                    Some("Run 'dcg install --omp'".to_string()),
-                )
-            }
-        };
+                            .to_string(),
+                        Some("Run 'dcg install --omp'".to_string()),
+                    )
+                }
+            };
         checks.push(DoctorCheck {
             id: "omp_extension",
             name: "Oh My Pi extension registration",
@@ -12429,11 +12429,15 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
 /// Whether this machine plausibly uses OMP. This gates doctor output so users
 /// without OMP are not prompted to install an irrelevant extension.
 fn omp_appears_in_use() -> bool {
-    if std::env::var_os("OMP_PROFILE").is_some() {
+    if std::env::var_os("OMP_PROFILE").is_some() || which_executable("omp").is_some() {
         return true;
     }
     let default_root = dirs::home_dir().unwrap_or_default().join(".omp");
-    default_root.is_dir() || omp_user_agent_dir().is_dir()
+    default_root.is_dir()
+        || omp_user_agent_dir().is_dir()
+        || project_omp_extension_path()
+            .ok()
+            .is_some_and(|path| path.exists())
 }
 
 /// Whether `path` holds a dcg-generated OMP extension.
@@ -12441,6 +12445,18 @@ fn omp_extension_is_dcg_owned(path: &std::path::Path) -> bool {
     std::fs::read_to_string(path)
         .map(|content| content.contains(OMP_EXTENSION_MARKER))
         .unwrap_or(false)
+}
+
+/// A dcg-owned OMP extension loaded by the current project/profile. Doctor must
+/// accept either installation mode instead of always inspecting the user path.
+fn registered_omp_extension_path() -> Option<std::path::PathBuf> {
+    project_omp_extension_path()
+        .ok()
+        .filter(|path| omp_extension_is_dcg_owned(path))
+        .or_else(|| {
+            let path = omp_user_extension_path();
+            omp_extension_is_dcg_owned(&path).then_some(path)
+        })
 }
 
 /// Shared doctor verdict for the build-provenance / update-pin check (#320),
@@ -13668,10 +13684,16 @@ fn config_path() -> std::path::PathBuf {
 
 /// Check if dcg is in PATH
 fn which_dcg() -> Option<std::path::PathBuf> {
-    // The installed binary is `dcg.exe` on Windows and `dcg` elsewhere. Probe for
-    // the platform-correct filename (`EXE_SUFFIX` is ".exe" on Windows, "" on
-    // Unix), otherwise `dcg doctor` reports a false "NOT FOUND in PATH" on Windows.
-    let exe_name = format!("dcg{}", std::env::consts::EXE_SUFFIX);
+    which_executable("dcg")
+}
+
+/// Find a native executable in PATH using the platform's executable suffix.
+/// OMP and dcg both ship native `.exe` files on Windows rather than command
+/// shims, so the same exact lookup is appropriate for doctor discovery.
+fn which_executable(name: &str) -> Option<std::path::PathBuf> {
+    // Probe for the platform-correct filename (`EXE_SUFFIX` is ".exe" on
+    // Windows and empty on Unix), otherwise native executables appear missing.
+    let exe_name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths).find_map(|dir| {
             let path = dir.join(&exe_name);

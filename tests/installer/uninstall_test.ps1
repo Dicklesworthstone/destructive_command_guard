@@ -205,5 +205,37 @@ try {
     Check (Test-Path $extension) "OMP: user-authored extension preserved"
 } finally { Remove-Item -Recurse -Force $h11 -ErrorAction SilentlyContinue }
 
+Write-Host "Test 12: Oh My Pi inactive profiles and repository-root extension are removed"
+$h12 = New-Tmp
+$savedLocation = (Get-Location).Path
+try {
+    $defaultExtension = Join-Path $h12 '.omp/agent/extensions/dcg-guard.ts'
+    $workExtension = Join-Path $h12 '.omp/profiles/work/agent/extensions/dcg-guard.ts'
+    $teamExtension = Join-Path $h12 '.omp/profiles/team/agent/extensions/dcg-guard.ts'
+    $userExtension = Join-Path $h12 '.omp/profiles/personal/agent/extensions/dcg-guard.ts'
+    $repo = Join-Path $h12 'repo'
+    $nested = Join-Path $repo 'a/b'
+    $projectExtension = Join-Path $repo '.omp/extensions/dcg-guard.ts'
+    foreach ($path in @($defaultExtension, $workExtension, $teamExtension, $userExtension, $projectExtension)) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+    }
+    New-Item -ItemType Directory -Force -Path (Join-Path $repo '.git'), $nested | Out-Null
+    foreach ($path in @($defaultExtension, $workExtension, $teamExtension, $projectExtension)) {
+        Set-Content -Path $path -Value '// dcg-omp-extension: generated'
+    }
+    Set-Content -Path $userExtension -Value 'export default function mine() {}'
+
+    Set-Location $nested
+    Check ((Unconfigure-OmpExtension -HomeDir $h12) -eq $true) "OMP: profile/project sweep removed generated extensions"
+    Check (-not (Test-Path $defaultExtension)) "OMP: default extension removed"
+    Check (-not (Test-Path $workExtension)) "OMP: inactive work profile removed"
+    Check (-not (Test-Path $teamExtension)) "OMP: inactive team profile removed"
+    Check (-not (Test-Path $projectExtension)) "OMP: repository-root extension removed from nested cwd"
+    Check (Test-Path $userExtension) "OMP: inactive user-authored extension preserved"
+} finally {
+    Set-Location $savedLocation
+    Remove-Item -Recurse -Force $h12 -ErrorAction SilentlyContinue
+}
+
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
 Write-Host "All uninstall parity tests passed." -ForegroundColor Green

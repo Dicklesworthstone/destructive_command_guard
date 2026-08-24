@@ -23,12 +23,14 @@ $savedGrok = $env:GROK_SESSION_ID
 $savedHermesHome = $env:HERMES_HOME
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedOs = $env:OS
+$savedPiConfigDir = $env:PI_CONFIG_DIR
 try {
     $env:PATH = ''                 # no CLI probing leaks
     $env:GROK_SESSION_ID = $null
     $env:HERMES_HOME = $null       # no Hermes home-resolution leaks (issue #270)
     $env:LOCALAPPDATA = $null
     $env:OS = $null
+    $env:PI_CONFIG_DIR = $null
 
     Write-Host "Test 1: detects only the agents whose config dir is present"
     $h1 = New-TempHome
@@ -82,6 +84,15 @@ try {
     Check (($names1e -join ',') -eq 'Omp') "summary lists only Omp (got '$($names1e -join ',')')"
     Remove-Item -Recurse -Force $h1e -ErrorAction SilentlyContinue
 
+    Write-Host "Test 1f: Oh My Pi detected from PI_CONFIG_DIR"
+    $h1f = New-TempHome
+    $env:PI_CONFIG_DIR = '.custom-omp'
+    New-Item -ItemType Directory -Force -Path (Join-Path $h1f '.custom-omp') | Out-Null
+    $a1f = Detect-Agents -HomeDir $h1f
+    Check ($a1f['Omp'] -eq $true) "Oh My Pi detected via PI_CONFIG_DIR"
+    $env:PI_CONFIG_DIR = $null
+    Remove-Item -Recurse -Force $h1f -ErrorAction SilentlyContinue
+
     Write-Host "Test 2: empty home -> nothing detected"
     $h2 = New-TempHome
     $a2 = Detect-Agents -HomeDir $h2
@@ -125,6 +136,7 @@ try {
     $env:HERMES_HOME = $savedHermesHome
     $env:LOCALAPPDATA = $savedLocalAppData
     $env:OS = $savedOs
+    $env:PI_CONFIG_DIR = $savedPiConfigDir
 }
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
