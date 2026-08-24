@@ -571,8 +571,8 @@ function Get-OmpAgentDir {
   elseif (Test-Path Env:PI_PROFILE) { $profile = $env:PI_PROFILE }
   if ($null -ne $profile) { $profile = $profile.Trim() }
   $validProfile = (-not [string]::IsNullOrEmpty($profile)) -and
-    ($profile -ne 'default') -and ($profile.Length -le 64) -and
-    ($profile -match '^[a-z0-9][a-z0-9._-]*$') -and (-not $profile.EndsWith('.')) -and
+    ($profile -cne 'default') -and ($profile.Length -le 64) -and
+    ($profile -cmatch '^[a-z0-9][a-z0-9._-]*$') -and (-not $profile.EndsWith('.')) -and
     ($profile -notmatch '^(?i:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\.|$)')
   if ($validProfile) {
     return [System.IO.Path]::Combine($configRoot, 'profiles', $profile, 'agent')

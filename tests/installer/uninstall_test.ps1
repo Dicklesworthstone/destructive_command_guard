@@ -551,6 +551,35 @@ Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Env:PI_PROFILE' -Error
 Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Env:PI_CODING_AGENT_DIR' -ErrorAction SilentlyContinue
 $resolved = Get-OmpAgentDir -HomeDir $h18
 Check ([string]::Equals($resolved, $defaultAgent18, [System.StringComparison]::Ordinal)) "OMP: empty override resolves to default agent dir"
+
+Write-Host "Test 19: Oh My Pi profile grammar and presence precedence are exact"
+$customAgent19 = Join-Path $h18 'operator-custom-agent'
+$profileCases19 = @(
+    [pscustomobject]@{ Name = 'both selectors absent'; OmpPresent = $false; Omp = ''; PiPresent = $false; Pi = ''; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'empty legacy selector'; OmpPresent = $false; Omp = ''; PiPresent = $true; Pi = ''; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'whitespace legacy selector'; OmpPresent = $false; Omp = ''; PiPresent = $true; Pi = '  '; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'lowercase legacy default sentinel'; OmpPresent = $false; Omp = ''; PiPresent = $true; Pi = 'default'; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'uppercase legacy default is invalid'; OmpPresent = $false; Omp = ''; PiPresent = $true; Pi = 'DEFAULT'; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'valid lowercase legacy profile'; OmpPresent = $false; Omp = ''; PiPresent = $true; Pi = 'work'; Override = $customAgent19; Expected = $derivedAgent18 },
+    [pscustomobject]@{ Name = 'uppercase legacy profile is invalid'; OmpPresent = $false; Omp = ''; PiPresent = $true; Pi = 'Work'; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'empty modern selector suppresses legacy'; OmpPresent = $true; Omp = ''; PiPresent = $true; Pi = 'work'; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'whitespace modern selector suppresses legacy'; OmpPresent = $true; Omp = '  '; PiPresent = $true; Pi = 'work'; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'lowercase modern default suppresses stale derivation'; OmpPresent = $true; Omp = 'default'; PiPresent = $true; Pi = 'work'; Override = $derivedAgent18; Expected = $defaultAgent18 },
+    [pscustomobject]@{ Name = 'uppercase modern default is invalid'; OmpPresent = $true; Omp = 'DEFAULT'; PiPresent = $true; Pi = 'work'; Override = $derivedAgent18; Expected = $derivedAgent18 },
+    [pscustomobject]@{ Name = 'valid lowercase modern profile'; OmpPresent = $true; Omp = 'work'; PiPresent = $true; Pi = 'other'; Override = $customAgent19; Expected = $derivedAgent18 },
+    [pscustomobject]@{ Name = 'uppercase modern profile is invalid and suppresses legacy'; OmpPresent = $true; Omp = 'Work'; PiPresent = $true; Pi = 'work'; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'invalid modern grammar suppresses legacy'; OmpPresent = $true; Omp = 'invalid/profile'; PiPresent = $true; Pi = 'work'; Override = $customAgent19; Expected = $customAgent19 }
+)
+foreach ($case in $profileCases19) {
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Env:OMP_PROFILE' -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Env:PI_PROFILE' -ErrorAction SilentlyContinue
+    if ($case.OmpPresent) { $env:OMP_PROFILE = $case.Omp }
+    if ($case.PiPresent) { $env:PI_PROFILE = $case.Pi }
+    $env:PI_CODING_AGENT_DIR = $case.Override
+
+    $resolved = Get-OmpAgentDir -HomeDir $h18
+    Check ([string]::Equals($resolved, $case.Expected, [System.StringComparison]::Ordinal)) "OMP: $($case.Name) resolves to '$($case.Expected)' (got '$resolved')"
+}
 } finally {
     foreach ($name in $ompSelectorNames) {
         if ($null -eq $savedOmpSelectors[$name]) {
