@@ -10307,28 +10307,35 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     // dcg at all.
     if omp_appears_in_use() {
         print!("Checking Oh My Pi extension registration... ");
-        if let Some(extension_path) = registered_omp_extension_path() {
-            println!("{}", "OK".green());
-            println!("  Found: {}", extension_path.display());
-        } else if let Err(error) = omp_user_extension_path() {
-            println!("{}", "MISCONFIGURED".red());
-            println!("  {error}");
-            issues += 1;
-            println!("  → Fix or unset PI_CONFIG_DIR, then run 'dcg install --omp'");
-        } else {
-            println!("{}", "NOT REGISTERED".yellow());
-            issues += 1;
-            if fix {
-                println!("  Attempting extension install...");
-                if install_omp_extension(false, false).is_ok() {
-                    println!("  {}", "Fixed!".green());
-                    fixed += 1;
+        match registered_omp_extension_path() {
+            Ok(Some(extension_path)) => {
+                println!("{}", "OK".green());
+                println!("  Found: {}", extension_path.display());
+            }
+            Err(error) => {
+                println!("{}", "MISCONFIGURED".red());
+                println!("  {error}");
+                issues += 1;
+                println!(
+                    "  → Fix or unset OMP_PROFILE, PI_PROFILE, or PI_CONFIG_DIR, then run \
+                     'dcg install --omp'"
+                );
+            }
+            Ok(None) => {
+                println!("{}", "NOT REGISTERED".yellow());
+                issues += 1;
+                if fix {
+                    println!("  Attempting extension install...");
+                    if install_omp_extension(false, false).is_ok() {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    } else {
+                        println!("  {}", "Failed to fix".red());
+                    }
                 } else {
-                    println!("  {}", "Failed to fix".red());
+                    println!("  → Run 'dcg install --omp' to install the native extension");
+                    println!("    (OMP bash commands are NOT guarded until it is installed)");
                 }
-            } else {
-                println!("  → Run 'dcg install --omp' to install the native extension");
-                println!("    (OMP bash commands are NOT guarded until it is installed)");
             }
         }
     }
@@ -11290,33 +11297,35 @@ fn collect_doctor_report(
     // Oh My Pi extension registration. Mirrored in `doctor_pretty` so strict,
     // pretty, and JSON doctor output agree.
     if omp_appears_in_use() {
-        let extension_path = omp_user_extension_path();
         let mut omp_fixed = false;
-        let (status, message, remediation) =
-            if let Some(registered_path) = registered_omp_extension_path() {
-                (
-                    DoctorCheckStatus::Ok,
-                    format!(
-                        "Native Oh My Pi extension found at {}",
-                        registered_path.display()
-                    ),
-                    None,
-                )
-            } else if let Err(error) = &extension_path {
+        let (status, message, remediation) = match registered_omp_extension_path() {
+            Ok(Some(registered_path)) => (
+                DoctorCheckStatus::Ok,
+                format!(
+                    "Native Oh My Pi extension found at {}",
+                    registered_path.display()
+                ),
+                None,
+            ),
+            Err(error) => {
                 issues += 1;
                 (
                     DoctorCheckStatus::Error,
                     format!("Cannot resolve the Oh My Pi extension path: {error}"),
-                    Some("Fix or unset PI_CONFIG_DIR, then run 'dcg install --omp'".to_string()),
+                    Some(
+                        "Fix or unset OMP_PROFILE, PI_PROFILE, or PI_CONFIG_DIR, then run \
+                         'dcg install --omp'"
+                            .to_string(),
+                    ),
                 )
-            } else {
+            }
+            Ok(None) => {
                 issues += 1;
                 if fix && install_omp_extension(false, false).is_ok() {
                     fixed += 1;
                     omp_fixed = true;
-                    let installed_path = extension_path
-                        .as_ref()
-                        .expect("validated OMP extension path before installation");
+                    let installed_path = omp_user_extension_path()
+                        .expect("OMP extension path validated during installation");
                     (
                         DoctorCheckStatus::Ok,
                         format!(
@@ -11334,7 +11343,8 @@ fn collect_doctor_report(
                         Some("Run 'dcg install --omp'".to_string()),
                     )
                 }
-            };
+            }
+        };
         checks.push(DoctorCheck {
             id: "omp_extension",
             name: "Oh My Pi extension registration",
@@ -12303,19 +12313,18 @@ fn opencode_plugin_is_dcg_owned(path: &std::path::Path) -> bool {
 /// uninstallers use it to distinguish dcg-owned output from user code.
 pub(crate) const OMP_EXTENSION_MARKER: &str = "dcg-omp-extension";
 
-/// Normalize an OMP profile name using the OMP v18 profile-name contract.
-/// Empty and `default` select the default profile; invalid names also fall
-/// back to the default, matching OMP's safe module-load behavior.
-fn normalize_omp_profile_name(profile: &str) -> Option<String> {
+/// Normalize a profile name using the upstream OMP profile-name contract.
+/// Empty, whitespace-only, and `default` select the default profile. Invalid
+/// explicit values are errors: OMP's module-load fallback is only a bootstrap
+/// detail, and its CLI re-validates the environment and refuses startup before
+/// writing profile state.
+fn normalize_omp_profile_name(profile: &str) -> std::io::Result<Option<String>> {
     let name = profile.trim();
-    if name.is_empty()
-        || name == "default"
-        || name == "."
-        || name == ".."
-        || name.ends_with('.')
-        || name.len() > 64
-    {
-        return None;
+    if name.is_empty() || name == "default" {
+        return Ok(None);
+    }
+    if name == "." || name == ".." || name.ends_with('.') || name.len() > 64 {
+        return Err(invalid_omp_profile_error(profile));
     }
 
     let mut chars = name.chars();
@@ -12326,7 +12335,7 @@ fn normalize_omp_profile_name(profile: &str) -> Option<String> {
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
     {
-        return None;
+        return Err(invalid_omp_profile_error(profile));
     }
 
     let base = name.split('.').next().unwrap_or(name);
@@ -12335,22 +12344,59 @@ fn normalize_omp_profile_name(profile: &str) -> Option<String> {
         || (upper.len() == 4
             && (upper.starts_with("COM") || upper.starts_with("LPT"))
             && upper.as_bytes()[3].is_ascii_digit());
-    (!reserved).then(|| name.to_string())
+    if reserved {
+        return Err(invalid_omp_profile_error(profile));
+    }
+    Ok(Some(name.to_string()))
+}
+
+fn invalid_omp_profile_error(profile: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "Invalid OMP profile {profile:?}. Profile names must match \
+             ^[a-z0-9][a-z0-9._-]{{0,63}}$, cannot be '.' or '..', cannot end with '.', \
+             and cannot be a Windows reserved device name (CON, PRN, AUX, NUL, COM0-9, \
+             LPT0-9, or any of those with an extension)"
+        ),
+    )
+}
+
+/// Observable state of one OMP profile environment variable. Keeping absence
+/// distinct from an explicit default selection is what preserves the
+/// `OMP_PROFILE`-over-`PI_PROFILE` precedence rule.
+enum OmpProfileEnvValue {
+    Absent,
+    Default,
+    Named(String),
+}
+
+fn omp_profile_env_value(variable: &'static str) -> std::io::Result<OmpProfileEnvValue> {
+    match std::env::var(variable) {
+        Ok(profile) => normalize_omp_profile_name(&profile)
+            .map(|profile| profile.map_or(OmpProfileEnvValue::Default, OmpProfileEnvValue::Named))
+            .map_err(|error| std::io::Error::new(error.kind(), format!("{variable}: {error}"))),
+        Err(std::env::VarError::NotPresent) => Ok(OmpProfileEnvValue::Absent),
+        Err(std::env::VarError::NotUnicode(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{variable} must contain valid Unicode; OMP rejects non-Unicode profile values"
+            ),
+        )),
+    }
 }
 
 /// Resolve OMP's active named profile. `OMP_PROFILE` takes precedence whenever
 /// it is set, including when it is explicitly empty; `PI_PROFILE` is the
 /// legacy fallback used only when `OMP_PROFILE` is absent.
-fn omp_active_profile() -> Option<String> {
-    match std::env::var("OMP_PROFILE") {
-        Ok(profile) => normalize_omp_profile_name(&profile),
-        Err(std::env::VarError::NotPresent) => std::env::var("PI_PROFILE")
-            .ok()
-            .and_then(|profile| normalize_omp_profile_name(&profile)),
-        // Presence still wins precedence. A non-Unicode value cannot satisfy
-        // OMP's ASCII profile-name grammar, but it must not expose the legacy
-        // PI_PROFILE fallback merely because Rust could not decode it.
-        Err(std::env::VarError::NotUnicode(_)) => None,
+fn omp_active_profile() -> std::io::Result<Option<String>> {
+    match omp_profile_env_value("OMP_PROFILE")? {
+        OmpProfileEnvValue::Named(profile) => Ok(Some(profile)),
+        OmpProfileEnvValue::Default => Ok(None),
+        OmpProfileEnvValue::Absent => match omp_profile_env_value("PI_PROFILE")? {
+            OmpProfileEnvValue::Named(profile) => Ok(Some(profile)),
+            OmpProfileEnvValue::Absent | OmpProfileEnvValue::Default => Ok(None),
+        },
     }
 }
 
@@ -12405,7 +12451,7 @@ fn omp_user_agent_dir() -> std::io::Result<std::path::PathBuf> {
     };
     let config_root = omp_config_root_from(&home, &config_name, cfg!(windows))?;
 
-    if let Some(profile) = omp_active_profile() {
+    if let Some(profile) = omp_active_profile()? {
         return Ok(config_root.join("profiles").join(profile).join("agent"));
     }
 
@@ -12534,7 +12580,10 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
 /// Whether this machine plausibly uses OMP. This gates doctor output so users
 /// without OMP are not prompted to install an irrelevant extension.
 fn omp_appears_in_use() -> bool {
-    if std::env::var_os("OMP_PROFILE").is_some() || which_executable("omp").is_some() {
+    if std::env::var_os("OMP_PROFILE").is_some()
+        || std::env::var_os("PI_PROFILE").is_some()
+        || which_executable("omp").is_some()
+    {
         return true;
     }
     let default_root_exists = dirs::home_dir().is_some_and(|home| home.join(".omp").is_dir());
@@ -12554,14 +12603,20 @@ fn omp_extension_is_dcg_owned(path: &std::path::Path) -> bool {
 
 /// A dcg-owned OMP extension loaded by the current project/profile. Doctor must
 /// accept either installation mode instead of always inspecting the user path.
-fn registered_omp_extension_path() -> Option<std::path::PathBuf> {
-    project_omp_extension_path()
+fn registered_omp_extension_path() -> std::io::Result<Option<std::path::PathBuf>> {
+    // Validate the live profile environment before doctor claims that OMP can
+    // start and load either extension. Keep the project-registration fast path
+    // independent of user-path settings that OMP does not need to discover it.
+    let _validated_profile = omp_active_profile()?;
+    if let Some(project_path) = project_omp_extension_path()
         .ok()
         .filter(|path| omp_extension_is_dcg_owned(path))
-        .or_else(|| {
-            let path = omp_user_extension_path().ok()?;
-            omp_extension_is_dcg_owned(&path).then_some(path)
-        })
+    {
+        return Ok(Some(project_path));
+    }
+
+    let user_path = omp_user_extension_path()?;
+    Ok(omp_extension_is_dcg_owned(&user_path).then_some(user_path))
 }
 
 /// Shared doctor verdict for the build-provenance / update-pin check (#320),
@@ -12664,6 +12719,9 @@ fn install_omp_extension(force: bool, project: bool) -> Result<(), Box<dyn std::
     use colored::Colorize;
 
     let extension_path = if project {
+        // Project extension discovery is cwd-only, but OMP still resolves and
+        // validates its active profile before loading any project extension.
+        let _validated_profile = omp_active_profile()?;
         project_omp_extension_path()?
     } else {
         omp_user_extension_path()?
@@ -18684,13 +18742,25 @@ if ($errors.Count -ne 0) {
 
     #[test]
     fn omp_profile_names_follow_upstream_safety_contract() {
-        assert_eq!(normalize_omp_profile_name("work"), Some("work".to_string()));
         assert_eq!(
-            normalize_omp_profile_name("team-1.dev"),
+            normalize_omp_profile_name("work").expect("valid profile"),
+            Some("work".to_string())
+        );
+        assert_eq!(
+            normalize_omp_profile_name(" team-1.dev ").expect("trimmed valid profile"),
             Some("team-1.dev".to_string())
         );
-        for invalid in ["", "default", ".", "..", "Upper", "../escape", "NUL"] {
-            assert_eq!(normalize_omp_profile_name(invalid), None, "{invalid}");
+        for default in ["", "  ", "default", " default "] {
+            assert_eq!(
+                normalize_omp_profile_name(default).expect("default profile sentinel"),
+                None,
+                "{default:?}"
+            );
+        }
+        for invalid in [".", "..", "Upper", "../escape", "NUL", "con.txt", "lpt9"] {
+            let error = normalize_omp_profile_name(invalid)
+                .expect_err("invalid explicit profile must not become the default");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{invalid}");
         }
     }
 

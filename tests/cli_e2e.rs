@@ -1823,6 +1823,7 @@ mod config_tests {
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("PI_CONFIG_DIR", ".custom-omp")
             .env("OMP_PROFILE", "work")
+            .env("PI_PROFILE", "Upper")
             .env("PI_CODING_AGENT_DIR", &ignored_override)
             .current_dir(temp.path())
             .output()
@@ -1858,7 +1859,7 @@ mod config_tests {
             .env("USERPROFILE", &second_home)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("OMP_PROFILE", "")
-            .env("PI_PROFILE", "legacy-profile")
+            .env("PI_PROFILE", "Upper")
             .env("PI_CODING_AGENT_DIR", &explicit_agent_dir)
             .current_dir(temp.path())
             .output()
@@ -1874,9 +1875,64 @@ mod config_tests {
         );
         assert!(
             !second_home
-                .join(".omp/profiles/legacy-profile/agent/extensions/dcg-guard.ts")
+                .join(".omp/profiles/Upper/agent/extensions/dcg-guard.ts")
                 .exists(),
-            "legacy PI_PROFILE must not win when OMP_PROFILE is present"
+            "a losing invalid PI_PROFILE must not be read when OMP_PROFILE is present"
+        );
+
+        let default_home = temp.path().join("default-home");
+        let default_agent_dir = temp.path().join("default-agent-dir");
+        std::fs::create_dir_all(&default_home).expect("default HOME");
+        let explicit_default_profile = Command::new(dcg_binary())
+            .args(["install", "--omp"])
+            .env_clear()
+            .env("HOME", &default_home)
+            .env("USERPROFILE", &default_home)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("OMP_PROFILE", "default")
+            .env("PI_PROFILE", "Upper")
+            .env("PI_CODING_AGENT_DIR", &default_agent_dir)
+            .current_dir(temp.path())
+            .output()
+            .expect("install explicit default OMP profile");
+        assert!(
+            explicit_default_profile.status.success(),
+            "explicit default profile install: {}",
+            String::from_utf8_lossy(&explicit_default_profile.stderr)
+        );
+        assert!(
+            default_agent_dir.join("extensions/dcg-guard.ts").is_file(),
+            "the explicit default sentinel suppresses PI_PROFILE and selects default-profile storage"
+        );
+
+        let legacy_home = temp.path().join("legacy-home");
+        let legacy_override = temp.path().join("ignored-legacy-agent-dir");
+        std::fs::create_dir_all(&legacy_home).expect("legacy HOME");
+        let legacy_fallback = Command::new(dcg_binary())
+            .args(["install", "--omp"])
+            .env_clear()
+            .env("HOME", &legacy_home)
+            .env("USERPROFILE", &legacy_home)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("PI_PROFILE", "legacy-profile")
+            .env("PI_CODING_AGENT_DIR", &legacy_override)
+            .current_dir(temp.path())
+            .output()
+            .expect("install legacy fallback OMP profile");
+        assert!(
+            legacy_fallback.status.success(),
+            "legacy fallback profile install: {}",
+            String::from_utf8_lossy(&legacy_fallback.stderr)
+        );
+        assert!(
+            legacy_home
+                .join(".omp/profiles/legacy-profile/agent/extensions/dcg-guard.ts")
+                .is_file(),
+            "PI_PROFILE selects a named profile only when OMP_PROFILE is absent"
+        );
+        assert!(
+            !legacy_override.join("extensions/dcg-guard.ts").exists(),
+            "a named PI_PROFILE must ignore PI_CODING_AGENT_DIR like a named OMP_PROFILE"
         );
 
         let third_home = temp.path().join("third-home");
@@ -1901,6 +1957,206 @@ mod config_tests {
                 .join("etc/omp-cfg/agent/extensions/dcg-guard.ts")
                 .is_file(),
             "Node path.join parity keeps an absolute-looking PI_CONFIG_DIR under HOME"
+        );
+    }
+
+    #[test]
+    fn install_omp_rejects_invalid_explicit_profiles_without_writing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
+        let explicit_agent_dir = temp.path().join("explicit-agent-dir");
+
+        let invalid_winner = Command::new(dcg_binary())
+            .args(["install", "--omp"])
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("OMP_PROFILE", "..")
+            .env("PI_PROFILE", "valid-fallback")
+            .env("PI_CODING_AGENT_DIR", &explicit_agent_dir)
+            .current_dir(temp.path())
+            .output()
+            .expect("reject invalid winning OMP_PROFILE");
+        assert!(
+            !invalid_winner.status.success(),
+            "OMP rejects the same invalid explicit profile at startup"
+        );
+        let stderr = String::from_utf8_lossy(&invalid_winner.stderr);
+        assert!(
+            stderr.contains("OMP_PROFILE") && stderr.contains("Invalid OMP profile"),
+            "diagnostic must identify the winning invalid variable: {stderr}"
+        );
+        assert!(
+            !explicit_agent_dir.join("extensions/dcg-guard.ts").exists(),
+            "invalid OMP_PROFILE must not silently write through PI_CODING_AGENT_DIR"
+        );
+        assert!(
+            !home_dir
+                .join(".omp/profiles/valid-fallback/agent/extensions/dcg-guard.ts")
+                .exists(),
+            "OMP_PROFILE presence must still suppress PI_PROFILE fallback"
+        );
+        assert!(
+            !home_dir.join(".omp/agent/extensions/dcg-guard.ts").exists(),
+            "invalid OMP_PROFILE must not collapse to the default profile"
+        );
+
+        let project_cwd = temp.path().join("project-with-invalid-profile");
+        std::fs::create_dir_all(&project_cwd).expect("project cwd");
+        let invalid_legacy = Command::new(dcg_binary())
+            .args(["install", "--omp", "--project"])
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("PI_PROFILE", "Upper")
+            .current_dir(&project_cwd)
+            .output()
+            .expect("reject invalid PI_PROFILE for project install");
+        assert!(
+            !invalid_legacy.status.success(),
+            "project installation cannot be healthy when OMP itself rejects startup"
+        );
+        let stderr = String::from_utf8_lossy(&invalid_legacy.stderr);
+        assert!(
+            stderr.contains("PI_PROFILE") && stderr.contains("Invalid OMP profile"),
+            "legacy-source diagnostic must name PI_PROFILE: {stderr}"
+        );
+        assert!(
+            !project_cwd.join(".omp/extensions/dcg-guard.ts").exists(),
+            "invalid PI_PROFILE must fail before a project extension write"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_omp_rejects_non_unicode_winning_profile_without_writing() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
+        let explicit_agent_dir = temp.path().join("explicit-agent-dir");
+        let invalid = std::ffi::OsString::from_vec(b"work-\xff".to_vec());
+
+        let output = Command::new(dcg_binary())
+            .args(["install", "--omp"])
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("OMP_PROFILE", invalid)
+            .env("PI_PROFILE", "valid-fallback")
+            .env("PI_CODING_AGENT_DIR", &explicit_agent_dir)
+            .current_dir(temp.path())
+            .output()
+            .expect("reject non-Unicode winning OMP_PROFILE");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("OMP_PROFILE") && stderr.contains("valid Unicode"),
+            "non-Unicode diagnostic must identify the winning variable: {stderr}"
+        );
+        assert!(
+            !explicit_agent_dir.join("extensions/dcg-guard.ts").exists(),
+            "non-Unicode OMP_PROFILE must not collapse to the agent-dir override"
+        );
+        assert!(
+            !home_dir
+                .join(".omp/profiles/valid-fallback/agent/extensions/dcg-guard.ts")
+                .exists(),
+            "a non-Unicode winning variable must not expose PI_PROFILE fallback"
+        );
+        assert!(
+            !home_dir.join(".omp/agent/extensions/dcg-guard.ts").exists(),
+            "non-Unicode OMP_PROFILE must not collapse to the default profile"
+        );
+    }
+
+    #[test]
+    fn doctor_rejects_invalid_profile_even_with_a_project_extension() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, bin_dir) = setup_doctor_env(&temp);
+        let extension = temp.path().join(".omp/extensions/dcg-guard.ts");
+        std::fs::create_dir_all(extension.parent().expect("extension parent"))
+            .expect("project OMP extension directory");
+        let original = b"// dcg-omp-extension: generated\n";
+        std::fs::write(&extension, original).expect("project OMP extension");
+
+        let output = Command::new(dcg_binary())
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("PATH", &bin_dir)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .env("OMP_PROFILE", "../escape")
+            .env("PI_PROFILE", "valid-fallback")
+            .current_dir(temp.path())
+            .args(["doctor", "--format", "json", "--strict"])
+            .output()
+            .expect("run strict doctor with invalid OMP profile");
+        assert!(
+            !output.status.success(),
+            "a marker alone cannot make an OMP-invalid environment healthy"
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("doctor JSON output");
+        let omp_check = report["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|check| check["id"] == "omp_extension")
+            .expect("OMP doctor check");
+        assert_eq!(omp_check["status"], "error");
+        assert!(
+            omp_check["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("OMP_PROFILE")),
+            "doctor must report the invalid winning variable: {omp_check}"
+        );
+        assert_eq!(
+            std::fs::read(&extension).expect("read project extension after doctor"),
+            original,
+            "read-only doctor must preserve the existing extension byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_invalid_legacy_profile_without_other_omp_signals() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, bin_dir) = setup_doctor_env(&temp);
+
+        let output = Command::new(dcg_binary())
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("PATH", &bin_dir)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .env("PI_PROFILE", "Upper")
+            .current_dir(temp.path())
+            .args(["doctor", "--format", "json", "--strict"])
+            .output()
+            .expect("run strict doctor with only an invalid legacy profile signal");
+        assert!(
+            !output.status.success(),
+            "invalid PI_PROFILE must not disappear merely because no OMP binary or config root is visible"
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("doctor JSON output");
+        let omp_check = report["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|check| check["id"] == "omp_extension")
+            .expect("PI_PROFILE presence must trigger the OMP doctor check");
+        assert_eq!(omp_check["status"], "error");
+        assert!(
+            omp_check["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("PI_PROFILE")),
+            "doctor must identify the invalid legacy variable: {omp_check}"
         );
     }
 
