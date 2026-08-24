@@ -12493,7 +12493,7 @@ fn build_omp_extension_source(executable: &std::path::Path) -> std::io::Result<S
 // before execution. Docs: https://github.com/Dicklesworthstone/destructive_command_guard
 import type {{ ExtensionAPI }} from "@oh-my-pi/pi-coding-agent";
 import {{ settings }} from "@oh-my-pi/pi-coding-agent/config/settings";
-import {{ isCmdShell, isPowerShell }} from "@oh-my-pi/pi-utils/procmgr";
+import {{ procmgr }} from "@oh-my-pi/pi-utils";
 import {{ resolveToCwd }} from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import {{ extractLeadingCdTarget }} from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 
@@ -12541,7 +12541,7 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
     if (usesLocalPty) {{
       try {{
         const shell = settings.getShellConfig().shell;
-        shellDialect = isCmdShell(shell) ? "cmd" : isPowerShell(shell) ? "ps" : "posix";
+        shellDialect = procmgr.isCmdShell(shell) ? "cmd" : procmgr.isPowerShell(shell) ? "ps" : "posix";
       }} catch (err) {{
         return {{
           block: true,
@@ -18770,21 +18770,16 @@ if ($errors.Count -ne 0) {
                 "import { settings } from \"@oh-my-pi/pi-coding-agent/config/settings\";"
             )
         );
-        assert!(
-            source.contains(
-                "import { isCmdShell, isPowerShell } from \"@oh-my-pi/pi-utils/procmgr\";"
-            )
-        );
+        assert!(source.contains("import { procmgr } from \"@oh-my-pi/pi-utils\";"));
         assert!(
             source.contains("command?: unknown; cwd?: unknown; async?: unknown; pty?: unknown")
         );
         assert!(source.contains(
             "toolInput?.pty === true && toolInput?.async !== true && ctx.hasUI && process.env.PI_NO_PTY !== \"1\""
         ));
-        assert!(
-            source
-                .contains("isCmdShell(shell) ? \"cmd\" : isPowerShell(shell) ? \"ps\" : \"posix\"")
-        );
+        assert!(source.contains(
+            "procmgr.isCmdShell(shell) ? \"cmd\" : procmgr.isPowerShell(shell) ? \"ps\" : \"posix\""
+        ));
         assert!(source.contains("settings.getShellConfig().shell"));
         assert!(source.contains("\"--dialect\", shellDialect"));
         assert!(
