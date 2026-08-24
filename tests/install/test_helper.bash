@@ -148,14 +148,17 @@ teardown_isolated_home() {
             may_remove_fixture=0
         fi
     fi
+    # Tests deliberately replace PATH to exercise missing-tool branches. Restore
+    # the harness capability before invoking rm, or teardown itself can lose the
+    # command it needs to clean its own bounded fixture.
+    if [[ -n "${ORIGINAL_PATH:-}" ]]; then
+        export PATH="$ORIGINAL_PATH"
+    fi
     if [[ "$may_remove_fixture" -eq 1 && -n "${TEST_TMPDIR:-}" && -d "${TEST_TMPDIR:-}" ]]; then
         rm -rf "$TEST_TMPDIR" || teardown_status=1
     fi
     if [[ -n "${ORIGINAL_HOME:-}" ]]; then
         export HOME="$ORIGINAL_HOME"
-    fi
-    if [[ -n "${ORIGINAL_PATH:-}" ]]; then
-        export PATH="$ORIGINAL_PATH"
     fi
 
     if [[ "${DCG_TEST_SAVED_OMP_PROFILE_SET:-}" = "x" ]]; then
