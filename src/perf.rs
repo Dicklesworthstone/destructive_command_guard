@@ -411,9 +411,7 @@ mod tests {
         );
         assert!(
             gate_step.contains("\"$BUDGET_MS\" -le 0")
-                && gate_step.contains(
-                    "HOOK_EVALUATION_BUDGET_MS must be one positive integer"
-                ),
+                && gate_step.contains("HOOK_EVALUATION_BUDGET_MS must be one positive integer"),
             "zero must be rejected as an invalid shipped budget, not interpreted \
              by the Python harness as a disabled gate"
         );
@@ -535,12 +533,7 @@ mod tests {
                 "build.rs lost required rustc identity field {required_builder_call}"
             );
         }
-        for stable_label in [
-            "Rustc release",
-            "Rustc commit",
-            "Rustc date",
-            "Rustc host",
-        ] {
+        for stable_label in ["Rustc release", "Rustc commit", "Rustc date", "Rustc host"] {
             assert!(
                 main_source.contains(stable_label),
                 "dcg --version lost stable compiler label {stable_label}"
@@ -589,7 +582,8 @@ mod tests {
             .expect("harness matrix must retain its private OMP bridge assertion");
         assert!(
             omp_case.contains("--robot test --stdin")
-                && omp_case.contains("--agent omp --dialect posix --format json --omp-bridge-output")
+                && omp_case
+                    .contains("--agent omp --dialect posix --format json --omp-bridge-output")
                 && omp_case.contains("expected_stdout")
                 && omp_case.contains("stdout_bytes"),
             "OMP matrix must assert exact argv, compact bytes, exit status, and streams"
