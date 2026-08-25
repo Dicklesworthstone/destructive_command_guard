@@ -12774,6 +12774,8 @@ import {{ procmgr }} from "@oh-my-pi/pi-utils";
 import {{ resolveToCwd }} from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import {{ extractLeadingCdTarget }} from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 
+// This marker-owned install artifact binds the guard to the exact dcg binary
+// selected by the installer. Ambient environment must not redirect it.
 const DCG_BIN = {path_literal};
 const DCG_CHILD_TIMEOUT_MS = {OMP_CHILD_EVALUATION_TIMEOUT_MS};
 type DcgChildOutcome = "spawn-throw" | "exit-0" | "exit-1" | "exit-2" | "exit-other";
@@ -12922,7 +12924,7 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
     let exitCode;
     try {{
       const proc = Bun.spawn([
-        process.env.DCG_BIN || DCG_BIN,
+        DCG_BIN,
         "--robot", "test", "--stdin", "--agent", "omp", "--dialect", shellDialect,
       ], {{
         cwd: commandCwd,
@@ -19381,6 +19383,14 @@ if ($errors.Count -ne 0) {
         let parsed: String = serde_json::from_str(literal).expect("valid JSON string literal");
         assert_eq!(std::path::Path::new(&parsed), executable);
         assert_ne!(parsed, "dcg", "never a bare PATH lookup");
+        assert!(
+            source.contains("const proc = Bun.spawn([\n        DCG_BIN,"),
+            "the installed absolute executable must be the direct child capability"
+        );
+        assert!(
+            !source.contains("process.env.DCG_BIN"),
+            "ambient environment must not redirect the marker-owned OMP guard"
+        );
     }
 
     /// OMP must not wait forever when the evaluator process wedges. The
@@ -19978,7 +19988,7 @@ console.log(JSON.stringify({
         std::process::Command::new(bun)
             .args(["run", "./runner.ts"])
             .current_dir(root)
-            .env_remove("DCG_BIN")
+            .env("DCG_BIN", root.join("ambient-decoy-dcg"))
             .env_remove("PI_NO_PTY")
             .output()
             .expect("launch Bun OMP bridge replay")

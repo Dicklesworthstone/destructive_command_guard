@@ -54,11 +54,14 @@ from that same directory.
 
 The extension uses OMP's pre-execution `tool_call` event and sends each `bash`
 command to `dcg --robot test --stdin --agent omp` with the dialect selected by
-OMP's execution route. Ordinary and managed-async calls use OMP's embedded
-Brush shell and pass `--dialect posix`, including on native Windows. An eligible
-local `pty: true` call instead maps OMP's configured external shell to
-`--dialect posix`, `cmd`, or `ps`; `PI_NO_PTY=1` disables that PTY route. A dcg
-deny, ask, or indeterminate result returns `{ block: true, reason }` to OMP.
+OMP's execution route. The embedded install-time absolute dcg path is
+authoritative: ambient `DCG_BIN` cannot redirect the marker-owned guard; rerun
+`dcg install --omp --force` after moving the binary. Ordinary and managed-async
+calls use OMP's embedded Brush shell and pass `--dialect posix`, including on
+native Windows. An eligible local `pty: true` call instead maps OMP's
+configured external shell to `--dialect posix`, `cmd`, or `ps`; `PI_NO_PTY=1`
+disables that PTY route. A dcg deny, ask, or indeterminate result returns
+`{ block: true, reason }` to OMP.
 Because the bridge supplies `--agent omp` explicitly, OMP remains distinct from
 legacy Pi even when OMP exposes Pi-family compatibility variables. The
 canonical profile key is `agents.omp`; `oh-my-pi` is accepted as an alias.
