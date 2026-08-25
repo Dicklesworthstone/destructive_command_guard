@@ -1207,12 +1207,11 @@ resolve_omp_uninstall_config_root() {
     printf '%s\n' "$result"
 }
 
-unconfigure_omp() {
-    # Oh My Pi extension: remove only marker-owned files. Cover the active
-    # profile, every named profile under the default/current config roots, the
-    # legacy agent-dir override, and the current working directory's project
-    # install. OMP's native extension discovery is cwd-only; it does not walk
-    # to a Git ancestor.
+collect_omp_uninstall_extensions() {
+    # Keep pre-confirmation inventory and post-confirmation cleanup on one
+    # candidate authority. Cleanup still re-checks every ownership marker after
+    # confirmation, so a file changed between the two phases is never removed
+    # based on stale inventory.
     local config_root
     config_root=$(resolve_omp_uninstall_config_root)
     local agent_dir="$config_root/agent"
@@ -1256,16 +1255,16 @@ unconfigure_omp() {
         agent_dir="$agent_dir_override"
     fi
 
-    local removed=0
-    local failed=0
-    local -a extensions=(
+    OMP_UNINSTALL_ENUMERATION_FAILED=0
+    OMP_UNINSTALL_FAILED_PROFILE_ROOTS=()
+    OMP_UNINSTALL_EXTENSIONS=(
         "$agent_dir/extensions/dcg-guard.ts"
         "$config_root/agent/extensions/dcg-guard.ts"
         "$HOME/.omp/agent/extensions/dcg-guard.ts"
         ".omp/extensions/dcg-guard.ts"
     )
     if [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
-        extensions+=("$PI_CODING_AGENT_DIR/extensions/dcg-guard.ts")
+        OMP_UNINSTALL_EXTENSIONS+=("$PI_CODING_AGENT_DIR/extensions/dcg-guard.ts")
     fi
     local -a profile_roots=(
         "$HOME/.omp/profiles"
@@ -1290,21 +1289,97 @@ unconfigure_omp() {
 
         if ! find "$profiles_root" -mindepth 1 -maxdepth 1 -type d -print \
             >/dev/null 2>&1; then
-            failed=1
-            warn "Could not inspect Oh My Pi profiles under $profiles_root"
+            OMP_UNINSTALL_ENUMERATION_FAILED=1
+            OMP_UNINSTALL_FAILED_PROFILE_ROOTS+=("$profiles_root")
             continue
         fi
         for profile_agent_dir in "$profiles_root"/*/agent; do
             [ -d "$profile_agent_dir" ] || continue
-            extensions+=("$profile_agent_dir/extensions/dcg-guard.ts")
+            OMP_UNINSTALL_EXTENSIONS+=("$profile_agent_dir/extensions/dcg-guard.ts")
         done
     done
+}
 
+inspect_omp_uninstall_extensions() {
+    # Populate the owned-candidate array without flattening paths through a
+    # newline-delimited command-substitution channel. Status 1 means no owned
+    # extension; status 2 means the inventory was incomplete and must not be
+    # described as "nothing to remove".
+    collect_omp_uninstall_extensions
+
+    OMP_UNINSTALL_OWNED_EXTENSIONS=()
     local -a seen_extensions=()
     local extension
     local seen_extension
     local grep_status
-    for extension in ${extensions[@]+"${extensions[@]}"}; do
+    local duplicate
+    local found=0
+    local failed="$OMP_UNINSTALL_ENUMERATION_FAILED"
+    for extension in ${OMP_UNINSTALL_EXTENSIONS[@]+"${OMP_UNINSTALL_EXTENSIONS[@]}"}; do
+        duplicate=0
+        for seen_extension in ${seen_extensions[@]+"${seen_extensions[@]}"}; do
+            if [ "$extension" = "$seen_extension" ]; then
+                duplicate=1
+                break
+            fi
+        done
+        [ "$duplicate" -eq 0 ] || continue
+        seen_extensions+=("$extension")
+
+        [ -f "$extension" ] || continue
+        if grep -q -- 'dcg-omp-extension' "$extension" 2>/dev/null; then
+            OMP_UNINSTALL_OWNED_EXTENSIONS+=("$extension")
+            found=1
+        else
+            grep_status=$?
+            if [ "$grep_status" -gt 1 ]; then
+                failed=1
+            fi
+        fi
+    done
+    [ "$failed" -eq 0 ] || return 2
+    [ "$found" -eq 1 ] || return 1
+    return 0
+}
+
+report_omp_uninstall_inventory() {
+    local status
+    if inspect_omp_uninstall_extensions; then
+        status=0
+    else
+        status=$?
+    fi
+
+    local extension
+    for extension in ${OMP_UNINSTALL_OWNED_EXTENSIONS[@]+"${OMP_UNINSTALL_OWNED_EXTENSIONS[@]}"}; do
+        log "  • Oh My Pi extension ($extension)"
+    done
+    if [ "$status" -eq 2 ]; then
+        warn "Oh My Pi extension inventory is incomplete; ownership will be rechecked before removal"
+    fi
+    return "$status"
+}
+
+unconfigure_omp() {
+    # Oh My Pi extension: remove only marker-owned files. Cover the active
+    # profile, every named profile under the default/current config roots, the
+    # legacy agent-dir override, and the current working directory's project
+    # install. OMP's native extension discovery is cwd-only; it does not walk
+    # to a Git ancestor.
+    collect_omp_uninstall_extensions
+
+    local removed=0
+    local failed="$OMP_UNINSTALL_ENUMERATION_FAILED"
+    local failed_profile_root
+    for failed_profile_root in ${OMP_UNINSTALL_FAILED_PROFILE_ROOTS[@]+"${OMP_UNINSTALL_FAILED_PROFILE_ROOTS[@]}"}; do
+        warn "Could not inspect Oh My Pi profiles under $failed_profile_root"
+    done
+    local -a seen_extensions=()
+    local extension
+    local seen_extension
+    local grep_status
+    local duplicate
+    for extension in ${OMP_UNINSTALL_EXTENSIONS[@]+"${OMP_UNINSTALL_EXTENSIONS[@]}"}; do
         duplicate=0
         for seen_extension in ${seen_extensions[@]+"${seen_extensions[@]}"}; do
             if [ "$extension" = "$seen_extension" ]; then
@@ -1465,6 +1540,15 @@ main() {
     if json_settings_has_dcg_command_hook "$posit_assistant_settings" "PreToolUse"; then
         log "  • Posit Assistant hook ($posit_assistant_settings)"
         found_anything=1
+    fi
+    local omp_inventory_status
+    if report_omp_uninstall_inventory; then
+        found_anything=1
+    else
+        omp_inventory_status=$?
+        # An incomplete inventory is actionable: continue to confirmation so
+        # cleanup can re-enumerate and report precise marker/removal failures.
+        [ "$omp_inventory_status" -ne 2 ] || found_anything=1
     fi
 
     # Config

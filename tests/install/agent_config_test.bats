@@ -4199,6 +4199,71 @@ MOCKEOF
     cmp -s "$user_snapshot" "$user_extension"
 }
 
+@test "OMP pre-confirmation inventory discloses every marker-owned cleanup scope without mutation" {
+    QUIET=0
+    export PI_CONFIG_DIR=".custom-omp"
+    export OMP_PROFILE="work"
+    export PI_CODING_AGENT_DIR="$TEST_TMPDIR/raw-omp-agent"
+    local -a extensions=(
+        "$HOME/.custom-omp/profiles/work/agent/extensions/dcg-guard.ts"
+        "$HOME/.custom-omp/agent/extensions/dcg-guard.ts"
+        "$HOME/.omp/agent/extensions/dcg-guard.ts"
+        "$HOME/.omp/profiles/default-inactive/agent/extensions/dcg-guard.ts"
+        "$HOME/.custom-omp/profiles/custom-inactive/agent/extensions/dcg-guard.ts"
+        "$PI_CODING_AGENT_DIR/extensions/dcg-guard.ts"
+        "$PWD/.omp/extensions/dcg-guard.ts"
+    )
+    local extension
+    for extension in "${extensions[@]}"; do
+        mkdir -p "$(dirname "$extension")"
+        printf '// dcg-omp-extension: generated\n' > "$extension"
+    done
+
+    run report_omp_uninstall_inventory
+
+    [ "$status" -eq 0 ]
+    for extension in "${extensions[@]}"; do
+        [[ "$output" == *"Oh My Pi extension ($extension)"* ]]
+        [ -f "$extension" ]
+        grep -Fxq '// dcg-omp-extension: generated' "$extension"
+    done
+}
+
+@test "OMP pre-confirmation inventory preserves and omits a near-marker user extension" {
+    QUIET=0
+    local extension="$HOME/.omp/agent/extensions/dcg-guard.ts"
+    local snapshot="$TEST_TMPDIR/dcg-guard.user.ts"
+    mkdir -p "$(dirname "$extension")"
+    printf '// DCG-OMP-EXTENSION: belongs to the user\nexport default function mine() {}\n' > "$extension"
+    cp "$extension" "$snapshot"
+
+    run report_omp_uninstall_inventory
+
+    [ "$status" -eq 1 ]
+    [[ "$output" != *"Oh My Pi extension"* ]]
+    cmp -s "$snapshot" "$extension"
+}
+
+@test "OMP pre-confirmation inventory surfaces incomplete profile enumeration" {
+    QUIET=0
+    local profiles_root="$HOME/.omp/profiles"
+    local extension="$profiles_root/work/agent/extensions/dcg-guard.ts"
+    mkdir -p "$(dirname "$extension")"
+    printf '// dcg-omp-extension: generated\n' > "$extension"
+    find() {
+        [ "${1:-}" != "$profiles_root" ] || return 1
+        command find "$@"
+    }
+
+    run report_omp_uninstall_inventory
+    unset -f find
+
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"Oh My Pi extension inventory is incomplete"* ]]
+    [[ "$output" != *"Nothing to remove"* ]]
+    [ -f "$extension" ]
+}
+
 @test "unconfigure_omp: removes marker-owned extension only" {
     extract_uninstall_functions
     mkdir -p "$HOME/.omp/agent/extensions"
