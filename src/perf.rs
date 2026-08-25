@@ -381,6 +381,11 @@ mod tests {
     /// fails rather than silently re-opening the hole.
     #[test]
     fn ci_enforces_absolute_latency_gate_against_shipped_budget() {
+        assert!(
+            HOOK_EVALUATION_BUDGET_MS > 0,
+            "the shipped hook budget must remain positive so gate mode cannot \
+             collapse into a disabled sentinel"
+        );
         let ci = include_str!("../.github/workflows/ci.yml");
 
         let gate_step = ci
@@ -403,6 +408,14 @@ mod tests {
             gate_step.contains("--assert-budget-ms \"$BUDGET_MS\""),
             "the same absolute gate step must pass its derived BUDGET_MS to \
              scripts/perf_baseline.py"
+        );
+        assert!(
+            gate_step.contains("\"$BUDGET_MS\" -le 0")
+                && gate_step.contains(
+                    "HOOK_EVALUATION_BUDGET_MS must be one positive integer"
+                ),
+            "zero must be rejected as an invalid shipped budget, not interpreted \
+             by the Python harness as a disabled gate"
         );
         assert!(
             gate_step.contains("LATENCY_ARTIFACT_DIR=\"$RUNNER_TEMP/dcg-perf-latency\"")
@@ -438,8 +451,9 @@ mod tests {
         assert!(
             artifact_step.contains("if: always()")
                 && artifact_step
-                    .contains("path: ${{ runner.temp }}/dcg-perf-latency/perf-latency-gate.json"),
-            "CI must retain perf-latency-gate.json on both pass and failure"
+                    .contains("path: ${{ runner.temp }}/dcg-perf-latency/perf-latency-gate.json")
+                && artifact_step.contains("if-no-files-found: error"),
+            "CI must require and retain perf-latency-gate.json on both pass and failure"
         );
 
         let relative_step = ci
@@ -451,9 +465,13 @@ mod tests {
             relative_step.contains("PERF_ARTIFACT_DIR=\"$RUNNER_TEMP/dcg-perf-relative\"")
                 && relative_step.contains("CURRENT_JSON=\"$PERF_ARTIFACT_DIR/perf-current.json\"")
                 && relative_step
-                    .contains("REPORT_MD=\"$PERF_ARTIFACT_DIR/perf-regression-report.md\""),
+                    .contains("REPORT_MD=\"$PERF_ARTIFACT_DIR/perf-regression-report.md\"")
+                && relative_step.contains("parse_constant=reject_non_finite_json_constant")
+                && relative_step.contains("math.isfinite(numeric)")
+                && relative_step.contains("required_baseline_case_ids"),
             "relative perf artifacts must stay outside the checkout so they do not \
-             make the following binary/source binding check fail"
+             make the following binary/source binding check fail, and malformed \
+             or vacuous baseline metrics must fail closed"
         );
 
         let matrix_step = ci
@@ -495,6 +513,86 @@ mod tests {
                 && classifier.contains("status = \"verified_exact_git_sha\"")
                 && classifier.contains("\"verified\": status == \"verified_exact_git_sha\""),
             "source binding must reject differing full SHAs even when descriptions match"
+        );
+    }
+
+    /// A certificate must identify the compiler that produced the binary, not
+    /// whichever rustup proxy is visible under its isolated measurement HOME.
+    #[test]
+    fn latency_certificate_binds_native_build_toolchain_and_retains_failures() {
+        let build_script = include_str!("../build.rs");
+        let main_source = include_str!("main.rs");
+        let harness = include_str!("../scripts/perf_baseline.py");
+
+        for required_builder_call in [
+            ".semver(true)",
+            ".commit_hash(true)",
+            ".commit_date(true)",
+            ".host_triple(true)",
+        ] {
+            assert!(
+                build_script.contains(required_builder_call),
+                "build.rs lost required rustc identity field {required_builder_call}"
+            );
+        }
+        for stable_label in [
+            "Rustc release",
+            "Rustc commit",
+            "Rustc date",
+            "Rustc host",
+        ] {
+            assert!(
+                main_source.contains(stable_label),
+                "dcg --version lost stable compiler label {stable_label}"
+            );
+        }
+
+        let classifier = harness
+            .split("def classify_toolchain_binding(")
+            .nth(1)
+            .and_then(|rest| rest.split("\ndef classify_source_binding(").next())
+            .expect("perf harness must retain its compiler-binding classifier");
+        assert!(
+            classifier.contains("invalid_rustc_identity_fields")
+                && classifier.contains("status = \"verified_exact_rustc_vv\"")
+                && classifier.contains("embedded[field] != observed[field]"),
+            "compiler binding must reject malformed or unequal identities before \
+             certifying exact rustc -vV equality"
+        );
+        assert!(
+            harness.contains("PERF_ARTIFACT_SCHEMA_VERSION = 4")
+                && harness.contains("gate_enabled = args.assert_budget_ms is not None")
+                && harness.contains("def run_guarded_entrypoint(")
+                && harness.contains("abort_emitter("),
+            "certificate schema, explicit gate sentinel, or emergency ERROR \
+             artifact retention regressed"
+        );
+        assert!(
+            harness.contains("REQUIRED_ABSOLUTE_GATE_CASE_IDS")
+                && harness.contains("absolute gate case contract is missing required ids")
+                && harness.contains("PERF_HOOK_AGENT = \"claude-code\"")
+                && harness.contains("[bin_path, \"--agent\", PERF_HOOK_AGENT]"),
+            "the absolute gate must not pass an empty or bypass-only case set, \
+             or infer a variable agent profile from process ancestry"
+        );
+    }
+
+    /// OMP's installed extension consumes a compact private robot envelope.
+    /// Testing the ordinary robot schema does not certify that callback seam.
+    #[test]
+    fn harness_matrix_uses_exact_omp_bridge_protocol() {
+        let harness = include_str!("../scripts/e2e_harness_matrix.sh");
+        let omp_case = harness
+            .split("assert_omp_bridge_case()")
+            .nth(1)
+            .and_then(|rest| rest.split("assert_omp_agent_attribution() {").next())
+            .expect("harness matrix must retain its private OMP bridge assertion");
+        assert!(
+            omp_case.contains("--robot test --stdin")
+                && omp_case.contains("--agent omp --dialect posix --format json --omp-bridge-output")
+                && omp_case.contains("expected_stdout")
+                && omp_case.contains("stdout_bytes"),
+            "OMP matrix must assert exact argv, compact bytes, exit status, and streams"
         );
     }
 

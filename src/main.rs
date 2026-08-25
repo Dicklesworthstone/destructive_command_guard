@@ -61,6 +61,9 @@ use std::time::{Duration, Instant};
 const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TIMESTAMP: Option<&str> = option_env!("VERGEN_BUILD_TIMESTAMP");
 const RUSTC_SEMVER: Option<&str> = option_env!("VERGEN_RUSTC_SEMVER");
+const RUSTC_COMMIT_HASH: Option<&str> = option_env!("VERGEN_RUSTC_COMMIT_HASH");
+const RUSTC_COMMIT_DATE: Option<&str> = option_env!("VERGEN_RUSTC_COMMIT_DATE");
+const RUSTC_HOST_TRIPLE: Option<&str> = option_env!("VERGEN_RUSTC_HOST_TRIPLE");
 const CARGO_TARGET: Option<&str> = option_env!("VERGEN_CARGO_TARGET_TRIPLE");
 // Git provenance (#320): `git describe --tags --dirty` at build time. Absent
 // (or the vergen placeholder) outside a git checkout.
@@ -1366,6 +1369,21 @@ fn print_version() {
             rustc.white(),
             "│".bright_black()
         );
+    }
+    // Stable compiler identity lines bind reproducibility tooling to the
+    // compiler that built this binary, rather than whichever rustc happens to
+    // be installed when the binary is later measured.
+    for (label, value) in [
+        ("Rustc release", RUSTC_SEMVER),
+        ("Rustc commit", RUSTC_COMMIT_HASH),
+        ("Rustc date", RUSTC_COMMIT_DATE),
+        ("Rustc host", RUSTC_HOST_TRIPLE),
+    ] {
+        if let Some(value) = value {
+            if !value.is_empty() && value != "VERGEN_IDEMPOTENT_OUTPUT" {
+                eprintln!("{label}: {value}");
+            }
+        }
     }
     if let Some(target) = CARGO_TARGET {
         eprintln!(

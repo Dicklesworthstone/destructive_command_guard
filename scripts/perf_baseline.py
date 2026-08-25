@@ -12,23 +12,48 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import math
 import os
 import platform
 import re
+import shutil
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, TextIO, Tuple
 
 
 PROCESS_BACKSTOP_SECONDS = 30.0
 TAIL_COVERAGE_PCT = 95
 TAIL_CONFIDENCE_PCT = 95
 MIN_TOLERANCE_SAMPLES = 59
+PERF_ARTIFACT_SCHEMA_VERSION = 4
+PERF_HOOK_AGENT = "claude-code"
+REQUIRED_ABSOLUTE_GATE_CASE_IDS = (
+    "quick_reject",
+    "safe_keyword",
+    "destructive_keyword",
+    "heredoc_inline",
+    "full_eval_redirect",
+    "full_eval_copy",
+    "posix_test_probe",
+    "xargs_fixed_template",
+    "multi_construct_245",
+)
+
+# Populated immediately after argument parsing so an unexpected exception can
+# still leave a self-contained ERROR certificate for an explicitly requested
+# gate. It deliberately contains only CLI values, never measured state.
+_UNCAUGHT_GATE_CONTEXT: Dict[str, Any] = {
+    "requested": False,
+    "output_path": None,
+    "supplied_budget_ms": None,
+    "margin_pct": 50,
+}
 
 
 def sha256_file(path: str) -> str:
@@ -37,6 +62,24 @@ def sha256_file(path: str) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def capture_host_context() -> Dict[str, Any]:
+    """Capture coarse host/load context without claiming benchmark control."""
+    try:
+        load_average = list(os.getloadavg())
+    except (AttributeError, OSError):
+        load_average = None
+    return {
+        "node": platform.node(),
+        "os": platform.system(),
+        "release": platform.release(),
+        "arch": platform.machine(),
+        "processor": platform.processor() or None,
+        "cpu_count": os.cpu_count(),
+        "python": platform.python_version(),
+        "load_average_1m_5m_15m": load_average,
+    }
 
 
 def run_one(
@@ -49,7 +92,7 @@ def run_one(
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}).encode()
     start = time.perf_counter_ns()
     result = subprocess.run(
-        [bin_path],
+        [bin_path, "--agent", PERF_HOOK_AGENT],
         input=payload,
         capture_output=True,
         check=False,
@@ -72,7 +115,7 @@ def measure_max_rss_kb(
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}).encode()
     try:
         result = subprocess.run(
-            ["/usr/bin/time", "-v", bin_path],
+            ["/usr/bin/time", "-v", bin_path, "--agent", PERF_HOOK_AGENT],
             input=payload,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -167,7 +210,7 @@ def validate_hook_case(
     """Prove that a timing candidate reached the intended hook outcome."""
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}).encode()
     result = subprocess.run(
-        [bin_path],
+        [bin_path, "--agent", PERF_HOOK_AGENT],
         input=payload,
         capture_output=True,
         check=False,
@@ -317,12 +360,60 @@ def capture_version_output(
     return (result.stdout + result.stderr).strip()
 
 
+def create_toolchain_probe_environment(
+    host_environment: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """Preserve host rustup discovery without contaminating measured children."""
+    source = os.environ if host_environment is None else host_environment
+    env = {
+        key: value
+        for key, value in source.items()
+        if not key.startswith("DCG_")
+    }
+    identity_keys = (
+        "CARGO_HOME",
+        "HOME",
+        "PATH",
+        "RUSTUP_HOME",
+        "RUSTUP_TOOLCHAIN",
+        "USERPROFILE",
+    )
+    return env, {
+        "scope": (
+            "host build-toolchain probe only; this environment is never passed "
+            "to measured dcg children"
+        ),
+        "host_home_preserved_for_rustup_proxy": True,
+        "ambient_dcg_keys_scrubbed": sorted(
+            key for key in source if key.startswith("DCG_")
+        ),
+        "identity_environment_value_sha256": {
+            key: hashlib.sha256(env[key].encode()).hexdigest()
+            for key in identity_keys
+            if key in env
+        },
+    }
+
+
 def capture_rustc_version(
     env: Dict[str, str], working_directory: str
-) -> Tuple[str, Optional[str]]:
+) -> Dict[str, Any]:
+    executable = shutil.which("rustc", path=env.get("PATH"))
+    canonical_executable = os.path.realpath(executable) if executable else None
+    executable_sha256 = None
+    if canonical_executable and os.path.isfile(canonical_executable):
+        try:
+            executable_sha256 = sha256_file(canonical_executable)
+        except OSError:
+            pass
+    executable_identity = {
+        "path": executable,
+        "canonical_path": canonical_executable,
+        "canonical_sha256": executable_sha256,
+    }
     try:
         result = subprocess.run(
-            ["rustc", "-vV"],
+            [executable or "rustc", "-vV"],
             capture_output=True,
             text=True,
             check=False,
@@ -330,14 +421,44 @@ def capture_rustc_version(
             cwd=working_directory,
             timeout=PROCESS_BACKSTOP_SECONDS,
         )
-        output = result.stdout.strip()
-        host = None
-        for line in output.splitlines():
-            if line.startswith("host:"):
-                host = line.split(":", 1)[1].strip()
-        return output, host
     except Exception as exc:  # noqa: BLE001
-        return f"error: {exc}", None
+        return {
+            "status": "error",
+            "error": str(exc),
+            "executable": executable_identity,
+        }
+
+    output = result.stdout.strip()
+    parsed: Dict[str, str] = {}
+    duplicate_fields = []
+    for line in output.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if key in parsed:
+            duplicate_fields.append(key)
+        parsed[key] = value.strip()
+    required = ("release", "commit-hash", "commit-date", "host")
+    missing = [key for key in required if not parsed.get(key)]
+    status = (
+        "ok"
+        if result.returncode == 0 and not missing and not duplicate_fields
+        else "error"
+    )
+    return {
+        "status": status,
+        "returncode": result.returncode,
+        "version_output": output,
+        "stderr": result.stderr.strip(),
+        "release": parsed.get("release"),
+        "commit_hash": parsed.get("commit-hash"),
+        "commit_date": parsed.get("commit-date"),
+        "host": parsed.get("host"),
+        "missing_fields": missing,
+        "duplicate_fields": sorted(set(duplicate_fields)),
+        "executable": executable_identity,
+    }
 
 
 def capture_git_sha(repo_root: str, env: Dict[str, str]) -> Optional[str]:
@@ -403,6 +524,109 @@ def extract_embedded_git_sha(version_output: str) -> Optional[str]:
         if value and value != "VERGEN_IDEMPOTENT_OUTPUT":
             return value
     return None
+
+
+def extract_embedded_rustc_toolchain(version_output: str) -> Dict[str, Optional[str]]:
+    """Extract the compiler identity embedded in the measured binary."""
+    ansi_escape = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+    labels = {
+        "Rustc release:": "release",
+        "Rustc commit:": "commit_hash",
+        "Rustc date:": "commit_date",
+        "Rustc host:": "host",
+    }
+    values: Dict[str, Optional[str]] = {key: None for key in labels.values()}
+    for raw_line in version_output.splitlines():
+        line = ansi_escape.sub("", raw_line).strip()
+        for label, key in labels.items():
+            if line.startswith(label):
+                value = line.split(label, 1)[1].strip()
+                if value and value != "VERGEN_IDEMPOTENT_OUTPUT":
+                    values[key] = value
+                break
+    return values
+
+
+def invalid_rustc_identity_fields(identity: Dict[str, Any]) -> Dict[str, str]:
+    """Return malformed compiler fields that cannot serve as an identity."""
+    invalid: Dict[str, str] = {}
+    release = identity.get("release")
+    commit_hash = identity.get("commit_hash")
+    commit_date = identity.get("commit_date")
+    host = identity.get("host")
+
+    if release and not re.fullmatch(
+        r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", release
+    ):
+        invalid["release"] = "expected a rustc semantic release identifier"
+    if commit_hash and not re.fullmatch(r"[0-9a-fA-F]{40}", commit_hash):
+        invalid["commit_hash"] = "expected a full 40-hex rustc commit hash"
+    if commit_date:
+        try:
+            parsed_date = time.strptime(commit_date, "%Y-%m-%d")
+            if time.strftime("%Y-%m-%d", parsed_date) != commit_date:
+                raise ValueError("non-canonical date")
+        except (ValueError, OverflowError):
+            invalid["commit_date"] = "expected a real ISO calendar date"
+    if host and not re.fullmatch(
+        r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_.]+){2,}", host
+    ):
+        invalid["host"] = "expected a Rust host target triple"
+    return invalid
+
+
+def classify_toolchain_binding(
+    embedded: Dict[str, Optional[str]], observed: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Bind the binary's build compiler to the currently observed rustc."""
+    fields = ("release", "commit_hash", "commit_date", "host")
+    missing_binary = [field for field in fields if not embedded.get(field)]
+    missing_observed = [field for field in fields if not observed.get(field)]
+    invalid_binary = invalid_rustc_identity_fields(embedded)
+    invalid_observed = invalid_rustc_identity_fields(observed)
+    mismatches = {
+        field: {"binary": embedded.get(field), "observed": observed.get(field)}
+        for field in fields
+        if embedded.get(field)
+        and observed.get(field)
+        and embedded[field] != observed[field]
+    }
+    if missing_binary:
+        status = "unverified_missing_binary_toolchain"
+        reason = f"dcg --version omitted compiler fields: {missing_binary}"
+    elif invalid_binary:
+        status = "unverified_malformed_binary_toolchain"
+        reason = f"dcg --version exposed malformed compiler fields: {invalid_binary}"
+    elif observed.get("status") != "ok" or missing_observed:
+        status = "unverified_missing_observed_toolchain"
+        reason = (
+            "rustc -vV could not provide one unambiguous compiler identity: "
+            f"status={observed.get('status')!r}, "
+            f"returncode={observed.get('returncode')!r}, "
+            f"missing={missing_observed}, "
+            f"duplicates={observed.get('duplicate_fields', [])}, "
+            f"error={observed.get('error')!r}"
+        )
+    elif invalid_observed:
+        status = "unverified_malformed_observed_toolchain"
+        reason = f"rustc -vV exposed malformed compiler fields: {invalid_observed}"
+    elif mismatches:
+        status = "mismatch"
+        reason = f"binary build compiler differs from observed rustc: {mismatches}"
+    else:
+        status = "verified_exact_rustc_vv"
+        reason = "binary and observed rustc identities match exactly"
+    return {
+        "method": "exact release/commit-hash/commit-date/host equality",
+        "status": status,
+        "verified": status == "verified_exact_rustc_vv",
+        "reason": reason,
+        "binary": embedded,
+        "observed": {field: observed.get(field) for field in fields},
+        "invalid_binary_fields": invalid_binary,
+        "invalid_observed_fields": invalid_observed,
+        "mismatches": mismatches,
+    }
 
 
 def classify_source_binding(
@@ -568,7 +792,15 @@ def capture_trace(
 
     try:
         result = subprocess.run(
-            [bin_path, "explain", command, "--format", "json"],
+            [
+                bin_path,
+                "--agent",
+                PERF_HOOK_AGENT,
+                "explain",
+                command,
+                "--format",
+                "json",
+            ],
             capture_output=True,
             text=True,
             check=False,
@@ -758,7 +990,14 @@ def probe_effective_budget(
     bin_path: str, env: Dict[str, str], working_directory: str
 ) -> Dict[str, Any]:
     result = subprocess.run(
-        [bin_path, "config", "--format", "json"],
+        [
+            bin_path,
+            "--agent",
+            PERF_HOOK_AGENT,
+            "config",
+            "--format",
+            "json",
+        ],
         capture_output=True,
         check=False,
         env=env,
@@ -876,6 +1115,71 @@ def run_internal_self_tests() -> None:
         "equal full Git SHAs on a clean checkout must verify",
     )
 
+    embedded_toolchain = {
+        "release": "1.98.0-nightly",
+        "commit_hash": "c" * 40,
+        "commit_date": "2026-06-05",
+        "host": "x86_64-unknown-linux-gnu",
+    }
+    observed_toolchain: Dict[str, Any] = {
+        "status": "ok",
+        **embedded_toolchain,
+    }
+    exact_toolchain = classify_toolchain_binding(
+        embedded_toolchain, observed_toolchain
+    )
+    require(
+        exact_toolchain["verified"],
+        "identical embedded and observed compiler identities must verify",
+    )
+    observed_toolchain["commit_hash"] = "d" * 40
+    mismatched_toolchain = classify_toolchain_binding(
+        embedded_toolchain, observed_toolchain
+    )
+    require(
+        not mismatched_toolchain["verified"]
+        and mismatched_toolchain["status"] == "mismatch",
+        "a stale binary built by another compiler must not verify",
+    )
+    for field, malformed_value in (
+        ("release", "unknown"),
+        ("commit_hash", "abc"),
+        ("commit_date", "yesterday"),
+        ("host", "unknown"),
+    ):
+        malformed_binary = dict(embedded_toolchain)
+        malformed_observed = {"status": "ok", **embedded_toolchain}
+        malformed_binary[field] = malformed_value
+        malformed_observed[field] = malformed_value
+        malformed_binding = classify_toolchain_binding(
+            malformed_binary, malformed_observed
+        )
+        require(
+            not malformed_binding["verified"]
+            and "malformed" in malformed_binding["status"],
+            f"equal malformed rustc {field} values must not verify",
+        )
+
+    synthetic_host_env = {
+        "HOME": "/host/home",
+        "PATH": "/host/home/.cargo/bin:/usr/bin",
+        "DCG_HOOK_TIMEOUT_MS": "5000",
+    }
+    compiler_env, compiler_env_evidence = create_toolchain_probe_environment(
+        synthetic_host_env
+    )
+    require(
+        compiler_env.get("HOME") == "/host/home"
+        and compiler_env.get("PATH") == "/host/home/.cargo/bin:/usr/bin",
+        "compiler probe must preserve the host HOME/PATH used by a rustup proxy",
+    )
+    require(
+        "DCG_HOOK_TIMEOUT_MS" not in compiler_env
+        and compiler_env_evidence["ambient_dcg_keys_scrubbed"]
+        == ["DCG_HOOK_TIMEOUT_MS"],
+        "compiler probe must still scrub unrelated ambient DCG_* settings",
+    )
+
     expected_tail_allowances = {58: -1, 59: 0, 100: 1}
     for sample_count, expected in expected_tail_allowances.items():
         observed = max_allowed_tail_exceedances(sample_count)
@@ -889,14 +1193,80 @@ def run_internal_self_tests() -> None:
         "large-sample binomial tolerance calculation underflowed",
     )
 
+    empty_gate = build_latency_gate(True, 1_000, 1_000, 1_000, 50, [], [], [])
+    require(
+        empty_gate["overall_result"] == "ERROR"
+        and empty_gate["evaluated_case_count"] == 0,
+        "an empty absolute case set must not pass vacuously",
+    )
+    bypass_only_gate = build_latency_gate(
+        True,
+        1_000,
+        1_000,
+        1_000,
+        50,
+        [{"id": "bypass"}],
+        [{"id": "bypass"}],
+        [],
+    )
+    require(
+        bypass_only_gate["overall_result"] == "ERROR",
+        "a bypass-only absolute case set must not pass vacuously",
+    )
+
+    saved_context = dict(_UNCAUGHT_GATE_CONTEXT)
+    recorded_aborts: List[Dict[str, Any]] = []
+    try:
+        _UNCAUGHT_GATE_CONTEXT.update(
+            {
+                "requested": True,
+                "output_path": "/outside/repository/certificate.json",
+                "supplied_budget_ms": 1_000,
+                "margin_pct": 50,
+            }
+        )
+
+        def explode() -> int:
+            raise RuntimeError("synthetic uncaught failure")
+
+        def record_abort(**kwargs: Any) -> None:
+            recorded_aborts.append(kwargs)
+
+        guarded_status = run_guarded_entrypoint(
+            explode, record_abort, io.StringIO()
+        )
+    finally:
+        _UNCAUGHT_GATE_CONTEXT.clear()
+        _UNCAUGHT_GATE_CONTEXT.update(saved_context)
+    require(
+        guarded_status == 1
+        and len(recorded_aborts) == 1
+        and "synthetic uncaught failure" in recorded_aborts[0]["reason"],
+        "an uncaught gate exception must emit one ERROR certificate and fail",
+    )
+
 
 def write_json_payload(payload: Dict[str, Any], output_path: Optional[str]) -> None:
     """Write one canonical JSON payload to the requested artifact destination."""
     output_json = json.dumps(payload, indent=2, sort_keys=True)
     if output_path:
-        with open(output_path, "w", encoding="utf-8") as handle:
+        output_path = os.path.abspath(output_path)
+        output_directory = os.path.dirname(output_path)
+        output_basename = os.path.basename(output_path)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output_directory,
+            prefix=f".{output_basename}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
             handle.write(output_json)
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary_path = handle.name
+        os.replace(temporary_path, output_path)
     else:
         print(output_json)
 
@@ -904,7 +1274,7 @@ def write_json_payload(payload: Dict[str, Any], output_path: Optional[str]) -> N
 def emit_gate_abort(
     output_path: Optional[str],
     reason: str,
-    supplied_budget_ms: int,
+    supplied_budget_ms: Optional[int],
     margin_pct: int,
     shipped_budget_ms: Optional[int] = None,
     effective_budget_ms: Optional[int] = None,
@@ -940,7 +1310,7 @@ def emit_gate_abort(
         "overall_result": "ERROR",
     }
     payload = {
-        "schema_version": 3,
+        "schema_version": PERF_ARTIFACT_SCHEMA_VERSION,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "preflight": details or {},
         "cases": [],
@@ -958,7 +1328,7 @@ def emit_gate_abort(
 
 def build_latency_gate(
     enabled: bool,
-    supplied_budget_ms: int,
+    supplied_budget_ms: Optional[int],
     shipped_budget_ms: int,
     effective_budget_ms: int,
     margin_pct: int,
@@ -969,6 +1339,7 @@ def build_latency_gate(
     """Build the authoritative gate verdict serialized into the JSON artifact."""
     spec_ids = [case["id"] for case in case_specs]
     result_ids = [case["id"] for case in results]
+    contract_errors: List[str] = []
     duplicate_spec_ids = sorted(
         case_id for case_id in set(spec_ids) if spec_ids.count(case_id) > 1
     )
@@ -976,18 +1347,33 @@ def build_latency_gate(
         case_id for case_id in set(result_ids) if result_ids.count(case_id) > 1
     )
     if duplicate_spec_ids:
-        raise ValueError(f"duplicate performance case ids: {duplicate_spec_ids}")
+        contract_errors.append(
+            f"duplicate performance case ids: {duplicate_spec_ids}"
+        )
     if duplicate_result_ids:
-        raise ValueError(f"duplicate performance result ids: {duplicate_result_ids}")
+        contract_errors.append(
+            f"duplicate performance result ids: {duplicate_result_ids}"
+        )
     unexpected_result_ids = sorted(set(result_ids) - set(spec_ids))
     if unexpected_result_ids:
-        raise ValueError(f"unexpected performance result ids: {unexpected_result_ids}")
+        contract_errors.append(
+            f"unexpected performance result ids: {unexpected_result_ids}"
+        )
     if not errors and set(result_ids) != set(spec_ids):
         missing_result_ids = sorted(set(spec_ids) - set(result_ids))
-        raise ValueError(
+        contract_errors.append(
             "successful measurement set is incomplete; missing result ids: "
             f"{missing_result_ids}"
         )
+    if enabled:
+        missing_required_case_ids = sorted(
+            set(REQUIRED_ABSOLUTE_GATE_CASE_IDS) - set(spec_ids)
+        )
+        if missing_required_case_ids:
+            contract_errors.append(
+                "absolute gate case contract is missing required ids: "
+                f"{missing_required_case_ids}"
+            )
 
     limit_ms = shipped_budget_ms * margin_pct / 100.0 if enabled else None
     result_by_id = {case["id"]: case for case in results}
@@ -1059,7 +1445,18 @@ def build_latency_gate(
                     f"{allowed_over_limit_sample_count}"
                 )
 
-    if errors:
+    expected_case_count = sum(spec["id"] != "bypass" for spec in case_specs)
+    evaluated_case_count = sum(case["status"] != "ERROR" for case in per_case)
+    if enabled and expected_case_count <= 0:
+        contract_errors.append("absolute gate has no evaluable cases")
+    if enabled and evaluated_case_count != expected_case_count:
+        contract_errors.append(
+            "absolute gate evaluated case count does not match its contract: "
+            f"{evaluated_case_count} != {expected_case_count}"
+        )
+    all_errors = [*errors, *contract_errors]
+
+    if all_errors:
         overall_result = "ERROR"
     elif not enabled:
         overall_result = "NOT_RUN"
@@ -1068,8 +1465,6 @@ def build_latency_gate(
     else:
         overall_result = "PASS"
 
-    expected_case_count = sum(spec["id"] != "bypass" for spec in case_specs)
-    evaluated_case_count = sum(case["status"] != "ERROR" for case in per_case)
     return {
         "enabled": enabled,
         "supplied_budget_ms": supplied_budget_ms,
@@ -1097,7 +1492,7 @@ def build_latency_gate(
         "evaluated_case_count": evaluated_case_count,
         "cases": per_case,
         "violations": violations,
-        "errors": list(errors),
+        "errors": all_errors,
         "overall_result": overall_result,
     }
 
@@ -1117,13 +1512,15 @@ def main() -> int:
     parser.add_argument(
         "--assert-budget-ms",
         type=int,
-        default=0,
+        default=None,
         help=(
             "Absolute evaluator-cost gate: pair every full hook invocation "
             "with DCG_BYPASS, subtract the matched process floor, and fail "
             "(exit 3) unless paired-delta p95 fits within this budget after "
             "applying --assert-margin-pct. The supplied value must exactly "
-            "match HOOK_EVALUATION_BUDGET_MS parsed from src/perf.rs."
+            "match the positive HOOK_EVALUATION_BUDGET_MS parsed from "
+            "src/perf.rs. Omitting this option leaves gate mode disabled; "
+            "supplying zero is an error rather than a disable sentinel."
         ),
     )
     parser.add_argument(
@@ -1146,7 +1543,15 @@ def main() -> int:
             return 1
         print("perf baseline self-test passed")
         return 0
-    gate_enabled = args.assert_budget_ms > 0
+    gate_enabled = args.assert_budget_ms is not None
+    _UNCAUGHT_GATE_CONTEXT.update(
+        {
+            "requested": gate_enabled,
+            "output_path": args.output,
+            "supplied_budget_ms": args.assert_budget_ms,
+            "margin_pct": args.assert_margin_pct,
+        }
+    )
 
     repo_root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
     if gate_enabled and args.output:
@@ -1206,8 +1611,15 @@ def main() -> int:
             )
         print(f"error: {reason}", file=sys.stderr)
         return 1
-    if args.assert_budget_ms < 0:
-        print("error: --assert-budget-ms must be >= 0", file=sys.stderr)
+    if gate_enabled and args.assert_budget_ms <= 0:
+        reason = "--assert-budget-ms must be > 0 when supplied"
+        emit_gate_abort(
+            args.output,
+            reason,
+            args.assert_budget_ms,
+            args.assert_margin_pct,
+        )
+        print(f"error: {reason}", file=sys.stderr)
         return 1
     if gate_enabled:
         if not 0 < args.assert_margin_pct <= 60:
@@ -1271,6 +1683,13 @@ def main() -> int:
         print(f"LATENCY GATE ABORTED: {reason}", file=sys.stderr)
         return 3
 
+    toolchain_probe_env, toolchain_probe_environment = (
+        create_toolchain_probe_environment()
+    )
+    rustc_observation_start = capture_rustc_version(
+        toolchain_probe_env, repo_root
+    )
+    host_context_start = capture_host_context()
     base_env, isolation = create_isolated_environment()
     working_directory = isolation["working_directory"]
     binary_sha_start = sha256_file(bin_path)
@@ -1329,7 +1748,31 @@ def main() -> int:
         )
         print(f"LATENCY GATE ABORTED: {reason}", file=sys.stderr)
         return 3
-    rustc_output, rustc_host = capture_rustc_version(base_env, repo_root)
+    embedded_rustc_toolchain = extract_embedded_rustc_toolchain(version_output)
+    toolchain_binding_start = classify_toolchain_binding(
+        embedded_rustc_toolchain, rustc_observation_start
+    )
+    toolchain_binding_start["required_for_latency_gate"] = gate_enabled
+    if gate_enabled and not toolchain_binding_start["verified"]:
+        reason = (
+            "measured binary is not provably bound to the observed compiler "
+            f"({toolchain_binding_start['status']}): "
+            f"{toolchain_binding_start['reason']}"
+        )
+        emit_gate_abort(
+            args.output,
+            reason,
+            args.assert_budget_ms,
+            args.assert_margin_pct,
+            shipped_budget_ms=shipped_budget_ms,
+            details={
+                "source_binding": source_binding_start,
+                "toolchain_binding": toolchain_binding_start,
+                "rustc_observation": rustc_observation_start,
+            },
+        )
+        print(f"LATENCY GATE ABORTED: {reason}", file=sys.stderr)
+        return 3
 
     try:
         config_probe = probe_effective_budget(bin_path, base_env, working_directory)
@@ -1451,6 +1894,12 @@ def main() -> int:
         git_state_end,
     )
     source_binding_end["required_for_latency_gate"] = gate_enabled
+    rustc_observation_end = capture_rustc_version(toolchain_probe_env, repo_root)
+    host_context_end = capture_host_context()
+    toolchain_binding_end = classify_toolchain_binding(
+        embedded_rustc_toolchain, rustc_observation_end
+    )
+    toolchain_binding_end["required_for_latency_gate"] = gate_enabled
     if binary_sha_end != binary_sha_start:
         errors.append("measured binary changed during the run")
     if git_sha_end != git_sha_start:
@@ -1469,6 +1918,10 @@ def main() -> int:
         errors.append("effective configuration changed during the run")
     if source_binding_end != source_binding_start:
         errors.append("binary/source provenance binding changed during the run")
+    if rustc_observation_end != rustc_observation_start:
+        errors.append("observed rustc toolchain changed during the run")
+    if toolchain_binding_end != toolchain_binding_start:
+        errors.append("binary/toolchain provenance binding changed during the run")
 
     latency_gate = build_latency_gate(
         gate_enabled,
@@ -1482,7 +1935,7 @@ def main() -> int:
     )
 
     payload = {
-        "schema_version": 3,
+        "schema_version": PERF_ARTIFACT_SCHEMA_VERSION,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "binary": {
             "path": bin_path,
@@ -1509,23 +1962,30 @@ def main() -> int:
             "perf_budget_source": source_budget_start,
             "perf_budget_source_end": source_budget_end,
         },
-        "toolchain_observation": {
-            "version_output": rustc_output,
-            "host": rustc_host,
+        "toolchain": {
+            "binary": embedded_rustc_toolchain,
+            "probe_environment": toolchain_probe_environment,
+            "observation": rustc_observation_start,
+            "observation_end": rustc_observation_end,
+            "binding": toolchain_binding_start,
+            "binding_end": toolchain_binding_end,
         },
         "host": {
-            "node": platform.node(),
-            "os": platform.system(),
-            "release": platform.release(),
-            "arch": platform.machine(),
-            "cpu_count": os.cpu_count(),
-            "python": platform.python_version(),
+            "start": host_context_start,
+            "end": host_context_end,
+            "controlled": False,
+            "note": (
+                "host load and power state are observational; compare retained "
+                "raw samples and load context before attributing small deltas"
+            ),
         },
         "environment_isolation": isolation,
         "effective_budget_probe": config_probe,
         "effective_budget_probe_end": config_probe_end,
         "method": {
             "mode": "process-per-invocation",
+            "explicit_agent_profile": PERF_HOOK_AGENT,
+            "hook_argv_suffix": ["--agent", PERF_HOOK_AGENT],
             "warmup": args.warmup,
             "runs": args.runs,
             "timer": "perf_counter_ns",
@@ -1550,6 +2010,16 @@ def main() -> int:
                 "excluded for host safety: DCG_SELF_HEAL_HOOK=0; this certificate "
                 "does not measure default hook self-healing work"
             ),
+            "toolchain_binding_scope": (
+                "native-build certificate: the running host rustc identity must "
+                "exactly match the compiler embedded in the binary; cross-compiled "
+                "artifacts require separate build attestation"
+            ),
+            "protocol_scope": (
+                "generic Bash hook JSON path; OMP compact bridge bytes are checked "
+                "by e2e_harness_matrix.sh, while the full Bun ExtensionAPI callback "
+                "requires separate end-to-end latency evidence"
+            ),
             "notes": (
                 "Raw samples are retained. max_rss_kb is measured separately via "
                 "/usr/bin/time -v. Only paired evaluator deltas are compared with "
@@ -1557,7 +2027,7 @@ def main() -> int:
             ),
         },
         "cases": results,
-        "errors": errors,
+        "errors": latency_gate["errors"],
         "latency_gate": latency_gate,
     }
 
@@ -1575,6 +2045,7 @@ def main() -> int:
                     "isolated_home": isolation["home"],
                     "working_directory": working_directory,
                     "source_binding": source_binding_start,
+                    "toolchain_binding": toolchain_binding_start,
                 }
             ),
             file=sys.stderr,
@@ -1609,11 +2080,48 @@ def main() -> int:
             )
 
     if latency_gate["overall_result"] == "ERROR":
-        print(f"error: {len(errors)} case(s) failed to run: {errors}", file=sys.stderr)
+        gate_errors = latency_gate["errors"]
+        print(
+            f"error: latency gate could not certify this run: {gate_errors}",
+            file=sys.stderr,
+        )
         return 1
 
     return 0
 
 
+def run_guarded_entrypoint(
+    entrypoint: Callable[[], int],
+    abort_emitter: Callable[..., None] = emit_gate_abort,
+    error_stream: TextIO = sys.stderr,
+) -> int:
+    """Turn an unexpected gate exception into retained ERROR evidence."""
+    try:
+        return entrypoint()
+    except Exception as exc:  # noqa: BLE001
+        reason = f"uncaught perf harness error: {type(exc).__name__}: {exc}"
+        context = dict(_UNCAUGHT_GATE_CONTEXT)
+        if context["requested"]:
+            try:
+                abort_emitter(
+                    output_path=context["output_path"],
+                    reason=reason,
+                    supplied_budget_ms=context["supplied_budget_ms"],
+                    margin_pct=context["margin_pct"],
+                    details={
+                        "exception_type": type(exc).__name__,
+                        "exception_message": str(exc),
+                    },
+                )
+            except Exception as certificate_exc:  # noqa: BLE001
+                print(
+                    "error: emergency latency-gate certificate emission also "
+                    f"failed: {certificate_exc}",
+                    file=error_stream,
+                )
+        print(f"error: {reason}", file=error_stream)
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_guarded_entrypoint(main))

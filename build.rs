@@ -9,7 +9,12 @@ fn main() {
     // Emit build metadata as environment variables at compile time
     let build = Build::builder().build_timestamp(true).build();
     let cargo = Cargo::builder().target_triple(true).build();
-    let rustc = Rustc::builder().semver(true).build();
+    let rustc = Rustc::builder()
+        .semver(true)
+        .commit_hash(true)
+        .commit_date(true)
+        .host_triple(true)
+        .build();
     // Git provenance (#320): `git describe --tags --dirty` distinguishes a
     // build made exactly at a release tag (`v1.2.3`) from a local build ahead
     // of it (`v1.2.3-7-gabc1234`, or a `-dirty` suffix). Outside a git

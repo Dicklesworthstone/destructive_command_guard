@@ -1477,12 +1477,20 @@ The `--version` output includes build metadata for debugging:
 dcg 0.1.0
   Built: 2026-01-07T22:13:10.413872881Z
   Rustc: 1.94.0-nightly
+Rustc release: 1.94.0-nightly
+Rustc commit: 0123456789abcdef0123456789abcdef01234567
+Rustc date: 2026-01-06
+Rustc host: x86_64-unknown-linux-gnu
   Target: x86_64-unknown-linux-musl
   Commit: v0.1.0
 Git SHA: 0123456789abcdef0123456789abcdef01234567
 ```
 
 This metadata is embedded at compile time via [vergen](https://github.com/rustyhorde/vergen), making it easy to identify exactly which build is running when troubleshooting.
+The absolute performance certificate compares all four stable `Rustc` identity
+fields with `rustc -vV`. That is deliberately a native-build check: a binary
+cross-compiled on a different compiler host needs separate build attestation
+instead of weakening the exact compiler identity requirement.
 
 ## Repository Scanning
 
