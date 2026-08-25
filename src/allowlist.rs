@@ -381,12 +381,14 @@ impl LayeredAllowlist {
             return None;
         }
 
-        let current_session_id = current_session_id();
+        let mut cached_session_id = None;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
                 // Skip entries that are invalid or don't match path restrictions
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref()) {
+                let current_session_id =
+                    session_id_for_entry(entry, &mut cached_session_id);
+                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
                     continue;
                 }
 
@@ -447,11 +449,13 @@ impl LayeredAllowlist {
         rule: &RuleId,
         cwd: Option<&Path>,
     ) -> Option<(&AllowEntry, AllowlistLayer)> {
-        let current_session_id = current_session_id();
+        let mut cached_session_id = None;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref()) {
+                let current_session_id =
+                    session_id_for_entry(entry, &mut cached_session_id);
+                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
                     continue;
                 }
 
@@ -472,11 +476,13 @@ impl LayeredAllowlist {
         command: &str,
         cwd: Option<&Path>,
     ) -> Option<AllowlistHit<'_>> {
-        let current_session_id = current_session_id();
+        let mut cached_session_id = None;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref()) {
+                let current_session_id =
+                    session_id_for_entry(entry, &mut cached_session_id);
+                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
                     continue;
                 }
 
@@ -515,11 +521,13 @@ impl LayeredAllowlist {
         command: &str,
         cwd: Option<&Path>,
     ) -> Option<AllowlistHit<'_>> {
-        let current_session_id = current_session_id();
+        let mut cached_session_id = None;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref()) {
+                let current_session_id =
+                    session_id_for_entry(entry, &mut cached_session_id);
+                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
                     continue;
                 }
 
@@ -582,11 +590,13 @@ impl LayeredAllowlist {
         command: &str,
         cwd: Option<&Path>,
     ) -> Option<AllowlistHit<'_>> {
-        let current_session_id = current_session_id();
+        let mut cached_session_id = None;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref()) {
+                let current_session_id =
+                    session_id_for_entry(entry, &mut cached_session_id);
+                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
                     continue;
                 }
 
@@ -1170,6 +1180,25 @@ fn session_scope_matches(entry: &AllowEntry, current_session_id: Option<&str>) -
     };
 
     bound_session_id == current_session_id
+}
+
+/// Resolve process/TTY identity only when an entry is actually session-scoped.
+///
+/// Ordinary and empty allowlists do not consult the session identifier at all.
+/// When a lookup contains multiple session-scoped entries, cache the result for
+/// that lookup so `/proc` is sampled once while preserving the existing
+/// per-lookup freshness boundary.
+fn session_id_for_entry<'a>(
+    entry: &AllowEntry,
+    cached_session_id: &'a mut Option<Option<String>>,
+) -> Option<&'a str> {
+    if entry.session != Some(true) {
+        return None;
+    }
+
+    cached_session_id
+        .get_or_insert_with(current_session_id)
+        .as_deref()
 }
 
 /// Check if all conditions on an allowlist entry are satisfied.
