@@ -58,6 +58,13 @@ fn configure_isolated_hook_child(command: &mut Command) {
     }
 
     let test_home = test_state_path("-home");
+    let test_config = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/e2e/fixtures/configs/minimal.toml");
+    assert!(
+        test_config.is_file(),
+        "isolated hook config fixture is missing: {}",
+        test_config.display()
+    );
     command
         .env("HOME", &test_home)
         .env("USERPROFILE", &test_home)
@@ -65,6 +72,8 @@ fn configure_isolated_hook_child(command: &mut Command) {
         .env("XDG_DATA_HOME", test_home.join(".local/share"))
         .env("APPDATA", test_home.join("AppData/Roaming"))
         .env("LOCALAPPDATA", test_home.join("AppData/Local"))
+        .env("ProgramData", &test_home)
+        .env("DCG_CONFIG", test_config)
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
         .env("DCG_HISTORY_DISABLED", "1")
         .env("DCG_SELF_HEAL_HOOK", "0")
@@ -88,7 +97,7 @@ fn dcg_binary() -> std::path::PathBuf {
 fn run_hook_mode(command: &str) -> (String, String, i32) {
     let _guard = HOOK_PROCESS_LOCK
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let input = format!(
         r#"{{"tool_name":"Bash","tool_input":{{"command":"{}"}}}}"#,
         command.replace('\\', "\\\\").replace('"', "\\\"")
@@ -476,7 +485,7 @@ fn test_hook_output_remediation_safe_alternative() {
 fn run_hook_mode_raw(input: &str) -> (String, String, i32) {
     let _guard = HOOK_PROCESS_LOCK
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut child_command = Command::new(dcg_binary());
     configure_isolated_hook_child(&mut child_command);
     let mut child = child_command
@@ -553,16 +562,8 @@ fn test_antigravity_envelope_allows_safe_command() {
 
     let (stdout, stderr, exit_code) = run_hook_mode_raw(input);
     assert_eq!(exit_code, 0, "safe command must exit 0\nstderr: {stderr}");
-
-    // dcg emits nothing (allow) or an explicit non-block decision for safe
-    // commands; in either case there must be no "block"/"deny" decision.
-    if !stdout.trim().is_empty() {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
-            let decision = json.get("decision").and_then(|d| d.as_str());
-            assert!(
-                decision != Some("block") && decision != Some("deny"),
-                "safe command must not be blocked, got decision: {decision:?}"
-            );
-        }
-    }
+    assert!(
+        stdout.trim().is_empty(),
+        "safe agy hook output must be silent, got: {stdout}"
+    );
 }
