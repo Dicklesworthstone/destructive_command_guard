@@ -436,9 +436,7 @@ mod tests {
             .and_then(|rest| rest.split("\n      - name: ").next())
             .expect("CI must retain the harness protocol matrix step");
         assert!(
-            matrix_step.contains(
-                "scripts/e2e_harness_matrix.sh --binary target/release/dcg"
-            ),
+            matrix_step.contains("scripts/e2e_harness_matrix.sh --binary target/release/dcg"),
             "CI must run the harness protocol matrix against the real release binary"
         );
     }
