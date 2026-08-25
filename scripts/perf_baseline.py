@@ -825,10 +825,10 @@ def build_latency_gate(
                     f"{shipped_budget_ms}ms hook budget)"
                 )
 
-    if not enabled:
-        overall_result = "NOT_RUN"
-    elif errors:
+    if errors:
         overall_result = "ERROR"
+    elif not enabled:
+        overall_result = "NOT_RUN"
     elif violations:
         overall_result = "FAIL"
     else:
@@ -932,6 +932,7 @@ def main() -> int:
     binary_sha_start = sha256_file(bin_path)
     binary_size = os.path.getsize(bin_path)
     git_sha_start = capture_git_sha(repo_root, base_env)
+    git_describe_start = capture_git_describe(repo_root, base_env)
     git_state_start = capture_git_state(repo_root, base_env)
     build_input_manifest_start = capture_build_input_manifest(repo_root)
     harness_manifest_start = capture_harness_manifest(repo_root)
@@ -940,6 +941,19 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"error: could not capture binary version: {exc}", file=sys.stderr)
         return 1
+    embedded_git_describe = extract_embedded_git_describe(version_output)
+    source_binding_start = classify_source_binding(
+        embedded_git_describe, git_describe_start, git_state_start
+    )
+    source_binding_start["required_for_latency_gate"] = gate_enabled
+    if gate_enabled and not source_binding_start["verified"]:
+        print(
+            "LATENCY GATE ABORTED: measured binary is not provably bound to "
+            f"this checkout ({source_binding_start['status']}): "
+            f"{source_binding_start['reason']}",
+            file=sys.stderr,
+        )
+        return 3
     rustc_output, rustc_host = capture_rustc_version(base_env, repo_root)
 
     try:
@@ -964,10 +978,11 @@ def main() -> int:
         )
         return 3 if gate_enabled else 1
 
+    case_specs = build_cases()
     results: List[Dict[str, Any]] = []
     errors: List[str] = []
 
-    for case in build_cases():
+    for case in case_specs:
         env = base_env.copy()
         env.update(case.get("env", {}))
         try:
@@ -1001,6 +1016,7 @@ def main() -> int:
 
     binary_sha_end = sha256_file(bin_path)
     git_sha_end = capture_git_sha(repo_root, base_env)
+    git_describe_end = capture_git_describe(repo_root, base_env)
     git_state_end = capture_git_state(repo_root, base_env)
     build_input_manifest_end = capture_build_input_manifest(repo_root)
     harness_manifest_end = capture_harness_manifest(repo_root)
@@ -1009,10 +1025,25 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         source_budget_end = {"error": str(exc)}
         errors.append("could not re-read src/perf.rs after the run")
+    try:
+        config_probe_end = probe_effective_budget(
+            bin_path, base_env, working_directory
+        )
+    except Exception as exc:  # noqa: BLE001
+        config_probe_end = {"error": str(exc)}
+        errors.append("could not repeat the effective hook budget probe after the run")
+    source_binding_end = classify_source_binding(
+        extract_embedded_git_describe(version_output),
+        git_describe_end,
+        git_state_end,
+    )
+    source_binding_end["required_for_latency_gate"] = gate_enabled
     if binary_sha_end != binary_sha_start:
         errors.append("measured binary changed during the run")
     if git_sha_end != git_sha_start:
         errors.append("repository HEAD changed during the run")
+    if git_describe_end != git_describe_start:
+        errors.append("repository Git description changed during the run")
     if git_state_end != git_state_start:
         errors.append("repository worktree state changed during the run")
     if build_input_manifest_end != build_input_manifest_start:
@@ -1021,9 +1052,24 @@ def main() -> int:
         errors.append("performance harness bytes changed during the run")
     if source_budget_end != source_budget_start:
         errors.append("src/perf.rs or its shipped budget changed during the run")
+    if config_probe_end != config_probe:
+        errors.append("effective configuration changed during the run")
+    if source_binding_end != source_binding_start:
+        errors.append("binary/source provenance binding changed during the run")
+
+    latency_gate = build_latency_gate(
+        gate_enabled,
+        args.assert_budget_ms,
+        shipped_budget_ms,
+        config_probe["hook_timeout_ms"],
+        args.assert_margin_pct,
+        case_specs,
+        results,
+        errors,
+    )
 
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "binary": {
             "path": bin_path,
@@ -1037,8 +1083,12 @@ def main() -> int:
             "repository_root": repo_root,
             "repository_git_sha": git_sha_start,
             "repository_git_sha_end": git_sha_end,
+            "repository_git_describe": git_describe_start,
+            "repository_git_describe_end": git_describe_end,
             "repository_state": git_state_start,
             "repository_state_end": git_state_end,
+            "binary_source_binding": source_binding_start,
+            "binary_source_binding_end": source_binding_end,
             "build_input_manifest": build_input_manifest_start,
             "build_input_manifest_end": build_input_manifest_end,
             "harness_manifest": harness_manifest_start,
@@ -1060,6 +1110,7 @@ def main() -> int:
         },
         "environment_isolation": isolation,
         "effective_budget_probe": config_probe,
+        "effective_budget_probe_end": config_probe_end,
         "method": {
             "mode": "process-per-invocation",
             "warmup": args.warmup,
@@ -1078,6 +1129,10 @@ def main() -> int:
                 else None
             ),
             "pair_order": "alternating AB/BA by sample index" if gate_enabled else None,
+            "self_heal_coverage": (
+                "excluded for host safety: DCG_SELF_HEAL_HOOK=0; this certificate "
+                "does not measure default hook self-healing work"
+            ),
             "notes": (
                 "Raw samples are retained. max_rss_kb is measured separately via "
                 "/usr/bin/time -v. Only paired evaluator deltas are compared with "
@@ -1086,6 +1141,7 @@ def main() -> int:
         },
         "cases": results,
         "errors": errors,
+        "latency_gate": latency_gate,
     }
 
     output_json = json.dumps(payload, indent=2, sort_keys=True)
@@ -1095,10 +1151,6 @@ def main() -> int:
             handle.write("\n")
     else:
         print(output_json)
-
-    if errors:
-        print(f"error: {len(errors)} case(s) failed to run: {errors}", file=sys.stderr)
-        return 1
 
     if gate_enabled:
         print(
@@ -1111,67 +1163,43 @@ def main() -> int:
                     "budget_source_sha256": source_budget_start["sha256"],
                     "isolated_home": isolation["home"],
                     "working_directory": working_directory,
+                    "source_binding": source_binding_start,
                 }
             ),
             file=sys.stderr,
         )
-
-        # Process spawn is outside the evaluator deadline. Compare only paired
-        # full-minus-bypass deltas while retaining raw end-to-end timings.
-        limit_ms = shipped_budget_ms * args.assert_margin_pct / 100.0
-        violations = []
-        gated_cases = 0
-        for case in results:
-            if case["id"] == "bypass":
-                continue
-            gated_cases += 1
-            signed_p95 = case["evaluator_delta_metrics"]["p95_ms"]
-            budget_consumption_p95 = max(0.0, signed_p95)
-            status = "ok" if budget_consumption_p95 <= limit_ms else "OVER"
+        for case_gate in latency_gate["cases"]:
             print(
                 json.dumps(
                     {
                         "event": "latency_gate_case",
-                        "case": case["id"],
-                        "full_process_p95_ms": round(case["metrics"]["p95_ms"], 3),
-                        "bypass_process_p95_ms": round(
-                            case["bypass_metrics"]["p95_ms"], 3
-                        ),
-                        "evaluator_delta_p50_ms": round(
-                            case["evaluator_delta_metrics"]["p50_ms"], 3
-                        ),
-                        "evaluator_delta_p95_ms": round(signed_p95, 3),
-                        "budget_consumption_p95_ms": round(
-                            budget_consumption_p95, 3
-                        ),
-                        "limit_ms": limit_ms,
-                        "budget_ms": shipped_budget_ms,
-                        "status": status,
+                        **case_gate,
+                        "budget_ms": latency_gate["shipped_budget_ms"],
                     }
                 ),
                 file=sys.stderr,
             )
-            if budget_consumption_p95 > limit_ms:
-                violations.append(
-                    f"{case['id']}: paired evaluator p95 "
-                    f"{budget_consumption_p95:.1f}ms exceeds "
-                    f"{limit_ms:.0f}ms ({args.assert_margin_pct}% of the "
-                    f"{shipped_budget_ms}ms hook budget)"
-                )
-        if violations:
+        if latency_gate["overall_result"] == "FAIL":
             print(
                 "LATENCY GATE FAILED — evaluator cost is eating the "
                 "fail-closed hook deadline (#245 regression class):",
                 file=sys.stderr,
             )
-            for violation in violations:
+            for violation in latency_gate["violations"]:
                 print(f"  {violation}", file=sys.stderr)
             return 3
-        print(
-            f"LATENCY GATE PASSED: {gated_cases} paired cases, evaluator p95 "
-            f"within {args.assert_margin_pct}% of the {shipped_budget_ms}ms budget",
-            file=sys.stderr,
-        )
+        if latency_gate["overall_result"] == "PASS":
+            print(
+                "LATENCY GATE PASSED: "
+                f"{latency_gate['evaluated_case_count']} paired cases, evaluator "
+                f"p95 within {latency_gate['margin_pct']}% of the "
+                f"{latency_gate['shipped_budget_ms']}ms budget",
+                file=sys.stderr,
+            )
+
+    if latency_gate["overall_result"] == "ERROR":
+        print(f"error: {len(errors)} case(s) failed to run: {errors}", file=sys.stderr)
+        return 1
 
     return 0
 

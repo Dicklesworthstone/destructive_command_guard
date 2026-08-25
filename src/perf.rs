@@ -383,28 +383,31 @@ mod tests {
     fn ci_enforces_absolute_latency_gate_against_shipped_budget() {
         let ci = include_str!("../.github/workflows/ci.yml");
 
+        let gate_step = ci
+            .split("      - name: Absolute evaluator-cost gate vs shipped default budget")
+            .nth(1)
+            .and_then(|rest| rest.split("\n      - name: ").next())
+            .expect("CI must retain the named absolute evaluator-cost gate step");
         assert!(
-            ci.contains("HOOK_EVALUATION_BUDGET_MS"),
-            "CI must derive the latency gate's budget by reading \
-             HOOK_EVALUATION_BUDGET_MS out of src/perf.rs — a hard-coded number \
-             in the workflow silently decouples the gate from the shipped \
-             default (#245)"
+            gate_step.contains(
+                r#"BUDGET_MS=$(grep -oP 'pub const HOOK_EVALUATION_BUDGET_MS: u64 = \K[0-9_]+' src/perf.rs | tr -d '_')"#
+            ),
+            "the absolute gate step must derive BUDGET_MS directly from \
+             HOOK_EVALUATION_BUDGET_MS in src/perf.rs"
         );
         assert!(
-            ci.contains("--assert-budget-ms"),
-            "CI must invoke scripts/perf_baseline.py with --assert-budget-ms; \
-             the relative baseline comparison alone cannot catch a uniform \
-             slowdown that eats the fixed hook deadline (#245)"
+            gate_step.contains("--assert-budget-ms \"$BUDGET_MS\""),
+            "the same absolute gate step must pass its derived BUDGET_MS to \
+             scripts/perf_baseline.py"
         );
         assert!(
-            ci.contains("scripts/e2e_harness_matrix.sh"),
-            "CI must run the harness protocol matrix: it is the only gate that \
-             asserts each agent's wire contract against the real binary"
+            gate_step.contains("--output perf-latency-gate.json"),
+            "the absolute gate must write its self-contained JSON certificate"
         );
 
         // The margin must leave real headroom: a gate set at ~100% of the
         // budget passes right up until the moment users start failing closed.
-        let margin = ci
+        let margin = gate_step
             .split("--assert-margin-pct")
             .nth(1)
             .and_then(|rest| rest.split_whitespace().next())
@@ -414,6 +417,29 @@ mod tests {
             margin <= 60,
             "latency gate margin is {margin}% of the budget; keep it <=60% so \
              the gate trips before real users hit indeterminate verdicts"
+        );
+
+        let artifact_step = ci
+            .split("      - name: Upload absolute latency gate certificate")
+            .nth(1)
+            .and_then(|rest| rest.split("\n      - name: ").next())
+            .expect("CI must retain the absolute latency certificate upload step");
+        assert!(
+            artifact_step.contains("if: always()")
+                && artifact_step.contains("path: perf-latency-gate.json"),
+            "CI must retain perf-latency-gate.json on both pass and failure"
+        );
+
+        let matrix_step = ci
+            .split("      - name: Harness protocol matrix (real binary, every agent wire format)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n      - name: ").next())
+            .expect("CI must retain the harness protocol matrix step");
+        assert!(
+            matrix_step.contains(
+                "scripts/e2e_harness_matrix.sh --binary target/release/dcg"
+            ),
+            "CI must run the harness protocol matrix against the real release binary"
         );
     }
 
