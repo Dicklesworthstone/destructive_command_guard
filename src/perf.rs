@@ -390,7 +390,7 @@ mod tests {
             .expect("CI must retain the named absolute evaluator-cost gate step");
         assert!(
             gate_step.contains(
-                r#"BUDGET_MS=$(grep -oP 'pub const HOOK_EVALUATION_BUDGET_MS: u64 = \K[0-9_]+' src/perf.rs | tr -d '_')"#
+                r"BUDGET_MS=$(grep -oP 'pub const HOOK_EVALUATION_BUDGET_MS: u64 = \K[0-9_]+' src/perf.rs | tr -d '_')"
             ),
             "the absolute gate step must derive BUDGET_MS directly from \
              HOOK_EVALUATION_BUDGET_MS in src/perf.rs"
