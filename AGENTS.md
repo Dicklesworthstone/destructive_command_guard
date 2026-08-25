@@ -285,9 +285,19 @@ Rules:
 - **Never hard-code the budget in `.github/workflows/ci.yml`.** It is grepped
   out of `HOOK_EVALUATION_BUDGET_MS`; `perf::tests::ci_enforces_absolute_latency_gate_against_shipped_budget`
   fails if that wiring is removed or the margin is loosened past 60%.
+- **Treat the JSON as the certificate, not stderr.** Gate mode records its
+  supplied/shipped/effective budgets, margin, derived limit, every per-case
+  verdict, violations, and overall PASS/FAIL in `latency_gate`; CI retains
+  that artifact even when the gate fails.
+- **Bind the binary to the checkout.** Gate mode requires a clean checkout and
+  exact equality between the binary's embedded `git describe --tags --dirty`
+  value and the repository's value. CI uses a full tag history so a shallow
+  clone cannot turn this proof into an unknown result.
 - Measure dcg's own cost as `full_eval − DCG_BYPASS`, never raw wall-clock:
   process spawn (≈940ms under Windows PowerShell) sits **outside** the
-  evaluation deadline and would otherwise produce false alarms.
+  evaluation deadline and would otherwise produce false alarms. For host
+  safety this certificate sets `DCG_SELF_HEAL_HOOK=0`, records that exclusion,
+  and therefore does not claim to measure self-healing work.
 - The fleet suite installs into a scratch prefix with an isolated `HOME` and
   `--no-configure`; it never touches a host's real agent hook config.
 - A probe that dies partway must FAIL, not pass: every probe emits
