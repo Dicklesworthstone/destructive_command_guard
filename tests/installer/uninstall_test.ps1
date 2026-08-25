@@ -414,6 +414,38 @@ try {
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h14 -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+Write-Host "Test 14a: Oh My Pi cleanup verifies deletion postconditions"
+$h14a = New-Tmp
+$savedRemoveOmpExtensionFile = (Get-Command Remove-OmpExtensionFile).ScriptBlock
+$savedWriteWarn = (Get-Command Write-Warn).ScriptBlock
+try {
+    $extension = Join-Path $h14a '.omp/agent/extensions/dcg-guard.ts'
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $extension))
+    [System.IO.File]::WriteAllText($extension, '// dcg-omp-extension: generated')
+    $before = [System.IO.File]::ReadAllBytes($extension)
+    $script:ompRemovalWarnings = @()
+
+    function Remove-OmpExtensionFile {
+        [CmdletBinding()]
+        param([string]$Path)
+    }
+    function Write-Warn {
+        param([string]$Message)
+        $script:ompRemovalWarnings += $Message
+    }
+
+    Check ((Unconfigure-OmpExtension -HomeDir $h14a -RepoRoot $h14a) -eq $false) "OMP: successful no-op removal is not reported as complete"
+    Check ([System.IO.File]::Exists($extension)) "OMP: no-op remover leaves the extension in place"
+    $after = [System.IO.File]::ReadAllBytes($extension)
+    Check ([System.Convert]::ToBase64String($before) -ceq [System.Convert]::ToBase64String($after)) "OMP: no-op remover leaves extension bytes unchanged"
+    Check ($script:ompRemovalWarnings.Count -eq 1) "OMP: failed deletion is reported exactly once"
+    Check ($script:ompRemovalWarnings[0] -like "Could not remove Oh My Pi extension at ${extension}:*") "OMP: no-op deletion warning names the exact extension"
+} finally {
+    Set-Item -LiteralPath 'Function:\Remove-OmpExtensionFile' -Value $savedRemoveOmpExtensionFile
+    Set-Item -LiteralPath 'Function:\Write-Warn' -Value $savedWriteWarn
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h14a -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host "Test 15: Oh My Pi cleanup does not claim success when profile enumeration fails"
 $h15 = New-Tmp
 $savedGetOmpProfileDirectories = (Get-Command Get-OmpProfileDirectories).ScriptBlock

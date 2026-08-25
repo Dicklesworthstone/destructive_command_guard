@@ -1401,7 +1401,8 @@ unconfigure_omp() {
 
         [ -f "$extension" ] || continue
         if grep -q -- 'dcg-omp-extension' "$extension" 2>/dev/null; then
-            if rm -f -- "$extension" 2>/dev/null; then
+            if rm -f -- "$extension" 2>/dev/null &&
+                [ ! -e "$extension" ] && [ ! -L "$extension" ]; then
                 removed=1
             else
                 failed=1

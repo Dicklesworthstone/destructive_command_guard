@@ -4442,6 +4442,28 @@ MOCKEOF
     [[ $'\n'"$output"$'\n' != *$'\nremoved\n'* ]]
 }
 
+@test "unconfigure_omp: a successful no-op remover cannot forge the removed marker" {
+    extract_uninstall_functions
+    local extension="$HOME/.omp/agent/extensions/dcg-guard.ts"
+    mkdir -p "$(dirname "$extension")"
+    printf '// dcg-omp-extension: generated\n' > "$extension"
+    local before
+    before=$(cat "$extension")
+    rm() { return 0; }
+
+    run unconfigure_omp
+    unset -f rm
+
+    [ "$status" -eq 0 ]
+    [ -f "$extension" ]
+    [ "$(cat "$extension")" = "$before" ]
+    [[ "$output" == *"Could not remove Oh My Pi extension at $extension"* ]]
+    local warning_count
+    warning_count=$(printf '%s\n' "$output" | grep -cF "Could not remove Oh My Pi extension at $extension")
+    [ "$warning_count" -eq 1 ]
+    [[ $'\n'"$output"$'\n' != *$'\nremoved\n'* ]]
+}
+
 @test "unconfigure_omp: warns and withholds the removed marker when marker inspection fails" {
     extract_uninstall_functions
     local default_extension="$HOME/.omp/agent/extensions/dcg-guard.ts"
