@@ -277,22 +277,18 @@ def run_case(
 def capture_version_output(
     bin_path: str, env: Dict[str, str], working_directory: str
 ) -> str:
-    try:
-        result = subprocess.run(
-            [bin_path, "--version"],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-            cwd=working_directory,
-            timeout=PROCESS_BACKSTOP_SECONDS,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"dcg --version exited {result.returncode}")
-        output = (result.stdout + result.stderr).strip()
-        return output
-    except Exception as exc:  # noqa: BLE001
-        return f"error: {exc}"
+    result = subprocess.run(
+        [bin_path, "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+        cwd=working_directory,
+        timeout=PROCESS_BACKSTOP_SECONDS,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"dcg --version exited {result.returncode}")
+    return (result.stdout + result.stderr).strip()
 
 
 def capture_rustc_version(
@@ -743,12 +739,13 @@ def main() -> int:
     if args.assert_budget_ms < 0:
         print("error: --assert-budget-ms must be >= 0", file=sys.stderr)
         return 1
-    if gate_enabled := args.assert_budget_ms > 0:
+    gate_enabled = args.assert_budget_ms > 0
+    if gate_enabled:
         if not 0 < args.assert_margin_pct <= 60:
             print("error: --assert-margin-pct must be in the range 1..=60", file=sys.stderr)
             return 1
     elif args.assert_margin_pct <= 0:
-        print("error: --assert-margin-pct must be in the range 1..=60", file=sys.stderr)
+        print("error: --assert-margin-pct must be > 0", file=sys.stderr)
         return 1
 
     try:
@@ -775,7 +772,11 @@ def main() -> int:
     git_state_start = capture_git_state(repo_root, base_env)
     build_input_manifest_start = capture_build_input_manifest(repo_root)
     harness_manifest_start = capture_harness_manifest(repo_root)
-    version_output = capture_version_output(bin_path, base_env, working_directory)
+    try:
+        version_output = capture_version_output(bin_path, base_env, working_directory)
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: could not capture binary version: {exc}", file=sys.stderr)
+        return 1
     rustc_output, rustc_host = capture_rustc_version(base_env, repo_root)
 
     try:
