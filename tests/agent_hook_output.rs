@@ -6,7 +6,37 @@
 #![allow(clippy::doc_markdown, clippy::uninlined_format_args)]
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// The denial path writes an allow-once record. Parallel cases must not race
+/// each other for the same bounded store lock and then mistake the deliberate
+/// code-less contention fallback for a wire-schema regression.
+static HOOK_PROCESS_LOCK: Mutex<()> = Mutex::new(());
+
+fn test_state_stem() -> &'static Path {
+    static STATE_STEM: OnceLock<PathBuf> = OnceLock::new();
+    STATE_STEM
+        .get_or_init(|| {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock must be after the Unix epoch")
+                .as_nanos();
+            std::env::temp_dir().join(format!(
+                "dcg-agent-hook-output-{}-{nonce}",
+                std::process::id()
+            ))
+        })
+        .as_path()
+}
+
+fn test_state_path(suffix: &str) -> PathBuf {
+    let mut path = test_state_stem().as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
 
 /// Path to the DCG binary (uses same target directory as the test binary).
 fn dcg_binary() -> std::path::PathBuf {
@@ -19,12 +49,44 @@ fn dcg_binary() -> std::path::PathBuf {
 
 /// Run dcg in hook mode with the given command as JSON input.
 fn run_hook_mode(command: &str) -> (String, String, i32) {
+    let _guard = HOOK_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let input = format!(
         r#"{{"tool_name":"Bash","tool_input":{{"command":"{}"}}}}"#,
         command.replace('\\', "\\\\").replace('"', "\\\"")
     );
 
-    let mut child = Command::new(dcg_binary())
+    let mut child_command = Command::new(dcg_binary());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("DCG_") {
+            child_command.env_remove(key);
+        }
+    }
+    let test_home = test_state_path("-home");
+    let test_tmp = std::env::temp_dir();
+    let mut child = child_command
+        .args(["--agent", "claude-code"])
+        .env("HOME", &test_home)
+        .env("USERPROFILE", &test_home)
+        .env("XDG_CONFIG_HOME", test_home.join(".config"))
+        .env("XDG_DATA_HOME", test_home.join(".local/share"))
+        .env("APPDATA", test_home.join("AppData/Roaming"))
+        .env("LOCALAPPDATA", test_home.join("AppData/Local"))
+        .env("TMPDIR", &test_tmp)
+        .env("TEMP", &test_tmp)
+        .env("TMP", &test_tmp)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_HISTORY_DISABLED", "1")
+        .env("DCG_SELF_HEAL_HOOK", "0")
+        .env(
+            "DCG_PENDING_EXCEPTIONS_PATH",
+            test_state_path("-pending-exceptions.jsonl"),
+        )
+        .env(
+            "DCG_ALLOW_ONCE_PATH",
+            test_state_path("-allow-once.jsonl"),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
