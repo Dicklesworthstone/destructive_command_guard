@@ -18,8 +18,9 @@ use crate::evaluator::{
 use crate::exit_codes::{EXIT_DENIED, EXIT_WARNING};
 use crate::highlight::{HighlightSpan, format_highlighted_command, should_use_color};
 use crate::history::{
-    ExportOptions, HistoryDb, HistoryStats, InteractiveAllowlistAuditEntry,
-    InteractiveAllowlistOptionType, Outcome, SuggestionAction, SuggestionAuditEntry,
+    CommandEntry, ENV_HISTORY_DB_PATH, ExportOptions, HistoryDb, HistoryStats, HistoryWriter,
+    InteractiveAllowlistAuditEntry, InteractiveAllowlistOptionType, Outcome, SuggestionAction,
+    SuggestionAuditEntry,
 };
 use crate::interactive::{
     AllowlistScope, InteractiveConfig, InteractiveResult, check_interactive_available,
@@ -4273,6 +4274,94 @@ fn resolve_mode_for_cli(
     crate::evaluator::resolve_effective_mode(config, command, result)
 }
 
+const ROBOT_INDETERMINATE_HISTORY_PACK: &str = "dcg.internal";
+const ROBOT_INDETERMINATE_HISTORY_PATTERN: &str = "evaluation-deadline";
+
+const fn should_record_robot_history(robot_mode: bool, history_enabled: bool) -> bool {
+    robot_mode && history_enabled
+}
+
+fn robot_history_db_path(config: &crate::config::HistoryConfig) -> Option<std::path::PathBuf> {
+    if let Ok(path) = std::env::var(ENV_HISTORY_DB_PATH) {
+        return Some(std::path::PathBuf::from(path));
+    }
+    config.expanded_database_path()
+}
+
+fn build_robot_history_entry(
+    agent_type: &str,
+    command: &str,
+    working_dir: &str,
+    result: &EvaluationResult,
+    resolved_mode: Option<DecisionMode>,
+    eval_duration: std::time::Duration,
+) -> CommandEntry {
+    let eval_duration_us = u64::try_from(eval_duration.as_micros()).unwrap_or(u64::MAX);
+
+    let (outcome, pack_id, pattern_name, allowlist_layer) = match result.decision {
+        EvaluationDecision::Allow => {
+            if let Some(override_) = result.allowlist_override.as_ref() {
+                (
+                    Outcome::Allow,
+                    override_.matched.pack_id.clone(),
+                    override_.matched.pattern_name.clone(),
+                    Some(override_.layer.label().to_string()),
+                )
+            } else {
+                (
+                    Outcome::Allow,
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pack_id.clone()),
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.clone()),
+                    None,
+                )
+            }
+        }
+        EvaluationDecision::Deny => {
+            let outcome = match resolved_mode.unwrap_or(DecisionMode::Deny) {
+                DecisionMode::Deny | DecisionMode::Ask => Outcome::Deny,
+                DecisionMode::Warn => Outcome::Warn,
+                DecisionMode::Log => Outcome::Allow,
+            };
+            (
+                outcome,
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pack_id.clone()),
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.clone()),
+                None,
+            )
+        }
+        EvaluationDecision::Indeterminate => (
+            Outcome::Deny,
+            Some(ROBOT_INDETERMINATE_HISTORY_PACK.to_string()),
+            Some(ROBOT_INDETERMINATE_HISTORY_PATTERN.to_string()),
+            None,
+        ),
+    };
+
+    CommandEntry {
+        agent_type: agent_type.to_string(),
+        working_dir: working_dir.to_string(),
+        command: command.to_string(),
+        outcome,
+        pack_id,
+        pattern_name,
+        eval_duration_us,
+        allowlist_layer,
+        ..Default::default()
+    }
+}
+
 fn read_test_command_from_stdin(max_command_bytes: usize) -> std::io::Result<String> {
     use std::io::Read as _;
 
@@ -4575,6 +4664,40 @@ fn test_command(
 
     let elapsed = start.elapsed();
     let resolved_mode = resolve_mode_for_cli(&effective_config, command, &result);
+
+    // Human `dcg test` remains a diagnostic and does not enter persistent
+    // history. Robot mode is also the native agent-integration boundary used
+    // by OMP, so retain its final post-graduation/post-force decision exactly
+    // as hook mode retains hook evaluations. Construct the writer only after
+    // evaluation so SQLite setup is outside `eval_duration_us`, and bound its
+    // drop wait by the same remaining deadline that governs the robot reply.
+    let _robot_history_writer = if should_record_robot_history(
+        robot_mode,
+        effective_config.history.enabled,
+    ) {
+        let working_dir = project_path.as_ref().map_or_else(
+            || "<unknown>".to_string(),
+            |path| path.to_string_lossy().into_owned(),
+        );
+        let mut writer = HistoryWriter::new(
+            robot_history_db_path(&effective_config.history),
+            &effective_config.history,
+        );
+        if let Some(deadline) = evaluation_deadline.as_ref() {
+            writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
+        }
+        writer.log(build_robot_history_entry(
+            detection.agent.config_key(),
+            command,
+            &working_dir,
+            &result,
+            resolved_mode,
+            elapsed,
+        ));
+        Some(writer)
+    } else {
+        None
+    };
 
     // Quiet mode: the command was fully evaluated above, so suppress all
     // human/structured output but still return the real decision so the exit
@@ -17722,6 +17845,133 @@ fn dev_generate_fixtures(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn robot_history_deny_fixture() -> EvaluationResult {
+        EvaluationResult::denied_by_pack_pattern(
+            "core.git",
+            "reset-hard",
+            "test denial",
+            None,
+            PackSeverity::Critical,
+            &[],
+        )
+    }
+
+    #[test]
+    fn robot_history_is_enabled_only_for_the_robot_integration_boundary() {
+        assert!(should_record_robot_history(true, true));
+        assert!(
+            !should_record_robot_history(false, true),
+            "human dcg test diagnostics must not pollute persistent command history"
+        );
+        assert!(
+            !should_record_robot_history(true, false),
+            "disabled history must not construct a writer"
+        );
+    }
+
+    #[test]
+    fn robot_history_preserves_agent_attribution_and_final_policy_outcome() {
+        let denied = robot_history_deny_fixture();
+        let cases = [
+            (DecisionMode::Deny, Outcome::Deny),
+            (DecisionMode::Ask, Outcome::Deny),
+            (DecisionMode::Warn, Outcome::Warn),
+            (DecisionMode::Log, Outcome::Allow),
+        ];
+
+        for (mode, expected) in cases {
+            let entry = build_robot_history_entry(
+                "omp",
+                "git reset --hard HEAD",
+                "/tmp/omp-project",
+                &denied,
+                Some(mode),
+                std::time::Duration::from_micros(41),
+            );
+            assert_eq!(entry.agent_type, "omp");
+            assert_eq!(entry.outcome, expected, "mode {mode:?}");
+            assert_eq!(entry.pack_id.as_deref(), Some("core.git"));
+            assert_eq!(entry.pattern_name.as_deref(), Some("reset-hard"));
+            assert_eq!(entry.eval_duration_us, 41);
+        }
+
+        let codex = build_robot_history_entry(
+            "codex-cli",
+            "git reset --hard HEAD",
+            "/tmp/codex-project",
+            &denied,
+            Some(DecisionMode::Deny),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(
+            codex.agent_type, "codex-cli",
+            "OMP attribution must come from explicit agent detection, not a hard-coded label"
+        );
+    }
+
+    #[test]
+    fn robot_history_uses_the_final_allow_and_conservative_indeterminate_states() {
+        let denied = robot_history_deny_fixture();
+        let mut forced_allow = denied.clone();
+        forced_allow.decision = EvaluationDecision::Allow;
+        forced_allow.bypass_method = Some(crate::evaluator::BypassMethod::Force);
+        let forced_entry = build_robot_history_entry(
+            "omp",
+            "git reset --hard HEAD",
+            "/tmp/omp-project",
+            &forced_allow,
+            Some(DecisionMode::Deny),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(forced_entry.outcome, Outcome::Allow);
+        assert_eq!(forced_entry.pack_id.as_deref(), Some("core.git"));
+        assert_eq!(forced_entry.pattern_name.as_deref(), Some("reset-hard"));
+
+        let indeterminate = EvaluationResult::indeterminate_due_to_budget();
+        let indeterminate_entry = build_robot_history_entry(
+            "omp",
+            "candidate command",
+            "/tmp/omp-project",
+            &indeterminate,
+            None,
+            std::time::Duration::from_millis(10),
+        );
+        assert_eq!(indeterminate_entry.outcome, Outcome::Deny);
+        assert_eq!(
+            indeterminate_entry.pack_id.as_deref(),
+            Some(ROBOT_INDETERMINATE_HISTORY_PACK)
+        );
+        assert_eq!(
+            indeterminate_entry.pattern_name.as_deref(),
+            Some(ROBOT_INDETERMINATE_HISTORY_PATTERN)
+        );
+    }
+
+    #[test]
+    fn robot_history_retains_allowlist_provenance() {
+        let matched = robot_history_deny_fixture()
+            .pattern_info
+            .expect("deny fixture has pattern metadata");
+        let allowed = EvaluationResult::allowed_by_allowlist(
+            matched,
+            crate::allowlist::AllowlistLayer::Agent,
+            "OMP profile allowlist".to_string(),
+        );
+        let entry = build_robot_history_entry(
+            "omp",
+            "git reset --hard HEAD",
+            "/tmp/omp-project",
+            &allowed,
+            Some(DecisionMode::Deny),
+            std::time::Duration::ZERO,
+        );
+
+        assert_eq!(entry.outcome, Outcome::Allow);
+        assert_eq!(entry.pack_id.as_deref(), Some("core.git"));
+        assert_eq!(entry.pattern_name.as_deref(), Some("reset-hard"));
+        assert_eq!(entry.allowlist_layer.as_deref(), Some("agent"));
+    }
 
     /// #335: `dcg doctor` counted the raw enabled-pack set, which carries the
     /// bare `core` category marker, while `dcg packs --enabled` lists the two

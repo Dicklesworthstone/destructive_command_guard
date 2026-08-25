@@ -62,6 +62,9 @@ deny, ask, or indeterminate result returns `{ block: true, reason }` to OMP.
 Because the bridge supplies `--agent omp` explicitly, OMP remains distinct from
 legacy Pi even when OMP exposes Pi-family compatibility variables. The
 canonical profile key is `agents.omp`; `oh-my-pi` is accepted as an alias.
+When `[history] enabled = true`, these robot-boundary evaluations are persisted
+with the canonical `agent_type = "omp"`; ordinary human `dcg test` diagnostics
+remain outside command history.
 
 The bridge spawns dcg directly, without a shell, and gives Bun a 30-second
 parent-side timeout with a hard kill signal. This is a pathological-hang
