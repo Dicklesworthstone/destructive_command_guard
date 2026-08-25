@@ -4451,7 +4451,7 @@ MOCKEOF
     before=$(cat "$extension")
     rm() { return 0; }
 
-    run unconfigure_omp
+    run report_unconfigure "Oh My Pi extension" unconfigure_omp
     unset -f rm
 
     [ "$status" -eq 0 ]
@@ -4462,6 +4462,7 @@ MOCKEOF
     warning_count=$(printf '%s\n' "$output" | grep -cF "Could not remove Oh My Pi extension at $extension")
     [ "$warning_count" -eq 1 ]
     [[ $'\n'"$output"$'\n' != *$'\nremoved\n'* ]]
+    [[ "$output" != *"Removed Oh My Pi extension"* ]]
 }
 
 @test "unconfigure_omp: warns and withholds the removed marker when marker inspection fails" {
