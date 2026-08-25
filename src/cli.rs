@@ -497,6 +497,12 @@ pub enum Command {
         /// dialect because the CLI cannot know the source shell.
         #[arg(long, value_enum, default_value = "unknown", env = "DCG_DIALECT")]
         dialect: DialectArg,
+
+        /// Emit only the bounded decision fields consumed by the generated
+        /// OMP bridge. This is an internal protocol surface, not a general
+        /// replacement for `dcg test --format json`.
+        #[arg(long, hide = true)]
+        omp_bridge_output: bool,
     },
 
     /// Generate a sample configuration file
@@ -927,6 +933,113 @@ const CLASSIFY_OUTPUT_SCHEMA_VERSION: u32 = 1;
 /// pattern has been proven, but execution is still blocked conservatively.
 const INDETERMINATE_REASON: &str = "Safety evaluation did not complete within the analysis budget";
 
+/// Maximum reason carried by dcg's private OMP bridge protocol.
+///
+/// The general robot schema intentionally retains complete diagnostics, but
+/// the OMP bridge consumes only the decision, reason, and rule id. Reusing the
+/// shipped default command budget keeps one diagnostic from becoming larger
+/// than the ordinary safety payload it describes. The truncation is UTF-8
+/// boundary-safe and never removes the decision or rule id.
+const OMP_BRIDGE_REASON_MAX_BYTES: usize = crate::config::DEFAULT_MAX_COMMAND_BYTES;
+
+/// Maximum stable rule identifier carried by the private OMP protocol.
+///
+/// External-pack files are capped, but their pack and pattern identifiers do
+/// not have smaller schema limits. Bound the composed identifier to the same
+/// ordinary-command budget so pack metadata cannot defeat the bridge's output
+/// bound. A field-specific suffix makes truncation visible to operators.
+const OMP_BRIDGE_RULE_ID_MAX_BYTES: usize = crate::config::DEFAULT_MAX_COMMAND_BYTES;
+
+/// Maximum expansion of one input byte under JSON string escaping.
+const OMP_BRIDGE_JSON_ESCAPE_EXPANSION: usize = 6;
+
+/// Exact maximum bytes outside `reason` and `rule_id`, including the longest
+/// decision (`indeterminate`) and the newline emitted by `println!`:
+/// `{"decision":"indeterminate","reason":"","rule_id":""}\n`.
+const OMP_BRIDGE_JSON_ENVELOPE_MAX_BYTES: usize = 54;
+
+/// Maximum stdout retained by the generated OMP bridge.
+///
+/// JSON can expand one input byte to six ASCII bytes (`\u00XX`). This exact
+/// expression covers both bounded variable fields, the longest fixed envelope,
+/// and `println!`'s newline without relying on Bun's ambiguous async
+/// `maxBuffer` termination signal.
+pub(crate) const OMP_CHILD_STDOUT_MAX_BYTES: usize = OMP_BRIDGE_JSON_ESCAPE_EXPANSION
+    * (OMP_BRIDGE_REASON_MAX_BYTES + OMP_BRIDGE_RULE_ID_MAX_BYTES)
+    + OMP_BRIDGE_JSON_ENVELOPE_MAX_BYTES;
+
+/// Maximum child diagnostics retained and forwarded by the OMP bridge.
+pub(crate) const OMP_CHILD_STDERR_MAX_BYTES: usize = OMP_BRIDGE_REASON_MAX_BYTES;
+
+/// UTF-16 code units emitted per command-input chunk.
+///
+/// A Unicode scalar occupies at most four UTF-8 bytes, so one quarter of the
+/// ordinary command budget bounds each encoded chunk while preserving the
+/// caller's configured total-command limit inside dcg.
+pub(crate) const OMP_CHILD_STDIN_CHUNK_CODE_UNITS: usize =
+    crate::config::DEFAULT_MAX_COMMAND_BYTES / 4;
+
+const OMP_BRIDGE_REASON_TRUNCATION_SUFFIX: &str = "\n[dcg: reason truncated]";
+const OMP_BRIDGE_RULE_ID_TRUNCATION_SUFFIX: &str = "[dcg: rule id truncated]";
+
+fn bounded_omp_bridge_field<'a>(
+    value: std::borrow::Cow<'a, str>,
+    max_bytes: usize,
+    suffix: &str,
+) -> std::borrow::Cow<'a, str> {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let mut end = max_bytes - suffix.len();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = String::with_capacity(max_bytes);
+    bounded.push_str(&value[..end]);
+    bounded.push_str(suffix);
+    std::borrow::Cow::Owned(bounded)
+}
+
+fn bounded_omp_bridge_reason(reason: &str) -> std::borrow::Cow<'_, str> {
+    bounded_omp_bridge_field(
+        std::borrow::Cow::Borrowed(reason),
+        OMP_BRIDGE_REASON_MAX_BYTES,
+        OMP_BRIDGE_REASON_TRUNCATION_SUFFIX,
+    )
+}
+
+fn bounded_omp_bridge_rule_id(rule_id: String) -> std::borrow::Cow<'static, str> {
+    bounded_omp_bridge_field(
+        std::borrow::Cow::Owned(rule_id),
+        OMP_BRIDGE_RULE_ID_MAX_BYTES,
+        OMP_BRIDGE_RULE_ID_TRUNCATION_SUFFIX,
+    )
+}
+
+fn validate_omp_bridge_output_agent(
+    omp_bridge_output: bool,
+    robot_mode: bool,
+    explicit_omp_agent: bool,
+) -> std::io::Result<()> {
+    if omp_bridge_output && (!robot_mode || !explicit_omp_agent) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--omp-bridge-output requires --robot and an explicit --agent omp selector",
+        ));
+    }
+    Ok(())
+}
+
+fn is_explicit_omp_agent(agent: Option<&str>) -> bool {
+    agent.is_some_and(|name| {
+        name.eq_ignore_ascii_case("omp")
+            || name.eq_ignore_ascii_case("oh-my-pi")
+            || name.eq_ignore_ascii_case("oh_my_pi")
+            || name.eq_ignore_ascii_case("ohmypi")
+    })
+}
+
 const fn policy_blocks_cli_execution(
     decision: EvaluationDecision,
     mode: Option<DecisionMode>,
@@ -1024,6 +1137,52 @@ pub struct TestOutput {
     /// analysis denied it. Additive field — absent means "not checked".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dialect_divergence: Option<DialectDivergence>,
+}
+
+/// Private compact protocol consumed by the marker-owned OMP extension.
+///
+/// In particular, this omits `TestOutput::command`: echoing a configured-large
+/// heredoc made child stdout and the bridge's former `.text()` buffer scale
+/// with input that OMP already holds in memory.
+#[derive(Debug, serde::Serialize)]
+struct OmpBridgeTestOutput<'a> {
+    decision: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<std::borrow::Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule_id: Option<std::borrow::Cow<'a, str>>,
+}
+
+fn omp_bridge_test_output(
+    result: &EvaluationResult,
+    resolved_mode: Option<DecisionMode>,
+) -> OmpBridgeTestOutput<'_> {
+    match result.decision {
+        EvaluationDecision::Allow => OmpBridgeTestOutput {
+            decision: "allow",
+            reason: None,
+            rule_id: None,
+        },
+        EvaluationDecision::Deny => {
+            let pattern = result.pattern_info.as_ref();
+            OmpBridgeTestOutput {
+                decision: resolved_mode.unwrap_or(DecisionMode::Deny).label(),
+                reason: pattern.map(|info| bounded_omp_bridge_reason(&info.reason)),
+                rule_id: pattern.and_then(|info| {
+                    info.pack_id.as_ref().and_then(|pack| {
+                        info.pattern_name
+                            .as_ref()
+                            .map(|pattern| bounded_omp_bridge_rule_id(format!("{pack}:{pattern}")))
+                    })
+                }),
+            }
+        }
+        EvaluationDecision::Indeterminate => OmpBridgeTestOutput {
+            decision: "indeterminate",
+            reason: Some(std::borrow::Cow::Borrowed(INDETERMINATE_REASON)),
+            rule_id: None,
+        },
+    }
 }
 
 /// Whether the posix dialect alone — the dialect the live Bash hook uses —
@@ -2181,6 +2340,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         (Config::load(), None)
     };
     let verbosity = Verbosity::from_cli(&cli);
+    let explicit_omp_agent = is_explicit_omp_agent(cli.agent.as_deref());
     maybe_show_update_notice(&cli, &config, verbosity);
 
     match cli.command {
@@ -2295,9 +2455,11 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             enforce_budget,
             force,
             dialect,
+            omp_bridge_output,
         }) => {
             // Robot mode forces JSON output
             let robot_mode = robot_mode_enabled(cli.robot);
+            validate_omp_bridge_output_agent(omp_bridge_output, robot_mode, explicit_omp_agent)?;
             let effective_format = if robot_mode { TestFormat::Json } else { format };
 
             // Load specific config file if provided, otherwise use default
@@ -2357,6 +2519,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     enforce_budget || robot_mode,
                     force,
                     dialect,
+                    omp_bridge_output,
                 );
                 // Exit with code 1 if command would be blocked (for CI/robot mode scripting)
                 if was_blocked {
@@ -4516,6 +4679,7 @@ fn test_command(
     enforce_budget: bool,
     force: bool,
     dialect: DialectArg,
+    omp_bridge_output: bool,
 ) -> bool {
     use std::time::{Duration, Instant};
 
@@ -4723,6 +4887,11 @@ fn test_command(
 
     // Handle structured output (JSON/TOON)
     if format.is_structured() {
+        if omp_bridge_output {
+            let output = omp_bridge_test_output(&result, resolved_mode);
+            println!("{}", serde_json::to_string(&output).unwrap());
+            return policy_blocks_cli_execution(result.decision, resolved_mode);
+        }
         let output = match result.decision {
             EvaluationDecision::Allow => {
                 let allowlist =
@@ -12778,10 +12947,14 @@ import {{ extractLeadingCdTarget }} from "@oh-my-pi/pi-coding-agent/tools/shell-
 // selected by the installer. Ambient environment must not redirect it.
 const DCG_BIN = {path_literal};
 const DCG_CHILD_TIMEOUT_MS = {OMP_CHILD_EVALUATION_TIMEOUT_MS};
+export const DCG_STDOUT_MAX_BYTES = {OMP_CHILD_STDOUT_MAX_BYTES};
+export const DCG_STDERR_MAX_BYTES = {OMP_CHILD_STDERR_MAX_BYTES};
+export const DCG_STDIN_CHUNK_CODE_UNITS = {OMP_CHILD_STDIN_CHUNK_CODE_UNITS};
 type DcgChildOutcome = "spawn-throw" | "exit-0" | "exit-1" | "exit-2" | "exit-other";
 type DcgParsedVerdict = "empty" | "malformed" | "allow" | "deny" | "ask" | "indeterminate" | "unknown";
 type DcgBridgeAction = "allow" | "block" | "infrastructure";
 type DcgParsedOutput = {{ verdict: DcgParsedVerdict; reason?: string; ruleId?: string }};
+type DcgBoundedText = {{ text: string; overflowed: boolean; readFailure?: string }};
 type OmpBashToolInput = {{ command?: unknown; cwd?: unknown; async?: unknown; pty?: unknown }};
 type OmpToolCallClassification =
   | {{ kind: "other-tool" }}
@@ -12860,9 +13033,19 @@ function childOutcomeFromExitCode(exitCode: unknown): DcgChildOutcome {{
   return "exit-other";
 }}
 
+function boundedDiagnosticText(text: string): string {{
+  const suffix = "\n[dcg: diagnostic truncated]";
+  const buffer = new Uint8Array(DCG_STDERR_MAX_BYTES - suffix.length);
+  const encoded = new TextEncoder().encodeInto(text, buffer);
+  if (encoded.read === text.length) return text;
+  // `stream: true` deliberately withholds a code point split by the byte cap.
+  const prefix = new TextDecoder().decode(buffer.subarray(0, encoded.written), {{ stream: true }});
+  return prefix + suffix;
+}}
+
 function describeChildCollectionFailure(reason: unknown): string {{
   try {{
-    return String(reason);
+    return boundedDiagnosticText(String(reason));
   }} catch {{
     return "<unprintable rejection>";
   }}
@@ -12874,6 +13057,102 @@ function observeChildCapability<T>(collect: () => Promise<T>): Promise<T> {{
   }} catch (reason) {{
     return Promise.reject(reason);
   }}
+}}
+
+export function commandUtf8Stream(command: string): ReadableStream<Uint8Array> {{
+  let offset = 0;
+  const text = new ReadableStream<string>({{
+    pull(controller): void {{
+      if (offset >= command.length) {{
+        controller.close();
+        return;
+      }}
+      let end = Math.min(offset + DCG_STDIN_CHUNK_CODE_UNITS, command.length);
+      // JavaScript slices by UTF-16 code unit. Keep an astral scalar together
+      // when the nominal boundary lands between its surrogate pair.
+      if (
+        end < command.length
+        && command.charCodeAt(end - 1) >= 0xd800
+        && command.charCodeAt(end - 1) <= 0xdbff
+        && command.charCodeAt(end) >= 0xdc00
+        && command.charCodeAt(end) <= 0xdfff
+      ) {{
+        end += 1;
+      }}
+      controller.enqueue(command.slice(offset, end));
+      offset = end;
+    }},
+  }});
+  // TextEncoderStream carries a trailing high surrogate across chunk
+  // boundaries, preserving the exact UTF-8 bytes without a command-sized
+  // `TextEncoder.encode()` allocation.
+  return text.pipeThrough(new TextEncoderStream());
+}}
+
+export function commandStdin(command: string): Uint8Array | ReadableStream<Uint8Array> {{
+  // Preserve Bun's low-overhead direct-byte path for ordinary commands. Only
+  // configured-large input pays the stream/object cost needed to bound peak
+  // encoding allocation.
+  return command.length <= DCG_STDIN_CHUNK_CODE_UNITS
+    ? new TextEncoder().encode(command)
+    : commandUtf8Stream(command);
+}}
+
+export async function collectBoundedText(
+  stream: ReadableStream<Uint8Array>,
+  maxBytes: number,
+): Promise<DcgBoundedText> {{
+  // Grow only with observed output. Compact allow/deny envelopes stay compact
+  // instead of reserving the entire safety cap on every guarded command.
+  let retained = new Uint8Array(0);
+  let retainedBytes = 0;
+  let overflowed = false;
+  let readFailure: string | undefined;
+  const reader = stream.getReader();
+  try {{
+    while (true) {{
+      const next = await reader.read();
+      if (next.done) break;
+      const chunk = next.value;
+      const available = maxBytes - retainedBytes;
+      const keep = Math.min(available, chunk.byteLength);
+      if (keep > 0) {{
+        const needed = retainedBytes + keep;
+        if (needed > retained.byteLength) {{
+          const doubled = retained.byteLength === 0 ? needed : retained.byteLength * 2;
+          const capacity = Math.min(maxBytes, Math.max(needed, doubled));
+          const grown = new Uint8Array(capacity);
+          grown.set(retained.subarray(0, retainedBytes));
+          retained = grown;
+        }}
+        retained.set(chunk.subarray(0, keep), retainedBytes);
+        retainedBytes += keep;
+      }}
+      if (keep < chunk.byteLength) overflowed = true;
+    }}
+  }} catch (reason) {{
+    // Preserve any complete verdict received before a stream fault. The fault
+    // remains independently visible and cannot downgrade an overflow block.
+    readFailure = describeChildCollectionFailure(reason);
+  }} finally {{
+    reader.releaseLock();
+  }}
+
+  const bytes = retained.subarray(0, retainedBytes);
+  // When the cap cuts a multi-byte scalar, streaming decode withholds that
+  // incomplete suffix instead of manufacturing U+FFFD. At/below the cap the
+  // final decode flushes normally, including chunks split inside a scalar.
+  const text = overflowed
+    ? new TextDecoder().decode(bytes, {{ stream: true }})
+    : new TextDecoder().decode(bytes);
+  return {{ text, overflowed, readFailure }};
+}}
+
+function visibleStderrDetail(stderr: DcgBoundedText): string {{
+  const detail = stderr.text.trim();
+  if (!stderr.overflowed) return detail;
+  const suffix = `[dcg: stderr exceeded ${{DCG_STDERR_MAX_BYTES}}-byte display cap; additional bytes omitted]`;
+  return detail ? `${{detail}}\n${{suffix}}` : suffix;
 }}
 
 export default function dcgGuard(pi: ExtensionAPI): void {{
@@ -12910,7 +13189,7 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
     }} catch (err) {{
       return {{
         block: true,
-        reason: `[dcg] OMP guard could not resolve the bash working directory safely: ${{err}}`,
+        reason: `[dcg] OMP guard could not resolve the bash working directory safely: ${{describeChildCollectionFailure(err)}}`,
       }};
     }}
 
@@ -12930,7 +13209,7 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
       }} catch (err) {{
         return {{
           block: true,
-          reason: `[dcg] OMP guard could not resolve the local PTY shell dialect safely: ${{err}}`,
+          reason: `[dcg] OMP guard could not resolve the local PTY shell dialect safely: ${{describeChildCollectionFailure(err)}}`,
         }};
       }}
     }}
@@ -12940,9 +13219,10 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
       proc = Bun.spawn([
         DCG_BIN,
         "--robot", "test", "--stdin", "--agent", "omp", "--dialect", shellDialect,
+        "--omp-bridge-output",
       ], {{
         cwd: commandCwd,
-        stdin: new TextEncoder().encode(command),
+        stdin: commandStdin(command),
         stdout: "pipe",
         stderr: "pipe",
         // Bun owns this timer and process reap. SIGKILL makes the ceiling a
@@ -12951,7 +13231,7 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
         killSignal: "SIGKILL",
       }});
     }} catch (err) {{
-      console.error(`[dcg] OMP guard could not run dcg: ${{err}}`);
+      console.error(`[dcg] OMP guard could not run dcg: ${{describeChildCollectionFailure(err)}}`);
       return;
     }}
 
@@ -12960,20 +13240,22 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
     // from stdout or exit 1. allSettled also keeps both pipes draining
     // concurrently before the monotone decision is classified.
     const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
-      observeChildCapability(() => new Response(proc.stdout).text()),
-      observeChildCapability(() => new Response(proc.stderr).text()),
+      observeChildCapability(() => collectBoundedText(proc.stdout, DCG_STDOUT_MAX_BYTES)),
+      observeChildCapability(() => collectBoundedText(proc.stderr, DCG_STDERR_MAX_BYTES)),
       observeChildCapability(() => proc.exited),
     ]);
     const collectionFailures: string[] = [];
-    let stdoutText = "";
+    let stdoutText: DcgBoundedText = {{ text: "", overflowed: false }};
     if (stdoutResult.status === "fulfilled") {{
       stdoutText = stdoutResult.value;
+      if (stdoutText.readFailure) collectionFailures.push(`stdout read failed: ${{stdoutText.readFailure}}`);
     }} else {{
       collectionFailures.push(`stdout read failed: ${{describeChildCollectionFailure(stdoutResult.reason)}}`);
     }}
-    let stderrText = "";
+    let stderrText: DcgBoundedText = {{ text: "", overflowed: false }};
     if (stderrResult.status === "fulfilled") {{
       stderrText = stderrResult.value;
+      if (stderrText.readFailure) collectionFailures.push(`stderr read failed: ${{stderrText.readFailure}}`);
     }} else {{
       collectionFailures.push(`stderr read failed: ${{describeChildCollectionFailure(stderrResult.reason)}}`);
     }}
@@ -12986,14 +13268,18 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
 
     // Treat the two child streams as separate capabilities: stdout alone may
     // carry the robot decision; stderr is diagnostic-only but never discarded.
-    const classification = classifyDcgChild(
-      childOutcomeFromExitCode(exitCode),
-      typeof stdoutText === "string" ? stdoutText : "",
-    );
-    const stderrDetail = typeof stderrText === "string" ? stderrText.trim() : "";
+    // An overflow is itself a conservative block. Never parse a retained JSON
+    // prefix: it might be a complete allow followed by a discarded denial.
+    const classification = stdoutText.overflowed
+      ? {{ action: "block" as const, output: {{ verdict: "unknown" as const }} }}
+      : classifyDcgChild(childOutcomeFromExitCode(exitCode), stdoutText.text);
+    const stderrDetail = visibleStderrDetail(stderrText);
+    if (stdoutText.overflowed) {{
+      console.error(`[dcg] OMP guard dcg stdout exceeded ${{DCG_STDOUT_MAX_BYTES}}-byte safety-verdict cap; blocking conservatively`);
+    }}
     if (classification.action === "infrastructure" || collectionFailures.length > 0) {{
       const exitDetail = typeof exitCode === "number" ? ` (exit ${{exitCode}})` : "";
-      const details = [stderrDetail, ...collectionFailures].filter(Boolean).join("; ");
+      const details = boundedDiagnosticText([stderrDetail, ...collectionFailures].filter(Boolean).join("; "));
       console.error(`[dcg] OMP guard infrastructure failure${{exitDetail}}${{details ? `: ${{details}}` : ""}}`);
       // A collection fault is not allowed to erase a completed deny-like
       // stdout verdict or the independent blocking exit-1 signal.
@@ -13005,9 +13291,11 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
     if (classification.action === "allow") return;
 
     const output = classification.output;
-    const reason = BLOCKING_DECISIONS.has(output.verdict)
-      ? output.reason || "Blocked by dcg"
-      : "Blocked by dcg (exit 1 without a blocking decision)";
+    const reason = stdoutText.overflowed
+      ? `Blocked by dcg because evaluator stdout exceeded the ${{DCG_STDOUT_MAX_BYTES}}-byte safety-verdict cap`
+      : BLOCKING_DECISIONS.has(output.verdict)
+        ? output.reason || "Blocked by dcg"
+        : "Blocked by dcg (exit 1 without a blocking decision)";
     const rule = output.ruleId ? `\n\nRule: ${{output.ruleId}}` : "";
     return {{ block: true, reason: `${{reason}}${{rule}}` }};
   }});
@@ -19475,12 +19763,216 @@ if ($errors.Count -ne 0) {
             .find("const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled")
             .expect("concurrent child collection");
         let classify = source
-            .find("const classification = classifyDcgChild(")
+            .find("const classification = stdoutText.overflowed")
             .expect("monotone classifier");
         assert!(
             spawn < collect && collect < classify,
             "the bounded child must be fully collected before stdout/status classification"
         );
+    }
+
+    /// The bridge's private robot envelope and both child pipes have explicit
+    /// byte ceilings. Collection must retain only observed bytes, keep draining
+    /// after overflow, and make overflow dominate any parseable prefix.
+    #[test]
+    fn omp_extension_source_bounds_streams_without_eager_cap_allocation() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        let has_bounded_compact_contract = |candidate: &str| {
+            candidate.contains("\"--omp-bridge-output\",")
+                && candidate.contains("collectBoundedText(proc.stdout, DCG_STDOUT_MAX_BYTES)")
+                && candidate.contains("collectBoundedText(proc.stderr, DCG_STDERR_MAX_BYTES)")
+                && !candidate.contains("new Response(proc.stdout).text()")
+                && !candidate.contains("new Response(proc.stderr).text()")
+        };
+        assert!(has_bounded_compact_contract(&source));
+
+        let unbounded_collector_mutant = source
+            .replace(
+                "collectBoundedText(proc.stdout, DCG_STDOUT_MAX_BYTES)",
+                "new Response(proc.stdout).text()",
+            )
+            .replace(
+                "collectBoundedText(proc.stderr, DCG_STDERR_MAX_BYTES)",
+                "new Response(proc.stderr).text()",
+            );
+        assert!(
+            !has_bounded_compact_contract(&unbounded_collector_mutant),
+            "the source contract must reject the former unbounded `.text()` collectors"
+        );
+        let full_envelope_mutant = source.replacen("        \"--omp-bridge-output\",\n", "", 1);
+        assert!(
+            !has_bounded_compact_contract(&full_envelope_mutant),
+            "the source contract must reject restoring the command-echoing general robot envelope"
+        );
+
+        assert!(source.contains(&format!(
+            "export const DCG_STDOUT_MAX_BYTES = {OMP_CHILD_STDOUT_MAX_BYTES};"
+        )));
+        assert!(source.contains(&format!(
+            "export const DCG_STDERR_MAX_BYTES = {OMP_CHILD_STDERR_MAX_BYTES};"
+        )));
+        assert!(source.contains("\"--omp-bridge-output\","));
+        assert!(source.contains(
+            "observeChildCapability(() => collectBoundedText(proc.stdout, DCG_STDOUT_MAX_BYTES))"
+        ));
+        assert!(source.contains(
+            "observeChildCapability(() => collectBoundedText(proc.stderr, DCG_STDERR_MAX_BYTES))"
+        ));
+        assert!(source.contains("while (true) {"));
+        assert!(source.contains("const next = await reader.read();"));
+        assert!(source.contains("reader.releaseLock();"));
+        assert!(source.contains("let retained = new Uint8Array(0);"));
+        assert!(source.contains("const capacity = Math.min(maxBytes, Math.max(needed, doubled));"));
+        assert!(
+            !source.contains("new Uint8Array(maxBytes)"),
+            "the ordinary compact verdict must not reserve the full safety cap"
+        );
+        assert!(
+            !source.contains("new Response(proc.stdout).text()")
+                && !source.contains("new Response(proc.stderr).text()"),
+            "Response.text() buffers child output without the bridge's explicit limits"
+        );
+        assert!(source.contains("return command.length <= DCG_STDIN_CHUNK_CODE_UNITS"));
+        assert!(source.contains("stdin: commandStdin(command),"));
+        assert_eq!(
+            source.matches("new TextEncoder().encode(command)").count(),
+            1,
+            "only the bounded ordinary-command fast path may encode in one allocation"
+        );
+        assert!(source.contains("readFailure = describeChildCollectionFailure(reason);"));
+        assert!(
+            source.contains("OMP guard could not run dcg: ${describeChildCollectionFailure(err)}")
+        );
+        assert_eq!(
+            source
+                .matches("${describeChildCollectionFailure(err)}")
+                .count(),
+            3,
+            "cwd, PTY-dialect, and spawn failures must all be bounded and total over hostile thrown values"
+        );
+        assert!(source.contains(
+            "if (stdoutText.readFailure) collectionFailures.push(`stdout read failed: ${stdoutText.readFailure}`);"
+        ));
+
+        let overflow = source
+            .find("const classification = stdoutText.overflowed")
+            .expect("overflow-first classification");
+        let parse = source[overflow..]
+            .find(": classifyDcgChild(")
+            .map(|offset| overflow + offset)
+            .expect("non-overflow classifier");
+        assert!(
+            overflow < parse,
+            "stdout overflow must block before any retained prefix is parsed"
+        );
+    }
+
+    #[test]
+    fn omp_bridge_field_bounds_and_json_cap_are_exact_and_utf8_safe() {
+        const {
+            assert!(OMP_BRIDGE_REASON_TRUNCATION_SUFFIX.len() < OMP_BRIDGE_REASON_MAX_BYTES);
+            assert!(OMP_BRIDGE_RULE_ID_TRUNCATION_SUFFIX.len() < OMP_BRIDGE_RULE_ID_MAX_BYTES);
+            assert!(
+                OMP_CHILD_STDOUT_MAX_BYTES
+                    == OMP_BRIDGE_JSON_ESCAPE_EXPANSION
+                        * (OMP_BRIDGE_REASON_MAX_BYTES + OMP_BRIDGE_RULE_ID_MAX_BYTES)
+                        + OMP_BRIDGE_JSON_ENVELOPE_MAX_BYTES
+            );
+        }
+
+        let just_under = "r".repeat(OMP_BRIDGE_REASON_MAX_BYTES - 1);
+        let bounded = bounded_omp_bridge_reason(&just_under);
+        assert!(matches!(bounded, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(bounded.len(), OMP_BRIDGE_REASON_MAX_BYTES - 1);
+
+        let at = "r".repeat(OMP_BRIDGE_REASON_MAX_BYTES);
+        let bounded = bounded_omp_bridge_reason(&at);
+        assert!(matches!(bounded, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(bounded.len(), OMP_BRIDGE_REASON_MAX_BYTES);
+
+        let multibyte_over = "🛸".repeat(OMP_BRIDGE_REASON_MAX_BYTES / 4 + 1);
+        let bounded = bounded_omp_bridge_reason(&multibyte_over);
+        assert_eq!(bounded.len(), OMP_BRIDGE_REASON_MAX_BYTES);
+        assert!(bounded.ends_with(OMP_BRIDGE_REASON_TRUNCATION_SUFFIX));
+        assert!(!bounded.contains('\u{fffd}'));
+
+        let giant_rule = "界".repeat(OMP_BRIDGE_RULE_ID_MAX_BYTES / 3 + 1);
+        let bounded_rule = bounded_omp_bridge_rule_id(giant_rule);
+        assert!(bounded_rule.len() <= OMP_BRIDGE_RULE_ID_MAX_BYTES);
+        assert!(bounded_rule.ends_with(OMP_BRIDGE_RULE_ID_TRUNCATION_SUFFIX));
+        assert!(!bounded_rule.contains('\u{fffd}'));
+
+        let control_reason = "\0".repeat(OMP_BRIDGE_REASON_MAX_BYTES);
+        let control_rule = "\0".repeat(OMP_BRIDGE_RULE_ID_MAX_BYTES);
+        let maximum = OmpBridgeTestOutput {
+            decision: "indeterminate",
+            reason: Some(std::borrow::Cow::Borrowed(&control_reason)),
+            rule_id: Some(std::borrow::Cow::Borrowed(&control_rule)),
+        };
+        let encoded = serde_json::to_string(&maximum).expect("serialize maximum compact envelope");
+        assert_eq!(encoded.len() + 1, OMP_CHILD_STDOUT_MAX_BYTES);
+    }
+
+    #[test]
+    fn omp_bridge_private_envelope_omits_command_and_general_robot_metadata() {
+        let allow_result = EvaluationResult::allowed();
+        let allowed = omp_bridge_test_output(&allow_result, None);
+        assert_eq!(
+            serde_json::to_string(&allowed).expect("serialize compact allow"),
+            r#"{"decision":"allow"}"#
+        );
+
+        let mut denied = EvaluationResult::allowed();
+        denied.decision = EvaluationDecision::Deny;
+        denied.pattern_info = Some(crate::evaluator::PatternMatch {
+            pack_id: Some("external.test".to_string()),
+            pattern_name: Some("danger".to_string()),
+            severity: None,
+            reason: "bounded reason".to_string(),
+            source: MatchSource::Pack,
+            matched_span: None,
+            matched_text_preview: None,
+            explanation: None,
+            suggestions: &[],
+        });
+        let compact =
+            serde_json::to_string(&omp_bridge_test_output(&denied, Some(DecisionMode::Deny)))
+                .expect("serialize compact deny");
+        assert_eq!(
+            compact,
+            r#"{"decision":"deny","reason":"bounded reason","rule_id":"external.test:danger"}"#
+        );
+        assert!(!compact.contains("command"));
+        for omitted in [
+            "schema_version",
+            "dcg_version",
+            "pack_id",
+            "pattern_name",
+            "explanation",
+            "severity",
+        ] {
+            assert!(
+                !compact.contains(omitted),
+                "private envelope unexpectedly contains {omitted}"
+            );
+        }
+    }
+
+    #[test]
+    fn omp_extension_source_keeps_astral_input_scalar_across_chunk_boundary() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        assert!(source.contains(&format!(
+            "export const DCG_STDIN_CHUNK_CODE_UNITS = {OMP_CHILD_STDIN_CHUNK_CODE_UNITS};"
+        )));
+        assert!(source.contains("command.charCodeAt(end - 1) >= 0xd800"));
+        assert!(source.contains("command.charCodeAt(end) <= 0xdfff"));
+        assert!(source.contains("end += 1;"));
+        assert!(source.contains("return text.pipeThrough(new TextEncoderStream());"));
+        assert!(source.contains("return command.length <= DCG_STDIN_CHUNK_CODE_UNITS"));
     }
 
     /// Each child observation is an independent capability. A rejected stderr
@@ -19569,7 +20061,7 @@ if ($errors.Count -ne 0) {
         let classify = source
             .find("const toolCall = classifyOmpToolCall(event);")
             .expect("structural classification call");
-        let spawn = source.find("const proc = Bun.spawn").expect("dcg spawn");
+        let spawn = source.find("proc = Bun.spawn").expect("dcg spawn");
         assert!(
             classify < spawn,
             "the structural boundary must classify the event before dcg is spawned"
@@ -19604,7 +20096,12 @@ if ($errors.Count -ne 0) {
         }
         assert!(source.contains("function parseDcgOutput("));
         assert!(source.contains("export function classifyDcgChild("));
-        assert!(source.contains("const classification = classifyDcgChild("));
+        assert!(source.contains("const classification = stdoutText.overflowed"));
+        assert!(
+            source.contains(
+                ": classifyDcgChild(childOutcomeFromExitCode(exitCode), stdoutText.text);"
+            )
+        );
         assert!(
             source.contains(
                 "reason: typeof record.reason === \"string\" ? record.reason : undefined"
@@ -19635,10 +20132,9 @@ if ($errors.Count -ne 0) {
         let source = build_omp_extension_source(&executable).expect("extension generation");
 
         assert!(source.contains(
-            r#"const classification = classifyDcgChild(
-      childOutcomeFromExitCode(exitCode),
-      typeof stdoutText === "string" ? stdoutText : "",
-    );"#
+            r#"const classification = stdoutText.overflowed
+      ? { action: "block" as const, output: { verdict: "unknown" as const } }
+      : classifyDcgChild(childOutcomeFromExitCode(exitCode), stdoutText.text);"#
         ));
         assert_eq!(
             source.matches("classifyDcgChild(").count(),
@@ -19655,31 +20151,29 @@ if ($errors.Count -ne 0) {
             !classifier.contains("stderr"),
             "stderr JSON is diagnostic text, never a decision input"
         );
-        assert!(source.contains(
-            r#"const stderrDetail = typeof stderrText === "string" ? stderrText.trim() : "";"#
-        ));
+        assert!(source.contains("const stderrDetail = visibleStderrDetail(stderrText);"));
         assert_eq!(
             source
-                .matches(
-                    "if (stderrDetail) console.error(`[dcg] OMP guard dcg stderr: ${stderrDetail}`);"
-                )
+                .matches("if (collectionFailures.length === 0 && stderrDetail) {")
                 .count(),
             1,
             "allow and block must share one non-infrastructure stderr forwarding point"
         );
         assert_eq!(
             source.matches(
-                "console.error(`[dcg] OMP guard infrastructure failure (exit ${exitCode})${stderrDetail ? `: ${stderrDetail}` : \"\"}`);"
+                "console.error(`[dcg] OMP guard infrastructure failure${exitDetail}${details ? `: ${details}` : \"\"}`);"
             ).count(),
             1,
             "the infrastructure diagnostic must include child stderr exactly once"
         );
 
         let infrastructure = source
-            .find("if (classification.action === \"infrastructure\")")
+            .find(
+                "if (classification.action === \"infrastructure\" || collectionFailures.length > 0)",
+            )
             .expect("infrastructure outcome branch");
         let forward = source
-            .find("if (stderrDetail) console.error(`[dcg] OMP guard dcg stderr: ${stderrDetail}`);")
+            .find("if (collectionFailures.length === 0 && stderrDetail) {")
             .expect("non-infrastructure stderr forwarding");
         let allow = source
             .find("if (classification.action === \"allow\") return;")
@@ -19781,6 +20275,12 @@ export function resolveToCwd(requested: string, cwd: string): string {
         std::fs::write(
             root.join("runner.ts"),
             r#"import dcgGuard, {
+  collectBoundedText,
+  commandStdin,
+  commandUtf8Stream,
+  DCG_STDERR_MAX_BYTES,
+  DCG_STDIN_CHUNK_CODE_UNITS,
+  DCG_STDOUT_MAX_BYTES,
   classifyDcgChild,
   classifyOmpToolCall,
 } from "./dcg-guard.ts";
@@ -19856,6 +20356,52 @@ const typedMetadata = classifyDcgChild(
 equal(typedMetadata.output.reason, undefined, "transition/non-string-reason");
 equal(typedMetadata.output.ruleId, undefined, "transition/non-string-rule-id");
 
+const byteStream = (chunks: Uint8Array[], error?: string): ReadableStream<Uint8Array> => {
+  let offset = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller): void {
+      if (offset < chunks.length) {
+        controller.enqueue(chunks[offset++]!);
+      } else if (error) {
+        controller.error(new Error(error));
+      } else {
+        controller.close();
+      }
+    },
+  });
+};
+const encoder = new TextEncoder();
+for (const [caseId, size, expectedOverflow] of [
+  ["collector/just-under", DCG_STDOUT_MAX_BYTES - 1, false],
+  ["collector/at", DCG_STDOUT_MAX_BYTES, false],
+  ["collector/over", DCG_STDOUT_MAX_BYTES + 1, true],
+] as const) {
+  const collected = await collectBoundedText(
+    byteStream([encoder.encode("x".repeat(size))]),
+    DCG_STDOUT_MAX_BYTES,
+  );
+  equal(collected.text.length, Math.min(size, DCG_STDOUT_MAX_BYTES), `${caseId}/retained`);
+  equal(collected.overflowed, expectedOverflow, `${caseId}/overflow`);
+}
+const saucerBytes = encoder.encode("🛸");
+const splitScalar = await collectBoundedText(
+  byteStream([saucerBytes.subarray(0, 2), saucerBytes.subarray(2)]),
+  DCG_STDOUT_MAX_BYTES,
+);
+equal(splitScalar.text, "🛸", "collector/multibyte-split/text");
+equal(splitScalar.overflowed, false, "collector/multibyte-split/overflow");
+const cutScalar = await collectBoundedText(
+  byteStream([encoder.encode("x".repeat(DCG_STDOUT_MAX_BYTES - 1)), saucerBytes]),
+  DCG_STDOUT_MAX_BYTES,
+);
+equal(cutScalar.text.length, DCG_STDOUT_MAX_BYTES - 1, "collector/multibyte-cap/text");
+check(!cutScalar.text.includes("�"), "collector/multibyte-cap/no-replacement");
+equal(cutScalar.overflowed, true, "collector/multibyte-cap/overflow");
+const boundaryCommand = "x".repeat(DCG_STDIN_CHUNK_CODE_UNITS - 1) + "🛸tail";
+equal(await new Response(commandUtf8Stream(boundaryCommand)).text(), boundaryCommand, "stdin/astral-boundary");
+check(commandStdin("echo ok") instanceof Uint8Array, "stdin/small-fast-path");
+check(commandStdin(boundaryCommand) instanceof ReadableStream, "stdin/large-stream-path");
+
 type ChildCase = {
   stdout?: string;
   stderr?: string;
@@ -19883,7 +20429,7 @@ const originalConsoleError = console.error;
 
 (Bun as unknown as { spawn: typeof Bun.spawn }).spawn = ((argv: string[], options: {
   cwd: string;
-  stdin: Uint8Array;
+  stdin: Uint8Array | ReadableStream<Uint8Array>;
   timeout: number;
   killSignal: string | number;
 }) => {
@@ -19892,21 +20438,36 @@ const originalConsoleError = console.error;
   equal(argv[0], observedExecutable, "callback/spawn/executable-stability");
   equal(options.timeout, 30_000, "callback/spawn/parent-timeout");
   equal(options.killSignal, "SIGKILL", "callback/spawn/kill-signal");
-  spawnRecords.push({
+  const record: SpawnRecord = {
     argv: [...argv],
     cwd: options.cwd,
-    stdin: new TextDecoder().decode(options.stdin),
+    stdin: "",
     timeout: options.timeout,
     killSignal: options.killSignal,
+  };
+  spawnRecords.push(record);
+  const stdinCollected = new Response(options.stdin).text().then(text => {
+    record.stdin = text;
   });
   const childStream = (text: string, error: string | undefined): ReadableStream<Uint8Array> => {
     if (!error) return new Blob([text]).stream();
+    let emitted = false;
     return new ReadableStream<Uint8Array>({
-      start(controller): void {
+      pull(controller): void {
+        if (!emitted && text.length > 0) {
+          emitted = true;
+          controller.enqueue(new TextEncoder().encode(text));
+          return;
+        }
         controller.error(new Error(error));
       },
     });
   };
+  const childExit = activeChild.stuckUntilTimeout
+    ? new Promise<number>(resolve => setTimeout(() => resolve(137), 5))
+    : activeChild.exitError
+      ? Promise.reject(new Error(activeChild.exitError))
+      : Promise.resolve(activeChild.exitCode ?? 0);
   return {
     stdout: childStream(activeChild.stdout ?? "", activeChild.stdoutError),
     stderr: childStream(activeChild.stderr ?? "", activeChild.stderrError),
@@ -19914,11 +20475,7 @@ const originalConsoleError = console.error;
     // production 30-second ceiling. The exact configured value and kill
     // signal are asserted above, so removing either production option turns
     // this replay red before the compressed timer can resolve.
-    exited: activeChild.stuckUntilTimeout
-      ? new Promise<number>(resolve => setTimeout(() => resolve(137), 5))
-      : activeChild.exitError
-        ? Promise.reject(new Error(activeChild.exitError))
-        : Promise.resolve(activeChild.exitCode ?? 0),
+    exited: Promise.all([childExit, stdinCollected]).then(([exitCode]) => exitCode),
   };
 }) as typeof Bun.spawn;
 console.error = (...values: unknown[]): void => {
@@ -19970,7 +20527,7 @@ try {
   equal(replay.spawns.length, 1, "callback/whitespace-allow/spawn-count");
   equal(replay.spawns[0]!.stdin, " \t", "callback/whitespace-allow/stdin-bytes");
   equal(replay.spawns[0]!.cwd, process.cwd(), "callback/whitespace-allow/cwd");
-  equal(replay.spawns[0]!.argv.slice(1), ["--robot", "test", "--stdin", "--agent", "omp", "--dialect", "posix"], "callback/whitespace-allow/argv");
+  equal(replay.spawns[0]!.argv.slice(1), ["--robot", "test", "--stdin", "--agent", "omp", "--dialect", "posix", "--omp-bridge-output"], "callback/whitespace-allow/argv");
   equal(replay.spawns[0]!.timeout, 30_000, "callback/whitespace-allow/parent-timeout");
   equal(replay.spawns[0]!.killSignal, "SIGKILL", "callback/whitespace-allow/kill-signal");
   equal(replay.errors, ["[dcg] OMP guard dcg stderr: allow diagnostic"], "callback/whitespace-allow/diagnostics");
@@ -19982,6 +20539,51 @@ try {
   );
   equal(replay.result, { block: true, reason: "danger\n\nRule: core.git:test" }, "callback/exit-zero-deny/result");
   equal(replay.errors, ["[dcg] OMP guard dcg stderr: block diagnostic"], "callback/exit-zero-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/oversized-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    { stdout: JSON.stringify({ decision: "deny", reason: "complete denial" }) + "x".repeat(DCG_STDOUT_MAX_BYTES), exitCode: 0 },
+  );
+  equal(replay.result, {
+    block: true,
+    reason: `Blocked by dcg because evaluator stdout exceeded the ${DCG_STDOUT_MAX_BYTES}-byte safety-verdict cap`,
+  }, "callback/oversized-deny/result");
+  check(replay.errors.some(error => error.includes("blocking conservatively")), "callback/oversized-deny/diagnostic");
+
+  replay = await invoke(
+    "callback/oversized-non-verdict",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stdout: "not-json" + "x".repeat(DCG_STDOUT_MAX_BYTES), exitCode: 0 },
+  );
+  equal(replay.result, {
+    block: true,
+    reason: `Blocked by dcg because evaluator stdout exceeded the ${DCG_STDOUT_MAX_BYTES}-byte safety-verdict cap`,
+  }, "callback/oversized-non-verdict/result");
+
+  replay = await invoke(
+    "callback/deny-then-stdout-fault",
+    { toolName: "bash", input: { command: "danger" } },
+    { stdout: JSON.stringify({ decision: "deny", reason: "deny survives midstream fault" }), stdoutError: "after verdict", exitCode: 0 },
+  );
+  equal(replay.result, { block: true, reason: "deny survives midstream fault" }, "callback/deny-then-stdout-fault/result");
+  check(replay.errors.some(error => error.includes("stdout read failed: Error: after verdict")), "callback/deny-then-stdout-fault/diagnostic");
+
+  replay = await invoke(
+    "callback/allow-then-stdout-fault",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stdout: JSON.stringify({ decision: "allow" }), stdoutError: "after apparent allow", exitCode: 0 },
+  );
+  equal(replay.result, undefined, "callback/allow-then-stdout-fault/result");
+  check(replay.errors.some(error => error.includes("stdout read failed: Error: after apparent allow")), "callback/allow-then-stdout-fault/diagnostic");
+
+  replay = await invoke(
+    "callback/stderr-overflow",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stdout: JSON.stringify({ decision: "allow" }), stderr: "d".repeat(DCG_STDERR_MAX_BYTES + 1), exitCode: 0 },
+  );
+  equal(replay.result, undefined, "callback/stderr-overflow/result");
+  check(replay.errors.some(error => error.includes("additional bytes omitted")), "callback/stderr-overflow/visible-marker");
 
   replay = await invoke(
     "callback/stderr-json-is-diagnostic",
@@ -20274,6 +20876,11 @@ console.log(JSON.stringify({
                 "callback/empty-command",
                 "callback/whitespace-allow",
                 "callback/exit-zero-deny",
+                "callback/oversized-deny",
+                "callback/oversized-non-verdict",
+                "callback/deny-then-stdout-fault",
+                "callback/allow-then-stdout-fault",
+                "callback/stderr-overflow",
                 "callback/stderr-json-is-diagnostic",
                 "callback/exit-one-stderr-only",
                 "callback/stderr-reject-deny",
@@ -20324,13 +20931,13 @@ console.log(JSON.stringify({
         );
 
         let settled_collector = r"    const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
-      observeChildCapability(() => new Response(proc.stdout).text()),
-      observeChildCapability(() => new Response(proc.stderr).text()),
+      observeChildCapability(() => collectBoundedText(proc.stdout, DCG_STDOUT_MAX_BYTES)),
+      observeChildCapability(() => collectBoundedText(proc.stderr, DCG_STDERR_MAX_BYTES)),
       observeChildCapability(() => proc.exited),
     ]);";
         let fail_fast_collector = r#"    const [stdoutValue, stderrValue, exitValue] = await Promise.all([
-      observeChildCapability(() => new Response(proc.stdout).text()),
-      observeChildCapability(() => new Response(proc.stderr).text()),
+      observeChildCapability(() => collectBoundedText(proc.stdout, DCG_STDOUT_MAX_BYTES)),
+      observeChildCapability(() => collectBoundedText(proc.stderr, DCG_STDERR_MAX_BYTES)),
       observeChildCapability(() => proc.exited),
     ]);
     const stdoutResult = { status: "fulfilled" as const, value: stdoutValue };
@@ -22190,6 +22797,47 @@ exclude = ["target/**"]
             Cli::try_parse_from(["dcg", "test", "--dialect", "klingon", "git status"]).is_err(),
             "an unknown dialect must be rejected rather than silently ignored"
         );
+    }
+
+    #[test]
+    fn omp_bridge_output_requires_robot_and_explicit_omp_agent() {
+        let cli = Cli::try_parse_from([
+            "dcg",
+            "--robot",
+            "test",
+            "--stdin",
+            "--agent",
+            "omp",
+            "--omp-bridge-output",
+        ])
+        .expect("the private OMP protocol accepts the global robot flag");
+        let Some(Command::TestCommand {
+            omp_bridge_output, ..
+        }) = cli.command
+        else {
+            unreachable!("Expected TestCommand");
+        };
+        assert!(omp_bridge_output);
+
+        let without_robot = Cli::try_parse_from([
+            "dcg",
+            "test",
+            "--stdin",
+            "--agent",
+            "omp",
+            "--omp-bridge-output",
+        ])
+        .expect("the runtime validator owns the global/subcommand dependency");
+        assert!(!robot_mode_enabled(without_robot.robot));
+        assert!(validate_omp_bridge_output_agent(true, false, true).is_err());
+        for agent in ["omp", "OMP", "oh-my-pi", "oh_my_pi", "ohmypi"] {
+            assert!(is_explicit_omp_agent(Some(agent)));
+            assert!(validate_omp_bridge_output_agent(true, true, true).is_ok());
+        }
+        assert!(!is_explicit_omp_agent(None));
+        assert!(!is_explicit_omp_agent(Some("codex")));
+        assert!(validate_omp_bridge_output_agent(true, true, false).is_err());
+        assert!(validate_omp_bridge_output_agent(false, false, false).is_ok());
     }
 
     #[test]
