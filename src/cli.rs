@@ -2227,7 +2227,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else if opencode {
                 install_opencode_plugin(force, project)?;
             } else if omp {
-                install_omp_extension(force, project)?;
+                install_omp_extension(force, project, true)?;
             } else {
                 install_hook(force, project)?;
             }
@@ -10330,12 +10330,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 issues += 1;
                 if fix {
                     println!("  Attempting extension refresh...");
-                    if install_omp_extension(true, project).is_ok()
-                        && matches!(
-                            registered_omp_extension(),
-                            Ok(OmpExtensionRegistration::Healthy(_))
-                        )
-                    {
+                    if refresh_loaded_owned_omp_extensions(project, true).is_ok() {
                         println!("  {}", "Fixed!".green());
                         fixed += 1;
                     } else {
@@ -10354,7 +10349,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 issues += 1;
                 if fix {
                     println!("  Attempting extension install...");
-                    if install_omp_extension(false, false).is_ok()
+                    if install_omp_extension(false, false, true).is_ok()
                         && matches!(
                             registered_omp_extension(),
                             Ok(OmpExtensionRegistration::Healthy(_))
@@ -11363,13 +11358,7 @@ fn collect_doctor_report(
             }
             Ok(OmpExtensionRegistration::OwnedUnhealthy { path, project }) => {
                 issues += 1;
-                if fix
-                    && install_omp_extension(true, project).is_ok()
-                    && matches!(
-                        registered_omp_extension(),
-                        Ok(OmpExtensionRegistration::Healthy(_))
-                    )
-                {
+                if fix && refresh_loaded_owned_omp_extensions(project, false).is_ok() {
                     fixed += 1;
                     omp_fixed = true;
                     (
@@ -11394,7 +11383,7 @@ fn collect_doctor_report(
             Ok(OmpExtensionRegistration::Missing) => {
                 issues += 1;
                 if fix
-                    && install_omp_extension(false, false).is_ok()
+                    && install_omp_extension(false, false, false).is_ok()
                     && matches!(
                         registered_omp_extension(),
                         Ok(OmpExtensionRegistration::Healthy(_))
@@ -12956,6 +12945,32 @@ fn registered_omp_extension() -> std::io::Result<OmpExtensionRegistration> {
     Ok(OmpExtensionRegistration::Missing)
 }
 
+/// Refresh every dcg-owned unhealthy extension OMP will load. There are only
+/// two authoritative scopes (project and active user/profile), so two attempts
+/// are a complete bound rather than an open-ended repair loop. Each install
+/// independently rechecks marker ownership before its atomic replacement.
+fn refresh_loaded_owned_omp_extensions(
+    first_project: bool,
+    announce: bool,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut project = first_project;
+    for refreshed in 1..=2 {
+        install_omp_extension(true, project, announce)?;
+        match registered_omp_extension()? {
+            OmpExtensionRegistration::Healthy(_) => return Ok(refreshed),
+            OmpExtensionRegistration::OwnedUnhealthy {
+                project: next_project,
+                ..
+            } => project = next_project,
+            OmpExtensionRegistration::Missing => {
+                return Err("OMP extension disappeared while doctor was refreshing it".into());
+            }
+        }
+    }
+
+    Err("OMP extensions remained unhealthy after refreshing both loaded scopes".into())
+}
+
 /// Shared doctor verdict for the build-provenance / update-pin check (#320),
 /// used by both renderers so `--strict` and `--format json` agree.
 fn build_provenance_doctor_parts(config: &Config) -> (DoctorCheckStatus, String, Option<String>) {
@@ -13052,7 +13067,11 @@ fn install_opencode_plugin(force: bool, project: bool) -> Result<(), Box<dyn std
 }
 
 /// Install the native Oh My Pi ExtensionAPI guard.
-fn install_omp_extension(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn install_omp_extension(
+    force: bool,
+    project: bool,
+    announce: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
     let extension_path = if project {
@@ -13076,8 +13095,10 @@ fn install_omp_extension(force: bool, project: bool) -> Result<(), Box<dyn std::
             .into());
         }
         if !force {
-            println!("{}", "OMP extension already installed!".yellow());
-            println!("Use --force to reinstall");
+            if announce {
+                println!("{}", "OMP extension already installed!".yellow());
+                println!("Use --force to reinstall");
+            }
             return Ok(());
         }
     }
@@ -13089,14 +13110,16 @@ fn install_omp_extension(force: bool, project: bool) -> Result<(), Box<dyn std::
     }
     write_settings_atomic(&extension_path, &source)?;
 
-    let level = if project { "project" } else { "user/profile" };
-    println!("{}", "OMP extension installed successfully!".green().bold());
-    println!("Extension written ({level}): {}", extension_path.display());
-    println!();
-    println!(
-        "{}",
-        "Restart Oh My Pi (start a new session) for the extension to load.".yellow()
-    );
+    if announce {
+        let level = if project { "project" } else { "user/profile" };
+        println!("{}", "OMP extension installed successfully!".green().bold());
+        println!("Extension written ({level}): {}", extension_path.display());
+        println!();
+        println!(
+            "{}",
+            "Restart Oh My Pi (start a new session) for the extension to load.".yellow()
+        );
+    }
     Ok(())
 }
 
