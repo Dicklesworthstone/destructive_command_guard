@@ -15,6 +15,15 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use destructive_command_guard::history::{HistoryConnection, SqliteValue};
+
+fn history_text(value: &SqliteValue) -> &str {
+    match value {
+        SqliteValue::Text(value) => value,
+        other => panic!("expected history text value, got {other:?}"),
+    }
+}
+
 /// Path to the dcg binary.
 fn dcg_binary() -> PathBuf {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_dcg") {
@@ -436,6 +445,119 @@ reason = "robot profile regression fixture"
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("Codex allowlist JSON");
     assert_eq!(json["decision"], "allow");
     assert_eq!(json["agent"]["detected"], "codex-cli");
+}
+
+/// The command dispatcher exits the process after a blocked robot result, so
+/// this must cross the real binary boundary: an in-process entry-construction
+/// test cannot prove that the asynchronous writer drains before `process::exit`.
+#[test]
+fn test_omp_robot_boundary_persists_history_before_block_exit_and_isolates_agents() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let xdg = temp.path().join("xdg");
+    let scratch = temp.path().join("tmp");
+    for directory in [&home, &xdg, &scratch] {
+        std::fs::create_dir_all(directory).expect("hermetic history directory");
+    }
+
+    let history_path = temp.path().join("robot-history.sqlite3");
+    let decoy_path = temp.path().join("configured-but-overridden.sqlite3");
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[history]\nenabled = true\ndatabase_path = '{}'\nbatch_size = 1\nbatch_flush_interval_ms = 1\nredaction_mode = \"none\"\n",
+            decoy_path.display()
+        ),
+    )
+    .expect("history config");
+
+    let run = |robot: bool, agent: &str, command: &str| {
+        let mut process = Command::new(dcg_binary());
+        if robot {
+            process.arg("--robot");
+        }
+        process
+            .args(["test", "--stdin", "--agent", agent, "--dialect", "posix"])
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("TMPDIR", &scratch)
+            .env("TEMP", &scratch)
+            .env("TMP", &scratch)
+            .env("DCG_CONFIG", &config_path)
+            .env("DCG_HISTORY_DB", &history_path)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .current_dir(temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = process.spawn().expect("spawn history boundary");
+        child
+            .stdin
+            .take()
+            .expect("history boundary stdin")
+            .write_all(command.as_bytes())
+            .expect("write history command");
+        child
+            .wait_with_output()
+            .expect("collect history boundary output")
+    };
+
+    let omp = run(true, "omp", "git reset --hard HEAD");
+    assert_eq!(
+        omp.status.code(),
+        Some(1),
+        "denied OMP command must cross the dispatch exit path: {}",
+        String::from_utf8_lossy(&omp.stderr)
+    );
+    let codex = run(true, "codex", "git status");
+    assert_eq!(codex.status.code(), Some(0));
+    let human = run(false, "omp", "git status");
+    assert_eq!(human.status.code(), Some(0));
+
+    assert!(
+        history_path.exists(),
+        "DCG_HISTORY_DB must receive the robot rows"
+    );
+    assert!(
+        !decoy_path.exists(),
+        "the environment database override must outrank configured database_path"
+    );
+
+    let connection = HistoryConnection::open(&history_path).expect("open robot history");
+    let rows = connection
+        .query(
+            "SELECT agent_type, working_dir, command, outcome, pack_id, pattern_name \
+             FROM commands ORDER BY id",
+        )
+        .expect("query robot history");
+    assert_eq!(
+        rows.len(),
+        2,
+        "two robot evaluations must persist while the human diagnostic stays out"
+    );
+
+    let omp_values = rows[0].values();
+    assert_eq!(history_text(&omp_values[0]), "omp");
+    assert_eq!(history_text(&omp_values[1]), temp.path().to_string_lossy());
+    assert_eq!(history_text(&omp_values[2]), "git reset --hard HEAD");
+    assert_eq!(history_text(&omp_values[3]), "deny");
+    assert_eq!(history_text(&omp_values[4]), "core.git");
+    assert_eq!(history_text(&omp_values[5]), "reset-hard");
+
+    let codex_values = rows[1].values();
+    assert_eq!(history_text(&codex_values[0]), "codex-cli");
+    assert_eq!(
+        history_text(&codex_values[1]),
+        temp.path().to_string_lossy()
+    );
+    assert_eq!(history_text(&codex_values[2]), "git status");
+    assert_eq!(history_text(&codex_values[3]), "allow");
+    assert_eq!(codex_values[4], SqliteValue::Null);
+    assert_eq!(codex_values[5], SqliteValue::Null);
 }
 
 /// The process cwd is the authority used by dcg's project-config discovery.
