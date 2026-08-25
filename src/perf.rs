@@ -401,11 +401,8 @@ mod tests {
              scripts/perf_baseline.py"
         );
         assert!(
-            gate_step.contains(
-                "LATENCY_ARTIFACT_DIR=\"$RUNNER_TEMP/dcg-perf-latency\""
-            ) && gate_step.contains(
-                "--output \"$LATENCY_ARTIFACT_DIR/perf-latency-gate.json\""
-            ),
+            gate_step.contains("LATENCY_ARTIFACT_DIR=\"$RUNNER_TEMP/dcg-perf-latency\"")
+                && gate_step.contains("--output \"$LATENCY_ARTIFACT_DIR/perf-latency-gate.json\""),
             "the absolute gate must write its self-contained certificate outside \
              the checkout so its own artifact cannot invalidate the source fence"
         );
@@ -431,9 +428,8 @@ mod tests {
             .expect("CI must retain the absolute latency certificate upload step");
         assert!(
             artifact_step.contains("if: always()")
-                && artifact_step.contains(
-                    "path: ${{ runner.temp }}/dcg-perf-latency/perf-latency-gate.json"
-                ),
+                && artifact_step
+                    .contains("path: ${{ runner.temp }}/dcg-perf-latency/perf-latency-gate.json"),
             "CI must retain perf-latency-gate.json on both pass and failure"
         );
 
@@ -445,9 +441,8 @@ mod tests {
         assert!(
             relative_step.contains("PERF_ARTIFACT_DIR=\"$RUNNER_TEMP/dcg-perf-relative\"")
                 && relative_step.contains("CURRENT_JSON=\"$PERF_ARTIFACT_DIR/perf-current.json\"")
-                && relative_step.contains(
-                    "REPORT_MD=\"$PERF_ARTIFACT_DIR/perf-regression-report.md\""
-                ),
+                && relative_step
+                    .contains("REPORT_MD=\"$PERF_ARTIFACT_DIR/perf-regression-report.md\""),
             "relative perf artifacts must stay outside the checkout so they do not \
              make the following binary/source binding check fail"
         );
