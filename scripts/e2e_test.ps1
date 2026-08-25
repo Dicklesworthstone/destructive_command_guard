@@ -64,6 +64,7 @@ $script:TestsPassed = 0
 $script:TestsFailed = 0
 $script:TestsSkipped = 0
 $script:TestsWarned = 0
+$script:BinaryExplicit = -not [string]::IsNullOrWhiteSpace($Binary)
 $script:CurrentId = ""
 $script:CurrentSw = $null
 $script:Results = [System.Collections.Generic.List[object]]::new()
@@ -166,6 +167,18 @@ function Resolve-DcgBinary {
 }
 
 function Assert-BinaryVersionFresh { param([string]$Bin)
+    if ($script:BinaryExplicit) { return }
+
+    $repoPath = [System.IO.Path]::GetFullPath($RepoRoot)
+    $binaryPath = [System.IO.Path]::GetFullPath($Bin)
+    $pathComparison = if ($env:OS -eq "Windows_NT" -or $IsWindows) {
+        [System.StringComparison]::OrdinalIgnoreCase
+    } else {
+        [System.StringComparison]::Ordinal
+    }
+    $repoPrefix = $repoPath + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $binaryPath.StartsWith($repoPrefix, $pathComparison)) { return }
+
     $cargoToml = Join-Path $RepoRoot "Cargo.toml"
     if (-not (Test-Path $cargoToml)) { return }
     $expected = (Select-String -Path $cargoToml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
@@ -182,10 +195,15 @@ function Assert-BinaryVersionFresh { param([string]$Bin)
     } finally {
         $ErrorActionPreference = $previousErrorAction
     }
-    $versionStderr = (Get-Content -Raw -LiteralPath $versionErrFile -ErrorAction SilentlyContinue)
-    $verOut = "$versionStdout`n$versionStderr".Trim()
-    if ($verOut -notmatch [regex]::Escape($expected)) {
-        Write-Line "WARNING: binary version ($verOut) != Cargo.toml ($expected); may be STALE. Rebuild for accurate results." "Yellow"
+    $actual = (($versionStdout -split "\r?\n")[0]).Trim()
+    if ($actual -ne $expected) {
+        $displayActual = if ([string]::IsNullOrWhiteSpace($actual)) { "unknown" } else { $actual }
+        [Console]::Error.WriteLine("Error: stale dcg binary selected")
+        [Console]::Error.WriteLine("Binary: $Bin")
+        [Console]::Error.WriteLine("Binary version: $displayActual")
+        [Console]::Error.WriteLine("Cargo.toml version: $expected")
+        [Console]::Error.WriteLine("Run 'cargo build --release' or pass -Binary PATH to the intended binary.")
+        exit 2
     }
 }
 
