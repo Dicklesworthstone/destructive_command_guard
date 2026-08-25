@@ -21218,10 +21218,10 @@ const MKTEMP_SCRATCH_STAND_IN: &str = "/tmp/dcg.mktemp.scratch";
 /// substitution and return the benign scratch stand-in path (#275).
 ///
 /// Deliberately narrow: only flags that cannot change where the path is
-/// created are accepted. A template argument, `-p`/`--tmpdir`, or `-t` can
-/// root the result outside the system temp dir (or under a caller-controlled
-/// `$TMPDIR`), and `-u`/`--dry-run` returns a name without creating it, so all
-/// of those keep the fail-closed treatment.
+/// created are accepted, plus one direct-child literal temp-family template
+/// ending in `XXXXXX`. `-p`/`--tmpdir` and `-t` can use a caller-controlled
+/// root, and `-u`/`--dry-run` returns a name without creating it, so those
+/// forms keep the fail-closed treatment.
 fn mktemp_scratch_assignment_value(raw: &str) -> Option<String> {
     mktemp_scratch_assignment_value_with_directory_requirement(raw, false)
 }
@@ -21251,14 +21251,30 @@ fn mktemp_scratch_assignment_value_with_directory_requirement(
         return None;
     }
     let mut directory = false;
+    let mut template = None;
     for word in words {
         match word {
             "-d" | "--directory" => directory = true,
             "-q" | "--quiet" => {}
+            _ if template.is_none() && literal_temp_mktemp_template(word) => template = Some(word),
             _ => return None,
         }
     }
     (!require_directory || directory).then(|| MKTEMP_SCRATCH_STAND_IN.to_string())
+}
+
+/// A caller-selected mktemp template is trustworthy only when its generated
+/// name is an immediate child of a literal temp-family root. The six trailing
+/// `X` bytes are the portable template form used by the reported command;
+/// nested parents and additional shell syntax are rejected.
+fn literal_temp_mktemp_template(template: &str) -> bool {
+    let Some(suffix) = ["/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/"]
+        .iter()
+        .find_map(|prefix| template.strip_prefix(prefix))
+    else {
+        return false;
+    };
+    !suffix.is_empty() && suffix.ends_with("XXXXXX") && !suffix.contains('/')
 }
 
 /// A whole-segment assignment value that is one literal shell word.
@@ -24248,6 +24264,287 @@ mod tests {
                 "safe loop form must remain allowed: {command:?}"
             );
         }
+    }
+
+    #[test]
+    fn frog_20260820155755_read_only_pdf_inventory_loop_is_allowed() {
+        let command = r#"for pdf in /tmp/pathology-reports/*.pdf; do pdftotext "$pdf" "/tmp/pathology-inventory/$(basename "$pdf" .pdf).txt"; pdfinfo "$pdf"; done"#;
+        let result = evaluate_with_pack_ids_in_dialect(
+            command,
+            &["core.git", "core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            result.is_allowed(),
+            "read-only PDF inventory loop must remain inspectable: {:?}",
+            result.pattern_info
+        );
+
+        let dynamic_destructive = evaluate_with_pack_ids_in_dialect(
+            r#"for tool in git; do "$tool" reset --hard; done"#,
+            &["core.git", "core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            dynamic_destructive.is_denied(),
+            "a loop-expanded destructive executable must remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn frog_20260825183349_static_read_loop_is_allowed() {
+        let command = "for file in ce-code-review/references/analysis.md ce-code-review/references/review.md ce-code-review/references/testing.md ce-code-review/references/rust.md ce-code-review/references/security.md; do wc -l \"$file\"; done";
+        let result = evaluate_with_pack_ids_in_dialect(
+            command,
+            &["core.git", "core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            result.is_allowed(),
+            "fixed-path read loop must remain inspectable: {:?}",
+            result.pattern_info
+        );
+
+        let dynamic_destructive = evaluate_with_pack_ids_in_dialect(
+            r#"for tool in git; do env X=1 "$tool" push --force origin main; done"#,
+            &["core.git", "core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            dynamic_destructive.is_denied(),
+            "a wrapped loop-expanded destructive executable must remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn frog_20260820182549_python_helper_name_is_not_postgresql() {
+        let safe = "python3 <<'PY'\ndef truncate(text, width=80):\n    return text[:width]\nprint(truncate('hello'))\nPY";
+        let result =
+            evaluate_with_pack_ids_in_dialect(safe, &["database.postgresql"], ShellDialect::Posix);
+        assert!(
+            result.is_allowed(),
+            "a Python helper name must not be classified as SQL: {:?}",
+            result.pattern_info
+        );
+
+        let dangerous = evaluate_with_pack_ids_in_dialect(
+            "psql app -c 'TRUNCATE TABLE observations'",
+            &["database.postgresql"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            dangerous.is_denied(),
+            "actual destructive SQL must stay denied"
+        );
+    }
+
+    #[test]
+    fn frog_20260820182549_dev_browser_temp_glob_is_allowed() {
+        let safe = evaluate_with_pack_ids_in_dialect(
+            "rm -f ~/.dev-browser/tmp/field-*.png",
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            safe.is_allowed(),
+            "bounded tool-temp screenshot cleanup must be allowed: {:?}",
+            safe.pattern_info
+        );
+
+        let dangerous = evaluate_with_pack_ids_in_dialect(
+            "rm -f ~/Documents/*.png",
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            dangerous.is_denied(),
+            "ordinary home-directory globs must stay denied"
+        );
+    }
+
+    #[test]
+    fn frog_20260823002434_restore_worktree_needs_atomic_clean_proof() {
+        let command = "git restore --source=083405b774a6107427293696bc8c2146a45f26bb --staged --worktree -- src/path.rs";
+        let result = evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+        assert!(
+            result.is_denied(),
+            "the command itself contains no atomic proof that the worktree is clean"
+        );
+        assert_eq!(
+            result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some("restore-worktree-explicit")
+        );
+        assert!(
+            result.pattern_info.as_ref().is_some_and(|info| info
+                .suggestions
+                .iter()
+                .any(|suggestion| { suggestion.command.contains("git apply --index") })),
+            "the denial must provide the non-discarding final-tree materialization recipe"
+        );
+    }
+
+    #[test]
+    fn frog_20260823161413_git_lfs_dry_run_dispatch_is_allowed() {
+        let safe = evaluate_with_pack_ids_in_dialect(
+            "git lfs push --dry-run origin landing/fabric-tryon-t04-20260823",
+            &["core.git"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            safe.is_allowed(),
+            "documented Git LFS dry-run dispatch must be allowed: {:?}",
+            safe.pattern_info
+        );
+
+        for dangerous in [
+            "git lfs push origin main",
+            "git lfs push --all origin",
+            "git lfs push -- --dry-run",
+        ] {
+            assert!(
+                evaluate_with_pack_ids_in_dialect(dangerous, &["core.git"], ShellDialect::Posix,)
+                    .is_denied(),
+                "mutating or post-terminator LFS pushes must stay denied: {dangerous}"
+            );
+        }
+
+        let visible_aliases = [
+            (
+                "git -c 'alias.lfs=!git reset --hard' lfs push --dry-run origin main",
+                "reset-hard",
+            ),
+            (
+                r#"git -c "alias.lfs=$BODY" lfs push --dry-run origin main"#,
+                "git-alias-semantic-unverified",
+            ),
+            (
+                "git config alias.lfs '!git reset --hard'; git lfs push --dry-run origin main",
+                "reset-hard",
+            ),
+        ];
+        for (command, expected_rule) in visible_aliases {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "visible LFS alias must take precedence over helper allowance: {command}: {:?}",
+                result.pattern_info
+            );
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some(expected_rule),
+                "wrong alias-path rule for {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn frog_20260823233307_mktemp_move_target_is_allowed() {
+        let safe = r#"task_tmp=$(mktemp -d /tmp/tilpas-lib-dist.XXXXXX); case "$task_tmp" in /tmp/tilpas-lib-dist.*) ;; *) exit 1 ;; esac; mv research/fabric-bench/dist "$task_tmp/fabric-bench-dist.original""#;
+        let result =
+            evaluate_with_pack_ids_in_dialect(safe, &["core.filesystem"], ShellDialect::Posix);
+        assert!(
+            result.is_allowed(),
+            "literal /tmp mktemp target must prove the move destination: {:?}",
+            result.pattern_info
+        );
+
+        for dangerous in [
+            r#"task_tmp=$(mktemp -d /etc/tilpas-lib-dist.XXXXXX); mv research/fabric-bench/dist "$task_tmp/fabric-bench-dist.original""#,
+            r#"task_tmp=$(mktemp -d /tmp/parent/tilpas-lib-dist.XXXXXX); mv research/fabric-bench/dist "$task_tmp/fabric-bench-dist.original""#,
+        ] {
+            assert!(
+                evaluate_with_pack_ids_in_dialect(
+                    dangerous,
+                    &["core.filesystem"],
+                    ShellDialect::Posix,
+                )
+                .is_denied(),
+                "non-direct or non-temp mktemp templates must stay denied: {dangerous}"
+            );
+        }
+    }
+
+    #[test]
+    fn frog_20260824032233_non_recursive_xargs_cleanup_is_allowed() {
+        let safe = "find /private/tmp/claude-501/session/scratchpad/v2check -type f -print0 | xargs -0 rm -f";
+        let result =
+            evaluate_with_pack_ids_in_dialect(safe, &["core.filesystem"], ShellDialect::Posix);
+        assert!(
+            result.is_allowed(),
+            "xargs rm without a recursive flag must not match rm-r-f-separate: {:?}",
+            result.pattern_info
+        );
+
+        let literal_scratch = evaluate_with_pack_ids_in_dialect(
+            "rm -r /private/tmp/claude-501/session/scratchpad/v2check",
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            literal_scratch.is_allowed(),
+            "a literal session-scratch temp path must use the existing temp carve-out: {:?}",
+            literal_scratch.pattern_info
+        );
+
+        let ambient_variable = evaluate_with_pack_ids_in_dialect(
+            r#"rm -r "$SCRATCHPAD/v2check""#,
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            ambient_variable.is_denied(),
+            "an ambient variable remains runtime-overridable and cannot inherit the literal carve-out"
+        );
+    }
+
+    #[test]
+    fn frog_20260825173900_inline_node_source_is_not_shell_or_wrangler() {
+        let safe = r#"node -e 'const source = "test source"; const fixture = "wrangler r2 bucket delete assets"; const extra = () => source + fixture.length + " negative case"; import("data:text/javascript," + encodeURIComponent(extra()));'"#;
+        let result = evaluate_with_pack_ids_in_dialect(
+            safe,
+            &["core.filesystem", "cdn.cloudflare_workers"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            result.is_allowed(),
+            "inline JavaScript syntax must not be parsed as shell redirection or Wrangler: {:?}",
+            result.pattern_info
+        );
+
+        let wrangler_delete = evaluate_with_pack_ids_in_dialect(
+            "wrangler r2 bucket delete assets",
+            &["cdn.cloudflare_workers"],
+            ShellDialect::Posix,
+        );
+        assert_eq!(
+            wrangler_delete
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some("wrangler-r2-bucket-delete"),
+            "an actual Wrangler deletion must remain denied"
+        );
+
+        let dynamic_redirect = evaluate_with_pack_ids_in_dialect(
+            r#"printf x > "$OUT""#,
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert_eq!(
+            dynamic_redirect
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some("redirect-truncate-dynamic-path"),
+            "an actual dynamic truncating redirect must remain denied"
+        );
     }
 
     #[test]

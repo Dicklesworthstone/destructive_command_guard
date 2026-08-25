@@ -2868,6 +2868,13 @@ pub fn create_pack() -> Pack {
 #[allow(clippy::too_many_lines)]
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
+        // Browser automation screenshots are session-generated cache files.
+        // Keep the exception whole-command, non-recursive, and inside the
+        // tool's direct tmp subtree so it cannot shadow a second deletion.
+        safe_pattern!(
+            "rm-force-dev-browser-tmp-glob",
+            r"^rm\s+(?:-f|--force)\s+~/\.dev-browser/tmp/[^/\s]*[*?\[][^/\s]*\s*$"
+        ),
         // rm -rf in /tmp (combined flags)
         safe_pattern!(
             "rm-rf-tmp",

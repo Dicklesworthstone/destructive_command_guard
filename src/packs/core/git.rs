@@ -2215,6 +2215,18 @@ fn resolve_visible_alias_invocation(
     InvokedGitAliasDecision::Unverified
 }
 
+/// The documented Git LFS inventory form performs no upload. Treat this one
+/// static argv shape like a known Git subcommand while leaving mutating LFS
+/// pushes and dynamically assembled arguments on the alias-unverified path.
+fn git_lfs_push_is_dry_run(arguments: &[String]) -> bool {
+    arguments.first().is_some_and(|argument| argument == "push")
+        && arguments
+            .iter()
+            .skip(1)
+            .take_while(|argument| argument.as_str() != "--")
+            .any(|argument| argument == "--dry-run")
+}
+
 /// Whether a token could ever reach Git's subcommand dispatch (a builtin, an
 /// `alias.<name>` config key, or an external `git-<name>` helper).
 ///
@@ -2629,6 +2641,15 @@ fn invoked_git_alias_segment_in_dialect(
             return InvokedGitAliasDecision::Unverified;
         }
         arguments.push(argument.decoded.clone());
+    }
+    // A visible alias has Git dispatch precedence over the external git-lfs
+    // helper. Preserve static shell-alias expansion and dynamic fail-closed
+    // handling before admitting the ordinary helper dry-run.
+    if command == "lfs"
+        && git_lfs_push_is_dry_run(&arguments)
+        && lookup_visible_alias(&definitions, "lfs").is_none()
+    {
+        return InvokedGitAliasDecision::NoMatch;
     }
     resolve_visible_alias_invocation(&definitions, command, arguments)
 }
@@ -5020,7 +5041,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              changes are permanently lost.\n\n\
              Safer alternatives:\n\
              - git restore --staged <path>: Only unstage, keeps working directory\n\
-             - git stash: Save changes first\n\n\
+             - git stash: Save changes first\n\
+             - For a reviewed clean-tree reconstruction, stream a binary diff into\n\
+               git apply --index; it refuses an index/worktree mismatch instead of discarding it\n\n\
              Preview changes first:\n  git diff <path>",
             &const {
                 [
@@ -5035,6 +5058,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                     PatternSuggestion::new(
                         "git diff {path}",
                         "Review what would be lost before discarding",
+                    ),
+                    PatternSuggestion::new(
+                        "git diff --binary HEAD {source} -- {path} | git apply --index",
+                        "Materialize a reviewed source tree without discarding a dirty worktree",
                     ),
                 ]
             }
