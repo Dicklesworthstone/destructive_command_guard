@@ -333,6 +333,79 @@ def capture_git_sha(repo_root: str, env: Dict[str, str]) -> Optional[str]:
         return None
 
 
+def capture_git_describe(repo_root: str, env: Dict[str, str]) -> Optional[str]:
+    """Capture the same tagged, dirty-aware description embedded by vergen-gix."""
+    try:
+        result = subprocess.run(
+            ["git", "describe", "--tags", "--dirty"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            cwd=repo_root,
+            timeout=PROCESS_BACKSTOP_SECONDS,
+        )
+        if result.returncode != 0:
+            return None
+        describe = result.stdout.strip()
+        return describe if describe else None
+    except Exception:
+        return None
+
+
+def extract_embedded_git_describe(version_output: str) -> Optional[str]:
+    """Extract the vergen Git description printed by ``dcg --version``."""
+    ansi_escape = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+    for raw_line in version_output.splitlines():
+        line = ansi_escape.sub("", raw_line)
+        if "Commit:" not in line:
+            continue
+        value = line.split("Commit:", 1)[1].split("│", 1)[0].strip()
+        if value and value != "VERGEN_IDEMPOTENT_OUTPUT":
+            return value
+    return None
+
+
+def classify_source_binding(
+    embedded_git_describe: Optional[str],
+    repository_git_describe: Optional[str],
+    repository_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Classify whether the measured binary is provably from this checkout."""
+    if repository_state["dirty"]:
+        status = "unverified_dirty_worktree"
+        reason = (
+            "the checkout is dirty, so Git metadata cannot bind the binary to "
+            "the current source bytes"
+        )
+    elif embedded_git_describe is None:
+        status = "unverified_missing_binary_provenance"
+        reason = "dcg --version did not expose an embedded Git description"
+    elif repository_git_describe is None:
+        status = "unverified_missing_repository_provenance"
+        reason = "git describe could not identify the checked-out source"
+    elif embedded_git_describe != repository_git_describe:
+        status = "mismatch"
+        reason = (
+            "the binary and checkout Git descriptions differ: "
+            f"{embedded_git_describe!r} != {repository_git_describe!r}"
+        )
+    else:
+        status = "verified_exact_git_describe"
+        reason = (
+            "the clean checkout and measured binary expose the same tagged "
+            "dirty-aware Git description"
+        )
+    return {
+        "method": "exact git describe --tags --dirty equality on a clean checkout",
+        "status": status,
+        "verified": status == "verified_exact_git_describe",
+        "reason": reason,
+        "binary_git_describe": embedded_git_describe,
+        "repository_git_describe": repository_git_describe,
+    }
+
+
 def capture_git_state(repo_root: str, env: Dict[str, str]) -> Dict[str, Any]:
     result = subprocess.run(
         ["git", "status", "--porcelain=v1", "--untracked-files=all"],
@@ -692,6 +765,96 @@ def probe_effective_budget(
         "effective_config": payload,
         "stdout_sha256": hashlib.sha256(result.stdout).hexdigest(),
         "stderr_sha256": hashlib.sha256(result.stderr).hexdigest(),
+    }
+
+
+def build_latency_gate(
+    enabled: bool,
+    supplied_budget_ms: int,
+    shipped_budget_ms: int,
+    effective_budget_ms: int,
+    margin_pct: int,
+    case_specs: List[Dict[str, Any]],
+    results: List[Dict[str, Any]],
+    errors: List[str],
+) -> Dict[str, Any]:
+    """Build the authoritative gate verdict serialized into the JSON artifact."""
+    limit_ms = shipped_budget_ms * margin_pct / 100.0 if enabled else None
+    result_by_id = {case["id"]: case for case in results}
+    per_case: List[Dict[str, Any]] = []
+    violations: List[str] = []
+
+    if enabled:
+        for spec in case_specs:
+            case_id = spec["id"]
+            if case_id == "bypass":
+                continue
+            case = result_by_id.get(case_id)
+            if case is None:
+                per_case.append(
+                    {
+                        "case": case_id,
+                        "status": "ERROR",
+                        "error": "measurement unavailable; see top-level errors",
+                    }
+                )
+                continue
+
+            signed_p95 = case["evaluator_delta_metrics"]["p95_ms"]
+            budget_consumption_p95 = max(0.0, signed_p95)
+            status = "PASS" if budget_consumption_p95 <= limit_ms else "FAIL"
+            per_case.append(
+                {
+                    "case": case_id,
+                    "full_process_p95_ms": case["metrics"]["p95_ms"],
+                    "bypass_process_p95_ms": case["bypass_metrics"]["p95_ms"],
+                    "evaluator_delta_p50_ms": case["evaluator_delta_metrics"][
+                        "p50_ms"
+                    ],
+                    "evaluator_delta_p95_ms": signed_p95,
+                    "budget_consumption_p95_ms": budget_consumption_p95,
+                    "limit_ms": limit_ms,
+                    "status": status,
+                }
+            )
+            if status == "FAIL":
+                violations.append(
+                    f"{case_id}: paired evaluator p95 "
+                    f"{budget_consumption_p95:.1f}ms exceeds "
+                    f"{limit_ms:.0f}ms ({margin_pct}% of the "
+                    f"{shipped_budget_ms}ms hook budget)"
+                )
+
+    if not enabled:
+        overall_result = "NOT_RUN"
+    elif errors:
+        overall_result = "ERROR"
+    elif violations:
+        overall_result = "FAIL"
+    else:
+        overall_result = "PASS"
+
+    expected_case_count = sum(spec["id"] != "bypass" for spec in case_specs)
+    evaluated_case_count = sum(case["status"] != "ERROR" for case in per_case)
+    return {
+        "enabled": enabled,
+        "supplied_budget_ms": supplied_budget_ms,
+        "shipped_budget_ms": shipped_budget_ms,
+        "effective_budget_ms": effective_budget_ms,
+        "margin_pct": margin_pct,
+        "limit_ms": limit_ms,
+        "estimand": (
+            "paired full hook wall time minus matched DCG_BYPASS wall time"
+            if enabled
+            else None
+        ),
+        "excluded_case_ids": ["bypass"] if enabled else [],
+        "expected_case_count": expected_case_count if enabled else 0,
+        "evaluated_case_count": evaluated_case_count,
+        "cases": per_case,
+        "violations": violations,
+        "errors": list(errors),
+        "overall_result": overall_result,
     }
 
 
