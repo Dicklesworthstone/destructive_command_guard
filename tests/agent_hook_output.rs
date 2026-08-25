@@ -38,6 +38,42 @@ fn test_state_path(suffix: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Fence hook subprocesses away from the caller's dcg state.
+///
+/// The explicit pending/allow-once paths are the causal isolation for these
+/// tests: denial metadata is omitted by design when the bounded pending-store
+/// lock cannot be acquired. The HOME-family variables keep the subprocess from
+/// reading the caller's ordinary user configuration on platforms where those
+/// variables define it; they are not intended to replace the explicit store
+/// paths.
+fn configure_isolated_hook_child(command: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("DCG_") {
+            command.env_remove(key);
+        }
+    }
+
+    let test_home = test_state_path("-home");
+    command
+        .env("HOME", &test_home)
+        .env("USERPROFILE", &test_home)
+        .env("XDG_CONFIG_HOME", test_home.join(".config"))
+        .env("XDG_DATA_HOME", test_home.join(".local/share"))
+        .env("APPDATA", test_home.join("AppData/Roaming"))
+        .env("LOCALAPPDATA", test_home.join("AppData/Local"))
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_HISTORY_DISABLED", "1")
+        .env("DCG_SELF_HEAL_HOOK", "0")
+        .env(
+            "DCG_PENDING_EXCEPTIONS_PATH",
+            test_state_path("-pending-exceptions.jsonl"),
+        )
+        .env(
+            "DCG_ALLOW_ONCE_PATH",
+            test_state_path("-allow-once.jsonl"),
+        );
+}
+
 /// Path to the DCG binary (uses same target directory as the test binary).
 fn dcg_binary() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
@@ -58,35 +94,9 @@ fn run_hook_mode(command: &str) -> (String, String, i32) {
     );
 
     let mut child_command = Command::new(dcg_binary());
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("DCG_") {
-            child_command.env_remove(key);
-        }
-    }
-    let test_home = test_state_path("-home");
-    let test_tmp = std::env::temp_dir();
+    configure_isolated_hook_child(&mut child_command);
     let mut child = child_command
         .args(["--agent", "claude-code"])
-        .env("HOME", &test_home)
-        .env("USERPROFILE", &test_home)
-        .env("XDG_CONFIG_HOME", test_home.join(".config"))
-        .env("XDG_DATA_HOME", test_home.join(".local/share"))
-        .env("APPDATA", test_home.join("AppData/Roaming"))
-        .env("LOCALAPPDATA", test_home.join("AppData/Local"))
-        .env("TMPDIR", &test_tmp)
-        .env("TEMP", &test_tmp)
-        .env("TMP", &test_tmp)
-        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
-        .env("DCG_HISTORY_DISABLED", "1")
-        .env("DCG_SELF_HEAL_HOOK", "0")
-        .env(
-            "DCG_PENDING_EXCEPTIONS_PATH",
-            test_state_path("-pending-exceptions.jsonl"),
-        )
-        .env(
-            "DCG_ALLOW_ONCE_PATH",
-            test_state_path("-allow-once.jsonl"),
-        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -230,25 +240,26 @@ fn test_hook_output_deny_has_remediation() {
         serde_json::from_str(&stdout).expect("hook output should be valid JSON");
 
     let hook_output = &json["hookSpecificOutput"];
+    assert_eq!(
+        hook_output["permissionDecision"], "deny",
+        "git reset --hard must exercise the denial metadata path"
+    );
+    assert!(
+        hook_output.get("remediation").is_some(),
+        "remediation field should be present for denied commands"
+    );
 
-    if hook_output["permissionDecision"] == "deny" {
-        assert!(
-            hook_output.get("remediation").is_some(),
-            "remediation field should be present for denied commands"
-        );
+    let remediation = &hook_output["remediation"];
 
-        let remediation = &hook_output["remediation"];
-
-        // Verify remediation structure
-        assert!(
-            remediation.get("explanation").is_some(),
-            "remediation.explanation should be present"
-        );
-        assert!(
-            remediation.get("allowOnceCommand").is_some(),
-            "remediation.allowOnceCommand should be present"
-        );
-    }
+    // Verify remediation structure on an uncontended isolated store.
+    assert!(
+        remediation.get("explanation").is_some(),
+        "remediation.explanation should be present"
+    );
+    assert!(
+        remediation.get("allowOnceCommand").is_some(),
+        "remediation.allowOnceCommand should be present"
+    );
 }
 
 #[test]
@@ -259,29 +270,31 @@ fn test_hook_output_deny_has_allow_once_code() {
         serde_json::from_str(&stdout).expect("hook output should be valid JSON");
 
     let hook_output = &json["hookSpecificOutput"];
+    assert_eq!(
+        hook_output["permissionDecision"], "deny",
+        "git reset --hard must exercise the allow-once metadata path"
+    );
+    assert!(
+        hook_output.get("allowOnceCode").is_some(),
+        "allowOnceCode should be present for denied commands"
+    );
 
-    if hook_output["permissionDecision"] == "deny" {
-        assert!(
-            hook_output.get("allowOnceCode").is_some(),
-            "allowOnceCode should be present for denied commands"
-        );
+    let code = hook_output["allowOnceCode"].as_str().unwrap();
+    assert!(!code.is_empty(), "allowOnceCode should not be empty");
 
-        let code = hook_output["allowOnceCode"].as_str().unwrap();
-        assert!(!code.is_empty(), "allowOnceCode should not be empty");
-
-        // Also verify the remediation includes the allow-once command
-        if let Some(remediation) = hook_output.get("remediation") {
-            let allow_cmd = remediation["allowOnceCommand"].as_str().unwrap();
-            assert!(
-                allow_cmd.contains("dcg allow-once"),
-                "allowOnceCommand should contain 'dcg allow-once'"
-            );
-            assert!(
-                allow_cmd.contains(code),
-                "allowOnceCommand should contain the allowOnceCode"
-            );
-        }
-    }
+    // On an uncontended isolated store, remediation must carry the same code.
+    let remediation = hook_output
+        .get("remediation")
+        .expect("remediation should accompany an allowOnceCode");
+    let allow_cmd = remediation["allowOnceCommand"].as_str().unwrap();
+    assert!(
+        allow_cmd.contains("dcg allow-once"),
+        "allowOnceCommand should contain 'dcg allow-once'"
+    );
+    assert!(
+        allow_cmd.contains(code),
+        "allowOnceCommand should contain the allowOnceCode"
+    );
 }
 
 #[test]
@@ -465,7 +478,12 @@ fn test_hook_output_remediation_safe_alternative() {
 
 /// Run dcg in hook mode with a raw JSON envelope (for non-Claude wire shapes).
 fn run_hook_mode_raw(input: &str) -> (String, String, i32) {
-    let mut child = Command::new(dcg_binary())
+    let _guard = HOOK_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut child_command = Command::new(dcg_binary());
+    configure_isolated_hook_child(&mut child_command);
+    let mut child = child_command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
