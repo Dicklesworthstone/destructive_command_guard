@@ -381,11 +381,13 @@ mod tests {
     /// fails rather than silently re-opening the hole.
     #[test]
     fn ci_enforces_absolute_latency_gate_against_shipped_budget() {
-        assert!(
-            HOOK_EVALUATION_BUDGET_MS > 0,
-            "the shipped hook budget must remain positive so gate mode cannot \
-             collapse into a disabled sentinel"
-        );
+        const {
+            assert!(
+                HOOK_EVALUATION_BUDGET_MS > 0,
+                "the shipped hook budget must remain positive so gate mode cannot \
+                 collapse into a disabled sentinel"
+            );
+        }
         let ci = include_str!("../.github/workflows/ci.yml");
 
         let gate_step = ci
