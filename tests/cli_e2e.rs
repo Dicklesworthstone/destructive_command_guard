@@ -3148,7 +3148,10 @@ mod config_tests {
                 .find(|check| check["id"] == "omp_extension")
                 .expect("OMP verification check");
             assert_eq!(verify_omp["status"], "ok", "{label}: {verify_omp}");
-            assert_eq!(verify_omp["fixed"], false, "{label}: {verify_omp}");
+            assert!(
+                verify_omp.get("fixed").is_none(),
+                "{label}: false `fixed` fields must retain the schema's omitted form: {verify_omp}"
+            );
         }
     }
 

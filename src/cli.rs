@@ -12855,13 +12855,6 @@ fn omp_extension_text_is_dcg_owned(content: &str) -> bool {
     content.contains(OMP_EXTENSION_MARKER)
 }
 
-/// Whether `path` holds a dcg-generated OMP extension. Ownership controls only
-/// whether dcg may replace/remove the file; it is deliberately weaker than the
-/// exact-byte health check used by doctor.
-fn omp_extension_is_dcg_owned(path: &std::path::Path) -> bool {
-    std::fs::read_to_string(path).is_ok_and(|content| omp_extension_text_is_dcg_owned(&content))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OmpExtensionInspection {
     Absent,
