@@ -426,44 +426,63 @@ MOCKEOF
     [[ " ${DETECTED_AGENTS[*]} " =~ " continue " ]]
 }
 
-@test "detect_agents: finds Oh My Pi when native state exists" {
-    log_test "Testing Oh My Pi detection..."
+@test "detect_agents: ignores stale Oh My Pi native state without an executable" {
+    log_test "Testing stale Oh My Pi native state..."
 
     mkdir -p "$HOME/.omp/agent"
     detect_agents
     log_test "Detected agents: ${DETECTED_AGENTS[*]:-none}"
 
-    [[ " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
+    [[ ! " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
 }
 
-@test "detect_agents: finds Oh My Pi under PI_CONFIG_DIR" {
-    log_test "Testing Oh My Pi custom config-root detection..."
+@test "detect_agents: ignores stale Oh My Pi path and profile selectors" {
+    log_test "Testing stale Oh My Pi selectors..."
 
     export PI_CONFIG_DIR=".custom-omp"
     mkdir -p "$HOME/.custom-omp/agent"
+    export PI_CODING_AGENT_DIR="$HOME/.custom-agent"
+    mkdir -p "$PI_CODING_AGENT_DIR"
+    export OMP_PROFILE="work"
+    export PI_PROFILE="legacy"
     detect_agents
 
-    [[ " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
+    [[ ! " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
 }
 
-@test "detect_agents: preserves a leading backslash in POSIX PI_CONFIG_DIR" {
-    log_test "Testing Oh My Pi literal-backslash config-root detection..."
+@test "detect_agents: ignores a non-executable omp PATH candidate" {
+    log_test "Testing a non-executable Oh My Pi PATH candidate..."
 
-    export PI_CONFIG_DIR='\.custom-omp'
-    mkdir -p "$HOME/\.custom-omp/agent"
+    printf '#!/usr/bin/env bash\nprintf "not executable\\n"\n' > "$TEST_TMPDIR/bin/omp"
     detect_agents
 
-    [[ " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
+    [[ ! " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
 }
 
-@test "detect_agents: normalizes PI_CONFIG_DIR before probing native state" {
-    log_test "Testing Oh My Pi lexically normalized config-root detection..."
+@test "detect_agents: ignores an omp shell function without an external executable" {
+    log_test "Testing an Oh My Pi function-only shadow..."
 
-    export PI_CONFIG_DIR='outer/../.custom-omp'
-    mkdir -p "$HOME/.custom-omp/agent"
+    omp() { printf 'function-shadow\n'; }
+    detect_agents
+
+    [[ ! " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
+}
+
+@test "detect_agents: resolves the external omp executable behind a function" {
+    log_test "Testing exact external Oh My Pi executable resolution..."
+
+    cat > "$TEST_TMPDIR/bin/omp" << 'EOF'
+#!/usr/bin/env bash
+printf 'omp/external-1.2.3\n'
+EOF
+    chmod +x "$TEST_TMPDIR/bin/omp"
+    omp() { printf 'function-shadow\n'; }
+    type() { printf '/definitely/not/omp\n'; }
+    AGENT_VERSION_LOOKUP=1
     detect_agents
 
     [[ " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
+    [ "$OMP_VERSION" = "omp/external-1.2.3" ]
 }
 
 @test "detect_agents: finds multiple agents" {

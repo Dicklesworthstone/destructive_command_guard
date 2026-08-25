@@ -445,16 +445,16 @@ detect_agents() {
     OPENCODE_VERSION=$(try_version opencode)
   fi
 
-  # Oh My Pi (`omp`) — native state under the configured root/agent override,
-  # an active profile environment, or an `omp` CLI on PATH.
-  local omp_config_root
-  omp_config_root=$(resolve_omp_config_root)
-  if [[ -d "$omp_config_root" ]] ||
-     [[ -n "${PI_CODING_AGENT_DIR:-}" && -d "$PI_CODING_AGENT_DIR" ]] ||
-     [[ "${OMP_PROFILE+x}" = "x" ]] ||
-     command -v omp &>/dev/null; then
+  # Oh My Pi (`omp`) — require an external executable on PATH. Config/profile
+  # state can outlive an uninstall, while command lookup also accepts aliases
+  # and functions that the non-interactive installer cannot safely identify as
+  # OMP. Resolve the exact disk candidate once, require a regular executable,
+  # and use that path for version lookup.
+  local omp_bin
+  omp_bin=$(builtin type -P omp 2>/dev/null || true)
+  if [[ -n "$omp_bin" && -f "$omp_bin" && -x "$omp_bin" ]]; then
     DETECTED_AGENTS+=("omp")
-    OMP_VERSION=$(try_version omp)
+    OMP_VERSION=$(try_version "$omp_bin")
   fi
 }
 
