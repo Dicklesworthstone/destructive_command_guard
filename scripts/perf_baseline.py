@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -822,22 +823,71 @@ def max_allowed_tail_exceedances(sample_count: int) -> int:
     exceedance_probability = 1.0 - (TAIL_COVERAGE_PCT / 100.0)
     alpha = 1.0 - (TAIL_CONFIDENCE_PCT / 100.0)
     non_exceedance_probability = 1.0 - exceedance_probability
-    probability = non_exceedance_probability**sample_count
-    cumulative = probability
-    allowed = 0 if cumulative <= alpha else -1
+    log_probability = sample_count * math.log(non_exceedance_probability)
+    log_cumulative = log_probability
+    log_alpha = math.log(alpha)
+    allowed = 0 if log_cumulative <= log_alpha else -1
 
     for exceedances in range(1, sample_count + 1):
-        probability *= (
-            (sample_count - exceedances + 1)
-            / exceedances
-            * exceedance_probability
-            / non_exceedance_probability
+        log_probability += (
+            math.log(sample_count - exceedances + 1)
+            - math.log(exceedances)
+            + math.log(exceedance_probability)
+            - math.log(non_exceedance_probability)
         )
-        cumulative += probability
-        if cumulative > alpha:
+        larger = max(log_cumulative, log_probability)
+        smaller = min(log_cumulative, log_probability)
+        log_cumulative = larger + math.log1p(math.exp(smaller - larger))
+        if log_cumulative > log_alpha:
             break
         allowed = exceedances
     return allowed
+
+
+def run_internal_self_tests() -> None:
+    """Exercise certificate invariants that previously admitted false greens."""
+
+    def require(condition: bool, message: str) -> None:
+        if not condition:
+            raise RuntimeError(message)
+
+    clean = {"dirty": False}
+    same_description = "v1.2.3"
+    different_sha = classify_source_binding(
+        "a" * 40,
+        "b" * 40,
+        same_description,
+        same_description,
+        clean,
+    )
+    require(
+        not different_sha["verified"] and different_sha["status"] == "mismatch",
+        "equal tag descriptions must not hide different full Git SHAs",
+    )
+    exact_sha = classify_source_binding(
+        "a" * 40,
+        "a" * 40,
+        same_description,
+        same_description,
+        clean,
+    )
+    require(
+        exact_sha["verified"] and exact_sha["status"] == "verified_exact_git_sha",
+        "equal full Git SHAs on a clean checkout must verify",
+    )
+
+    expected_tail_allowances = {58: -1, 59: 0, 100: 1}
+    for sample_count, expected in expected_tail_allowances.items():
+        observed = max_allowed_tail_exceedances(sample_count)
+        require(
+            observed == expected,
+            f"tail allowance for {sample_count} samples was {observed}, expected {expected}",
+        )
+    large_allowance = max_allowed_tail_exceedances(15_000)
+    require(
+        0 <= large_allowance < 15_000,
+        "large-sample binomial tolerance calculation underflowed",
+    )
 
 
 def write_json_payload(payload: Dict[str, Any], output_path: Optional[str]) -> None:
@@ -1054,6 +1104,11 @@ def build_latency_gate(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate dcg perf baseline JSON")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run mutation-sensitive certificate invariant checks and exit",
+    )
     parser.add_argument("--bin", default="./target/release/dcg", help="Path to dcg binary")
     parser.add_argument("--output", help="Write JSON output to this file")
     parser.add_argument("--warmup", type=int, default=30, help="Warmup iterations per case")
@@ -1083,6 +1138,14 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    if args.self_test:
+        try:
+            run_internal_self_tests()
+        except RuntimeError as exc:
+            print(f"perf baseline self-test failed: {exc}", file=sys.stderr)
+            return 1
+        print("perf baseline self-test passed")
+        return 0
     gate_enabled = args.assert_budget_ms > 0
 
     repo_root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))

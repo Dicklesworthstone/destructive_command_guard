@@ -396,6 +396,10 @@ mod tests {
              HOOK_EVALUATION_BUDGET_MS in src/perf.rs"
         );
         assert!(
+            gate_step.contains("python3 -B scripts/perf_baseline.py --self-test"),
+            "the absolute gate must exercise source-binding and large-sample tail mutants"
+        );
+        assert!(
             gate_step.contains("--assert-budget-ms \"$BUDGET_MS\""),
             "the same absolute gate step must pass its derived BUDGET_MS to \
              scripts/perf_baseline.py"

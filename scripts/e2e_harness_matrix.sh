@@ -197,37 +197,58 @@ assert_field_absent() {
   fi
 }
 
-# Assert the robot-mode contract used by native in-process extension bridges
-# such as Oh My Pi. These agents do not send a JSON hook envelope; their
-# extension passes the raw command on stdin and maps dcg's exit status/JSON back
-# to the host's blocking API.
-assert_robot_bridge_case() {
-  local harness="$1" case_name="$2" command="$3" expected_rc="$4" expected_decision="$5"
+# Assert the exact private robot-mode contract used by Oh My Pi. OMP passes the
+# raw command on stdin, requests the compact envelope, and maps dcg's exit
+# status plus these exact bytes back to ExtensionAPI's blocking result.
+assert_omp_bridge_case() {
+  local harness="$1" case_name="$2" command="$3" expected_rc="$4" expected_stdout="$5"
   local stdout_file="$SANDBOX/${harness}-${case_name}.stdout"
   local stderr_file="$SANDBOX/${harness}-${case_name}.stderr"
   local start end
   start="$(now_ms)"
   printf '%s' "$command" | run_dcg_cli --robot test --stdin \
-    --agent omp --dialect posix >"$stdout_file" 2>"$stderr_file"
+    --agent omp --dialect posix --format json --omp-bridge-output \
+    >"$stdout_file" 2>"$stderr_file"
   local rc=$?
   end="$(now_ms)"
   CASE_MS=""
   [[ -n "$start" && -n "$end" ]] && CASE_MS=$((end - start))
 
-  local decision agent method
-  decision="$(jq -r '.decision // empty' "$stdout_file" 2>/dev/null)"
-  agent="$(jq -r '.agent.detected // empty' "$stdout_file" 2>/dev/null)"
-  method="$(jq -r '.agent.detection_method // empty' "$stdout_file" 2>/dev/null)"
+  local stdout_data stdout_bytes expected_bytes
+  stdout_data="$(cat "$stdout_file")"
+  stdout_bytes="$(wc -c <"$stdout_file" | tr -d '[:space:]')"
+  expected_bytes=$((${#expected_stdout} + 1))
   if [[ $rc -ne $expected_rc ]]; then
     report fail "$harness" "$case_name" "exit $rc, want $expected_rc"
-  elif [[ "$decision" != "$expected_decision" ]]; then
-    report fail "$harness" "$case_name" "decision '$decision', want '$expected_decision'"
-  elif [[ "$agent" != "omp" || "$method" != "explicit" ]]; then
-    report fail "$harness" "$case_name" "agent attribution '$agent'/'$method', want omp/explicit"
   elif [[ -s "$stderr_file" ]]; then
-    report fail "$harness" "$case_name" "robot bridge polluted stderr"
+    report fail "$harness" "$case_name" "private OMP bridge polluted stderr"
+  elif [[ "$stdout_data" != "$expected_stdout" || "$stdout_bytes" -ne "$expected_bytes" ]]; then
+    report fail "$harness" "$case_name" \
+      "compact stdout mismatch: got ${stdout_bytes}B '${stdout_data:0:200}', want ${expected_bytes}B '$expected_stdout'"
   else
     report pass "$harness" "$case_name"
+  fi
+}
+
+# The compact OMP envelope intentionally omits attribution. Retain one ordinary
+# robot assertion so `--agent omp` cannot silently stop selecting OMP policy.
+assert_omp_agent_attribution() {
+  local stdout_file="$SANDBOX/omp-attribution.stdout"
+  local stderr_file="$SANDBOX/omp-attribution.stderr"
+  printf '%s' "$ALLOW_CMD" | run_dcg_cli --robot test --stdin \
+    --agent omp --dialect posix --format json >"$stdout_file" 2>"$stderr_file"
+  local rc=$? agent method
+  agent="$(jq -r '.agent.detected // empty' "$stdout_file" 2>/dev/null)"
+  method="$(jq -r '.agent.detection_method // empty' "$stdout_file" 2>/dev/null)"
+  if [[ $rc -ne 0 ]]; then
+    report fail omp agent-attribution "exit $rc, want 0"
+  elif [[ "$agent" != "omp" || "$method" != "explicit" ]]; then
+    report fail omp agent-attribution \
+      "agent attribution '$agent'/'$method', want omp/explicit"
+  elif [[ -s "$stderr_file" ]]; then
+    report fail omp agent-attribution "ordinary robot output polluted stderr"
+  else
+    report pass omp agent-attribution
   fi
 }
 
@@ -349,8 +370,10 @@ assert_case agy allow "$AGY_ALLOW" allow '.' ''
 
 # --- Oh My Pi: native ExtensionAPI bridge over robot stdin ------------------
 $JSON_OUTPUT || echo "Oh My Pi (omp)"
-assert_robot_bridge_case omp deny "$DENY_CMD" 1 deny
-assert_robot_bridge_case omp allow "$ALLOW_CMD" 0 allow
+assert_omp_bridge_case omp deny "$DENY_CMD" 1 \
+  '{"decision":"deny","reason":"git reset --hard destroys uncommitted changes. Use '\''git stash'\'' first.","rule_id":"core.git:reset-hard"}'
+assert_omp_bridge_case omp allow "$ALLOW_CMD" 0 '{"decision":"allow"}'
+assert_omp_agent_attribution
 
 # --- Cross-cutting invariants ----------------------------------------------
 $JSON_OUTPUT || echo "Cross-cutting invariants"

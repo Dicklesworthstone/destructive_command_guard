@@ -1345,6 +1345,7 @@ jobs:
         run: |
           LATENCY_ARTIFACT_DIR="$RUNNER_TEMP/dcg-perf-latency"
           mkdir -p "$LATENCY_ARTIFACT_DIR"
+          python3 -B scripts/perf_baseline.py --self-test
           BUDGET_MS=$(grep -oP 'pub const HOOK_EVALUATION_BUDGET_MS: u64 = \K[0-9_]+' src/perf.rs | tr -d '_')
           if [ -z "$BUDGET_MS" ]; then
             echo "::error::could not read HOOK_EVALUATION_BUDGET_MS from src/perf.rs"
