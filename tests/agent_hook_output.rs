@@ -58,8 +58,8 @@ fn configure_isolated_hook_child(command: &mut Command) {
     }
 
     let test_home = test_state_path("-home");
-    let test_config = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/e2e/fixtures/configs/minimal.toml");
+    let test_config =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/fixtures/configs/minimal.toml");
     assert!(
         test_config.is_file(),
         "isolated hook config fixture is missing: {}",
