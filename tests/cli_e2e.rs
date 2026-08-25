@@ -3093,8 +3093,10 @@ mod config_tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            let report: serde_json::Value = serde_json::from_slice(&output.stdout)
-                .unwrap_or_else(|error| panic!("{label}: stdout was not one JSON document: {error}"));
+            let report: serde_json::Value =
+                serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                    panic!("{label}: stdout was not one JSON document: {error}")
+                });
             let omp_check = report["checks"]
                 .as_array()
                 .expect("checks array")
@@ -3133,7 +3135,10 @@ mod config_tests {
                 .args(["doctor", "--format", "json", "--strict"])
                 .output()
                 .expect("verify repaired OMP extension health");
-            assert!(verify.status.success(), "{label}: repaired state is unhealthy");
+            assert!(
+                verify.status.success(),
+                "{label}: repaired state is unhealthy"
+            );
             let verify_report: serde_json::Value = serde_json::from_slice(&verify.stdout)
                 .unwrap_or_else(|error| panic!("{label}: verification JSON invalid: {error}"));
             let verify_omp = verify_report["checks"]
