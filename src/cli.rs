@@ -12860,6 +12860,22 @@ function childOutcomeFromExitCode(exitCode: unknown): DcgChildOutcome {{
   return "exit-other";
 }}
 
+function describeChildCollectionFailure(reason: unknown): string {{
+  try {{
+    return String(reason);
+  }} catch {{
+    return "<unprintable rejection>";
+  }}
+}}
+
+function observeChildCapability<T>(collect: () => Promise<T>): Promise<T> {{
+  try {{
+    return collect();
+  }} catch (reason) {{
+    return Promise.reject(reason);
+  }}
+}}
+
 export default function dcgGuard(pi: ExtensionAPI): void {{
   pi.on("tool_call", async (event, ctx) => {{
     const toolCall = classifyOmpToolCall(event);
@@ -12919,11 +12935,9 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
       }}
     }}
 
-    let stdoutText;
-    let stderrText;
-    let exitCode;
+    let proc: Bun.ReadableSubprocess;
     try {{
-      const proc = Bun.spawn([
+      proc = Bun.spawn([
         DCG_BIN,
         "--robot", "test", "--stdin", "--agent", "omp", "--dialect", shellDialect,
       ], {{
@@ -12936,14 +12950,38 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
         timeout: DCG_CHILD_TIMEOUT_MS,
         killSignal: "SIGKILL",
       }});
-      [stdoutText, stderrText, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
     }} catch (err) {{
       console.error(`[dcg] OMP guard could not run dcg: ${{err}}`);
       return;
+    }}
+
+    // Observe each child capability independently. Fail-fast aggregation would
+    // let one rejected diagnostic/exit promise erase a completed safety signal
+    // from stdout or exit 1. allSettled also keeps both pipes draining
+    // concurrently before the monotone decision is classified.
+    const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
+      observeChildCapability(() => new Response(proc.stdout).text()),
+      observeChildCapability(() => new Response(proc.stderr).text()),
+      observeChildCapability(() => proc.exited),
+    ]);
+    const collectionFailures: string[] = [];
+    let stdoutText = "";
+    if (stdoutResult.status === "fulfilled") {{
+      stdoutText = stdoutResult.value;
+    }} else {{
+      collectionFailures.push(`stdout read failed: ${{describeChildCollectionFailure(stdoutResult.reason)}}`);
+    }}
+    let stderrText = "";
+    if (stderrResult.status === "fulfilled") {{
+      stderrText = stderrResult.value;
+    }} else {{
+      collectionFailures.push(`stderr read failed: ${{describeChildCollectionFailure(stderrResult.reason)}}`);
+    }}
+    let exitCode: unknown = undefined;
+    if (exitResult.status === "fulfilled") {{
+      exitCode = exitResult.value;
+    }} else {{
+      collectionFailures.push(`exit status failed: ${{describeChildCollectionFailure(exitResult.reason)}}`);
     }}
 
     // Treat the two child streams as separate capabilities: stdout alone may
@@ -12953,11 +12991,17 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
       typeof stdoutText === "string" ? stdoutText : "",
     );
     const stderrDetail = typeof stderrText === "string" ? stderrText.trim() : "";
-    if (classification.action === "infrastructure") {{
-      console.error(`[dcg] OMP guard infrastructure failure (exit ${{exitCode}})${{stderrDetail ? `: ${{stderrDetail}}` : ""}}`);
-      return;
+    if (classification.action === "infrastructure" || collectionFailures.length > 0) {{
+      const exitDetail = typeof exitCode === "number" ? ` (exit ${{exitCode}})` : "";
+      const details = [stderrDetail, ...collectionFailures].filter(Boolean).join("; ");
+      console.error(`[dcg] OMP guard infrastructure failure${{exitDetail}}${{details ? `: ${{details}}` : ""}}`);
+      // A collection fault is not allowed to erase a completed deny-like
+      // stdout verdict or the independent blocking exit-1 signal.
+      if (classification.action !== "block") return;
     }}
-    if (stderrDetail) console.error(`[dcg] OMP guard dcg stderr: ${{stderrDetail}}`);
+    if (collectionFailures.length === 0 && stderrDetail) {{
+      console.error(`[dcg] OMP guard dcg stderr: ${{stderrDetail}}`);
+    }}
     if (classification.action === "allow") return;
 
     const output = classification.output;
@@ -19384,7 +19428,7 @@ if ($errors.Count -ne 0) {
         assert_eq!(std::path::Path::new(&parsed), executable);
         assert_ne!(parsed, "dcg", "never a bare PATH lookup");
         assert!(
-            source.contains("const proc = Bun.spawn([\n        DCG_BIN,"),
+            source.contains("proc = Bun.spawn([\n        DCG_BIN,"),
             "the installed absolute executable must be the direct child capability"
         );
         assert!(
@@ -19426,9 +19470,9 @@ if ($errors.Count -ne 0) {
             "the generated bridge must not leak a competing timer or abort listener"
         );
 
-        let spawn = source.find("const proc = Bun.spawn").expect("dcg spawn");
+        let spawn = source.find("proc = Bun.spawn").expect("dcg spawn");
         let collect = source
-            .find("[stdoutText, stderrText, exitCode] = await Promise.all")
+            .find("const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled")
             .expect("concurrent child collection");
         let classify = source
             .find("const classification = classifyDcgChild(")
@@ -19437,6 +19481,43 @@ if ($errors.Count -ne 0) {
             spawn < collect && collect < classify,
             "the bounded child must be fully collected before stdout/status classification"
         );
+    }
+
+    /// Each child observation is an independent capability. A rejected stderr
+    /// or exit-status promise must not make `Promise.all` discard a completed
+    /// blocking stdout verdict, and a rejected stdout read must not erase the
+    /// blocking exit-1 signal. Keep the generated collector explicitly
+    /// settled-per-capability so every failure remains available to the
+    /// monotone classifier and to visible infrastructure diagnostics.
+    #[test]
+    fn omp_extension_source_isolates_child_collection_faults() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        assert!(source.contains(
+            "const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled(["
+        ));
+        assert!(source.contains("let proc: Bun.ReadableSubprocess;"));
+        assert_eq!(
+            source.matches("observeChildCapability(() =>").count(),
+            3,
+            "stdout, stderr, and exit setup must each convert synchronous setup faults into independently settled rejections"
+        );
+        assert!(source.contains("function observeChildCapability<T>("));
+        assert!(
+            !source.contains("Promise.all(["),
+            "fail-fast aggregation can erase a safety verdict completed on another child channel"
+        );
+        for capability in ["stdout read", "stderr read", "exit status"] {
+            assert!(
+                source.contains(&format!("{capability} failed:")),
+                "generated bridge must diagnose a rejected {capability} capability"
+            );
+        }
+        assert!(source.contains(
+            "classification.action === \"infrastructure\" || collectionFailures.length > 0"
+        ));
+        assert!(source.contains("if (classification.action !== \"block\") return;"));
     }
 
     /// OMP's ordinary agent-loop path validates BashToolInput before emitting
@@ -19779,6 +19860,9 @@ type ChildCase = {
   stdout?: string;
   stderr?: string;
   exitCode?: number;
+  stdoutError?: string;
+  stderrError?: string;
+  exitError?: string;
   spawnError?: string;
   stuckUntilTimeout?: boolean;
 };
@@ -19815,16 +19899,26 @@ const originalConsoleError = console.error;
     timeout: options.timeout,
     killSignal: options.killSignal,
   });
+  const childStream = (text: string, error: string | undefined): ReadableStream<Uint8Array> => {
+    if (!error) return new Blob([text]).stream();
+    return new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.error(new Error(error));
+      },
+    });
+  };
   return {
-    stdout: new Blob([activeChild.stdout ?? ""]).stream(),
-    stderr: new Blob([activeChild.stderr ?? ""]).stream(),
+    stdout: childStream(activeChild.stdout ?? "", activeChild.stdoutError),
+    stderr: childStream(activeChild.stderr ?? "", activeChild.stderrError),
     // Model Bun's native timeout without making the certificate wait for the
     // production 30-second ceiling. The exact configured value and kill
     // signal are asserted above, so removing either production option turns
     // this replay red before the compressed timer can resolve.
     exited: activeChild.stuckUntilTimeout
       ? new Promise<number>(resolve => setTimeout(() => resolve(137), 5))
-      : Promise.resolve(activeChild.exitCode ?? 0),
+      : activeChild.exitError
+        ? Promise.reject(new Error(activeChild.exitError))
+        : Promise.resolve(activeChild.exitCode ?? 0),
   };
 }) as typeof Bun.spawn;
 console.error = (...values: unknown[]): void => {
@@ -19904,6 +19998,57 @@ try {
   );
   equal(replay.result, { block: true, reason: "Blocked by dcg (exit 1 without a blocking decision)" }, "callback/exit-one-stderr-only/result");
   equal(replay.errors, ["[dcg] OMP guard dcg stderr: status-only diagnostic"], "callback/exit-one-stderr-only/diagnostics");
+
+  replay = await invoke(
+    "callback/stderr-reject-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives stderr fault" }),
+      stderrError: "synthetic stderr read failure",
+      exitCode: 0,
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives stderr fault" }, "callback/stderr-reject-deny/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 0): stderr read failed: Error: synthetic stderr read failure"], "callback/stderr-reject-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/stdout-reject-exit-one",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdoutError: "synthetic stdout read failure",
+      stderr: "status diagnostic",
+      exitCode: 1,
+    },
+  );
+  equal(replay.result, { block: true, reason: "Blocked by dcg (exit 1 without a blocking decision)" }, "callback/stdout-reject-exit-one/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 1): status diagnostic; stdout read failed: Error: synthetic stdout read failure"], "callback/stdout-reject-exit-one/diagnostics");
+
+  replay = await invoke(
+    "callback/exit-reject-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives exit fault" }),
+      exitError: "synthetic exit status failure",
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives exit fault" }, "callback/exit-reject-deny/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure: exit status failed: Error: synthetic exit status failure"], "callback/exit-reject-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/stdout-reject-exit-zero",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stdoutError: "synthetic stdout read failure", exitCode: 0 },
+  );
+  equal(replay.result, undefined, "callback/stdout-reject-exit-zero/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 0): stdout read failed: Error: synthetic stdout read failure"], "callback/stdout-reject-exit-zero/diagnostics");
+
+  replay = await invoke(
+    "callback/exit-reject-no-verdict",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitError: "synthetic exit status failure" },
+  );
+  equal(replay.result, undefined, "callback/exit-reject-no-verdict/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure: exit status failed: Error: synthetic exit status failure"], "callback/exit-reject-no-verdict/diagnostics");
 
   replay = await invoke(
     "callback/exit-two-deny",
@@ -20131,6 +20276,11 @@ console.log(JSON.stringify({
                 "callback/exit-zero-deny",
                 "callback/stderr-json-is-diagnostic",
                 "callback/exit-one-stderr-only",
+                "callback/stderr-reject-deny",
+                "callback/stdout-reject-exit-one",
+                "callback/exit-reject-deny",
+                "callback/stdout-reject-exit-zero",
+                "callback/exit-reject-no-verdict",
                 "callback/exit-two-deny",
                 "callback/infrastructure-exit",
                 "callback/timeout-no-verdict",
@@ -20171,6 +20321,42 @@ console.log(JSON.stringify({
                 .contains("transition/exit-0/deny/action"),
             "mutant red must identify the changed transition cell\nstderr:\n{}",
             String::from_utf8_lossy(&mutant_output.stderr)
+        );
+
+        let settled_collector = r"    const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
+      observeChildCapability(() => new Response(proc.stdout).text()),
+      observeChildCapability(() => new Response(proc.stderr).text()),
+      observeChildCapability(() => proc.exited),
+    ]);";
+        let fail_fast_collector = r#"    const [stdoutValue, stderrValue, exitValue] = await Promise.all([
+      observeChildCapability(() => new Response(proc.stdout).text()),
+      observeChildCapability(() => new Response(proc.stderr).text()),
+      observeChildCapability(() => proc.exited),
+    ]);
+    const stdoutResult = { status: "fulfilled" as const, value: stdoutValue };
+    const stderrResult = { status: "fulfilled" as const, value: stderrValue };
+    const exitResult = { status: "fulfilled" as const, value: exitValue };"#;
+        assert_eq!(
+            source.matches(settled_collector).count(),
+            1,
+            "collection mutation witness must identify exactly one settled capability collector"
+        );
+        let collection_mutant = source.replacen(settled_collector, fail_fast_collector, 1);
+        let collection_mutant_root = temp.path().join("mutant-fail-fast-collection");
+        std::fs::create_dir_all(&collection_mutant_root)
+            .expect("create fail-fast collection mutant replay root");
+        let collection_mutant_output =
+            run_omp_bridge_bun_fixture(&bun, &collection_mutant_root, &collection_mutant);
+        assert!(
+            !collection_mutant_output.status.success(),
+            "the executable corpus vacuously accepted fail-fast child collection\nstdout:\n{}",
+            String::from_utf8_lossy(&collection_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&collection_mutant_output.stderr)
+                .contains("synthetic stderr read failure"),
+            "collector mutant red must reach the rejected diagnostic promise that erases a completed deny\nstderr:\n{}",
+            String::from_utf8_lossy(&collection_mutant_output.stderr)
         );
     }
 
