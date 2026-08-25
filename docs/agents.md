@@ -67,6 +67,9 @@ The bridge spawns dcg directly, without a shell, and gives Bun a 30-second
 parent-side timeout with a hard kill signal. This is a pathological-hang
 backstop above dcg's ordinary 1-second evaluator default and the broad Windows
 preset's 3-second default, not a replacement for those configurable budgets.
+An explicit evaluator budget above 30 seconds is nevertheless capped by this
+OMP-specific outer ceiling; direct hook and diagnostic invocations retain their
+configured budget.
 If the backstop terminates a child before it returns a safety verdict, the
 bridge reports the infrastructure failure and follows the established visible
 fail-open policy. A complete deny, ask, or indeterminate verdict already
