@@ -40,25 +40,21 @@ def run_one(
     command: str,
     env: Dict[str, str],
     working_directory: str,
+    expected_decision: str,
 ) -> float:
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}).encode()
     start = time.perf_counter_ns()
     result = subprocess.run(
         [bin_path],
         input=payload,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        capture_output=True,
         check=False,
         env=env,
         cwd=working_directory,
         timeout=PROCESS_BACKSTOP_SECONDS,
     )
     end = time.perf_counter_ns()
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"dcg exited {result.returncode} during timed hook invocation; "
-            "refusing to credit a failed process as latency evidence"
-        )
+    inspect_hook_result(result, expected_decision, "timed hook invocation")
     return (end - start) / 1_000_000.0
 
 
@@ -104,6 +100,58 @@ def percentile(sorted_values: List[float], pct: float) -> float:
     return sorted_values[idx]
 
 
+def inspect_hook_result(
+    result: subprocess.CompletedProcess[bytes],
+    expected_decision: str,
+) -> Dict[str, Any]:
+    """Validate one completed hook process and summarize its wire result."""
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"hook process exited {result.returncode}, expected hook exit 0; "
+            f"stderr={result.stderr.decode(errors='replace')[:240]!r}"
+        )
+
+    observed_decision: str
+    if not result.stdout:
+        observed_decision = "allow"
+        if result.stderr:
+            raise RuntimeError(
+                "allow result polluted stderr; refusing to credit a "
+                "non-conformant hook result"
+            )
+    else:
+        try:
+            parsed = json.loads(result.stdout)
+            observed_decision = parsed["hookSpecificOutput"]["permissionDecision"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise RuntimeError(
+                "hook process emitted non-hook stdout; refusing to credit it: "
+                f"{result.stdout[:240]!r}"
+            ) from exc
+        if observed_decision != "deny":
+            raise RuntimeError(
+                f"hook process emitted unexpected decision {observed_decision!r}"
+            )
+        if not result.stderr:
+            raise RuntimeError("deny result lost its stderr warning")
+
+    if observed_decision != expected_decision:
+        raise RuntimeError(
+            f"hook process observed {observed_decision!r}, "
+            f"expected {expected_decision!r}"
+        )
+
+    return {
+        "expected_decision": expected_decision,
+        "observed_decision": observed_decision,
+        "returncode": result.returncode,
+        "stdout_bytes": len(result.stdout),
+        "stderr_bytes": len(result.stderr),
+        "stdout_sha256": hashlib.sha256(result.stdout).hexdigest(),
+        "stderr_sha256": hashlib.sha256(result.stderr).hexdigest(),
+    }
+
+
 def validate_hook_case(
     bin_path: str,
     command: str,
@@ -122,51 +170,7 @@ def validate_hook_case(
         cwd=working_directory,
         timeout=PROCESS_BACKSTOP_SECONDS,
     )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"semantic control exited {result.returncode}, expected hook exit 0; "
-            f"stderr={result.stderr.decode(errors='replace')[:240]!r}"
-        )
-
-    observed_decision: str
-    if not result.stdout:
-        observed_decision = "allow"
-        if result.stderr:
-            raise RuntimeError(
-                "semantic allow control polluted stderr; refusing to time a "
-                "non-conformant hook outcome"
-            )
-    else:
-        try:
-            parsed = json.loads(result.stdout)
-            observed_decision = parsed["hookSpecificOutput"]["permissionDecision"]
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            raise RuntimeError(
-                "semantic control emitted non-hook stdout; refusing to time it: "
-                f"{result.stdout[:240]!r}"
-            ) from exc
-        if observed_decision != "deny":
-            raise RuntimeError(
-                f"semantic control emitted unexpected decision {observed_decision!r}"
-            )
-        if not result.stderr:
-            raise RuntimeError("semantic deny control lost its stderr warning")
-
-    if observed_decision != expected_decision:
-        raise RuntimeError(
-            f"semantic control observed {observed_decision!r}, "
-            f"expected {expected_decision!r}"
-        )
-
-    return {
-        "expected_decision": expected_decision,
-        "observed_decision": observed_decision,
-        "returncode": result.returncode,
-        "stdout_bytes": len(result.stdout),
-        "stderr_bytes": len(result.stderr),
-        "stdout_sha256": hashlib.sha256(result.stdout).hexdigest(),
-        "stderr_sha256": hashlib.sha256(result.stderr).hexdigest(),
-    }
+    return inspect_hook_result(result, expected_decision)
 
 
 def summarize_timings(timings: List[float]) -> Dict[str, Any]:
@@ -217,13 +221,30 @@ def run_case(
 
     def measure_pair(index: int) -> Tuple[float, Optional[float]]:
         if not paired_bypass:
-            return run_one(bin_path, command, env, working_directory), None
+            return (
+                run_one(
+                    bin_path,
+                    command,
+                    env,
+                    working_directory,
+                    expected_decision,
+                ),
+                None,
+            )
         if index % 2 == 0:
-            full_ms = run_one(bin_path, command, env, working_directory)
-            bypass_ms = run_one(bin_path, command, bypass_env, working_directory)
+            full_ms = run_one(
+                bin_path, command, env, working_directory, expected_decision
+            )
+            bypass_ms = run_one(
+                bin_path, command, bypass_env, working_directory, "allow"
+            )
         else:
-            bypass_ms = run_one(bin_path, command, bypass_env, working_directory)
-            full_ms = run_one(bin_path, command, env, working_directory)
+            bypass_ms = run_one(
+                bin_path, command, bypass_env, working_directory, "allow"
+            )
+            full_ms = run_one(
+                bin_path, command, env, working_directory, expected_decision
+            )
         return full_ms, bypass_ms
 
     for index in range(warmup):
