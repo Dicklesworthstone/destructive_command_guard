@@ -72,10 +72,7 @@ fn configure_isolated_hook_child(command: &mut Command) {
             "DCG_PENDING_EXCEPTIONS_PATH",
             test_state_path("-pending-exceptions.jsonl"),
         )
-        .env(
-            "DCG_ALLOW_ONCE_PATH",
-            test_state_path("-allow-once.jsonl"),
-        );
+        .env("DCG_ALLOW_ONCE_PATH", test_state_path("-allow-once.jsonl"));
 }
 
 /// Path to the DCG binary (uses same target directory as the test binary).
@@ -431,10 +428,7 @@ fn test_hook_output_rule_id_format() {
     let pack_id = hook_output["packId"]
         .as_str()
         .expect("denial must include a string packId");
-    assert_eq!(
-        parts[0], pack_id,
-        "ruleId pack portion should match packId"
-    );
+    assert_eq!(parts[0], pack_id, "ruleId pack portion should match packId");
 }
 
 #[test]
