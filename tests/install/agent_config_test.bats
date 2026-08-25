@@ -3896,12 +3896,15 @@ MOCKEOF
 @test "unconfigure_opencode: preserves a user-owned repo-root project plugin" {
     export XDG_CONFIG_HOME="$HOME/.config"
     mkdir -p "$TEST_WORKDIR/.git" "$TEST_WORKDIR/.opencode/plugins"
-    printf 'export const Mine = async () => ({});\n' > "$TEST_WORKDIR/.opencode/plugins/dcg-guard.js"
+    local plugin="$TEST_WORKDIR/.opencode/plugins/dcg-guard.js"
+    local snapshot="$TEST_TMPDIR/opencode-project.user.js"
+    printf 'export const Mine = async () => ({});\n' > "$plugin"
+    cp "$plugin" "$snapshot"
 
     run unconfigure_opencode
 
     [ "$status" -eq 0 ]
-    grep -q 'Mine' "$TEST_WORKDIR/.opencode/plugins/dcg-guard.js"
+    cmp -s "$snapshot" "$plugin"
 }
 
 @test "current_repo_root: retains physical-cwd fallback outside Git" {
