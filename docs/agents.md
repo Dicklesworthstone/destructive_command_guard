@@ -63,6 +63,16 @@ Because the bridge supplies `--agent omp` explicitly, OMP remains distinct from
 legacy Pi even when OMP exposes Pi-family compatibility variables. The
 canonical profile key is `agents.omp`; `oh-my-pi` is accepted as an alias.
 
+The bridge spawns dcg directly, without a shell, and gives Bun a 30-second
+parent-side timeout with a hard kill signal. This is a pathological-hang
+backstop above dcg's ordinary 1-second evaluator default and the broad Windows
+preset's 3-second default, not a replacement for those configurable budgets.
+If the backstop terminates a child before it returns a safety verdict, the
+bridge reports the infrastructure failure and follows the established visible
+fail-open policy. A complete deny, ask, or indeterminate verdict already
+written to stdout remains authoritative and blocks regardless of the forced
+exit status.
+
 OMP's public ExtensionAPI does not expose its ACP client-terminal capability or
 selected backend, and both ACP and JSON-RPC surface as `mode: "rpc"`. The bridge
 therefore does not infer a Windows dialect from mode: non-PTY RPC calls remain

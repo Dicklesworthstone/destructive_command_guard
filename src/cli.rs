@@ -19520,8 +19520,15 @@ type ChildCase = {
   stderr?: string;
   exitCode?: number;
   spawnError?: string;
+  stuckUntilTimeout?: boolean;
 };
-type SpawnRecord = { argv: string[]; cwd: string; stdin: string };
+type SpawnRecord = {
+  argv: string[];
+  cwd: string;
+  stdin: string;
+  timeout: number;
+  killSignal: string | number;
+};
 let activeChild: ChildCase = {};
 let callback: ((event: unknown, ctx: unknown) => Promise<unknown>) | undefined;
 let spawnRecords: SpawnRecord[] = [];
@@ -19530,19 +19537,34 @@ let observedExecutable: string | undefined;
 const originalSpawn = Bun.spawn;
 const originalConsoleError = console.error;
 
-(Bun as unknown as { spawn: typeof Bun.spawn }).spawn = ((argv: string[], options: { cwd: string; stdin: Uint8Array }) => {
+(Bun as unknown as { spawn: typeof Bun.spawn }).spawn = ((argv: string[], options: {
+  cwd: string;
+  stdin: Uint8Array;
+  timeout: number;
+  killSignal: string | number;
+}) => {
   if (activeChild.spawnError) throw new Error(activeChild.spawnError);
   if (observedExecutable === undefined) observedExecutable = argv[0];
   equal(argv[0], observedExecutable, "callback/spawn/executable-stability");
+  equal(options.timeout, 30_000, "callback/spawn/parent-timeout");
+  equal(options.killSignal, "SIGKILL", "callback/spawn/kill-signal");
   spawnRecords.push({
     argv: [...argv],
     cwd: options.cwd,
     stdin: new TextDecoder().decode(options.stdin),
+    timeout: options.timeout,
+    killSignal: options.killSignal,
   });
   return {
     stdout: new Blob([activeChild.stdout ?? ""]).stream(),
     stderr: new Blob([activeChild.stderr ?? ""]).stream(),
-    exited: Promise.resolve(activeChild.exitCode ?? 0),
+    // Model Bun's native timeout without making the certificate wait for the
+    // production 30-second ceiling. The exact configured value and kill
+    // signal are asserted above, so removing either production option turns
+    // this replay red before the compressed timer can resolve.
+    exited: activeChild.stuckUntilTimeout
+      ? new Promise<number>(resolve => setTimeout(() => resolve(137), 5))
+      : Promise.resolve(activeChild.exitCode ?? 0),
   };
 }) as typeof Bun.spawn;
 console.error = (...values: unknown[]): void => {
@@ -19595,6 +19617,8 @@ try {
   equal(replay.spawns[0]!.stdin, " \t", "callback/whitespace-allow/stdin-bytes");
   equal(replay.spawns[0]!.cwd, process.cwd(), "callback/whitespace-allow/cwd");
   equal(replay.spawns[0]!.argv.slice(1), ["--robot", "test", "--stdin", "--agent", "omp", "--dialect", "posix"], "callback/whitespace-allow/argv");
+  equal(replay.spawns[0]!.timeout, 30_000, "callback/whitespace-allow/parent-timeout");
+  equal(replay.spawns[0]!.killSignal, "SIGKILL", "callback/whitespace-allow/kill-signal");
   equal(replay.errors, ["[dcg] OMP guard dcg stderr: allow diagnostic"], "callback/whitespace-allow/diagnostics");
 
   replay = await invoke(
@@ -19635,6 +19659,28 @@ try {
   );
   equal(replay.result, undefined, "callback/infrastructure-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 9): child crash"], "callback/infrastructure-exit/diagnostics");
+
+  const timeoutStarted = performance.now();
+  replay = await invoke(
+    "callback/timeout-no-verdict",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stuckUntilTimeout: true },
+  );
+  check(performance.now() - timeoutStarted < 1_000, "callback/timeout-no-verdict/remained-bounded");
+  equal(replay.result, undefined, "callback/timeout-no-verdict/result");
+  equal(replay.spawns.length, 1, "callback/timeout-no-verdict/spawn-count");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137)"], "callback/timeout-no-verdict/diagnostics");
+
+  replay = await invoke(
+    "callback/timeout-after-deny",
+    { toolName: "bash", input: { command: "git reset --hard" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives timeout", rule_id: "core.git:test" }),
+      stuckUntilTimeout: true,
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives timeout\n\nRule: core.git:test" }, "callback/timeout-after-deny/result");
+  equal(replay.errors, [], "callback/timeout-after-deny/diagnostics");
 
   replay = await invoke(
     "callback/spawn-throw",
@@ -19827,6 +19873,8 @@ console.log(JSON.stringify({
                 "callback/exit-one-stderr-only",
                 "callback/exit-two-deny",
                 "callback/infrastructure-exit",
+                "callback/timeout-no-verdict",
+                "callback/timeout-after-deny",
                 "callback/spawn-throw",
             ]
             .map(str::to_string)
