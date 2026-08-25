@@ -2691,6 +2691,7 @@ mod config_tests {
         enum Fixture {
             Absent,
             Foreign,
+            InvalidUtf8Marker,
             Current,
             Truncated,
             Stale,
@@ -2704,6 +2705,7 @@ mod config_tests {
         let cases = [
             ("absent", Fixture::Absent, false),
             ("foreign", Fixture::Foreign, false),
+            ("invalid-utf8-marker", Fixture::InvalidUtf8Marker, false),
             ("owned-current", Fixture::Current, true),
             ("owned-truncated", Fixture::Truncated, false),
             ("owned-stale", Fixture::Stale, false),
@@ -2763,6 +2765,12 @@ mod config_tests {
                     std::fs::write(&extension, "export default function mine() {}\n")
                         .expect("foreign project OMP extension");
                 }
+                Fixture::InvalidUtf8Marker => {
+                    std::fs::create_dir_all(extension.parent().expect("extension parent"))
+                        .expect("project OMP extension directory");
+                    std::fs::write(&extension, b"// dcg-omp-extension\xff\n")
+                        .expect("invalid UTF-8 project OMP extension");
+                }
                 Fixture::Current
                 | Fixture::Truncated
                 | Fixture::Stale
@@ -2798,6 +2806,7 @@ mod config_tests {
                         Fixture::Current => current,
                         Fixture::Absent
                         | Fixture::Foreign
+                        | Fixture::InvalidUtf8Marker
                         | Fixture::ProjectTruncatedUserCurrent
                         | Fixture::ProjectCurrentUserTruncated
                         | Fixture::ProjectForeignUserCurrent => unreachable!(),
