@@ -2934,11 +2934,8 @@ mod config_tests {
             let install = install.output().expect("install current OMP extension");
             assert!(install.status.success(), "{label}: fixture install failed");
             let expected = std::fs::read(extension).expect("current extension bytes");
-            std::fs::write(
-                extension,
-                "// dcg-omp-extension: generated but truncated\n",
-            )
-            .expect("plant truncated owned extension");
+            std::fs::write(extension, "// dcg-omp-extension: generated but truncated\n")
+                .expect("plant truncated owned extension");
 
             let output = Command::new(dcg_binary())
                 .env_clear()
@@ -3021,7 +3018,10 @@ mod config_tests {
             .args(["doctor", "--format", "json", "--strict"])
             .output()
             .expect("verify installed user extension");
-        assert!(verify.status.success(), "healthy user candidate must be accepted");
+        assert!(
+            verify.status.success(),
+            "healthy user candidate must be accepted"
+        );
     }
 
     #[test]
