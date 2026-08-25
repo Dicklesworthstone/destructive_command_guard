@@ -3876,6 +3876,35 @@ MOCKEOF
     [ "$status" -eq 0 ]
 }
 
+@test "unconfigure_opencode: checks a repo-root project plugin only once" {
+    export XDG_CONFIG_HOME="$HOME/.config"
+    mkdir -p "$TEST_WORKDIR/.git" "$TEST_WORKDIR/.opencode/plugins"
+    printf '// dcg-opencode-plugin: generated\n' > "$TEST_WORKDIR/.opencode/plugins/dcg-guard.js"
+    local removal_log="$TEST_TMPDIR/opencode-removals.log"
+    rm() {
+        printf '%s\n' "$2" >> "$removal_log"
+    }
+
+    run unconfigure_opencode
+    unset -f rm
+
+    [ "$status" -eq 0 ]
+    [ "$(grep -cFx "$TEST_WORKDIR/.opencode/plugins/dcg-guard.js" "$removal_log")" -eq 1 ]
+    [ "$(wc -l < "$removal_log")" -eq 1 ]
+}
+
+@test "current_repo_root: cwd resolution failure is explicit and emits no path" {
+    pwd() {
+        return 1
+    }
+
+    run current_repo_root
+    unset -f pwd
+
+    [ "$status" -ne 0 ]
+    [ -z "$output" ]
+}
+
 # ============================================================================
 # Oh My Pi Configuration and Uninstall Tests
 # ============================================================================

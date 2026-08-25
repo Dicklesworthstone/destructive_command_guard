@@ -1108,7 +1108,9 @@ PYEOF
 
 current_repo_root() {
     local start
-    start=$(pwd -P)
+    if ! start=$(pwd -P) || [ -z "$start" ]; then
+        return 1
+    fi
     local root="$start"
     while true; do
         if [ -e "$root/.git" ]; then
@@ -1130,12 +1132,19 @@ unconfigure_opencode() {
     # working directory.
     local removed=0
     local plugin
-    local repo_root
-    repo_root=$(current_repo_root)
-    for plugin in \
-        "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/dcg-guard.js" \
-        "$repo_root/.opencode/plugins/dcg-guard.js" \
-        ".opencode/plugins/dcg-guard.js"; do
+    local repo_root=""
+    local -a plugins=(
+        "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/dcg-guard.js"
+    )
+    # `current_repo_root` falls back to the physical cwd outside Git, so one
+    # resolved project candidate covers both existing cleanup cases without
+    # checking the same file again through a relative alias. If cwd cannot be
+    # resolved, omit the project capability entirely rather than constructing
+    # `/.opencode/...` from an empty root.
+    if repo_root=$(current_repo_root); then
+        plugins+=("$repo_root/.opencode/plugins/dcg-guard.js")
+    fi
+    for plugin in "${plugins[@]}"; do
         if [ -f "$plugin" ] && grep -q 'dcg-opencode-plugin' "$plugin" 2>/dev/null; then
             rm -f "$plugin" 2>/dev/null && removed=1
         fi
