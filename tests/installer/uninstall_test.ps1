@@ -244,6 +244,10 @@ try {
 Write-Host "Test 12: Oh My Pi inactive profiles and repository-root extension are removed"
 $h12 = New-Tmp
 $savedLocation = (Get-Location).Path
+$workProfile = $null
+$userProfile = $null
+$workAttributes = $null
+$userAttributes = $null
 try {
     $defaultExtension = Join-Path $h12 '.omp/agent/extensions/dcg-guard.ts'
     $workExtension = Join-Path $h12 '.omp/profiles/work/agent/extensions/dcg-guard.ts'
@@ -259,7 +263,29 @@ try {
     foreach ($path in @($defaultExtension, $workExtension, $teamExtension, $projectExtension)) {
         Set-Content -Path $path -Value '// dcg-omp-extension: generated'
     }
-    Set-Content -Path $userExtension -Value 'export default function mine() {}'
+    Set-Content -Path $userExtension -Value '// DCG-OMP-EXTENSION: user-authored'
+
+    if ([System.IO.Path]::DirectorySeparatorChar -eq '\') {
+        $workProfile = Join-Path $h12 '.omp/profiles/work'
+        $userProfile = Join-Path $h12 '.omp/profiles/personal'
+        $workAttributes = [System.IO.File]::GetAttributes($workProfile)
+        $userAttributes = [System.IO.File]::GetAttributes($userProfile)
+        [System.IO.File]::SetAttributes(
+            $workProfile,
+            [System.IO.FileAttributes]($workAttributes -bor [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System)
+        )
+        [System.IO.File]::SetAttributes(
+            $userProfile,
+            [System.IO.FileAttributes]($userAttributes -bor [System.IO.FileAttributes]::Hidden)
+        )
+        $profiles = @(Get-OmpProfileDirectories -Path (Join-Path $h12 '.omp/profiles'))
+        Check (@($profiles | Where-Object {
+            [string]::Equals($_, $workProfile, [System.StringComparison]::OrdinalIgnoreCase)
+        }).Count -eq 1) "OMP: Hidden/System inactive profile is enumerated on Windows"
+        Check (@($profiles | Where-Object {
+            [string]::Equals($_, $userProfile, [System.StringComparison]::OrdinalIgnoreCase)
+        }).Count -eq 1) "OMP: hidden foreign-profile candidate is enumerated on Windows"
+    }
 
     Set-Location -LiteralPath $nested
     Check ((Unconfigure-OmpExtension -HomeDir $h12) -eq $true) "OMP: profile/project sweep removed generated extensions"
@@ -267,9 +293,17 @@ try {
     Check (-not (Test-Path $workExtension)) "OMP: inactive work profile removed"
     Check (-not (Test-Path $teamExtension)) "OMP: inactive team profile removed"
     Check (-not (Test-Path $projectExtension)) "OMP: repository-root extension removed from nested cwd"
-    Check (Test-Path $userExtension) "OMP: inactive user-authored extension preserved"
+    Check (Test-Path $userExtension) "OMP: inactive near-marker user extension is preserved, including from a hidden Windows profile"
 } finally {
     Set-Location $savedLocation
+    if ([System.IO.Path]::DirectorySeparatorChar -eq '\') {
+        if (($null -ne $workAttributes) -and [System.IO.Directory]::Exists($workProfile)) {
+            [System.IO.File]::SetAttributes($workProfile, $workAttributes)
+        }
+        if (($null -ne $userAttributes) -and [System.IO.Directory]::Exists($userProfile)) {
+            [System.IO.File]::SetAttributes($userProfile, $userAttributes)
+        }
+    }
     Remove-Item -Recurse -Force $h12 -ErrorAction SilentlyContinue
 }
 
