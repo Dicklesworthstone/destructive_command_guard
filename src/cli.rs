@@ -10330,7 +10330,12 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 issues += 1;
                 if fix {
                     println!("  Attempting extension refresh...");
-                    if install_omp_extension(true, project).is_ok() {
+                    if install_omp_extension(true, project).is_ok()
+                        && matches!(
+                            registered_omp_extension(),
+                            Ok(OmpExtensionRegistration::Healthy(_))
+                        )
+                    {
                         println!("  {}", "Fixed!".green());
                         fixed += 1;
                     } else {
@@ -10349,7 +10354,12 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 issues += 1;
                 if fix {
                     println!("  Attempting extension install...");
-                    if install_omp_extension(false, false).is_ok() {
+                    if install_omp_extension(false, false).is_ok()
+                        && matches!(
+                            registered_omp_extension(),
+                            Ok(OmpExtensionRegistration::Healthy(_))
+                        )
+                    {
                         println!("  {}", "Fixed!".green());
                         fixed += 1;
                     } else {
@@ -11353,7 +11363,13 @@ fn collect_doctor_report(
             }
             Ok(OmpExtensionRegistration::OwnedUnhealthy { path, project }) => {
                 issues += 1;
-                if fix && install_omp_extension(true, project).is_ok() {
+                if fix
+                    && install_omp_extension(true, project).is_ok()
+                    && matches!(
+                        registered_omp_extension(),
+                        Ok(OmpExtensionRegistration::Healthy(_))
+                    )
+                {
                     fixed += 1;
                     omp_fixed = true;
                     (
@@ -11377,7 +11393,13 @@ fn collect_doctor_report(
             }
             Ok(OmpExtensionRegistration::Missing) => {
                 issues += 1;
-                if fix && install_omp_extension(false, false).is_ok() {
+                if fix
+                    && install_omp_extension(false, false).is_ok()
+                    && matches!(
+                        registered_omp_extension(),
+                        Ok(OmpExtensionRegistration::Healthy(_))
+                    )
+                {
                     fixed += 1;
                     omp_fixed = true;
                     let installed_path = omp_user_extension_path()
