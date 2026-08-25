@@ -25,6 +25,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 PROCESS_BACKSTOP_SECONDS = 30.0
+TAIL_COVERAGE_PCT = 95
+TAIL_CONFIDENCE_PCT = 95
+MIN_TOLERANCE_SAMPLES = 59
 
 
 def sha256_file(path: str) -> str:
@@ -789,6 +792,32 @@ def probe_effective_budget(
     }
 
 
+def max_allowed_tail_exceedances(sample_count: int) -> int:
+    """Return the 95/95 one-sided binomial tolerance allowance."""
+    if sample_count < MIN_TOLERANCE_SAMPLES:
+        return -1
+
+    exceedance_probability = 1.0 - (TAIL_COVERAGE_PCT / 100.0)
+    alpha = 1.0 - (TAIL_CONFIDENCE_PCT / 100.0)
+    non_exceedance_probability = 1.0 - exceedance_probability
+    probability = non_exceedance_probability**sample_count
+    cumulative = probability
+    allowed = 0 if cumulative <= alpha else -1
+
+    for exceedances in range(1, sample_count + 1):
+        probability *= (
+            (sample_count - exceedances + 1)
+            / exceedances
+            * exceedance_probability
+            / non_exceedance_probability
+        )
+        cumulative += probability
+        if cumulative > alpha:
+            break
+        allowed = exceedances
+    return allowed
+
+
 def build_latency_gate(
     enabled: bool,
     supplied_budget_ms: int,
@@ -800,6 +829,28 @@ def build_latency_gate(
     errors: List[str],
 ) -> Dict[str, Any]:
     """Build the authoritative gate verdict serialized into the JSON artifact."""
+    spec_ids = [case["id"] for case in case_specs]
+    result_ids = [case["id"] for case in results]
+    duplicate_spec_ids = sorted(
+        case_id for case_id in set(spec_ids) if spec_ids.count(case_id) > 1
+    )
+    duplicate_result_ids = sorted(
+        case_id for case_id in set(result_ids) if result_ids.count(case_id) > 1
+    )
+    if duplicate_spec_ids:
+        raise ValueError(f"duplicate performance case ids: {duplicate_spec_ids}")
+    if duplicate_result_ids:
+        raise ValueError(f"duplicate performance result ids: {duplicate_result_ids}")
+    unexpected_result_ids = sorted(set(result_ids) - set(spec_ids))
+    if unexpected_result_ids:
+        raise ValueError(f"unexpected performance result ids: {unexpected_result_ids}")
+    if not errors and set(result_ids) != set(spec_ids):
+        missing_result_ids = sorted(set(spec_ids) - set(result_ids))
+        raise ValueError(
+            "successful measurement set is incomplete; missing result ids: "
+            f"{missing_result_ids}"
+        )
+
     limit_ms = shipped_budget_ms * margin_pct / 100.0 if enabled else None
     result_by_id = {case["id"]: case for case in results}
     per_case: List[Dict[str, Any]] = []
@@ -823,7 +874,19 @@ def build_latency_gate(
 
             signed_p95 = case["evaluator_delta_metrics"]["p95_ms"]
             budget_consumption_p95 = max(0.0, signed_p95)
-            status = "PASS" if budget_consumption_p95 <= limit_ms else "FAIL"
+            delta_samples = case["evaluator_delta_metrics"]["samples_ms"]
+            over_limit_sample_count = sum(
+                max(0.0, sample) > limit_ms for sample in delta_samples
+            )
+            allowed_over_limit_sample_count = max_allowed_tail_exceedances(
+                len(delta_samples)
+            )
+            status = (
+                "PASS"
+                if budget_consumption_p95 <= limit_ms
+                and over_limit_sample_count <= allowed_over_limit_sample_count
+                else "FAIL"
+            )
             per_case.append(
                 {
                     "case": case_id,
@@ -835,15 +898,27 @@ def build_latency_gate(
                     "evaluator_delta_p95_ms": signed_p95,
                     "budget_consumption_p95_ms": budget_consumption_p95,
                     "limit_ms": limit_ms,
+                    "over_limit_sample_count": over_limit_sample_count,
+                    "allowed_over_limit_sample_count": (
+                        allowed_over_limit_sample_count
+                    ),
                     "status": status,
                 }
             )
-            if status == "FAIL":
+            if budget_consumption_p95 > limit_ms:
                 violations.append(
                     f"{case_id}: paired evaluator p95 "
                     f"{budget_consumption_p95:.1f}ms exceeds "
                     f"{limit_ms:.0f}ms ({margin_pct}% of the "
                     f"{shipped_budget_ms}ms hook budget)"
+                )
+            if over_limit_sample_count > allowed_over_limit_sample_count:
+                violations.append(
+                    f"{case_id}: {over_limit_sample_count} of {len(delta_samples)} "
+                    "paired evaluator samples exceed the limit; the "
+                    f"{TAIL_CONFIDENCE_PCT}/{TAIL_COVERAGE_PCT} one-sided "
+                    "binomial tolerance rule allows at most "
+                    f"{allowed_over_limit_sample_count}"
                 )
 
     if errors:
@@ -866,6 +941,16 @@ def build_latency_gate(
         "limit_ms": limit_ms,
         "estimand": (
             "paired full hook wall time minus matched DCG_BYPASS wall time"
+            if enabled
+            else None
+        ),
+        "tail_rule": (
+            {
+                "kind": "one-sided exact binomial tolerance bound",
+                "confidence_pct": TAIL_CONFIDENCE_PCT,
+                "coverage_pct": TAIL_COVERAGE_PCT,
+                "minimum_sample_count": MIN_TOLERANCE_SAMPLES,
+            }
             if enabled
             else None
         ),
@@ -904,7 +989,9 @@ def main() -> int:
         default=50,
         help=(
             "Percentage of --assert-budget-ms that paired evaluator p95 may "
-            "consume (default 50; values above 60 are rejected)"
+            "consume (default 50; values above 60 are rejected). Gate mode "
+            "also applies a 95/95 one-sided binomial tolerance rule and "
+            f"requires at least {MIN_TOLERANCE_SAMPLES} measured samples."
         ),
     )
     args = parser.parse_args()
@@ -927,6 +1014,14 @@ def main() -> int:
     if gate_enabled:
         if not 0 < args.assert_margin_pct <= 60:
             print("error: --assert-margin-pct must be in the range 1..=60", file=sys.stderr)
+            return 1
+        if args.runs < MIN_TOLERANCE_SAMPLES:
+            print(
+                "error: latency gate requires --runs >= "
+                f"{MIN_TOLERANCE_SAMPLES} for its {TAIL_CONFIDENCE_PCT}/"
+                f"{TAIL_COVERAGE_PCT} one-sided binomial tolerance rule",
+                file=sys.stderr,
+            )
             return 1
     elif args.assert_margin_pct <= 0:
         print("error: --assert-margin-pct must be > 0", file=sys.stderr)
@@ -1150,6 +1245,10 @@ def main() -> int:
                 else None
             ),
             "pair_order": "alternating AB/BA by sample index" if gate_enabled else None,
+            "timed_sample_semantics": (
+                "every timed child result is captured and validated after the "
+                "timer stops; wrong decisions and malformed wire output fail the run"
+            ),
             "self_heal_coverage": (
                 "excluded for host safety: DCG_SELF_HEAL_HOOK=0; this certificate "
                 "does not measure default hook self-healing work"

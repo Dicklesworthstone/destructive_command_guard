@@ -1210,11 +1210,23 @@ jobs:
           with open(current_path, "r", encoding="utf-8") as handle:
               current = json.load(handle)
 
-          baseline_cases = {c["id"]: c for c in baseline.get("cases", [])}
-          current_cases = {c["id"]: c for c in current.get("cases", [])}
-
           violations = []
           rows = []
+
+          baseline_case_list = baseline.get("cases", [])
+          current_case_list = current.get("cases", [])
+
+          def duplicate_ids(cases):
+              ids = [case["id"] for case in cases]
+              return sorted(case_id for case_id in set(ids) if ids.count(case_id) > 1)
+
+          for label, cases in (("baseline", baseline_case_list), ("current", current_case_list)):
+              duplicates = duplicate_ids(cases)
+              if duplicates:
+                  violations.append(f"duplicate case ids in {label}: {', '.join(duplicates)}")
+
+          baseline_cases = {c["id"]: c for c in baseline_case_list}
+          current_cases = {c["id"]: c for c in current_case_list}
 
           for case_id in sorted(baseline_cases.keys()):
               if case_id not in current_cases:
@@ -1326,7 +1338,9 @@ jobs:
       # the matched difference against the SHIPPED default budget. Process
       # spawn sits outside that in-process deadline, so raw end-to-end p95 is
       # retained as evidence but is not substituted for evaluator cost. The
-      # run uses a hermetic HOME and no ambient DCG_* overrides.
+      # run uses a hermetic HOME and no ambient DCG_* overrides. One hundred
+      # samples also support the harness's 95/95 one-sided binomial tolerance
+      # rule (at most one over-limit sample per case).
       - name: Absolute evaluator-cost gate vs shipped default budget
         run: |
           LATENCY_ARTIFACT_DIR="$RUNNER_TEMP/dcg-perf-latency"
@@ -1339,7 +1353,7 @@ jobs:
           echo "Shipped default hook budget: ${BUDGET_MS}ms"
           python3 scripts/perf_baseline.py \
             --bin target/release/dcg \
-            --skip-trace --warmup 5 --runs 40 \
+            --skip-trace --warmup 5 --runs 100 \
             --assert-budget-ms "$BUDGET_MS" \
             --assert-margin-pct 50 \
             --output "$LATENCY_ARTIFACT_DIR/perf-latency-gate.json"
