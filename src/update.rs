@@ -598,7 +598,7 @@ pub const fn current_version() -> &'static str {
 /// (#320). Absent outside a git checkout (registry tarball installs).
 const GIT_DESCRIBE: Option<&str> = option_env!("VERGEN_GIT_DESCRIBE");
 
-/// Short commit SHA captured at compile time by `build.rs`.
+/// Full commit SHA captured at compile time by `build.rs`.
 pub const GIT_SHA: Option<&str> = option_env!("VERGEN_GIT_SHA");
 
 /// Explicit release-pipeline marker (#320): dist.yml and the DSR runbook

@@ -463,6 +463,37 @@ mod tests {
         );
     }
 
+    /// A release tag is descriptive metadata, not a commit identity: the same
+    /// tag text can point at different commits over time. Keep the certificate
+    /// bound to the full object id even when `git describe` is identical.
+    #[test]
+    fn latency_certificate_source_binding_requires_full_git_sha() {
+        let build_script = include_str!("../build.rs");
+        let main_source = include_str!("main.rs");
+        let harness = include_str!("../scripts/perf_baseline.py");
+
+        assert!(
+            build_script.contains(".sha(false)"),
+            "build.rs must embed the full Git object id, not vergen's short SHA"
+        );
+        assert!(
+            main_source.contains("Git SHA: {sha}"),
+            "dcg --version must expose the embedded full Git SHA for the certificate"
+        );
+
+        let classifier = harness
+            .split("def classify_source_binding(")
+            .nth(1)
+            .and_then(|rest| rest.split("\ndef capture_git_state(").next())
+            .expect("perf harness must retain its source-binding classifier");
+        assert!(
+            classifier.contains("elif embedded_git_sha != repository_git_sha:")
+                && classifier.contains("status = \"verified_exact_git_sha\"")
+                && classifier.contains("\"verified\": status == \"verified_exact_git_sha\""),
+            "source binding must reject differing full SHAs even when descriptions match"
+        );
+    }
+
     #[test]
     fn fail_open_threshold() {
         assert!(!exceeds_absolute_budget(Duration::from_millis(999)));

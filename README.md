@@ -1048,8 +1048,9 @@ outcome. For a guard it is not necessarily: a locally built binary may carry
 coverage the published release does not have yet, and replacing it silently
 downgrades protection. dcg therefore embeds **build provenance** at compile
 time (`git describe --tags --dirty`, shown as a `Commit:` line in
-`dcg --version`; release pipelines additionally set an explicit
-`DCG_RELEASE_BUILD=1` marker) and uses it three ways:
+`dcg --version`, plus the full commit object id shown as `Git SHA:`; release
+pipelines additionally set an explicit `DCG_RELEASE_BUILD=1` marker) and uses
+it three ways:
 
 - **`dcg update` refuses early** — before any network or installer work — when
   the installed binary is a local build ahead of its release tag, or when the
@@ -1477,6 +1478,8 @@ dcg 0.1.0
   Built: 2026-01-07T22:13:10.413872881Z
   Rustc: 1.94.0-nightly
   Target: x86_64-unknown-linux-musl
+  Commit: v0.1.0
+Git SHA: 0123456789abcdef0123456789abcdef01234567
 ```
 
 This metadata is embedded at compile time via [vergen](https://github.com/rustyhorde/vergen), making it easy to identify exactly which build is running when troubleshooting.

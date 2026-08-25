@@ -391,7 +391,22 @@ def extract_embedded_git_describe(version_output: str) -> Optional[str]:
     return None
 
 
+def extract_embedded_git_sha(version_output: str) -> Optional[str]:
+    """Extract the full vergen Git object id printed by ``dcg --version``."""
+    ansi_escape = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+    for raw_line in version_output.splitlines():
+        line = ansi_escape.sub("", raw_line).strip()
+        if not line.startswith("Git SHA:"):
+            continue
+        value = line.split("Git SHA:", 1)[1].strip()
+        if value and value != "VERGEN_IDEMPOTENT_OUTPUT":
+            return value
+    return None
+
+
 def classify_source_binding(
+    embedded_git_sha: Optional[str],
+    repository_git_sha: Optional[str],
     embedded_git_describe: Optional[str],
     repository_git_describe: Optional[str],
     repository_state: Dict[str, Any],
@@ -403,31 +418,37 @@ def classify_source_binding(
             "the checkout is dirty, so Git metadata cannot bind the binary to "
             "the current source bytes"
         )
-    elif embedded_git_describe is None:
+    elif embedded_git_sha is None:
         status = "unverified_missing_binary_provenance"
-        reason = "dcg --version did not expose an embedded Git description"
-    elif repository_git_describe is None:
+        reason = "dcg --version did not expose an embedded full Git SHA"
+    elif repository_git_sha is None:
         status = "unverified_missing_repository_provenance"
-        reason = "git describe could not identify the checked-out source"
-    elif embedded_git_describe != repository_git_describe:
+        reason = "git rev-parse could not identify the checked-out source"
+    elif embedded_git_sha != repository_git_sha:
         status = "mismatch"
         reason = (
-            "the binary and checkout Git descriptions differ: "
-            f"{embedded_git_describe!r} != {repository_git_describe!r}"
+            "the binary and checkout full Git SHAs differ: "
+            f"{embedded_git_sha!r} != {repository_git_sha!r}"
         )
     else:
-        status = "verified_exact_git_describe"
+        status = "verified_exact_git_sha"
         reason = (
-            "the clean checkout and measured binary expose the same tagged "
-            "dirty-aware Git description"
+            "the clean checkout and measured binary expose the same full "
+            "Git object id"
         )
     return {
-        "method": "exact git describe --tags --dirty equality on a clean checkout",
+        "method": "full Git SHA equality on a clean checkout",
         "status": status,
-        "verified": status == "verified_exact_git_describe",
+        "verified": status == "verified_exact_git_sha",
         "reason": reason,
+        "binary_git_sha": embedded_git_sha,
+        "repository_git_sha": repository_git_sha,
         "binary_git_describe": embedded_git_describe,
         "repository_git_describe": repository_git_describe,
+        "git_describe_matches": (
+            embedded_git_describe is not None
+            and embedded_git_describe == repository_git_describe
+        ),
     }
 
 
@@ -1214,9 +1235,14 @@ def main() -> int:
             )
         print(f"error: {reason}", file=sys.stderr)
         return 1
+    embedded_git_sha = extract_embedded_git_sha(version_output)
     embedded_git_describe = extract_embedded_git_describe(version_output)
     source_binding_start = classify_source_binding(
-        embedded_git_describe, git_describe_start, git_state_start
+        embedded_git_sha,
+        git_sha_start,
+        embedded_git_describe,
+        git_describe_start,
+        git_state_start,
     )
     source_binding_start["required_for_latency_gate"] = gate_enabled
     if gate_enabled and not source_binding_start["verified"]:
@@ -1355,6 +1381,8 @@ def main() -> int:
         config_probe_end = {"error": str(exc)}
         errors.append("could not repeat the effective hook budget probe after the run")
     source_binding_end = classify_source_binding(
+        extract_embedded_git_sha(version_output),
+        git_sha_end,
         extract_embedded_git_describe(version_output),
         git_describe_end,
         git_state_end,

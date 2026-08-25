@@ -18,7 +18,11 @@ fn main() {
     // runtime treats provenance as unknown.
     let gix = Gix::builder()
         .describe(true, true, None)
-        .sha(true)
+        // A short SHA is useful for display but is not a commit identity.  The
+        // performance certificate compares this value with `git rev-parse
+        // HEAD`, including at an exact release tag where `git describe`
+        // contains no commit suffix, so embed the full object id.
+        .sha(false)
         .dirty(false)
         .build();
 

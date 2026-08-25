@@ -65,6 +65,10 @@ const CARGO_TARGET: Option<&str> = option_env!("VERGEN_CARGO_TARGET_TRIPLE");
 // Git provenance (#320): `git describe --tags --dirty` at build time. Absent
 // (or the vergen placeholder) outside a git checkout.
 const GIT_DESCRIBE: Option<&str> = option_env!("VERGEN_GIT_DESCRIBE");
+// Full Git object id at build time. `build.rs` deliberately disables vergen's
+// short form so certificate tooling can bind a binary to one exact commit even
+// when `git describe` collapses to a release tag.
+const GIT_SHA: Option<&str> = option_env!("VERGEN_GIT_SHA");
 
 // NOTE: HookInput, ToolInput, HookOutput, HookSpecificOutput types are now defined
 // in the hook module. Use hook::HookInput, hook::read_hook_input(), etc.
@@ -1383,6 +1387,14 @@ fn print_version() {
                 describe.white(),
                 "│".bright_black()
             );
+        }
+    }
+    // Keep the human-friendly description above, but expose the full object id
+    // on its own stable line for provenance-sensitive tooling. This stays on
+    // stderr so stdout remains the single machine-readable semver line.
+    if let Some(sha) = GIT_SHA {
+        if !sha.is_empty() && sha != "VERGEN_IDEMPOTENT_OUTPUT" {
+            eprintln!("Git SHA: {sha}");
         }
     }
 
