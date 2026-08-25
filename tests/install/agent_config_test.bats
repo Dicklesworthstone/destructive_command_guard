@@ -3893,6 +3893,24 @@ MOCKEOF
     [ "$(wc -l < "$removal_log")" -eq 1 ]
 }
 
+@test "unconfigure_opencode: preserves a user-owned repo-root project plugin" {
+    export XDG_CONFIG_HOME="$HOME/.config"
+    mkdir -p "$TEST_WORKDIR/.git" "$TEST_WORKDIR/.opencode/plugins"
+    printf 'export const Mine = async () => ({});\n' > "$TEST_WORKDIR/.opencode/plugins/dcg-guard.js"
+
+    run unconfigure_opencode
+
+    [ "$status" -eq 0 ]
+    grep -q 'Mine' "$TEST_WORKDIR/.opencode/plugins/dcg-guard.js"
+}
+
+@test "current_repo_root: retains physical-cwd fallback outside Git" {
+    run current_repo_root
+
+    [ "$status" -eq 0 ]
+    [ "$output" = "$TEST_WORKDIR" ]
+}
+
 @test "current_repo_root: cwd resolution failure is explicit and emits no path" {
     pwd() {
         return 1
