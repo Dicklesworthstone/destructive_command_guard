@@ -12380,6 +12380,14 @@ fn opencode_plugin_is_dcg_owned(path: &std::path::Path) -> bool {
 /// uninstallers use it to distinguish dcg-owned output from user code.
 pub(crate) const OMP_EXTENSION_MARKER: &str = "dcg-omp-extension";
 
+/// Hard parent-side ceiling for one generated OMP bridge child.
+///
+/// dcg's ordinary evaluator deadline is 1 second and the broad Windows preset
+/// defaults to 3 seconds, but an operator may configure a larger deadline.
+/// Keep this pathological-hang backstop generous enough not to compete with
+/// those evaluator budgets while still bounding a wedged child at the bridge.
+pub(crate) const OMP_CHILD_EVALUATION_TIMEOUT_MS: u64 = 30_000;
+
 /// Normalize a profile name using the upstream OMP profile-name contract.
 /// Empty, whitespace-only, and `default` select the default profile. Invalid
 /// explicit values are errors: OMP's module-load fallback is only a bootstrap
@@ -12630,7 +12638,9 @@ fn project_omp_extension_path() -> std::io::Result<std::path::PathBuf> {
 /// dcg's robot-mode evaluator. The command is sent on stdin and dcg is spawned
 /// directly (never through a shell). A deny-like JSON verdict or exit 1 is a
 /// safety block; status-only infrastructure failures fail open with a visible
-/// diagnostic, consistent with dcg's other generated integration bridges.
+/// diagnostic, consistent with dcg's other generated integration bridges. A
+/// separate generous parent-side ceiling kills a pathologically wedged child;
+/// it does not replace dcg's own configurable evaluation deadline.
 fn build_omp_extension_source(executable: &std::path::Path) -> std::io::Result<String> {
     let path_literal = executable_javascript_literal(executable)?;
     Ok(format!(
@@ -12644,6 +12654,7 @@ import {{ resolveToCwd }} from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import {{ extractLeadingCdTarget }} from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 
 const DCG_BIN = {path_literal};
+const DCG_CHILD_TIMEOUT_MS = {OMP_CHILD_EVALUATION_TIMEOUT_MS};
 type DcgChildOutcome = "spawn-throw" | "exit-0" | "exit-1" | "exit-2" | "exit-other";
 type DcgParsedVerdict = "empty" | "malformed" | "allow" | "deny" | "ask" | "indeterminate" | "unknown";
 type DcgBridgeAction = "allow" | "block" | "infrastructure";
@@ -12797,6 +12808,10 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
         stdin: new TextEncoder().encode(command),
         stdout: "pipe",
         stderr: "pipe",
+        // Bun owns this timer and process reap. SIGKILL makes the ceiling a
+        // hard backstop even when a wedged evaluator cannot handle SIGTERM.
+        timeout: DCG_CHILD_TIMEOUT_MS,
+        killSignal: "SIGKILL",
       }});
       [stdoutText, stderrText, exitCode] = await Promise.all([
         new Response(proc.stdout).text(),
@@ -19118,6 +19133,50 @@ if ($errors.Count -ne 0) {
         let parsed: String = serde_json::from_str(literal).expect("valid JSON string literal");
         assert_eq!(std::path::Path::new(&parsed), executable);
         assert_ne!(parsed, "dcg", "never a bare PATH lookup");
+    }
+
+    /// OMP must not wait forever when the evaluator process wedges. The
+    /// bridge delegates the timer and reap lifecycle to Bun's native spawn
+    /// contract rather than racing a detached JavaScript timer. Keep the
+    /// ceiling above both shipped evaluator defaults so it remains a
+    /// pathological-hang backstop instead of competing with normal policy.
+    #[test]
+    fn omp_extension_source_bounds_the_child_evaluator() {
+        let executable = current_dcg_executable().expect("current executable");
+        let source = build_omp_extension_source(&executable).expect("extension generation");
+
+        assert!(
+            OMP_CHILD_EVALUATION_TIMEOUT_MS
+                > crate::perf::CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS,
+            "the bridge backstop must leave headroom above the largest shipped evaluator default"
+        );
+        assert!(
+            OMP_CHILD_EVALUATION_TIMEOUT_MS <= 60_000,
+            "a wedged evaluator must not stall an OMP bash call for more than one minute"
+        );
+        assert!(source.contains(&format!(
+            "const DCG_CHILD_TIMEOUT_MS = {OMP_CHILD_EVALUATION_TIMEOUT_MS};"
+        )));
+        assert!(source.contains("timeout: DCG_CHILD_TIMEOUT_MS,"));
+        assert!(source.contains("killSignal: \"SIGKILL\","));
+        assert!(
+            !source.contains("Promise.race(")
+                && !source.contains("setTimeout(")
+                && !source.contains("addEventListener("),
+            "the generated bridge must not leak a competing timer or abort listener"
+        );
+
+        let spawn = source.find("const proc = Bun.spawn").expect("dcg spawn");
+        let collect = source
+            .find("[stdoutText, stderrText, exitCode] = await Promise.all")
+            .expect("concurrent child collection");
+        let classify = source
+            .find("const classification = classifyDcgChild(")
+            .expect("monotone classifier");
+        assert!(
+            spawn < collect && collect < classify,
+            "the bounded child must be fully collected before stdout/status classification"
+        );
     }
 
     /// OMP's ordinary agent-loop path validates BashToolInput before emitting
