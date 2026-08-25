@@ -225,6 +225,20 @@ try {
     Set-Content -Path $extension -Value 'export default function mine() {}'
     Check ((Unconfigure-OmpExtension -HomeDir $h11 -RepoRoot $h11) -eq $false) "OMP: user extension not claimed"
     Check (Test-Path $extension) "OMP: user-authored extension preserved"
+
+    $nearMarkers = @(
+        [pscustomobject]@{ Name = 'uppercase marker'; Content = '// DCG-OMP-EXTENSION: user-authored' },
+        [pscustomobject]@{ Name = 'one-character marker mutation'; Content = '// dcg-omp-extensio: user-authored' },
+        [pscustomobject]@{ Name = 'punctuation marker mutation'; Content = '// dcg_omp_extension: user-authored' }
+    )
+    foreach ($case in $nearMarkers) {
+        [System.IO.File]::WriteAllText($extension, $case.Content)
+        $before = [System.IO.File]::ReadAllBytes($extension)
+        Check ((Unconfigure-OmpExtension -HomeDir $h11 -RepoRoot $h11) -eq $false) "OMP: $($case.Name) is not claimed"
+        Check ([System.IO.File]::Exists($extension)) "OMP: $($case.Name) file is preserved"
+        $after = [System.IO.File]::ReadAllBytes($extension)
+        Check ([System.Convert]::ToBase64String($before) -ceq [System.Convert]::ToBase64String($after)) "OMP: $($case.Name) bytes are unchanged"
+    }
 } finally { Remove-Item -Recurse -Force $h11 -ErrorAction SilentlyContinue }
 
 Write-Host "Test 12: Oh My Pi inactive profiles and repository-root extension are removed"

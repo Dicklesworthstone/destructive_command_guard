@@ -691,7 +691,10 @@ function Unconfigure-OmpExtension {
       Write-Warn "Could not inspect Oh My Pi extension at ${extension}: $($_.Exception.Message)"
       continue
     }
-    if ($content -notmatch 'dcg-omp-extension') { continue }
+    # Marker ownership is an exact, case-sensitive ASCII-spelling contract.
+    # PowerShell's regex operators are case-insensitive by default, so use an
+    # ordinal substring search to stay aligned with the Rust and Unix paths.
+    if ($content.IndexOf('dcg-omp-extension', [System.StringComparison]::Ordinal) -lt 0) { continue }
     try {
       Remove-OmpExtensionFile -Path $extension
       if ([System.IO.File]::Exists($extension)) {
