@@ -19145,15 +19145,17 @@ if ($errors.Count -ne 0) {
         let executable = current_dcg_executable().expect("current executable");
         let source = build_omp_extension_source(&executable).expect("extension generation");
 
-        assert!(
-            OMP_CHILD_EVALUATION_TIMEOUT_MS
-                > crate::perf::CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS,
-            "the bridge backstop must leave headroom above the largest shipped evaluator default"
-        );
-        assert!(
-            OMP_CHILD_EVALUATION_TIMEOUT_MS <= 60_000,
-            "a wedged evaluator must not stall an OMP bash call for more than one minute"
-        );
+        const {
+            assert!(
+                OMP_CHILD_EVALUATION_TIMEOUT_MS
+                    > crate::perf::CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS,
+                "the bridge backstop must leave headroom above the largest shipped evaluator default"
+            );
+            assert!(
+                OMP_CHILD_EVALUATION_TIMEOUT_MS <= 60_000,
+                "a wedged evaluator must not stall an OMP bash call for more than one minute"
+            );
+        }
         assert!(source.contains(&format!(
             "const DCG_CHILD_TIMEOUT_MS = {OMP_CHILD_EVALUATION_TIMEOUT_MS};"
         )));
