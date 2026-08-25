@@ -294,8 +294,18 @@ try {
     Remove-Item -Recurse -Force $h13 -ErrorAction SilentlyContinue
 }
 
+Write-Host "Test 13a: Oh My Pi profile enumeration keeps hidden-directory compatibility"
+$ompProfileEnumerator = (Get-Command Get-OmpProfileDirectories).ScriptBlock.ToString()
+$compatibleDirectoryCall = '[System.IO.Directory]::GetDirectories($Path)'
+Check ($ompProfileEnumerator.IndexOf($compatibleDirectoryCall, [System.StringComparison]::Ordinal) -ge 0) "OMP: profile sweep uses the compatible Directory.GetDirectories overload"
+Check ($ompProfileEnumerator.IndexOf('Get-ChildItem', [System.StringComparison]::OrdinalIgnoreCase) -lt 0) "OMP: profile sweep cannot silently omit Hidden/System directories via Get-ChildItem"
+Check ($ompProfileEnumerator.IndexOf('EnumerationOptions', [System.StringComparison]::OrdinalIgnoreCase) -lt 0) "OMP: profile sweep does not require newer EnumerationOptions on Windows PowerShell 5.1"
+$ompUnconfigure = (Get-Command Unconfigure-OmpExtension).ScriptBlock.ToString()
+$ordinalOwnershipCheck = '.IndexOf(''dcg-omp-extension'', [System.StringComparison]::Ordinal)'
+Check ($ompUnconfigure.IndexOf($ordinalOwnershipCheck, [System.StringComparison]::Ordinal) -ge 0) "OMP: broader profile inventory remains gated by the exact case-sensitive ownership marker"
+
 if ([System.IO.Path]::DirectorySeparatorChar -ne '\') {
-    Write-Host "Test 13a: Oh My Pi cleanup preserves literal backslashes in POSIX roots"
+    Write-Host "Test 13b: Oh My Pi cleanup preserves literal backslashes in POSIX roots"
     $h13a = New-Tmp
     try {
         $literalHome = [System.IO.Path]::Combine($h13a, 'home\literal')
@@ -322,7 +332,7 @@ if ([System.IO.Path]::DirectorySeparatorChar -ne '\') {
 }
 
 if ([System.IO.Path]::DirectorySeparatorChar -eq '\') {
-    Write-Host "Test 13b: Oh My Pi cleanup removes read-only generated extensions on Windows"
+    Write-Host "Test 13c: Oh My Pi cleanup removes read-only generated extensions on Windows"
     $h13b = New-Tmp
     $readOnlyExtension = [System.IO.Path]::Combine([string[]]@($h13b, '.omp', 'agent', 'extensions', 'dcg-guard.ts'))
     try {

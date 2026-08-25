@@ -612,6 +612,9 @@ function Get-OmpAgentDir {
 
 function Get-OmpProfileDirectories {
   param([string]$Path)
+  # Keep the one-argument overload for Windows PowerShell 5.1 compatibility.
+  # Its compatible enumeration does not skip Hidden/System attributes, unlike
+  # the default directory-listing cmdlet, so inactive hidden profiles are included.
   [System.IO.Directory]::GetDirectories($Path)
 }
 
