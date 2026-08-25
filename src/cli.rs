@@ -13219,6 +13219,7 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
       proc = Bun.spawn([
         DCG_BIN,
         "--robot", "test", "--stdin", "--agent", "omp", "--dialect", shellDialect,
+        "--format", "json",
         "--omp-bridge-output",
       ], {{
         cwd: commandCwd,
@@ -19669,6 +19670,10 @@ if ($errors.Count -ne 0) {
         assert!(source.contains("record.toolName !== \"bash\""));
         assert!(source.contains("\"--robot\", \"test\", \"--stdin\""));
         assert!(source.contains("\"--agent\", \"omp\""));
+        assert!(
+            source.contains("\"--format\", \"json\",\n        \"--omp-bridge-output\","),
+            "the private robot bridge must pin compact JSON before Clap reads ambient DCG_FORMAT"
+        );
         assert!(source.contains("\"deny\", \"ask\", \"indeterminate\""));
         assert!(source.contains("return { block: true, reason:"));
         assert!(source.contains("classifyDcgChild("));
@@ -20527,7 +20532,7 @@ try {
   equal(replay.spawns.length, 1, "callback/whitespace-allow/spawn-count");
   equal(replay.spawns[0]!.stdin, " \t", "callback/whitespace-allow/stdin-bytes");
   equal(replay.spawns[0]!.cwd, process.cwd(), "callback/whitespace-allow/cwd");
-  equal(replay.spawns[0]!.argv.slice(1), ["--robot", "test", "--stdin", "--agent", "omp", "--dialect", "posix", "--omp-bridge-output"], "callback/whitespace-allow/argv");
+  equal(replay.spawns[0]!.argv.slice(1), ["--robot", "test", "--stdin", "--agent", "omp", "--dialect", "posix", "--format", "json", "--omp-bridge-output"], "callback/whitespace-allow/argv");
   equal(replay.spawns[0]!.timeout, 30_000, "callback/whitespace-allow/parent-timeout");
   equal(replay.spawns[0]!.killSignal, "SIGKILL", "callback/whitespace-allow/kill-signal");
   equal(replay.errors, ["[dcg] OMP guard dcg stderr: allow diagnostic"], "callback/whitespace-allow/diagnostics");

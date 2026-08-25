@@ -53,8 +53,11 @@ extensions; it neither requires Git nor walks to an ancestor, so launch OMP
 from that same directory.
 
 The extension uses OMP's pre-execution `tool_call` event and sends each `bash`
-command to `dcg --robot test --stdin --agent omp` with the dialect selected by
-OMP's execution route. The embedded install-time absolute dcg path is
+command to `dcg --robot test --stdin --agent omp --format json` with the dialect
+selected by OMP's execution route. Pinning the private bridge format prevents
+ambient `DCG_FORMAT` from redirecting or invalidating its compact protocol
+without removing that variable from supported environment-conditioned policy.
+The embedded install-time absolute dcg path is
 authoritative: ambient `DCG_BIN` cannot redirect the marker-owned guard; rerun
 `dcg install --omp --force` after moving the binary. Ordinary and managed-async
 calls use OMP's embedded Brush shell and pass `--dialect posix`, including on
