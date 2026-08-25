@@ -48,7 +48,11 @@ fn test_state_path(suffix: &str) -> PathBuf {
 /// paths.
 fn configure_isolated_hook_child(command: &mut Command) {
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("DCG_") {
+        if key
+            .to_string_lossy()
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("DCG_"))
+        {
             command.env_remove(key);
         }
     }
@@ -156,10 +160,9 @@ fn test_hook_output_contains_permission_decision() {
         "permissionDecision field required in output"
     );
 
-    let decision = hook_output["permissionDecision"].as_str().unwrap();
-    assert!(
-        decision == "allow" || decision == "deny",
-        "permissionDecision should be 'allow' or 'deny', got: {decision}"
+    assert_eq!(
+        hook_output["permissionDecision"], "deny",
+        "git reset --hard must be denied"
     );
 }
 
@@ -172,19 +175,17 @@ fn test_hook_output_deny_has_rule_id() {
 
     let hook_output = &json["hookSpecificOutput"];
 
-    // For denied commands, ruleId should be present
-    if hook_output["permissionDecision"] == "deny" {
-        assert!(
-            hook_output.get("ruleId").is_some(),
-            "ruleId field should be present for denied commands"
-        );
+    assert_eq!(hook_output["permissionDecision"], "deny");
+    assert!(
+        hook_output.get("ruleId").is_some(),
+        "ruleId field should be present for denied commands"
+    );
 
-        let rule_id = hook_output["ruleId"].as_str().unwrap();
-        assert!(
-            rule_id.contains(':'),
-            "ruleId should have format 'packId:patternName', got: {rule_id}"
-        );
-    }
+    let rule_id = hook_output["ruleId"].as_str().unwrap();
+    assert!(
+        rule_id.contains(':'),
+        "ruleId should have format 'packId:patternName', got: {rule_id}"
+    );
 }
 
 #[test]
@@ -196,15 +197,14 @@ fn test_hook_output_deny_has_pack_id() {
 
     let hook_output = &json["hookSpecificOutput"];
 
-    if hook_output["permissionDecision"] == "deny" {
-        assert!(
-            hook_output.get("packId").is_some(),
-            "packId field should be present for denied commands"
-        );
+    assert_eq!(hook_output["permissionDecision"], "deny");
+    assert!(
+        hook_output.get("packId").is_some(),
+        "packId field should be present for denied commands"
+    );
 
-        let pack_id = hook_output["packId"].as_str().unwrap();
-        assert!(!pack_id.is_empty(), "packId should not be empty");
-    }
+    let pack_id = hook_output["packId"].as_str().unwrap();
+    assert!(!pack_id.is_empty(), "packId should not be empty");
 }
 
 #[test]
@@ -216,20 +216,19 @@ fn test_hook_output_deny_has_severity() {
 
     let hook_output = &json["hookSpecificOutput"];
 
-    if hook_output["permissionDecision"] == "deny" {
-        assert!(
-            hook_output.get("severity").is_some(),
-            "severity field should be present for denied commands"
-        );
+    assert_eq!(hook_output["permissionDecision"], "deny");
+    assert!(
+        hook_output.get("severity").is_some(),
+        "severity field should be present for denied commands"
+    );
 
-        let severity = hook_output["severity"].as_str().unwrap();
-        let valid_severities = ["critical", "high", "medium", "low"];
-        assert!(
-            valid_severities.contains(&severity),
-            "severity should be one of {:?}, got: {severity}",
-            valid_severities
-        );
-    }
+    let severity = hook_output["severity"].as_str().unwrap();
+    let valid_severities = ["critical", "high", "medium", "low"];
+    assert!(
+        valid_severities.contains(&severity),
+        "severity should be one of {:?}, got: {severity}",
+        valid_severities
+    );
 }
 
 #[test]
@@ -317,13 +316,11 @@ fn test_hook_output_permission_decision_reason() {
         "permissionDecisionReason should not be empty"
     );
 
-    // For denied commands, reason should be descriptive
-    if hook_output["permissionDecision"] == "deny" {
-        assert!(
-            reason.contains("BLOCKED") || reason.contains("Reason:"),
-            "permissionDecisionReason for deny should explain the block"
-        );
-    }
+    assert_eq!(hook_output["permissionDecision"], "deny");
+    assert!(
+        reason.contains("BLOCKED") || reason.contains("Reason:"),
+        "permissionDecisionReason for deny should explain the block"
+    );
 }
 
 #[test]
@@ -389,24 +386,23 @@ fn test_hook_output_multiple_destructive_commands() {
             "hook mode should exit 0 for cmd: {cmd}\nstderr: {stderr}"
         );
 
-        if !stdout.is_empty() {
-            let json: serde_json::Value = serde_json::from_str(&stdout)
-                .unwrap_or_else(|e| panic!("invalid JSON for cmd '{cmd}': {e}\nstdout: {stdout}"));
+        assert!(!stdout.is_empty(), "destructive command was allowed: {cmd}");
+        let json: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("invalid JSON for cmd '{cmd}': {e}\nstdout: {stdout}"));
 
-            let hook_output = &json["hookSpecificOutput"];
-
-            // All denied commands should have these fields
-            if hook_output["permissionDecision"] == "deny" {
-                assert!(
-                    hook_output.get("ruleId").is_some() || hook_output.get("packId").is_some(),
-                    "denied command should have ruleId or packId: {cmd}"
-                );
-                assert!(
-                    hook_output.get("severity").is_some(),
-                    "denied command should have severity: {cmd}"
-                );
-            }
-        }
+        let hook_output = &json["hookSpecificOutput"];
+        assert_eq!(
+            hook_output["permissionDecision"], "deny",
+            "destructive command was not denied: {cmd}"
+        );
+        assert!(
+            hook_output.get("ruleId").is_some() || hook_output.get("packId").is_some(),
+            "denied command should have ruleId or packId: {cmd}"
+        );
+        assert!(
+            hook_output.get("severity").is_some(),
+            "denied command should have severity: {cmd}"
+        );
     }
 }
 
@@ -419,26 +415,26 @@ fn test_hook_output_rule_id_format() {
 
     let hook_output = &json["hookSpecificOutput"];
 
-    if let Some(rule_id) = hook_output.get("ruleId") {
-        let rule_id_str = rule_id.as_str().unwrap();
+    assert_eq!(hook_output["permissionDecision"], "deny");
+    let rule_id_str = hook_output["ruleId"]
+        .as_str()
+        .expect("denial must include a string ruleId");
 
-        // Rule ID format: "{packId}:{patternName}"
-        let parts: Vec<&str> = rule_id_str.split(':').collect();
-        assert_eq!(
-            parts.len(),
-            2,
-            "ruleId should have format 'packId:patternName', got: {rule_id_str}"
-        );
+    // Rule ID format: "{packId}:{patternName}"
+    let parts: Vec<&str> = rule_id_str.split(':').collect();
+    assert_eq!(
+        parts.len(),
+        2,
+        "ruleId should have format 'packId:patternName', got: {rule_id_str}"
+    );
 
-        // The pack_id in ruleId should match packId field
-        if let Some(pack_id) = hook_output.get("packId") {
-            assert_eq!(
-                parts[0],
-                pack_id.as_str().unwrap(),
-                "ruleId pack portion should match packId"
-            );
-        }
-    }
+    let pack_id = hook_output["packId"]
+        .as_str()
+        .expect("denial must include a string packId");
+    assert_eq!(
+        parts[0], pack_id,
+        "ruleId pack portion should match packId"
+    );
 }
 
 #[test]
@@ -449,6 +445,12 @@ fn test_hook_output_remediation_safe_alternative() {
         serde_json::from_str(&stdout).expect("hook output should be valid JSON");
 
     let hook_output = &json["hookSpecificOutput"];
+
+    assert_eq!(hook_output["permissionDecision"], "deny");
+    assert!(
+        hook_output.get("remediation").is_some(),
+        "denial must include remediation"
+    );
 
     if let Some(remediation) = hook_output.get("remediation") {
         // safeAlternative is optional but when present should be helpful
