@@ -1175,8 +1175,10 @@ jobs:
           set +e
 
           BASELINE_JSON="perf/baselines/2026-01-11-after-lazy.json"
-          CURRENT_JSON="perf-current.json"
-          REPORT_MD="perf-regression-report.md"
+          PERF_ARTIFACT_DIR="$RUNNER_TEMP/dcg-perf-relative"
+          mkdir -p "$PERF_ARTIFACT_DIR"
+          CURRENT_JSON="$PERF_ARTIFACT_DIR/perf-current.json"
+          REPORT_MD="$PERF_ARTIFACT_DIR/perf-regression-report.md"
 
           python3 scripts/perf_baseline.py \
             --bin target/release/dcg \
@@ -1303,8 +1305,8 @@ jobs:
         with:
           name: perf-regression-artifacts
           path: |
-            perf-current.json
-            perf-regression-report.md
+            ${{ runner.temp }}/dcg-perf-relative/perf-current.json
+            ${{ runner.temp }}/dcg-perf-relative/perf-regression-report.md
           retention-days: 14
           if-no-files-found: ignore
 
@@ -1327,6 +1329,8 @@ jobs:
       # run uses a hermetic HOME and no ambient DCG_* overrides.
       - name: Absolute evaluator-cost gate vs shipped default budget
         run: |
+          LATENCY_ARTIFACT_DIR="$RUNNER_TEMP/dcg-perf-latency"
+          mkdir -p "$LATENCY_ARTIFACT_DIR"
           BUDGET_MS=$(grep -oP 'pub const HOOK_EVALUATION_BUDGET_MS: u64 = \K[0-9_]+' src/perf.rs | tr -d '_')
           if [ -z "$BUDGET_MS" ]; then
             echo "::error::could not read HOOK_EVALUATION_BUDGET_MS from src/perf.rs"
@@ -1338,14 +1342,14 @@ jobs:
             --skip-trace --warmup 5 --runs 40 \
             --assert-budget-ms "$BUDGET_MS" \
             --assert-margin-pct 50 \
-            --output perf-latency-gate.json
+            --output "$LATENCY_ARTIFACT_DIR/perf-latency-gate.json"
 
       - name: Upload absolute latency gate certificate
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: perf-latency-gate-certificate
-          path: perf-latency-gate.json
+          path: ${{ runner.temp }}/dcg-perf-latency/perf-latency-gate.json
           retention-days: 14
           if-no-files-found: warn
 
