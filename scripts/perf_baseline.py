@@ -106,11 +106,12 @@ def percentile(sorted_values: List[float], pct: float) -> float:
 def inspect_hook_result(
     result: subprocess.CompletedProcess[bytes],
     expected_decision: str,
+    context: str,
 ) -> Dict[str, Any]:
     """Validate one completed hook process and summarize its wire result."""
     if result.returncode != 0:
         raise RuntimeError(
-            f"hook process exited {result.returncode}, expected hook exit 0; "
+            f"{context} exited {result.returncode}, expected hook exit 0; "
             f"stderr={result.stderr.decode(errors='replace')[:240]!r}"
         )
 
@@ -119,7 +120,7 @@ def inspect_hook_result(
         observed_decision = "allow"
         if result.stderr:
             raise RuntimeError(
-                "allow result polluted stderr; refusing to credit a "
+                f"{context} allow result polluted stderr; refusing to credit a "
                 "non-conformant hook result"
             )
     else:
@@ -128,19 +129,19 @@ def inspect_hook_result(
             observed_decision = parsed["hookSpecificOutput"]["permissionDecision"]
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise RuntimeError(
-                "hook process emitted non-hook stdout; refusing to credit it: "
+                f"{context} emitted non-hook stdout; refusing to credit it: "
                 f"{result.stdout[:240]!r}"
             ) from exc
         if observed_decision != "deny":
             raise RuntimeError(
-                f"hook process emitted unexpected decision {observed_decision!r}"
+                f"{context} emitted unexpected decision {observed_decision!r}"
             )
         if not result.stderr:
-            raise RuntimeError("deny result lost its stderr warning")
+            raise RuntimeError(f"{context} deny result lost its stderr warning")
 
     if observed_decision != expected_decision:
         raise RuntimeError(
-            f"hook process observed {observed_decision!r}, "
+            f"{context} observed {observed_decision!r}, "
             f"expected {expected_decision!r}"
         )
 
@@ -173,7 +174,7 @@ def validate_hook_case(
         cwd=working_directory,
         timeout=PROCESS_BACKSTOP_SECONDS,
     )
-    return inspect_hook_result(result, expected_decision)
+    return inspect_hook_result(result, expected_decision, "semantic control")
 
 
 def summarize_timings(timings: List[float]) -> Dict[str, Any]:
@@ -1064,6 +1065,26 @@ def main() -> int:
     gate_enabled = args.assert_budget_ms > 0
 
     repo_root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+    if gate_enabled and args.output:
+        output_path = os.path.realpath(os.path.abspath(args.output))
+        try:
+            output_inside_repo = os.path.commonpath([repo_root, output_path]) == repo_root
+        except ValueError:
+            output_inside_repo = False
+        if output_inside_repo:
+            reason = (
+                "gate output must be outside the repository so writing the "
+                "certificate cannot invalidate the measured source snapshot"
+            )
+            emit_gate_abort(
+                None,
+                reason,
+                args.assert_budget_ms,
+                args.assert_margin_pct,
+                details={"rejected_output_path": output_path},
+            )
+            print(f"error: {reason}: {output_path}", file=sys.stderr)
+            return 1
     bin_path = os.path.realpath(os.path.abspath(args.bin))
     if not os.path.isfile(bin_path):
         reason = f"binary not found: {bin_path}"
@@ -1178,7 +1199,20 @@ def main() -> int:
     try:
         version_output = capture_version_output(bin_path, base_env, working_directory)
     except Exception as exc:  # noqa: BLE001
-        print(f"error: could not capture binary version: {exc}", file=sys.stderr)
+        reason = f"could not capture binary version: {exc}"
+        if gate_enabled:
+            emit_gate_abort(
+                args.output,
+                reason,
+                args.assert_budget_ms,
+                args.assert_margin_pct,
+                shipped_budget_ms=shipped_budget_ms,
+                details={
+                    "binary_path": bin_path,
+                    "binary_sha256": binary_sha_start,
+                },
+            )
+        print(f"error: {reason}", file=sys.stderr)
         return 1
     embedded_git_describe = extract_embedded_git_describe(version_output)
     source_binding_start = classify_source_binding(
@@ -1186,35 +1220,84 @@ def main() -> int:
     )
     source_binding_start["required_for_latency_gate"] = gate_enabled
     if gate_enabled and not source_binding_start["verified"]:
-        print(
-            "LATENCY GATE ABORTED: measured binary is not provably bound to "
+        reason = (
+            "measured binary is not provably bound to "
             f"this checkout ({source_binding_start['status']}): "
-            f"{source_binding_start['reason']}",
-            file=sys.stderr,
+            f"{source_binding_start['reason']}"
         )
+        emit_gate_abort(
+            args.output,
+            reason,
+            args.assert_budget_ms,
+            args.assert_margin_pct,
+            shipped_budget_ms=shipped_budget_ms,
+            details={
+                "binary_path": bin_path,
+                "binary_sha256": binary_sha_start,
+                "repository_git_sha": git_sha_start,
+                "source_binding": source_binding_start,
+            },
+        )
+        print(f"LATENCY GATE ABORTED: {reason}", file=sys.stderr)
         return 3
     rustc_output, rustc_host = capture_rustc_version(base_env, repo_root)
 
     try:
         config_probe = probe_effective_budget(bin_path, base_env, working_directory)
     except Exception as exc:  # noqa: BLE001
-        print(f"error: could not verify effective hook budget: {exc}", file=sys.stderr)
+        reason = f"could not verify effective hook budget: {exc}"
+        if gate_enabled:
+            emit_gate_abort(
+                args.output,
+                reason,
+                args.assert_budget_ms,
+                args.assert_margin_pct,
+                shipped_budget_ms=shipped_budget_ms,
+                details={"source_binding": source_binding_start},
+            )
+        print(f"error: {reason}", file=sys.stderr)
         return 3 if gate_enabled else 1
     if config_probe["hook_timeout_source"] != "default":
-        print(
-            "LATENCY RUN ABORTED: isolated config probe resolved a non-default "
+        reason = (
+            "isolated config probe resolved a non-default "
             f"hook timeout source ({config_probe['hook_timeout_source']!r}); "
-            "measurements would not represent shipped defaults",
-            file=sys.stderr,
+            "measurements would not represent shipped defaults"
         )
+        if gate_enabled:
+            emit_gate_abort(
+                args.output,
+                reason,
+                args.assert_budget_ms,
+                args.assert_margin_pct,
+                shipped_budget_ms=shipped_budget_ms,
+                effective_budget_ms=config_probe["hook_timeout_ms"],
+                details={
+                    "source_binding": source_binding_start,
+                    "effective_budget_probe": config_probe,
+                },
+            )
+        print(f"LATENCY RUN ABORTED: {reason}", file=sys.stderr)
         return 3 if gate_enabled else 1
     if config_probe["hook_timeout_ms"] != shipped_budget_ms:
-        print(
-            "LATENCY RUN ABORTED: isolated binary resolved "
+        reason = (
+            "isolated binary resolved "
             f"{config_probe['hook_timeout_ms']}ms but src/perf.rs declares "
-            f"{shipped_budget_ms}ms",
-            file=sys.stderr,
+            f"{shipped_budget_ms}ms"
         )
+        if gate_enabled:
+            emit_gate_abort(
+                args.output,
+                reason,
+                args.assert_budget_ms,
+                args.assert_margin_pct,
+                shipped_budget_ms=shipped_budget_ms,
+                effective_budget_ms=config_probe["hook_timeout_ms"],
+                details={
+                    "source_binding": source_binding_start,
+                    "effective_budget_probe": config_probe,
+                },
+            )
+        print(f"LATENCY RUN ABORTED: {reason}", file=sys.stderr)
         return 3 if gate_enabled else 1
 
     case_specs = build_cases()
@@ -1387,13 +1470,7 @@ def main() -> int:
         "latency_gate": latency_gate,
     }
 
-    output_json = json.dumps(payload, indent=2, sort_keys=True)
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as handle:
-            handle.write(output_json)
-            handle.write("\n")
-    else:
-        print(output_json)
+    write_json_payload(payload, args.output)
 
     if gate_enabled:
         print(

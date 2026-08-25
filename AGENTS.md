@@ -290,7 +290,9 @@ Rules:
   verdict, 95/95 binomial tail-tolerance result, violations, and overall
   PASS/FAIL in `latency_gate`; CI retains that artifact even when the gate
   fails. Gate mode requires at least 59 samples; CI uses 100 and permits at
-  most one over-limit sample per case.
+  most one over-limit sample per case. When using `--output` in gate mode,
+  place it outside the repository; the harness rejects in-tree output so its
+  own certificate cannot dirty the source snapshot it claims to measure.
 - **Bind the binary to the checkout.** Gate mode requires a clean checkout and
   exact equality between the binary's embedded `git describe --tags --dirty`
   value and the repository's value. CI uses a full tag history so a shallow
