@@ -818,6 +818,72 @@ def max_allowed_tail_exceedances(sample_count: int) -> int:
     return allowed
 
 
+def write_json_payload(payload: Dict[str, Any], output_path: Optional[str]) -> None:
+    """Write one canonical JSON payload to the requested artifact destination."""
+    output_json = json.dumps(payload, indent=2, sort_keys=True)
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as handle:
+            handle.write(output_json)
+            handle.write("\n")
+    else:
+        print(output_json)
+
+
+def emit_gate_abort(
+    output_path: Optional[str],
+    reason: str,
+    supplied_budget_ms: int,
+    margin_pct: int,
+    shipped_budget_ms: Optional[int] = None,
+    effective_budget_ms: Optional[int] = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Emit a self-contained error certificate for a gate preflight abort."""
+    limit_ms = (
+        shipped_budget_ms * margin_pct / 100.0
+        if shipped_budget_ms is not None and margin_pct > 0
+        else None
+    )
+    gate = {
+        "enabled": True,
+        "preflight_abort": True,
+        "supplied_budget_ms": supplied_budget_ms,
+        "shipped_budget_ms": shipped_budget_ms,
+        "effective_budget_ms": effective_budget_ms,
+        "margin_pct": margin_pct,
+        "limit_ms": limit_ms,
+        "estimand": "paired full hook wall time minus matched DCG_BYPASS wall time",
+        "tail_rule": {
+            "kind": "one-sided exact binomial tolerance bound",
+            "confidence_pct": TAIL_CONFIDENCE_PCT,
+            "coverage_pct": TAIL_COVERAGE_PCT,
+            "minimum_sample_count": MIN_TOLERANCE_SAMPLES,
+        },
+        "excluded_case_ids": ["bypass"],
+        "expected_case_count": 0,
+        "evaluated_case_count": 0,
+        "cases": [],
+        "violations": [],
+        "errors": [reason],
+        "overall_result": "ERROR",
+    }
+    payload = {
+        "schema_version": 3,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "preflight": details or {},
+        "cases": [],
+        "errors": [reason],
+        "latency_gate": gate,
+    }
+    try:
+        write_json_payload(payload, output_path)
+    except OSError as exc:
+        print(
+            f"error: could not write latency-gate abort certificate: {exc}",
+            file=sys.stderr,
+        )
+
+
 def build_latency_gate(
     enabled: bool,
     supplied_budget_ms: int,
@@ -995,33 +1061,74 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    gate_enabled = args.assert_budget_ms > 0
 
     repo_root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
     bin_path = os.path.realpath(os.path.abspath(args.bin))
     if not os.path.isfile(bin_path):
-        print(f"error: binary not found: {bin_path}", file=sys.stderr)
+        reason = f"binary not found: {bin_path}"
+        if gate_enabled:
+            emit_gate_abort(
+                args.output,
+                reason,
+                args.assert_budget_ms,
+                args.assert_margin_pct,
+                details={"binary_path": bin_path},
+            )
+        print(f"error: {reason}", file=sys.stderr)
         return 1
     if not os.access(bin_path, os.X_OK):
-        print(f"error: binary is not executable: {bin_path}", file=sys.stderr)
+        reason = f"binary is not executable: {bin_path}"
+        if gate_enabled:
+            emit_gate_abort(
+                args.output,
+                reason,
+                args.assert_budget_ms,
+                args.assert_margin_pct,
+                details={"binary_path": bin_path},
+            )
+        print(f"error: {reason}", file=sys.stderr)
         return 1
     if args.warmup < 0 or args.runs <= 0:
-        print("error: --warmup must be >= 0 and --runs must be > 0", file=sys.stderr)
+        reason = "--warmup must be >= 0 and --runs must be > 0"
+        if gate_enabled:
+            emit_gate_abort(
+                args.output,
+                reason,
+                args.assert_budget_ms,
+                args.assert_margin_pct,
+                details={"warmup": args.warmup, "runs": args.runs},
+            )
+        print(f"error: {reason}", file=sys.stderr)
         return 1
     if args.assert_budget_ms < 0:
         print("error: --assert-budget-ms must be >= 0", file=sys.stderr)
         return 1
-    gate_enabled = args.assert_budget_ms > 0
     if gate_enabled:
         if not 0 < args.assert_margin_pct <= 60:
-            print("error: --assert-margin-pct must be in the range 1..=60", file=sys.stderr)
+            reason = "--assert-margin-pct must be in the range 1..=60"
+            emit_gate_abort(
+                args.output,
+                reason,
+                args.assert_budget_ms,
+                args.assert_margin_pct,
+            )
+            print(f"error: {reason}", file=sys.stderr)
             return 1
         if args.runs < MIN_TOLERANCE_SAMPLES:
-            print(
-                "error: latency gate requires --runs >= "
+            reason = (
+                "latency gate requires --runs >= "
                 f"{MIN_TOLERANCE_SAMPLES} for its {TAIL_CONFIDENCE_PCT}/"
-                f"{TAIL_COVERAGE_PCT} one-sided binomial tolerance rule",
-                file=sys.stderr,
+                f"{TAIL_COVERAGE_PCT} one-sided binomial tolerance rule"
             )
+            emit_gate_abort(
+                args.output,
+                reason,
+                args.assert_budget_ms,
+                args.assert_margin_pct,
+                details={"runs": args.runs},
+            )
+            print(f"error: {reason}", file=sys.stderr)
             return 1
     elif args.assert_margin_pct <= 0:
         print("error: --assert-margin-pct must be > 0", file=sys.stderr)
@@ -1030,17 +1137,33 @@ def main() -> int:
     try:
         source_budget_start = capture_shipped_budget(repo_root)
     except Exception as exc:  # noqa: BLE001
-        print(f"error: could not derive shipped hook budget: {exc}", file=sys.stderr)
+        reason = f"could not derive shipped hook budget: {exc}"
+        if gate_enabled:
+            emit_gate_abort(
+                args.output,
+                reason,
+                args.assert_budget_ms,
+                args.assert_margin_pct,
+            )
+        print(f"error: {reason}", file=sys.stderr)
         return 1
     shipped_budget_ms = source_budget_start["hook_evaluation_budget_ms"]
     if gate_enabled and args.assert_budget_ms != shipped_budget_ms:
-        print(
-            "LATENCY GATE ABORTED: --assert-budget-ms "
+        reason = (
+            "--assert-budget-ms "
             f"({args.assert_budget_ms}) does not match the shipped "
             f"HOOK_EVALUATION_BUDGET_MS ({shipped_budget_ms}) parsed from "
-            f"{source_budget_start['path']}",
-            file=sys.stderr,
+            f"{source_budget_start['path']}"
         )
+        emit_gate_abort(
+            args.output,
+            reason,
+            args.assert_budget_ms,
+            args.assert_margin_pct,
+            shipped_budget_ms=shipped_budget_ms,
+            details={"budget_source": source_budget_start},
+        )
+        print(f"LATENCY GATE ABORTED: {reason}", file=sys.stderr)
         return 3
 
     base_env, isolation = create_isolated_environment()

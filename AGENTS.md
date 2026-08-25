@@ -287,8 +287,10 @@ Rules:
   fails if that wiring is removed or the margin is loosened past 60%.
 - **Treat the JSON as the certificate, not stderr.** Gate mode records its
   supplied/shipped/effective budgets, margin, derived limit, every per-case
-  verdict, violations, and overall PASS/FAIL in `latency_gate`; CI retains
-  that artifact even when the gate fails.
+  verdict, 95/95 binomial tail-tolerance result, violations, and overall
+  PASS/FAIL in `latency_gate`; CI retains that artifact even when the gate
+  fails. Gate mode requires at least 59 samples; CI uses 100 and permits at
+  most one over-limit sample per case.
 - **Bind the binary to the checkout.** Gate mode requires a clean checkout and
   exact equality between the binary's embedded `git describe --tags --dirty`
   value and the repository's value. CI uses a full tag history so a shallow
@@ -297,7 +299,10 @@ Rules:
   process spawn (≈940ms under Windows PowerShell) sits **outside** the
   evaluation deadline and would otherwise produce false alarms. For host
   safety this certificate sets `DCG_SELF_HEAL_HOOK=0`, records that exclusion,
-  and therefore does not claim to measure self-healing work.
+  and therefore does not claim to measure self-healing work. Capture and
+  validate every timed child's actual wire decision after stopping its timer;
+  before/after semantic controls alone cannot catch intermittent fail-open
+  behavior inside the sample window.
 - The fleet suite installs into a scratch prefix with an isolated `HOME` and
   `--no-configure`; it never touches a host's real agent hook config.
 - A probe that dies partway must FAIL, not pass: every probe emits

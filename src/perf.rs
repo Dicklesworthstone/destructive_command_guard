@@ -420,6 +420,11 @@ mod tests {
             "latency gate margin is {margin}% of the budget; keep it <=60% so \
              the gate trips before real users hit indeterminate verdicts"
         );
+        assert!(
+            gate_step.contains("--skip-trace --warmup 5 --runs 100"),
+            "the latency gate must retain 100 samples so its 95/95 binomial \
+             tolerance rule can reject more than one over-limit sample"
+        );
 
         let artifact_step = ci
             .split("      - name: Upload absolute latency gate certificate")
