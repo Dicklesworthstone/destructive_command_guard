@@ -2751,11 +2751,7 @@ mod config_tests {
                     "{label}: fixture install failed: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
-                let path = if project {
-                    &extension
-                } else {
-                    &user_extension
-                };
+                let path = if project { &extension } else { &user_extension };
                 std::fs::read_to_string(path).expect("read generated OMP extension")
             };
 
@@ -2785,15 +2781,9 @@ mod config_tests {
                             stale
                         }
                         Fixture::Disabled => {
-                            let disabled = current.replacen(
-                                "pi.on(\"tool_call\"",
-                                "pi.on(\"tool_result\"",
-                                1,
-                            );
-                            assert_ne!(
-                                disabled, current,
-                                "disabled fixture mutation must apply"
-                            );
+                            let disabled =
+                                current.replacen("pi.on(\"tool_call\"", "pi.on(\"tool_result\"", 1);
+                            assert_ne!(disabled, current, "disabled fixture mutation must apply");
                             disabled
                         }
                         Fixture::Malformed => {
@@ -2802,10 +2792,7 @@ mod config_tests {
                                 "export default function { dcgGuard",
                                 1,
                             );
-                            assert_ne!(
-                                malformed, current,
-                                "malformed fixture mutation must apply"
-                            );
+                            assert_ne!(malformed, current, "malformed fixture mutation must apply");
                             malformed
                         }
                         Fixture::Current => current,
@@ -2838,9 +2825,12 @@ mod config_tests {
                 }
             }
 
-            let original = extension
+            let original_project = extension
                 .is_file()
                 .then(|| std::fs::read(&extension).expect("read original extension bytes"));
+            let original_user = user_extension
+                .is_file()
+                .then(|| std::fs::read(&user_extension).expect("read original user bytes"));
             let output = Command::new(dcg_binary())
                 .env_clear()
                 .env("HOME", &home_dir)
@@ -2873,40 +2863,123 @@ mod config_tests {
                 if expected_healthy { "ok" } else { "error" },
                 "{label}: wrong OMP health verdict: {omp_check}"
             );
-            if let Some(original) = original {
+
+            let pretty = Command::new(dcg_binary())
+                .env_clear()
+                .env("HOME", &home_dir)
+                .env("USERPROFILE", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                .env("PATH", &bin_dir)
+                .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                .env("OMP_PROFILE", "")
+                .current_dir(temp.path())
+                .args(["doctor", "--strict"])
+                .output()
+                .expect("run strict pretty dcg doctor");
+            assert_eq!(
+                pretty.status.success(),
+                expected_healthy,
+                "{label}: pretty and JSON doctor disagreed; stdout: {} stderr: {}",
+                String::from_utf8_lossy(&pretty.stdout),
+                String::from_utf8_lossy(&pretty.stderr)
+            );
+
+            if let Some(original) = original_project {
                 assert_eq!(
                     std::fs::read(&extension).expect("read extension after doctor"),
                     original,
-                    "{label}: read-only doctor changed extension bytes"
+                    "{label}: read-only doctor changed project extension bytes"
+                );
+            }
+            if let Some(original) = original_user {
+                assert_eq!(
+                    std::fs::read(&user_extension).expect("read user extension after doctor"),
+                    original,
+                    "{label}: read-only doctor changed user extension bytes"
                 );
             }
         }
     }
 
     #[test]
-    fn doctor_fix_refreshes_an_unhealthy_owned_project_omp_extension_in_place() {
+    fn doctor_fix_refreshes_an_unhealthy_owned_omp_extension_in_its_exact_scope() {
+        for (label, project) in [("project", true), ("user", false)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (home_dir, xdg_config_dir, bin_dir) = setup_doctor_env(&temp);
+            let project_extension = temp.path().join(".omp/extensions/dcg-guard.ts");
+            let user_extension = home_dir.join(".omp/agent/extensions/dcg-guard.ts");
+            let extension = if project {
+                &project_extension
+            } else {
+                &user_extension
+            };
+            let other_extension = if project {
+                &user_extension
+            } else {
+                &project_extension
+            };
+
+            let mut install = Command::new(dcg_binary());
+            install
+                .env_clear()
+                .env("HOME", &home_dir)
+                .env("USERPROFILE", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                .env("OMP_PROFILE", "")
+                .current_dir(temp.path())
+                .args(["install", "--omp"]);
+            if project {
+                install.arg("--project");
+            }
+            let install = install.output().expect("install current OMP extension");
+            assert!(install.status.success(), "{label}: fixture install failed");
+            let expected = std::fs::read(extension).expect("current extension bytes");
+            std::fs::write(
+                extension,
+                "// dcg-omp-extension: generated but truncated\n",
+            )
+            .expect("plant truncated owned extension");
+
+            let output = Command::new(dcg_binary())
+                .env_clear()
+                .env("HOME", &home_dir)
+                .env("USERPROFILE", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                .env("PATH", &bin_dir)
+                .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                .env("OMP_PROFILE", "")
+                .current_dir(temp.path())
+                .args(["doctor", "--fix", "--strict"])
+                .output()
+                .expect("repair unhealthy OMP extension");
+            assert!(
+                output.status.success(),
+                "{label}: doctor --fix failed: stdout: {} stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read(extension).expect("repaired extension"),
+                expected,
+                "{label}: doctor must refresh the unhealthy owned scope in place"
+            );
+            assert!(
+                !other_extension.exists(),
+                "{label}: repair must not install a substitute at the other scope"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_fix_never_overwrites_a_foreign_omp_extension() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (home_dir, xdg_config_dir, bin_dir) = setup_doctor_env(&temp);
         let project_extension = temp.path().join(".omp/extensions/dcg-guard.ts");
         let user_extension = home_dir.join(".omp/agent/extensions/dcg-guard.ts");
-
-        let install = Command::new(dcg_binary())
-            .env_clear()
-            .env("HOME", &home_dir)
-            .env("USERPROFILE", &home_dir)
-            .env("XDG_CONFIG_HOME", &xdg_config_dir)
-            .env("OMP_PROFILE", "")
-            .current_dir(temp.path())
-            .args(["install", "--omp", "--project"])
-            .output()
-            .expect("install current project OMP extension");
-        assert!(install.status.success());
-        let expected = std::fs::read(&project_extension).expect("current extension bytes");
-        std::fs::write(
-            &project_extension,
-            "// dcg-omp-extension: generated but truncated\n",
-        )
-        .expect("plant truncated owned extension");
+        let foreign = b"export default function mine() {}\n";
+        std::fs::create_dir_all(project_extension.parent().expect("extension parent"))
+            .expect("project extension directory");
+        std::fs::write(&project_extension, foreign).expect("foreign project extension");
 
         let output = Command::new(dcg_binary())
             .env_clear()
@@ -2919,22 +2992,36 @@ mod config_tests {
             .current_dir(temp.path())
             .args(["doctor", "--fix", "--strict"])
             .output()
-            .expect("repair unhealthy project OMP extension");
+            .expect("fix doctor with foreign project extension");
         assert!(
             output.status.success(),
-            "doctor --fix failed: stdout: {} stderr: {}",
+            "doctor may install the other OMP-loaded scope: stdout: {} stderr: {}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(
-            std::fs::read(&project_extension).expect("repaired project extension"),
-            expected,
-            "doctor must refresh the unhealthy owned project scope in place"
+            std::fs::read(&project_extension).expect("read foreign project extension"),
+            foreign,
+            "doctor must never overwrite foreign extension bytes"
         );
         assert!(
-            !user_extension.exists(),
-            "repairing an owned project extension must not install a user-level substitute"
+            user_extension.is_file(),
+            "doctor should install a healthy extension at OMP's other loaded scope"
         );
+
+        let verify = Command::new(dcg_binary())
+            .env_clear()
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_config_dir)
+            .env("PATH", &bin_dir)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .env("OMP_PROFILE", "")
+            .current_dir(temp.path())
+            .args(["doctor", "--format", "json", "--strict"])
+            .output()
+            .expect("verify installed user extension");
+        assert!(verify.status.success(), "healthy user candidate must be accepted");
     }
 
     #[test]
