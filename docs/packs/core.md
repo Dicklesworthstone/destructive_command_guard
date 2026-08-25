@@ -125,6 +125,7 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
+| `rm-force-dev-browser-tmp-glob` | `^rm\s+(?:-f\|--force)\s+~/\.dev-browser/tmp/[^/\s]*[*?\[][^/\s]*\s*$` |
 | `rm-rf-tmp` | `^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
 | `rm-fr-tmp` | `^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
 | `rm-rf-var-tmp` | `^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
@@ -192,8 +193,6 @@ These patterns match potentially destructive commands:
 | `mv-dynamic-path` | mv with a shell-expanded or escaped path cannot be verified before execution. | high |
 | `redirect-truncate-root-home` | shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to a sensitive system or home path destroys the previous file contents. EXTREMELY DANGEROUS. | critical |
 | `redirect-truncate-dynamic-path` | shell redirect to a dynamic or escaped path may truncate a sensitive file and requires human approval. | high |
-
-`redirect-truncate-dynamic-path` remains fail-closed, with one POSIX exception: a double-quoted `$ROOT/$SUFFIX` assignment may redirect only when `ROOT` is the same-command result of exact `$(mktemp -d)` and `SUFFIX` is literal or comes from a literal `for` list. Reassignment, input, constructor-environment assignment, other substitutions, traversal, unquoted expansion, and dynamic dispatch remain blocked.
 
 ### Allowlist Guidance
 
