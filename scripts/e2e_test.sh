@@ -16,7 +16,7 @@
 #   --full        Run slow/expensive tests (memory test execution)
 #
 # Exit codes:
-#   0  All tests passed
+#   0  No tests failed (the summary still distinguishes skips and warnings)
 #   1  One or more tests failed
 #   2  Binary not found or other setup error
 
@@ -45,6 +45,8 @@ ARTIFACTS_DIR=""
 RUN_FULL=false
 TESTS_PASSED=0
 TESTS_FAILED=0
+TESTS_SKIPPED=0
+TESTS_WARNED=0
 TESTS_TOTAL=0
 
 # Timing data
@@ -302,8 +304,7 @@ log_info() {
 log_skip() {
     local desc="$1"
     local reason="${2:-}"
-    # Count skipped tests as passed (they're not failures)
-    ((++TESTS_PASSED))
+    ((++TESTS_SKIPPED))
     record_test_result "skip" "$desc" ""
 
     if ! $JSON_OUTPUT; then
@@ -318,7 +319,7 @@ log_skip() {
 # Log a warning (test passed but with caveats)
 log_warn() {
     local desc="$1"
-    ((++TESTS_PASSED))
+    ((++TESTS_WARNED))
     record_test_result "warn" "$desc" ""
 
     if ! $JSON_OUTPUT; then
@@ -745,8 +746,16 @@ test_memory_tests_run() {
 
     log_info "Running memory tests; output -> $output_file"
 
-    if (cd "$REPO_ROOT" && cargo test --test memory_tests --release -- \
-        --nocapture --test-threads=1 2>&1 | tee "$output_file"); then
+    local memory_test_status=0
+    if $JSON_OUTPUT; then
+        (cd "$REPO_ROOT" && cargo test --test memory_tests --release -- \
+            --nocapture --test-threads=1) >"$output_file" 2>&1 || memory_test_status=$?
+    else
+        (cd "$REPO_ROOT" && cargo test --test memory_tests --release -- \
+            --nocapture --test-threads=1 2>&1 | tee "$output_file") || memory_test_status=$?
+    fi
+
+    if [[ $memory_test_status -eq 0 ]]; then
         if grep -q "memory_leak_self_test.*PASSED" "$output_file"; then
             log_pass "$desc"
         else
@@ -1911,6 +1920,12 @@ run_ci_feature_tests
 
 SUITE_END_TIME=$(get_timestamp_ms)
 SUITE_DURATION_MS=$((SUITE_END_TIME - SUITE_START_TIME))
+TESTS_ACCOUNTED=$((TESTS_PASSED + TESTS_FAILED + TESTS_SKIPPED + TESTS_WARNED))
+
+if [[ $TESTS_ACCOUNTED -ne $TESTS_TOTAL || ${#TEST_RESULTS[@]} -ne $TESTS_TOTAL ]]; then
+    echo "Internal error: test result accounting mismatch (total=$TESTS_TOTAL, accounted=$TESTS_ACCOUNTED, records=${#TEST_RESULTS[@]})" >&2
+    exit 2
+fi
 
 # Calculate timing statistics
 calculate_timing_stats() {
@@ -1964,7 +1979,11 @@ output_json() {
     echo "    \"total\": $TESTS_TOTAL,"
     echo "    \"passed\": $TESTS_PASSED,"
     echo "    \"failed\": $TESTS_FAILED,"
-    echo "    \"success\": $( [[ $TESTS_FAILED -eq 0 ]] && echo "true" || echo "false" )"
+    echo "    \"skipped\": $TESTS_SKIPPED,"
+    echo "    \"warned\": $TESTS_WARNED,"
+    echo "    \"no_failures\": $( [[ $TESTS_FAILED -eq 0 ]] && echo "true" || echo "false" ),"
+    echo "    \"success\": $( [[ $TESTS_FAILED -eq 0 && $TESTS_SKIPPED -eq 0 && $TESTS_WARNED -eq 0 ]] && echo "true" || echo "false" ),"
+    echo "    \"complete\": $( [[ $TESTS_FAILED -eq 0 && $TESTS_SKIPPED -eq 0 && $TESTS_WARNED -eq 0 ]] && echo "true" || echo "false" )"
     echo "  },"
     echo "  \"timing\": {"
     echo "    \"suite_duration_ms\": $SUITE_DURATION_MS,"
@@ -2024,6 +2043,8 @@ if [[ $TESTS_FAILED -gt 0 ]]; then
 else
     echo -e "Failed: 0"
 fi
+echo -e "Skipped: ${TESTS_SKIPPED}"
+echo -e "Warned:  ${TESTS_WARNED}"
 
 # Timing summary
 stats=$(calculate_timing_stats)
@@ -2049,6 +2070,9 @@ echo ""
 if [[ $TESTS_FAILED -gt 0 ]]; then
     echo -e "${RED}Some tests failed!${NC}"
     exit 1
+elif [[ $TESTS_SKIPPED -gt 0 || $TESTS_WARNED -gt 0 ]]; then
+    echo -e "${YELLOW}${BOLD}Suite completed without failures; review skips/warnings.${NC}"
+    exit 0
 else
     echo -e "${GREEN}${BOLD}All tests passed!${NC}"
     exit 0
