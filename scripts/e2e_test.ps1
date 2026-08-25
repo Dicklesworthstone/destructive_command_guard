@@ -189,18 +189,21 @@ function Assert-BinaryVersionFresh { param([string]$Bin)
     # exits 0, so capture the streams separately just as Invoke-Dcg does.
     $versionErrFile = [System.IO.Path]::GetTempFileName()
     $previousErrorAction = $ErrorActionPreference
+    $versionExitCode = -1
     try {
         $ErrorActionPreference = "Continue"
         $versionStdout = (& $Bin --version 2>$versionErrFile | Out-String)
+        $versionExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorAction
     }
     $actual = (($versionStdout -split "\r?\n")[0]).Trim()
-    if ($actual -ne $expected) {
+    if ($versionExitCode -ne 0 -or $actual -cne $expected) {
         $displayActual = if ([string]::IsNullOrWhiteSpace($actual)) { "unknown" } else { $actual }
         [Console]::Error.WriteLine("Error: stale dcg binary selected")
         [Console]::Error.WriteLine("Binary: $Bin")
         [Console]::Error.WriteLine("Binary version: $displayActual")
+        [Console]::Error.WriteLine("Version command exit: $versionExitCode")
         [Console]::Error.WriteLine("Cargo.toml version: $expected")
         [Console]::Error.WriteLine("Run 'cargo build --release' or pass -Binary PATH to the intended binary.")
         exit 2
