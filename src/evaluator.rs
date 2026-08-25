@@ -20233,6 +20233,52 @@ fn evaluate_visible_git_shell_alias(
     None
 }
 
+/// Wrangler's regex fallback must inspect shell argv, not inert JavaScript
+/// source. Keep known process-execution source visible to the fallback; the
+/// inline-script AST pass runs before pack evaluation for its supported sinks.
+fn literal_node_inline_source_is_not_wrangler_argv(segment: &str, dialect: ShellDialect) -> bool {
+    if dialect != ShellDialect::Posix {
+        return false;
+    }
+    let stripped = strip_wrapper_prefixes(segment);
+    let command = stripped.normalized.as_ref();
+    let tokens = tokenize_for_shell_dialect(command, dialect);
+    let words: Vec<&str> = tokens
+        .iter()
+        .filter(|token| token.kind != NormalizeTokenKind::Separator)
+        .filter_map(|token| token.text(command))
+        .collect();
+    let [executable, mode, source] = words.as_slice() else {
+        return false;
+    };
+    if !source.starts_with('\'') || !source.ends_with('\'') || source.len() < 2 {
+        return false;
+    }
+    let source_body = &source[1..source.len() - 1];
+    if [
+        "child_process",
+        "exec(",
+        "execSync(",
+        "spawn(",
+        "spawnSync(",
+        "system(",
+        "eval(",
+    ]
+    .iter()
+    .any(|sink| source_body.contains(sink))
+    {
+        return false;
+    }
+    let mut decoder = ShellTokenDecoder::new(dialect);
+    let Some(executable) = decoder.decode(executable, ShellTokenRole::Syntax) else {
+        return false;
+    };
+    let Some(mode) = decoder.decode(mode, ShellTokenRole::Syntax) else {
+        return false;
+    };
+    executable.rsplit('/').next() == Some("node") && matches!(mode.as_ref(), "-e" | "--eval")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_cloudflare_workers_pack(
     pack_id: &str,
@@ -20368,7 +20414,11 @@ fn evaluate_cloudflare_workers_pack(
                     first_allowlist_hit,
                 );
             }
-            crate::packs::cdn::cloudflare_workers::WranglerSemanticDecision::NoMatch => {}
+            crate::packs::cdn::cloudflare_workers::WranglerSemanticDecision::NoMatch => {
+                if literal_node_inline_source_is_not_wrangler_argv(segment, shell_dialect) {
+                    continue;
+                }
+            }
         }
 
         let sanitized_segment = sanitize_for_pattern_matching(segment);
@@ -20546,6 +20596,66 @@ fn statically_safe_variable_redirect(
     values
         .iter()
         .all(|value| resolved_redirect_target_is_benign(&format!("{value}{suffix}")))
+}
+
+/// Prove that a literal temp-family `find -type f -print0` producer cannot
+/// inject an rm option through xargs: every emitted item retains the absolute
+/// root prefix and the consumer performs only non-recursive forced file removal.
+fn statically_safe_literal_find_xargs_cleanup(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    dialect_segment: &str,
+    dialect: ShellDialect,
+) -> bool {
+    if dialect != ShellDialect::Posix || dialect_segment.trim() != "xargs -0 rm -f" {
+        return false;
+    }
+    let [(find_start, find_end), (xargs_start, xargs_end)] = segment_ranges else {
+        return false;
+    };
+    if *xargs_start != segment_start
+        || !source
+            .get(..*find_start)
+            .is_some_and(|prefix| prefix.trim().is_empty())
+        || source
+            .get(*find_end..*xargs_start)
+            .is_none_or(|separator| separator.trim() != "|")
+        || !source
+            .get(*xargs_end..)
+            .is_some_and(|suffix| suffix.trim().is_empty())
+    {
+        return false;
+    }
+    let Some(find) = source.get(*find_start..*find_end).map(str::trim) else {
+        return false;
+    };
+    let mut words = find.split_ascii_whitespace();
+    let (Some("find"), Some(root), Some("-type"), Some("f"), Some("-print0"), None) = (
+        words.next(),
+        words.next(),
+        words.next(),
+        words.next(),
+        words.next(),
+        words.next(),
+    ) else {
+        return false;
+    };
+    let Some(suffix) = ["/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/"]
+        .iter()
+        .find_map(|prefix| root.strip_prefix(prefix))
+    else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix.split('/').all(|component| {
+            !component.is_empty()
+                && component != "."
+                && component != ".."
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        })
 }
 
 /// Prove the narrow cleanup companion to the scoped `mktemp -d` redirect
@@ -21967,13 +22077,19 @@ fn evaluate_core_filesystem_pack(
         if matches!(
             rm_decision,
             crate::packs::core::filesystem::RmParseDecision::Deny(_)
-        ) && statically_safe_scoped_mktemp_cleanup(
+        ) && (statically_safe_literal_find_xargs_cleanup(
             redirect_source,
             segment_ranges,
             segment_start,
             dialect_segment,
             shell_dialect,
-        ) {
+        ) || statically_safe_scoped_mktemp_cleanup(
+            redirect_source,
+            segment_ranges,
+            segment_start,
+            dialect_segment,
+            shell_dialect,
+        )) {
             rm_decision = crate::packs::core::filesystem::RmParseDecision::Allow;
         }
         let rm_was_semantically_handled = !matches!(
@@ -24502,6 +24618,23 @@ mod tests {
             ambient_variable.is_denied(),
             "an ambient variable remains runtime-overridable and cannot inherit the literal carve-out"
         );
+
+        for dangerous in [
+            "printf '%s\\0' -- -r | xargs -0 rm -f ./tree",
+            "find ./tree -type f -print0 | xargs -0 rm -f",
+            "find /private/tmp/scratch -type d -print0 | xargs -0 rm -f",
+            "find /private/tmp/scratch -type f -print0 | xargs -0 rm -rf",
+        ] {
+            assert!(
+                evaluate_with_pack_ids_in_dialect(
+                    dangerous,
+                    &["core.filesystem"],
+                    ShellDialect::Posix,
+                )
+                .is_denied(),
+                "unproven or recursive xargs input must stay denied: {dangerous}"
+            );
+        }
     }
 
     #[test]
@@ -24516,6 +24649,16 @@ mod tests {
             result.is_allowed(),
             "inline JavaScript syntax must not be parsed as shell redirection or Wrangler: {:?}",
             result.pattern_info
+        );
+
+        let executable_wrangler = evaluate_with_pack_ids_in_dialect(
+            r#"node -e 'require("child_process").execSync("wrangler r2 bucket delete assets")'"#,
+            &["cdn.cloudflare_workers"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            executable_wrangler.is_denied(),
+            "a real process-execution sink inside inline JavaScript must stay denied"
         );
 
         let wrangler_delete = evaluate_with_pack_ids_in_dialect(
@@ -30398,7 +30541,7 @@ mod tests {
         }
 
         let result = evaluate_with_pack_ids_in_dialect(
-            r#"go env GOPATH >/tmp/$(date +%s)"#,
+            r"go env GOPATH >/tmp/$(date +%s)",
             &["core.filesystem"],
             ShellDialect::Posix,
         );
