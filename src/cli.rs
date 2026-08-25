@@ -13066,7 +13066,9 @@ fn install_opencode_plugin(force: bool, project: bool) -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// Install the native Oh My Pi ExtensionAPI guard.
+/// Install the native Oh My Pi ExtensionAPI guard. `announce` is false when a
+/// structured doctor renderer owns stdout; ordinary install and pretty doctor
+/// keep the existing human-facing progress output.
 fn install_omp_extension(
     force: bool,
     project: bool,
