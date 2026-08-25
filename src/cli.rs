@@ -4671,33 +4671,31 @@ fn test_command(
     // as hook mode retains hook evaluations. Construct the writer only after
     // evaluation so SQLite setup is outside `eval_duration_us`, and bound its
     // drop wait by the same remaining deadline that governs the robot reply.
-    let _robot_history_writer = if should_record_robot_history(
-        robot_mode,
-        effective_config.history.enabled,
-    ) {
-        let working_dir = project_path.as_ref().map_or_else(
-            || "<unknown>".to_string(),
-            |path| path.to_string_lossy().into_owned(),
-        );
-        let mut writer = HistoryWriter::new(
-            robot_history_db_path(&effective_config.history),
-            &effective_config.history,
-        );
-        if let Some(deadline) = evaluation_deadline.as_ref() {
-            writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
-        }
-        writer.log(build_robot_history_entry(
-            detection.agent.config_key(),
-            command,
-            &working_dir,
-            &result,
-            resolved_mode,
-            elapsed,
-        ));
-        Some(writer)
-    } else {
-        None
-    };
+    let _robot_history_writer =
+        if should_record_robot_history(robot_mode, effective_config.history.enabled) {
+            let working_dir = project_path.as_ref().map_or_else(
+                || "<unknown>".to_string(),
+                |path| path.to_string_lossy().into_owned(),
+            );
+            let mut writer = HistoryWriter::new(
+                robot_history_db_path(&effective_config.history),
+                &effective_config.history,
+            );
+            if let Some(deadline) = evaluation_deadline.as_ref() {
+                writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
+            }
+            writer.log(build_robot_history_entry(
+                detection.agent.config_key(),
+                command,
+                &working_dir,
+                &result,
+                resolved_mode,
+                elapsed,
+            ));
+            Some(writer)
+        } else {
+            None
+        };
 
     // Quiet mode: the command was fully evaluated above, so suppress all
     // human/structured output but still return the real decision so the exit
