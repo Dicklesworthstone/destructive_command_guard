@@ -1,6 +1,6 @@
 [package]
 name = "destructive_command_guard"
-version = "0.10.0"
+version = "0.13.0"
 edition = "2024"
 resolver = "2"
 authors = [
@@ -103,6 +103,14 @@ rich_rust = { version = "0.2.2", features = ["markdown"], optional = true }
 
 [build-dependencies]
 vergen-gix = { version = "10.0.0-beta.8", features = ["build", "cargo", "rustc"] }
+# Windows PE metadata (#303): a VERSIONINFO resource (product/company/
+# description/version) and an application manifest. An unsigned, stripped,
+# size-optimized binary with NO version resource is a textbook input to
+# Defender's ML heuristics; the metadata also makes `dcg.exe` identifiable in
+# Explorer / Task Manager. Unconditional because a `[target.'cfg(windows)']`
+# build-dependency is resolved against the HOST, which would drop it on the
+# Linux cross-build; build.rs only invokes it when the TARGET is Windows.
+winresource = { version = "0.1.31", default-features = false }
 
 [dev-dependencies]
 assert_cmd = "2.2"

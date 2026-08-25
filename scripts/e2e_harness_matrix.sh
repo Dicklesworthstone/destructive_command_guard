@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # e2e_harness_matrix.sh — real-binary, no-mock conformance for every shipped
-# agent hook protocol.
+# agent hook protocol or native extension bridge.
 #
 # WHY THIS EXISTS
 # ---------------
@@ -197,6 +197,61 @@ assert_field_absent() {
   fi
 }
 
+# Assert the exact private robot-mode contract used by Oh My Pi. OMP passes the
+# raw command on stdin, requests the compact envelope, and maps dcg's exit
+# status plus these exact bytes back to ExtensionAPI's blocking result.
+assert_omp_bridge_case() {
+  local harness="$1" case_name="$2" command="$3" expected_rc="$4" expected_stdout="$5"
+  local stdout_file="$SANDBOX/${harness}-${case_name}.stdout"
+  local stderr_file="$SANDBOX/${harness}-${case_name}.stderr"
+  local start end
+  start="$(now_ms)"
+  printf '%s' "$command" | run_dcg_cli --robot test --stdin \
+    --agent omp --dialect posix --format json --omp-bridge-output \
+    >"$stdout_file" 2>"$stderr_file"
+  local rc=$?
+  end="$(now_ms)"
+  CASE_MS=""
+  [[ -n "$start" && -n "$end" ]] && CASE_MS=$((end - start))
+
+  local stdout_data stdout_bytes expected_bytes
+  stdout_data="$(cat "$stdout_file")"
+  stdout_bytes="$(wc -c <"$stdout_file" | tr -d '[:space:]')"
+  expected_bytes=$((${#expected_stdout} + 1))
+  if [[ $rc -ne $expected_rc ]]; then
+    report fail "$harness" "$case_name" "exit $rc, want $expected_rc"
+  elif [[ -s "$stderr_file" ]]; then
+    report fail "$harness" "$case_name" "private OMP bridge polluted stderr"
+  elif [[ "$stdout_data" != "$expected_stdout" || "$stdout_bytes" -ne "$expected_bytes" ]]; then
+    report fail "$harness" "$case_name" \
+      "compact stdout mismatch: got ${stdout_bytes}B '${stdout_data:0:200}', want ${expected_bytes}B '$expected_stdout'"
+  else
+    report pass "$harness" "$case_name"
+  fi
+}
+
+# The compact OMP envelope intentionally omits attribution. Retain one ordinary
+# robot assertion so `--agent omp` cannot silently stop selecting OMP policy.
+assert_omp_agent_attribution() {
+  local stdout_file="$SANDBOX/omp-attribution.stdout"
+  local stderr_file="$SANDBOX/omp-attribution.stderr"
+  printf '%s' "$ALLOW_CMD" | run_dcg_cli --robot test --stdin \
+    --agent omp --dialect posix --format json >"$stdout_file" 2>"$stderr_file"
+  local rc=$? agent method
+  agent="$(jq -r '.agent.detected // empty' "$stdout_file" 2>/dev/null)"
+  method="$(jq -r '.agent.detection_method // empty' "$stdout_file" 2>/dev/null)"
+  if [[ $rc -ne 0 ]]; then
+    report fail omp agent-attribution "exit $rc, want 0"
+  elif [[ "$agent" != "omp" || "$method" != "explicit" ]]; then
+    report fail omp agent-attribution \
+      "agent attribution '$agent'/'$method', want omp/explicit"
+  elif [[ -s "$stderr_file" ]]; then
+    report fail omp agent-attribution "ordinary robot output polluted stderr"
+  else
+    report pass omp agent-attribution
+  fi
+}
+
 DENY_CMD='git reset --hard'
 ALLOW_CMD='git status'
 
@@ -240,8 +295,11 @@ for field in ruleId packId severity; do
   else report fail claude-code "metadata:$field" "missing $field in denial (agents key allowlists on it)"; fi
 done
 got="$(printf '%s' "$CLAUDE_DENY" | run_dcg 2>/dev/null | jq -r '.hookSpecificOutput.hookEventName // empty')"
-[[ "$got" == "PreToolUse" ]] && report pass claude-code hookEventName \
-  || report fail claude-code hookEventName "want PreToolUse, got '$got'"
+if [[ "$got" == "PreToolUse" ]]; then
+  report pass claude-code hookEventName
+else
+  report fail claude-code hookEventName "want PreToolUse, got '$got'"
+fi
 
 # --- Codex CLI (strict parser: rejects unknown fields) ----------------------
 $JSON_OUTPUT || echo "Codex CLI"
@@ -286,8 +344,11 @@ assert_case hermes deny "$HERMES_DENY" deny '.decision' block
 assert_case hermes allow "$HERMES_ALLOW" allow '.' ''
 # Hermes cross-version alternate keys must both be present.
 got="$(printf '%s' "$HERMES_DENY" | run_dcg 2>/dev/null | jq -r '.action // empty')"
-[[ "$got" == "block" ]] && report pass hermes alt-action-key \
-  || report fail hermes alt-action-key "want action=block, got '$got'"
+if [[ "$got" == "block" ]]; then
+  report pass hermes alt-action-key
+else
+  report fail hermes alt-action-key "want action=block, got '$got'"
+fi
 
 # --- Grok (xAI): decision:"deny", camelCase wire shape ---------------------
 $JSON_OUTPUT || echo "Grok (xAI)"
@@ -307,6 +368,13 @@ AGY_ALLOW=$(jq -nc --arg c "$ALLOW_CMD" \
 assert_case agy deny "$AGY_DENY" deny '.decision' block
 assert_case agy allow "$AGY_ALLOW" allow '.' ''
 
+# --- Oh My Pi: native ExtensionAPI bridge over robot stdin ------------------
+$JSON_OUTPUT || echo "Oh My Pi (omp)"
+assert_omp_bridge_case omp deny "$DENY_CMD" 1 \
+  '{"decision":"deny","reason":"git reset --hard destroys uncommitted changes. Use '\''git stash'\'' first.","rule_id":"core.git:reset-hard"}'
+assert_omp_bridge_case omp allow "$ALLOW_CMD" 0 '{"decision":"allow"}'
+assert_omp_agent_attribution
+
 # --- Cross-cutting invariants ----------------------------------------------
 $JSON_OUTPUT || echo "Cross-cutting invariants"
 
@@ -317,11 +385,17 @@ assert_case all non-shell-tool-ignored \
 # Unparseable input fails OPEN by default (documented contract), and the
 # fail-closed opt-in must actually deny.
 out="$(printf 'not json at all' | run_dcg 2>/dev/null)"; rc=$?
-[[ $rc -eq 0 && -z "$out" ]] && report pass all malformed-fails-open \
-  || report fail all malformed-fails-open "want silent allow, rc=$rc out='${out:0:80}'"
+if [[ $rc -eq 0 && -z "$out" ]]; then
+  report pass all malformed-fails-open
+else
+  report fail all malformed-fails-open "want silent allow, rc=$rc out='${out:0:80}'"
+fi
 out="$(printf 'not json at all' | run_dcg DCG_FAIL_CLOSED=1 2>/dev/null)"
-[[ -n "$out" ]] && report pass all malformed-fail-closed-opt-in \
-  || report fail all malformed-fail-closed-opt-in "DCG_FAIL_CLOSED=1 produced no denial"
+if [[ -n "$out" ]]; then
+  report pass all malformed-fail-closed-opt-in
+else
+  report fail all malformed-fail-closed-opt-in "DCG_FAIL_CLOSED=1 produced no denial"
+fi
 
 # BOM-prefixed valid input must still be evaluated (issue #160).
 BOM_PAYLOAD="$(printf '\xef\xbb\xbf%s' "$CLAUDE_DENY")"

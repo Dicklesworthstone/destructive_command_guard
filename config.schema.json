@@ -17,7 +17,8 @@
         "max_findings_per_command": null,
         "check_updates": true,
         "self_heal_hook": true,
-        "fail_closed": false
+        "fail_closed": false,
+        "update_pin": false
       }
     },
     "output": {
@@ -57,9 +58,7 @@
       "$ref": "#/$defs/OverridesConfig",
       "default": {
         "allow": [],
-        "block": [],
-        "allowlist": null,
-        "allowlist_rules": null
+        "block": []
       }
     },
     "allowlist": {
@@ -291,6 +290,11 @@
           "description": "Fail-closed mode for unparseable hook input.\n\nWhen `true`, hook input that cannot be parsed as JSON is BLOCKED\n(denied) instead of allowed. The default (`false`) is the documented\nfail-open behavior: malformed input is allowed so a transient encoding\nglitch never blocks legitimate work. Intended for high-security\nenvironments. Override at runtime with the `DCG_FAIL_CLOSED` env var\n(a truthy value forces fail-closed, a falsy value forces fail-open).",
           "type": "boolean",
           "default": false
+        },
+        "update_pin": {
+          "description": "Pin the installed binary against `dcg update` (#320).\n\nWhen `true`, `dcg update` refuses to replace the installed binary\n(before any network or installer work) unless `--replace-local-build`\nis passed, and the background \"update available\" nudge is suppressed.\nIntended for operators running a local build that is ahead of the\npublished release, where a routine update would silently downgrade\nguard coverage. Override at runtime with `DCG_UPDATE_PIN`.\nDefault: false.",
+          "type": "boolean",
+          "default": false
         }
       }
     },
@@ -466,28 +470,6 @@
             "$ref": "#/$defs/BlockOverride"
           },
           "default": []
-        },
-        "allowlist": {
-          "description": "Simple allowlist format (backward compatible).\n\nExample in TOML:\n```toml\nallowlist = [\"npm run build\", \"cargo test\"]\n```",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "type": "string"
-          },
-          "default": null
-        },
-        "allowlist_rules": {
-          "description": "Extended allowlist rules with path-specific conditions.\n\nExample in TOML:\n```toml\n[[allowlist_rules]]\npattern = \"rm -rf node_modules\"\npaths = [\"/home/*/projects/*\", \"/workspace/*\"]\ncomment = \"Allow node_modules cleanup in project directories\"\n```",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "$ref": "#/$defs/AllowlistRule"
-          },
-          "default": null
         }
       }
     },
@@ -535,88 +517,6 @@
       "required": [
         "pattern",
         "reason"
-      ]
-    },
-    "AllowlistRule": {
-      "description": "An extended allowlist rule with optional path conditions.\n\nThis supports context-aware allowlisting where rules can be scoped\nto specific directories or path patterns. Rules can also have expiration\nsettings (mutually exclusive: only one of `expires`, `ttl`, `ttl_seconds`,\nor `session` should be set).",
-      "type": "object",
-      "properties": {
-        "pattern": {
-          "description": "The pattern to allow (regex supported).",
-          "type": "string"
-        },
-        "paths": {
-          "description": "Optional path patterns where this rule applies.\n\nIf `None` or empty, the rule applies globally.\nSupports glob patterns like `/home/*/projects/*`.",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "type": "string"
-          },
-          "default": null
-        },
-        "comment": {
-          "description": "Optional comment explaining the rule.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "expires": {
-          "description": "Optional expiration timestamp (ISO 8601 format).\n\nAfter this time, the rule is no longer active.\nExample: \"2024-06-01T00:00:00Z\"\n\nMutually exclusive with `ttl`, `ttl_seconds`, and `session`.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "ttl": {
-          "description": "Optional time-to-live duration as a human-readable string.\n\nSupported formats:\n- Minutes: \"30m\", \"30min\", \"30 minutes\"\n- Hours: \"4h\", \"4hr\", \"4 hours\"\n- Days: \"7d\", \"7 days\"\n- Weeks: \"1w\", \"1 week\"\n\nTTL is computed from `created_at` timestamp.\nMutually exclusive with `expires`, `ttl_seconds`, and `session`.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "ttl_seconds": {
-          "description": "Optional time-to-live duration in seconds.\n\nAlternative to `ttl` for programmatic use.\nTTL is computed from `created_at` timestamp.\nMutually exclusive with `expires`, `ttl`, and `session`.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0,
-          "default": null
-        },
-        "session": {
-          "description": "Whether this is a session-only rule.\n\nSession rules are valid only within the shell session that created them.\nMutually exclusive with `expires`, `ttl`, and `ttl_seconds`.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
-        },
-        "session_id": {
-          "description": "Session identifier this rule is bound to when `session = true`.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "created_at": {
-          "description": "Timestamp when this rule was created (ISO 8601 format).\n\nRequired for TTL-based expiration. If not set when a TTL is specified,\nit will be automatically set to the current time when the rule is loaded.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        }
-      },
-      "required": [
-        "pattern"
       ]
     },
     "AllowlistConfig": {

@@ -119,3 +119,21 @@ expected = "allow"
 description = "rm with -v (verbose) is safe"
 command = "rm -v file.txt"
 expected = "allow"
+
+# bd-5xgt controls: the flag-quote fix dequotes option-position tokens, but
+# quoted DATA is not a command and an unbalanced quote is a syntax error that
+# never runs rm — both must stay allowed.
+[[case]]
+description = "recursive-delete mention inside a quoted echo argument (data)"
+command = "echo 'rm -rf /'"
+expected = "allow"
+
+[[case]]
+description = "recursive-delete text as a grep search pattern (data)"
+command = "grep 'rm -rf' file"
+expected = "allow"
+
+[[case]]
+description = "unbalanced quote in an rm flag is a syntax error, not a bypass"
+command = "rm -r'f /"
+expected = "allow"

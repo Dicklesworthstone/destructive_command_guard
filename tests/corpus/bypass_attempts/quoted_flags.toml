@@ -1,0 +1,46 @@
+# Bypass attempts: balanced quotes embedded inside a flag token (bd-5xgt).
+#
+# bash concatenates adjacent quoted/unquoted characters, so `rm -r'f' /` runs
+# `rm -rf /`. dcg's rm flag matching must dequote the option cluster (flags are
+# always executed syntax, never data) so these do not evade the always-on
+# rm-rf guard. Every command here was cross-checked to produce `rm -rf /`
+# (argv `[-rf][/]`) in a real bash.
+
+[[case]]
+description = "quote inside the -rf flag (rm -r'f' /)"
+command = "rm -r'f' /"
+expected = "deny"
+
+[[case]]
+description = "quote splitting -r from f (rm -'r'f /)"
+command = "rm -'r'f /"
+expected = "deny"
+
+[[case]]
+description = "double-quote inside the flag (rm -r\"f\" /)"
+command = "rm -r\"f\" /"
+expected = "deny"
+
+[[case]]
+description = "quote spanning the dash and r (rm '-r'f /)"
+command = "rm '-r'f /"
+expected = "deny"
+
+[[case]]
+description = "backslash-escaped flag char (rm -r\\f /)"
+command = "rm -r\\f /"
+expected = "deny"
+
+[[case]]
+description = "empty quotes glued to a full flag (rm -rf'' /etc)"
+command = "rm -rf'' /etc"
+expected = "deny"
+
+[[case]]
+description = "fully split quoted flag chars (rm '-'r'f' /)"
+command = "rm '-'r'f' /"
+expected = "deny"
+
+# The allow-side controls for this class (quoted data args, unbalanced-quote
+# syntax errors) live in tests/corpus/false_positives/rm_safe.toml, since the
+# bypass_attempts category requires every case to deny.

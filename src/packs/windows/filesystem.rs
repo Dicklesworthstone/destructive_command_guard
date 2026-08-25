@@ -148,9 +148,9 @@ const REMOVE_ITEM_PARAMETER_ALIASES: &[(&str, RemoveItemParameter)] = &[
 ];
 
 const DEL_SUGGESTIONS: &[PatternSuggestion] = &[
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "del /s /q <dir> /p",
-        "Add /p to confirm each file, or scope the path precisely before deleting",
+        "/p prompts per file, but /s still recurses — dcg gates a recursive del regardless, so scope the path or use Move-Item instead",
     ),
     PatternSuggestion::new(
         "Move-Item <dir> $env:TEMP\\trash",

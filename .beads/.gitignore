@@ -43,3 +43,12 @@ beads.right.meta.json
 
 # bv (beads viewer) lock file
 .bv.lock
+
+# br write locks and temp files (br doctor expects these ignored)
+.write.lock
+*.tmp
+.br-db-write-*.lock
+.br-jsonl-write-*.lock
+
+# Schema-migration recovery bundles (local safety copies)
+.br_recovery/

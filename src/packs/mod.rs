@@ -228,6 +228,17 @@ pub struct PatternSuggestion {
     /// Platform this suggestion applies to.
     /// `Platform::All` (default) means it works everywhere.
     pub platform: Platform,
+
+    /// Whether dcg itself also gates this suggestion (issue #316).
+    ///
+    /// A gated suggestion is a *less* destructive form of the blocked
+    /// operation, not a freely runnable alternative: dcg will deny it too and
+    /// the user must approve it (allowlist, allow-once, or run it manually).
+    /// Rendering appends an explicit "dcg gates this too" marker so an agent
+    /// reading the block message does not retry it expecting an allow. The
+    /// suggestion self-consistency test treats gated entries as
+    /// expected-denied instead of failures.
+    pub gated: bool,
 }
 
 impl PatternSuggestion {
@@ -238,6 +249,7 @@ impl PatternSuggestion {
             command,
             description,
             platform: Platform::All,
+            gated: false,
         }
     }
 
@@ -252,6 +264,18 @@ impl PatternSuggestion {
             command,
             description,
             platform,
+            gated: false,
+        }
+    }
+
+    /// Create a suggestion that dcg itself also gates (see the `gated` field).
+    #[must_use]
+    pub const fn gated(command: &'static str, description: &'static str) -> Self {
+        Self {
+            command,
+            description,
+            platform: Platform::All,
+            gated: true,
         }
     }
 }
@@ -746,11 +770,8 @@ impl Pack {
                     .matches_destructive_named_by(cmd, |name| name != Some("branch-force-delete"));
             }
         }
-        let pnpm_publish_is_actionable = self.id != "package_managers"
-            || crate::packs::package_managers::invokes_pnpm_publish(cmd);
         self.destructive_patterns
             .iter()
-            .filter(|pattern| pattern.name != Some("pnpm-publish") || pnpm_publish_is_actionable)
             .find(|p| p.regex.is_match(cmd))
             .map(|p| DestructiveMatch {
                 reason: p.reason,
@@ -1232,6 +1253,9 @@ const CAREFUL_COMPANY_PRESET_MEMBERS: &[&str] = &[
     "database.snowflake",
     "database.supabase",
     "database.bigquery",
+    // Databricks is the same class of data-platform control plane as
+    // Snowflake/BigQuery above; added deliberately with the pack (GH#333).
+    "database.databricks",
     // Object stores and remote copy.
     "storage.s3",
     "storage.gcs",
@@ -1270,7 +1294,7 @@ pub fn preset_members(id: &str) -> Option<&'static [&'static str]> {
 
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 99] = [
+static PACK_ENTRIES: [PackEntry; 100] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new(
         "core.filesystem",
@@ -1684,7 +1708,18 @@ static PACK_ENTRIES: [PackEntry; 99] = [
     ),
     PackEntry::new(
         "database.mysql",
-        &["mysql", "mysqldump", "DROP", "TRUNCATE", "DELETE"],
+        // `mariadb` is the renamed client binary (the `mysql` symlink is not
+        // guaranteed to exist); "RESET MASTER" admits the reset-master rule
+        // when the statement reaches the shell without a `mysql` token (#323).
+        &[
+            "mysql",
+            "mysqldump",
+            "mariadb",
+            "RESET MASTER",
+            "DROP",
+            "TRUNCATE",
+            "DELETE",
+        ],
         database::mysql::create_pack,
     ),
     PackEntry::new(
@@ -1701,7 +1736,17 @@ static PACK_ENTRIES: [PackEntry; 99] = [
     ),
     PackEntry::new(
         "database.redis",
-        &["redis-cli", "FLUSHALL", "FLUSHDB", "DEBUG"],
+        // `valkey` / `keydb` cover the protocol-compatible client renames
+        // (`valkey-cli`, `keydb-cli`); without them every rule in this pack
+        // silently stopped firing on those binaries (#323).
+        &[
+            "redis-cli",
+            "valkey",
+            "keydb",
+            "FLUSHALL",
+            "FLUSHDB",
+            "DEBUG",
+        ],
         database::redis::create_pack,
     ),
     PackEntry::new(
@@ -1724,6 +1769,18 @@ static PACK_ENTRIES: [PackEntry; 99] = [
             "NOT MATCHED",
         ],
         database::bigquery::create_pack,
+    ),
+    PackEntry::new(
+        "database.databricks",
+        &[
+            "databricks",
+            "bundle destroy",
+            "permanent-delete",
+            "delete-scope",
+            "delete-secret",
+            "delete-acl",
+        ],
+        database::databricks::create_pack,
     ),
     PackEntry::new(
         "database.snowflake",
@@ -1850,11 +1907,15 @@ static PACK_ENTRIES: [PackEntry; 99] = [
         "system.disk",
         &[
             "dd",
+            "diskutil",
             "mkfs",
             "mkswap",
             "fdisk",
             "parted",
             "wipefs",
+            // Without `umount` the umount-force rule was dead: no other
+            // keyword in this list appears in `umount -f /mnt/x` (#323).
+            "umount",
             "mdadm",
             "btrfs",
             "dmsetup",
@@ -2697,9 +2758,19 @@ static GIT_FINDER: LazyLock<memmem::Finder<'static>> = LazyLock::new(|| memmem::
 #[allow(dead_code)]
 static RM_FINDER: LazyLock<memmem::Finder<'static>> = LazyLock::new(|| memmem::Finder::new("rm"));
 
+/// Word-character class for keyword pre-filter boundaries.
+///
+/// Deliberately EXCLUDES `_`, unlike regex `\w` (#323). Underscore-joined
+/// names are how real commands embed the very literals packs gate on —
+/// `DCG_DISABLE=1`, `cloudflare_record.www`, `WEBHOOK_SECRET` — and treating
+/// `_` as a word character made every such occurrence invisible to the
+/// pre-filter: the pack's regex was correct but never ran (a silent
+/// fail-open). Treating `_` as a boundary can only ADMIT more commands to
+/// full evaluation; the pack regexes still decide the verdict, so this is
+/// fail-closed with a negligible evaluation-frequency cost.
 #[inline]
 const fn is_word_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
+    byte.is_ascii_alphanumeric()
 }
 
 #[inline]
@@ -3673,6 +3744,38 @@ mod tests {
         assert!(
             pack_aware_quick_reject("echo digit", &keywords),
             "substring in a larger token should not trigger keyword gating"
+        );
+    }
+
+    #[test]
+    fn pack_aware_quick_reject_treats_underscore_as_boundary() {
+        // #323: underscore-joined names are how real commands embed the
+        // literals packs gate on. `_` must be a keyword boundary, or the
+        // pre-filter quick-rejects `DCG_DISABLE=1` / `cloudflare_record`
+        // and the pack regex — however correct — never runs.
+        let keywords: Vec<&str> = vec!["secret", "dcg", "cloudflare", "webhook"];
+
+        assert!(
+            !pack_aware_quick_reject("export SCW_SECRET_KEY=x", &keywords),
+            "underscore-joined credential name must admit keyword `secret`"
+        );
+        assert!(
+            !pack_aware_quick_reject("export DCG_DISABLE=1", &keywords),
+            "dcg self-weakening env var must admit keyword `dcg`"
+        );
+        assert!(
+            !pack_aware_quick_reject("terraform destroy -target=cloudflare_record.www", &keywords),
+            "terraform resource type must admit keyword `cloudflare`"
+        );
+        assert!(
+            !pack_aware_quick_reject("export WEBHOOK_SECRET=x", &keywords),
+            "UPPER_SNAKE env var must admit keyword `webhook`"
+        );
+
+        // Alphanumeric continuation is still NOT a boundary.
+        assert!(
+            pack_aware_quick_reject("echo dcgx", &keywords),
+            "keyword embedded in a longer alphanumeric token must still quick-reject"
         );
     }
 
@@ -5556,7 +5659,7 @@ mod tests {
             // full, so no member can be dropped without this failing.
             assert_eq!(
                 CAREFUL_COMPANY_PRESET_MEMBERS.len(),
-                30,
+                31,
                 "preset membership changed size; update the docs and this count together"
             );
             for category in [

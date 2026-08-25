@@ -95,9 +95,17 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chmod -R on root or system directories
         // `['"]?` before the leading `/` so quoted variants like
         // `chmod -R "/etc"` are caught — the shell unquotes to `/etc`.
+        // Bare `/` gets its own alternative (`['"]?(?:\s|$)`): the named-dir
+        // alternatives end in `\b`, which can never match after a bare `/`
+        // at end-of-string because both sides are non-word (issue #301).
+        // `/home` (and macOS `/Users`) is scoped to the home root or a whole
+        // single-user home (`home(?:/user)?`, where `~/.ssh` lives) — NOT
+        // deeper paths, so a routine `chmod -R /home/user/project` stays
+        // allowed while `chmod -R /home` (locks out every account) is blocked
+        // (issue #301; `/Users` parity mirrors the filesystem #325 fix).
         destructive_pattern!(
             "chmod-recursive-root",
-            r#"chmod\s+(?:.*(?:-[rR]|--recursive)).*\s+['"]?/(?:$|bin|boot|dev|etc|lib|lib64|opt|proc|root|run|sbin|srv|sys|usr|var)\b"#,
+            r#"chmod\s+(?:.*(?:-[rR]|--recursive)).*\s+['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))"#,
             "chmod -R on system directories can break system permissions.",
             Critical,
             "Recursively changing permissions on system directories can render the system \
@@ -111,7 +119,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chown -R on root or system directories
         destructive_pattern!(
             "chown-recursive-root",
-            r#"chown\s+(?:.*(?:-[rR]|--recursive)).*\s+['"]?/(?:$|bin|boot|dev|etc|lib|lib64|opt|proc|root|run|sbin|srv|sys|usr|var)\b"#,
+            r#"chown\s+(?:.*(?:-[rR]|--recursive)).*\s+['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))"#,
             "chown -R on system directories can break system ownership.",
             High,
             "Recursive ownership changes on system directories can disrupt services, \
@@ -168,7 +176,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // setfacl with dangerous patterns
         destructive_pattern!(
             "setfacl-all",
-            r#"setfacl\s+.*-[rR].*\s+['"]?/(?:$|bin|boot|dev|etc|lib|lib64|opt|proc|root|run|sbin|srv|sys|usr|var)\b"#,
+            r#"setfacl\s+.*-[rR].*\s+['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))"#,
             "setfacl -R on system directories can modify access control across the filesystem.",
             Critical,
             "Recursively modifying ACLs on system directories changes fine-grained access \
@@ -247,6 +255,72 @@ mod tests {
                 pattern.name
             );
         }
+    }
+
+    /// Issue #301: bare `/` and `/home` must be protected. The old regex
+    /// tail `(?:$|bin|...)\b` could never match a bare `/` (the `\b` after
+    /// the end-anchor has no word character to bound), and `/home` was
+    /// missing from the protected-path list entirely.
+    #[test]
+    fn recursive_root_covers_bare_slash_and_home_issue_301() {
+        let pack = create_pack();
+        assert_blocks_with_pattern(&pack, "chown -R user /", "chown-recursive-root");
+        assert_blocks_with_pattern(&pack, "chown -R user /home", "chown-recursive-root");
+        assert_blocks_with_pattern(&pack, "chown -R user '/'", "chown-recursive-root");
+        assert_blocks_with_pattern(&pack, "chown -R user /home/alice", "chown-recursive-root");
+        assert_blocks_with_pattern(&pack, "chmod -R 755 /", "chmod-recursive-root");
+        assert_blocks_with_pattern(&pack, "chmod -R 755 /home", "chmod-recursive-root");
+        assert_blocks_with_pattern(&pack, "chmod -R 755 \"/home\"", "chmod-recursive-root");
+        assert_blocks_with_pattern(&pack, "setfacl -R -m u:app:rwx /", "setfacl-all");
+        assert_blocks_with_pattern(&pack, "setfacl -R -m u:app:rwx /home", "setfacl-all");
+        // `chmod-777` also fires on the 777 case; the recursive-root rule must
+        // stand on its own for non-777 modes (the masking noted in #301).
+        assert_blocks_with_pattern(
+            &pack,
+            "chown -R deploy:deploy /home",
+            "chown-recursive-root",
+        );
+        // A whole single-user home (≤1 level, where ~/.ssh lives) is blocked,
+        // but a routine chmod on a project directory two-or-more levels deep
+        // stays allowed — `/home` is scoped, not a blanket prefix (issue #301).
+        let chmod = pack
+            .destructive_patterns
+            .iter()
+            .find(|p| p.name == Some("chmod-recursive-root"))
+            .expect("chmod rule");
+        for allowed in [
+            "chmod -R 755 /home/user/project",
+            "chmod -R 755 /home/alice/code/src",
+            "chmod -R 755 \"/home/bob/app\"",
+        ] {
+            assert!(
+                !chmod.regex.is_match(allowed),
+                "deep home project path must be allowed: {allowed}"
+            );
+        }
+    }
+
+    /// Issue #301 boundaries: paths that merely share a prefix with a
+    /// protected name, and non-recursive or non-rooted forms, must not match
+    /// the recursive-root rules.
+    #[test]
+    fn recursive_root_negative_boundaries_issue_301() {
+        let pack = create_pack();
+        let rule = |name: &str| {
+            pack.destructive_patterns
+                .iter()
+                .find(|p| p.name == Some(name))
+                .unwrap_or_else(|| panic!("rule {name} must exist"))
+        };
+        let chown = rule("chown-recursive-root");
+        let chmod = rule("chmod-recursive-root");
+        // Prefix-sharing paths are not protected paths.
+        assert!(!chown.regex.is_match("chown -R user /homeworks"));
+        assert!(!chmod.regex.is_match("chmod -R 755 /etcetera"));
+        // Non-system subtree.
+        assert!(!chown.regex.is_match("chown -R user /data/scratch"));
+        // Non-recursive chown on home is not this rule's concern.
+        assert!(!chown.regex.is_match("chown user /home/alice/file"));
     }
 
     #[test]

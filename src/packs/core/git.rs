@@ -4912,20 +4912,28 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                  expanded and field-split by the shell before git parses it, so its output can \
                  inject `-D`, `-f`, `-M`, or `-C` and turn a branch creation into a deletion or \
                  forced ref update. dcg cannot statically bound the expansion's output.\n\n\
-                 Safe spellings dcg allows without any exception:\n\
+                 The reliable fix is to resolve the dynamic value first and rerun the command \
+                 with the literal branch name.\n\n\
+                 For a branch *creation*, these spellings are safe without any exception:\n\
                  - Quote the name so it stays one word: git branch \"backup-$(date +%s)\"\n\
                  - End option parsing first: git branch -- backup-$(date +%s)\n\n\
-                 Both guarantee the expansion cannot become a flag.",
+                 Both guarantee the expansion cannot become a flag. They do not unlock a command \
+                 that already carries a literal deletion/force flag (`-D`, `-d`, `-f`, `-M`, \
+                 `-C`) — branch deletion stays gated on its own merits.",
             ),
             suggestions: &const {
                 [
                     PatternSuggestion::new(
+                        "Resolve the dynamic value first, then rerun with the literal branch name",
+                        "The expansion is the problem; a literal name is evaluated on its own merits",
+                    ),
+                    PatternSuggestion::new(
                         "git branch \"{name}\"",
-                        "Quote the branch name so the expansion stays a single non-flag word",
+                        "For a creation: quote the branch name so the expansion stays a single non-flag word",
                     ),
                     PatternSuggestion::new(
                         "git branch -- {name}",
-                        "`--` ends option parsing, so expanded output cannot become a flag",
+                        "For a creation: `--` ends option parsing, so expanded output cannot become a flag",
                     ),
                 ]
             },
@@ -4945,8 +4953,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - git diff <path>: Review what would be lost before discarding\n\n\
              Preview changes first:\n  git diff -- <path>\n\n\
              Recovering from a failed `git pull --rebase`?\n\
-             Run `dcg rebase-recover` in this repo, then retry the command. This issues a \
-             short-lived, single-shot permit that unblocks this rule only. A rebase already \
+             Run `dcg rebase-recover` in this repo, then retry the command on its own line \
+             (a leading `cd <repo> &&` is fine; nothing else may share the line). This \
+             issues a short-lived, single-shot permit that unblocks this rule only. A rebase already \
              in progress (`.git/rebase-merge/` or `.git/rebase-apply/` present) auto-allows \
              the same rule without a permit.",
             &const {
@@ -5010,8 +5019,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - git diff <path>: Review what would be lost\n\n\
              Preview changes first:\n  git diff <path>\n\n\
              Recovering from a failed `git pull --rebase`?\n\
-             Run `dcg rebase-recover` in this repo, then retry the command. This issues a \
-             short-lived, single-shot permit that unblocks this rule only. A rebase already \
+             Run `dcg rebase-recover` in this repo, then retry the command on its own line \
+             (a leading `cd <repo> &&` is fine; nothing else may share the line). This \
+             issues a short-lived, single-shot permit that unblocks this rule only. A rebase already \
              in progress (`.git/rebase-merge/` or `.git/rebase-apply/` present) auto-allows \
              the same rule without a permit.",
             &const {
@@ -5098,9 +5108,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                         "git reset --mixed HEAD~1",
                         "Undo commit, unstage changes, but keep working directory",
                     ),
-                    PatternSuggestion::new(
+                    PatternSuggestion::gated(
                         "git checkout -- {file}",
-                        "Reset a specific file only, preserving other changes",
+                        "Discards changes in one file only — still destructive, so dcg gates it too",
                     ),
                 ]
             }
@@ -5371,9 +5381,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                git fsck --unreachable | grep commit",
             &const {
                 [
-                    PatternSuggestion::new(
+                    PatternSuggestion::gated(
                         "git stash drop stash@{n}",
-                        "Remove one specific stash at a time",
+                        "Drops one stash at a time instead of all — still deletes stashed work, so dcg gates it too",
                     ),
                     PatternSuggestion::new("git stash list", "Review all stashes before clearing"),
                     PatternSuggestion::new(

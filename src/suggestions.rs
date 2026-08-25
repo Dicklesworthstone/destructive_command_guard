@@ -357,19 +357,21 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
         "core.git:branch-dynamic-token",
         vec![
             Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Resolve the dynamic value first, then pass the literal branch name — quoting \
+                 keeps a *creation* safe, but a command that keeps a deletion/force flag like \
+                 -D stays gated on its own merits",
+            ),
+            Suggestion::new(
                 SuggestionKind::SaferAlternative,
-                "Quote the branch name so the expansion stays a single non-flag word",
+                "For a creation: quote the branch name so the expansion stays a single non-flag word",
             )
             .with_command("git branch \"backup-$(date +%s)\""),
             Suggestion::new(
                 SuggestionKind::SaferAlternative,
-                "Add `--` to end option parsing so expanded output cannot become a flag",
+                "For a creation: add `--` to end option parsing so expanded output cannot become a flag",
             )
             .with_command("git branch -- <name>"),
-            Suggestion::new(
-                SuggestionKind::WorkflowFix,
-                "Resolve the dynamic value first, then pass the literal branch name",
-            ),
         ],
     );
 
@@ -597,15 +599,49 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         "core.filesystem:rsync-sensitive-then-delete",
         rm_rf_suggestions.clone(),
     );
-    // redirect-truncate-root-home: shell-syntax truncate-equivalent.
-    // Reuse rm_rf suggestion set (single-file destruction shape).
+    // redirect-truncate-*: shell-syntax truncate-equivalent. These need
+    // redirect-specific guidance — the rm_rf set (`ls -la` / `rm -ri` /
+    // move-to-trash) is about recursive deletion and reads as a non sequitur
+    // on a redirect denial (issues #316/#317).
+    let redirect_truncate_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "Resolve and inspect the redirect target path before truncating it",
+        ),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Use append (`>>`) when preserving existing content is acceptable",
+        ),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Redirect to a literal temp path instead of an expanded one",
+        )
+        .with_command("cmd > /tmp/scratch/out.log 2>&1"),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Back up the target first if its current content matters: `cp target target.bak`",
+        ),
+    ];
     m.insert(
         "core.filesystem:redirect-truncate-root-home",
-        rm_rf_suggestions.clone(),
+        redirect_truncate_suggestions.clone(),
     );
     m.insert(
         "core.filesystem:redirect-truncate-dynamic-path",
-        rm_rf_suggestions,
+        redirect_truncate_suggestions,
+    );
+    m.insert(
+        "core.filesystem:fork-bomb",
+        vec![
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "There is no safe variant of a fork bomb; do not run it",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "To test process limits, use `ulimit -u` inside a disposable VM or container",
+            ),
+        ],
     );
 }
 

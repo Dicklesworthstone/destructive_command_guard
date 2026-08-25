@@ -19,7 +19,6 @@
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-. (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
 
 $script:failures = 0
 function Check([bool]$cond, [string]$msg) {
@@ -42,6 +41,29 @@ function New-PositDir([string]$homeDir) {
 
 $dcgPath = 'C:\Users\me\.local\bin\dcg.exe'
 $expectedCommand = '"' + $dcgPath + '"'
+
+$ompSelectorNames = @('OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'PI_CODING_AGENT_DIR')
+$savedOmpSelectors = @{}
+foreach ($name in $ompSelectorNames) {
+    $savedOmpSelectors[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    # Detect-Agents is exercised below, so make its OMP isolation assertion
+    # non-vacuous even when the host starts with no OMP variables configured.
+    Microsoft.PowerShell.Management\Set-Item -LiteralPath "Env:$name" -Value "dcg-test-ambient-$name"
+}
+foreach ($name in $ompSelectorNames) {
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+}
+
+try {
+    $unclearedOmpSelectors = @($ompSelectorNames | Where-Object {
+        Test-Path -LiteralPath "Env:$_"
+    })
+    if ($unclearedOmpSelectors.Count -ne 0) {
+        throw "OMP test selector fence failed: $($unclearedOmpSelectors -join ', ')"
+    }
+    Check $true "OMP path/profile selectors are scrubbed before loading installer functions"
+
+    . (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
 
 # --- Test 1: create + idempotent + no BOM + wire shape ---
 Write-Host "Test 1: create / idempotent / no-BOM / wire shape"
@@ -191,7 +213,17 @@ try {
     $agents = Detect-Agents -HomeDir $h8
     Check ([bool]$agents['Posit']) "Detect-Agents flags Posit when ~/.posit/assistant exists"
     Check ((Get-DetectedAgentNames $agents) -contains 'Posit') "Get-DetectedAgentNames includes Posit"
+    Check (-not [bool]$agents['Omp']) "ambient OMP selectors cannot inject Omp into the Posit fixture"
 } finally { $env:PATH = $savedPath; Remove-Item -Recurse -Force $h8 -ErrorAction SilentlyContinue }
+} finally {
+    foreach ($name in $ompSelectorNames) {
+        if ($null -eq $savedOmpSelectors[$name]) {
+            Microsoft.PowerShell.Management\Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            Microsoft.PowerShell.Management\Set-Item -LiteralPath "Env:$name" -Value $savedOmpSelectors[$name]
+        }
+    }
+}
 
 if ($script:failures -gt 0) {
     Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red

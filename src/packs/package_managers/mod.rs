@@ -10,24 +10,78 @@ use crate::normalize::{NormalizeTokenKind, ShellDialect, ShellTokenDecoder, Shel
 use crate::packs::{DestructivePattern, Pack, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
 
-/// Whether a shell segment invokes pnpm's `publish` subcommand.
-///
-/// pnpm accepts both boolean and value-taking global options before its
-/// subcommand, so a regex cannot find the boundary without either missing
-/// valid forms (`--silent publish`) or maintaining a version-fragile option
-/// inventory. Instead, parse shell words and treat option-adjacent positional
-/// words as possible option values. A bare `publish` is the subcommand only
-/// when no earlier unambiguous positional word already established another
-/// command such as `run`; quoted `publish` remains argument data.
-#[must_use]
-pub(crate) fn invokes_pnpm_publish(command: &str) -> bool {
-    crate::packs::split_command_segments(command)
-        .into_iter()
-        .any(segment_invokes_pnpm_publish)
+/// Which package manager a `*-publish` rule guards, with the positional
+/// subcommand-prefix keywords that tool accepts before `publish`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublishExe {
+    Npm,
+    Yarn,
+    Pnpm,
 }
 
-fn segment_invokes_pnpm_publish(segment: &str) -> bool {
+impl PublishExe {
+    /// Map a destructive-rule name to the executable it guards.
+    pub(crate) fn from_rule(name: Option<&str>) -> Option<Self> {
+        match name {
+            Some("npm-publish") => Some(Self::Npm),
+            Some("yarn-publish") => Some(Self::Yarn),
+            Some("pnpm-publish") => Some(Self::Pnpm),
+            _ => None,
+        }
+    }
+
+    fn matches_executable(self, word: &str) -> bool {
+        let base = std::path::Path::new(word)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(word);
+        let stem = base
+            .strip_suffix(".cmd")
+            .or_else(|| base.strip_suffix(".exe"))
+            .or_else(|| base.strip_suffix(".com"))
+            .unwrap_or(base);
+        let name = match self {
+            Self::Npm => "npm",
+            Self::Yarn => "yarn",
+            Self::Pnpm => "pnpm",
+        };
+        stem.eq_ignore_ascii_case(name)
+    }
+
+    /// A positional word that stands between the executable and `publish`
+    /// without establishing a different subcommand (yarn's `workspace <name>`
+    /// and Berry's `npm` prefix; pnpm's spelled-out `recursive`).
+    fn is_transparent_prefix(self, word: &str) -> bool {
+        match self {
+            Self::Npm => false,
+            Self::Yarn => word == "workspace" || word == "npm",
+            Self::Pnpm => word == "recursive",
+        }
+    }
+
+    fn prefix_consumes_next_word(self, word: &str) -> bool {
+        matches!(self, Self::Yarn) && word == "workspace"
+    }
+}
+
+/// Whether `command` genuinely invokes the given package manager's `publish`
+/// subcommand. This inspects the ORIGINAL (unsanitized) command so quoting is
+/// intact: an unquoted `publish` in subcommand position is publication, while
+/// a quoted `publish` — or one sitting in option-value position — is argument
+/// data. The pack regexes run on the sanitized view, which has already lost
+/// the quotes that distinguish `pnpm --reporter "publish"` (a reporter value)
+/// from `pnpm --reporter publish`, so this gate is what keeps the former
+/// allowed while the latter fails closed (issue #306).
+#[must_use]
+pub(crate) fn invokes_publish_subcommand(command: &str, exe: PublishExe) -> bool {
+    crate::packs::split_command_segments(command)
+        .into_iter()
+        .any(|segment| segment_invokes_publish(segment, exe))
+}
+
+fn segment_invokes_publish(segment: &str, exe: PublishExe) -> bool {
     let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+    // (decoded value, was_unquoted) for each word token, in order.
     let words: Vec<(String, bool)> =
         crate::normalize::tokenize_for_shell_dialect(segment, ShellDialect::Posix)
             .iter()
@@ -39,37 +93,50 @@ fn segment_invokes_pnpm_publish(segment: &str) -> bool {
                 Some((decoded.into_owned(), was_unquoted))
             })
             .collect();
-    let Some(pnpm_index) = words.iter().position(|(word, _)| is_pnpm_executable(word)) else {
+
+    let Some(exe_index) = words
+        .iter()
+        .position(|(word, _)| exe.matches_executable(word))
+    else {
         return false;
     };
 
     let mut preceding_positional = false;
-    for index in pnpm_index + 1..words.len() {
+    let mut skip_next = false;
+    for index in exe_index + 1..words.len() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
         let (word, was_unquoted) = &words[index];
-        if word == "publish" && *was_unquoted {
+        // A bare word that does not immediately follow an option establishes a
+        // subcommand; a word after an option might be that option's value.
+        let follows_option = index > exe_index + 1 && words[index - 1].0.starts_with('-');
+        if word == "publish" {
+            // Quoting demotes `publish` to data ONLY in option-value position
+            // (`--reporter "publish"`): keep scanning for a real subcommand.
+            // In subcommand position, `publish` is the subcommand regardless
+            // of quoting — `pnpm 'publish'` still publishes — and an unquoted
+            // `publish` after an option stays fail-closed.
+            if follows_option && !was_unquoted {
+                continue;
+            }
             return !preceding_positional;
         }
         if word.starts_with('-') {
             continue;
         }
-        let follows_option = index > pnpm_index + 1 && words[index - 1].0.starts_with('-');
+        if exe.is_transparent_prefix(word) {
+            if exe.prefix_consumes_next_word(word) {
+                skip_next = true;
+            }
+            continue;
+        }
         if !follows_option {
             preceding_positional = true;
         }
     }
     false
-}
-
-fn is_pnpm_executable(word: &str) -> bool {
-    std::path::Path::new(word)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            name.eq_ignore_ascii_case("pnpm")
-                || ["pnpm.cmd", "pnpm.exe", "pnpm.com"]
-                    .iter()
-                    .any(|candidate| name.eq_ignore_ascii_case(candidate))
-        })
 }
 
 /// Create the Package Managers pack.
@@ -155,35 +222,63 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         // dry-run flags. Treat only bare `--dry-run` or explicit true
         // as previews; false-valued flags must not mask publish rules.
-        safe_pattern!("npm-dry-run", r"\bnpm\b.*--dry-run(?:=true)?(?:\s|$)"),
-        safe_pattern!("yarn-dry-run", r"\byarn\b.*--dry-run(?:=true)?(?:\s|$)"),
+        // Segment-bounded ([^;|&\n]*) so a dry-run in one shell segment
+        // cannot mask a real command in a later segment (issue #306).
+        safe_pattern!(
+            "npm-dry-run",
+            r"\bnpm\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"
+        ),
+        safe_pattern!(
+            "yarn-dry-run",
+            r"\byarn\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"
+        ),
         safe_pattern!(
             "pnpm-dry-run",
-            r"\bpnpm\b[^|;&]*--dry-run(?:=true)?(?:\s|$)"
+            r"\bpnpm\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"
         ),
-        safe_pattern!("cargo-dry-run", r"\bcargo\b.*--dry-run(?:=true)?(?:\s|$)"),
-        safe_pattern!("poetry-dry-run", r"\bpoetry\b.*--dry-run(?:=true)?(?:\s|$)"),
+        safe_pattern!(
+            "cargo-dry-run",
+            r"\bcargo\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"
+        ),
+        safe_pattern!(
+            "poetry-dry-run",
+            r"\bpoetry\b[^;|&\n]*--dry-run(?:=true)?(?:\s|$)"
+        ),
     ]
 }
 
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
-        // npm/yarn/pnpm publish
+        // npm/yarn/pnpm publish.
+        //
+        // `publish` must be in SUBCOMMAND position: only option tokens (and
+        // each option's possible value word) may sit between the executable
+        // and `publish`. An earlier bare positional word (`run`, `exec`, …)
+        // establishes a different subcommand, so a later `publish` is
+        // argument data, and an unbounded `.*?` gap would also cross shell
+        // segment boundaries (`pnpm run build; bun ./publish-snapshot.ts`) —
+        // both were false positives in issue #306. An option value may not
+        // itself be a bare `publish` (fail-closed: `pnpm --reporter publish`
+        // still denies; the clearly-data quoted form `--reporter "publish"`
+        // does not). The trailing lookahead keeps `--dry-run` previews
+        // allowed within the same segment only.
         destructive_pattern!(
             "npm-publish",
-            r"\bnpm\b.*?\bpublish\b(?!.*--dry-run(?:=true)?(?:\s|$))",
+            r"\bnpm(?:\.(?:cmd|exe|com))?\b(?:\s+--?[^\s;|&]+(?:\s+(?!publish(?:[\s;|&]|$))[^-\s;|&][^\s;|&]*)?)*\s+publish(?=[\s;|&]|$)(?![^;|&\n]*--dry-run(?:=true)?(?:\s|$))",
             "npm publish releases a package publicly. Use --dry-run first."
         ),
+        // yarn also reaches publish through the positional `workspace <name>`
+        // and Berry's `npm` prefix, so those two shapes stay denied.
         destructive_pattern!(
             "yarn-publish",
-            r"\byarn\b.*?\bpublish\b(?!.*--dry-run(?:=true)?(?:\s|$))",
+            r"\byarn(?:\.(?:cmd|exe|com))?\b(?:\s+(?:--?[^\s;|&]+(?:\s+(?!publish(?:[\s;|&]|$))[^-\s;|&][^\s;|&]*)?|workspace\s+[^\s;|&]+|npm\b))*\s+publish(?=[\s;|&]|$)(?![^;|&\n]*--dry-run(?:=true)?(?:\s|$))",
             "yarn publish releases a package publicly. Verify package.json first."
         ),
+        // pnpm's positional `recursive` prefix is `-r` spelled out.
         destructive_pattern!(
             "pnpm-publish",
-            r"\bpnpm\b[^|;&]*?\bpublish(?=\s|$)(?![^|;&]*--dry-run(?:=true)?(?:\s|$))",
-            "pnpm publish releases a package publicly.",
-            executables = ["pnpm"]
+            r"\bpnpm(?:\.(?:cmd|exe|com))?\b(?:\s+(?:--?[^\s;|&]+(?:\s+(?!publish(?:[\s;|&]|$))[^-\s;|&][^\s;|&]*)?|recursive\b))*\s+publish(?=[\s;|&]|$)(?![^;|&\n]*--dry-run(?:=true)?(?:\s|$))",
+            "pnpm publish releases a package publicly."
         ),
         // npm unpublish. The `(?=\s|$)` trailing anchor ensures the
         // subcommand token ends at whitespace or end-of-string — otherwise
@@ -290,6 +385,122 @@ mod tests {
         assert_allows, assert_blocks, assert_blocks_with_pattern, assert_no_safe_match,
         assert_safe_pattern_matches,
     };
+
+    /// Issue #306: the quoting-aware gate distinguishes a `publish` option
+    /// value (quoted, or in value position) from the `publish` subcommand,
+    /// inspecting the ORIGINAL command where quoting survives.
+    #[test]
+    fn invokes_publish_subcommand_gate_issue_306() {
+        use PublishExe::{Npm, Pnpm, Yarn};
+        // (command, exe, expected-invokes-publish)
+        let cases: &[(&str, PublishExe, bool)] = &[
+            ("pnpm publish", Pnpm, true),
+            ("pnpm -r publish", Pnpm, true),
+            ("pnpm recursive publish", Pnpm, true),
+            ("pnpm --filter workspace publish", Pnpm, true),
+            ("pnpm --silent publish", Pnpm, true),
+            ("pnpm --reporter append-only publish", Pnpm, true),
+            ("pnpm --reporter publish", Pnpm, true), // unquoted value → fail closed
+            ("cd pkg && pnpm publish", Pnpm, true),
+            ("pnpm.cmd publish", Pnpm, true),
+            // Quoting the subcommand does NOT demote it: `pnpm 'publish'` still
+            // publishes and must be caught (regression guard).
+            ("pnpm 'publish'", Pnpm, true),
+            ("pnpm \"publish\"", Pnpm, true),
+            // Quoted publish is a value only in OPTION-VALUE position.
+            ("pnpm --reporter \"publish\"", Pnpm, false),
+            ("pnpm --reporter 'publish'", Pnpm, false),
+            ("pnpm run build --reporter \"publish\"", Pnpm, false),
+            ("pnpm --reporter \"publish\" run build", Pnpm, false),
+            // A prior positional established a different subcommand.
+            ("pnpm run build publish", Pnpm, false),
+            ("pnpm run publish", Pnpm, false),
+            ("pnpm install publish", Pnpm, false),
+            // No pnpm executable at all (a pnpm inside quoted data).
+            ("grep \"pnpm publish\" notes.md", Pnpm, false),
+            ("pnpm run build; bun ./publish-snapshot.ts", Pnpm, false),
+            // npm / yarn
+            ("npm publish", Npm, true),
+            ("npm --registry https://r.example publish", Npm, true),
+            ("npm run build && node ./publish.js", Npm, false),
+            ("yarn publish", Yarn, true),
+            ("yarn workspace pkg-a publish", Yarn, true),
+            ("yarn npm publish", Yarn, true),
+            ("yarn run build publish", Yarn, false),
+        ];
+        for &(command, exe, expected) in cases {
+            assert_eq!(
+                invokes_publish_subcommand(command, exe),
+                expected,
+                "invokes_publish_subcommand({command:?}, {exe:?})"
+            );
+        }
+    }
+
+    /// Issue #306: `publish` is only pnpm's subcommand when it sits in
+    /// subcommand position; argument data and later shell segments are not
+    /// publication.
+    #[test]
+    fn publish_is_a_subcommand_not_argument_data_issue_306() {
+        let pack = create_pack();
+
+        // Argument data / different segment: allowed.
+        for command in [
+            "pnpm run build; bun ./publish-snapshot.ts",
+            "pnpm run build --reporter \"publish\"",
+            "pnpm --reporter \"publish\"",
+            "pnpm run build publish",
+            "npm run build && node ./publish.js",
+            "yarn run build publish",
+            "pnpm --silent publish-tool",
+        ] {
+            assert_allows(&pack, command);
+        }
+
+        // Real publication forms: still denied.
+        for (command, rule) in [
+            ("pnpm publish", "pnpm-publish"),
+            ("pnpm -r publish", "pnpm-publish"),
+            ("pnpm recursive publish", "pnpm-publish"),
+            ("pnpm --filter workspace publish", "pnpm-publish"),
+            ("pnpm --silent publish", "pnpm-publish"),
+            ("pnpm --reporter append-only publish", "pnpm-publish"),
+            // Unquoted option value named `publish` stays fail-closed.
+            ("pnpm --reporter publish", "pnpm-publish"),
+            ("pnpm.cmd --silent publish", "pnpm-publish"),
+            ("npm publish", "npm-publish"),
+            ("npm --registry https://r.example publish", "npm-publish"),
+            ("yarn publish", "yarn-publish"),
+            ("yarn workspace pkg-a publish", "yarn-publish"),
+            // (`yarn npm publish` also denies, attributed to npm-publish
+            // because that rule is listed first — asserted separately below.)
+            ("cd pkg && pnpm publish", "pnpm-publish"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+
+        // Berry's `yarn npm publish` must deny; attribution may land on
+        // either publish rule.
+        assert_blocks(&pack, "yarn npm publish", "publish");
+    }
+
+    /// Issue #306: a `--dry-run` belonging to a DIFFERENT tool in a later
+    /// segment must not connect back to `pnpm` across the separator and mask
+    /// a real publish. (A dry-run on a pnpm invocation in a later segment
+    /// still safe-matches that invocation — command-level masking is the
+    /// evaluator's segment-scoping concern, not this regex's.)
+    #[test]
+    fn dry_run_is_segment_bounded_issue_306() {
+        let pack = create_pack();
+        assert_no_safe_match(&pack, "pnpm publish; rsync -a --dry-run src/ dst/");
+        assert_blocks_with_pattern(
+            &pack,
+            "pnpm publish; rsync -a --dry-run src/ dst/",
+            "pnpm-publish",
+        );
+        // Same-segment dry-run remains a preview.
+        assert_safe_pattern_matches(&pack, "pnpm publish --dry-run");
+    }
 
     #[test]
     fn package_manager_patterns_match_with_global_flags() {

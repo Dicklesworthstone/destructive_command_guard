@@ -82,6 +82,14 @@ impl RecoveryReason {
     }
 }
 
+/// Whether `pack_id:pattern_name` is one of the rules rebase recovery may
+/// unlock. Only `core.git` patterns participate.
+#[must_use]
+pub fn is_recovery_rule(pack_id: Option<&str>, pattern_name: Option<&str>) -> bool {
+    pack_id == Some("core.git")
+        && pattern_name.is_some_and(|name| RECOVERY_PATTERNS.contains(&name))
+}
+
 /// Check whether a recovery unblock should fire for this pack/pattern in this cwd.
 ///
 /// Returns `Some(RecoveryReason)` if the given `pack_id`/`pattern_name` is
@@ -93,12 +101,7 @@ pub fn should_allow_recovery(
     pack_id: Option<&str>,
     pattern_name: Option<&str>,
 ) -> Option<RecoveryReason> {
-    // Only `core.git` patterns participate.
-    if pack_id != Some("core.git") {
-        return None;
-    }
-    let name = pattern_name?;
-    if !RECOVERY_PATTERNS.contains(&name) {
+    if !is_recovery_rule(pack_id, pattern_name) {
         return None;
     }
 
@@ -113,6 +116,599 @@ pub fn should_allow_recovery(
     }
 
     None
+}
+
+/// Resolve the directory a guarded `git` command will actually run in, so the
+/// rebase-state probe and the permit lookup target the right repository
+/// (issue #331).
+///
+/// The hook evaluates the command *before* it runs, from a process whose cwd is
+/// the harness's current directory. Agents routinely phrase recovery as one
+/// line — `cd <worktree> && git restore --ours -- f` — so the repository that
+/// matters is the one the command's own `cd` reaches, not the hook's cwd.
+/// Probing the hook cwd instead denied the documented recovery path exactly
+/// when it was being followed, and left a freshly minted permit unconsumed.
+///
+/// Resolution walks the top-level segments that precede `match_start` (the
+/// byte offset of the matched rule text inside `command`) and applies every
+/// `cd` / `pushd` whose target is a static literal, then a `git -C <literal>`
+/// on the matched segment. It deliberately gives up — returning `None`, which
+/// keeps the original deny — whenever the target cannot be known without
+/// running the shell: expansions (`$DIR`, `$(...)`, backticks), globs,
+/// `~user`, `cd -`, `popd`, any subshell or group (`(`, `{`) anywhere on the
+/// line, unbalanced quotes, or a directory that does not exist. A directory
+/// change or `git -C` *after* the matched segment also resolves to `None`:
+/// the whole line runs once it is allowed, and a second guarded call could
+/// otherwise land in a repository this resolution never probed. When the
+/// match offset is unknown the matched segment is taken to be the single
+/// top-level `git` segment; with two or more, or none, a command containing a
+/// directory change resolves to `None`, so a change dcg cannot attribute can
+/// never unlock recovery against the wrong repository.
+///
+/// This answers *where* the probe runs. Whether the rest of the line is
+/// safe is a separate question — see [`relaxed_allowlist`].
+///
+/// Only POSIX-style shells are modelled; PowerShell and cmd resolve to `base`
+/// unchanged (today's behavior). A command with no directory change at all
+/// also resolves to `base` unchanged, so existing callers see identical paths.
+#[must_use]
+pub fn resolve_recovery_cwd(
+    base: &Path,
+    command: &str,
+    match_start: Option<usize>,
+    dialect: crate::normalize::ShellDialect,
+) -> Option<PathBuf> {
+    resolve_recovery_cwd_with_home(
+        base,
+        command,
+        match_start,
+        dialect,
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+    )
+}
+
+/// [`resolve_recovery_cwd`] with an explicit `HOME` (tests must not mutate the
+/// process environment).
+fn resolve_recovery_cwd_with_home(
+    base: &Path,
+    command: &str,
+    match_start: Option<usize>,
+    dialect: crate::normalize::ShellDialect,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    use crate::normalize::ShellDialect;
+
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return Some(base.to_path_buf());
+    }
+
+    let segments = top_level_segment_ranges(command)?;
+    if segments.is_empty() {
+        return Some(base.to_path_buf());
+    }
+
+    // Subshells and groups anywhere on the line are not modelled: a `cd`
+    // inside `( … )` does not reach the outer shell, a match inside `( … )`
+    // may run in a directory the walk below would not see, and a group after
+    // the match can move a second guarded call elsewhere.
+    if has_unquoted_grouping(command) {
+        return None;
+    }
+
+    // A background `&` or a pipe `|` runs the segment on one side in a
+    // subshell, so a `cd` there never reaches the shell that runs the guarded
+    // git command. The segment walk below assumes every separator preserves
+    // the working directory (true for `&&`, `||`, `;`, newline), so fail
+    // closed when a subshell separator is present rather than resolve to a
+    // directory the git call does not actually run in.
+    if command_has_subshell_separator(command) {
+        return None;
+    }
+
+    // Classify every top-level segment once. An unparseable segment or one
+    // whose executable is only known at run time (`$DO_CD repo`) could be a
+    // directory change dcg cannot see, so resolution fails closed on it.
+    let mut leading: Vec<Option<(String, Vec<ShellWord>)>> = Vec::with_capacity(segments.len());
+    for &(start, end) in &segments {
+        let words = shell_words(&command[start..end])?;
+        // `GIT_DIR=…` / `GIT_WORK_TREE=…` re-point git at another repository
+        // exactly like the `--git-dir` / `--work-tree` options do (which the
+        // matched-segment walk fails closed on). A leading assignment is
+        // otherwise skipped as inert, so catch these here on any segment.
+        if words
+            .iter()
+            .take_while(|word| is_assignment_word(&word.text))
+            .any(|word| is_git_repo_redirecting_assignment(&word.text))
+        {
+            return None;
+        }
+        match leading_word(&words) {
+            Leading::Dynamic => return None,
+            Leading::Empty => leading.push(None),
+            Leading::Executable(index) => {
+                let name = words[index].text.clone();
+                let rest = words.into_iter().skip(index + 1).collect();
+                leading.push(Some((name, rest)));
+            }
+        }
+    }
+
+    // Locate the segment that owns the matched rule text.
+    let matched_index = match match_start {
+        // A match that sits between segments (e.g. on a separator) cannot be
+        // attributed.
+        Some(offset) => segments
+            .iter()
+            .position(|&(start, end)| offset >= start && offset < end),
+        None => {
+            let git_segments: Vec<usize> = leading
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.as_ref().is_some_and(|(name, _)| name == "git"))
+                .map(|(index, _)| index)
+                .collect();
+            match git_segments.as_slice() {
+                [only] => Some(*only),
+                _ => None,
+            }
+        }
+    };
+
+    // The match must land on a segment whose executable is `git`. A span
+    // offset is computed against the normalized command and mapped back with
+    // a constant shift, so a mis-mapped offset could otherwise land on a
+    // `cd` segment and have the walk below apply only the moves before it.
+    // Anything else (an inline shell payload, a separator byte) is
+    // unattributable: with no attributed segment, no directory change at all
+    // can be placed before or after the guarded call.
+    let matched_index = matched_index.filter(|&index| {
+        leading[index]
+            .as_ref()
+            .is_some_and(|(name, _)| name == "git")
+    });
+
+    // The whole line runs once the command is allowed, and the re-evaluation
+    // that follows grants the recovery rules wherever they appear — including
+    // inside a nested shell, whose own `cd` this walk cannot see. So every
+    // other segment may only be a static `cd`/`pushd` ahead of the match, a
+    // plain `git` call (no `-C`), or an inert builtin. Anything that can run
+    // further commands (`bash -c '…'`, `xargs`, `eval`, `source`, a script)
+    // or move the shell after the match could put a second guarded call in a
+    // repository this resolution never probed, so the window stays closed for
+    // the whole line; the documented flow is one command.
+    let mut cwd = base.to_path_buf();
+    let mut changed = false;
+
+    for (index, entry) in leading.iter().enumerate() {
+        if Some(index) == matched_index {
+            continue;
+        }
+        let Some((name, rest)) = entry else {
+            continue;
+        };
+        match name.as_str() {
+            "cd" | "pushd" if matched_index.is_some_and(|matched| index < matched) => {
+                let target = directory_change_target(name, rest, home)?;
+                cwd = join_directory(&cwd, &target);
+                changed = true;
+            }
+            "git"
+                if rest
+                    .iter()
+                    .all(|word| !git_option_moves_repository(&word.text)) => {}
+            "echo" | "printf" | "true" | "false" | ":" | "exit" | "pwd" | "test" | "[" => {}
+            _ => return None,
+        }
+    }
+
+    // `git -C <path>` on the matched segment moves the repository the same
+    // way. Walk git's global options up to the subcommand: `-C` may sit
+    // after other options (`git --no-pager -C other restore`), so stopping
+    // at the first non-`-C` word would probe the wrong repository.
+    if let Some((name, rest)) = matched_index.and_then(|index| leading[index].as_ref())
+        && name == "git"
+    {
+        let mut args = rest.iter();
+        while let Some(word) = args.next() {
+            if word.dynamic {
+                return None;
+            }
+            match word.text.as_str() {
+                "-C" => {
+                    let path = args.next()?;
+                    if path.dynamic || path.text.is_empty() {
+                        return None;
+                    }
+                    cwd = join_directory(&cwd, Path::new(&path.text));
+                    changed = true;
+                }
+                // `-c key=value` takes a separate value; never a path.
+                "-c" => {
+                    args.next()?;
+                }
+                // `--git-dir` / `--work-tree` / `--namespace` re-point git
+                // without moving the shell; not modelled, fail closed.
+                text if git_option_moves_repository(text) => return None,
+                text if text.starts_with('-') => {}
+                // The subcommand: global options end here.
+                _ => break,
+            }
+        }
+    }
+
+    if !changed {
+        return Some(base.to_path_buf());
+    }
+
+    // A target that does not exist has nothing to recover; canonicalizing
+    // also collapses `..` segments the way the shell's `cd -P` would.
+    fs::canonicalize(&cwd).ok().filter(|path| path.is_dir())
+}
+
+/// Whether `command` contains an unquoted subshell-creating separator: a
+/// background `&` or a pipe `|`/`|&`. `&&`, `||`, `;`, newline, and the `&` of
+/// a redirection (`2>&1`, `<&0`, `&>file`) preserve the shell's working
+/// directory and are not flagged.
+fn command_has_subshell_separator(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'\\' && !in_single {
+            i += 2;
+            continue;
+        }
+        match byte {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'|' if !in_single && !in_double => {
+                // `||` preserves cwd; a lone `|` (or `|&`) is a pipe.
+                if bytes.get(i + 1) == Some(&b'|') {
+                    i += 2;
+                    continue;
+                }
+                return true;
+            }
+            b'&' if !in_single && !in_double => {
+                // `&&` preserves cwd; `&>` is a redirection; a `&` right after
+                // a redirect byte is a file-descriptor duplication (`2>&1`,
+                // `<&0`). Anything else is backgrounding.
+                if bytes.get(i + 1) == Some(&b'&') {
+                    i += 2;
+                    continue;
+                }
+                let next_is_redirect = bytes.get(i + 1) == Some(&b'>');
+                let prev_is_redirect = i
+                    .checked_sub(1)
+                    .is_some_and(|p| matches!(bytes[p], b'>' | b'<'));
+                if next_is_redirect || prev_is_redirect {
+                    i += 1;
+                    continue;
+                }
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether a leading `NAME=value` word re-points git at another repository or
+/// worktree. These are the environment equivalents of `--git-dir` /
+/// `--work-tree` and must fail closed exactly like those options do.
+fn is_git_repo_redirecting_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    matches!(
+        name,
+        "GIT_DIR"
+            | "GIT_WORK_TREE"
+            | "GIT_COMMON_DIR"
+            | "GIT_OBJECT_DIRECTORY"
+            | "GIT_NAMESPACE"
+            | "GIT_INDEX_FILE"
+    )
+}
+
+/// Whether a `git` global option changes which repository or worktree the
+/// invocation operates on. `-C` is followed by the resolver on the matched
+/// segment; everything else here is unmodelled and fails closed.
+fn git_option_moves_repository(option: &str) -> bool {
+    option == "-C"
+        || option.starts_with("--git-dir")
+        || option.starts_with("--work-tree")
+        || option.starts_with("--namespace")
+}
+
+/// The allowlist to re-evaluate a command under once a recovery signal has
+/// been confirmed for it.
+///
+/// A recovery signal unlocks only the [`RECOVERY_PATTERNS`] — nothing about
+/// an in-progress rebase makes `git reset --hard` or a `git restore` in a
+/// second repository safe. The hook therefore re-runs the full evaluation
+/// with exactly those rules granted and lets every other finding on the line
+/// keep its own verdict: `git restore -- f; git reset --hard` is still denied
+/// by `reset-hard`, and the permit is left unconsumed because the command did
+/// not run.
+#[must_use]
+pub fn relaxed_allowlist(
+    base: &crate::allowlist::LayeredAllowlist,
+) -> crate::allowlist::LayeredAllowlist {
+    let rules: Vec<(&str, &str)> = RECOVERY_PATTERNS
+        .iter()
+        .map(|pattern| ("core.git", *pattern))
+        .collect();
+    base.with_rule_grants(&rules, "rebase-recovery re-evaluation", "rebase-recovery")
+}
+
+/// One shell word with the information the cwd walk needs: its unquoted text
+/// and whether any part of it is only known at run time.
+struct ShellWord {
+    text: String,
+    dynamic: bool,
+}
+
+/// Split one command segment into words, honoring single quotes, double
+/// quotes, and backslash escapes. Returns `None` on an unterminated quote.
+///
+/// `dynamic` marks words containing an unquoted or double-quoted expansion
+/// (`$`, backtick), an unquoted glob metacharacter, or a `~user` tilde — all
+/// of which the shell rewrites before `cd` ever sees the argument.
+fn shell_words(segment: &str) -> Option<Vec<ShellWord>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut dynamic = false;
+    let mut chars = segment.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(inner) => current.push(inner),
+                        None => return None,
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some(escaped @ ('"' | '\\' | '$' | '`')) => current.push(escaped),
+                            Some(other) => {
+                                current.push('\\');
+                                current.push(other);
+                            }
+                            None => return None,
+                        },
+                        Some(inner @ ('$' | '`')) => {
+                            dynamic = true;
+                            current.push(inner);
+                        }
+                        Some(inner) => current.push(inner),
+                        None => return None,
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                current.push(chars.next()?);
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(ShellWord {
+                        text: std::mem::take(&mut current),
+                        dynamic,
+                    });
+                    in_word = false;
+                    dynamic = false;
+                }
+            }
+            '$' | '`' | '*' | '?' | '[' => {
+                in_word = true;
+                dynamic = true;
+                current.push(ch);
+            }
+            '~' => {
+                // `~` and `~/…` are resolvable; `~user` is not modelled.
+                if !in_word && !matches!(chars.peek(), None | Some('/')) {
+                    dynamic = true;
+                }
+                in_word = true;
+                current.push(ch);
+            }
+            _ => {
+                in_word = true;
+                current.push(ch);
+            }
+        }
+    }
+    if in_word {
+        words.push(ShellWord {
+            text: current,
+            dynamic,
+        });
+    }
+    Some(words)
+}
+
+/// What a segment starts with, once `VAR=value` assignments and the bare
+/// transparent wrappers (`command`, `builtin`, `exec`, `sudo`, `env`, `nice`,
+/// `nohup`, `time`) are skipped. A wrapper option (`sudo -u bob git …`) is not
+/// modelled and reads as an unknown executable, which fails closed.
+enum Leading {
+    /// Nothing executable (assignments only, or an empty segment).
+    Empty,
+    /// The executable word is an expansion (`$cmd …`) — unknowable.
+    Dynamic,
+    /// The executable is the literal word at this index.
+    Executable(usize),
+}
+
+fn leading_word(words: &[ShellWord]) -> Leading {
+    let mut index = 0;
+    while let Some(word) = words.get(index) {
+        if is_assignment_word(&word.text) {
+            index += 1;
+            continue;
+        }
+        if word.dynamic {
+            return Leading::Dynamic;
+        }
+        if matches!(
+            word.text.as_str(),
+            "command" | "builtin" | "exec" | "sudo" | "env" | "nice" | "nohup" | "time"
+        ) {
+            index += 1;
+            continue;
+        }
+        return Leading::Executable(index);
+    }
+    Leading::Empty
+}
+
+fn is_assignment_word(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
+}
+
+/// The literal target of a `cd` / `pushd` argument list, or `None` when it
+/// depends on run-time state (`cd -`, expansions, `~user`, missing `HOME`,
+/// two operands — bash's `cd old new` substitution form).
+///
+/// `pushd` differs from `cd` in two ways that must fail closed: `pushd -n
+/// <dir>` pushes onto the directory stack *without* changing directory, and a
+/// bare `pushd` swaps the top two stack entries (it does not go `HOME`).
+fn directory_change_target(
+    command_name: &str,
+    args: &[ShellWord],
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let is_pushd = command_name == "pushd";
+    let mut operands: Vec<&ShellWord> = Vec::new();
+    let mut options_done = false;
+    for word in args {
+        if !options_done && word.text == "--" && !word.dynamic {
+            options_done = true;
+            continue;
+        }
+        // Options (`-P`, `-L`, `-e`, pushd's `-n`); a lone `-` is an operand.
+        if !options_done && word.text.len() > 1 && word.text.starts_with('-') {
+            // `pushd -n` pushes without changing directory — unmodelled.
+            if is_pushd && !word.dynamic && word.text == "-n" {
+                return None;
+            }
+            continue;
+        }
+        operands.push(word);
+    }
+
+    match operands.as_slice() {
+        // Bare `cd` goes HOME; bare `pushd` swaps the stack (no attributable
+        // move).
+        [] if is_pushd => None,
+        [] => home.map(Path::to_path_buf),
+        [operand] => {
+            if operand.dynamic || operand.text == "-" || operand.text.is_empty() {
+                return None;
+            }
+            if let Some(rest) = operand.text.strip_prefix('~') {
+                let home = home?;
+                return Some(match rest.strip_prefix('/') {
+                    Some("") | None => home.to_path_buf(),
+                    Some(relative) => home.join(relative),
+                });
+            }
+            Some(PathBuf::from(&operand.text))
+        }
+        _ => None,
+    }
+}
+
+fn join_directory(cwd: &Path, target: &Path) -> PathBuf {
+    if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        cwd.join(target)
+    }
+}
+
+/// Whether `prefix` contains an unquoted `(`, `)`, `{`, `}`, or backtick.
+fn has_unquoted_grouping(prefix: &str) -> bool {
+    let mut chars = prefix.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' => {
+                if !chars.any(|c| c == '\'') {
+                    return true; // unbalanced: treat as unknowable
+                }
+            }
+            '"' => loop {
+                match chars.next() {
+                    Some('"') => break,
+                    Some('\\') => {
+                        chars.next();
+                    }
+                    Some(_) => {}
+                    None => return true,
+                }
+            },
+            '\\' => {
+                chars.next();
+            }
+            '(' | ')' | '{' | '}' | '`' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Byte ranges of the top-level command segments of `command`, in order.
+///
+/// [`crate::packs::split_command_segments`] also returns command substitutions
+/// (before their enclosing segment); those are nested inside another range and
+/// are dropped here, because a `cd` inside `$( … )` never reaches the shell
+/// that runs the guarded command. Returns `None` if a segment cannot be
+/// located inside `command` (never expected; fail closed).
+fn top_level_segment_ranges(command: &str) -> Option<Vec<(usize, usize)>> {
+    let base = command.as_ptr() as usize;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for segment in crate::packs::split_command_segments(command) {
+        let start = (segment.as_ptr() as usize).checked_sub(base)?;
+        let end = start.checked_add(segment.len())?;
+        if end > command.len() {
+            return None;
+        }
+        ranges.push((start, end));
+    }
+    // Widest range first at equal starts so a nested range always follows the
+    // range that contains it.
+    ranges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    let mut top_level: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    let mut covered_until = 0;
+    for (start, end) in ranges {
+        if start < covered_until {
+            continue; // nested inside the previous top-level range
+        }
+        top_level.push((start, end));
+        covered_until = end;
+    }
+    Some(top_level)
 }
 
 /// Detect whether a rebase is in progress in the given working directory.
@@ -434,6 +1030,589 @@ mod tests {
         assert!(
             label.contains("permit"),
             "label must mention permit: {label}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // resolve_recovery_cwd (#331): the probe follows the command's own cd.
+    // ------------------------------------------------------------------
+
+    use crate::normalize::ShellDialect;
+
+    /// A scratch tree: `<root>/repo/sub`, `<root>/other`, `<root>/home`.
+    struct Tree {
+        root: PathBuf,
+    }
+
+    impl Tree {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "dcg-recovery-cwd-{}-{}-{}",
+                label,
+                std::process::id(),
+                now_epoch_secs()
+            ));
+            fs::create_dir_all(root.join("repo").join("sub")).unwrap();
+            fs::create_dir_all(root.join("other")).unwrap();
+            fs::create_dir_all(root.join("home")).unwrap();
+            fs::create_dir_all(root.join("dir with space")).unwrap();
+            Self {
+                root: fs::canonicalize(root).unwrap(),
+            }
+        }
+
+        fn path(&self, rel: &str) -> PathBuf {
+            self.root.join(rel)
+        }
+
+        fn home(&self) -> PathBuf {
+            self.path("home")
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Resolve with the match anchored on the first `git` in `command`.
+    fn resolve(tree: &Tree, base: &Path, command: &str) -> Option<PathBuf> {
+        let start = command.find("git").expect("command must mention git");
+        resolve_recovery_cwd_with_home(
+            base,
+            command,
+            Some(start),
+            ShellDialect::Posix,
+            Some(&tree.home()),
+        )
+    }
+
+    #[test]
+    fn recovery_cwd_without_directory_change_is_the_base_unchanged() {
+        let tree = Tree::new("no-cd");
+        let base = tree.path("other");
+        assert_eq!(
+            resolve(&tree, &base, "git restore --worktree --ours -- f.txt"),
+            Some(base.clone())
+        );
+        // Even a non-canonical base is returned verbatim: nothing moved.
+        let raw = tree.root.join("other").join(".");
+        assert_eq!(
+            resolve(&tree, &raw, "git restore -- f.txt"),
+            Some(raw.clone())
+        );
+    }
+
+    #[test]
+    fn recovery_cwd_follows_absolute_cd() {
+        let tree = Tree::new("abs-cd");
+        let repo = tree.path("repo");
+        let command = format!(
+            "cd {} && git restore --worktree --ours -- f.txt",
+            repo.display()
+        );
+        assert_eq!(
+            resolve(&tree, &tree.path("other"), &command),
+            Some(repo.clone())
+        );
+    }
+
+    #[test]
+    fn recovery_cwd_follows_relative_cd_semicolon_and_or_exit() {
+        let tree = Tree::new("rel-cd");
+        let repo = tree.path("repo");
+        for command in [
+            "cd repo && git restore -- f.txt",
+            "cd repo; git restore -- f.txt",
+            "cd repo || exit 1; git checkout -- .",
+            "cd ./repo && git restore -- f.txt",
+            "cd -- repo && git restore -- f.txt",
+            "cd -P repo && git restore -- f.txt",
+            "pushd repo && git restore -- f.txt",
+            "command cd repo && git restore -- f.txt",
+            "GIT_TRACE=1 cd repo && git restore -- f.txt",
+            "cd repo && cd sub && cd .. && git restore -- f.txt",
+            "cd repo\ngit restore -- f.txt",
+        ] {
+            assert_eq!(
+                resolve(&tree, &tree.root, command),
+                Some(repo.clone()),
+                "command: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_cwd_handles_quoted_and_tilde_targets() {
+        let tree = Tree::new("quoted-cd");
+        let spaced = tree.path("dir with space");
+        assert_eq!(
+            resolve(&tree, &tree.root, "cd 'dir with space' && git restore -- f"),
+            Some(spaced.clone())
+        );
+        assert_eq!(
+            resolve(
+                &tree,
+                &tree.root,
+                "cd \"dir with space\" && git restore -- f"
+            ),
+            Some(spaced.clone())
+        );
+        assert_eq!(
+            resolve(
+                &tree,
+                &tree.root,
+                "cd dir\\ with\\ space && git restore -- f"
+            ),
+            Some(spaced)
+        );
+        assert_eq!(
+            resolve(&tree, &tree.path("other"), "cd ~ && git restore -- f"),
+            Some(tree.home())
+        );
+        assert_eq!(
+            resolve(&tree, &tree.path("other"), "cd && git restore -- f"),
+            Some(tree.home())
+        );
+        // A literal `$` inside single quotes is not an expansion — but the
+        // directory does not exist, so there is nothing to recover there.
+        assert_eq!(
+            resolve(&tree, &tree.root, "cd '$REPO' && git restore -- f"),
+            None
+        );
+    }
+
+    #[test]
+    fn recovery_cwd_follows_git_dash_c() {
+        let tree = Tree::new("git-c");
+        let repo = tree.path("repo");
+        assert_eq!(
+            resolve(&tree, &tree.root, "git -C repo restore -- f.txt"),
+            Some(repo.clone())
+        );
+        assert_eq!(
+            resolve(
+                &tree,
+                &tree.path("other"),
+                "cd .. && git -C repo -C sub restore -- f"
+            ),
+            Some(repo.join("sub"))
+        );
+        let absolute = format!("git -C {} restore -- f", repo.display());
+        assert_eq!(
+            resolve(&tree, &tree.path("other"), &absolute),
+            Some(repo.clone())
+        );
+        // `-C` after other global options still moves the probe.
+        assert_eq!(
+            resolve(
+                &tree,
+                &tree.root,
+                "git --no-pager -c core.pager=cat -C repo restore -- f"
+            ),
+            Some(repo.clone())
+        );
+        // Only a literal path is followed.
+        assert_eq!(
+            resolve(&tree, &tree.root, "git -C \"$REPO\" restore -- f"),
+            None
+        );
+        // Re-pointing git without moving the shell is not modelled.
+        for command in [
+            "git --git-dir=repo/.git restore -- f",
+            "git --work-tree repo restore -- f",
+            "git --namespace=x restore -- f",
+            "git $OPT -C repo restore -- f",
+            "git -c",
+            "git -C",
+            "git restore -- f && git --work-tree=other status",
+        ] {
+            assert_eq!(resolve(&tree, &tree.root, command), None, "{command}");
+        }
+        // Options after the subcommand are arguments, not repository moves.
+        assert_eq!(
+            resolve(
+                &tree,
+                &tree.path("other"),
+                "git restore --source=HEAD -- f && git log --no-pager"
+            ),
+            Some(tree.path("other"))
+        );
+    }
+
+    #[test]
+    fn recovery_cwd_directory_change_after_the_match_is_not_a_probe_location() {
+        // A cd after the match never moves the probe (it runs after the
+        // guarded call) — and because the whole line runs once allowed, it
+        // closes the window entirely rather than being ignored; see
+        // `recovery_cwd_directory_change_after_the_match_fails_closed`.
+        let tree = Tree::new("cd-after");
+        let base = tree.path("other");
+        assert_ne!(
+            resolve(&tree, &base, "git restore -- f.txt && cd ../repo"),
+            Some(tree.path("repo"))
+        );
+        assert_ne!(
+            resolve(
+                &tree,
+                &tree.root,
+                "cd repo && git restore -- f && cd ../other"
+            ),
+            Some(tree.path("other"))
+        );
+    }
+
+    #[test]
+    fn recovery_cwd_fails_closed_on_subshell_separators() {
+        // A background `&` or a pipe `|` runs the `cd` side in a subshell, so
+        // it never reaches the shell that runs the guarded git command. These
+        // must not resolve to the `cd` target (which would open recovery
+        // against a repo the git call does not run in).
+        let tree = Tree::new("subshell");
+        for command in [
+            "cd repo & git restore -- f",
+            "cd repo | git restore -- f",
+            "cd repo |& git restore -- f",
+            "true | cd repo && git restore -- f",
+            "git restore -- f | tee log",
+        ] {
+            assert_eq!(resolve(&tree, &tree.root, command), None, "{command}");
+        }
+        // `&&`, `||`, `;`, and the `&` of a redirection are NOT subshell
+        // separators, so the detector leaves them resolvable.
+        for ok in [
+            "cd repo && git restore -- f",
+            "cd repo || exit; git restore -- f",
+            "git restore -- f 2>&1",
+            "git restore -- f >out 2>&1",
+            "git restore -- f <&0",
+        ] {
+            assert!(
+                !command_has_subshell_separator(ok),
+                "must not be flagged as a subshell separator: {ok}"
+            );
+        }
+        for flagged in ["a | b", "a |& b", "a & b", "cd x & git y"] {
+            assert!(
+                command_has_subshell_separator(flagged),
+                "must be flagged: {flagged}"
+            );
+        }
+        // `&&` isolated (not a lone `&`) plus a redirect `&` resolves normally.
+        assert_eq!(
+            resolve(&tree, &tree.root, "cd repo && git restore -- f 2>&1"),
+            Some(tree.path("repo"))
+        );
+    }
+
+    #[test]
+    fn recovery_cwd_fails_closed_on_git_repo_env_assignments() {
+        // GIT_DIR / GIT_WORK_TREE re-point git at another repository exactly
+        // like --git-dir / --work-tree, so they must fail closed.
+        let tree = Tree::new("git-env");
+        for command in [
+            "GIT_DIR=/other/.git git restore -- f",
+            "GIT_WORK_TREE=/other git restore -- f",
+            "GIT_DIR=/other/.git GIT_WORK_TREE=/other git restore -- f",
+            "cd repo && GIT_DIR=/other/.git git restore -- f",
+            "git restore -- f && GIT_DIR=/other/.git git restore -- g",
+        ] {
+            assert_eq!(resolve(&tree, &tree.root, command), None, "{command}");
+        }
+        // An ordinary env assignment (not repo-redirecting) still resolves.
+        assert_eq!(
+            resolve(&tree, &tree.root, "GIT_TRACE=1 cd repo && git restore -- f"),
+            Some(tree.path("repo"))
+        );
+    }
+
+    #[test]
+    fn recovery_cwd_fails_closed_on_pushd_without_a_directory_change() {
+        // `pushd -n <dir>` pushes without changing directory; a bare `pushd`
+        // swaps the stack. Neither is an attributable cwd move.
+        let tree = Tree::new("pushd");
+        for command in [
+            "pushd -n repo && git restore -- f",
+            "pushd && git restore -- f",
+            "pushd -n -- repo && git restore -- f",
+        ] {
+            assert_eq!(resolve(&tree, &tree.root, command), None, "{command}");
+        }
+        // A plain `pushd <dir>` is a real move and still resolves.
+        assert_eq!(
+            resolve(&tree, &tree.root, "pushd repo && git restore -- f"),
+            Some(tree.path("repo"))
+        );
+    }
+
+    #[test]
+    fn recovery_cwd_fails_closed_on_unknowable_targets() {
+        let tree = Tree::new("dynamic");
+        for command in [
+            "cd \"$REPO\" && git restore -- f",
+            "cd $REPO && git restore -- f",
+            "cd $(cat where) && git restore -- f",
+            "cd `cat where` && git restore -- f",
+            "cd ~someone && git restore -- f",
+            "cd - && git restore -- f",
+            "cd re* && git restore -- f",
+            "cd repo other && git restore -- f",
+            "popd && git restore -- f",
+            "cd missing && git restore -- f",
+            "cd repo && popd && git restore -- f",
+            "$DO_CD repo && git restore -- f",
+            "cd 'repo && git restore -- f",
+            "(cd repo) && git restore -- f",
+            "{ cd repo; } && git restore -- f",
+            "cd repo && (git restore -- f)",
+            "cd repo && git -C $SUB restore -- f",
+        ] {
+            assert_eq!(
+                resolve(&tree, &tree.root, command),
+                None,
+                "command must not resolve: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_cwd_substitution_cd_does_not_leak_into_outer_shell() {
+        let tree = Tree::new("subst");
+        // The `cd repo` runs inside `$( … )`; the outer shell never moves. The
+        // unquoted `(` ahead of the match makes this fail closed rather than
+        // resolve to `repo`.
+        assert_eq!(
+            resolve(
+                &tree,
+                &tree.root,
+                "echo $(cd repo && pwd) && git restore -- f"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn recovery_cwd_without_match_offset_requires_a_single_git_segment() {
+        let tree = Tree::new("no-offset");
+        let home = tree.home();
+        let unanchored = |base: &Path, command: &str| {
+            resolve_recovery_cwd_with_home(base, command, None, ShellDialect::Posix, Some(&home))
+        };
+        // No directory change: the base stands.
+        assert_eq!(
+            unanchored(&tree.path("other"), "git restore -- f"),
+            Some(tree.path("other"))
+        );
+        // One git segment: the cd is attributed to it.
+        assert_eq!(
+            unanchored(&tree.root, "cd repo && git restore -- f"),
+            Some(tree.path("repo"))
+        );
+        // Two git segments with a cd between them: ambiguous, fail closed.
+        assert_eq!(
+            unanchored(
+                &tree.root,
+                "cd repo && git status && cd ../other && git restore -- f"
+            ),
+            None
+        );
+        // A cd with no git segment at all: nothing attributable, fail closed.
+        assert_eq!(unanchored(&tree.root, "cd repo && make restore"), None);
+    }
+
+    #[test]
+    fn recovery_cwd_match_offset_between_segments_is_unattributable() {
+        let tree = Tree::new("separator-offset");
+        let command = "cd repo && git restore -- f";
+        let separator = command.find("&&").unwrap();
+        assert_eq!(
+            resolve_recovery_cwd_with_home(
+                &tree.root,
+                command,
+                Some(separator),
+                ShellDialect::Posix,
+                Some(&tree.home())
+            ),
+            None
+        );
+        // …unless nothing moves, in which case the base is still right.
+        let plain = "echo hi && git restore -- f";
+        assert_eq!(
+            resolve_recovery_cwd_with_home(
+                &tree.root,
+                plain,
+                Some(plain.find("&&").unwrap()),
+                ShellDialect::Posix,
+                Some(&tree.home())
+            ),
+            Some(tree.root.clone())
+        );
+    }
+
+    #[test]
+    fn recovery_cwd_non_posix_dialects_keep_the_base() {
+        let tree = Tree::new("dialect");
+        let base = tree.path("other");
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Cmd] {
+            assert_eq!(
+                resolve_recovery_cwd_with_home(
+                    &base,
+                    "cd ..\\repo; git restore -- f",
+                    Some(14),
+                    dialect,
+                    Some(&tree.home())
+                ),
+                Some(base.clone()),
+                "dialect {dialect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_cwd_directory_change_after_the_match_fails_closed() {
+        // The whole line runs once allowed; a later move could carry a
+        // second guarded call into a repository the probe never saw.
+        let tree = Tree::new("trailing-move");
+        for command in [
+            "cd repo && git restore -- f && cd ../other && git restore -- g",
+            "git restore -- f && cd other",
+            "git restore -- f; pushd other",
+            "git restore -- f && popd",
+            "git restore -- f && git -C other restore -- g",
+            "git restore -- f && git --no-pager -C other status",
+            // Anything that can run further commands may carry its own cd,
+            // before or after the match.
+            "git restore -- f && bash -c 'cd other && git restore -- g'",
+            "bash -c 'cd other && git restore -- g' && git restore -- f",
+            "git restore -- f | xargs -I{} git -C other restore -- {}",
+            "eval 'cd other' && git restore -- f",
+            "source ./enter-other.sh && git restore -- f",
+            ". ./enter-other.sh && git restore -- f",
+            "git restore -- f && ./finish.sh",
+            "git restore -- f && make",
+        ] {
+            assert_eq!(resolve(&tree, &tree.root, command), None, "{command}");
+        }
+        // Later segments that do not move are fine.
+        assert_eq!(
+            resolve(
+                &tree,
+                &tree.root,
+                "cd repo && git restore -- f && git status"
+            ),
+            Some(tree.path("repo"))
+        );
+    }
+
+    #[test]
+    fn recovery_cwd_grouping_anywhere_fails_closed() {
+        let tree = Tree::new("trailing-group");
+        for command in [
+            "git restore -- f && (cd other && git restore -- g)",
+            "git restore -- f; { cd other; git restore -- g; }",
+        ] {
+            assert_eq!(resolve(&tree, &tree.root, command), None, "{command}");
+        }
+        // Quoted or escaped parens are data, not grouping.
+        assert_eq!(
+            resolve(
+                &tree,
+                &tree.root,
+                "git restore -- 'f (1).txt' && echo \\(done\\)"
+            ),
+            Some(tree.root.clone())
+        );
+    }
+
+    #[test]
+    fn recovery_cwd_match_on_a_non_git_segment_is_unattributable() {
+        // A mis-mapped span offset landing on the cd segment must not apply
+        // the moves before it and then probe there.
+        let tree = Tree::new("non-git-segment");
+        let command = "cd repo && cd ../other && git restore -- f";
+        let home = tree.home();
+        let on_second_cd = command.find("cd ../other").unwrap();
+        assert_eq!(
+            resolve_recovery_cwd_with_home(
+                &tree.root,
+                command,
+                Some(on_second_cd),
+                ShellDialect::Posix,
+                Some(&home)
+            ),
+            None
+        );
+        // Bare transparent wrappers are seen through; an unknown wrapper is
+        // an unknown executable and fails closed even when nothing moves.
+        assert_eq!(
+            resolve_recovery_cwd_with_home(
+                &tree.path("other"),
+                "sudo git restore -- f",
+                Some(0),
+                ShellDialect::Posix,
+                Some(&home)
+            ),
+            Some(tree.path("other"))
+        );
+        assert_eq!(
+            resolve_recovery_cwd_with_home(
+                &tree.root,
+                "cd repo && env GIT_TRACE=1 git restore -- f",
+                Some(11),
+                ShellDialect::Posix,
+                Some(&home)
+            ),
+            Some(tree.path("repo"))
+        );
+        for command in ["doas git restore -- f", "sudo -u bob git restore -- f"] {
+            assert_eq!(
+                resolve_recovery_cwd_with_home(
+                    &tree.path("other"),
+                    command,
+                    Some(0),
+                    ShellDialect::Posix,
+                    Some(&home)
+                ),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn relaxed_allowlist_grants_exactly_the_recovery_rules() {
+        use crate::allowlist::LayeredAllowlist;
+        let relaxed = relaxed_allowlist(&LayeredAllowlist::default());
+        for pattern in RECOVERY_PATTERNS {
+            assert!(
+                relaxed
+                    .match_rule_at_path("core.git", pattern, None)
+                    .is_some(),
+                "{pattern} must be granted"
+            );
+        }
+        for (pack, pattern) in [
+            ("core.git", "reset-hard"),
+            ("core.git", "clean-force"),
+            ("core.git", "stash-drop"),
+            ("core.filesystem", "rm-rf-general"),
+        ] {
+            assert!(
+                relaxed.match_rule_at_path(pack, pattern, None).is_none(),
+                "{pack}:{pattern} must NOT be granted"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_cwd_public_entry_reads_home_from_environment() {
+        // Smoke test for the public wrapper: no directory change, base back.
+        let tree = Tree::new("public");
+        let base = tree.path("other");
+        assert_eq!(
+            resolve_recovery_cwd(&base, "git restore -- f", Some(0), ShellDialect::Posix),
+            Some(base)
         );
     }
 }

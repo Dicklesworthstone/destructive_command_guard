@@ -280,6 +280,20 @@ mod agent_detection_tests {
             "should produce output on stderr"
         );
     }
+
+    #[test]
+    fn test_explicit_omp_overrides_legacy_pi_environment() {
+        let (stdout, stderr, exit_code) = run_robot_mode_with_env(
+            &["--agent", "omp", "test", "--dialect", "posix", "git status"],
+            &[("PI_CODING_AGENT", "true")],
+        );
+
+        assert_eq!(exit_code, 0, "safe command should be allowed: {stderr}");
+        let output: serde_json::Value =
+            serde_json::from_str(&stdout).expect("robot test output should be valid JSON");
+        assert_eq!(output["agent"]["detected"], "omp");
+        assert_eq!(output["agent"]["detection_method"], "explicit");
+    }
 }
 
 // =============================================================================

@@ -121,9 +121,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                         "gh repo edit <owner>/<repo> --visibility private",
                         "Hide the repository without destroying it",
                     ),
-                    PatternSuggestion::new(
+                    PatternSuggestion::gated(
                         "gh repo archive <owner>/<repo>",
-                        "Read-only instead of deleted (also gated, but reversible)",
+                        "Read-only instead of deleted (reversible)",
                     ),
                     PatternSuggestion::new(
                         "gh repo view <owner>/<repo> --json name,isPrivate,pushedAt",
@@ -785,9 +785,10 @@ mod tests {
     /// — the agent bounces between two blocks and learns nothing. The FIRST
     /// suggestion in particular must be something it can actually run.
     ///
-    /// `gh repo archive` is deliberately excused: it is the right advice when
-    /// the alternative is deletion, it is reversible, and both rules that
-    /// offer it say in the same breath that it is gated too.
+    /// Suggestions constructed with `PatternSuggestion::gated` are excused:
+    /// they are explicitly presented as still-gated forms (#316), and the
+    /// registry-wide sweep in `tests/suggestion_self_consistency.rs` holds
+    /// every non-gated suggestion in every pack to the same standard.
     #[test]
     fn first_suggestion_is_never_blocked_by_this_pack() {
         let pack = create_pack();
@@ -797,6 +798,9 @@ mod tests {
             let Some(first) = pattern.suggestions.first() else {
                 continue;
             };
+            if first.gated {
+                continue;
+            }
             // Placeholders are illustrative, not runnable; substitute
             // something concrete so the regexes see a realistic command.
             let command = first
@@ -812,9 +816,6 @@ mod tests {
                 .replace("<run-id>", "999")
                 .replace("<child>", "7");
 
-            if command.contains("gh repo archive") {
-                continue;
-            }
             assert!(
                 pack.check(&command).is_none(),
                 "{name}'s first suggestion is blocked by this same pack, so the \

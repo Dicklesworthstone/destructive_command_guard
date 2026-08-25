@@ -1106,6 +1106,322 @@ PYEOF
     return $?
 }
 
+current_repo_root() {
+    local start
+    if ! start=$(pwd -P) || [ -z "$start" ]; then
+        return 1
+    fi
+    local root="$start"
+    while true; do
+        if [ -e "$root/.git" ]; then
+            printf '%s\n' "$root"
+            return 0
+        fi
+        [ "$root" = "/" ] && break
+        root="${root%/*}"
+        [ -n "$root" ] || root="/"
+    done
+    printf '%s\n' "$start"
+}
+
+unconfigure_opencode() {
+    # OpenCode plugin (#318): a standalone generated file. Delete it ONLY when
+    # it carries the dcg ownership marker — never remove a user-authored
+    # plugin that happens to share the name. Both the user-level and any
+    # repo-local copy are covered, including when uninstall runs in a nested
+    # working directory.
+    local removed=0
+    local plugin
+    local repo_root=""
+    local -a plugins=(
+        "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/dcg-guard.js"
+    )
+    # `current_repo_root` falls back to the physical cwd outside Git, so one
+    # resolved project candidate covers both existing cleanup cases without
+    # checking the same file again through a relative alias. If cwd cannot be
+    # resolved, omit the project capability entirely rather than constructing
+    # `/.opencode/...` from an empty root.
+    if repo_root=$(current_repo_root); then
+        plugins+=("$repo_root/.opencode/plugins/dcg-guard.js")
+    fi
+    for plugin in "${plugins[@]}"; do
+        if [ -f "$plugin" ] && grep -q 'dcg-opencode-plugin' "$plugin" 2>/dev/null; then
+            rm -f "$plugin" 2>/dev/null && removed=1
+        fi
+    done
+    if [ "$removed" -eq 1 ]; then
+        echo "removed" >&2
+    fi
+    return 0
+}
+
+# Mirror Node's POSIX `path.join(HOME, PI_CONFIG_DIR || ".omp")` lexically.
+# Backslashes are ordinary POSIX filename bytes; only `/` separates components.
+resolve_omp_uninstall_config_root() {
+    local config_name="${PI_CONFIG_DIR:-.omp}"
+    local remaining="$HOME/$config_name"
+    local absolute=0
+    local segment
+    local component
+    local result=""
+    local count
+    local last
+    local -a components=()
+
+    case "$remaining" in
+        /*) absolute=1 ;;
+    esac
+
+    while [ -n "$remaining" ]; do
+        case "$remaining" in
+            */*)
+                segment="${remaining%%/*}"
+                remaining="${remaining#*/}"
+                ;;
+            *)
+                segment="$remaining"
+                remaining=""
+                ;;
+        esac
+        case "$segment" in
+            "" | .) ;;
+            ..)
+                count=${#components[@]}
+                if [ "$count" -gt 0 ]; then
+                    last=$((count - 1))
+                    if [ "${components[$last]}" != ".." ]; then
+                        unset "components[$last]"
+                    elif [ "$absolute" -eq 0 ]; then
+                        components[${#components[@]}]=".."
+                    fi
+                elif [ "$absolute" -eq 0 ]; then
+                    components[0]=".."
+                fi
+                ;;
+            *) components[${#components[@]}]="$segment" ;;
+        esac
+    done
+
+    [ "$absolute" -eq 1 ] && result="/"
+    for component in ${components[@]+"${components[@]}"}; do
+        if [ "$result" = "/" ]; then
+            result="/$component"
+        elif [ -z "$result" ]; then
+            result="$component"
+        else
+            result="$result/$component"
+        fi
+    done
+    [ -n "$result" ] || result="."
+    printf '%s\n' "$result"
+}
+
+collect_omp_uninstall_extensions() {
+    # Keep pre-confirmation inventory and post-confirmation cleanup on one
+    # candidate authority. Cleanup still re-checks every ownership marker after
+    # confirmation, so a file changed between the two phases is never removed
+    # based on stale inventory.
+    local config_root
+    config_root=$(resolve_omp_uninstall_config_root)
+    local agent_dir="$config_root/agent"
+    local profile=""
+    if [ "${OMP_PROFILE+x}" = "x" ]; then
+        profile="$OMP_PROFILE"
+    elif [ "${PI_PROFILE+x}" = "x" ]; then
+        profile="$PI_PROFILE"
+    fi
+    profile=$(printf '%s' "$profile" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    local profile_base="${profile%%.*}"
+    local profile_reserved=0
+    case "$profile_base" in
+        con|prn|aux|nul|com[0-9]|lpt[0-9]) profile_reserved=1 ;;
+    esac
+    local agent_dir_override="${PI_CODING_AGENT_DIR:-}"
+    if { [ -z "$profile" ] || [ "$profile" = "default" ]; } &&
+        [ -n "$agent_dir_override" ]; then
+        local legacy_profile="${PI_PROFILE-}"
+        legacy_profile=$(printf '%s' "$legacy_profile" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        local legacy_profile_base="${legacy_profile%%.*}"
+        local legacy_profile_reserved=0
+        case "$legacy_profile_base" in
+            con|prn|aux|nul|com[0-9]|lpt[0-9]) legacy_profile_reserved=1 ;;
+        esac
+        if [ -n "$legacy_profile" ] && [ "$legacy_profile" != "default" ] &&
+            [ "${legacy_profile%.}" = "$legacy_profile" ] &&
+            [ "$legacy_profile_reserved" -eq 0 ] &&
+            [ "${#legacy_profile}" -le 64 ] &&
+            printf '%s' "$legacy_profile" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$' &&
+            [ "$agent_dir_override" = "$config_root/profiles/$legacy_profile/agent" ]; then
+            agent_dir_override=""
+        fi
+    fi
+    if [ -n "$profile" ] && [ "$profile" != "default" ] &&
+        [ "${profile%.}" = "$profile" ] && [ "$profile_reserved" -eq 0 ] &&
+        [ "${#profile}" -le 64 ] &&
+        printf '%s' "$profile" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$'; then
+        agent_dir="$config_root/profiles/$profile/agent"
+    elif [ -n "$agent_dir_override" ]; then
+        agent_dir="$agent_dir_override"
+    fi
+
+    OMP_UNINSTALL_ENUMERATION_FAILED=0
+    OMP_UNINSTALL_FAILED_PROFILE_ROOTS=()
+    OMP_UNINSTALL_EXTENSIONS=(
+        "$agent_dir/extensions/dcg-guard.ts"
+        "$config_root/agent/extensions/dcg-guard.ts"
+        "$HOME/.omp/agent/extensions/dcg-guard.ts"
+        ".omp/extensions/dcg-guard.ts"
+    )
+    if [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
+        OMP_UNINSTALL_EXTENSIONS+=("$PI_CODING_AGENT_DIR/extensions/dcg-guard.ts")
+    fi
+    local -a profile_roots=(
+        "$HOME/.omp/profiles"
+        "$config_root/profiles"
+    )
+    local -a seen_profile_roots=()
+    local profiles_root
+    local seen_profile_root
+    local profile_agent_dir
+    local duplicate
+    for profiles_root in ${profile_roots[@]+"${profile_roots[@]}"}; do
+        duplicate=0
+        for seen_profile_root in ${seen_profile_roots[@]+"${seen_profile_roots[@]}"}; do
+            if [ "$profiles_root" = "$seen_profile_root" ]; then
+                duplicate=1
+                break
+            fi
+        done
+        [ "$duplicate" -eq 0 ] || continue
+        seen_profile_roots+=("$profiles_root")
+        [ -d "$profiles_root" ] || continue
+
+        if ! find "$profiles_root" -mindepth 1 -maxdepth 1 -type d -print \
+            >/dev/null 2>&1; then
+            OMP_UNINSTALL_ENUMERATION_FAILED=1
+            OMP_UNINSTALL_FAILED_PROFILE_ROOTS+=("$profiles_root")
+            continue
+        fi
+        for profile_agent_dir in "$profiles_root"/*/agent; do
+            [ -d "$profile_agent_dir" ] || continue
+            OMP_UNINSTALL_EXTENSIONS+=("$profile_agent_dir/extensions/dcg-guard.ts")
+        done
+    done
+}
+
+inspect_omp_uninstall_extensions() {
+    # Populate the owned-candidate array without flattening paths through a
+    # newline-delimited command-substitution channel. Status 1 means no owned
+    # extension; status 2 means the inventory was incomplete and must not be
+    # described as "nothing to remove".
+    collect_omp_uninstall_extensions
+
+    OMP_UNINSTALL_OWNED_EXTENSIONS=()
+    local -a seen_extensions=()
+    local extension
+    local seen_extension
+    local grep_status
+    local duplicate
+    local found=0
+    local failed="$OMP_UNINSTALL_ENUMERATION_FAILED"
+    for extension in ${OMP_UNINSTALL_EXTENSIONS[@]+"${OMP_UNINSTALL_EXTENSIONS[@]}"}; do
+        duplicate=0
+        for seen_extension in ${seen_extensions[@]+"${seen_extensions[@]}"}; do
+            if [ "$extension" = "$seen_extension" ]; then
+                duplicate=1
+                break
+            fi
+        done
+        [ "$duplicate" -eq 0 ] || continue
+        seen_extensions+=("$extension")
+
+        [ -f "$extension" ] || continue
+        if grep -q -- 'dcg-omp-extension' "$extension" 2>/dev/null; then
+            OMP_UNINSTALL_OWNED_EXTENSIONS+=("$extension")
+            found=1
+        else
+            grep_status=$?
+            if [ "$grep_status" -gt 1 ]; then
+                failed=1
+            fi
+        fi
+    done
+    [ "$failed" -eq 0 ] || return 2
+    [ "$found" -eq 1 ] || return 1
+    return 0
+}
+
+report_omp_uninstall_inventory() {
+    local status
+    if inspect_omp_uninstall_extensions; then
+        status=0
+    else
+        status=$?
+    fi
+
+    local extension
+    for extension in ${OMP_UNINSTALL_OWNED_EXTENSIONS[@]+"${OMP_UNINSTALL_OWNED_EXTENSIONS[@]}"}; do
+        log "  • Oh My Pi extension ($extension)"
+    done
+    if [ "$status" -eq 2 ]; then
+        warn "Oh My Pi extension inventory is incomplete; ownership will be rechecked before removal"
+    fi
+    return "$status"
+}
+
+unconfigure_omp() {
+    # Oh My Pi extension: remove only marker-owned files. Cover the active
+    # profile, every named profile under the default/current config roots, the
+    # legacy agent-dir override, and the current working directory's project
+    # install. OMP's native extension discovery is cwd-only; it does not walk
+    # to a Git ancestor.
+    collect_omp_uninstall_extensions
+
+    local removed=0
+    local failed="$OMP_UNINSTALL_ENUMERATION_FAILED"
+    local failed_profile_root
+    for failed_profile_root in ${OMP_UNINSTALL_FAILED_PROFILE_ROOTS[@]+"${OMP_UNINSTALL_FAILED_PROFILE_ROOTS[@]}"}; do
+        warn "Could not inspect Oh My Pi profiles under $failed_profile_root"
+    done
+    local -a seen_extensions=()
+    local extension
+    local seen_extension
+    local grep_status
+    local duplicate
+    for extension in ${OMP_UNINSTALL_EXTENSIONS[@]+"${OMP_UNINSTALL_EXTENSIONS[@]}"}; do
+        duplicate=0
+        for seen_extension in ${seen_extensions[@]+"${seen_extensions[@]}"}; do
+            if [ "$extension" = "$seen_extension" ]; then
+                duplicate=1
+                break
+            fi
+        done
+        [ "$duplicate" -eq 0 ] || continue
+        seen_extensions+=("$extension")
+
+        [ -f "$extension" ] || continue
+        if grep -q -- 'dcg-omp-extension' "$extension" 2>/dev/null; then
+            if rm -f -- "$extension" 2>/dev/null &&
+                [ ! -e "$extension" ] && [ ! -L "$extension" ]; then
+                removed=1
+            else
+                failed=1
+                warn "Could not remove Oh My Pi extension at $extension"
+            fi
+        else
+            grep_status=$?
+            if [ "$grep_status" -gt 1 ]; then
+                failed=1
+                warn "Could not inspect Oh My Pi extension at $extension"
+            fi
+        fi
+    done
+    if [ "$removed" -eq 1 ] && [ "$failed" -eq 0 ]; then
+        echo "removed" >&2
+    fi
+    return 0
+}
+
 # Run an unconfigure function and report the outcome. The old call pattern
 # (`unconfigure_x 2>&1 | grep -q removed`) swallowed every human-visible line
 # the function printed — most importantly the `warn` fallback messages on
@@ -1235,6 +1551,15 @@ main() {
         log "  • Posit Assistant hook ($posit_assistant_settings)"
         found_anything=1
     fi
+    local omp_inventory_status
+    if report_omp_uninstall_inventory; then
+        found_anything=1
+    else
+        omp_inventory_status=$?
+        # An incomplete inventory is actionable: continue to confirmation so
+        # cleanup can re-enumerate and report precise marker/removal failures.
+        [ "$omp_inventory_status" -ne 2 ] || found_anything=1
+    fi
 
     # Config
     if { [ "$KEEP_CONFIG" -eq 0 ] || [ "$KEEP_HISTORY" -eq 0 ]; } &&
@@ -1308,6 +1633,8 @@ main() {
     report_unconfigure "Codex CLI hook" unconfigure_codex
     report_unconfigure "Hermes Agent hook" unconfigure_hermes
     report_unconfigure "Posit Assistant hook" unconfigure_posit_assistant
+    report_unconfigure "OpenCode plugin" unconfigure_opencode
+    report_unconfigure "Oh My Pi extension" unconfigure_omp
 
     # Remove Aider config
     if [ "$aider_configured" -eq 1 ] && unconfigure_aider; then

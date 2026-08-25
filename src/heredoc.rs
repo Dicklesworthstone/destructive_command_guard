@@ -63,7 +63,7 @@ use tracing::{debug, instrument, trace, warn};
 /// quote-aware scanner so we can suppress obvious false positives inside quoted
 /// literals (commit messages, search patterns, etc.) without introducing false
 /// negatives for real shell syntax (including `$()`/backtick substitutions).
-const HEREDOC_TRIGGER_PATTERNS: [&str; 18] = [
+const HEREDOC_TRIGGER_PATTERNS: [&str; 19] = [
     // Inline interpreter execution. These patterns intentionally allow:
     // - interleaved flags (python -I -c, bash --norc -c)
     // - combined short-flag clusters (bash -lc, node -pe, perl -pi -e)
@@ -131,6 +131,19 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 18] = [
     // longer words (`--cd`, `npm-c`) from firing. `$` is in the trailing class
     // for the attached Bash-quoted form `-c$'…'`. Tier 2 validates the grammar.
     r#"\bmise\b[^\n;|&]*\b(?:exec|x)\b[^\n;|&]*(?:^|[^\w-])(?:-c|--command)(?:[\s='"$]|$)"#,
+    // `ssh [options] destination <command…>` hands everything after the
+    // destination to the remote login shell as one command line (#326), so it
+    // is an inline-script wrapper exactly like `sh -c` and must be recursively
+    // evaluated — otherwise `ssh host '<destructive>'` rides through as quoted
+    // argv data while the unquoted spelling is denied. Tier 1 must be a
+    // superset of the Tier 2 grammar walk in `ssh_remote_payload`, so this
+    // deliberately over-matches: `ssh`/`ssh.exe` at a word start followed by
+    // more of the same pipeline segment containing a quote or `$` (an
+    // all-unquoted remote command is already visible to raw pattern matching,
+    // so Tier 2 only needs to run when quoting or expansion is present).
+    // `[\s;|&(/]` before `ssh` keeps `ssh-keygen`/`ssh-add`/`autossh` from
+    // triggering while still matching path-qualified `/usr/bin/ssh`.
+    r#"(?i)(?:^|[\s;|&(/])ssh(?:\.exe)?\s[^\n;|&]*['"$]"#,
 ];
 
 const MANUAL_HEREDOC_TRIGGER_INDEX: usize = HEREDOC_TRIGGER_PATTERNS.len();
@@ -1279,6 +1292,23 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         };
     }
 
+    // Extract `ssh … destination <command…>` remote payloads (#326)
+    extract_ssh_inline_scripts(
+        command,
+        limits,
+        start_time,
+        timeout,
+        &mut extracted,
+        &mut skip_reasons,
+    );
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, &mut skip_reasons) {
+        return if extracted.is_empty() {
+            ExtractionResult::Skipped(skip_reasons)
+        } else {
+            ExtractionResult::Extracted(extracted)
+        };
+    }
+
     // Extract here-strings (<<<)
     extract_herestrings(
         command,
@@ -1861,6 +1891,220 @@ fn dequoted_flag_word(text: &str, start: usize, end: usize) -> (&str, usize, usi
         return (inner, start + 1, end - 1);
     }
     (text, start, end)
+}
+
+/// Byte spans of one `ssh … destination <command…>` remote payload.
+struct SshRemotePayload {
+    /// Payload text: for a single payload word, one layer of matching
+    /// surrounding quotes removed; for multiple words, the raw span from the
+    /// first payload byte to the last (per-word quoting left intact, exactly
+    /// as the remote shell will see it after the local shell's one decode).
+    content: Range<usize>,
+    /// Full `ssh … <payload>` span, for span attribution.
+    full: Range<usize>,
+}
+
+/// ssh short options that consume a value (OpenSSH `getopt` string; the value
+/// may be attached, `-p22`, or the following argv word, `-p 22`).
+const SSH_VALUE_OPTIONS: &[u8] = b"BbcDEeFIiJLlmOoPpQRSWw";
+/// ssh short options that take no value and may be bundled (`-fnT`).
+const SSH_FLAG_OPTIONS: &[u8] = b"1246AaCfGgKkMNnqsTtVvXxYy";
+
+enum SshOptionShape {
+    /// Every letter is a no-value flag; the token is complete.
+    FlagsOnly,
+    /// The token ends in a value-taking letter; the NEXT token is its value.
+    TakesSeparateValue,
+    /// A value-taking letter with the value attached in the same token.
+    ValueAttached,
+    /// An option dcg does not model (long options, new letters).
+    Unknown,
+}
+
+/// Classify one leading-dash ssh option token against the modeled OpenSSH
+/// grammar. Bundled flags are walked letter by letter: the first value-taking
+/// letter either consumes the token's remainder (attached value) or the next
+/// argv word (separate value), matching `getopt` semantics.
+fn classify_ssh_option(word: &str) -> SshOptionShape {
+    let Some(letters) = word.strip_prefix('-') else {
+        return SshOptionShape::Unknown;
+    };
+    if letters.is_empty() || letters.starts_with('-') {
+        // Bare `-` or a long option: not part of the modeled grammar (`--` is
+        // handled by the caller before classification).
+        return SshOptionShape::Unknown;
+    }
+    let bytes = letters.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if SSH_FLAG_OPTIONS.contains(byte) {
+            continue;
+        }
+        if SSH_VALUE_OPTIONS.contains(byte) {
+            return if index + 1 == bytes.len() {
+                SshOptionShape::TakesSeparateValue
+            } else {
+                SshOptionShape::ValueAttached
+            };
+        }
+        return SshOptionShape::Unknown;
+    }
+    SshOptionShape::FlagsOnly
+}
+
+/// Extract the remote command payload of `ssh` invocations (#326).
+///
+/// `ssh [options] destination [command [argument …]]` concatenates every argv
+/// word after the destination with spaces and hands the result to the remote
+/// login shell — it is an inline-shell wrapper exactly like `sh -c`, minus the
+/// flag. Without this, `ssh host '<destructive>'` was span-classified as argv
+/// data of an unrecognised consumer and rode through, while the unquoted
+/// spelling was denied by raw pattern matching (#326).
+///
+/// Fail-open to the status quo, never past it: an unmodeled option (long
+/// options, letters newer than the modeled OpenSSH `getopt` string) makes the
+/// destination unidentifiable, so the walk extracts nothing and the command
+/// keeps exactly today's raw-token visibility. Unlike mise's `-c`, the payload
+/// here is positional — misparsing the destination under an unmodeled grammar
+/// would extract the wrong text, so bailing is the accuracy-preserving choice
+/// (a real ssh also refuses unknown options outright, so nothing executes in
+/// that shape anyway).
+fn extract_ssh_inline_scripts(
+    command: &str,
+    limits: &ExtractionLimits,
+    start_time: Instant,
+    timeout: Duration,
+    extracted: &mut Vec<ExtractedContent>,
+    skip_reasons: &mut Vec<SkipReason>,
+) {
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+        return;
+    }
+    if !command.contains("ssh") && !command.contains("SSH") {
+        return;
+    }
+
+    let tokens = crate::normalize::tokenize_for_normalization(command);
+    for index in 0..tokens.len() {
+        if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+            return;
+        }
+        let token = &tokens[index];
+        if token.kind != crate::normalize::NormalizeTokenKind::Word {
+            continue;
+        }
+        let Some(word) = token.text(command) else {
+            continue;
+        };
+        // Path-qualified spellings (`/usr/bin/ssh`, `C:\…\ssh.exe`) are the
+        // same program; `ssh-keygen`/`ssh-add`/`autossh` are not.
+        let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
+        let basename = basename
+            .strip_suffix(".exe")
+            .or_else(|| basename.strip_suffix(".EXE"))
+            .unwrap_or(basename);
+        if !basename.eq_ignore_ascii_case("ssh") {
+            continue;
+        }
+        let Some(payload) = ssh_remote_payload(command, &tokens, index) else {
+            continue;
+        };
+        let Some(content) = command.get(payload.content.clone()) else {
+            continue;
+        };
+        if !push_windows_inner(
+            extracted,
+            skip_reasons,
+            limits,
+            content,
+            payload.full,
+            Some(payload.content),
+            "ssh",
+        ) {
+            return;
+        }
+    }
+}
+
+/// Locate the remote-command payload of the `ssh` invocation whose executable
+/// token is at `start`. See [`extract_ssh_inline_scripts`] for the grammar and
+/// the deliberate bail on unmodeled options.
+fn ssh_remote_payload(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    start: usize,
+) -> Option<SshRemotePayload> {
+    use crate::normalize::NormalizeTokenKind;
+
+    let full_start = tokens.get(start)?.byte_range.start;
+    let mut index = start + 1;
+    let mut options_ended = false;
+
+    // Phase 1: options, then the destination.
+    loop {
+        let token = tokens.get(index)?;
+        if token.kind != NormalizeTokenKind::Word {
+            // Separator before any destination: an interactive `ssh host` in
+            // an earlier segment shape, or plain `ssh` — no payload.
+            return None;
+        }
+        let (word, _, _) = dequoted_flag_word(
+            token.text(command)?,
+            token.byte_range.start,
+            token.byte_range.end,
+        );
+        if !options_ended && word == "--" {
+            options_ended = true;
+            index += 1;
+            continue;
+        }
+        if !options_ended && word.len() > 1 && word.starts_with('-') {
+            match classify_ssh_option(word) {
+                SshOptionShape::FlagsOnly | SshOptionShape::ValueAttached => {
+                    index += 1;
+                }
+                SshOptionShape::TakesSeparateValue => {
+                    index += 2;
+                }
+                SshOptionShape::Unknown => return None,
+            }
+            continue;
+        }
+        // First non-option word: the destination.
+        index += 1;
+        break;
+    }
+
+    // Phase 2: the payload is the run of Word tokens after the destination,
+    // up to the next shell separator (which belongs to the LOCAL shell).
+    let payload_start = index;
+    let mut payload_end = index;
+    while let Some(token) = tokens.get(payload_end) {
+        if token.kind != NormalizeTokenKind::Word {
+            break;
+        }
+        payload_end += 1;
+    }
+    if payload_end == payload_start {
+        // Interactive session: no remote command.
+        return None;
+    }
+
+    let first = tokens.get(payload_start)?;
+    let last = tokens.get(payload_end - 1)?;
+    if payload_end - payload_start == 1 {
+        // Single payload word: strip one layer of quotes so the recursive
+        // evaluation sees the remote command line itself, exactly as the
+        // remote shell will.
+        let text = command.get(first.byte_range.clone())?;
+        return Some(SshRemotePayload {
+            content: unquoted_payload_range(text, first.byte_range.start),
+            full: full_start..first.byte_range.end,
+        });
+    }
+    Some(SshRemotePayload {
+        content: first.byte_range.start..last.byte_range.end,
+        full: full_start..last.byte_range.end,
+    })
 }
 
 /// Extract here-strings (<<<).
@@ -3835,6 +4079,93 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use proptest::prelude::*;
+
+    // ========================================================================
+    // ssh remote-payload extraction (#326)
+    // ========================================================================
+
+    mod ssh_remote_payload_extraction {
+        use super::*;
+
+        fn ssh_payloads(command: &str) -> Vec<String> {
+            let result = extract_content(command, &ExtractionLimits::default());
+            match result {
+                ExtractionResult::Extracted(contents) => contents
+                    .into_iter()
+                    .filter(|content| content.target_command.as_deref() == Some("ssh"))
+                    .map(|content| content.content)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
+
+        #[test]
+        fn quoted_single_word_payload_is_unquoted_and_extracted() {
+            assert_eq!(ssh_payloads("ssh host 'dropdb mydb'"), ["dropdb mydb"]);
+            assert_eq!(ssh_payloads("ssh host \"rm -rf /srv\""), ["rm -rf /srv"]);
+            assert_eq!(
+                ssh_payloads("ssh user@10.0.0.5 'git reset --hard'"),
+                ["git reset --hard"]
+            );
+        }
+
+        #[test]
+        fn multi_word_payload_keeps_raw_per_word_quoting() {
+            // The remote shell re-parses the concatenated words, so per-word
+            // quotes must survive: `'&&'` here is remote DATA locally quoted.
+            assert_eq!(
+                ssh_payloads("ssh host cd /app '&&' ls"),
+                ["cd /app '&&' ls"]
+            );
+        }
+
+        #[test]
+        fn value_taking_options_are_skipped_when_locating_the_destination() {
+            assert_eq!(
+                ssh_payloads("ssh -i key.pem -p 2222 -o StrictHostKeyChecking=no host 'uptime'"),
+                ["uptime"]
+            );
+            // Attached value form.
+            assert_eq!(ssh_payloads("ssh -p2222 host 'uptime'"), ["uptime"]);
+            // Bundled no-value flags ending in a value-taker.
+            assert_eq!(ssh_payloads("ssh -fnT -l root host 'uptime'"), ["uptime"]);
+        }
+
+        #[test]
+        fn double_dash_ends_option_parsing() {
+            assert_eq!(ssh_payloads("ssh -- host 'uptime'"), ["uptime"]);
+        }
+
+        #[test]
+        fn unmodeled_options_bail_without_extraction() {
+            // Real ssh refuses unknown options, so nothing executes in this
+            // shape; extraction must not guess at the destination.
+            assert!(ssh_payloads("ssh --fake host 'rm -rf /'").is_empty());
+        }
+
+        #[test]
+        fn interactive_sessions_and_relatives_extract_nothing() {
+            assert!(ssh_payloads("ssh host").is_empty());
+            assert!(ssh_payloads("ssh -N -L 8080:internal:80 host").is_empty());
+            assert!(ssh_payloads("ssh-keygen -t ed25519 -f 'key file'").is_empty());
+            assert!(ssh_payloads("autossh host 'uptime'").is_empty());
+            assert!(ssh_payloads("scp 'file a.txt' host:/tmp/").is_empty());
+        }
+
+        #[test]
+        fn path_qualified_and_chained_invocations_extract() {
+            assert_eq!(ssh_payloads("/usr/bin/ssh host 'uptime'"), ["uptime"]);
+            assert_eq!(
+                ssh_payloads("ssh a 'uptime' && ssh b 'df -h'"),
+                ["uptime", "df -h"]
+            );
+        }
+
+        #[test]
+        fn payload_stops_at_local_shell_separators() {
+            assert_eq!(ssh_payloads("ssh host 'uptime'; echo done"), ["uptime"]);
+        }
+    }
 
     // ========================================================================
     // POSIX command-substitution extraction (grammar-recovery scoping)

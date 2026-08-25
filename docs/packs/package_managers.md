@@ -54,11 +54,11 @@ These patterns match safe commands that are always allowed:
 | `cargo-safe` | `\bcargo\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:build\|test\|check\|clippy\|fmt\|doc\|bench)\b` |
 | `apt-list` | `\bapt\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|show\|search)(?=\s\|$)` |
 | `apt-get-list` | `\bapt-get\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:update\|upgrade)(?!\s+.*-y)` |
-| `npm-dry-run` | `\bnpm\b.*--dry-run(?:=true)?(?:\s\|$)` |
-| `yarn-dry-run` | `\byarn\b.*--dry-run(?:=true)?(?:\s\|$)` |
-| `pnpm-dry-run` | `\bpnpm\b[^\|;&]*--dry-run(?:=true)?(?:\s\|$)` |
-| `cargo-dry-run` | `\bcargo\b.*--dry-run(?:=true)?(?:\s\|$)` |
-| `poetry-dry-run` | `\bpoetry\b.*--dry-run(?:=true)?(?:\s\|$)` |
+| `npm-dry-run` | `\bnpm\b[^;\|&\n]*--dry-run(?:=true)?(?:\s\|$)` |
+| `yarn-dry-run` | `\byarn\b[^;\|&\n]*--dry-run(?:=true)?(?:\s\|$)` |
+| `pnpm-dry-run` | `\bpnpm\b[^;\|&\n]*--dry-run(?:=true)?(?:\s\|$)` |
+| `cargo-dry-run` | `\bcargo\b[^;\|&\n]*--dry-run(?:=true)?(?:\s\|$)` |
+| `poetry-dry-run` | `\bpoetry\b[^;\|&\n]*--dry-run(?:=true)?(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 

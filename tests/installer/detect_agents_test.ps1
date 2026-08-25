@@ -6,7 +6,6 @@
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-. (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
 
 $script:failures = 0
 function Check([bool]$cond, [string]$msg) {
@@ -23,12 +22,34 @@ $savedGrok = $env:GROK_SESSION_ID
 $savedHermesHome = $env:HERMES_HOME
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedOs = $env:OS
+$ompSelectorNames = @('OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'PI_CODING_AGENT_DIR')
+$savedOmpSelectors = @{}
+foreach ($name in $ompSelectorNames) {
+    $savedOmpSelectors[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    # Seed a non-vacuous ambient value before proving the fixture fence clears
+    # it. This catches a missing scrub even on otherwise clean CI hosts.
+    Microsoft.PowerShell.Management\Set-Item -LiteralPath "Env:$name" -Value "dcg-test-ambient-$name"
+}
+foreach ($name in $ompSelectorNames) {
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+}
 try {
+    $unclearedOmpSelectors = @($ompSelectorNames | Where-Object {
+        Test-Path -LiteralPath "Env:$_"
+    })
+    if ($unclearedOmpSelectors.Count -ne 0) {
+        throw "OMP test selector fence failed: $($unclearedOmpSelectors -join ', ')"
+    }
+    Check $true "OMP path/profile selectors are scrubbed before loading installer functions"
+
+    . (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
+
     $env:PATH = ''                 # no CLI probing leaks
     $env:GROK_SESSION_ID = $null
     $env:HERMES_HOME = $null       # no Hermes home-resolution leaks (issue #270)
     $env:LOCALAPPDATA = $null
     $env:OS = $null
+    $env:PI_CONFIG_DIR = $null
 
     Write-Host "Test 1: detects only the agents whose config dir is present"
     $h1 = New-TempHome
@@ -45,6 +66,7 @@ try {
     Check ($a['Agy'] -eq $false) "Agy NOT detected (no agy on PATH)"
     Check ($a['Hermes'] -eq $false) "Hermes NOT detected"
     Check ($a['Posit'] -eq $false) "Posit Assistant NOT detected"
+    Check ($a['Omp'] -eq $false) "Oh My Pi NOT detected"
     $names = Get-DetectedAgentNames $a
     Check (($names -join ',') -eq 'Claude,Gemini,Grok') "summary lists detected agents in config order (got '$($names -join ',')')"
     Remove-Item -Recurse -Force $h1 -ErrorAction SilentlyContinue
@@ -71,6 +93,73 @@ try {
     $a1d = Detect-Agents -HomeDir $h1d
     Check ($a1d['Posit'] -eq $true) "Posit detected via legacy ~/.positai"
     Remove-Item -Recurse -Force $h1d -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1e: Oh My Pi detected from ~/.omp"
+    $h1e = New-TempHome
+    New-Item -ItemType Directory -Force -Path (Join-Path $h1e '.omp') | Out-Null
+    $a1e = Detect-Agents -HomeDir $h1e
+    Check ($a1e['Omp'] -eq $true) "Oh My Pi detected via ~/.omp"
+    $names1e = Get-DetectedAgentNames $a1e
+    Check (($names1e -join ',') -eq 'Omp') "summary lists only Omp (got '$($names1e -join ',')')"
+    Remove-Item -Recurse -Force $h1e -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1f: Oh My Pi detected from PI_CONFIG_DIR"
+    $h1f = New-TempHome
+    $env:PI_CONFIG_DIR = '.custom-omp'
+    New-Item -ItemType Directory -Force -Path (Join-Path $h1f '.custom-omp') | Out-Null
+    $a1f = Detect-Agents -HomeDir $h1f
+    Check ($a1f['Omp'] -eq $true) "Oh My Pi detected via PI_CONFIG_DIR"
+    $env:PI_CONFIG_DIR = $null
+    Remove-Item -Recurse -Force $h1f -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1g: Oh My Pi detection treats wildcard characters in HOME literally"
+    $h1g = Join-Path ([System.IO.Path]::GetTempPath()) ("dcg_detect_[omp]_" + [Guid]::NewGuid().ToString('N'))
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $h1g '.omp'))
+    $a1g = Detect-Agents -HomeDir $h1g
+    Check ($a1g['Omp'] -eq $true) "Oh My Pi detected when HOME contains brackets"
+
+    Write-Host "Test 1h: Windows drive-qualified PI_CONFIG_DIR cannot escape HOME"
+    $env:PI_CONFIG_DIR = 'C:\omp-outside-home'
+    Check ($null -eq (Get-OmpConfigRootForDetection -HomeDir $h1g -WindowsSemantics $true)) "drive-qualified OMP config root rejected for Windows detection"
+
+    Write-Host "Test 1i: OMP detection config root follows native Node path joining"
+    $nativeWindows = [System.IO.Path]::DirectorySeparatorChar -eq '\'
+    $oracleHome = if ($nativeWindows) { 'C:\Users\u' } else { '/home/u' }
+    $env:PI_CONFIG_DIR = 'outer/../normalized-omp'
+    $normalizedRoot = Get-OmpConfigRootForDetection -HomeDir $oracleHome -WindowsSemantics $nativeWindows
+    $expectedNormalizedRoot = if ($nativeWindows) { 'C:\Users\u\normalized-omp' } else { '/home/u/normalized-omp' }
+    Check ([string]::Equals($normalizedRoot, $expectedNormalizedRoot, [System.StringComparison]::Ordinal)) "detection normalizes dot and parent components"
+    $env:PI_CONFIG_DIR = '../../../../../../../../../../../../x'
+    $clampedRoot = Get-OmpConfigRootForDetection -HomeDir $oracleHome -WindowsSemantics $nativeWindows
+    $expectedClampedRoot = if ($nativeWindows) { 'C:\x' } else { '/x' }
+    Check ([string]::Equals($clampedRoot, $expectedClampedRoot, [System.StringComparison]::Ordinal)) "detection clamps excess parent components at the filesystem root"
+    if (-not $nativeWindows) {
+        $env:PI_CONFIG_DIR = '\.literal-backslash'
+        $backslashRoot = Get-OmpConfigRootForDetection -HomeDir $oracleHome -WindowsSemantics $false
+        Check ([string]::Equals($backslashRoot, '/home/u/\.literal-backslash', [System.StringComparison]::Ordinal)) "POSIX detection preserves leading backslash literally (got '$backslashRoot')"
+
+        $backslashHome = New-TempHome
+        try {
+            $literalConfigRoot = [System.IO.Path]::Combine($backslashHome, '\.literal-backslash')
+            $normalizedDecoyRoot = [System.IO.Path]::Combine($backslashHome, '.literal-backslash')
+            [void][System.IO.Directory]::CreateDirectory($literalConfigRoot)
+            $literalAgents = Detect-Agents -HomeDir $backslashHome
+            Check ($literalAgents['Omp'] -eq $true) "POSIX detection finds the literal-backslash config root"
+
+            [System.IO.Directory]::Delete($literalConfigRoot, $true)
+            [void][System.IO.Directory]::CreateDirectory($normalizedDecoyRoot)
+            $decoyAgents = Detect-Agents -HomeDir $backslashHome
+            Check ($decoyAgents['Omp'] -eq $false) "POSIX detection does not probe a separator-normalized decoy"
+        } finally {
+            if ([System.IO.Directory]::Exists($backslashHome)) {
+                [System.IO.Directory]::Delete($backslashHome, $true)
+            }
+        }
+    }
+    $env:PI_CONFIG_DIR = $null
+    $names1g = Get-DetectedAgentNames $a1g
+    Check (($names1g -join ',') -eq 'Omp') "bracketed HOME summary lists only Omp (got '$($names1g -join ',')')"
+    Remove-Item -LiteralPath $h1g -Recurse -Force -ErrorAction SilentlyContinue
 
     Write-Host "Test 2: empty home -> nothing detected"
     $h2 = New-TempHome
@@ -115,6 +204,13 @@ try {
     $env:HERMES_HOME = $savedHermesHome
     $env:LOCALAPPDATA = $savedLocalAppData
     $env:OS = $savedOs
+    foreach ($name in $ompSelectorNames) {
+        if ($null -eq $savedOmpSelectors[$name]) {
+            Microsoft.PowerShell.Management\Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            Microsoft.PowerShell.Management\Set-Item -LiteralPath "Env:$name" -Value $savedOmpSelectors[$name]
+        }
+    }
 }
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }

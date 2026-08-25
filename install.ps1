@@ -779,30 +779,14 @@ function Remove-DcgPredecessor {
   $removed
 }
 
-# Append a guarded check to the user's PowerShell profile that warns, on each new
-# session, if the dcg PreToolUse hook has gone missing from ~/.claude/settings.json
-# (Claude Code can silently drop it when it rewrites settings). Idempotent
-# (marker-guarded). The PowerShell analog of `dcg setup`'s Unix shell-RC check.
-# Returns "added" | "already" | "failed".
-function Add-DcgProfileCheck {
-  param([string]$ProfilePath = $PROFILE.CurrentUserAllHosts)
-
-  $marker = "# dcg: warn if the Claude Code hook was silently removed"
-  try {
-    if (Test-Path $ProfilePath -PathType Leaf) {
-      $content = Get-Content -Raw -Path $ProfilePath
-      if ($content -and $content.Contains($marker)) { return "already" }
-    } else {
-      $dir = Split-Path -Parent $ProfilePath
-      if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-    }
-
-    # Single-quoted here-string: written verbatim into the profile (no expansion now).
-    # Detection must accept every command shape the installers write: bare `dcg`,
-    # an absolute Unix or Windows path, and the PowerShell quoted-invocation form
-    # `& 'C:\...\dcg.exe' [args]` (issue #282: naively splitting that on [\\/]
-    # leaves a trailing quote + args, so the hook looked missing every session).
-    $block = @'
+# The startup-check block written into PowerShell profiles. Single-quoted
+# here-string: written verbatim into the profile (no expansion at install time).
+# Detection must accept every command shape the installers write: bare `dcg`,
+# an absolute Unix or Windows path, and the PowerShell quoted-invocation form
+# `& 'C:\...\dcg.exe' [args]` (issue #282: naively splitting that on [\\/]
+# leaves a trailing quote + args, so the hook looked missing every session).
+$script:DcgProfileCheckMarker = "# dcg: warn if the Claude Code hook was silently removed"
+$script:DcgProfileCheckBlock = @'
 if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
   try {
     $dcgCfg = Get-Content -Raw "$HOME\.claude\settings.json" | ConvertFrom-Json
@@ -820,8 +804,107 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
 }
 '@
 
-    Add-Content -Path $ProfilePath -Value ("`n" + $marker + "`n" + $block)
-    return "added"
+# Replace a stale dcg startup-check block (marker line through the first
+# column-0 closing brace) in $Content with the current marker + block.
+# Returns the updated content, or $null if the managed region could not be
+# located (hand-mangled block).
+function Repair-DcgProfileCheckContent {
+  param([string]$Content)
+  $pattern = '(?ms)^[ \t]*' + [regex]::Escape($script:DcgProfileCheckMarker) + '[ \t]*\r?\n.*?^\}[ \t]*(\r?\n|\z)'
+  $rx = [regex]$pattern
+  if (-not $rx.IsMatch($Content)) { return $null }
+  # Escape '$' in the replacement so block text like $dcgCfg is inserted verbatim.
+  $repl = ($script:DcgProfileCheckMarker + "`n" + $script:DcgProfileCheckBlock + "`n").Replace('$', '$$')
+  $rx.Replace($Content, $repl, 1)
+}
+
+# Append a guarded check to the user's PowerShell profile that warns, on each new
+# session, if the dcg PreToolUse hook has gone missing from ~/.claude/settings.json
+# (Claude Code can silently drop it when it rewrites settings). Idempotent
+# (marker-guarded), and self-repairing: a marker whose block text differs from
+# the current one (e.g. the pre-#282 naive path split that warned on every
+# session) is rewritten in place — re-running the installer really does fix a
+# stale check. Also repairs stale blocks in the *other* host's profile
+# (Windows PowerShell 5.1 and pwsh 7 keep separate profile.ps1 files), since
+# the warning may fire in a different host than the one running the installer.
+# The PowerShell analog of `dcg setup`'s Unix shell-RC check.
+# Returns "added" | "already" | "updated" | "failed".
+function Add-DcgProfileCheck {
+  param(
+    [string]$ProfilePath = $PROFILE.CurrentUserAllHosts,
+    [string[]]$AlsoRepairPaths = $null
+  )
+
+  $marker = $script:DcgProfileCheckMarker
+  $block = $script:DcgProfileCheckBlock
+  # Line-ending-insensitive "is the current block already present" test: the
+  # block's own newlines depend on how this script was fetched (LF via irm,
+  # CRLF via a CRLF checkout) and profiles get re-saved by editors either way.
+  # Without normalization a current block that differs only in EOLs would be
+  # rewritten on every run.
+  $normBlock = $block.Replace("`r`n", "`n")
+  try {
+    if ($null -eq $AlsoRepairPaths) {
+      # Both hosts' CurrentUserAllHosts profiles, wherever Documents lives
+      # (OneDrive redirection included). Non-existent paths are skipped below.
+      $AlsoRepairPaths = @()
+      $docs = [Environment]::GetFolderPath('MyDocuments')
+      if ($docs) {
+        $AlsoRepairPaths = @(
+          (Join-Path $docs 'WindowsPowerShell\profile.ps1'),
+          (Join-Path $docs 'PowerShell\profile.ps1')
+        )
+      }
+    }
+
+    $status = $null
+    if (Test-Path $ProfilePath -PathType Leaf) {
+      $content = Get-Content -Raw -Path $ProfilePath
+      if ($content -and $content.Contains($marker)) {
+        if ($content.Replace("`r`n", "`n").Contains($normBlock)) {
+          $status = "already"
+        } else {
+          $repaired = Repair-DcgProfileCheckContent -Content $content
+          if ($null -ne $repaired) {
+            Set-Content -Path $ProfilePath -Value $repaired -NoNewline
+          } else {
+            # Marker present but the block boundary is unrecognizable; append a
+            # fresh block so at least the current check runs.
+            Add-Content -Path $ProfilePath -Value ("`n" + $marker + "`n" + $block)
+          }
+          $status = "updated"
+        }
+      }
+    } else {
+      $dir = Split-Path -Parent $ProfilePath
+      if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    }
+
+    if ($null -eq $status) {
+      Add-Content -Path $ProfilePath -Value ("`n" + $marker + "`n" + $block)
+      $status = "added"
+    }
+
+    # Best-effort repair of stale blocks in other profiles (never adds new ones).
+    foreach ($other in $AlsoRepairPaths) {
+      if (-not $other) { continue }
+      try {
+        $otherFull = [System.IO.Path]::GetFullPath($other)
+        $mainFull = [System.IO.Path]::GetFullPath($ProfilePath)
+        if ($otherFull -eq $mainFull) { continue }
+        if (-not (Test-Path $other -PathType Leaf)) { continue }
+        $otherContent = Get-Content -Raw -Path $other
+        if (-not ($otherContent -and $otherContent.Contains($marker))) { continue }
+        if ($otherContent.Replace("`r`n", "`n").Contains($normBlock)) { continue }
+        $repaired = Repair-DcgProfileCheckContent -Content $otherContent
+        if ($null -ne $repaired) {
+          Set-Content -Path $other -Value $repaired -NoNewline
+          if ($status -eq "already") { $status = "updated" }
+        }
+      } catch { }
+    }
+
+    return $status
   } catch {
     return "failed"
   }
@@ -1699,6 +1782,26 @@ function Resolve-ChecksumToken {
   throw "no valid SHA-256 found for $artifactLeaf (per-file .sha256, SHA256SUMS.txt, SHA256SUMS all failed)"
 }
 
+function Get-OmpConfigRootForDetection {
+  param(
+    [string]$HomeDir = $HOME,
+    [bool]$WindowsSemantics = ([System.IO.Path]::DirectorySeparatorChar -eq '\')
+  )
+  $configName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
+  $configName = if ($WindowsSemantics) {
+    $configName.TrimStart([char[]]@('\', '/'))
+  } else {
+    $configName.TrimStart([char[]]@('/'))
+  }
+  if ($WindowsSemantics -and $configName -match '^[A-Za-z]:') { return $null }
+  try {
+    $joined = if ($configName.Length -eq 0) { $HomeDir } else { [System.IO.Path]::Combine($HomeDir, $configName) }
+    [System.IO.Path]::GetFullPath($joined)
+  } catch {
+    $null
+  }
+}
+
 function Detect-Agents {
   # Probe for installed coding agents (config dir under $HomeDir, or the agent's
   # CLI on PATH). Returns an [ordered] map of
@@ -1710,7 +1813,10 @@ function Detect-Agents {
   param([string]$HomeDir = $HOME, [string]$RepoRoot = "")
   $null = $RepoRoot
   function _has([string]$cmd) { [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
-  function _dir([string]$name) { Test-Path (Join-Path $HomeDir $name) -PathType Container }
+  function _dir([string]$name) {
+    Test-Path -LiteralPath (Join-Path $HomeDir $name) -PathType Container -ErrorAction SilentlyContinue
+  }
+  $ompConfigRoot = Get-OmpConfigRootForDetection -HomeDir $HomeDir
   [ordered]@{
     'Claude'  = ((_dir '.claude')  -or (_has 'claude'))
     'Codex'   = ((_dir '.codex')   -or (_has 'codex'))
@@ -1718,15 +1824,20 @@ function Detect-Agents {
     'Cursor'  = ((_dir '.cursor')  -or (_has 'cursor'))
     'Copilot' = ((_dir '.copilot') -or
       (-not [string]::IsNullOrWhiteSpace($env:COPILOT_HOME) -and
-        (Test-Path $env:COPILOT_HOME -PathType Container)) -or
+        (Test-Path -LiteralPath $env:COPILOT_HOME -PathType Container -ErrorAction SilentlyContinue)) -or
       (_has 'copilot') -or (_has 'gh-copilot'))
     'Grok'    = ((_dir '.grok')    -or (-not [string]::IsNullOrEmpty($env:GROK_SESSION_ID)))
     'Agy'     = (_has 'agy')
     'Hermes'  = ((_dir '.hermes') -or (_has 'hermes') -or
-      (Test-Path (Get-HermesConfigDir -HomeDir $HomeDir) -PathType Container))
+      (Test-Path -LiteralPath (Get-HermesConfigDir -HomeDir $HomeDir) -PathType Container -ErrorAction SilentlyContinue))
     # A bare ~/.posit is not enough — other Posit tools share that directory.
-    'Posit'   = ((Test-Path (Join-Path (Join-Path $HomeDir '.posit') 'assistant') -PathType Container) -or
+    'Posit'   = ((Test-Path -LiteralPath (Join-Path (Join-Path $HomeDir '.posit') 'assistant') -PathType Container -ErrorAction SilentlyContinue) -or
       (_dir '.positai') -or (_has 'pa'))
+    'Omp'     = (($null -ne $ompConfigRoot -and
+        [System.IO.Directory]::Exists($ompConfigRoot)) -or
+      (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR) -and
+        [System.IO.Directory]::Exists($env:PI_CODING_AGENT_DIR)) -or
+      (Test-Path Env:OMP_PROFILE) -or (_has 'omp'))
   }
 }
 
@@ -1734,7 +1845,7 @@ function Get-DetectedAgentNames {
   # The display-names of agents Detect-Agents flagged as present, in order.
   param($Agents)
   @(
-    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit')) {
+    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit', 'Omp')) {
       if ($Agents[$name]) { $name }
     }
   )
@@ -1769,6 +1880,7 @@ Configured agents (when detected, or with -Force/-EasyMode):
   Gemini CLI   (~/.gemini/settings.json)      Copilot CLI (~/.copilot/hooks/dcg.json)
   Cursor IDE   (~/.cursor/hooks.json)         Hermes      (HERMES_HOME, else %LOCALAPPDATA%\hermes\config.yaml)
   Posit Assistant (~/.posit/assistant/settings.json)
+  Oh My Pi     (active profile's extensions/dcg-guard.ts via dcg install --omp)
   Grok / agy   via dcg install --grok / --agy under -EasyMode when detected
 '@
   exit 0
@@ -2172,6 +2284,22 @@ if ($detectedAgents['Posit'] -or $forceConfig) {
   }
 }
 
+# Configure Oh My Pi through dcg's generated native ExtensionAPI module. The
+# Rust installer is the single source of truth for active-profile resolution,
+# marker ownership, and the embedded absolute dcg.exe path.
+if ($detectedAgents['Omp'] -or $forceConfig) {
+  Write-Host ""
+  try {
+    & $dcgExe install --omp --force | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Ok "Configured Oh My Pi extension via 'dcg install --omp'" }
+    else { Write-Warn "'dcg install --omp' exited with code $LASTEXITCODE" }
+  } catch {
+    Write-Warn "Oh My Pi extension configuration failed: $_"
+  }
+} else {
+  Write-Info "Oh My Pi not detected; re-run with -EasyMode to configure its extension anyway"
+}
+
 # Grok (xAI) and Antigravity (agy): configured via the dcg binary itself rather
 # than hand-rolled JSON. `dcg install --grok` / `--agy` are pure-Rust and use
 # current_exe(), so they produce the correct hook on Windows and stay the single
@@ -2204,6 +2332,7 @@ if ($EasyMode) {
   try {
     switch (Add-DcgProfileCheck) {
       "added" { Write-Ok "Added a PowerShell `$PROFILE check that warns if the Claude hook goes missing" }
+      "updated" { Write-Ok "Replaced a stale PowerShell `$PROFILE hook-check with the current version" }
       "already" { Write-Info "PowerShell `$PROFILE hook-check already present" }
       default { Write-Warn "Could not add the PowerShell `$PROFILE hook-check" }
     }

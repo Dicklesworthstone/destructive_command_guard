@@ -10,6 +10,7 @@
 //! - dmsetup device-mapper operations
 //! - nbd-client network block device
 //! - LVM destructive commands (pvremove, vgremove, lvremove, etc.)
+//! - macOS diskutil erase/partition/APFS-delete operations
 
 use crate::packs::{DestructivePattern, Pack, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
@@ -22,9 +23,11 @@ pub fn create_pack() -> Pack {
         name: "Disk Operations",
         description: "Protects against destructive disk operations like dd to devices, \
                       mkfs, partition table modifications, RAID management, \
-                      btrfs/LVM/device-mapper operations, and network block devices",
+                      btrfs/LVM/device-mapper operations, network block devices, \
+                      and macOS diskutil erase/partition/APFS deletion",
         keywords: &[
             "dd",
+            "diskutil",
             "fdisk",
             "mkfs",
             "mkswap",
@@ -164,6 +167,16 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!("nbd-client-list", r"nbd-client\s+-l\b"),
         // nbd-client -check (check connection)
         safe_pattern!("nbd-client-check", r"nbd-client\s+.*-check\b"),
+        // --- macOS diskutil safe patterns (read-only) ---
+        // Verbs are matched case-insensitively because diskutil itself accepts
+        // any casing. End-bounded with [^;&|\r\n]* so a read-only verb cannot
+        // mask a chained destructive command in a later segment — every shell
+        // separator, newline included, ends the whitelisted span (conservative:
+        // failing to match here just falls through to the destructive check).
+        safe_pattern!(
+            "diskutil-readonly",
+            r"(?i)diskutil\s+(?:list|info|information|activity|listFilesystems|apfs\s+list(?:Snapshots|Users)?)\b[^;&|\r\n]*$"
+        ),
         // --- LVM safe patterns (read-only) ---
         // lvs, vgs, pvs (list commands)
         safe_pattern!("lvm-list", r"\b(?:lvs|vgs|pvs)\b"),
@@ -421,6 +434,52 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             r"lvconvert\s+(?:.*\s+)?--merge\b",
             "lvconvert --merge reverts LV to snapshot state, discarding changes since snapshot."
         ),
+        // --- macOS diskutil destructive patterns (issue #305) ---
+        // diskutil verbs are case-insensitive, so all three rules use (?i).
+        // Erase family: destroys all data on the target disk or volume.
+        destructive_pattern!(
+            "diskutil-erase",
+            r"(?i)diskutil\s+(?:eraseDisk|eraseVolume|reformat|zeroDisk|randomDisk|secureErase)\b",
+            "diskutil erase operations DESTROY all data on the target disk or volume.",
+            Critical,
+            "diskutil eraseDisk/eraseVolume/reformat/zeroDisk/randomDisk/secureErase \
+             overwrite the target's contents. On APFS this removes every volume in \
+             the container. There is no recovery without backups.\n\n\
+             Inspect the target first:\n  \
+             diskutil list\n  \
+             diskutil info <disk>",
+            executables = ["diskutil"]
+        ),
+        // Partition-table rewrites: partitionDisk erases the whole disk;
+        // splitPartition/mergePartitions destroy the contents of the
+        // partitions they reshape (merge keeps only the first).
+        destructive_pattern!(
+            "diskutil-partition",
+            r"(?i)diskutil\s+(?:partitionDisk|splitPartition|mergePartitions|resetFusion)\b",
+            "diskutil partitioning operations rewrite the partition map and erase data.",
+            Critical,
+            "diskutil partitionDisk erases the entire disk before writing the new \
+             partition map; splitPartition and mergePartitions destroy the contents \
+             of the partitions they reshape (merge preserves only the first when \
+             asked); resetFusion wipes both constituent devices.\n\n\
+             Preview the current layout first:\n  \
+             diskutil list <disk>",
+            executables = ["diskutil"]
+        ),
+        // APFS container/volume/snapshot deletion.
+        destructive_pattern!(
+            "diskutil-apfs-delete",
+            r"(?i)diskutil\s+(?:apfs|ap)\s+(?:deleteContainer|deleteVolume|eraseVolume|deleteSnapshot)\b",
+            "diskutil apfs delete/erase operations permanently remove APFS containers, volumes, or snapshots.",
+            Critical,
+            "Deleting an APFS container destroys every volume inside it; deleting or \
+             erasing a volume destroys that volume's data; deleting a snapshot \
+             removes a restore point. None of these are recoverable without \
+             backups.\n\n\
+             List APFS structure first:\n  \
+             diskutil apfs list",
+            executables = ["diskutil"]
+        ),
     ]
 }
 
@@ -448,6 +507,94 @@ mod tests {
         let pack = create_pack();
         assert!(!pack.might_match("echo hello"));
         assert!(pack.check("echo hello").is_none());
+    }
+
+    /// Issue #305: macOS diskutil erase, partition, and APFS deletion
+    /// operations must be blocked while read-only inspection stays allowed.
+    #[test]
+    fn diskutil_destructive_operations_are_blocked_issue_305() {
+        let pack = create_pack();
+        assert!(
+            pack.might_match("diskutil eraseDisk APFS PROBE /dev/disk999"),
+            "diskutil must be reachable via pack keywords"
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "diskutil eraseDisk APFS PROBE /dev/disk999",
+            "diskutil-erase",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "diskutil eraseVolume free none disk3s2",
+            "diskutil-erase",
+        );
+        assert_blocks_with_pattern(&pack, "diskutil reformat disk3s2", "diskutil-erase");
+        assert_blocks_with_pattern(&pack, "diskutil zeroDisk /dev/disk999", "diskutil-erase");
+        assert_blocks_with_pattern(
+            &pack,
+            "diskutil secureErase 0 /dev/disk999",
+            "diskutil-erase",
+        );
+        // Verb casing is not load-bearing: diskutil accepts any casing.
+        assert_blocks_with_pattern(
+            &pack,
+            "diskutil erasedisk APFS X /dev/disk999",
+            "diskutil-erase",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "diskutil partitionDisk /dev/disk999 GPT APFS PROBE 100%",
+            "diskutil-partition",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "diskutil splitPartition disk3s2 2 JHFS+ A 50% JHFS+ B 50%",
+            "diskutil-partition",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "diskutil mergePartitions JHFS+ merged disk3s2 disk3s4",
+            "diskutil-partition",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "diskutil apfs deleteContainer disk999",
+            "diskutil-apfs-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "diskutil apfs deleteVolume disk3s7",
+            "diskutil-apfs-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "diskutil apfs eraseVolume disk3s7",
+            "diskutil-apfs-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "diskutil apfs deleteSnapshot disk3s1 -uuid 0FCE82D1",
+            "diskutil-apfs-delete",
+        );
+    }
+
+    /// Issue #305: read-only diskutil commands stay allowed.
+    #[test]
+    fn diskutil_readonly_operations_stay_allowed_issue_305() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "diskutil list");
+        assert_safe_pattern_matches(&pack, "diskutil list /dev/disk0");
+        assert_safe_pattern_matches(&pack, "diskutil info /dev/disk0");
+        assert_safe_pattern_matches(&pack, "diskutil activity");
+        assert_safe_pattern_matches(&pack, "diskutil apfs list");
+        assert_safe_pattern_matches(&pack, "diskutil apfs listSnapshots disk3s1");
+        assert_allows(&pack, "diskutil list");
+        assert_allows(&pack, "diskutil info disk3");
+        // A read-only verb must not mask a chained destructive verb.
+        let chained = pack
+            .check("diskutil list && diskutil eraseDisk APFS X /dev/disk999")
+            .expect("chained eraseDisk must still block");
+        assert_eq!(chained.name, Some("diskutil-erase"));
     }
 
     #[test]

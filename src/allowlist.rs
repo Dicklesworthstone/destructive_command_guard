@@ -243,6 +243,56 @@ impl LayeredAllowlist {
     /// exact-command only. The config field is named `additional_allowlist`, but
     /// accepting these strings as regexes would create a bypass path without the
     /// normal `risk_acknowledged` review gate.
+    /// A copy of this allowlist with one extra in-memory layer granting
+    /// exactly the given `pack_id:pattern_name` rules, evaluated first.
+    ///
+    /// Used for scoped re-evaluation: a grant that applies to a specific
+    /// rule set (rebase recovery) must suppress only those rules, so that
+    /// every other pattern on the same command line keeps its own verdict.
+    /// The layer carries no paths, conditions, or expiry — the caller has
+    /// already decided the grant applies to this invocation.
+    #[must_use]
+    pub fn with_rule_grants(&self, rules: &[(&str, &str)], reason: &str, source: &str) -> Self {
+        let entries: Vec<AllowEntry> = rules
+            .iter()
+            .map(|(pack_id, pattern_name)| AllowEntry {
+                selector: AllowSelector::Rule(RuleId {
+                    pack_id: (*pack_id).to_string(),
+                    pattern_name: (*pattern_name).to_string(),
+                }),
+                reason: reason.to_string(),
+                added_by: Some(source.to_string()),
+                added_at: None,
+                expires_at: None,
+                ttl: None,
+                session: None,
+                session_id: None,
+                context: None,
+                conditions: HashMap::new(),
+                environments: Vec::new(),
+                paths: None,
+                risk_acknowledged: false,
+            })
+            .collect();
+
+        let mut relaxed = self.clone();
+        if entries.is_empty() {
+            return relaxed;
+        }
+        relaxed.layers.insert(
+            0,
+            LoadedAllowlistLayer {
+                layer: AllowlistLayer::Agent,
+                path: PathBuf::from(format!("<{source}>")),
+                file: AllowlistFile {
+                    entries,
+                    errors: Vec::new(),
+                },
+            },
+        );
+        relaxed
+    }
+
     pub fn prepend_agent_exact_commands(&mut self, agent_key: &str, commands: &[String]) {
         let entries: Vec<AllowEntry> = commands
             .iter()

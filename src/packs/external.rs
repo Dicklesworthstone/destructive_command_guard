@@ -140,6 +140,13 @@ pub struct ExternalSuggestion {
     /// Platform this suggestion applies to (default: all).
     #[serde(default)]
     pub platform: ExternalPlatform,
+
+    /// Whether dcg also gates this suggestion (default: false). A gated
+    /// suggestion is a less-destructive form that still requires explicit
+    /// approval; rendering marks it so agents do not retry it expecting an
+    /// allow (#316).
+    #[serde(default)]
+    pub gated: bool,
 }
 
 /// Platform specifier for external pack suggestions.
@@ -591,6 +598,7 @@ impl ExternalPack {
                             command: Box::leak(s.command.into_boxed_str()),
                             description: Box::leak(s.description.into_boxed_str()),
                             platform: s.platform.into(),
+                            gated: s.gated,
                         })
                         .collect();
                     Box::leak(suggestion_vec.into_boxed_slice())

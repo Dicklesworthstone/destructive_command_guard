@@ -9,8 +9,10 @@
 //! - Snowflake (modern `snow sql` CLI)
 //! - `Supabase` (`supabase db`, `supabase migration`, `supabase projects`)
 //! - `BigQuery` (`bq` CLI and `GoogleSQL`)
+//! - Databricks (`databricks` CLI: workspace/fs/bundle/secrets/api deletes)
 
 pub mod bigquery;
+pub mod databricks;
 pub mod mongodb;
 pub mod mysql;
 pub mod postgresql;

@@ -59,8 +59,37 @@ fn mask_dynamic_fields(mut json: Value) -> Value {
                     Value::String("dcg allow-once <DYNAMIC>".to_string());
             }
         }
+
+        // Mask the dynamic allow-once code inside the reason text (GH#332:
+        // the reason names the scoped remedy, and the minted code changes
+        // per invocation).
+        if let Some(reason) = hook_output
+            .get("permissionDecisionReason")
+            .and_then(Value::as_str)
+        {
+            let masked = mask_allow_once_code_in_text(reason);
+            if masked != reason {
+                hook_output["permissionDecisionReason"] = Value::String(masked);
+            }
+        }
     }
     json
+}
+
+/// Replace a minted `dcg allow-once <code>` occurrence with a stable token.
+fn mask_allow_once_code_in_text(text: &str) -> String {
+    const NEEDLE: &str = "dcg allow-once ";
+    let Some(idx) = text.find(NEEDLE) else {
+        return text.to_string();
+    };
+    let code_start = idx + NEEDLE.len();
+    let code_end = text[code_start..]
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .map_or(text.len(), |off| code_start + off);
+    if code_end == code_start {
+        return text.to_string();
+    }
+    format!("{}<DYNAMIC>{}", &text[..code_start], &text[code_end..])
 }
 
 /// Compare JSON output against a golden file.

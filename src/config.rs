@@ -802,6 +802,7 @@ struct GeneralConfigLayer {
     max_command_bytes: Option<usize>,
     max_findings_per_command: Option<usize>,
     fail_closed: Option<bool>,
+    update_pin: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -1770,6 +1771,17 @@ pub struct GeneralConfig {
     /// environments. Override at runtime with the `DCG_FAIL_CLOSED` env var
     /// (a truthy value forces fail-closed, a falsy value forces fail-open).
     pub fail_closed: bool,
+
+    /// Pin the installed binary against `dcg update` (#320).
+    ///
+    /// When `true`, `dcg update` refuses to replace the installed binary
+    /// (before any network or installer work) unless `--replace-local-build`
+    /// is passed, and the background "update available" nudge is suppressed.
+    /// Intended for operators running a local build that is ahead of the
+    /// published release, where a routine update would silently downgrade
+    /// guard coverage. Override at runtime with `DCG_UPDATE_PIN`.
+    /// Default: false.
+    pub update_pin: bool,
 }
 
 /// Default limits for input size (used when not configured).
@@ -1790,6 +1802,7 @@ impl Default for GeneralConfig {
             check_updates: true,
             self_heal_hook: true,
             fail_closed: false,
+            update_pin: false,
         }
     }
 }
@@ -2756,26 +2769,54 @@ pub struct OverridesConfig {
     #[serde(default)]
     pub block: Vec<BlockOverride>,
 
-    /// Simple allowlist format (backward compatible).
-    ///
-    /// Example in TOML:
-    /// ```toml
-    /// allowlist = ["npm run build", "cargo test"]
-    /// ```
-    #[serde(default)]
-    pub allowlist: Option<Vec<String>>,
+    /// REMOVED (#327): `overrides.allowlist` parsed, appeared in the schema,
+    /// and was never consulted during evaluation — the layer merge dropped it,
+    /// so a config using it silently had no effect. The key is now detected
+    /// only so `dcg config` / `dcg doctor` can warn and point at the surfaces
+    /// that work: `overrides.allow`, per-rule `exempt_target_globs`, and
+    /// `dcg allowlist add`.
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub allowlist: Option<toml::Value>,
 
-    /// Extended allowlist rules with path-specific conditions.
-    ///
-    /// Example in TOML:
-    /// ```toml
-    /// [[allowlist_rules]]
-    /// pattern = "rm -rf node_modules"
-    /// paths = ["/home/*/projects/*", "/workspace/*"]
-    /// comment = "Allow node_modules cleanup in project directories"
-    /// ```
-    #[serde(default)]
-    pub allowlist_rules: Option<Vec<AllowlistRule>>,
+    /// REMOVED (#327): `overrides.allowlist_rules` had the same silent-drop
+    /// fate as `allowlist` above, with the extra hazard that its documented
+    /// `paths` condition was ignored even by the dead compile path — wiring it
+    /// up as parsed would have granted path-scoped configs global allowances.
+    /// Detected only, to warn.
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub allowlist_rules: Option<toml::Value>,
+}
+
+impl OverridesConfig {
+    /// Warnings for config keys that parse but are no longer part of the
+    /// schema (#327). Surfaced through `dcg config` and `dcg doctor` so a
+    /// silently-ignored key is distinguishable from one that simply didn't
+    /// match.
+    #[must_use]
+    pub fn removed_key_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.allowlist.is_some() {
+            warnings.push(
+                "`overrides.allowlist` is not enforced (removed in #327; it was parsed but \
+                 never consulted). Use `overrides.allow` regex overrides, a per-rule \
+                 `[rules.\"<pack:rule>\"] exempt_target_globs` target exemption, or \
+                 `dcg allowlist add`."
+                    .to_string(),
+            );
+        }
+        if self.allowlist_rules.is_some() {
+            warnings.push(
+                "`overrides.allowlist_rules` is not enforced (removed in #327; it was parsed \
+                 but never consulted, and its `paths` condition was never implemented). For \
+                 path-scoped exemptions use `[rules.\"<pack:rule>\"] exempt_target_globs`, or \
+                 `dcg allowlist add --path`."
+                    .to_string(),
+            );
+        }
+        warnings
+    }
 }
 
 /// Settings for layered allowlist files (`.dcg/allowlist.toml`,
@@ -2801,384 +2842,6 @@ impl Default for AllowlistConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct AllowlistConfigLayer {
     auto_prune_expired: Option<bool>,
-}
-
-/// An extended allowlist rule with optional path conditions.
-///
-/// This supports context-aware allowlisting where rules can be scoped
-/// to specific directories or path patterns. Rules can also have expiration
-/// settings (mutually exclusive: only one of `expires`, `ttl`, `ttl_seconds`,
-/// or `session` should be set).
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct AllowlistRule {
-    /// The pattern to allow (regex supported).
-    pub pattern: String,
-
-    /// Optional path patterns where this rule applies.
-    ///
-    /// If `None` or empty, the rule applies globally.
-    /// Supports glob patterns like `/home/*/projects/*`.
-    #[serde(default)]
-    pub paths: Option<Vec<String>>,
-
-    /// Optional comment explaining the rule.
-    #[serde(default)]
-    pub comment: Option<String>,
-
-    /// Optional expiration timestamp (ISO 8601 format).
-    ///
-    /// After this time, the rule is no longer active.
-    /// Example: "2024-06-01T00:00:00Z"
-    ///
-    /// Mutually exclusive with `ttl`, `ttl_seconds`, and `session`.
-    #[serde(default)]
-    pub expires: Option<String>,
-
-    /// Optional time-to-live duration as a human-readable string.
-    ///
-    /// Supported formats:
-    /// - Minutes: "30m", "30min", "30 minutes"
-    /// - Hours: "4h", "4hr", "4 hours"
-    /// - Days: "7d", "7 days"
-    /// - Weeks: "1w", "1 week"
-    ///
-    /// TTL is computed from `created_at` timestamp.
-    /// Mutually exclusive with `expires`, `ttl_seconds`, and `session`.
-    #[serde(default)]
-    pub ttl: Option<String>,
-
-    /// Optional time-to-live duration in seconds.
-    ///
-    /// Alternative to `ttl` for programmatic use.
-    /// TTL is computed from `created_at` timestamp.
-    /// Mutually exclusive with `expires`, `ttl`, and `session`.
-    #[serde(default)]
-    pub ttl_seconds: Option<u64>,
-
-    /// Whether this is a session-only rule.
-    ///
-    /// Session rules are valid only within the shell session that created them.
-    /// Mutually exclusive with `expires`, `ttl`, and `ttl_seconds`.
-    #[serde(default)]
-    pub session: Option<bool>,
-
-    /// Session identifier this rule is bound to when `session = true`.
-    #[serde(default)]
-    pub session_id: Option<String>,
-
-    /// Timestamp when this rule was created (ISO 8601 format).
-    ///
-    /// Required for TTL-based expiration. If not set when a TTL is specified,
-    /// it will be automatically set to the current time when the rule is loaded.
-    #[serde(default)]
-    pub created_at: Option<String>,
-}
-
-impl Default for AllowlistRule {
-    fn default() -> Self {
-        Self {
-            pattern: String::new(),
-            paths: None,
-            comment: None,
-            expires: None,
-            ttl: None,
-            ttl_seconds: None,
-            session: None,
-            session_id: None,
-            created_at: None,
-        }
-    }
-}
-
-/// Parse a human-readable TTL duration string into seconds.
-///
-/// Supported formats:
-/// - Seconds: "30", "30s", "30 sec", "30 seconds"
-/// - Minutes: "30m", "30min", "30 minutes", "30 minute"
-/// - Hours: "4h", "4hr", "4 hours", "4 hour"
-/// - Days: "7d", "7 day", "7 days"
-/// - Weeks: "1w", "1 week", "1 weeks"
-/// - Combined: "1h30m", "1 hour 30 minutes", "2d4h"
-///
-/// # Errors
-///
-/// Returns an error if the format is invalid or the number cannot be parsed.
-pub fn parse_ttl_duration(s: &str) -> Result<u64, String> {
-    let s = s.trim().to_lowercase();
-    if s.is_empty() {
-        return Err("TTL duration cannot be empty".to_string());
-    }
-
-    if s.chars().all(|c| c.is_ascii_digit()) {
-        let seconds = s
-            .parse::<u64>()
-            .map_err(|_| format!("invalid TTL number: '{s}'"))?;
-        return if seconds == 0 {
-            Err("TTL duration must be greater than zero".to_string())
-        } else {
-            Ok(seconds)
-        };
-    }
-
-    let bytes = s.as_bytes();
-    let mut pos = 0;
-    let mut total_seconds = 0_u64;
-
-    while pos < bytes.len() {
-        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        if pos >= bytes.len() {
-            break;
-        }
-
-        let number_start = pos;
-        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
-            pos += 1;
-        }
-        if number_start == pos {
-            return Err(format!("expected TTL number near '{}'", &s[number_start..]));
-        }
-
-        let num_str = &s[number_start..pos];
-        let num = num_str
-            .parse::<u64>()
-            .map_err(|_| format!("invalid TTL number: '{num_str}'"))?;
-
-        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        let unit_start = pos;
-        while pos < bytes.len() && bytes[pos].is_ascii_alphabetic() {
-            pos += 1;
-        }
-        if unit_start == pos {
-            return Err(format!("missing TTL unit after '{num_str}'"));
-        }
-
-        let unit = &s[unit_start..pos];
-        let multiplier = match unit {
-            "s" | "sec" | "secs" | "second" | "seconds" => 1,
-            "m" | "min" | "mins" | "minute" | "minutes" => 60,
-            "h" | "hr" | "hrs" | "hour" | "hours" => 3600,
-            "d" | "day" | "days" => 86_400,
-            "w" | "week" | "weeks" => 604_800,
-            _ => return Err(format!("unknown TTL unit: '{unit}'")),
-        };
-
-        let component = num
-            .checked_mul(multiplier)
-            .ok_or_else(|| format!("TTL overflow: {num} * {multiplier}"))?;
-        total_seconds = total_seconds
-            .checked_add(component)
-            .ok_or_else(|| "TTL overflow while adding duration components".to_string())?;
-
-        if pos < bytes.len() && !bytes[pos].is_ascii_whitespace() && !bytes[pos].is_ascii_digit() {
-            let unexpected = s[pos..].chars().next().unwrap_or('\0');
-            return Err(format!("unexpected TTL character: '{unexpected}'"));
-        }
-    }
-
-    if total_seconds == 0 {
-        Err("TTL duration must be greater than zero".to_string())
-    } else {
-        Ok(total_seconds)
-    }
-}
-
-impl AllowlistRule {
-    /// Check if this rule is currently active (not expired).
-    #[must_use]
-    pub fn is_active(&self) -> bool {
-        let now = Utc::now();
-
-        if self.session.unwrap_or(false) {
-            let Some(bound_session_id) = self.session_id.as_deref().map(str::trim) else {
-                return false;
-            };
-            if bound_session_id.is_empty() {
-                return false;
-            }
-
-            let Some(current_session_id) = crate::allowlist::current_session_id() else {
-                return false;
-            };
-            if bound_session_id != current_session_id.trim() {
-                return false;
-            }
-        }
-
-        // Check absolute expiration timestamp
-        if let Some(expires_str) = &self.expires {
-            if let Ok(expires) = DateTime::parse_from_rfc3339(expires_str) {
-                if now >= expires {
-                    return false;
-                }
-            }
-        }
-
-        // Check TTL-based expiration (requires created_at)
-        if let Some(created_str) = &self.created_at {
-            if let Ok(created) = DateTime::parse_from_rfc3339(created_str) {
-                // Try ttl (human-readable) first, then ttl_seconds
-                let ttl_secs = if let Some(ttl_str) = &self.ttl {
-                    parse_ttl_duration(ttl_str).ok()
-                } else {
-                    self.ttl_seconds
-                };
-
-                if let Some(secs) = ttl_secs {
-                    let expires_at = created + chrono::Duration::seconds(secs as i64);
-                    if now >= expires_at {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        true
-    }
-
-    /// Check if this rule applies globally (no path restrictions).
-    #[must_use]
-    pub fn is_global(&self) -> bool {
-        match &self.paths {
-            None => true,
-            Some(paths) => paths.is_empty() || paths.iter().any(|p| p == "*"),
-        }
-    }
-
-    /// Validate the rule.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Pattern is empty
-    /// - Paths contain invalid glob patterns
-    /// - Expires format is invalid
-    /// - TTL format is invalid
-    /// - Multiple expiration methods are specified (only one of expires/ttl/ttl_seconds/session allowed)
-    pub fn validate(&self) -> Result<(), String> {
-        // Pattern must be non-empty
-        if self.pattern.trim().is_empty() {
-            return Err("allowlist rule pattern must be non-empty".to_string());
-        }
-
-        // Count how many expiration methods are set
-        let expiration_count = [
-            self.expires.is_some(),
-            self.ttl.is_some(),
-            self.ttl_seconds.is_some(),
-            self.session.unwrap_or(false),
-        ]
-        .iter()
-        .filter(|&&b| b)
-        .count();
-
-        if expiration_count > 1 {
-            return Err(
-                "only one of expires, ttl, ttl_seconds, or session should be set".to_string(),
-            );
-        }
-
-        if self.session.unwrap_or(false)
-            && self
-                .session_id
-                .as_deref()
-                .map(str::trim)
-                .is_none_or(str::is_empty)
-        {
-            return Err("session=true requires non-empty session_id".to_string());
-        }
-
-        // Validate expires format if present
-        if let Some(expires_str) = &self.expires {
-            match DateTime::parse_from_rfc3339(expires_str) {
-                Ok(expires) => {
-                    // Warn if already expired (not an error, just informational)
-                    let now = Utc::now();
-                    if now >= expires {
-                        // Log warning but don't fail - the rule will just be inactive
-                        eprintln!(
-                            "warning: allowlist rule '{}' has already expired ({})",
-                            self.pattern, expires_str
-                        );
-                    }
-                }
-                Err(_) => {
-                    return Err(format!(
-                        "invalid expires format '{}': expected ISO 8601 (e.g., 2024-06-01T00:00:00Z)",
-                        expires_str
-                    ));
-                }
-            }
-        }
-
-        // Validate TTL format if present
-        if let Some(ttl_str) = &self.ttl {
-            parse_ttl_duration(ttl_str).map_err(|e| format!("invalid TTL '{}': {}", ttl_str, e))?;
-        }
-
-        // Validate created_at format if present
-        if let Some(created_str) = &self.created_at {
-            if DateTime::parse_from_rfc3339(created_str).is_err() {
-                return Err(format!(
-                    "invalid created_at format '{}': expected ISO 8601 (e.g., 2024-06-01T00:00:00Z)",
-                    created_str
-                ));
-            }
-        }
-
-        // Warn if TTL is set but created_at is missing (rule won't expire as expected)
-        if (self.ttl.is_some() || self.ttl_seconds.is_some()) && self.created_at.is_none() {
-            eprintln!(
-                "warning: allowlist rule '{}' has TTL but no created_at timestamp; \
-                 TTL will be computed from when the rule is first loaded",
-                self.pattern
-            );
-        }
-
-        // Validate path patterns (basic check for common mistakes)
-        if let Some(paths) = &self.paths {
-            for path in paths {
-                if path.trim().is_empty() {
-                    return Err("allowlist rule path pattern must be non-empty".to_string());
-                }
-                // Check for obviously invalid patterns
-                if path.contains("**/**") {
-                    return Err(format!(
-                        "invalid glob pattern '{}': consecutive ** not allowed",
-                        path
-                    ));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Ensure the rule has a created_at timestamp.
-    ///
-    /// If `created_at` is not set and a TTL is specified, this sets it to the
-    /// current time. This should be called when loading rules from config.
-    pub fn ensure_created_at(&mut self) {
-        if self.created_at.is_none() && (self.ttl.is_some() || self.ttl_seconds.is_some()) {
-            self.created_at = Some(Utc::now().to_rfc3339());
-        }
-    }
-
-    /// Get the effective TTL in seconds, if any.
-    ///
-    /// Returns the TTL from either the human-readable `ttl` field or the
-    /// numeric `ttl_seconds` field.
-    #[must_use]
-    pub fn effective_ttl_seconds(&self) -> Option<u64> {
-        if let Some(ttl_str) = &self.ttl {
-            parse_ttl_duration(ttl_str).ok()
-        } else {
-            self.ttl_seconds
-        }
-    }
 }
 
 /// An allow override - patterns that should be permitted.
@@ -3972,10 +3635,37 @@ pub enum PatternKind {
 
 impl CompiledOverrides {
     /// Check allow overrides. Returns true if command should be allowed.
+    ///
+    /// Allow patterns are substring-matched, and this check runs *before* pack
+    /// evaluation, so on a compound command a single matching entry used to
+    /// return `allowed` for text it never examined: an entry naming a scratch
+    /// path allowed that path plus whatever followed the `&&` (#340). A
+    /// safe segment silencing a destructive one is the same bypass class
+    /// `split_command_segments` already closes for pack patterns, so allow
+    /// overrides now clear each segment on its own terms.
+    ///
+    /// A single-segment command keeps the historical whole-string semantics.
+    /// A compound command is allowed only when every segment is itself
+    /// allowed; an entry that covers one segment no longer speaks for the
+    /// rest, and anything uncovered falls through to normal evaluation.
+    /// Anchored entries compose across a chain for the first time as a
+    /// result — previously `^a$` and `^b$` allowed neither half of `a && b`.
     #[inline]
     #[must_use]
     pub fn check_allow(&self, command: &str) -> bool {
-        self.allow.iter().any(|o| o.matches(command))
+        if self.allow.is_empty() {
+            return false;
+        }
+
+        let segments = crate::packs::split_command_segments(command);
+        if segments.len() <= 1 {
+            return self.allow.iter().any(|o| o.matches(command));
+        }
+
+        segments.iter().all(|segment| {
+            let segment = segment.trim();
+            segment.is_empty() || self.allow.iter().any(|o| o.matches(segment))
+        })
     }
 
     /// Check block overrides. Returns the reason if command should be blocked.
@@ -4060,147 +3750,7 @@ impl OverridesConfig {
             }
         }
 
-        // Compile simple allowlist patterns (backward-compatible format)
-        if let Some(allowlist) = &self.allowlist {
-            for pattern in allowlist {
-                if pattern.trim().is_empty() {
-                    continue;
-                }
-                match CompiledRegex::new(pattern) {
-                    Ok(regex) => {
-                        compiled.allow.push(CompiledAllowOverride {
-                            regex,
-                            pattern: pattern.clone(),
-                            condition: ConditionCheck::Always,
-                        });
-                    }
-                    Err(e) => {
-                        compiled.invalid_patterns.push(InvalidPattern {
-                            pattern: pattern.clone(),
-                            error: e.clone(),
-                            kind: PatternKind::Allow,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Compile extended allowlist rules
-        if let Some(rules) = &self.allowlist_rules {
-            for rule in rules {
-                // Skip inactive (expired) rules
-                if !rule.is_active() {
-                    continue;
-                }
-
-                // Validate the rule - skip invalid ones but log the error
-                if let Err(e) = rule.validate() {
-                    compiled.invalid_patterns.push(InvalidPattern {
-                        pattern: rule.pattern.clone(),
-                        error: e,
-                        kind: PatternKind::Allow,
-                    });
-                    continue;
-                }
-
-                match CompiledRegex::new(&rule.pattern) {
-                    Ok(regex) => {
-                        compiled.allow.push(CompiledAllowOverride {
-                            regex,
-                            pattern: rule.pattern.clone(),
-                            condition: ConditionCheck::Always,
-                        });
-                    }
-                    Err(e) => {
-                        compiled.invalid_patterns.push(InvalidPattern {
-                            pattern: rule.pattern.clone(),
-                            error: e.clone(),
-                            kind: PatternKind::Allow,
-                        });
-                    }
-                }
-            }
-        }
-
         compiled
-    }
-
-    /// Load and merge all allowlist rules from both formats.
-    ///
-    /// This returns a unified list of `AllowlistRule` structs, converting
-    /// simple allowlist patterns to the extended format.
-    #[must_use]
-    pub fn load_allowlist(&self) -> Vec<AllowlistRule> {
-        let mut rules = Vec::new();
-
-        // Convert simple format to AllowlistRule
-        if let Some(simple) = &self.allowlist {
-            for pattern in simple {
-                if pattern.trim().is_empty() {
-                    continue;
-                }
-                rules.push(AllowlistRule {
-                    pattern: pattern.clone(),
-                    paths: None, // None means global
-                    ..Default::default()
-                });
-            }
-        }
-
-        // Add extended format rules
-        if let Some(extended) = &self.allowlist_rules {
-            for rule in extended {
-                // Only include active rules
-                if rule.is_active() {
-                    rules.push(rule.clone());
-                }
-            }
-        }
-
-        // Warn on duplicate patterns (log to stderr in debug builds)
-        #[cfg(debug_assertions)]
-        {
-            let mut seen = std::collections::HashSet::new();
-            for rule in &rules {
-                if !seen.insert(&rule.pattern) {
-                    eprintln!(
-                        "dcg: warning: duplicate allowlist pattern: {}",
-                        rule.pattern
-                    );
-                }
-            }
-        }
-
-        rules
-    }
-
-    /// Validate all allowlist rules.
-    ///
-    /// # Errors
-    ///
-    /// Returns a list of validation errors for invalid rules.
-    pub fn validate_allowlist(&self) -> Vec<String> {
-        let mut errors = Vec::new();
-
-        // Validate simple patterns
-        if let Some(patterns) = &self.allowlist {
-            for (i, pattern) in patterns.iter().enumerate() {
-                if pattern.trim().is_empty() {
-                    errors.push(format!("allowlist[{}]: pattern must be non-empty", i));
-                }
-            }
-        }
-
-        // Validate extended rules
-        if let Some(rules) = &self.allowlist_rules {
-            for (i, rule) in rules.iter().enumerate() {
-                if let Err(e) = rule.validate() {
-                    errors.push(format!("allowlist_rules[{}]: {}", i, e));
-                }
-            }
-        }
-
-        errors
     }
 }
 
@@ -4703,6 +4253,9 @@ impl Config {
         if let Some(fail_closed) = general.fail_closed {
             self.general.fail_closed = fail_closed;
         }
+        if let Some(update_pin) = general.update_pin {
+            self.general.update_pin = update_pin;
+        }
     }
 
     const fn merge_output_layer(&mut self, output: OutputConfigLayer) {
@@ -4749,6 +4302,15 @@ impl Config {
     fn merge_overrides_layer(&mut self, overrides: OverridesConfig) {
         self.overrides.allow.extend(overrides.allow);
         self.overrides.block.extend(overrides.block);
+        // #327: carry the removed-key sentinels forward so `dcg config` and
+        // `dcg doctor` can warn that the key is not enforced. Without this the
+        // merge silently dropped the keys — exactly the failure being fixed.
+        if overrides.allowlist.is_some() {
+            self.overrides.allowlist = overrides.allowlist;
+        }
+        if overrides.allowlist_rules.is_some() {
+            self.overrides.allowlist_rules = overrides.allowlist_rules;
+        }
     }
 
     const fn merge_allowlist_layer(&mut self, allowlist: AllowlistConfigLayer) {
@@ -5010,6 +4572,13 @@ impl Config {
         if let Some(disable) = get_env("DCG_NO_UPDATE_CHECK") {
             if env_disable_flag_enabled(&disable) {
                 self.general.check_updates = false;
+            }
+        }
+
+        // DCG_UPDATE_PIN=true|false|1|0 (#320)
+        if let Some(update_pin) = get_env(&format!("{ENV_PREFIX}_UPDATE_PIN")) {
+            if let Some(parsed) = parse_env_bool(&update_pin) {
+                self.general.update_pin = parsed;
             }
         }
 
@@ -5421,6 +4990,49 @@ impl Config {
         packs.insert("core".to_string());
 
         packs
+    }
+
+    /// Remove an agent profile's pack exclusions from an already-expanded set.
+    ///
+    /// [`Self::enabled_pack_ids_for_agent`] applies profile exclusions to the
+    /// configured built-in packs. Callers then auto-enable external packs, so
+    /// those later contributions need the same final exclusion pass. Core
+    /// packs remain mandatory regardless of profile settings.
+    pub fn remove_disabled_packs_for_agent(
+        &self,
+        enabled_packs: &mut HashSet<String>,
+        agent: &crate::agent::Agent,
+    ) {
+        let profile = self.agents.profile_for_agent(agent);
+        for disabled in &profile.disabled_packs {
+            if disabled == "core" || disabled.starts_with("core.") {
+                continue;
+            }
+            enabled_packs.remove(disabled);
+            enabled_packs.retain(|pack| !pack.starts_with(&format!("{disabled}.")));
+        }
+    }
+
+    /// Apply an agent profile to already-loaded project/user/system allowlists.
+    ///
+    /// Disabling allowlists is deliberately absolute: it removes both the
+    /// loaded layers and the profile's own additional exact commands. When
+    /// enabled, agent commands are prepended as the highest-precedence layer.
+    #[must_use]
+    pub fn apply_agent_allowlist_profile(
+        &self,
+        agent: &crate::agent::Agent,
+        mut allowlists: crate::allowlist::LayeredAllowlist,
+    ) -> crate::allowlist::LayeredAllowlist {
+        if self.allowlist_disabled_for_agent(agent) {
+            return crate::allowlist::LayeredAllowlist::default();
+        }
+
+        allowlists.prepend_agent_exact_commands(
+            agent.config_key(),
+            self.additional_allowlist_for_agent(agent),
+        );
+        allowlists
     }
 
     /// Get additional allowlist entries for an agent.
@@ -7983,6 +7595,73 @@ enabled = false
         assert!(!compiled.check_allow("git status"));
     }
 
+    /// #340: an unanchored allow entry is substring-matched against the whole
+    /// command, and `check_allow` short-circuits before pack evaluation. One
+    /// matching segment therefore used to carry every other segment with it.
+    #[test]
+    fn unanchored_allow_override_does_not_launder_later_segments() {
+        let overrides = OverridesConfig {
+            allow: vec![AllowOverride::Simple(
+                "git stash list /srv/scratch/build".to_string(),
+            )],
+            block: vec![],
+            ..Default::default()
+        };
+        let compiled = overrides.compile();
+
+        // The entry still allows exactly what it names.
+        assert!(compiled.check_allow("git stash list /srv/scratch/build"));
+
+        // But it no longer speaks for a second segment it never matched.
+        for command in [
+            "git stash list /srv/scratch/build && git reset --hard",
+            "git stash list /srv/scratch/build; git reset --hard",
+            "git stash list /srv/scratch/build || git reset --hard",
+            "git stash list /srv/scratch/build | git reset --hard",
+        ] {
+            assert!(
+                !compiled.check_allow(command),
+                "allow entry laundered a trailing segment: {command}"
+            );
+        }
+    }
+
+    /// A command substitution is returned as its own segment, so a safe outer
+    /// command cannot carry a destructive inner one past the allow check.
+    #[test]
+    fn allow_override_does_not_launder_command_substitution() {
+        let overrides = OverridesConfig {
+            allow: vec![AllowOverride::Simple("echo".to_string())],
+            block: vec![],
+            ..Default::default()
+        };
+        let compiled = overrides.compile();
+
+        assert!(compiled.check_allow("echo hello"));
+        assert!(!compiled.check_allow("echo $(git reset --hard)"));
+    }
+
+    /// Every segment being independently allowed is still allowed, and anchored
+    /// entries now compose across a chain (previously neither half matched the
+    /// whole string, so the compound was denied).
+    #[test]
+    fn allow_override_permits_fully_covered_compound() {
+        let overrides = OverridesConfig {
+            allow: vec![
+                AllowOverride::Simple("^git stash list$".to_string()),
+                AllowOverride::Simple("^git status$".to_string()),
+            ],
+            block: vec![],
+            ..Default::default()
+        };
+        let compiled = overrides.compile();
+
+        assert!(compiled.check_allow("git stash list"));
+        assert!(compiled.check_allow("git stash list && git status"));
+        assert!(compiled.check_allow("git status; git stash list"));
+        assert!(!compiled.check_allow("git stash list && git reset --hard"));
+    }
+
     #[test]
     fn test_compile_block_override() {
         let overrides = OverridesConfig {
@@ -8192,407 +7871,62 @@ enabled = false
     }
 
     // ========================================================================
-    // AllowlistRule and Extended Allowlist Tests (git_safety_guard-fvuf)
+    // Removed overrides.allowlist / allowlist_rules keys (#327)
     // ========================================================================
 
     #[test]
-    fn test_allowlist_rule_validation_empty_pattern() {
-        let rule = AllowlistRule {
-            pattern: "".to_string(),
-            ..Default::default()
-        };
-        assert!(rule.validate().is_err());
-        assert!(rule.validate().unwrap_err().contains("non-empty"));
-    }
+    fn removed_allowlist_keys_are_detected_and_warned() {
+        let overrides: OverridesConfig = toml::from_str(
+            r#"
+            allowlist = ["rm -rf /srv/scratch/build"]
 
-    #[test]
-    fn test_allowlist_rule_validation_whitespace_pattern() {
-        let rule = AllowlistRule {
-            pattern: "   ".to_string(),
-            ..Default::default()
-        };
-        assert!(rule.validate().is_err());
-    }
+            [[allowlist_rules]]
+            pattern = "rm -rf /srv/scratch/build"
+            paths = ["/srv/scratch/*"]
+            "#,
+        )
+        .expect("configs carrying the removed keys must still parse");
 
-    #[test]
-    fn test_allowlist_rule_validation_valid_pattern() {
-        let rule = AllowlistRule {
-            pattern: "npm run build".to_string(),
-            paths: Some(vec!["/home/*/projects/*".to_string()]),
-            comment: Some("Allow builds".to_string()),
-            ..Default::default()
-        };
-        assert!(rule.validate().is_ok());
-    }
-
-    #[test]
-    fn test_allowlist_rule_validation_invalid_expires() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            expires: Some("not-a-date".to_string()),
-            ..Default::default()
-        };
-        assert!(rule.validate().is_err());
-        assert!(rule.validate().unwrap_err().contains("expires"));
-    }
-
-    #[test]
-    fn test_allowlist_rule_validation_valid_expires() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            expires: Some("2030-01-01T00:00:00Z".to_string()),
-            ..Default::default()
-        };
-        assert!(rule.validate().is_ok());
-    }
-
-    #[test]
-    fn test_parse_ttl_duration_accepts_cli_style_combined_units() {
-        assert_eq!(parse_ttl_duration("1h30m").unwrap(), 5_400);
-        assert_eq!(parse_ttl_duration("1 hour 30 minutes").unwrap(), 5_400);
-        assert_eq!(parse_ttl_duration("2d4h").unwrap(), 187_200);
-        assert_eq!(parse_ttl_duration("1w 2d 3h 4m 5s").unwrap(), 788_645);
-    }
-
-    #[test]
-    fn test_parse_ttl_duration_preserves_legacy_single_units() {
-        assert_eq!(parse_ttl_duration("30").unwrap(), 30);
-        assert_eq!(parse_ttl_duration("30 seconds").unwrap(), 30);
-        assert_eq!(parse_ttl_duration("30m").unwrap(), 1_800);
-        assert_eq!(parse_ttl_duration("4 hr").unwrap(), 14_400);
-        assert_eq!(parse_ttl_duration("7 days").unwrap(), 604_800);
-    }
-
-    #[test]
-    fn test_parse_ttl_duration_rejects_invalid_or_empty_values() {
-        assert!(parse_ttl_duration("").unwrap_err().contains("empty"));
-        assert!(
-            parse_ttl_duration("0h")
-                .unwrap_err()
-                .contains("greater than zero")
+        let warnings = overrides.removed_key_warnings();
+        assert_eq!(
+            warnings.len(),
+            2,
+            "one warning per removed key: {warnings:?}"
         );
+        assert!(warnings[0].contains("overrides.allowlist"));
+        assert!(warnings[1].contains("overrides.allowlist_rules"));
         assert!(
-            parse_ttl_duration("1h thirty minutes")
-                .unwrap_err()
-                .contains("number")
-        );
-        assert!(
-            parse_ttl_duration("1x")
-                .unwrap_err()
-                .contains("unknown TTL unit")
-        );
-        assert!(
-            parse_ttl_duration("1h30")
-                .unwrap_err()
-                .contains("missing TTL unit")
+            warnings.iter().all(|w| w.contains("exempt_target_globs")),
+            "warnings must point at a working alternative: {warnings:?}"
         );
     }
 
     #[test]
-    fn test_allowlist_rule_validation_accepts_combined_ttl() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            ttl: Some("1h30m".to_string()),
-            created_at: Some("2026-01-01T00:00:00Z".to_string()),
-            ..Default::default()
-        };
+    fn removed_allowlist_keys_grant_no_allowances() {
+        let overrides: OverridesConfig = toml::from_str(
+            r#"
+            allowlist = ["rm -rf /srv/scratch/build"]
 
-        assert!(rule.validate().is_ok());
-        assert_eq!(rule.effective_ttl_seconds(), Some(5_400));
-    }
+            [[allowlist_rules]]
+            pattern = "rm -rf /srv/scratch/build"
+            "#,
+        )
+        .expect("configs carrying the removed keys must still parse");
 
-    #[test]
-    fn test_allowlist_rule_validation_session_requires_session_id() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            session: Some(true),
-            session_id: None,
-            ..Default::default()
-        };
-        assert!(rule.validate().is_err());
-        assert!(rule.validate().unwrap_err().contains("session_id"));
-    }
-
-    #[test]
-    fn test_allowlist_rule_is_active_no_expiry() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            ..Default::default()
-        };
-        assert!(rule.is_active());
-    }
-
-    #[test]
-    fn test_allowlist_rule_is_active_future_expiry() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            expires: Some("2030-01-01T00:00:00Z".to_string()),
-            ..Default::default()
-        };
-        assert!(rule.is_active());
-    }
-
-    #[test]
-    fn test_allowlist_rule_is_active_past_expiry() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            expires: Some("2020-01-01T00:00:00Z".to_string()),
-            ..Default::default()
-        };
-        assert!(!rule.is_active());
-    }
-
-    #[test]
-    fn test_allowlist_rule_is_active_session_mismatch_is_inactive() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            session: Some(true),
-            session_id: Some("ppid:0|tty:/dev/pts/999".to_string()),
-            ..Default::default()
-        };
-        assert!(!rule.is_active());
-    }
-
-    #[test]
-    fn test_allowlist_rule_is_active_session_match_follows_runtime_detection() {
-        let detected = crate::allowlist::current_session_id();
-        let bound = detected
-            .clone()
-            .unwrap_or_else(|| "ppid:0|tty:/dev/pts/999".to_string());
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            session: Some(true),
-            session_id: Some(bound),
-            ..Default::default()
-        };
-
-        if detected.is_some() {
-            assert!(rule.is_active());
-        } else {
-            assert!(!rule.is_active());
-        }
-    }
-
-    #[test]
-    fn test_allowlist_rule_is_global_no_paths() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            paths: None,
-            ..Default::default()
-        };
-        assert!(rule.is_global());
-    }
-
-    #[test]
-    fn test_allowlist_rule_is_global_empty_paths() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            paths: Some(vec![]),
-            ..Default::default()
-        };
-        assert!(rule.is_global());
-    }
-
-    #[test]
-    fn test_allowlist_rule_is_global_wildcard() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            paths: Some(vec!["*".to_string()]),
-            ..Default::default()
-        };
-        assert!(rule.is_global());
-    }
-
-    #[test]
-    fn test_allowlist_rule_not_global_with_paths() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            paths: Some(vec!["/home/user/*".to_string()]),
-            ..Default::default()
-        };
-        assert!(!rule.is_global());
-    }
-
-    #[test]
-    fn test_compile_simple_allowlist() {
-        let overrides = OverridesConfig {
-            allowlist: Some(vec!["npm run build".to_string(), "cargo test".to_string()]),
-            ..Default::default()
-        };
         let compiled = overrides.compile();
-
-        assert_eq!(compiled.allow.len(), 2);
-        assert!(compiled.invalid_patterns.is_empty());
-        assert!(compiled.check_allow("npm run build"));
-        assert!(compiled.check_allow("cargo test"));
-        assert!(!compiled.check_allow("rm -rf"));
+        assert!(compiled.allow.is_empty());
+        assert!(!compiled.check_allow("rm -rf /srv/scratch/build"));
     }
 
     #[test]
-    fn test_compile_allowlist_rules() {
-        let overrides = OverridesConfig {
-            allowlist_rules: Some(vec![AllowlistRule {
-                pattern: "rm -rf node_modules".to_string(),
-                paths: Some(vec!["/home/*/projects/*".to_string()]),
-                comment: Some("Allow node_modules cleanup".to_string()),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        };
-        let compiled = overrides.compile();
-
-        assert_eq!(compiled.allow.len(), 1);
-        assert!(compiled.invalid_patterns.is_empty());
-        assert!(compiled.check_allow("rm -rf node_modules"));
-    }
-
-    #[test]
-    fn test_compile_both_allowlist_formats() {
-        let overrides = OverridesConfig {
-            allowlist: Some(vec!["npm run build".to_string()]),
-            allowlist_rules: Some(vec![AllowlistRule {
-                pattern: "cargo test".to_string(),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        };
-        let compiled = overrides.compile();
-
-        // Both formats should be merged
-        assert_eq!(compiled.allow.len(), 2);
-        assert!(compiled.check_allow("npm run build"));
-        assert!(compiled.check_allow("cargo test"));
-    }
-
-    #[test]
-    fn test_compile_skips_expired_rules() {
-        let overrides = OverridesConfig {
-            allowlist_rules: Some(vec![
-                AllowlistRule {
-                    pattern: "active-command".to_string(),
-                    expires: Some("2030-01-01T00:00:00Z".to_string()),
-                    ..Default::default()
-                },
-                AllowlistRule {
-                    pattern: "expired-command".to_string(),
-                    expires: Some("2020-01-01T00:00:00Z".to_string()),
-                    ..Default::default()
-                },
-            ]),
-            ..Default::default()
-        };
-        let compiled = overrides.compile();
-
-        // Only the active rule should be compiled
-        assert_eq!(compiled.allow.len(), 1);
-        assert!(compiled.check_allow("active-command"));
-        assert!(!compiled.check_allow("expired-command"));
-    }
-
-    #[test]
-    fn test_compile_skips_empty_patterns() {
-        let overrides = OverridesConfig {
-            allowlist: Some(vec![
-                "valid-pattern".to_string(),
-                "".to_string(),
-                "   ".to_string(),
-            ]),
-            ..Default::default()
-        };
-        let compiled = overrides.compile();
-
-        // Only valid patterns should be compiled
-        assert_eq!(compiled.allow.len(), 1);
-        assert!(compiled.check_allow("valid-pattern"));
-    }
-
-    #[test]
-    fn test_load_allowlist_merges_formats() {
-        let overrides = OverridesConfig {
-            allowlist: Some(vec!["simple-pattern".to_string()]),
-            allowlist_rules: Some(vec![AllowlistRule {
-                pattern: "extended-pattern".to_string(),
-                paths: Some(vec!["/home/*".to_string()]),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        };
-        let rules = overrides.load_allowlist();
-
-        assert_eq!(rules.len(), 2);
-
-        // Simple pattern should be converted to AllowlistRule with no paths
-        assert_eq!(rules[0].pattern, "simple-pattern");
-        assert!(rules[0].paths.is_none());
-
-        // Extended pattern should preserve its paths
-        assert_eq!(rules[1].pattern, "extended-pattern");
-        assert!(rules[1].paths.is_some());
-    }
-
-    #[test]
-    fn test_load_allowlist_filters_expired() {
-        let overrides = OverridesConfig {
-            allowlist_rules: Some(vec![
-                AllowlistRule {
-                    pattern: "active".to_string(),
-                    ..Default::default()
-                },
-                AllowlistRule {
-                    pattern: "expired".to_string(),
-                    expires: Some("2020-01-01T00:00:00Z".to_string()),
-                    ..Default::default()
-                },
-            ]),
-            ..Default::default()
-        };
-        let rules = overrides.load_allowlist();
-
-        // Only active rules should be returned
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].pattern, "active");
-    }
-
-    #[test]
-    fn test_validate_allowlist_empty_pattern() {
-        let overrides = OverridesConfig {
-            allowlist: Some(vec!["".to_string()]),
-            ..Default::default()
-        };
-        let errors = overrides.validate_allowlist();
-
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("non-empty"));
-    }
-
-    #[test]
-    fn test_validate_allowlist_invalid_rule() {
-        let overrides = OverridesConfig {
-            allowlist_rules: Some(vec![AllowlistRule {
-                pattern: "".to_string(),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        };
-        let errors = overrides.validate_allowlist();
-
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("allowlist_rules[0]"));
-    }
-
-    #[test]
-    fn test_validate_allowlist_valid() {
-        let overrides = OverridesConfig {
-            allowlist: Some(vec!["valid-pattern".to_string()]),
-            allowlist_rules: Some(vec![AllowlistRule {
-                pattern: "also-valid".to_string(),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        };
-        let errors = overrides.validate_allowlist();
-
-        assert!(errors.is_empty());
+    fn absent_removed_keys_produce_no_warnings() {
+        let overrides: OverridesConfig = toml::from_str(
+            r#"
+            allow = ["^git stash list$"]
+            "#,
+        )
+        .expect("plain overrides must parse");
+        assert!(overrides.removed_key_warnings().is_empty());
     }
 
     // ========================================================================
@@ -9497,6 +8831,14 @@ enabled = false
                 ..Default::default()
             },
         );
+        config.profiles.insert(
+            "oh-my-pi".to_string(),
+            AgentProfile {
+                trust_level: TrustLevel::High,
+                additional_allowlist: vec!["cargo test".to_string()],
+                ..Default::default()
+            },
+        );
 
         let codex_profile = config.profile_for_agent(&Agent::CodexCli);
         assert_eq!(codex_profile.trust_level, TrustLevel::High);
@@ -9509,6 +8851,14 @@ enabled = false
         let claude_profile = config.profile_for("claude-code");
         assert_eq!(claude_profile.trust_level, TrustLevel::Low);
         assert!(claude_profile.disabled_allowlist);
+
+        let omp_profile = config.profile_for_agent(&Agent::Omp);
+        assert_eq!(omp_profile.trust_level, TrustLevel::High);
+        assert!(
+            omp_profile
+                .additional_allowlist
+                .contains(&"cargo test".to_string())
+        );
     }
 
     #[test]

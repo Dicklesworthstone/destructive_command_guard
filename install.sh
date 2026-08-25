@@ -238,6 +238,8 @@ CURSOR_VERSION=""
 COPILOT_VERSION=""
 HERMES_VERSION=""
 POSIT_ASSISTANT_VERSION=""
+OPENCODE_VERSION=""
+OMP_VERSION=""
 
 print_agent_scan_notice() {
   [ "$QUIET" -eq 1 ] && return 0
@@ -298,6 +300,69 @@ posit_assistant_installed() {
   [ -d "$HOME/.posit/assistant" ] ||
     [ -d "$HOME/.positai" ] ||
     command -v pa >/dev/null 2>&1
+}
+
+# Mirror Node's POSIX `path.join(HOME, PI_CONFIG_DIR || ".omp")` without
+# requiring Node to be installed. This is lexical by design: repeated `/`, `.`
+# and `..` components are normalized, extra parents stop at `/`, and a leading
+# backslash remains an ordinary filename byte on POSIX.
+resolve_omp_config_root() {
+  local config_name="${PI_CONFIG_DIR:-.omp}"
+  local remaining="$HOME/$config_name"
+  local absolute=0
+  local segment
+  local component
+  local result=""
+  local count
+  local last
+  local -a components=()
+
+  case "$remaining" in
+    /*) absolute=1 ;;
+  esac
+
+  while [ -n "$remaining" ]; do
+    case "$remaining" in
+      */*)
+        segment="${remaining%%/*}"
+        remaining="${remaining#*/}"
+        ;;
+      *)
+        segment="$remaining"
+        remaining=""
+        ;;
+    esac
+    case "$segment" in
+      "" | .) ;;
+      ..)
+        count=${#components[@]}
+        if [ "$count" -gt 0 ]; then
+          last=$((count - 1))
+          if [ "${components[$last]}" != ".." ]; then
+            unset "components[$last]"
+          elif [ "$absolute" -eq 0 ]; then
+            components[${#components[@]}]=".."
+          fi
+        elif [ "$absolute" -eq 0 ]; then
+          components[0]=".."
+        fi
+        ;;
+      *) components[${#components[@]}]="$segment" ;;
+    esac
+  done
+
+  [ "$absolute" -eq 1 ] && result="/"
+  for component in ${components[@]+"${components[@]}"}; do
+    if [ "$result" = "/" ]; then
+      result="/$component"
+    elif [ -z "$result" ]; then
+      result="$component"
+    else
+      result="$result/$component"
+    fi
+  done
+  [ -n "$result" ] || result="."
+  printf '%s\n' "$result"
 }
 
 detect_agents() {
@@ -372,6 +437,25 @@ detect_agents() {
     DETECTED_AGENTS+=("posit-assistant")
     POSIT_ASSISTANT_VERSION=$(try_version pa)
   fi
+
+  # OpenCode (opencode.ai) — global config at ${XDG_CONFIG_HOME:-~/.config}/opencode,
+  # optional `opencode` CLI on PATH.
+  if [[ -d "${XDG_CONFIG_HOME:-$HOME/.config}/opencode" ]] || command -v opencode &>/dev/null; then
+    DETECTED_AGENTS+=("opencode")
+    OPENCODE_VERSION=$(try_version opencode)
+  fi
+
+  # Oh My Pi (`omp`) — require an external executable on PATH. Config/profile
+  # state can outlive an uninstall, while command lookup also accepts aliases
+  # and functions that the non-interactive installer cannot safely identify as
+  # OMP. Resolve the exact disk candidate once, require a regular executable,
+  # and use that path for version lookup.
+  local omp_bin
+  omp_bin=$(builtin type -P omp 2>/dev/null || true)
+  if [[ -n "$omp_bin" && -f "$omp_bin" && -x "$omp_bin" ]]; then
+    DETECTED_AGENTS+=("omp")
+    OMP_VERSION=$(try_version "$omp_bin")
+  fi
 }
 
 print_detected_agents() {
@@ -434,6 +518,16 @@ print_detected_agents() {
           [[ -n "$POSIT_ASSISTANT_VERSION" ]] && ver_info=" (${POSIT_ASSISTANT_VERSION})"
           gum style --foreground 42 "  ✓ Posit Assistant${ver_info}"
           ;;
+        opencode)
+          local ver_info=""
+          [[ -n "$OPENCODE_VERSION" ]] && ver_info=" (${OPENCODE_VERSION})"
+          gum style --foreground 42 "  ✓ OpenCode${ver_info}"
+          ;;
+        omp)
+          local ver_info=""
+          [[ -n "$OMP_VERSION" ]] && ver_info=" (${OMP_VERSION})"
+          gum style --foreground 42 "  ✓ Oh My Pi (omp)${ver_info}"
+          ;;
       esac
     done
     echo ""
@@ -486,6 +580,16 @@ print_detected_agents() {
           local ver_info=""
           [[ -n "$POSIT_ASSISTANT_VERSION" ]] && ver_info=" (${POSIT_ASSISTANT_VERSION})"
           echo -e "  \033[0;32m✓\033[0m Posit Assistant${ver_info}"
+          ;;
+        opencode)
+          local ver_info=""
+          [[ -n "$OPENCODE_VERSION" ]] && ver_info=" (${OPENCODE_VERSION})"
+          echo -e "  \033[0;32m✓\033[0m OpenCode${ver_info}"
+          ;;
+        omp)
+          local ver_info=""
+          [[ -n "$OMP_VERSION" ]] && ver_info=" (${OMP_VERSION})"
+          echo -e "  \033[0;32m✓\033[0m Oh My Pi (omp)${ver_info}"
           ;;
       esac
     done
@@ -851,6 +955,26 @@ maybe_add_path() {
 
 DCG_SHELL_CHECK_MARKER="# dcg: warn if hook was silently removed"
 
+# Replace the managed dcg shell-check region (the marker line through the
+# first column-0 `fi`) in an RC file with the current snippet body. Used when
+# a marker is present but the block text is stale (issue #282's second act:
+# marker-only idempotence pinned users to the first snippet they ever got).
+# $1 = rc file, $2 = replacement text (snippet without its leading blank line).
+repair_shell_check_region() {
+  local rc="$1" body="$2" start end tmp
+  start=$( { grep -nF "$DCG_SHELL_CHECK_MARKER" "$rc" | head -n 1 | cut -d: -f1; } 2>/dev/null || true)
+  [ -n "$start" ] || return 1
+  end=$(awk -v s="$start" 'NR >= s && /^fi[ \t]*$/ { print NR; exit }' "$rc" 2>/dev/null || true)
+  [ -n "$end" ] || return 1
+  tmp=$(mktemp) || return 1
+  {
+    head -n $((start - 1)) "$rc"
+    printf '%s\n' "$body"
+    tail -n +"$((end + 1))" "$rc"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  cat "$tmp" > "$rc" && rm -f "$tmp"
+}
+
 maybe_add_shell_check() {
   # Add a shell startup check that warns if the DCG hook has been silently
   # removed from ~/.claude/settings.json. Silent when present, fast (ms),
@@ -868,12 +992,28 @@ if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
 fi
 EOFSNIPPET
   )
+  # The snippet minus its leading blank line: what a managed region should
+  # contain, used both as the is-current test and the repair replacement.
+  local body="${snippet#?}"
 
   local added=0
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
     if [ -e "$rc" ] && [ -w "$rc" ]; then
       if grep -qF "$DCG_SHELL_CHECK_MARKER" "$rc" 2>/dev/null; then
-        added=1  # Already present — don't trigger fallback
+        added=1  # Present — repair in place if the block text is stale
+        case "$(cat "$rc")" in
+          *"$body"*) ;;
+          *)
+            if repair_shell_check_region "$rc" "$body"; then
+              ok "Updated stale shell startup check in $rc"
+            else
+              # Region boundary unrecognizable — append a current block so at
+              # least the up-to-date check runs.
+              printf '%s\n' "$snippet" >> "$rc"
+              ok "Appended current shell startup check to $rc (old block not auto-removable)"
+            fi
+          ;;
+        esac
         continue
       fi
       printf '%s\n' "$snippet" >> "$rc"
@@ -1652,6 +1792,10 @@ HERMES_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"
 HERMES_FAILURE_REASON=""
 POSIT_ASSISTANT_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"
 POSIT_ASSISTANT_FAILURE_REASON=""
+OPENCODE_STATUS=""  # "created"|"merged"|"skipped"|"failed"|"conflict"
+OPENCODE_FAILURE_REASON=""
+OMP_STATUS=""  # "created"|"merged"|"skipped"|"failed"|"conflict"
+OMP_FAILURE_REASON=""
 POSIT_ASSISTANT_BACKUP=""
 CLAUDE_BACKUP=""
 GEMINI_BACKUP=""
@@ -3728,6 +3872,146 @@ EOFSET
   fi
 }
 
+configure_opencode() {
+  # OpenCode (opencode.ai) intercepts shell commands only through plugins, so
+  # dcg ships a native `tool.execute.before` plugin (#318). The freshly
+  # installed binary is the single source of truth for the plugin content:
+  # `dcg install --opencode` writes
+  # ${XDG_CONFIG_HOME:-~/.config}/opencode/plugins/dcg-guard.js with an
+  # ownership marker, refuses to overwrite a user-owned file of the same name,
+  # and `--force` refreshes a dcg-owned one (keeping the embedded binary path
+  # current across upgrades).
+  if ! is_agent_detected "opencode"; then
+    OPENCODE_STATUS="skipped"
+    return 0
+  fi
+
+  local dcg_bin="$DEST/dcg"
+  if [ ! -x "$dcg_bin" ]; then
+    OPENCODE_STATUS="failed"
+    OPENCODE_FAILURE_REASON="dcg binary not found at $dcg_bin"
+    return 1
+  fi
+
+  local plugin_path="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/dcg-guard.js"
+  local existed=0
+  [ -f "$plugin_path" ] && existed=1
+
+  local output
+  if output=$("$dcg_bin" install --opencode --force 2>&1); then
+    if [ "$existed" -eq 1 ]; then
+      OPENCODE_STATUS="merged"
+    else
+      OPENCODE_STATUS="created"
+    fi
+    AUTO_CONFIGURED=1
+    return 0
+  fi
+
+  if printf '%s' "$output" | grep -q "was not generated by dcg"; then
+    OPENCODE_STATUS="conflict"
+    OPENCODE_FAILURE_REASON="existing $plugin_path is not dcg-owned"
+  else
+    OPENCODE_STATUS="failed"
+    OPENCODE_FAILURE_REASON=$(printf '%s' "$output" | tail -n 1)
+  fi
+  return 1
+}
+
+resolve_omp_agent_dir() {
+  # Keep the shell installer's status probe in lock-step with OMP/dcg's active
+  # profile resolver. In particular, named profiles ignore the legacy
+  # PI_CODING_AGENT_DIR override and OMP_PROFILE (even empty) wins PI_PROFILE.
+  local config_root
+  config_root=$(resolve_omp_config_root)
+  local profile=""
+  if [ "${OMP_PROFILE+x}" = "x" ]; then
+    profile="$OMP_PROFILE"
+  elif [ "${PI_PROFILE+x}" = "x" ]; then
+    profile="$PI_PROFILE"
+  fi
+  profile=$(printf '%s' "$profile" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  local profile_base="${profile%%.*}"
+  local profile_reserved=0
+  case "$profile_base" in
+    con|prn|aux|nul|com[0-9]|lpt[0-9]) profile_reserved=1 ;;
+  esac
+  if [ -n "$profile" ] && [ "$profile" != "default" ] &&
+     [ "${profile%.}" = "$profile" ] && [ "${#profile}" -le 64 ] &&
+     [ "$profile_reserved" -eq 0 ] &&
+     printf '%s' "$profile" | grep -Eq '^[a-z0-9][a-z0-9._-]*$'; then
+    printf '%s\n' "$config_root/profiles/$profile/agent"
+  elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
+    # OMP's setProfile() exports its derived profile path through this legacy
+    # variable. If OMP_PROFILE later selects default mode, PI_PROFILE can be a
+    # lower-priority provenance tag for a now-stale value. Suppress only that
+    # exact derivation; path-shaped and near-match overrides remain custom.
+    local legacy_profile="${PI_PROFILE-}"
+    legacy_profile=$(printf '%s' "$legacy_profile" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    local legacy_profile_base="${legacy_profile%%.*}"
+    local legacy_profile_reserved=0
+    case "$legacy_profile_base" in
+      con|prn|aux|nul|com[0-9]|lpt[0-9]) legacy_profile_reserved=1 ;;
+    esac
+    if { [ -z "$profile" ] || [ "$profile" = "default" ]; } &&
+       [ -n "$legacy_profile" ] && [ "$legacy_profile" != "default" ] &&
+       [ "${legacy_profile%.}" = "$legacy_profile" ] &&
+       [ "${#legacy_profile}" -le 64 ] &&
+       [ "$legacy_profile_reserved" -eq 0 ] &&
+       printf '%s' "$legacy_profile" | grep -Eq '^[a-z0-9][a-z0-9._-]*$' &&
+       [ "$PI_CODING_AGENT_DIR" = "$config_root/profiles/$legacy_profile/agent" ]; then
+      printf '%s\n' "$config_root/agent"
+    else
+      printf '%s\n' "$PI_CODING_AGENT_DIR"
+    fi
+  else
+    printf '%s\n' "$config_root/agent"
+  fi
+}
+
+configure_omp() {
+  # The freshly installed dcg binary generates OMP's native ExtensionAPI
+  # module. `--force` refreshes only marker-owned files, which also keeps the
+  # embedded absolute binary path current after upgrades.
+  if ! is_agent_detected "omp"; then
+    OMP_STATUS="skipped"
+    return 0
+  fi
+
+  local dcg_bin="$DEST/dcg"
+  if [ ! -x "$dcg_bin" ]; then
+    OMP_STATUS="failed"
+    OMP_FAILURE_REASON="dcg binary not found at $dcg_bin"
+    return 1
+  fi
+
+  local agent_dir
+  agent_dir=$(resolve_omp_agent_dir)
+  local extension_path="$agent_dir/extensions/dcg-guard.ts"
+  local existed=0
+  [ -f "$extension_path" ] && existed=1
+
+  local output
+  if output=$("$dcg_bin" install --omp --force 2>&1); then
+    if [ "$existed" -eq 1 ]; then
+      OMP_STATUS="merged"
+    else
+      OMP_STATUS="created"
+    fi
+    AUTO_CONFIGURED=1
+    return 0
+  fi
+
+  if printf '%s' "$output" | grep -q "was not generated by dcg"; then
+    OMP_STATUS="conflict"
+    OMP_FAILURE_REASON="existing OMP dcg-guard.ts is not dcg-owned"
+  else
+    OMP_STATUS="failed"
+    OMP_FAILURE_REASON=$(printf '%s' "$output" | tail -n 1)
+  fi
+  return 1
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Run Auto-Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3801,6 +4085,14 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
 
   # Configure Posit Assistant (if installed)
   configure_posit_assistant
+
+  # Configure OpenCode (if installed)
+  configure_opencode
+
+  # Configure Oh My Pi (if installed)
+  # A refusal/failure is a terminal OMP_STATUS state rendered in the summary;
+  # do not let `set -e` erase that truthful result or abort other install work.
+  configure_omp || true
 else
   info "Skipping agent configuration (--no-configure)"
 fi
@@ -4048,6 +4340,52 @@ case "$POSIT_ASSISTANT_STATUS" in
       summary_lines+=("Posit Assistant: Configuration failed ($POSIT_ASSISTANT_FAILURE_REASON)")
     else
       summary_lines+=("Posit Assistant: Configuration failed")
+    fi
+    ;;
+esac
+
+case "$OPENCODE_STATUS" in
+  created)
+    summary_lines+=("OpenCode:    Installed native tool.execute.before plugin (dcg-guard.js)")
+    summary_lines+=("             Restart OpenCode to load it")
+    ;;
+  merged)
+    summary_lines+=("OpenCode:    Refreshed dcg-owned plugin (dcg-guard.js)")
+    ;;
+  skipped|"")
+    summary_lines+=("OpenCode:    Not installed (skipped)")
+    ;;
+  conflict)
+    summary_lines+=("OpenCode:    Skipped — existing dcg-guard.js is not dcg-owned ($OPENCODE_FAILURE_REASON)")
+    ;;
+  failed)
+    if [ -n "$OPENCODE_FAILURE_REASON" ]; then
+      summary_lines+=("OpenCode:    Configuration failed ($OPENCODE_FAILURE_REASON)")
+    else
+      summary_lines+=("OpenCode:    Configuration failed")
+    fi
+    ;;
+esac
+
+case "$OMP_STATUS" in
+  created)
+    summary_lines+=("Oh My Pi:    Installed native tool_call extension (dcg-guard.ts)")
+    summary_lines+=("              Restart omp to load it")
+    ;;
+  merged)
+    summary_lines+=("Oh My Pi:    Refreshed dcg-owned extension (dcg-guard.ts)")
+    ;;
+  skipped|"")
+    summary_lines+=("Oh My Pi:    Not installed (skipped)")
+    ;;
+  conflict)
+    summary_lines+=("Oh My Pi:    Skipped — existing dcg-guard.ts is not dcg-owned ($OMP_FAILURE_REASON)")
+    ;;
+  failed)
+    if [ -n "$OMP_FAILURE_REASON" ]; then
+      summary_lines+=("Oh My Pi:    Configuration failed ($OMP_FAILURE_REASON)")
+    else
+      summary_lines+=("Oh My Pi:    Configuration failed")
     fi
     ;;
 esac

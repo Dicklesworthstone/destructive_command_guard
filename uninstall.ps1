@@ -524,6 +524,194 @@ function Unconfigure-HermesHook {
   $removedAny
 }
 
+function Get-DcgRepositoryRoot {
+  param([string]$StartDir = (Get-Location).Path)
+  try {
+    $current = Get-Item -LiteralPath $StartDir -ErrorAction Stop
+    while ($null -ne $current) {
+      if (Test-Path -LiteralPath (Join-Path $current.FullName '.git')) { return $current.FullName }
+      $current = $current.Parent
+    }
+    return [System.IO.Path]::GetFullPath($StartDir)
+  } catch {
+    return $StartDir
+  }
+}
+
+function Get-OmpConfigRoot {
+  param(
+    [string]$HomeDir = $HOME,
+    [bool]$WindowsSemantics = ([System.IO.Path]::DirectorySeparatorChar -eq '\')
+  )
+  $configName = if ([string]::IsNullOrEmpty($env:PI_CONFIG_DIR)) { '.omp' } else { $env:PI_CONFIG_DIR }
+  $configName = if ($WindowsSemantics) {
+    $configName.TrimStart([char[]]@('\', '/'))
+  } else {
+    $configName.TrimStart([char[]]@('/'))
+  }
+  if ($WindowsSemantics -and $configName -match '^[A-Za-z]:') {
+    throw "PI_CONFIG_DIR must be a directory name relative to HOME on Windows, not drive-qualified path '$($env:PI_CONFIG_DIR)'"
+  }
+  try {
+    $joined = if ($configName.Length -eq 0) { $HomeDir } else { [System.IO.Path]::Combine($HomeDir, $configName) }
+    [System.IO.Path]::GetFullPath($joined)
+  } catch {
+    throw "Could not resolve PI_CONFIG_DIR '$($env:PI_CONFIG_DIR)' beneath HOME '$HomeDir': $($_.Exception.Message)"
+  }
+}
+
+function Get-OmpAgentDir {
+  # Mirror OMP's active-profile directory resolution closely enough for safe,
+  # marker-owned extension cleanup.
+  param([string]$HomeDir = $HOME)
+  $configRoot = Get-OmpConfigRoot -HomeDir $HomeDir
+
+  $profile = $null
+  if (Test-Path Env:OMP_PROFILE) { $profile = $env:OMP_PROFILE }
+  elseif (Test-Path Env:PI_PROFILE) { $profile = $env:PI_PROFILE }
+  if ($null -ne $profile) { $profile = $profile.Trim() }
+  $validProfile = (-not [string]::IsNullOrEmpty($profile)) -and
+    ($profile -cne 'default') -and ($profile.Length -le 64) -and
+    ($profile -cmatch '^[a-z0-9][a-z0-9._-]*$') -and (-not $profile.EndsWith('.')) -and
+    ($profile -notmatch '^(?i:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\.|$)')
+  if ($validProfile) {
+    return [System.IO.Path]::Combine($configRoot, 'profiles', $profile, 'agent')
+  }
+  if (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR)) {
+    # setProfile() propagates a named profile's derived path through this
+    # legacy variable. A higher-priority explicit default can leave that value
+    # stale beside PI_PROFILE. Match upstream's provenance check exactly:
+    # validate the losing profile, derive its path, then compare ordinally.
+    $activeProfileIsDefault = [string]::IsNullOrEmpty($profile) -or ($profile -ceq 'default')
+    $legacyProfile = $env:PI_PROFILE
+    if ($null -ne $legacyProfile) { $legacyProfile = $legacyProfile.Trim() }
+    $validLegacyProfile = $activeProfileIsDefault -and
+      (-not [string]::IsNullOrEmpty($legacyProfile)) -and
+      ($legacyProfile -cne 'default') -and ($legacyProfile.Length -le 64) -and
+      [regex]::IsMatch($legacyProfile, '^[a-z0-9][a-z0-9._-]*$') -and
+      (-not $legacyProfile.EndsWith('.')) -and
+      (-not [regex]::IsMatch(
+        $legacyProfile,
+        '^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\.|$)',
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+      ))
+    if ($validLegacyProfile) {
+      $derivedAgentDir = [System.IO.Path]::Combine($configRoot, 'profiles', $legacyProfile, 'agent')
+      if ([string]::Equals(
+        $env:PI_CODING_AGENT_DIR,
+        $derivedAgentDir,
+        [System.StringComparison]::Ordinal
+      )) {
+        return [System.IO.Path]::Combine($configRoot, 'agent')
+      }
+    }
+    return $env:PI_CODING_AGENT_DIR
+  }
+  [System.IO.Path]::Combine($configRoot, 'agent')
+}
+
+function Get-OmpProfileDirectories {
+  param([string]$Path)
+  # Keep the one-argument overload for Windows PowerShell 5.1 compatibility.
+  # Its compatible enumeration does not skip Hidden/System attributes, unlike
+  # the default directory-listing cmdlet, so inactive hidden profiles are included.
+  [System.IO.Directory]::GetDirectories($Path)
+}
+
+function Read-OmpExtensionText {
+  param([string]$Path)
+  [System.IO.File]::ReadAllText($Path)
+}
+
+function Remove-OmpExtensionFile {
+  param([string]$Path)
+  if ([System.IO.Path]::DirectorySeparatorChar -eq '\') {
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+  } else {
+    [System.IO.File]::Delete($Path)
+  }
+}
+
+function Test-OmpMissingPathException {
+  param([System.Exception]$Exception)
+  while ($null -ne $Exception.InnerException) { $Exception = $Exception.InnerException }
+  ($Exception -is [System.IO.FileNotFoundException]) -or
+    ($Exception -is [System.IO.DirectoryNotFoundException])
+}
+
+function Unconfigure-OmpExtension {
+  # Remove only marker-owned dcg-guard.ts files; preserve user-authored files.
+  # Sweep all profiles under the default/current config roots so changing
+  # profiles after installation cannot leave a live extension behind.
+  param([string]$HomeDir = $HOME, [string]$RepoRoot = '')
+  if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $RepoRoot = Get-DcgRepositoryRoot
+  }
+  $removed = $false
+  $failed = $false
+  $configRoots = @([System.IO.Path]::Combine($HomeDir, '.omp'))
+  $currentConfigRoot = $null
+  try {
+    $currentConfigRoot = Get-OmpConfigRoot -HomeDir $HomeDir
+    $configRoots += $currentConfigRoot
+  } catch {
+    $failed = $true
+    Write-Warn "Could not resolve the Oh My Pi config root: $($_.Exception.Message)"
+  }
+  $configRoots = @($configRoots | Select-Object -Unique)
+  $paths = @([System.IO.Path]::Combine($RepoRoot, '.omp', 'extensions', 'dcg-guard.ts'))
+  if ($null -ne $currentConfigRoot) {
+    try {
+      $paths += [System.IO.Path]::Combine((Get-OmpAgentDir -HomeDir $HomeDir), 'extensions', 'dcg-guard.ts')
+    } catch {
+      $failed = $true
+      Write-Warn "Could not resolve the active Oh My Pi agent directory: $($_.Exception.Message)"
+    }
+  }
+  if (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR)) {
+    $paths += [System.IO.Path]::Combine($env:PI_CODING_AGENT_DIR, 'extensions', 'dcg-guard.ts')
+  }
+  foreach ($configRoot in $configRoots) {
+    $paths += [System.IO.Path]::Combine($configRoot, 'agent', 'extensions', 'dcg-guard.ts')
+    $profilesRoot = [System.IO.Path]::Combine($configRoot, 'profiles')
+    try {
+      foreach ($profileDir in Get-OmpProfileDirectories -Path $profilesRoot) {
+        $paths += [System.IO.Path]::Combine($profileDir, 'agent', 'extensions', 'dcg-guard.ts')
+      }
+    } catch {
+      if (Test-OmpMissingPathException -Exception $_.Exception) { continue }
+      $failed = $true
+      Write-Warn "Could not inspect Oh My Pi profiles under ${profilesRoot}: $($_.Exception.Message)"
+    }
+  }
+  $paths = @($paths | Select-Object -Unique)
+  foreach ($extension in $paths) {
+    try {
+      $content = Read-OmpExtensionText -Path $extension
+    } catch {
+      if (Test-OmpMissingPathException -Exception $_.Exception) { continue }
+      $failed = $true
+      Write-Warn "Could not inspect Oh My Pi extension at ${extension}: $($_.Exception.Message)"
+      continue
+    }
+    # Marker ownership is an exact, case-sensitive ASCII-spelling contract.
+    # PowerShell's regex operators are case-insensitive by default, so use an
+    # ordinal substring search to stay aligned with the Rust and Unix paths.
+    if ($content.IndexOf('dcg-omp-extension', [System.StringComparison]::Ordinal) -lt 0) { continue }
+    try {
+      Remove-OmpExtensionFile -Path $extension
+      if ([System.IO.File]::Exists($extension)) {
+        throw "file still exists after removal"
+      }
+      $removed = $true
+    } catch {
+      $failed = $true
+      Write-Warn "Could not remove Oh My Pi extension at ${extension}: $($_.Exception.Message)"
+    }
+  }
+  $removed -and (-not $failed)
+}
+
 # Testing entrypoint: when dot-sourced with -LoadFunctionsOnly, stop here so the
 # functions above are available without running the uninstall body below.
 if ($LoadFunctionsOnly) { return }
@@ -601,6 +789,8 @@ $agyHooks = Join-Path (Join-Path (Join-Path $HOME ".gemini") "config") "hooks.js
 if (Remove-DcgHooksFromJsonFile -Path $agyHooks -DeleteEmptyFile) {
   Write-Ok "Removed Antigravity (agy) hook"
 }
+
+if (Unconfigure-OmpExtension) { Write-Ok "Removed Oh My Pi extension" }
 
 if (Test-Path $binary -PathType Leaf) {
   Remove-Item -Force -Path $binary

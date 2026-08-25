@@ -11,8 +11,18 @@
 //!   - 4: Parse/input error
 //!   - 5: IO error
 
+use std::io::Write as _;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+use destructive_command_guard::history::{HistoryConnection, SqliteValue};
+
+fn history_text(value: &SqliteValue) -> &str {
+    match value {
+        SqliteValue::Text(value) => value,
+        other => panic!("expected history text value, got {other:?}"),
+    }
+}
 
 /// Path to the dcg binary.
 fn dcg_binary() -> PathBuf {
@@ -56,6 +66,76 @@ fn run_dcg_with_env(args: &[&str], key: &str, value: &str) -> (String, String, i
     let exit_code = output.status.code().unwrap_or(-1);
 
     (stdout, stderr, exit_code)
+}
+
+/// Run the exact robot/stdin boundary used by the generated OMP extension
+/// against a hermetic agent-profile config.
+fn run_omp_boundary_with_config(config: &str, agent: &str, command: &str) -> (String, String, i32) {
+    run_omp_boundary_with_policy(config, None, agent, None, command)
+}
+
+fn run_omp_boundary_with_policy(
+    config: &str,
+    user_allowlist: Option<&str>,
+    agent: &str,
+    with_packs: Option<&str>,
+    command: &str,
+) -> (String, String, i32) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let xdg = temp.path().join("xdg");
+    let scratch = temp.path().join("tmp");
+    std::fs::create_dir_all(xdg.join("dcg")).expect("XDG dcg directory");
+    std::fs::create_dir_all(&home).expect("HOME directory");
+    std::fs::create_dir_all(&scratch).expect("temporary directory");
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(&config_path, config).expect("profile config");
+    if let Some(allowlist) = user_allowlist {
+        std::fs::write(xdg.join("dcg/allowlist.toml"), allowlist).expect("user allowlist");
+    }
+
+    let mut process = Command::new(dcg_binary());
+    process
+        .args([
+            "--robot",
+            "test",
+            "--stdin",
+            "--agent",
+            agent,
+            "--dialect",
+            "posix",
+        ])
+        .env_clear()
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("TMPDIR", &scratch)
+        .env("TEMP", &scratch)
+        .env("TMP", &scratch)
+        .env("DCG_CONFIG", &config_path)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .current_dir(temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(pack) = with_packs {
+        process.args(["--with-packs", pack]);
+    }
+
+    let mut child = process.spawn().expect("spawn OMP robot boundary");
+    child
+        .stdin
+        .take()
+        .expect("OMP robot stdin")
+        .write_all(command.as_bytes())
+        .expect("write OMP command");
+    let output = child.wait_with_output().expect("collect OMP robot output");
+
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.code().unwrap_or(-1),
+    )
 }
 
 // =============================================================================
@@ -225,6 +305,348 @@ fn test_robot_mode_json_has_rule_id() {
     }
 }
 
+/// The generated OMP extension selects `--agent omp`; that selector must alter
+/// evaluation policy, not merely the JSON attribution field.
+#[test]
+fn test_omp_robot_boundary_applies_profile_packs_and_allowlist() {
+    let config = r#"
+[agents.omp]
+extra_packs = ["containers.docker"]
+additional_allowlist = ["git reset --hard HEAD~1"]
+"#;
+
+    let (stdout, stderr, exit_code) =
+        run_omp_boundary_with_config(config, "omp", "docker system prune");
+    assert_eq!(exit_code, 1, "OMP extra pack must block; stderr: {stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("OMP pack JSON");
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "containers.docker");
+    assert_eq!(json["agent"]["detected"], "omp");
+
+    let (stdout, stderr, exit_code) =
+        run_omp_boundary_with_config(config, "codex", "docker system prune");
+    assert_eq!(
+        exit_code, 0,
+        "OMP pack delta must not leak to Codex; stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("Codex pack JSON");
+    assert_eq!(json["decision"], "allow");
+    assert_eq!(json["agent"]["detected"], "codex-cli");
+
+    let (stdout, stderr, exit_code) =
+        run_omp_boundary_with_config(config, "omp", "git reset --hard HEAD~1");
+    assert_eq!(
+        exit_code, 0,
+        "OMP additional allowlist must allow exact command; stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("OMP allowlist JSON");
+    assert_eq!(json["decision"], "allow");
+    assert_eq!(json["agent"]["detected"], "omp");
+
+    let (stdout, stderr, exit_code) =
+        run_omp_boundary_with_config(config, "codex", "git reset --hard HEAD~1");
+    assert_eq!(
+        exit_code, 1,
+        "OMP allowlist must not leak to Codex; stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("Codex deny JSON");
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "core.git");
+}
+
+#[test]
+fn test_omp_robot_boundary_applies_profile_disables_and_cli_pack_override() {
+    let config = r#"
+[packs]
+enabled = ["containers.docker"]
+
+[agents.omp]
+disabled_packs = ["containers"]
+additional_allowlist = ["git reset --hard HEAD~1"]
+disabled_allowlist = true
+"#;
+    let user_allowlist = r#"
+[[allow]]
+exact_command = "git reset --hard HEAD~1"
+reason = "robot profile regression fixture"
+"#;
+
+    let (stdout, stderr, exit_code) = run_omp_boundary_with_policy(
+        config,
+        Some(user_allowlist),
+        "omp",
+        None,
+        "docker system prune",
+    );
+    assert_eq!(
+        exit_code, 0,
+        "OMP disabled pack must be absent; stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("OMP disabled-pack JSON");
+    assert_eq!(json["decision"], "allow");
+
+    let (stdout, stderr, exit_code) = run_omp_boundary_with_policy(
+        config,
+        Some(user_allowlist),
+        "codex",
+        None,
+        "docker system prune",
+    );
+    assert_eq!(
+        exit_code, 1,
+        "OMP disabled pack must not leak to Codex; stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("Codex base-pack JSON");
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "containers.docker");
+
+    let (stdout, stderr, exit_code) = run_omp_boundary_with_policy(
+        config,
+        Some(user_allowlist),
+        "omp",
+        Some("containers.docker"),
+        "docker system prune",
+    );
+    assert_eq!(
+        exit_code, 1,
+        "explicit --with-packs must outrank the profile exclusion; stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("OMP CLI-pack JSON");
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "containers.docker");
+
+    let (stdout, stderr, exit_code) = run_omp_boundary_with_policy(
+        config,
+        Some(user_allowlist),
+        "omp",
+        None,
+        "git reset --hard HEAD~1",
+    );
+    assert_eq!(
+        exit_code, 1,
+        "disabled_allowlist must suppress base and agent entries; stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("OMP no-allowlist JSON");
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "core.git");
+    assert!(json["allowlist"].is_null());
+
+    let (stdout, stderr, exit_code) = run_omp_boundary_with_policy(
+        config,
+        Some(user_allowlist),
+        "codex",
+        None,
+        "git reset --hard HEAD~1",
+    );
+    assert_eq!(
+        exit_code, 0,
+        "OMP disabled_allowlist must not suppress Codex layers; stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("Codex allowlist JSON");
+    assert_eq!(json["decision"], "allow");
+    assert_eq!(json["agent"]["detected"], "codex-cli");
+}
+
+/// The command dispatcher exits the process after a blocked robot result, so
+/// this must cross the real binary boundary: an in-process entry-construction
+/// test cannot prove that the asynchronous writer drains before `process::exit`.
+#[test]
+fn test_omp_robot_boundary_persists_history_before_block_exit_and_isolates_agents() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let xdg = temp.path().join("xdg");
+    let scratch = temp.path().join("tmp");
+    for directory in [&home, &xdg, &scratch] {
+        std::fs::create_dir_all(directory).expect("hermetic history directory");
+    }
+
+    let history_path = temp.path().join("robot-history.sqlite3");
+    let decoy_path = temp.path().join("configured-but-overridden.sqlite3");
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[history]\nenabled = true\ndatabase_path = '{}'\nbatch_size = 1\nbatch_flush_interval_ms = 1\nredaction_mode = \"none\"\n",
+            decoy_path.display()
+        ),
+    )
+    .expect("history config");
+
+    let run = |robot: bool, agent: &str, command: &str| {
+        let mut process = Command::new(dcg_binary());
+        if robot {
+            process.arg("--robot");
+        }
+        process
+            .args(["test", "--stdin", "--agent", agent, "--dialect", "posix"])
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("TMPDIR", &scratch)
+            .env("TEMP", &scratch)
+            .env("TMP", &scratch)
+            .env("DCG_CONFIG", &config_path)
+            .env("DCG_HISTORY_DB", &history_path)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .current_dir(temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = process.spawn().expect("spawn history boundary");
+        child
+            .stdin
+            .take()
+            .expect("history boundary stdin")
+            .write_all(command.as_bytes())
+            .expect("write history command");
+        child
+            .wait_with_output()
+            .expect("collect history boundary output")
+    };
+
+    let omp = run(true, "omp", "git reset --hard HEAD");
+    assert_eq!(
+        omp.status.code(),
+        Some(1),
+        "denied OMP command must cross the dispatch exit path: {}",
+        String::from_utf8_lossy(&omp.stderr)
+    );
+    let codex = run(true, "codex", "git status");
+    assert_eq!(codex.status.code(), Some(0));
+    let human = run(false, "omp", "git status");
+    assert_eq!(human.status.code(), Some(0));
+
+    assert!(
+        history_path.exists(),
+        "DCG_HISTORY_DB must receive the robot rows"
+    );
+    assert!(
+        !decoy_path.exists(),
+        "the environment database override must outrank configured database_path"
+    );
+
+    let connection = HistoryConnection::open(&history_path).expect("open robot history");
+    let rows = connection
+        .query(
+            "SELECT agent_type, working_dir, command, outcome, pack_id, pattern_name \
+             FROM commands ORDER BY id",
+        )
+        .expect("query robot history");
+    assert_eq!(
+        rows.len(),
+        2,
+        "two robot evaluations must persist while the human diagnostic stays out"
+    );
+
+    let expected_working_dir = temp.path().canonicalize().expect("canonical temp cwd");
+
+    let omp_values = rows[0].values();
+    assert_eq!(history_text(&omp_values[0]), "omp");
+    assert_eq!(
+        history_text(&omp_values[1]),
+        expected_working_dir.to_string_lossy()
+    );
+    assert_eq!(history_text(&omp_values[2]), "git reset --hard HEAD");
+    assert_eq!(history_text(&omp_values[3]), "deny");
+    assert_eq!(history_text(&omp_values[4]), "core.git");
+    assert_eq!(history_text(&omp_values[5]), "reset-hard");
+
+    let codex_values = rows[1].values();
+    assert_eq!(history_text(&codex_values[0]), "codex-cli");
+    assert_eq!(
+        history_text(&codex_values[1]),
+        expected_working_dir.to_string_lossy()
+    );
+    assert_eq!(history_text(&codex_values[2]), "git status");
+    assert_eq!(history_text(&codex_values[3]), "allow");
+    assert_eq!(codex_values[4], SqliteValue::Null);
+    assert_eq!(codex_values[5], SqliteValue::Null);
+}
+
+/// The process cwd is the authority used by dcg's project-config discovery.
+/// This models the generated bridge spawning dcg in a bash call's effective
+/// cwd rather than in OMP's ambient process directory.
+#[cfg(unix)]
+#[test]
+fn test_omp_robot_boundary_uses_execution_cwd_project_policy() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let xdg = temp.path().join("xdg");
+    let scratch = temp.path().join("tmp");
+    let session_cwd = temp.path().join("session-project");
+    let tool_cwd = temp.path().join("tool-project");
+    for directory in [&home, &xdg, &scratch, &session_cwd, &tool_cwd] {
+        std::fs::create_dir_all(directory).expect("hermetic OMP boundary directory");
+    }
+    std::fs::create_dir_all(tool_cwd.join(".git")).expect("tool project marker");
+    std::fs::write(
+        tool_cwd.join(".dcg.toml"),
+        "[packs]\nenabled = [\"containers.docker\"]\n",
+    )
+    .expect("tool-cwd project policy");
+
+    let run = |cwd: &std::path::Path| {
+        let mut child = Command::new(dcg_binary())
+            .args([
+                "--robot",
+                "test",
+                "--stdin",
+                "--agent",
+                "omp",
+                "--dialect",
+                "posix",
+            ])
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("TMPDIR", &scratch)
+            .env("TEMP", &scratch)
+            .env("TMP", &scratch)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn OMP robot cwd boundary");
+        child
+            .stdin
+            .take()
+            .expect("OMP robot stdin")
+            .write_all(b"docker system prune")
+            .expect("write OMP command");
+        child
+            .wait_with_output()
+            .expect("collect OMP cwd boundary output")
+    };
+
+    let session = run(&session_cwd);
+    assert_eq!(
+        session.status.code(),
+        Some(0),
+        "session policy deliberately leaves Docker disabled: {}",
+        String::from_utf8_lossy(&session.stderr)
+    );
+    let session_json: serde_json::Value =
+        serde_json::from_slice(&session.stdout).expect("session-cwd robot JSON");
+    assert_eq!(session_json["decision"], "allow");
+
+    let tool = run(&tool_cwd);
+    assert_eq!(
+        tool.status.code(),
+        Some(1),
+        "tool-cwd project policy must block Docker: {}",
+        String::from_utf8_lossy(&tool.stderr)
+    );
+    let tool_json: serde_json::Value =
+        serde_json::from_slice(&tool.stdout).expect("tool-cwd robot JSON");
+    assert_eq!(tool_json["decision"], "deny");
+    assert_eq!(tool_json["pack_id"], "containers.docker");
+}
+
 // =============================================================================
 // Exit Code Tests
 // =============================================================================
@@ -392,4 +814,63 @@ fn test_robot_flag_and_env_produce_same_result() {
         json_flag["decision"], json_env["decision"],
         "decision should match between flag and env var"
     );
+}
+
+// =============================================================================
+// Budget Enforcement (issue #309)
+// =============================================================================
+
+/// Issue #309: robot mode is an agent integration boundary, so it must honor
+/// the configured hook evaluation budget WITHOUT the human-facing
+/// `--enforce-budget` diagnostic flag. Otherwise a parent process's own
+/// timeout can kill dcg before it emits a bounded JSON verdict.
+#[test]
+fn test_robot_stdin_enforces_hook_budget_without_flag() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    // A synthetic multi-construct command large enough that full evaluation
+    // cannot complete inside the 10ms floor budget on any realistic machine:
+    // many segments, each with an inline-python trigger and a pipeline.
+    use std::fmt::Write as _;
+    let mut command = String::from("set -e\n");
+    for i in 0..200 {
+        let _ = writeln!(
+            command,
+            "python3 -c 'print({i})' | head -1; for p in /tmp/probe-{i}/*/x.json; do cat \"$p\"; done"
+        );
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().to_str().expect("utf8 home");
+    let mut child = std::process::Command::new(dcg_binary())
+        .args(["--robot", "test", "--stdin"])
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("XDG_CONFIG_HOME", home)
+        .env_remove("DCG_CONFIG")
+        .env("DCG_HOOK_TIMEOUT_MS", "10")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dcg --robot test --stdin");
+    child
+        .stdin
+        .take()
+        .expect("stdin handle")
+        .write_all(command.as_bytes())
+        .expect("write candidate command");
+    let output = child.wait_with_output().expect("collect output");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "budget exhaustion must exit non-zero; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("robot mode must emit JSON");
+    assert_eq!(json["decision"], "indeterminate");
+    assert_eq!(json["source"], "analysis_budget");
 }

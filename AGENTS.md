@@ -250,17 +250,18 @@ three must be green before any release.
 
 | Suite | Catches | Why unit tests can't |
 |-------|---------|----------------------|
-| `scripts/e2e_harness_matrix.sh` | Wire-protocol breakage for **every** agent (Claude Code, Codex, Gemini, Copilot, Hermes, Grok, agy) | Unit tests call Rust functions; harnesses parse **bytes**. Asserts decision field + exit code + stdout/stderr separation per protocol against the real binary. |
-| `scripts/perf_baseline.py --assert-budget-ms` | **#245**: per-invocation cost silently eating the fixed hook deadline | The perf job is a *relative* ratchet — a uniform slowdown just gets re-baselined. This gate asserts cold p95 against the **shipped** `HOOK_EVALUATION_BUDGET_MS` with a hermetic HOME and scrubbed `DCG_*`. |
+| `scripts/e2e_harness_matrix.sh` | Wire/bridge breakage for **every** agent (Claude Code, Codex, Gemini, Copilot, Hermes, Grok, agy, OMP) | Unit tests call Rust functions; harnesses parse **bytes**. Asserts decision field + exit code + stdout/stderr separation per protocol against the real binary. |
+| `scripts/perf_baseline.py --assert-budget-ms` | **#245**: evaluator cost silently eating the fixed hook deadline | The perf job is a *relative* ratchet — a uniform slowdown just gets re-baselined. This gate asserts paired `full_eval − DCG_BYPASS` p95 against the **shipped** `HOOK_EVALUATION_BUDGET_MS` with a hermetic HOME and scrubbed `DCG_*`; raw process latency remains separate evidence. |
 | `scripts/e2e_fleet_install.sh` | Published artifact missing/unrunnable per platform; installer picking the wrong triple; checksum/signature verification silently skipped; hook config non-idempotent | Nothing in-tree proves the **public download path** works on real Linux/macOS/Windows hardware. |
 
 ```bash
-# Protocol conformance for all 7 harnesses (needs a release binary + jq)
+# Protocol/bridge conformance for all 8 harnesses (needs a release binary + jq)
 ./scripts/e2e_harness_matrix.sh --binary target/release/dcg
 
-# Absolute latency gate — the #245 guard. Budget MUST come from src/perf.rs.
+# Absolute evaluator-cost gate — the #245 guard. Budget MUST come from src/perf.rs.
+BUDGET_MS=$(sed -nE 's/^pub const HOOK_EVALUATION_BUDGET_MS: u64 = ([0-9_]+);$/\1/p' src/perf.rs | tr -d '_')
 python3 scripts/perf_baseline.py --bin target/release/dcg --skip-trace \
-  --assert-budget-ms 1000 --assert-margin-pct 50
+  --assert-budget-ms "$BUDGET_MS" --assert-margin-pct 50
 
 # Real installs from the PUBLIC release on every DSR host
 ./scripts/e2e_fleet_install.sh --version vX.Y.Z          # whole fleet
@@ -284,9 +285,26 @@ Rules:
 - **Never hard-code the budget in `.github/workflows/ci.yml`.** It is grepped
   out of `HOOK_EVALUATION_BUDGET_MS`; `perf::tests::ci_enforces_absolute_latency_gate_against_shipped_budget`
   fails if that wiring is removed or the margin is loosened past 60%.
+- **Treat the JSON as the certificate, not stderr.** Gate mode records its
+  supplied/shipped/effective budgets, margin, derived limit, every per-case
+  verdict, 95/95 binomial tail-tolerance result, violations, and overall
+  PASS/FAIL in `latency_gate`; CI retains that artifact even when the gate
+  fails. Gate mode requires at least 59 samples; CI uses 100 and permits at
+  most one over-limit sample per case. When using `--output` in gate mode,
+  place it outside the repository; the harness rejects in-tree output so its
+  own certificate cannot dirty the source snapshot it claims to measure.
+- **Bind the binary to the checkout.** Gate mode requires a clean checkout and
+  exact equality between the binary's embedded `git describe --tags --dirty`
+  value and the repository's value. CI uses a full tag history so a shallow
+  clone cannot turn this proof into an unknown result.
 - Measure dcg's own cost as `full_eval − DCG_BYPASS`, never raw wall-clock:
   process spawn (≈940ms under Windows PowerShell) sits **outside** the
-  evaluation deadline and would otherwise produce false alarms.
+  evaluation deadline and would otherwise produce false alarms. For host
+  safety this certificate sets `DCG_SELF_HEAL_HOOK=0`, records that exclusion,
+  and therefore does not claim to measure self-healing work. Capture and
+  validate every timed child's actual wire decision after stopping its timer;
+  before/after semantic controls alone cannot catch intermittent fail-open
+  behavior inside the sample window.
 - The fleet suite installs into a scratch prefix with an isolated `HOME` and
   `--no-configure`; it never touches a host's real agent hook config.
 - A probe that dies partway must FAIL, not pass: every probe emits
@@ -1468,7 +1486,13 @@ native build:
 2. Verify that checkout's `HEAD` equals `TAG_SHA` and that its worktree is
    clean.
 3. Temporarily point DSR's host source mapping at that fresh checkout.
-4. Use a brand-new output path and run the build with `--no-sync`:
+4. Export `DCG_RELEASE_BUILD=1` in the build environment (#320). The binary
+   embeds this marker at compile time so `dcg update` and `dcg doctor` can
+   prove release provenance; a DSR build without it is classified from git
+   metadata alone, which requires the checkout to sit exactly at the release
+   tag with a clean worktree (step 2 already guarantees that, so the marker is
+   belt-and-suspenders — set it anyway).
+5. Use a brand-new output path and run the build with `--no-sync`:
 
    ```bash
    dsr build destructive_command_guard \
@@ -1478,7 +1502,7 @@ native build:
      --output-dir <brand-new-output-directory>
    ```
 
-5. Restore the previous DSR host mapping immediately after collection, even
+6. Restore the previous DSR host mapping immediately after collection, even
    when the build or artifact collection fails.
 
 Do not remove the staged checkout or output directory without the user's
@@ -1675,3 +1699,5 @@ NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are cha
 ## Note on Built-in TODO Functionality
 
 Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.
+
+For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"

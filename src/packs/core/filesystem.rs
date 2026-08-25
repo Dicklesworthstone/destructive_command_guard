@@ -24,8 +24,12 @@ const RM_RF_ROOT_HOME_SUGGESTIONS: &[PatternSuggestion] = &[
         "List directory contents to verify the path",
     ),
     PatternSuggestion::new(
-        "rm -rf /path/to/specific/subdirectory",
-        "Use explicit, specific paths instead of root or home",
+        "rm -rf /tmp/<subdir>",
+        "Scope deletion to a disposable temp path — dcg allows literal /tmp targets without confirmation",
+    ),
+    PatternSuggestion::gated(
+        "rm -rf <specific-subdirectory>",
+        "A specific non-temp path is safer than root/home but still a recursive delete, so it needs approval",
     ),
 ];
 
@@ -111,7 +115,7 @@ const FIND_DELETE_SUGGESTIONS: &[PatternSuggestion] = &[
         "find /tmp/{subdir} -delete",
         "Safe temp directory deletion (allowed without confirmation)",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "find {path} -print -delete",
         "If you must proceed: use -print to log every deletion",
     ),
@@ -123,7 +127,7 @@ const FIND_DELETE_SUGGESTIONS: &[PatternSuggestion] = &[
 /// destruction with no recovery.
 const UNLINK_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new("ls -la {path}", "Verify the path before unlinking"),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "cp {path} {path}.bak && unlink {path}",
         "Make a backup first if you really must remove the original",
     ),
@@ -143,7 +147,7 @@ const UNLINK_SUGGESTIONS: &[PatternSuggestion] = &[
 /// shrinks the file by N bytes (data loss). Both are recoverable only
 /// from backups.
 const TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "cp {path} {path}.bak && truncate -s 0 {path}",
         "Make a backup before zeroing the file",
     ),
@@ -153,8 +157,8 @@ const TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
         "Safe temp-directory truncate (allowed without confirmation)",
     ),
     PatternSuggestion::new(
-        "head -c <N> {path} > {path}.head && mv {path}.head {path}",
-        "Keep the first N bytes instead of dropping data blindly",
+        "head -c <N> {path} > /tmp/{subdir}/head && cp -f /tmp/{subdir}/head {path}",
+        "Keep the first N bytes instead of dropping data blindly (write via a temp file)",
     ),
 ];
 
@@ -167,7 +171,7 @@ const SHRED_SUGGESTIONS: &[PatternSuggestion] = &[
         "ls -la {path}",
         "Verify the path before shredding (no recovery)",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "cp {path} {path}.bak && shred -u {path}",
         "Make a backup first if you might need the data",
     ),
@@ -175,7 +179,7 @@ const SHRED_SUGGESTIONS: &[PatternSuggestion] = &[
         "shred -u /tmp/{subdir}/scratch",
         "Safe temp-directory shred (allowed without confirmation)",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "shred -n 1 -u {path}",
         "Single-pass shred is faster (and on SSDs, multi-pass adds little)",
     ),
@@ -214,7 +218,7 @@ const DD_OVERWRITE_SUGGESTIONS: &[PatternSuggestion] = &[
         "ls -la {path}",
         "Verify the path before overwriting (no recovery)",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "cp {path} {path}.bak && dd if=/dev/zero of={path} bs=1M count=10",
         "Make a backup first if you might need the data",
     ),
@@ -238,9 +242,32 @@ const MV_SENSITIVE_SUGGESTIONS: &[PatternSuggestion] = &[
         "cp -a {path} {path}.bak",
         "Copy first (preserves the original) — verify the copy, then remove only after confirmation",
     ),
+    PatternSuggestion::gated(
+        "mv {path} {path}.deleted-YYYYMMDD",
+        "In-place rename for soft-delete (no cross-segment hop, easy to undo) — any mv touching a sensitive path is still gated",
+    ),
+    PatternSuggestion::new(
+        "mv /tmp/{subdir}/foo /tmp/{subdir}/bar",
+        "Safe temp-directory rename (allowed without confirmation)",
+    ),
+];
+
+/// Suggestions for `mv-dynamic-path`. Same shape as the sensitive-path set,
+/// but the in-place rename stays ungated: with a *literal* path it is exactly
+/// the escape from the dynamic-path denial (a literal non-sensitive rename is
+/// allowed), so the gate marker would be wrong here.
+const MV_DYNAMIC_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "ls -la {path}",
+        "Resolve and verify the expanded path before any move",
+    ),
+    PatternSuggestion::new(
+        "cp -a {path} {path}.bak",
+        "Copy first (preserves the original) — verify the copy, then remove only after confirmation",
+    ),
     PatternSuggestion::new(
         "mv {path} {path}.deleted-YYYYMMDD",
-        "In-place rename for soft-delete (no cross-segment hop, easy to undo)",
+        "Use resolved literal paths for an in-place soft-delete rename",
     ),
     PatternSuggestion::new(
         "mv /tmp/{subdir}/foo /tmp/{subdir}/bar",
@@ -277,8 +304,8 @@ const SENSITIVE_PROPAGATION_DELETE_SUGGESTIONS: &[PatternSuggestion] = &[
 const REDIRECT_TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new("ls -la {path}", "Verify the path before any redirect"),
     PatternSuggestion::new(
-        "cp {path} {path}.bak && echo data > {path}",
-        "Make a backup first if you might need the previous content",
+        "cp {path} {path}.bak && echo data > /tmp/{subdir}/out && cp -f /tmp/{subdir}/out {path}",
+        "Back up the target, write the new content to a temp file, then copy it into place",
     ),
     PatternSuggestion::new(
         "echo data >> {path}",
@@ -1086,6 +1113,33 @@ pub(crate) fn filesystem_semantic_scan_required(command: &str, dialect: ShellDia
         || (dialect == ShellDialect::Cmd
             && command.contains('>')
             && command.contains(['%', '!', '^']))
+        // Fork-bomb reachability (issue #302): the `fork-bomb` rule matches a
+        // shell function-definition shape (`name() { … }`). The paren pair is
+        // pure syntax that keyword-based quick-reject cannot see, and POSIX
+        // permits whitespace inside it (`name ( )`), so a literal `()` keyword
+        // both costs a keyword slot and misses the spaced form. A space-
+        // tolerant scan here forces core.filesystem to run whenever an empty
+        // paren pair is present; the regex then does the precise matching.
+        || command_contains_empty_paren_pair(command)
+}
+
+/// True when the command contains `(` followed by only ASCII whitespace and
+/// then `)` — the empty parameter list of a shell function definition, the one
+/// piece of the fork-bomb shape that carries no executable keyword.
+fn command_contains_empty_paren_pair(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    while let Some(open) = bytes[index..].iter().position(|&b| b == b'(') {
+        let mut cursor = index + open + 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b')') {
+            return true;
+        }
+        index = index + open + 1;
+    }
+    false
 }
 
 /// Refine the global substring index's candidate signal for core.filesystem.
@@ -2319,21 +2373,31 @@ fn parse_rm_segment_with_option_scanning(
             continue;
         }
 
+        // Option tokens are always executed shell syntax (never data), so a
+        // quote embedded in the option cluster is concatenation the shell has
+        // already resolved: `rm -r'f' /`, `rm -'r'f /`, and `rm '-r'f /` all
+        // run `rm -rf /`. Collapse balanced quotes to read the true flags
+        // (bd-5xgt). Operands keep their own quote handling below, so a quoted
+        // data path is unaffected. An *unbalanced* quote is a shell syntax
+        // error that never runs rm, so it stays opaque and matches nothing.
+        let dequoted = dequote_rm_flag_token(text);
+        let flag_text = dequoted.as_ref();
+
         if !options_ended {
-            if text == "--" {
+            if flag_text == "--" {
                 options_ended = true;
                 flags.saw_terminator = true;
                 continue;
             }
 
-            if text.starts_with('-') && text != "-" {
+            if flag_text.starts_with('-') && flag_text != "-" {
                 let option_decision = if option_scanning
                     == RmOptionScanning::AppleStopAtFirstOperand
-                    && !apple_rm_option_token_is_valid(text)
+                    && !apple_rm_option_token_is_valid(flag_text)
                 {
                     RmOptionDecision::Invalid
                 } else {
-                    apply_rm_option(text, token.byte_range.clone(), &mut flags)
+                    apply_rm_option(flag_text, token.byte_range.clone(), &mut flags)
                 };
                 match option_decision {
                     RmOptionDecision::Continue => {}
@@ -2576,6 +2640,73 @@ fn apply_rm_long_option(
     }
 
     RmOptionDecision::Continue
+}
+
+/// Collapse balanced shell quotes and backslash escapes within an `rm` option
+/// token so the true flag letters are read (`-r'f'` -> `-rf`, `-r"f"` -> `-rf`,
+/// `'-r'f` -> `-rf`). Only applied to option-position tokens, which are always
+/// executed syntax rather than data.
+///
+/// Returns the token unchanged (borrowed) when it has no quotes/escapes, or
+/// when a quote is *unbalanced* — an unterminated quote is a shell syntax error
+/// that never runs `rm`, so it must stay opaque and match no flag rather than
+/// be silently "repaired" into a destructive one.
+fn dequote_rm_flag_token(token: &str) -> std::borrow::Cow<'_, str> {
+    if !token.bytes().any(|b| matches!(b, b'\'' | b'"' | b'\\')) {
+        return std::borrow::Cow::Borrowed(token);
+    }
+    let mut out = String::with_capacity(token.len());
+    let mut chars = token.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // Single quotes: everything until the next `'` is literal.
+            '\'' => {
+                let mut closed = false;
+                for inner in chars.by_ref() {
+                    if inner == '\'' {
+                        closed = true;
+                        break;
+                    }
+                    out.push(inner);
+                }
+                if !closed {
+                    return std::borrow::Cow::Borrowed(token);
+                }
+            }
+            // Double quotes: literal, except backslash escapes `"`, `\`, `$`,
+            // and backtick (POSIX double-quote semantics).
+            '"' => {
+                let mut closed = false;
+                while let Some(inner) = chars.next() {
+                    match inner {
+                        '"' => {
+                            closed = true;
+                            break;
+                        }
+                        '\\' => match chars.next() {
+                            Some(esc @ ('"' | '\\' | '$' | '`')) => out.push(esc),
+                            Some(other) => {
+                                out.push('\\');
+                                out.push(other);
+                            }
+                            None => return std::borrow::Cow::Borrowed(token),
+                        },
+                        other => out.push(other),
+                    }
+                }
+                if !closed {
+                    return std::borrow::Cow::Borrowed(token);
+                }
+            }
+            // A backslash outside quotes escapes the next character.
+            '\\' => match chars.next() {
+                Some(escaped) => out.push(escaped),
+                None => return std::borrow::Cow::Borrowed(token),
+            },
+            other => out.push(other),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 fn strip_outer_quotes(token: &str) -> (QuoteKind, &str) {
@@ -3193,7 +3324,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chain can be classified.
         destructive_pattern!(
             "cp-sensitive-then-delete",
-            r#"\bcp\b[^|;&]*(?:\s(?:-[A-Za-z]*a[A-Za-z]*|--archive)\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
+            r#"\bcp\b[^|;&]*(?:\s(?:-[A-Za-z]*a[A-Za-z]*|--archive)\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
             "archive copy of a sensitive path into temp followed by forced recursive deletion is a cross-segment data-loss bypass. EXTREMELY DANGEROUS.",
             Critical,
             "`cp -al /etc /tmp/x && rm -rf /tmp/x` is a propagation variant of the \
@@ -3208,7 +3339,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "ln-symlink-sensitive-then-delete",
-            r#"\bln\b[^|;&]*\s-[A-Za-z]*s[A-Za-z]*[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
+            r#"\bln\b[^|;&]*\s-[A-Za-z]*s[A-Za-z]*[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
             "symlink from a sensitive path into temp followed by forced recursive deletion can traverse and destroy the target. EXTREMELY DANGEROUS.",
             Critical,
             "`ln -s /etc /tmp/x && rm -rf /tmp/x/.` can turn an apparently safe temp \
@@ -3222,7 +3353,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "rsync-sensitive-then-delete",
-            r#"\brsync\b[^|;&]*(?:\s(?:-[A-Za-z]*a[A-Za-z]*|--archive)\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
+            r#"\brsync\b[^|;&]*(?:\s(?:-[A-Za-z]*a[A-Za-z]*|--archive)\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
             "rsync archive of a sensitive path into temp followed by forced recursive deletion is a cross-segment data-loss bypass. EXTREMELY DANGEROUS.",
             Critical,
             "`rsync -a /etc/ /tmp/dest/ && rm -rf /tmp/dest` is the rsync form of the \
@@ -3252,10 +3383,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Boot files, making the system unbootable\n\n\
              There is NO recovery without backups. Even with backups, full restoration \
              takes hours to days.\n\n\
-             If you need to delete specific files, use explicit paths:\n  \
-             rm -rf /path/to/specific/directory\n\n\
-             Always preview what would be deleted first:\n  \
-             find /path/to/directory -type f | head -20",
+             dcg auto-allows recursive deletion only for literal temp paths:\n  \
+             rm -rf /tmp/<subdir>/scratch\n\n\
+             For any other directory, preview first and then delete interactively \
+             (dcg allows the interactive form):\n  \
+             find /path/to/directory -type f | head -20\n  \
+             rm -ri /path/to/directory",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // Same root/home catastrophe but with SEPARATE flags (`rm -r -f /`,
@@ -3406,7 +3539,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // `(find /etc -delete)` and `find /etc -delete | tee log`
             // both fire. Without `)` in the set, subshell forms
             // silently bypass.
-            r#"\bfind\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s-delete(?:\s|$|[;&|)\n])"#,
+            r#"\bfind\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s-delete(?:\s|$|[;&|)\n])"#,
             "find <sensitive-path> -delete is bytewise-equivalent to rm -rf on root/home and is EXTREMELY DANGEROUS. This command will NOT be executed.",
             Critical,
             "`find <path> -delete` is the bytewise-equivalent of `rm -rf <path>`: \
@@ -3470,7 +3603,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // standard.
         destructive_pattern!(
             "unlink-root-home",
-            r#"\bunlink\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
+            r#"\bunlink\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
             "unlink on a sensitive system or home path is one-shot data destruction with no recovery. EXTREMELY DANGEROUS.",
             Critical,
             "`unlink <file>` is the raw POSIX unlink(2) primitive: it removes a single \
@@ -3518,7 +3651,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `truncate-grow` safe pattern above.
         destructive_pattern!(
             "truncate-zero-root-home",
-            r#"\btruncate\b[^|;&]*?(?:\s-s\s+(?!\+)\S+|\s--size=(?!\+)\S+)[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
+            r#"\btruncate\b[^|;&]*?(?:\s-s\s+(?!\+)\S+|\s--size=(?!\+)\S+)[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
             "truncate with a potentially shrinking size on a sensitive system or home path destroys data. EXTREMELY DANGEROUS.",
             Critical,
             "`truncate -s 0 <file>` zeros a file in place. `truncate -s -<N> <file>` \
@@ -3561,7 +3694,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // sensitive paths.
         destructive_pattern!(
             "shred-root-home",
-            r#"\bshred\b[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
+            r#"\bshred\b[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
             "shred on a sensitive system or home path destroys data beyond forensic recovery. EXTREMELY DANGEROUS.",
             Critical,
             "`shred` overwrites file content with random data (DoD-style multi-pass by \
@@ -3627,7 +3760,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // latent gap; closing it pack-wide is tracked separately.
         destructive_pattern!(
             "tar-remove-files-root-home",
-            r#"\btar\b[^|;&]*?\s--remove-files\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)|\btar\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?\s--remove-files\b"#,
+            r#"\btar\b[^|;&]*?\s--remove-files\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)|\btar\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?\s--remove-files\b"#,
             "tar --remove-files on a sensitive system or home path is recursive deletion masquerading as an archive operation. EXTREMELY DANGEROUS.",
             Critical,
             "`tar --remove-files -cf <archive> <source>` first archives the source paths \
@@ -3685,7 +3818,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `(dd if=/dev/zero of=/etc/passwd)` still classify as Critical.
         destructive_pattern!(
             "dd-overwrite-root-home",
-            r#"\bdd\b[^|;&]*?\bof=['"\\]?(?!/dev/)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            r#"\bdd\b[^|;&]*?\bof=['"\\]?(?!/dev/)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
             "dd of=<sensitive-path> overwrites file contents in place. EXTREMELY DANGEROUS on a system or home file.",
             Critical,
             "`dd if=/dev/zero of=<file>` and `dd if=/dev/urandom of=<file>` overwrite the \
@@ -3768,7 +3901,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // tier to fall back on.
         destructive_pattern!(
             "mv-sensitive-source-root-home",
-            r#"\bmv\b[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            r#"\bmv\b[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
             "mv touching a sensitive system or home path is the cross-segment recursive-force-delete bypass. EXTREMELY DANGEROUS.",
             Critical,
             "`mv /etc /tmp/x && rm -rf /tmp/x` is the canonical cross-segment bypass: \
@@ -3800,7 +3933,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Resolve and inspect every path before moving it.\n\
              - Use an explicit literal `/tmp/<subdir>` or `/var/tmp/<subdir>` path.\n\
              - Use `dcg allow-once` only after verifying the resolved source and destination.",
-            MV_SENSITIVE_SUGGESTIONS
+            MV_DYNAMIC_SUGGESTIONS
         ),
         // ----- `> <sensitive>` (Critical: shell redirect truncate) -----
         //
@@ -3842,12 +3975,22 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // pain we can add a safe pattern later.
         // Two carve-outs in the regex below worth understanding:
         //
-        //   1. `(?!/dev/(?:null|zero|full)\b)` — never fire on the
-        //      universal "discard output" sinks. `cmd > /dev/null` and
-        //      `cmd 2>&1 > /dev/null` are the most common shell idioms
-        //      in existence; without this carve-out the `dev` element
-        //      of the sensitive set would block essentially every
-        //      script that suppresses output.
+        //   1. `(?!/dev/(?:null|zero|full|tty)\b)` — never fire on the
+        //      genuinely write-safe character devices. `cmd > /dev/null` and
+        //      `cmd 2>&1 > /dev/null` are the most common shell idioms in
+        //      existence, and `/dev/null`, `/dev/zero`, `/dev/full`, and the
+        //      controlling terminal `/dev/tty` are ALWAYS character devices —
+        //      opening them with O_TRUNC cannot destroy persistent data
+        //      (#324). `/dev/stdout`, `/dev/stderr`, and `/dev/fd/N` are
+        //      deliberately NOT carved out: they are symlinks to whatever fd
+        //      0/1/2/N currently point at, which may be a regular file (e.g.
+        //      after `exec > logfile` or an inherited redirect), where
+        //      O_TRUNC truncates that real file. The #324 carve-out for them
+        //      rested on a false premise (that they are always character
+        //      devices) and reopened a data-loss path; the guard's
+        //      zero-false-negatives posture blocks them instead. The `\b`
+        //      keeps `/dev/tty0`..`/dev/ttyN` (consoles / other terminals)
+        //      blocked as before.
         //
         //   2. `(?:['"\\]|\$['"])?` — extends the historical optional
         //      single-char quote prefix to also accept the two-byte
@@ -3856,7 +3999,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //      bypass with `> $'/etc/passwd'` or `> $"/etc/passwd"`.
         destructive_pattern!(
             "redirect-truncate-root-home",
-            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full|tty)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
             "shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to a sensitive system or home path destroys the previous file contents. EXTREMELY DANGEROUS.",
             Critical,
             "`> /etc/passwd` (or `: > /etc/passwd`, `echo > /etc/passwd`, etc.) opens \
@@ -3867,7 +4010,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              There is NO recovery without backups.\n\n\
              Safer alternatives:\n\
              - Use append (`>>`) to preserve existing content: `echo line >> <file>`.\n\
-             - Make a backup: `cp <file> <file>.bak && echo data > <file>`.\n\
+             - Make a backup, then write via a temp file:\n  \
+               `cp <file> <file>.bak && echo data > /tmp/<subdir>/out && cp -f /tmp/<subdir>/out <file>`\n  \
+               (a truncating redirect straight back onto a home/system path is denied \
+               by this same rule).\n\
              - For temp scratch: `> /tmp/<subdir>/scratch` is allowed.\n\
              - Read redirects (`< <file>`) are not affected — they don't truncate.",
             REDIRECT_TRUNCATE_SUGGESTIONS
@@ -3887,6 +4033,28 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Use append (`>>`) when preserving existing content is acceptable.",
             REDIRECT_TRUNCATE_SUGGESTIONS
         ),
+        // Classic fork bomb: a no-argument function whose body pipes itself
+        // into itself in the background, immediately invoked
+        // (`:(){ :|:& };:` and word-named variants). The backreferences
+        // enforce that all three identifiers are the same, which is what
+        // separates a fork bomb from an ordinary function definition — this
+        // deliberately selects the backtracking engine. Differently shaped
+        // bombs (`while true; do (x) & done`) are out of scope: the regex
+        // crate family cannot enforce those without unbounded false
+        // positives, and the canonical form is the one agents actually
+        // reproduce (issue #302).
+        destructive_pattern!(
+            "fork-bomb",
+            r"([A-Za-z0-9_:]+)\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&\s*;?\s*\}\s*;\s*\1",
+            "This is a fork bomb: it recursively spawns processes until the system is unusable.",
+            Critical,
+            "A fork bomb defines a function that pipes itself into itself in the \
+             background and then calls it. Process count grows exponentially until \
+             the kernel can no longer schedule anything; the machine typically \
+             needs a hard reboot, losing all unsaved work in every application.\n\n\
+             There is no legitimate reason to run this shape. If you are testing \
+             process limits, use `ulimit -u` in a disposable VM or container."
+        ),
     ]
 }
 
@@ -3895,6 +4063,112 @@ mod tests {
     use super::*;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    #[test]
+    fn dequote_rm_flag_token_collapses_balanced_quotes() {
+        // bd-5xgt: balanced quotes inside a flag are shell concatenation.
+        for (input, want) in [
+            ("-r'f'", "-rf"),
+            ("-'r'f", "-rf"),
+            ("-r\"f\"", "-rf"),
+            ("'-r'f", "-rf"),
+            ("'-rf'", "-rf"),
+            ("-rf''", "-rf"),
+            ("'-'r'f'", "-rf"),
+            ("-r\\f", "-rf"),
+            ("--recursive", "--recursive"),
+            ("-rf", "-rf"),
+        ] {
+            assert_eq!(
+                dequote_rm_flag_token(input).as_ref(),
+                want,
+                "input {input:?}"
+            );
+        }
+        // An unbalanced quote is a syntax error: leave it opaque so it matches
+        // no flag (never "repair" it into a destructive one).
+        for opaque in ["-r'f", "-r\"f", "-rf\\"] {
+            assert_eq!(
+                dequote_rm_flag_token(opaque).as_ref(),
+                opaque,
+                "unbalanced {opaque:?} must stay opaque"
+            );
+        }
+        // A token with no quotes is borrowed unchanged.
+        assert!(matches!(
+            dequote_rm_flag_token("-rf"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// Issue #302: the canonical fork bomb and word-named variants are
+    /// blocked; ordinary function definitions that merely pipe two different
+    /// commands are not. Evaluator-level reachability is handled by
+    /// `filesystem_semantic_scan_required` (an empty paren pair forces the
+    /// pack), not by a pack keyword — see the empty_paren_pair tests and the
+    /// evaluator's `fork_bomb_denies_through_full_pipeline_issue_302`.
+    #[test]
+    fn fork_bomb_is_blocked_issue_302() {
+        let pack = create_pack();
+        // The fork-bomb rule spans shell separators, so it is matched
+        // whole-command (never through `Pack::check`, which is keyword-gated
+        // and per-segment). Test the compiled regex and the force check
+        // directly; the end-to-end deny is in the evaluator test.
+        let fork_bomb = pack
+            .destructive_patterns
+            .iter()
+            .find(|p| p.name == Some("fork-bomb"))
+            .expect("fork-bomb rule must exist");
+        for bomb in [
+            ":(){ :|:& };:",
+            "bomb(){ bomb|bomb& };bomb",
+            ": () { : | : & ; } ; :",
+            "b(){ b|b&;};b",
+            // Spaced paren pair — the literal `()` keyword missed this; the
+            // space-tolerant force check reaches it.
+            ":( ){ :|:& };:",
+        ] {
+            assert!(
+                filesystem_semantic_scan_required(bomb, ShellDialect::Posix),
+                "fork bomb must force the pack via semantic scan: {bomb}"
+            );
+            assert!(
+                fork_bomb.regex.is_match(bomb),
+                "fork-bomb regex must match: {bomb}"
+            );
+        }
+        // Same-shape functions piping two DIFFERENT commands are not bombs.
+        for benign in [
+            "serve(){ python|tee & };logs",
+            "f(){ a|b& };f",
+            "retry(){ curl -s x|jq . ; };retry",
+        ] {
+            assert!(
+                !fork_bomb.regex.is_match(benign),
+                "non-self-referential function must not match fork-bomb: {benign}"
+            );
+        }
+    }
+
+    /// The space-tolerant empty-paren detector that gives the fork-bomb rule
+    /// its evaluator reachability (issue #302).
+    #[test]
+    fn empty_paren_pair_detection_issue_302() {
+        for present in [":(){ :;}", "foo() {}", ":( ){ }", "x(  )", "arr=()", "$()"] {
+            assert!(
+                command_contains_empty_paren_pair(present),
+                "empty paren pair expected: {present}"
+            );
+        }
+        for absent in [
+            "echo hi", "(ls)", "foo(bar)", "$(date)", "$((1+1))", "a || b",
+        ] {
+            assert!(
+                !command_contains_empty_paren_pair(absent),
+                "no empty paren pair expected: {absent}"
+            );
+        }
+    }
 
     /// The `-r`/`-f` rules match the FLAG PAIR, not an argv0, so they also
     /// cover `rm` used as another tool's subcommand. That is deliberate and
@@ -5272,17 +5546,121 @@ mod tests {
 
     #[test]
     fn redirect_to_dev_devices_still_blocks() {
-        // The /dev/{null,zero,full} carve-out must NOT relax actual
-        // device destruction (`> /dev/sda` etc.) — only the safe sinks.
+        // The write-safe-device carve-out must NOT relax actual device
+        // destruction (`> /dev/sda` etc.) — only the safe sinks. This
+        // includes near-misses of the #324 carve-out: `/dev/st0` is a
+        // TAPE device (truncate-adjacent name, real data), `/dev/tty0`
+        // and `/dev/ttys002` are other terminals/consoles, and
+        // `/dev/fd/N` for N > 2 can dup a regular-file descriptor where
+        // O_TRUNC truncates a real file.
         let pack = create_pack();
         for cmd in [
             "> /dev/sda",
             "echo zero > /dev/sda1",
             "command > /dev/sdb",
             "echo > /dev/nvme0n1",
+            "echo > /dev/st0",
+            "echo > /dev/tty0",
+            "echo > /dev/ttys002",
+            "echo x > /dev/fd/3",
+            "echo x > /dev/fd/7",
+            "echo x > /dev/fd/12",
+            "echo x > /dev/stdouts",
         ] {
             assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
         }
+    }
+
+    #[test]
+    fn redirect_to_controlling_terminal_is_allowed() {
+        // `/dev/tty` is the controlling terminal — always a character
+        // device, never a regular file — so opening it with O_TRUNC cannot
+        // destroy persistent data. It stays carved out alongside
+        // /dev/null|zero|full.
+        let pack = create_pack();
+        for cmd in [
+            "echo prompt > /dev/tty",
+            "read -p x < /dev/tty > /dev/tty",
+            "echo x > /dev/null",
+            "echo x > /dev/zero",
+            "echo x > /dev/full",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_to_std_stream_symlinks_blocks() {
+        // `/dev/stdout`, `/dev/stderr`, and `/dev/fd/N` are symlinks to
+        // whatever fd 0/1/2/N currently point at — which may be a regular
+        // file (after `exec > logfile`, or an inherited redirect). Opening
+        // them with O_TRUNC then truncates that real file, so the #324
+        // carve-out for them was unsound and is removed: the guard blocks
+        // them under its zero-false-negatives posture.
+        let pack = create_pack();
+        for cmd in [
+            "gh pr view 204 --json number,title > /dev/stdout",
+            "command > /dev/stdout",
+            "command >/dev/stdout",
+            "command > /dev/stderr",
+            "echo warn 1> /dev/stderr",
+            "echo warn 2> /dev/stdout",
+            "command &> /dev/stdout",
+            "echo x > /dev/fd/0",
+            "echo x > /dev/fd/1",
+            "echo x >/dev/fd/2",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+    }
+
+    #[test]
+    fn redirect_truncate_macos_home_spelling_blocks() {
+        // #325: tools hand agents absolute resolved paths, so the macOS
+        // home spelling `/Users/<user>/...` is what a truncating
+        // redirect actually names in practice. The rm family already
+        // treated /Users as sensitive; the redirect rule must agree
+        // with it or the guard blocks the uncertain form
+        // (`> $D/.zshrc`) while allowing the exactly-named one.
+        let pack = create_pack();
+        for cmd in [
+            "echo x > /Users/jemanuel/.zshrc",
+            "echo x >/Users/jemanuel/.zshrc",
+            ": > /Users/jemanuel/.zshrc",
+            "echo x >| /Users/jemanuel/.zshrc",
+            "echo x 2> /Users/jemanuel/.zshrc",
+            "echo x &> /Users/jemanuel/.zshrc",
+            "printf x > /Users/jemanuel/.ssh/config",
+            "echo x > \"/Users/jemanuel/.zshrc\"",
+            "echo x > /Users",
+            "echo x > /Users/Shared/notes.txt",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+
+        // `/Users` must only match as a complete path component.
+        for cmd in ["echo x > /Usersland/file.txt", "echo x > ./Users/file.txt"] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn mv_sensitive_source_macos_home_spelling_blocks() {
+        // #325 sibling: mv-sensitive-source-root-home shares the
+        // sensitive-path alternation and must carry the macOS spelling
+        // too (platform parity with the Linux `/home` posture).
+        let pack = create_pack();
+        assert_blocks_with_pattern(
+            &pack,
+            "mv /Users/jemanuel/.zshrc /tmp/x",
+            "mv-sensitive-source-root-home",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "mv /home/user/.zshrc /tmp/x",
+            "mv-sensitive-source-root-home",
+        );
     }
 
     #[test]

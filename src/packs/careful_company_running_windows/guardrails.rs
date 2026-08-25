@@ -70,7 +70,7 @@ const DCG_SUGGESTIONS: &[PatternSuggestion] = &[
         "dcg explain \"<command>\"",
         "If dcg is blocking something needed, find out why rather than disabling the guard",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "Ask the operator to run: dcg allowlist add <ruleId> -r \"<approved reason>\"",
         "Allowlisting is an operator action — an agent that can widen its own allowlist is not guarded",
     ),
@@ -352,15 +352,42 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              recorded reason",
             DCG_SUGGESTIONS
         ),
+        // Delete/rewrite/move verbs tamper no matter where the config path
+        // appears (moving or renaming the live file away removes the hook
+        // just as surely as deleting it). The COPY family is deliberately
+        // absent here: `Copy-Item ~/.claude/settings.json <backup>` is a
+        // read of the config — the protective operation, not the attack —
+        // so copy verbs are covered by the destination-position rule below
+        // instead (issue #313).
         destructive_pattern!(
             "agent-hook-config-tamper",
-            r"(?i)(?:\b(?:remove-item|ri|del|erase|rd|rmdir|clear-content|set-content|add-content|out-file|move-item|rename-item|copy-item|new-item|copy|xcopy|robocopy)\b[^|&;\r\n]*?(?:[\s\x22'=\\/])|>{1,2}\s*|\[(?:system\.)?io\.file\]::(?:writealltext|writeallbytes|appendalltext)\s*\([^|&;\r\n]*?(?:[\s\x22']))\.(?:claude|codex|cursor|gemini|copilot|grok|hermes)[\\/][^|&;\r\n]*\.(?:json|toml|ya?ml)\b",
+            r"(?i)(?:\b(?:remove-item|ri|del|erase|rd|rmdir|clear-content|set-content|add-content|out-file|move-item|rename-item|new-item)\b[^|&;\r\n]*?(?:[\s\x22'=\\/])|>{1,2}\s*|\[(?:system\.)?io\.file\]::(?:writealltext|writeallbytes|appendalltext)\s*\([^|&;\r\n]*?(?:[\s\x22']))\.(?:claude|codex|cursor|gemini|copilot|grok|hermes)[\\/][^|&;\r\n]*\.(?:json|toml|ya?ml)\b",
             "Editing or deleting the agent's hook configuration can silently remove dcg's protection.",
             High,
             "dcg runs because it is registered as a PreToolUse hook in files like \
              `~/.claude/settings.json` or `~/.codex/hooks.json`. Rewriting or deleting one of those \
              files removes the guard with no error and no warning — the next dangerous command simply \
              runs.\n\n\
+             Safer alternatives:\n\
+             - `dcg doctor` to check hook health without editing anything\n\
+             - `dcg install` to repair a hook, which preserves coexisting entries\n\
+             - Ask the operator to make configuration changes",
+            DCG_SUGGESTIONS
+        ),
+        // Copy verbs tamper only when the agent config path is the WRITE
+        // side: the `-Destination` named parameter, or a positional
+        // destination (an earlier non-flag operand exists before the config
+        // path). Reading the config as the source operand — a backup copy —
+        // stays allowed (issue #313).
+        destructive_pattern!(
+            "agent-hook-config-overwrite",
+            r"(?i)\b(?:copy-item|copy|xcopy|robocopy)\b(?:[^|&;\r\n]*?-destination[:\s]+[\x22']?(?:(?!\s+[-/])[^|&;\r\n])*?|(?:\s+[-/][^\s|&;]+)*\s+(?!-)[^\s|&;]+\s+(?![-/])(?:[^|&;\r\n\s]|\s+(?![-/]))*?)[\s\x22'=\\/]?\.(?:claude|codex|cursor|gemini|copilot|grok|hermes)[\\/][^|&;\r\n]*\.(?:json|toml|ya?ml)(?![\w.-])",
+            "Copying a file ONTO the agent's hook configuration replaces it and can silently remove dcg's protection.",
+            High,
+            "A copy whose DESTINATION is a hook-configuration file (like \
+             `~/.claude/settings.json` or `~/.codex/hooks.json`) overwrites the \
+             registered hooks in one step. Copying the configuration OUT to a \
+             backup is a read and is not blocked.\n\n\
              Safer alternatives:\n\
              - `dcg doctor` to check hook health without editing anything\n\
              - `dcg install` to repair a hook, which preserves coexisting entries\n\
@@ -595,7 +622,7 @@ mod tests {
             ),
             (
                 "Copy-Item .\\weak.json .cursor\\settings.json",
-                "agent-hook-config-tamper",
+                "agent-hook-config-overwrite",
             ),
             (
                 "[IO.File]::WriteAllText('.gemini\\settings.json', '{}')",
@@ -613,6 +640,48 @@ mod tests {
         for (command, expected) in checks {
             assert_blocks_reachably(&pack, command, expected);
         }
+    }
+
+    /// Issue #313: copying the hook config OUT (a backup) is a read and must
+    /// stay allowed; copying anything ONTO the hook config replaces it and
+    /// must deny.
+    #[test]
+    fn hook_config_backup_copy_is_read_not_tamper_issue_313() {
+        let pack = create_pack();
+
+        // Config as SOURCE: protective backup reads.
+        for command in [
+            "Copy-Item ~/.claude/settings.json ~/settings-backup.json",
+            "Copy-Item $env:USERPROFILE\\.claude\\settings.json C:\\backups\\settings-backup.json",
+            "Copy-Item -Path ~/.claude/settings.json -Destination ~/backup.json",
+            "Copy-Item -Destination ~/backup.json -Path ~/.claude/settings.json",
+            "copy %USERPROFILE%\\.codex\\hooks.json C:\\backups\\hooks-backup.json",
+            // Sibling backup with a suffix is not the live config file.
+            "Copy-Item ~/.claude/settings.json ~/.claude/settings.json.bak",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "backup copy must be allowed: {command}"
+            );
+        }
+
+        // Config as DESTINATION: overwrites the registered hooks.
+        for command in [
+            "Copy-Item .\\weak.json ~/.claude/settings.json",
+            "Copy-Item payload.json -Destination $env:USERPROFILE\\.claude\\settings.json",
+            "Copy-Item -Destination ~/.codex/hooks.json -Path payload.json",
+            "copy /y payload.json %USERPROFILE%\\.cursor\\hooks.json",
+            "xcopy payload.json %USERPROFILE%\\.claude\\settings.json",
+        ] {
+            assert_blocks_reachably(&pack, command, "agent-hook-config-overwrite");
+        }
+
+        // Moving or renaming the live config away still removes protection.
+        assert_blocks_reachably(
+            &pack,
+            "Move-Item ~/.claude/settings.json ~/elsewhere.json",
+            "agent-hook-config-tamper",
+        );
     }
 
     #[test]

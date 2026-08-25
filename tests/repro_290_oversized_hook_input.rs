@@ -277,6 +277,117 @@ fn issue_290_oversized_envelope_without_tool_name_is_not_denied() {
     );
 }
 
+/// Run dcg on a raw oversized payload with `windows.filesystem` enabled, so
+/// the PowerShell/cmd rules participate (they are default-off on Unix).
+fn run_hook_raw_windows(input: &str, home: &Path) -> (String, String, i32) {
+    let config_path = home.join("dcg-test-config.toml");
+    fs::write(&config_path, "").expect("failed to write empty config");
+
+    let mut child = Command::new(dcg_binary())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("xdg_config"))
+        .env("DCG_CONFIG", &config_path)
+        .env("DCG_PACKS", "windows.filesystem")
+        .env(
+            "DCG_PENDING_EXCEPTIONS_PATH",
+            home.join("pending_exceptions.jsonl"),
+        )
+        .env_remove("DCG_FAIL_CLOSED")
+        .spawn()
+        .expect("failed to spawn dcg process");
+
+    {
+        let stdin = child.stdin.as_mut().expect("failed to get stdin");
+        stdin
+            .write_all(input.as_bytes())
+            .expect("failed to write to stdin");
+    }
+
+    let output = child.wait_with_output().expect("failed to wait for dcg");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
+/// #322 fresh-eyes follow-up: the oversized-input fail-closed path resolved
+/// each scan window with an UNREFINED dialect, so padding a `Bash`-labeled
+/// PowerShell payload past `max_command_bytes` slipped `Remove-Item -Recurse
+/// -Force` through under Posix (a cmdlet is an inert unknown binary there).
+/// The path now applies the same `refine_shell_dialect` widening per window.
+#[test]
+fn issue_322_oversized_mislabeled_powershell_is_denied() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    // Padding INSIDE the command, after the destructive PowerShell part —
+    // the exact evasion shape the #290 windows scan exists to catch.
+    let command = format!(
+        "Remove-Item -Recurse -Force C:\\src ; {}",
+        "A".repeat(PADDING_BYTES)
+    );
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": command }
+    })
+    .to_string();
+    assert!(input.len() > 256 * 1024, "envelope must exceed the limit");
+
+    let (stdout, stderr, exit_code) = run_hook_raw_windows(&input, temp.path());
+    assert_eq!(exit_code, 0, "hook mode exits 0 on deny\nstderr: {stderr}");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("expected deny JSON ({e}); stdout: {stdout:?}\nstderr: {stderr}")
+    });
+    assert_eq!(
+        json["hookSpecificOutput"]["permissionDecision"]
+            .as_str()
+            .unwrap_or_default(),
+        "deny",
+        "oversized mislabeled PowerShell payload must fail closed, got: {stdout:?}"
+    );
+}
+
+/// #322 fresh-eyes follow-up (normal size): a `Bash`-labeled PowerShell
+/// alias invocation (`rm -Recurse -Force`) is widened and denied by the
+/// windows pack. Proves the alias-widening signal end-to-end, not just at
+/// the dialect-refinement unit level.
+#[test]
+fn issue_322_mislabeled_powershell_alias_is_denied() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let input = r#"{"tool_name":"Bash","tool_input":{"command":"rm -Recurse -Force C:\\src"}}"#;
+
+    let (stdout, stderr, exit_code) = run_hook_raw_windows(input, temp.path());
+    assert_eq!(exit_code, 0, "hook mode exits 0 on deny\nstderr: {stderr}");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("expected deny JSON ({e}); stdout: {stdout:?}\nstderr: {stderr}")
+    });
+    assert_eq!(
+        json["hookSpecificOutput"]["permissionDecision"]
+            .as_str()
+            .unwrap_or_default(),
+        "deny",
+        "mislabeled PowerShell alias must fail closed, got: {stdout:?}"
+    );
+}
+
+/// Guard against over-widening: a plain POSIX `rm -rf` in a temp dir stays
+/// allowed even with the windows pack enabled — the alias signal requires a
+/// Windows-shell-only argument, which `-rf` is not.
+#[test]
+fn issue_322_posix_rm_rf_temp_not_over_widened() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let input = r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/scratch"}}"#;
+
+    let (stdout, _stderr, exit_code) = run_hook_raw_windows(input, temp.path());
+    assert_eq!(exit_code, 0, "hook mode exits 0");
+    assert!(
+        stdout.trim().is_empty(),
+        "POSIX temp cleanup must stay allowed, got: {stdout:?}"
+    );
+}
+
 /// Normal-size destructive flow is unchanged by the truncated-prefix path.
 #[test]
 fn issue_290_normal_size_deny_unchanged() {

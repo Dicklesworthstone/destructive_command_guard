@@ -56,9 +56,9 @@ const DROP_SCHEMA_SUGGESTIONS: &[PatternSuggestion] = &[
         "SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema_name}'",
         "List all tables in the schema",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "DROP SCHEMA {schema_name} RESTRICT",
-        "Use RESTRICT to fail if schema is not empty",
+        "RESTRICT fails if the schema is not empty — still a DROP, so it is gated as well",
     ),
 ];
 
@@ -68,9 +68,9 @@ const TRUNCATE_TABLE_SUGGESTIONS: &[PatternSuggestion] = &[
         "SELECT COUNT(*) FROM {tablename}",
         "Check how many rows would be deleted",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "BEGIN; TRUNCATE {tablename}; -- ROLLBACK or COMMIT",
-        "Wrap in transaction for rollback capability",
+        "Wrap in a transaction for rollback capability — the TRUNCATE inside is gated as well",
     ),
     PatternSuggestion::new(
         "CREATE TABLE {tablename}_backup AS SELECT * FROM {tablename}",
@@ -88,13 +88,13 @@ const DELETE_WITHOUT_WHERE_SUGGESTIONS: &[PatternSuggestion] = &[
         "SELECT COUNT(*) FROM {tablename}",
         "Check how many rows exist",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "TRUNCATE TABLE {tablename}",
-        "Use TRUNCATE if you truly want all rows deleted (faster)",
+        "Faster if you truly want all rows gone — but TRUNCATE is gated as well",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "BEGIN; DELETE FROM {tablename}; -- ROLLBACK or COMMIT",
-        "Wrap in transaction for rollback capability",
+        "Wrap in a transaction for rollback capability — the unfiltered DELETE is gated as well",
     ),
 ];
 
