@@ -10307,8 +10307,8 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     // dcg at all.
     if omp_appears_in_use() {
         print!("Checking Oh My Pi extension registration... ");
-        match registered_omp_extension_path() {
-            Ok(Some(extension_path)) => {
+        match registered_omp_extension() {
+            Ok(OmpExtensionRegistration::Healthy(extension_path)) => {
                 println!("{}", "OK".green());
                 println!("  Found: {}", extension_path.display());
             }
@@ -10321,7 +10321,30 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                      'dcg install --omp'"
                 );
             }
-            Ok(None) => {
+            Ok(OmpExtensionRegistration::OwnedUnhealthy { path, project }) => {
+                println!("{}", "OUTDATED OR DAMAGED".yellow());
+                println!(
+                    "  Found dcg-owned but non-current bytes at {}",
+                    path.display()
+                );
+                issues += 1;
+                if fix {
+                    println!("  Attempting extension refresh...");
+                    if install_omp_extension(true, project).is_ok() {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    } else {
+                        println!("  {}", "Failed to fix".red());
+                    }
+                } else {
+                    println!(
+                        "  → Run 'dcg install --omp --force{}' to refresh the native extension",
+                        if project { " --project" } else { "" }
+                    );
+                    println!("    (OMP bash commands are NOT guarded by this unhealthy bridge)");
+                }
+            }
+            Ok(OmpExtensionRegistration::Missing) => {
                 println!("{}", "NOT REGISTERED".yellow());
                 issues += 1;
                 if fix {
@@ -11307,8 +11330,8 @@ fn collect_doctor_report(
     // pretty, and JSON doctor output agree.
     if omp_appears_in_use() {
         let mut omp_fixed = false;
-        let (status, message, remediation) = match registered_omp_extension_path() {
-            Ok(Some(registered_path)) => (
+        let (status, message, remediation) = match registered_omp_extension() {
+            Ok(OmpExtensionRegistration::Healthy(registered_path)) => (
                 DoctorCheckStatus::Ok,
                 format!(
                     "Native Oh My Pi extension found at {}",
@@ -11328,7 +11351,31 @@ fn collect_doctor_report(
                     ),
                 )
             }
-            Ok(None) => {
+            Ok(OmpExtensionRegistration::OwnedUnhealthy { path, project }) => {
+                issues += 1;
+                if fix && install_omp_extension(true, project).is_ok() {
+                    fixed += 1;
+                    omp_fixed = true;
+                    (
+                        DoctorCheckStatus::Ok,
+                        format!("Refreshed native Oh My Pi extension at {}", path.display()),
+                        None,
+                    )
+                } else {
+                    let project_flag = if project { " --project" } else { "" };
+                    (
+                        DoctorCheckStatus::Error,
+                        format!(
+                            "Oh My Pi extension at {} is dcg-owned but outdated, damaged, or disabled",
+                            path.display()
+                        ),
+                        Some(format!(
+                            "Run 'dcg install --omp --force{project_flag}' to refresh it"
+                        )),
+                    )
+                }
+            }
+            Ok(OmpExtensionRegistration::Missing) => {
                 issues += 1;
                 if fix && install_omp_extension(false, false).is_ok() {
                     fixed += 1;
@@ -12793,29 +12840,99 @@ fn omp_appears_in_use() -> bool {
             .is_some_and(|path| path.exists())
 }
 
-/// Whether `path` holds a dcg-generated OMP extension.
-fn omp_extension_is_dcg_owned(path: &std::path::Path) -> bool {
-    std::fs::read_to_string(path)
-        .map(|content| content.contains(OMP_EXTENSION_MARKER))
-        .unwrap_or(false)
+fn omp_extension_text_is_dcg_owned(content: &str) -> bool {
+    content.contains(OMP_EXTENSION_MARKER)
 }
 
-/// A dcg-owned OMP extension loaded by the current project/profile. Doctor must
-/// accept either installation mode instead of always inspecting the user path.
-fn registered_omp_extension_path() -> std::io::Result<Option<std::path::PathBuf>> {
+/// Whether `path` holds a dcg-generated OMP extension. Ownership controls only
+/// whether dcg may replace/remove the file; it is deliberately weaker than the
+/// exact-byte health check used by doctor.
+fn omp_extension_is_dcg_owned(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .is_ok_and(|content| omp_extension_text_is_dcg_owned(&content))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OmpExtensionInspection {
+    Absent,
+    Foreign,
+    OwnedUnhealthy,
+    Healthy,
+}
+
+fn inspect_omp_extension(
+    path: &std::path::Path,
+    expected_source: &str,
+) -> std::io::Result<OmpExtensionInspection> {
+    let content = match std::fs::read(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OmpExtensionInspection::Absent);
+        }
+        Err(error) => {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("could not inspect {}: {error}", path.display()),
+            ));
+        }
+    };
+
+    if content == expected_source.as_bytes() {
+        Ok(OmpExtensionInspection::Healthy)
+    } else if std::str::from_utf8(&content).is_ok_and(omp_extension_text_is_dcg_owned) {
+        Ok(OmpExtensionInspection::OwnedUnhealthy)
+    } else {
+        Ok(OmpExtensionInspection::Foreign)
+    }
+}
+
+#[derive(Debug)]
+enum OmpExtensionRegistration {
+    Healthy(std::path::PathBuf),
+    OwnedUnhealthy {
+        path: std::path::PathBuf,
+        project: bool,
+    },
+    Missing,
+}
+
+/// Inspect the project and active-profile extension paths OMP actually loads.
+/// A marker grants overwrite/removal authority, but only exact generated bytes
+/// prove that the bridge is current and enabled.
+fn registered_omp_extension() -> std::io::Result<OmpExtensionRegistration> {
     // Validate the live profile environment before doctor claims that OMP can
-    // start and load either extension. Keep the project-registration fast path
-    // independent of user-path settings that OMP does not need to discover it.
+    // start and load either extension.
     let _validated_profile = omp_active_profile()?;
-    if let Some(project_path) = project_omp_extension_path()
-        .ok()
-        .filter(|path| omp_extension_is_dcg_owned(path))
-    {
-        return Ok(Some(project_path));
+    let executable = current_dcg_executable()?;
+    let expected_source = build_omp_extension_source(&executable)?;
+
+    let project_path = project_omp_extension_path()?;
+    let project_state = inspect_omp_extension(&project_path, &expected_source)?;
+    let user_path = omp_user_extension_path()?;
+    let user_state = inspect_omp_extension(&user_path, &expected_source)?;
+
+    // OMP loads both locations. A current copy at one scope must not hide a
+    // stale dcg-owned copy at the other scope: both callbacks would run.
+    if project_state == OmpExtensionInspection::OwnedUnhealthy {
+        return Ok(OmpExtensionRegistration::OwnedUnhealthy {
+            path: project_path,
+            project: true,
+        });
+    }
+    if user_state == OmpExtensionInspection::OwnedUnhealthy {
+        return Ok(OmpExtensionRegistration::OwnedUnhealthy {
+            path: user_path,
+            project: false,
+        });
+    }
+    if project_state == OmpExtensionInspection::Healthy {
+        return Ok(OmpExtensionRegistration::Healthy(project_path));
+    }
+    if user_state == OmpExtensionInspection::Healthy {
+        return Ok(OmpExtensionRegistration::Healthy(user_path));
     }
 
-    let user_path = omp_user_extension_path()?;
-    Ok(omp_extension_is_dcg_owned(&user_path).then_some(user_path))
+    Ok(OmpExtensionRegistration::Missing)
 }
 
 /// Shared doctor verdict for the build-provenance / update-pin check (#320),

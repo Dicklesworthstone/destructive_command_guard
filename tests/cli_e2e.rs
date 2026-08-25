@@ -2695,6 +2695,10 @@ mod config_tests {
             Truncated,
             Stale,
             Disabled,
+            Malformed,
+            ProjectTruncatedUserCurrent,
+            ProjectCurrentUserTruncated,
+            ProjectForeignUserCurrent,
         }
 
         let cases = [
@@ -2704,12 +2708,56 @@ mod config_tests {
             ("owned-truncated", Fixture::Truncated, false),
             ("owned-stale", Fixture::Stale, false),
             ("owned-disabled", Fixture::Disabled, false),
+            ("owned-malformed", Fixture::Malformed, false),
+            (
+                "project-truncated-user-current",
+                Fixture::ProjectTruncatedUserCurrent,
+                false,
+            ),
+            (
+                "project-current-user-truncated",
+                Fixture::ProjectCurrentUserTruncated,
+                false,
+            ),
+            (
+                "project-foreign-user-current",
+                Fixture::ProjectForeignUserCurrent,
+                true,
+            ),
         ];
 
         for (label, fixture, expected_healthy) in cases {
             let temp = tempfile::tempdir().expect("tempdir");
             let (home_dir, xdg_config_dir, bin_dir) = setup_doctor_env(&temp);
             let extension = temp.path().join(".omp/extensions/dcg-guard.ts");
+            let user_extension = home_dir.join(".omp/agent/extensions/dcg-guard.ts");
+
+            let install_current = |project: bool| {
+                let mut install = Command::new(dcg_binary());
+                install
+                    .env_clear()
+                    .env("HOME", &home_dir)
+                    .env("USERPROFILE", &home_dir)
+                    .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                    .env("OMP_PROFILE", "")
+                    .current_dir(temp.path())
+                    .args(["install", "--omp"]);
+                if project {
+                    install.arg("--project");
+                }
+                let output = install.output().expect("install current OMP extension");
+                assert!(
+                    output.status.success(),
+                    "{label}: fixture install failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let path = if project {
+                    &extension
+                } else {
+                    &user_extension
+                };
+                std::fs::read_to_string(path).expect("read generated OMP extension")
+            };
 
             match fixture {
                 Fixture::Absent => {}
@@ -2719,24 +2767,12 @@ mod config_tests {
                     std::fs::write(&extension, "export default function mine() {}\n")
                         .expect("foreign project OMP extension");
                 }
-                Fixture::Current | Fixture::Truncated | Fixture::Stale | Fixture::Disabled => {
-                    let install = Command::new(dcg_binary())
-                        .env_clear()
-                        .env("HOME", &home_dir)
-                        .env("USERPROFILE", &home_dir)
-                        .env("XDG_CONFIG_HOME", &xdg_config_dir)
-                        .env("OMP_PROFILE", "")
-                        .current_dir(temp.path())
-                        .args(["install", "--omp", "--project"])
-                        .output()
-                        .expect("install current project OMP extension");
-                    assert!(
-                        install.status.success(),
-                        "{label}: fixture install failed: {}",
-                        String::from_utf8_lossy(&install.stderr)
-                    );
-                    let current = std::fs::read_to_string(&extension)
-                        .expect("read generated project OMP extension");
+                Fixture::Current
+                | Fixture::Truncated
+                | Fixture::Stale
+                | Fixture::Disabled
+                | Fixture::Malformed => {
+                    let current = install_current(true);
                     let candidate = match fixture {
                         Fixture::Truncated => "// dcg-omp-extension: generated\n".to_string(),
                         Fixture::Stale => {
@@ -2760,10 +2796,45 @@ mod config_tests {
                             );
                             disabled
                         }
+                        Fixture::Malformed => {
+                            let malformed = current.replacen(
+                                "export default function dcgGuard",
+                                "export default function { dcgGuard",
+                                1,
+                            );
+                            assert_ne!(
+                                malformed, current,
+                                "malformed fixture mutation must apply"
+                            );
+                            malformed
+                        }
                         Fixture::Current => current,
-                        Fixture::Absent | Fixture::Foreign => unreachable!(),
+                        Fixture::Absent
+                        | Fixture::Foreign
+                        | Fixture::ProjectTruncatedUserCurrent
+                        | Fixture::ProjectCurrentUserTruncated
+                        | Fixture::ProjectForeignUserCurrent => unreachable!(),
                     };
                     std::fs::write(&extension, candidate).expect("write OMP health fixture");
+                }
+                Fixture::ProjectTruncatedUserCurrent => {
+                    install_current(true);
+                    install_current(false);
+                    std::fs::write(&extension, "// dcg-omp-extension: truncated\n")
+                        .expect("write truncated project extension");
+                }
+                Fixture::ProjectCurrentUserTruncated => {
+                    install_current(true);
+                    install_current(false);
+                    std::fs::write(&user_extension, "// dcg-omp-extension: truncated\n")
+                        .expect("write truncated user extension");
+                }
+                Fixture::ProjectForeignUserCurrent => {
+                    install_current(false);
+                    std::fs::create_dir_all(extension.parent().expect("extension parent"))
+                        .expect("project OMP extension directory");
+                    std::fs::write(&extension, "export default function mine() {}\n")
+                        .expect("foreign project OMP extension");
                 }
             }
 
