@@ -6513,14 +6513,37 @@ fi
     )
 }
 
+/// Build a Git subprocess for CLI operations.
+///
+/// Release binaries honor the operator's normal Git configuration. Unit tests
+/// suppress ambient global, system, and command-scope configuration so that
+/// configuration cannot redirect a temporary repository's hooks or otherwise
+/// perturb its fixtures; repository-local configuration remains in force.
+fn git_command(cwd: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command.current_dir(cwd);
+
+    #[cfg(test)]
+    {
+        let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        command
+            .env("GIT_CONFIG_GLOBAL", null_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_CONFIG")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS");
+    }
+
+    command
+}
+
 fn git_resolve_path(
     cwd: &std::path::Path,
     git_path: &str,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     ensure_git_repo(cwd)?;
 
-    let output = std::process::Command::new("git")
-        .current_dir(cwd)
+    let output = git_command(cwd)
         .args(["rev-parse", "--git-path", git_path])
         .output()?;
 
@@ -6548,8 +6571,7 @@ fn git_show_toplevel(
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     ensure_git_repo(cwd)?;
 
-    let output = std::process::Command::new("git")
-        .current_dir(cwd)
+    let output = git_command(cwd)
         .args(["rev-parse", "--show-toplevel"])
         .output()?;
 
@@ -7120,8 +7142,7 @@ fn get_staged_files_at(
 ) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
     ensure_git_repo(cwd)?;
 
-    let output = std::process::Command::new("git")
-        .current_dir(cwd)
+    let output = git_command(cwd)
         .args([
             "diff",
             "--cached",
@@ -7164,8 +7185,7 @@ fn get_git_diff_files_at(
     // flag or contains shell metacharacters.
     validate_git_rev_range(rev_range)?;
 
-    let output = std::process::Command::new("git")
-        .current_dir(cwd)
+    let output = git_command(cwd)
         .args([
             "diff",
             "-M",
@@ -7220,8 +7240,7 @@ fn validate_git_rev_range(rev_range: &str) -> Result<(), Box<dyn std::error::Err
 }
 
 fn ensure_git_repo(cwd: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let output = std::process::Command::new("git")
-        .current_dir(cwd)
+    let output = git_command(cwd)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()?;
 
@@ -24502,18 +24521,8 @@ exclude = ["target/**"]
     // Pre-commit install/uninstall tests
     // ========================================================================
 
-    fn isolated_git_command(dir: &std::path::Path) -> std::process::Command {
-        let mut command = std::process::Command::new("git");
-        let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
-        command
-            .current_dir(dir)
-            .env("GIT_CONFIG_GLOBAL", null_config)
-            .env("GIT_CONFIG_NOSYSTEM", "1");
-        command
-    }
-
     fn init_temp_git_repo(dir: &std::path::Path) {
-        let output = isolated_git_command(dir)
+        let output = git_command(dir)
             .args(["init", "-q"])
             .output()
             .expect("git init");
@@ -24531,15 +24540,15 @@ exclude = ["target/**"]
         std::fs::create_dir_all(&fake_home).expect("create fake home");
         std::fs::write(
             fake_home.join(".gitconfig"),
-            "[dcg]\n\tambientGlobal = visible\n",
+            "[core]\n\thooksPath = ambient-hooks\n[dcg]\n\tambientGlobal = visible\n",
         )
         .expect("write ambient global git config");
         let ambient_system_config = tmp.path().join("ambient-system.gitconfig");
         std::fs::write(&ambient_system_config, "[dcg]\n\tambientSystem = visible\n")
             .expect("write ambient system git config");
 
-        for key in ["dcg.ambientGlobal", "dcg.ambientSystem"] {
-            let output = isolated_git_command(tmp.path())
+        for key in ["core.hooksPath", "dcg.ambientGlobal", "dcg.ambientSystem"] {
+            let output = git_command(tmp.path())
                 .env("HOME", &fake_home)
                 .env("USERPROFILE", &fake_home)
                 .env("XDG_CONFIG_HOME", &fake_home)
@@ -24559,6 +24568,87 @@ exclude = ["target/**"]
                 String::from_utf8_lossy(&output.stdout)
             );
         }
+    }
+
+    #[test]
+    fn scan_pre_commit_ignores_ambient_command_scope_git_config() {
+        const CHILD_MARKER: &str = "DCG_TEST_AMBIENT_GIT_CONFIG_CHILD";
+        const CHILD_COMPLETION: &str = "dcg-ambient-git-config-child-complete";
+        const REDIRECTED_HOOKS_PATH: &str = "ambient-hooks";
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let test_exe = std::env::current_exe().expect("current test executable");
+
+            for config_source in ["count", "parameters"] {
+                let mut child = std::process::Command::new(&test_exe);
+                child
+                    .args([
+                        "--exact",
+                        "cli::tests::scan_pre_commit_ignores_ambient_command_scope_git_config",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_MARKER, "1")
+                    .env_remove("GIT_CONFIG_COUNT")
+                    .env_remove("GIT_CONFIG_KEY_0")
+                    .env_remove("GIT_CONFIG_VALUE_0")
+                    .env_remove("GIT_CONFIG_PARAMETERS");
+
+                match config_source {
+                    "count" => {
+                        child
+                            .env("GIT_CONFIG_COUNT", "1")
+                            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+                            .env("GIT_CONFIG_VALUE_0", REDIRECTED_HOOKS_PATH);
+                    }
+                    "parameters" => {
+                        child.env(
+                            "GIT_CONFIG_PARAMETERS",
+                            format!("'core.hooksPath={REDIRECTED_HOOKS_PATH}'"),
+                        );
+                    }
+                    _ => unreachable!("fixed config-source inventory"),
+                }
+
+                let output = child.output().expect("run isolated child test");
+                assert!(
+                    output.status.success(),
+                    "{config_source} child failed\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains(CHILD_COMPLETION),
+                    "{config_source} child passed without executing the exact test\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            return;
+        }
+
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        init_temp_git_repo(repo.path());
+        let redirected_hook = repo.path().join(REDIRECTED_HOOKS_PATH).join("pre-commit");
+
+        let hook_path = install_scan_pre_commit_hook_at(repo.path()).expect("install hook");
+        assert!(
+            hook_path.starts_with(repo.path()),
+            "hook escaped temporary repository: {}",
+            hook_path.display()
+        );
+        assert!(hook_path.exists(), "fixture hook should exist");
+        assert_ne!(hook_path, redirected_hook, "command-scope config won");
+        assert!(
+            !redirected_hook.exists(),
+            "ambient command-scope config redirected hook: {}",
+            redirected_hook.display()
+        );
+
+        let removed = uninstall_scan_pre_commit_hook_at(repo.path()).expect("uninstall hook");
+        assert_eq!(removed.as_deref(), Some(hook_path.as_path()));
+        assert!(!hook_path.exists(), "fixture hook should be removed");
+        println!("{CHILD_COMPLETION}");
     }
 
     #[test]
@@ -25088,10 +25178,7 @@ exclude = ["target/**"]
     // ========================================================================
 
     fn run_git(cwd: &std::path::Path, args: &[&str]) {
-        let output = isolated_git_command(cwd)
-            .args(args)
-            .output()
-            .expect("run git");
+        let output = git_command(cwd).args(args).output().expect("run git");
 
         assert!(
             output.status.success(),
