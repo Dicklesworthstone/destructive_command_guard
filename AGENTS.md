@@ -1540,11 +1540,34 @@ per-file `.sha256` sidecars, `SHA256SUMS`, SLSA `.intoto.jsonl` provenance,
 The order is strict:
 
 1. Finalize payload bytes and filenames.
-2. Generate per-file SHA256 sidecars and the aggregate checksum manifest.
-3. Generate and verify SLSA provenance against the frozen payload.
-4. Sign publishable payloads and metadata with DSR minisign.
-5. Generate key-based cosign bundles for the local-release trust path.
-6. Independently verify every signature and bundle.
+2. Gate on embedded build provenance (below) for every payload binary.
+3. Generate per-file SHA256 sidecars and the aggregate checksum manifest.
+4. Generate and verify SLSA provenance against the frozen payload.
+5. Sign publishable payloads and metadata with DSR minisign.
+6. Generate key-based cosign bundles for the local-release trust path.
+7. Independently verify every signature and bundle.
+
+**Embedded-provenance gate (mandatory, per binary, before any checksum).**
+The v0.13.0 macOS assets shipped with `VERGEN_GIT_DESCRIBE =
+"v0.13.0-dirty"` because they were built from a dirty checkout without
+`DCG_RELEASE_BUILD=1`; every install from those bytes then classified as
+`LocalAheadOfRelease` and `dcg update` refused to run on macOS (#344).
+The invariant a published binary must satisfy is: `classify_provenance()`
+== `Release`, i.e. the embedded describe equals `v<VERSION>` exactly OR the
+`DCG_RELEASE_BUILD` marker is embedded. Check both, for every target,
+including cross-compiled ones you cannot execute locally:
+
+```bash
+# Runnable targets: the Commit line must be exactly the tag.
+./dcg --version | grep -F "Commit: ${VERSION}"
+# Every target, runnable or not: no -dirty / -N-g<sha> suffix may be embedded.
+tar -xOf "dcg-<target>.tar.xz" dcg | strings | grep -E "^${VERSION}-(dirty|[0-9]+-g)" \
+  && { echo "dirty/ahead describe embedded — rebuild from a clean checkout at the tag with DCG_RELEASE_BUILD=1"; exit 1; }
+```
+
+A failure here means rebuilding from a brand-new checkout at the tag (step 2
+of the preflight) — never proceeding to checksums, and never "fixing" it by
+retagging around a dirty tree.
 
 Use DSR's configured private keys directly from its protected secret location.
 Private keys and password material must remain mode `600` and must never be
