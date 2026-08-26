@@ -319,11 +319,12 @@ pub struct DestructivePattern {
     /// `None` means the rule is unscoped: it matches any text the engine hands
     /// it, exactly as before this field existed. `Some(list)` restricts the
     /// rule to text governed by one of the listed executables — the evaluator
-    /// resolves the argv0 of the command segment the match starts in (wrappers
-    /// such as `sudo`/`env` and leading assignments stripped, path basename,
-    /// `.exe`/`.cmd`/`.bat`/`.com` removed, ASCII case-insensitive) and skips
-    /// the rule unless it is in this list. A dynamic argv0 (one containing a
-    /// shell expansion) never matches.
+    /// requires the complete regex match to stay inside a command segment,
+    /// resolves that segment's argv0 (wrappers such as `sudo`/`env` and leading
+    /// assignments stripped, path basename, `.exe`/`.cmd`/`.bat`/`.com`
+    /// removed, ASCII case-insensitive), and skips the rule unless it is in
+    /// this list. A dynamic argv0 (one containing a shell expansion) never
+    /// matches.
     ///
     /// Names must be written lowercase without a path or extension.
     pub executables: Option<&'static [&'static str]>,
@@ -3986,6 +3987,7 @@ mod tests {
             "guardctl danger",
             "sudo /opt/tools/GUARDCTL.EXE danger",
             "printf danger; guardctl danger",
+            "X=$(printf danger) guardctl danger",
         ] {
             assert_eq!(
                 pack.matches_destructive(command)
@@ -3998,6 +4000,7 @@ mod tests {
         for command in [
             "printf danger",
             "guardctl status; printf danger",
+            "guardctl status \"$(printf danger)\"",
             "$TOOL danger",
         ] {
             assert!(
@@ -4012,8 +4015,9 @@ mod tests {
         let enabled = HashSet::from(["system.permissions".to_string()]);
 
         for command in [
-            "sudo /usr/bin/CHMOD.EXE 777 /tmp/real",
+            "sudo /usr/bin/chmod 777 /tmp/real",
             "printf 'chmod 777 /tmp/foreign'; chmod 777 /tmp/real",
+            "X=$(printf 'chmod 777 /tmp/foreign') chmod 777 /tmp/real",
         ] {
             let result = REGISTRY.check_command(command, &enabled);
             assert!(result.blocked, "declared executable must deny: {command:?}");
@@ -4024,6 +4028,7 @@ mod tests {
         for command in [
             "printf '%s' 'chmod 777 /tmp/foreign'",
             "chmod 755 /tmp/safe; printf 'chmod 777 /tmp/foreign'",
+            "chmod 755 \"$(printf 'chmod 777 /tmp/foreign')\"",
         ] {
             let result = REGISTRY.check_command(command, &enabled);
             assert!(
@@ -4064,6 +4069,7 @@ mod tests {
         for command in [
             "printf danger",
             "guardctl status; printf danger",
+            "guardctl status \"$(printf danger)\"",
             "$TOOL danger",
         ] {
             assert!(

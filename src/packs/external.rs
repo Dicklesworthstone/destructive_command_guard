@@ -35,7 +35,7 @@
 //!     description: Non-production deployments are allowed
 //! ```
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
@@ -52,6 +52,9 @@ const ID_PATTERN: &str = r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$";
 
 /// Version format regex pattern (semantic versioning).
 const VERSION_PATTERN: &str = r"^\d+\.\d+\.\d+$";
+
+/// Windows executable suffixes removed by runtime argv0 resolution.
+const WINDOWS_EXECUTABLE_SUFFIXES: [&str; 4] = [".exe", ".cmd", ".bat", ".com"];
 
 /// An external pack definition loaded from YAML.
 #[derive(Debug, Clone, Deserialize)]
@@ -95,6 +98,7 @@ const fn default_schema_version() -> u32 {
 
 /// A destructive pattern from an external pack file.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalDestructivePattern {
     /// Stable pattern identifier within the pack.
     pub name: String,
@@ -120,12 +124,31 @@ pub struct ExternalDestructivePattern {
 
     /// Executables this rule is about (issue #289).
     ///
-    /// Omit the key (or leave it empty) to keep the rule unscoped. When
-    /// present, the rule only fires on command segments whose resolved argv0
-    /// is one of these names — written lowercase, without a path or a
-    /// `.exe`/`.cmd`/`.bat`/`.com` extension.
-    #[serde(default)]
+    /// Omit the key to keep the rule unscoped. When present, the list must be
+    /// non-empty and the rule only fires on command segments whose resolved
+    /// argv0 is one of these canonical names — written lowercase ASCII,
+    /// without a path or a `.exe`/`.cmd`/`.bat`/`.com` extension.
+    #[serde(default, deserialize_with = "deserialize_present_executables")]
     pub executables: Option<Vec<String>>,
+}
+
+/// Deserialize an explicitly present `executables` key.
+///
+/// Serde does not call this function when the key is omitted because the field
+/// has a default. A present YAML null (including a blank `executables:` value)
+/// reaches this function as `None` and is rejected rather than silently
+/// becoming an unscoped rule.
+fn deserialize_present_executables<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<Vec<String>>::deserialize(deserializer)?
+        .map(Some)
+        .ok_or_else(|| {
+            <D::Error as serde::de::Error>::custom(
+                "`executables` must be a non-null sequence; omit the key for an unscoped rule",
+            )
+        })
 }
 
 /// A safer command suggestion from an external pack file.
@@ -244,6 +267,16 @@ pub enum PackParseError {
     /// Duplicate pattern name within a pack.
     DuplicatePattern { name: String },
 
+    /// An `executables` key was present with no names.
+    EmptyExecutables { pattern_name: String },
+
+    /// An executable scope name was not in canonical form.
+    InvalidExecutable {
+        pattern_name: String,
+        executable: String,
+        reason: String,
+    },
+
     /// Empty pack (no patterns defined).
     EmptyPack,
 
@@ -286,6 +319,22 @@ impl fmt::Display for PackParseError {
             }
             Self::DuplicatePattern { name } => {
                 write!(f, "Duplicate pattern name: {name}")
+            }
+            Self::EmptyExecutables { pattern_name } => {
+                write!(
+                    f,
+                    "Invalid executables for pattern '{pattern_name}': list must not be empty"
+                )
+            }
+            Self::InvalidExecutable {
+                pattern_name,
+                executable,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "Invalid executable '{executable}' for pattern '{pattern_name}': {reason}"
+                )
             }
             Self::EmptyPack => write!(f, "Pack has no patterns defined"),
             Self::IdCollision { id, builtin_name } => {
@@ -368,6 +417,53 @@ pub fn parse_pack_string(content: &str) -> Result<ExternalPack, PackParseError> 
     Ok(pack)
 }
 
+/// Return why an external executable scope name is not canonical.
+fn external_executable_name_error(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("name must not be empty");
+    }
+    if !name.is_ascii() {
+        return Some("name must contain only ASCII characters");
+    }
+    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Some("name must be lowercase");
+    }
+    if name.contains(['/', '\\']) {
+        return Some("name must be a basename without path separators");
+    }
+    if name.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Some("name must not contain whitespace");
+    }
+    if name.contains(['$', '`', '%']) {
+        return Some("name must not contain dynamic shell characters (`$`, backtick, or `%`)");
+    }
+    if WINDOWS_EXECUTABLE_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+    {
+        return Some("name must omit Windows executable suffixes (.exe/.cmd/.bat/.com)");
+    }
+
+    let mut bytes = name.bytes();
+    if !bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        return Some("name must start with a lowercase ASCII letter or digit");
+    }
+    if !bytes.all(|byte| {
+        byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || matches!(byte, b'.' | b'_' | b'-' | b'+')
+    }) {
+        return Some(
+            "name may contain only lowercase ASCII letters, digits, '.', '_', '-', or '+'",
+        );
+    }
+
+    None
+}
+
 /// Validate an external pack structure.
 ///
 /// Checks:
@@ -375,6 +471,7 @@ pub fn parse_pack_string(content: &str) -> Result<ExternalPack, PackParseError> 
 /// - ID matches the required format
 /// - Version matches semantic versioning format
 /// - All pattern regex compiles successfully
+/// - Executable scopes are non-empty and contain canonical basenames
 /// - No duplicate pattern names
 /// - At least one pattern is defined
 fn validate_pack(pack: &ExternalPack) -> Result<(), PackParseError> {
@@ -419,6 +516,23 @@ fn validate_pack(pack: &ExternalPack) -> Result<(), PackParseError> {
             return Err(PackParseError::DuplicatePattern {
                 name: pattern.name.clone(),
             });
+        }
+
+        if let Some(executables) = pattern.executables.as_deref() {
+            if executables.is_empty() {
+                return Err(PackParseError::EmptyExecutables {
+                    pattern_name: pattern.name.clone(),
+                });
+            }
+            for executable in executables {
+                if let Some(reason) = external_executable_name_error(executable) {
+                    return Err(PackParseError::InvalidExecutable {
+                        pattern_name: pattern.name.clone(),
+                        executable: executable.clone(),
+                        reason: reason.to_string(),
+                    });
+                }
+            }
         }
 
         // Validate regex compiles
@@ -604,18 +718,16 @@ impl ExternalPack {
                     Box::leak(suggestion_vec.into_boxed_slice())
                 };
 
-                // An empty list would scope the rule to nothing, which is a
-                // silently dead rule; treat it as "unscoped" instead.
-                let executables: Option<&'static [&'static str]> = p
-                    .executables
-                    .filter(|names| !names.is_empty())
-                    .map(|names| {
-                        let leaked: Vec<&'static str> = names
-                            .into_iter()
-                            .map(|n| Box::leak(n.into_boxed_str()) as &'static str)
-                            .collect();
-                        Box::leak(leaked.into_boxed_slice()) as &'static [&'static str]
-                    });
+                // Validated packs contain a non-empty canonical list here.
+                // Preserve `Some([])` for directly constructed, unvalidated
+                // values rather than broadening an invalid scope to unscoped.
+                let executables: Option<&'static [&'static str]> = p.executables.map(|names| {
+                    let leaked: Vec<&'static str> = names
+                        .into_iter()
+                        .map(|n| Box::leak(n.into_boxed_str()) as &'static str)
+                        .collect();
+                    Box::leak(leaked.into_boxed_slice()) as &'static [&'static str]
+                });
 
                 DestructivePattern {
                     regex: LazyCompiledRegex::new(Box::leak(p.pattern.into_boxed_str())),
@@ -1144,9 +1256,8 @@ safe_patterns:
         assert_eq!(pack.destructive_patterns[0].severity, Severity::Critical);
     }
 
-    /// Issue #289: an external pack may scope a rule to the executables it is
-    /// about. Omitting the key — or giving an empty list, which would scope the
-    /// rule to nothing — leaves the rule unscoped.
+    /// Issue #289: canonical executable basenames survive validation and
+    /// conversion unchanged; omitting the key leaves the rule unscoped.
     #[test]
     fn external_executables_round_trip_issue_289() {
         let yaml = r#"
@@ -1161,27 +1272,160 @@ destructive_patterns:
     pattern: dangerous
     executables:
       - chmod
-      - Chown.exe
+      - git-lfs
+      - python3.12
+      - g++
   - name: unscoped
     pattern: dangerous
-  - name: empty-list
-    pattern: dangerous
-    executables: []
 "#;
         let external = parse_pack_string(yaml).unwrap();
         assert_eq!(
             external.destructive_patterns[0].executables.as_deref(),
-            Some(&["chmod".to_string(), "Chown.exe".to_string()][..])
+            Some(
+                &[
+                    "chmod".to_string(),
+                    "git-lfs".to_string(),
+                    "python3.12".to_string(),
+                    "g++".to_string(),
+                ][..]
+            )
         );
         assert!(external.destructive_patterns[1].executables.is_none());
 
         let pack = external.into_pack();
         assert_eq!(
             pack.destructive_patterns[0].executables,
-            Some(&["chmod", "Chown.exe"][..])
+            Some(&["chmod", "git-lfs", "python3.12", "g++"][..])
         );
         assert!(pack.destructive_patterns[1].executables.is_none());
-        assert!(pack.destructive_patterns[2].executables.is_none());
+    }
+
+    #[test]
+    fn external_executables_reject_empty_list_issue_289() {
+        let yaml = r#"
+id: test.executables
+name: Executable Scoped
+version: 1.0.0
+destructive_patterns:
+  - name: empty-list
+    pattern: dangerous
+    executables: []
+"#;
+        let error = parse_pack_string(yaml).expect_err("an empty scope must be rejected");
+        assert!(matches!(
+            &error,
+            PackParseError::EmptyExecutables { pattern_name }
+                if pattern_name == "empty-list"
+        ));
+        assert!(error.to_string().contains("list must not be empty"));
+    }
+
+    #[test]
+    fn external_executables_reject_explicit_null_issue_289() {
+        for yaml in [
+            r#"
+id: test.executables
+name: Executable Scoped
+version: 1.0.0
+destructive_patterns:
+  - name: null-list
+    pattern: dangerous
+    executables: null
+"#,
+            r#"
+id: test.executables
+name: Executable Scoped
+version: 1.0.0
+destructive_patterns:
+  - name: blank-list
+    pattern: dangerous
+    executables:
+"#,
+        ] {
+            let error = parse_pack_string(yaml)
+                .expect_err("an explicitly null executable scope must be rejected");
+            let PackParseError::Yaml(source) = error else {
+                panic!("explicit null must fail during YAML deserialization: {error}");
+            };
+            assert!(
+                source.to_string().contains(
+                    "`executables` must be a non-null sequence; omit the key for an unscoped rule"
+                ),
+                "wrong explicit-null diagnostic: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_executables_reject_singular_key_typo_issue_289() {
+        let yaml = r#"
+id: test.executables
+name: Executable Scoped
+version: 1.0.0
+destructive_patterns:
+  - name: singular-key
+    pattern: dangerous
+    executable:
+      - chmod
+"#;
+        let error =
+            parse_pack_string(yaml).expect_err("an unknown singular scope key must be rejected");
+        let PackParseError::Yaml(source) = error else {
+            panic!("unknown scope key must fail during YAML deserialization: {error}");
+        };
+        let message = source.to_string();
+        assert!(
+            message.contains("unknown field") && message.contains("executable"),
+            "wrong unknown-field diagnostic: {message}"
+        );
+    }
+
+    #[test]
+    fn external_executables_reject_noncanonical_names_issue_289() {
+        for executable in [
+            "",
+            "Chown",
+            "Chown.exe",
+            "chown.exe",
+            "chown.cmd",
+            "chown.bat",
+            "chown.com",
+            "/usr/bin/chown",
+            r"C:\bin\chown",
+            "chown helper",
+            "chown\t",
+            "$TOOL",
+            "`which chown`",
+            "%TOOL%",
+            "chown;echo",
+            "chown🔥",
+        ] {
+            let yaml = format!(
+                r#"
+id: test.executables
+name: Executable Scoped
+version: 1.0.0
+destructive_patterns:
+  - name: noncanonical
+    pattern: dangerous
+    executables:
+      - {executable:?}
+"#
+            );
+            let error = parse_pack_string(&yaml)
+                .expect_err("a noncanonical executable scope must be rejected");
+            assert!(
+                matches!(
+                    &error,
+                    PackParseError::InvalidExecutable {
+                        pattern_name,
+                        executable: rejected,
+                        ..
+                    } if pattern_name == "noncanonical" && rejected == executable
+                ),
+                "wrong validation result for {executable:?}: {error}"
+            );
+        }
     }
 
     #[test]

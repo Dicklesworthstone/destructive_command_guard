@@ -309,6 +309,10 @@ const SENSITIVE_PROPAGATION_DELETE_SUGGESTIONS: &[PatternSuggestion] = &[
 const REDIRECT_TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new("ls -la {path}", "Verify the path before any redirect"),
     PatternSuggestion::new(
+        "producer | dcg create-new {path}",
+        "After resolving a literal destination, create it only if no file, directory, or symlink already exists",
+    ),
+    PatternSuggestion::new(
         "cp {path} {path}.bak && echo data > /tmp/{subdir}/out && cp -f /tmp/{subdir}/out {path}",
         "Back up the target, write the new content to a temp file, then copy it into place",
     ),
@@ -4325,6 +4329,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              There is NO recovery without backups.\n\n\
              Safer alternatives:\n\
              - Use append (`>>`) to preserve existing content: `echo line >> <file>`.\n\
+             - To create a destination only when it is absent, resolve a literal path and use:\n  \
+               `producer | dcg create-new <path>` (existing files, directories, and symlinks are refused).\n\
              - Make a backup, then write via a temp file:\n  \
                `cp <file> <file>.bak && echo data > /tmp/<subdir>/out && cp -f /tmp/<subdir>/out <file>`\n  \
                (a truncating redirect straight back onto a home/system path is denied \
@@ -5699,6 +5705,28 @@ mod tests {
         ] {
             assert_blocks_with_severity(&pack, cmd, Severity::Critical);
             assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+    }
+
+    #[test]
+    fn redirect_truncate_rules_suggest_exclusive_create_new_sink() {
+        let pack = create_pack();
+        for rule_name in [
+            "redirect-truncate-root-home",
+            "redirect-truncate-dynamic-path",
+        ] {
+            let rule = pack
+                .destructive_patterns
+                .iter()
+                .find(|pattern| pattern.name == Some(rule_name))
+                .unwrap_or_else(|| panic!("missing {rule_name} rule"));
+            assert!(
+                rule.suggestions.iter().any(|suggestion| {
+                    suggestion.command == "producer | dcg create-new {path}"
+                        && suggestion.description.contains("only if no file")
+                }),
+                "{rule_name} must expose the non-overwriting positive capability"
+            );
         }
     }
 
