@@ -241,7 +241,7 @@ try {
     }
 } finally { Remove-Item -Recurse -Force $h11 -ErrorAction SilentlyContinue }
 
-Write-Host "Test 12: Oh My Pi inactive profiles and repository-root extension are removed"
+Write-Host "Test 12: Oh My Pi inactive profiles and exact-cwd project extension are removed"
 $h12 = New-Tmp
 $savedLocation = (Get-Location).Path
 $workProfile = $null
@@ -255,15 +255,17 @@ try {
     $userExtension = Join-Path $h12 '.omp/profiles/personal/agent/extensions/dcg-guard.ts'
     $repo = Join-Path $h12 'repo'
     $nested = Join-Path $repo 'a/b'
-    $projectExtension = Join-Path $repo '.omp/extensions/dcg-guard.ts'
-    foreach ($path in @($defaultExtension, $workExtension, $teamExtension, $userExtension, $projectExtension)) {
+    $ancestorProjectExtension = Join-Path $repo '.omp/extensions/dcg-guard.ts'
+    $activeProjectExtension = Join-Path $nested '.omp/extensions/dcg-guard.ts'
+    foreach ($path in @($defaultExtension, $workExtension, $teamExtension, $userExtension, $ancestorProjectExtension, $activeProjectExtension)) {
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
     }
     New-Item -ItemType Directory -Force -Path (Join-Path $repo '.git'), $nested | Out-Null
-    foreach ($path in @($defaultExtension, $workExtension, $teamExtension, $projectExtension)) {
+    foreach ($path in @($defaultExtension, $workExtension, $teamExtension, $ancestorProjectExtension, $activeProjectExtension)) {
         Set-Content -Path $path -Value '// dcg-omp-extension: generated'
     }
     Set-Content -Path $userExtension -Value '// DCG-OMP-EXTENSION: user-authored'
+    $ancestorProjectBytes = [System.IO.File]::ReadAllBytes($ancestorProjectExtension)
 
     if ([System.IO.Path]::DirectorySeparatorChar -eq '\') {
         $workProfile = Join-Path $h12 '.omp/profiles/work'
@@ -292,7 +294,10 @@ try {
     Check (-not (Test-Path $defaultExtension)) "OMP: default extension removed"
     Check (-not (Test-Path $workExtension)) "OMP: inactive work profile removed"
     Check (-not (Test-Path $teamExtension)) "OMP: inactive team profile removed"
-    Check (-not (Test-Path $projectExtension)) "OMP: repository-root extension removed from nested cwd"
+    Check (-not (Test-Path -LiteralPath $activeProjectExtension)) "OMP: exact-cwd project extension removed"
+    Check (Test-Path -LiteralPath $ancestorProjectExtension) "OMP: Git-ancestor extension preserved from nested cwd"
+    $ancestorProjectBytesAfter = [System.IO.File]::ReadAllBytes($ancestorProjectExtension)
+    Check ([System.Convert]::ToBase64String($ancestorProjectBytes) -ceq [System.Convert]::ToBase64String($ancestorProjectBytesAfter)) "OMP: preserved Git-ancestor extension remains byte-identical"
     Check (Test-Path $userExtension) "OMP: inactive near-marker user extension is preserved, including from a hidden Windows profile"
 } finally {
     Set-Location $savedLocation
@@ -312,8 +317,8 @@ $h13 = New-Tmp
 $savedLocation = (Get-Location).Path
 try {
     $repo = Join-Path $h13 'repo[one]'
-    $nested = Join-Path $repo 'nested'
-    $projectExtension = Join-Path $repo '.omp/extensions/dcg-guard.ts'
+    $nested = Join-Path $repo 'nested[active]'
+    $projectExtension = Join-Path $nested '.omp/extensions/dcg-guard.ts'
     [void][System.IO.Directory]::CreateDirectory((Join-Path $repo '.git'))
     [void][System.IO.Directory]::CreateDirectory($nested)
     [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $projectExtension))
@@ -321,8 +326,8 @@ try {
 
     Set-Location -LiteralPath $nested
     Check ((Get-DcgRepositoryRoot) -eq $repo) "OMP: repository root with brackets is discovered literally"
-    Check ((Unconfigure-OmpExtension -HomeDir $h13) -eq $true) "OMP: bracketed project extension is removed"
-    Check (-not (Test-Path -LiteralPath $projectExtension)) "OMP: no project extension remains"
+    Check ((Unconfigure-OmpExtension -HomeDir $h13) -eq $true) "OMP: exact bracketed-cwd project extension is removed"
+    Check (-not (Test-Path -LiteralPath $projectExtension)) "OMP: no exact-cwd project extension remains"
 } finally {
     Set-Location $savedLocation
     Remove-Item -Recurse -Force $h13 -ErrorAction SilentlyContinue

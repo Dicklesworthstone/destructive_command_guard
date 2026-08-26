@@ -645,7 +645,10 @@ function Unconfigure-OmpExtension {
   # profiles after installation cannot leave a live extension behind.
   param([string]$HomeDir = $HOME, [string]$RepoRoot = '')
   if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
-    $RepoRoot = Get-DcgRepositoryRoot
+    # OMP project extensions are discovered from the process cwd only. Do not
+    # walk to a Git ancestor: that can remove an inactive ancestor extension
+    # while leaving the extension loaded from the current directory in place.
+    $RepoRoot = (Get-Location).Path
   }
   $removed = $false
   $failed = $false
