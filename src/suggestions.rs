@@ -468,6 +468,60 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
     );
 }
 
+/// Recursive rm rules whose target is a root, home, or sensitive system path.
+/// Their safer alternative must narrow the scope; repeating any recursive rm
+/// here would merely restate the catastrophic operation.
+const ROOT_HOME_RECURSIVE_RM_SUGGESTION_RULES: &[&str] = &[
+    "core.filesystem:rm-rf-root-home",
+    "core.filesystem:rm-r-f-separate-root-home",
+    "core.filesystem:rm-recursive-force-root-home",
+    "core.filesystem:rm-recursive-root-home",
+];
+
+/// Recursive rm rules for non-root targets. Their operand can still be a
+/// regular file, so every command must accept either a file or a directory.
+const GENERAL_RECURSIVE_RM_SUGGESTION_RULES: &[&str] = &[
+    "core.filesystem:rm-rf-general",
+    "core.filesystem:rm-r-f-separate",
+    "core.filesystem:rm-recursive-force-long",
+    "core.filesystem:rm-recursive-general",
+];
+
+/// A terminal `find -delete` preview must preserve the original expression and
+/// its implicit depth-first traversal. Arbitrary boolean expressions have no
+/// guaranteed exact mechanical rewrite.
+const FIND_DELETE_SUGGESTION_RULES: &[&str] = &[
+    "core.filesystem:find-delete-root-home",
+    "core.filesystem:find-delete-general",
+];
+
+/// `tar --remove-files` should remain an archive operation while preserving
+/// its sources, not be translated into a recursive rm workflow.
+const TAR_REMOVE_FILES_SUGGESTION_RULES: &[&str] = &[
+    "core.filesystem:tar-remove-files-root-home",
+    "core.filesystem:tar-remove-files-general",
+];
+
+/// Rules that destroy or overwrite one file. Their preview must accept a file
+/// operand; a directory-only `find path/ ...` command is incorrect here.
+const SINGLE_FILE_SUGGESTION_RULES: &[&str] = &[
+    "core.filesystem:unlink-root-home",
+    "core.filesystem:unlink-general",
+    "core.filesystem:truncate-zero-root-home",
+    "core.filesystem:truncate-zero-general",
+    "core.filesystem:shred-root-home",
+    "core.filesystem:shred-general",
+    "core.filesystem:dd-overwrite-root-home",
+    "core.filesystem:dd-overwrite-general",
+];
+
+/// Move rules can target either a file or a directory, so their preview uses
+/// `ls -ld` on the object itself and never assumes a tree.
+const MOVED_PATH_SUGGESTION_RULES: &[&str] = &[
+    "core.filesystem:mv-sensitive-source-root-home",
+    "core.filesystem:mv-dynamic-path",
+];
+
 /// Register suggestions for core.filesystem pack rules.
 fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>) {
     m.insert(
@@ -488,127 +542,303 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         ],
     );
 
-    // Shared suggestions for recursive rm and equivalent destructive-path rules.
-    // This registry feeds scan/trace output, independently of the authored
-    // PatternSuggestion guidance attached to hook denials. Keep the two
-    // surfaces semantically aligned so scan output does not advertise a form
-    // that is ineffective under a hook or a trash path from the wrong OS.
-    let rm_rf_suggestions = vec![
+    // This registry feeds scan/trace output independently of the authored
+    // PatternSuggestion guidance attached to hook denials. Root/home matches
+    // must narrow the target instead of advertising another recursive delete.
+    let root_home_recursive_rm_suggestions = vec![
         Suggestion::new(
             SuggestionKind::PreviewFirst,
-            "Preview the target tree with `find path/ -maxdepth 2 -print` before deleting",
+            "Preview the target path with `find path -maxdepth 2 -print` before deleting",
         )
-        .with_command("find path/ -maxdepth 2 -print"),
+        .with_command("find path -maxdepth 2 -print"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Copy one specific, explicitly reviewed file or directory to a backup; `reviewed-path` must be non-root, non-home, and non-sensitive, never the blocked root, home, or sensitive target, and the original is preserved",
+        )
+        .with_command("cp -a reviewed-path /tmp/reviewed-backup"),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Verify the backup first and require separate approval for any cleanup; never substitute the blocked root, home, or sensitive path itself",
+        ),
+    ];
+    for &rule_id in ROOT_HOME_RECURSIVE_RM_SUGGESTION_RULES {
+        m.insert(rule_id, root_home_recursive_rm_suggestions.clone());
+    }
+
+    let general_recursive_rm_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "Preview the target path with `find path -maxdepth 2 -print` before deleting",
+        )
+        .with_command("find path -maxdepth 2 -print"),
         Suggestion::new(
             SuggestionKind::SaferAlternative,
             "Use `rm -ri` only from an interactive terminal; with stdin closed (as under an agent hook), it deletes nothing and exits 0",
         )
-        .with_command("rm -ri path/"),
+        .with_command("rm -ri path"),
         Suggestion::new(
             SuggestionKind::WorkflowFix,
-            "Move to trash with `trash-put path/` on Linux (trash-cli), or `mv path/ ~/.Trash/` on macOS",
+            "Move to trash with `trash-put path` on Linux (trash-cli), or `mv path ~/.Trash/` on macOS",
         ),
     ];
+    for &rule_id in GENERAL_RECURSIVE_RM_SUGGESTION_RULES {
+        m.insert(rule_id, general_recursive_rm_suggestions.clone());
+    }
 
-    // Register for all actual pattern names from filesystem.rs
-    m.insert("core.filesystem:rm-rf-root-home", rm_rf_suggestions.clone());
-    m.insert(
-        "core.filesystem:rm-r-f-separate-root-home",
-        rm_rf_suggestions.clone(),
-    );
-    m.insert(
-        "core.filesystem:rm-recursive-force-root-home",
-        rm_rf_suggestions.clone(),
-    );
-    m.insert("core.filesystem:rm-rf-general", rm_rf_suggestions.clone());
-    // Globbed rm under a home directory (#247): the glob is the recursion, so
-    // the same preview/trash/scoping alternatives apply.
-    m.insert("core.filesystem:rm-glob-home", rm_rf_suggestions.clone());
-    m.insert("core.filesystem:rm-r-f-separate", rm_rf_suggestions.clone());
-    m.insert(
-        "core.filesystem:rm-recursive-force-long",
-        rm_rf_suggestions.clone(),
-    );
-    // `find ... -delete` mirrors `rm -rf` (bytewise-equivalent destruction
-    // on the matched tree). Reuse the same suggestion set — the safer
-    // alternatives (preview the target tree, scope to /tmp, use a
-    // platform-appropriate trash command) all apply identically.
-    m.insert(
-        "core.filesystem:find-delete-root-home",
-        rm_rf_suggestions.clone(),
-    );
-    m.insert(
-        "core.filesystem:find-delete-general",
-        rm_rf_suggestions.clone(),
-    );
-    // unlink-root-home / unlink-general: same shape as rm/find-delete.
-    // Reuse the same suggestion set — the safer alternatives (preview the
-    // target tree, scope to /tmp, use a platform-appropriate trash command)
-    // all apply identically.
-    m.insert(
-        "core.filesystem:unlink-root-home",
-        rm_rf_suggestions.clone(),
-    );
-    m.insert("core.filesystem:unlink-general", rm_rf_suggestions.clone());
-    // truncate-zero-* (zero/shrink in place): same shape as unlink — single-
-    // file content destruction. Reuse the same suggestion set.
-    m.insert(
-        "core.filesystem:truncate-zero-root-home",
-        rm_rf_suggestions.clone(),
-    );
-    m.insert(
-        "core.filesystem:truncate-zero-general",
-        rm_rf_suggestions.clone(),
-    );
-    // shred-* (overwrite + optional unlink): same single-file destruction
-    // shape. Reuse the rm_rf suggestion set.
-    m.insert("core.filesystem:shred-root-home", rm_rf_suggestions.clone());
-    m.insert("core.filesystem:shred-general", rm_rf_suggestions.clone());
-    // tar-remove-files-* (archive-then-delete on sources): recursive-
-    // delete sibling. Reuse rm_rf suggestion set.
-    m.insert(
-        "core.filesystem:tar-remove-files-root-home",
-        rm_rf_suggestions.clone(),
-    );
-    m.insert(
-        "core.filesystem:tar-remove-files-general",
-        rm_rf_suggestions.clone(),
-    );
-    // dd-overwrite-* (file-level dd with of=<sensitive>): file
-    // truncate-equivalent. Reuse the rm_rf suggestion set.
-    m.insert(
-        "core.filesystem:dd-overwrite-root-home",
-        rm_rf_suggestions.clone(),
-    );
-    m.insert(
-        "core.filesystem:dd-overwrite-general",
-        rm_rf_suggestions.clone(),
-    );
-    // mv-sensitive-source-root-home: cross-segment bypass closure.
-    // Reuse rm_rf suggestion set (same broad-destruction shape).
-    m.insert(
-        "core.filesystem:mv-sensitive-source-root-home",
-        rm_rf_suggestions.clone(),
-    );
-    m.insert("core.filesystem:mv-dynamic-path", rm_rf_suggestions.clone());
-    // sensitive-source propagation into temp followed by forced deletion:
-    // same broad data-loss shape as the mv cross-segment bypass.
+    // A terminal -delete can be transformed into a depth-first read-only
+    // preview. Inside an arbitrary boolean expression, delete success can
+    // affect evaluation, so there is no universally exact textual rewrite.
+    let find_delete_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "For a terminal `-delete` action, preserve every original search root, option, and predicate, retain or add `-depth`, then replace that terminal action with `-print`",
+        ),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "When `-delete` is inside an arbitrary boolean expression, there is no guaranteed exact mechanical rewrite; construct and inspect a read-only expression manually",
+        ),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Constrain both the find roots and predicates to a literal temp subtree before any separately approved deletion",
+        ),
+    ];
+    for &rule_id in FIND_DELETE_SUGGESTION_RULES {
+        m.insert(rule_id, find_delete_suggestions.clone());
+    }
+
+    let tar_remove_files_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "Inspect the exact source operands before archiving or removing anything",
+        )
+        .with_command("ls -la source"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Create the archive without `--remove-files` so every source is preserved",
+        )
+        .with_command("tar -cf archive.tar source"),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Verify the archive in a separate step before considering any separately approved source cleanup",
+        )
+        .with_command("tar -tf archive.tar"),
+    ];
+    for &rule_id in TAR_REMOVE_FILES_SUGGESTION_RULES {
+        m.insert(rule_id, tar_remove_files_suggestions.clone());
+    }
+
     m.insert(
         "core.filesystem:cp-sensitive-then-delete",
-        rm_rf_suggestions.clone(),
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Inspect the exact sensitive source before copying it",
+            )
+            .with_command("ls -ld source"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Run the archive copy without chaining any deletion, then inspect the backup separately",
+            )
+            .with_command("cp -a source backup"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Verify source and backup in a separate step before considering cleanup",
+            )
+            .with_command("diff -r source backup"),
+        ],
     );
+
     m.insert(
         "core.filesystem:ln-symlink-sensitive-then-delete",
-        rm_rf_suggestions.clone(),
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Inspect where the link points before removing anything",
+            )
+            .with_command("readlink link"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Unlink only the symlink itself; never recursively remove the link target",
+            )
+            .with_command("unlink link"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Create, inspect, and clean up a symlink in separate commands without appending `/.` to it",
+            ),
+        ],
     );
+
     m.insert(
         "core.filesystem:rsync-sensitive-then-delete",
-        rm_rf_suggestions.clone(),
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Preview a transfer to a fresh, non-existing backup destination without changing files or chaining deletion",
+            )
+            .with_command("rsync -a --dry-run --ignore-existing source fresh-backup/"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Copy to a fresh, non-existing backup destination without the later deletion; `--ignore-existing` prevents overwriting if that path unexpectedly exists",
+            )
+            .with_command("rsync -a --ignore-existing source fresh-backup/"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Verify source and the fresh backup in a separate step before considering cleanup",
+            )
+            .with_command("diff -r source fresh-backup"),
+        ],
     );
+
+    // A home-directory glob is a shell-selected file set, not necessarily a
+    // directory tree. Preview the expansion itself instead of appending `/`.
+    m.insert(
+        "core.filesystem:rm-glob-home",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Preview the exact glob expansion with `ls -la path-pattern` before deleting",
+            )
+            .with_command("ls -la path-pattern"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Delete explicitly named files so the removal set is reviewable",
+            )
+            .with_command("rm path/file-one path/file-two"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Move reviewed matches with `trash-put` on Linux (trash-cli), or into `~/.Trash/` on macOS",
+            ),
+        ],
+    );
+
+    let single_file_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "Inspect the file with `ls -la path` before deleting or overwriting it",
+        )
+        .with_command("ls -la path"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Copy the file to a reviewed backup before unlinking or overwriting it",
+        )
+        .with_command("cp -p path path.bak"),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Move a disposable file with `trash-put path` on Linux (trash-cli), or `mv path ~/.Trash/` on macOS",
+        ),
+    ];
+    for &rule_id in SINGLE_FILE_SUGGESTION_RULES {
+        m.insert(rule_id, single_file_suggestions.clone());
+    }
+
+    let moved_path_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "Inspect the exact source and destination with `ls -ld path` before moving",
+        )
+        .with_command("ls -ld path"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Copy to a literal backup path first, then verify the copy before any move",
+        )
+        .with_command("cp -a path path.bak"),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Resolve dynamic paths to literal source and destination values in a separate review step",
+        ),
+    ];
+    for &rule_id in MOVED_PATH_SUGGESTION_RULES {
+        m.insert(rule_id, moved_path_suggestions.clone());
+    }
+
+    // The command word is assembled at runtime. Do not guess a platform or
+    // repeat the unverified delete; make the executable and target reviewable.
+    m.insert(
+        "core.filesystem:rm-recursive-unverified",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Render and inspect the assembled executable, flags, and target as data before running it",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Use a literal executable and literal target in a separate command so dcg can evaluate the exact operation",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Avoid a find -exec placeholder or PowerShell splat as the command word for recursive deletion",
+            ),
+        ],
+    );
+
+    // PowerShell guidance stays PowerShell-native and uses the runtime's own
+    // cross-platform temp-directory resolver; never advertise Unix rm/trash.
+    m.insert(
+        "core.filesystem:powershell-remove-item-recursive",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List the item tree with `Get-ChildItem -Recurse path` before removing it",
+            )
+            .with_command("Get-ChildItem -Recurse path"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Use `Remove-Item -Recurse -WhatIf path` to preview without deleting",
+            )
+            .with_command("Remove-Item -Recurse -WhatIf path"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Move the tree aside with `Move-Item path (Join-Path ([IO.Path]::GetTempPath()) delete-me-reviewed)`",
+            )
+            .with_command(
+                "Move-Item path (Join-Path ([IO.Path]::GetTempPath()) delete-me-reviewed)",
+            ),
+        ],
+    );
+
+    m.insert(
+        "core.filesystem:rm-bare-glob",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List what the working-directory glob expands to before deleting anything",
+            )
+            .with_command("ls -la"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Delete explicitly named files so the removal set is reviewable",
+            )
+            .with_command("rm ./file-one ./file-two"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Constrain the glob to a reviewed shape such as `*.log` instead of every file",
+            ),
+        ],
+    );
+    m.insert(
+        "core.filesystem:rm-bare-glob-root",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List the filesystem root before naming any one target",
+            )
+            .with_command("ls -la /"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Name one reviewed root-level file instead of the unbounded /* expansion",
+            )
+            .with_command("rm /specific-file"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Move one reviewed file aside first instead of deleting every root entry",
+            )
+            .with_command("mv /specific-file /tmp/delete-me-reviewed"),
+        ],
+    );
+
     // redirect-truncate-*: shell-syntax truncate-equivalent. These need
-    // redirect-specific guidance — the rm_rf set (tree preview / `rm -ri` /
-    // move-to-trash) is about recursive deletion and reads as a non sequitur on
-    // a redirect denial (issues #316/#317).
+    // redirect-specific guidance; deletion suggestions read as a non sequitur
+    // on a redirect denial (issues #316/#317).
     let redirect_truncate_suggestions = vec![
         Suggestion::new(
             SuggestionKind::PreviewFirst,
@@ -1608,6 +1838,11 @@ fn register_system_permissions_suggestions(m: &mut HashMap<&'static str, Vec<Sug
 mod tests {
     use super::*;
 
+    fn required_suggestion(rule_id: &str, kind: SuggestionKind) -> &'static Suggestion {
+        get_suggestion_by_kind(rule_id, kind)
+            .unwrap_or_else(|| panic!("missing {kind:?} suggestion for {rule_id}"))
+    }
+
     #[test]
     fn suggestion_kind_labels() {
         assert_eq!(SuggestionKind::PreviewFirst.label(), "Preview first");
@@ -1719,8 +1954,15 @@ mod tests {
             "core.filesystem:rm-r-f-separate-root-home",
             "core.filesystem:rm-recursive-force-root-home",
             "core.filesystem:rm-rf-general",
+            "core.filesystem:rm-glob-home",
             "core.filesystem:rm-r-f-separate",
             "core.filesystem:rm-recursive-force-long",
+            "core.filesystem:rm-recursive-root-home",
+            "core.filesystem:rm-recursive-general",
+            "core.filesystem:rm-recursive-unverified",
+            "core.filesystem:powershell-remove-item-recursive",
+            "core.filesystem:rm-bare-glob",
+            "core.filesystem:rm-bare-glob-root",
             "core.filesystem:find-delete-root-home",
             "core.filesystem:find-delete-general",
             "core.filesystem:unlink-root-home",
@@ -1751,37 +1993,63 @@ mod tests {
     }
 
     #[test]
-    fn rm_registry_guidance_is_hook_and_platform_accurate() {
-        // These rules share `rm_rf_suggestions`, the categorized registry used
-        // by scan/trace rather than the PatternSuggestion hook renderer.
-        let rm_rules = [
-            "core.filesystem:rm-rf-root-home",
-            "core.filesystem:rm-r-f-separate-root-home",
-            "core.filesystem:rm-recursive-force-root-home",
-            "core.filesystem:rm-rf-general",
-            "core.filesystem:rm-glob-home",
-            "core.filesystem:rm-r-f-separate",
-            "core.filesystem:rm-recursive-force-long",
-        ];
-
-        for rule_id in rm_rules {
-            let suggestions = get_suggestions(rule_id)
-                .unwrap_or_else(|| panic!("missing scan/trace suggestions for {rule_id}"));
-            let preview = suggestions
-                .iter()
-                .find(|suggestion| suggestion.kind == SuggestionKind::PreviewFirst)
-                .unwrap_or_else(|| panic!("missing preview for {rule_id}"));
+    fn secondary_registry_root_home_recursive_rm_consumers_narrow_the_target() {
+        for &rule_id in ROOT_HOME_RECURSIVE_RM_SUGGESTION_RULES {
+            let preview = required_suggestion(rule_id, SuggestionKind::PreviewFirst);
             assert_eq!(
                 preview.command.as_deref(),
-                Some("find path/ -maxdepth 2 -print"),
-                "{rule_id}: find uses -maxdepth (one dash) and prints without deleting",
+                Some("find path -maxdepth 2 -print"),
+                "{rule_id}: find accepts files or trees, uses -maxdepth (one dash), and prints without deleting",
             );
             assert!(!preview.text.contains("--maxdepth"), "{rule_id}");
+            assert!(!preview.text.contains("path/"), "{rule_id}");
 
-            let interactive = suggestions
+            let narrowed = required_suggestion(rule_id, SuggestionKind::SaferAlternative);
+            assert_eq!(
+                narrowed.command.as_deref(),
+                Some("cp -a reviewed-path /tmp/reviewed-backup"),
+                "{rule_id}"
+            );
+            assert!(
+                narrowed
+                    .text
+                    .contains("specific, explicitly reviewed file or directory")
+            );
+            assert!(
+                narrowed
+                    .text
+                    .contains("must be non-root, non-home, and non-sensitive")
+            );
+            assert!(narrowed.text.contains("never the blocked root"));
+            assert!(narrowed.text.contains("original is preserved"));
+
+            let commands = get_suggestions(rule_id)
+                .expect("root/home guidance")
                 .iter()
-                .find(|suggestion| suggestion.kind == SuggestionKind::SaferAlternative)
-                .unwrap_or_else(|| panic!("missing safer alternative for {rule_id}"));
+                .filter_map(|suggestion| suggestion.command.as_deref())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(!commands.contains("rm -r"), "{rule_id}: {commands}");
+            assert!(
+                !commands.contains("rm --recursive"),
+                "{rule_id}: {commands}"
+            );
+        }
+    }
+
+    #[test]
+    fn secondary_registry_general_recursive_rm_consumers_accept_files_or_trees() {
+        for &rule_id in GENERAL_RECURSIVE_RM_SUGGESTION_RULES {
+            let preview = required_suggestion(rule_id, SuggestionKind::PreviewFirst);
+            assert_eq!(
+                preview.command.as_deref(),
+                Some("find path -maxdepth 2 -print"),
+                "{rule_id}"
+            );
+            assert!(!preview.text.contains("path/"), "{rule_id}");
+
+            let interactive = required_suggestion(rule_id, SuggestionKind::SaferAlternative);
+            assert_eq!(interactive.command.as_deref(), Some("rm -ri path"));
             assert!(
                 interactive.text.contains("interactive terminal"),
                 "{rule_id}"
@@ -1789,17 +2057,239 @@ mod tests {
             assert!(interactive.text.contains("stdin closed"), "{rule_id}");
             assert!(interactive.text.contains("deletes nothing"), "{rule_id}");
 
-            let trash = suggestions
-                .iter()
-                .find(|suggestion| suggestion.kind == SuggestionKind::WorkflowFix)
-                .unwrap_or_else(|| panic!("missing trash guidance for {rule_id}"));
+            let trash = required_suggestion(rule_id, SuggestionKind::WorkflowFix);
             assert!(trash.text.contains("trash-put") && trash.text.contains("Linux"));
             assert!(trash.text.contains("~/.Trash/") && trash.text.contains("macOS"));
+            assert!(!trash.text.contains("~/.local/share/Trash"), "{rule_id}");
+        }
+    }
+
+    #[test]
+    fn secondary_registry_find_delete_consumers_preserve_the_expression() {
+        for &rule_id in FIND_DELETE_SUGGESTION_RULES {
+            let preview = required_suggestion(rule_id, SuggestionKind::PreviewFirst);
+            assert!(preview.command.is_none(), "{rule_id}");
+            assert!(preview.text.contains("For a terminal `-delete` action"));
             assert!(
-                !trash.text.contains("~/.local/share/Trash"),
-                "{rule_id}: do not advertise the Linux trash path as portable",
+                preview
+                    .text
+                    .contains("original search root, option, and predicate")
+            );
+            assert!(preview.text.contains("retain or add `-depth`"));
+            assert!(preview.text.contains("terminal action with `-print`"));
+
+            let safer = required_suggestion(rule_id, SuggestionKind::SaferAlternative);
+            assert!(safer.text.contains("read-only"), "{rule_id}");
+            assert!(
+                safer.text.contains("arbitrary boolean expression"),
+                "{rule_id}"
+            );
+            assert!(
+                safer
+                    .text
+                    .contains("no guaranteed exact mechanical rewrite")
             );
         }
+    }
+
+    #[test]
+    fn secondary_registry_tar_remove_files_consumers_preserve_sources() {
+        for &rule_id in TAR_REMOVE_FILES_SUGGESTION_RULES {
+            let safer = required_suggestion(rule_id, SuggestionKind::SaferAlternative);
+            assert_eq!(safer.command.as_deref(), Some("tar -cf archive.tar source"));
+            assert!(safer.text.contains("without `--remove-files`"), "{rule_id}");
+
+            for command in get_suggestions(rule_id)
+                .expect("tar guidance")
+                .iter()
+                .filter_map(|suggestion| suggestion.command.as_deref())
+            {
+                assert!(!command.contains("--remove-files"), "{rule_id}: {command}");
+                assert!(!command.contains("rm -r"), "{rule_id}: {command}");
+            }
+        }
+    }
+
+    #[test]
+    fn secondary_registry_sensitive_propagation_guidance_matches_each_operation() {
+        let cp_rule = "core.filesystem:cp-sensitive-then-delete";
+        assert_eq!(
+            required_suggestion(cp_rule, SuggestionKind::SaferAlternative)
+                .command
+                .as_deref(),
+            Some("cp -a source backup"),
+        );
+
+        let link_rule = "core.filesystem:ln-symlink-sensitive-then-delete";
+        let unlink = required_suggestion(link_rule, SuggestionKind::SaferAlternative);
+        assert_eq!(unlink.command.as_deref(), Some("unlink link"));
+        assert!(unlink.text.contains("symlink itself"));
+        assert!(
+            unlink
+                .text
+                .contains("never recursively remove the link target")
+        );
+
+        let rsync_rule = "core.filesystem:rsync-sensitive-then-delete";
+        assert_eq!(
+            required_suggestion(rsync_rule, SuggestionKind::PreviewFirst)
+                .command
+                .as_deref(),
+            Some("rsync -a --dry-run --ignore-existing source fresh-backup/"),
+        );
+        assert_eq!(
+            required_suggestion(rsync_rule, SuggestionKind::SaferAlternative)
+                .command
+                .as_deref(),
+            Some("rsync -a --ignore-existing source fresh-backup/"),
+        );
+        let rsync_safer = required_suggestion(rsync_rule, SuggestionKind::SaferAlternative);
+        assert!(rsync_safer.text.contains("fresh, non-existing"));
+        assert!(rsync_safer.text.contains("prevents overwriting"));
+
+        for rule_id in [cp_rule, link_rule, rsync_rule] {
+            let commands = get_suggestions(rule_id)
+                .expect("propagation guidance")
+                .iter()
+                .filter_map(|suggestion| suggestion.command.as_deref())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(!commands.contains("rm -r"), "{rule_id}: {commands}");
+        }
+    }
+
+    #[test]
+    fn secondary_registry_single_file_consumers_use_file_guidance() {
+        for &rule_id in SINGLE_FILE_SUGGESTION_RULES {
+            let preview = required_suggestion(rule_id, SuggestionKind::PreviewFirst);
+            assert_eq!(preview.command.as_deref(), Some("ls -la path"), "{rule_id}");
+            assert!(!preview.text.contains("find "), "{rule_id}");
+            assert!(!preview.text.contains("path/"), "{rule_id}");
+
+            let backup = required_suggestion(rule_id, SuggestionKind::SaferAlternative);
+            assert_eq!(backup.command.as_deref(), Some("cp -p path path.bak"));
+            assert!(backup.text.contains("file"), "{rule_id}");
+        }
+    }
+
+    #[test]
+    fn secondary_registry_moved_path_consumers_accept_files_or_directories() {
+        for &rule_id in MOVED_PATH_SUGGESTION_RULES {
+            let preview = required_suggestion(rule_id, SuggestionKind::PreviewFirst);
+            assert_eq!(preview.command.as_deref(), Some("ls -ld path"), "{rule_id}");
+            assert!(!preview.text.contains("path/"), "{rule_id}");
+            assert!(
+                required_suggestion(rule_id, SuggestionKind::SaferAlternative)
+                    .text
+                    .contains("literal backup path"),
+                "{rule_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn secondary_registry_home_glob_previews_the_expansion() {
+        let rule_id = "core.filesystem:rm-glob-home";
+        assert_eq!(
+            required_suggestion(rule_id, SuggestionKind::PreviewFirst)
+                .command
+                .as_deref(),
+            Some("ls -la path-pattern"),
+        );
+        let trash = required_suggestion(rule_id, SuggestionKind::WorkflowFix);
+        assert!(trash.text.contains("trash-put") && trash.text.contains("Linux"));
+        assert!(trash.text.contains("~/.Trash/") && trash.text.contains("macOS"));
+    }
+
+    #[test]
+    fn secondary_registry_covers_every_classifier_only_rule_accurately() {
+        let classifier_only_rules = [
+            "core.filesystem:rm-recursive-root-home",
+            "core.filesystem:rm-recursive-general",
+            "core.filesystem:rm-recursive-unverified",
+            "core.filesystem:powershell-remove-item-recursive",
+            "core.filesystem:rm-bare-glob",
+            "core.filesystem:rm-bare-glob-root",
+        ];
+        for rule_id in classifier_only_rules {
+            let suggestions = get_suggestions(rule_id)
+                .unwrap_or_else(|| panic!("missing secondary suggestions for {rule_id}"));
+            assert!(!suggestions.is_empty(), "{rule_id}");
+            assert!(
+                suggestions
+                    .iter()
+                    .any(|suggestion| suggestion.kind == SuggestionKind::SaferAlternative),
+                "{rule_id} has no safer alternative for scan output"
+            );
+        }
+
+        assert_eq!(
+            required_suggestion(
+                "core.filesystem:rm-recursive-root-home",
+                SuggestionKind::SaferAlternative,
+            )
+            .command
+            .as_deref(),
+            Some("cp -a reviewed-path /tmp/reviewed-backup"),
+        );
+
+        let unverified = get_suggestions("core.filesystem:rm-recursive-unverified")
+            .expect("unverified classifier guidance");
+        let unverified_text = unverified
+            .iter()
+            .map(|suggestion| suggestion.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(unverified_text.contains("assembled executable"));
+        assert!(unverified_text.contains("literal executable"));
+        assert!(unverified_text.contains("PowerShell splat"));
+
+        let powershell = get_suggestions("core.filesystem:powershell-remove-item-recursive")
+            .expect("PowerShell classifier guidance");
+        let powershell_commands: Vec<_> = powershell
+            .iter()
+            .filter_map(|suggestion| suggestion.command.as_deref())
+            .collect();
+        assert_eq!(
+            powershell_commands,
+            [
+                "Get-ChildItem -Recurse path",
+                "Remove-Item -Recurse -WhatIf path",
+                "Move-Item path (Join-Path ([IO.Path]::GetTempPath()) delete-me-reviewed)",
+            ]
+        );
+        let powershell_text = powershell
+            .iter()
+            .flat_map(|suggestion| {
+                [
+                    suggestion.text.as_str(),
+                    suggestion.command.as_deref().unwrap_or(""),
+                ]
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        for unix_advice in ["rm -", "find ", "ls -", "/tmp", "trash-put", "~/.Trash"] {
+            assert!(
+                !powershell_text.contains(unix_advice),
+                "PowerShell guidance contains Unix advice {unix_advice:?}: {powershell_text}"
+            );
+        }
+
+        assert_eq!(
+            required_suggestion("core.filesystem:rm-bare-glob", SuggestionKind::PreviewFirst)
+                .command
+                .as_deref(),
+            Some("ls -la"),
+        );
+        assert_eq!(
+            required_suggestion(
+                "core.filesystem:rm-bare-glob-root",
+                SuggestionKind::PreviewFirst
+            )
+            .command
+            .as_deref(),
+            Some("ls -la /"),
+        );
     }
 
     #[test]
@@ -1856,9 +2346,9 @@ mod tests {
     }
 
     #[test]
-    fn coverage_all_core_pack_patterns_have_suggestions() {
-        // This test dynamically checks all destructive patterns in core.* packs
-        // against the suggestion registry, ensuring complete coverage.
+    fn coverage_all_core_pack_rules_have_suggestions() {
+        // This dynamically checks regex-backed and semantic-classifier rules in
+        // core.* packs against the secondary suggestion registry.
         //
         // This satisfies the acceptance criteria for git_safety_guard-1gt.5.2:
         // "A coverage test that asserts all core destructive patterns have at least 1 suggestion."
@@ -1873,12 +2363,10 @@ mod tests {
                 .get(pack_id)
                 .unwrap_or_else(|| panic!("Pack {pack_id} should exist"));
 
-            for pattern in &pack.destructive_patterns {
-                if let Some(pattern_name) = pattern.name {
-                    let rule_id = format!("{pack_id}:{pattern_name}");
-                    if get_suggestions(&rule_id).is_none() {
-                        missing_suggestions.push(rule_id);
-                    }
+            for rule_name in pack.guidance_rule_names() {
+                let rule_id = format!("{pack_id}:{rule_name}");
+                if get_suggestions(&rule_id).is_none() {
+                    missing_suggestions.push(rule_id);
                 }
             }
         }
@@ -1891,19 +2379,15 @@ mod tests {
     }
 
     #[test]
-    fn coverage_core_patterns_count_matches_registry() {
-        // Verify the number of patterns with suggestions matches actual pack definitions.
-        // This catches drift between packs and suggestion registry.
+    fn coverage_core_rule_count_matches_registry() {
+        // Verify regex-backed plus semantic guidance rule counts match the
+        // secondary registry. This catches drift in either direction.
 
         use crate::packs::REGISTRY;
 
-        // Count patterns in core.git
+        // Count guidance-bearing rules in core.git.
         let git_pack = REGISTRY.get("core.git").unwrap();
-        let git_pattern_count = git_pack
-            .destructive_patterns
-            .iter()
-            .filter(|p| p.name.is_some())
-            .count();
+        let git_rule_count = git_pack.guidance_rule_names().count();
 
         // Count suggestions for core.git
         let git_suggestion_count = SUGGESTION_REGISTRY
@@ -1912,17 +2396,14 @@ mod tests {
             .count();
 
         assert_eq!(
-            git_pattern_count, git_suggestion_count,
-            "core.git pattern count ({git_pattern_count}) != suggestion count ({git_suggestion_count})"
+            git_rule_count, git_suggestion_count,
+            "core.git rule count ({git_rule_count}) != suggestion count ({git_suggestion_count})"
         );
 
-        // Count patterns in core.filesystem
+        // Count guidance-bearing rules in core.filesystem, including semantic
+        // classifier-only names.
         let fs_pack = REGISTRY.get("core.filesystem").unwrap();
-        let fs_pattern_count = fs_pack
-            .destructive_patterns
-            .iter()
-            .filter(|p| p.name.is_some())
-            .count();
+        let fs_rule_count = fs_pack.guidance_rule_names().count();
 
         // Count suggestions for core.filesystem
         let fs_suggestion_count = SUGGESTION_REGISTRY
@@ -1931,8 +2412,8 @@ mod tests {
             .count();
 
         assert_eq!(
-            fs_pattern_count, fs_suggestion_count,
-            "core.filesystem pattern count ({fs_pattern_count}) != suggestion count ({fs_suggestion_count})"
+            fs_rule_count, fs_suggestion_count,
+            "core.filesystem rule count ({fs_rule_count}) != suggestion count ({fs_suggestion_count})"
         );
     }
 
@@ -2040,7 +2521,7 @@ mod tests {
 
     #[test]
     fn coverage_all_suggestion_rules_are_valid() {
-        // Verify every rule_id in SUGGESTION_REGISTRY matches a real pack/pattern.
+        // Verify every rule_id matches a regex-backed or semantic pack rule.
         use crate::packs::REGISTRY;
         let mut invalid = Vec::new();
         for rule_id in SUGGESTION_REGISTRY.keys() {
@@ -2057,12 +2538,8 @@ mod tests {
                 invalid.push(format!("{rule_id} (pack not found)"));
                 continue;
             };
-            if !pack
-                .destructive_patterns
-                .iter()
-                .any(|p| p.name == Some(pattern_name))
-            {
-                invalid.push(format!("{rule_id} (pattern not found)"));
+            if !pack.guidance_rule_names().any(|name| name == pattern_name) {
+                invalid.push(format!("{rule_id} (rule not found)"));
             }
         }
         assert!(
