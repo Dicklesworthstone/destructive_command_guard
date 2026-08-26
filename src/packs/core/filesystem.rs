@@ -37,7 +37,7 @@ const RM_RF_ROOT_HOME_SUGGESTIONS: &[PatternSuggestion] = &[
 const RM_RF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "rm -ri {path}",
-        "Interactive mode: confirms each file before deletion",
+        "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
     ),
     PatternSuggestion::with_platform(
         "trash-put {path}",
@@ -48,6 +48,11 @@ const RM_RF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = &[
         "gio trash {path}",
         "Move to trash via GNOME (requires gio)",
         Platform::Linux,
+    ),
+    PatternSuggestion::with_platform(
+        "mv {path} ~/.Trash/",
+        "Move to the Finder trash instead of deleting (macOS has no ~/.local/share/Trash)",
+        Platform::MacOS,
     ),
     PatternSuggestion::new(
         "mv {path} /tmp/delete-me-{timestamp}",
@@ -71,7 +76,7 @@ const RM_RF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = &[
 const RM_R_F_SEPARATE_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "rm -ri {path}",
-        "Interactive mode: confirms each file before deletion",
+        "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
     ),
     PatternSuggestion::new(
         "rm -r -f /tmp/{subdir}",
@@ -87,10 +92,10 @@ const RM_R_F_SEPARATE_SUGGESTIONS: &[PatternSuggestion] = &[
 const RM_RECURSIVE_FORCE_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "rm --interactive --recursive {path}",
-        "Interactive mode: confirms each file before deletion",
+        "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
     ),
     PatternSuggestion::new(
-        "find {path} --maxdepth 2 -ls | head -30",
+        "find {path} -maxdepth 2 -ls | head -30",
         "Preview directory structure before deletion",
     ),
     PatternSuggestion::new(
@@ -346,6 +351,180 @@ const RM_RECURSIVE_UNVERIFIED_NAME: &str = "rm-recursive-unverified";
 const RM_RECURSIVE_UNVERIFIED_REASON: &str = "a dynamically resolved executable may be rm and is followed by recursive deletion syntax that cannot be verified safe before shell expansion.";
 const POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME: &str = "powershell-remove-item-recursive";
 const POWERSHELL_REMOVE_ITEM_RECURSIVE_REASON: &str = "PowerShell Remove-Item (or an alias) with -Recurse permanently deletes an entire item tree without using the Recycle Bin.";
+
+// ============================================================================
+// Guidance for classifier-only rules (#348)
+// ============================================================================
+//
+// The semantic rm classifier decides reason and severity itself and never
+// walks `destructive_patterns`, so a denial it produces has to look its
+// explanation and safer-alternative suggestions up by rule name
+// (`Pack::rule_guidance`). Most classifier rule names double as regex rules
+// and carry their text on the pattern. The four below exist only inside the
+// classifier, so their guidance lives here. These rows are text only: they
+// cannot change what the guard blocks, only what a blocked caller is told.
+
+/// Suggestions for a recursive `rm` that carries no force flag.
+const RM_RECURSIVE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "rm -ri {path}",
+        "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
+    ),
+    PatternSuggestion::with_platform(
+        "trash-put {path}",
+        "Move to trash instead of permanent deletion (requires trash-cli)",
+        Platform::Linux,
+    ),
+    PatternSuggestion::with_platform(
+        "mv {path} ~/.Trash/",
+        "Move to the Finder trash instead of deleting (macOS has no ~/.local/share/Trash)",
+        Platform::MacOS,
+    ),
+    PatternSuggestion::new(
+        "mv {path} /tmp/delete-me-{timestamp}",
+        "Move the tree aside instead of deleting it; remove the holding copy after review",
+    ),
+    PatternSuggestion::new(
+        "rm -r /tmp/{subdir}",
+        "Safe temp directory deletion (allowed without confirmation)",
+    ),
+    PatternSuggestion::new(
+        "ls -la {path}",
+        "List directory contents to verify the path",
+    ),
+];
+
+/// Suggestions for a recursive delete whose command word is resolved at run
+/// time (`find … -exec {} -r …`, PowerShell splatting).
+const RM_RECURSIVE_UNVERIFIED_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::gated(
+        "rm -r {path}",
+        "Name the executable literally so the recursive delete gets the ordinary rm decision",
+    ),
+    PatternSuggestion::new(
+        "echo {command}",
+        "Print the assembled command first, then run the literal text it produced",
+    ),
+    PatternSuggestion::new(
+        "ls -la {path}",
+        "List directory contents to verify the path",
+    ),
+];
+
+/// Suggestions for PowerShell `Remove-Item -Recurse`.
+const POWERSHELL_REMOVE_ITEM_RECURSIVE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "Get-ChildItem -Recurse {path}",
+        "List the item tree before removing it",
+    ),
+    PatternSuggestion::new(
+        "Remove-Item -Recurse -WhatIf {path}",
+        "Report what the removal would do without removing anything",
+    ),
+    PatternSuggestion::new(
+        "Move-Item {path} (Join-Path ([IO.Path]::GetTempPath()) delete-me-{timestamp})",
+        "Move the tree aside instead of deleting it; the temp path resolves on Windows and POSIX pwsh alike",
+    ),
+];
+
+const RM_RECURSIVE_GENERAL_EXPLANATION: &str = "rm -r deletes a directory and everything under it. Leaving off -f does not \
+     bound the command: -f only decides whether errors are reported and whether a \
+     write-protected file is queried, and that query reaches a terminal, not an agent \
+     hook. Everything the process can unlink, it unlinks, and there is no undo.\n\n\
+     dcg auto-allows recursive deletion only for literal temp paths:\n  \
+     rm -r /tmp/<subdir>/scratch\n\n\
+     For any other directory, preview first, then either delete interactively or move \
+     the tree aside (dcg allows both forms):\n  \
+     ls -la /path/to/directory\n  \
+     rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+     mv /path/to/directory /tmp/delete-me-<literal-timestamp>\n\n\
+     The trash directory is ~/.Trash on macOS and ~/.local/share/Trash on Linux.";
+
+const RM_RECURSIVE_ROOT_HOME_EXPLANATION: &str = "A recursive rm rooted at /, ~, or $HOME removes the account or the machine, and \
+     leaving off -f changes nothing about that: -f decides whether errors are reported, \
+     not what is deleted.\n\n\
+     There is NO recovery without backups. Even with backups, full restoration takes \
+     hours to days.\n\n\
+     If one directory under the home was meant, name it in full and delete that \
+     instead:\n  \
+     rm -r ~/projects/scratch-build   # a specific path, still reviewed\n  \
+     rm -r ~                          # never this\n\n\
+     dcg auto-allows recursive deletion only for literal temp paths:\n  \
+     rm -r /tmp/<subdir>/scratch\n\n\
+     For a specific directory, preview first, then either delete interactively or move \
+     the tree aside (dcg allows both forms):\n  \
+     ls -la /path/to/directory\n  \
+     rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+     mv /path/to/directory /tmp/delete-me-<literal-timestamp>";
+
+const RM_RECURSIVE_UNVERIFIED_EXPLANATION: &str = "The command word is resolved at run time, so dcg cannot read which binary will \
+     run, and the arguments beside it are recursive deletion syntax. A find -exec \
+     placeholder is filled from the search result, and PowerShell splatting takes both \
+     the flags and the path from a hashtable, so in either form the deletion target is \
+     assembled after this check would have run. dcg fails closed here rather than guess.\n\n\
+     Make the command word literal and the command gets the ordinary recursive-rm \
+     decision instead:\n  \
+     rm -r ./tree\n\n\
+     If the command really must be assembled, print the assembled text first and run \
+     that literal text. Reading the tree costs nothing and is always accepted:\n  \
+     ls -la /path/to/directory";
+
+const POWERSHELL_REMOVE_ITEM_RECURSIVE_EXPLANATION: &str = "Remove-Item -Recurse deletes the whole item tree immediately. PowerShell has no \
+     Recycle Bin step: the cmdlet unlinks, and nothing lands anywhere recoverable.\n\n\
+     Preview and safer forms:\n  \
+     Get-ChildItem -Recurse <path>          # list the tree first\n  \
+     Remove-Item -Recurse -WhatIf <path>    # report the removal without doing it (dcg allows -WhatIf)\n  \
+     Move-Item <path> (Join-Path ([IO.Path]::GetTempPath()) delete-me-<literal-timestamp>)\n\n\
+     To recycle rather than delete, call \
+     Microsoft.VisualBasic.FileIO.FileSystem::DeleteDirectory with SendToRecycleBin.";
+
+/// Explanation and safer-alternative suggestions for a rule that only the
+/// semantic rm/PowerShell classifier can attribute a denial to.
+///
+/// Returns `None` for every rule that has a `destructive_patterns` entry, so
+/// the pattern's own text stays authoritative for those.
+pub(crate) fn classifier_rule_guidance(
+    name: &str,
+) -> Option<(&'static str, &'static [PatternSuggestion])> {
+    match name {
+        n if n == RM_RECURSIVE_GENERAL_NAME => {
+            Some((RM_RECURSIVE_GENERAL_EXPLANATION, RM_RECURSIVE_SUGGESTIONS))
+        }
+        n if n == RM_RECURSIVE_ROOT_HOME_NAME => Some((
+            RM_RECURSIVE_ROOT_HOME_EXPLANATION,
+            RM_RF_ROOT_HOME_SUGGESTIONS,
+        )),
+        n if n == RM_RECURSIVE_UNVERIFIED_NAME => Some((
+            RM_RECURSIVE_UNVERIFIED_EXPLANATION,
+            RM_RECURSIVE_UNVERIFIED_SUGGESTIONS,
+        )),
+        n if n == POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME => Some((
+            POWERSHELL_REMOVE_ITEM_RECURSIVE_EXPLANATION,
+            POWERSHELL_REMOVE_ITEM_RECURSIVE_SUGGESTIONS,
+        )),
+        _ => None,
+    }
+}
+
+/// Every rule name the semantic rm/PowerShell classifier can emit.
+///
+/// Kept beside the constants so a test can prove that each one delivers
+/// authored guidance through `Pack::rule_guidance`: a new classifier rule
+/// without a `destructive_patterns` entry or a `classifier_rule_guidance`
+/// row would otherwise reach the blocked caller mute (#348).
+#[cfg(test)]
+pub(crate) const CLASSIFIER_RULE_NAMES: &[&str] = &[
+    RM_RF_ROOT_HOME_NAME,
+    RM_R_F_SEPARATE_ROOT_HOME_NAME,
+    RM_RECURSIVE_FORCE_ROOT_HOME_NAME,
+    RM_RF_GENERAL_NAME,
+    RM_R_F_SEPARATE_NAME,
+    RM_RECURSIVE_FORCE_NAME,
+    RM_RECURSIVE_ROOT_HOME_NAME,
+    RM_RECURSIVE_GENERAL_NAME,
+    RM_RECURSIVE_UNVERIFIED_NAME,
+    POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME,
+];
 
 pub(crate) fn is_pre_rm_propagation_rule(name: Option<&str>) -> bool {
     matches!(
@@ -3425,8 +3604,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Wildcards can expand to match more than expected\n\
              - No undo mechanism exists\n\n\
              Safe alternatives:\n\
-             - rm -ri: Interactive mode, confirms each file\n\
-             - trash-cli: Moves files to trash instead of deleting\n\
+             - rm -ri: Interactive mode, confirms each file. Needs a terminal: with stdin closed, as under an agent hook, it prompts, deletes nothing, and exits 0\n\
+             - mv <path> /tmp/delete-me-<literal-timestamp>: Move the tree aside instead of deleting it (dcg allows this form)\n\
+             - trash-cli (Linux) or mv <path> ~/.Trash/ (macOS): Moves files to trash instead of deleting\n\
              - rm -rf in literal /tmp or /var/tmp subdirectories: Allowed\n\
              - Variable-rooted paths such as $TMPDIR: Reviewed because the environment may point anywhere\n\n\
              Preview what would be deleted:\n  \
@@ -3455,7 +3635,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Safer alternatives:\n\
              - Preview the expansion first: `ls ~/Downloads/*.md`\n\
              - Delete explicitly named files: `rm ~/Downloads/one-file.md`\n\
-             - Move to trash instead: `mv ~/Downloads/*.md ~/.local/share/Trash/`",
+             - Move to trash instead: `mv ~/Downloads/*.md ~/.Trash/` on macOS, \
+             `mv ~/Downloads/*.md ~/.local/share/Trash/` on Linux",
             RM_RF_GENERAL_SUGGESTIONS
         ),
         // rm -r -f (separate flags)
@@ -3501,7 +3682,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Use absolute paths to avoid ambiguity\n\
              - Consider using trash-cli for recoverable deletion\n\n\
              Preview command:\n  \
-             find /path --maxdepth 2 -ls | head -30",
+             find /path -maxdepth 2 -ls | head -30",
             RM_RECURSIVE_FORCE_SUGGESTIONS
         ),
         // ----- `find ... -delete` (Critical: root/home target) -----
@@ -6956,6 +7137,124 @@ mod tests {
             "rm -ri ./tree {audit}> /etc/passwd",
         ] {
             assert_blocks_with_pattern(&pack, command, "redirect-truncate-root-home");
+        }
+    }
+}
+
+/// The rm classifier never walks `destructive_patterns`, so its denials must
+/// find their guidance by rule name (#348). These tests prove every rule it
+/// can emit resolves to authored text, and that the rule list they iterate
+/// cannot silently fall behind the constants it mirrors.
+#[cfg(test)]
+mod classifier_guidance_tests {
+    use super::*;
+
+    const PLACEHOLDER: &str = "No additional explanation is available yet";
+
+    /// Forms dcg accepts, either unconditionally or for literal temp paths.
+    /// An explanation that names none of them tells the caller only that it
+    /// lost.
+    const ACCEPTED_FORMS: &[&str] = &["rm -ri", "/tmp/delete-me-", "ls -la", "-WhatIf"];
+
+    #[test]
+    fn every_classifier_rule_resolves_to_authored_guidance() {
+        let pack = create_pack();
+        for &name in CLASSIFIER_RULE_NAMES {
+            let (explanation, suggestions) = pack.rule_guidance(name);
+            let explanation = explanation
+                .unwrap_or_else(|| panic!("classifier rule {name} has no explanation"));
+            assert!(
+                !explanation.contains(PLACEHOLDER),
+                "classifier rule {name} resolves to the placeholder"
+            );
+            assert!(
+                ACCEPTED_FORMS.iter().any(|form| explanation.contains(form)),
+                "classifier rule {name} names no command dcg accepts: {explanation}"
+            );
+            assert!(
+                !suggestions.is_empty(),
+                "classifier rule {name} offers no safer alternative"
+            );
+            for suggestion in suggestions {
+                assert!(
+                    !suggestion.command.contains("--maxdepth"),
+                    "{name}: find takes -maxdepth, not --maxdepth"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn classifier_rule_explanations_are_distinct() {
+        // One shared blurb attached to every rule would satisfy the test
+        // above while telling a PowerShell caller about `rm -ri`.
+        let pack = create_pack();
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for &name in CLASSIFIER_RULE_NAMES {
+            let explanation = pack.rule_guidance(name).0.expect("explanation");
+            if let Some((other, _)) = seen.iter().find(|(_, text)| *text == explanation) {
+                panic!("{name} reuses the explanation authored for {other}");
+            }
+            seen.push((name, explanation));
+        }
+    }
+
+    #[test]
+    fn classifier_only_guidance_covers_exactly_the_pattern_less_rules() {
+        // A rule with a regex pattern carries its text on the pattern; the
+        // classifier-only table must cover the rest and nothing else, or a
+        // row is dead (shadowed by the pattern) or a rule is mute.
+        let pack = create_pack();
+        for &name in CLASSIFIER_RULE_NAMES {
+            let has_pattern = pack
+                .destructive_patterns
+                .iter()
+                .any(|pattern| pattern.name == Some(name));
+            let has_table_row = classifier_rule_guidance(name).is_some();
+            assert!(
+                has_pattern != has_table_row,
+                "{name}: pattern={has_pattern} table={has_table_row}; exactly one must hold"
+            );
+        }
+        assert!(classifier_rule_guidance("no-such-rule").is_none());
+    }
+
+    #[test]
+    fn classifier_rule_name_list_mirrors_the_constants() {
+        // The list is hand-maintained; tie it to the `*_NAME` constants in
+        // this module so a new classifier rule cannot ship without a row in
+        // the list (and therefore without the guidance checks above).
+        let declared: Vec<&str> = include_str!("filesystem.rs")
+            .lines()
+            .filter(|line| line.starts_with("const ") && line.contains("_NAME: &str"))
+            .collect();
+        assert_eq!(
+            declared.len(),
+            CLASSIFIER_RULE_NAMES.len(),
+            "this module declares {} rule-name constants but CLASSIFIER_RULE_NAMES lists {}: \
+             add the new rule to the list and author its guidance.\n{declared:#?}",
+            declared.len(),
+            CLASSIFIER_RULE_NAMES.len()
+        );
+    }
+
+    #[test]
+    fn rm_suggestions_no_longer_advertise_linux_trash_on_macos() {
+        // #348: `~/.local/share/Trash` does not exist on macOS; every rm rule
+        // that offers a trash move must offer the Finder trash for macOS.
+        let pack = create_pack();
+        let trash_rules = [
+            RM_RF_GENERAL_NAME,
+            RM_RECURSIVE_GENERAL_NAME,
+        ];
+        for name in trash_rules {
+            let (_, suggestions) = pack.rule_guidance(name);
+            assert!(
+                suggestions.iter().any(|suggestion| {
+                    suggestion.platform == Platform::MacOS && suggestion.command.contains("~/.Trash")
+                }),
+                "{name} offers no macOS trash suggestion"
+            );
         }
     }
 }

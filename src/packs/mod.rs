@@ -810,6 +810,36 @@ impl Pack {
             })
     }
 
+    /// Explanation and safer-alternative suggestions authored for the rule
+    /// named `name` (#348).
+    ///
+    /// Semantic classifiers (the `core.filesystem` rm parser) build their own
+    /// hit and never walk `destructive_patterns`, so a denial they produce has
+    /// to look its guidance up by rule name. A rule that also exists as a
+    /// regex pattern answers with that pattern's text; a classifier-only rule
+    /// answers with the guidance authored beside the classifier; anything
+    /// else answers with nothing, which renders as the generic placeholder.
+    #[must_use]
+    pub fn rule_guidance(
+        &self,
+        name: &str,
+    ) -> (Option<&'static str>, &'static [PatternSuggestion]) {
+        if let Some(pattern) = self
+            .destructive_patterns
+            .iter()
+            .find(|pattern| pattern.name == Some(name))
+        {
+            return (pattern.explanation, pattern.suggestions);
+        }
+        if self.id == "core.filesystem"
+            && let Some((explanation, suggestions)) =
+                crate::packs::core::filesystem::classifier_rule_guidance(name)
+        {
+            return (Some(explanation), suggestions);
+        }
+        (None, &[])
+    }
+
     /// Check a command against this pack.
     /// Returns Some(DestructiveMatch) if blocked, None if allowed.
     ///
@@ -870,11 +900,12 @@ impl Pack {
             match crate::packs::core::filesystem::parse_rm_command(cmd) {
                 crate::packs::core::filesystem::RmParseDecision::Allow => return None,
                 crate::packs::core::filesystem::RmParseDecision::Deny(hit) => {
+                    let (explanation, _) = self.rule_guidance(hit.pattern_name);
                     return Some(DestructiveMatch {
                         reason: hit.reason,
                         name: Some(hit.pattern_name),
                         severity: hit.severity,
-                        explanation: None,
+                        explanation,
                     });
                 }
                 crate::packs::core::filesystem::RmParseDecision::NoMatch => {}

@@ -22098,6 +22098,12 @@ fn evaluate_core_filesystem_pack(
             crate::packs::core::filesystem::RmParseDecision::Allow => continue,
             crate::packs::core::filesystem::RmParseDecision::NoMatch => {}
             crate::packs::core::filesystem::RmParseDecision::Deny(hit) => {
+                // The classifier decides reason and severity itself and never
+                // walks the pattern list, so attach the authored explanation
+                // and safer alternatives by rule name (#348). Without this
+                // every rm denial reaches the blocked caller with the
+                // generic "no additional explanation" placeholder.
+                let (hit_explanation, hit_suggestions) = pack.rule_guidance(hit.pattern_name);
                 let span = hit.span.as_ref().map(|span| MatchSpan {
                     start: span.start + segment_start,
                     end: span.end + segment_start,
@@ -22132,8 +22138,8 @@ fn evaluate_core_filesystem_pack(
                                 source: MatchSource::Pack,
                                 matched_span: mapped_span,
                                 matched_text_preview: preview,
-                                explanation: None,
-                                suggestions: &[],
+                                explanation: hit_explanation.map(str::to_string),
+                                suggestions: hit_suggestions,
                             },
                             allow_hit.layer,
                             allow_hit.entry.reason.clone(),
@@ -22146,9 +22152,9 @@ fn evaluate_core_filesystem_pack(
                                 pack_id,
                                 hit.pattern_name,
                                 hit.reason,
-                                None,
+                                hit_explanation,
                                 hit.severity,
-                                &[],
+                                hit_suggestions,
                             )
                         },
                         |mapped_span| {
@@ -22156,9 +22162,9 @@ fn evaluate_core_filesystem_pack(
                                 pack_id,
                                 hit.pattern_name,
                                 hit.reason,
-                                None,
+                                hit_explanation,
                                 hit.severity,
-                                &[],
+                                hit_suggestions,
                                 original_command,
                                 mapped_span,
                             )
@@ -24489,6 +24495,81 @@ mod tests {
         let result = evaluate_command("", &config, &[], &compiled, &allowlists);
         assert!(result.is_allowed());
         assert!(result.pattern_info.is_none());
+    }
+
+    /// Regression for #348: denials decided by the rm classifier reached the
+    /// caller with no explanation and no suggestions, because the classifier
+    /// builds its own hit instead of walking the pattern list.
+    #[test]
+    fn rm_classifier_denials_carry_authored_guidance() {
+        const PLACEHOLDER: &str = "No additional explanation is available yet";
+        let cases = [
+            ("rm -rf node_modules", "rm-rf-general"),
+            ("rm -r -f ./build", "rm-r-f-separate"),
+            ("rm --recursive --force ./build", "rm-recursive-force-long"),
+            ("rm -r ./build", "rm-recursive-general"),
+            ("rm -rf ~", "rm-rf-root-home"),
+            ("rm -r -f ~", "rm-r-f-separate-root-home"),
+            ("rm --recursive --force ~", "rm-recursive-force-root-home"),
+            ("rm -r ~", "rm-recursive-root-home"),
+        ];
+        let mut explanations: Vec<(&str, String)> = Vec::new();
+        for (command, expected_rule) in cases {
+            let result = evaluate_with_pack_ids(command, &["core.filesystem"]);
+            assert!(result.is_denied(), "{command} must be denied");
+            let info = result
+                .pattern_info
+                .as_ref()
+                .unwrap_or_else(|| panic!("{command}: denial carries no pattern info"));
+            assert_eq!(
+                info.pattern_name.as_deref(),
+                Some(expected_rule),
+                "{command}: unexpected rule"
+            );
+            let explanation = info
+                .explanation
+                .clone()
+                .unwrap_or_else(|| panic!("{command}: denial carries no explanation"));
+            assert!(
+                !explanation.contains(PLACEHOLDER),
+                "{command}: explanation is the placeholder"
+            );
+            assert!(
+                !info.suggestions.is_empty(),
+                "{command}: denial carries no suggestions"
+            );
+            explanations.push((expected_rule, explanation));
+        }
+        // Each rule speaks for itself: the general and the root/home forms
+        // must not share one text.
+        let general = &explanations[0].1;
+        let root_home = &explanations[4].1;
+        assert_ne!(general, root_home, "general and root/home rules share an explanation");
+        let plain_recursive = &explanations[3].1;
+        assert_ne!(general, plain_recursive, "rm -rf and rm -r rules share an explanation");
+    }
+
+    /// The forms the #348 guidance advertises must actually be accepted:
+    /// guidance that points at another denial is worse than none.
+    #[test]
+    fn rm_guidance_advertised_forms_stay_allowed() {
+        for command in [
+            "rm -ri ./build",
+            "rm -ri /path/to/directory",
+            "mv ./build /tmp/delete-me-20260826",
+            "mv ./build ~/.Trash/",
+            "rm -rf /tmp/scratch/build",
+            "rm -r /tmp/scratch/build",
+            "ls -la ./build",
+            "find ./build -maxdepth 2 -ls | head -30",
+        ] {
+            let result = evaluate_with_pack_ids(command, &["core.filesystem"]);
+            assert!(
+                result.is_allowed(),
+                "{command} is advertised as accepted but was denied: {:?}",
+                result.pattern_info.as_ref().and_then(|info| info.pattern_name.clone())
+            );
+        }
     }
 
     #[test]
