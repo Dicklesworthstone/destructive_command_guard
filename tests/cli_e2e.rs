@@ -33,6 +33,165 @@ fn run_dcg(args: &[&str]) -> std::process::Output {
         .expect("failed to execute dcg")
 }
 
+/// Run `dcg create-new` with byte-exact piped input and capture every output
+/// stream. The command must never use stdout, because its intended use is as a
+/// safe sink at the end of a pipeline.
+fn run_create_new(
+    path: &std::path::Path,
+    input: &[u8],
+) -> (std::process::Output, std::io::Result<()>) {
+    let mut child = Command::new(dcg_binary())
+        .arg("create-new")
+        .arg(path)
+        .env_remove("DCG_QUIET")
+        .env_remove("DCG_ROBOT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn dcg create-new");
+
+    let stdin_write = child
+        .stdin
+        .take()
+        .expect("failed to open create-new stdin")
+        .write_all(input);
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for dcg create-new");
+    (output, stdin_write)
+}
+
+fn assert_refused_sink_write_is_benign(result: &std::io::Result<()>) {
+    assert!(
+        match result {
+            Ok(()) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::BrokenPipe,
+        },
+        "refused sink produced an unexpected stdin error: {result:?}"
+    );
+}
+
+#[test]
+fn create_new_streams_exact_bytes_once_without_stdout() {
+    let temp = tempfile::tempdir().expect("failed to create temp dir");
+    let destination = temp.path().join("payload.bin");
+    let original = b"first\0payload\n\xff\xfe";
+
+    let (first, first_write) = run_create_new(&destination, original);
+    first_write.expect("successful create-new must consume every input byte");
+    assert!(
+        first.status.success(),
+        "first create-new invocation failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        first.stdout.is_empty(),
+        "create-new must reserve stdout for pipeline composition"
+    );
+    assert!(
+        String::from_utf8_lossy(&first.stderr).contains("Created"),
+        "successful creation should be confirmed on stderr"
+    );
+    assert_eq!(
+        std::fs::read(&destination).expect("read created file"),
+        original,
+        "stdin bytes must reach the destination without text decoding"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(&destination)
+            .expect("created file metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "new files must not grant group or other permissions"
+        );
+    }
+
+    let replacement = b"replacement that must never land";
+    let (second, second_write) = run_create_new(&destination, replacement);
+    assert_refused_sink_write_is_benign(&second_write);
+    assert!(
+        !second.status.success(),
+        "create-new must fail when any destination entry already exists"
+    );
+    assert!(
+        second.stdout.is_empty(),
+        "create-new errors belong on stderr, never stdout"
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("refusing to replace existing path"),
+        "existing-path failure should explain the non-overwrite guarantee: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&destination).expect("read destination after refused replacement"),
+        original,
+        "a second invocation must preserve every original byte"
+    );
+}
+
+#[test]
+fn create_new_does_not_create_missing_parent_directories() {
+    let temp = tempfile::tempdir().expect("failed to create temp dir");
+    let missing_parent = temp.path().join("missing");
+    let destination = missing_parent.join("payload.txt");
+
+    let (output, stdin_write) = run_create_new(&destination, b"must not be written");
+    assert_refused_sink_write_is_benign(&stdin_write);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not create new file"),
+        "missing-parent failure should carry create context: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !missing_parent.exists(),
+        "create-new must not manufacture parent directories"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn create_new_refuses_an_existing_symlink_without_touching_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("failed to create temp dir");
+    let target = temp.path().join("target.txt");
+    let link = temp.path().join("destination-link");
+    std::fs::write(&target, b"target stays unchanged").expect("write symlink target");
+    symlink(&target, &link).expect("create destination symlink");
+
+    let (output, stdin_write) = run_create_new(&link, b"must not follow the symlink");
+    assert_refused_sink_write_is_benign(&stdin_write);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("refusing to replace existing path"),
+        "symlink refusal should state the non-overwrite guarantee: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&target).expect("read symlink target"),
+        b"target stays unchanged"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .expect("symlink metadata")
+            .file_type()
+            .is_symlink(),
+        "the destination symlink itself must remain intact"
+    );
+}
+
 fn run_dcg_with_env(args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
     let mut cmd = Command::new(dcg_binary());
     cmd.args(args)

@@ -139,9 +139,9 @@ fi
 # 3. Prove verification actually happened (not silently skipped).
 grep -qi "checksum" "$INSTALL_LOG" && echo "RESULT:checksum_verified:PASS" \
   || echo "RESULT:checksum_verified:FAIL:no checksum evidence in installer output"
-grep -qi "signature.*verified\|Trusted comment" "$INSTALL_LOG" \
+grep -qi "Signature verified (minisign key " "$INSTALL_LOG" \
   && echo "RESULT:minisign_verified:PASS" \
-  || echo "RESULT:minisign_verified:FAIL:no signature evidence"
+  || echo "RESULT:minisign_verified:FAIL:no minisign key verification evidence"
 
 BIN="$DEST/dcg"
 [ -x "$BIN" ] || { echo "RESULT:binary_present:FAIL:not executable at $BIN"; exit 1; }
@@ -463,7 +463,7 @@ try {
 $logText = ''
 if (Test-Path $log) { $logText = Get-Content $log -Raw -ErrorAction SilentlyContinue }
 if ($logText -match '(?i)checksum') { Emit 'checksum_verified' 'PASS' } else { Emit 'checksum_verified' 'FAIL' 'no checksum evidence in installer output' }
-if ($logText -match '(?i)signature.*verified|Trusted comment') { Emit 'minisign_verified' 'PASS' } else { Emit 'minisign_verified' 'FAIL' 'strict minisign verification did not complete' }
+if ($logText -match '(?i)Signature verified \(minisign key ') { Emit 'minisign_verified' 'PASS' } else { Emit 'minisign_verified' 'FAIL' 'strict minisign key verification did not complete' }
 
 $bin = Join-Path $dest 'dcg.exe'
 if (Test-Path $bin) {

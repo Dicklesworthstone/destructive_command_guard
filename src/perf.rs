@@ -636,6 +636,11 @@ mod tests {
             "a truncated probe must not pass without reporting signature verification"
         );
         assert!(
+            unix_probe.contains("Signature verified (minisign key ")
+                && windows_probe.contains("Signature verified \\(minisign key "),
+            "fleet probes must certify minisign verification specifically, not a different signature mechanism"
+        );
+        assert!(
             !unix_probe.contains("RESULT:minisign_verified:SKIP")
                 && !windows_probe.contains("Emit 'minisign_verified' 'SKIP'"),
             "release probes must fail rather than skip missing signature evidence"

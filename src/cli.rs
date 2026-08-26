@@ -294,6 +294,18 @@ pub enum Command {
         ttl: Option<u64>,
     },
 
+    /// Create a new file from stdin without overwriting any existing path
+    ///
+    /// Opens PATH with exclusive create-new semantics, then streams stdin into
+    /// it. The parent directory must already exist. Existing files, directories,
+    /// and symlinks are refused without modification.
+    #[command(name = "create-new")]
+    CreateNew {
+        /// Destination path, which must not already exist
+        #[arg(value_name = "PATH")]
+        path: std::path::PathBuf,
+    },
+
     /// Install the hook into Claude Code settings (or another agent with
     /// `--grok`, `--agy`, `--opencode`, or `--omp`)
     #[command(name = "install")]
@@ -2647,6 +2659,15 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::RebaseRecover { ttl }) => {
             handle_rebase_recover(ttl, robot_mode_enabled(cli.robot))?;
         }
+        Some(Command::CreateNew { path }) => {
+            let bytes_written = create_new_from_stdin(&path)?;
+            if !verbosity.quiet && !robot_mode_enabled(cli.robot) {
+                eprintln!(
+                    "Created {} from stdin ({bytes_written} bytes)",
+                    path.display()
+                );
+            }
+        }
         Some(Command::Scan(scan)) => {
             handle_scan_command(&config, scan, verbosity)?;
         }
@@ -2709,6 +2730,45 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Stream stdin into a newly created regular file without a check-then-open
+/// race. `create_new(true)` maps to the platform's exclusive-create primitive,
+/// so any existing directory entry (including a symlink) makes `open` fail and
+/// is never truncated or followed.
+fn create_new_from_stdin(path: &std::path::Path) -> std::io::Result<u64> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+
+    let mut destination = options.open(path).map_err(|error| {
+        let context = if error.kind() == std::io::ErrorKind::AlreadyExists {
+            "refusing to replace existing path"
+        } else {
+            "could not create new file"
+        };
+        std::io::Error::new(
+            error.kind(),
+            format!("{context} `{}`: {error}", path.display()),
+        )
+    })?;
+
+    let mut stdin = std::io::stdin().lock();
+    std::io::copy(&mut stdin, &mut destination).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed writing stdin to newly created file `{}`; the file may contain partial input: {error}",
+                path.display()
+            ),
+        )
+    })
 }
 
 fn write_completions(shell: CompletionShell) -> Result<(), Box<dyn std::error::Error>> {
@@ -19314,6 +19374,19 @@ mod tests {
     fn test_cli_parse_no_args() {
         let cli = Cli::parse_from(["dcg"]);
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn test_cli_parse_create_new_requires_exactly_one_path() {
+        let cli = Cli::try_parse_from(["dcg", "create-new", "artifact.bin"])
+            .expect("parse create-new path");
+        let Some(Command::CreateNew { path }) = cli.command else {
+            unreachable!("Expected CreateNew command");
+        };
+        assert_eq!(path, std::path::PathBuf::from("artifact.bin"));
+
+        assert!(Cli::try_parse_from(["dcg", "create-new"]).is_err());
+        assert!(Cli::try_parse_from(["dcg", "create-new", "one", "two"]).is_err());
     }
 
     #[test]

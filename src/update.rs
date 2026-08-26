@@ -643,8 +643,7 @@ fn classify_provenance(
     release_marker: Option<&str>,
     version: &str,
 ) -> BuildProvenance {
-    let release_marker_enabled =
-        release_marker.is_some_and(crate::output::env_flag_value_enabled);
+    let release_marker_enabled = release_marker.is_some_and(crate::output::env_flag_value_enabled);
     let Some(describe) = describe else {
         return if release_marker_enabled {
             BuildProvenance::Release

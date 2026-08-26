@@ -1844,6 +1844,10 @@ fn print_help() {
         "allow-once".green()
     );
     eprintln!(
+        "    {}    Create a new file from stdin without overwriting",
+        "create-new".green()
+    );
+    eprintln!(
         "    {}         Scan files for destructive commands",
         "scan".green()
     );
