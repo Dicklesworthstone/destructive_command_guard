@@ -818,7 +818,6 @@ impl Pack {
     /// never enter that array. Returning both inventories here lets consumers
     /// validate all suggestions without duplicating the classifier's private
     /// rule list. A name emitted by both paths is yielded only once.
-    #[must_use]
     pub fn guidance_rule_names(&self) -> impl Iterator<Item = &'static str> + '_ {
         let classifier_names: &'static [&'static str] = if self.id == "core.filesystem" {
             crate::packs::core::filesystem::CLASSIFIER_RULE_NAMES
