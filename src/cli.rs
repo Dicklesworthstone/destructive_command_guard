@@ -21146,9 +21146,9 @@ console.log(JSON.stringify({
             String::from_utf8_lossy(&collection_mutant_output.stderr)
         );
 
-        let bounded_stdin_dispatch = r#"  return command.length <= DCG_STDIN_CHUNK_CODE_UNITS
+        let bounded_stdin_dispatch = r"  return command.length <= DCG_STDIN_CHUNK_CODE_UNITS
     ? new TextEncoder().encode(command)
-    : commandUtf8Stream(command);"#;
+    : commandUtf8Stream(command);";
         let unbounded_stdin_dispatch = r"  return new TextEncoder().encode(command);";
         assert_eq!(
             source.matches(bounded_stdin_dispatch).count(),
