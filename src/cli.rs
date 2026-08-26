@@ -20520,6 +20520,7 @@ const equalBytes = (actual: Uint8Array, expected: Uint8Array, caseId: string): v
     check(actual[index] === expected[index], `${caseId}/byte-${index}`);
   }
 };
+const stdinCaseIds: string[] = [];
 for (const [caseId, command, expectedPath] of [
   ["stdin/direct-controls", "nul\0lf\ncr\rtab\tesc\u001b", "direct"],
   ["stdin/direct-astral", "界🛸é", "direct"],
@@ -20534,6 +20535,7 @@ for (const [caseId, command, expectedPath] of [
   const stdin = commandStdin(command);
   equal(stdin instanceof Uint8Array ? "direct" : "stream", expectedPath, `${caseId}/path`);
   equalBytes(await encodedCommandStdin(command), encoder.encode(command), caseId);
+  stdinCaseIds.push(caseId);
 }
 
 type ChildCase = {
@@ -20867,6 +20869,7 @@ console.log(JSON.stringify({
   bunVersion: Bun.version,
   toolCaseIds,
   transitionCaseIds,
+  stdinCaseIds,
   callbackCaseIds,
   spawnExecutable: observedExecutable,
   stubExports: [
@@ -21025,6 +21028,21 @@ console.log(JSON.stringify({
             .collect::<Vec<_>>();
         assert_eq!(string_array("transitionCaseIds"), expected_transition_ids);
         assert_eq!(
+            string_array("stdinCaseIds"),
+            [
+                "stdin/direct-controls",
+                "stdin/direct-astral",
+                "stdin/direct-lone-high",
+                "stdin/direct-lone-low",
+                "stdin/stream-just-over",
+                "stdin/stream-astral-boundary",
+                "stdin/stream-lone-high-boundary",
+                "stdin/stream-lone-low-boundary",
+                "stdin/stream-reversed-surrogates",
+            ]
+            .map(str::to_string)
+        );
+        assert_eq!(
             string_array("callbackCaseIds"),
             [
                 "callback/other-tool",
@@ -21126,6 +21144,32 @@ console.log(JSON.stringify({
                 .contains("synthetic stderr read failure"),
             "collector mutant red must reach the rejected diagnostic promise that erases a completed deny\nstderr:\n{}",
             String::from_utf8_lossy(&collection_mutant_output.stderr)
+        );
+
+        let bounded_stdin_dispatch = r#"  return command.length <= DCG_STDIN_CHUNK_CODE_UNITS
+    ? new TextEncoder().encode(command)
+    : commandUtf8Stream(command);"#;
+        let unbounded_stdin_dispatch = r"  return new TextEncoder().encode(command);";
+        assert_eq!(
+            source.matches(bounded_stdin_dispatch).count(),
+            1,
+            "stdin mutation witness must identify exactly one bounded dispatch"
+        );
+        let stdin_mutant = source.replacen(bounded_stdin_dispatch, unbounded_stdin_dispatch, 1);
+        let stdin_mutant_root = temp.path().join("mutant-unbounded-stdin");
+        std::fs::create_dir_all(&stdin_mutant_root).expect("create stdin mutant replay root");
+        let stdin_mutant_output =
+            run_omp_bridge_bun_fixture(&bun, &stdin_mutant_root, &stdin_mutant);
+        assert!(
+            !stdin_mutant_output.status.success(),
+            "the executable corpus vacuously accepted command-sized stdin encoding\nstdout:\n{}",
+            String::from_utf8_lossy(&stdin_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&stdin_mutant_output.stderr)
+                .contains("stdin/large-stream-path"),
+            "stdin mutant red must identify the lost large-command stream path\nstderr:\n{}",
+            String::from_utf8_lossy(&stdin_mutant_output.stderr)
         );
     }
 
