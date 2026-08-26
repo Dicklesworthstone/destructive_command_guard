@@ -381,7 +381,7 @@ impl LayeredAllowlist {
             return None;
         }
 
-        let mut cached_session_id = None;
+        let mut cached_session_id = SessionIdCache::Unresolved;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
@@ -448,7 +448,7 @@ impl LayeredAllowlist {
         rule: &RuleId,
         cwd: Option<&Path>,
     ) -> Option<(&AllowEntry, AllowlistLayer)> {
-        let mut cached_session_id = None;
+        let mut cached_session_id = SessionIdCache::Unresolved;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
@@ -474,7 +474,7 @@ impl LayeredAllowlist {
         command: &str,
         cwd: Option<&Path>,
     ) -> Option<AllowlistHit<'_>> {
-        let mut cached_session_id = None;
+        let mut cached_session_id = SessionIdCache::Unresolved;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
@@ -518,7 +518,7 @@ impl LayeredAllowlist {
         command: &str,
         cwd: Option<&Path>,
     ) -> Option<AllowlistHit<'_>> {
-        let mut cached_session_id = None;
+        let mut cached_session_id = SessionIdCache::Unresolved;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
@@ -586,7 +586,7 @@ impl LayeredAllowlist {
         command: &str,
         cwd: Option<&Path>,
     ) -> Option<AllowlistHit<'_>> {
-        let mut cached_session_id = None;
+        let mut cached_session_id = SessionIdCache::Unresolved;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
@@ -1191,17 +1191,39 @@ fn session_scope_matches(entry: &AllowEntry, current_session_id: Option<&str>) -
 /// When a lookup contains multiple session-scoped entries, cache the result for
 /// that lookup so `/proc` is sampled once while preserving the existing
 /// per-lookup freshness boundary.
+enum SessionIdCache {
+    Unresolved,
+    Unavailable,
+    Resolved(String),
+}
+
 fn session_id_for_entry<'a>(
     entry: &AllowEntry,
-    cached_session_id: &'a mut Option<Option<String>>,
+    cached_session_id: &'a mut SessionIdCache,
+) -> Option<&'a str> {
+    session_id_for_entry_with(entry, cached_session_id, current_session_id)
+}
+
+fn session_id_for_entry_with<'a>(
+    entry: &AllowEntry,
+    cached_session_id: &'a mut SessionIdCache,
+    resolve_session_id: impl FnOnce() -> Option<String>,
 ) -> Option<&'a str> {
     if entry.session != Some(true) {
         return None;
     }
 
-    cached_session_id
-        .get_or_insert_with(current_session_id)
-        .as_deref()
+    if matches!(cached_session_id, SessionIdCache::Unresolved) {
+        *cached_session_id = match resolve_session_id() {
+            Some(session_id) => SessionIdCache::Resolved(session_id),
+            None => SessionIdCache::Unavailable,
+        };
+    }
+
+    match cached_session_id {
+        SessionIdCache::Resolved(session_id) => Some(session_id.as_str()),
+        SessionIdCache::Unresolved | SessionIdCache::Unavailable => None,
+    }
 }
 
 /// Check if all conditions on an allowlist entry are satisfied.
@@ -2650,6 +2672,33 @@ mod tests {
                     .is_none()
             );
         });
+    }
+
+    #[test]
+    fn session_id_cache_resolves_unavailable_once_across_session_entries() {
+        let mut first_entry = make_test_entry();
+        first_entry.session = Some(true);
+        let mut second_entry = make_test_entry();
+        second_entry.session = Some(true);
+        let resolver_calls = std::cell::Cell::new(0);
+        let mut cached_session_id = SessionIdCache::Unresolved;
+
+        let resolve_unavailable = || {
+            resolver_calls.set(resolver_calls.get() + 1);
+            None
+        };
+        assert_eq!(
+            session_id_for_entry_with(&first_entry, &mut cached_session_id, resolve_unavailable),
+            None
+        );
+        assert!(matches!(cached_session_id, SessionIdCache::Unavailable));
+
+        assert_eq!(
+            session_id_for_entry_with(&second_entry, &mut cached_session_id, resolve_unavailable),
+            None
+        );
+        assert!(matches!(cached_session_id, SessionIdCache::Unavailable));
+        assert_eq!(resolver_calls.get(), 1);
     }
 
     #[test]

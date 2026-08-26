@@ -199,14 +199,17 @@ assert_field_absent() {
 
 # Assert the exact private robot-mode contract used by Oh My Pi. OMP passes the
 # raw command on stdin, requests the compact envelope, and maps dcg's exit
-# status plus these exact bytes back to ExtensionAPI's blocking result.
+# status plus these exact bytes back to ExtensionAPI's blocking result. The
+# remaining arguments name a producer so cases can carry bytes such as NUL
+# that a shell variable cannot represent.
 assert_omp_bridge_case() {
-  local harness="$1" case_name="$2" command="$3" expected_rc="$4" expected_stdout="$5"
+  local harness="$1" case_name="$2" expected_rc="$3" expected_stdout="$4"
+  shift 4
   local stdout_file="$SANDBOX/${harness}-${case_name}.stdout"
   local stderr_file="$SANDBOX/${harness}-${case_name}.stderr"
   local start end
   start="$(now_ms)"
-  printf '%s' "$command" | run_dcg_cli --robot test --stdin \
+  "$@" | run_dcg_cli --robot test --stdin \
     --agent omp --dialect posix --format json --omp-bridge-output \
     >"$stdout_file" 2>"$stderr_file"
   local rc=$?
@@ -370,9 +373,14 @@ assert_case agy allow "$AGY_ALLOW" allow '.' ''
 
 # --- Oh My Pi: native ExtensionAPI bridge over robot stdin ------------------
 $JSON_OUTPUT || echo "Oh My Pi (omp)"
-assert_omp_bridge_case omp deny "$DENY_CMD" 1 \
-  '{"decision":"deny","reason":"git reset --hard destroys uncommitted changes. Use '\''git stash'\'' first.","rule_id":"core.git:reset-hard"}'
-assert_omp_bridge_case omp allow "$ALLOW_CMD" 0 '{"decision":"allow"}'
+OMP_DENY_OUTPUT='{"decision":"deny","reason":"git reset --hard destroys uncommitted changes. Use '\''git stash'\'' first.","rule_id":"core.git:reset-hard"}'
+assert_omp_bridge_case omp deny 1 "$OMP_DENY_OUTPUT" printf '%s' "$DENY_CMD"
+assert_omp_bridge_case omp allow 0 '{"decision":"allow"}' printf '%s' "$ALLOW_CMD"
+assert_omp_bridge_case omp newline-only 0 '{"decision":"allow"}' printf '\n'
+assert_omp_bridge_case omp crlf-only 0 '{"decision":"allow"}' printf '\r\n'
+# Keep the NUL out of a shell variable: bash variables cannot preserve it.
+assert_omp_bridge_case omp control-bytes-destructive-tail 1 "$OMP_DENY_OUTPUT" \
+  printf 'echo safe\000\t\033\ngit reset --hard'
 assert_omp_agent_attribution
 
 # --- Cross-cutting invariants ----------------------------------------------

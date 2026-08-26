@@ -587,8 +587,18 @@ mod tests {
                 && omp_case
                     .contains("--agent omp --dialect posix --format json --omp-bridge-output")
                 && omp_case.contains("expected_stdout")
-                && omp_case.contains("stdout_bytes"),
+                && omp_case.contains("stdout_bytes")
+                && omp_case.contains("\"$@\" | run_dcg_cli"),
             "OMP matrix must assert exact argv, compact bytes, exit status, and streams"
+        );
+        assert!(
+            harness.contains(
+                "assert_omp_bridge_case omp newline-only 0 '{\"decision\":\"allow\"}' printf '\\n'"
+            ) && harness.contains(
+                "assert_omp_bridge_case omp crlf-only 0 '{\"decision\":\"allow\"}' printf '\\r\\n'"
+            ) && harness.contains("assert_omp_bridge_case omp control-bytes-destructive-tail 1")
+                && harness.contains("printf 'echo safe\\000\\t\\033\\ngit reset --hard'"),
+            "OMP matrix must preserve terminal line endings and feed control bytes without lossy shell variables"
         );
     }
 
