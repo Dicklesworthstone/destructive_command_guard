@@ -810,6 +810,33 @@ impl Pack {
             })
     }
 
+    /// Names of every rule whose authored guidance can be resolved by
+    /// [`Self::rule_guidance`].
+    ///
+    /// Most rules are regex-backed entries in `destructive_patterns`.
+    /// `core.filesystem` also has semantic rm/PowerShell classifier rules that
+    /// never enter that array. Returning both inventories here lets consumers
+    /// validate all suggestions without duplicating the classifier's private
+    /// rule list. A name emitted by both paths is yielded only once.
+    #[must_use]
+    pub fn guidance_rule_names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        let classifier_names: &'static [&'static str] = if self.id == "core.filesystem" {
+            crate::packs::core::filesystem::CLASSIFIER_RULE_NAMES
+        } else {
+            &[]
+        };
+
+        self.destructive_patterns
+            .iter()
+            .filter_map(|pattern| pattern.name)
+            .chain(classifier_names.iter().copied().filter(|name| {
+                !self
+                    .destructive_patterns
+                    .iter()
+                    .any(|pattern| pattern.name == Some(*name))
+            }))
+    }
+
     /// Explanation and safer-alternative suggestions authored for the rule
     /// named `name` (#348).
     ///

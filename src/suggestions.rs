@@ -488,20 +488,25 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         ],
     );
 
-    // Shared suggestions for all recursive force-delete variants
+    // Shared suggestions for recursive rm and equivalent destructive-path rules.
+    // This registry feeds scan/trace output, independently of the authored
+    // PatternSuggestion guidance attached to hook denials. Keep the two
+    // surfaces semantically aligned so scan output does not advertise a form
+    // that is ineffective under a hook or a trash path from the wrong OS.
     let rm_rf_suggestions = vec![
         Suggestion::new(
             SuggestionKind::PreviewFirst,
-            "List contents first with `ls -la` to verify target",
-        ),
+            "Preview the target tree with `find path/ -maxdepth 2 -print` before deleting",
+        )
+        .with_command("find path/ -maxdepth 2 -print"),
         Suggestion::new(
             SuggestionKind::SaferAlternative,
-            "Use `rm -ri` for interactive confirmation of each file",
+            "Use `rm -ri` only from an interactive terminal; with stdin closed (as under an agent hook), it deletes nothing and exits 0",
         )
         .with_command("rm -ri path/"),
         Suggestion::new(
             SuggestionKind::WorkflowFix,
-            "Move to trash instead: `mv path ~/.local/share/Trash/`",
+            "Move to trash with `trash-put path/` on Linux (trash-cli), or `mv path/ ~/.Trash/` on macOS",
         ),
     ];
 
@@ -526,8 +531,8 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
     );
     // `find ... -delete` mirrors `rm -rf` (bytewise-equivalent destruction
     // on the matched tree). Reuse the same suggestion set — the safer
-    // alternatives (preview with -ls, scope to /tmp, use trash-cli) all
-    // apply identically.
+    // alternatives (preview the target tree, scope to /tmp, use a
+    // platform-appropriate trash command) all apply identically.
     m.insert(
         "core.filesystem:find-delete-root-home",
         rm_rf_suggestions.clone(),
@@ -537,8 +542,9 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         rm_rf_suggestions.clone(),
     );
     // unlink-root-home / unlink-general: same shape as rm/find-delete.
-    // Reuse the same suggestion set — the safer alternatives (preview
-    // with ls, scope to /tmp, use trash-cli) all apply identically.
+    // Reuse the same suggestion set — the safer alternatives (preview the
+    // target tree, scope to /tmp, use a platform-appropriate trash command)
+    // all apply identically.
     m.insert(
         "core.filesystem:unlink-root-home",
         rm_rf_suggestions.clone(),
@@ -600,9 +606,9 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         rm_rf_suggestions.clone(),
     );
     // redirect-truncate-*: shell-syntax truncate-equivalent. These need
-    // redirect-specific guidance — the rm_rf set (`ls -la` / `rm -ri` /
-    // move-to-trash) is about recursive deletion and reads as a non sequitur
-    // on a redirect denial (issues #316/#317).
+    // redirect-specific guidance — the rm_rf set (tree preview / `rm -ri` /
+    // move-to-trash) is about recursive deletion and reads as a non sequitur on
+    // a redirect denial (issues #316/#317).
     let redirect_truncate_suggestions = vec![
         Suggestion::new(
             SuggestionKind::PreviewFirst,
@@ -1740,6 +1746,58 @@ mod tests {
             assert!(
                 get_suggestions(rule).is_some(),
                 "Expected suggestions for {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn rm_registry_guidance_is_hook_and_platform_accurate() {
+        // These rules share `rm_rf_suggestions`, the categorized registry used
+        // by scan/trace rather than the PatternSuggestion hook renderer.
+        let rm_rules = [
+            "core.filesystem:rm-rf-root-home",
+            "core.filesystem:rm-r-f-separate-root-home",
+            "core.filesystem:rm-recursive-force-root-home",
+            "core.filesystem:rm-rf-general",
+            "core.filesystem:rm-glob-home",
+            "core.filesystem:rm-r-f-separate",
+            "core.filesystem:rm-recursive-force-long",
+        ];
+
+        for rule_id in rm_rules {
+            let suggestions = get_suggestions(rule_id)
+                .unwrap_or_else(|| panic!("missing scan/trace suggestions for {rule_id}"));
+            let preview = suggestions
+                .iter()
+                .find(|suggestion| suggestion.kind == SuggestionKind::PreviewFirst)
+                .unwrap_or_else(|| panic!("missing preview for {rule_id}"));
+            assert_eq!(
+                preview.command.as_deref(),
+                Some("find path/ -maxdepth 2 -print"),
+                "{rule_id}: find uses -maxdepth (one dash) and prints without deleting",
+            );
+            assert!(!preview.text.contains("--maxdepth"), "{rule_id}");
+
+            let interactive = suggestions
+                .iter()
+                .find(|suggestion| suggestion.kind == SuggestionKind::SaferAlternative)
+                .unwrap_or_else(|| panic!("missing safer alternative for {rule_id}"));
+            assert!(
+                interactive.text.contains("interactive terminal"),
+                "{rule_id}"
+            );
+            assert!(interactive.text.contains("stdin closed"), "{rule_id}");
+            assert!(interactive.text.contains("deletes nothing"), "{rule_id}");
+
+            let trash = suggestions
+                .iter()
+                .find(|suggestion| suggestion.kind == SuggestionKind::WorkflowFix)
+                .unwrap_or_else(|| panic!("missing trash guidance for {rule_id}"));
+            assert!(trash.text.contains("trash-put") && trash.text.contains("Linux"));
+            assert!(trash.text.contains("~/.Trash/") && trash.text.contains("macOS"));
+            assert!(
+                !trash.text.contains("~/.local/share/Trash"),
+                "{rule_id}: do not advertise the Linux trash path as portable",
             );
         }
     }

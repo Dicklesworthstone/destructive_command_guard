@@ -126,9 +126,9 @@ fn non_gated_suggestions_are_not_denied_by_their_own_pack() {
 
     for pack_id in registry.all_pack_ids() {
         let pack = registry.get(pack_id).expect("registered pack resolves");
-        for pattern in &pack.destructive_patterns {
-            let rule = pattern.name.unwrap_or("unnamed");
-            for suggestion in pattern.suggestions {
+        for rule in pack.guidance_rule_names() {
+            let (_, suggestions) = pack.rule_guidance(rule);
+            for suggestion in suggestions {
                 if suggestion.gated {
                     continue;
                 }
@@ -168,9 +168,9 @@ fn gated_suggestions_are_actually_denied_by_their_own_pack() {
 
     for pack_id in registry.all_pack_ids() {
         let pack = registry.get(pack_id).expect("registered pack resolves");
-        for pattern in &pack.destructive_patterns {
-            let rule = pattern.name.unwrap_or("unnamed");
-            for suggestion in pattern.suggestions {
+        for rule in pack.guidance_rule_names() {
+            let (_, suggestions) = pack.rule_guidance(rule);
+            for suggestion in suggestions {
                 if !suggestion.gated {
                     continue;
                 }
@@ -194,5 +194,38 @@ fn gated_suggestions_are_actually_denied_by_their_own_pack() {
         failures.is_empty(),
         "stale gated markers:\n{}",
         failures.join("\n")
+    );
+}
+
+/// Semantic classifier rules do not appear in `destructive_patterns`. Pin the
+/// extra inventory that `guidance_rule_names` contributes so the two registry-
+/// wide checks above cannot silently fall back to regex-backed rules only.
+#[test]
+fn classifier_only_guidance_participates_in_registry_wide_checks() {
+    let registry = PackRegistry::new();
+    let pack = registry
+        .get("core.filesystem")
+        .expect("core.filesystem pack resolves");
+    let pattern_names: std::collections::HashSet<_> = pack
+        .destructive_patterns
+        .iter()
+        .filter_map(|pattern| pattern.name)
+        .collect();
+    let classifier_only: Vec<_> = pack
+        .guidance_rule_names()
+        .filter(|name| !pattern_names.contains(name))
+        .collect();
+
+    assert_eq!(
+        classifier_only,
+        [
+            "rm-recursive-root-home",
+            "rm-recursive-general",
+            "rm-recursive-unverified",
+            "powershell-remove-item-recursive",
+            "rm-bare-glob",
+            "rm-bare-glob-root",
+        ],
+        "update the classifier-only inventory and keep its suggestions in the registry-wide checks",
     );
 }

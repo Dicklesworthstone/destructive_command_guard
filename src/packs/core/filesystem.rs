@@ -567,7 +567,6 @@ pub(crate) fn classifier_rule_guidance(
 /// authored guidance through `Pack::rule_guidance`: a new classifier rule
 /// without a `destructive_patterns` entry or a `classifier_rule_guidance`
 /// row would otherwise reach the blocked caller mute (#348).
-#[cfg(test)]
 pub(crate) const CLASSIFIER_RULE_NAMES: &[&str] = &[
     RM_RF_ROOT_HOME_NAME,
     RM_R_F_SEPARATE_ROOT_HOME_NAME,

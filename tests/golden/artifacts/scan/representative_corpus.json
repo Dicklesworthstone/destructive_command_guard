@@ -52,7 +52,7 @@
         "severity": "error",
         "rule_id": "core.filesystem:rm-rf-general",
         "reason": "rm -rf is destructive and requires human approval. Explain what you want to delete and why, then ask the user to run the command manually.",
-        "suggestion": "Use `rm -ri` for interactive confirmation of each file"
+        "suggestion": "Use `rm -ri` only from an interactive terminal; with stdin closed (as under an agent hook), it deletes nothing and exits 0"
       },
       {
         "file": "representative.sh",
@@ -63,7 +63,7 @@
         "severity": "error",
         "rule_id": "core.filesystem:rm-rf-root-home",
         "reason": "rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed. Ask the user to run it manually if truly needed.",
-        "suggestion": "Use `rm -ri` for interactive confirmation of each file"
+        "suggestion": "Use `rm -ri` only from an interactive terminal; with stdin closed (as under an agent hook), it deletes nothing and exits 0"
       }
     ]
   },
