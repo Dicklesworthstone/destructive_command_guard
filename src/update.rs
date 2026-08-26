@@ -952,31 +952,58 @@ fn disable_env_flag_enabled(value: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// #320: provenance classification distinguishes release builds, local
-    /// builds ahead of the tag, and metadata-free builds.
+    /// #320/#344: a release marker is fallback evidence for builds where git
+    /// metadata is unavailable, not permission to contradict explicit git
+    /// state.
+    #[test]
+    fn release_marker_only_fills_unusable_git_metadata() {
+        for describe in [None, Some(""), Some("VERGEN_IDEMPOTENT_OUTPUT")] {
+            assert_eq!(
+                classify_provenance(describe, Some("1"), "0.11.0"),
+                BuildProvenance::Release,
+                "{describe:?}"
+            );
+        }
+
+        for describe in ["v0.11.0-7-gabc1234", "v0.11.0-dirty", "v0.10.0"] {
+            assert_eq!(
+                classify_provenance(Some(describe), Some("1"), "0.11.0"),
+                BuildProvenance::LocalAheadOfRelease {
+                    describe: describe.to_string()
+                },
+                "release marker must not bless explicit git state: {describe}"
+            );
+        }
+    }
+
+    /// #320/#344: exact matching tag metadata is independently sufficient,
+    /// while documented falsey marker values cannot manufacture provenance.
     #[test]
     fn classify_provenance_covers_release_local_and_unknown() {
-        // Explicit release marker wins regardless of git state.
-        assert_eq!(
-            classify_provenance(Some("v0.11.0-7-gabc1234"), Some("1"), "0.11.0"),
-            BuildProvenance::Release
-        );
-        // A falsy/empty marker does not count as a release marker.
-        assert_eq!(
-            classify_provenance(None, Some("0"), "0.11.0"),
-            BuildProvenance::Unknown
-        );
-        assert_eq!(
-            classify_provenance(None, Some(""), "0.11.0"),
-            BuildProvenance::Unknown
-        );
-        // Clean checkout exactly at the version's tag.
-        assert_eq!(
-            classify_provenance(Some("v0.11.0"), None, "0.11.0"),
-            BuildProvenance::Release
-        );
-        // Commits past the tag, dirty worktrees, and describes rooted at an
-        // older tag are all local builds.
+        for release_marker in [None, Some("1"), Some("true"), Some("yes"), Some("on")] {
+            assert_eq!(
+                classify_provenance(Some("v0.11.0"), release_marker, "0.11.0"),
+                BuildProvenance::Release,
+                "{release_marker:?}"
+            );
+        }
+
+        for release_marker in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("NO"),
+            Some("n"),
+            Some("Off"),
+        ] {
+            assert_eq!(
+                classify_provenance(None, release_marker, "0.11.0"),
+                BuildProvenance::Unknown,
+                "{release_marker:?}"
+            );
+        }
+
         for describe in ["v0.11.0-7-gabc1234", "v0.11.0-dirty", "v0.10.0-40-gdeadbee"] {
             assert_eq!(
                 classify_provenance(Some(describe), None, "0.11.0"),
@@ -986,19 +1013,14 @@ mod tests {
                 "{describe}"
             );
         }
-        // No metadata (registry tarball) and the vergen placeholder.
-        assert_eq!(
-            classify_provenance(None, None, "0.11.0"),
-            BuildProvenance::Unknown
-        );
-        assert_eq!(
-            classify_provenance(Some("VERGEN_IDEMPOTENT_OUTPUT"), None, "0.11.0"),
-            BuildProvenance::Unknown
-        );
-        assert_eq!(
-            classify_provenance(Some(""), None, "0.11.0"),
-            BuildProvenance::Unknown
-        );
+
+        for describe in [None, Some("VERGEN_IDEMPOTENT_OUTPUT"), Some("")] {
+            assert_eq!(
+                classify_provenance(describe, None, "0.11.0"),
+                BuildProvenance::Unknown,
+                "{describe:?}"
+            );
+        }
     }
 
     /// win-test-rollback-bom: the Windows rename-then-copy executable swap must

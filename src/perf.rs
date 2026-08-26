@@ -602,6 +602,46 @@ mod tests {
         );
     }
 
+    /// #351: the release fleet gate must fail if long-lived signatures are
+    /// absent or if any probe silently skips their verification.
+    #[test]
+    fn fleet_install_gate_requires_minisign_on_every_platform() {
+        let fleet = include_str!("../scripts/e2e_fleet_install.sh");
+        let unix_probe = fleet
+            .split("unix_probe() {")
+            .nth(1)
+            .and_then(|rest| rest.split("windows_probe() {").next())
+            .expect("fleet gate must retain its Unix probe");
+        let windows_probe = fleet
+            .split("windows_probe() {")
+            .nth(1)
+            .and_then(|rest| rest.split("EXPECTED_CASES=(").next())
+            .expect("fleet gate must retain its Windows probe");
+        let expected_cases = fleet
+            .split("EXPECTED_CASES=(")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .expect("fleet gate must retain its probe completeness contract");
+
+        assert!(
+            unix_probe.contains("--require-minisign --verify --no-configure"),
+            "Unix fleet installs must require a valid minisign signature"
+        );
+        assert!(
+            windows_probe.contains("-RequireMinisign -Verify -NoConfigure"),
+            "Windows fleet installs must require a valid minisign signature"
+        );
+        assert!(
+            expected_cases.contains("minisign_verified"),
+            "a truncated probe must not pass without reporting signature verification"
+        );
+        assert!(
+            !unix_probe.contains("RESULT:minisign_verified:SKIP")
+                && !windows_probe.contains("Emit 'minisign_verified' 'SKIP'"),
+            "release probes must fail rather than skip missing signature evidence"
+        );
+    }
+
     #[test]
     fn fail_open_threshold() {
         assert!(!exceeds_absolute_budget(Duration::from_millis(999)));

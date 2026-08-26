@@ -3936,6 +3936,127 @@ mod tests {
         }
     }
 
+    fn executable_scoped_test_pack() -> Pack {
+        Pack::new(
+            "test.executable_scope".to_string(),
+            "Executable scope test",
+            "Exercises executable-scoped low-level pack APIs",
+            &["danger"],
+            Vec::new(),
+            vec![crate::destructive_pattern!(
+                "dangerous-operation",
+                r"\bdanger\b",
+                "guardctl danger is destructive",
+                High,
+                executables = ["guardctl"]
+            )],
+        )
+    }
+
+    #[test]
+    fn direct_pack_matching_honors_executable_scope_issue_289() {
+        let pack = executable_scoped_test_pack();
+
+        for command in [
+            "guardctl danger",
+            "sudo /opt/tools/GUARDCTL.EXE danger",
+            "printf danger; guardctl danger",
+        ] {
+            assert_eq!(
+                pack.matches_destructive(command)
+                    .and_then(|matched| matched.name),
+                Some("dangerous-operation"),
+                "a match owned by the declared executable must survive: {command:?}"
+            );
+        }
+
+        for command in [
+            "printf danger",
+            "guardctl status; printf danger",
+            "$TOOL danger",
+        ] {
+            assert!(
+                pack.matches_destructive(command).is_none(),
+                "foreign or dynamic argv0 text must not satisfy executable scope: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_check_command_honors_executable_scope_issue_289() {
+        let enabled = HashSet::from(["system.permissions".to_string()]);
+
+        for command in [
+            "sudo /usr/bin/CHMOD.EXE 777 /tmp/real",
+            "printf 'chmod 777 /tmp/foreign'; chmod 777 /tmp/real",
+        ] {
+            let result = REGISTRY.check_command(command, &enabled);
+            assert!(result.blocked, "declared executable must deny: {command:?}");
+            assert_eq!(result.pack_id.as_deref(), Some("system.permissions"));
+            assert_eq!(result.pattern_name.as_deref(), Some("chmod-777"));
+        }
+
+        for command in [
+            "printf '%s' 'chmod 777 /tmp/foreign'",
+            "chmod 755 /tmp/safe; printf 'chmod 777 /tmp/foreign'",
+        ] {
+            let result = REGISTRY.check_command(command, &enabled);
+            assert!(
+                !result.blocked,
+                "a chmod-shaped match in a foreign segment must stay allowed: {command:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_store_verdicts_honor_executable_scope_issue_289() {
+        let mut store = ExternalPackStore::new();
+        let pack = executable_scoped_test_pack();
+        let pack_id = pack.id.clone();
+        store.packs.insert(pack_id.clone(), pack);
+        let enabled = HashSet::from([pack_id]);
+
+        for command in [
+            "guardctl danger",
+            "printf danger; sudo /opt/GUARDCTL.CMD danger",
+        ] {
+            let basic = store
+                .check_command(command, &enabled)
+                .expect("basic external-store verdict must preserve a governed match");
+            assert!(basic.blocked, "{command:?}: {basic:?}");
+            assert_eq!(
+                basic.pattern_name.as_deref(),
+                Some("dangerous-operation")
+            );
+
+            let detailed = store
+                .check_command_with_details(command, &enabled)
+                .expect("detailed external-store verdict must preserve a governed match");
+            assert!(detailed.blocked, "{command:?}: {detailed:?}");
+            assert_eq!(
+                detailed.pattern_name.as_deref(),
+                Some("dangerous-operation")
+            );
+        }
+
+        for command in [
+            "printf danger",
+            "guardctl status; printf danger",
+            "$TOOL danger",
+        ] {
+            assert!(
+                store.check_command(command, &enabled).is_none(),
+                "basic external-store verdict must reject a foreign-segment match: {command:?}"
+            );
+            assert!(
+                store
+                    .check_command_with_details(command, &enabled)
+                    .is_none(),
+                "detailed external-store verdict must reject a foreign-segment match: {command:?}"
+            );
+        }
+    }
+
     #[test]
     fn pack_aware_quick_reject_ignores_inert_quoted_payloads_near_shell_syntax() {
         let keywords: Vec<&str> = vec!["git", "rm", ">/", "> /"];

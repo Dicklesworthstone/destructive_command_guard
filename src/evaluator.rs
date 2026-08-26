@@ -30796,6 +30796,66 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_producer_into_powershell_preserves_consumer_diagnostics() {
+        let command = "python generate.py | pwsh";
+        let result = evaluate_with_pack_ids_in_dialect(
+            command,
+            &["core.filesystem"],
+            ShellDialect::PowerShell,
+        );
+        assert!(
+            result.is_denied(),
+            "bare PowerShell must keep treating piped stdin as executable source"
+        );
+        let info = result.pattern_info.expect("denial carries diagnostics");
+        assert_eq!(info.pack_id.as_deref(), Some("heredoc.posix"));
+        assert_eq!(info.pattern_name.as_deref(), Some("pipeline-consumer"));
+        assert!(
+            info.reason
+                .contains("producer \"python\" is not a statically modeled literal source"),
+            "producer-specific provenance must survive: {:?}",
+            info.reason
+        );
+        let consumer_start = command.find("pwsh").expect("fixture contains consumer");
+        assert_eq!(
+            info.matched_span,
+            Some(MatchSpan {
+                start: consumer_start,
+                end: consumer_start + "pwsh".len(),
+            }),
+            "diagnostic must point at the shell consuming executable stdin"
+        );
+        assert_eq!(info.matched_text_preview.as_deref(), Some("pwsh"));
+
+        for fixed_consumer in [
+            "python generate.py | pwsh -Command 'Write-Output ok'",
+            r"python generate.py | pwsh -File C:\ops\deploy.ps1",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                fixed_consumer,
+                &["core.filesystem"],
+                ShellDialect::PowerShell,
+            );
+            assert!(
+                result.is_allowed(),
+                "fixed script/file forms consume pipeline stdin as data: {fixed_consumer:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        let explicit_stdin = "python generate.py | pwsh -Command -";
+        let result = evaluate_with_pack_ids_in_dialect(
+            explicit_stdin,
+            &["core.filesystem"],
+            ShellDialect::PowerShell,
+        );
+        assert!(
+            result.is_denied(),
+            "-Command - explicitly executes pipeline stdin as source"
+        );
+    }
+
+    #[test]
     fn launcher_unverified_denials_carry_stable_allowlistable_rule_ids() {
         // #316/bd-l9jf: the fail-closed launcher-verifier family previously
         // denied as MatchSource::LegacyPattern with `rule_id: null`, so the

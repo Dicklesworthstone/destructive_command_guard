@@ -122,30 +122,26 @@ if ! curl -fsSL -o "$WORK/install.sh" "$REPO_RAW/install.sh"; then
 fi
 echo "RESULT:fetch_installer:PASS"
 
-# 2. Install the pinned version. --require-minisign makes signature
-#    verification mandatory when minisign exists; checksum is always enforced.
-MINISIGN_FLAG=""
-command -v minisign >/dev/null 2>&1 && MINISIGN_FLAG="--require-minisign"
+# 2. Install the pinned version with the release's long-lived signature as a
+#    hard requirement. This is a release gate, so a host without the verifier
+#    is missing gate infrastructure rather than evidence that may be skipped.
 INSTALL_LOG="$WORK/install.log"
 if HOME="$HOME_SANDBOX" XDG_CONFIG_HOME="$HOME_SANDBOX/.config" \
    bash "$WORK/install.sh" --version "$VERSION" --dest "$DEST" \
-     $MINISIGN_FLAG --verify --no-configure >"$INSTALL_LOG" 2>&1; then
-  echo "RESULT:install:PASS:${MINISIGN_FLAG:-checksum-only}"
+     --require-minisign --verify --no-configure >"$INSTALL_LOG" 2>&1; then
+  echo "RESULT:install:PASS:checksum+minisign"
 else
   echo "RESULT:install:FAIL:$(tail -3 "$INSTALL_LOG" | tr '\n' ' ')"
+  echo "RESULT:minisign_verified:FAIL:strict signed install did not complete"
   exit 1
 fi
 
 # 3. Prove verification actually happened (not silently skipped).
 grep -qi "checksum" "$INSTALL_LOG" && echo "RESULT:checksum_verified:PASS" \
   || echo "RESULT:checksum_verified:FAIL:no checksum evidence in installer output"
-if [ -n "$MINISIGN_FLAG" ]; then
-  grep -qi "signature.*verified\|Trusted comment" "$INSTALL_LOG" \
-    && echo "RESULT:minisign_verified:PASS" \
-    || echo "RESULT:minisign_verified:FAIL:no signature evidence"
-else
-  echo "RESULT:minisign_verified:SKIP:minisign not installed on host"
-fi
+grep -qi "signature.*verified\|Trusted comment" "$INSTALL_LOG" \
+  && echo "RESULT:minisign_verified:PASS" \
+  || echo "RESULT:minisign_verified:FAIL:no signature evidence"
 
 BIN="$DEST/dcg"
 [ -x "$BIN" ] || { echo "RESULT:binary_present:FAIL:not executable at $BIN"; exit 1; }
@@ -456,7 +452,7 @@ try {
 $log = Join-Path $work 'install.log'
 try {
   & ([scriptblock]::Create($installerSource)) -Version $Version -Dest $dest `
-      -Verify -NoConfigure *> $log
+      -RequireMinisign -Verify -NoConfigure *> $log
   Emit 'install' 'PASS'
 } catch {
   $tail = ''
@@ -467,7 +463,7 @@ try {
 $logText = ''
 if (Test-Path $log) { $logText = Get-Content $log -Raw -ErrorAction SilentlyContinue }
 if ($logText -match '(?i)checksum') { Emit 'checksum_verified' 'PASS' } else { Emit 'checksum_verified' 'FAIL' 'no checksum evidence in installer output' }
-if ($logText -match '(?i)signature.*verified|Trusted comment') { Emit 'minisign_verified' 'PASS' } else { Emit 'minisign_verified' 'SKIP' 'minisign/cosign unavailable or not exercised' }
+if ($logText -match '(?i)signature.*verified|Trusted comment') { Emit 'minisign_verified' 'PASS' } else { Emit 'minisign_verified' 'FAIL' 'strict minisign verification did not complete' }
 
 $bin = Join-Path $dest 'dcg.exe'
 if (Test-Path $bin) {
@@ -586,7 +582,7 @@ PSEOF
 # ---------------------------------------------------------------------------
 # Every probe must announce probe_complete. Without this, a probe that dies
 # halfway through (bad quoting, crashed shell) looks like a clean pass.
-EXPECTED_CASES=(fetch_installer install checksum_verified binary_present
+EXPECTED_CASES=(fetch_installer install checksum_verified minisign_verified binary_present
                 version_match effective_budget hook_deny hook_allow
                 no_indeterminate_verdicts latency_under_budget probe_complete)
 
