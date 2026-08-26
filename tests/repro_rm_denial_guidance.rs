@@ -17,19 +17,29 @@
 //! rules — `find -delete`, `unlink`, `truncate`, `shred` — were never
 //! affected; they deliver their explanations through the pattern list.
 //!
-//! These tests assert the guidance is carried, and that it comes from the rule
-//! that actually matched: an implementation that attached the first rm
+//! These tests assert the guidance is carried, that it comes from the rule
+//! that actually matched, and that every rule the classifier can attribute a
+//! denial to has text of its own. An implementation that attached the first rm
 //! explanation it found, or a single shared blurb, fails
-//! `explanation_comes_from_the_matching_rule_not_any_rm_rule`.
+//! `explanation_comes_from_the_matching_rule_not_any_rm_rule` and
+//! `no_two_classifier_rules_share_one_explanation`.
+//!
+//! Four of those rules — `rm-recursive-general`, `rm-recursive-root-home`,
+//! `rm-recursive-unverified`, `powershell-remove-item-recursive` — have no
+//! regex to hang an explanation on, so the pack authors theirs beside the
+//! classifier instead. `every_classifier_rule_carries_its_own_guidance` drives
+//! all ten through the public evaluator so no rule can be wired and untested.
 
+use destructive_command_guard::Agent;
 use destructive_command_guard::config::Config;
 use destructive_command_guard::evaluator::{EvaluationResult, evaluate_command};
 use destructive_command_guard::load_default_allowlists;
+use destructive_command_guard::packs::REGISTRY;
 
 /// Distinctive sentence that only `rm-rf-general` authors.
 const GENERAL_MARKER: &str = "Wildcards can expand to match more than expected";
 /// Distinctive sentence that only `rm-rf-root-home` authors.
-const ROOT_HOME_MARKER: &str = "dcg auto-allows recursive deletion only for literal temp paths";
+const ROOT_HOME_MARKER: &str = "Boot files, making the system unbootable";
 /// Placeholder the caller used to receive instead of real guidance.
 const PLACEHOLDER: &str = "No additional explanation is available yet";
 
@@ -37,13 +47,11 @@ fn evaluate(cmd: &str) -> EvaluationResult {
     let config = Config::default();
     let compiled_overrides = config.overrides.compile();
     let allowlists = load_default_allowlists();
-    evaluate_command(
-        cmd,
-        &config,
-        &["rm", "find", "shred", "truncate", "unlink"],
-        &compiled_overrides,
-        &allowlists,
-    )
+    // The production keyword set, not a hand-picked one: a rule that only the
+    // real prefilter can reach must be reachable here too.
+    let enabled_packs = config.enabled_pack_ids_for_agent(&Agent::ClaudeCode);
+    let keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+    evaluate_command(cmd, &config, &keywords, &compiled_overrides, &allowlists)
 }
 
 fn denial_parts(cmd: &str) -> (String, String) {
@@ -138,12 +146,6 @@ fn explanation_comes_from_the_matching_rule_not_any_rm_rule() {
 
 /// One classifier decides every rm flag style, so the same drop hit all of
 /// them. Each style resolves to its own rule and must find its own text.
-///
-/// `rm-recursive-general` and `rm-recursive-root-home` are absent here on
-/// purpose: the pack authors no explanation for either, so there is nothing
-/// for this lookup to deliver and they still report the placeholder. That is a
-/// separate gap in the pack data, not in the wiring. Adding their text is all
-/// it takes to move them into this table.
 #[test]
 fn every_rm_flag_style_carries_its_own_explanation() {
     for (cmd, expected_rule) in [
@@ -166,26 +168,80 @@ fn every_rm_flag_style_carries_its_own_explanation() {
     }
 }
 
-/// Pins the remaining gap so it is visible rather than silently tolerated:
-/// these two rules are wired correctly and still report the placeholder,
-/// because the pack has no text for them. When someone authors it, this test
-/// fails and the rules move into the table above.
+/// Every rule the classifier can attribute a denial to, driven through the
+/// public evaluator. Four of these have no `destructive_patterns` entry, so a
+/// name-keyed lookup against the pattern list alone leaves them on the
+/// placeholder; that is the shape of the bug this file exists for, one level
+/// deeper than the flag styles above.
 #[test]
-fn rules_with_no_authored_text_are_the_only_ones_left_on_the_placeholder() {
-    for (cmd, expected_rule) in [
-        ("rm -r ./build", "rm-recursive-general"),
-        ("rm -r ~/some-project", "rm-recursive-root-home"),
-    ] {
-        let result = evaluate(cmd);
-        assert!(result.is_denied(), "expected '{cmd}' to be denied");
-        let info = result.pattern_info.expect("pattern info");
-        assert_eq!(info.pattern_name.as_deref(), Some(expected_rule));
+fn every_classifier_rule_carries_its_own_guidance() {
+    for (cmd, expected_rule) in CLASSIFIER_CASES {
+        let (rule, explanation) = denial_parts(cmd);
+        assert_eq!(rule, *expected_rule, "unexpected rule for '{cmd}'");
         assert!(
-            info.explanation.is_none(),
-            "'{expected_rule}' now has authored text — move it into              every_rm_flag_style_carries_its_own_explanation"
+            explanation.len() > 120,
+            "'{cmd}' explanation is too short to be the authored text: {explanation}"
+        );
+        assert!(
+            ACCEPTED_FORMS.iter().any(|form| explanation.contains(form)),
+            "'{cmd}' was blocked by {rule} without naming a command dcg accepts: {explanation}"
         );
     }
 }
+
+/// The discriminating half of the coverage test. Authoring one shared blurb
+/// for the four uncovered rules would satisfy every assertion above.
+#[test]
+fn no_two_classifier_rules_share_one_explanation() {
+    let mut seen: Vec<(&str, String)> = Vec::new();
+    for (cmd, rule) in CLASSIFIER_CASES {
+        let (_, explanation) = denial_parts(cmd);
+        if let Some((other, _)) = seen.iter().find(|(_, text)| *text == explanation) {
+            panic!("{rule} reuses the explanation authored for {other}");
+        }
+        seen.push((rule, explanation));
+    }
+}
+
+/// Every rule name the `core.filesystem` classifier can produce, with a
+/// command that reaches it.
+const CLASSIFIER_CASES: &[(&str, &str)] = &[
+    ("rm -rf ./build", "rm-rf-general"),
+    ("rm -r -f ./build", "rm-r-f-separate"),
+    ("rm --recursive --force ./build", "rm-recursive-force-long"),
+    ("rm -rf ~/some-project", "rm-rf-root-home"),
+    ("rm -r -f ~/some-project", "rm-r-f-separate-root-home"),
+    (
+        "rm --recursive --force ~/some-project",
+        "rm-recursive-force-root-home",
+    ),
+    ("rm -r ./build", "rm-recursive-general"),
+    ("rm -r ~/some-project", "rm-recursive-root-home"),
+    (
+        r"find /bin/rm -maxdepth 0 -exec {} -r ./tree \;",
+        "rm-recursive-unverified",
+    ),
+    // The PowerShell branch of the same classifier. `Remove-Item` is a
+    // keyword of the Windows packs, which are off on this host, so the
+    // reachable shape here is a PowerShell payload that another enabled
+    // keyword lets past the prefilter.
+    (
+        r#"pwsh -NoProfile -Command "rm -r ./a; Remove-Item -Recurse ./b""#,
+        "powershell-remove-item-recursive",
+    ),
+];
+
+/// Commands dcg accepts as written, or accepts for the temp paths it
+/// auto-allows. An explanation that names none of them leaves the caller with
+/// nothing to run instead.
+const ACCEPTED_FORMS: &[&str] = &[
+    "rm -ri",
+    "/tmp/delete-me-",
+    "~/.Trash",
+    "ls -la",
+    "Get-ChildItem",
+    "-WhatIf",
+];
 
 /// Negative control: restoring guidance must not turn an allowed command into
 /// a denial. These are the cleanup forms the explanation now advertises.
@@ -196,6 +252,9 @@ fn advertised_cleanup_forms_stay_allowed() {
         "mv ./build /tmp/delete-me-1787702991",
         "rm -rf /tmp/scratch-1787702991/build",
         "ls -la ./build",
+        // The PowerShell forms the new explanation advertises, in the payload
+        // shape that reaches the classifier at all.
+        r#"pwsh -NoProfile -Command "rm -ri ./a; Remove-Item -Recurse -WhatIf ./b""#,
     ] {
         assert!(
             !evaluate(cmd).is_denied(),

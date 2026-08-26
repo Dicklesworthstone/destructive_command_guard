@@ -352,6 +352,176 @@ const RM_RECURSIVE_UNVERIFIED_REASON: &str = "a dynamically resolved executable 
 const POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME: &str = "powershell-remove-item-recursive";
 const POWERSHELL_REMOVE_ITEM_RECURSIVE_REASON: &str = "PowerShell Remove-Item (or an alias) with -Recurse permanently deletes an entire item tree without using the Recycle Bin.";
 
+/// Suggestions for a recursive `rm` that carries no force flag.
+const RM_RECURSIVE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "rm -ri {path}",
+        "Interactive mode: confirms each file before deletion — needs a terminal; with stdin closed it deletes nothing and exits 0",
+    ),
+    PatternSuggestion::with_platform(
+        "mv {path} ~/.Trash/",
+        "Move to the Finder trash — macOS has no ~/.local/share/Trash",
+        Platform::MacOS,
+    ),
+    PatternSuggestion::with_platform(
+        "trash-put {path}",
+        "Move to trash instead of permanent deletion (requires trash-cli)",
+        Platform::Linux,
+    ),
+    PatternSuggestion::new(
+        "mv {path} /tmp/delete-me-{timestamp}",
+        "Move the tree aside instead of deleting it, then remove the holding copy after review",
+    ),
+    PatternSuggestion::new(
+        "ls -la {path}",
+        "List what the path holds before removing it",
+    ),
+];
+
+/// Suggestions for a recursive delete whose command word is decided at run time.
+const RM_UNVERIFIED_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "rm -r {path}",
+        "Name the executable literally so the command can be read before it runs",
+    ),
+    PatternSuggestion::new(
+        "echo {command}",
+        "Print the assembled command first, then run the literal text it produced",
+    ),
+    PatternSuggestion::new(
+        "ls -la {path}",
+        "List what the path holds before removing it",
+    ),
+];
+
+/// Suggestions for PowerShell `Remove-Item -Recurse`.
+const POWERSHELL_REMOVE_ITEM_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::with_platform(
+        "Get-ChildItem -Recurse {path}",
+        "List the item tree before removing it",
+        Platform::Windows,
+    ),
+    PatternSuggestion::with_platform(
+        "Remove-Item -Recurse -WhatIf {path}",
+        "Report what the removal would do without removing anything",
+        Platform::Windows,
+    ),
+    PatternSuggestion::with_platform(
+        "Move-Item {path} $env:TEMP\\delete-me-{timestamp}",
+        "Move the tree aside instead of deleting it, then remove the holding copy after review",
+        Platform::Windows,
+    ),
+];
+
+/// Every rule name the semantic rm/PowerShell classifier can attribute a
+/// denial to.
+///
+/// A classifier rule has no regex, so a reader cannot find it by scanning
+/// `destructive_patterns`, and neither can the guidance lookup. Keep this list
+/// complete: `classifier_rule_name_list_stays_complete` fails when a `*_NAME`
+/// constant is added to this module without a row here, and
+/// `every_classifier_rule_name_has_authored_guidance` fails when a listed rule
+/// has nothing to tell the caller it just blocked.
+#[cfg(test)]
+pub(crate) const CLASSIFIER_RULE_NAMES: &[&str] = &[
+    RM_RF_ROOT_HOME_NAME,
+    RM_R_F_SEPARATE_ROOT_HOME_NAME,
+    RM_RECURSIVE_FORCE_ROOT_HOME_NAME,
+    RM_RF_GENERAL_NAME,
+    RM_R_F_SEPARATE_NAME,
+    RM_RECURSIVE_FORCE_NAME,
+    RM_RECURSIVE_ROOT_HOME_NAME,
+    RM_RECURSIVE_GENERAL_NAME,
+    RM_RECURSIVE_UNVERIFIED_NAME,
+    POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME,
+];
+
+/// Explanation and safer-alternative suggestions for the classifier rules that
+/// no `destructive_patterns` entry covers.
+///
+/// A regex rule carries its guidance on the pattern itself. These four rules
+/// exist only inside the classifier, so their guidance lives here, keyed by
+/// rule name. The rows are text: adding one cannot change what the guard
+/// blocks, only what a blocked caller is told.
+const CLASSIFIER_ONLY_GUIDANCE: &[(&str, &str, &[PatternSuggestion])] = &[
+    (
+        RM_RECURSIVE_GENERAL_NAME,
+        "rm -r deletes a directory and everything under it. Leaving off -f does not bound \
+         the command: -f decides whether errors are reported and whether a write-protected \
+         file is queried, and that query reaches you only when stdin is a terminal, which \
+         it is not under an agent hook. Everything the process can unlink, it unlinks.\n\n\
+         dcg auto-allows recursive deletion only for literal temp paths:\n  \
+         rm -r /tmp/<subdir>/scratch\n\n\
+         For any other directory, preview first, then either delete interactively or move \
+         the tree aside (dcg allows both forms):\n  \
+         ls -la /path/to/directory\n  \
+         rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+         mv /path/to/directory /tmp/delete-me-<literal-timestamp>\n\n\
+         The trash directory is ~/.Trash on macOS and ~/.local/share/Trash on Linux.",
+        RM_RECURSIVE_SUGGESTIONS,
+    ),
+    (
+        RM_RECURSIVE_ROOT_HOME_NAME,
+        "A recursive rm rooted at /, ~, or $HOME removes the account or the machine, and \
+         leaving off -f changes nothing about that: -f decides whether errors are reported, \
+         not what is deleted.\n\n\
+         There is NO recovery without backups. Even with backups, full restoration takes \
+         hours to days.\n\n\
+         If one directory under the home was meant, name it in full and delete that \
+         instead:\n  \
+         rm -r ~/projects/scratch-build   # a specific path, still reviewed\n  \
+         rm -r ~                          # never this\n\n\
+         dcg auto-allows recursive deletion only for literal temp paths:\n  \
+         rm -r /tmp/<subdir>/scratch\n\n\
+         For a specific directory, preview first, then either delete interactively or \
+         move the tree aside (dcg allows both forms):\n  \
+         ls -la /path/to/directory\n  \
+         rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+         mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
+        RM_RF_ROOT_HOME_SUGGESTIONS,
+    ),
+    (
+        RM_RECURSIVE_UNVERIFIED_NAME,
+        "The command word is decided at run time, so dcg cannot read which binary will run, \
+         and the arguments beside it are recursive deletion syntax. A find -exec placeholder \
+         is filled from the search result, and PowerShell splatting takes both the flags and \
+         the path from a hashtable, so in either form the deletion target is assembled after \
+         the check would have run. dcg fails closed here rather than guess.\n\n\
+         Make the command word literal and the command gets the ordinary recursive-rm \
+         decision instead:\n  \
+         rm -r ./tree\n\n\
+         If the command really must be assembled, print the assembled text first and run \
+         that literal text. Reading the tree costs nothing and is always accepted:\n  \
+         ls -la /path/to/directory",
+        RM_UNVERIFIED_SUGGESTIONS,
+    ),
+    (
+        POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME,
+        "Remove-Item -Recurse deletes the whole item tree immediately. PowerShell has no \
+         Recycle Bin step: the cmdlet unlinks, and nothing lands anywhere recoverable.\n\n\
+         Preview and safer forms:\n  \
+         Get-ChildItem -Recurse <path>          # list the tree first\n  \
+         Remove-Item -Recurse -WhatIf <path>    # report the removal without doing it\n  \
+         Move-Item <path> $env:TEMP\\delete-me-<literal-timestamp>\n\n\
+         To recycle rather than delete, call \
+         Microsoft.VisualBasic.FileIO.FileSystem::DeleteDirectory with SendToRecycleBin.",
+        POWERSHELL_REMOVE_ITEM_SUGGESTIONS,
+    ),
+];
+
+/// Guidance authored for a rule that only the classifier can emit.
+///
+/// Returns `None` for every rule the pack's `destructive_patterns` list already
+/// covers, so the pattern's own text stays authoritative.
+pub(crate) fn classifier_only_guidance(
+    name: &str,
+) -> Option<(&'static str, &'static [PatternSuggestion])> {
+    CLASSIFIER_ONLY_GUIDANCE
+        .iter()
+        .find(|(rule, _, _)| *rule == name)
+        .map(|(_, explanation, suggestions)| (*explanation, *suggestions))
+}
+
 pub(crate) fn is_pre_rm_propagation_rule(name: Option<&str>) -> bool {
     matches!(
         name,
@@ -3402,7 +3572,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             Critical,
             "Separate `-r -f` flags on `/` or `~` have identical effect to `rm -rf /`: \
              recursive, forced, silent deletion of the entire filesystem or home directory.\n\n\
-             There is NO recovery without backups. Run only if truly intended.",
+             There is NO recovery without backups. Run only if truly intended.\n\n\
+             For a specific directory, preview first, then either delete interactively \
+             or move the tree aside (dcg allows both forms):\n  \
+             ls -la /path/to/directory\n  \
+             rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // Same root/home catastrophe but with LONG flags
@@ -3413,7 +3588,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "rm --recursive --force targeting root or home is EXTREMELY DANGEROUS.",
             Critical,
             "The long-flag form has identical effect to `rm -rf /`: recursive, forced, \
-             silent deletion. Run only if truly intended.",
+             silent deletion. Run only if truly intended.\n\n\
+             For a specific directory, preview first, then either delete interactively \
+             or move the tree aside (dcg allows both forms):\n  \
+             ls -la /path/to/directory\n  \
+             rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // General rm -rf (caught after safe patterns) - High because temp paths are allowed
@@ -3462,7 +3642,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Safer alternatives:\n\
              - Preview the expansion first: `ls ~/Downloads/*.md`\n\
              - Delete explicitly named files: `rm ~/Downloads/one-file.md`\n\
-             - Move to trash instead: `mv ~/Downloads/*.md ~/.local/share/Trash/`",
+             - Move to trash instead: `mv ~/Downloads/*.md ~/.Trash/` on macOS, `~/.local/share/Trash/` on Linux",
             RM_RF_GENERAL_SUGGESTIONS
         ),
         // rm -r -f (separate flags)
@@ -3508,7 +3688,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Use absolute paths to avoid ambiguity\n\
              - Consider using trash-cli for recoverable deletion\n\n\
              Preview command:\n  \
-             find /path --maxdepth 2 -ls | head -30",
+             find /path -maxdepth 2 -ls | head -30\n\n\
+             Forms dcg accepts instead:\n  \
+             rm --recursive --force /tmp/<subdir>   # literal temp paths are allowed\n  \
+             rm -ri /path/to/directory              # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
             RM_RECURSIVE_FORCE_SUGGESTIONS
         ),
         // ----- `find ... -delete` (Critical: root/home target) -----
@@ -6964,5 +7148,98 @@ mod tests {
         ] {
             assert_blocks_with_pattern(&pack, command, "redirect-truncate-root-home");
         }
+    }
+}
+#[cfg(test)]
+mod classifier_guidance_tests {
+    use super::*;
+
+    /// The text a caller sees when nothing was authored for the rule that
+    /// blocked it.
+    const PLACEHOLDER: &str = "No additional explanation is available yet";
+
+    /// Commands dcg lets through unchanged, or lets through for the temp paths
+    /// it auto-allows. An explanation that names none of them tells the caller
+    /// only that it lost.
+    const ACCEPTED_FORMS: &[&str] = &[
+        "rm -ri",
+        "/tmp/delete-me-",
+        "~/.Trash",
+        "ls -la",
+        "Get-ChildItem",
+        "-WhatIf",
+    ];
+
+    #[test]
+    fn every_classifier_rule_name_has_authored_guidance() {
+        let pack = create_pack();
+        for &name in CLASSIFIER_RULE_NAMES {
+            let (explanation, suggestions) = pack.pattern_guidance(name);
+            let explanation = explanation.unwrap_or_else(|| {
+                panic!("classifier rule {name} blocks callers with no explanation")
+            });
+            assert!(
+                !explanation.contains(PLACEHOLDER),
+                "classifier rule {name} falls back to the placeholder"
+            );
+            assert!(
+                explanation.len() > 120,
+                "classifier rule {name} explains itself in {} characters, which is not \
+                 enough to say which cleanup form is accepted",
+                explanation.len()
+            );
+            assert!(
+                ACCEPTED_FORMS.iter().any(|form| explanation.contains(form)),
+                "classifier rule {name} says what is blocked but names no command dcg \
+                 accepts, so the blocked caller has nothing to run instead"
+            );
+            assert!(
+                !suggestions.is_empty(),
+                "classifier rule {name} offers no safer alternative"
+            );
+        }
+    }
+
+    /// Each rule must describe itself, not borrow another rule's text. Without
+    /// this, one shared explanation attached to all ten would satisfy the test
+    /// above while telling a PowerShell caller about `rm -ri`.
+    /// Each rule must describe itself, not borrow another rule's text. Without
+    /// this, one shared explanation attached to all ten would satisfy the test
+    /// above while telling a PowerShell caller about `rm -ri`.
+    #[test]
+    fn classifier_rules_do_not_share_one_explanation() {
+        let pack = create_pack();
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for &name in CLASSIFIER_RULE_NAMES {
+            let explanation = pack
+                .pattern_guidance(name)
+                .0
+                .expect("every classifier rule has an explanation");
+            if let Some((other, _)) = seen.iter().find(|(_, text)| *text == explanation) {
+                panic!("{name} reuses the explanation authored for {other}");
+            }
+            seen.push((name, explanation));
+        }
+    }
+
+    /// The rule-name list is hand-maintained, so guard it against the source it
+    /// is meant to mirror: every classifier rule name in this module is a
+    /// top-level `*_NAME` constant, and each one needs a row above.
+    #[test]
+    fn classifier_rule_name_list_stays_complete() {
+        let source = include_str!("filesystem.rs");
+        let declared: Vec<&str> = source
+            .lines()
+            .filter(|line| line.starts_with("const ") && line.contains("_NAME: &str"))
+            .collect();
+        assert_eq!(
+            declared.len(),
+            CLASSIFIER_RULE_NAMES.len(),
+            "this module declares {} rule-name constants but CLASSIFIER_RULE_NAMES lists {}. \
+             Add the new rule to CLASSIFIER_RULE_NAMES and author its explanation, or the \
+             denial reaches the blocked caller with no guidance.\ndeclared: {declared:#?}",
+            declared.len(),
+            CLASSIFIER_RULE_NAMES.len()
+        );
     }
 }

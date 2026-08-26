@@ -813,9 +813,18 @@ impl Pack {
         self.destructive_patterns
             .iter()
             .find(|pattern| pattern.name == Some(name))
-            .map_or((None, &[][..]), |pattern| {
-                (pattern.explanation, pattern.suggestions)
-            })
+            .map_or_else(
+                || {
+                    // Rules that live only inside a semantic classifier have no
+                    // pattern to carry their text, so their guidance is authored
+                    // beside the classifier instead.
+                    core::filesystem::classifier_only_guidance(name)
+                        .map_or((None, &[][..]), |(explanation, suggestions)| {
+                            (Some(explanation), suggestions)
+                        })
+                },
+                |pattern| (pattern.explanation, pattern.suggestions),
+            )
     }
 
     fn destructive_match_by_name(&self, name: &str) -> Option<DestructiveMatch> {
