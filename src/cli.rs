@@ -12967,6 +12967,20 @@ fn omp_default_agent_dir_from(
     std::path::PathBuf::from(agent_dir_override)
 }
 
+fn omp_coding_agent_dir_env_value(
+    value: Option<std::ffi::OsString>,
+) -> std::io::Result<Option<std::ffi::OsString>> {
+    #[cfg(unix)]
+    if value.as_ref().is_some_and(|value| value.to_str().is_none()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "PI_CODING_AGENT_DIR must contain valid UTF-8 on Unix; OMP reads environment paths as JavaScript strings",
+        ));
+    }
+
+    Ok(value)
+}
+
 /// OMP's active user agent directory. The default is `~/.omp/agent`; named
 /// profiles live under `~/.omp/profiles/<name>/agent`. OMP ignores the legacy
 /// `PI_CODING_AGENT_DIR` override when a named profile is active, so dcg does
@@ -13003,7 +13017,8 @@ fn omp_user_agent_dir() -> std::io::Result<std::path::PathBuf> {
         Ok(OmpProfileEnvValue::Named(profile)) => Some(profile),
         Ok(OmpProfileEnvValue::Absent | OmpProfileEnvValue::Default) | Err(_) => None,
     };
-    let agent_dir_override = std::env::var_os("PI_CODING_AGENT_DIR");
+    let agent_dir_override =
+        omp_coding_agent_dir_env_value(std::env::var_os("PI_CODING_AGENT_DIR"))?;
     Ok(omp_default_agent_dir_from(
         &config_root,
         agent_dir_override.as_deref(),
@@ -22878,6 +22893,53 @@ console.log(JSON.stringify({
         let error = executable_javascript_literal(std::path::Path::new(&invalid))
             .expect_err("non-UTF-8 paths cannot be represented faithfully in JavaScript");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn omp_agent_dir_override_rejects_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        assert_eq!(
+            omp_coding_agent_dir_env_value(Some(std::ffi::OsString::from("relative-agent")))
+                .expect("Unicode override"),
+            Some(std::ffi::OsString::from("relative-agent"))
+        );
+        assert_eq!(
+            omp_coding_agent_dir_env_value(Some(std::ffi::OsString::new()))
+                .expect("empty override"),
+            Some(std::ffi::OsString::new()),
+            "the downstream default-profile resolver owns empty-value handling"
+        );
+        assert_eq!(
+            omp_coding_agent_dir_env_value(None).expect("absent override"),
+            None
+        );
+
+        let invalid = std::ffi::OsString::from_vec(b"agent-\xff".to_vec());
+        let error = omp_coding_agent_dir_env_value(Some(invalid))
+            .expect_err("OMP cannot address a raw-byte-only extension directory");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("PI_CODING_AGENT_DIR"));
+        assert!(error.to_string().contains("valid UTF-8 on Unix"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn omp_agent_dir_override_preserves_native_windows_wide_values() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        let units = [0x0061, 0x0067, 0x0065, 0x006e, 0x0074, 0xd800];
+        let value = std::ffi::OsString::from_wide(&units);
+        assert!(
+            value.to_str().is_none(),
+            "fixture must not coerce to String"
+        );
+        let preserved = omp_coding_agent_dir_env_value(Some(value.clone()))
+            .expect("Windows override")
+            .expect("present override");
+        assert_eq!(preserved, value);
+        assert_eq!(preserved.encode_wide().collect::<Vec<_>>(), units);
     }
 
     #[test]
