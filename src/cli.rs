@@ -21695,8 +21695,8 @@ console.log(JSON.stringify({
             String::from_utf8_lossy(&unsafe_signal_mutant_output.stderr)
         );
 
-        let safe_invalid_exit_detail = r#"return ` (exit status invalid: ${typeof exitCode})`;"#;
-        let unsafe_invalid_exit_detail = r#"return ` (exit status ${typeof exitCode} ${describeChildCollectionFailure(exitCode)})`;"#;
+        let safe_invalid_exit_detail = r"return ` (exit status invalid: ${typeof exitCode})`;";
+        let unsafe_invalid_exit_detail = r"return ` (exit status ${typeof exitCode} ${describeChildCollectionFailure(exitCode)})`;";
         assert_eq!(
             source.matches(safe_invalid_exit_detail).count(),
             1,
