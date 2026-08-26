@@ -1155,6 +1155,22 @@ unconfigure_opencode() {
     return 0
 }
 
+# Validate the complete profile value as one ASCII pathname component. A
+# line-oriented grep would accept a valid first line and ignore an injected
+# second line, so keep this check inside Bash's whole-string pattern matcher.
+omp_profile_has_ascii_shape() {
+    local profile="$1"
+    case "$profile" in
+        [abcdefghijklmnopqrstuvwxyz0123456789]*)
+            case "$profile" in
+                *[!abcdefghijklmnopqrstuvwxyz0123456789._-]*) return 1 ;;
+                *) return 0 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 # Mirror Node's POSIX `path.join(HOME, PI_CONFIG_DIR || ".omp")` lexically.
 # Backslashes are ordinary POSIX filename bytes; only `/` separates components.
 resolve_omp_uninstall_config_root() {
@@ -1222,7 +1238,12 @@ collect_omp_uninstall_extensions() {
     # confirmation, so a file changed between the two phases is never removed
     # based on stale inventory.
     local config_root
-    config_root=$(resolve_omp_uninstall_config_root)
+    # Command substitution strips every trailing LF. Keep a non-LF sentinel
+    # after the resolver's framing newline, then remove exactly the sentinel and
+    # framing byte so LF bytes belonging to the path remain intact.
+    config_root=$(resolve_omp_uninstall_config_root; printf '\034')
+    config_root="${config_root%$'\034'}"
+    config_root="${config_root%$'\n'}"
     local agent_dir="$config_root/agent"
     local profile=""
     if [ "${OMP_PROFILE+x}" = "x" ]; then
@@ -1250,7 +1271,7 @@ collect_omp_uninstall_extensions() {
             [ "${legacy_profile%.}" = "$legacy_profile" ] &&
             [ "$legacy_profile_reserved" -eq 0 ] &&
             [ "${#legacy_profile}" -le 64 ] &&
-            printf '%s' "$legacy_profile" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$' &&
+            omp_profile_has_ascii_shape "$legacy_profile" &&
             [ "$agent_dir_override" = "$config_root/profiles/$legacy_profile/agent" ]; then
             agent_dir_override=""
         fi
@@ -1258,7 +1279,7 @@ collect_omp_uninstall_extensions() {
     if [ -n "$profile" ] && [ "$profile" != "default" ] &&
         [ "${profile%.}" = "$profile" ] && [ "$profile_reserved" -eq 0 ] &&
         [ "${#profile}" -le 64 ] &&
-        printf '%s' "$profile" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$'; then
+        omp_profile_has_ascii_shape "$profile"; then
         agent_dir="$config_root/profiles/$profile/agent"
     elif [ -n "$agent_dir_override" ]; then
         agent_dir="$agent_dir_override"

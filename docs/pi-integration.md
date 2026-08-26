@@ -1,6 +1,6 @@
 # Pi Integration
 
-Last updated: 2026-06-01
+Last updated: 2026-08-26
 
 This document shows how to connect dcg to the [Pi coding agent](https://github.com/earendil-works/pi)
 (`earendil-works/pi`). Pi is not auto-configured by dcg's installer — Pi's
@@ -70,24 +70,49 @@ import { spawn } from "node:child_process";
 
 const DCG_BIN = process.env.DCG_BIN ?? "dcg";
 
+// Fail open when dcg itself cannot run (not installed, fd exhaustion, ...),
+// so a broken install never wedges Pi. Flip this to { deny: true, ... } to
+// fail closed instead.
+const UNAVAILABLE = { deny: false, reason: "" };
+
 function dcgDecision(command: string): Promise<{ deny: boolean; reason: string }> {
   return new Promise((resolve) => {
-    const child = spawn(DCG_BIN, ["--robot", "test", command], {
-      stdio: ["ignore", "pipe", "ignore"],
-    });
+    // Resolve exactly once: "error" and "close" can both fire, and a
+    // synchronous spawn failure must not race a later event.
+    let settled = false;
+    const settle = (decision: { deny: boolean; reason: string }) => {
+      if (settled) return;
+      settled = true;
+      resolve(decision);
+    };
+
+    // Pi runs on Bun, and Bun's spawn() differs from Node in two ways that
+    // matter here: a failed posix_spawn (ENOENT, ENFILE, EAGAIN, ...) is
+    // thrown synchronously from spawn() rather than delivered as an "error"
+    // event, and when the stdio pipes cannot be set up the returned child can
+    // have no `stdout` at all. Handle both, or the extension crashes and the
+    // host aborts the tool call instead of failing open.
+    let child;
+    try {
+      child = spawn(DCG_BIN, ["--robot", "test", command], {
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch {
+      settle(UNAVAILABLE);
+      return;
+    }
 
     let stdout = "";
-    child.stdout.on("data", (chunk) => {
+    child.stdout?.on("data", (chunk) => {
       stdout += chunk.toString();
     });
 
-    // Fail open if dcg can't be found / spawned, so a broken install never
-    // wedges Pi. Flip this to resolve({ deny: true, ... }) to fail closed.
-    child.on("error", () => resolve({ deny: false, reason: "" }));
+    child.on("error", () => settle(UNAVAILABLE));
 
     child.on("close", (code) => {
       if (code === 1) {
-        // Denied. The reason lives in the robot-mode JSON.
+        // Denied. The reason lives in the robot-mode JSON; if the stdout
+        // pipe was missing the exit code is still authoritative.
         let reason = "Blocked by dcg (destructive command).";
         try {
           const parsed = JSON.parse(stdout);
@@ -96,10 +121,10 @@ function dcgDecision(command: string): Promise<{ deny: boolean; reason: string }
         } catch {
           /* keep the default reason */
         }
-        resolve({ deny: true, reason });
+        settle({ deny: true, reason });
       } else {
         // 0 = allowed; >=3 = dcg error -> fail open.
-        resolve({ deny: false, reason: "" });
+        settle(UNAVAILABLE);
       }
     });
   });
@@ -111,13 +136,25 @@ export default function (pi: ExtensionAPI) {
     const command = String(event.input?.command ?? "");
     if (!command.trim()) return;
 
-    const { deny, reason } = await dcgDecision(command);
-    if (deny) {
-      return { block: true, reason };
+    let decision;
+    try {
+      decision = await dcgDecision(command);
+    } catch {
+      // Anything unexpected inside the guard is a guard failure, not a
+      // reason to abort the tool call.
+      decision = UNAVAILABLE;
+    }
+    if (decision.deny) {
+      return { block: true, reason: decision.reason };
     }
   });
 }
 ```
+
+> **Oh My Pi users:** since v0.13.0, `dcg install --omp` writes a generated
+> `tool_call` extension for OMP that already covers the Bun failure modes
+> above; prefer it over hand-maintaining this recipe. The recipe remains the
+> path for Pi proper, which also runs on Bun.
 
 Adjust the tool-name check (`event.toolName !== "bash"`) if your Pi build names
 its shell tool differently, and set `DCG_BIN` if `dcg` is not on Pi's `PATH`

@@ -302,6 +302,22 @@ posit_assistant_installed() {
     command -v pa >/dev/null 2>&1
 }
 
+# Validate the complete profile value as one ASCII pathname component. A
+# line-oriented grep would accept a valid first line and ignore an injected
+# second line, so keep this check inside Bash's whole-string pattern matcher.
+omp_profile_has_ascii_shape() {
+  local profile="$1"
+  case "$profile" in
+    [abcdefghijklmnopqrstuvwxyz0123456789]*)
+      case "$profile" in
+        *[!abcdefghijklmnopqrstuvwxyz0123456789._-]*) return 1 ;;
+        *) return 0 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 # Mirror Node's POSIX `path.join(HOME, PI_CONFIG_DIR || ".omp")` without
 # requiring Node to be installed. This is lexical by design: repeated `/`, `.`
 # and `..` components are normalized, extra parents stop at `/`, and a leading
@@ -1614,15 +1630,51 @@ if [ "$NO_CHECKSUM" -eq 1 ]; then
   warn "Verification skipped (--no-verify)"
 else
   if [ -z "$CHECKSUM" ]; then
+    # Resolution order mirrors install.ps1: (1) per-artifact `<asset>.sha256`
+    # (or --checksum-url); (2) aggregate `SHA256SUMS.txt` / `SHA256SUMS` in
+    # the same release, selecting the row whose filename matches the asset.
+    # Releases produced by the manual/DSR pipeline publish only the aggregate
+    # manifest, so the per-artifact 404 must not abort the install (#342).
+    CHECKSUM_FILE="$TMP/checksum.sha256"
+    EXPLICIT_CHECKSUM_URL="$CHECKSUM_URL"
     [ -z "$CHECKSUM_URL" ] && CHECKSUM_URL="${URL}.sha256"
     info "Fetching checksum from ${CHECKSUM_URL}"
-    CHECKSUM_FILE="$TMP/checksum.sha256"
-    if ! curl -fsSL "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
-      err "Checksum required and could not be fetched"
+    if curl -fsSL "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
+      CHECKSUM=$(awk 'NF { print $1; exit }' "$CHECKSUM_FILE")
+    elif [ -n "$EXPLICIT_CHECKSUM_URL" ]; then
+      # An operator-supplied URL that fails is an error, not a fallback case.
+      err "Checksum could not be fetched from --checksum-url ${EXPLICIT_CHECKSUM_URL}"
       err "Use --no-verify to skip checksum verification (not recommended)"
       exit 1
+    else
+      RELEASE_BASE_URL="${URL%/*}"
+      MANIFEST_FILE="$TMP/SHA256SUMS"
+      for MANIFEST_NAME in SHA256SUMS.txt SHA256SUMS; do
+        MANIFEST_URL="${RELEASE_BASE_URL}/${MANIFEST_NAME}"
+        info "Per-artifact checksum not published; trying ${MANIFEST_URL}"
+        if ! curl -fsSL "$MANIFEST_URL" -o "$MANIFEST_FILE"; then
+          continue
+        fi
+        # Manifest rows are `<hash>  <file>` (optionally `*<file>` for
+        # binary mode); match on the basename so `dir/file` rows work too.
+        CHECKSUM=$(awk -v want="$TAR" '
+          NF >= 2 {
+            file = $2
+            sub(/^\*/, "", file)
+            sub(/^.*\//, "", file)
+            if (file == want && $1 ~ /^[0-9a-fA-F]{64}$/) { print $1; exit }
+          }' "$MANIFEST_FILE")
+        if [ -n "$CHECKSUM" ]; then
+          break
+        fi
+      done
+      if [ -z "$CHECKSUM" ]; then
+        err "Checksum required and could not be fetched"
+        err "Tried ${URL}.sha256 and the release SHA256SUMS manifest"
+        err "Use --no-verify to skip checksum verification (not recommended)"
+        exit 1
+      fi
     fi
-    CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
     if [ -z "$CHECKSUM" ]; then
       err "Empty checksum file"
       exit 1
@@ -3923,7 +3975,12 @@ resolve_omp_agent_dir() {
   # profile resolver. In particular, named profiles ignore the legacy
   # PI_CODING_AGENT_DIR override and OMP_PROFILE (even empty) wins PI_PROFILE.
   local config_root
-  config_root=$(resolve_omp_config_root)
+  # Command substitution strips every trailing LF. Keep a non-LF sentinel
+  # after the resolver's framing newline, then remove exactly the sentinel and
+  # framing byte so LF bytes belonging to the path remain intact.
+  config_root=$(resolve_omp_config_root; printf '\034')
+  config_root="${config_root%$'\034'}"
+  config_root="${config_root%$'\n'}"
   local profile=""
   if [ "${OMP_PROFILE+x}" = "x" ]; then
     profile="$OMP_PROFILE"
@@ -3939,7 +3996,7 @@ resolve_omp_agent_dir() {
   if [ -n "$profile" ] && [ "$profile" != "default" ] &&
      [ "${profile%.}" = "$profile" ] && [ "${#profile}" -le 64 ] &&
      [ "$profile_reserved" -eq 0 ] &&
-     printf '%s' "$profile" | grep -Eq '^[a-z0-9][a-z0-9._-]*$'; then
+     omp_profile_has_ascii_shape "$profile"; then
     printf '%s\n' "$config_root/profiles/$profile/agent"
   elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
     # OMP's setProfile() exports its derived profile path through this legacy
@@ -3958,7 +4015,7 @@ resolve_omp_agent_dir() {
        [ "${legacy_profile%.}" = "$legacy_profile" ] &&
        [ "${#legacy_profile}" -le 64 ] &&
        [ "$legacy_profile_reserved" -eq 0 ] &&
-       printf '%s' "$legacy_profile" | grep -Eq '^[a-z0-9][a-z0-9._-]*$' &&
+       omp_profile_has_ascii_shape "$legacy_profile" &&
        [ "$PI_CODING_AGENT_DIR" = "$config_root/profiles/$legacy_profile/agent" ]; then
       printf '%s\n' "$config_root/agent"
     else
@@ -3986,7 +4043,9 @@ configure_omp() {
   fi
 
   local agent_dir
-  agent_dir=$(resolve_omp_agent_dir)
+  agent_dir=$(resolve_omp_agent_dir; printf '\034')
+  agent_dir="${agent_dir%$'\034'}"
+  agent_dir="${agent_dir%$'\n'}"
   local extension_path="$agent_dir/extensions/dcg-guard.ts"
   local existed=0
   [ -f "$extension_path" ] && existed=1

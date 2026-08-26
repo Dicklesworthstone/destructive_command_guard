@@ -4094,6 +4094,80 @@ MOCKEOF
     [ "$output" = "$default_agent" ]
 }
 
+@test "OMP shell resolvers preserve trailing LF bytes through internal captures" {
+    command -v python3 >/dev/null 2>&1 || skip "python3 not available"
+
+    export PI_CONFIG_DIR=$'cfg\n'
+    unset OMP_PROFILE PI_PROFILE PI_CODING_AGENT_DIR
+    local resolved_file="$TEST_TMPDIR/resolved-agent.bin"
+    resolve_omp_agent_dir > "$resolved_file"
+    python3 - "$resolved_file" "$HOME" <<'PY'
+import os
+import sys
+
+resolved_file, home = sys.argv[1:]
+with open(resolved_file, "rb") as handle:
+    actual = handle.read()
+expected = os.fsencode(home) + b"/cfg\n/agent\n"
+if actual != expected:
+    raise SystemExit(f"agent-dir bytes differ: actual={actual!r}, expected={expected!r}")
+PY
+
+    collect_omp_uninstall_extensions
+    local expected_extension="$HOME/cfg"$'\n'"/agent/extensions/dcg-guard.ts"
+    local extension
+    local found=0
+    for extension in "${OMP_UNINSTALL_EXTENSIONS[@]}"; do
+        if [ "$extension" = "$expected_extension" ]; then
+            found=1
+            break
+        fi
+    done
+    [ "$found" -eq 1 ]
+
+    export PI_CONFIG_DIR=""
+    export PI_CODING_AGENT_DIR="$TEST_TMPDIR/custom-agent"$'\n'
+    local installed_extension="$PI_CODING_AGENT_DIR/extensions/dcg-guard.ts"
+    mkdir -p "$(dirname "$installed_extension")"
+    printf '// dcg-omp-extension: generated\n' > "$installed_extension"
+    DETECTED_AGENTS=("omp")
+    OMP_STATUS=""
+    make_omp_mock_dcg ok
+
+    configure_omp
+
+    [ "$OMP_STATUS" = "merged" ]
+    [ -f "$installed_extension" ]
+}
+
+@test "OMP shell profile validation rejects an embedded newline as one value" {
+    export OMP_PROFILE=$'work\n../../../../victim'
+    unset PI_PROFILE PI_CONFIG_DIR
+    export PI_CODING_AGENT_DIR="$TEST_TMPDIR/operator-agent"
+
+    run resolve_omp_agent_dir
+
+    [ "$status" -eq 0 ]
+    [ "$output" = "$PI_CODING_AGENT_DIR" ]
+
+    unset PI_CODING_AGENT_DIR
+    local synthetic_component="$HOME/.omp/profiles/work"$'\n'".."
+    local outside_extension="$HOME/victim/agent/extensions/dcg-guard.ts"
+    mkdir -p "$synthetic_component" "$(dirname "$outside_extension")"
+    printf '// dcg-omp-extension: generated\n' > "$outside_extension"
+
+    local inspect_status
+    if inspect_omp_uninstall_extensions; then
+        inspect_status=0
+    else
+        inspect_status=$?
+    fi
+
+    [ "$inspect_status" -eq 1 ]
+    [ "${#OMP_UNINSTALL_OWNED_EXTENSIONS[@]}" -eq 0 ]
+    [ -f "$outside_extension" ]
+}
+
 @test "unconfigure_omp: active default resolves before the stale cleanup candidate" {
     extract_uninstall_functions
     export PI_CONFIG_DIR=".custom-omp"
