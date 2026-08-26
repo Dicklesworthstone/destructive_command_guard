@@ -1113,6 +1113,11 @@ fn parse_timestamp(timestamp: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     None
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CURRENT_SESSION_ID_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Resolve the current shell session identifier.
 ///
 /// Resolution order:
@@ -1120,6 +1125,9 @@ fn parse_timestamp(timestamp: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 /// 2. Linux process fingerprint from parent PID + stdin TTY path
 #[must_use]
 pub fn current_session_id() -> Option<String> {
+    #[cfg(test)]
+    CURRENT_SESSION_ID_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     if let Ok(from_env) = std::env::var("DCG_SESSION_ID") {
         let trimmed = from_env.trim();
         if !trimmed.is_empty() {
@@ -2514,6 +2522,139 @@ mod tests {
             paths: None,
             risk_acknowledged: false,
         }
+    }
+
+    fn layered_allowlist_for_session_resolution_tests(
+        session_id: Option<&str>,
+    ) -> LayeredAllowlist {
+        let toml = r#"
+            [[allow]]
+            rule = "core.git:reset-hard"
+            reason = "rule selector"
+
+            [[allow]]
+            rule = "core.git:*"
+            reason = "second rule selector"
+
+            [[allow]]
+            exact_command = "exact candidate"
+            reason = "exact selector"
+
+            [[allow]]
+            command_prefix = "prefix candidate"
+            reason = "prefix selector"
+
+            [[allow]]
+            pattern = "^pattern candidate$"
+            reason = "pattern selector"
+            risk_acknowledged = true
+        "#;
+        let mut file = parse_allowlist_toml(AllowlistLayer::Project, Path::new("dummy"), toml);
+        if let Some(session_id) = session_id {
+            for entry in &mut file.entries {
+                entry.session = Some(true);
+                entry.session_id = Some(session_id.to_string());
+            }
+        }
+        LayeredAllowlist {
+            layers: vec![LoadedAllowlistLayer {
+                layer: AllowlistLayer::Project,
+                path: PathBuf::from("dummy"),
+                file,
+            }],
+        }
+    }
+
+    fn reset_session_id_resolution_count() {
+        CURRENT_SESSION_ID_CALLS.with(|calls| calls.set(0));
+    }
+
+    fn assert_session_id_resolution_count(expected: usize, lookup: impl FnOnce()) {
+        reset_session_id_resolution_count();
+        lookup();
+        CURRENT_SESSION_ID_CALLS.with(|calls| assert_eq!(calls.get(), expected));
+    }
+
+    #[test]
+    fn layered_allowlist_entry_points_skip_session_resolution_for_ordinary_entries() {
+        let allowlist = layered_allowlist_for_session_resolution_tests(None);
+        let exact_rule = RuleId::parse("core.git:reset-hard").expect("valid rule id");
+
+        assert_session_id_resolution_count(0, || {
+            assert!(
+                allowlist
+                    .match_rule_at_path("core.git", "reset-hard", None)
+                    .is_some()
+            );
+        });
+        assert_session_id_resolution_count(0, || {
+            assert!(allowlist.lookup_rule_at_path(&exact_rule, None).is_some());
+        });
+        assert_session_id_resolution_count(0, || {
+            assert!(
+                allowlist
+                    .match_exact_command_at_path("exact candidate", None)
+                    .is_some()
+            );
+        });
+        assert_session_id_resolution_count(0, || {
+            assert!(
+                allowlist
+                    .match_command_prefix_at_path("prefix candidate --safe", None)
+                    .is_some()
+            );
+        });
+        assert_session_id_resolution_count(0, || {
+            assert!(
+                allowlist
+                    .match_pattern_at_path("pattern candidate", None)
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn layered_allowlist_entry_points_cache_one_session_resolution_per_lookup() {
+        let current = current_session_id().unwrap_or_default();
+        let mismatched = if current == "dcg-test-session-a" {
+            "dcg-test-session-b"
+        } else {
+            "dcg-test-session-a"
+        };
+        let allowlist = layered_allowlist_for_session_resolution_tests(Some(mismatched));
+        let exact_rule = RuleId::parse("core.git:reset-hard").expect("valid rule id");
+
+        assert_session_id_resolution_count(1, || {
+            assert!(
+                allowlist
+                    .match_rule_at_path("core.git", "reset-hard", None)
+                    .is_none()
+            );
+        });
+        assert_session_id_resolution_count(1, || {
+            assert!(allowlist.lookup_rule_at_path(&exact_rule, None).is_none());
+        });
+        assert_session_id_resolution_count(1, || {
+            assert!(
+                allowlist
+                    .match_exact_command_at_path("exact candidate", None)
+                    .is_none()
+            );
+        });
+        assert_session_id_resolution_count(1, || {
+            assert!(
+                allowlist
+                    .match_command_prefix_at_path("prefix candidate --safe", None)
+                    .is_none()
+            );
+        });
+        assert_session_id_resolution_count(1, || {
+            assert!(
+                allowlist
+                    .match_pattern_at_path("pattern candidate", None)
+                    .is_none()
+            );
+        });
     }
 
     #[test]

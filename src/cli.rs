@@ -2473,7 +2473,10 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let command = if stdin {
-                read_test_command_from_stdin(effective_config.general.max_command_bytes())?
+                read_test_command_from_stdin(
+                    effective_config.general.max_command_bytes(),
+                    omp_bridge_output,
+                )?
             } else {
                 command.ok_or_else(|| {
                     std::io::Error::new(
@@ -4525,17 +4528,29 @@ fn build_robot_history_entry(
     }
 }
 
-fn read_test_command_from_stdin(max_command_bytes: usize) -> std::io::Result<String> {
+fn read_test_command_from_stdin(
+    max_command_bytes: usize,
+    preserve_terminal_line_ending: bool,
+) -> std::io::Result<String> {
     use std::io::Read as _;
 
+    read_test_command(
+        std::io::stdin().lock(),
+        max_command_bytes,
+        preserve_terminal_line_ending,
+    )
+}
+
+fn read_test_command(
+    reader: impl std::io::Read,
+    max_command_bytes: usize,
+    preserve_terminal_line_ending: bool,
+) -> std::io::Result<String> {
     let mut bytes = Vec::new();
     let limit = u64::try_from(max_command_bytes)
         .unwrap_or(u64::MAX)
         .saturating_add(1);
-    std::io::stdin()
-        .lock()
-        .take(limit)
-        .read_to_end(&mut bytes)?;
+    reader.take(limit).read_to_end(&mut bytes)?;
     if bytes.len() > max_command_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -4549,7 +4564,12 @@ fn read_test_command_from_stdin(max_command_bytes: usize) -> std::io::Result<Str
             format!("stdin command is not valid UTF-8: {error}"),
         )
     })?;
-    if command.ends_with('\n') {
+    // Human-facing `dcg test --stdin` traditionally accepts a line-oriented
+    // producer such as `printf '%s\n' "$command"`, so retain its one-line-ending
+    // normalization. The private OMP bridge sends raw shell source with no
+    // framing delimiter: removing LF/CRLF there changes the guarded command
+    // (and turns a newline-only OMP no-op into an input error).
+    if !preserve_terminal_line_ending && command.ends_with('\n') {
         command.pop();
         if command.ends_with('\r') {
             command.pop();
@@ -13083,9 +13103,10 @@ export function commandUtf8Stream(command: string): ReadableStream<Uint8Array> {
       offset = end;
     }},
   }});
-  // TextEncoderStream carries a trailing high surrogate across chunk
-  // boundaries, preserving the exact UTF-8 bytes without a command-sized
-  // `TextEncoder.encode()` allocation.
+  // TextEncoderStream carries a valid surrogate pair across chunk boundaries,
+  // preserving its UTF-8 scalar without a command-sized allocation. As the
+  // Encoding Standard requires, both this path and `TextEncoder.encode()`
+  // canonicalize an unpaired UTF-16 surrogate to U+FFFD.
   return text.pipeThrough(new TextEncoderStream());
 }}
 
@@ -18973,6 +18994,76 @@ mod tests {
     }
 
     #[test]
+    fn test_stdin_reader_preserves_raw_omp_bytes_but_keeps_human_line_mode() {
+        let raw = "printf 'control'\0\t\u{1b}\n🛸\\\r\n";
+
+        let omp = read_test_command(std::io::Cursor::new(raw.as_bytes()), raw.len(), true)
+            .expect("private OMP stdin accepts valid UTF-8 shell source");
+        assert_eq!(omp.as_bytes(), raw.as_bytes());
+
+        let human = read_test_command(std::io::Cursor::new(raw.as_bytes()), raw.len(), false)
+            .expect("human line-oriented stdin accepts the same source");
+        assert_eq!(human.as_bytes(), &raw.as_bytes()[..raw.len() - 2]);
+        assert_ne!(
+            omp, human,
+            "restoring unconditional terminal-CRLF trimming must make this test fail"
+        );
+
+        let newline_only = read_test_command(std::io::Cursor::new(b"\n"), 1, true)
+            .expect("OMP newline-only shell no-op remains a command");
+        assert_eq!(newline_only.as_bytes(), b"\n");
+        assert_eq!(
+            read_test_command(std::io::Cursor::new(b"echo ok\n\n"), 9, false)
+                .expect("human stdin removes exactly one line ending")
+                .as_bytes(),
+            b"echo ok\n"
+        );
+    }
+
+    #[test]
+    fn test_stdin_reader_bounds_and_utf8_errors_remain_conservative() {
+        let at_limit = "🛸\0\n";
+        assert_eq!(
+            read_test_command(
+                std::io::Cursor::new(at_limit.as_bytes()),
+                at_limit.len(),
+                true,
+            )
+            .expect("exact byte limit is accepted")
+            .as_bytes(),
+            at_limit.as_bytes()
+        );
+
+        let configured_limit = crate::config::DEFAULT_MAX_COMMAND_BYTES;
+        let exact_limit = vec![b'x'; configured_limit];
+        assert_eq!(
+            read_test_command(
+                std::io::Cursor::new(exact_limit.as_slice()),
+                configured_limit,
+                true,
+            )
+            .expect("the shipped byte limit is accepted exactly")
+            .len(),
+            configured_limit
+        );
+
+        let over_limit_bytes = vec![b'x'; configured_limit + 1];
+        let over_limit = read_test_command(
+            std::io::Cursor::new(over_limit_bytes.as_slice()),
+            configured_limit,
+            true,
+        )
+            .expect_err("one byte over the limit must fail");
+        assert_eq!(over_limit.kind(), std::io::ErrorKind::InvalidData);
+        assert!(over_limit.to_string().contains("exceeds general.max_command_bytes"));
+
+        let invalid_utf8 = read_test_command(std::io::Cursor::new([0xf0, 0x28, 0x8c, 0x28]), 4, true)
+            .expect_err("non-UTF-8 stdin must fail instead of being lossily decoded");
+        assert_eq!(invalid_utf8.kind(), std::io::ErrorKind::InvalidData);
+        assert!(invalid_utf8.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
     fn test_cli_parse_init() {
         let cli = Cli::parse_from(["dcg", "init"]);
         assert!(matches!(cli.command, Some(Command::Init { .. })));
@@ -20407,6 +20498,39 @@ equal(await new Response(commandUtf8Stream(boundaryCommand)).text(), boundaryCom
 check(commandStdin("echo ok") instanceof Uint8Array, "stdin/small-fast-path");
 check(commandStdin(boundaryCommand) instanceof ReadableStream, "stdin/large-stream-path");
 
+const loneHigh = JSON.parse('"\\ud800"') as string;
+const loneLow = JSON.parse('"\\udc00"') as string;
+equal(Array.from(encoder.encode(loneHigh)), [0xef, 0xbf, 0xbd], "stdin/lone-high/replacement");
+equal(Array.from(encoder.encode(loneLow)), [0xef, 0xbf, 0xbd], "stdin/lone-low/replacement");
+
+const encodedCommandStdin = async (command: string): Promise<Uint8Array> => {
+  const stdin = commandStdin(command);
+  return stdin instanceof Uint8Array
+    ? stdin
+    : new Uint8Array(await new Response(stdin).arrayBuffer());
+};
+const equalBytes = (actual: Uint8Array, expected: Uint8Array, caseId: string): void => {
+  equal(actual.byteLength, expected.byteLength, `${caseId}/length`);
+  for (let index = 0; index < expected.byteLength; index += 1) {
+    check(actual[index] === expected[index], `${caseId}/byte-${index}`);
+  }
+};
+for (const [caseId, command, expectedPath] of [
+  ["stdin/direct-controls", "nul\0lf\ncr\rtab\tesc\u001b", "direct"],
+  ["stdin/direct-astral", "界🛸é", "direct"],
+  ["stdin/direct-lone-high", `head${loneHigh}`, "direct"],
+  ["stdin/direct-lone-low", `${loneLow}tail`, "direct"],
+  ["stdin/stream-just-over", "x".repeat(DCG_STDIN_CHUNK_CODE_UNITS + 1), "stream"],
+  ["stdin/stream-astral-boundary", boundaryCommand, "stream"],
+  ["stdin/stream-lone-high-boundary", "x".repeat(DCG_STDIN_CHUNK_CODE_UNITS - 1) + loneHigh + "tail", "stream"],
+  ["stdin/stream-lone-low-boundary", "x".repeat(DCG_STDIN_CHUNK_CODE_UNITS) + loneLow + "tail", "stream"],
+  ["stdin/stream-reversed-surrogates", "x".repeat(DCG_STDIN_CHUNK_CODE_UNITS) + loneLow + loneHigh, "stream"],
+] as const) {
+  const stdin = commandStdin(command);
+  equal(stdin instanceof Uint8Array ? "direct" : "stream", expectedPath, `${caseId}/path`);
+  equalBytes(await encodedCommandStdin(command), encoder.encode(command), caseId);
+}
+
 type ChildCase = {
   stdout?: string;
   stderr?: string;
@@ -20536,6 +20660,28 @@ try {
   equal(replay.spawns[0]!.timeout, 30_000, "callback/whitespace-allow/parent-timeout");
   equal(replay.spawns[0]!.killSignal, "SIGKILL", "callback/whitespace-allow/kill-signal");
   equal(replay.errors, ["[dcg] OMP guard dcg stderr: allow diagnostic"], "callback/whitespace-allow/diagnostics");
+
+  for (const [caseId, command] of [
+    ["callback/stdin-newline-only", "\n"],
+    ["callback/stdin-crlf-only", "\r\n"],
+    ["callback/stdin-controls", "nul\0lf\ncr\rtab\tesc\u001b"],
+    ["callback/stdin-astral-boundary", boundaryCommand],
+    ["callback/stdin-lone-high-direct", `head${loneHigh}`],
+    ["callback/stdin-lone-high-stream", "x".repeat(DCG_STDIN_CHUNK_CODE_UNITS - 1) + loneHigh + "tail"],
+  ] as const) {
+    replay = await invoke(
+      caseId,
+      { toolName: "bash", input: { command } },
+      { stdout: JSON.stringify({ decision: "allow" }), exitCode: 0 },
+    );
+    equal(replay.result, undefined, `${caseId}/result`);
+    equal(replay.spawns.length, 1, `${caseId}/spawn-count`);
+    equal(
+      replay.spawns[0]!.stdin,
+      new TextDecoder().decode(encoder.encode(command)),
+      `${caseId}/canonical-utf8`,
+    );
+  }
 
   replay = await invoke(
     "callback/exit-zero-deny",
