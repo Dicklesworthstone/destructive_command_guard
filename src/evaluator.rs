@@ -24508,6 +24508,8 @@ mod tests {
             ("rm -r -f ./build", "rm-r-f-separate"),
             ("rm --recursive --force ./build", "rm-recursive-force-long"),
             ("rm -r ./build", "rm-recursive-general"),
+            ("rm -f *", "rm-bare-glob"),
+            ("rm -f /*", "rm-bare-glob-root"),
             ("rm -rf ~", "rm-rf-root-home"),
             ("rm -r -f ~", "rm-r-f-separate-root-home"),
             ("rm --recursive --force ~", "rm-recursive-force-root-home"),
@@ -24542,11 +24544,24 @@ mod tests {
         }
         // Each rule speaks for itself: the general and the root/home forms
         // must not share one text.
-        let general = &explanations[0].1;
-        let root_home = &explanations[4].1;
-        assert_ne!(general, root_home, "general and root/home rules share an explanation");
-        let plain_recursive = &explanations[3].1;
-        assert_ne!(general, plain_recursive, "rm -rf and rm -r rules share an explanation");
+        let by_rule = |rule: &str| {
+            explanations
+                .iter()
+                .find(|(name, _)| *name == rule)
+                .map(|(_, text)| text.clone())
+                .unwrap_or_else(|| panic!("no case exercised {rule}"))
+        };
+        let general = by_rule("rm-rf-general");
+        assert_ne!(
+            general,
+            by_rule("rm-rf-root-home"),
+            "general and root/home rules share an explanation"
+        );
+        assert_ne!(
+            general,
+            by_rule("rm-recursive-general"),
+            "rm -rf and rm -r rules share an explanation"
+        );
     }
 
     /// The forms the #348 guidance advertises must actually be accepted:

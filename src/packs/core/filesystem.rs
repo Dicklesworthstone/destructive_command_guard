@@ -345,6 +345,10 @@ const RM_RECURSIVE_FORCE_REASON: &str =
     "rm --recursive --force is destructive and requires human approval.";
 const RM_RECURSIVE_ROOT_HOME_NAME: &str = "rm-recursive-root-home";
 const RM_RECURSIVE_ROOT_HOME_REASON: &str = "recursive rm targeting a root, home, or absolute system path is EXTREMELY DANGEROUS, even without --force.";
+const RM_BARE_GLOB_NAME: &str = "rm-bare-glob";
+const RM_BARE_GLOB_REASON: &str = "rm with a bare * operand deletes every file the shell finds in the working directory - an unbounded, shell-chosen file set that cannot be reviewed from the command text. This command will NOT be executed.";
+const RM_BARE_GLOB_ROOT_NAME: &str = "rm-bare-glob-root";
+const RM_BARE_GLOB_ROOT_REASON: &str = "rm /* deletes the top-level entries of the filesystem root; on systems where /bin, /lib, and /sbin are symlinks this can brick the machine even without -r. EXTREMELY DANGEROUS.";
 const RM_RECURSIVE_GENERAL_NAME: &str = "rm-recursive-general";
 const RM_RECURSIVE_GENERAL_REASON: &str = "recursive rm can silently remove an entire writable directory tree and requires human approval, even without --force.";
 const RM_RECURSIVE_UNVERIFIED_NAME: &str = "rm-recursive-unverified";
@@ -427,6 +431,53 @@ const POWERSHELL_REMOVE_ITEM_RECURSIVE_SUGGESTIONS: &[PatternSuggestion] = &[
     ),
 ];
 
+/// Suggestions for a non-recursive rm with a bare `*` operand.
+const RM_BARE_GLOB_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "ls -la",
+        "List what the glob would expand to before deleting anything",
+    ),
+    PatternSuggestion::new(
+        "rm ./file-one ./file-two",
+        "Delete explicitly named files so the removal set is reviewable",
+    ),
+    PatternSuggestion::new(
+        "rm *.log",
+        "Constrain the glob to a reviewable shape instead of everything",
+    ),
+    PatternSuggestion::new(
+        "rm -i *",
+        "Interactive glob delete: confirms each file (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
+    ),
+    PatternSuggestion::new(
+        "mv ./file /tmp/delete-me-{timestamp}",
+        "Move files aside instead of deleting them; remove the holding copy after review",
+    ),
+];
+
+const RM_BARE_GLOB_EXPLANATION: &str = "A bare * (or ./*) handed to rm is expanded by the shell at execution time, so \
+     the command text never shows what gets deleted: every file in the working \
+     directory that matches, whatever the directory happens to contain when the \
+     command runs. Leaving off -f does not bound it - -f only decides whether errors \
+     are reported, and the write-protection query it suppresses reaches nobody under \
+     an agent hook.\n\n\
+     Preview the expansion, then delete a reviewable set (dcg allows these forms):\n  \
+     ls -la                           # see what * would match\n  \
+     rm ./file-one ./file-two         # explicitly named files\n  \
+     rm *.log                         # a constrained, reviewable glob\n  \
+     rm -i *                          # interactive; needs a terminal - with stdin closed it deletes nothing and exits 0\n  \
+     mv ./file /tmp/delete-me-<literal-timestamp>   # move aside instead of deleting";
+
+const RM_BARE_GLOB_ROOT_EXPLANATION: &str = "rm /* expands to every top-level entry of the filesystem root. Without -r the \
+     directories survive, but on systems where /bin, /lib, and /sbin are symlinks \
+     into /usr, deleting those symlinks bricks the machine - no shell, no rescue \
+     tooling, and -f is irrelevant to any of it.\n\n\
+     There is almost no legitimate reason to run this. If one file under / was \
+     meant, name it explicitly after previewing (dcg allows these forms):\n  \
+     ls -la /                        # see what /* would match\n  \
+     rm /specific-file               # one named file, still reviewed\n  \
+     mv /specific-file /tmp/delete-me-<literal-timestamp>";
+
 const RM_RECURSIVE_GENERAL_EXPLANATION: &str = "rm -r deletes a directory and everything under it. Leaving off -f does not \
      bound the command: -f only decides whether errors are reported and whether a \
      write-protected file is queried, and that query reaches a terminal, not an agent \
@@ -502,6 +553,11 @@ pub(crate) fn classifier_rule_guidance(
             POWERSHELL_REMOVE_ITEM_RECURSIVE_EXPLANATION,
             POWERSHELL_REMOVE_ITEM_RECURSIVE_SUGGESTIONS,
         )),
+        n if n == RM_BARE_GLOB_NAME => Some((RM_BARE_GLOB_EXPLANATION, RM_BARE_GLOB_SUGGESTIONS)),
+        n if n == RM_BARE_GLOB_ROOT_NAME => Some((
+            RM_BARE_GLOB_ROOT_EXPLANATION,
+            RM_BARE_GLOB_SUGGESTIONS,
+        )),
         _ => None,
     }
 }
@@ -524,6 +580,8 @@ pub(crate) const CLASSIFIER_RULE_NAMES: &[&str] = &[
     RM_RECURSIVE_GENERAL_NAME,
     RM_RECURSIVE_UNVERIFIED_NAME,
     POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME,
+    RM_BARE_GLOB_NAME,
+    RM_BARE_GLOB_ROOT_NAME,
 ];
 
 pub(crate) fn is_pre_rm_propagation_rule(name: Option<&str>) -> bool {
@@ -2602,9 +2660,20 @@ fn parse_rm_segment_with_option_scanning(
         }
     }
 
-    let flag_state = flags.resolve();
-    let Some(flag_state) = flag_state else {
-        return RmParseDecision::NoMatch;
+    // GNU rm resolves -f/--force and all interactive modes in argv order.
+    // -i and -I override an earlier force; a later force overrides either.
+    let redirected_stdin = tokens
+        .iter()
+        .skip(start_idx)
+        .take_while(|token| token.kind != NormalizeTokenKind::Separator)
+        .filter_map(|token| token.text(command))
+        .any(starts_with_shell_stdin_redirection);
+    let interactive_prompts = flags.interactive_mode.prompts();
+
+    let Some(flag_state) = flags.resolve() else {
+        // Non-recursive rm has no dangerous flag shape of its own, but a bare
+        // `*` operand still hands the shell an unbounded deletion set (#334).
+        return parse_bare_glob_rm(&paths, interactive_prompts, automated_stdin, redirected_stdin);
     };
 
     // `rm -r` without an operand only reports a usage error. More
@@ -2614,14 +2683,6 @@ fn parse_rm_segment_with_option_scanning(
         return RmParseDecision::NoMatch;
     }
 
-    // GNU rm resolves -f/--force and all interactive modes in argv order.
-    // -i and -I override an earlier force; a later force overrides either.
-    let redirected_stdin = tokens
-        .iter()
-        .skip(start_idx)
-        .take_while(|token| token.kind != NormalizeTokenKind::Separator)
-        .filter_map(|token| token.text(command))
-        .any(starts_with_shell_stdin_redirection);
     if flag_state.interactive_mode.prompts() && !automated_stdin && !redirected_stdin {
         return RmParseDecision::Allow;
     }
@@ -2703,6 +2764,68 @@ fn parse_rm_segment_with_option_scanning(
         severity,
         span,
     })
+}
+
+/// Deny a non-recursive `rm` whose operand is a bare working-directory or
+/// root glob (#334): `rm -f *`, `rm ./*`, `rm /*`.
+///
+/// Without `-r` the recursive rules never see these, yet the shell expands
+/// the glob to every matching entry, so the deleted set is unbounded and
+/// invisible in the command text. `-f` is deliberately not required: it only
+/// changes error reporting, and the write-protection query it suppresses
+/// reaches nobody under an agent hook. Suffix and prefix globs (`*.log`,
+/// `build/*`) stay untouched — they name a reviewable shape — as do quoted
+/// operands (`rm '*'` is one literal file) and genuinely interactive
+/// invocations, which prompt per file exactly like the recursive forms.
+fn parse_bare_glob_rm(
+    paths: &[PathToken<'_>],
+    interactive_prompts: bool,
+    automated_stdin: bool,
+    redirected_stdin: bool,
+) -> RmParseDecision {
+    if paths.is_empty() {
+        return RmParseDecision::NoMatch;
+    }
+    if interactive_prompts && !automated_stdin && !redirected_stdin {
+        // The per-file prompt bounds the deletion; with stdin closed, as
+        // under a hook, rm deletes nothing and exits 0.
+        return RmParseDecision::NoMatch;
+    }
+
+    let unquoted_operand = |wanted: fn(&str) -> bool| {
+        paths
+            .iter()
+            .find(|path| path.quote == QuoteKind::None && wanted(path.unquoted))
+    };
+
+    // Root first: the more severe attribution wins when both shapes appear.
+    if let Some(path) = unquoted_operand(|text| text == "/*") {
+        if rm_targets_exempted_for_rule(RM_BARE_GLOB_ROOT_NAME, paths) {
+            // Only this rule stands down (#284); other rules still see the
+            // command, so report no-match rather than a shielding allow.
+            return RmParseDecision::NoMatch;
+        }
+        return RmParseDecision::Deny(RmParseMatch {
+            pattern_name: RM_BARE_GLOB_ROOT_NAME,
+            reason: RM_BARE_GLOB_ROOT_REASON,
+            severity: Severity::Critical,
+            span: Some(path.range.clone()),
+        });
+    }
+
+    if let Some(path) = unquoted_operand(|text| matches!(text, "*" | "./*")) {
+        if rm_targets_exempted_for_rule(RM_BARE_GLOB_NAME, paths) {
+            return RmParseDecision::NoMatch;
+        }
+        return RmParseDecision::Deny(RmParseMatch {
+            pattern_name: RM_BARE_GLOB_NAME,
+            reason: RM_BARE_GLOB_REASON,
+            severity: Severity::High,
+            span: Some(path.range.clone()),
+        });
+    }
+
+    RmParseDecision::NoMatch
 }
 
 fn apple_rm_option_token_is_valid(text: &str) -> bool {
@@ -7256,5 +7379,57 @@ mod classifier_guidance_tests {
                 "{name} offers no macOS trash suggestion"
             );
         }
+    }
+
+    /// #334: a bare `*` handed to non-recursive rm wipes an unbounded,
+    /// shell-chosen file set and must be reviewed; reviewable shapes (suffix
+    /// globs, named files, quoted literals, interactive) stay allowed.
+    #[test]
+    fn bare_glob_rm_is_denied_and_reviewable_shapes_stay_allowed() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("rm -f *", RM_BARE_GLOB_NAME),
+            ("rm *", RM_BARE_GLOB_NAME),
+            ("rm -f ./*", RM_BARE_GLOB_NAME),
+            ("rm -fv *", RM_BARE_GLOB_NAME),
+            ("cd /srv/app && rm -f *", RM_BARE_GLOB_NAME),
+            ("rm /*", RM_BARE_GLOB_ROOT_NAME),
+            ("rm -f /*", RM_BARE_GLOB_ROOT_NAME),
+        ] {
+            let matched = pack
+                .check(command)
+                .unwrap_or_else(|| panic!("{command} must be denied"));
+            assert_eq!(matched.name, Some(rule), "{command}");
+            assert!(
+                matched.explanation.is_some(),
+                "{command}: bare-glob denial must carry guidance"
+            );
+        }
+
+        for command in [
+            "rm *.log",
+            "rm -f *.env",
+            "rm build/*",
+            "rm -f build/*",
+            "rm '*'",
+            "rm \"*\"",
+            "rm -i *",
+            "rm ./file-one ./file-two",
+            "rm -f notes.txt",
+            "echo *",
+            "ls *",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|matched| matched.name)
+            );
+        }
+
+        // Recursive spellings keep their established, more specific rules.
+        assert_eq!(
+            pack.check("rm -rf *").and_then(|matched| matched.name),
+            Some(RM_RF_GENERAL_NAME)
+        );
     }
 }
