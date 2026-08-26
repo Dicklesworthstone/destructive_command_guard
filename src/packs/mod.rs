@@ -343,6 +343,28 @@ impl std::fmt::Debug for DestructivePattern {
     }
 }
 
+impl DestructivePattern {
+    /// Match through the same executable-scope contract as the primary
+    /// evaluator. Unscoped rules retain their historical raw-regex behavior.
+    fn matches_command(&self, command: &str) -> bool {
+        match self.executables {
+            None => self.regex.is_match(command),
+            Some(executables) => crate::evaluator::executable_scoped_pattern_matches(
+                &self.regex,
+                command,
+                executables,
+            ),
+        }
+    }
+
+    /// Scope a parser/semantic match that has no regex byte span.
+    fn semantic_match_is_in_scope(&self, command: &str) -> bool {
+        self.executables.is_none_or(|executables| {
+            crate::evaluator::command_invokes_declared_executable(command, executables)
+        })
+    }
+}
+
 /// Macro to create a safe pattern with compile-time name checking.
 ///
 /// The pattern is lazily compiled on first use, not at construction time.
@@ -721,10 +743,10 @@ impl Pack {
                     return None;
                 }
                 crate::packs::careful_company_running_windows::transfer::DirectScpDecision::Destructive => {
-                    return self.destructive_match_by_name("scp-to-remote");
+                    return self.destructive_match_by_name("scp-to-remote", cmd);
                 }
                 crate::packs::careful_company_running_windows::transfer::DirectScpDecision::Unverified => {
-                    return self.destructive_match_by_name("scp-destination-unverified");
+                    return self.destructive_match_by_name("scp-destination-unverified", cmd);
                 }
                 crate::packs::careful_company_running_windows::transfer::DirectScpDecision::NotDirect => {}
             }
@@ -736,7 +758,7 @@ impl Pack {
                     return None;
                 }
                 crate::packs::remote::scp::ScpSemanticDecision::Destructive(name) => {
-                    return self.destructive_match_by_name(name);
+                    return self.destructive_match_by_name(name, cmd);
                 }
                 crate::packs::remote::scp::ScpSemanticDecision::NoMatch => {
                     let segments = crate::packs::split_command_segments(cmd);
@@ -751,11 +773,13 @@ impl Pack {
         if self.id == "core.git" {
             match crate::packs::core::git::branch_command_decision(cmd) {
                 crate::packs::core::git::BranchCommandDecision::Destructive => {
-                    return self.destructive_match_by_name("branch-force-delete");
+                    return self.destructive_match_by_name("branch-force-delete", cmd);
                 }
                 crate::packs::core::git::BranchCommandDecision::DestructiveDynamic => {
-                    return self
-                        .destructive_match_by_name(crate::packs::core::git::BRANCH_DYNAMIC_RULE);
+                    return self.destructive_match_by_name(
+                        crate::packs::core::git::BRANCH_DYNAMIC_RULE,
+                        cmd,
+                    );
                 }
                 crate::packs::core::git::BranchCommandDecision::NonDestructive => return None,
                 crate::packs::core::git::BranchCommandDecision::NotBranch
@@ -772,7 +796,7 @@ impl Pack {
         }
         self.destructive_patterns
             .iter()
-            .find(|p| p.regex.is_match(cmd))
+            .find(|p| p.matches_command(cmd))
             .map(|p| DestructiveMatch {
                 reason: p.reason,
                 name: p.name,
@@ -789,7 +813,7 @@ impl Pack {
         self.destructive_patterns
             .iter()
             .filter(|p| predicate(p.name))
-            .find(|p| p.regex.is_match(cmd))
+            .find(|p| p.matches_command(cmd))
             .map(|p| DestructiveMatch {
                 reason: p.reason,
                 name: p.name,
@@ -798,10 +822,10 @@ impl Pack {
             })
     }
 
-    fn destructive_match_by_name(&self, name: &str) -> Option<DestructiveMatch> {
+    fn destructive_match_by_name(&self, name: &str, cmd: &str) -> Option<DestructiveMatch> {
         self.destructive_patterns
             .iter()
-            .find(|pattern| pattern.name == Some(name))
+            .find(|pattern| pattern.name == Some(name) && pattern.semantic_match_is_in_scope(cmd))
             .map(|pattern| DestructiveMatch {
                 reason: pattern.reason,
                 name: pattern.name,
@@ -909,7 +933,7 @@ impl Pack {
                 crate::packs::remote::scp::ScpSemanticDecision::Safe
                 | crate::packs::remote::scp::ScpSemanticDecision::NonDestructive => return None,
                 crate::packs::remote::scp::ScpSemanticDecision::Destructive(name) => {
-                    return self.destructive_match_by_name(name);
+                    return self.destructive_match_by_name(name, cmd);
                 }
                 crate::packs::remote::scp::ScpSemanticDecision::NoMatch => {}
             }
@@ -945,10 +969,11 @@ impl Pack {
                 }
                 crate::packs::cdn::cloudflare_workers::WranglerSemanticDecision::Destructive(
                     name,
-                ) => return self.destructive_match_by_name(name),
+                ) => return self.destructive_match_by_name(name, cmd),
                 crate::packs::cdn::cloudflare_workers::WranglerSemanticDecision::Unverified => {
                     return self.destructive_match_by_name(
                         crate::packs::cdn::cloudflare_workers::WRANGLER_UNVERIFIED_RULE,
+                        cmd,
                     );
                 }
                 crate::packs::cdn::cloudflare_workers::WranglerSemanticDecision::NoMatch => {}
@@ -4024,10 +4049,7 @@ mod tests {
                 .check_command(command, &enabled)
                 .expect("basic external-store verdict must preserve a governed match");
             assert!(basic.blocked, "{command:?}: {basic:?}");
-            assert_eq!(
-                basic.pattern_name.as_deref(),
-                Some("dangerous-operation")
-            );
+            assert_eq!(basic.pattern_name.as_deref(), Some("dangerous-operation"));
 
             let detailed = store
                 .check_command_with_details(command, &enabled)

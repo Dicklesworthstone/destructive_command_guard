@@ -601,19 +601,21 @@ const GIT_DESCRIBE: Option<&str> = option_env!("VERGEN_GIT_DESCRIBE");
 /// Full commit SHA captured at compile time by `build.rs`.
 pub const GIT_SHA: Option<&str> = option_env!("VERGEN_GIT_SHA");
 
-/// Explicit release-pipeline marker (#320): dist.yml and the DSR runbook
-/// export `DCG_RELEASE_BUILD=1` around `cargo build`, so a published binary
-/// can prove its provenance even when the build environment's git metadata is
-/// unavailable (shallow CI checkouts).
+/// Explicit release-pipeline fallback marker (#320): dist.yml and the DSR
+/// runbook export `DCG_RELEASE_BUILD=1` around `cargo build`, so a published
+/// binary can prove its provenance when the build environment's git metadata
+/// is unavailable (shallow CI checkouts). Usable git metadata remains
+/// authoritative, so this marker cannot bless a dirty or ahead-of-tag build.
 const RELEASE_BUILD_MARKER: Option<&str> = option_env!("DCG_RELEASE_BUILD");
 
 /// Where this binary came from, as far as compile-time metadata can prove
 /// (#320).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildProvenance {
-    /// Built by a release pipeline, or from a clean checkout exactly at this
-    /// version's release tag. Replacing it with the published release of the
-    /// same or newer version loses nothing.
+    /// Built from a clean checkout exactly at this version's release tag, or
+    /// built by a release pipeline when git metadata was unavailable.
+    /// Replacing it with the published release of the same or newer version
+    /// loses nothing.
     Release,
     /// Built from a git checkout that is ahead of (or dirty relative to) the
     /// release tag for this version. Replacing it with the published release
@@ -641,16 +643,24 @@ fn classify_provenance(
     release_marker: Option<&str>,
     version: &str,
 ) -> BuildProvenance {
-    if release_marker.is_some_and(|v| !v.is_empty() && v != "0") {
-        return BuildProvenance::Release;
-    }
+    let release_marker_enabled =
+        release_marker.is_some_and(crate::output::env_flag_value_enabled);
     let Some(describe) = describe else {
-        return BuildProvenance::Unknown;
+        return if release_marker_enabled {
+            BuildProvenance::Release
+        } else {
+            BuildProvenance::Unknown
+        };
     };
     // vergen substitutes a fixed placeholder when git metadata could not be
-    // gathered; treat it (and empty output) as no provenance at all.
+    // gathered; treat it (and empty output) as absent metadata, where the
+    // explicit release-pipeline marker may supply the missing provenance.
     if describe.is_empty() || describe == "VERGEN_IDEMPOTENT_OUTPUT" {
-        return BuildProvenance::Unknown;
+        return if release_marker_enabled {
+            BuildProvenance::Release
+        } else {
+            BuildProvenance::Unknown
+        };
     }
     if describe == format!("v{version}") {
         return BuildProvenance::Release;
@@ -957,12 +967,14 @@ mod tests {
     /// state.
     #[test]
     fn release_marker_only_fills_unusable_git_metadata() {
-        for describe in [None, Some(""), Some("VERGEN_IDEMPOTENT_OUTPUT")] {
-            assert_eq!(
-                classify_provenance(describe, Some("1"), "0.11.0"),
-                BuildProvenance::Release,
-                "{describe:?}"
-            );
+        for release_marker in ["1", "true", "YES", "on", " enabled "] {
+            for describe in [None, Some(""), Some("VERGEN_IDEMPOTENT_OUTPUT")] {
+                assert_eq!(
+                    classify_provenance(describe, Some(release_marker), "0.11.0"),
+                    BuildProvenance::Release,
+                    "{release_marker:?}, {describe:?}"
+                );
+            }
         }
 
         for describe in ["v0.11.0-7-gabc1234", "v0.11.0-dirty", "v0.10.0"] {

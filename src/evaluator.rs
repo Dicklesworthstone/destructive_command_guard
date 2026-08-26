@@ -666,6 +666,27 @@ impl EvaluationResult {
         }
     }
 
+    /// Create an embedded-sink denial mapped back to the outer command.
+    ///
+    /// Executable-stdin analysis evaluates producer bytes separately, but the
+    /// actionable location in the operator's command is the consumer that
+    /// executes those bytes. Preserve that source map so hook/explain output
+    /// does not fall back to a caret at byte zero.
+    #[must_use]
+    pub fn denied_by_embedded_sink_with_span(
+        rule_id: &str,
+        reason: &str,
+        command: &str,
+        span: MatchSpan,
+    ) -> Self {
+        let mut result = Self::denied_by_embedded_sink(rule_id, reason);
+        if let Some(info) = result.pattern_info.as_mut() {
+            info.matched_span = Some(span);
+            info.matched_text_preview = Some(extract_match_preview(command, &span));
+        }
+        result
+    }
+
     /// Create a recorded-warning result for a curated shell-init idiom
     /// (`eval "$(ssh-agent -s)"`, `source <(kubectl completion bash)`, …).
     ///
@@ -6430,6 +6451,14 @@ enum ExecutableTextSink {
         rule: &'static str,
         reason: &'static str,
     },
+    /// A producer-specific failure whose provenance must remain visible in
+    /// the denial. `matched_span` points at the outer executable consumer when
+    /// its tokenizer supplied an exact source map.
+    UnverifiedSource {
+        rule: &'static str,
+        reason: String,
+        matched_span: Option<MatchSpan>,
+    },
     /// The outermost `eval "$(…)"` / `source <(…)` consumer of a curated,
     /// structurally plain shell-init idiom (`ssh-agent -s`, `brew shellenv`,
     /// …). Downgraded to a recorded warning under a dedicated rule; posture
@@ -8403,6 +8432,15 @@ fn push_executable_input_source(
     kind: PipelineSourceKind,
     sinks: &mut Vec<ExecutableTextSink>,
 ) {
+    push_executable_input_source_at(source, kind, None, sinks);
+}
+
+fn push_executable_input_source_at(
+    source: IndirectInputSource,
+    kind: PipelineSourceKind,
+    matched_span: Option<MatchSpan>,
+    sinks: &mut Vec<ExecutableTextSink>,
+) {
     if sinks.len() >= MAX_EXECUTABLE_TEXT_SINKS {
         sinks.push(ExecutableTextSink::Unverified {
             rule: SINK_ANALYSIS_BOUNDS_RULE,
@@ -8421,9 +8459,10 @@ fn push_executable_input_source(
                     return;
                 };
                 for record in records {
-                    push_executable_input_source(
+                    push_executable_input_source_at(
                         IndirectInputSource::StaticProducer(record),
                         PipelineSourceKind::PosixShell,
+                        matched_span,
                         sinks,
                     );
                 }
@@ -8438,9 +8477,10 @@ fn push_executable_input_source(
                     return;
                 };
                 for record in records {
-                    push_executable_input_source(
+                    push_executable_input_source_at(
                         IndirectInputSource::StaticProducer(record),
                         PipelineSourceKind::Interpreter(language),
+                        matched_span,
                         sinks,
                     );
                 }
@@ -8455,9 +8495,10 @@ fn push_executable_input_source(
                     return;
                 };
                 for record in records {
-                    push_executable_input_source(
+                    push_executable_input_source_at(
                         IndirectInputSource::StaticProducer(record),
                         PipelineSourceKind::PowerShell,
+                        matched_span,
                         sinks,
                     );
                 }
@@ -8472,9 +8513,10 @@ fn push_executable_input_source(
                     return;
                 };
                 for record in records {
-                    push_executable_input_source(
+                    push_executable_input_source_at(
                         IndirectInputSource::StaticProducer(record),
                         PipelineSourceKind::Cmd,
+                        matched_span,
                         sinks,
                     );
                 }
@@ -8488,9 +8530,10 @@ fn push_executable_input_source(
                     });
                     return;
                 };
-                push_executable_input_source(
+                push_executable_input_source_at(
                     IndirectInputSource::StaticProducer(records.join(" ")),
                     PipelineSourceKind::PowerShell,
+                    matched_span,
                     sinks,
                 );
                 return;
@@ -8503,9 +8546,10 @@ fn push_executable_input_source(
                     });
                     return;
                 };
-                push_executable_input_source(
+                push_executable_input_source_at(
                     IndirectInputSource::StaticProducer(records.join(" ")),
                     PipelineSourceKind::Cmd,
+                    matched_span,
                     sinks,
                 );
                 return;
@@ -8546,10 +8590,32 @@ fn push_executable_input_source(
                 reason: "an executable pipeline reads source from a file that dcg cannot verify without a race",
             }
         }
-        IndirectInputSource::Template { .. } | IndirectInputSource::Unverified(_) => {
+        IndirectInputSource::Template { .. } => {
             ExecutableTextSink::Unverified {
                 rule: PIPELINE_CONSUMER_RULE,
                 reason: "an executable pipeline receives source that dcg cannot statically verify",
+            }
+        }
+        IndirectInputSource::Unverified(reason) => {
+            let consumer = match kind {
+                PipelineSourceKind::PosixShell | PipelineSourceKind::PosixShellRecords(_) => {
+                    "POSIX shell"
+                }
+                PipelineSourceKind::Interpreter(_)
+                | PipelineSourceKind::InterpreterRecords(_, _) => "interpreter",
+                PipelineSourceKind::PowerShell
+                | PipelineSourceKind::PowerShellRecords(_)
+                | PipelineSourceKind::PowerShellJoinedRecords(_) => "PowerShell",
+                PipelineSourceKind::Cmd
+                | PipelineSourceKind::CmdRecords(_)
+                | PipelineSourceKind::CmdJoinedRecords(_) => "cmd.exe",
+            };
+            ExecutableTextSink::UnverifiedSource {
+                rule: PIPELINE_CONSUMER_RULE,
+                reason: format!(
+                    "{consumer} executes pipeline input as source, but {reason}"
+                ),
+                matched_span,
             }
         }
     };
@@ -22699,6 +22765,81 @@ fn span_starts_in_executable_segment(
             && command
                 .get(start..end)
                 .is_some_and(|segment| segment_invokes_executable(segment, executables))
+    })
+}
+
+/// Apply the evaluator's executable-scope contract to a low-level raw pattern
+/// lookup (issue #289).
+///
+/// The primary evaluator checks each command segment before its whole-command
+/// pass. Mirror that order here so a pattern whose authored prefix accepts
+/// start-of-input (for example `(?:^|[;&])tool ...`) can still match a later
+/// governed segment. The whole-command pass then preserves patterns that
+/// legitimately span segments, but only when the match starts in a segment
+/// owned by a declared executable. Dynamic argv0 values remain unresolved.
+pub(crate) fn executable_scoped_pattern_matches(
+    regex: &crate::packs::regex_engine::LazyCompiledRegex,
+    command: &str,
+    executables: &[&str],
+) -> bool {
+    let mut segment_ranges =
+        command_segment_ranges_in_dialect(command, crate::normalize::ShellDialect::Unknown);
+    if segment_ranges.is_empty() {
+        segment_ranges.push((0, command.len()));
+    }
+
+    if segment_ranges.iter().any(|&(start, end)| {
+        command.get(start..end).is_some_and(|segment| {
+            segment_invokes_executable(segment, executables) && regex.is_match(segment)
+        })
+    }) {
+        return true;
+    }
+
+    if segment_ranges.len() == 1 {
+        return false;
+    }
+
+    let mut search_start = 0usize;
+    loop {
+        let Some((start, end)) = regex.find_from(command, search_start) else {
+            return false;
+        };
+        if span_starts_in_executable_segment(
+            MatchSpan { start, end },
+            command,
+            &segment_ranges,
+            executables,
+        ) {
+            return true;
+        }
+
+        if end > search_start {
+            search_start = end;
+        } else if end < command.len() {
+            let Some(ch) = command[end..].chars().next() else {
+                return false;
+            };
+            search_start = end + ch.len_utf8();
+        } else {
+            return false;
+        }
+    }
+}
+
+/// Coarse executable-scope gate for semantic matches that have no regex span.
+/// This is the same fallback used by the primary evaluator when a parser-only
+/// rule cannot attribute a more precise byte range.
+pub(crate) fn command_invokes_declared_executable(command: &str, executables: &[&str]) -> bool {
+    let ranges =
+        command_segment_ranges_in_dialect(command, crate::normalize::ShellDialect::Unknown);
+    if ranges.is_empty() {
+        return segment_invokes_executable(command, executables);
+    }
+    ranges.iter().any(|&(start, end)| {
+        command
+            .get(start..end)
+            .is_some_and(|segment| segment_invokes_executable(segment, executables))
     })
 }
 
