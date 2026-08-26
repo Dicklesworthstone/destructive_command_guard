@@ -313,7 +313,8 @@ fn python_heredoc_to_powershell_hook_denial_is_actionable() {
         .as_str()
         .expect("hook denial carries a reason");
     assert!(
-        reason.contains("heredoc input could not be extracted completely"),
+        reason.contains("heredoc pipeline producer \"python\"")
+            && reason.contains("is not a statically modeled literal source"),
         "hook JSON must retain producer provenance: {reason}"
     );
     assert!(

@@ -15967,6 +15967,10 @@ fn literal_heredoc_producer_source(command: &str) -> Option<IndirectInputSource>
         .filter(|content| content.heredoc_type.is_some())
         .collect();
     let heredoc_count = heredocs.len();
+    let producer_target = heredocs
+        .iter()
+        .find_map(|content| content.target_command.as_deref())
+        .map(str::to_owned);
     let mut cat_inputs = heredocs.into_iter().filter(|content| {
         content
             .target_command
@@ -15979,9 +15983,10 @@ fn literal_heredoc_producer_source(command: &str) -> Option<IndirectInputSource>
         // ways dcg does not model. That is an unverifiable source, not "no
         // heredoc here".
         return (heredoc_count > 0).then(|| {
-            IndirectInputSource::Unverified(
-                "heredoc pipeline producer is not a literal cat".to_string(),
-            )
+            let target = producer_target.as_deref().unwrap_or("unknown command");
+            IndirectInputSource::Unverified(format!(
+                "heredoc pipeline producer {target:?} is not a statically modeled literal source"
+            ))
         });
     };
     if cat_inputs.next().is_some() {
@@ -23095,10 +23100,19 @@ fn evaluate_pack_destructive_patterns(
         })
         .flatten();
     let unmasked_pattern_command = syntax_view.as_deref().unwrap_or(command_slice);
-    let decoded_without_source_map = shell_dialect != crate::normalize::ShellDialect::Unknown
-        && unmasked_pattern_command != command_slice;
-    let masked_pattern_command =
-        mask_nested_segment_ranges(unmasked_pattern_command, slice_offset, ignored_ranges);
+    let transformed_without_source_map = unmasked_pattern_command != command_slice;
+    // A dialect decoder may synthesize executable syntax from substitutions
+    // (for example `g$(printf it) reset --hard`). Its view has no byte-for-byte
+    // source map, so applying ranges from the raw command would erase the
+    // decoded argv0 or options and turn a proven destructive command into an
+    // allow. The role-aware decoder has already decided which substitutions
+    // are executable syntax; nested-range masking is only for source-aligned
+    // regex views.
+    let masked_pattern_command = if transformed_without_source_map {
+        Cow::Borrowed(unmasked_pattern_command)
+    } else {
+        mask_nested_segment_ranges(unmasked_pattern_command, slice_offset, ignored_ranges)
+    };
     let pattern_command = masked_pattern_command.as_ref();
     let redirect_syntax_command = if pack_id == "core.filesystem"
         && shell_dialect != crate::normalize::ShellDialect::Unknown
@@ -23168,7 +23182,7 @@ fn evaluate_pack_destructive_patterns(
         // deliberately carry no source span. A broad regex span can point at
         // option data such as an earlier `--format -d`, which is worse than no
         // span and would mislead explain/audit output.
-        let matched_span = if semantic_branch_match || decoded_without_source_map {
+        let matched_span = if semantic_branch_match || transformed_without_source_map {
             None
         } else {
             find_actionable_command_pattern_span(
@@ -23190,7 +23204,7 @@ fn evaluate_pack_destructive_patterns(
         }
 
         let decoded_regex_match =
-            decoded_without_source_map && pattern.regex.is_match(pattern_command);
+            transformed_without_source_map && pattern.regex.is_match(pattern_command);
         if !semantic_branch_match && !decoded_regex_match && matched_span.is_none() {
             continue;
         }
@@ -31209,9 +31223,20 @@ mod tests {
             let info = result.pattern_info.expect("denial carries diagnostics");
             assert_eq!(info.pack_id.as_deref(), Some("heredoc.posix"));
             assert_eq!(info.pattern_name.as_deref(), Some("pipeline-consumer"));
-            assert!(
-                info.reason
+            let provenance_is_specific = match dialect {
+                ShellDialect::PowerShell => info
+                    .reason
                     .contains("heredoc input could not be extracted completely"),
+                ShellDialect::Posix => {
+                    info.reason.contains("heredoc pipeline producer \"python\"")
+                        && info
+                            .reason
+                            .contains("is not a statically modeled literal source")
+                }
+                ShellDialect::Cmd | ShellDialect::Unknown => unreachable!(),
+            };
+            assert!(
+                provenance_is_specific,
                 "heredoc provenance must survive the pipeline topology ({dialect:?}): {:?}",
                 info.reason
             );
