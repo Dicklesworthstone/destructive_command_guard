@@ -540,9 +540,16 @@ fn test_omp_robot_boundary_persists_history_before_block_exit_and_isolates_agent
         "two robot evaluations must persist while the human diagnostic stays out"
     );
 
+    // The child process records its own current_dir(), which the OS reports
+    // in canonical form (macOS resolves the /var -> /private/var symlink), so
+    // canonicalize the expectation instead of comparing the raw tempdir path.
+    let recorded_cwd = temp
+        .path()
+        .canonicalize()
+        .expect("canonicalize history cwd");
     let omp_values = rows[0].values();
     assert_eq!(history_text(&omp_values[0]), "omp");
-    assert_eq!(history_text(&omp_values[1]), temp.path().to_string_lossy());
+    assert_eq!(history_text(&omp_values[1]), recorded_cwd.to_string_lossy());
     assert_eq!(history_text(&omp_values[2]), "git reset --hard HEAD");
     assert_eq!(history_text(&omp_values[3]), "deny");
     assert_eq!(history_text(&omp_values[4]), "core.git");
@@ -552,7 +559,7 @@ fn test_omp_robot_boundary_persists_history_before_block_exit_and_isolates_agent
     assert_eq!(history_text(&codex_values[0]), "codex-cli");
     assert_eq!(
         history_text(&codex_values[1]),
-        temp.path().to_string_lossy()
+        recorded_cwd.to_string_lossy()
     );
     assert_eq!(history_text(&codex_values[2]), "git status");
     assert_eq!(history_text(&codex_values[3]), "allow");
