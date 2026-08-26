@@ -20153,7 +20153,7 @@ if ($errors.Count -ne 0) {
             );
         }
         assert!(source.contains(
-            "classification.action === \"infrastructure\" || collectionFailures.length > 0"
+            "classification.action === \"infrastructure\" || protocolDetail || collectionFailures.length > 0"
         ));
         assert!(source.contains("if (classification.action !== \"block\") return;"));
     }
@@ -20305,7 +20305,9 @@ if ($errors.Count -ne 0) {
         assert!(source.contains("const stderrDetail = visibleStderrDetail(stderrText);"));
         assert_eq!(
             source
-                .matches("if (collectionFailures.length === 0 && !protocolDetail && stderrDetail) {")
+                .matches(
+                    "if (collectionFailures.length === 0 && !protocolDetail && stderrDetail) {",
+                )
                 .count(),
             1,
             "allow and block must share one non-infrastructure stderr forwarding point"
@@ -20519,7 +20521,10 @@ for (const [baseCaseId, stdout, expectedVerdict, expectedWitness] of [
   ["framing/deny-crlf-before-partial-junk", `${verdictFixtures.deny}\r\n{`, "deny", true],
   ["framing/partial-deny-then-allow", `{"decision":"den\n${verdictFixtures.allow}\n`, "malformed", false],
   ["framing/allow-before-partial-junk", `${verdictFixtures.allow}\n{`, "malformed", false],
-  ["framing/deny-with-same-line-junk", `${verdictFixtures.deny}junk`, "malformed", false],
+  ["framing/deny-prefix-incomplete-json", `{"decision":"deny"\n`, "malformed", false],
+  ["framing/ask-prefix-incomplete-json", `{"decision":"ask"\n`, "malformed", false],
+  ["framing/indeterminate-prefix-incomplete-json", `{"decision":"indeterminate"\n`, "malformed", false],
+  ["framing/deny-with-same-line-junk", `${verdictFixtures.deny}junk\n`, "malformed", false],
 ] as const) {
   for (const outcome of outcomes) {
     const caseId = `${baseCaseId}/${outcome}`;
@@ -21028,7 +21033,7 @@ console.log(JSON.stringify({
     /// Translation-validates the exact generated module in Bun. This is an
     /// explicit opt-in gate because the Rust project does not otherwise depend
     /// on Bun: invoke it with
-    /// `cargo test --lib cli::tests::omp_generated_extension_executes_replay_certificate -- --ignored --exact --nocapture`.
+    /// `DCG_OMP_REPLAY_ROOT=/fresh/persistent/path cargo test --lib cli::tests::omp_generated_extension_executes_replay_certificate -- --ignored --exact --nocapture`.
     /// The same corpus must reject a one-cell transition mutant, which proves
     /// the replay is sensitive to the safety behavior it certifies.
     #[test]
@@ -21042,8 +21047,20 @@ console.log(JSON.stringify({
         );
         let executable = current_dcg_executable().expect("current executable");
         let source = build_omp_extension_source(&executable).expect("extension generation");
-        let temp = tempfile::tempdir().expect("temporary bridge replay root");
-        let exact_root = temp.path().join("exact");
+        let temporary_root;
+        let replay_root = if let Some(path) = std::env::var_os("DCG_OMP_REPLAY_ROOT") {
+            let root = std::path::PathBuf::from(path);
+            std::fs::create_dir(&root).expect("create fresh persistent bridge replay root");
+            temporary_root = None;
+            root
+        } else {
+            let root = tempfile::tempdir().expect("temporary bridge replay root");
+            let path = root.path().to_path_buf();
+            temporary_root = Some(root);
+            path
+        };
+        let _temporary_root_guard = temporary_root;
+        let exact_root = replay_root.join("exact");
         std::fs::create_dir_all(&exact_root).expect("create exact replay root");
 
         let output = run_omp_bridge_bun_fixture(&bun, &exact_root, &source);
@@ -21163,6 +21180,9 @@ console.log(JSON.stringify({
             "framing/deny-crlf-before-partial-junk",
             "framing/partial-deny-then-allow",
             "framing/allow-before-partial-junk",
+            "framing/deny-prefix-incomplete-json",
+            "framing/ask-prefix-incomplete-json",
+            "framing/indeterminate-prefix-incomplete-json",
             "framing/deny-with-same-line-junk",
         ]
         .into_iter()
@@ -21244,7 +21264,7 @@ console.log(JSON.stringify({
             "mutation witness must identify exactly one production transition row"
         );
         let mutant = source.replacen(exit_zero_row, mutated_exit_zero_row, 1);
-        let mutant_root = temp.path().join("mutant-exit-zero-deny");
+        let mutant_root = replay_root.join("mutant-exit-zero-deny");
         std::fs::create_dir_all(&mutant_root).expect("create mutant replay root");
         let mutant_output = run_omp_bridge_bun_fixture(&bun, &mutant_root, &mutant);
         assert!(
@@ -21266,9 +21286,8 @@ console.log(JSON.stringify({
             "framing mutation witness must identify exactly one blocking-frame recovery"
         );
         let framing_mutant = source.replacen(framed_block_return, "return parsed;", 1);
-        let framing_mutant_root = temp.path().join("mutant-drop-framed-block");
-        std::fs::create_dir_all(&framing_mutant_root)
-            .expect("create framing mutant replay root");
+        let framing_mutant_root = replay_root.join("mutant-drop-framed-block");
+        std::fs::create_dir_all(&framing_mutant_root).expect("create framing mutant replay root");
         let framing_mutant_output =
             run_omp_bridge_bun_fixture(&bun, &framing_mutant_root, &framing_mutant);
         assert!(
@@ -21277,11 +21296,41 @@ console.log(JSON.stringify({
             String::from_utf8_lossy(&framing_mutant_output.stdout)
         );
         assert!(
-            String::from_utf8_lossy(&framing_mutant_output.stderr).contains(
-                "framing/deny-before-partial-junk/spawn-throw/parsed-verdict"
-            ),
+            String::from_utf8_lossy(&framing_mutant_output.stderr)
+                .contains("framing/deny-before-partial-junk/spawn-throw/parsed-verdict"),
             "framing mutant red must identify the erased complete deny witness\nstderr:\n{}",
             String::from_utf8_lossy(&framing_mutant_output.stderr)
+        );
+
+        let parsed_candidate = "const candidate = parseDcgJson(frame);";
+        let prefix_only_candidate = r#"const candidate = {
+        verdict: frame.startsWith('{"decision":"deny"')
+          ? "deny" as const
+          : frame.startsWith('{"decision":"ask"')
+            ? "ask" as const
+            : "indeterminate" as const,
+      };"#;
+        assert_eq!(
+            source.matches(parsed_candidate).count(),
+            1,
+            "prefix-only mutation witness must identify exactly one parsed blocking candidate"
+        );
+        let prefix_only_mutant = source.replacen(parsed_candidate, prefix_only_candidate, 1);
+        let prefix_only_mutant_root = replay_root.join("mutant-prefix-only-framing");
+        std::fs::create_dir_all(&prefix_only_mutant_root)
+            .expect("create prefix-only framing mutant replay root");
+        let prefix_only_mutant_output =
+            run_omp_bridge_bun_fixture(&bun, &prefix_only_mutant_root, &prefix_only_mutant);
+        assert!(
+            !prefix_only_mutant_output.status.success(),
+            "the executable corpus vacuously accepted prefix-only blocking-frame recovery\nstdout:\n{}",
+            String::from_utf8_lossy(&prefix_only_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&prefix_only_mutant_output.stderr)
+                .contains("framing/deny-prefix-incomplete-json/spawn-throw/parsed-verdict"),
+            "prefix-only mutant red must identify delimiter-complete invalid JSON\nstderr:\n{}",
+            String::from_utf8_lossy(&prefix_only_mutant_output.stderr)
         );
 
         let settled_collector = r"    const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
@@ -21303,7 +21352,7 @@ console.log(JSON.stringify({
             "collection mutation witness must identify exactly one settled capability collector"
         );
         let collection_mutant = source.replacen(settled_collector, fail_fast_collector, 1);
-        let collection_mutant_root = temp.path().join("mutant-fail-fast-collection");
+        let collection_mutant_root = replay_root.join("mutant-fail-fast-collection");
         std::fs::create_dir_all(&collection_mutant_root)
             .expect("create fail-fast collection mutant replay root");
         let collection_mutant_output =
@@ -21315,8 +21364,8 @@ console.log(JSON.stringify({
         );
         assert!(
             String::from_utf8_lossy(&collection_mutant_output.stderr)
-                .contains("synthetic stderr read failure"),
-            "collector mutant red must reach the rejected diagnostic promise that erases a completed deny\nstderr:\n{}",
+                .contains("synthetic exit status failure"),
+            "collector mutant red must reach the rejected exit-status promise that erases a completed deny\nstderr:\n{}",
             String::from_utf8_lossy(&collection_mutant_output.stderr)
         );
 
@@ -21330,7 +21379,7 @@ console.log(JSON.stringify({
             "stdin mutation witness must identify exactly one bounded dispatch"
         );
         let stdin_mutant = source.replacen(bounded_stdin_dispatch, unbounded_stdin_dispatch, 1);
-        let stdin_mutant_root = temp.path().join("mutant-unbounded-stdin");
+        let stdin_mutant_root = replay_root.join("mutant-unbounded-stdin");
         std::fs::create_dir_all(&stdin_mutant_root).expect("create stdin mutant replay root");
         let stdin_mutant_output =
             run_omp_bridge_bun_fixture(&bun, &stdin_mutant_root, &stdin_mutant);
