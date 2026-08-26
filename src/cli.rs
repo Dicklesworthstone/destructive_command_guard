@@ -12973,7 +12973,12 @@ export const DCG_STDIN_CHUNK_CODE_UNITS = {OMP_CHILD_STDIN_CHUNK_CODE_UNITS};
 type DcgChildOutcome = "spawn-throw" | "exit-0" | "exit-1" | "exit-2" | "exit-other";
 type DcgParsedVerdict = "empty" | "malformed" | "allow" | "deny" | "ask" | "indeterminate" | "unknown";
 type DcgBridgeAction = "allow" | "block" | "infrastructure";
-type DcgParsedOutput = {{ verdict: DcgParsedVerdict; reason?: string; ruleId?: string }};
+type DcgParsedOutput = {{
+  verdict: DcgParsedVerdict;
+  reason?: string;
+  ruleId?: string;
+  framedBlockingWitness?: true;
+}};
 type DcgBoundedText = {{ text: string; overflowed: boolean; readFailure?: string }};
 type OmpBashToolInput = {{ command?: unknown; cwd?: unknown; async?: unknown; pty?: unknown }};
 type OmpToolCallClassification =
@@ -13008,10 +13013,7 @@ export function classifyOmpToolCall(event: unknown): OmpToolCallClassification {
   return {{ kind: "bash", input: toolInput, command: toolInput.command }};
 }}
 
-function parseDcgOutput(stdoutText: string): DcgParsedOutput {{
-  const text = stdoutText.trim();
-  if (!text) return {{ verdict: "empty" }};
-
+function parseDcgJson(text: string): DcgParsedOutput {{
   let raw: unknown;
   try {{
     raw = JSON.parse(text);
@@ -13036,6 +13038,39 @@ function parseDcgOutput(stdoutText: string): DcgParsedOutput {{
     reason: typeof record.reason === "string" ? record.reason : undefined,
     ruleId: typeof record.rule_id === "string" ? record.rule_id : undefined,
   }};
+}}
+
+function parseDcgOutput(stdoutText: string): DcgParsedOutput {{
+  const text = stdoutText.trim();
+  if (!text) return {{ verdict: "empty" }};
+
+  const parsed = parseDcgJson(text);
+  if (parsed.verdict !== "malformed") return parsed;
+
+  // The private Rust producer emits exactly one compact JSON object followed
+  // by LF. If later bytes corrupt the aggregate, retain any independently
+  // parseable, delimiter-complete blocking frame as an absorbing witness.
+  // Never recover allow, never parse an unterminated suffix, and never infer a
+  // JSON prefix from same-line junk. The exact decision prefixes cheaply skip
+  // arbitrary diagnostic lines before paying for JSON.parse on this cold path.
+  let frameStart = 0;
+  while (true) {{
+    const frameEnd = stdoutText.indexOf("\n", frameStart);
+    if (frameEnd < 0) break;
+    const frame = stdoutText.slice(frameStart, frameEnd).trim();
+    const mightBlock =
+      frame.startsWith('{{"decision":"deny"') ||
+      frame.startsWith('{{"decision":"ask"') ||
+      frame.startsWith('{{"decision":"indeterminate"');
+    if (mightBlock) {{
+      const candidate = parseDcgJson(frame);
+      if (BLOCKING_DECISIONS.has(candidate.verdict)) {{
+        return {{ ...candidate, framedBlockingWitness: true }};
+      }}
+    }}
+    frameStart = frameEnd + 1;
+  }}
+  return parsed;
 }}
 
 export function classifyDcgChild(
@@ -13296,18 +13331,27 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
       ? {{ action: "block" as const, output: {{ verdict: "unknown" as const }} }}
       : classifyDcgChild(childOutcomeFromExitCode(exitCode), stdoutText.text);
     const stderrDetail = visibleStderrDetail(stderrText);
+    const protocolDetail = stdoutText.overflowed
+      ? ""
+      : classification.output.framedBlockingWitness
+        ? "dcg stdout contained extra or incomplete data around a complete blocking verdict"
+        : classification.output.verdict === "malformed"
+          ? "dcg stdout was malformed"
+          : classification.output.verdict === "unknown"
+            ? "dcg stdout carried an unrecognized decision"
+            : "";
     if (stdoutText.overflowed) {{
       console.error(`[dcg] OMP guard dcg stdout exceeded ${{DCG_STDOUT_MAX_BYTES}}-byte safety-verdict cap; blocking conservatively`);
     }}
-    if (classification.action === "infrastructure" || collectionFailures.length > 0) {{
+    if (classification.action === "infrastructure" || protocolDetail || collectionFailures.length > 0) {{
       const exitDetail = typeof exitCode === "number" ? ` (exit ${{exitCode}})` : "";
-      const details = boundedDiagnosticText([stderrDetail, ...collectionFailures].filter(Boolean).join("; "));
+      const details = boundedDiagnosticText([protocolDetail, stderrDetail, ...collectionFailures].filter(Boolean).join("; "));
       console.error(`[dcg] OMP guard infrastructure failure${{exitDetail}}${{details ? `: ${{details}}` : ""}}`);
       // A collection fault is not allowed to erase a completed deny-like
       // stdout verdict or the independent blocking exit-1 signal.
       if (classification.action !== "block") return;
     }}
-    if (collectionFailures.length === 0 && stderrDetail) {{
+    if (collectionFailures.length === 0 && !protocolDetail && stderrDetail) {{
       console.error(`[dcg] OMP guard dcg stderr: ${{stderrDetail}}`);
     }}
     if (classification.action === "allow") return;
@@ -20195,7 +20239,12 @@ if ($errors.Count -ne 0) {
                 "generated bridge is missing transition row: {row}"
             );
         }
+        assert!(source.contains("function parseDcgJson("));
         assert!(source.contains("function parseDcgOutput("));
+        assert!(source.contains("const frameEnd = stdoutText.indexOf(\"\\n\", frameStart);"));
+        assert!(source.contains("if (frameEnd < 0) break;"));
+        assert!(source.contains("return { ...candidate, framedBlockingWitness: true };"));
+        assert!(source.contains("Never recover allow, never parse an unterminated suffix"));
         assert!(source.contains("export function classifyDcgChild("));
         assert!(source.contains("const classification = stdoutText.overflowed"));
         assert!(
@@ -20255,7 +20304,7 @@ if ($errors.Count -ne 0) {
         assert!(source.contains("const stderrDetail = visibleStderrDetail(stderrText);"));
         assert_eq!(
             source
-                .matches("if (collectionFailures.length === 0 && stderrDetail) {")
+                .matches("if (collectionFailures.length === 0 && !protocolDetail && stderrDetail) {")
                 .count(),
             1,
             "allow and block must share one non-infrastructure stderr forwarding point"
@@ -20270,11 +20319,11 @@ if ($errors.Count -ne 0) {
 
         let infrastructure = source
             .find(
-                "if (classification.action === \"infrastructure\" || collectionFailures.length > 0)",
+                "if (classification.action === \"infrastructure\" || protocolDetail || collectionFailures.length > 0)",
             )
             .expect("infrastructure outcome branch");
         let forward = source
-            .find("if (collectionFailures.length === 0 && stderrDetail) {")
+            .find("if (collectionFailures.length === 0 && !protocolDetail && stderrDetail) {")
             .expect("non-infrastructure stderr forwarding");
         let allow = source
             .find("if (classification.action === \"allow\") return;")
@@ -20457,6 +20506,38 @@ const typedMetadata = classifyDcgChild(
 equal(typedMetadata.output.reason, undefined, "transition/non-string-reason");
 equal(typedMetadata.output.ruleId, undefined, "transition/non-string-rule-id");
 
+const framingCaseIds: string[] = [];
+for (const [baseCaseId, stdout, expectedVerdict, expectedWitness] of [
+  ["framing/deny-before-partial-junk", `${verdictFixtures.deny}\n{`, "deny", true],
+  ["framing/ask-before-partial-junk", `${verdictFixtures.ask}\n{`, "ask", true],
+  ["framing/indeterminate-before-partial-junk", `${verdictFixtures.indeterminate}\n{`, "indeterminate", true],
+  ["framing/allow-then-deny", `${verdictFixtures.allow}\n${verdictFixtures.deny}\n`, "deny", true],
+  ["framing/deny-then-allow", `${verdictFixtures.deny}\n${verdictFixtures.allow}\n`, "deny", true],
+  ["framing/junk-then-deny", `diagnostic junk\n${verdictFixtures.deny}\n`, "deny", true],
+  ["framing/partial-deny-then-deny", `{{"decision":"den\n${verdictFixtures.deny}\n`, "deny", true],
+  ["framing/deny-crlf-before-partial-junk", `${verdictFixtures.deny}\r\n{`, "deny", true],
+  ["framing/partial-deny-then-allow", `{{"decision":"den\n${verdictFixtures.allow}\n`, "malformed", false],
+  ["framing/allow-before-partial-junk", `${verdictFixtures.allow}\n{`, "malformed", false],
+  ["framing/deny-with-same-line-junk", `${verdictFixtures.deny}junk`, "malformed", false],
+] as const) {
+  for (const outcome of outcomes) {
+    const caseId = `${baseCaseId}/${outcome}`;
+    const classified = classifyDcgChild(outcome, stdout);
+    equal(classified.output.verdict, expectedVerdict, `${caseId}/parsed-verdict`);
+    equal(
+      classified.output.framedBlockingWitness === true,
+      expectedWitness,
+      `${caseId}/blocking-witness`,
+    );
+    equal(
+      classified.action,
+      expectedWitness ? "block" : expectedActions[outcome].malformed,
+      `${caseId}/action`,
+    );
+    framingCaseIds.push(caseId);
+  }
+}
+
 const byteStream = (chunks: Uint8Array[], error?: string): ReadableStream<Uint8Array> => {
   let offset = 0;
   return new ReadableStream<Uint8Array>({
@@ -20540,6 +20621,7 @@ for (const [caseId, command, expectedPath] of [
 
 type ChildCase = {
   stdout?: string;
+  stdoutChunks?: string[];
   stderr?: string;
   exitCode?: number;
   stdoutError?: string;
@@ -20585,17 +20667,19 @@ const originalConsoleError = console.error;
   const stdinCollected = new Response(options.stdin).text().then(text => {
     record.stdin = text;
   });
-  const childStream = (text: string, error: string | undefined): ReadableStream<Uint8Array> => {
-    if (!error) return new Blob([text]).stream();
-    let emitted = false;
+  const childStream = (chunks: string[], error: string | undefined): ReadableStream<Uint8Array> => {
+    let offset = 0;
     return new ReadableStream<Uint8Array>({
       pull(controller): void {
-        if (!emitted && text.length > 0) {
-          emitted = true;
-          controller.enqueue(new TextEncoder().encode(text));
-          return;
+        while (offset < chunks.length) {
+          const chunk = encoder.encode(chunks[offset++]!);
+          if (chunk.byteLength > 0) {
+            controller.enqueue(chunk);
+            return;
+          }
         }
-        controller.error(new Error(error));
+        if (error) controller.error(new Error(error));
+        else controller.close();
       },
     });
   };
@@ -20605,8 +20689,8 @@ const originalConsoleError = console.error;
       ? Promise.reject(new Error(activeChild.exitError))
       : Promise.resolve(activeChild.exitCode ?? 0);
   return {
-    stdout: childStream(activeChild.stdout ?? "", activeChild.stdoutError),
-    stderr: childStream(activeChild.stderr ?? "", activeChild.stderrError),
+    stdout: childStream(activeChild.stdoutChunks ?? [activeChild.stdout ?? ""], activeChild.stdoutError),
+    stderr: childStream([activeChild.stderr ?? ""], activeChild.stderrError),
     // Model Bun's native timeout without making the certificate wait for the
     // production 30-second ceiling. The exact configured value and kill
     // signal are asserted above, so removing either production option turns
@@ -20728,12 +20812,51 @@ try {
   check(replay.errors.some(error => error.includes("stdout read failed: Error: after verdict")), "callback/deny-then-stdout-fault/diagnostic");
 
   replay = await invoke(
+    "callback/framed-deny-split-junk-fault",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdoutChunks: [
+        '{{"decision":"de',
+        'ny","reason":"framed deny survives split"}',
+        "\n",
+        "{",
+      ],
+      stdoutError: "after framed junk",
+      exitCode: 0,
+    },
+  );
+  equal(replay.result, { block: true, reason: "framed deny survives split" }, "callback/framed-deny-split-junk-fault/result");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit 0): dcg stdout contained extra or incomplete data around a complete blocking verdict; stdout read failed: Error: after framed junk",
+  ], "callback/framed-deny-split-junk-fault/diagnostics");
+
+  replay = await invoke(
     "callback/allow-then-stdout-fault",
     { toolName: "bash", input: { command: "echo safe" } },
     { stdout: JSON.stringify({ decision: "allow" }), stdoutError: "after apparent allow", exitCode: 0 },
   );
   equal(replay.result, undefined, "callback/allow-then-stdout-fault/result");
   check(replay.errors.some(error => error.includes("stdout read failed: Error: after apparent allow")), "callback/allow-then-stdout-fault/diagnostic");
+
+  replay = await invoke(
+    "callback/malformed-exit-zero-visible",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stdout: "not-json", exitCode: 0 },
+  );
+  equal(replay.result, undefined, "callback/malformed-exit-zero-visible/result");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit 0): dcg stdout was malformed",
+  ], "callback/malformed-exit-zero-visible/diagnostics");
+
+  replay = await invoke(
+    "callback/unknown-exit-two-visible",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { stdout: JSON.stringify({ decision: "future" }), exitCode: 2 },
+  );
+  equal(replay.result, undefined, "callback/unknown-exit-two-visible/result");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit 2): dcg stdout carried an unrecognized decision",
+  ], "callback/unknown-exit-two-visible/diagnostics");
 
   replay = await invoke(
     "callback/stderr-overflow",
@@ -20869,6 +20992,7 @@ console.log(JSON.stringify({
   bunVersion: Bun.version,
   toolCaseIds,
   transitionCaseIds,
+  framingCaseIds,
   stdinCaseIds,
   callbackCaseIds,
   spawnExecutable: observedExecutable,
@@ -21027,6 +21151,27 @@ console.log(JSON.stringify({
             })
             .collect::<Vec<_>>();
         assert_eq!(string_array("transitionCaseIds"), expected_transition_ids);
+        let expected_framing_ids = [
+            "framing/deny-before-partial-junk",
+            "framing/ask-before-partial-junk",
+            "framing/indeterminate-before-partial-junk",
+            "framing/allow-then-deny",
+            "framing/deny-then-allow",
+            "framing/junk-then-deny",
+            "framing/partial-deny-then-deny",
+            "framing/deny-crlf-before-partial-junk",
+            "framing/partial-deny-then-allow",
+            "framing/allow-before-partial-junk",
+            "framing/deny-with-same-line-junk",
+        ]
+        .into_iter()
+        .flat_map(|case_id| {
+            ["spawn-throw", "exit-0", "exit-1", "exit-2", "exit-other"]
+                .into_iter()
+                .map(move |outcome| format!("{case_id}/{outcome}"))
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(string_array("framingCaseIds"), expected_framing_ids);
         assert_eq!(
             string_array("stdinCaseIds"),
             [
