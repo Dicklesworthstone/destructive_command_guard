@@ -1,7 +1,7 @@
 name: False Positive Report
 description: A legitimate command is being incorrectly blocked by dcg
 title: "[False Positive] "
-labels: ["false-positive", "bug"]
+labels: ["bug"]
 body:
   - type: markdown
     attributes:
