@@ -20153,7 +20153,7 @@ if ($errors.Count -ne 0) {
             );
         }
         assert!(source.contains(
-            "classification.action === \"infrastructure\" || collectionFailures.length > 0"
+            "classification.action === \"infrastructure\" || protocolDetail || collectionFailures.length > 0"
         ));
         assert!(source.contains("if (classification.action !== \"block\") return;"));
     }
@@ -20305,7 +20305,9 @@ if ($errors.Count -ne 0) {
         assert!(source.contains("const stderrDetail = visibleStderrDetail(stderrText);"));
         assert_eq!(
             source
-                .matches("if (collectionFailures.length === 0 && !protocolDetail && stderrDetail) {")
+                .matches(
+                    "if (collectionFailures.length === 0 && !protocolDetail && stderrDetail) {"
+                )
                 .count(),
             1,
             "allow and block must share one non-infrastructure stderr forwarding point"
@@ -21267,8 +21269,7 @@ console.log(JSON.stringify({
         );
         let framing_mutant = source.replacen(framed_block_return, "return parsed;", 1);
         let framing_mutant_root = temp.path().join("mutant-drop-framed-block");
-        std::fs::create_dir_all(&framing_mutant_root)
-            .expect("create framing mutant replay root");
+        std::fs::create_dir_all(&framing_mutant_root).expect("create framing mutant replay root");
         let framing_mutant_output =
             run_omp_bridge_bun_fixture(&bun, &framing_mutant_root, &framing_mutant);
         assert!(
@@ -21277,9 +21278,8 @@ console.log(JSON.stringify({
             String::from_utf8_lossy(&framing_mutant_output.stdout)
         );
         assert!(
-            String::from_utf8_lossy(&framing_mutant_output.stderr).contains(
-                "framing/deny-before-partial-junk/spawn-throw/parsed-verdict"
-            ),
+            String::from_utf8_lossy(&framing_mutant_output.stderr)
+                .contains("framing/deny-before-partial-junk/spawn-throw/parsed-verdict"),
             "framing mutant red must identify the erased complete deny witness\nstderr:\n{}",
             String::from_utf8_lossy(&framing_mutant_output.stderr)
         );
