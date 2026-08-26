@@ -81,7 +81,7 @@ safe_patterns:                       # Patterns that explicitly allow
 A regex like `mytool\s+.*--force` can pair the word `mytool` in one command
 with `--force` from a completely different one. Listing `executables` tells dcg
 which programs the rule is actually about, and the rule then only fires when
-the match starts inside a command segment that runs one of them:
+the complete match stays inside a command segment that runs one of them:
 
 ```yaml
 destructive_patterns:
@@ -101,13 +101,16 @@ How dcg resolves a segment's program:
 - A path is reduced to its basename, so `/usr/local/bin/mytool` resolves to
   `mytool`.
 - A trailing `.exe`, `.cmd`, `.bat`, or `.com` is removed.
-- Comparison is ASCII case-insensitive. Write the names lowercase, without a
-  path or extension.
+- Comparison against the resolved program is ASCII case-insensitive, but pack
+  declarations must use canonical lowercase ASCII basenames: start with a
+  letter or digit; then use only letters, digits, `.`, `_`, `+`, or `-`; and
+  omit paths and executable extensions.
 - If the program name is dynamic (it contains `$`, a backtick, or `%VAR%`),
   dcg cannot know what will run, and the rule does **not** fire.
 
-Omit the key — or give an empty list — to leave the rule unscoped, matching
-anywhere in the command as before.
+Omit the key to leave the rule unscoped, matching anywhere in the command as
+before. An explicitly empty list is rejected so a misspelled scope cannot
+silently become broader or turn into a dead rule.
 
 ### Safe Pattern Fields
 

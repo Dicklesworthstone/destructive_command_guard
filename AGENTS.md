@@ -1553,17 +1553,28 @@ The v0.13.0 macOS assets shipped with `VERGEN_GIT_DESCRIBE =
 `DCG_RELEASE_BUILD=1`; every install from those bytes then classified as
 `LocalAheadOfRelease` and `dcg update` refused to run on macOS (#344).
 The invariant a published binary must satisfy is: `classify_provenance()`
-== `Release`, i.e. the embedded describe equals `v<VERSION>` exactly OR the
-`DCG_RELEASE_BUILD` marker is embedded. Check both, for every target,
-including cross-compiled ones you cannot execute locally:
+== `Release`. Usable git metadata is authoritative and must equal
+`v<VERSION>` exactly; the `DCG_RELEASE_BUILD` marker is only a classifier
+fallback when the embedded describe is absent, empty, or the vergen
+placeholder. The marker never overrides a dirty, ahead-of-tag, or wrong-tag
+describe, and the release process is intentionally stricter: every published
+artifact must carry the exact usable describe. Execute each extracted binary
+on its native release host (including targets cross-compiled elsewhere) before
+signing it:
 
 ```bash
-# Runnable targets: the Commit line must be exactly the tag.
-./dcg --version | grep -F "Commit: ${VERSION}"
-# Every target, runnable or not: no -dirty / -N-g<sha> suffix may be embedded.
-tar -xOf "dcg-<target>.tar.xz" dcg | strings | grep -E "^${VERSION}-(dirty|[0-9]+-g)" \
-  && { echo "dirty/ahead describe embedded — rebuild from a clean checkout at the tag with DCG_RELEASE_BUILD=1"; exit 1; }
+# Run this on every artifact's native target: extract the Commit token and
+# compare it exactly to the tag.
+EMBEDDED_DESCRIBE=$(./dcg --version 2>&1 \
+  | sed -nE 's/.*Commit:[[:space:]]+([^[:space:]]+).*/\1/p')
+[ "${EMBEDDED_DESCRIBE}" = "${VERSION}" ] \
+  || { echo "embedded describe is not exactly ${VERSION}: ${EMBEDDED_DESCRIBE:-<missing>}"; exit 1; }
 ```
+
+A `strings` scan is useful diagnosis but is not this gate: it can miss a clean
+wrong tag, a missing describe, or a placeholder. If a native target cannot run
+the extracted binary and produce the exact comparison above, do not publish
+that artifact.
 
 A failure here means rebuilding from a brand-new checkout at the tag (step 2
 of the preflight) — never proceeding to checksums, and never "fixing" it by

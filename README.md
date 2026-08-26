@@ -1259,6 +1259,23 @@ dcg --help
 echo '{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}' | dcg
 ```
 
+### Exclusive File Creation (`dcg create-new`)
+
+Use `create-new` as a pipeline sink when the destination must be new. It opens
+the final path with the operating system's exclusive-create primitive, streams
+stdin byte-for-byte, and writes human status/errors to stderr so stdout stays
+empty:
+
+```bash
+producer | dcg create-new ./artifact.bin
+```
+
+The parent directory must already exist. The command exits non-zero without
+modifying anything if the destination is already a file, directory, or symlink;
+on Unix, a newly created file starts with private permissions (`0600`, subject
+to the process umask). A later stdin or disk error can leave the newly created
+path with a partial stream; `create-new` never removes or replaces that path.
+
 ### Test Mode (`dcg test`)
 
 Use `dcg test` to evaluate a command **without executing it**. This is useful for CI checks, false-positive debugging, and config validation before rollout.
