@@ -4532,8 +4532,6 @@ fn read_test_command_from_stdin(
     max_command_bytes: usize,
     preserve_terminal_line_ending: bool,
 ) -> std::io::Result<String> {
-    use std::io::Read as _;
-
     read_test_command(
         std::io::stdin().lock(),
         max_command_bytes,
@@ -4546,6 +4544,8 @@ fn read_test_command(
     max_command_bytes: usize,
     preserve_terminal_line_ending: bool,
 ) -> std::io::Result<String> {
+    use std::io::Read as _;
+
     let mut bytes = Vec::new();
     let limit = u64::try_from(max_command_bytes)
         .unwrap_or(u64::MAX)
@@ -19053,12 +19053,17 @@ mod tests {
             configured_limit,
             true,
         )
-            .expect_err("one byte over the limit must fail");
+        .expect_err("one byte over the limit must fail");
         assert_eq!(over_limit.kind(), std::io::ErrorKind::InvalidData);
-        assert!(over_limit.to_string().contains("exceeds general.max_command_bytes"));
+        assert!(
+            over_limit
+                .to_string()
+                .contains("exceeds general.max_command_bytes")
+        );
 
-        let invalid_utf8 = read_test_command(std::io::Cursor::new([0xf0, 0x28, 0x8c, 0x28]), 4, true)
-            .expect_err("non-UTF-8 stdin must fail instead of being lossily decoded");
+        let invalid_utf8 =
+            read_test_command(std::io::Cursor::new([0xf0, 0x28, 0x8c, 0x28]), 4, true)
+                .expect_err("non-UTF-8 stdin must fail instead of being lossily decoded");
         assert_eq!(invalid_utf8.kind(), std::io::ErrorKind::InvalidData);
         assert!(invalid_utf8.to_string().contains("not valid UTF-8"));
     }

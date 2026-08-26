@@ -386,8 +386,7 @@ impl LayeredAllowlist {
         for layer in &self.layers {
             for entry in &layer.file.entries {
                 // Skip entries that are invalid or don't match path restrictions
-                let current_session_id =
-                    session_id_for_entry(entry, &mut cached_session_id);
+                let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
                 if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
                     continue;
                 }
@@ -453,8 +452,7 @@ impl LayeredAllowlist {
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
-                let current_session_id =
-                    session_id_for_entry(entry, &mut cached_session_id);
+                let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
                 if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
                     continue;
                 }
@@ -480,8 +478,7 @@ impl LayeredAllowlist {
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
-                let current_session_id =
-                    session_id_for_entry(entry, &mut cached_session_id);
+                let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
                 if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
                     continue;
                 }
@@ -525,8 +522,7 @@ impl LayeredAllowlist {
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
-                let current_session_id =
-                    session_id_for_entry(entry, &mut cached_session_id);
+                let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
                 if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
                     continue;
                 }
@@ -594,8 +590,7 @@ impl LayeredAllowlist {
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
-                let current_session_id =
-                    session_id_for_entry(entry, &mut cached_session_id);
+                let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
                 if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
                     continue;
                 }
