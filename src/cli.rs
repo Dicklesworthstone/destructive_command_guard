@@ -13051,8 +13051,9 @@ function parseDcgOutput(stdoutText: string): DcgParsedOutput {{
   // by LF. If later bytes corrupt the aggregate, retain any independently
   // parseable, delimiter-complete blocking frame as an absorbing witness.
   // Never recover allow, never parse an unterminated suffix, and never infer a
-  // JSON prefix from same-line junk. The exact decision prefixes cheaply skip
-  // arbitrary diagnostic lines before paying for JSON.parse on this cold path.
+  // JSON prefix from same-line junk. OmpBridgeTestOutput declares `decision`
+  // first, so its exact prefixes cheaply skip arbitrary diagnostic lines
+  // before paying for JSON.parse on this cold path.
   let frameStart = 0;
   while (true) {{
     const frameEnd = stdoutText.indexOf("\n", frameStart);
