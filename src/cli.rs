@@ -12970,7 +12970,8 @@ const DCG_CHILD_TIMEOUT_MS = {OMP_CHILD_EVALUATION_TIMEOUT_MS};
 export const DCG_STDOUT_MAX_BYTES = {OMP_CHILD_STDOUT_MAX_BYTES};
 export const DCG_STDERR_MAX_BYTES = {OMP_CHILD_STDERR_MAX_BYTES};
 export const DCG_STDIN_CHUNK_CODE_UNITS = {OMP_CHILD_STDIN_CHUNK_CODE_UNITS};
-type DcgChildOutcome = "spawn-throw" | "exit-0" | "exit-1" | "exit-2" | "exit-other";
+const DCG_SIGNAL_CODE_MAX_CHARS = 64;
+type DcgChildOutcome = "spawn-throw" | "exit-0" | "exit-1" | "exit-2" | "exit-other" | "signal";
 type DcgParsedVerdict = "empty" | "malformed" | "allow" | "deny" | "ask" | "indeterminate" | "unknown";
 type DcgBridgeAction = "allow" | "block" | "infrastructure";
 type DcgParsedOutput = {{
@@ -12996,6 +12997,7 @@ const DCG_CHILD_TRANSITIONS: Record<DcgChildOutcome, Record<DcgParsedVerdict, Dc
   "exit-1": {{ empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }},
   "exit-2": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
   "exit-other": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
+  "signal": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
 }};
 
 // OMP's agent loop schema-validates built-in bash arguments before emitting
@@ -13082,9 +13084,42 @@ export function classifyDcgChild(
   return {{ action: DCG_CHILD_TRANSITIONS[outcome][output.verdict], output }};
 }}
 
-function childOutcomeFromExitCode(exitCode: unknown): DcgChildOutcome {{
-  if (exitCode === 0) return "exit-0";
+function isDcgSignalName(signalCode: string): boolean {{
+  if (
+    signalCode.length <= 3 ||
+    signalCode.length > DCG_SIGNAL_CODE_MAX_CHARS ||
+    !signalCode.startsWith("SIG")
+  ) return false;
+  for (let index = 3; index < signalCode.length; index += 1) {{
+    const code = signalCode.charCodeAt(index);
+    if (!((code >= 0x41 && code <= 0x5a) || (code >= 0x30 && code <= 0x39))) return false;
+  }}
+  return true;
+}}
+
+function isDcgSignalCode(signalCode: unknown): signalCode is string | number {{
+  return (
+    (typeof signalCode === "string" && isDcgSignalName(signalCode)) ||
+    (typeof signalCode === "number" && Number.isInteger(signalCode) && signalCode > 0)
+  );
+}}
+
+function isDcgExitCode(exitCode: unknown): exitCode is number {{
+  return typeof exitCode === "number" && Number.isInteger(exitCode) && exitCode >= 0;
+}}
+
+export function childOutcomeFromTermination(
+  exitCode: unknown,
+  signalCode: unknown,
+): DcgChildOutcome {{
+  // Preserve dcg's independent blocking status even under an impossible or
+  // future runtime shape that reports both exit 1 and a signal.
   if (exitCode === 1) return "exit-1";
+  // Bun's `.exited` resolves to 128 + signal on POSIX, which is identical to
+  // an ordinary process that chose that numeric exit. `signalCode`, populated
+  // after exit, is the authoritative provenance discriminator.
+  if (isDcgSignalCode(signalCode)) return "signal";
+  if (exitCode === 0) return "exit-0";
   if (exitCode === 2) return "exit-2";
   return "exit-other";
 }}
@@ -13105,6 +13140,16 @@ function describeChildCollectionFailure(reason: unknown): string {{
   }} catch {{
     return "<unprintable rejection>";
   }}
+}}
+
+function childTerminationDetail(exitCode: unknown, signalCode: unknown): string {{
+  if (isDcgSignalCode(signalCode)) return ` (signal ${{signalCode}})`;
+  if (isDcgExitCode(exitCode)) return ` (exit ${{exitCode}})`;
+  if (exitCode === undefined) return " (exit status unavailable)";
+  if (exitCode === null) return " (exit status null)";
+  // Never echo an invalid runtime value: control characters or a hostile
+  // `toString` implementation could forge diagnostics.
+  return ` (exit status invalid: ${{typeof exitCode}})`;
 }}
 
 function observeChildCapability<T>(collect: () => Promise<T>): Promise<T> {{
@@ -13323,14 +13368,30 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
     }} else {{
       collectionFailures.push(`exit status failed: ${{describeChildCollectionFailure(exitResult.reason)}}`);
     }}
+    // Bun populates `signalCode` only after termination. Read it after both
+    // pipes and `.exited` have independently settled so an early rejection of
+    // the exit observation cannot hide a later signal that arrives before EOF.
+    // The property is synchronous; retain a throwing getter as its own fault.
+    let signalCode: unknown = undefined;
+    try {{
+      signalCode = proc.signalCode;
+      if (signalCode !== null && !isDcgSignalCode(signalCode)) {{
+        // Never echo an invalid runtime value: control characters could forge
+        // a diagnostic line. Its type is enough to identify the contract fault.
+        collectionFailures.push(`signal status invalid: ${{typeof signalCode}}`);
+      }}
+    }} catch (reason) {{
+      collectionFailures.push(`signal status failed: ${{describeChildCollectionFailure(reason)}}`);
+    }}
 
     // Treat the two child streams as separate capabilities: stdout alone may
     // carry the robot decision; stderr is diagnostic-only but never discarded.
     // An overflow is itself a conservative block. Never parse a retained JSON
     // prefix: it might be a complete allow followed by a discarded denial.
+    const childOutcome = childOutcomeFromTermination(exitCode, signalCode);
     const classification = stdoutText.overflowed
       ? {{ action: "block" as const, output: {{ verdict: "unknown" as const }} }}
-      : classifyDcgChild(childOutcomeFromExitCode(exitCode), stdoutText.text);
+      : classifyDcgChild(childOutcome, stdoutText.text);
     const stderrDetail = visibleStderrDetail(stderrText);
     const protocolDetail = stdoutText.overflowed
       ? ""
@@ -13344,15 +13405,21 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
     if (stdoutText.overflowed) {{
       console.error(`[dcg] OMP guard dcg stdout exceeded ${{DCG_STDOUT_MAX_BYTES}}-byte safety-verdict cap; blocking conservatively`);
     }}
-    if (classification.action === "infrastructure" || protocolDetail || collectionFailures.length > 0) {{
-      const exitDetail = typeof exitCode === "number" ? ` (exit ${{exitCode}})` : "";
+    const hasInfrastructureDiagnostic =
+      classification.action === "infrastructure" ||
+      childOutcome === "exit-other" ||
+      isDcgSignalCode(signalCode) ||
+      Boolean(protocolDetail) ||
+      collectionFailures.length > 0;
+    if (hasInfrastructureDiagnostic) {{
+      const terminationDetail = childTerminationDetail(exitCode, signalCode);
       const details = boundedDiagnosticText([protocolDetail, stderrDetail, ...collectionFailures].filter(Boolean).join("; "));
-      console.error(`[dcg] OMP guard infrastructure failure${{exitDetail}}${{details ? `: ${{details}}` : ""}}`);
+      console.error(`[dcg] OMP guard infrastructure failure${{terminationDetail}}${{details ? `: ${{details}}` : ""}}`);
       // A collection fault is not allowed to erase a completed deny-like
       // stdout verdict or the independent blocking exit-1 signal.
       if (classification.action !== "block") return;
     }}
-    if (collectionFailures.length === 0 && !protocolDetail && stderrDetail) {{
+    if (!hasInfrastructureDiagnostic && stderrDetail) {{
       console.error(`[dcg] OMP guard dcg stderr: ${{stderrDetail}}`);
     }}
     if (classification.action === "allow") return;
@@ -20124,9 +20191,11 @@ if ($errors.Count -ne 0) {
     /// Each child observation is an independent capability. A rejected stderr
     /// or exit-status promise must not make `Promise.all` discard a completed
     /// blocking stdout verdict, and a rejected stdout read must not erase the
-    /// blocking exit-1 signal. Keep the generated collector explicitly
-    /// settled-per-capability so every failure remains available to the
-    /// monotone classifier and to visible infrastructure diagnostics.
+    /// blocking exit-1 status. Signal provenance is read only after all three
+    /// asynchronous capabilities settle, and a property-access fault remains
+    /// independent. Keep the generated collector explicitly settled per
+    /// capability so every failure remains available to the monotone
+    /// classifier and to visible infrastructure diagnostics.
     #[test]
     fn omp_extension_source_isolates_child_collection_faults() {
         let executable = current_dcg_executable().expect("current executable");
@@ -20135,26 +20204,39 @@ if ($errors.Count -ne 0) {
         assert!(source.contains(
             "const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled(["
         ));
+        assert!(source.contains("observeChildCapability(() => proc.exited),"));
+        assert!(source.contains("signalCode = proc.signalCode;"));
+        let settled = source
+            .find("const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([")
+            .expect("settled child capabilities");
+        let signal = source
+            .find("signalCode = proc.signalCode;")
+            .expect("post-settlement signal read");
+        assert!(
+            settled < signal,
+            "signal provenance must be read after the streams and exit observation settle"
+        );
         assert!(source.contains("let proc: Bun.ReadableSubprocess;"));
         assert_eq!(
             source.matches("observeChildCapability(() =>").count(),
             3,
             "stdout, stderr, and exit setup must each convert synchronous setup faults into independently settled rejections"
         );
+        assert!(!source.contains("signalObservation"));
         assert!(source.contains("function observeChildCapability<T>("));
         assert!(
             !source.contains("Promise.all(["),
             "fail-fast aggregation can erase a safety verdict completed on another child channel"
         );
-        for capability in ["stdout read", "stderr read", "exit status"] {
+        for capability in ["stdout read", "stderr read", "exit status", "signal status"] {
             assert!(
                 source.contains(&format!("{capability} failed:")),
                 "generated bridge must diagnose a rejected {capability} capability"
             );
         }
-        assert!(source.contains(
-            "classification.action === \"infrastructure\" || protocolDetail || collectionFailures.length > 0"
-        ));
+        assert!(source.contains("childOutcome === \"exit-other\" ||"));
+        assert!(source.contains("isDcgSignalCode(signalCode) ||"));
+        assert!(source.contains("Boolean(protocolDetail) ||"));
         assert!(source.contains("if (classification.action !== \"block\") return;"));
     }
 
@@ -20234,6 +20316,7 @@ if ($errors.Count -ne 0) {
             r#""exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }"#,
             r#""exit-2": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#,
             r#""exit-other": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
+            r#""signal": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
         ] {
             assert!(
                 source.contains(row),
@@ -20247,12 +20330,25 @@ if ($errors.Count -ne 0) {
         assert!(source.contains("return { ...candidate, framedBlockingWitness: true };"));
         assert!(source.contains("Never recover allow, never parse an unterminated suffix"));
         assert!(source.contains("export function classifyDcgChild("));
+        assert!(source.contains("export function childOutcomeFromTermination("));
+        assert!(source.contains("const DCG_SIGNAL_CODE_MAX_CHARS = 64;"));
+        assert!(source.contains("function isDcgSignalName(signalCode: string): boolean"));
+        assert!(source.contains("!signalCode.startsWith(\"SIG\")"));
+        assert!(source.contains("code >= 0x41 && code <= 0x5a"));
+        assert!(source.contains("code >= 0x30 && code <= 0x39"));
+        assert!(source.contains("signal status invalid: ${typeof signalCode}"));
+        assert!(source.contains("exit status invalid: ${typeof exitCode}"));
+        assert!(!source.contains("describeChildCollectionFailure(exitCode)"));
+        assert!(source.contains("if (exitCode === 1) return \"exit-1\";"));
+        assert!(source.contains("if (isDcgSignalCode(signalCode)) return \"signal\";"));
         assert!(source.contains("const classification = stdoutText.overflowed"));
         assert!(
             source.contains(
-                ": classifyDcgChild(childOutcomeFromExitCode(exitCode), stdoutText.text);"
+                "const childOutcome = childOutcomeFromTermination(exitCode, signalCode);"
             )
         );
+        assert!(source.contains(": classifyDcgChild(childOutcome, stdoutText.text);"));
+        assert!(!source.contains("childOutcomeFromExitCode"));
         assert!(
             source.contains(
                 "reason: typeof record.reason === \"string\" ? record.reason : undefined"
@@ -20285,7 +20381,7 @@ if ($errors.Count -ne 0) {
         assert!(source.contains(
             r#"const classification = stdoutText.overflowed
       ? { action: "block" as const, output: { verdict: "unknown" as const } }
-      : classifyDcgChild(childOutcomeFromExitCode(exitCode), stdoutText.text);"#
+      : classifyDcgChild(childOutcome, stdoutText.text);"#
         ));
         assert_eq!(
             source.matches("classifyDcgChild(").count(),
@@ -20296,7 +20392,7 @@ if ($errors.Count -ne 0) {
             .find("export function classifyDcgChild(")
             .expect("classifier declaration")
             ..source
-                .find("function childOutcomeFromExitCode(")
+                .find("function isDcgSignalCode(")
                 .expect("classifier boundary")];
         assert!(
             !classifier.contains("stderr"),
@@ -20305,28 +20401,24 @@ if ($errors.Count -ne 0) {
         assert!(source.contains("const stderrDetail = visibleStderrDetail(stderrText);"));
         assert_eq!(
             source
-                .matches(
-                    "if (collectionFailures.length === 0 && !protocolDetail && stderrDetail) {",
-                )
+                .matches("if (!hasInfrastructureDiagnostic && stderrDetail) {")
                 .count(),
             1,
             "allow and block must share one non-infrastructure stderr forwarding point"
         );
         assert_eq!(
             source.matches(
-                "console.error(`[dcg] OMP guard infrastructure failure${exitDetail}${details ? `: ${details}` : \"\"}`);"
+                "console.error(`[dcg] OMP guard infrastructure failure${terminationDetail}${details ? `: ${details}` : \"\"}`);"
             ).count(),
             1,
             "the infrastructure diagnostic must include child stderr exactly once"
         );
 
         let infrastructure = source
-            .find(
-                "if (classification.action === \"infrastructure\" || protocolDetail || collectionFailures.length > 0)",
-            )
+            .find("if (hasInfrastructureDiagnostic)")
             .expect("infrastructure outcome branch");
         let forward = source
-            .find("if (collectionFailures.length === 0 && !protocolDetail && stderrDetail) {")
+            .find("if (!hasInfrastructureDiagnostic && stderrDetail) {")
             .expect("non-infrastructure stderr forwarding");
         let allow = source
             .find("if (classification.action === \"allow\") return;")
@@ -20434,6 +20526,7 @@ export function resolveToCwd(requested: string, cwd: string): string {
   DCG_STDERR_MAX_BYTES,
   DCG_STDIN_CHUNK_CODE_UNITS,
   DCG_STDOUT_MAX_BYTES,
+  childOutcomeFromTermination,
   classifyDcgChild,
   classifyOmpToolCall,
 } from "./dcg-guard.ts";
@@ -20475,7 +20568,7 @@ for (const [caseId, event, expectedKind, expectedCommand] of toolCases) {
   toolCaseIds.push(caseId);
 }
 
-const outcomes = ["spawn-throw", "exit-0", "exit-1", "exit-2", "exit-other"] as const;
+const outcomes = ["spawn-throw", "exit-0", "exit-1", "exit-2", "exit-other", "signal"] as const;
 const verdictFixtures = {
   empty: " \n\t",
   malformed: "{",
@@ -20491,6 +20584,7 @@ const expectedActions = {
   "exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" },
   "exit-2": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" },
   "exit-other": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
+  "signal": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
 } as const;
 const transitionCaseIds: string[] = [];
 for (const outcome of outcomes) {
@@ -20508,6 +20602,37 @@ const typedMetadata = classifyDcgChild(
 );
 equal(typedMetadata.output.reason, undefined, "transition/non-string-reason");
 equal(typedMetadata.output.ruleId, undefined, "transition/non-string-rule-id");
+
+const terminationCaseIds: string[] = [];
+for (const [caseId, exitCode, signalCode, expectedOutcome] of [
+  ["termination/exit-0", 0, null, "exit-0"],
+  ["termination/exit-1", 1, null, "exit-1"],
+  ["termination/exit-2", 2, null, "exit-2"],
+  ["termination/exit-9", 9, null, "exit-other"],
+  ["termination/normal-exit-137", 137, null, "exit-other"],
+  ["termination/sigkill", 137, "SIGKILL", "signal"],
+  ["termination/numeric-signal", 137, 9, "signal"],
+  ["termination/signal-beats-exit-0", 0, "SIGTERM", "signal"],
+  ["termination/exit-1-beats-signal", 1, "SIGKILL", "exit-1"],
+  ["termination/undefined-exit", undefined, null, "exit-other"],
+  ["termination/null-exit", null, null, "exit-other"],
+  ["termination/string-exit", "0", null, "exit-other"],
+  ["termination/fractional-exit", 0.5, null, "exit-other"],
+  ["termination/nan-exit", Number.NaN, null, "exit-other"],
+  ["termination/empty-signal", 137, "", "exit-other"],
+  ["termination/control-signal", 137, "SIGKILL\n\u001b[31mFORGED", "exit-other"],
+  ["termination/lowercase-signal", 137, "sigkill", "exit-other"],
+  ["termination/bare-sig", 137, "SIG", "exit-other"],
+  ["termination/oversized-signal", 137, "S".repeat(65), "exit-other"],
+  ["termination/object-signal", 137, { signal: "SIGKILL" }, "exit-other"],
+] as const) {
+  equal(
+    childOutcomeFromTermination(exitCode, signalCode),
+    expectedOutcome,
+    `${caseId}/outcome`,
+  );
+  terminationCaseIds.push(caseId);
+}
 
 const framingCaseIds: string[] = [];
 for (const [baseCaseId, stdout, expectedVerdict, expectedWitness] of [
@@ -20629,10 +20754,14 @@ type ChildCase = {
   stdout?: string;
   stdoutChunks?: string[];
   stderr?: string;
-  exitCode?: number;
+  exitCode?: unknown;
+  signalCode?: unknown;
+  signalAfterStdout?: unknown;
+  stdoutTerminalDelayMs?: number;
   stdoutError?: string;
   stderrError?: string;
   exitError?: string;
+  signalError?: string;
   spawnError?: string;
   stuckUntilTimeout?: boolean;
 };
@@ -20673,10 +20802,15 @@ const originalConsoleError = console.error;
   const stdinCollected = new Response(options.stdin).text().then(text => {
     record.stdin = text;
   });
-  const childStream = (chunks: string[], error: string | undefined): ReadableStream<Uint8Array> => {
+  const childStream = (
+    chunks: string[],
+    error: string | undefined,
+    beforeTerminal?: () => void,
+    terminalDelayMs = 0,
+  ): ReadableStream<Uint8Array> => {
     let offset = 0;
     return new ReadableStream<Uint8Array>({
-      pull(controller): void {
+      async pull(controller): Promise<void> {
         while (offset < chunks.length) {
           const chunk = encoder.encode(chunks[offset++]!);
           if (chunk.byteLength > 0) {
@@ -20684,24 +20818,45 @@ const originalConsoleError = console.error;
             return;
           }
         }
+        if (terminalDelayMs > 0) await Bun.sleep(terminalDelayMs);
+        beforeTerminal?.();
         if (error) controller.error(new Error(error));
         else controller.close();
       },
     });
   };
+  const childExitValue = Object.hasOwn(activeChild, "exitCode") ? activeChild.exitCode : 0;
+  let childSignalValue = Object.hasOwn(activeChild, "signalCode")
+    ? activeChild.signalCode
+    : null;
   const childExit = activeChild.stuckUntilTimeout
-    ? new Promise<number>(resolve => setTimeout(() => resolve(137), 5))
+    ? new Promise<unknown>(resolve => setTimeout(() => {
+        childSignalValue = "SIGKILL";
+        resolve(137);
+      }, 5))
     : activeChild.exitError
       ? Promise.reject(new Error(activeChild.exitError))
-      : Promise.resolve(activeChild.exitCode ?? 0);
+      : Promise.resolve(childExitValue);
+  const childSignalError = activeChild.signalError;
+  const hasSignalAfterStdout = Object.hasOwn(activeChild, "signalAfterStdout");
+  const signalAfterStdout = activeChild.signalAfterStdout;
   return {
-    stdout: childStream(activeChild.stdoutChunks ?? [activeChild.stdout ?? ""], activeChild.stdoutError),
+    stdout: childStream(
+      activeChild.stdoutChunks ?? [activeChild.stdout ?? ""],
+      activeChild.stdoutError,
+      hasSignalAfterStdout ? () => { childSignalValue = signalAfterStdout; } : undefined,
+      activeChild.stdoutTerminalDelayMs,
+    ),
     stderr: childStream([activeChild.stderr ?? ""], activeChild.stderrError),
     // Model Bun's native timeout without making the certificate wait for the
     // production 30-second ceiling. The exact configured value and kill
     // signal are asserted above, so removing either production option turns
     // this replay red before the compressed timer can resolve.
     exited: Promise.all([childExit, stdinCollected]).then(([exitCode]) => exitCode),
+    get signalCode(): unknown {
+      if (childSignalError) throw new Error(childSignalError);
+      return childSignalValue;
+    },
   };
 }) as typeof Bun.spawn;
 console.error = (...values: unknown[]): void => {
@@ -20921,7 +21076,27 @@ try {
     },
   );
   equal(replay.result, { block: true, reason: "deny survives exit fault" }, "callback/exit-reject-deny/result");
-  equal(replay.errors, ["[dcg] OMP guard infrastructure failure: exit status failed: Error: synthetic exit status failure"], "callback/exit-reject-deny/diagnostics");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status unavailable): exit status failed: Error: synthetic exit status failure"], "callback/exit-reject-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/signal-reject-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives signal fault" }),
+      exitCode: 0,
+      signalError: "synthetic signal status failure",
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives signal fault" }, "callback/signal-reject-deny/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 0): signal status failed: Error: synthetic signal status failure"], "callback/signal-reject-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/signal-reject-exit-one",
+    { toolName: "bash", input: { command: "danger" } },
+    { stdout: "", exitCode: 1, signalError: "synthetic signal status failure" },
+  );
+  equal(replay.result, { block: true, reason: "Blocked by dcg (exit 1 without a blocking decision)" }, "callback/signal-reject-exit-one/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 1): signal status failed: Error: synthetic signal status failure"], "callback/signal-reject-exit-one/diagnostics");
 
   replay = await invoke(
     "callback/stdout-reject-exit-zero",
@@ -20937,7 +21112,20 @@ try {
     { exitError: "synthetic exit status failure" },
   );
   equal(replay.result, undefined, "callback/exit-reject-no-verdict/result");
-  equal(replay.errors, ["[dcg] OMP guard infrastructure failure: exit status failed: Error: synthetic exit status failure"], "callback/exit-reject-no-verdict/diagnostics");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status unavailable): exit status failed: Error: synthetic exit status failure"], "callback/exit-reject-no-verdict/diagnostics");
+
+  replay = await invoke(
+    "callback/exit-reject-late-sigkill-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives late signal" }),
+      exitError: "synthetic early exit status failure",
+      signalAfterStdout: "SIGKILL",
+      stdoutTerminalDelayMs: 5,
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives late signal" }, "callback/exit-reject-late-sigkill-deny/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL): exit status failed: Error: synthetic early exit status failure"], "callback/exit-reject-late-sigkill-deny/diagnostics");
 
   replay = await invoke(
     "callback/exit-two-deny",
@@ -20954,6 +21142,123 @@ try {
   equal(replay.result, undefined, "callback/infrastructure-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 9): child crash"], "callback/infrastructure-exit/diagnostics");
 
+  replay = await invoke(
+    "callback/exit-nine-after-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    { stdout: JSON.stringify({ decision: "deny", reason: "deny survives exit nine" }), exitCode: 9 },
+  );
+  equal(replay.result, { block: true, reason: "deny survives exit nine" }, "callback/exit-nine-after-deny/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 9)"], "callback/exit-nine-after-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/normal-exit-137",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: 137, signalCode: null },
+  );
+  equal(replay.result, undefined, "callback/normal-exit-137/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137)"], "callback/normal-exit-137/diagnostics");
+
+  replay = await invoke(
+    "callback/normal-exit-137-after-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    { stdout: JSON.stringify({ decision: "deny", reason: "deny survives exit 137" }), exitCode: 137, signalCode: null },
+  );
+  equal(replay.result, { block: true, reason: "deny survives exit 137" }, "callback/normal-exit-137-after-deny/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137)"], "callback/normal-exit-137-after-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/sigkill-no-verdict",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: 137, signalCode: "SIGKILL" },
+  );
+  equal(replay.result, undefined, "callback/sigkill-no-verdict/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL)"], "callback/sigkill-no-verdict/diagnostics");
+
+  replay = await invoke(
+    "callback/sigkill-after-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives signal" }),
+      stderr: "signal-side diagnostic",
+      exitCode: 137,
+      signalCode: "SIGKILL",
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives signal" }, "callback/sigkill-after-deny/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL): signal-side diagnostic"], "callback/sigkill-after-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/exit-one-beats-signal",
+    { toolName: "bash", input: { command: "danger" } },
+    { stderr: "exit-one signal diagnostic", exitCode: 1, signalCode: "SIGKILL" },
+  );
+  equal(replay.result, { block: true, reason: "Blocked by dcg (exit 1 without a blocking decision)" }, "callback/exit-one-beats-signal/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL): exit-one signal diagnostic"], "callback/exit-one-beats-signal/diagnostics");
+
+  replay = await invoke(
+    "callback/undefined-exit",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: undefined },
+  );
+  equal(replay.result, undefined, "callback/undefined-exit/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status unavailable)"], "callback/undefined-exit/diagnostics");
+
+  replay = await invoke(
+    "callback/null-exit",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: null },
+  );
+  equal(replay.result, undefined, "callback/null-exit/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status null)"], "callback/null-exit/diagnostics");
+
+  replay = await invoke(
+    "callback/control-exit",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: "137\n\u001b[31mFORGED" },
+  );
+  equal(replay.result, undefined, "callback/control-exit/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status invalid: string)"], "callback/control-exit/diagnostics");
+
+  replay = await invoke(
+    "callback/oversized-exit",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: "7".repeat(DCG_STDERR_MAX_BYTES + 1) },
+  );
+  equal(replay.result, undefined, "callback/oversized-exit/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status invalid: string)"], "callback/oversized-exit/diagnostics");
+
+  replay = await invoke(
+    "callback/hostile-object-exit",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: { toString(): string { throw new Error("invalid exit status must not be coerced"); } } },
+  );
+  equal(replay.result, undefined, "callback/hostile-object-exit/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status invalid: object)"], "callback/hostile-object-exit/diagnostics");
+
+  replay = await invoke(
+    "callback/invalid-signal",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: 137, signalCode: { signal: "SIGKILL" } },
+  );
+  equal(replay.result, undefined, "callback/invalid-signal/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137): signal status invalid: object"], "callback/invalid-signal/diagnostics");
+
+  replay = await invoke(
+    "callback/control-signal",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: 137, signalCode: "SIGKILL\n\u001b[31mFORGED" },
+  );
+  equal(replay.result, undefined, "callback/control-signal/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137): signal status invalid: string"], "callback/control-signal/diagnostics");
+
+  replay = await invoke(
+    "callback/oversized-signal",
+    { toolName: "bash", input: { command: "echo safe" } },
+    { exitCode: 137, signalCode: "S".repeat(DCG_STDERR_MAX_BYTES + 1) },
+  );
+  equal(replay.result, undefined, "callback/oversized-signal/result");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137): signal status invalid: string"], "callback/oversized-signal/diagnostics");
+
   const timeoutStarted = performance.now();
   replay = await invoke(
     "callback/timeout-no-verdict",
@@ -20963,7 +21268,7 @@ try {
   check(performance.now() - timeoutStarted < 1_000, "callback/timeout-no-verdict/remained-bounded");
   equal(replay.result, undefined, "callback/timeout-no-verdict/result");
   equal(replay.spawns.length, 1, "callback/timeout-no-verdict/spawn-count");
-  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137)"], "callback/timeout-no-verdict/diagnostics");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL)"], "callback/timeout-no-verdict/diagnostics");
 
   replay = await invoke(
     "callback/timeout-after-deny",
@@ -20974,7 +21279,7 @@ try {
     },
   );
   equal(replay.result, { block: true, reason: "deny survives timeout\n\nRule: core.git:test" }, "callback/timeout-after-deny/result");
-  equal(replay.errors, [], "callback/timeout-after-deny/diagnostics");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL)"], "callback/timeout-after-deny/diagnostics");
 
   replay = await invoke(
     "callback/spawn-throw",
@@ -20998,6 +21303,7 @@ console.log(JSON.stringify({
   bunVersion: Bun.version,
   toolCaseIds,
   transitionCaseIds,
+  terminationCaseIds,
   framingCaseIds,
   stdinCaseIds,
   callbackCaseIds,
@@ -21152,23 +21458,56 @@ console.log(JSON.stringify({
             ]
             .map(str::to_string)
         );
-        let expected_transition_ids = ["spawn-throw", "exit-0", "exit-1", "exit-2", "exit-other"]
+        let expected_transition_ids = [
+            "spawn-throw",
+            "exit-0",
+            "exit-1",
+            "exit-2",
+            "exit-other",
+            "signal",
+        ]
+        .into_iter()
+        .flat_map(|outcome| {
+            [
+                "empty",
+                "malformed",
+                "allow",
+                "deny",
+                "ask",
+                "indeterminate",
+                "unknown",
+            ]
             .into_iter()
-            .flat_map(|outcome| {
-                [
-                    "empty",
-                    "malformed",
-                    "allow",
-                    "deny",
-                    "ask",
-                    "indeterminate",
-                    "unknown",
-                ]
-                .into_iter()
-                .map(move |verdict| format!("transition/{outcome}/{verdict}"))
-            })
-            .collect::<Vec<_>>();
+            .map(move |verdict| format!("transition/{outcome}/{verdict}"))
+        })
+        .collect::<Vec<_>>();
         assert_eq!(string_array("transitionCaseIds"), expected_transition_ids);
+        assert_eq!(
+            string_array("terminationCaseIds"),
+            [
+                "termination/exit-0",
+                "termination/exit-1",
+                "termination/exit-2",
+                "termination/exit-9",
+                "termination/normal-exit-137",
+                "termination/sigkill",
+                "termination/numeric-signal",
+                "termination/signal-beats-exit-0",
+                "termination/exit-1-beats-signal",
+                "termination/undefined-exit",
+                "termination/null-exit",
+                "termination/string-exit",
+                "termination/fractional-exit",
+                "termination/nan-exit",
+                "termination/empty-signal",
+                "termination/control-signal",
+                "termination/lowercase-signal",
+                "termination/bare-sig",
+                "termination/oversized-signal",
+                "termination/object-signal",
+            ]
+            .map(str::to_string)
+        );
         let expected_framing_ids = [
             "framing/deny-before-partial-junk",
             "framing/ask-before-partial-junk",
@@ -21187,9 +21526,16 @@ console.log(JSON.stringify({
         ]
         .into_iter()
         .flat_map(|case_id| {
-            ["spawn-throw", "exit-0", "exit-1", "exit-2", "exit-other"]
-                .into_iter()
-                .map(move |outcome| format!("{case_id}/{outcome}"))
+            [
+                "spawn-throw",
+                "exit-0",
+                "exit-1",
+                "exit-2",
+                "exit-other",
+                "signal",
+            ]
+            .into_iter()
+            .map(move |outcome| format!("{case_id}/{outcome}"))
         })
         .collect::<Vec<_>>();
         assert_eq!(string_array("framingCaseIds"), expected_framing_ids);
@@ -21235,10 +21581,27 @@ console.log(JSON.stringify({
                 "callback/stderr-reject-deny",
                 "callback/stdout-reject-exit-one",
                 "callback/exit-reject-deny",
+                "callback/signal-reject-deny",
+                "callback/signal-reject-exit-one",
                 "callback/stdout-reject-exit-zero",
                 "callback/exit-reject-no-verdict",
+                "callback/exit-reject-late-sigkill-deny",
                 "callback/exit-two-deny",
                 "callback/infrastructure-exit",
+                "callback/exit-nine-after-deny",
+                "callback/normal-exit-137",
+                "callback/normal-exit-137-after-deny",
+                "callback/sigkill-no-verdict",
+                "callback/sigkill-after-deny",
+                "callback/exit-one-beats-signal",
+                "callback/undefined-exit",
+                "callback/null-exit",
+                "callback/control-exit",
+                "callback/oversized-exit",
+                "callback/hostile-object-exit",
+                "callback/invalid-signal",
+                "callback/control-signal",
+                "callback/oversized-signal",
                 "callback/timeout-no-verdict",
                 "callback/timeout-after-deny",
                 "callback/spawn-throw",
@@ -21277,6 +21640,112 @@ console.log(JSON.stringify({
                 .contains("transition/exit-0/deny/action"),
             "mutant red must identify the changed transition cell\nstderr:\n{}",
             String::from_utf8_lossy(&mutant_output.stderr)
+        );
+
+        let signal_classifier = r#"if (isDcgSignalCode(signalCode)) return "signal";"#;
+        let signal_collapse_mutant = r#"if (isDcgSignalCode(signalCode)) return "exit-other";"#;
+        assert_eq!(
+            source.matches(signal_classifier).count(),
+            1,
+            "signal mutation witness must identify exactly one provenance classifier"
+        );
+        let signal_mutant = source.replacen(signal_classifier, signal_collapse_mutant, 1);
+        let signal_mutant_root = replay_root.join("mutant-collapse-signal-provenance");
+        std::fs::create_dir_all(&signal_mutant_root)
+            .expect("create signal-provenance mutant replay root");
+        let signal_mutant_output =
+            run_omp_bridge_bun_fixture(&bun, &signal_mutant_root, &signal_mutant);
+        assert!(
+            !signal_mutant_output.status.success(),
+            "the executable corpus vacuously accepted collapsing SIGKILL into ordinary exit 137\nstdout:\n{}",
+            String::from_utf8_lossy(&signal_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&signal_mutant_output.stderr)
+                .contains("termination/sigkill/outcome"),
+            "signal mutant red must identify lost signal provenance\nstderr:\n{}",
+            String::from_utf8_lossy(&signal_mutant_output.stderr)
+        );
+
+        let safe_signal_name_predicate =
+            r#"(typeof signalCode === "string" && isDcgSignalName(signalCode)) ||"#;
+        let unsafe_signal_name_predicate =
+            r#"(typeof signalCode === "string" && signalCode.length > 0) ||"#;
+        assert_eq!(
+            source.matches(safe_signal_name_predicate).count(),
+            1,
+            "signal-name mutation witness must identify exactly one safe string predicate"
+        );
+        let unsafe_signal_mutant =
+            source.replacen(safe_signal_name_predicate, unsafe_signal_name_predicate, 1);
+        let unsafe_signal_mutant_root = replay_root.join("mutant-unsafe-signal-name");
+        std::fs::create_dir_all(&unsafe_signal_mutant_root)
+            .expect("create unsafe-signal-name mutant replay root");
+        let unsafe_signal_mutant_output =
+            run_omp_bridge_bun_fixture(&bun, &unsafe_signal_mutant_root, &unsafe_signal_mutant);
+        assert!(
+            !unsafe_signal_mutant_output.status.success(),
+            "the executable corpus vacuously accepted control characters in signal diagnostics\nstdout:\n{}",
+            String::from_utf8_lossy(&unsafe_signal_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&unsafe_signal_mutant_output.stderr)
+                .contains("termination/control-signal/outcome"),
+            "unsafe signal-name mutant red must identify the control-injection case\nstderr:\n{}",
+            String::from_utf8_lossy(&unsafe_signal_mutant_output.stderr)
+        );
+
+        let safe_invalid_exit_detail = r#"return ` (exit status invalid: ${typeof exitCode})`;"#;
+        let unsafe_invalid_exit_detail = r#"return ` (exit status ${typeof exitCode} ${describeChildCollectionFailure(exitCode)})`;"#;
+        assert_eq!(
+            source.matches(safe_invalid_exit_detail).count(),
+            1,
+            "invalid-exit mutation witness must identify exactly one type-only diagnostic"
+        );
+        let unsafe_exit_mutant =
+            source.replacen(safe_invalid_exit_detail, unsafe_invalid_exit_detail, 1);
+        let unsafe_exit_mutant_root = replay_root.join("mutant-echo-invalid-exit");
+        std::fs::create_dir_all(&unsafe_exit_mutant_root)
+            .expect("create unsafe invalid-exit mutant replay root");
+        let unsafe_exit_mutant_output =
+            run_omp_bridge_bun_fixture(&bun, &unsafe_exit_mutant_root, &unsafe_exit_mutant);
+        assert!(
+            !unsafe_exit_mutant_output.status.success(),
+            "the executable corpus vacuously accepted echoing hostile exit-status bytes\nstdout:\n{}",
+            String::from_utf8_lossy(&unsafe_exit_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&unsafe_exit_mutant_output.stderr)
+                .contains("callback/control-exit/diagnostics"),
+            "unsafe invalid-exit mutant red must identify the control-injection callback\nstderr:\n{}",
+            String::from_utf8_lossy(&unsafe_exit_mutant_output.stderr)
+        );
+
+        let abnormal_exit_clause = "      childOutcome === \"exit-other\" ||\n";
+        assert_eq!(
+            source.matches(abnormal_exit_clause).count(),
+            1,
+            "abnormal-exit mutation witness must identify exactly one visibility clause"
+        );
+        let silent_abnormal_exit_mutant = source.replacen(abnormal_exit_clause, "", 1);
+        let silent_abnormal_exit_mutant_root = replay_root.join("mutant-silent-abnormal-exit");
+        std::fs::create_dir_all(&silent_abnormal_exit_mutant_root)
+            .expect("create silent abnormal-exit mutant replay root");
+        let silent_abnormal_exit_mutant_output = run_omp_bridge_bun_fixture(
+            &bun,
+            &silent_abnormal_exit_mutant_root,
+            &silent_abnormal_exit_mutant,
+        );
+        assert!(
+            !silent_abnormal_exit_mutant_output.status.success(),
+            "the executable corpus vacuously accepted hiding an abnormal exit behind a deny\nstdout:\n{}",
+            String::from_utf8_lossy(&silent_abnormal_exit_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&silent_abnormal_exit_mutant_output.stderr)
+                .contains("callback/exit-nine-after-deny/diagnostics"),
+            "silent abnormal-exit mutant red must identify the missing exit diagnostic\nstderr:\n{}",
+            String::from_utf8_lossy(&silent_abnormal_exit_mutant_output.stderr)
         );
 
         let framed_block_return = "return { ...candidate, framedBlockingWitness: true };";

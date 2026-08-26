@@ -80,10 +80,14 @@ An explicit evaluator budget above 30 seconds is nevertheless capped by this
 OMP-specific outer ceiling; direct hook and diagnostic invocations retain their
 configured budget.
 If the backstop terminates a child before it returns a safety verdict, the
-bridge reports the infrastructure failure and follows the established visible
-fail-open policy. A complete deny, ask, or indeterminate verdict already
-written to stdout remains authoritative and blocks regardless of the forced
-exit status.
+bridge reads Bun's post-exit `signalCode`, reports the exact signal as an
+infrastructure failure, and follows the established visible fail-open policy.
+This keeps an ordinary numeric exit 137 distinct from a timeout or other
+`SIGKILL`. A complete deny, ask, or indeterminate verdict already written to
+stdout remains authoritative and blocks regardless of the signal; dcg's
+independent blocking exit 1 remains authoritative if status observation is
+otherwise contradictory or faulty. Other abnormal exit statuses remain
+visible even when a deny-like stdout verdict is authoritative.
 
 OMP's public ExtensionAPI does not expose its ACP client-terminal capability or
 selected backend, and both ACP and JSON-RPC surface as `mode: "rpc"`. The bridge
