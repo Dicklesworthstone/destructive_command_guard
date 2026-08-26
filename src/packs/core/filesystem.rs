@@ -6,7 +6,10 @@
 //! - equivalent destruction through `find -delete`, `unlink`, `truncate`, and
 //!   archive/remove or cross-segment relocation primitives
 
-use crate::packs::{DestructivePattern, Pack, PatternSuggestion, Platform, SafePattern, Severity};
+use crate::packs::{
+    ClassifierGuidance, DestructivePattern, Pack, PatternSuggestion, Platform, SafePattern,
+    Severity,
+};
 use crate::{destructive_pattern, safe_pattern};
 
 // ============================================================================
@@ -95,7 +98,7 @@ const RM_RECURSIVE_FORCE_SUGGESTIONS: &[PatternSuggestion] = &[
         "Interactive mode: confirms each file before deletion — needs a terminal; with stdin closed it deletes nothing and exits 0",
     ),
     PatternSuggestion::new(
-        "find {path} --maxdepth 2 -ls | head -30",
+        "find {path} -maxdepth 2 -ls | head -30",
         "Preview directory structure before deletion",
     ),
     PatternSuggestion::new(
@@ -380,7 +383,7 @@ const RM_RECURSIVE_SUGGESTIONS: &[PatternSuggestion] = &[
 
 /// Suggestions for a recursive delete whose command word is decided at run time.
 const RM_UNVERIFIED_SUGGESTIONS: &[PatternSuggestion] = &[
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "rm -r {path}",
         "Name the executable literally so the command can be read before it runs",
     ),
@@ -396,20 +399,18 @@ const RM_UNVERIFIED_SUGGESTIONS: &[PatternSuggestion] = &[
 
 /// Suggestions for PowerShell `Remove-Item -Recurse`.
 const POWERSHELL_REMOVE_ITEM_SUGGESTIONS: &[PatternSuggestion] = &[
-    PatternSuggestion::with_platform(
+    PatternSuggestion::new(
         "Get-ChildItem -Recurse {path}",
         "List the item tree before removing it",
-        Platform::Windows,
     ),
-    PatternSuggestion::with_platform(
+    PatternSuggestion::new(
         "Remove-Item -Recurse -WhatIf {path}",
         "Report what the removal would do without removing anything",
-        Platform::Windows,
     ),
-    PatternSuggestion::with_platform(
-        "Move-Item {path} $env:TEMP\\delete-me-{timestamp}",
-        "Move the tree aside instead of deleting it, then remove the holding copy after review",
-        Platform::Windows,
+    PatternSuggestion::new(
+        "Move-Item {path} (Join-Path ([IO.Path]::GetTempPath()) delete-me-{timestamp})",
+        "Move the tree aside instead of deleting it, then remove the holding copy after review; \
+         the temp path resolves on Windows and on POSIX pwsh alike",
     ),
 ];
 
@@ -443,8 +444,8 @@ pub(crate) const CLASSIFIER_RULE_NAMES: &[&str] = &[
 /// exist only inside the classifier, so their guidance lives here, keyed by
 /// rule name. The rows are text: adding one cannot change what the guard
 /// blocks, only what a blocked caller is told.
-const CLASSIFIER_ONLY_GUIDANCE: &[(&str, &str, &[PatternSuggestion])] = &[
-    (
+pub(crate) const CLASSIFIER_ONLY_GUIDANCE: &[ClassifierGuidance] = &[
+    ClassifierGuidance::new(
         RM_RECURSIVE_GENERAL_NAME,
         "rm -r deletes a directory and everything under it. Leaving off -f does not bound \
          the command: -f decides whether errors are reported and whether a write-protected \
@@ -460,7 +461,7 @@ const CLASSIFIER_ONLY_GUIDANCE: &[(&str, &str, &[PatternSuggestion])] = &[
          The trash directory is ~/.Trash on macOS and ~/.local/share/Trash on Linux.",
         RM_RECURSIVE_SUGGESTIONS,
     ),
-    (
+    ClassifierGuidance::new(
         RM_RECURSIVE_ROOT_HOME_NAME,
         "A recursive rm rooted at /, ~, or $HOME removes the account or the machine, and \
          leaving off -f changes nothing about that: -f decides whether errors are reported, \
@@ -480,7 +481,7 @@ const CLASSIFIER_ONLY_GUIDANCE: &[(&str, &str, &[PatternSuggestion])] = &[
          mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
         RM_RF_ROOT_HOME_SUGGESTIONS,
     ),
-    (
+    ClassifierGuidance::new(
         RM_RECURSIVE_UNVERIFIED_NAME,
         "The command word is decided at run time, so dcg cannot read which binary will run, \
          and the arguments beside it are recursive deletion syntax. A find -exec placeholder \
@@ -495,14 +496,14 @@ const CLASSIFIER_ONLY_GUIDANCE: &[(&str, &str, &[PatternSuggestion])] = &[
          ls -la /path/to/directory",
         RM_UNVERIFIED_SUGGESTIONS,
     ),
-    (
+    ClassifierGuidance::new(
         POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME,
         "Remove-Item -Recurse deletes the whole item tree immediately. PowerShell has no \
          Recycle Bin step: the cmdlet unlinks, and nothing lands anywhere recoverable.\n\n\
          Preview and safer forms:\n  \
          Get-ChildItem -Recurse <path>          # list the tree first\n  \
          Remove-Item -Recurse -WhatIf <path>    # report the removal without doing it\n  \
-         Move-Item <path> $env:TEMP\\delete-me-<literal-timestamp>\n\n\
+         Move-Item <path> (Join-Path ([IO.Path]::GetTempPath()) delete-me-<literal-timestamp>)\n\n\
          To recycle rather than delete, call \
          Microsoft.VisualBasic.FileIO.FileSystem::DeleteDirectory with SendToRecycleBin.",
         POWERSHELL_REMOVE_ITEM_SUGGESTIONS,
@@ -518,8 +519,8 @@ pub(crate) fn classifier_only_guidance(
 ) -> Option<(&'static str, &'static [PatternSuggestion])> {
     CLASSIFIER_ONLY_GUIDANCE
         .iter()
-        .find(|(rule, _, _)| *rule == name)
-        .map(|(_, explanation, suggestions)| (*explanation, *suggestions))
+        .find(|row| row.rule == name)
+        .map(|row| (row.explanation, row.suggestions))
 }
 
 pub(crate) fn is_pre_rm_propagation_rule(name: Option<&str>) -> bool {
@@ -7200,9 +7201,6 @@ mod classifier_guidance_tests {
         }
     }
 
-    /// Each rule must describe itself, not borrow another rule's text. Without
-    /// this, one shared explanation attached to all ten would satisfy the test
-    /// above while telling a PowerShell caller about `rm -ri`.
     /// Each rule must describe itself, not borrow another rule's text. Without
     /// this, one shared explanation attached to all ten would satisfy the test
     /// above while telling a PowerShell caller about `rm -ri`.

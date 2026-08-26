@@ -4903,6 +4903,41 @@ mod tests {
         assert!(alternatives.is_empty());
     }
 
+    /// Guidance a caller never reads is not guidance. Rendering drops every
+    /// suggestion whose platform does not match the host, so a rule tagged for
+    /// one platform hands every other host an empty list and falls back to the
+    /// generic contextual line. Classifier rules are reachable on any host —
+    /// `pwsh` runs on macOS and Linux, and the rm classifier fires there — so
+    /// each one must render alternatives of its own on the platform this test
+    /// runs on. Asserting a non-empty list alone would pass on the contextual
+    /// fallback, so every rendered line must trace back to the rule's table.
+    #[test]
+    fn classifier_guidance_survives_platform_filtering_on_this_host() {
+        for row in crate::packs::classifier_guidance() {
+            let alternatives =
+                pattern_suggestion_alternatives("rm -r ./tree", true, row.suggestions);
+
+            assert!(
+                !alternatives.is_empty(),
+                "{} renders no alternative on {}",
+                row.rule,
+                std::env::consts::OS
+            );
+            for line in &alternatives {
+                assert!(
+                    row.suggestions
+                        .iter()
+                        .any(|suggestion| line.contains(suggestion.command)),
+                    "{} rendered {line:?} on {}, which is not one of its own suggestions — the \
+                     platform filter discarded the authored guidance and the contextual fallback \
+                     took over",
+                    row.rule,
+                    std::env::consts::OS
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_pattern_suggestion_alternatives_falls_back_to_contextual() {
         let alternatives = pattern_suggestion_alternatives("git clean -fd", true, &[]);

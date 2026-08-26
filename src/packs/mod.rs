@@ -280,6 +280,50 @@ impl PatternSuggestion {
     }
 }
 
+/// Guidance authored for a rule that only a semantic classifier can attribute.
+///
+/// A classifier rule carries no regex, so it has no `DestructivePattern` row to
+/// hang an explanation or suggestions on. Anything that walks
+/// `destructive_patterns` to reach every published suggestion — the #316
+/// self-consistency sweep, for one — must walk [`classifier_guidance`] as well,
+/// or these rules ship unchecked.
+#[derive(Debug, Clone, Copy)]
+pub struct ClassifierGuidance {
+    /// The rule name the classifier attributes the denial to.
+    pub rule: &'static str,
+    /// Why the command was blocked and which form is accepted instead.
+    pub explanation: &'static str,
+    /// Safer alternatives, rendered under the same platform filter and gated
+    /// marker as any pattern's suggestions.
+    pub suggestions: &'static [PatternSuggestion],
+}
+
+impl ClassifierGuidance {
+    /// Create a guidance row for a classifier-only rule.
+    #[must_use]
+    pub const fn new(
+        rule: &'static str,
+        explanation: &'static str,
+        suggestions: &'static [PatternSuggestion],
+    ) -> Self {
+        Self {
+            rule,
+            explanation,
+            suggestions,
+        }
+    }
+}
+
+/// Every classifier-only guidance row in the built-in packs.
+///
+/// Pair this with `PackRegistry::all_pack_ids` when a check must cover every
+/// suggestion dcg can publish: the pack list reaches regex rules, this reaches
+/// the rest.
+#[must_use]
+pub fn classifier_guidance() -> &'static [ClassifierGuidance] {
+    core::filesystem::CLASSIFIER_ONLY_GUIDANCE
+}
+
 /// A safe pattern that, when matched, allows the command immediately.
 pub struct SafePattern {
     /// Lazily-compiled regex pattern.
