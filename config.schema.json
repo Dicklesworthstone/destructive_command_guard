@@ -18,6 +18,7 @@
         "check_updates": true,
         "self_heal_hook": true,
         "fail_closed": false,
+        "unverified_decision": "ask",
         "update_pin": false
       }
     },
@@ -291,12 +292,32 @@
           "type": "boolean",
           "default": false
         },
+        "unverified_decision": {
+          "description": "Decision published when dcg cannot verify a command at all (#338):\nthe evaluation deadline expired, or the command exceeds\n`max_command_bytes`.\n\nThe default `ask` routes the command to an explicit operator decision\non review-capable protocols (Claude-compatible, Copilot); protocols\nwithout an `ask` decision always block. Set `deny` for unattended or\nautonomous sessions, where nobody is present to answer the prompt and\nan auto-approver would otherwise wave through exactly the commands dcg\ndeclined to inspect. Override at runtime with\n`DCG_UNVERIFIED_DECISION=deny|ask`.",
+          "$ref": "#/$defs/UnverifiedDecision",
+          "default": "ask"
+        },
         "update_pin": {
           "description": "Pin the installed binary against `dcg update` (#320).\n\nWhen `true`, `dcg update` refuses to replace the installed binary\n(before any network or installer work) unless `--replace-local-build`\nis passed, and the background \"update available\" nudge is suppressed.\nIntended for operators running a local build that is ahead of the\npublished release, where a routine update would silently downgrade\nguard coverage. Override at runtime with `DCG_UPDATE_PIN`.\nDefault: false.",
           "type": "boolean",
           "default": false
         }
       }
+    },
+    "UnverifiedDecision": {
+      "description": "Fallback decision for a command dcg could not verify (#338): evaluation\ndeadline exhausted, or command over `general.max_command_bytes`.\n\nThis is deliberately a two-value enum rather than `PolicyMode`: an\nunverified command has no matched rule to warn or log about, so the only\nmeaningful choices are routing it to an operator (`ask`) or refusing it\n(`deny`).",
+      "oneOf": [
+        {
+          "description": "Route the unverified command to an explicit operator decision on\nreview-capable protocols. Protocols without an `ask` decision block.",
+          "type": "string",
+          "const": "ask"
+        },
+        {
+          "description": "Refuse the unverified command on every protocol. The right posture for\nunattended sessions: the denial reason is actionable (shrink or split\nthe command), while an unanswered `ask` stalls or — worse — gets\nauto-approved without inspection.",
+          "type": "string",
+          "const": "deny"
+        }
+      ]
     },
     "OutputConfig": {
       "description": "Output display configuration.\n\nControls optional output enhancements like span highlighting and explanations.",
