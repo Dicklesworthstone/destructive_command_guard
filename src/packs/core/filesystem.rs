@@ -3684,10 +3684,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              takes hours to days.\n\n\
              dcg auto-allows recursive deletion only for literal temp paths:\n  \
              rm -rf /tmp/<subdir>/scratch\n\n\
-             For any other directory, preview first and then delete interactively \
-             (dcg allows the interactive form):\n  \
+             For any other directory, preview first, then either delete interactively \
+             or move the tree aside (dcg allows both forms):\n  \
              find /path/to/directory -type f | head -20\n  \
-             rm -ri /path/to/directory",
+             rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // Same root/home catastrophe but with SEPARATE flags (`rm -r -f /`,
@@ -3702,7 +3703,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             Critical,
             "Separate `-r -f` flags on `/` or `~` have identical effect to `rm -rf /`: \
              recursive, forced, silent deletion of the entire filesystem or home directory.\n\n\
-             There is NO recovery without backups. Run only if truly intended.",
+             There is NO recovery without backups. Run only if truly intended.\n\n\
+             For a specific directory, preview first, then either delete interactively \
+             or move the tree aside (dcg allows both forms):\n  \
+             ls -la /path/to/directory\n  \
+             rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // Same root/home catastrophe but with LONG flags
@@ -3713,7 +3719,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "rm --recursive --force targeting root or home is EXTREMELY DANGEROUS.",
             Critical,
             "The long-flag form has identical effect to `rm -rf /`: recursive, forced, \
-             silent deletion. Run only if truly intended.",
+             silent deletion. Run only if truly intended.\n\n\
+             For a specific directory, preview first, then either delete interactively \
+             or move the tree aside (dcg allows both forms):\n  \
+             ls -la /path/to/directory\n  \
+             rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // General rm -rf (caught after safe patterns) - High because temp paths are allowed
@@ -3809,7 +3820,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Use absolute paths to avoid ambiguity\n\
              - Consider using trash-cli for recoverable deletion\n\n\
              Preview command:\n  \
-             find /path -maxdepth 2 -ls | head -30",
+             find /path -maxdepth 2 -ls | head -30\n\n\
+             Forms dcg accepts instead:\n  \
+             rm --recursive --force /tmp/<subdir>   # literal temp paths are allowed\n  \
+             rm -ri /path/to/directory              # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
             RM_RECURSIVE_FORCE_SUGGESTIONS
         ),
         // ----- `find ... -delete` (Critical: root/home target) -----
