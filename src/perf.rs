@@ -653,6 +653,41 @@ mod tests {
         );
     }
 
+    /// #344: reject bad embedded provenance before an archive reaches the
+    /// release job. The public fleet probe is intentionally a second,
+    /// post-publication boundary; it must not be the first place a dirty,
+    /// ahead, or placeholder describe is discovered.
+    #[test]
+    fn dist_gate_checks_exact_embedded_tag_before_packaging() {
+        let dist = include_str!("../.github/workflows/dist.yml");
+
+        let build_job = dist
+            .split("  build:")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  release:").next())
+            .expect("distribution workflow must retain its build job");
+        assert!(
+            build_job.contains("fetch-depth: 0"),
+            "release builders need full tag history for trustworthy git describe metadata"
+        );
+        assert!(
+            build_job.contains("Verify embedded release tag (Unix)")
+                && build_job.contains("embedded_describe")
+                && build_job.contains("$GITHUB_REF_NAME"),
+            "every runnable Unix artifact must report the exact release tag before packaging"
+        );
+        assert!(
+            build_job.contains("$embeddedDescribe -cne $env:GITHUB_REF_NAME"),
+            "the native Windows artifact must report the exact release tag before packaging"
+        );
+        assert!(
+            build_job.contains("Verify embedded release tag (Windows ARM64 cross-build)")
+                && build_job.contains("Find-ByteSequence")
+                && build_job.contains("$tagWithSuffix"),
+            "the non-runnable Windows ARM64 artifact must contain the tag and reject dirty/ahead suffixes"
+        );
+    }
+
     #[test]
     fn fail_open_threshold() {
         assert!(!exceeds_absolute_budget(Duration::from_millis(999)));

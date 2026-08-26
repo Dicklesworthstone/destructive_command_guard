@@ -100,6 +100,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          # `git describe --tags` is release evidence, not decoration. A
+          # shallow build checkout can lose the tag/history needed to embed
+          # the exact release provenance (#344).
+          fetch-depth: 0
 
       - name: Install Rust nightly
         # rust-toolchain.toml pins channel = "nightly-2026-06-06", so every
@@ -130,11 +135,36 @@ jobs:
       - name: Build release binary
         # DCG_RELEASE_BUILD marks release-pipeline provenance (#320): the
         # binary can then prove it is a published release rather than a local
-        # build ahead of its tag, even when the CI checkout's git metadata is
-        # shallow. Read at compile time via option_env! in src/update.rs.
+        # build ahead of its tag when Git metadata is unavailable. The exact
+        # tag checks below remain authoritative when metadata is present.
+        # Read at compile time via option_env! in src/update.rs.
         env:
           DCG_RELEASE_BUILD: "1"
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify embedded release tag (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          if [[ ! -x "$binary" ]]; then
+            echo "::error::expected runnable release binary not found at $binary"
+            exit 1
+          fi
+
+          version_output="$("$binary" --version 2>&1)"
+          embedded_describe="$(
+            printf '%s\n' "$version_output" |
+              sed -nE 's/.*Commit:[[:space:]]*([^[:space:]]+).*/\1/p' |
+              head -1
+          )"
+          if [[ "$embedded_describe" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::embedded git describe must equal release tag exactly: expected $GITHUB_REF_NAME, got '${embedded_describe:-<missing>}'"
+            printf '%s\n' "$version_output"
+            exit 1
+          fi
+          echo "embedded release provenance verified: $embedded_describe"
 
       - name: Verify Linux x86_64 musl binary has no glibc symbols
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -224,6 +254,54 @@ jobs:
           }
           Write-Output "Windows binary verified: PE32+ magic 'MZ' present"
 
+      - name: Verify embedded release tag (Windows ARM64 cross-build)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          # The x64 runner cannot execute the ARM64 binary. Inspect the PE
+          # bytes instead: the exact tag must be embedded, while tag-plus-'-'
+          # rejects both dirty and ahead `git describe` spellings (#344).
+          $ErrorActionPreference = 'Stop'
+          $binary = "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+            Write-Output "::error::expected cross-built release binary not found at $binary"
+            exit 1
+          }
+
+          function Find-ByteSequence {
+            param(
+              [byte[]] $Haystack,
+              [byte[]] $Needle
+            )
+            if ($Needle.Length -eq 0 -or $Needle.Length -gt $Haystack.Length) {
+              return $false
+            }
+            for ($i = 0; $i -le $Haystack.Length - $Needle.Length; $i++) {
+              $matches = $true
+              for ($j = 0; $j -lt $Needle.Length; $j++) {
+                if ($Haystack[$i + $j] -ne $Needle[$j]) {
+                  $matches = $false
+                  break
+                }
+              }
+              if ($matches) { return $true }
+            }
+            return $false
+          }
+
+          $bytes = [System.IO.File]::ReadAllBytes($binary)
+          $tagBytes = [System.Text.Encoding]::ASCII.GetBytes($env:GITHUB_REF_NAME)
+          $tagWithSuffix = [System.Text.Encoding]::ASCII.GetBytes("$env:GITHUB_REF_NAME-")
+          if (-not (Find-ByteSequence -Haystack $bytes -Needle $tagBytes)) {
+            Write-Output "::error::cross-built binary does not embed release tag $env:GITHUB_REF_NAME"
+            exit 1
+          }
+          if (Find-ByteSequence -Haystack $bytes -Needle $tagWithSuffix) {
+            Write-Output "::error::cross-built binary embeds dirty/ahead provenance beginning with $env:GITHUB_REF_NAME-"
+            exit 1
+          }
+          Write-Output "embedded ARM64 release provenance verified: $env:GITHUB_REF_NAME"
+
       - name: Execute Windows binary (allow + deny + --version)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
@@ -237,6 +315,16 @@ jobs:
           $ver = (& $bin --version 2>&1 | Out-String)
           if ($LASTEXITCODE -ne 0) { Write-Output "::error::dcg.exe --version failed (exit $LASTEXITCODE)"; exit 1 }
           Write-Output "version: $($ver.Trim())"
+          $commitMatch = [regex]::Match($ver, 'Commit:\s+(?<describe>[^\s│]+)')
+          if (-not $commitMatch.Success) {
+            Write-Output "::error::dcg.exe --version did not report embedded git provenance"
+            exit 1
+          }
+          $embeddedDescribe = $commitMatch.Groups['describe'].Value
+          if ($embeddedDescribe -cne $env:GITHUB_REF_NAME) {
+            Write-Output "::error::embedded git describe must equal release tag exactly: expected $env:GITHUB_REF_NAME, got '$embeddedDescribe'"
+            exit 1
+          }
 
           # ALLOW: a safe command must produce empty stdout (silent exit 0).
           $allow = ('{"tool_name":"Bash","tool_input":{"command":"git status"}}' | & $bin | Out-String)
