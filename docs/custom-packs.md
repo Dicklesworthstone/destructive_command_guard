@@ -119,14 +119,18 @@ anywhere in the command as before.
 
 ## Severity Levels
 
-Severity determines the default action when a command matches:
+Severity determines the default decision mode when a command matches, and how
+much configuration it takes to relax that decision. It is one axis: rule
+authors fold irreversibility, blast radius, and how often the operation is
+legitimately needed into the level they pick — there is no separate
+reversibility field.
 
-| Severity | Default Action | Use Case |
-|----------|---------------|----------|
-| `critical` | Always deny | Irreversible operations (rm -rf /, DROP DATABASE) |
-| `high` | Deny (allowlistable) | Dangerous but sometimes needed (force push, truncate) |
-| `medium` | Warn but allow | Worth noting but not blocking (large deletes) |
-| `low` | Log only | Learning/audit purposes |
+| Severity | Default Action | How it can be relaxed | Use Case |
+|----------|---------------|----------------------|----------|
+| `critical` | Deny | Only by an explicit per-rule `[policy.rules]` override or a per-rule allowlist entry; broad `warn`/`log` policy (global or per-pack) cannot relax it | Catastrophic, typically irreversible operations (rm -rf /, DROP DATABASE) |
+| `high` | Deny | Per-rule overrides and allowlists, and broad policy | Dangerous but sometimes needed (force push, truncate) |
+| `medium` | Warn but allow | n/a (already allows) | Worth noting but not blocking (large deletes) |
+| `low` | Log only | n/a (already allows) | Learning/audit purposes |
 
 ## Keywords Best Practices
 
