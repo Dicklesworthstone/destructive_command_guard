@@ -20514,9 +20514,9 @@ for (const [baseCaseId, stdout, expectedVerdict, expectedWitness] of [
   ["framing/allow-then-deny", `${verdictFixtures.allow}\n${verdictFixtures.deny}\n`, "deny", true],
   ["framing/deny-then-allow", `${verdictFixtures.deny}\n${verdictFixtures.allow}\n`, "deny", true],
   ["framing/junk-then-deny", `diagnostic junk\n${verdictFixtures.deny}\n`, "deny", true],
-  ["framing/partial-deny-then-deny", `{{"decision":"den\n${verdictFixtures.deny}\n`, "deny", true],
+  ["framing/partial-deny-then-deny", `{"decision":"den\n${verdictFixtures.deny}\n`, "deny", true],
   ["framing/deny-crlf-before-partial-junk", `${verdictFixtures.deny}\r\n{`, "deny", true],
-  ["framing/partial-deny-then-allow", `{{"decision":"den\n${verdictFixtures.allow}\n`, "malformed", false],
+  ["framing/partial-deny-then-allow", `{"decision":"den\n${verdictFixtures.allow}\n`, "malformed", false],
   ["framing/allow-before-partial-junk", `${verdictFixtures.allow}\n{`, "malformed", false],
   ["framing/deny-with-same-line-junk", `${verdictFixtures.deny}junk`, "malformed", false],
 ] as const) {
@@ -20816,7 +20816,7 @@ try {
     { toolName: "bash", input: { command: "danger" } },
     {
       stdoutChunks: [
-        '{{"decision":"de',
+        '{"decision":"de',
         'ny","reason":"framed deny survives split"}',
         "\n",
         "{",
@@ -21204,7 +21204,10 @@ console.log(JSON.stringify({
                 "callback/oversized-deny",
                 "callback/oversized-non-verdict",
                 "callback/deny-then-stdout-fault",
+                "callback/framed-deny-split-junk-fault",
                 "callback/allow-then-stdout-fault",
+                "callback/malformed-exit-zero-visible",
+                "callback/unknown-exit-two-visible",
                 "callback/stderr-overflow",
                 "callback/stderr-json-is-diagnostic",
                 "callback/exit-one-stderr-only",
@@ -21253,6 +21256,31 @@ console.log(JSON.stringify({
                 .contains("transition/exit-0/deny/action"),
             "mutant red must identify the changed transition cell\nstderr:\n{}",
             String::from_utf8_lossy(&mutant_output.stderr)
+        );
+
+        let framed_block_return = "return { ...candidate, framedBlockingWitness: true };";
+        assert_eq!(
+            source.matches(framed_block_return).count(),
+            1,
+            "framing mutation witness must identify exactly one blocking-frame recovery"
+        );
+        let framing_mutant = source.replacen(framed_block_return, "return parsed;", 1);
+        let framing_mutant_root = temp.path().join("mutant-drop-framed-block");
+        std::fs::create_dir_all(&framing_mutant_root)
+            .expect("create framing mutant replay root");
+        let framing_mutant_output =
+            run_omp_bridge_bun_fixture(&bun, &framing_mutant_root, &framing_mutant);
+        assert!(
+            !framing_mutant_output.status.success(),
+            "the executable corpus vacuously accepted dropping a complete framed block\nstdout:\n{}",
+            String::from_utf8_lossy(&framing_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&framing_mutant_output.stderr).contains(
+                "framing/deny-before-partial-junk/spawn-throw/parsed-verdict"
+            ),
+            "framing mutant red must identify the erased complete deny witness\nstderr:\n{}",
+            String::from_utf8_lossy(&framing_mutant_output.stderr)
         );
 
         let settled_collector = r"    const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
