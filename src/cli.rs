@@ -12049,6 +12049,54 @@ fn is_dcg_hook_entry_for_matcher(entry: &serde_json::Value, matcher: &str) -> bo
             })
 }
 
+/// Hook-object keys that dcg owns and rewrites on install and self-heal.
+///
+/// Everything else on a hook object (`timeout`, and any field the host adds
+/// in the future) is operator- or host-owned: a repair carries those fields
+/// forward unchanged (#345) and their presence never marks a hook stale.
+/// `shell` is in this list even though only the Windows hook emits it, so a
+/// `settings.json` restored from another OS cannot carry a foreign `shell`
+/// value onto the repaired hook.
+const DCG_OWNED_HOOK_KEYS: &[&str] = &["type", "command", "shell"];
+
+/// Whether `hook` is the dcg hook `desired_hook` describes, judged on the
+/// dcg-owned keys only.
+///
+/// A hook with an extra `"timeout": 10` set by the operator is still the
+/// current dcg hook; comparing whole objects (the pre-#345 behavior) made
+/// every such hook look stale, and the "repair" then dropped the timeout.
+fn hook_has_dcg_identity(hook: &serde_json::Value, desired_hook: &serde_json::Value) -> bool {
+    hook.is_object()
+        && DCG_OWNED_HOOK_KEYS
+            .iter()
+            .all(|key| hook.get(key) == desired_hook.get(key))
+}
+
+/// Rebuild the hook object dcg will write, keeping host-owned fields from the
+/// hook it replaces (#345).
+///
+/// `desired_hook` supplies every dcg-owned key; `previous` (the dcg hook found
+/// in the existing settings, if any) supplies the rest. dcg-owned keys absent
+/// from `desired_hook` are dropped even when `previous` has them, so identity
+/// always ends up exactly as dcg defines it for this platform.
+fn merge_host_owned_hook_fields(
+    desired_hook: serde_json::Value,
+    previous: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(previous) = previous.and_then(serde_json::Value::as_object) else {
+        return desired_hook;
+    };
+    let serde_json::Value::Object(desired) = desired_hook else {
+        return desired_hook;
+    };
+    let mut merged = previous.clone();
+    for key in DCG_OWNED_HOOK_KEYS {
+        merged.remove(*key);
+    }
+    merged.extend(desired);
+    serde_json::Value::Object(merged)
+}
+
 fn is_exact_hook_entry_for_matcher(
     entry: &serde_json::Value,
     matcher: &str,
@@ -12061,7 +12109,11 @@ fn is_exact_hook_entry_for_matcher(
         && entry
             .get("hooks")
             .and_then(serde_json::Value::as_array)
-            .is_some_and(|hooks| hooks.iter().any(|hook| hook == desired_hook))
+            .is_some_and(|hooks| {
+                hooks
+                    .iter()
+                    .any(|hook| hook_has_dcg_identity(hook, desired_hook))
+            })
 }
 
 fn remove_dcg_hooks_from_pre_tool_use(pre_tool_use: &mut Vec<serde_json::Value>) -> bool {
@@ -12129,6 +12181,11 @@ fn install_dcg_hook_for_matcher(
     let original = pre_tool_use.clone();
     let mut canonical_entry = None;
     let mut retained_entries = Vec::with_capacity(original.len());
+    // The dcg hook being replaced, so its host-owned fields (`timeout`, ...)
+    // survive the rewrite (#345). A hook under the canonical matcher is the
+    // best template; one under a legacy matcher is the fallback.
+    let mut previous_canonical_hook: Option<serde_json::Value> = None;
+    let mut previous_legacy_hook: Option<serde_json::Value> = None;
 
     for mut entry in original {
         let entry_matcher = entry
@@ -12149,10 +12206,14 @@ fn install_dcg_hook_for_matcher(
             };
             let original_len = entry_hooks.len();
             entry_hooks.retain(|hook| {
-                !hook
+                let is_dcg = hook
                     .get("command")
                     .and_then(|command| command.as_str())
-                    .is_some_and(is_dcg_command)
+                    .is_some_and(is_dcg_command);
+                if is_dcg && previous_canonical_hook.is_none() {
+                    previous_canonical_hook = Some(hook.clone());
+                }
+                !is_dcg
             });
             let keep_duplicate = entry_hooks.len() == original_len || !entry_hooks.is_empty();
 
@@ -12180,10 +12241,14 @@ fn install_dcg_hook_for_matcher(
                 Some(entry_hooks) => {
                     let original_len = entry_hooks.len();
                     entry_hooks.retain(|hook| {
-                        !hook
+                        let is_dcg = hook
                             .get("command")
                             .and_then(|command| command.as_str())
-                            .is_some_and(is_dcg_command)
+                            .is_some_and(is_dcg_command);
+                        if is_dcg && previous_legacy_hook.is_none() {
+                            previous_legacy_hook = Some(hook.clone());
+                        }
+                        !is_dcg
                     });
                     entry_hooks.len() < original_len && entry_hooks.is_empty()
                 }
@@ -12194,6 +12259,9 @@ fn install_dcg_hook_for_matcher(
             retained_entries.push(entry);
         }
     }
+
+    let previous_hook = previous_canonical_hook.or(previous_legacy_hook);
+    let desired_hook = merge_host_owned_hook_fields(desired_hook, previous_hook.as_ref());
 
     let mut canonical_entry = canonical_entry.unwrap_or(hook_config);
     canonical_entry["hooks"]
@@ -25927,6 +25995,186 @@ exclude = ["target/**"]
             .and_then(|arr| arr.as_array())
             .is_some_and(|a| a.iter().any(is_dcg_hook_entry));
         assert!(is_registered, "hook should be repaired once lock is free");
+    }
+
+    /// A dcg hook whose only difference from the desired one is a host-owned
+    /// field (#345): the operator's `timeout` bound.
+    fn dcg_hook_with_timeout(command: &str, timeout: u64) -> serde_json::Value {
+        let mut hook = claude_dcg_hook().expect("current executable resolves");
+        hook["command"] = serde_json::Value::String(command.to_string());
+        hook["timeout"] = serde_json::json!(timeout);
+        hook
+    }
+
+    fn canonical_dcg_hook(settings: &serde_json::Value) -> &serde_json::Value {
+        settings["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse array")
+            .iter()
+            .find(|entry| entry["matcher"] == CLAUDE_SHELL_MATCHER)
+            .and_then(|entry| entry["hooks"].as_array())
+            .and_then(|hooks| {
+                hooks.iter().find(|hook| {
+                    hook["command"]
+                        .as_str()
+                        .is_some_and(is_dcg_command)
+                })
+            })
+            .expect("a dcg hook under the canonical matcher")
+    }
+
+    #[test]
+    fn self_heal_keeps_operator_timeout_when_hook_is_current() {
+        // Regression for #345: an operator-set `timeout` on the current dcg
+        // hook must not make it look stale. Both the lock-free fast path and
+        // the merge must report "nothing to do".
+        let desired = claude_dcg_hook().unwrap();
+        let current_command = desired["command"].as_str().unwrap().to_string();
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": CLAUDE_SHELL_MATCHER,
+                    "hooks": [dcg_hook_with_timeout(&current_command, 10)]
+                }]
+            }
+        });
+
+        assert!(
+            settings_has_exact_dcg_hook(&settings, &desired),
+            "a current hook with a host-owned timeout is not stale"
+        );
+        let changed = install_dcg_hook_into_settings(&mut settings, false).unwrap();
+        assert!(!changed, "no repair when only host-owned fields differ");
+        assert_eq!(canonical_dcg_hook(&settings)["timeout"], 10);
+    }
+
+    #[test]
+    fn self_heal_repair_carries_operator_timeout_forward() {
+        // Regression for #345: repairing a stale command path must keep the
+        // operator's timeout on the rewritten hook, on both the self-heal and
+        // the `dcg install --force` paths.
+        let desired = claude_dcg_hook().unwrap();
+        let current_command = desired["command"].as_str().unwrap().to_string();
+        for force in [false, true] {
+            let mut settings = serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": CLAUDE_SHELL_MATCHER,
+                        "hooks": [
+                            dcg_hook_with_timeout("/stale/path/to/dcg", 10),
+                            { "type": "command", "command": "other-hook" }
+                        ]
+                    }]
+                }
+            });
+
+            assert!(!settings_has_exact_dcg_hook(&settings, &desired));
+            let changed = install_dcg_hook_into_settings(&mut settings, force).unwrap();
+            assert!(changed, "stale command must be repaired (force={force})");
+
+            let hook = canonical_dcg_hook(&settings);
+            assert_eq!(hook["command"].as_str(), Some(current_command.as_str()));
+            assert_eq!(hook["timeout"], 10, "timeout lost on repair (force={force})");
+            assert_eq!(hook["type"], "command");
+
+            let hooks = settings["hooks"]["PreToolUse"][0]["hooks"]
+                .as_array()
+                .unwrap();
+            assert_eq!(hooks.len(), 2, "exactly one dcg hook plus the coexisting hook");
+            assert!(hooks.iter().any(|hook| hook["command"] == "other-hook"));
+            assert!(
+                settings_has_exact_dcg_hook(&settings, &desired),
+                "repaired settings pass the fast path (force={force})"
+            );
+        }
+    }
+
+    #[test]
+    fn self_heal_repair_carries_timeout_from_legacy_matcher() {
+        // A hook migrating off the legacy matcher keeps its host-owned fields.
+        let desired = claude_dcg_hook().unwrap();
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": LEGACY_CLAUDE_SHELL_MATCHER,
+                    "hooks": [dcg_hook_with_timeout("/stale/path/to/dcg", 7)]
+                }]
+            }
+        });
+
+        let changed = install_dcg_hook_into_settings(&mut settings, false).unwrap();
+        assert!(changed);
+        let hook = canonical_dcg_hook(&settings);
+        assert_eq!(hook["command"], desired["command"]);
+        assert_eq!(hook["timeout"], 7);
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(
+            pre.iter()
+                .all(|entry| entry["matcher"] != LEGACY_CLAUDE_SHELL_MATCHER),
+            "emptied legacy entry is dropped"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn self_heal_repair_drops_foreign_dcg_owned_fields() {
+        // `shell` is dcg-owned (only the Windows hook emits it). A settings.json
+        // restored from another OS must not carry it onto the repaired Unix
+        // hook, while the host-owned timeout still survives.
+        let desired = claude_dcg_hook().unwrap();
+        let mut hook = dcg_hook_with_timeout(desired["command"].as_str().unwrap(), 10);
+        hook["shell"] = serde_json::json!("powershell");
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{ "matcher": CLAUDE_SHELL_MATCHER, "hooks": [hook] }]
+            }
+        });
+
+        assert!(
+            !settings_has_exact_dcg_hook(&settings, &desired),
+            "a foreign dcg-owned field marks the hook stale"
+        );
+        let changed = install_dcg_hook_into_settings(&mut settings, false).unwrap();
+        assert!(changed);
+        let repaired = canonical_dcg_hook(&settings);
+        assert!(repaired.get("shell").is_none(), "foreign shell field dropped");
+        assert_eq!(repaired["timeout"], 10);
+    }
+
+    #[test]
+    fn self_heal_at_preserves_operator_timeout_end_to_end() {
+        // The reporter's repro for #345: seed a stale hook that carries
+        // `"timeout": 10`, run the real repair path, and read the file back.
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let lock_path = dir.path().join("selfheal.lock");
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": CLAUDE_SHELL_MATCHER,
+                    "hooks": [dcg_hook_with_timeout("/stale/path/to/dcg", 10)]
+                }]
+            }
+        });
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+
+        let healed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let desired = claude_dcg_hook().unwrap();
+        let hook = canonical_dcg_hook(&healed);
+        assert_eq!(hook["command"], desired["command"]);
+        assert_eq!(hook["timeout"], 10, "self-heal must not drop the timeout");
+
+        // And a second pass is a no-op: the timeout does not re-trigger repair.
+        let before = std::fs::read_to_string(&settings_path).unwrap();
+        ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+        assert_eq!(before, std::fs::read_to_string(&settings_path).unwrap());
     }
 
     #[test]
