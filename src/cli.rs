@@ -12698,6 +12698,23 @@ pub(crate) const OMP_EXTENSION_MARKER: &str = "dcg-omp-extension";
 /// those evaluator budgets while still bounding a wedged child at the bridge.
 pub(crate) const OMP_CHILD_EVALUATION_TIMEOUT_MS: u64 = 30_000;
 
+/// Maximum time to drain stdout/stderr after Bun reports child termination.
+///
+/// A descendant can inherit either pipe after the direct dcg child exits, so
+/// process termination alone does not prove EOF. Keep a short grace for bytes
+/// already in flight, then cancel the local readers and classify every byte
+/// retained before that boundary.
+pub(crate) const OMP_CHILD_PIPE_DRAIN_GRACE_MS: u64 = 250;
+
+/// Independent ceiling for observing the direct child and both of its pipes.
+///
+/// Bun's native child timeout normally settles first. The extra two drain
+/// windows cover signal/reap propagation plus one bounded post-exit drain; if
+/// the exit capability itself never settles, this outer watchdog still closes
+/// the local observation boundary.
+pub(crate) const OMP_CHILD_OBSERVATION_TIMEOUT_MS: u64 =
+    OMP_CHILD_EVALUATION_TIMEOUT_MS + 2 * OMP_CHILD_PIPE_DRAIN_GRACE_MS;
+
 /// Normalize a profile name using the upstream OMP profile-name contract.
 /// Empty, whitespace-only, and `default` select the default profile. Invalid
 /// explicit values are errors: OMP's module-load fallback is only a bootstrap
@@ -12967,6 +12984,8 @@ import {{ extractLeadingCdTarget }} from "@oh-my-pi/pi-coding-agent/tools/shell-
 // selected by the installer. Ambient environment must not redirect it.
 const DCG_BIN = {path_literal};
 const DCG_CHILD_TIMEOUT_MS = {OMP_CHILD_EVALUATION_TIMEOUT_MS};
+export const DCG_CHILD_PIPE_DRAIN_GRACE_MS = {OMP_CHILD_PIPE_DRAIN_GRACE_MS};
+export const DCG_CHILD_OBSERVATION_TIMEOUT_MS = {OMP_CHILD_OBSERVATION_TIMEOUT_MS};
 export const DCG_STDOUT_MAX_BYTES = {OMP_CHILD_STDOUT_MAX_BYTES};
 export const DCG_STDERR_MAX_BYTES = {OMP_CHILD_STDERR_MAX_BYTES};
 export const DCG_STDIN_CHUNK_CODE_UNITS = {OMP_CHILD_STDIN_CHUNK_CODE_UNITS};
@@ -12981,6 +13000,14 @@ type DcgParsedOutput = {{
   framedBlockingWitness?: true;
 }};
 type DcgBoundedText = {{ text: string; overflowed: boolean; readFailure?: string }};
+type DcgObservationBoundary = "pipe-drain" | "hard-deadline";
+type DcgChildObservationResults = {{
+  stdoutResult: PromiseSettledResult<DcgBoundedText>;
+  stderrResult: PromiseSettledResult<DcgBoundedText>;
+  exitResult: PromiseSettledResult<unknown>;
+  boundary?: DcgObservationBoundary;
+  killFailure?: string;
+}};
 type OmpBashToolInput = {{ command?: unknown; cwd?: unknown; async?: unknown; pty?: unknown }};
 type OmpToolCallClassification =
   | {{ kind: "other-tool" }}
@@ -12988,6 +13015,7 @@ type OmpToolCallClassification =
   | {{ kind: "bash"; input: OmpBashToolInput; command: string }};
 
 const BLOCKING_DECISIONS: ReadonlySet<DcgParsedVerdict> = new Set<DcgParsedVerdict>(["deny", "ask", "indeterminate"]);
+const DCG_OBSERVATION_ABORTED = Symbol("dcg-child-observation-aborted");
 // Bun exposes no stdout when spawn itself throws. That runtime catch remains a
 // visible infrastructure fail-open; this total row makes the pure classifier
 // exhaustive for replay/model tests and preserves deny-like monotonicity.
@@ -13203,6 +13231,7 @@ export function commandStdin(command: string): Uint8Array | ReadableStream<Uint8
 export async function collectBoundedText(
   stream: ReadableStream<Uint8Array>,
   maxBytes: number,
+  abortSignal?: AbortSignal,
 ): Promise<DcgBoundedText> {{
   // Grow only with observed output. Compact allow/deny envelopes stay compact
   // instead of reserving the entire safety cap on every guarded command.
@@ -13211,6 +13240,23 @@ export async function collectBoundedText(
   let overflowed = false;
   let readFailure: string | undefined;
   const reader = stream.getReader();
+  let cancellationRequested = false;
+  const cancelReader = (): void => {{
+    if (cancellationRequested) return;
+    cancellationRequested = true;
+    try {{
+      // WHATWG stream cancellation settles pending reads. Attach a rejection
+      // handler even though the result is diagnostic-only, so a hostile or
+      // future stream implementation cannot create a late unhandled rejection.
+      void reader.cancel(DCG_OBSERVATION_ABORTED).catch(() => {{}});
+    }} catch {{
+      // A synchronous cancellation fault is a runtime contract violation.
+      // The independently bounded child observation still reports its fixed
+      // deadline diagnostic if the standard pending-read settlement occurs.
+    }}
+  }};
+  if (abortSignal?.aborted) cancelReader();
+  else abortSignal?.addEventListener("abort", cancelReader, {{ once: true }});
   try {{
     while (true) {{
       const next = await reader.read();
@@ -13235,8 +13281,9 @@ export async function collectBoundedText(
   }} catch (reason) {{
     // Preserve any complete verdict received before a stream fault. The fault
     // remains independently visible and cannot downgrade an overflow block.
-    readFailure = describeChildCollectionFailure(reason);
+    if (!cancellationRequested) readFailure = describeChildCollectionFailure(reason);
   }} finally {{
+    abortSignal?.removeEventListener("abort", cancelReader);
     reader.releaseLock();
   }}
 
@@ -13255,6 +13302,101 @@ function visibleStderrDetail(stderr: DcgBoundedText): string {{
   if (!stderr.overflowed) return detail;
   const suffix = `[dcg: stderr exceeded ${{DCG_STDERR_MAX_BYTES}}-byte display cap; additional bytes omitted]`;
   return detail ? `${{detail}}\n${{suffix}}` : suffix;
+}}
+
+function observeChildCapabilityUntil<T>(
+  capability: Promise<T>,
+  abortSignal: AbortSignal,
+): Promise<T> {{
+  if (abortSignal.aborted) return Promise.reject(DCG_OBSERVATION_ABORTED);
+  return new Promise<T>((resolve, reject) => {{
+    let settled = false;
+    const finishResolve = (value: T): void => {{
+      if (settled) return;
+      settled = true;
+      abortSignal.removeEventListener("abort", onAbort);
+      resolve(value);
+    }};
+    const finishReject = (reason: unknown): void => {{
+      if (settled) return;
+      settled = true;
+      abortSignal.removeEventListener("abort", onAbort);
+      reject(reason);
+    }};
+    const onAbort = (): void => finishReject(DCG_OBSERVATION_ABORTED);
+    abortSignal.addEventListener("abort", onAbort, {{ once: true }});
+    // Both handlers remain attached even if the watchdog wins. A late
+    // fulfillment or rejection is consumed rather than becoming unhandled.
+    capability.then(finishResolve, finishReject);
+  }});
+}}
+
+function killDcgChild(proc: Bun.ReadableSubprocess): string | undefined {{
+  try {{
+    proc.kill("SIGKILL");
+    return undefined;
+  }} catch (reason) {{
+    return describeChildCollectionFailure(reason);
+  }}
+}}
+
+async function observeDcgChild(proc: Bun.ReadableSubprocess): Promise<DcgChildObservationResults> {{
+  const observationAbort = new AbortController();
+  const observationDeadline = performance.now() + DCG_CHILD_OBSERVATION_TIMEOUT_MS;
+  let observationFinished = false;
+  let boundary: DcgObservationBoundary | undefined;
+  let killFailure: string | undefined;
+  const abortObservation = (nextBoundary: DcgObservationBoundary, killChild: boolean): void => {{
+    if (observationFinished || observationAbort.signal.aborted) return;
+    boundary = nextBoundary;
+    if (killChild) killFailure = killDcgChild(proc);
+    observationAbort.abort(DCG_OBSERVATION_ABORTED);
+  }};
+
+  // Arm immediately after the successful spawn. This is independent of Bun's
+  // native process timeout and therefore also bounds an exit observation that
+  // never settles. Synchronous Bun.spawn/event-loop stalls remain outside any
+  // in-process JavaScript timer's authority.
+  let observationTimer = setTimeout(
+    () => abortObservation("hard-deadline", true),
+    DCG_CHILD_OBSERVATION_TIMEOUT_MS,
+  );
+  const rawExitObservation = observeChildCapability(() => proc.exited);
+  const armPipeDrainDeadline = (killChild: boolean): void => {{
+    if (observationFinished || observationAbort.signal.aborted) return;
+    if (killChild) killFailure = killDcgChild(proc);
+    clearTimeout(observationTimer);
+    const remainingHardBudget = Math.max(0, observationDeadline - performance.now());
+    const pipeDrainWins = remainingHardBudget > DCG_CHILD_PIPE_DRAIN_GRACE_MS;
+    observationTimer = setTimeout(
+      () => abortObservation(pipeDrainWins ? "pipe-drain" : "hard-deadline", false),
+      Math.min(DCG_CHILD_PIPE_DRAIN_GRACE_MS, remainingHardBudget),
+    );
+  }};
+  rawExitObservation.then(
+    () => armPipeDrainDeadline(false),
+    () => armPipeDrainDeadline(true),
+  );
+
+  try {{
+    const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
+      observeChildCapability(() => collectBoundedText(
+        proc.stdout,
+        DCG_STDOUT_MAX_BYTES,
+        observationAbort.signal,
+      )),
+      observeChildCapability(() => collectBoundedText(
+        proc.stderr,
+        DCG_STDERR_MAX_BYTES,
+        observationAbort.signal,
+      )),
+      observeChildCapabilityUntil(rawExitObservation, observationAbort.signal),
+    ]);
+    return {{ stdoutResult, stderrResult, exitResult, boundary, killFailure }};
+  }} finally {{
+    observationFinished = true;
+    clearTimeout(observationTimer);
+  }}
 }}
 
 export default function dcgGuard(pi: ExtensionAPI): void {{
@@ -13338,15 +13480,18 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
       return;
     }}
 
-    // Observe each child capability independently. Fail-fast aggregation would
-    // let one rejected diagnostic/exit promise erase a completed safety signal
-    // from stdout or exit 1. allSettled also keeps both pipes draining
-    // concurrently before the monotone decision is classified.
-    const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
-      observeChildCapability(() => collectBoundedText(proc.stdout, DCG_STDOUT_MAX_BYTES)),
-      observeChildCapability(() => collectBoundedText(proc.stderr, DCG_STDERR_MAX_BYTES)),
-      observeChildCapability(() => proc.exited),
-    ]);
+    // Observe each child capability independently under one cleared watchdog.
+    // Fail-fast aggregation could erase a completed safety signal; waiting for
+    // bare pipe EOF could outlive the direct child when a descendant inherits
+    // an fd. The observer preserves retained bytes, bounds the drain, and
+    // kills the direct child if exit observation itself faults or stalls.
+    const {{
+      stdoutResult,
+      stderrResult,
+      exitResult,
+      boundary: observationBoundary,
+      killFailure: observationKillFailure,
+    }} = await observeDcgChild(proc);
     const collectionFailures: string[] = [];
     let stdoutText: DcgBoundedText = {{ text: "", overflowed: false }};
     if (stdoutResult.status === "fulfilled") {{
@@ -13365,8 +13510,20 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
     let exitCode: unknown = undefined;
     if (exitResult.status === "fulfilled") {{
       exitCode = exitResult.value;
-    }} else {{
+    }} else if (exitResult.reason !== DCG_OBSERVATION_ABORTED) {{
       collectionFailures.push(`exit status failed: ${{describeChildCollectionFailure(exitResult.reason)}}`);
+    }}
+    if (observationBoundary === "pipe-drain") {{
+      collectionFailures.push(
+        `child pipes exceeded the ${{DCG_CHILD_PIPE_DRAIN_GRACE_MS}}-millisecond post-exit drain grace`,
+      );
+    }} else if (observationBoundary === "hard-deadline") {{
+      collectionFailures.push(
+        `child observation exceeded the ${{DCG_CHILD_OBSERVATION_TIMEOUT_MS}}-millisecond outer deadline`,
+      );
+    }}
+    if (observationKillFailure) {{
+      collectionFailures.push(`direct-child SIGKILL failed: ${{observationKillFailure}}`);
     }}
     // Bun populates `signalCode` only after termination. Read it after both
     // pipes and `.exited` have independently settled so an early rejection of
@@ -19938,11 +20095,10 @@ if ($errors.Count -ne 0) {
         );
     }
 
-    /// OMP must not wait forever when the evaluator process wedges. The
-    /// bridge delegates the timer and reap lifecycle to Bun's native spawn
-    /// contract rather than racing a detached JavaScript timer. Keep the
-    /// ceiling above both shipped evaluator defaults so it remains a
-    /// pathological-hang backstop instead of competing with normal policy.
+    /// OMP must not wait forever when the evaluator process or one of its
+    /// inherited pipes wedges. Bun's native process timeout owns the direct
+    /// child, while one cleared JavaScript watchdog independently bounds exit
+    /// observation and post-exit pipe draining.
     #[test]
     fn omp_extension_source_bounds_the_child_evaluator() {
         let executable = current_dcg_executable().expect("current executable");
@@ -19962,25 +20118,48 @@ if ($errors.Count -ne 0) {
         assert!(source.contains(&format!(
             "const DCG_CHILD_TIMEOUT_MS = {OMP_CHILD_EVALUATION_TIMEOUT_MS};"
         )));
+        assert!(source.contains(&format!(
+            "export const DCG_CHILD_PIPE_DRAIN_GRACE_MS = {OMP_CHILD_PIPE_DRAIN_GRACE_MS};"
+        )));
+        assert!(source.contains(&format!(
+            "export const DCG_CHILD_OBSERVATION_TIMEOUT_MS = {OMP_CHILD_OBSERVATION_TIMEOUT_MS};"
+        )));
         assert!(source.contains("timeout: DCG_CHILD_TIMEOUT_MS,"));
         assert!(source.contains("killSignal: \"SIGKILL\","));
         assert!(
-            !source.contains("Promise.race(")
-                && !source.contains("setTimeout(")
-                && !source.contains("addEventListener("),
-            "the generated bridge must not leak a competing timer or abort listener"
+            !source.contains("Promise.race("),
+            "a bare race would leave losing observations and rejections detached"
         );
+        assert!(source.contains("let observationTimer = setTimeout("));
+        assert!(source.contains(
+            "const observationDeadline = performance.now() + DCG_CHILD_OBSERVATION_TIMEOUT_MS;"
+        ));
+        assert!(source.contains(
+            "const remainingHardBudget = Math.max(0, observationDeadline - performance.now());"
+        ));
+        assert!(source.contains(
+            "const pipeDrainWins = remainingHardBudget > DCG_CHILD_PIPE_DRAIN_GRACE_MS;"
+        ));
+        assert!(source.contains("Math.min(DCG_CHILD_PIPE_DRAIN_GRACE_MS, remainingHardBudget),"));
+        assert!(source.contains(
+            "() => abortObservation(pipeDrainWins ? \"pipe-drain\" : \"hard-deadline\", false),"
+        ));
+        assert!(source.contains("clearTimeout(observationTimer);"));
+        assert!(source.contains("observationFinished = true;"));
+        assert!(source.contains("observationAbort.abort(DCG_OBSERVATION_ABORTED);"));
+        assert!(source.contains("reader.cancel(DCG_OBSERVATION_ABORTED).catch(() => {});"));
+        assert!(source.contains("if (killChild) killFailure = killDcgChild(proc);"));
 
         let spawn = source.find("proc = Bun.spawn").expect("dcg spawn");
-        let collect = source
-            .find("const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled")
-            .expect("concurrent child collection");
+        let observe = source
+            .find("} = await observeDcgChild(proc);")
+            .expect("bounded child observation");
         let classify = source
             .find("const classification = stdoutText.overflowed")
             .expect("monotone classifier");
         assert!(
-            spawn < collect && collect < classify,
-            "the bounded child must be fully collected before stdout/status classification"
+            spawn < observe && observe < classify,
+            "the watchdog must start immediately after successful spawn and settle before classification"
         );
     }
 
@@ -19994,8 +20173,12 @@ if ($errors.Count -ne 0) {
 
         let has_bounded_compact_contract = |candidate: &str| {
             candidate.contains("\"--omp-bridge-output\",")
-                && candidate.contains("collectBoundedText(proc.stdout, DCG_STDOUT_MAX_BYTES)")
-                && candidate.contains("collectBoundedText(proc.stderr, DCG_STDERR_MAX_BYTES)")
+                && candidate.contains(
+                    "collectBoundedText(\n        proc.stdout,\n        DCG_STDOUT_MAX_BYTES,\n        observationAbort.signal,"
+                )
+                && candidate.contains(
+                    "collectBoundedText(\n        proc.stderr,\n        DCG_STDERR_MAX_BYTES,\n        observationAbort.signal,"
+                )
                 && !candidate.contains("new Response(proc.stdout).text()")
                 && !candidate.contains("new Response(proc.stderr).text()")
         };
@@ -20003,11 +20186,11 @@ if ($errors.Count -ne 0) {
 
         let unbounded_collector_mutant = source
             .replace(
-                "collectBoundedText(proc.stdout, DCG_STDOUT_MAX_BYTES)",
+                "collectBoundedText(\n        proc.stdout,\n        DCG_STDOUT_MAX_BYTES,\n        observationAbort.signal,\n      )",
                 "new Response(proc.stdout).text()",
             )
             .replace(
-                "collectBoundedText(proc.stderr, DCG_STDERR_MAX_BYTES)",
+                "collectBoundedText(\n        proc.stderr,\n        DCG_STDERR_MAX_BYTES,\n        observationAbort.signal,\n      )",
                 "new Response(proc.stderr).text()",
             );
         assert!(
@@ -20028,10 +20211,10 @@ if ($errors.Count -ne 0) {
         )));
         assert!(source.contains("\"--omp-bridge-output\","));
         assert!(source.contains(
-            "observeChildCapability(() => collectBoundedText(proc.stdout, DCG_STDOUT_MAX_BYTES))"
+            "proc.stdout,\n        DCG_STDOUT_MAX_BYTES,\n        observationAbort.signal,"
         ));
         assert!(source.contains(
-            "observeChildCapability(() => collectBoundedText(proc.stderr, DCG_STDERR_MAX_BYTES))"
+            "proc.stderr,\n        DCG_STDERR_MAX_BYTES,\n        observationAbort.signal,"
         ));
         assert!(source.contains("while (true) {"));
         assert!(source.contains("const next = await reader.read();"));
@@ -20054,7 +20237,9 @@ if ($errors.Count -ne 0) {
             1,
             "only the bounded ordinary-command fast path may encode in one allocation"
         );
-        assert!(source.contains("readFailure = describeChildCollectionFailure(reason);"));
+        assert!(source.contains(
+            "if (!cancellationRequested) readFailure = describeChildCollectionFailure(reason);"
+        ));
         assert!(
             source.contains("OMP guard could not run dcg: ${describeChildCollectionFailure(err)}")
         );
@@ -20188,14 +20373,12 @@ if ($errors.Count -ne 0) {
         assert!(source.contains("return command.length <= DCG_STDIN_CHUNK_CODE_UNITS"));
     }
 
-    /// Each child observation is an independent capability. A rejected stderr
-    /// or exit-status promise must not make `Promise.all` discard a completed
-    /// blocking stdout verdict, and a rejected stdout read must not erase the
-    /// blocking exit-1 status. Signal provenance is read only after all three
-    /// asynchronous capabilities settle, and a property-access fault remains
-    /// independent. Keep the generated collector explicitly settled per
-    /// capability so every failure remains available to the monotone
-    /// classifier and to visible infrastructure diagnostics.
+    /// Each child observation is an independent, deadline-bounded capability.
+    /// A rejected stderr or exit-status promise must not discard a completed
+    /// blocking stdout verdict, and cancellation must retain bytes observed
+    /// before the boundary. The direct child is killed when exit observation
+    /// faults or stalls; both fulfillment and rejection handlers remain
+    /// attached so late settlement cannot become unhandled.
     #[test]
     fn omp_extension_source_isolates_child_collection_faults() {
         let executable = current_dcg_executable().expect("current executable");
@@ -20204,7 +20387,19 @@ if ($errors.Count -ne 0) {
         assert!(source.contains(
             "const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled(["
         ));
-        assert!(source.contains("observeChildCapability(() => proc.exited),"));
+        assert!(
+            source
+                .contains("const rawExitObservation = observeChildCapability(() => proc.exited);")
+        );
+        assert!(
+            source.contains(
+                "observeChildCapabilityUntil(rawExitObservation, observationAbort.signal),"
+            )
+        );
+        assert!(source.contains("capability.then(finishResolve, finishReject);"));
+        assert!(source.contains("() => armPipeDrainDeadline(true),"));
+        assert!(source.contains("if (killChild) killFailure = killDcgChild(proc);"));
+        assert!(source.contains("return { text, overflowed, readFailure };"));
         assert!(source.contains("signalCode = proc.signalCode;"));
         let settled = source
             .find("const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([")
@@ -20220,7 +20415,7 @@ if ($errors.Count -ne 0) {
         assert_eq!(
             source.matches("observeChildCapability(() =>").count(),
             3,
-            "stdout, stderr, and exit setup must each convert synchronous setup faults into independently settled rejections"
+            "stdout, stderr, and exit setup must each convert synchronous setup faults into independent rejections"
         );
         assert!(!source.contains("signalObservation"));
         assert!(source.contains("function observeChildCapability<T>("));
@@ -20523,6 +20718,8 @@ export function resolveToCwd(requested: string, cwd: string): string {
   collectBoundedText,
   commandStdin,
   commandUtf8Stream,
+  DCG_CHILD_OBSERVATION_TIMEOUT_MS,
+  DCG_CHILD_PIPE_DRAIN_GRACE_MS,
   DCG_STDERR_MAX_BYTES,
   DCG_STDIN_CHUNK_CODE_UNITS,
   DCG_STDOUT_MAX_BYTES,
@@ -20757,11 +20954,21 @@ type ChildCase = {
   exitCode?: unknown;
   signalCode?: unknown;
   signalAfterStdout?: unknown;
+  stdoutInitialDelayMs?: number;
   stdoutTerminalDelayMs?: number;
+  stderrInitialDelayMs?: number;
+  stderrTerminalDelayMs?: number;
+  exitDelayMs?: number;
+  exitAtHardDeadlineMinusMs?: number;
   stdoutError?: string;
   stderrError?: string;
+  stdoutCancelError?: string;
+  stderrCancelError?: string;
   exitError?: string;
   signalError?: string;
+  signalAfterKill?: unknown;
+  signalAfterKillDelayMs?: number;
+  killError?: string;
   spawnError?: string;
   stuckUntilTimeout?: boolean;
 };
@@ -20771,6 +20978,9 @@ type SpawnRecord = {
   stdin: string;
   timeout: number;
   killSignal: string | number;
+  killCalls: number;
+  stdoutCancelCalls: number;
+  stderrCancelCalls: number;
 };
 let activeChild: ChildCase = {};
 let callback: ((event: unknown, ctx: unknown) => Promise<unknown>) | undefined;
@@ -20779,6 +20989,68 @@ let diagnostics: string[] = [];
 let observedExecutable: string | undefined;
 const originalSpawn = Bun.spawn;
 const originalConsoleError = console.error;
+const originalSetTimeout = globalThis.setTimeout;
+const originalClearTimeout = globalThis.clearTimeout;
+const originalPerformanceNow = performance.now.bind(performance);
+const activeWatchdogTimers = new Set<ReturnType<typeof setTimeout>>();
+let watchdogFireCount = 0;
+let watchdogScheduleCount = 0;
+let virtualNowMs = 0;
+let pendingWatchdogRearm = false;
+let currentCasePeakWatchdogs = 0;
+let peakWatchdogCount = 0;
+const unhandledRejections: unknown[] = [];
+const recordUnhandledRejection = (reason: unknown): void => {
+  unhandledRejections.push(reason);
+};
+process.on("unhandledRejection", recordUnhandledRejection);
+(performance as unknown as { now: () => number }).now = (): number => virtualNowMs;
+
+// Execute production watchdog branches without waiting 30 seconds. Clearing a
+// known watchdog transfers ownership to at most one rearm, so a shortened
+// absolute-deadline delay is still recognized. Advancing the monotonic virtual
+// clock by the requested delay keeps deadline arithmetic faithful while wall
+// time remains compressed.
+globalThis.setTimeout = ((
+  handler: (...args: unknown[]) => void,
+  delay?: number,
+  ...args: unknown[]
+) => {
+  const requestedDelay = Math.max(0, delay ?? 0);
+  const isInitialWatchdog = delay === DCG_CHILD_OBSERVATION_TIMEOUT_MS;
+  const isRearmedWatchdog =
+    !isInitialWatchdog && pendingWatchdogRearm && requestedDelay <= DCG_CHILD_PIPE_DRAIN_GRACE_MS;
+  const isWatchdog = isInitialWatchdog || isRearmedWatchdog;
+  if (isWatchdog) pendingWatchdogRearm = false;
+  const effectiveDelay = isInitialWatchdog
+    ? 25
+    : isRearmedWatchdog
+      ? requestedDelay >= DCG_CHILD_PIPE_DRAIN_GRACE_MS
+        ? 8
+        : Math.max(1, requestedDelay)
+      : requestedDelay;
+  const virtualDeadline = virtualNowMs + requestedDelay;
+  let timer: ReturnType<typeof setTimeout>;
+  timer = originalSetTimeout(() => {
+    virtualNowMs = Math.max(virtualNowMs, virtualDeadline);
+    if (isWatchdog) {
+      activeWatchdogTimers.delete(timer);
+      watchdogFireCount += 1;
+    }
+    handler(...args);
+  }, effectiveDelay);
+  if (isWatchdog) {
+    activeWatchdogTimers.add(timer);
+    watchdogScheduleCount += 1;
+    currentCasePeakWatchdogs = Math.max(currentCasePeakWatchdogs, activeWatchdogTimers.size);
+    peakWatchdogCount = Math.max(peakWatchdogCount, activeWatchdogTimers.size);
+  }
+  return timer;
+}) as typeof setTimeout;
+globalThis.clearTimeout = ((timer: ReturnType<typeof setTimeout>): void => {
+  if (activeWatchdogTimers.delete(timer)) pendingWatchdogRearm = true;
+  originalClearTimeout(timer);
+}) as typeof clearTimeout;
 
 (Bun as unknown as { spawn: typeof Bun.spawn }).spawn = ((argv: string[], options: {
   cwd: string;
@@ -20797,6 +21069,9 @@ const originalConsoleError = console.error;
     stdin: "",
     timeout: options.timeout,
     killSignal: options.killSignal,
+    killCalls: 0,
+    stdoutCancelCalls: 0,
+    stderrCancelCalls: 0,
   };
   spawnRecords.push(record);
   const stdinCollected = new Response(options.stdin).text().then(text => {
@@ -20806,11 +21081,34 @@ const originalConsoleError = console.error;
     chunks: string[],
     error: string | undefined,
     beforeTerminal?: () => void,
+    initialDelayMs = 0,
     terminalDelayMs = 0,
+    cancelError?: string,
+    onCancel?: () => void,
   ): ReadableStream<Uint8Array> => {
     let offset = 0;
+    let initialDelayComplete = initialDelayMs === 0;
+    let cancelled = false;
+    let releaseDelay: (() => void) | undefined;
+    const cancellableDelay = (delayMs: number): Promise<void> => new Promise(resolve => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        releaseDelay = undefined;
+        originalClearTimeout(timer);
+        resolve();
+      };
+      const timer = originalSetTimeout(finish, delayMs);
+      releaseDelay = finish;
+    });
     return new ReadableStream<Uint8Array>({
       async pull(controller): Promise<void> {
+        if (!initialDelayComplete) {
+          await cancellableDelay(initialDelayMs);
+          initialDelayComplete = true;
+          if (cancelled) return;
+        }
         while (offset < chunks.length) {
           const chunk = encoder.encode(chunks[offset++]!);
           if (chunk.byteLength > 0) {
@@ -20818,14 +21116,24 @@ const originalConsoleError = console.error;
             return;
           }
         }
-        if (terminalDelayMs > 0) await Bun.sleep(terminalDelayMs);
+        if (terminalDelayMs > 0) await cancellableDelay(terminalDelayMs);
+        if (cancelled) return;
         beforeTerminal?.();
         if (error) controller.error(new Error(error));
         else controller.close();
       },
+      cancel(): void | Promise<void> {
+        onCancel?.();
+        cancelled = true;
+        releaseDelay?.();
+        if (cancelError) return Promise.reject(new Error(cancelError));
+      },
     });
   };
   const childExitValue = Object.hasOwn(activeChild, "exitCode") ? activeChild.exitCode : 0;
+  const childExitError = activeChild.exitError;
+  const childExitDelayMs = activeChild.exitDelayMs;
+  const exitAtHardDeadlineMinusMs = activeChild.exitAtHardDeadlineMinusMs;
   let childSignalValue = Object.hasOwn(activeChild, "signalCode")
     ? activeChild.signalCode
     : null;
@@ -20834,20 +21142,48 @@ const originalConsoleError = console.error;
         childSignalValue = "SIGKILL";
         resolve(137);
       }, 5))
-    : activeChild.exitError
-      ? Promise.reject(new Error(activeChild.exitError))
-      : Promise.resolve(childExitValue);
+    : exitAtHardDeadlineMinusMs !== undefined
+      ? new Promise<unknown>((resolve, reject) => originalSetTimeout(() => {
+          virtualNowMs = Math.max(
+            virtualNowMs,
+            DCG_CHILD_OBSERVATION_TIMEOUT_MS - exitAtHardDeadlineMinusMs,
+          );
+          if (childExitError) reject(new Error(childExitError));
+          else resolve(childExitValue);
+        }, 24))
+    : childExitDelayMs
+      ? new Promise<unknown>((resolve, reject) => originalSetTimeout(() => {
+          if (childExitError) reject(new Error(childExitError));
+          else resolve(childExitValue);
+        }, childExitDelayMs))
+      : childExitError
+        ? Promise.reject(new Error(childExitError))
+        : Promise.resolve(childExitValue);
   const childSignalError = activeChild.signalError;
   const hasSignalAfterStdout = Object.hasOwn(activeChild, "signalAfterStdout");
   const signalAfterStdout = activeChild.signalAfterStdout;
+  const hasSignalAfterKill = Object.hasOwn(activeChild, "signalAfterKill");
+  const signalAfterKill = activeChild.signalAfterKill;
+  const signalAfterKillDelayMs = activeChild.signalAfterKillDelayMs ?? 0;
   return {
     stdout: childStream(
       activeChild.stdoutChunks ?? [activeChild.stdout ?? ""],
       activeChild.stdoutError,
       hasSignalAfterStdout ? () => { childSignalValue = signalAfterStdout; } : undefined,
+      activeChild.stdoutInitialDelayMs,
       activeChild.stdoutTerminalDelayMs,
+      activeChild.stdoutCancelError,
+      () => { record.stdoutCancelCalls += 1; },
     ),
-    stderr: childStream([activeChild.stderr ?? ""], activeChild.stderrError),
+    stderr: childStream(
+      [activeChild.stderr ?? ""],
+      activeChild.stderrError,
+      undefined,
+      activeChild.stderrInitialDelayMs,
+      activeChild.stderrTerminalDelayMs,
+      activeChild.stderrCancelError,
+      () => { record.stderrCancelCalls += 1; },
+    ),
     // Model Bun's native timeout without making the certificate wait for the
     // production 30-second ceiling. The exact configured value and kill
     // signal are asserted above, so removing either production option turns
@@ -20856,6 +21192,17 @@ const originalConsoleError = console.error;
     get signalCode(): unknown {
       if (childSignalError) throw new Error(childSignalError);
       return childSignalValue;
+    },
+    kill(signal: string | number): void {
+      record.killCalls += 1;
+      if (activeChild.killError) throw new Error(activeChild.killError);
+      if (hasSignalAfterKill) {
+        if (signalAfterKillDelayMs > 0) {
+          originalSetTimeout(() => { childSignalValue = signalAfterKill; }, signalAfterKillDelayMs);
+        } else {
+          childSignalValue = signalAfterKill;
+        }
+      }
     },
   };
 }) as typeof Bun.spawn;
@@ -20875,12 +21222,31 @@ try {
   check(callback !== undefined, "callback/registration/missing-handler");
 
   const invoke = async (caseId: string, event: unknown, child: ChildCase = {}) => {
+    virtualNowMs = 0;
+    pendingWatchdogRearm = false;
+    currentCasePeakWatchdogs = 0;
     activeChild = child;
     spawnRecords = [];
     diagnostics = [];
+    const watchdogSchedulesBefore = watchdogScheduleCount;
+    const watchdogFiresBefore = watchdogFireCount;
+    const started = originalPerformanceNow();
+    const virtualStarted = performance.now();
     const result = await callback!(event, { cwd: process.cwd(), hasUI: false, mode: "rpc" });
+    const elapsedMs = originalPerformanceNow() - started;
+    const virtualElapsedMs = performance.now() - virtualStarted;
+    check(activeWatchdogTimers.size === 0, `${caseId}/watchdog-cleared`);
     callbackCaseIds.push(caseId);
-    return { result, spawns: [...spawnRecords], errors: [...diagnostics] };
+    return {
+      result,
+      spawns: [...spawnRecords],
+      errors: [...diagnostics],
+      elapsedMs,
+      virtualElapsedMs,
+      peakWatchdogs: currentCasePeakWatchdogs,
+      watchdogSchedules: watchdogScheduleCount - watchdogSchedulesBefore,
+      watchdogFires: watchdogFireCount - watchdogFiresBefore,
+    };
   };
 
   let replay = await invoke("callback/other-tool", { toolName: "read", input: {} });
@@ -21076,7 +21442,8 @@ try {
     },
   );
   equal(replay.result, { block: true, reason: "deny survives exit fault" }, "callback/exit-reject-deny/result");
-  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status unavailable): exit status failed: Error: synthetic exit status failure"], "callback/exit-reject-deny/diagnostics");
+  equal(replay.spawns[0]!.killCalls, 1, "callback/exit-reject-deny/direct-child-kill");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status unavailable): exit status failed: Error: synthetic exit status failure"], "callback/exit-reject-deny/diagnostics-without-unobserved-signal");
 
   replay = await invoke(
     "callback/signal-reject-deny",
@@ -21112,7 +21479,8 @@ try {
     { exitError: "synthetic exit status failure" },
   );
   equal(replay.result, undefined, "callback/exit-reject-no-verdict/result");
-  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status unavailable): exit status failed: Error: synthetic exit status failure"], "callback/exit-reject-no-verdict/diagnostics");
+  equal(replay.spawns[0]!.killCalls, 1, "callback/exit-reject-no-verdict/direct-child-kill");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status unavailable): exit status failed: Error: synthetic exit status failure"], "callback/exit-reject-no-verdict/diagnostics-without-unobserved-signal");
 
   replay = await invoke(
     "callback/exit-reject-late-sigkill-deny",
@@ -21120,12 +21488,16 @@ try {
     {
       stdout: JSON.stringify({ decision: "deny", reason: "deny survives late signal" }),
       exitError: "synthetic early exit status failure",
-      signalAfterStdout: "SIGKILL",
-      stdoutTerminalDelayMs: 5,
+      signalAfterKill: "SIGKILL",
+      signalAfterKillDelayMs: 5,
+      stdoutTerminalDelayMs: 80,
     },
   );
   equal(replay.result, { block: true, reason: "deny survives late signal" }, "callback/exit-reject-late-sigkill-deny/result");
-  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL): exit status failed: Error: synthetic early exit status failure"], "callback/exit-reject-late-sigkill-deny/diagnostics");
+  equal(replay.spawns[0]!.killCalls, 1, "callback/exit-reject-late-sigkill-deny/direct-child-kill");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (signal SIGKILL): exit status failed: Error: synthetic early exit status failure; child pipes exceeded the 250-millisecond post-exit drain grace",
+  ], "callback/exit-reject-late-sigkill-deny/diagnostics");
 
   replay = await invoke(
     "callback/exit-two-deny",
@@ -21259,13 +21631,188 @@ try {
   equal(replay.result, undefined, "callback/oversized-signal/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137): signal status invalid: string"], "callback/oversized-signal/diagnostics");
 
-  const timeoutStarted = performance.now();
+  replay = await invoke(
+    "callback/pipe-deadline-before-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "too late" }),
+      stdoutInitialDelayMs: 80,
+      exitCode: 0,
+    },
+  );
+  equal(replay.result, undefined, "callback/pipe-deadline-before-deny/result");
+  check(replay.elapsedMs < 50, "callback/pipe-deadline-before-deny/remained-bounded");
+  equal(replay.watchdogFires, 1, "callback/pipe-deadline-before-deny/watchdog-fire-count");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit 0): child pipes exceeded the 250-millisecond post-exit drain grace",
+  ], "callback/pipe-deadline-before-deny/diagnostics-exactly-once");
+
+  replay = await invoke(
+    "callback/pipe-deadline-after-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "retained deny survives cancellation" }),
+      stdoutTerminalDelayMs: 80,
+      exitCode: 0,
+    },
+  );
+  equal(replay.result, { block: true, reason: "retained deny survives cancellation" }, "callback/pipe-deadline-after-deny/result");
+  check(replay.elapsedMs < 50, "callback/pipe-deadline-after-deny/remained-bounded");
+  equal(replay.watchdogFires, 1, "callback/pipe-deadline-after-deny/watchdog-fire-count");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit 0): child pipes exceeded the 250-millisecond post-exit drain grace",
+  ], "callback/pipe-deadline-after-deny/diagnostics-exactly-once");
+
+  replay = await invoke(
+    "callback/stderr-pipe-deadline-after-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives held stderr" }),
+      stderr: "retained stderr",
+      stderrTerminalDelayMs: 80,
+      exitCode: 0,
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives held stderr" }, "callback/stderr-pipe-deadline-after-deny/result");
+  check(replay.elapsedMs < 50, "callback/stderr-pipe-deadline-after-deny/remained-bounded");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit 0): retained stderr; child pipes exceeded the 250-millisecond post-exit drain grace",
+  ], "callback/stderr-pipe-deadline-after-deny/diagnostics-exactly-once");
+
+  replay = await invoke(
+    "callback/pipe-deadline-after-overflow",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: "x".repeat(DCG_STDOUT_MAX_BYTES + 1),
+      stdoutTerminalDelayMs: 80,
+      exitCode: 0,
+    },
+  );
+  equal(replay.result, {
+    block: true,
+    reason: `Blocked by dcg because evaluator stdout exceeded the ${DCG_STDOUT_MAX_BYTES}-byte safety-verdict cap`,
+  }, "callback/pipe-deadline-after-overflow/result");
+  check(replay.elapsedMs < 50, "callback/pipe-deadline-after-overflow/remained-bounded");
+  equal(replay.errors, [
+    `[dcg] OMP guard dcg stdout exceeded ${DCG_STDOUT_MAX_BYTES}-byte safety-verdict cap; blocking conservatively`,
+    "[dcg] OMP guard infrastructure failure (exit 0): child pipes exceeded the 250-millisecond post-exit drain grace",
+  ], "callback/pipe-deadline-after-overflow/diagnostics-each-exactly-once");
+
+  replay = await invoke(
+    "callback/cancel-reject-after-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives rejected cancellation" }),
+      stdoutTerminalDelayMs: 80,
+      stdoutCancelError: "synthetic stdout cancel rejection",
+      exitCode: 0,
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives rejected cancellation" }, "callback/cancel-reject-after-deny/result");
+  equal(replay.spawns[0]!.stdoutCancelCalls, 1, "callback/cancel-reject-after-deny/cancel-owner-once");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit 0): child pipes exceeded the 250-millisecond post-exit drain grace",
+  ], "callback/cancel-reject-after-deny/boundary-diagnostic-exactly-once");
+
+  replay = await invoke(
+    "callback/cancel-reject-after-overflow",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: "x".repeat(DCG_STDOUT_MAX_BYTES + 1),
+      stdoutTerminalDelayMs: 80,
+      stdoutCancelError: "synthetic overflow cancel rejection",
+      exitCode: 0,
+    },
+  );
+  equal(replay.result, {
+    block: true,
+    reason: `Blocked by dcg because evaluator stdout exceeded the ${DCG_STDOUT_MAX_BYTES}-byte safety-verdict cap`,
+  }, "callback/cancel-reject-after-overflow/result");
+  equal(replay.spawns[0]!.stdoutCancelCalls, 1, "callback/cancel-reject-after-overflow/cancel-owner-once");
+  equal(replay.errors, [
+    `[dcg] OMP guard dcg stdout exceeded ${DCG_STDOUT_MAX_BYTES}-byte safety-verdict cap; blocking conservatively`,
+    "[dcg] OMP guard infrastructure failure (exit 0): child pipes exceeded the 250-millisecond post-exit drain grace",
+  ], "callback/cancel-reject-after-overflow/diagnostics-each-exactly-once");
+  await new Promise<void>(resolve => originalSetTimeout(resolve, 0));
+  equal(unhandledRejections, [], "callback/cancel-reject/no-unhandled-rejection");
+
+  replay = await invoke(
+    "callback/exit-one-tick-before-hard-deadline",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives absolute deadline" }),
+      stdoutTerminalDelayMs: 80,
+      exitCode: 0,
+      exitAtHardDeadlineMinusMs: 1,
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives absolute deadline" }, "callback/exit-one-tick-before-hard-deadline/result");
+  equal(replay.virtualElapsedMs, DCG_CHILD_OBSERVATION_TIMEOUT_MS, "callback/exit-one-tick-before-hard-deadline/absolute-virtual-deadline");
+  check(replay.elapsedMs < 55, "callback/exit-one-tick-before-hard-deadline/remained-wall-bounded");
+  equal(replay.spawns[0]!.killCalls, 0, "callback/exit-one-tick-before-hard-deadline/no-dead-child-rekill");
+  equal(replay.spawns[0]!.stdoutCancelCalls, 1, "callback/exit-one-tick-before-hard-deadline/cancel-owner-once");
+  equal(replay.watchdogSchedules, 2, "callback/exit-one-tick-before-hard-deadline/initial-plus-clamped-rearm");
+  equal(replay.watchdogFires, 1, "callback/exit-one-tick-before-hard-deadline/watchdog-fire-count");
+  equal(replay.peakWatchdogs, 1, "callback/exit-one-tick-before-hard-deadline/peak-active-watchdog");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit 0): child observation exceeded the 30500-millisecond outer deadline",
+  ], "callback/exit-one-tick-before-hard-deadline/diagnostic-exactly-once");
+  const absoluteDeadlineDiagnostics = [...diagnostics];
+  const absoluteDeadlineFires = watchdogFireCount;
+  await new Promise<void>(resolve => originalSetTimeout(resolve, 40));
+  equal(diagnostics, absoluteDeadlineDiagnostics, "callback/exit-one-tick-before-hard-deadline/no-late-diagnostic");
+  equal(watchdogFireCount, absoluteDeadlineFires, "callback/exit-one-tick-before-hard-deadline/no-late-watchdog");
+  equal(unhandledRejections, [], "callback/exit-one-tick-before-hard-deadline/no-late-unhandled-rejection");
+
+  replay = await invoke(
+    "callback/exit-reject-kill-failure",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives kill failure" }),
+      exitError: "synthetic exit status failure",
+      killError: "synthetic kill failure",
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives kill failure" }, "callback/exit-reject-kill-failure/result");
+  equal(replay.spawns[0]!.killCalls, 1, "callback/exit-reject-kill-failure/direct-child-kill-attempt");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit status unavailable): exit status failed: Error: synthetic exit status failure; direct-child SIGKILL failed: Error: synthetic kill failure",
+  ], "callback/exit-reject-kill-failure/diagnostics-exactly-once");
+
+  replay = await invoke(
+    "callback/hard-deadline-after-deny",
+    { toolName: "bash", input: { command: "danger" } },
+    {
+      stdout: JSON.stringify({ decision: "deny", reason: "deny survives hard deadline" }),
+      stdoutTerminalDelayMs: 80,
+      stderrTerminalDelayMs: 80,
+      exitDelayMs: 70,
+      exitError: "late exit observation rejection",
+      signalAfterKill: "SIGKILL",
+      signalAfterKillDelayMs: 60,
+    },
+  );
+  equal(replay.result, { block: true, reason: "deny survives hard deadline" }, "callback/hard-deadline-after-deny/result");
+  check(replay.elapsedMs < 55, "callback/hard-deadline-after-deny/remained-bounded");
+  equal(replay.spawns[0]!.killCalls, 1, "callback/hard-deadline-after-deny/direct-child-kill");
+  equal(replay.watchdogSchedules, 1, "callback/hard-deadline-after-deny/one-watchdog-at-a-time");
+  equal(replay.watchdogFires, 1, "callback/hard-deadline-after-deny/watchdog-fire-count");
+  equal(replay.errors, [
+    "[dcg] OMP guard infrastructure failure (exit status unavailable): child observation exceeded the 30500-millisecond outer deadline",
+  ], "callback/hard-deadline-after-deny/no-unobserved-signal-diagnostic");
+  const settledDiagnostics = [...diagnostics];
+  const settledWatchdogFires = watchdogFireCount;
+  await new Promise<void>(resolve => originalSetTimeout(resolve, 90));
+  equal(diagnostics, settledDiagnostics, "callback/hard-deadline-after-deny/no-late-diagnostic");
+  equal(watchdogFireCount, settledWatchdogFires, "callback/hard-deadline-after-deny/no-late-watchdog");
+  equal(unhandledRejections, [], "callback/hard-deadline-after-deny/no-late-unhandled-rejection");
+
   replay = await invoke(
     "callback/timeout-no-verdict",
     { toolName: "bash", input: { command: "echo safe" } },
     { stuckUntilTimeout: true },
   );
-  check(performance.now() - timeoutStarted < 1_000, "callback/timeout-no-verdict/remained-bounded");
+  check(replay.elapsedMs < 1_000, "callback/timeout-no-verdict/remained-bounded");
   equal(replay.result, undefined, "callback/timeout-no-verdict/result");
   equal(replay.spawns.length, 1, "callback/timeout-no-verdict/spawn-count");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL)"], "callback/timeout-no-verdict/diagnostics");
@@ -21288,10 +21835,15 @@ try {
   );
   equal(replay.result, undefined, "callback/spawn-throw/result");
   equal(replay.spawns.length, 0, "callback/spawn-throw/spawn-count");
+  equal(replay.watchdogSchedules, 0, "callback/spawn-throw/no-watchdog-before-successful-spawn");
   equal(replay.errors, ["[dcg] OMP guard could not run dcg: Error: synthetic spawn failure"], "callback/spawn-throw/diagnostics");
 } finally {
   (Bun as unknown as { spawn: typeof Bun.spawn }).spawn = originalSpawn;
   console.error = originalConsoleError;
+  globalThis.setTimeout = originalSetTimeout;
+  globalThis.clearTimeout = originalClearTimeout;
+  (performance as unknown as { now: () => number }).now = originalPerformanceNow;
+  process.off("unhandledRejection", recordUnhandledRejection);
 }
 
 const bridgeBytes = new Uint8Array(await Bun.file(new URL("./dcg-guard.ts", import.meta.url)).arrayBuffer());
@@ -21307,6 +21859,10 @@ console.log(JSON.stringify({
   framingCaseIds,
   stdinCaseIds,
   callbackCaseIds,
+  watchdogScheduleCount,
+  watchdogFireCount,
+  peakWatchdogCount,
+  unhandledRejectionCount: unhandledRejections.length,
   spawnExecutable: observedExecutable,
   stubExports: [
     "@oh-my-pi/pi-coding-agent/config/settings:settings",
@@ -21602,11 +22158,48 @@ console.log(JSON.stringify({
                 "callback/invalid-signal",
                 "callback/control-signal",
                 "callback/oversized-signal",
+                "callback/pipe-deadline-before-deny",
+                "callback/pipe-deadline-after-deny",
+                "callback/stderr-pipe-deadline-after-deny",
+                "callback/pipe-deadline-after-overflow",
+                "callback/cancel-reject-after-deny",
+                "callback/cancel-reject-after-overflow",
+                "callback/exit-one-tick-before-hard-deadline",
+                "callback/exit-reject-kill-failure",
+                "callback/hard-deadline-after-deny",
                 "callback/timeout-no-verdict",
                 "callback/timeout-after-deny",
                 "callback/spawn-throw",
             ]
             .map(str::to_string)
+        );
+        assert_eq!(
+            certificate
+                .get("unhandledRejectionCount")
+                .and_then(serde_json::Value::as_u64),
+            Some(0),
+            "late child settlement must not create an unhandled rejection"
+        );
+        assert!(
+            certificate
+                .get("watchdogScheduleCount")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|count| count > 0),
+            "the exact replay must exercise production watchdog scheduling"
+        );
+        assert!(
+            certificate
+                .get("watchdogFireCount")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|count| count >= 5),
+            "the exact replay must execute pipe, hard, and compressed native-timeout observation boundaries"
+        );
+        assert_eq!(
+            certificate
+                .get("peakWatchdogCount")
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "the bridge must never own more than one active observation watchdog"
         );
         assert_eq!(
             string_array("stubExports"),
@@ -21803,14 +22396,30 @@ console.log(JSON.stringify({
         );
 
         let settled_collector = r"    const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
-      observeChildCapability(() => collectBoundedText(proc.stdout, DCG_STDOUT_MAX_BYTES)),
-      observeChildCapability(() => collectBoundedText(proc.stderr, DCG_STDERR_MAX_BYTES)),
-      observeChildCapability(() => proc.exited),
+      observeChildCapability(() => collectBoundedText(
+        proc.stdout,
+        DCG_STDOUT_MAX_BYTES,
+        observationAbort.signal,
+      )),
+      observeChildCapability(() => collectBoundedText(
+        proc.stderr,
+        DCG_STDERR_MAX_BYTES,
+        observationAbort.signal,
+      )),
+      observeChildCapabilityUntil(rawExitObservation, observationAbort.signal),
     ]);";
         let fail_fast_collector = r#"    const [stdoutValue, stderrValue, exitValue] = await Promise.all([
-      observeChildCapability(() => collectBoundedText(proc.stdout, DCG_STDOUT_MAX_BYTES)),
-      observeChildCapability(() => collectBoundedText(proc.stderr, DCG_STDERR_MAX_BYTES)),
-      observeChildCapability(() => proc.exited),
+      observeChildCapability(() => collectBoundedText(
+        proc.stdout,
+        DCG_STDOUT_MAX_BYTES,
+        observationAbort.signal,
+      )),
+      observeChildCapability(() => collectBoundedText(
+        proc.stderr,
+        DCG_STDERR_MAX_BYTES,
+        observationAbort.signal,
+      )),
+      observeChildCapabilityUntil(rawExitObservation, observationAbort.signal),
     ]);
     const stdoutResult = { status: "fulfilled" as const, value: stdoutValue };
     const stderrResult = { status: "fulfilled" as const, value: stderrValue };
@@ -21836,6 +22445,173 @@ console.log(JSON.stringify({
                 .contains("synthetic exit status failure"),
             "collector mutant red must reach the rejected exit-status promise that erases a completed deny\nstderr:\n{}",
             String::from_utf8_lossy(&collection_mutant_output.stderr)
+        );
+
+        let plain_unbounded_collector = r"    const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
+      observeChildCapability(() => collectBoundedText(proc.stdout, DCG_STDOUT_MAX_BYTES)),
+      observeChildCapability(() => collectBoundedText(proc.stderr, DCG_STDERR_MAX_BYTES)),
+      rawExitObservation,
+    ]);";
+        let unbounded_observation_mutant =
+            source.replacen(settled_collector, plain_unbounded_collector, 1);
+        let unbounded_observation_mutant_root =
+            replay_root.join("mutant-plain-all-settled-unbounded-observation");
+        std::fs::create_dir_all(&unbounded_observation_mutant_root)
+            .expect("create plain-allSettled observation mutant replay root");
+        let unbounded_observation_mutant_output = run_omp_bridge_bun_fixture(
+            &bun,
+            &unbounded_observation_mutant_root,
+            &unbounded_observation_mutant,
+        );
+        assert!(
+            !unbounded_observation_mutant_output.status.success(),
+            "the executable corpus vacuously accepted plain allSettled without observation cancellation\nstdout:\n{}",
+            String::from_utf8_lossy(&unbounded_observation_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&unbounded_observation_mutant_output.stderr)
+                .contains("callback/pipe-deadline-before-deny/result"),
+            "plain-allSettled mutant red must identify a verdict admitted after the pipe deadline\nstderr:\n{}",
+            String::from_utf8_lossy(&unbounded_observation_mutant_output.stderr)
+        );
+
+        let absolute_clamped_rearm = r#"    const remainingHardBudget = Math.max(0, observationDeadline - performance.now());
+    const pipeDrainWins = remainingHardBudget > DCG_CHILD_PIPE_DRAIN_GRACE_MS;
+    observationTimer = setTimeout(
+      () => abortObservation(pipeDrainWins ? "pipe-drain" : "hard-deadline", false),
+      Math.min(DCG_CHILD_PIPE_DRAIN_GRACE_MS, remainingHardBudget),
+    );"#;
+        let relative_drain_rearm = r#"    observationTimer = setTimeout(
+      () => abortObservation("pipe-drain", false),
+      DCG_CHILD_PIPE_DRAIN_GRACE_MS,
+    );"#;
+        assert_eq!(
+            source.matches(absolute_clamped_rearm).count(),
+            1,
+            "absolute-deadline mutation witness must identify exactly one clamped rearm"
+        );
+        let relative_deadline_mutant =
+            source.replacen(absolute_clamped_rearm, relative_drain_rearm, 1);
+        let relative_deadline_mutant_root = replay_root.join("mutant-relative-post-exit-deadline");
+        std::fs::create_dir_all(&relative_deadline_mutant_root)
+            .expect("create relative post-exit deadline mutant replay root");
+        let relative_deadline_mutant_output = run_omp_bridge_bun_fixture(
+            &bun,
+            &relative_deadline_mutant_root,
+            &relative_deadline_mutant,
+        );
+        assert!(
+            !relative_deadline_mutant_output.status.success(),
+            "the executable corpus vacuously accepted a fresh post-exit grace beyond the absolute deadline\nstdout:\n{}",
+            String::from_utf8_lossy(&relative_deadline_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&relative_deadline_mutant_output.stderr)
+                .contains("callback/exit-one-tick-before-hard-deadline/absolute-virtual-deadline"),
+            "relative-deadline mutant red must identify the original hard deadline overrun\nstderr:\n{}",
+            String::from_utf8_lossy(&relative_deadline_mutant_output.stderr)
+        );
+
+        let retained_collector_result = "  return { text, overflowed, readFailure };";
+        let dropped_retained_collector_result =
+            "  return { text: cancellationRequested ? \"\" : text, overflowed, readFailure };";
+        assert_eq!(
+            source.matches(retained_collector_result).count(),
+            1,
+            "retention mutation witness must identify exactly one bounded collector result"
+        );
+        let dropped_retained_mutant = source.replacen(
+            retained_collector_result,
+            dropped_retained_collector_result,
+            1,
+        );
+        let dropped_retained_mutant_root = replay_root.join("mutant-drop-retained-block-on-cancel");
+        std::fs::create_dir_all(&dropped_retained_mutant_root)
+            .expect("create retained-block cancellation mutant replay root");
+        let dropped_retained_mutant_output = run_omp_bridge_bun_fixture(
+            &bun,
+            &dropped_retained_mutant_root,
+            &dropped_retained_mutant,
+        );
+        assert!(
+            !dropped_retained_mutant_output.status.success(),
+            "the executable corpus vacuously accepted erasing a retained block on cancellation\nstdout:\n{}",
+            String::from_utf8_lossy(&dropped_retained_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&dropped_retained_mutant_output.stderr)
+                .contains("callback/exit-reject-late-sigkill-deny/result"),
+            "retained-block mutant red must identify the first canceled complete deny\nstderr:\n{}",
+            String::from_utf8_lossy(&dropped_retained_mutant_output.stderr)
+        );
+
+        let cleared_watchdog = r"  } finally {
+    observationFinished = true;
+    clearTimeout(observationTimer);
+  }";
+        let uncleared_watchdog = r"  } finally {
+    observationFinished = true;
+  }";
+        assert_eq!(
+            source.matches(cleared_watchdog).count(),
+            1,
+            "watchdog mutation witness must identify exactly one cleanup boundary"
+        );
+        let uncleared_watchdog_mutant = source.replacen(cleared_watchdog, uncleared_watchdog, 1);
+        let uncleared_watchdog_mutant_root = replay_root.join("mutant-uncleared-watchdog");
+        std::fs::create_dir_all(&uncleared_watchdog_mutant_root)
+            .expect("create uncleared-watchdog mutant replay root");
+        let uncleared_watchdog_mutant_output = run_omp_bridge_bun_fixture(
+            &bun,
+            &uncleared_watchdog_mutant_root,
+            &uncleared_watchdog_mutant,
+        );
+        assert!(
+            !uncleared_watchdog_mutant_output.status.success(),
+            "the executable corpus vacuously accepted a live post-callback watchdog\nstdout:\n{}",
+            String::from_utf8_lossy(&uncleared_watchdog_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&uncleared_watchdog_mutant_output.stderr)
+                .contains("callback/whitespace-allow/watchdog-cleared"),
+            "uncleared-watchdog mutant red must identify the first leaked callback timer\nstderr:\n{}",
+            String::from_utf8_lossy(&uncleared_watchdog_mutant_output.stderr)
+        );
+
+        let exit_fault_kill = r"  rawExitObservation.then(
+    () => armPipeDrainDeadline(false),
+    () => armPipeDrainDeadline(true),
+  );";
+        let exit_fault_without_kill = r"  rawExitObservation.then(
+    () => armPipeDrainDeadline(false),
+    () => armPipeDrainDeadline(false),
+  );";
+        assert_eq!(
+            source.matches(exit_fault_kill).count(),
+            1,
+            "exit-fault mutation witness must identify exactly one rejection branch"
+        );
+        let exit_fault_without_kill_mutant =
+            source.replacen(exit_fault_kill, exit_fault_without_kill, 1);
+        let exit_fault_without_kill_mutant_root =
+            replay_root.join("mutant-exit-rejection-without-kill");
+        std::fs::create_dir_all(&exit_fault_without_kill_mutant_root)
+            .expect("create exit-rejection kill mutant replay root");
+        let exit_fault_without_kill_mutant_output = run_omp_bridge_bun_fixture(
+            &bun,
+            &exit_fault_without_kill_mutant_root,
+            &exit_fault_without_kill_mutant,
+        );
+        assert!(
+            !exit_fault_without_kill_mutant_output.status.success(),
+            "the executable corpus vacuously accepted an exit-observation rejection without direct-child kill\nstdout:\n{}",
+            String::from_utf8_lossy(&exit_fault_without_kill_mutant_output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&exit_fault_without_kill_mutant_output.stderr)
+                .contains("callback/exit-reject-deny/direct-child-kill"),
+            "exit-rejection mutant red must identify the missing direct-child kill\nstderr:\n{}",
+            String::from_utf8_lossy(&exit_fault_without_kill_mutant_output.stderr)
         );
 
         let bounded_stdin_dispatch = r"  return command.length <= DCG_STDIN_CHUNK_CODE_UNITS

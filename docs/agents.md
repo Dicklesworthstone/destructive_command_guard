@@ -73,21 +73,62 @@ with the canonical `agent_type = "omp"`; ordinary human `dcg test` diagnostics
 remain outside command history.
 
 The bridge spawns dcg directly, without a shell, and gives Bun a 30-second
-parent-side timeout with a hard kill signal. This is a pathological-hang
-backstop above dcg's ordinary 1-second evaluator default and the broad Windows
-preset's 3-second default, not a replacement for those configurable budgets.
-An explicit evaluator budget above 30 seconds is nevertheless capped by this
-OMP-specific outer ceiling; direct hook and diagnostic invocations retain their
-configured budget.
-If the backstop terminates a child before it returns a safety verdict, the
-bridge reads Bun's post-exit `signalCode`, reports the exact signal as an
-infrastructure failure, and follows the established visible fail-open policy.
-This keeps an ordinary numeric exit 137 distinct from a timeout or other
-`SIGKILL`. A complete deny, ask, or indeterminate verdict already written to
-stdout remains authoritative and blocks regardless of the signal; dcg's
-independent blocking exit 1 remains authoritative if status observation is
-otherwise contradictory or faulty. Other abnormal exit statuses remain
-visible even when a deny-like stdout verdict is authoritative.
+parent-side timeout with a hard kill signal. Immediately after a successful
+spawn it records one monotonic absolute deadline 30.5 seconds away and arms one
+observation watchdog. A direct child can exit while a descendant still holds
+its stdout or stderr descriptor, so exit settlement rearms that sole timer for
+the lesser of a 250-millisecond pipe-drain grace and the remaining absolute
+budget. If the remaining hard budget wins, expiry retains hard-deadline
+provenance. Exit-observation rejection attempts one direct-child `SIGKILL` and
+uses the same clamped drain; neither rearm kills again. Every active watchdog is
+cleared when observation finishes, and late exit settlement or rejection
+remains consumed. There is no retry, replacement process, or second
+concurrently active bridge watchdog.
+
+This is the finite child-observation lineage:
+
+| Current state + event | Process action | Pipe/clock action | Result invariant |
+|---|---|---|---|
+| `Bun.spawn` throws | No child exists | No watchdog is armed | One visible spawn diagnostic; fail open |
+| Spawn succeeds | Bun owns the 30-second direct-child timeout | Record and arm the monotonic 30.5-second absolute observation deadline; read both capped pipes and exit concurrently | No classification before the bounded observation settles |
+| Complete deny/ask/indeterminate frame or stdout overflow arrives | None | Retain the frame or capped overflow evidence while observation continues | Blocking evidence is absorbing |
+| Exit resolves before the hard deadline | None; the direct child is already gone | Rearm for `min(250 ms, remaining hard budget)` | Bytes already read remain eligible evidence; the absolute deadline cannot move |
+| Exit rejects before the hard deadline | Attempt one direct-child `SIGKILL` | Rearm for `min(250 ms, remaining hard budget)` without another kill | The exit fault and any kill fault remain visible; kill request alone does not prove a signal |
+| Drain grace expires | The direct child has exited or already received the rejection-path kill | Cancel both local readers | Retained block/overflow still blocks; missing evidence follows visible infrastructure fail-open |
+| Hard observation deadline expires | Attempt one direct-child `SIGKILL` | Cancel both readers and the local exit wrapper | Retained block/overflow still blocks; deadline remains visible |
+| All three observations settle first | None | Clear the active watchdog | Read signal provenance, classify once, and emit each owned diagnostic once |
+
+If a blocking frame and a deadline become runnable together, JavaScript's event
+loop imposes a total order: bytes delivered before reader cancellation are
+retained and absorbing; bytes delivered after cancellation are outside the
+observation boundary. The stdout and stderr caps bound retained memory, and the
+outer/deferred deadlines bound a standards-compliant asynchronous observation.
+If an underlying WHATWG cancellation algorithm rejects, the stream is still
+closed and pending reads settle; the bridge consumes the cancellation promise's
+rejection while retaining prior deny/ask/indeterminate and overflow evidence.
+The backstops sit above dcg's ordinary 1-second evaluator default and the broad
+Windows preset's 3-second default, not in place of those configurable budgets.
+An explicit evaluator budget above 30 seconds is nevertheless capped on this
+OMP bridge; direct hook and diagnostic invocations retain their configured
+budget.
+
+Two seams remain fundamentally outside this in-process boundary. A synchronous
+stall inside `Bun.spawn` (or any JavaScript/event-loop stall) prevents a timer
+from starting or firing. Bun's `proc.kill()` targets the direct child, not a
+process group, so it cannot prove that descendants were terminated or release
+their unrelated resources; local reader cancellation bounds the callback even
+when an inherited pipe holder survives. A non-standard stream whose synchronous
+cancel path throws without settling a pending read is likewise outside the Web
+Streams contract and cannot be bounded by another JavaScript promise. After
+observation, the bridge reads Bun's `signalCode` and reports an exact signal
+only when Bun actually exposes one; a successful `proc.kill("SIGKILL")` request
+does not itself forge SIGKILL provenance. This keeps an ordinary numeric exit
+137 distinct from an observed timeout or other observed `SIGKILL`.
+A complete deny, ask, or indeterminate verdict already written to stdout
+remains authoritative regardless of signal, cancellation, stream/exit fault,
+or deadline; stdout overflow and dcg's independent blocking exit 1 are likewise
+absorbing. Other abnormal statuses and infrastructure faults remain visible
+even when blocking evidence controls the action.
 
 OMP's public ExtensionAPI does not expose its ACP client-terminal capability or
 selected backend, and both ACP and JSON-RPC surface as `mode: "rpc"`. The bridge
