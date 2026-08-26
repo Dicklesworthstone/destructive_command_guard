@@ -24504,7 +24504,11 @@ exclude = ["target/**"]
 
     fn isolated_git_command(dir: &std::path::Path) -> std::process::Command {
         let mut command = std::process::Command::new("git");
-        command.current_dir(dir);
+        let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        command
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", null_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1");
         command
     }
 
@@ -24531,11 +24535,8 @@ exclude = ["target/**"]
         )
         .expect("write ambient global git config");
         let ambient_system_config = tmp.path().join("ambient-system.gitconfig");
-        std::fs::write(
-            &ambient_system_config,
-            "[dcg]\n\tambientSystem = visible\n",
-        )
-        .expect("write ambient system git config");
+        std::fs::write(&ambient_system_config, "[dcg]\n\tambientSystem = visible\n")
+            .expect("write ambient system git config");
 
         for key in ["dcg.ambientGlobal", "dcg.ambientSystem"] {
             let output = isolated_git_command(tmp.path())
