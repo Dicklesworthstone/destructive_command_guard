@@ -2444,17 +2444,34 @@ pub fn write_indeterminate_to(
     stderr: &mut impl Write,
     protocol: HookProtocol,
     reason: &str,
+    deny: bool,
 ) {
     let _ = writeln!(stderr);
     let _ = writeln!(stderr, "{} {reason}", "dcg INDETERMINATE:".yellow().bold());
+
+    // `ask` presumes a human is present to answer. On an unattended session
+    // that prompt either stalls forever or gets waved through by an
+    // auto-approver — for exactly the commands dcg declined to inspect — so
+    // `general.unverified_decision = "deny"` downgrades the review-capable
+    // protocols to an outright denial (#338). Protocols without a native
+    // `ask` decision already block below regardless of this setting.
+    let review_decision = if deny { "deny" } else { "ask" };
+    let review_reason: Cow<'_, str> = if deny {
+        Cow::Owned(format!(
+            "{reason} Denied without review because unverified commands are configured to deny \
+             (general.unverified_decision)."
+        ))
+    } else {
+        Cow::Borrowed(reason)
+    };
 
     match protocol {
         HookProtocol::ClaudeCompatible => {
             let output = HookOutput {
                 hook_specific_output: HookSpecificOutput {
                     hook_event_name: "PreToolUse",
-                    permission_decision: "ask",
-                    permission_decision_reason: Cow::Borrowed(reason),
+                    permission_decision: review_decision,
+                    permission_decision_reason: review_reason,
                     allow_once_code: None,
                     allow_once_full_hash: None,
                     rule_id: None,
@@ -2469,8 +2486,8 @@ pub fn write_indeterminate_to(
         }
         HookProtocol::Copilot => {
             let output = CopilotHookOutput {
-                permission_decision: "ask",
-                permission_decision_reason: Cow::Borrowed(reason),
+                permission_decision: review_decision,
+                permission_decision_reason: review_reason,
             };
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
@@ -2573,12 +2590,12 @@ pub fn write_indeterminate_to(
 /// Emit a safety-evaluation indeterminate response on process stdout/stderr.
 #[cold]
 #[inline(never)]
-pub fn output_indeterminate_for_protocol(protocol: HookProtocol, reason: &str) {
+pub fn output_indeterminate_for_protocol(protocol: HookProtocol, reason: &str, deny: bool) {
     let out = io::stdout();
     let mut out_handle = out.lock();
     let err = io::stderr();
     let mut err_handle = err.lock();
-    write_indeterminate_to(&mut out_handle, &mut err_handle, protocol, reason);
+    write_indeterminate_to(&mut out_handle, &mut err_handle, protocol, reason, deny);
 }
 
 /// Write a warning response to arbitrary stdout/stderr writers (test seam).
@@ -5090,7 +5107,7 @@ mod tests {
         for (protocol, expected_decision) in cases {
             let mut stdout = FlushProbe::default();
             let mut stderr = FlushProbe::default();
-            write_indeterminate_to(&mut stdout, &mut stderr, protocol, REASON);
+            write_indeterminate_to(&mut stdout, &mut stderr, protocol, REASON, false);
 
             assert!(
                 !stdout.bytes.is_empty(),
@@ -5131,6 +5148,63 @@ mod tests {
                 assert_eq!(json["action"], "block");
                 assert_eq!(json["message"], REASON);
             }
+        }
+    }
+
+    /// #338: `general.unverified_decision = "deny"` must convert the
+    /// review-capable protocols' `ask` into an outright denial, so an
+    /// unattended session cannot stall on (or auto-approve) exactly the
+    /// commands dcg declined to inspect. Protocols that already block keep
+    /// blocking, with their reason bytes unchanged.
+    #[test]
+    fn test_write_indeterminate_denies_when_unverified_decision_is_deny() {
+        const REASON: &str = "Command is 126015 bytes and exceeds limit 65536 bytes; \
+            DCG did not evaluate it. Reduce the command size or raise \
+            general.max_command_bytes after review.";
+
+        let cases = [
+            (HookProtocol::ClaudeCompatible, "deny", true),
+            (HookProtocol::Copilot, "deny", true),
+            (HookProtocol::Codex, "deny", false),
+            (HookProtocol::Gemini, "deny", false),
+            (HookProtocol::Hermes, "block", false),
+            (HookProtocol::Grok, "deny", false),
+            (HookProtocol::Antigravity, "block", false),
+        ];
+
+        for (protocol, expected_decision, reason_is_annotated) in cases {
+            let mut stdout = FlushProbe::default();
+            let mut stderr = FlushProbe::default();
+            write_indeterminate_to(&mut stdout, &mut stderr, protocol, REASON, true);
+
+            let json: serde_json::Value = serde_json::from_slice(&stdout.bytes)
+                .unwrap_or_else(|error| panic!("{protocol:?} output must be JSON: {error}"));
+            let (decision, reason) = match protocol {
+                HookProtocol::ClaudeCompatible | HookProtocol::Codex => {
+                    let specific = &json["hookSpecificOutput"];
+                    (
+                        specific["permissionDecision"].as_str(),
+                        specific["permissionDecisionReason"].as_str(),
+                    )
+                }
+                HookProtocol::Copilot => (
+                    json["permissionDecision"].as_str(),
+                    json["permissionDecisionReason"].as_str(),
+                ),
+                HookProtocol::Gemini
+                | HookProtocol::Hermes
+                | HookProtocol::Grok
+                | HookProtocol::Antigravity => (json["decision"].as_str(), json["reason"].as_str()),
+            };
+
+            assert_eq!(decision, Some(expected_decision), "payload: {json}");
+            let reason = reason.unwrap_or_else(|| panic!("{protocol:?} carries no reason"));
+            assert!(reason.starts_with(REASON), "payload: {json}");
+            assert_eq!(
+                reason.contains("unverified_decision"),
+                reason_is_annotated,
+                "only the downgraded ask protocols explain the configured denial: {json}"
+            );
         }
     }
 

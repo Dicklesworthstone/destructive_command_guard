@@ -237,6 +237,46 @@ fn bare_hook_fail_closed_still_allows_valid_commands() {
     );
 }
 
+#[test]
+fn bare_hook_unverified_decision_controls_oversized_fallback() {
+    // #338: an oversized command is one of the two deterministic unverified
+    // paths. Default posture routes it to `ask`; the unattended posture
+    // (`DCG_UNVERIFIED_DECISION=deny`) must refuse it outright.
+    let padding = "x".repeat(70 * 1024);
+    let raw = format!(
+        r#"{{"tool_name":"Bash","tool_input":{{"command":"echo {padding}"}}}}"#
+    )
+    .into_bytes();
+
+    let asked = run_dcg_hook_raw(&raw, &[]);
+    let stdout = String::from_utf8_lossy(&asked.stdout);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"ask\""),
+        "default unverified fallback must be ask.\nstdout: {stdout}"
+    );
+
+    let denied = run_dcg_hook_raw(&raw, &[("DCG_UNVERIFIED_DECISION", "deny")]);
+    let stdout = String::from_utf8_lossy(&denied.stdout);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"deny\""),
+        "DCG_UNVERIFIED_DECISION=deny must refuse the unverified command.\nstdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("unverified_decision"),
+        "the denial must say it came from the configured unverified posture.\nstdout: {stdout}"
+    );
+
+    // The posture only governs the unverified path: ordinary commands keep
+    // their ordinary decisions under it.
+    let safe = br#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
+    let safe_out = run_dcg_hook_raw(safe, &[("DCG_UNVERIFIED_DECISION", "deny")]);
+    assert!(safe_out.status.success());
+    assert!(
+        String::from_utf8_lossy(&safe_out.stdout).trim().is_empty(),
+        "unverified_decision=deny must still allow a valid safe command"
+    );
+}
+
 /// Run bare `dcg` with raw stdin, optional env, and an optional user config
 /// file written to `XDG_CONFIG_HOME/dcg/config.toml`.
 fn run_dcg_hook_raw_cfg(

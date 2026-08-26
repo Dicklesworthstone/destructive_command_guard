@@ -236,12 +236,13 @@ fn handle_indeterminate_evaluation(
     working_dir: &str,
     stage: &str,
     deadline: &Deadline,
+    deny_unverified: bool,
 ) {
     let elapsed = deadline.elapsed();
     let budget = deadline.max_duration();
 
     let reason = format_indeterminate_reason(stage, budget);
-    hook::output_indeterminate_for_protocol(protocol, &reason);
+    hook::output_indeterminate_for_protocol(protocol, &reason, deny_unverified);
 
     if let Some(writer) = history_writer {
         let entry = build_history_entry(
@@ -1141,7 +1142,11 @@ fn publish_decisive_response(
         ResolvedCommandOutcome::Allow(_) => return,
         ResolvedCommandOutcome::OversizedCommand { command_len } => {
             let reason = format_oversized_command_reason(command_len, ctx.max_command_bytes);
-            hook::output_indeterminate_for_protocol(ctx.hook_protocol, &reason);
+            hook::output_indeterminate_for_protocol(
+                ctx.hook_protocol,
+                &reason,
+                ctx.config.unverified_denies(),
+            );
             return;
         }
         ResolvedCommandOutcome::DeadlineExhausted { command, stage } => {
@@ -1153,6 +1158,7 @@ fn publish_decisive_response(
                 ctx.working_dir,
                 stage,
                 ctx.deadline,
+                ctx.config.unverified_denies(),
             );
             return;
         }
@@ -1612,7 +1618,7 @@ fn main() {
     // bytes are identical either way.
     if additional_commands.is_empty() && command.len() > max_command_bytes {
         let reason = format_oversized_command_reason(command.len(), max_command_bytes);
-        hook::output_indeterminate_for_protocol(hook_protocol, &reason);
+        hook::output_indeterminate_for_protocol(hook_protocol, &reason, config.unverified_denies());
         return;
     }
 

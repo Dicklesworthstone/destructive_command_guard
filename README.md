@@ -666,6 +666,7 @@ Environment variables override config files (highest priority):
 - `DCG_HIGH_CONTRAST=1`: enable high-contrast output (ASCII borders + monochrome palette)
 - `DCG_FORMAT=text|json|sarif`: default output format (command-specific — see [Output Formats](#output-formats-and-dcg_format) for which values each subcommand actually accepts; real SARIF is `dcg scan`-only)
 - `DCG_FAIL_CLOSED=1`: block (deny) on hook input that cannot be parsed, instead of the default fail-open allow (opt-in; see [Bounded Failure Policy](#bounded-failure-policy))
+- `DCG_UNVERIFIED_DECISION=deny|ask`: decision for commands dcg could not verify (evaluation timeout, or over `max_command_bytes`); `deny` suits unattended sessions where nobody can answer `ask` (see [Bounded Failure Policy](#bounded-failure-policy))
 - `DCG_BYPASS=1`: bypass dcg entirely (escape hatch; use sparingly)
 - `DCG_CONFIG=/path/to/config.toml`: use explicit config file
 - `DCG_HEREDOC_ENABLED=true|false`: enable/disable heredoc scanning
@@ -813,8 +814,8 @@ an oversized extracted command as proof that execution is safe.
 |----------|------------------|----------------------------|
 | Malformed or oversized raw hook JSON | Allow with an audit warning | `general.fail_closed = true` denies |
 | Transient hook stdin I/O error | Allow with an audit warning | Always fail-open because the payload was not attacker-controlled |
-| Extracted command exceeds `max_command_bytes` | Explicit indeterminate result | Review-capable clients receive `ask`; other clients block |
-| Absolute evaluation deadline expires | Explicit indeterminate result | Review-capable clients receive `ask`; other clients block |
+| Extracted command exceeds `max_command_bytes` | Explicit indeterminate result | Review-capable clients receive `ask` (`unverified_decision = "deny"` turns this into a deny); other clients block |
+| Absolute evaluation deadline expires | Explicit indeterminate result | Review-capable clients receive `ask` (`unverified_decision = "deny"` turns this into a deny); other clients block |
 | Heredoc extraction/parse/AST failure | Run the bounded fallback scanner | `fallback_on_parse_error = false` or `fallback_on_timeout = false` blocks |
 
 **Configurable Strictness**:
@@ -844,6 +845,23 @@ or at runtime:
 ```bash
 DCG_FAIL_CLOSED=1   # env var overrides the config value
 ```
+
+For the two **unverified** outcomes (evaluation deadline expired, or command
+over `max_command_bytes`), the default `ask` presumes a human is present to
+answer. On unattended or autonomous sessions there is no such human, and
+anything auto-answering prompts would approve exactly the commands dcg
+declined to inspect. Opt those sessions into denial instead:
+
+```toml
+[general]
+unverified_decision = "deny"   # refuse what could not be inspected
+```
+
+or at runtime with `DCG_UNVERIFIED_DECISION=deny`. The denial reason is
+actionable (shrink or split the command; raise `hook_timeout_ms` /
+`max_command_bytes` after review), and ordinary verified commands are
+unaffected. A repository `.dcg.toml` may set `unverified_decision = "deny"`
+(tightening) but never relax an operator's `deny` back to `ask`.
 
 The default is **fail-open** (unparseable input is allowed) and is unchanged
 unless you opt in. With fail-closed enabled, a genuinely unparseable hook

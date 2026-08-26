@@ -694,8 +694,15 @@ impl ConfigLayer {
         } = self;
 
         let general = general.and_then(|general| {
-            (general.fail_closed == Some(true)).then(|| GeneralConfigLayer {
-                fail_closed: Some(true),
+            // Only monotonic tightenings survive: a repository may opt the
+            // session INTO fail-closed or deny-on-unverified, never out.
+            let fail_closed = (general.fail_closed == Some(true)).then_some(true);
+            let unverified_decision = (general.unverified_decision
+                == Some(UnverifiedDecision::Deny))
+            .then_some(UnverifiedDecision::Deny);
+            (fail_closed.is_some() || unverified_decision.is_some()).then(|| GeneralConfigLayer {
+                fail_closed,
+                unverified_decision,
                 ..GeneralConfigLayer::default()
             })
         });
@@ -802,6 +809,7 @@ struct GeneralConfigLayer {
     max_command_bytes: Option<usize>,
     max_findings_per_command: Option<usize>,
     fail_closed: Option<bool>,
+    unverified_decision: Option<UnverifiedDecision>,
     update_pin: Option<bool>,
 }
 
@@ -1772,6 +1780,19 @@ pub struct GeneralConfig {
     /// (a truthy value forces fail-closed, a falsy value forces fail-open).
     pub fail_closed: bool,
 
+    /// Decision published when dcg cannot verify a command at all (#338):
+    /// the evaluation deadline expired, or the command exceeds
+    /// `max_command_bytes`.
+    ///
+    /// The default `ask` routes the command to an explicit operator decision
+    /// on review-capable protocols (Claude-compatible, Copilot); protocols
+    /// without an `ask` decision always block. Set `deny` for unattended or
+    /// autonomous sessions, where nobody is present to answer the prompt and
+    /// an auto-approver would otherwise wave through exactly the commands dcg
+    /// declined to inspect. Override at runtime with
+    /// `DCG_UNVERIFIED_DECISION=deny|ask`.
+    pub unverified_decision: UnverifiedDecision,
+
     /// Pin the installed binary against `dcg update` (#320).
     ///
     /// When `true`, `dcg update` refuses to replace the installed binary
@@ -1782,6 +1803,29 @@ pub struct GeneralConfig {
     /// guard coverage. Override at runtime with `DCG_UPDATE_PIN`.
     /// Default: false.
     pub update_pin: bool,
+}
+
+/// Fallback decision for a command dcg could not verify (#338): evaluation
+/// deadline exhausted, or command over `general.max_command_bytes`.
+///
+/// This is deliberately a two-value enum rather than `PolicyMode`: an
+/// unverified command has no matched rule to warn or log about, so the only
+/// meaningful choices are routing it to an operator (`ask`) or refusing it
+/// (`deny`).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum UnverifiedDecision {
+    /// Route the unverified command to an explicit operator decision on
+    /// review-capable protocols. Protocols without an `ask` decision block.
+    #[default]
+    Ask,
+    /// Refuse the unverified command on every protocol. The right posture for
+    /// unattended sessions: the denial reason is actionable (shrink or split
+    /// the command), while an unanswered `ask` stalls or — worse — gets
+    /// auto-approved without inspection.
+    Deny,
 }
 
 /// Default limits for input size (used when not configured).
@@ -1802,6 +1846,7 @@ impl Default for GeneralConfig {
             check_updates: true,
             self_heal_hook: true,
             fail_closed: false,
+            unverified_decision: UnverifiedDecision::Ask,
             update_pin: false,
         }
     }
@@ -4253,6 +4298,9 @@ impl Config {
         if let Some(fail_closed) = general.fail_closed {
             self.general.fail_closed = fail_closed;
         }
+        if let Some(unverified_decision) = general.unverified_decision {
+            self.general.unverified_decision = unverified_decision;
+        }
         if let Some(update_pin) = general.update_pin {
             self.general.update_pin = update_pin;
         }
@@ -4864,6 +4912,24 @@ impl Config {
             return value;
         }
         self.general.fail_closed
+    }
+
+    /// Whether an unverified command (deadline exhausted, or over the command
+    /// size limit) must be denied instead of routed to `ask` (#338).
+    ///
+    /// The `DCG_UNVERIFIED_DECISION` environment variable overrides the
+    /// configured `general.unverified_decision`: `deny` forces denial, `ask`
+    /// forces the default review routing, anything else is ignored.
+    #[must_use]
+    pub fn unverified_denies(&self) -> bool {
+        if let Ok(value) = env::var(format!("{ENV_PREFIX}_UNVERIFIED_DECISION")) {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "deny" => return true,
+                "ask" => return false,
+                _ => {}
+            }
+        }
+        self.general.unverified_decision == UnverifiedDecision::Deny
     }
 
     /// Get the effective pack configuration for a specific project path.
@@ -6276,6 +6342,50 @@ batch_flush_interval_ms = 29
         );
         // Sibling field from the same section is honored too (sanity).
         assert!(config.general.verbose);
+    }
+
+    #[test]
+    fn unverified_decision_defaults_to_ask_and_merges_from_config_file() {
+        // #338: the unverified fallback is `ask` unless configured.
+        let config = Config::default();
+        assert_eq!(config.general.unverified_decision, UnverifiedDecision::Ask);
+
+        let layer: ConfigLayer = toml::from_str("[general]\nunverified_decision = \"deny\"\n")
+            .expect("layer parses");
+        let mut config = Config::default();
+        config.merge_layer(layer);
+        assert_eq!(
+            config.general.unverified_decision,
+            UnverifiedDecision::Deny,
+            "unverified_decision from a config file must survive the layer merge"
+        );
+
+        // An explicit `ask` in a later layer relaxes an earlier `deny` (both
+        // came from operator-owned layers; only repo configs are restricted).
+        let layer: ConfigLayer = toml::from_str("[general]\nunverified_decision = \"ask\"\n")
+            .expect("layer parses");
+        config.merge_layer(layer);
+        assert_eq!(config.general.unverified_decision, UnverifiedDecision::Ask);
+    }
+
+    #[test]
+    fn unverified_decision_from_repo_config_is_tighten_only() {
+        // #338 + repo-config threat model: an attacker-controlled `.dcg.toml`
+        // may opt a session INTO deny-on-unverified, never out of it.
+        let deny_layer: ConfigLayer =
+            toml::from_str("[general]\nunverified_decision = \"deny\"\nverbose = true\n")
+                .expect("layer parses");
+        let restricted = deny_layer.into_restricted_project_policy();
+        let general = restricted.general.expect("deny retained");
+        assert_eq!(general.unverified_decision, Some(UnverifiedDecision::Deny));
+        assert_eq!(general.verbose, None, "non-security fields are dropped");
+
+        let ask_layer: ConfigLayer = toml::from_str("[general]\nunverified_decision = \"ask\"\n")
+            .expect("layer parses");
+        assert!(
+            ask_layer.into_restricted_project_policy().general.is_none(),
+            "a repository must not be able to relax deny back to ask"
+        );
     }
 
     #[test]

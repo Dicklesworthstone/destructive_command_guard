@@ -21,6 +21,7 @@ therefore accepts only settings that monotonically add enforcement:
 - `[packs].enabled`
 - `[policy].default_mode = "deny"` and per-pack/per-rule entries equal to `"deny"`
 - `[general].fail_closed = true`
+- `[general].unverified_decision = "deny"`
 - `[heredoc].enabled = true`
 - `[heredoc].fallback_on_parse_error = false`
 - `[heredoc].fallback_on_timeout = false`
