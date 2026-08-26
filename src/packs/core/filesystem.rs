@@ -37,7 +37,7 @@ const RM_RF_ROOT_HOME_SUGGESTIONS: &[PatternSuggestion] = &[
 const RM_RF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "rm -ri {path}",
-        "Interactive mode: confirms each file before deletion",
+        "Interactive mode: confirms each file before deletion — needs a terminal; with stdin closed it deletes nothing and exits 0",
     ),
     PatternSuggestion::with_platform(
         "trash-put {path}",
@@ -48,6 +48,11 @@ const RM_RF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = &[
         "gio trash {path}",
         "Move to trash via GNOME (requires gio)",
         Platform::Linux,
+    ),
+    PatternSuggestion::with_platform(
+        "mv {path} ~/.Trash/",
+        "Move to the Finder trash — macOS has no ~/.local/share/Trash",
+        Platform::MacOS,
     ),
     PatternSuggestion::new(
         "mv {path} /tmp/delete-me-{timestamp}",
@@ -71,7 +76,7 @@ const RM_RF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = &[
 const RM_R_F_SEPARATE_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "rm -ri {path}",
-        "Interactive mode: confirms each file before deletion",
+        "Interactive mode: confirms each file before deletion — needs a terminal; with stdin closed it deletes nothing and exits 0",
     ),
     PatternSuggestion::new(
         "rm -r -f /tmp/{subdir}",
@@ -87,7 +92,7 @@ const RM_R_F_SEPARATE_SUGGESTIONS: &[PatternSuggestion] = &[
 const RM_RECURSIVE_FORCE_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "rm --interactive --recursive {path}",
-        "Interactive mode: confirms each file before deletion",
+        "Interactive mode: confirms each file before deletion — needs a terminal; with stdin closed it deletes nothing and exits 0",
     ),
     PatternSuggestion::new(
         "find {path} --maxdepth 2 -ls | head -30",
@@ -3378,10 +3383,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              takes hours to days.\n\n\
              dcg auto-allows recursive deletion only for literal temp paths:\n  \
              rm -rf /tmp/<subdir>/scratch\n\n\
-             For any other directory, preview first and then delete interactively \
-             (dcg allows the interactive form):\n  \
+             For any other directory, preview first, then either delete interactively \
+             or move the tree aside (dcg allows both forms):\n  \
              find /path/to/directory -type f | head -20\n  \
-             rm -ri /path/to/directory",
+             rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // Same root/home catastrophe but with SEPARATE flags (`rm -r -f /`,
@@ -3425,7 +3431,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Wildcards can expand to match more than expected\n\
              - No undo mechanism exists\n\n\
              Safe alternatives:\n\
-             - rm -ri: Interactive mode, confirms each file\n\
+             - rm -ri: Interactive mode, confirms each file. Needs a terminal; with stdin closed, as under an agent hook, it prompts, deletes nothing, and exits 0\n\
+             - mv <path> /tmp/delete-me-<literal-timestamp>: Move the tree aside instead of deleting it\n\
              - trash-cli: Moves files to trash instead of deleting\n\
              - rm -rf in literal /tmp or /var/tmp subdirectories: Allowed\n\
              - Variable-rooted paths such as $TMPDIR: Reviewed because the environment may point anywhere\n\n\

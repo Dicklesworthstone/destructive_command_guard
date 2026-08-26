@@ -9,6 +9,7 @@
   "pack_id": "core.filesystem",
   "pattern_name": "rm-rf-root-home",
   "reason": "rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed. Ask the user to run it manually if truly needed.",
+  "explanation": "This command would recursively delete files starting from the root filesystem (/) or home directory (~). This is catastrophic and will destroy:\n\n- Your entire operating system\n- All installed applications and libraries\n- All user data, documents, and configurations\n- Boot files, making the system unbootable\n\nThere is NO recovery without backups. Even with backups, full restoration takes hours to days.\n\ndcg auto-allows recursive deletion only for literal temp paths:\n  rm -rf /tmp/<subdir>/scratch\n\nFor any other directory, preview first, then either delete interactively or move the tree aside (dcg allows both forms):\n  find /path/to/directory -type f | head -20\n  rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
   "source": "pack",
   "matched_span": [
     3,

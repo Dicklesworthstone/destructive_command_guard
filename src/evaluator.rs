@@ -22098,6 +22098,16 @@ fn evaluate_core_filesystem_pack(
             crate::packs::core::filesystem::RmParseDecision::Allow => continue,
             crate::packs::core::filesystem::RmParseDecision::NoMatch => {}
             crate::packs::core::filesystem::RmParseDecision::Deny(hit) => {
+                // The rm classifier builds its own hit, so it never walks the
+                // pack's pattern list and never picks up the explanation and
+                // safer-alternative suggestions authored for the rule that
+                // just fired. Re-attach them by name: without this, every
+                // rm denial reaches the blocked caller with no guidance at
+                // all, and the caller cannot tell which cleanup form the
+                // guard would accept. The regex-matched filesystem rules
+                // deliver theirs already, which is what makes the gap
+                // visible side by side.
+                let (hit_explanation, hit_suggestions) = pack.pattern_guidance(hit.pattern_name);
                 let span = hit.span.as_ref().map(|span| MatchSpan {
                     start: span.start + segment_start,
                     end: span.end + segment_start,
@@ -22132,8 +22142,8 @@ fn evaluate_core_filesystem_pack(
                                 source: MatchSource::Pack,
                                 matched_span: mapped_span,
                                 matched_text_preview: preview,
-                                explanation: None,
-                                suggestions: &[],
+                                explanation: hit_explanation.map(str::to_string),
+                                suggestions: hit_suggestions,
                             },
                             allow_hit.layer,
                             allow_hit.entry.reason.clone(),
@@ -22146,9 +22156,9 @@ fn evaluate_core_filesystem_pack(
                                 pack_id,
                                 hit.pattern_name,
                                 hit.reason,
-                                None,
+                                hit_explanation,
                                 hit.severity,
-                                &[],
+                                hit_suggestions,
                             )
                         },
                         |mapped_span| {
@@ -22156,9 +22166,9 @@ fn evaluate_core_filesystem_pack(
                                 pack_id,
                                 hit.pattern_name,
                                 hit.reason,
-                                None,
+                                hit_explanation,
                                 hit.severity,
-                                &[],
+                                hit_suggestions,
                                 original_command,
                                 mapped_span,
                             )

@@ -798,6 +798,26 @@ impl Pack {
             })
     }
 
+    /// Look up the guidance authored for one named pattern: its detailed
+    /// explanation and its safer-alternative suggestions.
+    ///
+    /// Semantic classifiers decide the reason and severity themselves, so they
+    /// never walk the `destructive_patterns` list and never pick up the
+    /// guidance the pack authored for the rule they just fired. This lookup
+    /// re-attaches it by name, so a caller blocked by the rm classifier is told
+    /// what it may run instead.
+    pub(crate) fn pattern_guidance(
+        &self,
+        name: &str,
+    ) -> (Option<&'static str>, &'static [PatternSuggestion]) {
+        self.destructive_patterns
+            .iter()
+            .find(|pattern| pattern.name == Some(name))
+            .map_or((None, &[][..]), |pattern| {
+                (pattern.explanation, pattern.suggestions)
+            })
+    }
+
     fn destructive_match_by_name(&self, name: &str) -> Option<DestructiveMatch> {
         self.destructive_patterns
             .iter()
@@ -870,11 +890,19 @@ impl Pack {
             match crate::packs::core::filesystem::parse_rm_command(cmd) {
                 crate::packs::core::filesystem::RmParseDecision::Allow => return None,
                 crate::packs::core::filesystem::RmParseDecision::Deny(hit) => {
+                    // Carry the named pattern's explanation, the same way the
+                    // scp and wrangler classifier branches do through
+                    // `destructive_match_by_name`. The rm classifier decides
+                    // reason and severity itself, but dropping the explanation
+                    // made every rm denial report "no additional explanation
+                    // is available yet", so the pack's safe-alternative
+                    // guidance never reached the caller that was just
+                    // blocked.
                     return Some(DestructiveMatch {
                         reason: hit.reason,
                         name: Some(hit.pattern_name),
                         severity: hit.severity,
-                        explanation: None,
+                        explanation: self.pattern_guidance(hit.pattern_name).0,
                     });
                 }
                 crate::packs::core::filesystem::RmParseDecision::NoMatch => {}

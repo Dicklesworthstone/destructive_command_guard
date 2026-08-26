@@ -496,12 +496,17 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         ),
         Suggestion::new(
             SuggestionKind::SaferAlternative,
-            "Use `rm -ri` for interactive confirmation of each file",
+            "Use `rm -ri` for interactive confirmation of each file. It needs a terminal: with stdin closed, as under an agent hook, it prompts, deletes nothing, and still exits 0",
         )
         .with_command("rm -ri path/"),
         Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Move the tree aside instead of deleting it, then remove the holding copy after review",
+        )
+        .with_command("mv path /tmp/delete-me-<seconds>"),
+        Suggestion::new(
             SuggestionKind::WorkflowFix,
-            "Move to trash instead: `mv path ~/.local/share/Trash/`",
+            "Move to trash instead: `trash-put path` with trash-cli, or the platform trash directory (`~/.Trash` on macOS)",
         ),
     ];
 
