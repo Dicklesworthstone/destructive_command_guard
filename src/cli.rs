@@ -13048,8 +13048,9 @@ import {{ procmgr }} from "@oh-my-pi/pi-utils";
 import {{ resolveToCwd }} from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import {{ extractLeadingCdTarget }} from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 
-// This marker-owned install artifact binds the guard to the exact dcg binary
-// selected by the installer. Ambient environment must not redirect it.
+// This marker-owned install artifact binds the guard to the install-time
+// absolute dcg pathname. It does not attest the bytes later resolved there;
+// ambient environment must not redirect the pathname.
 const DCG_BIN = {path_literal};
 const DCG_CHILD_TIMEOUT_MS = {OMP_CHILD_EVALUATION_TIMEOUT_MS};
 export const DCG_CHILD_PIPE_DRAIN_GRACE_MS = {OMP_CHILD_PIPE_DRAIN_GRACE_MS};
@@ -20153,6 +20154,16 @@ if ($errors.Count -ne 0) {
         let parsed: String = serde_json::from_str(literal).expect("valid JSON string literal");
         assert_eq!(std::path::Path::new(&parsed), executable);
         assert_ne!(parsed, "dcg", "never a bare PATH lookup");
+        assert!(
+            source.contains(
+                "binds the guard to the install-time\n// absolute dcg pathname. It does not attest the bytes later resolved there;"
+            ),
+            "the generated artifact must describe its authority as pathname binding, not byte identity"
+        );
+        assert!(
+            !source.contains("exact dcg binary"),
+            "the generated artifact must not overstate pathname authority as byte identity"
+        );
         assert!(
             source.contains("proc = Bun.spawn([\n        DCG_BIN,"),
             "the installed absolute executable must be the direct child capability"

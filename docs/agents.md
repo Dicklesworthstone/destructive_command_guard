@@ -57,13 +57,23 @@ command to `dcg --robot test --stdin --agent omp --format json` with the dialect
 selected by OMP's execution route. Pinning the private bridge format prevents
 ambient `DCG_FORMAT` from redirecting or invalidating its compact protocol
 without removing that variable from supported environment-conditioned policy.
-The embedded install-time absolute dcg path is
-authoritative: ambient `DCG_BIN` cannot redirect the marker-owned guard; rerun
-`dcg install --omp --force` after moving the binary. Ordinary and managed-async
-calls use OMP's embedded Brush shell and pass `--dialect posix`, including on
-native Windows. An eligible local `pty: true` call instead maps OMP's
-configured external shell to `--dialect posix`, `cmd`, or `ps`; `PI_NO_PTY=1`
-disables that PTY route. A dcg deny, ask, or indeterminate result returns
+The embedded install-time absolute dcg pathname is authoritative: ambient
+`DCG_BIN` cannot redirect the marker-owned guard. This binds a pathname, not a
+hash, inode/file ID, signature, or immutable executable object. Bun resolves
+that pathname again for each tool call, so moving or removing the file produces
+a visible infrastructure failure, while replacing bytes at the same pathname
+changes what a later callback executes. `dcg doctor` compares the marker-owned
+extension with source generated for the doctor process's pathname at inspection
+time; it does not attest binary contents or an extension already loaded by a
+running OMP session. To rebind deliberately, run
+`/desired/path/dcg install --omp --force` (add `--project` for project scope)
+and restart OMP. Protect the binary, extension, and their parent directories
+from writers not trusted to control OMP execution; a writer that can replace the
+extension can already run code inside OMP. Ordinary and managed-async calls use
+OMP's embedded Brush shell and pass `--dialect posix`, including on native
+Windows. An eligible local `pty: true` call instead maps OMP's configured
+external shell to `--dialect posix`, `cmd`, or `ps`; `PI_NO_PTY=1` disables that
+PTY route. A dcg deny, ask, or indeterminate result returns
 `{ block: true, reason }` to OMP.
 Because the bridge supplies `--agent omp` explicitly, OMP remains distinct from
 legacy Pi even when OMP exposes Pi-family compatibility variables. The
