@@ -8590,12 +8590,10 @@ fn push_executable_input_source_at(
                 reason: "an executable pipeline reads source from a file that dcg cannot verify without a race",
             }
         }
-        IndirectInputSource::Template { .. } => {
-            ExecutableTextSink::Unverified {
-                rule: PIPELINE_CONSUMER_RULE,
-                reason: "an executable pipeline receives source that dcg cannot statically verify",
-            }
-        }
+        IndirectInputSource::Template { .. } => ExecutableTextSink::Unverified {
+            rule: PIPELINE_CONSUMER_RULE,
+            reason: "an executable pipeline receives source that dcg cannot statically verify",
+        },
         IndirectInputSource::Unverified(reason) => {
             let consumer = match kind {
                 PipelineSourceKind::PosixShell | PipelineSourceKind::PosixShellRecords(_) => {
@@ -8612,9 +8610,7 @@ fn push_executable_input_source_at(
             };
             ExecutableTextSink::UnverifiedSource {
                 rule: PIPELINE_CONSUMER_RULE,
-                reason: format!(
-                    "{consumer} executes pipeline input as source, but {reason}"
-                ),
+                reason: format!("{consumer} executes pipeline input as source, but {reason}"),
                 matched_span,
             }
         }
@@ -9435,6 +9431,32 @@ fn dialect_stage_argv(
         .collect()
 }
 
+fn dialect_stage_executable_span(
+    command: &str,
+    tokens: &crate::normalize::NormalizeTokens,
+    range: &std::ops::Range<usize>,
+    executable: &str,
+    dialect: ShellDialect,
+) -> Option<MatchSpan> {
+    let expected = cmd_executable_basename(executable);
+    let mut decoder = crate::normalize::ShellTokenDecoder::new(dialect);
+    tokens
+        .iter()
+        .filter(|token| {
+            token.kind == crate::normalize::NormalizeTokenKind::Word
+                && token.byte_range.start >= range.start
+                && token.byte_range.end <= range.end
+        })
+        .find_map(|token| {
+            let raw = token.text(command)?;
+            let decoded = decoder.decode(raw, crate::normalize::ShellTokenRole::Syntax)?;
+            (cmd_executable_basename(decoded.as_ref()) == expected).then_some(MatchSpan {
+                start: token.byte_range.start,
+                end: token.byte_range.end,
+            })
+        })
+}
+
 /// Split a stage's decoded argv into its non-redirect words and whether it
 /// carries a stdin (`<`) redirect. The cmd/PowerShell tokenizer keeps
 /// redirection operators as ordinary words, so `cmd < payload.bat` tokenizes as
@@ -9527,6 +9549,9 @@ fn collect_dialect_pipeline_stdin_sinks(
         let Some(mode) = dialect_stdin_reading_shell(&argv) else {
             continue;
         };
+        let consumer_span = argv.first().and_then(|executable| {
+            dialect_stage_executable_span(command, &tokens, &range, executable, dialect)
+        });
         // `cmd < payload.bat` / `pwsh < script.ps1`: a bare stdin-reading shell
         // whose stdin is a redirected file reads its program from a file dcg
         // cannot verify without a race — fail closed, like the POSIX
@@ -9547,7 +9572,12 @@ fn collect_dialect_pipeline_stdin_sinks(
                     .get(stages[index - 1].0.clone())
                     .map(str::trim)
                     .unwrap_or_default();
-                push_executable_input_source(static_producer_source(producer), kind, sinks);
+                push_executable_input_source_at(
+                    static_producer_source(producer),
+                    kind,
+                    consumer_span,
+                    sinks,
+                );
             }
             PipelineShellInputMode::Unverified => {
                 sinks.push(ExecutableTextSink::Unverified {
@@ -11110,6 +11140,44 @@ fn evaluate_executable_text_sinks(
                     continue;
                 }
                 return Some(EvaluationResult::denied_by_embedded_sink(rule, reason));
+            }
+            ExecutableTextSink::UnverifiedSource {
+                rule,
+                reason,
+                matched_span,
+            } => {
+                let (pack_id, pattern_name) = split_ast_rule_id(rule);
+                if let Some(hit) =
+                    allowlists.match_rule_at_path(&pack_id, &pattern_name, project_path)
+                {
+                    if first_allowlist_hit.is_none() {
+                        *first_allowlist_hit = Some((
+                            PatternMatch {
+                                pack_id: Some(pack_id),
+                                pattern_name: Some(pattern_name),
+                                severity: Some(crate::packs::Severity::High),
+                                reason: reason.clone(),
+                                source: MatchSource::HeredocAst,
+                                matched_span,
+                                matched_text_preview: matched_span
+                                    .map(|span| extract_match_preview(command, &span)),
+                                explanation: None,
+                                suggestions: &[],
+                            },
+                            hit.layer,
+                            hit.entry.reason.clone(),
+                        ));
+                    }
+                    continue;
+                }
+                return Some(matched_span.map_or_else(
+                    || EvaluationResult::denied_by_embedded_sink(rule, &reason),
+                    |span| {
+                        EvaluationResult::denied_by_embedded_sink_with_span(
+                            rule, &reason, command, span,
+                        )
+                    },
+                ));
             }
             ExecutableTextSink::InitIdiomWarn { idiom } => {
                 // The warn downgrade is a decision about the operator's
