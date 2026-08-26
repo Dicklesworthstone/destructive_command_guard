@@ -288,6 +288,44 @@ fn run_dcg_hook(command: &str) -> HookRunOutput {
     run_dcg_hook_with_env(command, &[])
 }
 
+#[test]
+fn python_heredoc_to_powershell_hook_denial_is_actionable() {
+    let command = "python - <<'PY' | pwsh\nprint('{\"status\": \"ok\"}')\nPY";
+    let result = run_dcg_hook_with_env(
+        command,
+        &[
+            ("NO_COLOR", std::ffi::OsStr::new("1")),
+            ("DCG_DIALECT", std::ffi::OsStr::new("posix")),
+        ],
+    );
+    let stdout = result.stdout_str();
+    let stderr = result.stderr_str();
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("hook denial must be valid JSON");
+    let denial = &json["hookSpecificOutput"];
+
+    assert_eq!(denial["permissionDecision"], "deny", "{stdout}\n{stderr}");
+    assert_eq!(
+        denial["ruleId"], "heredoc.posix:pipeline-consumer",
+        "the hook must expose the stable rule id: {stdout}"
+    );
+    let reason = denial["permissionDecisionReason"]
+        .as_str()
+        .expect("hook denial carries a reason");
+    assert!(
+        reason.contains("heredoc input could not be extracted completely"),
+        "hook JSON must retain producer provenance: {reason}"
+    );
+    assert!(
+        reason.contains("-Command <script>") && reason.contains("-File <path>"),
+        "hook JSON must carry scoped PowerShell remediation: {reason}"
+    );
+    assert!(
+        stderr.contains("pwsh") && stderr.contains("^^^^"),
+        "human diagnostics must point at the PowerShell consumer:\n{stderr}"
+    );
+}
+
 /// Run bare `dcg` (hook mode, no subcommand) writing RAW bytes to stdin, with
 /// optional extra environment. Used to exercise UTF-8 BOM handling and
 /// unparseable-input handling (issue #160).

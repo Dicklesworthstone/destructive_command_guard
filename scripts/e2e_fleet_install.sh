@@ -147,12 +147,23 @@ BIN="$DEST/dcg"
 [ -x "$BIN" ] || { echo "RESULT:binary_present:FAIL:not executable at $BIN"; exit 1; }
 echo "RESULT:binary_present:PASS"
 
-# 4. The installed binary must run on THIS os/arch and report the pinned version.
-GOT_VERSION="$("$BIN" --version 2>&1 | head -1 | tr -d '\r')"
+# 4. The installed binary must run on THIS os/arch, report the pinned version,
+#    and prove it was built from exactly that clean release tag. A semver-only
+#    check would have accepted the v0.13.0 macOS `v0.13.0-dirty` artifacts.
+VERSION_OUTPUT="$("$BIN" --version 2>&1 | tr -d '\r')"
+GOT_VERSION="$(printf '%s\n' "$VERSION_OUTPUT" | head -1)"
 case "$GOT_VERSION" in
   *"${VERSION#v}"*) echo "RESULT:version_match:PASS:$GOT_VERSION" ;;
   *) echo "RESULT:version_match:FAIL:want ${VERSION#v} got '$GOT_VERSION'" ;;
 esac
+EMBEDDED_DESCRIBE="$(printf '%s\n' "$VERSION_OUTPUT" \
+  | sed -nE 's/.*Commit:[[:space:]]+([^[:space:]]+).*/\1/p' \
+  | head -1)"
+if [ "$EMBEDDED_DESCRIBE" = "$VERSION" ]; then
+  echo "RESULT:provenance_match:PASS:$EMBEDDED_DESCRIBE"
+else
+  echo "RESULT:provenance_match:FAIL:want $VERSION got '${EMBEDDED_DESCRIBE:-<missing>}'"
+fi
 
 # 5. Real hook protocol against the installed artifact.
 #
@@ -475,8 +486,12 @@ if (Test-Path $bin) {
 }
 
 $wanted = $Version.TrimStart('v')
-$got = (& $bin --version 2>&1 | Select-Object -First 1) -join ''
+$versionOutput = (& $bin --version 2>&1 | Out-String)
+$got = ($versionOutput -split "`r?`n" | Select-Object -First 1) -join ''
 if ($got -like "*$wanted*") { Emit 'version_match' 'PASS' $got } else { Emit 'version_match' 'FAIL' "want $wanted got '$got'" }
+$describeMatch = [regex]::Match($versionOutput, 'Commit:\s+(\S+)')
+$embeddedDescribe = if ($describeMatch.Success) { $describeMatch.Groups[1].Value } else { '' }
+if ($embeddedDescribe -ceq $Version) { Emit 'provenance_match' 'PASS' $embeddedDescribe } else { Emit 'provenance_match' 'FAIL' "want $Version got '$embeddedDescribe'" }
 
 # DCG_SELF_HEAL_HOOK / DCG_HISTORY_DISABLED are already set at the top of this
 # probe, before the installer ran.
@@ -583,7 +598,7 @@ PSEOF
 # Every probe must announce probe_complete. Without this, a probe that dies
 # halfway through (bad quoting, crashed shell) looks like a clean pass.
 EXPECTED_CASES=(fetch_installer install checksum_verified minisign_verified binary_present
-                version_match effective_budget hook_deny hook_allow
+                version_match provenance_match effective_budget hook_deny hook_allow
                 no_indeterminate_verdicts latency_under_budget probe_complete)
 
 parse_results() {

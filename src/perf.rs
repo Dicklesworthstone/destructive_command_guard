@@ -636,6 +636,12 @@ mod tests {
             "a truncated probe must not pass without reporting signature verification"
         );
         assert!(
+            expected_cases.contains("provenance_match")
+                && unix_probe.contains("EMBEDDED_DESCRIBE")
+                && windows_probe.contains("$embeddedDescribe -ceq $Version"),
+            "fleet probes must require exact clean-tag provenance, not semver alone"
+        );
+        assert!(
             unix_probe.contains("Signature verified (minisign key ")
                 && windows_probe.contains("Signature verified \\(minisign key "),
             "fleet probes must certify minisign verification specifically, not a different signature mechanism"

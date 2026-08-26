@@ -20254,6 +20254,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                     command_for_packs,
                     &segment_ranges,
                     executables,
+                    shell_dialect,
                 )
             {
                 continue;
@@ -22806,6 +22807,13 @@ fn command_word_after_prefix_syntax(segment: &str) -> Option<String> {
                     in_case_pattern = false;
                 }
             }
+            NormalizeTokenKind::Word if matches!(raw, "for" | "select") => {
+                // The remaining words form a loop header (`for name in ...`),
+                // not a command invocation. The `do` body is emitted as its
+                // own segment and resolved independently.
+                return None;
+            }
+            NormalizeTokenKind::Word if crate::normalize::is_env_assignment(raw) => {}
             NormalizeTokenKind::Word if in_case_pattern || is_command_prefix_reserved_word(raw) => {
                 in_case_pattern |= raw == "case";
             }
@@ -22835,7 +22843,48 @@ fn command_word_after_prefix_syntax(segment: &str) -> Option<String> {
 /// executable is not statically known. A dynamic argv0 never satisfies an
 /// `executables=` rule; this tranche deliberately adds no new fail-closed
 /// finding for that case.
-fn segment_executable_name(segment: &str) -> Option<String> {
+fn cmd_segment_executable_name_at_depth(segment: &str, depth: usize) -> Option<String> {
+    const MAX_CONTROL_DEPTH: usize = 8;
+
+    if depth >= MAX_CONTROL_DEPTH {
+        return None;
+    }
+    let segment = segment.trim();
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Cmd);
+    if let Some(WindowsLauncherParse::Envelope(envelope)) =
+        parse_cmd_control_segment(segment, &tokens, MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES, false)
+    {
+        let ranges = command_segment_ranges_in_dialect(&envelope.command, ShellDialect::Cmd);
+        let mut non_empty = ranges
+            .into_iter()
+            .filter_map(|(start, end)| envelope.command.get(start..end))
+            .filter(|candidate| !candidate.trim().is_empty());
+        let payload = non_empty.next()?;
+        if non_empty.next().is_some() {
+            // Multiple IF/ELSE branches can invoke different executables. A
+            // single argv0 cannot soundly describe that whole control segment;
+            // the recursive control-flow evaluator handles the branches.
+            return None;
+        }
+        return cmd_segment_executable_name_at_depth(payload, depth + 1);
+    }
+
+    let raw = cmd_first_executable_word(segment)?;
+    let decoded = shell_word_value(raw, ShellDialect::Cmd)?;
+    if decoded.contains(['%', '!']) {
+        // Percent and delayed-exclamation expansion can replace argv0 at
+        // runtime. An executable-scoped rule must not guess its command.
+        return None;
+    }
+    let basename = cmd_executable_basename(decoded.as_ref());
+    (!basename.is_empty()).then_some(basename)
+}
+
+fn segment_executable_name_in_dialect(segment: &str, dialect: ShellDialect) -> Option<String> {
+    if dialect == ShellDialect::Cmd {
+        return cmd_segment_executable_name_at_depth(segment, 0);
+    }
+
     let stripped = crate::normalize::strip_wrapper_prefixes(segment);
     let normalized = stripped.normalized.as_ref();
     let leading = normalized.split_whitespace().next()?;
@@ -22844,12 +22893,13 @@ fn segment_executable_name(segment: &str) -> Option<String> {
     // a leading grouping character or reserved word pays for the tokenizing
     // walk.
     let walked;
-    let word = if word_is_command_prefix_syntax(leading) {
-        walked = command_word_after_prefix_syntax(normalized)?;
-        walked.as_str()
-    } else {
-        leading
-    };
+    let word =
+        if word_is_command_prefix_syntax(leading) || crate::normalize::is_env_assignment(leading) {
+            walked = command_word_after_prefix_syntax(normalized)?;
+            walked.as_str()
+        } else {
+            leading
+        };
     if word.contains(['$', '`', '%']) {
         return None;
     }
@@ -22877,13 +22927,26 @@ fn segment_executable_name(segment: &str) -> Option<String> {
     Some(lowered)
 }
 
+#[cfg(test)]
+fn segment_executable_name(segment: &str) -> Option<String> {
+    segment_executable_name_in_dialect(segment, ShellDialect::Unknown)
+}
+
 /// Whether a segment's resolved argv0 is one of the rule's declared executables.
-fn segment_invokes_executable(segment: &str, executables: &[&str]) -> bool {
-    segment_executable_name(segment).is_some_and(|argv0| {
+fn segment_invokes_executable_in_dialect(
+    segment: &str,
+    executables: &[&str],
+    dialect: ShellDialect,
+) -> bool {
+    segment_executable_name_in_dialect(segment, dialect).is_some_and(|argv0| {
         executables
             .iter()
             .any(|candidate| candidate.eq_ignore_ascii_case(&argv0))
     })
+}
+
+fn segment_invokes_executable(segment: &str, executables: &[&str]) -> bool {
+    segment_invokes_executable_in_dialect(segment, executables, ShellDialect::Unknown)
 }
 
 /// Whole-command gate for `executables=` rules (issue #289).
@@ -22897,17 +22960,19 @@ fn span_is_inside_executable_segment(
     command: &str,
     segment_ranges: &[(usize, usize)],
     executables: &[&str],
+    dialect: ShellDialect,
 ) -> bool {
     if segment_ranges.is_empty() {
-        return span.end <= command.len() && segment_invokes_executable(command, executables);
+        return span.end <= command.len()
+            && segment_invokes_executable_in_dialect(command, executables, dialect);
     }
     segment_ranges.iter().any(|&(start, end)| {
         span.start >= start
             && span.end <= end
             && (span.start < end || start == end)
-            && command
-                .get(start..end)
-                .is_some_and(|segment| segment_invokes_executable(segment, executables))
+            && command.get(start..end).is_some_and(|segment| {
+                segment_invokes_executable_in_dialect(segment, executables, dialect)
+            })
     })
 }
 
@@ -23148,11 +23213,12 @@ fn evaluate_pack_destructive_patterns(
                     command_slice,
                     segments,
                     executables,
+                    shell_dialect,
                 ),
                 None => segments.iter().any(|&(start, end)| {
-                    command_slice
-                        .get(start..end)
-                        .is_some_and(|segment| segment_invokes_executable(segment, executables))
+                    command_slice.get(start..end).is_some_and(|segment| {
+                        segment_invokes_executable_in_dialect(segment, executables, shell_dialect)
+                    })
                 }),
             };
             if !governed {
@@ -31857,7 +31923,10 @@ mod tests {
             .expect("real chmod denial carries diagnostics");
         assert_eq!(info.pack_id.as_deref(), Some("system.permissions"));
         assert_eq!(info.pattern_name.as_deref(), Some("chmod-777"));
-        assert_eq!(info.matched_text_preview.as_deref(), Some("chmod 777"));
+        assert_eq!(
+            info.matched_text_preview.as_deref().map(str::trim_end),
+            Some("chmod 777")
+        );
         assert!(
             info.matched_span
                 .is_some_and(|span| span.start > command.find(") chmod").expect("outer chmod")),
@@ -31877,6 +31946,7 @@ mod tests {
             ("chmod.cmd -R 755", Some("chmod")),
             ("sudo -u root chmod -R 755 /etc", Some("chmod")),
             ("env FOO=bar chmod -R 755 /etc", Some("chmod")),
+            ("X=$(printf ignored) chmod -R 755 /etc", Some("chmod")),
             ("\"chmod\" -R 755 /etc", Some("chmod")),
             ("$CHMOD -R 755 /etc", None),
             ("${CHMOD:-chmod} -R 755 /etc", None),
@@ -31897,6 +31967,20 @@ mod tests {
         ));
         assert!(!segment_invokes_executable("grep -R foo /etc", &["chmod"]));
         assert!(!segment_invokes_executable("$X -R 755 /etc", &["chmod"]));
+
+        for (segment, expected) in [
+            ("@C:\\Tools\\MYTOOL.EXE danger", Some("mytool")),
+            ("if exist marker.txt @mytool danger", Some("mytool")),
+            ("if not errorlevel 1 ( @mytool danger )", Some("mytool")),
+            ("%TOOL% danger", None),
+            ("!TOOL! danger", None),
+        ] {
+            assert_eq!(
+                segment_executable_name_in_dialect(segment, ShellDialect::Cmd).as_deref(),
+                expected,
+                "Cmd argv0 resolution for {segment:?}"
+            );
+        }
     }
 
     /// Issue #289 follow-up (finding 1): compound-command syntax must not be
@@ -31951,6 +32035,14 @@ mod tests {
             );
         }
 
+        for segment in ["for f in danger", "select choice in safe danger"] {
+            assert_eq!(
+                segment_executable_name(segment),
+                None,
+                "loop headers do not invoke their iteration variable: {segment:?}"
+            );
+        }
+
         // Reserved words are matched whole, never as prefixes, and a
         // non-reserved leading word still wins.
         assert_eq!(
@@ -31959,8 +32051,8 @@ mod tests {
         );
         assert_eq!(
             segment_executable_name("for f in a").as_deref(),
-            Some("f"),
-            "a `for` loop header runs no command; it must not resolve to the body's"
+            None,
+            "a `for` loop header runs no command"
         );
     }
 
