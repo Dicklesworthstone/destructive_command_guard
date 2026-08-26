@@ -24502,9 +24502,14 @@ exclude = ["target/**"]
     // Pre-commit install/uninstall tests
     // ========================================================================
 
+    fn isolated_git_command(dir: &std::path::Path) -> std::process::Command {
+        let mut command = std::process::Command::new("git");
+        command.current_dir(dir);
+        command
+    }
+
     fn init_temp_git_repo(dir: &std::path::Path) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
+        let output = isolated_git_command(dir)
             .args(["init", "-q"])
             .output()
             .expect("git init");
@@ -24513,6 +24518,46 @@ exclude = ["target/**"]
             "git init failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn temporary_git_commands_ignore_ambient_global_and_system_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fake_home = tmp.path().join("ambient-home");
+        std::fs::create_dir_all(&fake_home).expect("create fake home");
+        std::fs::write(
+            fake_home.join(".gitconfig"),
+            "[dcg]\n\tambientGlobal = visible\n",
+        )
+        .expect("write ambient global git config");
+        let ambient_system_config = tmp.path().join("ambient-system.gitconfig");
+        std::fs::write(
+            &ambient_system_config,
+            "[dcg]\n\tambientSystem = visible\n",
+        )
+        .expect("write ambient system git config");
+
+        for key in ["dcg.ambientGlobal", "dcg.ambientSystem"] {
+            let output = isolated_git_command(tmp.path())
+                .env("HOME", &fake_home)
+                .env("USERPROFILE", &fake_home)
+                .env("XDG_CONFIG_HOME", &fake_home)
+                .env("GIT_CONFIG_SYSTEM", &ambient_system_config)
+                .args(["config", "--get", key])
+                .output()
+                .expect("query isolated git config");
+
+            assert!(
+                !output.status.success(),
+                "temporary git command inherited {key}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "temporary git command printed ambient {key}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
     }
 
     #[test]
@@ -25042,8 +25087,7 @@ exclude = ["target/**"]
     // ========================================================================
 
     fn run_git(cwd: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(cwd)
+        let output = isolated_git_command(cwd)
             .args(args)
             .output()
             .expect("run git");
