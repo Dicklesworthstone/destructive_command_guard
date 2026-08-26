@@ -6350,8 +6350,8 @@ batch_flush_interval_ms = 29
         let config = Config::default();
         assert_eq!(config.general.unverified_decision, UnverifiedDecision::Ask);
 
-        let layer: ConfigLayer = toml::from_str("[general]\nunverified_decision = \"deny\"\n")
-            .expect("layer parses");
+        let layer: ConfigLayer =
+            toml::from_str("[general]\nunverified_decision = \"deny\"\n").expect("layer parses");
         let mut config = Config::default();
         config.merge_layer(layer);
         assert_eq!(
@@ -6362,8 +6362,8 @@ batch_flush_interval_ms = 29
 
         // An explicit `ask` in a later layer relaxes an earlier `deny` (both
         // came from operator-owned layers; only repo configs are restricted).
-        let layer: ConfigLayer = toml::from_str("[general]\nunverified_decision = \"ask\"\n")
-            .expect("layer parses");
+        let layer: ConfigLayer =
+            toml::from_str("[general]\nunverified_decision = \"ask\"\n").expect("layer parses");
         config.merge_layer(layer);
         assert_eq!(config.general.unverified_decision, UnverifiedDecision::Ask);
     }
@@ -6380,8 +6380,8 @@ batch_flush_interval_ms = 29
         assert_eq!(general.unverified_decision, Some(UnverifiedDecision::Deny));
         assert_eq!(general.verbose, None, "non-security fields are dropped");
 
-        let ask_layer: ConfigLayer = toml::from_str("[general]\nunverified_decision = \"ask\"\n")
-            .expect("layer parses");
+        let ask_layer: ConfigLayer =
+            toml::from_str("[general]\nunverified_decision = \"ask\"\n").expect("layer parses");
         assert!(
             ask_layer.into_restricted_project_policy().general.is_none(),
             "a repository must not be able to relax deny back to ask"

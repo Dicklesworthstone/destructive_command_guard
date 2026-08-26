@@ -243,10 +243,8 @@ fn bare_hook_unverified_decision_controls_oversized_fallback() {
     // paths. Default posture routes it to `ask`; the unattended posture
     // (`DCG_UNVERIFIED_DECISION=deny`) must refuse it outright.
     let padding = "x".repeat(70 * 1024);
-    let raw = format!(
-        r#"{{"tool_name":"Bash","tool_input":{{"command":"echo {padding}"}}}}"#
-    )
-    .into_bytes();
+    let raw = format!(r#"{{"tool_name":"Bash","tool_input":{{"command":"echo {padding}"}}}}"#)
+        .into_bytes();
 
     let asked = run_dcg_hook_raw(&raw, &[]);
     let stdout = String::from_utf8_lossy(&asked.stdout);

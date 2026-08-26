@@ -26196,11 +26196,9 @@ exclude = ["target/**"]
             .find(|entry| entry["matcher"] == CLAUDE_SHELL_MATCHER)
             .and_then(|entry| entry["hooks"].as_array())
             .and_then(|hooks| {
-                hooks.iter().find(|hook| {
-                    hook["command"]
-                        .as_str()
-                        .is_some_and(is_dcg_command)
-                })
+                hooks
+                    .iter()
+                    .find(|hook| hook["command"].as_str().is_some_and(is_dcg_command))
             })
             .expect("a dcg hook under the canonical matcher")
     }
@@ -26256,13 +26254,20 @@ exclude = ["target/**"]
 
             let hook = canonical_dcg_hook(&settings);
             assert_eq!(hook["command"].as_str(), Some(current_command.as_str()));
-            assert_eq!(hook["timeout"], 10, "timeout lost on repair (force={force})");
+            assert_eq!(
+                hook["timeout"], 10,
+                "timeout lost on repair (force={force})"
+            );
             assert_eq!(hook["type"], "command");
 
             let hooks = settings["hooks"]["PreToolUse"][0]["hooks"]
                 .as_array()
                 .unwrap();
-            assert_eq!(hooks.len(), 2, "exactly one dcg hook plus the coexisting hook");
+            assert_eq!(
+                hooks.len(),
+                2,
+                "exactly one dcg hook plus the coexisting hook"
+            );
             assert!(hooks.iter().any(|hook| hook["command"] == "other-hook"));
             assert!(
                 settings_has_exact_dcg_hook(&settings, &desired),
@@ -26319,7 +26324,10 @@ exclude = ["target/**"]
         let changed = install_dcg_hook_into_settings(&mut settings, false).unwrap();
         assert!(changed);
         let repaired = canonical_dcg_hook(&settings);
-        assert!(repaired.get("shell").is_none(), "foreign shell field dropped");
+        assert!(
+            repaired.get("shell").is_none(),
+            "foreign shell field dropped"
+        );
         assert_eq!(repaired["timeout"], 10);
     }
 

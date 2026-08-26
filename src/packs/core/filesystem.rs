@@ -554,10 +554,9 @@ pub(crate) fn classifier_rule_guidance(
             POWERSHELL_REMOVE_ITEM_RECURSIVE_SUGGESTIONS,
         )),
         n if n == RM_BARE_GLOB_NAME => Some((RM_BARE_GLOB_EXPLANATION, RM_BARE_GLOB_SUGGESTIONS)),
-        n if n == RM_BARE_GLOB_ROOT_NAME => Some((
-            RM_BARE_GLOB_ROOT_EXPLANATION,
-            RM_BARE_GLOB_SUGGESTIONS,
-        )),
+        n if n == RM_BARE_GLOB_ROOT_NAME => {
+            Some((RM_BARE_GLOB_ROOT_EXPLANATION, RM_BARE_GLOB_SUGGESTIONS))
+        }
         _ => None,
     }
 }
@@ -2673,7 +2672,12 @@ fn parse_rm_segment_with_option_scanning(
     let Some(flag_state) = flags.resolve() else {
         // Non-recursive rm has no dangerous flag shape of its own, but a bare
         // `*` operand still hands the shell an unbounded deletion set (#334).
-        return parse_bare_glob_rm(&paths, interactive_prompts, automated_stdin, redirected_stdin);
+        return parse_bare_glob_rm(
+            &paths,
+            interactive_prompts,
+            automated_stdin,
+            redirected_stdin,
+        );
     };
 
     // `rm -r` without an operand only reports a usage error. More
@@ -7284,8 +7288,8 @@ mod classifier_guidance_tests {
         let pack = create_pack();
         for &name in CLASSIFIER_RULE_NAMES {
             let (explanation, suggestions) = pack.rule_guidance(name);
-            let explanation = explanation
-                .unwrap_or_else(|| panic!("classifier rule {name} has no explanation"));
+            let explanation =
+                explanation.unwrap_or_else(|| panic!("classifier rule {name} has no explanation"));
             assert!(
                 !explanation.contains(PLACEHOLDER),
                 "classifier rule {name} resolves to the placeholder"
@@ -7366,15 +7370,13 @@ mod classifier_guidance_tests {
         // #348: `~/.local/share/Trash` does not exist on macOS; every rm rule
         // that offers a trash move must offer the Finder trash for macOS.
         let pack = create_pack();
-        let trash_rules = [
-            RM_RF_GENERAL_NAME,
-            RM_RECURSIVE_GENERAL_NAME,
-        ];
+        let trash_rules = [RM_RF_GENERAL_NAME, RM_RECURSIVE_GENERAL_NAME];
         for name in trash_rules {
             let (_, suggestions) = pack.rule_guidance(name);
             assert!(
                 suggestions.iter().any(|suggestion| {
-                    suggestion.platform == Platform::MacOS && suggestion.command.contains("~/.Trash")
+                    suggestion.platform == Platform::MacOS
+                        && suggestion.command.contains("~/.Trash")
                 }),
                 "{name} offers no macOS trash suggestion"
             );

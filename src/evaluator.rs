@@ -24582,7 +24582,10 @@ mod tests {
             assert!(
                 result.is_allowed(),
                 "{command} is advertised as accepted but was denied: {:?}",
-                result.pattern_info.as_ref().and_then(|info| info.pattern_name.clone())
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.clone())
             );
         }
     }
