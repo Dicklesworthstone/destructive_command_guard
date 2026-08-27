@@ -198,6 +198,7 @@ nursery = { level = "warn", priority = -1 }
 # without forcing a behavior-neutral rewrite of hundreds of control-flow sites.
 collapsible_if = "allow"
 duration_suboptimal_units = "allow"
+assert_is_empty = "allow"
 # Established project-wide style exceptions.
 return_self_not_must_use = "allow"
 suboptimal_flops = "allow"

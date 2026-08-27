@@ -442,7 +442,6 @@ fn shell_word_is_dynamic(raw: &str, dialect: crate::normalize::ShellDialect) -> 
                 }
                 index += 1;
             }
-            false
         }
         crate::normalize::ShellDialect::PowerShell => {
             let bytes = raw.as_bytes();
@@ -478,7 +477,6 @@ fn shell_word_is_dynamic(raw: &str, dialect: crate::normalize::ShellDialect) -> 
                     _ => index += 1,
                 }
             }
-            false
         }
         crate::normalize::ShellDialect::Posix | crate::normalize::ShellDialect::Unknown => {
             let bytes = raw.as_bytes();
@@ -521,9 +519,9 @@ fn shell_word_is_dynamic(raw: &str, dialect: crate::normalize::ShellDialect) -> 
                     _ => index += 1,
                 }
             }
-            false
         }
     }
+    false
 }
 
 fn powershell_stop_parsing_word_is_dynamic(raw: &str) -> bool {

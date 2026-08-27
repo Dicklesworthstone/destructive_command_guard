@@ -1228,7 +1228,6 @@ fn git_token_has_active_expansion(raw: &str, dialect: ShellDialect) -> bool {
                     _ => {}
                 }
             }
-            false
         }
         ShellDialect::PowerShell => {
             let mut chars = raw.chars().peekable();
@@ -1332,9 +1331,9 @@ fn git_token_expansion_may_split(raw: &str, dialect: ShellDialect) -> bool {
                     _ => {}
                 }
             }
-            false
         }
     }
+    false
 }
 
 fn git_dynamic_fragments(decoded: &str, dialect: ShellDialect) -> Vec<String> {
