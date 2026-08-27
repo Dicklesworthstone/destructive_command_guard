@@ -381,14 +381,9 @@ fn singular_tool_call_envelope_still_detects_antigravity() {
 // tests cannot mutate the environment safely (`std::env::set_var` is unsafe
 // and racy under the parallel test runner).
 
-/// Path to the dcg binary (same workspace-relative discovery as
-/// tests/codex_hook_protocol.rs).
+/// Path to the exact dcg binary Cargo built for this integration test.
 fn dcg_binary() -> std::path::PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // test binary name
-    path.pop(); // deps/
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 /// Spawn the real dcg binary in hook mode with a hermetic environment (plus

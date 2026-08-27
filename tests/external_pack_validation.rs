@@ -1290,13 +1290,9 @@ mod issue_293_bounded_loading {
         );
     }
 
-    /// Path to the DCG binary (uses same target directory as the test binary).
+    /// Path to the exact DCG binary Cargo built for this integration test.
     fn dcg_binary() -> PathBuf {
-        let mut path = std::env::current_exe().unwrap();
-        path.pop(); // Remove test binary name
-        path.pop(); // Remove deps/
-        path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-        path
+        PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
     }
 
     /// End-to-end: a broken custom pack file must warn on stderr WITHOUT

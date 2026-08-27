@@ -13,11 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn dcg_binary() -> PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // deps
-    path.pop(); // debug
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 struct Sandbox {

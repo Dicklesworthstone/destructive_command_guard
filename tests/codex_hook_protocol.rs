@@ -134,14 +134,9 @@ impl fmt::Debug for HookOutcome {
 // Binary discovery
 // ---------------------------------------------------------------------------
 
-/// Path to the dcg binary (same workspace-relative discovery as
-/// tests/agent_hook_output.rs).
+/// Path to the exact dcg binary Cargo built for this integration test.
 fn dcg_binary() -> PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // test binary name
-    path.pop(); // deps/
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 // ---------------------------------------------------------------------------

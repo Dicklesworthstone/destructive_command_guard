@@ -32,15 +32,7 @@ fn dcg_binary() -> PathBuf {
         return PathBuf::from(path);
     }
 
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_dcg") {
-        return PathBuf::from(path);
-    }
-
-    let mut path = std::env::current_exe().expect("current test executable");
-    path.pop();
-    path.pop();
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 fn run_dcg(args: &[&str]) -> DcgOutput {

@@ -6,11 +6,7 @@ use std::process::{Command, Output, Stdio};
 
 /// Path to the dcg binary compiled for this test run.
 fn dcg_binary() -> PathBuf {
-    let mut path = std::env::current_exe().expect("current_exe");
-    path.pop(); // test binary name
-    path.pop(); // deps/
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 fn stdout_text(output: &Output) -> String {

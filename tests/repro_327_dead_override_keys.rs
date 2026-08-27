@@ -15,11 +15,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 fn dcg_binary() -> PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // test binary name
-    path.pop(); // deps/
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 struct TestEnv {

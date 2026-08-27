@@ -26,15 +26,7 @@ fn history_text(value: &SqliteValue) -> &str {
 
 /// Path to the dcg binary.
 fn dcg_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_dcg") {
-        return PathBuf::from(path);
-    }
-
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // Remove test binary name
-    path.pop(); // Remove deps/
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 /// Run a dcg command and return stdout, stderr, exit code.

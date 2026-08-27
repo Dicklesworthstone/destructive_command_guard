@@ -17,13 +17,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Path to the DCG binary (uses same target directory as the test binary).
+/// Path to the exact DCG binary Cargo built for this integration test.
 fn dcg_binary() -> PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // Remove test binary name
-    path.pop(); // Remove deps/
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 /// Run dcg in hook mode with an isolated HOME/config and an explicit

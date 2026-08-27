@@ -18,18 +18,7 @@ use std::process::Command;
 fn run_dcg_scan(args: &[&str]) -> std::process::Output {
     let dcg_bin = std::env::var("DCG_BIN")
         .map(std::path::PathBuf::from)
-        .or_else(|_| {
-            std::env::var_os("CARGO_BIN_EXE_dcg")
-                .map(std::path::PathBuf::from)
-                .ok_or(std::env::VarError::NotPresent)
-        })
-        .unwrap_or_else(|_| {
-            let mut path = std::env::current_exe().expect("current_exe");
-            path.pop(); // test binary name
-            path.pop(); // deps/
-            path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-            path
-        });
+        .unwrap_or_else(|_| std::path::PathBuf::from(env!("CARGO_BIN_EXE_dcg")));
 
     Command::new(dcg_bin)
         .args(["scan"])

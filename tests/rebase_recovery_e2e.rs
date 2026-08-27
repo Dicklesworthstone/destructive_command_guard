@@ -14,11 +14,7 @@ use std::process::Command;
 use destructive_command_guard::history::{HistoryDb, SqliteValue};
 
 fn dcg_binary() -> PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // deps
-    path.pop(); // debug
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 /// Run the dcg hook with `command` and `cwd`, returning stdout.

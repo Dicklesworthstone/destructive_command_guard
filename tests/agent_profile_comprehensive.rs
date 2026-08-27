@@ -24,18 +24,9 @@ use std::process::{Command, Stdio};
 // Test Utilities
 // =============================================================================
 
-/// Path to the DCG binary. Prefers `CARGO_BIN_EXE_dcg` (set by Cargo when
-/// building integration tests against a binary target) and falls back to the
-/// `target/<profile>/dcg` layout used by `cargo test`.
+/// Path to the exact DCG binary Cargo built for this integration test.
 fn dcg_binary() -> std::path::PathBuf {
-    if let Some(p) = option_env!("CARGO_BIN_EXE_dcg") {
-        return std::path::PathBuf::from(p);
-    }
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // Remove test binary name
-    path.pop(); // Remove deps/
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 /// Per-spawn isolated HOME / XDG_CONFIG_HOME / TMPDIR so dcg cannot read or

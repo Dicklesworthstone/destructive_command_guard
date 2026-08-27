@@ -6,13 +6,9 @@
 
 use std::process::Command;
 
-/// Path to the DCG binary (uses same target directory as the test binary).
+/// Path to the exact DCG binary Cargo built for this integration test.
 fn dcg_binary() -> std::path::PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // Remove test binary name
-    path.pop(); // Remove deps/
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 /// Run a dcg command and return stdout, stderr, exit code.

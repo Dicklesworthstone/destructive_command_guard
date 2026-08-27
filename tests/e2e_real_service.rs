@@ -230,15 +230,7 @@ fn dcg_binary() -> PathBuf {
         return pane_target_binary;
     }
 
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_dcg").map(PathBuf::from) {
-        return path;
-    }
-
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    path.pop();
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 fn run_hook(

@@ -19,13 +19,9 @@ use std::process::{Command, Stdio};
 /// Payload size safely past the default 256 KiB `max_hook_input_bytes`.
 const PADDING_BYTES: usize = 300 * 1024;
 
-/// Path to the DCG binary (uses same target directory as the test binary).
+/// Path to the exact DCG binary Cargo built for this integration test.
 fn dcg_binary() -> PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // Remove test binary name
-    path.pop(); // Remove deps/
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 /// Run dcg in hook mode with raw stdin bytes and an isolated HOME/config
