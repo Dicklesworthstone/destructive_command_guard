@@ -8,6 +8,7 @@ This document describes packs in the `secrets` category.
 - [AWS Secrets Manager](#secretsaws_secrets)
 - [1Password CLI](#secretsonepassword)
 - [Doppler CLI](#secretsdoppler)
+- [Infisical CLI](#secretsinfisical)
 
 ---
 
@@ -259,6 +260,50 @@ To allowlist all rules from this pack (use with caution):
 ```toml
 [[allow]]
 rule = "secrets.doppler:*"
+reason = "Your reason here"
+risk_acknowledged = true
+```
+
+---
+
+## Infisical CLI
+
+**Pack ID:** `secrets.infisical`
+
+Protects against deleting Infisical secrets, folders, and dynamic-secret leases, plus resetting local Infisical configuration.
+
+### Keywords
+
+Commands containing these keywords are checked against this pack:
+
+- `infisical`
+
+### Destructive Patterns (Blocked)
+
+These patterns match potentially destructive commands:
+
+| Pattern Name | Reason | Severity |
+|--------------|--------|----------|
+| `infisical-secrets-delete` | infisical secrets delete removes one or more stored secrets. | high |
+| `infisical-folders-delete` | infisical secrets folders delete removes a secrets folder. | critical |
+| `infisical-dynamic-lease-delete` | infisical dynamic-secrets lease delete revokes a live dynamic-secret lease. | high |
+| `infisical-reset` | infisical reset clears local Infisical-generated configuration data. | high |
+
+### Allowlist Guidance
+
+To allowlist a specific rule from this pack, add to your allowlist:
+
+```toml
+[[allow]]
+rule = "secrets.infisical:<pattern-name>"
+reason = "Your reason here"
+```
+
+To allowlist all rules from this pack (use with caution):
+
+```toml
+[[allow]]
+rule = "secrets.infisical:*"
 reason = "Your reason here"
 risk_acknowledged = true
 ```

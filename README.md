@@ -285,9 +285,27 @@ it to `[packs] enabled` — see [Enable More Protection](#enable-more-protection
 
 ### Secrets Management Packs
 - `secrets.aws_secrets` - Protects against destructive AWS Secrets Manager and SSM Parameter Store operations like delete-secret and delete-parameter.
+- `secret_disclosure` - **Exact opt-in** protection against secret-manager commands that print credential values into an agent transcript; injection commands such as `infisical run`, `op run`, and `doppler run` remain allowed. It is intentionally outside the `secrets.*` category so existing `enabled = ["secrets"]` configurations do not change policy on upgrade.
 - `secrets.doppler` - Protects against destructive Doppler CLI operations like deleting secrets, configs, environments, or projects.
+- `secrets.infisical` - Protects against deleting Infisical secrets, folders, and dynamic-secret leases, plus resetting local Infisical configuration.
 - `secrets.onepassword` - Protects against destructive 1Password CLI operations like deleting items, documents, users, groups, and vaults.
 - `secrets.vault` - Protects against destructive Vault CLI operations like deleting secrets, disabling auth/secret engines, revoking leases/tokens, and deleting policies.
+
+Provider packs preserve dcg's default destructive-operation scope: read commands
+remain allowed. Teams that also treat transcript disclosure as destructive can
+enable the separate policy explicitly:
+
+```toml
+[packs]
+enabled = ["secrets.infisical", "secret_disclosure"]
+```
+
+With `secret_disclosure` enabled, value-emitting reads such as `infisical
+secrets get`, `infisical export`, `op read`, `doppler secrets download`, `vault
+kv get`, `aws secretsmanager get-secret-value`, and decrypted SSM reads are
+blocked. Metadata inspection and direct process injection remain available.
+The opt-in `careful_company_running_windows` preset also includes both new packs
+as deliberate members of its pinned secret-store policy.
 
 ### Platform Packs
 - `platform.github` - Protects against destructive GitHub CLI operations like changing repository visibility or deleting repositories, gists, releases, or SSH keys.

@@ -26,6 +26,9 @@ packs. This supplies the ordinary destructive-operation coverage expected from
 the policy, including Snowflake table drops, without duplicating those rules
 under new IDs. The cross-category list is curated: a future pack in one of those
 reused service categories does not silently enter a company's deployed policy.
+The current pinned secret-store membership includes `secrets.infisical` and the
+value-emission guard `secret_disclosure`, so direct process injection remains
+available while agent-visible secret reads are denied.
 
 The preset is opt-in, including on Windows. It is a command-line policy layer,
 not a network firewall, endpoint detection product, or data-loss-prevention

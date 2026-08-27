@@ -4241,10 +4241,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Any shell-expanded mv path can resolve to `/`, `/etc`, or another
         // sensitive tree. `mv` intentionally has no broad general tier, so it
         // needs an explicit fail-closed rule for variables, command
-        // substitutions, and backslash-obfuscated path traversal.
+        // substitutions, and backslash-obfuscated path traversal. A
+        // backslash immediately followed by LF (or CRLF) is a shell line
+        // continuation, not part of any path token, so it is excluded from
+        // the backslash evidence (#356). A doubled backslash before a newline
+        // still matches at the first backslash, as it is a real escaped byte.
         destructive_pattern!(
             "mv-dynamic-path",
-            r"\bmv\b[^|;&]*[\\$`]",
+            r"\bmv\b[^|;&]*(?:[$`]|\\(?:[^\r\n]|$|\r(?:[^\n]|$)))",
             "mv with a shell-expanded or escaped path cannot be verified before execution.",
             High,
             "Shell variables and command substitutions are controlled by the calling environment and may resolve to `/`, `/etc`, a home directory, or another persistent tree. Backslash escapes can also hide traversal from lexical path checks, so dcg cannot safely classify this move.\n\n\
@@ -5489,6 +5493,27 @@ mod tests {
             "mv ./src/a.rs ./src/b.rs",
         ] {
             assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn mv_literal_operands_with_line_continuations_are_allowed_issue_356() {
+        let pack = create_pack();
+        for cmd in [
+            "mv fileA.md fileB.md \\\n               fileC.md \\\n               destdir/",
+            "mv fileA.md fileB.md \\\r\n               fileC.md \\\r\n               destdir/",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+
+        // Only the shell's backslash-newline join is inert. Runtime
+        // expansion and in-path escaping remain unverifiable and blocked.
+        for cmd in [
+            "mv fileA.md \\\n               $DEST/",
+            r"mv fileA\ name.md destdir/",
+            "mv fileA\\\rdest.md destdir/",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "mv-dynamic-path");
         }
     }
 

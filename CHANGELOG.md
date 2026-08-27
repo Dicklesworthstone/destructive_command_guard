@@ -11,6 +11,32 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.13.8](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.8) -- 2026-08-27 [Release]
+
+### Added
+
+- **Add explicit Infisical and transcript-disclosure protection.** The new
+  `secrets.infisical` pack blocks destructive secret, folder, dynamic-lease,
+  and local-reset operations. The separate exact opt-in `secret_disclosure` pack
+  blocks value-emitting reads across Infisical, 1Password, Doppler, Vault, AWS
+  Secrets Manager, and decrypted SSM while leaving metadata inspection and
+  direct process injection available. Provider packs retain their existing
+  mutation-only policy unless disclosure protection is explicitly enabled;
+  enabling the `secrets` category alone does not activate it.
+  ([#355])
+
+### Fixed
+
+- **Treat shell line continuations as syntax, not dynamic `mv` paths.** Literal
+  multi-file `mv` commands split with backslash-LF or backslash-CRLF now match
+  their single-line equivalent. Variables, substitutions, doubled
+  backslashes, and in-path escapes remain fail-closed. ([#356])
+
+[#355]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/355
+[#356]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/356
+
+---
+
 ## [v0.13.7](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.7) -- 2026-08-27 [Release]
 
 ### Release integrity

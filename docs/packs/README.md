@@ -37,7 +37,8 @@ enabled = ["kubernetes", "database", "containers"]
 | [platform](platform.md) | 5 | GitHub Platform, GitLab Platform, Railway Platform, ... |
 | [remote](remote.md) | 3 | rsync, ssh, scp |
 | [search](search.md) | 4 | Elasticsearch, OpenSearch, Algolia, ... |
-| [secrets](secrets.md) | 4 | HashiCorp Vault, AWS Secrets Manager, 1Password CLI, ... |
+| [secret_disclosure](secret_disclosure.md) | 1 | Secret Value Disclosure |
+| [secrets](secrets.md) | 5 | HashiCorp Vault, AWS Secrets Manager, 1Password CLI, ... |
 | [storage](storage.md) | 4 | AWS S3, Google Cloud Storage, MinIO, ... |
 | [strict_git](strict_git.md) | 1 | Strict Git |
 | [system](system.md) | 3 | Disk Operations, Permissions, Services |
@@ -62,6 +63,8 @@ enabled = ["kubernetes", "database", "containers"]
 - [`secrets.aws_secrets`](secrets.md#secretsaws_secrets)
 - [`secrets.onepassword`](secrets.md#secretsonepassword)
 - [`secrets.doppler`](secrets.md#secretsdoppler)
+- [`secrets.infisical`](secrets.md#secretsinfisical)
+- [`secret_disclosure`](secret_disclosure.md#secret_disclosure)
 - [`platform.github`](platform.md#platformgithub)
 - [`platform.gitlab`](platform.md#platformgitlab)
 - [`platform.railway`](platform.md#platformrailway)

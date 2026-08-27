@@ -1357,6 +1357,8 @@ const CAREFUL_COMPANY_PRESET_MEMBERS: &[&str] = &[
     "secrets.aws_secrets",
     "secrets.onepassword",
     "secrets.doppler",
+    "secrets.infisical",
+    "secret_disclosure",
     // Cloud control planes.
     "cloud.aws",
     "cloud.gcp",
@@ -1377,7 +1379,7 @@ pub fn preset_members(id: &str) -> Option<&'static [&'static str]> {
 
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 100] = [
+static PACK_ENTRIES: [PackEntry; 102] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new(
         "core.filesystem",
@@ -1525,6 +1527,24 @@ static PACK_ENTRIES: [PackEntry; 100] = [
         "secrets.doppler",
         &["doppler"],
         secrets::doppler::create_pack,
+    ),
+    PackEntry::new(
+        "secrets.infisical",
+        &["infisical"],
+        secrets::infisical::create_pack,
+    ),
+    PackEntry::new(
+        "secret_disclosure",
+        &[
+            "infisical",
+            "doppler",
+            "vault",
+            "aws",
+            "secretsmanager",
+            "ssm",
+            "op",
+        ],
+        secrets::disclosure::create_pack,
     ),
     PackEntry::new("platform.github", &["gh"], platform::github::create_pack),
     PackEntry::new(
@@ -5861,7 +5881,7 @@ mod tests {
             // full, so no member can be dropped without this failing.
             assert_eq!(
                 CAREFUL_COMPANY_PRESET_MEMBERS.len(),
-                31,
+                33,
                 "preset membership changed size; update the docs and this count together"
             );
             for category in [
@@ -5916,6 +5936,8 @@ mod tests {
                 "remote.ssh",
                 "backup.restic",
                 "secrets.vault",
+                "secrets.infisical",
+                "secret_disclosure",
                 "cloud.aws",
             ] {
                 assert!(
