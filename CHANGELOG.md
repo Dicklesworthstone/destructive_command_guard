@@ -11,6 +11,75 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.13.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.1) -- 2026-08-27 [Release]
+
+This patch release turns the post-v0.13.0 safety and release hardening into a
+clean, signed distribution. It also substantially improves diagnostics,
+external-pack validation, OMP lifecycle safety, and the quality of suggested
+alternatives after a block.
+
+### Security
+
+- **Unverified commands no longer fail open for unattended agents.** Commands
+  that cannot be evaluated completely, including deadline exhaustion and
+  incomplete nested evaluation, retain an indeterminate decision and are
+  denied when the host cannot ask for review.
+- **Filesystem coverage now catches unbounded non-recursive glob deletion.**
+  Risky `rm` expansions no longer evade the recursive-delete rules merely by
+  omitting `-r`; bounded scratch-directory operations retain their narrow safe
+  path.
+- **External packs validate executable scope canonically.** Pack authors get a
+  concrete validation error when a rule's declared executable scope and its
+  regex semantics disagree, preventing broad or misleading attribution.
+- **OMP's native bridge has a tighter trust boundary.** The generated extension
+  binds to the installed `dcg` binary, rejects lossy executable paths, preserves
+  signal provenance, bounds child observation and stream resources, and keeps
+  host-owned hook fields during self-healing.
+
+### Added
+
+- **Pack validation is wired into the CLI.** Custom-pack authors can validate
+  schema and semantic problems before enabling a pack, with focused diagnostics
+  for executable scopes and rule definitions. ([#289])
+- **Release-grade performance certificates.** The absolute evaluator budget
+  gate now binds results to the full source commit, verifies every timed wire
+  decision, applies an explicit 95/95 tail-tolerance rule, and emits a
+  self-contained failure certificate outside the measured checkout.
+- **More complete integration management.** CLI and installer flows can inspect
+  and unconfigure supported agent integrations explicitly, with stronger
+  ownership checks and truthful dry-run/summary behavior across Unix and
+  Windows.
+
+### Fixed
+
+- **Normal upgrades can consume aggregate checksums.** The POSIX installer now
+  falls back from an adjacent `<archive>.sha256` file to `SHA256SUMS.txt` or
+  `SHA256SUMS`, matching the PowerShell installer and repairing the tag-pinned
+  updater path reported in [#342].
+- **Official binaries have exact release provenance.** The release path now
+  rejects dirty or ahead-of-tag binaries before signing, preventing the
+  `LocalAheadOfRelease` false classification reported in [#344].
+- **Every archive is signed by the DSR release authority.** The six platform
+  archives publish adjacent `.minisig` files under the documented long-lived
+  key, repairing the fail-closed installer path reported in [#351].
+- **Pipeline diagnostics preserve the command users actually wrote.** Shell
+  transformations no longer erase syntax needed for matching and explanations;
+  unverifiable Python-to-PowerShell pipelines identify the producer that could
+  not be modeled instead of presenting an opaque refusal.
+- **Safer alternatives are operation-specific.** Suggestions now reflect the
+  destructive operation's flags and target shape, and their classifier rules
+  are checked for self-consistency.
+- **Windows and hook protocol tests are host-independent.** Fixtures isolate
+  ambient Git/configuration state, choose current-platform binary names, and
+  reject stale Windows binaries instead of silently exercising old bytes.
+
+[#289]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/289
+[#342]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/342
+[#344]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/344
+[#351]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/351
+
+---
+
 ## [v0.13.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.0) -- 2026-08-24 [Release]
 
 Minor bump: this release adds first-class support for a new agent host (Oh My Pi)
