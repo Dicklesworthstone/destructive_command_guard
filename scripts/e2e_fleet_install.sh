@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # e2e_fleet_install.sh — install dcg on every real platform from the PUBLIC
-# release URL, exactly as the README tells users to, then prove the installed
-# binary actually guards commands.
+# release URL using the same tag-pinned installer bytes as `dcg update`, then
+# prove the installed binary actually guards commands.
 #
 # WHY THIS EXISTS
 # ---------------
@@ -37,7 +37,8 @@ HOSTS_OVERRIDE=""
 JSON_OUTPUT=false
 INCLUDE_WINDOWS=true
 LOCAL_ONLY=false
-REPO_RAW="https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main"
+REPO_RAW="https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard"
+REPO_RELEASE="https://github.com/Dicklesworthstone/destructive_command_guard/releases/download"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -92,7 +93,7 @@ report() {
 unix_probe() {
 cat <<'PROBE'
 set -u
-VERSION="$1"; REPO_RAW="$2"
+VERSION="$1"; REPO_RAW="$2"; REPO_RELEASE="$3"
 
 # Drop every ambient DCG_* for the WHOLE probe, before anything runs. The hook
 # calls below additionally use `env -i`, but the installer cannot: it needs the
@@ -116,13 +117,39 @@ cd "$WORK" || exit 2
 
 echo "RESULT:platform:$(uname -s)/$(uname -m)"
 
-# 1. Fetch the installer exactly as the README instructs.
-if ! curl -fsSL -o "$WORK/install.sh" "$REPO_RAW/install.sh"; then
+# 1. Fetch the exact tag-pinned installer that `dcg update` executes.
+if ! curl -fsSL -o "$WORK/install.sh" "$REPO_RAW/$VERSION/install.sh"; then
   echo "RESULT:fetch_installer:FAIL:curl failed"; exit 1
 fi
 echo "RESULT:fetch_installer:PASS"
 
-# 2. Install the pinned version with the release's long-lived signature as a
+# 2. Verify the installer itself before executing it. Archive verification
+# cannot protect users from a modified installer that has already started.
+if ! curl -fsSL -o "$WORK/install.sh.sha256" \
+    "$REPO_RELEASE/$VERSION/install.sh.sha256"; then
+  echo "RESULT:installer_checksum_verified:FAIL:install.sh.sha256 unavailable"; exit 1
+fi
+INSTALLER_EXPECTED="$(awk 'NF { print $1; exit }' "$WORK/install.sh.sha256" | tr -d '\r')"
+if [ "${#INSTALLER_EXPECTED}" -ne 64 ]; then
+  echo "RESULT:installer_checksum_verified:FAIL:malformed install.sh.sha256"; exit 1
+fi
+case "$INSTALLER_EXPECTED" in
+  *[!0-9a-fA-F]*) echo "RESULT:installer_checksum_verified:FAIL:non-hex install.sh.sha256"; exit 1 ;;
+esac
+if command -v sha256sum >/dev/null 2>&1; then
+  INSTALLER_ACTUAL="$(sha256sum "$WORK/install.sh" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  INSTALLER_ACTUAL="$(shasum -a 256 "$WORK/install.sh" | awk '{print $1}')"
+else
+  echo "RESULT:installer_checksum_verified:FAIL:no SHA256 verifier"; exit 1
+fi
+if [ "$(printf '%s' "$INSTALLER_ACTUAL" | tr 'A-F' 'a-f')" != \
+     "$(printf '%s' "$INSTALLER_EXPECTED" | tr 'A-F' 'a-f')" ]; then
+  echo "RESULT:installer_checksum_verified:FAIL:install.sh digest mismatch"; exit 1
+fi
+echo "RESULT:installer_checksum_verified:PASS:$INSTALLER_ACTUAL"
+
+# 3. Install the pinned version with the release's long-lived signature as a
 #    hard requirement. This is a release gate, so a host without the verifier
 #    is missing gate infrastructure rather than evidence that may be skipped.
 INSTALL_LOG="$WORK/install.log"
@@ -136,7 +163,7 @@ else
   exit 1
 fi
 
-# 3. Prove verification actually happened (not silently skipped).
+# 4. Prove archive verification actually happened (not silently skipped).
 grep -qi "checksum" "$INSTALL_LOG" && echo "RESULT:checksum_verified:PASS" \
   || echo "RESULT:checksum_verified:FAIL:no checksum evidence in installer output"
 grep -qi "Signature verified (minisign key " "$INSTALL_LOG" \
@@ -147,7 +174,7 @@ BIN="$DEST/dcg"
 [ -x "$BIN" ] || { echo "RESULT:binary_present:FAIL:not executable at $BIN"; exit 1; }
 echo "RESULT:binary_present:PASS"
 
-# 4. The installed binary must run on THIS os/arch, report the pinned version,
+# 5. The installed binary must run on THIS os/arch, report the pinned version,
 #    and prove it was built from exactly that clean release tag. A semver-only
 #    check would have accepted the v0.13.0 macOS `v0.13.0-dirty` artifacts.
 VERSION_OUTPUT="$("$BIN" --version 2>&1 | tr -d '\r')"
@@ -446,16 +473,33 @@ New-Item -ItemType Directory -Force -Path $dest | Out-Null
 $homeSandbox = Join-Path $work 'home'
 New-Item -ItemType Directory -Force -Path $homeSandbox | Out-Null
 
-# Use the EXACT form the README documents. The scriptblock invocation is what
-# users actually run (and is what keeps a default Restricted ExecutionPolicy
-# from blocking the install) — testing a file-based run would exercise a path
-# no documented user takes.
-$installerSource = $null
+# Use the same tag-pinned installer bytes as `dcg update`, but retain the
+# documented scriptblock invocation after the bytes have been verified.
+$installerPath = Join-Path $work 'install.ps1'
+$installerChecksumPath = Join-Path $work 'install.ps1.sha256'
 try {
-  $installerSource = Invoke-RestMethod -Uri "$RepoRaw/install.ps1"
+  Invoke-WebRequest -UseBasicParsing -Uri "$RepoRaw/$Version/install.ps1" -OutFile $installerPath
   Emit 'fetch_installer' 'PASS'
 } catch {
   Emit 'fetch_installer' 'FAIL' $_.Exception.Message
+  Emit 'probe_complete' 'PASS'
+  exit 0
+}
+
+try {
+  Invoke-WebRequest -UseBasicParsing -Uri "$RepoRelease/$Version/install.ps1.sha256" -OutFile $installerChecksumPath
+  $expectedInstallerSha = ((Get-Content -LiteralPath $installerChecksumPath -Raw).Trim() -split '\s+')[0]
+  if ($expectedInstallerSha -notmatch '^[0-9a-fA-F]{64}$') {
+    throw 'install.ps1.sha256 is malformed'
+  }
+  $actualInstallerSha = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($actualInstallerSha -cne $expectedInstallerSha.ToLowerInvariant()) {
+    throw 'install.ps1 digest mismatch'
+  }
+  Emit 'installer_checksum_verified' 'PASS' $actualInstallerSha
+  $installerSource = Get-Content -LiteralPath $installerPath -Raw
+} catch {
+  Emit 'installer_checksum_verified' 'FAIL' $_.Exception.Message
   Emit 'probe_complete' 'PASS'
   exit 0
 }
@@ -597,7 +641,7 @@ PSEOF
 # ---------------------------------------------------------------------------
 # Every probe must announce probe_complete. Without this, a probe that dies
 # halfway through (bad quoting, crashed shell) looks like a clean pass.
-EXPECTED_CASES=(fetch_installer install checksum_verified minisign_verified binary_present
+EXPECTED_CASES=(fetch_installer installer_checksum_verified install checksum_verified minisign_verified binary_present
                 version_match provenance_match effective_budget hook_deny hook_allow
                 no_indeterminate_verdicts latency_under_budget probe_complete)
 
@@ -646,7 +690,7 @@ $JSON_OUTPUT || echo
 
 # --- Local host (this machine) ---------------------------------------------
 $JSON_OUTPUT || echo "local ($(uname -s)/$(uname -m))"
-local_out="$(unix_probe | bash -s -- "$VERSION" "$REPO_RAW" 2>&1)"
+local_out="$(unix_probe | bash -s -- "$VERSION" "$REPO_RAW" "$REPO_RELEASE" 2>&1)"
 parse_results "local" "$local_out"
 
 # --- Remote Unix hosts ------------------------------------------------------
@@ -657,7 +701,7 @@ for host in "${UNIX_SSH_HOSTS[@]}"; do
     continue
   fi
   remote_out="$(unix_probe | ssh -o ConnectTimeout=10 -o BatchMode=yes "$host" \
-    "bash -s -- '$VERSION' '$REPO_RAW'" 2>&1)"
+    "bash -s -- '$VERSION' '$REPO_RAW' '$REPO_RELEASE'" 2>&1)"
   parse_results "$host" "$remote_out"
 done
 
@@ -668,7 +712,8 @@ if $INCLUDE_WINDOWS; then
     report skip "$WINDOWS_SSH_HOST" "reachability" "ssh unreachable"
   else
     # Inject parameters as PowerShell variables, then the fully-quoted probe.
-    win_out="$( { printf "\$Version = '%s'\n\$RepoRaw = '%s'\n" "$VERSION" "$REPO_RAW"
+    win_out="$( { printf "\$Version = '%s'\n\$RepoRaw = '%s'\n\$RepoRelease = '%s'\n" \
+                    "$VERSION" "$REPO_RAW" "$REPO_RELEASE"
                   windows_probe; } \
       | ssh -o ConnectTimeout=10 -o BatchMode=yes "$WINDOWS_SSH_HOST" \
           "powershell -NoProfile -NonInteractive -Command -" 2>&1 )"

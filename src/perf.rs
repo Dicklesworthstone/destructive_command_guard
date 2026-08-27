@@ -613,10 +613,10 @@ mod tests {
         );
     }
 
-    /// #351: the release fleet gate must fail if long-lived signatures are
-    /// absent or if any probe silently skips their verification.
+    /// #351/#353: the release fleet gate must fail if the tag-pinned installer
+    /// or archive is unverified, or if any probe silently skips verification.
     #[test]
-    fn fleet_install_gate_requires_minisign_on_every_platform() {
+    fn fleet_install_gate_requires_installer_checksums_and_minisign_on_every_platform() {
         let fleet = include_str!("../scripts/e2e_fleet_install.sh");
         let unix_probe = fleet
             .split("unix_probe() {")
@@ -641,6 +641,17 @@ mod tests {
         assert!(
             windows_probe.contains("-RequireMinisign -Verify -NoConfigure"),
             "Windows fleet installs must require a valid minisign signature"
+        );
+        assert!(
+            unix_probe.contains("$REPO_RAW/$VERSION/install.sh")
+                && unix_probe.contains("$REPO_RELEASE/$VERSION/install.sh.sha256")
+                && windows_probe.contains("$RepoRaw/$Version/install.ps1")
+                && windows_probe.contains("$RepoRelease/$Version/install.ps1.sha256"),
+            "fleet installs must verify the exact tag-pinned installer before execution"
+        );
+        assert!(
+            expected_cases.contains("installer_checksum_verified"),
+            "a truncated probe must not pass without reporting installer verification"
         );
         assert!(
             expected_cases.contains("minisign_verified"),
