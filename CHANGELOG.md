@@ -11,6 +11,20 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.13.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.3) -- 2026-08-27 [Release]
+
+### Release integrity
+
+- **Bind strict DSR binaries to their exact tagged source.** DSR builds from an
+  authenticated tracked-byte snapshot that intentionally excludes `.git`, so
+  v0.13.2 could not expose the full commit SHA required by dcg's absolute
+  latency certificate. DSR now passes its independently verified tag and SHA
+  into every native build; dcg validates both before embedding them. This
+  superseding patch preserves v0.13.2's current-key signatures while restoring
+  the source-to-binary proof required by the release gate.
+
+---
+
 ## [v0.13.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.2) -- 2026-08-27 [Release]
 
 ### Release integrity
