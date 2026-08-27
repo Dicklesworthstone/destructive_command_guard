@@ -1090,7 +1090,7 @@ fn decode_powershell_encoded_command(b64: &str) -> Option<String> {
         return None;
     }
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     let decoded = String::from_utf16_lossy(&units);

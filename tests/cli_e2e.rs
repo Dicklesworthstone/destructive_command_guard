@@ -147,7 +147,7 @@ fn create_new_does_not_create_missing_parent_directories() {
     let (output, stdin_write) = run_create_new(&destination, b"must not be written");
     assert_refused_sink_write_is_benign(&stdin_write);
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, [] as [u8; 0]);
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("could not create new file"),
         "missing-parent failure should carry create context: {}",
@@ -173,7 +173,7 @@ fn create_new_refuses_an_existing_symlink_without_touching_its_target() {
     let (output, stdin_write) = run_create_new(&link, b"must not follow the symlink");
     assert_refused_sink_write_is_benign(&stdin_write);
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, [] as [u8; 0]);
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("refusing to replace existing path"),
         "symlink refusal should state the non-overwrite guarantee: {}",
@@ -538,7 +538,7 @@ fn fail_closed_via_config_file_blocks_unparseable() {
         Some("[general]\nverbose = false\n"),
     );
     assert!(open.status.success());
-    assert!(String::from_utf8_lossy(&open.stdout).trim().is_empty());
+    assert_eq!(String::from_utf8_lossy(&open.stdout).trim(), "");
 }
 
 #[test]
@@ -575,7 +575,7 @@ fn fail_closed_oversized_input_is_denied() {
     // Default: fail-open (allowed, exit 0).
     let open = run_dcg_hook_raw(&big, &[]);
     assert!(open.status.success(), "default oversized input fails open");
-    assert!(String::from_utf8_lossy(&open.stdout).trim().is_empty());
+    assert_eq!(String::from_utf8_lossy(&open.stdout).trim(), "");
 
     // Fail-closed: denied.
     let closed = run_dcg_hook_raw(&big, &[("DCG_FAIL_CLOSED", "1")]);

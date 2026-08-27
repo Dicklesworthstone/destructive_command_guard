@@ -3793,11 +3793,7 @@ fn pack_aware_quick_reject_from_normalized_spans(
     // check. Likewise, producer argv can become executable source when piped to
     // an interpreter. Do not widen ordinary inert pipelines (`echo ... | cat`)
     // to a full scan: quoted documentation there remains data (#230).
-    if syntax_outside_executable_spans_matches_keyword(normalized, enabled_keywords) {
-        return false;
-    }
-
-    true // No keywords found in executable spans, safe to skip pack checking
+    !syntax_outside_executable_spans_matches_keyword(normalized, enabled_keywords) // No keywords found in executable spans, safe to skip pack checking
 }
 
 #[cfg(test)]

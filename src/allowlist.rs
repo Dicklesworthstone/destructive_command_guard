@@ -629,10 +629,7 @@ pub fn command_prefix_safely_matches(command: &str, prefix: &str) -> bool {
             return false;
         }
     }
-    if tail_has_shell_chain_metachars(tail) {
-        return false;
-    }
-    true
+    !tail_has_shell_chain_metachars(tail)
 }
 
 /// Built-in command prefixes for *inspection wrappers* — see dcg#132.

@@ -175,7 +175,7 @@ fn tool_calls_object_shape_still_denies_via_tool_input() {
     let extracted =
         extract_command_with_context(&input).expect("tool_input path must still extract");
     assert_eq!(extracted.command, "rm -rf /");
-    assert!(extracted.additional_commands.is_empty());
+    assert_eq!(extracted.additional_commands, [] as [(std::string::String, destructive_command_guard::normalize::ShellDialect); 0]);
 }
 
 #[test]

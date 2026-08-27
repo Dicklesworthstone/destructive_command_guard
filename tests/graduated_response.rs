@@ -437,7 +437,7 @@ fn escalation_messages_minimal_context_no_crash() {
         },
     ] {
         let msg = format_escalation_message(&response, &ctx);
-        assert!(!msg.is_empty());
+        assert_ne!(msg, "");
         assert!(msg.contains("dangerous-cmd"));
         assert!(!msg.contains("Pattern:"));
         assert!(!msg.contains("Severity:"));

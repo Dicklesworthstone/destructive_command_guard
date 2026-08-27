@@ -1628,8 +1628,8 @@ fn cross_protocol_allow_structural_parity() {
     // Both exit 0 with empty stdout
     assert_eq!(codex.exit_code, 0);
     assert_eq!(claude.exit_code, 0);
-    assert!(codex.stdout.is_empty());
-    assert!(claude.stdout.is_empty());
+    assert_eq!(codex.stdout, [] as [u8; 0]);
+    assert_eq!(claude.stdout, [] as [u8; 0]);
 }
 
 // ===========================================================================
@@ -1988,8 +1988,8 @@ fn failopen_same_behavior_both_protocols() {
         claude_outcome.exit_code, 0,
         "Claude-style missing command must fail-open\n{claude_outcome}"
     );
-    assert!(codex_outcome.stdout.is_empty());
-    assert!(claude_outcome.stdout.is_empty());
+    assert_eq!(codex_outcome.stdout, [] as [u8; 0]);
+    assert_eq!(claude_outcome.stdout, [] as [u8; 0]);
 }
 
 // ===========================================================================
@@ -2605,9 +2605,7 @@ fn codex_deny_with_history_disabled_still_emits_json() {
         "Codex deny must exit normally with history disabled"
     );
     assert!(
-        serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            .ok()
-            .is_some_and(|json| json["hookSpecificOutput"]["permissionDecision"] == "deny"),
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).is_ok_and(|json| json["hookSpecificOutput"]["permissionDecision"] == "deny"),
         "Codex deny must produce minimal JSON with history disabled"
     );
     assert!(
@@ -2677,9 +2675,7 @@ fn codex_rapid_fire_denies_all_persist_to_history() {
             "Codex deny must exit normally for '{cmd}'"
         );
         assert!(
-            serde_json::from_slice::<serde_json::Value>(&output.stdout)
-                .ok()
-                .is_some_and(|json| { json["hookSpecificOutput"]["permissionDecision"] == "deny" }),
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).is_ok_and(|json| { json["hookSpecificOutput"]["permissionDecision"] == "deny" }),
             "Codex deny must emit minimal JSON for '{cmd}'"
         );
     }
@@ -2757,9 +2753,7 @@ fn codex_deny_history_write_protected_dir_no_panic() {
         "Codex deny must exit normally even when history DB creation fails"
     );
     assert!(
-        serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            .ok()
-            .is_some_and(|json| json["hookSpecificOutput"]["permissionDecision"] == "deny"),
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).is_ok_and(|json| json["hookSpecificOutput"]["permissionDecision"] == "deny"),
         "Codex deny JSON must survive history DB failure"
     );
     assert!(

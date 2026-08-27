@@ -4416,7 +4416,7 @@ fn decode_powershell_encoded_payload(
         return Err("PowerShell -EncodedCommand payload has odd UTF-16LE length".to_string());
     }
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     let decoded = String::from_utf16(&units)
@@ -13888,7 +13888,7 @@ fn collect_inherited_exec_stdin_flows(command: &str, flows: &mut Vec<IndirectInp
 }
 
 fn raw_command_is_exec_builtin(command: &str) -> bool {
-    shell_words::split(command).ok().is_some_and(|tokens| {
+    shell_words::split(command).is_ok_and(|tokens| {
         tokens
             .iter()
             .find(|token| !is_shell_assignment(token))

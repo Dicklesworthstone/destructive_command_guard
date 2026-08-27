@@ -713,12 +713,11 @@ impl<'a> LoggedPackTestRunner<'a> {
                 "Expected pack '{}' to allow command '{}' but it was blocked",
                 self.pack.id, command
             );
-        } else {
-            self.logger
-                .log_pattern_match("none", command, false, duration_us);
-            self.logger
-                .log_test_result_detailed("assert_allows", true, "", None, Some(command));
         }
+        self.logger
+            .log_pattern_match("none", command, false, duration_us);
+        self.logger
+            .log_test_result_detailed("assert_allows", true, "", None, Some(command));
     }
 
     /// Run a batch of blocking assertions.
