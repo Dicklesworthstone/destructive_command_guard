@@ -7,10 +7,12 @@
 # silent: `if true; then chmod -R 755 /etc; fi` resolved `then`, `(chmod …)`
 # resolved `(chmod`. That is a deny→allow false negative on a security rule.
 #
-# These are true-positive *controls*: each one really does run chmod/chown/
-# setfacl against a system path and must deny in every dialect. The companion
-# false-positive shapes live in issue_287_permission_chains.toml — the two files
-# together pin both sides of the boundary.
+# These are true-positive *controls*: each one runs chmod/chown/setfacl against
+# a system path in every dialect listed for that case. POSIX-only control-flow
+# forms are deliberately limited to `posix` and fail-closed `unknown`: Cmd and
+# PowerShell reject those forms without executing their bodies. The companion
+# false-positive shapes live in issue_287_permission_chains.toml — the two
+# files together pin both sides of the boundary.
 
 [[case]]
 description = "subshell around chmod -R on /etc"
@@ -39,14 +41,7 @@ command = "{ chmod -R 755 /etc; }"
 expected = "deny"
 rule_id = "system.permissions:chmod-recursive-root"
 issue = 289
-known_failing = true
-known_failing_dialects = ["ps"]
-known_failing_reason = """
-Pre-existing and unrelated to argv0 resolution: under a caller-proven PowerShell \
-dialect a balanced `{ ... }` is treated as an unexecuted script block, so no pack \
-sees its body. `{ chmod -R 755 /etc` (unbalanced) denies under ps, and the whole \
-shape denies under posix/cmd/unknown. Owned by the PowerShell script-block \
-model, not by #289."""
+dialects = ["posix", "unknown"]
 
 [[case]]
 description = "if/then guarding chmod -R on /etc"
@@ -54,6 +49,7 @@ command = "if true; then chmod -R 755 /etc; fi"
 expected = "deny"
 rule_id = "system.permissions:chmod-recursive-root"
 issue = 289
+dialects = ["posix", "unknown"]
 
 [[case]]
 description = "if/else guarding chmod -R on /etc"
@@ -61,6 +57,7 @@ command = "if false; then true; else chmod -R 755 /etc; fi"
 expected = "deny"
 rule_id = "system.permissions:chmod-recursive-root"
 issue = 289
+dialects = ["posix", "unknown"]
 
 [[case]]
 description = "elif branch guarding chmod -R on /etc"
@@ -68,6 +65,7 @@ command = "if false; then true; elif true; then chmod -R 755 /etc; fi"
 expected = "deny"
 rule_id = "system.permissions:chmod-recursive-root"
 issue = 289
+dialects = ["posix", "unknown"]
 
 [[case]]
 description = "for loop body running chmod -R on /etc"
@@ -75,6 +73,7 @@ command = "for f in a; do chmod -R 755 /etc; done"
 expected = "deny"
 rule_id = "system.permissions:chmod-recursive-root"
 issue = 289
+dialects = ["posix", "unknown"]
 
 [[case]]
 description = "while loop body running chmod -R on /etc"
@@ -82,6 +81,7 @@ command = "while true; do chmod -R 755 /etc; done"
 expected = "deny"
 rule_id = "system.permissions:chmod-recursive-root"
 issue = 289
+dialects = ["posix", "unknown"]
 
 [[case]]
 description = "until loop body running chmod -R on /etc"
@@ -89,6 +89,7 @@ command = "until false; do chmod -R 755 /etc; done"
 expected = "deny"
 rule_id = "system.permissions:chmod-recursive-root"
 issue = 289
+dialects = ["posix", "unknown"]
 
 [[case]]
 description = "case arm running chmod -R on /etc"
@@ -96,6 +97,7 @@ command = "case x in *) chmod -R 755 /etc;; esac"
 expected = "deny"
 rule_id = "system.permissions:chmod-recursive-root"
 issue = 289
+dialects = ["posix", "unknown"]
 
 [[case]]
 description = "negation prefix before chmod -R on /etc"
@@ -103,6 +105,7 @@ command = "! chmod -R 755 /etc"
 expected = "deny"
 rule_id = "system.permissions:chmod-recursive-root"
 issue = 289
+dialects = ["posix", "unknown"]
 
 [[case]]
 description = "subshell after an && separator"
@@ -124,6 +127,7 @@ command = "time chmod -R 755 /etc"
 expected = "deny"
 rule_id = "system.permissions:chmod-recursive-root"
 issue = 289
+dialects = ["posix", "ps", "unknown"]
 
 [[case]]
 description = "subshell around chown -R on /etc"
@@ -138,6 +142,7 @@ command = "if true; then chown -R u:g /etc; fi"
 expected = "deny"
 rule_id = "system.permissions:chown-recursive-root"
 issue = 289
+dialects = ["posix", "unknown"]
 
 [[case]]
 description = "while loop body running chown -R on /etc"
@@ -145,28 +150,28 @@ command = "while true; do chown -R u:g /etc; done"
 expected = "deny"
 rule_id = "system.permissions:chown-recursive-root"
 issue = 289
+dialects = ["posix", "unknown"]
 
 [[case]]
 description = "brace group around setfacl -R on /etc"
 command = "{ setfacl -R -m u:x:rwx /etc; }"
 expected = "deny"
 issue = 289
-known_failing = true
-known_failing_dialects = ["ps"]
-known_failing_reason = """
-Same pre-existing PowerShell script-block gap as the chmod brace group above."""
+dialects = ["posix", "unknown"]
 
 [[case]]
 description = "for loop body running setfacl -R on /etc"
 command = "for f in a; do setfacl -R -m u:x:rwx /etc; done"
 expected = "deny"
 issue = 289
+dialects = ["posix", "unknown"]
 
 [[case]]
 description = "if/then guarding chmod 777 on a system file"
 command = "if true; then chmod 777 /etc/passwd; fi"
 expected = "deny"
 issue = 289
+dialects = ["posix", "unknown"]
 
 [[case]]
 description = "subshell around a setuid chmod"
