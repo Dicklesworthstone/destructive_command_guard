@@ -11,6 +11,20 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.13.5](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.5) -- 2026-08-27 [Release]
+
+### Security
+
+- **Fail closed when an update installer checksum is unavailable.** The Unix
+  and Windows update paths now refuse to execute a downloaded installer unless
+  its tag-matched SHA256 sidecar is present and valid. This removes the legacy
+  fallback that could describe an update as verified after continuing past a
+  missing installer checksum. ([#352])
+
+[#352]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/352
+
+---
+
 ## [v0.13.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.4) -- 2026-08-27 [Release]
 
 ### Release integrity
