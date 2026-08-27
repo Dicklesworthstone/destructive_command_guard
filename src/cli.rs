@@ -19864,13 +19864,8 @@ mod tests {
         let checksum_path = temp_dir.path().join("install.ps1.sha256");
         std::fs::write(&script_path, "Write-Host verified\n").unwrap();
 
-        let error = require_verified_installer(
-            &script_path,
-            &checksum_path,
-            "install.ps1",
-            false,
-        )
-        .expect_err("missing installer checksum must fail closed");
+        let error = require_verified_installer(&script_path, &checksum_path, "install.ps1", false)
+            .expect_err("missing installer checksum must fail closed");
 
         assert!(error.to_string().contains("install.ps1.sha256 is required"));
         assert!(
@@ -19882,15 +19877,16 @@ mod tests {
 
     #[test]
     fn update_installer_accepts_matching_checksum() {
-        use sha2::{Digest as _, Sha256};
-
         let temp_dir = InstallerTempDir::create().unwrap();
         let script_path = temp_dir.path().join("install.sh");
         let checksum_path = temp_dir.path().join("install.sh.sha256");
         let script = b"#!/bin/sh\necho verified\n";
-        let digest = format!("{:x}", Sha256::digest(script));
         std::fs::write(&script_path, script).unwrap();
-        std::fs::write(&checksum_path, format!("{digest}  install.sh\n")).unwrap();
+        std::fs::write(
+            &checksum_path,
+            "9c76ec33e2b9013ce136f3bf6750ce60f6a40def87b4a724c89c7d55af27b4f7  install.sh\n",
+        )
+        .unwrap();
 
         require_verified_installer(&script_path, &checksum_path, "install.sh", true).unwrap();
     }
