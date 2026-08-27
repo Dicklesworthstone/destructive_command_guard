@@ -11,7 +11,24 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.13.7](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.7) -- 2026-08-27 [Release]
+
+### Release integrity
+
+- **Ship portable Linux archives without macOS metadata members.** DSR now
+  disables extended attributes as well as macOS copyfile metadata while
+  packaging tar archives. This prevents `._dcg` AppleDouble members from
+  appearing when GNU tar reads a Linux archive, so the strict installer sees
+  exactly the one root-level `dcg` binary it requires. v0.13.7 supersedes the
+  Linux artifacts from v0.13.6; the product changes are otherwise identical.
+
+---
+
 ## [v0.13.6](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.6) -- 2026-08-27 [Release]
+
+The macOS and Windows artifacts passed the public install gate, but the Linux
+archives included a macOS `._dcg` metadata member and were correctly rejected
+by the strict installer. Use v0.13.7 or newer on Linux.
 
 ### Fixed
 
