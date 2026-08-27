@@ -4416,7 +4416,9 @@ fn decode_powershell_encoded_payload(
         return Err("PowerShell -EncodedCommand payload has odd UTF-16LE length".to_string());
     }
     let units: Vec<u16> = bytes
-        .as_chunks::<2>().0.iter()
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     let decoded = String::from_utf16(&units)

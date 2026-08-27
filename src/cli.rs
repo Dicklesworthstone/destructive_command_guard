@@ -12011,8 +12011,7 @@ fn is_dcg_program_basename(program: &str) -> bool {
     stem.eq_ignore_ascii_case("dcg")
         || (std::path::Path::new(program).is_absolute()
             && std::env::current_exe()
-                .ok()
-                .is_some_and(|current| current == std::path::Path::new(program)))
+                .is_ok_and(|current| current == std::path::Path::new(program)))
 }
 
 fn dcg_command_program(cmd: &str) -> Option<String> {
@@ -13773,8 +13772,7 @@ fn omp_appears_in_use() -> bool {
     default_root_exists
         || omp_user_agent_dir().is_ok_and(|path| path.is_dir())
         || project_omp_extension_path()
-            .ok()
-            .is_some_and(|path| omp_extension_entry_exists(&path).unwrap_or(true))
+            .is_ok_and(|path| omp_extension_entry_exists(&path).unwrap_or(true))
 }
 
 fn omp_extension_text_is_dcg_owned(content: &str) -> bool {
@@ -15803,11 +15801,7 @@ fn run_smoke_test(config: &Config) -> bool {
         &allowlists,
         &heredoc_settings,
     );
-    if deny_result.is_allowed() {
-        return false;
-    }
-
-    true
+    !deny_result.is_allowed()
 }
 
 // ============================================================================
@@ -15942,9 +15936,7 @@ fn resolve_layer(project: bool, user: bool) -> AllowlistLayer {
 }
 
 fn project_allowlist_is_trusted() -> bool {
-    std::env::current_dir()
-        .ok()
-        .is_some_and(|cwd| crate::config::explicitly_trusts_project_policy(&cwd))
+    std::env::current_dir().is_ok_and(|cwd| crate::config::explicitly_trusts_project_policy(&cwd))
 }
 
 fn ensure_allowlist_layer_is_writable(

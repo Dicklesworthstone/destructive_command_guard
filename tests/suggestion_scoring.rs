@@ -727,7 +727,10 @@ fn allowlist_suggestion_with_path_analysis() {
 
     let suggestion = AllowlistSuggestion::from_cluster(cluster).with_path_analysis(&working_dirs);
 
-    assert_ne!(suggestion.path_patterns, [] as [destructive_command_guard::PathPattern; 0]);
+    assert_ne!(
+        suggestion.path_patterns,
+        [] as [destructive_command_guard::PathPattern; 0]
+    );
     assert!(suggestion.suggest_path_specific);
     assert!(
         suggestion

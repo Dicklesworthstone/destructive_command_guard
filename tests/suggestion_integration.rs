@@ -134,7 +134,10 @@ fn generate_enhanced_suggestions_clustered_paths() {
     // Should suggest path-specific allowlisting
     assert!(suggestion.suggest_path_specific);
     assert_eq!(suggestion.reason, SuggestionReason::PathClustered);
-    assert_ne!(suggestion.path_patterns, [] as [destructive_command_guard::PathPattern; 0]);
+    assert_ne!(
+        suggestion.path_patterns,
+        [] as [destructive_command_guard::PathPattern; 0]
+    );
 }
 
 #[test]
