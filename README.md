@@ -1020,15 +1020,15 @@ present.
 ### From source (Rust 1.95+; pinned nightly recommended)
 
 The locked dependency graph requires Rust 1.95 or newer. Release builds use the
-repository's known-good `nightly-2026-06-06` pin; the included
+repository's known-good `nightly-2026-08-25` pin; the included
 `rust-toolchain.toml` selects it automatically inside a checkout.
 
 ```bash
 # Install the release toolchain if you don't have it
-rustup toolchain install nightly-2026-06-06
+rustup toolchain install nightly-2026-08-25
 
 # Install the tagged source reproducibly
-cargo +nightly-2026-06-06 install --locked --git https://github.com/Dicklesworthstone/destructive_command_guard --tag v0.7.6 destructive_command_guard
+cargo +nightly-2026-08-25 install --locked --git https://github.com/Dicklesworthstone/destructive_command_guard --tag v0.7.6 destructive_command_guard
 ```
 
 ### Manual build
