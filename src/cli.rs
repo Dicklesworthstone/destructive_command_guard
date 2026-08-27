@@ -14678,6 +14678,24 @@ fn verify_installer_checksum(
     }
 }
 
+fn require_verified_installer(
+    script_path: &std::path::Path,
+    checksum_path: &std::path::Path,
+    artifact_name: &str,
+    checksum_downloaded: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !checksum_downloaded {
+        return Err(format!(
+            "{artifact_name}.sha256 is required; refusing to execute an unverified installer"
+        )
+        .into());
+    }
+
+    verify_installer_checksum(script_path, checksum_path, artifact_name)?;
+    eprintln!("dcg update: {artifact_name} sha256 verified.");
+    Ok(())
+}
+
 fn download_verified_installer(
     script_url: &str,
     sha_url: &str,
@@ -14688,14 +14706,13 @@ fn download_verified_installer(
     let checksum_path = temp_dir.path().join(format!("{artifact_name}.sha256"));
 
     download_file(script_url, &script_path)?;
-    if try_download_file(sha_url, &checksum_path)? {
-        verify_installer_checksum(&script_path, &checksum_path, artifact_name)?;
-        eprintln!("dcg update: {artifact_name} sha256 verified.");
-    } else {
-        eprintln!(
-            "dcg update: {artifact_name}.sha256 not published for this tag; proceeding without verification."
-        );
-    }
+    let checksum_downloaded = try_download_file(sha_url, &checksum_path)?;
+    require_verified_installer(
+        &script_path,
+        &checksum_path,
+        artifact_name,
+        checksum_downloaded,
+    )?;
 
     Ok((temp_dir, script_path))
 }
@@ -14705,18 +14722,17 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
     // requested version, or from the latest release for the default update path
     // (not whatever is on `main`).
     //
-    // Per `git_safety_guard-ythp`, we additionally download install.sh to a
-    // temp file and verify install.sh.sha256 when the matching release
-    // publishes it. Older tags will not have the checksum; we warn and proceed
-    // to preserve the update path for stale binaries.
+    // Download the tag-pinned installer to a temp file and require the matching
+    // release checksum before executing it. A missing checksum fails closed:
+    // the installer itself is executable code, so archive verification later
+    // in that script cannot repair an unverified handoff.
     let requested_version = update.version.clone();
     let normalized_tag = update_installer_tag(requested_version.as_deref())?;
     let script_url = format!(
         "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/{normalized_tag}/install.sh"
     );
-    // Releases-download URL where install.sh.sha256 is published from
-    // dist.yml. Pre-ythp tags will 404 here; the verification step
-    // detects that and warns rather than aborting.
+    // Releases-download URL where the DSR release contract publishes
+    // install.sh.sha256.
     let sha_url = format!(
         "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/{normalized_tag}/install.sh.sha256"
     );
@@ -19839,6 +19855,44 @@ mod tests {
     fn test_update_installer_tag_rejects_non_semver_tags() {
         assert!(update_installer_tag(Some("../../main")).is_err());
         assert!(update_installer_tag(Some("main")).is_err());
+    }
+
+    #[test]
+    fn update_installer_refuses_missing_checksum() {
+        let temp_dir = InstallerTempDir::create().unwrap();
+        let script_path = temp_dir.path().join("install.ps1");
+        let checksum_path = temp_dir.path().join("install.ps1.sha256");
+        std::fs::write(&script_path, "Write-Host verified\n").unwrap();
+
+        let error = require_verified_installer(
+            &script_path,
+            &checksum_path,
+            "install.ps1",
+            false,
+        )
+        .expect_err("missing installer checksum must fail closed");
+
+        assert!(error.to_string().contains("install.ps1.sha256 is required"));
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to execute an unverified installer")
+        );
+    }
+
+    #[test]
+    fn update_installer_accepts_matching_checksum() {
+        use sha2::{Digest as _, Sha256};
+
+        let temp_dir = InstallerTempDir::create().unwrap();
+        let script_path = temp_dir.path().join("install.sh");
+        let checksum_path = temp_dir.path().join("install.sh.sha256");
+        let script = b"#!/bin/sh\necho verified\n";
+        let digest = format!("{:x}", Sha256::digest(script));
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::write(&checksum_path, format!("{digest}  install.sh\n")).unwrap();
+
+        require_verified_installer(&script_path, &checksum_path, "install.sh", true).unwrap();
     }
 
     #[test]
