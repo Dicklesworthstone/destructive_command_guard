@@ -11,6 +11,31 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.13.6](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.6) -- 2026-08-27 [Release]
+
+### Fixed
+
+- **Resolve literal executable assignments before per-pack evaluation.**
+  Straight-line POSIX forms such as `d=docker; $d system prune -af` now bind
+  the later segment to Docker and report `containers.docker:system-prune`
+  instead of borrowing flags into an unrelated Git rule. Dynamic assignments
+  remain fail-closed, and evaluated segments cannot hide a destructive command
+  later in the chain. ([#288], [#289])
+- **Allow new literal files inside home-directory worktrees.** A truncating
+  redirect to a currently absent literal target in an existing VCS worktree is
+  treated as creation. Existing files, symlinks, dynamic paths, missing
+  parents, system paths, and `.git` internals remain blocked; `dcg create-new`
+  remains the race-free exclusive-create path. ([#337])
+- **Guard GitHub repository visibility changes.** `gh repo edit --visibility`
+  now requires review under the GitHub platform pack. ([#354])
+
+[#288]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/288
+[#289]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/289
+[#337]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/337
+[#354]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/354
+
+---
+
 ## [v0.13.5](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.5) -- 2026-08-27 [Release]
 
 ### Security
