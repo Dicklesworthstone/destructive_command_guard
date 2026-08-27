@@ -11,12 +11,27 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.13.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.2) -- 2026-08-27 [Release]
+
+### Release integrity
+
+- **Route DSR signing through dcg's current release authority.** The v0.13.1
+  archives were signed on the build coordinator with dcg's retired
+  `36B847D11BA5A0D0` key, so current installers correctly rejected them. This
+  superseding patch is signed on the dedicated signing host with the embedded
+  `69B3955C8D2E62A8` trust root; the product and safety behavior from v0.13.1 is
+  otherwise unchanged.
+
+---
+
 ## [v0.13.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.1) -- 2026-08-27 [Release]
 
-This patch release turns the post-v0.13.0 safety and release hardening into a
-clean, signed distribution. It also substantially improves diagnostics,
-external-pack validation, OMP lifecycle safety, and the quality of suggested
-alternatives after a block.
+This patch release was intended to turn the post-v0.13.0 safety and release
+hardening into a clean, signed distribution. Its published archives were
+mistakenly signed with dcg's retired key and are therefore rejected by current
+installers; v0.13.2 supersedes it. The underlying changes substantially improve
+diagnostics, external-pack validation, OMP lifecycle safety, and the quality of
+suggested alternatives after a block.
 
 ### Security
 
