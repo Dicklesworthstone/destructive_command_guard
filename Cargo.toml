@@ -193,6 +193,11 @@ rich-output = ["dep:rich_rust"]  # Enable rich_rust for premium terminal output
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
+# `assert!(x.is_empty())` is idiomatic and reads clearly; this lint only asks for
+# `assert_eq!(x, "")` to get a nicer failure message. It fires on hundreds of test
+# assertions here with no defect behind any of them, and the suggestion is
+# type-specific so `clippy --fix` cannot apply it. Allowed per the convention above.
+assert_is_empty = "allow"
 # The pinned release nightly promotes two purely stylistic lints across the
 # entire mature codebase. Keep `-D warnings` meaningful for correctness lints
 # without forcing a behavior-neutral rewrite of hundreds of control-flow sites.
@@ -217,6 +222,11 @@ must_use_candidate = "allow"
 single_match_else = "allow"
 unnested_or_patterns = "allow"
 match_same_arms = "allow"
+# nursery lint with a message near-identical to match_same_arms. Same reasoning: the
+# two sites are long shell-dialect predicates inside the guard that decides whether a
+# destructive command runs; hoisting their shared trailing expression would
+# restructure that control flow for a stylistic gain.
+branches_sharing_code = "allow"
 needless_pass_by_value = "allow"
 similar_names = "allow"
 match_wildcard_for_single_variants = "allow"
