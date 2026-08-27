@@ -11762,6 +11762,205 @@ fn mask_posix_assignments_consumed_as_data<'a>(
     )
 }
 
+#[derive(Debug)]
+struct ResolvedPosixExecutableInvocation {
+    segment_range: std::ops::Range<usize>,
+    argv0_range: std::ops::Range<usize>,
+    replacement_len: usize,
+    command: String,
+}
+
+#[derive(Debug, Default)]
+struct PosixExecutableAssignmentModel {
+    inert_ranges: Vec<std::ops::Range<usize>>,
+    invocations: Vec<ResolvedPosixExecutableInvocation>,
+}
+
+/// Parse one assignment-only POSIX segment whose value is entirely literal.
+///
+/// The returned value keeps its original shell spelling so quoted executable
+/// paths remain one word when substituted into the later invocation. Dynamic
+/// values deliberately refuse the proof.
+fn literal_posix_executable_assignment(segment: &str) -> Option<(String, String)> {
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    let mut words = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word);
+    let token = words.next()?;
+    if words.next().is_some()
+        || tokens
+            .iter()
+            .any(|token| token.kind == NormalizeTokenKind::Separator)
+    {
+        return None;
+    }
+    let raw = token.text(segment)?;
+    let equals = raw.find('=')?;
+    let name = raw.get(..equals)?;
+    let raw_value = raw.get(equals + 1..)?;
+    if name.is_empty()
+        || raw_value.is_empty()
+        || !name.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphabetic() || byte == b'_' || index > 0 && byte.is_ascii_digit()
+        })
+        || contains_dynamic_shell_output(raw_value)
+    {
+        return None;
+    }
+    let decoded = shell_word_value(raw, ShellDialect::Posix)?;
+    let (decoded_name, decoded_value) = decoded.split_once('=')?;
+    if decoded_name != name || decoded_value.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), raw_value.to_string()))
+}
+
+/// Return an exact executable-position variable reference.
+fn posix_variable_argv0(segment: &str) -> Option<(String, std::ops::Range<usize>)> {
+    let token = tokenize_for_shell_dialect(segment, ShellDialect::Posix)
+        .into_iter()
+        .find(|token| token.kind == NormalizeTokenKind::Word)?;
+    let raw = token.text(segment)?;
+    let expansion = if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        inner
+    } else if raw.starts_with('\'') {
+        return None;
+    } else {
+        raw
+    };
+    let name = expansion
+        .strip_prefix('$')
+        .and_then(|value| value.strip_prefix('{'))
+        .and_then(|value| value.strip_suffix('}'))
+        .or_else(|| expansion.strip_prefix('$'))?;
+    if name.is_empty()
+        || !name.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphabetic() || byte == b'_' || index > 0 && byte.is_ascii_digit()
+        })
+    {
+        return None;
+    }
+    Some((name.to_string(), token.byte_range))
+}
+
+/// Build the bounded literal-assignment portion of #289's command model.
+///
+/// Only a straight-line prefix separated by semicolons or newlines
+/// participates. Pipelines, boolean control flow, functions, and arbitrary
+/// intervening commands refuse the proof rather than guessing about shell
+/// state. Each resolved invocation is evaluated independently, then its source
+/// bytes and the assignment-only segments are masked from the ordinary
+/// whole-command pass so another pack cannot misattribute their tokens.
+fn model_literal_posix_executable_assignments(
+    command: &str,
+    dialect: ShellDialect,
+) -> PosixExecutableAssignmentModel {
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return PosixExecutableAssignmentModel::default();
+    }
+    let ranges = top_level_segment_ranges(command);
+    if ranges.len() < 2
+        || ranges.windows(2).any(|pair| {
+            let separator = command.get(pair[0].1..pair[1].0).unwrap_or_default();
+            !separator
+                .chars()
+                .all(|ch| ch.is_ascii_whitespace() || ch == ';')
+        })
+    {
+        return PosixExecutableAssignmentModel::default();
+    }
+
+    let mut bindings = HashMap::<String, String>::new();
+    let mut model = PosixExecutableAssignmentModel::default();
+    for &(start, end) in &ranges {
+        let Some(segment) = command.get(start..end) else {
+            return PosixExecutableAssignmentModel::default();
+        };
+        if let Some((name, value)) = literal_posix_executable_assignment(segment) {
+            bindings.insert(name, value);
+            model.inert_ranges.push(start..end);
+            continue;
+        }
+        let Some((name, argv0_range)) = posix_variable_argv0(segment) else {
+            break;
+        };
+        let Some(replacement) = bindings.get(&name) else {
+            break;
+        };
+        let mut resolved = String::with_capacity(
+            segment.len() + replacement.len().saturating_sub(argv0_range.len()),
+        );
+        resolved.push_str(&segment[..argv0_range.start]);
+        resolved.push_str(replacement);
+        resolved.push_str(&segment[argv0_range.end..]);
+        model.inert_ranges.push(start..end);
+        model.invocations.push(ResolvedPosixExecutableInvocation {
+            segment_range: start..end,
+            argv0_range,
+            replacement_len: replacement.len(),
+            command: resolved,
+        });
+    }
+    if model.invocations.is_empty() {
+        return PosixExecutableAssignmentModel::default();
+    }
+    model
+}
+
+fn mask_modeled_posix_executable_assignments<'a>(
+    command: &'a str,
+    model: &PosixExecutableAssignmentModel,
+) -> Cow<'a, str> {
+    if model.invocations.is_empty() {
+        return Cow::Borrowed(command);
+    }
+    let mut masked = command.as_bytes().to_vec();
+    for range in &model.inert_ranges {
+        masked[range.clone()].fill(b' ');
+    }
+    Cow::Owned(
+        String::from_utf8(masked)
+            .expect("modeled POSIX segments are masked with same-length ASCII spaces"),
+    )
+}
+
+fn remap_modeled_posix_invocation_result(
+    result: &mut EvaluationResult,
+    invocation: &ResolvedPosixExecutableInvocation,
+    original: &str,
+) {
+    let Some(info) = result.pattern_info.as_mut() else {
+        return;
+    };
+    let Some(span) = info.matched_span else {
+        return;
+    };
+    let replacement_start = invocation.argv0_range.start;
+    let replacement_end = replacement_start.saturating_add(invocation.replacement_len);
+    let map_boundary = |offset: usize, is_end: bool| {
+        if offset <= replacement_start {
+            offset
+        } else if offset >= replacement_end {
+            invocation.argv0_range.end + offset - replacement_end
+        } else if is_end {
+            invocation.argv0_range.end
+        } else {
+            invocation.argv0_range.start
+        }
+    };
+    let mapped = MatchSpan {
+        start: invocation.segment_range.start + map_boundary(span.start, false),
+        end: invocation.segment_range.start + map_boundary(span.end, true),
+    };
+    if mapped.start <= mapped.end && mapped.end <= original.len() {
+        info.matched_span = Some(mapped);
+        info.matched_text_preview = Some(extract_match_preview(original, &mapped));
+    } else {
+        info.matched_span = None;
+        info.matched_text_preview = None;
+    }
+}
+
 fn resolve_project_path(
     heredoc_settings: &crate::config::HeredocSettings,
     project_path: Option<&Path>,
@@ -12555,12 +12754,15 @@ fn evaluate_command_in_single_dialect_view(
     let project_path = resolve_project_path(heredoc_settings, project_path);
     let project_path = project_path.as_deref();
 
+    let posix_executable_model = model_literal_posix_executable_assignments(command, shell_dialect);
+
     // Launcher and substitution evaluation recurses before the ordinary
     // full-command allowlist phase. Honor an authorization for the exact outer
     // command first, after explicit block overrides have already won above.
     // This does not consult rule selectors, so authorizing one outer envelope
     // cannot accidentally authorize arbitrary nested commands.
-    let checked_allow_once_before_nested = may_evaluate_nested_payload_before_allowlists(command);
+    let checked_allow_once_before_nested = may_evaluate_nested_payload_before_allowlists(command)
+        || !posix_executable_model.invocations.is_empty();
     if checked_allow_once_before_nested
         && (allow_once_match(command, allow_once_audit).is_some()
             || outer_command_allowlisted_before_nested_evaluation(
@@ -12571,6 +12773,46 @@ fn evaluate_command_in_single_dialect_view(
     {
         return EvaluationResult::allowed();
     }
+
+    // A straight-line `d=docker; $d system prune -af` carries enough static
+    // evidence to resolve `$d` before pack dispatch. Evaluate that concrete
+    // segment through the same recursive pipeline, then mask the original
+    // assignment and dynamic-argv0 spelling so unrelated rules cannot borrow
+    // their tokens (issue #289). A dynamic assignment keeps the established
+    // fail-closed path.
+    for invocation in &posix_executable_model.invocations {
+        let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+            &invocation.command,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            ShellDialect::Posix,
+            nested_command_depth + 1,
+            inherited_automated_stdin,
+        );
+        if nested_evaluation_incomplete(&result) || result.effective_mode.is_some() {
+            remap_modeled_posix_invocation_result(&mut result, invocation, command);
+            return result;
+        }
+        if heredoc_allowlist_hit.is_none()
+            && let Some(allowlist_override) = result.allowlist_override.take()
+        {
+            let mut matched = allowlist_override.matched;
+            matched.matched_span = None;
+            matched.matched_text_preview = None;
+            heredoc_allowlist_hit =
+                Some((matched, allowlist_override.layer, allowlist_override.reason));
+        }
+    }
+    let posix_executable_masked =
+        mask_modeled_posix_executable_assignments(command, &posix_executable_model);
+    let command = posix_executable_masked.as_ref();
 
     // PowerShell aliases created earlier in the same submitted script affect
     // command resolution in later statements. Expand only those visible,
@@ -20308,6 +20550,16 @@ fn evaluate_packs_with_allowlists_at_depth(
                 continue;
             }
 
+            // #337: a literal, currently absent target inside an existing
+            // home-directory worktree creates a new file rather than
+            // truncating one. Existing and unprovable targets stay denied.
+            if pattern.name == Some("redirect-truncate-root-home")
+                && pack_id == "core.filesystem"
+                && redirect_targets_are_new_worktree_files(command_for_packs, shell_dialect)
+            {
+                continue;
+            }
+
             // The rule matched a real redirect operator. Its target is now
             // known, so apply the rule-scoped target exemption (#284). Only
             // this rule stands down; every other pattern still sees the whole
@@ -22053,6 +22305,130 @@ fn powershell_null_device_redirects_only(command: &str, dialect: ShellDialect) -
     })
 }
 
+fn literal_home_redirect_path(raw: &str, home: &Path) -> Option<PathBuf> {
+    let (value, expands_home) = if let Some(inner) = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        (inner, true)
+    } else if let Some(inner) = raw
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        (inner, false)
+    } else {
+        (raw, true)
+    };
+    if value.is_empty()
+        || value.contains(['\\', '`', '*', '?', '[', ']'])
+        || value.contains(char::is_whitespace)
+    {
+        return None;
+    }
+
+    let path = if expands_home {
+        if value == "~" {
+            home.to_path_buf()
+        } else if let Some(suffix) = value.strip_prefix("~/") {
+            home.join(suffix)
+        } else if let Some(suffix) = value.strip_prefix("$HOME/") {
+            home.join(suffix)
+        } else if let Some(suffix) = value.strip_prefix("$HOME") {
+            if suffix.is_empty() {
+                home.to_path_buf()
+            } else {
+                return None;
+            }
+        } else if let Some(suffix) = value
+            .strip_prefix('$')
+            .and_then(|suffix| suffix.strip_prefix("{HOME}"))
+        {
+            if let Some(suffix) = suffix.strip_prefix('/') {
+                home.join(suffix)
+            } else if suffix.is_empty() {
+                home.to_path_buf()
+            } else {
+                return None;
+            }
+        } else {
+            if value.contains(['$', '~']) {
+                return None;
+            }
+            PathBuf::from(value)
+        }
+    } else {
+        if value.contains(['$', '~']) {
+            return None;
+        }
+        PathBuf::from(value)
+    };
+    path.is_absolute().then_some(path)
+}
+
+fn path_is_new_file_in_worktree(target: &Path, home: &Path) -> bool {
+    match fs::symlink_metadata(target) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return false,
+    }
+    if target
+        .components()
+        .any(|component| component.as_os_str() == ".git")
+    {
+        return false;
+    }
+    let Some(parent) = target.parent() else {
+        return false;
+    };
+    let Ok(parent) = fs::canonicalize(parent) else {
+        return false;
+    };
+    let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    if !parent.starts_with(&canonical_home) {
+        return false;
+    }
+
+    let mut cursor = Some(parent.as_path());
+    while let Some(directory) = cursor {
+        if !directory.starts_with(&canonical_home) {
+            break;
+        }
+        if fs::symlink_metadata(directory.join(".git")).is_ok() {
+            return true;
+        }
+        cursor = directory.parent();
+    }
+    false
+}
+
+fn redirect_targets_are_new_worktree_files_with_home(
+    command: &str,
+    dialect: ShellDialect,
+    home: &Path,
+) -> bool {
+    let Some(targets) = unquoted_output_redirect_targets(command, dialect) else {
+        return false;
+    };
+    targets.into_iter().all(|raw| {
+        literal_home_redirect_path(&raw, home)
+            .is_some_and(|target| path_is_new_file_in_worktree(&target, home))
+    })
+}
+
+/// Suppress the home-path truncation rule only when every redirect target is a
+/// currently absent literal file inside an existing VCS worktree.
+///
+/// This is intentionally evaluated only after the destructive redirect regex
+/// has matched, so ordinary hook traffic pays no filesystem cost. Existing
+/// files, symlinks, missing parents, dynamic targets, system paths, and `.git`
+/// internals remain denied. The existence check cannot make the shell's later
+/// open atomic; callers needing race-free exclusive creation should use
+/// `dcg create-new`.
+fn redirect_targets_are_new_worktree_files(command: &str, dialect: ShellDialect) -> bool {
+    dirs::home_dir().is_some_and(|home| {
+        redirect_targets_are_new_worktree_files_with_home(command, dialect, &home)
+    })
+}
+
 /// Whether a matched `core.filesystem` redirect rule is suppressed by a
 /// configured `[rules."core.filesystem:<name>"] exempt_target_globs` (#284).
 ///
@@ -23285,6 +23661,11 @@ fn evaluate_pack_destructive_patterns(
             // `powershell_null_device_redirects_only`.
             if pattern.name == Some("redirect-truncate-dynamic-path")
                 && powershell_null_device_redirects_only(redirect_syntax_command, shell_dialect)
+            {
+                continue;
+            }
+            if pattern.name == Some("redirect-truncate-root-home")
+                && redirect_targets_are_new_worktree_files(redirect_syntax_command, shell_dialect)
             {
                 continue;
             }
@@ -30787,6 +31168,163 @@ mod tests {
                 result.pattern_info
             );
         }
+    }
+
+    #[test]
+    fn literal_assignment_resolves_dynamic_argv0_to_the_owning_pack() {
+        let cases = [
+            (
+                "d=docker; $d system prune -af",
+                &["core.git", "containers.docker"][..],
+                "containers.docker",
+                "system-prune",
+            ),
+            (
+                "x=chmod; $x -R 755 /etc",
+                &["core.git", "system.permissions"][..],
+                "system.permissions",
+                "chmod-recursive-root",
+            ),
+            (
+                "g=git; $g reset --hard",
+                &["core.git", "containers.docker"][..],
+                "core.git",
+                "reset-hard",
+            ),
+        ];
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for (command, packs, expected_pack, expected_rule) in cases {
+                let result = evaluate_with_pack_ids_in_dialect(command, packs, dialect);
+                assert!(
+                    result.is_denied(),
+                    "resolved destructive argv0 must deny ({dialect:?}): {command}: {:?}",
+                    result.pattern_info
+                );
+                let info = result.pattern_info.expect("denial carries attribution");
+                assert_eq!(info.pack_id.as_deref(), Some(expected_pack), "{command}");
+                assert_eq!(
+                    info.pattern_name.as_deref(),
+                    Some(expected_rule),
+                    "{command}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn literal_assignment_argv0_model_preserves_benign_and_chained_controls() {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                "x=echo; $x 'docker system prune -af'",
+                &["core.git", "core.filesystem", "containers.docker"],
+                dialect,
+            );
+            assert!(
+                result.is_allowed(),
+                "resolved benign executable must not lend argument data to docker ({dialect:?}): {:?}",
+                result.pattern_info
+            );
+
+            let result = evaluate_with_pack_ids_in_dialect(
+                "x=echo; $x safe; rm -rf /",
+                &["core.git", "core.filesystem", "containers.docker"],
+                dialect,
+            );
+            assert!(
+                result.is_denied(),
+                "masking the resolved segment must not hide destruction later ({dialect:?})"
+            );
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pack_id.as_deref()),
+                Some("core.filesystem")
+            );
+
+            let result = evaluate_with_pack_ids_in_dialect(
+                "x=$OTHER; $x system prune -af",
+                &["core.git", "containers.docker"],
+                dialect,
+            );
+            assert!(
+                result.is_denied(),
+                "dynamic assignment must retain fail-closed behavior ({dialect:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn new_literal_home_redirects_are_allowed_only_inside_worktrees() {
+        let home = tempfile::tempdir().expect("temp home");
+        let repo = home.path().join("repo");
+        let nested = repo.join("docs");
+        fs::create_dir_all(repo.join(".git")).expect("git marker");
+        fs::create_dir_all(&nested).expect("nested directory");
+        let existing = nested.join("existing.md");
+        fs::write(&existing, b"keep").expect("existing fixture");
+
+        assert!(redirect_targets_are_new_worktree_files_with_home(
+            "echo hi > ~/repo/docs/new.md",
+            ShellDialect::Posix,
+            home.path(),
+        ));
+        assert!(redirect_targets_are_new_worktree_files_with_home(
+            &format!("echo hi > {}/docs/new-absolute.md", repo.display()),
+            ShellDialect::Posix,
+            home.path(),
+        ));
+        assert!(!redirect_targets_are_new_worktree_files_with_home(
+            "echo hi > ~/repo/docs/existing.md",
+            ShellDialect::Posix,
+            home.path(),
+        ));
+        assert!(!redirect_targets_are_new_worktree_files_with_home(
+            "echo hi > ~/repo/missing-parent/new.md",
+            ShellDialect::Posix,
+            home.path(),
+        ));
+        assert!(!redirect_targets_are_new_worktree_files_with_home(
+            "echo hi > ~/repo/.git/new-control-file",
+            ShellDialect::Posix,
+            home.path(),
+        ));
+        assert!(!redirect_targets_are_new_worktree_files_with_home(
+            "echo hi > $TARGET",
+            ShellDialect::Posix,
+            home.path(),
+        ));
+        assert!(!redirect_targets_are_new_worktree_files_with_home(
+            "echo hi > /etc/new-dcg-file",
+            ShellDialect::Posix,
+            home.path(),
+        ));
+        assert!(!redirect_targets_are_new_worktree_files_with_home(
+            "echo hi > ~/repo/docs/new.md > ~/repo/docs/existing.md",
+            ShellDialect::Posix,
+            home.path(),
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_worktree_redirect_refuses_existing_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().expect("temp home");
+        let repo = home.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).expect("git marker");
+        let target = repo.join("real.md");
+        let link = repo.join("new-looking.md");
+        fs::write(&target, b"keep").expect("target fixture");
+        symlink(&target, &link).expect("symlink fixture");
+
+        assert!(!redirect_targets_are_new_worktree_files_with_home(
+            "echo hi > ~/repo/new-looking.md",
+            ShellDialect::Posix,
+            home.path(),
+        ));
+        assert_eq!(fs::read(target).expect("target unchanged"), b"keep");
     }
 
     #[test]
