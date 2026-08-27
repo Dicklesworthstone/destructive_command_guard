@@ -47,6 +47,7 @@ use destructive_command_guard::pending_exceptions::{
     MaintenanceRecheck, PendingExceptionStore, PersistBudget, log_maintenance,
 };
 use destructive_command_guard::perf::{Deadline, HOOK_EVALUATION_BUDGET};
+use destructive_command_guard::update::{GIT_DESCRIBE, GIT_SHA};
 // Import HookInput for parsing stdin JSON in hook mode
 #[cfg(test)]
 use destructive_command_guard::hook::HookInput;
@@ -65,13 +66,6 @@ const RUSTC_COMMIT_HASH: Option<&str> = option_env!("VERGEN_RUSTC_COMMIT_HASH");
 const RUSTC_COMMIT_DATE: Option<&str> = option_env!("VERGEN_RUSTC_COMMIT_DATE");
 const RUSTC_HOST_TRIPLE: Option<&str> = option_env!("VERGEN_RUSTC_HOST_TRIPLE");
 const CARGO_TARGET: Option<&str> = option_env!("VERGEN_CARGO_TARGET_TRIPLE");
-// Git provenance (#320): `git describe --tags --dirty` at build time. Absent
-// (or the vergen placeholder) outside a git checkout.
-const GIT_DESCRIBE: Option<&str> = option_env!("VERGEN_GIT_DESCRIBE");
-// Full Git object id at build time. `build.rs` deliberately disables vergen's
-// short form so certificate tooling can bind a binary to one exact commit even
-// when `git describe` collapses to a release tag.
-const GIT_SHA: Option<&str> = option_env!("VERGEN_GIT_SHA");
 
 // NOTE: HookInput, ToolInput, HookOutput, HookSpecificOutput types are now defined
 // in the hook module. Use hook::HookInput, hook::read_hook_input(), etc.

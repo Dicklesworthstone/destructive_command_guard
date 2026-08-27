@@ -5,6 +5,12 @@
 
 use vergen_gix::{Build, Cargo, Emitter, Gix, Rustc};
 
+const DSR_RELEASE_GIT_SHA: &str = "DSR_RELEASE_GIT_SHA";
+const DSR_RELEASE_GIT_REF: &str = "DSR_RELEASE_GIT_REF";
+const EMBEDDED_GIT_SHA: &str = "DCG_DSR_GIT_SHA";
+const EMBEDDED_GIT_DESCRIBE: &str = "DCG_DSR_GIT_DESCRIBE";
+const EMBEDDED_RELEASE_BUILD: &str = "DCG_DSR_RELEASE_BUILD";
+
 fn main() {
     // Emit build metadata as environment variables at compile time
     let build = Build::builder().build_timestamp(true).build();
@@ -31,10 +37,10 @@ fn main() {
         .dirty(false)
         .build();
 
-    // Make the explicit release-channel marker (#320) rebuild-aware: release
-    // pipelines (dist.yml, DSR) export DCG_RELEASE_BUILD=1 so the binary can
-    // prove it was produced by a release pipeline rather than a dev checkout.
+    // Make the legacy explicit release-channel marker (#320) rebuild-aware.
+    // Strict DSR builds use the stronger exact source identity below.
     println!("cargo:rerun-if-env-changed=DCG_RELEASE_BUILD");
+    emit_dsr_release_provenance();
 
     let mut emitter = Emitter::default();
 
@@ -61,6 +67,67 @@ fn main() {
     }
 
     embed_windows_resources();
+}
+
+/// Embed the source identity that DSR already validated before creating its
+/// tracked-byte release snapshot.
+///
+/// Strict DSR snapshots intentionally omit `.git`, so `vergen-gix` cannot
+/// discover a commit from inside them. DSR supplies the exact SHA and tag as
+/// explicit build inputs instead. Both values must agree with this package's
+/// version, and the output variable names are reserved so ambient shell state
+/// cannot impersonate build-script output.
+fn emit_dsr_release_provenance() {
+    for name in [
+        DSR_RELEASE_GIT_SHA,
+        DSR_RELEASE_GIT_REF,
+        EMBEDDED_GIT_SHA,
+        EMBEDDED_GIT_DESCRIBE,
+        EMBEDDED_RELEASE_BUILD,
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+
+    for reserved in [
+        EMBEDDED_GIT_SHA,
+        EMBEDDED_GIT_DESCRIBE,
+        EMBEDDED_RELEASE_BUILD,
+    ] {
+        assert!(
+            std::env::var_os(reserved).is_none(),
+            "{reserved} is reserved for dcg build-script output"
+        );
+    }
+
+    let sha = std::env::var(DSR_RELEASE_GIT_SHA).ok();
+    let git_ref = std::env::var(DSR_RELEASE_GIT_REF).ok();
+    let (sha, git_ref) = match (sha, git_ref) {
+        (None, None) => return,
+        (Some(sha), Some(git_ref)) => (sha, git_ref),
+        _ => panic!("DSR release provenance requires both a Git SHA and tag"),
+    };
+
+    assert!(
+        is_full_lowercase_git_sha(&sha),
+        "DSR release provenance supplied an invalid full Git SHA"
+    );
+    let expected_ref = format!("v{}", env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        git_ref, expected_ref,
+        "DSR release provenance tag does not match the package version"
+    );
+
+    println!("cargo:rustc-env={EMBEDDED_GIT_SHA}={sha}");
+    println!("cargo:rustc-env={EMBEDDED_GIT_DESCRIBE}={git_ref}");
+    println!("cargo:rustc-env={EMBEDDED_RELEASE_BUILD}=1");
+}
+
+fn is_full_lowercase_git_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && value.bytes().any(|byte| byte != b'0')
 }
 
 /// Embed a VERSIONINFO resource and an application manifest into the Windows

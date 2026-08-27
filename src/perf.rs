@@ -498,6 +498,17 @@ mod tests {
             build_script.contains(".sha(false)"),
             "build.rs must embed the full Git object id, not vergen's short SHA"
         );
+        for required_dsr_binding in [
+            "DSR_RELEASE_GIT_SHA",
+            "DSR_RELEASE_GIT_REF",
+            "DCG_DSR_GIT_SHA",
+            "DCG_DSR_GIT_DESCRIBE",
+        ] {
+            assert!(
+                build_script.contains(required_dsr_binding),
+                "build.rs must bridge strict DSR source identity through {required_dsr_binding}"
+            );
+        }
         assert!(
             main_source.contains("Git SHA: {sha}"),
             "dcg --version must expose the embedded full Git SHA for the certificate"

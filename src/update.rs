@@ -594,19 +594,36 @@ pub const fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+const fn prefer_dsr_metadata<'a>(dsr: Option<&'a str>, vergen: Option<&'a str>) -> Option<&'a str> {
+    match dsr {
+        Some(value) => Some(value),
+        None => vergen,
+    }
+}
+
 /// `git describe --tags --dirty` captured at compile time by `build.rs`
-/// (#320). Absent outside a git checkout (registry tarball installs).
-const GIT_DESCRIBE: Option<&str> = option_env!("VERGEN_GIT_DESCRIBE");
+/// (#320). Strict DSR snapshots use their prevalidated release tag because the
+/// tracked-byte build root intentionally has no `.git` directory.
+pub const GIT_DESCRIBE: Option<&str> = prefer_dsr_metadata(
+    option_env!("DCG_DSR_GIT_DESCRIBE"),
+    option_env!("VERGEN_GIT_DESCRIBE"),
+);
 
 /// Full commit SHA captured at compile time by `build.rs`.
-pub const GIT_SHA: Option<&str> = option_env!("VERGEN_GIT_SHA");
+pub const GIT_SHA: Option<&str> = prefer_dsr_metadata(
+    option_env!("DCG_DSR_GIT_SHA"),
+    option_env!("VERGEN_GIT_SHA"),
+);
 
-/// Explicit release-pipeline fallback marker (#320): dist.yml and the DSR
-/// runbook export `DCG_RELEASE_BUILD=1` around `cargo build`, so a published
-/// binary can prove its provenance when the build environment's git metadata
-/// is unavailable (shallow CI checkouts). Usable git metadata remains
-/// authoritative, so this marker cannot bless a dirty or ahead-of-tag build.
-const RELEASE_BUILD_MARKER: Option<&str> = option_env!("DCG_RELEASE_BUILD");
+/// Explicit release-pipeline fallback marker (#320). Strict DSR builds emit
+/// their marker only after the supplied SHA and tag have passed build-script
+/// validation; legacy release builders may still export `DCG_RELEASE_BUILD=1`.
+/// Usable git metadata remains authoritative, so neither marker can bless a
+/// dirty or ahead-of-tag build.
+const RELEASE_BUILD_MARKER: Option<&str> = prefer_dsr_metadata(
+    option_env!("DCG_DSR_RELEASE_BUILD"),
+    option_env!("DCG_RELEASE_BUILD"),
+);
 
 /// Where this binary came from, as far as compile-time metadata can prove
 /// (#320).
@@ -960,6 +977,19 @@ fn disable_env_flag_enabled(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dsr_release_identity_precedes_git_discovery_fallbacks() {
+        assert_eq!(
+            prefer_dsr_metadata(Some("certified"), Some("discovered")),
+            Some("certified")
+        );
+        assert_eq!(
+            prefer_dsr_metadata(None, Some("discovered")),
+            Some("discovered")
+        );
+        assert_eq!(prefer_dsr_metadata(None, None), None);
+    }
 
     /// #320/#344: a release marker is fallback evidence for builds where git
     /// metadata is unavailable, not permission to contradict explicit git
