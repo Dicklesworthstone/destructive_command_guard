@@ -475,6 +475,8 @@ platform.github:
     reason: "Deletes repository"
   - command: "gh repo delete owner/repo --yes"
     reason: "Deletes repository without confirmation"
+  - command: "gh repo edit owner/repo --visibility private --accept-visibility-change-consequences"
+    reason: "Changes repository visibility with potentially irreversible side effects"
   - command: "gh repo archive owner/repo"
     reason: "Archives repository"
   - command: "gh gist delete 12345"

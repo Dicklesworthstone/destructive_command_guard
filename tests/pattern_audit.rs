@@ -728,6 +728,7 @@ fn test_audit_backtracking_requirements() {
                 "gh-repo-deploy-key-delete",
                 "gh-repo-list-view",
                 "gh-run-cancel",
+                "gh-repo-visibility-change",
                 "gh-secret-delete",
                 "gh-secret-list",
                 "gh-ssh-key-delete",

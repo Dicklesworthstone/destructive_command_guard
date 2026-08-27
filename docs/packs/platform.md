@@ -16,7 +16,7 @@ This document describes packs in the `platform` category.
 
 **Pack ID:** `platform.github`
 
-Protects against destructive GitHub CLI operations like deleting repositories, gists, releases, or SSH keys.
+Protects against destructive GitHub CLI operations like changing repository visibility or deleting repositories, gists, releases, or SSH keys.
 
 ### Keywords
 
@@ -48,6 +48,7 @@ These patterns match potentially destructive commands:
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
 | `gh-repo-delete` | gh repo delete permanently deletes a GitHub repository. This cannot be undone. | high |
+| `gh-repo-visibility-change` | gh repo edit --visibility changes repository visibility and can remove stars or detach forks. | high |
 | `gh-repo-archive` | gh repo archive makes a repository read-only. While reversible, it stops all write access. | high |
 | `gh-gist-delete` | gh gist delete permanently deletes a Gist. | high |
 | `gh-release-delete` | gh release delete permanently deletes a release. | high |

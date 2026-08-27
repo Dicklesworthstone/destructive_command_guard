@@ -3,6 +3,7 @@
 //! This pack targets high-impact operations when managing GitHub repositories,
 //! gists, releases, and other platform resources:
 //! - Deleting repositories
+//! - Changing repository visibility
 //! - Archiving repositories
 //! - Deleting gists
 //! - Deleting releases
@@ -18,7 +19,7 @@ pub fn create_pack() -> Pack {
     Pack {
         id: "platform.github".to_string(),
         name: "GitHub Platform",
-        description: "Protects against destructive GitHub CLI operations like deleting repositories, gists, releases, or SSH keys.",
+        description: "Protects against destructive GitHub CLI operations like changing repository visibility or deleting repositories, gists, releases, or SSH keys.",
         // Broad on purpose: global `gh` flags can appear before the subcommand.
         keywords: &["gh"],
         safe_patterns: create_safe_patterns(),
@@ -114,22 +115,36 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Safer alternatives:\n\
              - gh repo archive: makes it read-only while keeping everything visible \
              (dcg gates this one too, but it is reversible)\n\
-             - gh repo edit --visibility private: hides it without destroying it",
+             - gh repo view: confirms the target before any destructive action",
             &const {
                 [
                     PatternSuggestion::new(
-                        "gh repo edit <owner>/<repo> --visibility private",
-                        "Hide the repository without destroying it",
+                        "gh repo view <owner>/<repo> --json name,visibility,isPrivate,pushedAt",
+                        "Confirm which repository you are about to act on",
                     ),
                     PatternSuggestion::gated(
                         "gh repo archive <owner>/<repo>",
                         "Read-only instead of deleted (reversible)",
                     ),
-                    PatternSuggestion::new(
-                        "gh repo view <owner>/<repo> --json name,isPrivate,pushedAt",
-                        "Confirm which repository you are about to act on",
-                    ),
                 ]
+            }
+        ),
+        destructive_pattern!(
+            "gh-repo-visibility-change",
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+repo\s+edit\b(?:\s+(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--visibility(?:=|\s+))[^\s;&|]+))*\s+--visibility(?:=|\s+)(?:(?:\x22[^\x22]+\x22)|(?:'[^']+')|[^\s;&|]+)",
+            "gh repo edit --visibility changes repository visibility and can remove stars or detach forks.",
+            High,
+            "Changing repository visibility has consequences beyond access control. \
+             GitHub warns that a transition can remove stars and watchers, detach public \
+             forks, disable push rulesets, and expose Actions history or logs to newly \
+             eligible users. Treat every visibility transition as a consequential \
+             repository mutation and obtain explicit approval for the exact repository \
+             and target visibility.",
+            &const {
+                [PatternSuggestion::new(
+                    "gh repo view <owner>/<repo> --json nameWithOwner,visibility,isPrivate",
+                    "Inspect the current repository and visibility before requesting approval",
+                )]
             }
         ),
         destructive_pattern!(
@@ -531,6 +546,18 @@ mod tests {
         let checks = vec![
             ("gh repo delete owner/repo", "gh-repo-delete"),
             ("gh -R owner/repo repo delete", "gh-repo-delete"),
+            (
+                "gh repo edit owner/repo --visibility private --accept-visibility-change-consequences",
+                "gh-repo-visibility-change",
+            ),
+            (
+                "gh repo edit --visibility=internal owner/repo",
+                "gh-repo-visibility-change",
+            ),
+            (
+                "gh -R owner/repo repo edit --visibility public",
+                "gh-repo-visibility-change",
+            ),
             ("gh repo archive owner/repo", "gh-repo-archive"),
             ("gh gist delete 123", "gh-gist-delete"),
             ("gh release delete v1.0", "gh-release-delete"),
@@ -577,6 +604,11 @@ mod tests {
     fn github_blocks_each_destructive_pattern() {
         let pack = create_pack();
         assert_blocks_with_pattern(&pack, "gh repo delete owner/repo", "gh-repo-delete");
+        assert_blocks_with_pattern(
+            &pack,
+            "gh repo edit owner/repo --visibility private --accept-visibility-change-consequences",
+            "gh-repo-visibility-change",
+        );
         assert_blocks_with_pattern(&pack, "gh repo archive owner/repo", "gh-repo-archive");
         assert_blocks_with_pattern(&pack, "gh gist delete 123", "gh-gist-delete");
         assert_blocks_with_pattern(&pack, "gh release delete v1.0", "gh-release-delete");
@@ -686,6 +718,11 @@ mod tests {
         let pack = create_pack();
         // All github destructive patterns use default severity (High)
         assert_blocks_with_severity(&pack, "gh repo delete owner/repo", Severity::High);
+        assert_blocks_with_severity(
+            &pack,
+            "gh repo edit owner/repo --visibility private",
+            Severity::High,
+        );
         assert_blocks_with_severity(&pack, "gh repo archive owner/repo", Severity::High);
         assert_blocks_with_severity(&pack, "gh gist delete 123", Severity::High);
         assert_blocks_with_severity(&pack, "gh release delete v1.0", Severity::High);
@@ -779,6 +816,11 @@ mod tests {
         let pack = create_pack();
         assert_no_match(&pack, "git status");
         assert_no_match(&pack, "echo hello");
+        assert_no_match(
+            &pack,
+            "gh repo edit acme/widgets --description \"--visibility private\"",
+        );
+        assert_no_match(&pack, "gh repo edit acme/widgets --enable-issues");
     }
 
     /// A denial that recommends a command this same pack blocks is a dead end
