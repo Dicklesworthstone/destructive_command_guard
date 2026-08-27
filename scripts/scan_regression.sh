@@ -6,7 +6,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-DCG="${PROJECT_DIR}/target/release/dcg"
+DCG="${DCG_SCAN_REGRESSION_BIN:-${PROJECT_DIR}/target/release/dcg}"
 FIXTURES_DIR="${PROJECT_DIR}/tests/fixtures/scan"
 EXPECTED="${FIXTURES_DIR}/expected_output.json"
 if [ -n "${DCG_SCAN_REGRESSION_ACTUAL:-}" ]; then
@@ -17,7 +17,7 @@ fi
 
 # Check prerequisites
 if [ ! -f "$DCG" ]; then
-    echo "Error: Release binary not found at $DCG"
+    echo "Error: dcg binary not found at $DCG"
     echo "Run: cargo build --release"
     exit 1
 fi
@@ -32,7 +32,11 @@ echo "Binary: $DCG"
 echo "Fixtures: $FIXTURES_DIR"
 
 # Run scan and capture output (stderr goes to /dev/null to avoid corrupting JSON)
-"$DCG" scan --paths "$FIXTURES_DIR" --format json --top 0 > "$ACTUAL" 2>/dev/null || true
+# The golden intentionally exercises optional PostgreSQL and Docker rules in
+# addition to the default core packs. Keep that scope explicit so the gate does
+# not silently lose those findings when runtime defaults change.
+"$DCG" scan --paths "$FIXTURES_DIR" --format json --top 0 \
+    --with-packs database.postgresql,containers.docker > "$ACTUAL" 2>/dev/null || true
 
 # Compare the complete deterministic scan contract. The scanner receives an
 # absolute fixture path, while the checked-in golden uses repository-relative
