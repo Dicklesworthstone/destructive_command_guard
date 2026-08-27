@@ -602,7 +602,9 @@ const fn prefer_dsr_metadata<'a>(dsr: Option<&'a str>, vergen: Option<&'a str>) 
 }
 
 /// `git describe --tags --dirty` captured at compile time by `build.rs`
-/// (#320). Strict DSR snapshots use their prevalidated release tag because the
+/// (#320).
+///
+/// Strict DSR snapshots use their prevalidated release tag because the
 /// tracked-byte build root intentionally has no `.git` directory.
 pub const GIT_DESCRIBE: Option<&str> = prefer_dsr_metadata(
     option_env!("DCG_DSR_GIT_DESCRIBE"),
