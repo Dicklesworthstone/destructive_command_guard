@@ -153,7 +153,7 @@ fn exercise_heredoc_pipeline(command: &str) {
         ExtractionResult::NoContent
         | ExtractionResult::Skipped(_)
         | ExtractionResult::Failed(_) => {
-            assert_budget_deadline_fails_open(command);
+            assert_budget_deadline_is_indeterminate(command);
         }
     }
 }
@@ -211,7 +211,7 @@ fn validate_ast_matches(code: &str, language: ScriptLanguage) {
     );
 }
 
-fn assert_budget_deadline_fails_open(command: &str) {
+fn assert_budget_deadline_is_indeterminate(command: &str) {
     let deadline = Deadline::new(Duration::ZERO);
     while !deadline.is_exceeded() {
         std::hint::spin_loop();
@@ -227,6 +227,6 @@ fn assert_budget_deadline_fails_open(command: &str) {
         Some(&deadline),
     );
 
-    assert!(result.is_allowed());
+    assert!(result.is_indeterminate());
     assert!(result.skipped_due_to_budget);
 }
