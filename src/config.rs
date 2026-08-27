@@ -9584,9 +9584,17 @@ low = "disabled"
             ConfigFileAuthority::EnforcementOnly,
             true,
         );
-        assert!(traced_layer.is_some());
         let traced_outcome = traced_outcome.expect("tracing requested");
-        assert_eq!(traced_outcome.status, ConfigFileStatus::Loaded);
+        #[cfg(unix)]
+        {
+            assert!(traced_layer.is_some());
+            assert_eq!(traced_outcome.status, ConfigFileStatus::Loaded);
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(traced_layer.is_none());
+            assert_eq!(traced_outcome.status, ConfigFileStatus::IgnoredUnsupported);
+        }
         assert_eq!(
             traced_outcome.authority,
             ConfigFileAuthority::EnforcementOnly

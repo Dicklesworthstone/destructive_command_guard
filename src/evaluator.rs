@@ -26973,12 +26973,14 @@ mod tests {
             std::fs::write(&dangerous, dangerous_body).expect("write dangerous client script");
             std::fs::write(&safe, safe_body).expect("write safe client script");
 
-            let dangerous_command = format!("{prefix} {}{suffix}", dangerous.display());
+            let dangerous_arg = dangerous.to_string_lossy().replace('\\', "/");
+            let dangerous_command = format!("{prefix} {dangerous_arg}{suffix}");
             assert!(
                 evaluate_with_pack_ids(&dangerous_command, &[pack_id]).is_denied(),
                 "destructive executable file must block: {dangerous_command}"
             );
-            let safe_command = format!("{prefix} {}{suffix}", safe.display());
+            let safe_arg = safe.to_string_lossy().replace('\\', "/");
+            let safe_command = format!("{prefix} {safe_arg}{suffix}");
             assert!(
                 evaluate_with_pack_ids(&safe_command, &[pack_id]).is_allowed(),
                 "safe executable file must remain allowed: {safe_command}"
@@ -27552,10 +27554,13 @@ mod tests {
         std::fs::write(&dangerous, "e rm -rf /\n").expect("write dangerous sed program");
         std::fs::write(&dynamic, "e $DCG_TEST_COMMAND\n").expect("write dynamic sed program");
         std::fs::write(&safe, "s/foo/bar/g\n").expect("write safe sed program");
+        let dangerous_arg = dangerous.to_string_lossy().replace('\\', "/");
+        let dynamic_arg = dynamic.to_string_lossy().replace('\\', "/");
+        let safe_arg = safe.to_string_lossy().replace('\\', "/");
 
         for command in [
-            format!("sed -f {} input.txt", dangerous.display()),
-            format!("sed -nf{} input.txt", dangerous.display()),
+            format!("sed -f {dangerous_arg} input.txt"),
+            format!("sed -nf{dangerous_arg} input.txt"),
         ] {
             assert!(
                 evaluate_with_pack_ids(&command, &["core.filesystem"]).is_denied(),
@@ -27564,7 +27569,7 @@ mod tests {
         }
 
         let dynamic_result = evaluate_with_pack_ids(
-            &format!("sed --file={} input.txt", dynamic.display()),
+            &format!("sed --file={dynamic_arg} input.txt"),
             &["core.filesystem"],
         );
         assert!(dynamic_result.is_denied());
@@ -27578,7 +27583,7 @@ mod tests {
 
         assert!(
             evaluate_with_pack_ids(
-                &format!("sed -f {} input.txt", safe.display()),
+                &format!("sed -f {safe_arg} input.txt"),
                 &["core.filesystem"],
             )
             .is_allowed(),
@@ -27587,11 +27592,7 @@ mod tests {
 
         assert!(
             evaluate_with_pack_ids(
-                &format!(
-                    "printf 'e rm -rf /' > {}; sed -f {} input.txt",
-                    safe.display(),
-                    safe.display()
-                ),
+                &format!("printf 'e rm -rf /' > {safe_arg}; sed -f {safe_arg} input.txt"),
                 &["core.filesystem"],
             )
             .is_denied(),

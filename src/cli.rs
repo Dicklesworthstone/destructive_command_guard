@@ -25281,21 +25281,34 @@ exclude = ["target/**"]
     }
 
     #[test]
-    fn get_staged_files_handles_spaces_and_newlines() {
+    fn get_staged_files_handles_spaces() {
         let repo = init_fixture_repo();
 
         std::fs::write(repo.path().join("hello world.rs"), "x").expect("write");
-        std::fs::write(repo.path().join("weird\nname.rs"), "y").expect("write");
-        run_git(repo.path(), &["add", "hello world.rs", "weird\nname.rs"]);
+        run_git(repo.path(), &["add", "hello world.rs"]);
 
         let paths = get_staged_files_at(repo.path()).expect("staged files");
-        let rendered: Vec<String> = paths
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == std::path::Path::new("hello world.rs"))
+        );
+    }
 
-        assert!(rendered.contains(&"hello world.rs".to_string()));
-        assert!(rendered.contains(&"weird\nname.rs".to_string()));
+    #[cfg(unix)]
+    #[test]
+    fn get_staged_files_handles_newlines() {
+        let repo = init_fixture_repo();
+
+        std::fs::write(repo.path().join("weird\nname.rs"), "y").expect("write");
+        run_git(repo.path(), &["add", "weird\nname.rs"]);
+
+        let paths = get_staged_files_at(repo.path()).expect("staged files");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == std::path::Path::new("weird\nname.rs"))
+        );
     }
 
     #[test]
