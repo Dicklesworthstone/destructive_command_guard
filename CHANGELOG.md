@@ -11,6 +11,24 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.13.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.4) -- 2026-08-27 [Release]
+
+### Release integrity
+
+- **Verify tag-pinned installer bytes before execution.** The real fleet gate
+  now downloads the same tagged `install.sh` / `install.ps1` bytes used by
+  `dcg update`, requires their adjacent SHA256 sidecars, and verifies the digest
+  before invoking either script.
+- **Ship signed installer scripts in the strict DSR contract.** Both installers,
+  their checksum sidecars, and their current-key minisign signatures join the
+  six signed binary archives in the exact public asset set. This closes the
+  installer-authentication gap found while replaying the v0.12.5 updater path.
+  ([#353])
+
+[#353]: https://github.com/Dicklesworthstone/destructive_command_guard/issues/353
+
+---
+
 ## [v0.13.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.3) -- 2026-08-27 [Release]
 
 ### Release integrity
