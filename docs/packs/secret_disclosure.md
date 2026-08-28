@@ -12,7 +12,7 @@ This document describes packs in the `secret_disclosure` category.
 
 **Pack ID:** `secret_disclosure`
 
-Opt-in protection against secret-manager commands that emit credential values to stdout and therefore into an agent transcript.
+Opt-in protection against secret-manager commands that expose credential values through agent-visible output or agent-chosen files.
 
 ### Keywords
 

@@ -11,6 +11,24 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.13.9](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.9) -- 2026-08-27 [Release]
+
+### Fixed
+
+- **Close Windows executable-spelling gaps in scoped pack rules.** Executable
+  scoping now treats `.cmd`, `.bat`, and `.com` like `.exe` in the native Cmd
+  dialect, matching the documented contract and preserving protection through
+  `CALL`, `IF`, `START`, and `FOR`. The Infisical and disclosure rules also
+  match case-insensitive Windows executable names and suffixes explicitly.
+- **Complete opt-in secret-disclosure coverage without blocking help.** The
+  disclosure pack now catches redirected bare Infisical listings, AWS Secrets
+  Manager batch reads, and all decrypted SSM parameter-read variants. Safe
+  `-h`, `--help`, and AWS `help` invocations remain available, including when
+  nested secret reads still require denial. The pack now retains service-tier
+  attribution ahead of the broader Windows egress preset.
+
+---
+
 ## [v0.13.8](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.8) -- 2026-08-27 [Release]
 
 ### Added

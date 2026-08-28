@@ -1,4 +1,4 @@
-//! Opt-in guard against commands that print secret values to agent transcripts.
+//! Opt-in guard against commands that expose secret values to agent-visible output.
 //!
 //! This is deliberately separate from the ordinary `secrets.*` destruction
 //! packs. It changes policy from "prevent mutation" to "prevent disclosure"
@@ -13,8 +13,8 @@ pub fn create_pack() -> Pack {
     Pack {
         id: "secret_disclosure".to_string(),
         name: "Secret Value Disclosure",
-        description: "Opt-in protection against secret-manager commands that emit credential \
-                      values to stdout and therefore into an agent transcript.",
+        description: "Opt-in protection against secret-manager commands that expose credential \
+                      values through agent-visible output or agent-chosen files.",
         keywords: &[
             "infisical",
             "doppler",
