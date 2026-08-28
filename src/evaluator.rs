@@ -10567,10 +10567,14 @@ fn cmd_executable_basename(decoded: &str) -> String {
         .next()
         .unwrap_or(decoded)
         .to_ascii_lowercase();
+    for extension in [".exe", ".cmd", ".bat", ".com"] {
+        if let Some(base) = basename.strip_suffix(extension)
+            && !base.is_empty()
+        {
+            return base.to_string();
+        }
+    }
     basename
-        .strip_suffix(".exe")
-        .unwrap_or(&basename)
-        .to_string()
 }
 
 fn cmd_attached_short_data_value<'a>(
@@ -32536,6 +32540,9 @@ mod tests {
 
         for (segment, expected) in [
             ("@C:\\Tools\\MYTOOL.EXE danger", Some("mytool")),
+            ("@C:\\Tools\\MYTOOL.CMD danger", Some("mytool")),
+            ("@C:\\Tools\\MYTOOL.BAT danger", Some("mytool")),
+            ("@C:\\Tools\\MYTOOL.COM danger", Some("mytool")),
             ("if exist marker.txt @mytool danger", Some("mytool")),
             ("if not errorlevel 1 ( @mytool danger )", Some("mytool")),
             ("%TOOL% danger", None),
@@ -32545,6 +32552,39 @@ mod tests {
                 segment_executable_name_in_dialect(segment, ShellDialect::Cmd).as_deref(),
                 expected,
                 "Cmd argv0 resolution for {segment:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_batch_suffixes_preserve_executable_scope_through_control_flow() {
+        for command in [
+            "infisical.cmd secrets get API_KEY --plain",
+            "call infisical.cmd secrets get API_KEY --plain",
+            "if 1==1 infisical.cmd secrets get API_KEY --plain",
+            "start \"\" infisical.cmd secrets get API_KEY --plain",
+            "for %A in (1) do infisical.cmd secrets get API_KEY --plain",
+            "aws.bat secretsmanager get-secret-value --secret-id prod/api",
+            "op.com read op://prod/api/key",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["secret_disclosure"],
+                ShellDialect::Cmd,
+            );
+            assert!(
+                result.is_denied(),
+                "Cmd batch suffixes and control flow must not bypass executable scope: \
+                 {command:?}: {:?}",
+                result.pattern_info
+            );
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pack_id.as_deref()),
+                Some("secret_disclosure"),
+                "{command:?}"
             );
         }
     }

@@ -265,6 +265,22 @@ mod tests {
     }
 
     #[test]
+    fn cmd_batch_suffixes_cannot_bypass_disclosure_policy() {
+        let enabled = HashSet::from(["secret_disclosure".to_string()]);
+        for command in [
+            "infisical.cmd secrets get API_KEY --plain",
+            "aws.bat secretsmanager get-secret-value --secret-id prod/api",
+            "op.com read op://prod/api/key",
+        ] {
+            let result = REGISTRY.check_command(command, &enabled);
+            assert!(
+                result.blocked,
+                "Cmd batch suffixes must not bypass {command:?}"
+            );
+        }
+    }
+
+    #[test]
     fn injection_metadata_and_mutation_do_not_match_disclosure_rules() {
         let pack = create_pack();
         for command in [

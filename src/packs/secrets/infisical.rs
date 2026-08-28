@@ -101,6 +101,9 @@ mod tests {
             ),
             ("infisical reset", "infisical-reset"),
             (r"INFISICAL.EXE reset", "infisical-reset"),
+            (r"INFISICAL.CMD reset", "infisical-reset"),
+            (r"INFISICAL.BAT reset", "infisical-reset"),
+            (r"INFISICAL.COM reset", "infisical-reset"),
             (
                 r"C:\Tools\INFISICAL.EXE secrets delete API_KEY",
                 "infisical-secrets-delete",
