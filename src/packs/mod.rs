@@ -2333,7 +2333,7 @@ impl PackRegistry {
     /// 7. **Tier 7 (database/search/messaging/backup)**: `database.*`, `search.*`, `messaging.*`, `backup.*`
     /// 8. **Tier 8 (`package_managers`)**: package manager protections
     /// 9. **Tier 9 (`strict_git`)**: extra git paranoia
-    /// 10. **Tier 10 (services)**: `cicd.*`, `email.*`, `featureflags.*`, `secrets.*`, `monitoring.*`, `payment.*`
+    /// 10. **Tier 10 (services)**: `cicd.*`, `email.*`, `featureflags.*`, `secrets.*`, `secret_disclosure`, `monitoring.*`, `payment.*`
     /// 11. **Tier 11 (windows)**: `windows.*` - native-Windows filesystem, disk, registry, PowerShell
     /// 12. **Tier 12 (egress preset)**: `careful_company_running_windows.*` - deliberately last of
     ///     the known categories so tool-specific packs claim attribution first
@@ -2377,7 +2377,8 @@ impl PackRegistry {
             "backup" | "database" | "messaging" | "search" => 7,
             "package_managers" => 8,
             "strict_git" => 9,
-            "cicd" | "email" | "featureflags" | "secrets" | "monitoring" | "payment" => 10, // CI/CD + email + feature flags + secrets + monitoring + payment tooling
+            "cicd" | "email" | "featureflags" | "secrets" | "secret_disclosure" | "monitoring"
+            | "payment" => 10, // CI/CD + email + feature flags + secrets + monitoring + payment tooling
             // `windows` needs an explicit arm. Without one it falls to the
             // catch-all, which would put it BEHIND the preset below and hand
             // the preset attribution for commands both match (`sc delete
@@ -4954,6 +4955,7 @@ mod tests {
         assert_eq!(PackRegistry::pack_tier("email.ses"), 10);
         assert_eq!(PackRegistry::pack_tier("featureflags.launchdarkly"), 10);
         assert_eq!(PackRegistry::pack_tier("secrets.vault"), 10);
+        assert_eq!(PackRegistry::pack_tier("secret_disclosure"), 10);
         assert_eq!(PackRegistry::pack_tier("monitoring.splunk"), 10);
         assert_eq!(PackRegistry::pack_tier("payment.stripe"), 10);
 

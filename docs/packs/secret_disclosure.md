@@ -26,6 +26,15 @@ Commands containing these keywords are checked against this pack:
 - `ssm`
 - `op`
 
+### Safe Patterns (Allowed)
+
+These patterns match safe commands that are always allowed:
+
+| Pattern Name | Pattern |
+|--------------|----------|
+| `secret-cli-dashed-help` | `(?i:\b(?:infisical\|op\|doppler\|vault\|aws)(?:\.exe\|\.cmd\|\.bat\|\.com)?\b)[^\|;&]*\s+(?:-h\|--help)(?:\s\|$)` |
+| `aws-secret-read-help` | `(?i:\baws(?:\.exe\|\.cmd\|\.bat\|\.com)?\b)(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:secretsmanager\s+(?:get-secret-value\|batch-get-secret-value)\|ssm\s+(?:get-parameter\|get-parameters\|get-parameters-by-path\|get-parameter-history))\s+help(?:\s\|$)` |
+
 ### Destructive Patterns (Blocked)
 
 These patterns match potentially destructive commands:
@@ -41,8 +50,8 @@ These patterns match potentially destructive commands:
 | `onepassword-document-get-output` | op document get emits protected document contents. | high |
 | `doppler-secrets-output` | doppler secrets get/list/download emits secret values. | high |
 | `vault-read-output` | vault read/kv get can print secret values to stdout. | high |
-| `aws-secretsmanager-read-output` | aws secretsmanager get-secret-value prints a stored secret value. | high |
-| `aws-ssm-decrypted-read-output` | aws ssm get-parameter(s) --with-decryption prints decrypted parameter values. | high |
+| `aws-secretsmanager-read-output` | aws secretsmanager get-secret-value and batch-get-secret-value print stored secret values. | high |
+| `aws-ssm-decrypted-read-output` | aws ssm decrypted parameter reads print SecureString values. | high |
 
 ### Allowlist Guidance
 

@@ -24,7 +24,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
         destructive_pattern!(
             "infisical-secrets-delete",
-            r"\binfisical\b(?:\s+--?\S+(?:\s+\S+)?)*\s+secrets\s+delete\b",
+            r"(?i:\binfisical(?:\.exe|\.cmd|\.bat|\.com)?\b)(?:\s+--?\S+(?:\s+\S+)?)*\s+secrets\s+delete\b",
             "infisical secrets delete removes one or more stored secrets.",
             High,
             "Deleting a secret can immediately break applications and automation that depend \
@@ -34,7 +34,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "infisical-folders-delete",
-            r"\binfisical\b(?:\s+--?\S+(?:\s+\S+)?)*\s+secrets\s+folders\s+delete\b",
+            r"(?i:\binfisical(?:\.exe|\.cmd|\.bat|\.com)?\b)(?:\s+--?\S+(?:\s+\S+)?)*\s+secrets\s+folders\s+delete\b",
             "infisical secrets folders delete removes a secrets folder.",
             Critical,
             "Deleting a secrets folder can remove or orphan a whole subtree used by multiple \
@@ -43,7 +43,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "infisical-dynamic-lease-delete",
-            r"\binfisical\b(?:\s+--?\S+(?:\s+\S+)?)*\s+dynamic-secrets\s+lease\s+delete\b",
+            r"(?i:\binfisical(?:\.exe|\.cmd|\.bat|\.com)?\b)(?:\s+--?\S+(?:\s+\S+)?)*\s+dynamic-secrets\s+lease\s+delete\b",
             "infisical dynamic-secrets lease delete revokes a live dynamic-secret lease.",
             High,
             "Deleting a dynamic-secret lease revokes credentials that a running service may \
@@ -52,7 +52,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "infisical-reset",
-            r"\binfisical\b(?:\s+--?\S+(?:\s+\S+)?)*\s+reset\b",
+            r"(?i:\binfisical(?:\.exe|\.cmd|\.bat|\.com)?\b)(?:\s+--?\S+(?:\s+\S+)?)*\s+reset\b",
             "infisical reset clears local Infisical-generated configuration data.",
             High,
             "Resetting the CLI removes its generated local configuration and authentication \
@@ -100,6 +100,11 @@ mod tests {
                 "infisical-dynamic-lease-delete",
             ),
             ("infisical reset", "infisical-reset"),
+            (r"INFISICAL.EXE reset", "infisical-reset"),
+            (
+                r"C:\Tools\INFISICAL.EXE secrets delete API_KEY",
+                "infisical-secrets-delete",
+            ),
         ] {
             assert_blocks_with_pattern(&pack, command, rule);
         }
