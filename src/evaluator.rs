@@ -23419,6 +23419,49 @@ pub(crate) fn command_invokes_declared_executable(command: &str, executables: &[
     })
 }
 
+/// `core.git:branch-dynamic-token` is the one `core.git` rule whose entire
+/// evidence is a *shell expansion*: an unquoted `$`/backtick reaches git's argv,
+/// the shell expands and field-splits it, and the result can inject `-D`/`-f`/
+/// `-M`/`-C`. Every other `core.git` rule — `branch-force-delete`, `reset-hard`,
+/// … — judges literal tokens.
+///
+/// A heredoc with a **quoted** delimiter received by a proven **non-shell**
+/// interpreter (`python3 - <<'PY'`, `node - <<'JS'`, …) is precisely the case
+/// where that evidence does not exist: POSIX guarantees the outer shell performs
+/// no expansion, and the receiver does not run its stdin as shell. The bytes
+/// `git branch $name` in such a body are inert text to every shell that runs
+/// this command line — the same status they already have in the inline spelling
+/// `python3 -c 'git branch $name'`, which dcg allows today. Denying one and
+/// allowing the other is an inconsistency in the delivery mechanism, not a
+/// security boundary (#357, and the #136/#278 heredoc-body class).
+///
+/// This withdraws *only* that one piece of evidence. The body is NOT masked: it
+/// keeps flowing through the conservative raw-shell scan, so `rm -rf /etc`,
+/// `git branch -D main`, and `git reset --hard` inside the very same body still
+/// deny, and the #136-revert posture is untouched. A shell receiver
+/// (`bash <<'EOF'`) or an unquoted delimiter (`<<EOF`) keeps the deny, because in
+/// both of those a shell really does expand the token.
+///
+/// Fail-safe: any coordinate ambiguity returns `false`. The slice maps onto
+/// `original_command` byte-for-byte only when normalization was the identity, the
+/// same guard the git semantic parser above uses for `git_semantic_command`.
+fn dynamic_branch_evidence_is_outer_shell_inert(
+    branch_decision: Option<crate::packs::core::git::BranchCommandDecision>,
+    original_command: &str,
+    normalized_offset: Option<usize>,
+    slice_offset: usize,
+    slice_len: usize,
+) -> bool {
+    matches!(
+        branch_decision,
+        Some(crate::packs::core::git::BranchCommandDecision::DestructiveDynamic)
+    ) && normalized_offset == Some(0)
+        && crate::heredoc::range_is_inert_interpreter_stdin(
+            original_command,
+            &(slice_offset..slice_offset.saturating_add(slice_len)),
+        )
+}
+
 fn evaluate_pack_destructive_patterns(
     pack_id: &str,
     pack: &crate::packs::Pack,
@@ -23469,6 +23512,12 @@ fn evaluate_pack_destructive_patterns(
     if matches!(
         branch_decision,
         Some(crate::packs::core::git::BranchCommandDecision::NonDestructive)
+    ) || dynamic_branch_evidence_is_outer_shell_inert(
+        branch_decision,
+        original_command,
+        normalized_offset,
+        slice_offset,
+        command_slice.len(),
     ) {
         return None;
     }
@@ -37548,6 +37597,165 @@ mod tests {
                     .is_allowed(),
                 "{dialect:?} must be unaffected by the unknown-dialect fan-out"
             );
+        }
+    }
+
+    // ========================================================================
+    // A quoted delimiter into a non-shell interpreter withdraws the
+    // dynamic-branch evidence, and nothing else (#357, #136/#278 class)
+    // ========================================================================
+
+    mod inert_quoted_interpreter_heredoc {
+        use super::{ShellDialect, evaluate_with_pack_ids_in_dialect};
+
+        fn denied(command: &str) -> bool {
+            [ShellDialect::Posix, ShellDialect::Unknown]
+                .into_iter()
+                .any(|dialect| {
+                    evaluate_with_pack_ids_in_dialect(
+                        command,
+                        &["core.git", "core.filesystem"],
+                        dialect,
+                    )
+                    .is_denied()
+                })
+        }
+
+        fn denying_rule(command: &str) -> Option<String> {
+            evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            )
+            .pattern_info
+            .as_ref()
+            .and_then(|info| info.pattern_name.as_deref())
+            .map(str::to_string)
+        }
+
+        /// `branch-dynamic-token`'s entire finding is "an unquoted `$`/backtick
+        /// reaches git's argv, where the shell expands and field-splits it into
+        /// something that may be `-D`". A quoted delimiter means the outer shell
+        /// expands nothing, and a non-shell interpreter does not run its stdin as
+        /// shell — so no shell ever sees that expansion and the evidence is
+        /// absent by construction.
+        ///
+        /// dcg already reaches this conclusion for the inline spelling:
+        /// `python3 -c 'git branch $name'` is allowed today. Denying the heredoc
+        /// spelling of the identical bytes to the identical receiver made the
+        /// verdict a property of the delivery mechanism (#357).
+        #[test]
+        fn quoted_delimiter_to_a_non_shell_interpreter_is_not_dynamic_branch_evidence_357() {
+            for command in [
+                "python3 - <<'EOF'\ngit branch $name\nEOF",
+                "python3 <<'PY'\ngit branch $(cat name)\nPY",
+                "python3 - <<'PY'\ngit branch `cat name`\nPY",
+                "/usr/bin/python3 - <<'PY'\ngit branch $name\nPY",
+                "node - <<'JS'\ngit branch $name\nJS",
+                "ruby <<'RB'\ngit branch $name\nRB",
+                "perl <<'PL'\ngit branch $name\nPL",
+                "php <<'PHP'\ngit branch $name\nPHP",
+                "deno <<'TS'\ngit branch $name\nTS",
+                // The reported shape: an editing heredoc whose body merely
+                // contains text that reads as a git invocation.
+                "cd /tmp/project && python3 - <<'PY'\ns = open('a.ts').read()\n# git branch $name\nopen('a.ts', 'w').write(s)\nPY",
+            ] {
+                assert!(
+                    !denied(command),
+                    "quoted delimiter + non-shell interpreter is not dynamic-branch evidence: {command:?}"
+                );
+            }
+        }
+
+        /// The two conditions are load-bearing, and each alone must keep the
+        /// deny. An unquoted delimiter really is expanded by the outer shell
+        /// before the receiver ever runs; a shell receiver really does expand
+        /// the body when it executes it.
+        #[test]
+        fn shell_receivers_and_unquoted_delimiters_keep_the_dynamic_branch_deny_357() {
+            for command in [
+                // Unquoted delimiter: the OUTER shell expands the body.
+                "python3 - <<EOF\ngit branch $name\nEOF",
+                "node - <<JS\ngit branch $name\nJS",
+                // Shell receivers: the body is shell and really is executed.
+                "bash <<'EOF'\ngit branch $name\nEOF",
+                "sh <<'EOF'\ngit branch $name\nEOF",
+                "zsh <<'EOF'\ngit branch $name\nEOF",
+                "fish <<'EOF'\ngit branch $name\nEOF",
+                // `dash`/`ksh` are not modeled as a language, so they are
+                // Unknown — which must stay conservative, never "not a shell".
+                "dash <<'EOF'\ngit branch $name\nEOF",
+                "ksh <<'EOF'\ngit branch $name\nEOF",
+                // Unmodeled receivers keep the conservative treatment.
+                "jq -f - <<'EOF'\ngit branch $name\nEOF",
+                "sqlite3 db <<'EOF'\ngit branch $name\nEOF",
+                "somebin - <<'EOF'\ngit branch $name\nEOF",
+                // A real invocation AFTER the terminator is outside the body.
+                "python3 - <<'EOF'\nx = 1\nEOF\ngit branch $name",
+                // Text that merely resembles a heredoc operator cannot declare
+                // a span of the command inert.
+                "echo 'python3 - <<EOF'; git branch $name",
+            ] {
+                assert!(
+                    denied(command),
+                    "outer-shell expansion is still reachable here: {command:?}"
+                );
+            }
+        }
+
+        /// The body is NOT masked. Only the one expansion-shaped finding is
+        /// withdrawn, so every rule that judges a literal token still sees the
+        /// body and still fires — which is exactly what the #136/#278 revert
+        /// requires of the conservative raw-shell scan.
+        #[test]
+        fn literal_destructive_evidence_in_the_same_body_still_denies_136() {
+            for (command, rule) in [
+                (
+                    "python3 - <<'PY'\ngit branch -D main\nPY",
+                    "branch-force-delete",
+                ),
+                (
+                    "python3 - <<'PY'\ngit branch -M main other\nPY",
+                    "branch-force-delete",
+                ),
+                ("python3 - <<'PY'\ngit reset --hard\nPY", "reset-hard"),
+                ("python3 - <<'PY'\nrm -rf /etc\nPY", "rm-rf-root-home"),
+                (
+                    "python3 - <<'PY'\nprint(\"rm -rf $HOME\")\nPY",
+                    "rm-rf-root-home",
+                ),
+            ] {
+                assert_eq!(
+                    denying_rule(command).as_deref(),
+                    Some(rule),
+                    "literal destructive evidence must survive: {command:?}"
+                );
+            }
+        }
+
+        /// A wrapper has materially different lookup and execution rules and can
+        /// itself be a function, alias, or PATH-selected executable, so proving
+        /// only its final argument is not a proof about the receiver. And a
+        /// receiver name that visible shell state may have rebound is no proof
+        /// either. Both fail closed.
+        #[test]
+        fn wrapper_and_rebindable_receivers_stay_conservative_357() {
+            for command in [
+                "env python3 - <<'PY'\ngit branch $name\nPY",
+                "sudo python3 - <<'PY'\ngit branch $name\nPY",
+                "command python3 - <<'PY'\ngit branch $name\nPY",
+                "nohup python3 - <<'PY'\ngit branch $name\nPY",
+                "python3() { bash -s; }\npython3 - <<'PY'\ngit branch $name\nPY",
+                "alias python3='bash -s'\npython3 - <<'PY'\ngit branch $name\nPY",
+                "eval 'python3(){ bash -s; }'; python3 - <<'PY'\ngit branch $name\nPY",
+                "./python3 - <<'PY'\ngit branch $name\nPY",
+                "/tmp/python3 - <<'PY'\ngit branch $name\nPY",
+            ] {
+                assert!(
+                    denied(command),
+                    "an unproven receiver must keep the conservative deny: {command:?}"
+                );
+            }
         }
     }
 }

@@ -173,3 +173,37 @@ expected = "allow"
 description = "wc here-string is DATA"
 command = "wc -c <<<'rm -rf /'"
 expected = "allow"
+
+# ============================================================================
+# Quoted delimiter into a non-shell interpreter (#357)
+#
+# `<<'EOF'` suppresses every outer-shell expansion, and `python3`/`node`/`ruby`
+# do not run their stdin as shell. `branch-dynamic-token`'s entire finding is
+# "an unquoted expansion reaches git's argv", so no shell ever sees it. The
+# inline spelling `python3 -c 'git branch $name'` is already allowed; these are
+# the same bytes to the same receiver.
+#
+# The body is NOT masked: the literal cases in true_positives/git_destructive
+# and bypass_attempts/obfuscation prove it still flows through the raw-shell
+# scan (#136 / #278).
+# ============================================================================
+
+[[case]]
+description = "quoted python heredoc body is not dynamic-branch evidence (#357)"
+command = "python3 - <<'PY'\ngit branch $name\nPY"
+expected = "allow"
+
+[[case]]
+description = "quoted node heredoc body is not dynamic-branch evidence (#357)"
+command = "node - <<'JS'\ngit branch $(cat name)\nJS"
+expected = "allow"
+
+[[case]]
+description = "quoted ruby heredoc body is not dynamic-branch evidence (#357)"
+command = "ruby <<'RB'\ngit branch `cat name`\nRB"
+expected = "allow"
+
+[[case]]
+description = "an editing python heredoc whose body merely mentions a branch (#357)"
+command = "cd /tmp/project && python3 - <<'PY'\ns = open('a.ts').read()\n# git branch $name\nopen('a.ts', 'w').write(s)\nPY"
+expected = "allow"
