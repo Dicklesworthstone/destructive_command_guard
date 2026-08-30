@@ -181,3 +181,18 @@ expected = "allow"
 description = "literal command substitution output passed to echo is inert data"
 command = "echo \"$(printf 'git reset --hard')\""
 expected = "allow"
+
+[[case]]
+description = "a path whose basename is only glob metacharacters names nothing (#360)"
+command = "/* *"
+expected = "allow"
+
+[[case]]
+description = "a C block comment reaching the shell is not a git branch command (#360)"
+command = "/** Default language for new articles */"
+expected = "allow"
+
+[[case]]
+description = "a wildcard word cannot stand in for the branch subcommand (#360)"
+command = "/* b*"
+expected = "allow"

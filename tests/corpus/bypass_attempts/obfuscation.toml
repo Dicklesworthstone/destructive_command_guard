@@ -88,3 +88,21 @@ expected = "deny"
 description = "TMPDIR default expansion is denied because a nonempty unsafe value wins"
 command = "rm -rf ${TMPDIR:-/tmp}/build"
 expected = "deny"
+
+[[case]]
+description = "wildcard directory with a literal git basename (#361)"
+command = "/usr/*/git branch -D main"
+expected = "deny"
+rule_id = "core.git:branch-dynamic-token"
+
+[[case]]
+description = "wildcard root directory with a literal git basename (#361)"
+command = "/*/bin/git branch $name"
+expected = "deny"
+rule_id = "core.git:branch-dynamic-token"
+
+[[case]]
+description = "literal branch deletion after a wildcard executable (#360)"
+command = "/* -D main"
+expected = "deny"
+rule_id = "core.git:branch-dynamic-token"

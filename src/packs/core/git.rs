@@ -1515,23 +1515,51 @@ fn git_semantic_word_is_unbounded(word: &GitSemanticWord, dialect: ShellDialect)
             .all(String::is_empty)
 }
 
-fn git_semantic_executable_may_equal(
+/// The executable-*name* view of a word: the basename after the last path
+/// separator, with `dynamic` recomputed from that basename alone.
+///
+/// Only the basename names the program, so both questions a `core.git` gate
+/// asks — "may this name be `git`?" and "does this name carry literal
+/// evidence?" — are properties of the basename. Inheriting the whole word's
+/// `dynamic` flag answers them against a different string and fails in both
+/// directions: a wildcard *directory* leaves a fully literal `git` basename
+/// marked dynamic, and a wildcard *basename* lets the `/` separator count as
+/// the literal evidence that a pure expansion is supposed to lack.
+fn git_semantic_executable_basename(
     word: &GitSemanticWord,
     dialect: ShellDialect,
-    candidate: &str,
-) -> bool {
+) -> GitSemanticWord {
     let decoded = if dialect == ShellDialect::Cmd {
         word.decoded.trim_start_matches('@')
     } else {
         &word.decoded
     };
     let basename = decoded.rsplit(['/', '\\']).next().unwrap_or(decoded);
-    let word = GitSemanticWord {
+    // More than one fragment means an expansion was found inside the basename
+    // itself. A single fragment is wholly literal text, whatever the rest of
+    // the path did.
+    let dynamic = word.dynamic && git_dynamic_fragments(basename, dialect).len() > 1;
+    GitSemanticWord {
         decoded: basename.to_string(),
-        dynamic: word.dynamic,
+        dynamic,
         may_split: word.may_split,
-    };
+    }
+}
+
+fn git_semantic_executable_may_equal(
+    word: &GitSemanticWord,
+    dialect: ShellDialect,
+    candidate: &str,
+) -> bool {
+    let word = git_semantic_executable_basename(word, dialect);
     git_symbolic_word_may_equal(&word, dialect, candidate, true)
+}
+
+/// [`git_semantic_word_is_unbounded`] judged on the executable name (#281). A
+/// path separator is not evidence about the name that follows it, so `/*` is
+/// exactly as unbounded as the bare `*` that already supplies no Git evidence.
+fn git_semantic_executable_is_unbounded(word: &GitSemanticWord, dialect: ShellDialect) -> bool {
+    git_semantic_word_is_unbounded(&git_semantic_executable_basename(word, dialect), dialect)
 }
 
 fn decode_git_semantic_words(command: &str, dialect: ShellDialect) -> Option<DecodedGitWords> {
@@ -3562,7 +3590,7 @@ fn dynamic_git_branch_may_mutate(command: &str, dialect: ShellDialect) -> bool {
     // two unknowns are not evidence. Literal branch syntax after it (e.g.
     // `$(producer) branch -d feature`) still fails closed below.
     let executable_unbounded =
-        !powershell_expression && git_semantic_word_is_unbounded(executable, dialect);
+        !powershell_expression && git_semantic_executable_is_unbounded(executable, dialect);
     let dashed_branch = !powershell_expression
         && !executable_unbounded
         && (git_semantic_executable_may_equal(executable, dialect, "git-branch")
@@ -3578,6 +3606,22 @@ fn dynamic_git_branch_may_mutate(command: &str, dialect: ShellDialect) -> bool {
     index += 1;
     if dashed_branch {
         return semantic_branch_argv_may_mutate(&words[index..], dialect);
+    }
+
+    // #281, applied to the whole remaining argv rather than only to the tail
+    // that follows a dynamic word. When the executable name proved nothing,
+    // no word here may stand in for the literal `branch` subcommand — but a
+    // literal deletion/force flag is still evidence in plain sight, and it can
+    // sit in the very first argv slot when the unbounded executable is a glob
+    // (`/* -D main`) rather than an expansion (`$g $sub -D main`).
+    if executable_unbounded
+        && literal_branch_tokens_prove_mutation(
+            words[index..]
+                .iter()
+                .map(|word| (!word.dynamic).then_some(word.decoded.as_str())),
+        )
+    {
+        return true;
     }
 
     loop {
@@ -3690,7 +3734,15 @@ fn dynamic_git_branch_may_mutate(command: &str, dialect: ShellDialect) -> bool {
             index += 1;
             continue;
         }
-        // An unresolved command may be a persistent alias for `branch`.
+        // An unresolved command may be a persistent alias for `branch` — but
+        // only once something has established that Git is running at all.
+        // #281: when the executable name was itself unbounded, an unknown
+        // subcommand is a second unknown, and two unknowns are not evidence.
+        // The literal-flag scan above already kept any deletion in plain
+        // sight, so there is nothing further to prove here.
+        if executable_unbounded {
+            return false;
+        }
         return semantic_branch_argv_may_mutate(&words[index + 1..], dialect);
     }
 }
@@ -5564,6 +5616,129 @@ mod tests {
                             | BranchCommandDecision::DestructiveDynamic
                     ),
                     "no branch mutation evidence, must not deny: {command} ({dialect:?}) -> {decision:?}"
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // A pure-wildcard basename is an unbounded executable name (#360, #361)
+    // =========================================================================
+
+    /// A path whose basename is *only* glob metacharacters names nothing. It
+    /// may still expand to `git`, exactly as the bare `*` that #281 already
+    /// treats as no evidence, so the two spellings must agree: a second
+    /// wildcard word cannot serve as both the `branch` subcommand and the
+    /// dynamic token the rule requires.
+    ///
+    /// The reported symptom was that an ordinary C/JSDoc block comment reaching
+    /// a shell was denied as a destructive Git invocation (#360).
+    #[test]
+    fn pure_wildcard_basename_supplies_no_git_evidence_360() {
+        for command in [
+            // The four-character minimal reproducer.
+            "/* *",
+            // The C block-comment pair, and the real JSDoc line that was denied.
+            "/* */",
+            "/** Default language for new articles */",
+            // Every pure-metacharacter basename spelling.
+            "/? *",
+            "/?? *",
+            "/[a-z]* *",
+            "./* *",
+            "bin/* *",
+            // A wildcard word that "may equal" branch is still only a wildcard.
+            "/* b*",
+            // A dynamic expansion behind a path separator is no more bounded
+            // than the bare expansion: the `/` is not evidence about the name.
+            "dir/$X $sub",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    !matches!(
+                        decision,
+                        BranchCommandDecision::Destructive
+                            | BranchCommandDecision::DestructiveDynamic
+                    ),
+                    "pure-wildcard basename supplies no git evidence: {command} ({dialect:?}) -> {decision:?}"
+                );
+            }
+        }
+    }
+
+    /// The reported command in full: a `python3` heredoc that rewrites source
+    /// files and contains neither `git` nor `branch`. The JSDoc line inside the
+    /// body is what manufactured the match (#360).
+    #[test]
+    fn python_heredoc_rewriting_source_is_not_a_git_branch_360() {
+        let command = concat!(
+            "cd /tmp/project && python3 - <<'PY'\n",
+            "edits = [\n",
+            "    ('src/config.ts', '/** Default language for new articles */', '/** Default locale */'),\n",
+            "]\n",
+            "for p, old, new in edits:\n",
+            "    s = open(p).read()\n",
+            "    open(p, 'w').write(s.replace(old, new))\n",
+            "PY",
+        );
+        for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+            let decision = branch_command_decision_in_dialect(command, dialect);
+            assert!(
+                !matches!(
+                    decision,
+                    BranchCommandDecision::Destructive | BranchCommandDecision::DestructiveDynamic
+                ),
+                "python heredoc rewriting source is not a git branch command: ({dialect:?}) -> {decision:?}"
+            );
+        }
+    }
+
+    /// The mirror defect (#361). A wildcard in a *directory* component leaves a
+    /// fully literal `git` basename, which unambiguously names Git — treating
+    /// that name as dynamic let a real destructive invocation evade the entire
+    /// `core.git` pack while the literal-path spelling was denied.
+    #[test]
+    fn wildcard_directory_with_literal_git_basename_stays_fail_closed_361() {
+        for command in [
+            "/usr/*/git branch -D main",
+            "/usr/*/git branch $name",
+            "/*/bin/git branch $name",
+            "/usr/b?n/git branch -D main",
+            "$HOME/*/git branch -D main",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    matches!(
+                        decision,
+                        BranchCommandDecision::Destructive
+                            | BranchCommandDecision::DestructiveDynamic
+                    ),
+                    "literal git basename must stay fail-closed: {command} ({dialect:?}) -> {decision:?}"
+                );
+            }
+        }
+    }
+
+    /// The allow above must not become a bypass. A literal deletion/force flag
+    /// after a wildcard executable is evidence in plain sight, exactly as it is
+    /// after the `$g $sub` spelling that #281 already keeps fail-closed.
+    #[test]
+    fn literal_mutation_after_wildcard_executable_stays_fail_closed_360() {
+        for command in [
+            "/* -D main",
+            "/* -d feature",
+            "/* --delete --force main",
+            "/* -M old new",
+            "bin/* -D main",
+            "/* $sub -D main",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                assert_eq!(
+                    branch_command_decision_in_dialect(command, dialect),
+                    BranchCommandDecision::DestructiveDynamic,
+                    "literal mutation evidence must stay denied: {command} ({dialect:?})"
                 );
             }
         }
