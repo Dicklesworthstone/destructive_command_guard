@@ -58,7 +58,7 @@ once_cell = "1.19"
 # default SIMD feature, which is base64's only unsafe-code surface.
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 async-trait = "0.1.89"
-rust-mcp-sdk = { version = "1.0.1", default-features = false, features = ["server", "stdio", "macros"] }
+rust-mcp-sdk = { version = "2.0.0", default-features = false, features = ["server", "stdio", "macros"] }
 tokio = { version = "1.52", features = ["rt-multi-thread"] }
 rayon = { version = "1.11", optional = true }
 
