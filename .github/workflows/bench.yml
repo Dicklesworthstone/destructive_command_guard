@@ -26,9 +26,6 @@ on:
       - 'Cargo.lock'
   # Allow manual trigger
   workflow_dispatch:
-  # Run on schedule for baseline tracking
-  schedule:
-    - cron: '0 6 * * 1'  # Weekly on Monday at 6am UTC
 
 env:
   CARGO_TERM_COLOR: always

@@ -4,9 +4,6 @@ on:
   pull_request:
   push:
     branches: [main]
-  schedule:
-    # Run deep suite daily at 3am UTC
-    - cron: '0 3 * * *'
   workflow_dispatch:
     # Allow manual triggering for deep suite
 

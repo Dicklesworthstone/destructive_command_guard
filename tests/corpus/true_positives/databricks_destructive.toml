@@ -1,0 +1,47 @@
+# database.databricks — GH#359 follow-up scope.
+#
+# The force/auto-approve forms are the ones the issue singles out: they
+# override the CLI's own non-empty checks and confirmation prompts, so the
+# guard is the last line before an irreversible control-plane deletion.
+
+[[case]]
+description = "metastore deletion with --force removes a non-empty metastore (#359)"
+command = "databricks metastores delete 12345678-abcd --force"
+expected = "deny"
+rule_id = "database.databricks:databricks-metastores-delete"
+
+[[case]]
+description = "account-level metastore deletion is the same operation via the account API (#359)"
+command = "databricks account metastores delete 12345678-abcd --force"
+expected = "deny"
+rule_id = "database.databricks:databricks-metastores-delete"
+
+[[case]]
+description = "catalog deletion with --force overrides the non-empty check (#359)"
+command = "databricks -p production catalogs delete analytics --force"
+expected = "deny"
+rule_id = "database.databricks:databricks-catalogs-delete-force"
+
+[[case]]
+description = "schema deletion with --force overrides the non-empty check (#359)"
+command = "databricks schemas delete analytics.events --force"
+expected = "deny"
+rule_id = "database.databricks:databricks-schemas-delete-force"
+
+[[case]]
+description = "apps delete --auto-approve destroys the project deployment without confirmation (#359)"
+command = "databricks apps delete --auto-approve"
+expected = "deny"
+rule_id = "database.databricks:databricks-apps-delete-auto-approve"
+
+[[case]]
+description = "account service principal deletion breaks automation account-wide (#359)"
+command = "databricks account service-principals delete 1234567890"
+expected = "deny"
+rule_id = "database.databricks:databricks-account-identity-delete"
+
+[[case]]
+description = "account users-v2 deletion is an account-wide identity operation (#359)"
+command = "databricks --profile production account users-v2 delete 42"
+expected = "deny"
+rule_id = "database.databricks:databricks-account-identity-delete"

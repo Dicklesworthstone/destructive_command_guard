@@ -139,3 +139,27 @@ description = "git push -f (short form)"
 command = "git push -f origin main"
 expected = "deny"
 rule_id = "core.git:push-force-short"
+
+[[case]]
+description = "an unquoted delimiter really is expanded by the outer shell (#357)"
+command = "python3 - <<PY\ngit branch $name\nPY"
+expected = "deny"
+rule_id = "core.git:branch-dynamic-token"
+
+[[case]]
+description = "a shell receiver executes its quoted heredoc body (#357)"
+command = "bash <<'EOF'\ngit branch $name\nEOF"
+expected = "deny"
+rule_id = "core.git:branch-dynamic-token"
+
+[[case]]
+description = "an unmodeled receiver may be a shell and keeps the conservative deny (#357)"
+command = "dash <<'EOF'\ngit branch $name\nEOF"
+expected = "deny"
+rule_id = "core.git:branch-dynamic-token"
+
+[[case]]
+description = "a literal branch deletion in a quoted interpreter body still denies (#357)"
+command = "python3 - <<'PY'\ngit branch -D main\nPY"
+expected = "deny"
+rule_id = "core.git:branch-force-delete"

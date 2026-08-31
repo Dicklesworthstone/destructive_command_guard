@@ -23460,12 +23460,40 @@ fn evaluate_pack_destructive_patterns(
     {
         return None;
     }
-    let branch_decision = (pack_id == "core.git").then(|| {
+    let mut branch_decision = (pack_id == "core.git").then(|| {
         crate::packs::core::git::branch_command_decision_in_dialect(
             git_semantic_command,
             shell_dialect,
         )
     });
+    // `branch-dynamic-token` is the one `core.git` finding whose entire
+    // evidence is an *outer-shell expansion*: an unquoted `$`/backtick that a
+    // shell would expand and field-split into git's argv. When this slice is
+    // the body of a quoted-delimiter heredoc received by a proven non-shell
+    // interpreter, no shell ever performs that expansion (POSIX suppresses it
+    // outside, and python/node/ruby/… do not run their stdin as shell), so
+    // the evidence does not exist — the same conclusion dcg already reaches
+    // for the inline `python3 -c 'git branch $name'` spelling (#357).
+    //
+    // Only that one attribution is withdrawn. Setting the decision back to
+    // `None` (rather than returning early) keeps every literal-token rule in
+    // this pack — `branch-force-delete`, `reset-hard`, … — matching the very
+    // same body via the ordinary pattern loop below, which is exactly the
+    // conservative raw-shell posture #136/#278 require. The coordinate guard
+    // (`normalized_offset == Some(0)`) mirrors `git_semantic_command` above:
+    // the slice maps byte-for-byte onto `original_command` only when
+    // normalization was the identity.
+    if matches!(
+        branch_decision,
+        Some(crate::packs::core::git::BranchCommandDecision::DestructiveDynamic)
+    ) && normalized_offset == Some(0)
+        && crate::heredoc::range_is_inert_interpreter_stdin(
+            original_command,
+            &(slice_offset..slice_offset.saturating_add(command_slice.len())),
+        )
+    {
+        branch_decision = None;
+    }
     if matches!(
         branch_decision,
         Some(crate::packs::core::git::BranchCommandDecision::NonDestructive)
@@ -23638,6 +23666,24 @@ fn evaluate_pack_destructive_patterns(
         // (`"git">/dev/null reset --hard`) keep the operator *outside* the
         // quotes, so they remain matched.
         if is_core_filesystem_redirect_rule(pack_id, pattern.name) {
+            // A redirect rule's finding is *outer-shell syntax*: a `>` the
+            // shell would open and truncate through. Inside a
+            // quoted-delimiter heredoc body received by a proven non-shell
+            // interpreter, the outer shell opens nothing — the bytes go to
+            // python/node/ruby verbatim — so a `>` there (typically an `<x>`
+            // placeholder in documentation prose) is not a shell redirect
+            // (#363). The whole match must sit inside the proven body; the
+            // coordinate guard mirrors the branch-decision one above.
+            if normalized_offset == Some(0) {
+                let inert_range = matched_span.as_ref().map_or_else(
+                    || slice_offset..slice_offset.saturating_add(command_slice.len()),
+                    |span| span.start..span.end,
+                );
+                if crate::heredoc::range_is_inert_interpreter_stdin(original_command, &inert_range)
+                {
+                    continue;
+                }
+            }
             if first_unquoted_output_redirect(redirect_syntax_command, shell_dialect).is_none() {
                 continue;
             }
@@ -37548,6 +37594,153 @@ mod tests {
                     .is_allowed(),
                 "{dialect:?} must be unaffected by the unknown-dialect fan-out"
             );
+        }
+    }
+
+    // ========================================================================
+    // Quoted-delimiter heredoc bodies into proven non-shell interpreters
+    // withdraw only expansion-shaped evidence (#357, #363)
+    // ========================================================================
+
+    mod inert_quoted_interpreter_heredoc {
+        use super::{ShellDialect, evaluate_with_pack_ids_in_dialect};
+
+        fn denied(command: &str) -> bool {
+            [ShellDialect::Posix, ShellDialect::Unknown]
+                .into_iter()
+                .any(|dialect| {
+                    evaluate_with_pack_ids_in_dialect(
+                        command,
+                        &["core.git", "core.filesystem"],
+                        dialect,
+                    )
+                    .is_denied()
+                })
+        }
+
+        fn denying_rule(command: &str) -> Option<String> {
+            evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            )
+            .pattern_info
+            .as_ref()
+            .and_then(|info| info.pattern_name.as_deref())
+            .map(str::to_string)
+        }
+
+        /// `branch-dynamic-token`'s entire evidence is an unquoted expansion
+        /// reaching git's argv through a shell. A quoted delimiter means the
+        /// outer shell expands nothing, and python/node/ruby do not run their
+        /// stdin as shell — so that expansion never happens anywhere. The
+        /// inline spelling `python3 -c 'git branch $name'` already reaches
+        /// this conclusion; the heredoc spelling of the same bytes to the
+        /// same receiver must agree (#357).
+        #[test]
+        fn quoted_interpreter_heredoc_is_not_dynamic_branch_evidence_357() {
+            for command in [
+                "python3 - <<'EOF'\ngit branch $name\nEOF",
+                "python3 <<'PY'\ngit branch $(cat name)\nPY",
+                "python3 - <<'PY'\ngit branch `cat name`\nPY",
+                "/usr/bin/python3 - <<'PY'\ngit branch $name\nPY",
+                "node - <<'JS'\ngit branch $name\nJS",
+                "ruby <<'RB'\ngit branch $name\nRB",
+                "perl <<'PL'\ngit branch $name\nPL",
+                "cd /tmp/project && python3 - <<'PY'\ns = open('a.ts').read()\n# git branch $name\nopen('a.ts', 'w').write(s)\nPY",
+            ] {
+                assert!(
+                    !denied(command),
+                    "no shell ever expands this body: {command:?}"
+                );
+            }
+        }
+
+        /// Each of the two predicate conditions alone must keep the deny: an
+        /// unquoted delimiter is expanded by the outer shell, a shell (or
+        /// unmodeled, or wrapper-obscured, or visibly rebindable) receiver
+        /// executes the body, and content outside the body is ordinary shell.
+        #[test]
+        fn every_relaxation_of_the_predicate_keeps_the_deny_357() {
+            for command in [
+                "python3 - <<EOF\ngit branch $name\nEOF",
+                "node - <<JS\ngit branch $name\nJS",
+                "bash <<'EOF'\ngit branch $name\nEOF",
+                "sh <<'EOF'\ngit branch $name\nEOF",
+                "zsh <<'EOF'\ngit branch $name\nEOF",
+                "dash <<'EOF'\ngit branch $name\nEOF",
+                "ksh <<'EOF'\ngit branch $name\nEOF",
+                "somebin - <<'EOF'\ngit branch $name\nEOF",
+                "env python3 - <<'PY'\ngit branch $name\nPY",
+                "sudo python3 - <<'PY'\ngit branch $name\nPY",
+                "python3() { bash -s; }\npython3 - <<'PY'\ngit branch $name\nPY",
+                "alias python3='bash -s'\npython3 - <<'PY'\ngit branch $name\nPY",
+                "./python3 - <<'PY'\ngit branch $name\nPY",
+                "python3 - <<'PY'\nx = 1\nPY\ngit branch $name",
+                "echo 'python3 - <<EOF'; git branch $name",
+            ] {
+                assert!(
+                    denied(command),
+                    "a shell can still reach this expansion: {command:?}"
+                );
+            }
+        }
+
+        /// The suppression withdraws ONLY the expansion-shaped attribution.
+        /// Rules that judge literal tokens still see the very same body and
+        /// still fire — the #136/#278 conservative-rescan posture.
+        #[test]
+        fn literal_destructive_evidence_in_the_same_body_still_denies_136() {
+            for (command, rule) in [
+                (
+                    "python3 - <<'PY'\ngit branch -D main\nPY",
+                    "branch-force-delete",
+                ),
+                ("python3 - <<'PY'\ngit reset --hard\nPY", "reset-hard"),
+                ("python3 - <<'PY'\nrm -rf /etc\nPY", "rm-rf-root-home"),
+                (
+                    "python3 - <<'PY'\nprint(\"rm -rf $HOME\")\nPY",
+                    "rm-rf-root-home",
+                ),
+            ] {
+                assert_eq!(
+                    denying_rule(command).as_deref(),
+                    Some(rule),
+                    "literal destructive evidence must survive: {command:?}"
+                );
+            }
+        }
+
+        /// #363: a `>` inside such a body is bytes handed to the interpreter,
+        /// not an outer-shell redirect, so the truncate rules stand down for
+        /// doc prose with `<x>` placeholders — while a real outer redirect,
+        /// or the same body under an unquoted delimiter, keeps the deny.
+        #[test]
+        fn placeholder_gt_in_quoted_interpreter_body_is_not_a_redirect_363() {
+            let reported = concat!(
+                "python3 - <<'PYEOF'\n",
+                "- `DATA_DIR` resolves *inside each instance*: `~/.app/instances/<i>/store-data/` — sqlite `index.db` (+ `-wal`/`-shm`) plus `logs/`, `records/`, `blocks/`, `.meta/`, `.backup/`.\n",
+                "- Every instance's `gw.json` is identically `{\"search\": {\"bm25\": {\"language\": \"en\"}}}` — the **local** backend. No cloud block on any instance.\n",
+                "- The package DOES ship a Cloud client (`~/.app/plugins/vendor-plugin/src/core/store/client.ts`, wants `url`/`user`/`apiKey`, auth header `Bearer acct=x&api_key=y`) — but it is **dormant**. No url/user/apiKey exists in any instance `.env`, any gw config, or anywhere under `~/.app`.\n",
+                "PYEOF",
+            );
+            assert!(
+                !denied(reported),
+                "the reported three-line doc body must be allowed"
+            );
+
+            // The same placeholder text under an UNQUOTED delimiter is
+            // genuinely expanded/redirect-bearing shell as far as the outer
+            // shell is concerned; nothing here may weaken that.
+            let unquoted = reported.replace("<<'PYEOF'", "<<PYEOF");
+            assert!(
+                denied(&unquoted),
+                "an unquoted delimiter keeps the conservative treatment"
+            );
+
+            // A real outer-shell truncate after the terminator still denies.
+            let outer = "python3 - <<'PY'\nx = 1\nPY\n: > \"$HOME/.bashrc\"";
+            assert!(denied(outer), "a real outer redirect must stay denied");
         }
     }
 }

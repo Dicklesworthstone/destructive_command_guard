@@ -13,6 +13,16 @@
 //! - resource deletes: jobs, pipelines, repos, cluster-policies,
 //!   instance-pools, warehouses, tokens
 //!
+//! Follow-up scope (GH#359) — Unity Catalog hierarchy and account identities:
+//! - `metastores delete` / `account metastores delete` (with or without
+//!   `--force`, which deletes even a non-empty metastore)
+//! - `catalogs delete` / `schemas delete` (Critical with `--force`, which
+//!   overrides the non-empty check; High otherwise)
+//! - `apps delete` (Critical with `--auto-approve`, which skips the CLI's own
+//!   confirmation and can destroy a whole Apps project's resources)
+//! - account identity deletion: `account users-v2 | service-principals |
+//!   groups-v2 delete` (account-wide blast radius)
+//!
 //! Global targeting flags (`-p/--profile <name>`, `-t/--target <name>`) may
 //! appear between `databricks` and the command group; the shared
 //! flag-consuming prefix keeps every rule matching regardless of their
@@ -241,6 +251,172 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             },
             executables = ["databricks"]
         ),
+        // ---- Unity Catalog hierarchy and account identities (GH#359) ------
+        // Force variants sort above their plain siblings (first-match-wins),
+        // mirroring the recursive/plain split above.
+        destructive_pattern!(
+            "databricks-metastores-delete",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?databricks(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+(?:account\s+)?metastores\s+delete\b",
+            "databricks metastores delete removes an entire Unity Catalog metastore.",
+            Critical,
+            "The metastore is the top of the Unity Catalog hierarchy: every catalog, \
+             schema, table, volume, and grant in it hangs off this one object. With \
+             `--force` Databricks deletes the metastore even when it is not empty, so a \
+             single command can sever an organization's entire governed data estate. \
+             The account-level spelling (`databricks account metastores delete`) is the \
+             same operation through the account API.\n\n\
+             Confirm the target first:\n  \
+             databricks metastores get <METASTORE_ID>",
+            &const {
+                [
+                    PatternSuggestion::new(
+                        "databricks metastores get <METASTORE_ID>",
+                        "Confirm which metastore the ID refers to before any deletion",
+                    ),
+                    PatternSuggestion::new(
+                        "databricks metastores list",
+                        "List metastores to double-check the target",
+                    ),
+                ]
+            },
+            executables = ["databricks"]
+        ),
+        destructive_pattern!(
+            "databricks-catalogs-delete-force",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?databricks(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+catalogs\s+delete\b(?:\s+[^\s;&|]+)*\s+-{1,2}force\b",
+            "databricks catalogs delete --force removes a catalog even when it still contains schemas and tables.",
+            Critical,
+            "`--force` overrides the non-empty check: every schema, table, volume, \
+             function, and model under the catalog goes with it in one call. Unity \
+             Catalog object deletion has no undo.\n\n\
+             See what the catalog contains first:\n  \
+             databricks schemas list <CATALOG>",
+            &const {
+                [PatternSuggestion::new(
+                    "databricks schemas list <CATALOG>",
+                    "List the schemas the forced delete would take with it",
+                )]
+            },
+            executables = ["databricks"]
+        ),
+        destructive_pattern!(
+            "databricks-catalogs-delete",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?databricks(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+catalogs\s+delete\b",
+            "databricks catalogs delete removes a Unity Catalog catalog.",
+            High,
+            "A catalog is a top-level data namespace. Even without `--force` (which \
+             refuses when the catalog is non-empty), deleting one removes its grants and \
+             registration and cannot be undone.\n\n\
+             Confirm the target first:\n  \
+             databricks catalogs get <CATALOG>",
+            &const {
+                [PatternSuggestion::new(
+                    "databricks catalogs get <CATALOG>",
+                    "Confirm which catalog the name refers to before deletion",
+                )]
+            },
+            executables = ["databricks"]
+        ),
+        destructive_pattern!(
+            "databricks-schemas-delete-force",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?databricks(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+schemas\s+delete\b(?:\s+[^\s;&|]+)*\s+-{1,2}force\b",
+            "databricks schemas delete --force removes a schema even when it still contains tables.",
+            Critical,
+            "`--force` overrides the non-empty check: every table, volume, and function \
+             in the schema is deleted with it. There is no recycle bin for Unity \
+             Catalog objects.\n\n\
+             See what the schema contains first:\n  \
+             databricks tables list <CATALOG> <SCHEMA>",
+            &const {
+                [PatternSuggestion::new(
+                    "databricks tables list <CATALOG> <SCHEMA>",
+                    "List the tables the forced delete would take with it",
+                )]
+            },
+            executables = ["databricks"]
+        ),
+        destructive_pattern!(
+            "databricks-schemas-delete",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?databricks(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+schemas\s+delete\b",
+            "databricks schemas delete removes a Unity Catalog schema.",
+            High,
+            "Schema deletion removes the namespace and its grants. Without `--force` the \
+             CLI refuses a non-empty schema, but the deletion itself still cannot be \
+             undone.\n\n\
+             Confirm the target first:\n  \
+             databricks schemas get <CATALOG.SCHEMA>",
+            &const {
+                [PatternSuggestion::new(
+                    "databricks schemas get <CATALOG.SCHEMA>",
+                    "Confirm which schema the name refers to before deletion",
+                )]
+            },
+            executables = ["databricks"]
+        ),
+        destructive_pattern!(
+            "databricks-apps-delete-auto-approve",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?databricks(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+apps\s+delete\b(?:\s+[^\s;&|]+)*\s+--auto-approve\b",
+            "databricks apps delete --auto-approve destroys the app's deployed resources without confirmation.",
+            Critical,
+            "Run from a Databricks Apps project directory without a name, `apps delete` \
+             tears down every resource the project deployed — the same blast radius as \
+             `bundle destroy`. `--auto-approve` skips the CLI's own interactive \
+             confirmation, so a wrong profile or directory destroys the deployment \
+             silently.\n\n\
+             Review the app first:\n  \
+             databricks apps list",
+            &const {
+                [PatternSuggestion::new(
+                    "databricks apps list",
+                    "List the apps and confirm the target before deletion",
+                )]
+            },
+            executables = ["databricks"]
+        ),
+        destructive_pattern!(
+            "databricks-apps-delete",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?databricks(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+apps\s+delete\b",
+            "databricks apps delete removes a Databricks App and its deployed resources.",
+            High,
+            "Deleting an app removes its deployments and compute. From a project \
+             directory with no explicit name it targets the project's own app, so the \
+             blast radius depends on the working directory as much as the argv.\n\n\
+             Review the app first:\n  \
+             databricks apps get <APP_NAME>",
+            &const {
+                [PatternSuggestion::new(
+                    "databricks apps get <APP_NAME>",
+                    "Confirm which app the command would remove",
+                )]
+            },
+            executables = ["databricks"]
+        ),
+        destructive_pattern!(
+            "databricks-account-identity-delete",
+            r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?databricks(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+account\s+(?:users(?:-v2)?|service-principals|groups(?:-v2)?)\s+delete\b",
+            "databricks account identity deletion removes an account-wide user, service principal, or group.",
+            Critical,
+            "Account-level identities are shared by every workspace in the account. \
+             Deleting a service principal breaks the jobs, automation, API access, and \
+             compute it owns everywhere at once; deleting a user or group orphans \
+             assets and grants across workspaces. Databricks itself recommends \
+             deactivation over deletion when the goal is only to stop access.\n\n\
+             Inspect the identity first:\n  \
+             databricks account service-principals get <ID>  (or the matching `get`)",
+            &const {
+                [
+                    PatternSuggestion::new(
+                        "databricks account service-principals get <ID>",
+                        "Confirm which principal the ID refers to and what it owns",
+                    ),
+                    PatternSuggestion::new(
+                        "databricks account users-v2 patch <ID> --json '{\"active\": false}'",
+                        "Deactivate instead of delete when the goal is only to stop access",
+                    ),
+                ]
+            },
+            executables = ["databricks"]
+        ),
         destructive_pattern!(
             "databricks-api-delete",
             r"(?:^|[\s;&|(])(?:[^\s;&|]*[/\\])?databricks(?:\.exe)?(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+api\s+delete\b",
@@ -375,6 +551,142 @@ mod tests {
             ),
         ] {
             assert_blocks_with_pattern(&pack, command, expected);
+        }
+    }
+
+    /// GH#359 follow-up scope: Unity Catalog hierarchy, apps, and account
+    /// identities.
+    #[test]
+    fn unity_catalog_and_account_identity_deletes_block_359() {
+        let pack = create_pack();
+        for (command, expected) in [
+            (
+                "databricks metastores delete 12345678-abcd",
+                "databricks-metastores-delete",
+            ),
+            (
+                "databricks metastores delete 12345678-abcd --force",
+                "databricks-metastores-delete",
+            ),
+            (
+                "databricks account metastores delete 12345678-abcd --force",
+                "databricks-metastores-delete",
+            ),
+            (
+                "databricks catalogs delete analytics --force",
+                "databricks-catalogs-delete-force",
+            ),
+            (
+                "databricks catalogs delete analytics",
+                "databricks-catalogs-delete",
+            ),
+            (
+                "databricks schemas delete analytics.events --force",
+                "databricks-schemas-delete-force",
+            ),
+            (
+                "databricks schemas delete analytics.events",
+                "databricks-schemas-delete",
+            ),
+            (
+                "databricks apps delete --auto-approve",
+                "databricks-apps-delete-auto-approve",
+            ),
+            (
+                "databricks apps delete my-app --auto-approve",
+                "databricks-apps-delete-auto-approve",
+            ),
+            ("databricks apps delete my-app", "databricks-apps-delete"),
+            (
+                "databricks account users-v2 delete 123",
+                "databricks-account-identity-delete",
+            ),
+            (
+                "databricks account users delete 123",
+                "databricks-account-identity-delete",
+            ),
+            (
+                "databricks account service-principals delete 456",
+                "databricks-account-identity-delete",
+            ),
+            (
+                "databricks account groups-v2 delete 789",
+                "databricks-account-identity-delete",
+            ),
+        ] {
+            assert_blocks_with_pattern(&pack, command, expected);
+        }
+    }
+
+    /// Positional `-p/--profile` handling applies to the GH#359 rules too,
+    /// whether the flag comes before the command group or after the argv.
+    #[test]
+    fn global_flags_do_not_defeat_359_rules() {
+        let pack = create_pack();
+        for (command, expected) in [
+            (
+                "databricks -p production catalogs delete analytics --force",
+                "databricks-catalogs-delete-force",
+            ),
+            (
+                "databricks account metastores delete 12345678 --force -p production",
+                "databricks-metastores-delete",
+            ),
+            (
+                "databricks --profile production account service-principals delete 456",
+                "databricks-account-identity-delete",
+            ),
+            (
+                "databricks -t prod apps delete --auto-approve",
+                "databricks-apps-delete-auto-approve",
+            ),
+        ] {
+            assert_blocks_with_pattern(&pack, command, expected);
+        }
+    }
+
+    /// Severity split: force/auto-approve and identity/metastore forms are
+    /// Critical; the plain container deletes are High.
+    #[test]
+    fn severity_tiers_359() {
+        let pack = create_pack();
+        for command in [
+            "databricks metastores delete 1",
+            "databricks catalogs delete analytics --force",
+            "databricks schemas delete analytics.events --force",
+            "databricks apps delete --auto-approve",
+            "databricks account service-principals delete 456",
+        ] {
+            assert_blocks_with_severity(&pack, command, Severity::Critical);
+        }
+        for command in [
+            "databricks catalogs delete analytics",
+            "databricks schemas delete analytics.events",
+            "databricks apps delete my-app",
+        ] {
+            assert_blocks_with_severity(&pack, command, Severity::High);
+        }
+    }
+
+    /// Read-only forms of the GH#359 command groups stay allowed.
+    #[test]
+    fn read_only_359_operations_do_not_match() {
+        let pack = create_pack();
+        for command in [
+            "databricks metastores list",
+            "databricks metastores get 12345678-abcd",
+            "databricks metastores summary",
+            "databricks catalogs list",
+            "databricks catalogs get analytics",
+            "databricks schemas list analytics",
+            "databricks schemas get analytics.events",
+            "databricks apps list",
+            "databricks apps get my-app",
+            "databricks account users-v2 list",
+            "databricks account service-principals get 456",
+            "databricks tables exists analytics.events.clicks",
+        ] {
+            assert_no_match(&pack, command);
         }
     }
 

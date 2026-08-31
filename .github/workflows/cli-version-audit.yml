@@ -1,9 +1,6 @@
 name: cli-version-audit
 
 on:
-  schedule:
-    # Weekly audit (Sunday 02:30 UTC)
-    - cron: "30 2 * * 0"
   workflow_dispatch:
 
 jobs:

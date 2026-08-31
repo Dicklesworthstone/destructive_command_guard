@@ -88,3 +88,39 @@ expected = "deny"
 description = "TMPDIR default expansion is denied because a nonempty unsafe value wins"
 command = "rm -rf ${TMPDIR:-/tmp}/build"
 expected = "deny"
+
+[[case]]
+description = "glob directory component with a literal git basename (#361)"
+command = "/usr/*/git branch -D main"
+expected = "deny"
+rule_id = "core.git:branch-dynamic-token"
+
+[[case]]
+description = "glob root component with a literal git basename and dynamic branch (#361)"
+command = "/*/bin/git branch $name"
+expected = "deny"
+rule_id = "core.git:branch-dynamic-token"
+
+[[case]]
+description = "literal deletion flag straight after a wildcard executable (#360)"
+command = "/* -D main"
+expected = "deny"
+rule_id = "core.git:branch-dynamic-token"
+
+[[case]]
+description = "a wrapper is not a proof about the heredoc receiver (#357)"
+command = "env python3 - <<'PY'\ngit branch $name\nPY"
+expected = "deny"
+rule_id = "core.git:branch-dynamic-token"
+
+[[case]]
+description = "visible rebinding of the interpreter name keeps the deny (#357)"
+command = "alias python3='bash -s'\npython3 - <<'PY'\ngit branch $name\nPY"
+expected = "deny"
+rule_id = "core.git:branch-dynamic-token"
+
+[[case]]
+description = "a real invocation after the terminator is outside the body (#357)"
+command = "python3 - <<'PY'\nx = 1\nPY\ngit branch $name"
+expected = "deny"
+rule_id = "core.git:branch-dynamic-token"

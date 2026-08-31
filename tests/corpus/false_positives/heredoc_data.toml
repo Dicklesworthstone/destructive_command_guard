@@ -173,3 +173,44 @@ expected = "allow"
 description = "wc here-string is DATA"
 command = "wc -c <<<'rm -rf /'"
 expected = "allow"
+
+# ============================================================================
+# Quoted delimiter into a non-shell interpreter (#357, #363)
+#
+# `<<'EOF'` suppresses every outer-shell expansion, and python3/node/ruby do
+# not run their stdin as shell, so expansion-shaped evidence (`$name` reaching
+# git's argv, a `>` read as an outer-shell redirect) does not exist for these
+# bodies. The bodies are NOT masked: the literal cases in
+# true_positives/git_destructive.toml prove they still flow through the
+# conservative raw-shell scan (#136/#278).
+# ============================================================================
+
+[[case]]
+description = "quoted python heredoc body is not dynamic-branch evidence (#357)"
+command = "python3 - <<'PY'\ngit branch $name\nPY"
+expected = "allow"
+
+[[case]]
+description = "quoted node heredoc body is not dynamic-branch evidence (#357)"
+command = "node - <<'JS'\ngit branch $(cat name)\nJS"
+expected = "allow"
+
+[[case]]
+description = "an editing python heredoc whose body merely mentions a branch (#357)"
+command = "cd /tmp/project && python3 - <<'PY'\ns = open('a.ts').read()\n# git branch $name\nopen('a.ts', 'w').write(s)\nPY"
+expected = "allow"
+
+[[case]]
+description = "line-leading backtick in a quoted heredoc fed to cat inside command substitution (#357)"
+command = "gh api X -f body=\"$(cat <<'EOF'\n`x`\nEOF\n)\""
+expected = "allow"
+
+[[case]]
+description = "markdown fence lines in a quoted cat heredoc inside command substitution (#357)"
+command = "gh api repos/o/r/issues -f body=\"$(cat <<'EOF'\n```ts\nconst x = 1\n```\nEOF\n)\""
+expected = "allow"
+
+[[case]]
+description = "doc prose with <x> placeholders in a quoted python heredoc (#363)"
+command = "python3 - <<'PYEOF'\n- `DATA_DIR` resolves *inside each instance*: `~/.app/instances/<i>/store-data/` — sqlite `index.db` (+ `-wal`/`-shm`) plus `logs/`, `records/`, `blocks/`, `.meta/`, `.backup/`.\n- Every instance's `gw.json` is identically `{\"search\": {\"bm25\": {\"language\": \"en\"}}}` — the **local** backend. No cloud block on any instance.\n- The package DOES ship a Cloud client (`~/.app/plugins/vendor-plugin/src/core/store/client.ts`, wants `url`/`user`/`apiKey`, auth header `Bearer acct=x&api_key=y`) — but it is **dormant**. No url/user/apiKey exists in any instance `.env`, any gw config, or anywhere under `~/.app`.\nPYEOF"
+expected = "allow"

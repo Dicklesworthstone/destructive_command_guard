@@ -2616,7 +2616,99 @@ pub(crate) fn stdin_data_sink_may_be_overridden(
     let mut overridden = false;
     let mut parse_error = false;
     find_visible_shell_name_override(ast.root(), target, &mut overridden, &mut parse_error);
+    if overridden && !parse_error {
+        return true;
+    }
+    if !parse_error {
+        return false;
+    }
+    // The prefix cut can land mid-construct: a heredoc inside an unclosed
+    // command substitution (`gh api -f body="$(cat <<'EOF'` …, #357) leaves
+    // the prefix unparsable even though the complete command is perfectly
+    // well-formed shell. Re-run the override scan over the WHOLE command,
+    // which sees strictly more source than the prefix did. This stays sound:
+    // an override nested inside a sibling command substitution runs in a
+    // subshell and cannot rebind the receiver's name in the shell that feeds
+    // this heredoc, while top-level assignments, function definitions, and
+    // mutator commands are all top-level nodes the walker still visits —
+    // including ones after the operator, which only adds conservatism. A
+    // whole-command parse error keeps the fail-closed answer.
+    let ast = AstGrep::new(command, SupportLang::Bash);
+    let mut overridden = false;
+    let mut parse_error = false;
+    find_shell_name_override_deep(ast.root(), target, &mut overridden, &mut parse_error);
     overridden || parse_error
+}
+
+/// The whole-command retry walker for [`stdin_data_sink_may_be_overridden`].
+///
+/// Identical to [`find_visible_shell_name_override`] except that it keeps
+/// descending *into* command nodes instead of stopping at each resolved simple
+/// command. The prefix walker may stop there because everything nested deeper
+/// in the prefix runs before the heredoc's own command; the whole-command walk
+/// cannot, because an override *inside the same command substitution* as the
+/// receiver (`foo "$(cat(){ bash -s; }; cat <<'EOF' …)"`) runs in the very
+/// subshell that feeds the heredoc. Descending everywhere also re-flags the
+/// temporary-env shapes (`PATH=/tmp printf …`) the prefix walker deliberately
+/// tolerates — acceptable, since this path only ever runs where the old
+/// behavior was "never mask", so every extra flag is mere conservatism.
+#[allow(clippy::needless_pass_by_value)]
+fn find_shell_name_override_deep<D: ast_grep_core::Doc>(
+    node: ast_grep_core::Node<'_, D>,
+    target: &str,
+    overridden: &mut bool,
+    parse_error: &mut bool,
+) {
+    if *overridden || *parse_error {
+        return;
+    }
+    match node.kind().as_ref() {
+        "ERROR" => {
+            *parse_error = true;
+            return;
+        }
+        "function_definition" => {
+            let Some(name) = node.field("name") else {
+                *overridden = true;
+                return;
+            };
+            let name = name.text();
+            if name.as_ref() == target || !is_static_shell_name(name.as_ref()) {
+                *overridden = true;
+                return;
+            }
+        }
+        "variable_assignment" => {
+            let text = node.text();
+            if shell_assignment_name(text.as_ref()) == Some("PATH") {
+                *overridden = true;
+                return;
+            }
+        }
+        "command" => {
+            let text = node.text();
+            match shell_words::split(text.as_ref()) {
+                Ok(tokens) => {
+                    if shell_command_may_override_name(&tokens, target) {
+                        *overridden = true;
+                        return;
+                    }
+                    // Unlike the prefix walker, fall through and keep
+                    // descending: nested substitutions share fate with the
+                    // heredoc receiver when they enclose it.
+                }
+                Err(_) => {
+                    *parse_error = true;
+                    *overridden = true;
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+    for child in node.children() {
+        find_shell_name_override_deep(child, target, overridden, parse_error);
+    }
 }
 
 #[must_use]
@@ -2983,6 +3075,94 @@ pub fn is_interpreter_source_heredoc_command(cmd: &str) -> bool {
         | ScriptLanguage::Go
         | ScriptLanguage::Unknown => false,
     }
+}
+
+/// Whether a heredoc target name provably does NOT execute its stdin as
+/// shell: a concrete non-shell interpreter reading its program from the body
+/// (`python`/`python3`, `node`/`nodejs`, `deno`/`bun`, `ruby`/`irb`, `perl`,
+/// `php`, `go`), path basenames included.
+///
+/// [`ScriptLanguage::Bash`] — which covers `sh`/`bash`/`zsh`/`fish` and
+/// PowerShell — is deliberately excluded because those receivers execute their
+/// stdin as shell, and so is [`ScriptLanguage::Unknown`], because an
+/// unrecognized name (`dash`, `ksh`, `busybox`, a wrapper script) may well be
+/// a shell. `false` is the fail-safe answer in every uncertain case: the body
+/// simply keeps its conservative treatment.
+///
+/// This function makes no claim that the body is *safe* — only that the outer
+/// shell hands it to a non-shell program. Its sole consumer is
+/// [`range_is_inert_interpreter_stdin`].
+#[must_use]
+pub fn is_non_shell_interpreter_stdin_command(cmd: &str) -> bool {
+    let cmd_name = cmd.rsplit(['/', '\\']).next().unwrap_or(cmd);
+    matches!(
+        ScriptLanguage::from_command(cmd_name),
+        ScriptLanguage::Python
+            | ScriptLanguage::JavaScript
+            | ScriptLanguage::TypeScript
+            | ScriptLanguage::Ruby
+            | ScriptLanguage::Perl
+            | ScriptLanguage::Php
+            | ScriptLanguage::Go
+    )
+}
+
+/// True when `range` (byte offsets into `command`) lies entirely inside a
+/// heredoc body that no shell will ever expand or execute:
+///
+/// 1. the delimiter is **quoted** (`<<'EOF'`, `<<"EOF"`, `<<E\OF`), so POSIX
+///    guarantees the *outer* shell performs no parameter expansion, command
+///    substitution, or arithmetic expansion on the body, and
+/// 2. the receiver is a proven non-shell interpreter
+///    ([`is_non_shell_interpreter_stdin_command`]) whose name the visible
+///    shell state cannot have rebound
+///    ([`stdin_data_sink_may_be_overridden`]), so the *inner* program does
+///    not run the body as shell either.
+///
+/// Under those two conditions the bytes in `range` are handed to the
+/// interpreter verbatim; no shell anywhere sees them as shell syntax. That is
+/// the whole claim — the body is still interpreter source and deliberately
+/// keeps flowing through the conservative raw-shell rescan (#136/#278);
+/// nothing here masks it. The predicate exists to withdraw findings whose
+/// entire evidence IS outer-shell syntax (an unquoted `$`/backtick reaching
+/// git's argv for `core.git:branch-dynamic-token`, a `>` read as an
+/// outer-shell redirect for the `core.filesystem` truncate rules — #357,
+/// #363).
+///
+/// Fail-safe in every ambiguous direction: an empty/inverted range, an
+/// unparsable command, a here-string, an unquoted delimiter, an unknown or
+/// wrapper-obscured receiver, and a range that leaks past either body
+/// boundary all return `false`.
+#[must_use]
+pub(crate) fn range_is_inert_interpreter_stdin(command: &str, range: &Range<usize>) -> bool {
+    if range.start >= range.end || !command.contains("<<") {
+        return false;
+    }
+    // Only AST-proven heredoc operators qualify: raw `<<` bytes inside quotes
+    // or comments must never be able to declare part of the command inert.
+    let Some(heredocs) = active_heredocs(command) else {
+        return false;
+    };
+    heredocs.iter().any(|heredoc| {
+        let ActiveHeredocBody::Heredoc {
+            body_start,
+            body_end,
+            delimiter_quoted,
+        } = heredoc.body
+        else {
+            return false;
+        };
+        if !delimiter_quoted || range.start < body_start || range.end > body_end {
+            return false;
+        }
+        let Some(target) = extract_heredoc_target_command(command, heredoc.operator_start) else {
+            return false;
+        };
+        if !is_non_shell_interpreter_stdin_command(&target) {
+            return false;
+        }
+        !stdin_data_sink_may_be_overridden(command, heredoc.operator_start, &target)
+    })
 }
 
 /// Check whether the command owning the heredoc at `heredoc_start` is a `git`
@@ -6948,6 +7128,163 @@ EOF";
                 !mask_non_expanding_data_heredocs(command).contains("rm -r ./tree"),
                 "literal mutator words must not cause an obvious masking false positive: {command:?}"
             );
+        }
+    }
+
+    // ========================================================================
+    // Inert interpreter stdin (#357, #363): quoted delimiter + proven
+    // non-shell receiver means no shell ever expands or executes those bytes
+    // ========================================================================
+
+    mod inert_interpreter_stdin {
+        use super::*;
+
+        /// Ask the predicate about the span of `needle` inside `command`.
+        fn needle_is_inert(command: &str, needle: &str) -> bool {
+            let start = command
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} not found in {command:?}"));
+            range_is_inert_interpreter_stdin(command, &(start..start + needle.len()))
+        }
+
+        #[test]
+        fn quoted_delimiter_into_a_proven_non_shell_interpreter_is_inert() {
+            for command in [
+                "python3 - <<'PY'\ngit branch $name\nPY",
+                "python3 - <<\"PY\"\ngit branch $name\nPY",
+                "python3 <<'PY'\ngit branch $name\nPY",
+                "/usr/bin/python3 - <<'PY'\ngit branch $name\nPY",
+                "node - <<'JS'\ngit branch $name\nJS",
+                "ruby <<'RB'\ngit branch $name\nRB",
+                "perl <<'PL'\ngit branch $name\nPL",
+                "php <<'PHP'\ngit branch $name\nPHP",
+                "bun <<'TS'\ngit branch $name\nTS",
+                "cd /tmp/proj && python3 - <<'PY'\ngit branch $name\nPY",
+            ] {
+                assert!(
+                    needle_is_inert(command, "git branch $name"),
+                    "no shell ever expands these bytes: {command:?}"
+                );
+            }
+        }
+
+        /// Both conditions are load-bearing. An unquoted delimiter is
+        /// expanded by the OUTER shell before the receiver runs; a shell
+        /// receiver expands the body itself when it executes it; and an
+        /// unmodeled name (`dash`, `ksh`, `jq`, anything unknown) may well be
+        /// a shell, so Unknown must never read as "not a shell".
+        #[test]
+        fn unquoted_delimiters_and_shell_or_unknown_receivers_are_never_inert() {
+            for command in [
+                "python3 - <<PY\ngit branch $name\nPY",
+                "node - <<JS\ngit branch $name\nJS",
+                "bash <<'EOF'\ngit branch $name\nEOF",
+                "sh <<'EOF'\ngit branch $name\nEOF",
+                "zsh <<'EOF'\ngit branch $name\nEOF",
+                "fish <<'EOF'\ngit branch $name\nEOF",
+                "pwsh <<'EOF'\ngit branch $name\nEOF",
+                "dash <<'EOF'\ngit branch $name\nEOF",
+                "ksh <<'EOF'\ngit branch $name\nEOF",
+                "jq -f - <<'EOF'\ngit branch $name\nEOF",
+                "sqlite3 db <<'EOF'\ngit branch $name\nEOF",
+                "somebin - <<'EOF'\ngit branch $name\nEOF",
+                // `cat` is a data sink handled by the (stronger) masking
+                // path; this predicate deliberately claims nothing about it.
+                "cat <<'EOF'\ngit branch $name\nEOF",
+            ] {
+                assert!(
+                    !needle_is_inert(command, "git branch $name"),
+                    "a shell may still expand or execute this body: {command:?}"
+                );
+            }
+        }
+
+        /// Wrappers resolve their targets under different rules and can
+        /// themselves be rebound; visible shell state that may rebind the
+        /// receiver name, and arbitrary paths that merely borrow an
+        /// interpreter's basename, all fail closed.
+        #[test]
+        fn wrapped_rebound_or_path_spoofed_receivers_are_never_inert() {
+            for command in [
+                "env python3 - <<'PY'\ngit branch $name\nPY",
+                "sudo python3 - <<'PY'\ngit branch $name\nPY",
+                "command python3 - <<'PY'\ngit branch $name\nPY",
+                "nohup python3 - <<'PY'\ngit branch $name\nPY",
+                "python3() { bash -s; }\npython3 - <<'PY'\ngit branch $name\nPY",
+                "alias python3='bash -s'\npython3 - <<'PY'\ngit branch $name\nPY",
+                "eval 'python3(){ bash -s; }'; python3 - <<'PY'\ngit branch $name\nPY",
+                "source ./bindings.sh; python3 - <<'PY'\ngit branch $name\nPY",
+                "./python3 - <<'PY'\ngit branch $name\nPY",
+                "/tmp/python3 - <<'PY'\ngit branch $name\nPY",
+            ] {
+                assert!(
+                    !needle_is_inert(command, "git branch $name"),
+                    "an unproven receiver must fail closed: {command:?}"
+                );
+            }
+        }
+
+        /// The claim covers only the body's own bytes: text after the
+        /// terminator, ranges that straddle a boundary, degenerate ranges,
+        /// and fake `<<` text inside quotes prove nothing.
+        #[test]
+        fn only_bytes_fully_inside_the_body_are_inert() {
+            let after = "python3 - <<'PY'\nx = 1\nPY\ngit branch $name";
+            assert!(
+                !needle_is_inert(after, "git branch $name"),
+                "content after the terminator is ordinary shell source"
+            );
+
+            let body = "python3 - <<'PY'\ngit branch $name\nPY";
+            let operator = body.find("<<'PY'").expect("operator");
+            let end = body.len();
+            assert!(
+                !range_is_inert_interpreter_stdin(body, &(operator..end)),
+                "a range straddling the body start must not be claimed inert"
+            );
+            assert!(!range_is_inert_interpreter_stdin(body, &(4..4)));
+            assert!(!range_is_inert_interpreter_stdin(body, &(0..usize::MAX)));
+
+            let fake = "echo 'python3 - <<PY'\ngit branch $name";
+            assert!(
+                !needle_is_inert(fake, "git branch $name"),
+                "quoted text resembling a heredoc operator is data, not syntax"
+            );
+        }
+
+        #[test]
+        fn receiver_name_classification_matches_script_language_model() {
+            for name in [
+                "python", "python3", "python3.12", "python.exe", "node", "nodejs", "deno", "bun",
+                "ruby", "irb", "perl", "php", "go",
+            ] {
+                assert!(
+                    is_non_shell_interpreter_stdin_command(name),
+                    "{name} reads a non-shell program from stdin"
+                );
+            }
+            for name in [
+                "sh",
+                "bash",
+                "zsh",
+                "fish",
+                "pwsh",
+                "powershell",
+                "powershell.exe",
+                "dash",
+                "ksh",
+                "busybox",
+                "jq",
+                "sqlite3",
+                "cat",
+                "tee",
+                "somebin",
+            ] {
+                assert!(
+                    !is_non_shell_interpreter_stdin_command(name),
+                    "{name} must not be classified as a proven non-shell interpreter"
+                );
+            }
         }
     }
 }
