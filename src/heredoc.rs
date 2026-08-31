@@ -3077,10 +3077,11 @@ pub fn is_interpreter_source_heredoc_command(cmd: &str) -> bool {
     }
 }
 
-/// Whether a heredoc target name provably does NOT execute its stdin as
-/// shell: a concrete non-shell interpreter reading its program from the body
-/// (`python`/`python3`, `node`/`nodejs`, `deno`/`bun`, `ruby`/`irb`, `perl`,
-/// `php`, `go`), path basenames included.
+/// Whether a heredoc target name provably does NOT execute its stdin as shell.
+///
+/// True only for a concrete non-shell interpreter reading its program from the
+/// body (`python`/`python3`, `node`/`nodejs`, `deno`/`bun`, `ruby`/`irb`,
+/// `perl`, `php`, `go`), path basenames included.
 ///
 /// [`ScriptLanguage::Bash`] — which covers `sh`/`bash`/`zsh`/`fish` and
 /// PowerShell — is deliberately excluded because those receivers execute their
