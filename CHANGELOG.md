@@ -11,6 +11,72 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.14.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.14.0) -- 2026-09-01 [Release]
+
+### Added
+
+- **Databricks pack rules, precision heredoc interpreter scoping, and strict
+  git scoping.** New rules cover destructive Databricks CLI operations
+  (#357, #359); basename-evidence matching closes the false-negative wave
+  from #360/#361; heredoc interpreter scoping stops inert heredoc bodies
+  from tripping embedded-language analysis (#363); and `strict_git` rules
+  are scoped to actual `git` executables (#362), eliminating the
+  `ls .git/rebase-merge` class of false positives.
+- **Doctor per-harness enablement checks (#368).** `dcg doctor` now verifies
+  the gate is actually reachable, not merely installed: a new `codex_hook`
+  check distinguishes Enabled / never-approved / Disabled / NotRegistered
+  states in Codex's `hooks.json` + `config.toml` trust model (`--fix` flips
+  `enabled = true` on an existing entry only — doctor never forges a trust
+  entry), and the OpenCode check byte-compares the installed `dcg-guard.js`
+  plugin against canonical source, so an edited or stubbed plugin surfaces
+  as OUTDATED OR MODIFIED instead of passing as healthy. Both checks fail
+  doctor (and `--strict`) when the hook is present but unreachable.
+
+### Fixed
+
+- **Rescue home-subtree moves and quoted Trash soft-deletes (#371).**
+  `mv-sensitive-source-root-home` and `rm-rf-root-home` each recommended the
+  command the other denies, so no move-then-cleanup could complete inside a
+  home directory. Two narrowly-scoped safe patterns fix the deadlock:
+  in-home renames (both sides ≥ required depth under the same home root, no
+  dotfile trees, no `..`, no dynamic expansion) and the #244 Trash rescue
+  with quoted tokens — quoting was previously a one-directional deny
+  amplifier even though filenames with spaces must be quoted. Rule prose now
+  recommends only remediations that actually run for a home path.
+- **Deny `git show <ref>:<path>` redirected onto the same `<path>` (#373).**
+  The checkout-ref-discard remediation recommended `git show` without
+  warning that redirecting output back onto the shown path reaches the
+  identical overwrite the rule denies — a live agent session followed that
+  guidance and overwrote an uncommitted file. A new sibling rule
+  `show-redirect-overwrite-source` pins redirect target == shown path via
+  backreference (covers `>`, `>>`, `>|`), while captures to a new file and
+  the bare view stay allowed; structured suggestions registered for the new
+  rule.
+- **Treat `git apply` patch heredocs as structured stdin data (#374).** A
+  quoted heredoc containing an ordinary unified diff fed to
+  `git apply --cached` was denied as an unknown embedded language; `git`
+  parses a stdin patch as data in every mode. The structured git stdin-sink
+  proof (#136/#277 machinery) now covers `apply`, with fail-closed edges
+  preserved (`--unsafe-paths`, config-bearing invocations, PATH/alias
+  overrides still refuse the proof).
+- **Cover dashed-builtin spellings narrowed by #362 scoping (#367).** Scoping
+  strict_git rules to `executables=["git"]` silently dropped `git-rebase` /
+  `git-push --force` style dashed spellings; each rule's executables list now
+  includes its dashed form and the push-master/push-main regexes learned the
+  `git-push` spelling, with tests pinning both the restored coverage and the
+  intact #362 narrowing.
+- **Stop hook-mode test spawns from self-healing the caller's real agent hook
+  (#372).** Running the test suite could install the freshly built dev binary
+  as a global Claude Code PreToolUse hook on the developer's machine; the
+  four integration targets that spawn dcg in hook mode now set
+  `DCG_SELF_HEAL_HOOK=0`, keeping the suite hermetic.
+
+### Changed
+
+- Dependency bumps: flate2 1.1.10, tru 0.2.4, which 8.0.6 (PR #369).
+
+---
+
 ## [v0.13.9](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.13.9) -- 2026-08-27 [Release]
 
 ### Fixed
