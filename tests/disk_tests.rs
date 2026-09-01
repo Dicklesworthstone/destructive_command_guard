@@ -14,6 +14,11 @@ fn run_hook(command: &str) -> String {
 
     let mut child = Command::new(dcg_binary())
         .env("DCG_PACKS", "system.disk")
+        // Hook-mode self-heal writes the invoked binary's own path into the
+        // caller's real agent settings, so without this a test run registers
+        // `target/release/dcg` as a global Claude Code PreToolUse hook on the
+        // developer's machine.
+        .env("DCG_SELF_HEAL_HOOK", "0")
         // Classification is the subject of these E2Es. Keep scheduler stalls
         // on a saturated test host from exercising the separately unit-tested
         // 200 ms fail-closed deadline policy instead.

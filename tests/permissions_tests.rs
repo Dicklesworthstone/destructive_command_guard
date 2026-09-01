@@ -14,6 +14,12 @@ fn run_hook(command: &str) -> String {
 
     let mut child = Command::new(dcg_binary())
         .env("DCG_PACKS", "system.permissions")
+        // Hook-mode self-heal writes the invoked binary's own path into the
+        // caller's real agent settings. Without this, running the test suite
+        // registers `target/release/dcg` as a global Claude Code PreToolUse
+        // hook on the developer's machine, so every shell command they run
+        // afterwards is screened by an unreviewed dev build.
+        .env("DCG_SELF_HEAL_HOOK", "0")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
