@@ -45,7 +45,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "push-force-any",
             r#"git\b.*?\bpush(?:[^\n;]*\s(?:--force(?:=\S*)?|--force-with-lease(?:=\S*)?|-f)(?=\s|$)|(?:\s+\S+)*\s+(?:\$?["']|\\)*\+\S+)"#,
             "Force push (even with --force-with-lease) can rewrite remote history. Disabled in strict mode.",
-            executables = ["git"]
+            executables = ["git", "git-push"]
         ),
         // `--mirror` force-updates every mirrored ref and deletes remote refs
         // that are absent locally. It is at least as destructive as --force.
@@ -53,7 +53,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "push-mirror",
             r"git\b.*?\bpush\b[^\n;]*(?:^|\s)--mirror(?:=\S*)?(?=\s|$)",
             "git push --mirror force-updates and deletes remote refs. Disabled in strict mode.",
-            executables = ["git"]
+            executables = ["git", "git-push"]
         ),
         // A dynamically constructed push argument can render Git's leading
         // `+refspec` force syntax only after the shell expands it. Strict mode
@@ -64,70 +64,70 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "push-dynamic-argument",
             r"git\b.*?\bpush\b[^\n;]*(?:\\|\$|`|\*|\?|\{|\}|\[)",
             "Force push risk: a shell-expanded or escaped git push argument cannot be verified as non-forcing. Use literal remote and refspec arguments in strict mode.",
-            executables = ["git"]
+            executables = ["git", "git-push"]
         ),
         // Block rebase (can rewrite history)
         destructive_pattern!(
             "rebase",
             r"git\b.*?\brebase\b",
             "git rebase rewrites commit history. Disabled in strict mode.",
-            executables = ["git"]
+            executables = ["git", "git-rebase"]
         ),
         // Block commit --amend (rewrites last commit)
         destructive_pattern!(
             "commit-amend",
             r"git\b.*?\bcommit\s+.*--amend",
             "git commit --amend rewrites the last commit. Disabled in strict mode.",
-            executables = ["git"]
+            executables = ["git", "git-commit"]
         ),
         // Block cherry-pick (can be misused)
         destructive_pattern!(
             "cherry-pick",
             r"git\b.*?\bcherry-pick\b",
             "git cherry-pick can introduce duplicate commits. Review carefully.",
-            executables = ["git"]
+            executables = ["git", "git-cherry-pick"]
         ),
         // Block filter-branch (rewrites entire history)
         destructive_pattern!(
             "filter-branch",
             r"git\b.*?\bfilter-branch\b",
             "git filter-branch rewrites entire repository history. Extremely dangerous!",
-            executables = ["git"]
+            executables = ["git", "git-filter-branch"]
         ),
         // Block filter-repo (modern replacement for filter-branch)
         destructive_pattern!(
             "filter-repo",
             r"git\b.*?\bfilter-repo\b",
             "git filter-repo rewrites repository history. Review carefully.",
-            executables = ["git"]
+            executables = ["git", "git-filter-repo"]
         ),
         // Block reflog expire (can lose recovery points)
         destructive_pattern!(
             "reflog-expire",
             r"git\b.*?\breflog\s+expire",
             "git reflog expire removes reflog entries needed for recovery.",
-            executables = ["git"]
+            executables = ["git", "git-reflog"]
         ),
         // Block gc with aggressive options
         destructive_pattern!(
             "gc-aggressive",
             r"git\b.*?\bgc\s+.*--(?:aggressive|prune)",
             "git gc with aggressive/prune options can remove recoverable objects.",
-            executables = ["git"]
+            executables = ["git", "git-gc"]
         ),
         // Block worktree remove
         destructive_pattern!(
             "worktree-remove",
             r"git\b.*?\bworktree\s+remove",
             "git worktree remove deletes a linked working tree.",
-            executables = ["git"]
+            executables = ["git", "git-worktree"]
         ),
         // Block submodule deinit
         destructive_pattern!(
             "submodule-deinit",
             r"git\b.*?\bsubmodule\s+deinit",
             "git submodule deinit removes submodule configuration.",
-            executables = ["git"]
+            executables = ["git", "git-submodule"]
         ),
         // Block git add . (stages everything, may include secrets, .env, build artifacts)
         // Use (?:\s|$) instead of \s*$ so we also catch compound commands like
@@ -139,30 +139,30 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "add-all-dot",
             r#"git\b.*?\badd\s+['"]?\.['"]?(?:\s|$)"#,
             "git add . stages everything including secrets, .env files, and build artifacts. Use 'git add <specific-files>' instead.",
-            executables = ["git"]
+            executables = ["git", "git-add"]
         ),
         // Block git add -A / git add --all (same concern as git add .)
         destructive_pattern!(
             "add-all-flag",
             r"git\b.*?\badd\s+(?:-A|--all)\b",
             "git add -A/--all stages all changes including secrets, .env files, and build artifacts. Use 'git add <specific-files>' instead.",
-            executables = ["git"]
+            executables = ["git", "git-add"]
         ),
         // Block push to master. Separators include `/` so explicit refspecs
         // like `HEAD:refs/heads/master` are caught — `main` appearing after
         // `/` in `refs/heads/main` used to bypass the old `[\s:]` separator.
         destructive_pattern!(
             "push-master",
-            r"git\s+(?:\S+\s+)*push\s+(?:.*[\s:/])?\+?master(?:\s|$)",
+            r"git(?:\s+(?:\S+\s+)*push|-push)\s+(?:.*[\s:/])?\+?master(?:\s|$)",
             "Direct push to master is blocked. Use a feature branch and open a Pull Request.",
-            executables = ["git"]
+            executables = ["git", "git-push"]
         ),
         // Block push to main
         destructive_pattern!(
             "push-main",
-            r"git\s+(?:\S+\s+)*push\s+(?:.*[\s:/])?\+?main(?:\s|$)",
+            r"git(?:\s+(?:\S+\s+)*push|-push)\s+(?:.*[\s:/])?\+?main(?:\s|$)",
             "Direct push to main is blocked. Use a feature branch and open a Pull Request.",
-            executables = ["git"]
+            executables = ["git", "git-push"]
         ),
     ]
 }
@@ -206,6 +206,67 @@ mod tests {
         assert_blocks(&pack, "git add .", "stages everything");
         assert_blocks(&pack, "/usr/bin/git rebase main", "rebase");
         assert_blocks(&pack, "cd repo && git rebase main", "rebase");
+    }
+
+    /// Dashed-builtin spellings resolve argv0 to `git-<sub>`, not `git`, so
+    /// the #362 `executables = ["git"]` scoping silently narrowed the pack:
+    /// `git-rebase` / `git-push --force` passed strict_git entirely (#367).
+    /// Every rule now also declares its dashed spelling, restoring the
+    /// pre-#362 coverage without reopening the `ls .git/rebase-merge` FP.
+    #[test]
+    fn dashed_builtin_spellings_still_match_367() {
+        let pack = create_pack();
+        assert_blocks(&pack, "git-rebase -i HEAD~3", "rebase");
+        assert_blocks(&pack, "git-push --force origin topic", "Force push");
+        assert_blocks(&pack, "git-push origin --mirror", "--mirror");
+        assert_blocks(&pack, "git-push origin +topic:topic", "Force push");
+        assert_blocks(&pack, "git-push origin main", "Direct push to main");
+        assert_blocks(&pack, "git-push origin master", "Direct push to master");
+        assert_blocks(
+            &pack,
+            "git-push origin HEAD:refs/heads/main",
+            "Direct push to main",
+        );
+        assert_blocks(&pack, "git-commit --amend", "rewrites the last commit");
+        assert_blocks(&pack, "git-cherry-pick abc123", "duplicate commits");
+        assert_blocks(
+            &pack,
+            "git-filter-branch --tree-filter 'rm -f secret' HEAD",
+            "filter-branch",
+        );
+        assert_blocks(
+            &pack,
+            "git-filter-repo --path secret --invert-paths",
+            "history",
+        );
+        assert_blocks(&pack, "git-reflog expire --all", "reflog");
+        assert_blocks(
+            &pack,
+            "git-gc --aggressive --prune=now",
+            "recoverable objects",
+        );
+        assert_blocks(&pack, "git-worktree remove dead", "worktree");
+        assert_blocks(&pack, "git-submodule deinit lib", "submodule");
+        assert_blocks(&pack, "git-add .", "stages everything");
+        assert_blocks(&pack, "git-add -A", "stages all changes");
+        // Path-qualified dashed spelling (git's own exec dir layout).
+        assert_blocks(&pack, "/usr/libexec/git-core/git-rebase main", "rebase");
+        // Chained: the governed segment still blocks.
+        assert_blocks(&pack, "cd repo && git-rebase main", "rebase");
+    }
+
+    /// The dashed extension must not reopen what #362 closed: commands that
+    /// merely mention git-flavored text but whose argv0 is neither `git` nor
+    /// a dashed builtin stay unmatched, and ordinary dashed pushes to a
+    /// feature branch remain allowed.
+    #[test]
+    fn dashed_builtin_scoping_stays_narrow_367() {
+        let pack = create_pack();
+        assert_no_match(&pack, "ls .git/rebase-merge");
+        assert_no_match(&pack, "cat .git/rebase-apply/head-name");
+        assert_no_match(&pack, "echo git-rebase is disabled here");
+        assert_no_match(&pack, "grep -r 'git-push --force' docs/");
+        assert_allows(&pack, "git-push origin feature-topic");
     }
 
     #[test]
