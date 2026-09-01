@@ -5012,7 +5012,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              lost - they cannot be recovered.\n\n\
              Safer alternatives:\n\
              - git stash: Save changes first, then checkout, then restore with 'git stash pop'\n\
-             - git show <ref>:<path>: View the file content without overwriting\n\n\
+             - git show <ref>:<path>: View the file content without overwriting. View only — \
+             redirecting the output back onto <path> (`git show <ref>:<path> > <path>`) reaches \
+             the exact overwrite this rule denies. To capture the content, redirect to a NEW \
+             file: `git show <ref>:<path> > <path>.from-ref`\n\n\
              Preview what would change:\n  git diff HEAD <ref> -- <path>",
             &const {
                 [
@@ -5022,7 +5025,52 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                     ),
                     PatternSuggestion::new(
                         "git show {ref}:{path}",
-                        "View the file content without overwriting",
+                        "View the file content without overwriting (view only — do not redirect back onto the same path)",
+                    ),
+                    PatternSuggestion::new(
+                        "git diff HEAD {ref} -- {path}",
+                        "Preview what would change before overwriting",
+                    ),
+                ]
+            }
+        ),
+        // `git show <ref>:<path>` is safe on its own (stdout only), and the
+        // checkout-ref-discard remediation above recommends it. But redirected
+        // back onto the SAME path it reaches the identical end state that rule
+        // denies: the working-tree file is overwritten with another commit's
+        // content and uncommitted changes to it are lost (#373). Deny only the
+        // same-path shape (a backreference pins redirect target == shown
+        // path), so `git show HEAD:f > f.from-ref` and every other capture to
+        // a new file stays allowed. Covers `>`, `>>`, and `>|`; the piped
+        // `| tee <path>` spelling cannot be a core.git pattern (this pack is
+        // matched per pipeline segment by design), so the prose warns about
+        // it instead.
+        destructive_pattern!(
+            "show-redirect-overwrite-source",
+            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*show\s+[^\s:]+:(\S+)\s*(?:>>|>\|?)\s*(?:\./)?\1(?:[\s;&|)]|$)",
+            "git show <ref>:<path> redirected onto the same <path> overwrites the working tree file, exactly like the denied 'git checkout <ref> -- <path>'.",
+            High,
+            "Redirecting `git show <ref>:<path>` back onto `<path>` replaces the working-tree \
+             file with the version from another commit or branch. Any uncommitted changes to \
+             that file are permanently lost — the same hazard `checkout-ref-discard` exists to \
+             prevent, reached through a redirect instead of a checkout.\n\n\
+             The piped spelling `git show <ref>:<path> | tee <path>` reaches the same \
+             overwrite and is just as unsafe.\n\n\
+             Safer alternatives:\n\
+             - Redirect to a NEW file, then inspect: `git show <ref>:<path> > <path>.from-ref`\n\
+             - git stash: Save changes first, then take the other version, then \
+             'git stash pop'\n\
+             - Bare `git show <ref>:<path>` (no redirect) only prints and is always allowed.\n\n\
+             Preview what would change:\n  git diff HEAD <ref> -- <path>",
+            &const {
+                [
+                    PatternSuggestion::new(
+                        "git show {ref}:{path} > {path}.from-ref",
+                        "Capture the other version into a NEW file instead of overwriting the working copy",
+                    ),
+                    PatternSuggestion::new(
+                        "git stash",
+                        "Save changes first, then take the other version, then 'git stash pop'",
                     ),
                     PatternSuggestion::new(
                         "git diff HEAD {ref} -- {path}",
@@ -6512,6 +6560,46 @@ git x",
         assert_blocks_with_severity(&pack, "git checkout -- file.txt", Severity::High);
         assert_blocks_with_pattern(&pack, "git checkout -- file.txt", "checkout-discard");
         assert_blocks(&pack, "git checkout -- .", "discards uncommitted changes");
+    }
+
+    /// #373: the checkout-ref-discard remediation recommends
+    /// `git show <ref>:<path>`, which is safe bare but reaches the identical
+    /// overwrite when redirected back onto the same path. The sibling rule
+    /// denies exactly the same-path redirected shape; every capture to a new
+    /// file and the bare view stay allowed.
+    #[test]
+    fn show_redirect_onto_same_path_is_denied_373() {
+        let pack = create_pack();
+
+        for cmd in [
+            // The reported shape.
+            "git show origin/main:Directory.Packages.props > Directory.Packages.props",
+            "git show HEAD~1:src/config.rs > src/config.rs",
+            "git show origin/main:README.md >> README.md",
+            "git show origin/main:README.md >| README.md",
+            "git show HEAD:a.txt > ./a.txt",
+            "git show HEAD:a.txt > a.txt && cargo build",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "show-redirect-overwrite-source");
+            assert_blocks_with_severity(&pack, cmd, Severity::High);
+        }
+
+        // Bare view and captures to a new file are the recommended safe forms.
+        for cmd in [
+            "git show origin/main:Directory.Packages.props",
+            "git show HEAD~1:src/config.rs",
+            "git show origin/main:README.md > README.md.from-ref",
+            "git show origin/main:README.md > /tmp/README.md",
+            "git show HEAD:a.txt > b.txt",
+            "git show HEAD:a.txt | less",
+            "git show HEAD:a.txt | grep TODO",
+        ] {
+            assert!(
+                pack.check(cmd)
+                    .is_none_or(|hit| hit.name != Some("show-redirect-overwrite-source")),
+                "safe form must not match show-redirect-overwrite-source: {cmd:?}"
+            );
+        }
     }
 
     #[test]

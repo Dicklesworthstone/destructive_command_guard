@@ -350,6 +350,8 @@ fn test_audit_backtracking_requirements() {
                 "restore-staged-long",
                 "restore-staged-short",
                 "restore-worktree",
+                // Backreference pins redirect target == shown path (#373).
+                "show-redirect-overwrite-source",
             ]),
         ),
         (
