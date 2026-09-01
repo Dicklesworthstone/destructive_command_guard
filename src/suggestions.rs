@@ -333,6 +333,30 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
         checkout_discard_suggestions,
     );
 
+    // `git show <ref>:<path>` redirected onto the same <path> (#373): the
+    // remediation is to capture into a NEW file, or stash before taking the
+    // other version.
+    m.insert(
+        "core.git:show-redirect-overwrite-source",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Run `git status` and `git diff` to see uncommitted changes that would be lost",
+            )
+            .with_command("git status && git diff"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Redirect to a NEW file instead of overwriting the working copy",
+            )
+            .with_command("git show <ref>:<path> > <path>.from-ref"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Stash first, then take the other version, then `git stash pop`",
+            )
+            .with_command("git stash"),
+        ],
+    );
+
     m.insert(
         "core.git:branch-force-delete",
         vec![
