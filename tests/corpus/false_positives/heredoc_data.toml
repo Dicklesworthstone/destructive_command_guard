@@ -214,3 +214,13 @@ expected = "allow"
 description = "doc prose with <x> placeholders in a quoted python heredoc (#363)"
 command = "python3 - <<'PYEOF'\n- `DATA_DIR` resolves *inside each instance*: `~/.app/instances/<i>/store-data/` — sqlite `index.db` (+ `-wal`/`-shm`) plus `logs/`, `records/`, `blocks/`, `.meta/`, `.backup/`.\n- Every instance's `gw.json` is identically `{\"search\": {\"bm25\": {\"language\": \"en\"}}}` — the **local** backend. No cloud block on any instance.\n- The package DOES ship a Cloud client (`~/.app/plugins/vendor-plugin/src/core/store/client.ts`, wants `url`/`user`/`apiKey`, auth header `Bearer acct=x&api_key=y`) — but it is **dormant**. No url/user/apiKey exists in any instance `.env`, any gw config, or anywhere under `~/.app`.\nPYEOF"
 expected = "allow"
+
+[[case]]
+description = "quoted patch heredoc feeding git apply --cached is patch data, not embedded code (#374)"
+command = "git apply --cached <<'PATCH'\ndiff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n one\n+two\nPATCH"
+expected = "allow"
+
+[[case]]
+description = "quoted patch heredoc feeding plain git apply is the same stdin data contract (#374)"
+command = "git apply --check <<'PATCH'\ndiff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\nPATCH"
+expected = "allow"

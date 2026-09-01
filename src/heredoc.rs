@@ -3252,6 +3252,15 @@ fn is_git_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
     // and Git passes the heredoc through to those aliases unchanged.
     let accepts_file_stdin = matches!(subcommand, "commit" | "tag" | "notes");
     let accepts_plain_stdin = matches!(subcommand, "hash-object" | "update-index");
+    // `git apply` reads the patch itself from stdin when no file operand (or
+    // `-`) is given, and a unified-diff body is data in every mode (--cached,
+    // --check, --index, worktree): git parses it as a patch, never executes
+    // it (#374). One exception keeps the fail-closed path: `--unsafe-paths`
+    // lets the patch govern paths outside the working tree, so that body
+    // stays visible for scanning.
+    if subcommand == "apply" {
+        return !subcommand_args.iter().any(|arg| arg == "--unsafe-paths");
+    }
     for (i, arg) in subcommand_args.iter().enumerate() {
         match arg.as_str() {
             // `-F -` / `--file -`: message read from stdin (commit/tag/notes).
@@ -3335,7 +3344,7 @@ fn git_builtin_subcommand_and_args(args: &[String]) -> Option<(&str, &[String])>
     let subcommand = args.get(index)?.as_str();
     matches!(
         subcommand,
-        "commit" | "tag" | "notes" | "hash-object" | "update-index"
+        "commit" | "tag" | "notes" | "hash-object" | "update-index" | "apply"
     )
     .then(|| (subcommand, &args[index + 1..]))
 }
@@ -6813,6 +6822,74 @@ fi"#;
         assert!(
             m8.contains(&rmrf),
             "git sentinel on a prior line must NOT mask a later bash here-string: {m8:?}"
+        );
+    }
+
+    /// #374: `git apply` consumes its stdin as a unified-diff PATCH — data git
+    /// parses, never executes. The reported FP was a quoted heredoc feeding
+    /// `git apply --cached` denied as an unknown embedded language. The body
+    /// is masked like other structured git stdin sinks; `--unsafe-paths` and
+    /// alias-capable configuration keep the fail-closed path.
+    #[test]
+    fn mask_git_apply_patch_stdin_data_sink_374() {
+        let rmrf = format!("{}{}{}", "rm", " -", "rf");
+
+        // The reported shape: index-only staging of one hunk.
+        let reported = "git apply --cached <<'PATCH'\n\
+diff --git a/README.md b/README.md\n\
+--- a/README.md\n\
++++ b/README.md\n\
+@@ -1 +1,2 @@\n \
+one\n\
++two\n\
+PATCH";
+        let masked = mask_non_executing_heredocs(reported);
+        assert!(
+            !masked.contains("README"),
+            "patch body for `git apply --cached` must be masked as stdin data: {masked:?}"
+        );
+        assert!(
+            masked.contains("git apply --cached"),
+            "the owning command must remain scannable: {masked:?}"
+        );
+
+        // Other stdin-reading apply modes are the same data contract.
+        for command in [
+            "git apply <<'PATCH'\npatch-body git restore --worktree .\nPATCH",
+            "git apply --check <<'PATCH'\npatch-body git restore --worktree .\nPATCH",
+            "git apply --cached - <<'PATCH'\npatch-body git restore --worktree .\nPATCH",
+            "git -C /repo apply --cached <<'PATCH'\npatch-body git restore --worktree .\nPATCH",
+        ] {
+            let masked = mask_non_executing_heredocs(command);
+            assert!(
+                !masked.contains("restore"),
+                "apply patch body should be masked: {command:?} -> {masked:?}"
+            );
+        }
+
+        // `--unsafe-paths` lets the patch govern paths outside the working
+        // tree; the body stays visible for scanning.
+        let unsafe_paths =
+            format!("git apply --unsafe-paths --cached <<'PATCH'\n{rmrf} /etc\nPATCH");
+        assert!(
+            mask_non_executing_heredocs(&unsafe_paths).contains(&rmrf),
+            "--unsafe-paths must keep the body scannable"
+        );
+
+        // Alias-capable configuration still fails closed (same as #136).
+        let aliased = format!(
+            "git -c 'alias.apply=!bash -s --' apply --cached <<'PATCH'\n{rmrf} /etc\nPATCH"
+        );
+        assert!(
+            mask_non_executing_heredocs(&aliased).contains(&rmrf),
+            "config-bearing git invocations must never prove a data sink"
+        );
+
+        // Soundness: content after the terminator stays scannable.
+        let after = format!("git apply --cached <<'PATCH'\nbody\nPATCH\n{rmrf} /etc");
+        assert!(
+            mask_non_executing_heredocs(&after).contains(&rmrf),
+            "command after the heredoc terminator must remain scannable"
         );
     }
 
