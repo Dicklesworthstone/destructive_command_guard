@@ -467,6 +467,14 @@ These patterns match potentially destructive commands:
 | `databricks-clusters-permanent-delete` | databricks clusters permanent-delete removes a cluster rather than terminating it. | critical |
 | `databricks-secrets-delete-scope` | databricks secrets delete-scope removes the scope with ALL its secrets and ACLs. | critical |
 | `databricks-secrets-delete` | databricks secrets delete-secret/delete-acl removes a secret or its access control. | high |
+| `databricks-metastores-delete` | databricks metastores delete removes an entire Unity Catalog metastore. | critical |
+| `databricks-catalogs-delete-force` | databricks catalogs delete --force removes a catalog even when it still contains schemas and tables. | critical |
+| `databricks-catalogs-delete` | databricks catalogs delete removes a Unity Catalog catalog. | high |
+| `databricks-schemas-delete-force` | databricks schemas delete --force removes a schema even when it still contains tables. | critical |
+| `databricks-schemas-delete` | databricks schemas delete removes a Unity Catalog schema. | high |
+| `databricks-apps-delete-auto-approve` | databricks apps delete --auto-approve destroys the app's deployed resources without confirmation. | critical |
+| `databricks-apps-delete` | databricks apps delete removes a Databricks App and its deployed resources. | high |
+| `databricks-account-identity-delete` | databricks account identity deletion removes an account-wide user, service principal, or group. | critical |
 | `databricks-api-delete` | databricks api delete performs an arbitrary REST DELETE against the workspace or account API. | high |
 | `databricks-resource-delete` | databricks resource delete removes a job, pipeline, repo, policy, pool, warehouse, or token. | high |
 

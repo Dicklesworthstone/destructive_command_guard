@@ -7256,8 +7256,19 @@ EOF";
         #[test]
         fn receiver_name_classification_matches_script_language_model() {
             for name in [
-                "python", "python3", "python3.12", "python.exe", "node", "nodejs", "deno", "bun",
-                "ruby", "irb", "perl", "php", "go",
+                "python",
+                "python3",
+                "python3.12",
+                "python.exe",
+                "node",
+                "nodejs",
+                "deno",
+                "bun",
+                "ruby",
+                "irb",
+                "perl",
+                "php",
+                "go",
             ] {
                 assert!(
                     is_non_shell_interpreter_stdin_command(name),
