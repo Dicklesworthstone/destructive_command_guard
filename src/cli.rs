@@ -10660,33 +10660,132 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         }
     }
 
-    // Check 3c: OpenCode plugin registration (#318). Only surfaced when
-    // OpenCode is plausibly in use. Unlike Grok, OpenCode has NO Claude
-    // compatibility layer: without the native plugin its shell calls never
-    // reach dcg, so a missing plugin is an error, not a nudge.
+    // Check 3b2: Codex hook registration AND enablement (#368). Codex loads
+    // PreToolUse hooks from ~/.codex/hooks.json but only RUNS a hook the user
+    // has approved: a `[hooks.state."<file>:pre_tool_use:<i>:<j>"]` entry in
+    // ~/.codex/config.toml, not carrying `enabled = false`. A hook that is
+    // registered but untrusted or disabled silently never runs — the gate
+    // reports healthy while it is unreachable, the #296 failure class.
+    //
+    // `collect_doctor_report` carries the same check (id `codex_hook`).
+    if codex_appears_in_use() {
+        print!("Checking Codex hook registration... ");
+        match probe_codex_dcg_hook() {
+            CodexHookProbe::Registered {
+                state_key,
+                state: CodexHookState::Enabled,
+            } => {
+                println!("{}", "OK".green());
+                println!("  Registered and enabled ({state_key})");
+            }
+            CodexHookProbe::Registered {
+                state_key,
+                state: CodexHookState::NoStateEntry,
+            } => {
+                println!("{}", "NOT TRUSTED".red());
+                issues += 1;
+                println!("  The dcg hook is registered but has no [hooks.state] entry, so");
+                println!("  Codex will not run it ({state_key})");
+                println!(
+                    "  → Start Codex and approve the dcg hook when prompted (doctor will \
+                     not forge a trust entry)"
+                );
+            }
+            CodexHookProbe::Registered {
+                state_key,
+                state: CodexHookState::Disabled,
+            } => {
+                println!("{}", "DISABLED".red());
+                issues += 1;
+                println!("  The dcg hook is trusted but 'enabled = false' ({state_key})");
+                if fix {
+                    println!("  Attempting to re-enable...");
+                    if enable_codex_hook_state(&state_key).is_ok() {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    } else {
+                        println!("  {}", "Failed to fix".red());
+                    }
+                } else {
+                    println!(
+                        "  → Run 'dcg doctor --fix' to set enabled = true, or edit \
+                         ~/.codex/config.toml"
+                    );
+                }
+            }
+            CodexHookProbe::NotRegistered => {
+                println!("{}", "NOT REGISTERED".yellow());
+                issues += 1;
+                println!("  Codex is in use but ~/.codex/hooks.json has no dcg PreToolUse hook");
+                println!(
+                    "  → Re-run the dcg install script to register it, then start Codex \
+                     once to approve the hook"
+                );
+                println!("    (Codex shell commands are NOT guarded until then)");
+            }
+            CodexHookProbe::HooksFileInvalid(err) => {
+                println!("{}", "ERROR".red());
+                issues += 1;
+                println!("  ~/.codex/hooks.json cannot be parsed: {err}");
+                println!("  → Fix the JSON by hand, or move it aside and re-run the installer");
+            }
+        }
+    }
+
+    // Check 3c: OpenCode plugin registration (#318) and fidelity (#368). Only
+    // surfaced when OpenCode is plausibly in use. Unlike Grok, OpenCode has
+    // NO Claude compatibility layer: without the native plugin its shell
+    // calls never reach dcg, so a missing plugin is an error, not a nudge.
+    // Presence alone is not health: an edited or stubbed plugin keeps the
+    // ownership marker while guarding nothing, so the installed bytes must
+    // match the canonical source for the dcg path the plugin embeds.
     //
     // `collect_doctor_report` carries the same check (id `opencode_plugin`)
     // so `--strict` and `--format json` agree.
     if opencode_appears_in_use() {
         print!("Checking OpenCode plugin registration... ");
         let plugin_path = opencode_user_plugin_path();
-        if opencode_plugin_is_dcg_owned(&plugin_path) {
-            println!("{}", "OK".green());
-            println!("  Found: {}", plugin_path.display());
-        } else {
-            println!("{}", "NOT REGISTERED".yellow());
-            issues += 1;
-            if fix {
-                println!("  Attempting plugin install...");
-                if install_opencode_plugin(false, false).is_ok() {
-                    println!("  {}", "Fixed!".green());
-                    fixed += 1;
+        match probe_opencode_plugin(&plugin_path) {
+            OpencodePluginProbe::Current => {
+                println!("{}", "OK".green());
+                println!("  Found: {}", plugin_path.display());
+            }
+            OpencodePluginProbe::OwnedStale => {
+                println!("{}", "OUTDATED OR MODIFIED".red());
+                issues += 1;
+                println!(
+                    "  {} is dcg-owned but does not match the canonical plugin \
+                     (edited, stubbed, or generated by another dcg version)",
+                    plugin_path.display()
+                );
+                if fix {
+                    println!("  Attempting plugin refresh...");
+                    if install_opencode_plugin(true, false).is_ok() {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    } else {
+                        println!("  {}", "Failed to fix".red());
+                    }
                 } else {
-                    println!("  {}", "Failed to fix".red());
+                    println!("  → Run 'dcg install --opencode --force' to restore it");
+                    println!("    (a modified plugin may guard nothing)");
                 }
-            } else {
-                println!("  → Run 'dcg install --opencode' to install the native plugin");
-                println!("    (OpenCode shell commands are NOT guarded until it is installed)");
+            }
+            OpencodePluginProbe::MissingOrUnowned => {
+                println!("{}", "NOT REGISTERED".yellow());
+                issues += 1;
+                if fix {
+                    println!("  Attempting plugin install...");
+                    if install_opencode_plugin(false, false).is_ok() {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    } else {
+                        println!("  {}", "Failed to fix".red());
+                    }
+                } else {
+                    println!("  → Run 'dcg install --opencode' to install the native plugin");
+                    println!("    (OpenCode shell commands are NOT guarded until it is installed)");
+                }
             }
         }
     }
@@ -11675,40 +11774,161 @@ fn collect_doctor_report(
         });
     }
 
-    // OpenCode plugin registration (#318). Mirrored in `doctor_pretty` — see
-    // the renderer-parity note above the Grok block.
+    // Codex hook registration AND enablement (#368). Mirrored in
+    // `doctor_pretty` — see the renderer-parity note above the Grok block. A
+    // hook that is registered in hooks.json but untrusted (no [hooks.state]
+    // entry) or disabled (`enabled = false`) silently never runs.
+    if codex_appears_in_use() {
+        let mut codex_fixed = false;
+        let (status, message, remediation) = match probe_codex_dcg_hook() {
+            CodexHookProbe::Registered {
+                state_key,
+                state: CodexHookState::Enabled,
+            } => (
+                DoctorCheckStatus::Ok,
+                format!("Codex dcg hook registered and enabled ({state_key})"),
+                None,
+            ),
+            CodexHookProbe::Registered {
+                state_key,
+                state: CodexHookState::NoStateEntry,
+            } => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    format!(
+                        "Codex dcg hook is registered but has no [hooks.state] entry, so \
+                         Codex will not run it ({state_key})"
+                    ),
+                    Some(
+                        "Start Codex and approve the dcg hook when prompted (doctor will \
+                         not forge a trust entry)"
+                            .to_string(),
+                    ),
+                )
+            }
+            CodexHookProbe::Registered {
+                state_key,
+                state: CodexHookState::Disabled,
+            } => {
+                issues += 1;
+                if fix && enable_codex_hook_state(&state_key).is_ok() {
+                    fixed += 1;
+                    codex_fixed = true;
+                    (
+                        DoctorCheckStatus::Ok,
+                        format!("Re-enabled the Codex dcg hook ({state_key})"),
+                        None,
+                    )
+                } else {
+                    (
+                        DoctorCheckStatus::Error,
+                        format!("Codex dcg hook is trusted but 'enabled = false' ({state_key})"),
+                        Some(
+                            "Run 'dcg doctor --fix' to set enabled = true, or edit \
+                             ~/.codex/config.toml"
+                                .to_string(),
+                        ),
+                    )
+                }
+            }
+            CodexHookProbe::NotRegistered => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    "Codex is in use but ~/.codex/hooks.json has no dcg PreToolUse hook — \
+                     its shell commands are not guarded"
+                        .to_string(),
+                    Some(
+                        "Re-run the dcg install script to register it, then start Codex \
+                         once to approve the hook"
+                            .to_string(),
+                    ),
+                )
+            }
+            CodexHookProbe::HooksFileInvalid(err) => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    format!("~/.codex/hooks.json cannot be parsed: {err}"),
+                    Some(
+                        "Fix the JSON by hand, or move it aside and re-run the installer"
+                            .to_string(),
+                    ),
+                )
+            }
+        };
+        checks.push(DoctorCheck {
+            id: "codex_hook",
+            name: "Codex hook registration",
+            status,
+            message,
+            remediation,
+            fixed: codex_fixed,
+        });
+    }
+
+    // OpenCode plugin registration (#318) and fidelity (#368). Mirrored in
+    // `doctor_pretty` — see the renderer-parity note above the Grok block.
     if opencode_appears_in_use() {
         let plugin_path = opencode_user_plugin_path();
         let mut opencode_fixed = false;
-        let (status, message, remediation) = if opencode_plugin_is_dcg_owned(&plugin_path) {
-            (
+        let (status, message, remediation) = match probe_opencode_plugin(&plugin_path) {
+            OpencodePluginProbe::Current => (
                 DoctorCheckStatus::Ok,
                 format!("Native OpenCode plugin found at {}", plugin_path.display()),
                 None,
-            )
-        } else {
-            // OpenCode has no Claude-compatibility fallback: without the
-            // plugin, its shell calls never reach dcg at all.
-            issues += 1;
-            if fix && install_opencode_plugin(false, false).is_ok() {
-                fixed += 1;
-                opencode_fixed = true;
-                (
-                    DoctorCheckStatus::Ok,
-                    format!(
-                        "Installed native OpenCode plugin at {}",
-                        plugin_path.display()
-                    ),
-                    None,
-                )
-            } else {
-                (
-                    DoctorCheckStatus::Error,
-                    "OpenCode is in use but has no dcg plugin — its shell commands are not \
-                     guarded"
-                        .to_string(),
-                    Some("Run 'dcg install --opencode'".to_string()),
-                )
+            ),
+            OpencodePluginProbe::OwnedStale => {
+                issues += 1;
+                if fix && install_opencode_plugin(true, false).is_ok() {
+                    fixed += 1;
+                    opencode_fixed = true;
+                    (
+                        DoctorCheckStatus::Ok,
+                        format!(
+                            "Refreshed native OpenCode plugin at {}",
+                            plugin_path.display()
+                        ),
+                        None,
+                    )
+                } else {
+                    (
+                        DoctorCheckStatus::Error,
+                        format!(
+                            "OpenCode plugin at {} is dcg-owned but does not match the \
+                             canonical plugin (edited, stubbed, or generated by another \
+                             dcg version) — it may guard nothing",
+                            plugin_path.display()
+                        ),
+                        Some("Run 'dcg install --opencode --force'".to_string()),
+                    )
+                }
+            }
+            OpencodePluginProbe::MissingOrUnowned => {
+                // OpenCode has no Claude-compatibility fallback: without the
+                // plugin, its shell calls never reach dcg at all.
+                issues += 1;
+                if fix && install_opencode_plugin(false, false).is_ok() {
+                    fixed += 1;
+                    opencode_fixed = true;
+                    (
+                        DoctorCheckStatus::Ok,
+                        format!(
+                            "Installed native OpenCode plugin at {}",
+                            plugin_path.display()
+                        ),
+                        None,
+                    )
+                } else {
+                    (
+                        DoctorCheckStatus::Error,
+                        "OpenCode is in use but has no dcg plugin — its shell commands are not \
+                         guarded"
+                            .to_string(),
+                        Some("Run 'dcg install --opencode'".to_string()),
+                    )
+                }
             }
         };
         checks.push(DoctorCheck {
@@ -12825,11 +13045,251 @@ fn opencode_appears_in_use() -> bool {
         .is_some_and(std::path::Path::is_dir)
 }
 
-/// Whether `path` holds a dcg-generated OpenCode plugin.
-fn opencode_plugin_is_dcg_owned(path: &std::path::Path) -> bool {
-    std::fs::read_to_string(path)
-        .map(|content| content.contains(OPENCODE_PLUGIN_MARKER))
-        .unwrap_or(false)
+/// Fidelity of an installed OpenCode plugin against the canonical source
+/// this dcg build would generate (#368).
+///
+/// Ownership (the marker) proves who wrote the file; it does not prove the
+/// guard still works. A manually edited or stubbed plugin keeps the marker
+/// but may no longer route anything through dcg, so doctor must distinguish
+/// "present" from "byte-identical to what `dcg install --opencode` ships".
+#[derive(Debug, PartialEq, Eq)]
+enum OpencodePluginProbe {
+    /// No file, unreadable, or not dcg-owned (no marker).
+    MissingOrUnowned,
+    /// dcg-owned and byte-identical to the canonical source for the dcg
+    /// binary path the plugin itself embeds.
+    Current,
+    /// dcg-owned but the bytes differ from the canonical source — edited,
+    /// stubbed, or generated by a different dcg version.
+    OwnedStale,
+}
+
+/// Compare an installed OpenCode plugin against the canonical source.
+///
+/// The canonical source is rebuilt around the dcg path the plugin itself
+/// embeds (`const DCG_BIN = "..."`), not this process's executable, so a
+/// plugin legitimately installed from another dcg location is not flagged
+/// merely for the path difference.
+fn probe_opencode_plugin(path: &std::path::Path) -> OpencodePluginProbe {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return OpencodePluginProbe::MissingOrUnowned;
+    };
+    if !content.contains(OPENCODE_PLUGIN_MARKER) {
+        return OpencodePluginProbe::MissingOrUnowned;
+    }
+    let embedded_path = content.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("const DCG_BIN = ")
+            .and_then(|rest| rest.strip_suffix(';'))
+            .and_then(|literal| serde_json::from_str::<String>(literal).ok())
+    });
+    match embedded_path {
+        Some(dcg_path) => match build_opencode_plugin_source(std::path::Path::new(&dcg_path)) {
+            Ok(canonical) if canonical == content => OpencodePluginProbe::Current,
+            _ => OpencodePluginProbe::OwnedStale,
+        },
+        None => OpencodePluginProbe::OwnedStale,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Codex hook registration + enablement probe (#368)
+// ---------------------------------------------------------------------------
+
+/// User-level Codex hooks file (written by the dcg install script).
+fn codex_hooks_json_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".codex")
+        .join("hooks.json")
+}
+
+/// User-level Codex configuration, which carries the `[hooks.state]` trust
+/// and enablement table.
+fn codex_config_toml_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".codex")
+        .join("config.toml")
+}
+
+/// Whether this machine appears to run Codex: its config directory exists or
+/// the `codex` binary is on PATH. Gates the doctor check so machines without
+/// Codex are not pestered.
+fn codex_appears_in_use() -> bool {
+    codex_hooks_json_path()
+        .parent()
+        .is_some_and(std::path::Path::is_dir)
+        || which_executable("codex").is_some()
+}
+
+/// Per-hook enablement state derived from Codex's `[hooks.state]` table.
+///
+/// Codex keys the table by `<hooks-file>:<event>:<entry-index>:<hook-index>`
+/// and only runs a registered hook once the user has approved it (a
+/// `trusted_hash` entry exists) and it is not `enabled = false`. A hook that
+/// is registered in hooks.json but absent from the state table — or present
+/// with `enabled = false` — silently never runs: the exact
+/// trusted-but-not-enabled failure mode from #368/#296.
+#[derive(Debug, PartialEq, Eq)]
+enum CodexHookState {
+    /// State entry exists and is not disabled.
+    Enabled,
+    /// No `[hooks.state]` entry for the dcg hook: Codex has never been asked
+    /// to trust it, so it does not run.
+    NoStateEntry,
+    /// State entry exists but carries `enabled = false`.
+    Disabled,
+}
+
+/// Result of probing the Codex dcg hook.
+#[derive(Debug, PartialEq, Eq)]
+enum CodexHookProbe {
+    /// hooks.json is missing or contains no dcg PreToolUse Bash hook.
+    NotRegistered,
+    /// hooks.json exists but cannot be parsed.
+    HooksFileInvalid(String),
+    /// The dcg hook is registered; `state_key` is its `[hooks.state]` key.
+    Registered {
+        state_key: String,
+        state: CodexHookState,
+    },
+}
+
+/// Whether a Codex hook `command` string invokes the dcg binary (first-token
+/// basename match, mirroring the install script's detection).
+fn codex_command_is_dcg(command: &str) -> bool {
+    let Some(first) = command.split_whitespace().next() else {
+        return false;
+    };
+    let basename = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    let lowered = basename.to_ascii_lowercase();
+    let stem = ["exe", "cmd", "bat", "com"]
+        .iter()
+        .find_map(|ext| lowered.strip_suffix(&format!(".{ext}")))
+        .unwrap_or(&lowered);
+    stem == "dcg"
+}
+
+/// Probe the user-level Codex hook registration and enablement.
+fn probe_codex_dcg_hook() -> CodexHookProbe {
+    probe_codex_dcg_hook_at(&codex_hooks_json_path(), &codex_config_toml_path())
+}
+
+/// Testable core of [`probe_codex_dcg_hook`]: explicit file locations.
+fn probe_codex_dcg_hook_at(
+    hooks_path: &std::path::Path,
+    config_path: &std::path::Path,
+) -> CodexHookProbe {
+    let raw = match std::fs::read_to_string(hooks_path) {
+        Ok(raw) => raw,
+        Err(_) => return CodexHookProbe::NotRegistered,
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(err) => return CodexHookProbe::HooksFileInvalid(err.to_string()),
+    };
+
+    // The state key indexes the PreToolUse array as loaded, so `entry_index`
+    // counts EVERY element (including non-Bash matchers), not just Bash ones.
+    let mut found: Option<(usize, usize)> = None;
+    if let Some(entries) = parsed
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(serde_json::Value::as_array)
+    {
+        'outer: for (entry_index, entry) in entries.iter().enumerate() {
+            if entry.get("matcher").and_then(serde_json::Value::as_str) != Some("Bash") {
+                continue;
+            }
+            let Some(hooks) = entry.get("hooks").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for (hook_index, hook) in hooks.iter().enumerate() {
+                if hook
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(codex_command_is_dcg)
+                {
+                    found = Some((entry_index, hook_index));
+                    break 'outer;
+                }
+            }
+        }
+    }
+    let Some((entry_index, hook_index)) = found else {
+        return CodexHookProbe::NotRegistered;
+    };
+
+    let state_key = format!(
+        "{}:pre_tool_use:{entry_index}:{hook_index}",
+        hooks_path.display()
+    );
+
+    let state = match std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Table>().ok())
+    {
+        Some(config) => {
+            let entry = config
+                .get("hooks")
+                .and_then(toml::Value::as_table)
+                .and_then(|hooks| hooks.get("state"))
+                .and_then(toml::Value::as_table)
+                .and_then(|state| state.get(state_key.as_str()))
+                .and_then(toml::Value::as_table);
+            match entry {
+                None => CodexHookState::NoStateEntry,
+                Some(entry) => {
+                    if entry.get("enabled").and_then(toml::Value::as_bool) == Some(false) {
+                        CodexHookState::Disabled
+                    } else {
+                        CodexHookState::Enabled
+                    }
+                }
+            }
+        }
+        // No parseable config.toml means no trust decision is recorded.
+        None => CodexHookState::NoStateEntry,
+    };
+
+    CodexHookProbe::Registered { state_key, state }
+}
+
+/// `--fix` half of the Codex enablement check: flip `enabled` back to `true`
+/// on an EXISTING `[hooks.state]` entry.
+///
+/// Deliberately narrow: doctor never creates a state entry or a
+/// `trusted_hash` — that would forge a trust decision only the user (through
+/// Codex's own approval prompt) may make. Re-enabling a hook the user
+/// already trusted is legitimate repair; anything more is not. Formatting of
+/// the rest of config.toml is preserved via toml_edit. Idempotent.
+fn enable_codex_hook_state(state_key: &str) -> Result<(), Box<dyn std::error::Error>> {
+    enable_codex_hook_state_at(&codex_config_toml_path(), state_key)
+}
+
+/// Testable core of [`enable_codex_hook_state`]: explicit config location.
+fn enable_codex_hook_state_at(
+    config_path: &std::path::Path,
+    state_key: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let raw = std::fs::read_to_string(config_path)?;
+    let mut doc: toml_edit::DocumentMut = raw.parse()?;
+    let entry = doc
+        .get_mut("hooks")
+        .and_then(|hooks| hooks.get_mut("state"))
+        .and_then(|state| state.get_mut(state_key))
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or_else(|| {
+            format!(
+                "no [hooks.state.\"{state_key}\"] entry exists in {}; approve the hook in \
+                 Codex first (doctor will not forge a trust entry)",
+                config_path.display()
+            )
+        })?;
+    entry.insert("enabled", toml_edit::value(true));
+    write_settings_atomic(config_path, &doc.to_string())?;
+    Ok(())
 }
 
 /// Ownership marker embedded in the generated Oh My Pi extension.
@@ -20221,6 +20681,238 @@ if ($errors.Count -ne 0) {
                 "install must reject conflicting targets {left} and {right}"
             );
         }
+    }
+
+    // ---- #368: Codex hook enablement probe -------------------------------
+
+    fn codex_fixture(hooks_json: Option<&str>, config_toml: Option<&str>) -> CodexHookProbe {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks_path = dir.path().join("hooks.json");
+        let config_path = dir.path().join("config.toml");
+        if let Some(raw) = hooks_json {
+            std::fs::write(&hooks_path, raw).expect("write hooks.json");
+        }
+        if let Some(raw) = config_toml {
+            std::fs::write(&config_path, raw).expect("write config.toml");
+        }
+        // Rewrite the state key to be location-independent for assertions:
+        // callers compare against the returned key when needed.
+        probe_codex_dcg_hook_at(&hooks_path, &config_path)
+    }
+
+    const CODEX_HOOKS_DCG_FIRST: &str = r#"{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "/home/u/.local/bin/dcg" } ] }
+    ]
+  }
+}"#;
+
+    #[test]
+    fn codex_probe_registered_and_trusted_is_enabled_368() {
+        // The real installed shape: trusted_hash entry, no explicit enabled
+        // flag. Absence of `enabled = false` means the hook runs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks_path = dir.path().join("hooks.json");
+        std::fs::write(&hooks_path, CODEX_HOOKS_DCG_FIRST).expect("write");
+        let config_path = dir.path().join("config.toml");
+        let key = format!("{}:pre_tool_use:0:0", hooks_path.display());
+        std::fs::write(
+            &config_path,
+            format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"sha256:abc\"\n"),
+        )
+        .expect("write");
+        assert_eq!(
+            probe_codex_dcg_hook_at(&hooks_path, &config_path),
+            CodexHookProbe::Registered {
+                state_key: key,
+                state: CodexHookState::Enabled,
+            }
+        );
+    }
+
+    #[test]
+    fn codex_probe_registered_without_state_entry_is_untrusted_368() {
+        // Registered in hooks.json but never approved: Codex will not run it.
+        let probe = codex_fixture(Some(CODEX_HOOKS_DCG_FIRST), Some("[hooks.state]\n"));
+        assert!(
+            matches!(
+                probe,
+                CodexHookProbe::Registered {
+                    state: CodexHookState::NoStateEntry,
+                    ..
+                }
+            ),
+            "missing state entry must surface as NoStateEntry: {probe:?}"
+        );
+        // Missing config.toml entirely is the same trust vacuum.
+        let probe = codex_fixture(Some(CODEX_HOOKS_DCG_FIRST), None);
+        assert!(matches!(
+            probe,
+            CodexHookProbe::Registered {
+                state: CodexHookState::NoStateEntry,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn codex_probe_enabled_false_is_disabled_368() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks_path = dir.path().join("hooks.json");
+        std::fs::write(&hooks_path, CODEX_HOOKS_DCG_FIRST).expect("write");
+        let config_path = dir.path().join("config.toml");
+        let key = format!("{}:pre_tool_use:0:0", hooks_path.display());
+        std::fs::write(
+            &config_path,
+            format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"sha256:abc\"\nenabled = false\n"),
+        )
+        .expect("write");
+        assert_eq!(
+            probe_codex_dcg_hook_at(&hooks_path, &config_path),
+            CodexHookProbe::Registered {
+                state_key: key,
+                state: CodexHookState::Disabled,
+            }
+        );
+    }
+
+    #[test]
+    fn codex_probe_state_key_indexes_full_pre_tool_use_array_368() {
+        // The dcg hook sits in the SECOND PreToolUse element (a non-Bash
+        // entry first), so the derived key must use entry index 1 — the state
+        // table indexes the array as loaded, not Bash-only positions.
+        let hooks_json = r#"{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Write", "hooks": [ { "type": "command", "command": "/bin/other" } ] },
+      { "matcher": "Bash", "hooks": [
+          { "type": "command", "command": "/usr/bin/env-thing" },
+          { "type": "command", "command": "/home/u/.local/bin/dcg" }
+      ] }
+    ]
+  }
+}"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks_path = dir.path().join("hooks.json");
+        std::fs::write(&hooks_path, hooks_json).expect("write");
+        let config_path = dir.path().join("config.toml");
+        match probe_codex_dcg_hook_at(&hooks_path, &config_path) {
+            CodexHookProbe::Registered { state_key, .. } => {
+                assert!(
+                    state_key.ends_with(":pre_tool_use:1:1"),
+                    "key must index the full array (entry 1, hook 1): {state_key}"
+                );
+            }
+            other => panic!("expected Registered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_probe_stub_or_missing_hook_is_not_registered_368() {
+        // A /bin/true stub in the dcg slot must NOT count as registered —
+        // that is exactly the trusted-but-not-dcg failure #368 describes.
+        let stub = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/bin/true"}]}]}}"#;
+        assert_eq!(
+            codex_fixture(Some(stub), None),
+            CodexHookProbe::NotRegistered
+        );
+        assert_eq!(codex_fixture(None, None), CodexHookProbe::NotRegistered);
+        assert!(matches!(
+            codex_fixture(Some("{not json"), None),
+            CodexHookProbe::HooksFileInvalid(_)
+        ));
+    }
+
+    #[test]
+    fn codex_command_is_dcg_matches_basename_not_substring_368() {
+        assert!(codex_command_is_dcg("/Users/u/.local/bin/dcg"));
+        assert!(codex_command_is_dcg("dcg"));
+        assert!(codex_command_is_dcg("dcg.exe"));
+        assert!(codex_command_is_dcg(r"C:\bin\DCG.EXE"));
+        assert!(!codex_command_is_dcg("/bin/true"));
+        assert!(!codex_command_is_dcg("my-dcg-wrapper"));
+        assert!(!codex_command_is_dcg("python3 -c 'print(1)'"));
+        assert!(!codex_command_is_dcg(""));
+    }
+
+    #[test]
+    fn codex_enable_fix_flips_existing_entry_only_368() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let key = "/home/u/.codex/hooks.json:pre_tool_use:0:0";
+        std::fs::write(
+            &config_path,
+            format!(
+                "# user comment survives\nmodel = \"gpt-5\"\n\n[hooks.state.\"{key}\"]\ntrusted_hash = \"sha256:abc\"\nenabled = false\n"
+            ),
+        )
+        .expect("write");
+
+        enable_codex_hook_state_at(&config_path, key).expect("fix succeeds");
+        let after = std::fs::read_to_string(&config_path).expect("read back");
+        assert!(after.contains("enabled = true"), "flag flipped: {after}");
+        assert!(after.contains("# user comment survives"), "formatting kept");
+        assert!(
+            after.contains("trusted_hash = \"sha256:abc\""),
+            "trust kept"
+        );
+        // Idempotent.
+        enable_codex_hook_state_at(&config_path, key).expect("idempotent");
+
+        // A missing entry is refused — doctor must never forge trust.
+        let err = enable_codex_hook_state_at(&config_path, "/nope:pre_tool_use:9:9")
+            .expect_err("must refuse to create entries");
+        assert!(err.to_string().contains("approve the hook in Codex"));
+        let unchanged = std::fs::read_to_string(&config_path).expect("read back");
+        assert_eq!(after, unchanged, "refusal must not modify the file");
+    }
+
+    // ---- #368: OpenCode plugin fidelity probe ----------------------------
+
+    #[test]
+    fn opencode_probe_distinguishes_current_stale_and_unowned_368() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plugin_path = dir.path().join("dcg-guard.js");
+
+        // Canonical bytes for an arbitrary embedded dcg path: Current.
+        let canonical = build_opencode_plugin_source(std::path::Path::new("/opt/bin/dcg"))
+            .expect("canonical source");
+        std::fs::write(&plugin_path, &canonical).expect("write");
+        assert_eq!(
+            probe_opencode_plugin(&plugin_path),
+            OpencodePluginProbe::Current
+        );
+
+        // A one-line edit keeps the marker but is no longer canonical.
+        std::fs::write(&plugin_path, format!("{canonical}\n// edited\n")).expect("write");
+        assert_eq!(
+            probe_opencode_plugin(&plugin_path),
+            OpencodePluginProbe::OwnedStale
+        );
+
+        // A stub that keeps the marker but guards nothing: exactly the #368
+        // regression a presence-only check cannot see.
+        std::fs::write(
+            &plugin_path,
+            format!("// {OPENCODE_PLUGIN_MARKER}\nexport const DcgGuard = async () => ({{}});\n"),
+        )
+        .expect("write");
+        assert_eq!(
+            probe_opencode_plugin(&plugin_path),
+            OpencodePluginProbe::OwnedStale
+        );
+
+        // No marker: user-owned, and a missing file likewise.
+        std::fs::write(&plugin_path, "export const Other = 1;\n").expect("write");
+        assert_eq!(
+            probe_opencode_plugin(&plugin_path),
+            OpencodePluginProbe::MissingOrUnowned
+        );
+        assert_eq!(
+            probe_opencode_plugin(&dir.path().join("absent.js")),
+            OpencodePluginProbe::MissingOrUnowned
+        );
     }
 
     /// #318: the generated OpenCode plugin embeds the absolute dcg path as a
