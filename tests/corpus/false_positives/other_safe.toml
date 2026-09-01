@@ -81,3 +81,49 @@ expected = "allow"
 description = "make is safe"
 command = "make all"
 expected = "allow"
+
+# ============================================================================
+# Ordinary file organisation inside one home subtree
+#
+# `mv-sensitive-source-root-home` fires on any mv mentioning /Users or /home,
+# which denied every rename under a home directory. Both sides here stay at
+# least two components below the same home-root form, so nothing leaves the
+# home tree and the relocate-then-delete bypass the rule exists for is not
+# reachable. Quoted spellings matter: a personal filename containing a space
+# must be quoted, and the rescues used to read bare words only.
+# ============================================================================
+
+[[case]]
+description = "rename inside a home subtree is ordinary file organisation"
+command = "mv /Users/merlin/Documents/a.txt /Users/merlin/Documents/b.txt"
+expected = "allow"
+
+[[case]]
+description = "tilde rename inside a home subtree is safe"
+command = "mv ~/Documents/Personal ~/Documents/_archived/"
+expected = "allow"
+
+[[case]]
+description = "quoted home-subtree move with spaces in the name is safe"
+command = "mv \"/Users/merlin/Documents/Personal/Admin/758 Texola Court Sale\" \"/Users/merlin/Documents/_archived/\""
+expected = "allow"
+
+[[case]]
+description = "single-quoted home-subtree move is safe"
+command = "mv '/Users/merlin/Documents/a b.txt' '/Users/merlin/Desktop/'"
+expected = "allow"
+
+[[case]]
+description = "linux home-subtree move is safe"
+command = "mv /home/user/docs/notes /home/user/docs/archive/"
+expected = "allow"
+
+[[case]]
+description = "quoted soft-delete into the macOS Trash is the documented remediation"
+command = "mv \"/Users/merlin/Documents/a b.txt\" ~/.Trash/"
+expected = "allow"
+
+[[case]]
+description = "soft-delete into a resolved-home Trash path is safe"
+command = "mv \"/Users/merlin/Documents/Personal/Admin\" /Users/merlin/.Trash/"
+expected = "allow"

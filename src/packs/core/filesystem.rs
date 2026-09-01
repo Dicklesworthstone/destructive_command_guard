@@ -247,9 +247,9 @@ const MV_SENSITIVE_SUGGESTIONS: &[PatternSuggestion] = &[
         "cp -a {path} {path}.bak",
         "Copy first (preserves the original) — verify the copy, then remove only after confirmation",
     ),
-    PatternSuggestion::gated(
+    PatternSuggestion::new(
         "mv {path} {path}.deleted-YYYYMMDD",
-        "In-place rename for soft-delete (no cross-segment hop, easy to undo) — any mv touching a sensitive path is still gated",
+        "In-place rename for soft-delete (no cross-segment hop, easy to undo) — allowed inside a home subtree; a home root, a top-level home directory, a dotfile tree, or a system path is still gated",
     ),
     PatternSuggestion::new(
         "mv /tmp/{subdir}/foo /tmp/{subdir}/bar",
@@ -3597,6 +3597,73 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "mv-to-trash",
             r"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:~/|/home/[^/\s]+/|/Users/[^/\s]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[A-Za-z0-9._][^\s;|&]*)+[ \t]+(?:~/\.local/share/Trash|~/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&]*)?\s*$"
         ),
+        // -----------------------------------------------------------------
+        // `mv` into the platform Trash, with quoted paths and a resolved
+        // home directory.
+        //
+        // `mv-to-trash` above reads only bare, unquoted words, but the
+        // destructive rule it rescues from is quote-tolerant: its path
+        // alternation is prefixed by `['\"\\]?`. Quoting therefore only ever
+        // moves a command toward deny, and a personal file whose name
+        // contains a space MUST be quoted -- so the soft-delete dcg itself
+        // recommends is unreachable for exactly the files most likely to
+        // need it. The same asymmetry hides the resolved spelling: an agent
+        // that has already expanded `~` writes `/Users/<user>/.Trash`, which
+        // the `~`-only destination above cannot match.
+        //
+        // The source class is deliberately identical to `mv-to-trash` (home
+        // subpath, tmp family, or relative path -- never a bare `~`, a whole
+        // `/home/<user>` or `/Users/<user>` root, nor a sensitive system
+        // tree), only with quoted variants added. The destination is still a
+        // Trash directory, so the rescued operation stays recoverable.
+        // -----------------------------------------------------------------
+        safe_pattern!(
+            "mv-to-trash-quoted",
+            r#"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~/|/home/[^/\s'"]+/|/Users/[^/\s'"]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[A-Za-z0-9._][^\s;|&]*|"(?:~/|/home/[^/"]+/|/Users/[^/"]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|")|[^"]*/\.\.(?:/|"))[A-Za-z0-9._][^"$`;|&]*"|'(?:~/|/home/[^/']+/|/Users/[^/']+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|')|[^']*/\.\.(?:/|'))[A-Za-z0-9._][^'$`;|&]*'))+[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"']*)?|"(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"']*)?"|'(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"']*)?')[ \t]*$"#
+        ),
+        // -----------------------------------------------------------------
+        // Ordinary renames and moves *inside* one home subtree.
+        //
+        // `mv-sensitive-source-root-home` fires on any mv whose command line
+        // mentions `/Users/...` or `/home/...`, so every rename under a home
+        // directory is denied -- and the escapes the two home rules
+        // recommend to each other close the loop: that rule points at
+        // `cp -a <src> <src>.bak && diff -r ... && <recursive delete of
+        // src>`, whose cleanup step `rm-rf-root-home` denies, and
+        // `rm-rf-root-home` points back at
+        // `mv <dir> /tmp/delete-me-<timestamp>`, which this rule denies. No
+        // sanctioned path completes, so routine file organisation under
+        // `~/Documents` needs a per-command `dcg allow-once`.
+        //
+        // What this rescues is strictly a rename within one user's own
+        // visible content, which cannot be the cross-segment
+        // relocate-then-delete bypass the rule exists for: both sides stay
+        // under the same home-root form, so nothing leaves the home tree and
+        // no recursive delete of the destination is allowed either.
+        //
+        // The boundaries, each load-bearing:
+        // - A source needs at least TWO components below the home root, so a
+        //   home root itself (`~`, `/Users/<user>`) and a top-level home
+        //   directory (`~/Documents`) can never be the thing being moved. A
+        //   destination needs one, because moving *into* `~/Desktop` is
+        //   ordinary while moving `~/Desktop` away is a restructure.
+        // - The first component below the home root may not begin with `.`,
+        //   so every dotfile tree -- `~/.ssh`, `~/.aws`, `~/.config`,
+        //   `~/.claude` -- keeps the deny on both sides.
+        // - `..` is rejected in every later component, so no token can climb
+        //   out of the home tree it names.
+        // - Dynamic expansion (`$`, backticks, backslashes) is excluded
+        //   globally and inside every path token, so `$HOME/...` and command
+        //   substitution still fall through to the fail-closed rules. Flags
+        //   may not take a value, which keeps `mv -t /etc ...` and
+        //   `--target-directory=/etc` out.
+        // - Anchored whole-command, so a compound that appends a destructive
+        //   second segment is not rescued.
+        // -----------------------------------------------------------------
+        safe_pattern!(
+            "mv-within-home",
+            r#"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)+/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)+/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)+/?'))+[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?')[ \t]*$"#
+        ),
     ]
 }
 
@@ -3688,10 +3755,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              dcg auto-allows recursive deletion only for literal temp paths:\n  \
              rm -rf /tmp/<subdir>/scratch\n\n\
              For any other directory, preview first, then either delete interactively \
-             or move the tree aside (dcg allows both forms):\n  \
+             or move the tree aside (dcg allows all three forms):\n  \
              find /path/to/directory -type f | head -20\n  \
              rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
-             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
+             mv /path/to/directory ~/.Trash/            # macOS soft-delete, recoverable\n  \
+             mv /path/to/directory ~/.local/share/Trash/ # Linux soft-delete, recoverable\n\n\
+             Under a home directory, prefer the Trash move: relocating into /tmp is \
+             itself denied there (`mv-sensitive-source-root-home`), because \
+             relocate-then-delete is the bypass that rule exists to stop.",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // Same root/home catastrophe but with SEPARATE flags (`rm -r -f /`,
@@ -4231,11 +4302,18 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              `/usr`, `/var`, `/home`, `~`, `$HOME`, ...) blocks here, including \
              in-place renames within /etc.\n\n\
              Safer alternatives:\n\
-             - Backup with copy + verify + delete:\n  \
-               `cp -a <source> <source>.bak && diff -r <source> <source>.bak && rm -rf <source>`\n\
-             - Soft-delete via in-place rename: `mv <file> <file>.deleted-YYYYMMDD` \
-               (use `dcg allow-once` for the rename, then a follow-up `rm` after a soak period).\n\
-             - Pure tmp-to-tmp moves: `mv /tmp/<a> /tmp/<b>` is allowed.",
+             - Rename or move within one home subtree — allowed, quoted or not:\n  \
+               `mv ~/Documents/<a> ~/Documents/<b>` (both sides at least two components \
+               below the home root, no dotfile tree, no `..`).\n\
+             - Soft-delete into the platform Trash (recoverable, and allowed):\n  \
+               `mv <path> ~/.Trash/` on macOS, `mv <path> ~/.local/share/Trash/` on Linux.\n\
+             - Soft-delete via in-place rename: `mv <file> <file>.deleted-YYYYMMDD`.\n\
+             - Copy first and verify, then delete the copy's source only with explicit \
+               approval: `cp -a <source> <source>.bak && diff -r <source> <source>.bak` \
+               (the recursive delete of a home or system source stays gated).\n\
+             - Pure tmp-to-tmp moves: `mv /tmp/<a> /tmp/<b>` is allowed.\n\
+             - Moving a home root, a top-level home directory, or a dotfile tree is \
+               still gated: use `dcg allow-once` for those.",
             MV_SENSITIVE_SUGGESTIONS
         ),
         // Any shell-expanded mv path can resolve to `/`, `/etc`, or another

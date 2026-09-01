@@ -124,3 +124,63 @@ description = "a real invocation after the terminator is outside the body (#357)
 command = "python3 - <<'PY'\nx = 1\nPY\ngit branch $name"
 expected = "deny"
 rule_id = "core.git:branch-dynamic-token"
+
+# ============================================================================
+# Home-subtree move rescue must not become a relocate-then-delete bypass
+#
+# `mv-within-home` allows a rename that stays inside one home subtree. These
+# are the shapes it must never rescue: a home root or top-level home directory
+# as the source, a dotfile tree on either side, a `..` escape, a dynamic path,
+# a flag carrying a target value, a hop out of the home tree, and a compound
+# command whose second segment is destructive.
+# ============================================================================
+
+[[case]]
+description = "moving a whole home root is still the relocate half of the bypass"
+command = "mv /Users/merlin /tmp/x"
+expected = "deny"
+
+[[case]]
+description = "moving a top-level home directory is a restructure, not a rename"
+command = "mv ~/Documents ~/Docs"
+expected = "deny"
+
+[[case]]
+description = "home-subtree rescue does not extend to dotfile trees"
+command = "mv ~/.ssh/id_rsa ~/Documents/x"
+expected = "deny"
+
+[[case]]
+description = "home-subtree rescue does not allow writing into a dotfile tree"
+command = "mv ~/Documents/x ~/.ssh/authorized_keys"
+expected = "deny"
+
+[[case]]
+description = "dot-dot cannot climb out of the home tree it names"
+command = "mv ~/Documents/a ~/Documents/../../etc/x"
+expected = "deny"
+
+[[case]]
+description = "quoted dot-dot escape from a home subtree is still denied"
+command = "mv \"/Users/merlin/Documents/../.ssh/key\" \"/Users/merlin/Documents/x\""
+expected = "deny"
+
+[[case]]
+description = "expanded home variable still fails closed"
+command = "mv \"$HOME/Documents/a\" ~/Documents/b"
+expected = "deny"
+
+[[case]]
+description = "a value-taking flag cannot smuggle a system target"
+command = "mv -t /etc ~/Documents/a"
+expected = "deny"
+
+[[case]]
+description = "leaving the home tree for tmp is still relocate-then-delete"
+command = "mv ~/Documents/a/b /tmp/x"
+expected = "deny"
+
+[[case]]
+description = "trash rescue does not launder a sensitive source"
+command = "mv /etc ~/.Trash/"
+expected = "deny"
