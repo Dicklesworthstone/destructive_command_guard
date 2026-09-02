@@ -18,9 +18,9 @@ use crate::evaluator::{
 use crate::exit_codes::{EXIT_DENIED, EXIT_WARNING};
 use crate::highlight::{HighlightSpan, format_highlighted_command, should_use_color};
 use crate::history::{
-    CommandEntry, ENV_HISTORY_DB_PATH, ExportOptions, HistoryDb, HistoryStats, HistoryWriter,
-    InteractiveAllowlistAuditEntry, InteractiveAllowlistOptionType, Outcome, SuggestionAction,
-    SuggestionAuditEntry,
+    CommandEntry, ENV_HISTORY_DISABLED, ExportOptions, HistoryDb, HistoryPathSource, HistoryStats,
+    HistoryWriter, InteractiveAllowlistAuditEntry, InteractiveAllowlistOptionType, Outcome,
+    ResolvedHistoryPath, SuggestionAction, SuggestionAuditEntry,
 };
 use crate::interactive::{
     AllowlistScope, InteractiveConfig, InteractiveResult, check_interactive_available,
@@ -4469,7 +4469,7 @@ fn log_interactive_allowlist_audit_event(
         return Ok(());
     }
 
-    let db_path = config.history.expanded_database_path();
+    let db_path = Some(ResolvedHistoryPath::resolve(&config.history).path);
     let db = HistoryDb::open_with_max_size(db_path, config.history.max_size_mb)?;
 
     let cwd = std::env::current_dir()
@@ -4507,11 +4507,8 @@ const fn should_record_robot_history(robot_mode: bool, history_enabled: bool) ->
     robot_mode && history_enabled
 }
 
-fn robot_history_db_path(config: &crate::config::HistoryConfig) -> Option<std::path::PathBuf> {
-    if let Ok(path) = std::env::var(ENV_HISTORY_DB_PATH) {
-        return Some(std::path::PathBuf::from(path));
-    }
-    config.expanded_database_path()
+fn robot_history_db_path(config: &crate::config::HistoryConfig) -> std::path::PathBuf {
+    ResolvedHistoryPath::resolve(config).path
 }
 
 fn build_robot_history_entry(
@@ -4922,7 +4919,7 @@ fn test_command(
                 |path| path.to_string_lossy().into_owned(),
             );
             let mut writer = HistoryWriter::new(
-                robot_history_db_path(&effective_config.history),
+                Some(robot_history_db_path(&effective_config.history)),
                 &effective_config.history,
             );
             if let Some(deadline) = evaluation_deadline.as_ref() {
@@ -8552,7 +8549,7 @@ fn handle_stats_rules(
     use chrono::{Duration, Utc};
 
     // Open history database
-    let db_path = config.history.expanded_database_path();
+    let db_path = Some(ResolvedHistoryPath::resolve(&config.history).path);
     let db = match HistoryDb::open_with_max_size(db_path, config.history.max_size_mb) {
         Ok(db) => db,
         Err(err) => {
@@ -9019,7 +9016,7 @@ fn handle_suggest_allowlist_command(
     };
 
     // Open history database
-    let db_path = config.history.expanded_database_path();
+    let db_path = Some(ResolvedHistoryPath::resolve(&config.history).path);
     let db = match HistoryDb::open_with_max_size(db_path, config.history.max_size_mb) {
         Ok(db) => db,
         Err(err) => {
@@ -9622,7 +9619,7 @@ fn handle_history_command(
     config: &Config,
     action: HistoryAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let db_path = config.history.expanded_database_path();
+    let db_path = Some(ResolvedHistoryPath::resolve(&config.history).path);
     let db = match HistoryDb::open_with_max_size(db_path, config.history.max_size_mb) {
         Ok(db) => db,
         Err(err) => {
@@ -11003,6 +11000,22 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         config.hook_timeout_source()
     );
 
+    // Check 5b: History database location (#381)
+    print!("Checking history database... ");
+    let history = history_doctor_check(config);
+    match history.status {
+        DoctorCheckStatus::Ok | DoctorCheckStatus::Skipped => println!("{}", "OK".green()),
+        DoctorCheckStatus::Warning => println!("{}", "WARNING".yellow()),
+        DoctorCheckStatus::Error => {
+            issues += 1;
+            println!("{}", "ERROR".red());
+        }
+    }
+    println!("  {}", history.message);
+    if let Some(remediation) = &history.remediation {
+        println!("  → {remediation}");
+    }
+
     // Check 6: Smoke test
     print!("Running smoke test... ");
     if run_smoke_test(config) {
@@ -11231,6 +11244,99 @@ fn doctor_pass_summary(report: &DoctorReport) -> &'static str {
     } else {
         "All checks passed (guard not wired to any agent)"
     }
+}
+
+/// Outcome of the doctor's history-database check, shared by every renderer.
+struct HistoryDoctorCheck {
+    status: DoctorCheckStatus,
+    message: String,
+    remediation: Option<String>,
+}
+
+/// Report where the history database resolves to and whether the hook could
+/// write there (#381).
+///
+/// The probe is deliberately side-effect free: an existing file is opened for
+/// writing without touching its bytes, and a missing file is judged by its
+/// nearest existing ancestor's permission bits. Read-only bind mounts are only
+/// detectable once the file exists, which is exactly the upgrade case the
+/// legacy-location note covers.
+fn history_doctor_check(config: &Config) -> HistoryDoctorCheck {
+    let resolved = ResolvedHistoryPath::resolve(&config.history);
+    let location = format!(
+        "{} (via {})",
+        resolved.path.display(),
+        resolved.source.describe()
+    );
+    let relocate_hint = format!(
+        "Set DCG_HISTORY_DB or [history] database_path to a writable file, \
+         or move {} (with its -wal/-shm sidecars) to the default state directory",
+        resolved.path.display()
+    );
+
+    if crate::history::history_disabled_by_env() {
+        return HistoryDoctorCheck {
+            status: DoctorCheckStatus::Ok,
+            message: format!("disabled by {ENV_HISTORY_DISABLED}; would use {location}"),
+            remediation: None,
+        };
+    }
+    if !config.history.enabled {
+        return HistoryDoctorCheck {
+            status: DoctorCheckStatus::Ok,
+            message: format!("disabled ([history] enabled = false); would use {location}"),
+            remediation: None,
+        };
+    }
+
+    let legacy_note = if resolved.source == HistoryPathSource::LegacyConfigDir {
+        "; this is the pre-0.15 location and stays in use until the file is moved"
+    } else {
+        ""
+    };
+
+    match probe_history_path_writable(&resolved.path) {
+        Ok(()) => HistoryDoctorCheck {
+            status: DoctorCheckStatus::Ok,
+            message: format!("enabled; database {location}{legacy_note}"),
+            remediation: None,
+        },
+        Err(reason) => HistoryDoctorCheck {
+            status: DoctorCheckStatus::Warning,
+            message: format!("enabled but the hook cannot write {location}: {reason}{legacy_note}"),
+            remediation: Some(relocate_hint),
+        },
+    }
+}
+
+/// Non-destructive writability probe for the history database path.
+fn probe_history_path_writable(path: &std::path::Path) -> Result<(), String> {
+    if path.is_file() {
+        // Opening for write does not modify the file; SQLite needs exactly this.
+        return std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map(drop)
+            .map_err(|err| format!("existing file is not writable ({err})"));
+    }
+    if path.exists() {
+        return Err("path exists but is not a regular file".to_string());
+    }
+    let Some(existing_ancestor) = path.ancestors().skip(1).find(|dir| dir.exists()) else {
+        return Ok(());
+    };
+    let metadata = std::fs::metadata(existing_ancestor)
+        .map_err(|err| format!("cannot inspect {} ({err})", existing_ancestor.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "{} is not a directory",
+            existing_ancestor.display()
+        ));
+    }
+    if metadata.permissions().readonly() {
+        return Err(format!("{} is read-only", existing_ancestor.display()));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
@@ -11538,6 +11644,17 @@ fn collect_doctor_report(
             config.hook_timeout_source()
         ),
         remediation: None,
+        fixed: false,
+    });
+
+    // Check 5b: History database location (#381)
+    let history = history_doctor_check(config);
+    checks.push(DoctorCheck {
+        id: "history",
+        name: "History database",
+        status: history.status,
+        message: history.message,
+        remediation: history.remediation,
         fixed: false,
     });
 

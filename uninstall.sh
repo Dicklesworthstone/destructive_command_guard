@@ -8,7 +8,7 @@
 # Options:
 #   --yes            Skip confirmation prompt
 #   --keep-config    Keep configuration files (~/.config/dcg/)
-#   --keep-history   Keep history.db, backups, and ~/.local/share/dcg/
+#   --keep-history   Keep history.db (in ~/.config/dcg or ${XDG_STATE_HOME:-~/.local/state}/dcg), backups, and ~/.local/share/dcg/
 #   --purge          Remove everything (overrides keep flags)
 #   --quiet          Suppress non-error output
 #
@@ -1464,10 +1464,12 @@ report_unconfigure() {
 remove_state_directories() {
     local config_dir="$1"
     local data_dir="$2"
+    local state_dir="$3"
 
-    # history.db and release backups share ~/.config/dcg with config.toml.
-    # KeepConfig and KeepHistory therefore need field-level removal rather than
-    # treating the whole directory as one category.
+    # Releases before 0.15 wrote history.db beside config.toml, and release
+    # backups still live there. KeepConfig and KeepHistory therefore need
+    # field-level removal rather than treating the whole directory as one
+    # category. Newer installs keep history.db in $state_dir (#381).
     if [ -d "$config_dir" ]; then
         if [ "$KEEP_CONFIG" -eq 0 ] && [ "$KEEP_HISTORY" -eq 0 ]; then
             if rm -rf "$config_dir" 2>/dev/null; then
@@ -1506,6 +1508,14 @@ remove_state_directories() {
             warn "Failed to remove history data"
         fi
     fi
+
+    if [ "$KEEP_HISTORY" -eq 0 ] && [ -d "$state_dir" ]; then
+        if rm -rf "$state_dir" 2>/dev/null; then
+            ok "Removed history database ($state_dir)"
+        else
+            warn "Failed to remove history database ($state_dir)"
+        fi
+    fi
 }
 
 # Main uninstall function
@@ -1520,6 +1530,9 @@ main() {
     # Determine paths
     local config_dir="$HOME/.config/dcg"
     local data_dir="$HOME/.local/share/dcg"
+    # Default history.db location since 0.15 (#381); older installs keep it
+    # in $config_dir, which remove_state_directories also handles.
+    local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/dcg"
     local claude_settings="$HOME/.claude/settings.json"
     local gemini_settings="$HOME/.gemini/settings.json"
     local aider_config="$HOME/.aider.conf.yml"
@@ -1594,6 +1607,10 @@ main() {
         log "  • History data ($data_dir)"
         found_anything=1
     fi
+    if [ "$KEEP_HISTORY" -eq 0 ] && [ -d "$state_dir" ]; then
+        log "  • History database ($state_dir)"
+        found_anything=1
+    fi
 
     # Binary
     if [ -n "$binary" ] && [ -f "$binary" ]; then
@@ -1664,7 +1681,7 @@ main() {
         fi
     fi
 
-    remove_state_directories "$config_dir" "$data_dir"
+    remove_state_directories "$config_dir" "$data_dir" "$state_dir"
 
     # Remove binary
     if [ -n "$binary" ] && [ -f "$binary" ]; then

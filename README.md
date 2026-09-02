@@ -700,6 +700,34 @@ Environment variables override config files (highest priority):
   updater refuses before any network/installer work unless
   `--replace-local-build` is passed, and the "update available" nudge is
   suppressed. Same as `general.update_pin = true` in config.
+- `DCG_HISTORY_DB=/path/to/history.db`: history database file (overrides
+  `[history] database_path`; `~` is expanded). See [Command History](#command-history).
+- `DCG_HISTORY_DISABLED=1`: never open the history database, even when
+  `[history] enabled = true`.
+
+### Command History
+
+Command history is **opt-in** (`[history] enabled = true`). When enabled, the
+hook records every evaluated command (redacted per `redaction_mode`) in a
+SQLite database that `dcg history`, `dcg stats`, and `dcg suggest-allowlist`
+read.
+
+Where the database lives, highest priority first:
+
+1. `DCG_HISTORY_DB` environment variable
+2. `[history] database_path` in config (`~` expanded; relative paths resolve
+   against the working directory)
+3. An existing `history.db` beside `config.toml` (`~/.config/dcg/history.db`)
+   from a release before 0.15 — it keeps being used until you move it
+4. The platform state directory: `$XDG_STATE_HOME/dcg/history.db`, defaulting
+   to `~/.local/state/dcg/history.db` on Linux/macOS, and
+   `%LOCALAPPDATA%\dcg\history.db` on Windows
+
+History is state, not configuration, so it no longer defaults into
+`~/.config/dcg`; a sandbox that mounts the config directory read-only keeps
+working. Directories dcg creates for the database are owner-only (`0700`).
+`dcg doctor` prints the resolved path, which rule selected it, and whether the
+hook can write there.
 
 ### Output Formats and `DCG_FORMAT`
 
@@ -1155,7 +1183,8 @@ The Unix uninstaller:
 - Removes dcg hooks and marker-owned bridges from Claude Code, Codex CLI, Cursor IDE, Gemini CLI, GitHub Copilot CLI (user-level plus legacy repo-local), Hermes Agent, Posit Assistant, OpenCode, Oh My Pi, and Aider
 - Removes the dcg binary
 - Removes configuration (`~/.config/dcg/`) and history (the
-  `~/.config/dcg/history.db` SQLite files plus `~/.local/share/dcg/`)
+  `history.db` SQLite files in `~/.config/dcg/` or
+  `${XDG_STATE_HOME:-~/.local/state}/dcg/`, plus `~/.local/share/dcg/`)
 - Prompts for confirmation before making changes
 
 The PowerShell uninstaller removes the Windows `dcg.exe` binary, the exact User PATH entry added by `install.ps1`, dcg hooks or marker-owned extensions from Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, Posit Assistant, Oh My Pi, Grok, and Antigravity (`agy`), plus dcg configuration/history from native `%APPDATA%` / `%LOCALAPPDATA%` and any legacy `~/.config` / `~/.local/share` locations.

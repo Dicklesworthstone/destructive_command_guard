@@ -38,8 +38,10 @@
 mod schema;
 mod sqlite;
 
-use crate::config::{HistoryConfig, HistoryRedactionMode};
+use crate::config::{HistoryConfig, HistoryRedactionMode, resolve_config_path_value};
 use crate::logging::{RedactionConfig, RedactionMode};
+use std::env;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -61,6 +63,184 @@ pub const ENV_HISTORY_DB_PATH: &str = "DCG_HISTORY_DB";
 
 /// Environment variable to disable history collection entirely.
 pub const ENV_HISTORY_DISABLED: &str = "DCG_HISTORY_DISABLED";
+
+/// Whether [`ENV_HISTORY_DISABLED`] is set to `1` or `true` (case-insensitive).
+#[must_use]
+pub fn history_disabled_by_env() -> bool {
+    env::var(ENV_HISTORY_DISABLED)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Which rule selected the history database path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryPathSource {
+    /// The `DCG_HISTORY_DB` environment variable.
+    Environment,
+    /// `[history] database_path` from the loaded configuration.
+    Config,
+    /// An existing database at the pre-0.15 location beside `config.toml`.
+    LegacyConfigDir,
+    /// The platform state directory: `$XDG_STATE_HOME/dcg` or
+    /// `~/.local/state/dcg` on Unix, `%LOCALAPPDATA%\dcg` on Windows.
+    Default,
+}
+
+impl HistoryPathSource {
+    /// Short human-readable label for diagnostics.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Environment => "DCG_HISTORY_DB",
+            Self::Config => "[history] database_path",
+            Self::LegacyConfigDir => "legacy config-directory location",
+            Self::Default => "default state directory",
+        }
+    }
+}
+
+/// A history database path together with the rule that selected it.
+///
+/// Every reader and writer of the history database must go through
+/// [`ResolvedHistoryPath::resolve`] so the hook, `dcg history`, `dcg stats`,
+/// and `dcg doctor` all agree on one file. Precedence, highest first:
+///
+/// 1. `DCG_HISTORY_DB` (non-empty; `~` expanded, relative paths resolved
+///    against the current directory).
+/// 2. `[history] database_path` in the effective configuration.
+/// 3. An existing `history.db` beside `config.toml` (the location every
+///    release before 0.15 wrote to). It is honored, never moved, so an
+///    upgrade keeps its data.
+/// 4. The platform state directory. History is state, not configuration, so
+///    it no longer defaults into `~/.config/dcg`; sandboxes that mount the
+///    config directory read-only keep working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedHistoryPath {
+    /// The database file path.
+    pub path: PathBuf,
+    /// Which rule selected `path`.
+    pub source: HistoryPathSource,
+}
+
+impl ResolvedHistoryPath {
+    /// Resolve the history database path for `config`.
+    #[must_use]
+    pub fn resolve(config: &HistoryConfig) -> Self {
+        Self::from_parts(
+            env::var(ENV_HISTORY_DB_PATH).ok().as_deref(),
+            config.expanded_database_path(),
+            existing_legacy_db_path(),
+            default_state_db_path(),
+        )
+    }
+
+    /// Resolve without a loaded configuration (env, legacy, then default).
+    #[must_use]
+    pub fn resolve_without_config() -> Self {
+        Self::from_parts(
+            env::var(ENV_HISTORY_DB_PATH).ok().as_deref(),
+            None,
+            existing_legacy_db_path(),
+            default_state_db_path(),
+        )
+    }
+
+    fn from_parts(
+        env_override: Option<&str>,
+        config_path: Option<PathBuf>,
+        existing_legacy: Option<PathBuf>,
+        default_path: PathBuf,
+    ) -> Self {
+        let cwd = env::current_dir().ok();
+        if let Some(path) =
+            env_override.and_then(|raw| resolve_config_path_value(raw, cwd.as_deref()))
+        {
+            return Self {
+                path,
+                source: HistoryPathSource::Environment,
+            };
+        }
+        if let Some(path) = config_path {
+            return Self {
+                path,
+                source: HistoryPathSource::Config,
+            };
+        }
+        if let Some(path) = existing_legacy {
+            return Self {
+                path,
+                source: HistoryPathSource::LegacyConfigDir,
+            };
+        }
+        Self {
+            path: default_path,
+            source: HistoryPathSource::Default,
+        }
+    }
+}
+
+/// The pre-0.15 database location, if a database already exists there.
+///
+/// Mirrors the config-directory search in `Config::user_config_path`:
+/// `$XDG_CONFIG_HOME`, then `~/.config`, then the platform-native config
+/// directory. Only an existing *file* counts; an empty directory does not pin
+/// new installs to the old location.
+fn existing_legacy_db_path() -> Option<PathBuf> {
+    let mut bases: Vec<PathBuf> = Vec::with_capacity(3);
+    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
+        let xdg = PathBuf::from(xdg);
+        if xdg.is_absolute() {
+            bases.push(xdg);
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        bases.push(home.join(".config"));
+    }
+    if let Some(native) = dirs::config_dir() {
+        bases.push(native);
+    }
+    bases
+        .into_iter()
+        .map(|base| base.join("dcg").join(DEFAULT_DB_FILENAME))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The default database location for new installs.
+fn default_state_db_path() -> PathBuf {
+    state_db_path_from(
+        env::var_os("XDG_STATE_HOME").as_deref(),
+        dirs::home_dir().as_deref(),
+        dirs::data_local_dir().as_deref(),
+    )
+}
+
+/// Pure form of [`default_state_db_path`] for tests.
+///
+/// Unix: `$XDG_STATE_HOME/dcg/history.db` when set to an absolute path, else
+/// `~/.local/state/dcg/history.db` (the XDG Base Directory default for state
+/// such as logs and history). Windows: `%LOCALAPPDATA%\dcg\history.db`.
+fn state_db_path_from(
+    xdg_state_home: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+    windows_local_data: Option<&Path>,
+) -> PathBuf {
+    let home_state = || home.map(|h| h.join(".local").join("state"));
+    let base = if cfg!(windows) {
+        windows_local_data
+            .map(Path::to_path_buf)
+            .or_else(home_state)
+    } else {
+        xdg_state_home
+            .map(Path::new)
+            .filter(|p| p.is_absolute())
+            .map(Path::to_path_buf)
+            .or_else(home_state)
+    };
+    base.unwrap_or_else(|| PathBuf::from(".local").join("state"))
+        .join("dcg")
+        .join(DEFAULT_DB_FILENAME)
+}
 
 enum HistoryMessage {
     Entry(Box<CommandEntry>),
@@ -937,5 +1117,166 @@ mod tests {
         );
 
         let _ = release_tx.send(());
+    }
+
+    // ---- history database path resolution (#381) ----
+
+    fn abs(segments: &[&str]) -> PathBuf {
+        let mut path = if cfg!(windows) {
+            PathBuf::from(r"C:\")
+        } else {
+            PathBuf::from("/")
+        };
+        path.extend(segments);
+        path
+    }
+
+    #[test]
+    fn env_override_beats_config_legacy_and_default() {
+        let env_path = abs(&["srv", "env.db"]);
+        let resolved = ResolvedHistoryPath::from_parts(
+            Some(env_path.to_str().unwrap()),
+            Some(abs(&["cfg", "config.db"])),
+            Some(abs(&["home", ".config", "dcg", "history.db"])),
+            abs(&["home", ".local", "state", "dcg", "history.db"]),
+        );
+        assert_eq!(resolved.source, HistoryPathSource::Environment);
+        assert_eq!(resolved.path, env_path);
+    }
+
+    #[test]
+    fn blank_env_override_is_ignored() {
+        let config_path = abs(&["cfg", "config.db"]);
+        let resolved = ResolvedHistoryPath::from_parts(
+            Some("   "),
+            Some(config_path.clone()),
+            None,
+            abs(&["default.db"]),
+        );
+        assert_eq!(resolved.source, HistoryPathSource::Config);
+        assert_eq!(resolved.path, config_path);
+    }
+
+    #[test]
+    fn env_override_expands_tilde_and_relative_paths() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let resolved = ResolvedHistoryPath::from_parts(
+            Some("~/dcg-hist.db"),
+            None,
+            None,
+            abs(&["default.db"]),
+        );
+        assert_eq!(resolved.source, HistoryPathSource::Environment);
+        assert_eq!(resolved.path, home.join("dcg-hist.db"));
+
+        let relative =
+            ResolvedHistoryPath::from_parts(Some("rel/hist.db"), None, None, abs(&["default.db"]));
+        assert!(
+            relative.path.is_absolute(),
+            "relative DCG_HISTORY_DB must resolve against the working directory: {}",
+            relative.path.display()
+        );
+        assert!(relative.path.ends_with(Path::new("rel").join("hist.db")));
+    }
+
+    #[test]
+    fn config_beats_legacy_and_default() {
+        let config_path = abs(&["cfg", "config.db"]);
+        let resolved = ResolvedHistoryPath::from_parts(
+            None,
+            Some(config_path.clone()),
+            Some(abs(&["legacy.db"])),
+            abs(&["default.db"]),
+        );
+        assert_eq!(resolved.source, HistoryPathSource::Config);
+        assert_eq!(resolved.path, config_path);
+    }
+
+    #[test]
+    fn existing_legacy_database_beats_default() {
+        let legacy = abs(&["home", ".config", "dcg", "history.db"]);
+        let resolved =
+            ResolvedHistoryPath::from_parts(None, None, Some(legacy.clone()), abs(&["default.db"]));
+        assert_eq!(resolved.source, HistoryPathSource::LegacyConfigDir);
+        assert_eq!(resolved.path, legacy);
+    }
+
+    #[test]
+    fn default_is_used_when_nothing_else_applies() {
+        let default = abs(&["home", ".local", "state", "dcg", "history.db"]);
+        let resolved = ResolvedHistoryPath::from_parts(None, None, None, default.clone());
+        assert_eq!(resolved.source, HistoryPathSource::Default);
+        assert_eq!(resolved.path, default);
+    }
+
+    #[test]
+    fn default_state_path_prefers_xdg_state_home_on_unix() {
+        let home = abs(&["home", "u"]);
+        let xdg = abs(&["custom", "state"]);
+        let local = abs(&["appdata", "local"]);
+        let path = state_db_path_from(Some(xdg.as_os_str()), Some(&home), Some(&local));
+        if cfg!(windows) {
+            assert_eq!(path, local.join("dcg").join(DEFAULT_DB_FILENAME));
+        } else {
+            assert_eq!(path, xdg.join("dcg").join(DEFAULT_DB_FILENAME));
+        }
+    }
+
+    #[test]
+    fn default_state_path_falls_back_to_home_local_state() {
+        let home = abs(&["home", "u"]);
+        let expected = home
+            .join(".local")
+            .join("state")
+            .join("dcg")
+            .join(DEFAULT_DB_FILENAME);
+        assert_eq!(state_db_path_from(None, Some(&home), None), expected);
+        // A relative XDG_STATE_HOME is invalid per the spec and must be ignored.
+        assert_eq!(
+            state_db_path_from(
+                Some(std::ffi::OsStr::new("relative/state")),
+                Some(&home),
+                None
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn default_state_path_never_lands_in_the_config_directory() {
+        let home = abs(&["home", "u"]);
+        let path = state_db_path_from(None, Some(&home), Some(&abs(&["local"])));
+        assert!(
+            !path.starts_with(home.join(".config")),
+            "history is state, not configuration: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn default_state_path_without_home_is_relative_state_dir() {
+        let path = state_db_path_from(None, None, None);
+        assert_eq!(
+            path,
+            PathBuf::from(".local")
+                .join("state")
+                .join("dcg")
+                .join(DEFAULT_DB_FILENAME)
+        );
+    }
+
+    #[test]
+    fn source_labels_are_stable() {
+        assert_eq!(HistoryPathSource::Environment.describe(), "DCG_HISTORY_DB");
+        assert_eq!(
+            HistoryPathSource::Config.describe(),
+            "[history] database_path"
+        );
+        assert_eq!(
+            serde_json::to_string(&HistoryPathSource::LegacyConfigDir).unwrap(),
+            "\"legacy_config_dir\""
+        );
     }
 }

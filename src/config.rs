@@ -5495,8 +5495,13 @@ redaction_mode = "pattern"
 retention_days = 90
 max_size_mb = 500
 
-# Optional database path override.
-# database_path = "~/.config/dcg/history.db"
+# Optional database path override (`~` is expanded; relative paths resolve
+# against the working directory). The DCG_HISTORY_DB environment variable
+# takes precedence over this setting. Default: $XDG_STATE_HOME/dcg/history.db
+# (~/.local/state/dcg/history.db) on Unix, %LOCALAPPDATA%\dcg\history.db on
+# Windows; an existing ~/.config/dcg/history.db from an older release keeps
+# being used until you move it. `dcg doctor` shows the resolved path.
+# database_path = "~/.local/state/dcg/history.db"
 
 #─────────────────────────────────────────────────────────────
 # GRADUATED RESPONSE SYSTEM

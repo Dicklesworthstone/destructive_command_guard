@@ -2609,12 +2609,18 @@ fn codex_deny_with_history_disabled_still_emits_json() {
         "Codex deny must still produce stderr with history disabled"
     );
 
-    // No history DB should be created
-    let default_db = home.path().join(".config/dcg/history.db");
-    assert!(
-        !default_db.exists(),
-        "no history DB should be created when history is disabled"
-    );
+    // No history DB should be created, neither at the current default
+    // state-directory location nor at the pre-0.15 config-directory one.
+    for default_db in [
+        home.path().join(".local/state/dcg/history.db"),
+        home.path().join(".config/dcg/history.db"),
+    ] {
+        assert!(
+            !default_db.exists(),
+            "no history DB should be created when history is disabled: {}",
+            default_db.display()
+        );
+    }
 }
 
 #[test]

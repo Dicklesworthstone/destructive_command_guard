@@ -284,10 +284,12 @@ function Remove-DcgHooksFromJsonFile {
 }
 
 function Remove-DcgStateDirectories {
-  # history.db currently lives beside config.toml in $ConfigDir. Treat it and
-  # SQLite's live sidecars as history so -KeepConfig and -KeepHistory remain
-  # independent. Backups also share the native Windows config root because
-  # dirs::data_dir() resolves to roaming AppData. $DataDir contains local logs.
+  # Releases before 0.15 wrote history.db beside config.toml in $ConfigDir.
+  # Treat it and SQLite's live sidecars as history so -KeepConfig and
+  # -KeepHistory remain independent. Backups also share the native Windows
+  # config root because dirs::data_dir() resolves to roaming AppData. $DataDir
+  # (%LOCALAPPDATA%\dcg) holds local logs and, since 0.15, the default
+  # history.db (#381); it is removed as a whole unless -KeepHistory.
   param(
     [string]$ConfigDir,
     [string]$DataDir,

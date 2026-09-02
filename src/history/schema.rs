@@ -12,7 +12,6 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::env;
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 
@@ -117,6 +116,22 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 /// Default database filename.
 pub const DEFAULT_DB_FILENAME: &str = "history.db";
+
+/// Create `dir` and any missing ancestors, owner-only (`0700`) on Unix.
+///
+/// Existing directories are left untouched (their mode is not tightened) so a
+/// user who deliberately shares `~/.local/state` keeps their layout; only what
+/// dcg itself creates is private.
+fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
 
 /// History-specific error type.
 #[derive(Debug)]
@@ -763,27 +778,28 @@ pub struct HistoryDb {
 impl HistoryDb {
     /// Open or create the history database at the default path.
     ///
-    /// The default path is the platform-native dcg configuration directory
-    /// (while honoring an existing legacy XDG-style installation), unless
-    /// overridden by the `DCG_HISTORY_DB` environment variable.
+    /// The default path is [`Self::default_path`]: the `DCG_HISTORY_DB`
+    /// environment variable, else an existing legacy database beside
+    /// `config.toml`, else the platform state directory.
     ///
     /// # Errors
     ///
     /// Returns an error if the database cannot be opened or initialized.
     pub fn open(path: Option<PathBuf>) -> Result<Self, HistoryError> {
-        // Check if history is disabled
-        if env::var(super::ENV_HISTORY_DISABLED)
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false)
-        {
+        if super::history_disabled_by_env() {
             return Err(HistoryError::Disabled);
         }
 
         let db_path = path.unwrap_or_else(Self::default_path);
 
-        // Ensure parent directory exists
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        // Ensure the parent directory exists. The database records every
+        // command an agent ran (redacted or not, per config), so directories
+        // created here are private to the user.
+        if let Some(parent) = db_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            create_private_dir_all(parent)?;
         }
 
         let conn = Connection::open(&db_path)?;
@@ -829,32 +845,14 @@ impl HistoryDb {
     }
 
     /// Get the default database path.
+    ///
+    /// `DCG_HISTORY_DB` wins, then an existing legacy `<config dir>/dcg/history.db`,
+    /// then the platform state directory. See
+    /// [`super::ResolvedHistoryPath`] for the full precedence including
+    /// `[history] database_path`.
     #[must_use]
     pub fn default_path() -> PathBuf {
-        if let Ok(path) = env::var(super::ENV_HISTORY_DB_PATH) {
-            return PathBuf::from(path);
-        }
-
-        // Check XDG-style path first (~/.config/dcg/), then platform-native
-        let xdg_base = dirs::home_dir().map(|h| h.join(".config"));
-        let xdg_path = xdg_base
-            .as_ref()
-            .map(|b| b.join("dcg").join(DEFAULT_DB_FILENAME));
-        if let Some(ref path) = xdg_path {
-            if path.exists()
-                || xdg_base
-                    .as_ref()
-                    .map(|b| b.join("dcg").exists())
-                    .unwrap_or(false)
-            {
-                return path.clone();
-            }
-        }
-
-        // Fall back to platform-native
-        let base = dirs::config_dir()
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"));
-        base.join("dcg").join(DEFAULT_DB_FILENAME)
+        super::ResolvedHistoryPath::resolve_without_config().path
     }
 
     /// Get the database file path (None for in-memory).

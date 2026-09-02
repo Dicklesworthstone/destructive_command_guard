@@ -32,7 +32,7 @@ use destructive_command_guard::evaluator::{
 #[allow(unused_imports)]
 use destructive_command_guard::exit_codes::{EXIT_DENIED, EXIT_PARSE_ERROR, EXIT_SUCCESS};
 use destructive_command_guard::history::{
-    CommandEntry, ENV_HISTORY_DB_PATH, HistoryWriter, Outcome as HistoryOutcome,
+    CommandEntry, HistoryWriter, Outcome as HistoryOutcome, ResolvedHistoryPath,
 };
 use destructive_command_guard::hook;
 use destructive_command_guard::load_default_allowlists;
@@ -107,11 +107,10 @@ fn enable_windows_ansi() {
     }
 }
 
-fn history_db_path(config: &destructive_command_guard::config::HistoryConfig) -> Option<PathBuf> {
-    if let Ok(path) = std::env::var(ENV_HISTORY_DB_PATH) {
-        return Some(PathBuf::from(path));
-    }
-    config.expanded_database_path()
+/// The one history database every writer and reader agrees on
+/// (`DCG_HISTORY_DB` > `[history] database_path` > legacy > state dir).
+fn history_db_path(config: &destructive_command_guard::config::HistoryConfig) -> PathBuf {
+    ResolvedHistoryPath::resolve(config).path
 }
 
 fn build_history_entry(
@@ -310,7 +309,8 @@ fn handle_unparseable_hook_input(
         } else {
             HistoryOutcome::Allow
         };
-        let mut writer = HistoryWriter::new(history_db_path(&config.history), &config.history);
+        let mut writer =
+            HistoryWriter::new(Some(history_db_path(&config.history)), &config.history);
         writer.limit_drop_wait_to(HOOK_EVALUATION_BUDGET);
         let entry = build_history_entry(
             detected_agent.config_key(),
@@ -563,7 +563,7 @@ fn try_deny_oversized_input(
             if matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask) {
                 let mut history_writer = if config.history.enabled {
                     let mut writer =
-                        HistoryWriter::new(history_db_path(&config.history), &config.history);
+                        HistoryWriter::new(Some(history_db_path(&config.history)), &config.history);
                     writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
                     Some(writer)
                 } else {
@@ -1661,7 +1661,8 @@ fn main() {
     );
 
     let mut history_writer = if config.history.enabled {
-        let mut writer = HistoryWriter::new(history_db_path(&config.history), &config.history);
+        let mut writer =
+            HistoryWriter::new(Some(history_db_path(&config.history)), &config.history);
         writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
         Some(writer)
     } else {

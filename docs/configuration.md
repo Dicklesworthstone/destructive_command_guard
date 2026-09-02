@@ -342,6 +342,34 @@ extra_packs = ["paranoid"]
 See [agents.md](agents.md) for full documentation on agent detection, trust
 levels, and profile configuration.
 
+## Command History
+
+```toml
+[history]
+enabled = false            # opt-in
+redaction_mode = "pattern" # "pattern" | "full" | "none"
+retention_days = 90
+max_size_mb = 500
+# database_path = "~/.local/state/dcg/history.db"
+```
+
+The database path resolves in this order (highest priority first):
+
+1. `DCG_HISTORY_DB` (environment; `~` expanded, relative paths resolved
+   against the working directory; blank values are ignored)
+2. `[history] database_path`
+3. An existing `history.db` beside `config.toml` (`$XDG_CONFIG_HOME/dcg`,
+   `~/.config/dcg`, or the platform-native config directory) written by a
+   release before 0.15 — honored, never moved
+4. `$XDG_STATE_HOME/dcg/history.db` when `XDG_STATE_HOME` is an absolute
+   path, else `~/.local/state/dcg/history.db`; on Windows
+   `%LOCALAPPDATA%\dcg\history.db`
+
+`DCG_HISTORY_DISABLED=1` prevents the database from being opened at all.
+Directories dcg creates for the database are `0700` on Unix. `dcg doctor`
+reports the resolved path, its source, and whether the hook can write there
+(check id `history` in `--format json`).
+
 ## Editor Autocomplete & Validation (JSON Schema)
 
 dcg publishes a JSON Schema for `config.toml` so editors can offer field
