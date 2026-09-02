@@ -3674,21 +3674,18 @@ fn collect_active_heredocs<D: ast_grep_core::Doc>(
         };
         let mut body_range = None;
         let mut end_start = None;
-        // tree-sitter-bash exposes the normalized delimiter as
-        // `heredoc_start`; its node text does not retain the quote or
-        // backslash bytes that suppress expansion. Inspect the redirect
-        // header itself so `<<'EOF'`, `<<\"EOF\"`, and `<<E\\OF` remain
-        // distinguishable from an expanding `<<EOF` body.
-        let header = text
-            .split_once(['\r', '\n'])
-            .map_or_else(|| text.as_ref(), |(line, _)| line);
-        let mut delimiter_quoted = header.contains(['\'', '"', '\\']);
+        let mut delimiter_quoted = false;
         for child in node.children() {
             match child.kind().as_ref() {
                 "heredoc_body" => body_range = Some(child.range()),
                 "heredoc_end" => end_start = Some(child.range().start),
                 "heredoc_start" => {
-                    delimiter_quoted |= child.text().contains(['\'', '"', '\\']);
+                    delimiter_quoted |= heredoc_delimiter_is_quoted(
+                        text.as_ref(),
+                        offset,
+                        child.range().end.saturating_sub(node.range().start),
+                        child.text().as_ref(),
+                    );
                 }
                 _ => {}
             }
@@ -3716,6 +3713,35 @@ fn collect_active_heredocs<D: ast_grep_core::Doc>(
     for child in node.children() {
         collect_active_heredocs(child, heredocs, parse_error);
     }
+}
+
+/// Whether a heredoc delimiter suppresses expansion (`<<'EOF'`, `<<"EOF"`,
+/// `<<E\OF`, `<<\EOF`), judged from the delimiter word alone.
+///
+/// `redirect_text` is the full `heredoc_redirect` node text, `operator_offset`
+/// the index of its `<<`, and `delimiter_end` the end (relative to the node)
+/// of the `heredoc_start` node. tree-sitter-bash hangs the rest of the
+/// statement — a trailing pipeline or file redirect — under the same
+/// `heredoc_redirect` node, so an earlier version of this check that scanned
+/// the whole header line mistook `cat <<EOF | tee "out"` and
+/// `cat <<EOF > 'out'` for non-expanding heredocs and masked a live `$(…)`
+/// in the body away from evaluation. Only the bytes between the operator and
+/// the end of the delimiter word carry the quoting; the grammar's normalized
+/// `heredoc_start` text is consulted as well in case a grammar version keeps
+/// the quote bytes only there.
+fn heredoc_delimiter_is_quoted(
+    redirect_text: &str,
+    operator_offset: usize,
+    delimiter_end: usize,
+    delimiter_text: &str,
+) -> bool {
+    const QUOTING_BYTES: [char; 3] = ['\'', '"', '\\'];
+    let word_start = operator_offset.saturating_add(2);
+    // An unusable slice contributes nothing: over-reporting quoting would
+    // mask an expanding body away from evaluation (the fail-open direction),
+    // whereas the normalized delimiter text below still catches real quotes.
+    let delimiter_word = redirect_text.get(word_start..delimiter_end).unwrap_or("");
+    delimiter_word.contains(QUOTING_BYTES) || delimiter_text.contains(QUOTING_BYTES)
 }
 
 fn mask_preserve_newlines(input: &str) -> String {
@@ -4080,6 +4106,9 @@ fn collect_command_substitutions_recursive<D: ast_grep_core::Doc>(
     if kind == "ERROR" {
         let range = node.range();
         error_ranges.push((range.start, range.end));
+    } else if kind == "heredoc_redirect" {
+        collect_heredoc_redirect_substitutions(node, substitutions, parse_error, error_ranges);
+        return;
     } else if kind == "command_substitution" {
         let text = node.text();
         let text = text.as_ref();
@@ -4100,12 +4129,17 @@ fn collect_command_substitutions_recursive<D: ast_grep_core::Doc>(
                     .and_then(|inner| inner.strip_suffix('`'))
             });
         if let Some(body) = body {
-            // Backquoted substitutions escape nested backticks as `\``. The
-            // nested shell parse sees those as executable delimiters after the
-            // outer backquote layer is removed, so expose them to recursion.
             let range = node.range();
+            let body = if text.starts_with('`') {
+                // The outer backquote layer consumes its escapes before the
+                // nested shell parses the body (see
+                // `unescape_backquoted_body`).
+                unescape_backquoted_body(body)
+            } else {
+                body.to_string()
+            };
             substitutions.push(PosixCommandSubstitution {
-                body: body.replace("\\`", "`"),
+                body,
                 start: range.start + leading_whitespace,
                 end: range.end,
             });
@@ -4121,6 +4155,190 @@ fn collect_command_substitutions_recursive<D: ast_grep_core::Doc>(
     for child in node.children() {
         collect_command_substitutions_recursive(child, substitutions, parse_error, error_ranges);
     }
+}
+
+/// Enumerate the substitutions under one `heredoc_redirect` node.
+///
+/// The children — the `heredoc_body` plus any pipeline or file redirect the
+/// grammar hangs under the same node — are walked as usual, which captures
+/// the `$(…)` nodes tree-sitter-bash parses inside an expanding body. The
+/// grammar leaves backquoted substitutions in that body as plain
+/// `heredoc_content`, yet the outer shell expands `` `…` `` exactly like
+/// `$(…)` before the target ever receives the body, so those are enumerated
+/// by hand (#377). A quoted delimiter (`<<'EOF'`, `<<"EOF"`, `<<\EOF`)
+/// suppresses expansion, so such bodies are left alone.
+fn collect_heredoc_redirect_substitutions<D: ast_grep_core::Doc>(
+    node: ast_grep_core::Node<'_, D>,
+    substitutions: &mut Vec<PosixCommandSubstitution>,
+    parse_error: &mut bool,
+    error_ranges: &mut Vec<(usize, usize)>,
+) {
+    let text = node.text();
+    let node_start = node.range().start;
+    let Some(operator_offset) = text.find("<<") else {
+        *parse_error = true;
+        return;
+    };
+    let mut delimiter_quoted = false;
+    let mut body = None;
+    for child in node.children() {
+        match child.kind().as_ref() {
+            "heredoc_start" => {
+                delimiter_quoted |= heredoc_delimiter_is_quoted(
+                    text.as_ref(),
+                    operator_offset,
+                    child.range().end.saturating_sub(node_start),
+                    child.text().as_ref(),
+                );
+            }
+            "heredoc_body" => body = Some(child),
+            _ => {}
+        }
+    }
+
+    let first_child_index = substitutions.len();
+    for child in node.children() {
+        collect_command_substitutions_recursive(child, substitutions, parse_error, error_ranges);
+    }
+    if delimiter_quoted {
+        return;
+    }
+    let Some(body) = body else {
+        return;
+    };
+    let body_range = body.range();
+    let body_text = body.text();
+
+    // Everything the walk above found under this redirect, in source order.
+    let mut parsed = substitutions.split_off(first_child_index);
+    parsed.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| right.end.cmp(&left.end))
+    });
+    // Spans the grammar already parsed inside the body. The scanner treats
+    // them as opaque so a backtick inside a parsed `$(…)` can neither open
+    // nor close a backquoted span; their bodies are evaluated on their own.
+    let opaque: Vec<(usize, usize)> = parsed
+        .iter()
+        .filter(|found| found.start >= body_range.start && found.end <= body_range.end)
+        .map(|found| (found.start - body_range.start, found.end - body_range.start))
+        .collect();
+    match scan_backquoted_substitutions(body_text.as_ref(), body_range.start, &opaque) {
+        Ok(backquoted) => {
+            // A parsed `$(…)` sitting inside a backquoted span is reached
+            // again when the evaluator recurses into that span's body; drop
+            // the direct entry so it is not evaluated twice. Both lists are
+            // sorted and the backquoted spans do not overlap each other, so a
+            // single forward pass finds the only span that can enclose each
+            // entry (bounded work even for a substitution-dense body).
+            let mut outer_index = 0;
+            for found in parsed {
+                while backquoted
+                    .get(outer_index)
+                    .is_some_and(|outer| outer.end <= found.start)
+                {
+                    outer_index += 1;
+                }
+                let shadowed = backquoted
+                    .get(outer_index)
+                    .is_some_and(|outer| found.start > outer.start && found.end < outer.end);
+                if !shadowed {
+                    substitutions.push(found);
+                }
+            }
+            substitutions.extend(backquoted);
+        }
+        Err(PosixCommandSubstitutionParseError) => {
+            substitutions.extend(parsed);
+            *parse_error = true;
+        }
+    }
+}
+
+/// Scan an expanding heredoc body for backquoted command substitutions.
+///
+/// `opaque` lists byte spans, relative to `body` and sorted by start, that
+/// tree-sitter already parsed as substitutions; each is skipped whole
+/// wherever it sits. Escapes follow the here-document rules (POSIX 2.7.4): a
+/// backslash quotes only the byte after it, so a backtick directly after a
+/// backslash never delimits a substitution, while `\\`` is an escaped
+/// backslash followed by a live backtick. An unterminated backquote is a
+/// shell syntax error whose extent cannot be bounded, so it fails closed.
+fn scan_backquoted_substitutions(
+    body: &str,
+    base: usize,
+    opaque: &[(usize, usize)],
+) -> Result<Vec<PosixCommandSubstitution>, PosixCommandSubstitutionParseError> {
+    let bytes = body.as_bytes();
+    let mut found = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut next_opaque = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        while opaque
+            .get(next_opaque)
+            .is_some_and(|&(start, _)| start < index)
+        {
+            next_opaque += 1;
+        }
+        if let Some(&(start, end)) = opaque.get(next_opaque) {
+            if start == index {
+                next_opaque += 1;
+                index = end.max(index + 1);
+                continue;
+            }
+        }
+        match bytes[index] {
+            b'\\' => {
+                // Skip the quoted byte. Multi-byte UTF-8 continuation bytes
+                // are never ASCII, so landing inside a code point cannot
+                // produce a false backtick or backslash match.
+                index += 2;
+                continue;
+            }
+            b'`' => {
+                if let Some(start) = open.take() {
+                    found.push(PosixCommandSubstitution {
+                        body: unescape_backquoted_body(&body[start + 1..index]),
+                        start: base + start,
+                        end: base + index + 1,
+                    });
+                } else {
+                    open = Some(index);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if open.is_some() {
+        return Err(PosixCommandSubstitutionParseError);
+    }
+    Ok(found)
+}
+
+/// Apply the backquote layer's escape processing to a substitution body.
+///
+/// Within backquotes a backslash keeps its literal meaning except before
+/// `$`, `` ` ``, or `\`, where it quotes that byte (POSIX 2.6.3). The nested
+/// shell parse must see the post-escape text: `` `echo \$(rm -rf ~)` `` runs
+/// `rm` because the inner shell receives a live `$(…)`, and `` \`…\` `` is a
+/// nested backquoted substitution. Leaving the escapes in place made that
+/// `$(…)` inert to the nested parse.
+fn unescape_backquoted_body(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(quoted) = chars.next_if(|next| matches!(next, '$' | '`' | '\\')) {
+                out.push(quoted);
+                continue;
+            }
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Extract executable shell commands from heredoc/script content.
@@ -4424,6 +4642,207 @@ mod tests {
                 extract_posix_command_substitutions(content),
                 Err(PosixCommandSubstitutionParseError)
             );
+        }
+
+        // #377: tree-sitter-bash parses `$(…)` inside an expanding heredoc
+        // body but leaves backquoted substitutions as plain content, so the
+        // two spellings of the same body diverged: `$(…)` was enumerated and
+        // `` `…` `` was invisible.
+        #[test]
+        fn backquoted_substitution_in_unquoted_heredoc_body_is_enumerated() {
+            let content = "tee /private/tmp/sink.md <<EOF\n`rm -rf ~/foo`\nEOF\n";
+            let found = extract_posix_command_substitutions(content).expect("well-formed");
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].body, "rm -rf ~/foo");
+            assert_eq!(&content[found[0].start..found[0].end], "`rm -rf ~/foo`");
+
+            let dollar = "tee /private/tmp/sink.md <<EOF\n$(rm -rf ~/foo)\nEOF\n";
+            let found_dollar = extract_posix_command_substitutions(dollar).expect("well-formed");
+            assert_eq!(found_dollar.len(), 1);
+            assert_eq!(found_dollar[0].body, found[0].body);
+        }
+
+        #[test]
+        fn backquoted_substitution_in_heredoc_prose_and_redirect_shapes() {
+            for content in [
+                "cat > /private/tmp/sink.md <<EOF\nintro\n`rm -rf ~/foo`\noutro\nEOF\n",
+                "cat <<EOF | tee /private/tmp/sink.md\n`rm -rf ~/foo`\nEOF\n",
+                "cat <<EOF > \"/private/tmp/sink.md\"\n`rm -rf ~/foo`\nEOF\n",
+                "tee \"/private/tmp/sink.md\" <<EOF\n`rm -rf ~/foo`\nEOF\n",
+                "tee /private/tmp/sink.md <<-EOF\n\t`rm -rf ~/foo`\n\tEOF\n",
+                "tee /private/tmp/sink.md << EOF\n`rm -rf ~/foo`\nEOF\n",
+            ] {
+                let found = extract_posix_command_substitutions(content)
+                    .unwrap_or_else(|_| panic!("well-formed: {content:?}"));
+                assert_eq!(
+                    found.iter().map(|s| s.body.as_str()).collect::<Vec<_>>(),
+                    ["rm -rf ~/foo"],
+                    "{content:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn backquotes_in_quoted_heredoc_body_are_literal_text() {
+            for content in [
+                "tee /private/tmp/sink.md <<'EOF'\n`rm -rf ~/foo`\nEOF\n",
+                "tee /private/tmp/sink.md <<\"EOF\"\n`rm -rf ~/foo`\nEOF\n",
+                "tee /private/tmp/sink.md <<\\EOF\n`rm -rf ~/foo`\nEOF\n",
+                "tee /private/tmp/sink.md <<E'O'F\n`rm -rf ~/foo`\nEOF\n",
+                "tee /private/tmp/sink.md <<-'EOF'\n\t`rm -rf ~/foo`\n\tEOF\n",
+                // An odd backtick in prose is fine when nothing expands it.
+                "cat > /private/tmp/notes.md <<'EOF'\nuse the `foo command\nEOF\n",
+            ] {
+                let found = extract_posix_command_substitutions(content)
+                    .unwrap_or_else(|_| panic!("well-formed: {content:?}"));
+                assert!(found.is_empty(), "{content:?}: {found:?}");
+            }
+        }
+
+        #[test]
+        fn both_spellings_in_one_heredoc_body_are_enumerated_in_order() {
+            let content = "tee /private/tmp/sink.md <<EOF\nfoo `git status` bar $(ls)\nEOF\n";
+            let found = extract_posix_command_substitutions(content).expect("well-formed");
+            assert_eq!(
+                found.iter().map(|s| s.body.as_str()).collect::<Vec<_>>(),
+                ["git status", "ls"]
+            );
+            assert!(found[0].end <= found[1].start);
+        }
+
+        #[test]
+        fn heredoc_backquote_escapes_follow_here_document_rules() {
+            // `\`` is a literal backtick in the body and inside a
+            // substitution; `\\` is a literal backslash that does not quote
+            // the following backtick.
+            let content = "tee /private/tmp/sink.md <<EOF\nfoo `ls \\`date\\`` \\`x\nEOF\n";
+            let found = extract_posix_command_substitutions(content).expect("well-formed");
+            assert_eq!(
+                found.iter().map(|s| s.body.as_str()).collect::<Vec<_>>(),
+                ["ls `date`"]
+            );
+
+            let content = "tee /private/tmp/sink.md <<EOF\n\\\\`rm -rf ~/foo`\nEOF\n";
+            let found = extract_posix_command_substitutions(content).expect("well-formed");
+            assert_eq!(
+                found.iter().map(|s| s.body.as_str()).collect::<Vec<_>>(),
+                ["rm -rf ~/foo"]
+            );
+
+            // A backtick escaped at the here-document layer never opens.
+            let content = "tee /private/tmp/sink.md <<EOF\n\\`rm -rf ~/foo\\`\nEOF\n";
+            let found = extract_posix_command_substitutions(content).expect("well-formed");
+            assert!(found.is_empty(), "{found:?}");
+        }
+
+        #[test]
+        fn nested_spellings_inside_heredoc_body_are_enumerated_once() {
+            // A backquote wrapping `$(…)`: the outer span is the unit; the
+            // inner `$(…)` is reached again when the evaluator recurses.
+            let content = "tee /private/tmp/sink.md <<EOF\n`echo $(rm -rf ~/foo)`\nEOF\n";
+            let found = extract_posix_command_substitutions(content).expect("well-formed");
+            assert_eq!(
+                found.iter().map(|s| s.body.as_str()).collect::<Vec<_>>(),
+                ["echo $(rm -rf ~/foo)"]
+            );
+
+            // `$(…)` wrapping a backquote: the grammar parses the whole
+            // `$(…)`; the backticks inside it belong to that body.
+            let content = "tee /private/tmp/sink.md <<EOF\n$(echo `rm -rf ~/foo`)\nEOF\n";
+            let found = extract_posix_command_substitutions(content).expect("well-formed");
+            assert_eq!(
+                found.iter().map(|s| s.body.as_str()).collect::<Vec<_>>(),
+                ["echo `rm -rf ~/foo`"]
+            );
+
+            // A heredoc nested inside a substitution is handled when the
+            // evaluator recurses into that substitution's body.
+            let outer = "x=$(cat <<EOF\n`rm -rf ~/foo`\nEOF\n)\n";
+            let found = extract_posix_command_substitutions(outer).expect("well-formed");
+            assert_eq!(found.len(), 1);
+            let inner = extract_posix_command_substitutions(&found[0].body).expect("well-formed");
+            assert_eq!(
+                inner.iter().map(|s| s.body.as_str()).collect::<Vec<_>>(),
+                ["rm -rf ~/foo"]
+            );
+        }
+
+        #[test]
+        fn markdown_fences_in_unquoted_heredoc_execute_the_fenced_block() {
+            // Three backticks are an empty substitution plus an opener: the
+            // outer shell runs the fenced block. The `$(…)` spelling of the
+            // same mistake was already denied; the fence form must be too.
+            let content =
+                "cat > /private/tmp/notes.md <<EOF\n# Notes\n```bash\ngit reset --hard\n```\nEOF\n";
+            let found = extract_posix_command_substitutions(content).expect("well-formed");
+            assert_eq!(
+                found.iter().map(|s| s.body.as_str()).collect::<Vec<_>>(),
+                ["", "bash\ngit reset --hard\n", ""]
+            );
+        }
+
+        #[test]
+        fn unterminated_backquote_in_unquoted_heredoc_fails_closed() {
+            for content in [
+                "tee /private/tmp/sink.md <<EOF\n`rm -rf ~/foo\nEOF\n",
+                "tee /private/tmp/sink.md <<EOF\nprose `rm -rf ~/foo\nEOF\n",
+                "tee /private/tmp/sink.md <<EOF\n`a` `rm -rf ~/foo\nEOF\n",
+            ] {
+                assert_eq!(
+                    extract_posix_command_substitutions(content),
+                    Err(PosixCommandSubstitutionParseError),
+                    "{content:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn backquote_body_escapes_are_applied_before_nested_parse() {
+            // `\$` inside backquotes is a live `$` to the inner shell, so
+            // `` `echo \$(rm -rf ~)` `` runs `rm`. The body handed to the
+            // nested parse must carry the post-escape text.
+            let found = extract_posix_command_substitutions("echo `echo \\$(rm -rf ~/foo)`")
+                .expect("well-formed");
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].body, "echo $(rm -rf ~/foo)");
+            let nested = extract_posix_command_substitutions(&found[0].body).expect("well-formed");
+            assert_eq!(nested.len(), 1);
+            assert_eq!(nested[0].body, "rm -rf ~/foo");
+
+            assert_eq!(
+                unescape_backquoted_body("a \\$b \\`c\\` \\\\ \\n"),
+                "a $b `c` \\ \\n"
+            );
+            assert_eq!(unescape_backquoted_body("plain"), "plain");
+            assert_eq!(unescape_backquoted_body("trailing\\"), "trailing\\");
+        }
+
+        #[test]
+        fn heredoc_delimiter_quoting_is_judged_from_the_delimiter_word_only() {
+            // A quote later on the header line (a piped or redirected
+            // target) must not turn an expanding heredoc into a quoted one.
+            for content in [
+                "cat <<EOF | tee \"/private/tmp/sink.md\"\n$(git reset --hard)\nEOF\n",
+                "cat <<EOF > \"/private/tmp/sink.md\"\n$(git reset --hard)\nEOF\n",
+                "cat <<EOF | grep 'x'\n$(git reset --hard)\nEOF\n",
+            ] {
+                let masked = mask_non_expanding_data_heredocs(content);
+                assert!(
+                    masked.contains("$(git reset --hard)"),
+                    "expanding body must survive masking: {content:?} -> {masked:?}"
+                );
+                let found = extract_posix_command_substitutions(content)
+                    .unwrap_or_else(|_| panic!("well-formed: {content:?}"));
+                assert_eq!(
+                    found.iter().map(|s| s.body.as_str()).collect::<Vec<_>>(),
+                    ["git reset --hard"],
+                    "{content:?}"
+                );
+            }
+            // A genuinely quoted delimiter is still masked for a data sink.
+            let quoted = "cat <<'EOF' | tee /private/tmp/sink.md\n$(git reset --hard)\nEOF\n";
+            let masked = mask_non_expanding_data_heredocs(quoted);
+            assert!(!masked.contains("$(git reset --hard)"), "{masked:?}");
         }
     }
 

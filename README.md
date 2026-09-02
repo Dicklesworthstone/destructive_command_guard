@@ -1350,7 +1350,9 @@ dcg test --dialect posix "echo 'AT&T'"
 - `--dialect <unknown|posix|ps|cmd>` (also `DCG_DIALECT`): evaluate a single
   shell dialect instead of all of them. The default `unknown` fans out to every
   dialect because the CLI cannot know the source shell; `posix` reproduces the
-  path the `Bash` PreToolUse hook takes and `ps` the `PowerShell` one. Use it
+  path the `Bash` PreToolUse hook takes and `ps` the `PowerShell` one (a Codex
+  `Bash` payload on native Windows runs PowerShell and is evaluated as `ps` —
+  see [docs/codex-integration.md](docs/codex-integration.md)). Use it
   when a diagnostic must match the live hook — an all-dialect run can report
   costs and evaluation paths the hook never has (for example, a literal `&`
   byte defeats quick-reject only on the all-dialect route). Also available on

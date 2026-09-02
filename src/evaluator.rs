@@ -31159,6 +31159,135 @@ mod tests {
         }
     }
 
+    /// #377: a backquoted substitution in an unquoted heredoc body is
+    /// expanded by the outer shell exactly like `$(…)`, so both spellings
+    /// must reach the same rule.
+    #[test]
+    fn backquoted_substitution_in_unquoted_heredoc_is_denied_like_dollar_paren() {
+        let packs = ["core.git", "core.filesystem"];
+        let dollar = "tee /private/tmp/sink.md <<EOF\nnote: $(git reset --hard) done\nEOF";
+        let backtick = "tee /private/tmp/sink.md <<EOF\nnote: `git reset --hard` done\nEOF";
+        let expected = evaluate_with_pack_ids_in_dialect(dollar, &packs, ShellDialect::Posix);
+        assert!(expected.is_denied(), "{:?}", expected.pattern_info);
+        let expected_rule = expected
+            .pattern_info
+            .as_ref()
+            .and_then(|info| info.pattern_name.clone());
+        assert_eq!(expected_rule.as_deref(), Some("reset-hard"));
+
+        for command in [
+            backtick,
+            "cat > /private/tmp/sink.md <<EOF\n`git reset --hard`\nEOF",
+            "cat > /private/tmp/sink.md <<EOF\nintro\n`git reset --hard`\noutro\nEOF",
+            "cat > /private/tmp/other.md <<EOF\n`git reset --hard`\nEOF",
+            "cat <<EOF | tee /private/tmp/sink.md\n`git reset --hard`\nEOF",
+            "tee /private/tmp/sink.md <<-EOF\n\t`git reset --hard`\n\tEOF",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(result.is_denied(), "must deny: {command:?}");
+            let rule = result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.clone());
+            assert_eq!(rule, expected_rule, "{command:?}");
+        }
+
+        // Nested spellings. A substitution that makes up a whole heredoc line
+        // may be claimed first by the fail-closed launcher check
+        // (`heredoc.shell:launcher-unverified`) rather than the nested rule —
+        // the same attribution the `$(…)` spelling already receives — so
+        // only the denial is asserted here.
+        for command in [
+            "tee /private/tmp/sink.md <<EOF\n`echo $(git reset --hard)`\nEOF",
+            "tee /private/tmp/sink.md <<EOF\n$(echo `git reset --hard`)\nEOF",
+            "tee /private/tmp/sink.md <<EOF\n`echo \\`git reset --hard\\``\nEOF",
+            "x=$(cat <<EOF\n`git reset --hard`\nEOF\n)",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(result.is_denied(), "must deny: {command:?}");
+        }
+
+        // A quoted delimiter suppresses expansion: the body is data to `tee`.
+        for command in [
+            "tee /private/tmp/sink.md <<'EOF'\n`git reset --hard`\nEOF",
+            "tee /private/tmp/sink.md <<\"EOF\"\n`git reset --hard`\nEOF",
+            "tee /private/tmp/sink.md <<\\EOF\n`git reset --hard`\nEOF",
+            // Backticks escaped at the here-document layer are literal.
+            "tee /private/tmp/sink.md <<EOF\n\\`git status\\`\nEOF",
+            // Benign substitutions stay allowed under either spelling.
+            "tee /private/tmp/sink.md <<EOF\nbuilt on `date` by $(whoami)\nEOF",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                !result.is_denied(),
+                "must allow: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // An unterminated backquote is a shell syntax error whose extent
+        // dcg cannot bound; it fails closed like an unterminated `$(`.
+        let result = evaluate_with_pack_ids_in_dialect(
+            "tee /private/tmp/sink.md <<EOF\n`git reset --hard\nEOF",
+            &packs,
+            ShellDialect::Posix,
+        );
+        assert!(result.is_denied(), "{:?}", result.pattern_info);
+    }
+
+    /// The backquote layer's `\$` escape yields a live `$(…)` for the inner
+    /// shell; the nested parse must see the post-escape body.
+    #[test]
+    fn escaped_dollar_paren_inside_backquotes_is_evaluated() {
+        let result = evaluate_with_pack_ids_in_dialect(
+            "echo `echo \\$(git reset --hard)`",
+            &["core.git"],
+            ShellDialect::Posix,
+        );
+        assert!(result.is_denied(), "{:?}", result.pattern_info);
+        assert_eq!(
+            result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some("reset-hard")
+        );
+    }
+
+    /// A quote later on a heredoc header line (`| tee "out"`, `> 'out'`)
+    /// must not turn an expanding heredoc into a non-expanding one.
+    #[test]
+    fn quote_after_heredoc_delimiter_does_not_mask_expanding_body() {
+        for command in [
+            "cat <<EOF | tee \"/private/tmp/sink.md\"\nnote: $(git reset --hard) done\nEOF",
+            "cat <<EOF > \"/private/tmp/sink.md\"\nnote: $(git reset --hard) done\nEOF",
+            "cat <<EOF | grep 'x'\nnote: $(git reset --hard) done\nEOF",
+            "cat <<EOF | tee \"/private/tmp/sink.md\"\nnote: `git reset --hard` done\nEOF",
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+            assert!(result.is_denied(), "must deny: {command:?}");
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some("reset-hard"),
+                "{command:?}"
+            );
+        }
+        let result = evaluate_with_pack_ids_in_dialect(
+            "cat <<'EOF' | tee \"/private/tmp/sink.md\"\n$(git reset --hard)\nEOF",
+            &["core.git"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            !result.is_denied(),
+            "quoted delimiter is data: {:?}",
+            result.pattern_info
+        );
+    }
+
     #[test]
     fn literal_assignment_proves_variable_redirect_target() {
         // #249-adjacent: a redirect whose `$VAR` target is proven by a single

@@ -167,6 +167,9 @@ wire format is recognized on Windows. Hook *configuration* coverage:
   Codex extends hook coverage upstream
   ([openai/codex#16246](https://github.com/openai/codex/issues/16246)). The simple
   per-tool shell path *is* intercepted. This is upstream, not fixable in dcg.
+  Payloads on that path are named `Bash` but run through PowerShell on native
+  Windows, so dcg evaluates them under the PowerShell dialect (#379); use
+  `dcg test --dialect ps` to reproduce the hook's verdict from the CLI.
 - **Runtime-built Cmd words**: dcg sees the command text supplied to the hook,
   not the future process environment. It decodes deterministic caret syntax and
   recursively inspects static `cmd /c`, `call`, `if`, `start`, and
