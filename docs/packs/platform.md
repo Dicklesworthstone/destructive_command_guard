@@ -40,6 +40,9 @@ These patterns match safe commands that are always allowed:
 | `gh-auth-status` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+auth\s+status\b` |
 | `gh-status` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+status\b` |
 | `gh-api-explicit-get` | `^(?!(?=.*(?:-X\s*\|--method(?:=\|\s+))DELETE\b))gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+api\b.*(?:-X\s*\|--method(?:=\|\s+))GET\b` |
+| `gh-help` | `gh(?:\s+(?:\x22[^\x22]*\x22\|'[^']*'\|(?!--(?:\s\|$))[^\s;&\|<>\x22']+))*\s+--help(?:\s\|$)` |
+| `gh-help-short` | `gh(?!(?:\s+[^\s;&\|]+)*?\s+repo\s+edit(?:\s\|$))(?:\s+(?:\x22[^\x22]*\x22\|'[^']*'\|(?!--(?:\s\|$))[^\s;&\|<>\x22']+))*\s+-h(?:\s\|$)` |
+| `gh-help-topic` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+help(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -52,6 +55,7 @@ These patterns match potentially destructive commands:
 | `gh-repo-archive` | gh repo archive makes a repository read-only. While reversible, it stops all write access. | high |
 | `gh-gist-delete` | gh gist delete permanently deletes a Gist. | high |
 | `gh-release-delete` | gh release delete permanently deletes a release. | high |
+| `gh-release-delete-asset` | gh release delete-asset permanently deletes an uploaded release asset. | medium |
 | `gh-issue-delete` | gh issue delete permanently deletes an issue. | high |
 | `gh-ssh-key-delete` | gh ssh-key delete removes an SSH key, potentially breaking access. | high |
 | `gh-secret-delete` | gh secret delete removes GitHub Actions secrets. | high |

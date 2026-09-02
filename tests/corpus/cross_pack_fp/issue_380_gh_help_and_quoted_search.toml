@@ -1,0 +1,158 @@
+# Cross-pack false positives: #380 — `gh release delete-asset --help` and
+# quoted search text matched `platform.github:gh-release-delete`.
+#
+# Three distinct shapes, each fixed at its own layer:
+# 1. `delete\b` matched before the `-` of `delete-asset`; the verb now ends in
+#    `(?![\w-])` and asset deletion is its own (medium) rule.
+# 2. `--help` / `-h` / `gh help ...` print usage and exit before any API call;
+#    the pack now carries help safe-patterns.
+# 3. `gh search <kind> <query>` and `gh issue|pr list -S/--search` carry
+#    search text; the sanitizer now masks it before any pack regex runs.
+#
+# Source: issue #380
+
+[[case]]
+description = "gh release delete-asset --help prints usage only"
+command = "gh release delete-asset --help"
+expected = "allow"
+issue = 380
+
+[[case]]
+description = "gh release delete-asset with operands and --help prints usage only"
+command = "gh release delete-asset v1 file.tgz --help"
+expected = "allow"
+issue = 380
+
+[[case]]
+description = "gh release delete --help prints usage only"
+command = "gh release delete --help"
+expected = "allow"
+issue = 380
+
+[[case]]
+description = "gh release delete with a tag and trailing --help prints usage only"
+command = "gh release delete v1.2.3 --yes --cleanup-tag --help"
+expected = "allow"
+issue = 380
+
+[[case]]
+description = "short help flag on gh release delete"
+command = "gh release delete -h"
+expected = "allow"
+issue = 380
+
+[[case]]
+description = "gh help topic for release delete"
+command = "gh help release delete"
+expected = "allow"
+issue = 380
+
+[[case]]
+description = "gh repo delete --help prints usage only"
+command = "gh repo delete --help"
+expected = "allow"
+issue = 380
+
+[[case]]
+description = "single-quoted search text mentioning gh release delete"
+command = "gh search issues 'gh release delete' --repo owner/project"
+expected = "allow"
+issue = 380
+
+[[case]]
+description = "double-quoted search text mentioning gh release delete"
+command = "gh search issues \"gh release delete\" --repo owner/project"
+expected = "allow"
+issue = 380
+
+[[case]]
+description = "unquoted multi-word search query"
+command = "gh search prs gh release delete --state open --repo owner/project"
+expected = "allow"
+issue = 380
+
+[[case]]
+description = "gh search code for the repo delete phrase"
+command = "gh search code 'gh repo delete' --owner acme"
+expected = "allow"
+issue = 380
+
+[[case]]
+description = "gh issue list --search query mentioning release delete"
+command = "gh issue list --search 'gh release delete' --state all"
+expected = "allow"
+issue = 380
+
+[[case]]
+description = "gh pr list -S query mentioning release delete"
+command = "gh pr list -S \"release delete-asset\" --repo owner/project"
+expected = "allow"
+issue = 380
+
+# ---- true-positive controls -------------------------------------------------
+
+[[case]]
+description = "control: gh release delete really deletes"
+command = "gh release delete v1"
+expected = "deny"
+issue = 380
+rule_id = "platform.github:gh-release-delete"
+
+[[case]]
+description = "control: gh release delete with --yes and --cleanup-tag"
+command = "gh release delete v1.2.3 --yes --cleanup-tag --repo owner/project"
+expected = "deny"
+issue = 380
+rule_id = "platform.github:gh-release-delete"
+
+[[case]]
+description = "control: --help after a bare -- is a positional tag, not help"
+command = "gh release delete -- --help"
+expected = "deny"
+issue = 380
+rule_id = "platform.github:gh-release-delete"
+
+[[case]]
+description = "control: --help inside a quoted tag argument is not help"
+command = "gh release delete 'v1 --help' --yes"
+expected = "deny"
+issue = 380
+rule_id = "platform.github:gh-release-delete"
+
+[[case]]
+description = "control: gh release delete-asset deletes an uploaded artifact (own rule)"
+command = "gh release delete-asset v1 file.tgz -y"
+expected = "deny"
+issue = 380
+rule_id = "platform.github:gh-release-delete-asset"
+
+[[case]]
+description = "control: a help call in one segment does not shield the next"
+command = "gh release view v1 --help && gh release delete v1 --yes"
+expected = "deny"
+issue = 380
+rule_id = "platform.github:gh-release-delete"
+
+[[case]]
+description = "control: gh search masking ends at the segment boundary"
+command = "gh search issues 'release delete' && gh release delete v1 --yes"
+expected = "deny"
+issue = 380
+rule_id = "platform.github:gh-release-delete"
+
+# cmd.exe has no `$(...)` substitution — there the text is inert query data,
+# so the control only applies to the shells that would run it.
+[[case]]
+description = "control: command substitution inside a search query still runs"
+command = "gh search issues \"$(gh release delete v1 --yes)\""
+expected = "deny"
+issue = 380
+rule_id = "platform.github:gh-release-delete"
+dialects = ["posix", "ps", "unknown"]
+
+[[case]]
+description = "control: gh repo edit -h is --homepage, not help"
+command = "gh repo edit acme/widgets -h https://example.com --visibility private"
+expected = "deny"
+issue = 380
+rule_id = "platform.github:gh-repo-visibility-change"

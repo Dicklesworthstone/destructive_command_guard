@@ -483,6 +483,8 @@ platform.github:
     reason: "Deletes gist"
   - command: "gh release delete v1.0.0"
     reason: "Deletes release"
+  - command: "gh release delete-asset v1.0.0 dcg-x86_64.tar.xz -y"
+    reason: "Deletes an uploaded release asset"
   - command: "gh issue delete 123"
     reason: "Deletes issue"
   - command: "gh ssh-key delete 1"

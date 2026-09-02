@@ -947,6 +947,10 @@ pub static SAFE_STRING_REGISTRY: SafeStringRegistry = SafeStringRegistry {
         SafeFlagEntry::both("gh", "-t", "--title"),
         SafeFlagEntry::both("gh", "-b", "--body"),
         SafeFlagEntry::both("gh", "-m", "--message"),
+        // `gh issue list -S` / `gh pr list --search` take a GitHub search
+        // query; nothing in it is executed (#380). `gh search <kind>` takes
+        // its query as positionals and is handled in the sanitizer loop.
+        SafeFlagEntry::both("gh", "-S", "--search"),
         // curl - request data and headers are not executed
         SafeFlagEntry::both("curl", "-d", "--data"),
         SafeFlagEntry::both("curl", "-H", "--header"),
@@ -1146,6 +1150,11 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
     let mut git_subcommand: Option<&str> = None;
     let mut git_waiting_for_value = false;
     let mut git_options_ended = false;
+    // `gh`: the first non-option token names the subcommand. `gh search
+    // <kind> <query...>` is a read-only query whose entire remaining argv
+    // (positionals and flag values alike) is search text, so it switches the
+    // segment into the same all-args-data mode as echo/printf (#380).
+    let mut gh_subcommand_seen = false;
     // For args-data commands (echo/printf): set when we just consumed a
     // shell redirect operator and the next token is its target. The
     // target is left visible (not masked) so destructive-redirect rules
@@ -1166,6 +1175,7 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
             git_subcommand = None;
             git_waiting_for_value = false;
             git_options_ended = false;
+            gh_subcommand_seen = false;
             next_token_is_redirect_target = false;
             continue;
         }
@@ -1231,6 +1241,7 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
             git_subcommand = None;
             git_waiting_for_value = false;
             git_options_ended = false;
+            gh_subcommand_seen = false;
 
             pending_safe_flag = None;
             options_ended = false;
@@ -1277,6 +1288,21 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
                     search_cmd_override = Some("grep");
                     is_git_subcommand_token = true;
                 }
+            }
+        }
+
+        // `gh` has no global option that takes a value, so the first token
+        // that is not option-shaped is the subcommand. Only `search` changes
+        // masking; every other subcommand keeps the flag-driven handling
+        // below (`--title`, `--body`, `-S`, ...).
+        if !gh_subcommand_seen
+            && cmd.rsplit('/').next().unwrap_or(cmd) == "gh"
+            && !(token_text.starts_with('-') && token_text != "-")
+        {
+            gh_subcommand_seen = true;
+            if token_text == "search" {
+                segment_cmd_is_all_args_data = true;
+                continue;
             }
         }
 
@@ -4394,6 +4420,115 @@ mod tests {
                 "did not expect `{non_op}` to be classified as a redirect operator"
             );
         }
+    }
+
+    // =========================================================================
+    // Issue #380: `gh search` queries and `-S/--search` values are data
+    // =========================================================================
+
+    #[test]
+    fn sanitize_masks_gh_search_query_positionals() {
+        for cmd in [
+            "gh search issues 'gh release delete' --repo owner/project",
+            "gh search issues \"gh release delete\" --repo owner/project",
+            "gh search prs gh release delete --state open",
+            "gh search code 'gh repo delete' --owner acme",
+            "gh search commits \"release delete\" --repo owner/project",
+            "gh search repos release delete",
+            "/usr/local/bin/gh search issues 'gh release delete'",
+            "sudo gh search issues 'gh release delete'",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(cmd);
+            assert!(
+                matches!(sanitized, std::borrow::Cow::Owned(_)),
+                "search query was not masked at all: {cmd} -> {sanitized}"
+            );
+            assert!(
+                !sanitized.as_ref().contains("delete"),
+                "search query leaked: {cmd} -> {sanitized}"
+            );
+            assert!(
+                sanitized.as_ref().contains("gh search"),
+                "executable part must stay visible: {cmd} -> {sanitized}"
+            );
+            assert_eq!(sanitized.len(), cmd.len(), "masking must preserve length");
+        }
+    }
+
+    #[test]
+    fn sanitize_masks_gh_list_search_flag_values() {
+        for cmd in [
+            "gh issue list --search 'gh release delete'",
+            "gh issue list -S \"release delete\" --state all",
+            "gh pr list --search='gh release delete' --repo owner/project",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(cmd);
+            assert!(
+                !sanitized.as_ref().contains("delete"),
+                "search flag value leaked: {cmd} -> {sanitized}"
+            );
+            assert!(
+                sanitized.as_ref().contains("list"),
+                "executable part must stay visible: {cmd} -> {sanitized}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_gh_search_keeps_executable_constructs_visible() {
+        // Inline code inside the query is still shell-executed.
+        let cmd = "gh search issues \"$(gh release delete v1 --yes)\"";
+        let sanitized = sanitize_for_pattern_matching(cmd);
+        assert!(
+            sanitized.as_ref().contains("gh release delete v1 --yes"),
+            "command substitution inside a search query must stay visible: {sanitized}"
+        );
+
+        // A redirect target is the shell's, not gh's.
+        let cmd = "gh search issues foo > /etc/passwd";
+        let sanitized = sanitize_for_pattern_matching(cmd);
+        assert!(
+            sanitized.as_ref().contains("> /etc/passwd"),
+            "redirect target must stay visible: {sanitized}"
+        );
+
+        // Masking ends at the segment boundary.
+        let cmd = "gh search issues 'release delete' && gh release delete v1 --yes";
+        let sanitized = sanitize_for_pattern_matching(cmd);
+        assert!(
+            sanitized.as_ref().contains("&& gh release delete v1 --yes"),
+            "the next segment must stay visible: {sanitized}"
+        );
+        assert!(
+            !sanitized.as_ref().contains("'release delete'"),
+            "the query in the first segment must still be masked: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn sanitize_gh_non_search_subcommands_keep_positionals_visible() {
+        // Only `search` switches to all-args-data; a real deletion's argv is
+        // untouched so the platform.github rules still see it.
+        for cmd in [
+            "gh release delete v1 --yes --cleanup-tag",
+            "gh release delete-asset v1 file.tgz -y",
+            "gh repo delete acme/widgets --yes",
+            "gh -R acme/widgets release delete v1",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(cmd);
+            assert_eq!(
+                sanitized.as_ref(),
+                cmd,
+                "non-search gh argv must not be masked"
+            );
+        }
+    }
+
+    #[test]
+    fn test_registry_gh_search_flags() {
+        assert!(SAFE_STRING_REGISTRY.is_flag_data("gh", "-S"));
+        assert!(SAFE_STRING_REGISTRY.is_flag_data("gh", "--search"));
+        assert!(!SAFE_STRING_REGISTRY.is_flag_data_multivalue("gh", "--search"));
     }
 
     // =========================================================================

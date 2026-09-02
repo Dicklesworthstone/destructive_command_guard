@@ -98,6 +98,34 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "gh-api-explicit-get",
             r"^(?!(?=.*(?:-X\s*|--method(?:=|\s+))DELETE\b))gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+api\b.*(?:-X\s*|--method(?:=|\s+))GET\b"
         ),
+        // Help output (issue #380). `gh` is a cobra CLI: `--help` anywhere in
+        // argv prints the command's usage and exits before any API call, so
+        // `gh release delete v1 --help` is inert. Only tokens *before* a bare
+        // `--` count — after it, `--help` is a positional (a tag name) and the
+        // command really runs. A quoted token is consumed whole so a `--help`
+        // embedded in an argument (`'x --help'`) never reads as the flag; a
+        // token with unbalanced or attached quotes simply fails to match here
+        // and falls through to the destructive rules (fail closed). The walk
+        // also stops at `<`/`>`: a redirection target is the shell's, so
+        // `... --yes > --help` is a real deletion writing to a file, not help.
+        safe_pattern!(
+            "gh-help",
+            r"gh(?:\s+(?:\x22[^\x22]*\x22|'[^']*'|(?!--(?:\s|$))[^\s;&|<>\x22']+))*\s+--help(?:\s|$)"
+        ),
+        // `-h` is cobra's short help flag for every `gh` command that does not
+        // reuse the letter. `gh repo edit` does (`-h` = `--homepage`), and it is
+        // a guarded command, so the short spelling is only trusted when the
+        // argv is not a `repo edit` invocation.
+        safe_pattern!(
+            "gh-help-short",
+            r"gh(?!(?:\s+[^\s;&|]+)*?\s+repo\s+edit(?:\s|$))(?:\s+(?:\x22[^\x22]*\x22|'[^']*'|(?!--(?:\s|$))[^\s;&|<>\x22']+))*\s+-h(?:\s|$)"
+        ),
+        // `gh help <command...>` prints usage for the named command and never
+        // runs it.
+        safe_pattern!(
+            "gh-help-topic",
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+help(?:\s|$)"
+        ),
     ]
 }
 
@@ -105,7 +133,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
         destructive_pattern!(
             "gh-repo-delete",
-            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+repo\s+delete\b",
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+repo\s+delete(?![\w-])",
             "gh repo delete permanently deletes a GitHub repository. This cannot be undone.",
             High,
             "Deleting a repository removes its code, issues, pull requests, releases, \
@@ -149,7 +177,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "gh-repo-archive",
-            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+repo\s+archive\b",
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+repo\s+archive(?![\w-])",
             "gh repo archive makes a repository read-only. While reversible, it stops all write access.",
             High,
             "Archiving is reversible, but until it is reversed nobody can push, open \
@@ -166,7 +194,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "gh-gist-delete",
-            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+gist\s+delete\b",
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+gist\s+delete(?![\w-])",
             "gh gist delete permanently deletes a Gist.",
             High,
             "Gist deletion is immediate and permanent — there is no trash and no \
@@ -187,9 +215,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 ]
             }
         ),
+        // The verb ends in `(?![\w-])`, not `\b`: `\b` sits between `delete`
+        // and `-`, so it also matched the sibling `gh release delete-asset`
+        // (issue #380). Asset deletion is its own rule below.
         destructive_pattern!(
             "gh-release-delete",
-            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+release\s+delete\b",
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+release\s+delete(?![\w-])",
             "gh release delete permanently deletes a release.",
             High,
             "Deleting a release destroys its uploaded assets. Anyone installing by that \
@@ -215,9 +246,42 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 ]
             }
         ),
+        // Deleting one uploaded asset is narrower than deleting the release
+        // (the release, its tag, and every other asset survive), so it gets
+        // its own rule id and a lower severity rather than being explained as
+        // release deletion (issue #380).
+        destructive_pattern!(
+            "gh-release-delete-asset",
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+release\s+delete-asset(?![\w-])",
+            "gh release delete-asset permanently deletes an uploaded release asset.",
+            Medium,
+            "The release itself stays published, but the named asset is removed \
+             immediately and cannot be restored from GitHub. Anything downloading that \
+             asset by URL — install scripts, CI pipelines, package managers pinned to \
+             it — starts getting 404s until an identical file is re-uploaded.\n\n\
+             Safer alternatives:\n\
+             - gh release download <tag> --pattern <asset>: keep a copy first\n\
+             - gh release upload <tag> <file> --clobber: replace the asset in place",
+            &const {
+                [
+                    PatternSuggestion::new(
+                        "gh release view <tag>",
+                        "List the release's assets and confirm the exact name",
+                    ),
+                    PatternSuggestion::new(
+                        "gh release download <tag> --pattern <asset>",
+                        "Save the asset before deleting it",
+                    ),
+                    PatternSuggestion::new(
+                        "gh release upload <tag> <file> --clobber",
+                        "Replace the asset in place instead of deleting it",
+                    ),
+                ]
+            }
+        ),
         destructive_pattern!(
             "gh-issue-delete",
-            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+issue\s+delete\b",
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+issue\s+delete(?![\w-])",
             "gh issue delete permanently deletes an issue.",
             High,
             "Issue deletion is permanent and takes the whole discussion thread with it. \
@@ -240,7 +304,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "gh-ssh-key-delete",
-            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+ssh-key\s+delete\b",
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+ssh-key\s+delete(?![\w-])",
             "gh ssh-key delete removes an SSH key, potentially breaking access.",
             High,
             "Removing an SSH key takes effect immediately for every machine using it. If \
@@ -258,7 +322,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "gh-secret-delete",
-            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+secret\s+(?:delete|remove)\b",
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+secret\s+(?:delete|remove)(?![\w-])",
             "gh secret delete removes GitHub Actions secrets.",
             High,
             "Secret values are write-only — GitHub will not show you the value, so a \
@@ -281,7 +345,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "gh-variable-delete",
-            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+variable\s+(?:delete|remove)\b",
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+variable\s+(?:delete|remove)(?![\w-])",
             "gh variable delete removes GitHub Actions variables.",
             High,
             "Workflows referencing the variable resolve it to an empty string rather than \
@@ -304,7 +368,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "gh-repo-deploy-key-delete",
-            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+repo\s+deploy-key\s+delete\b",
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+repo\s+deploy-key\s+delete(?![\w-])",
             "gh repo deploy-key delete removes a deploy key and can break access.",
             High,
             "Deploy keys are how servers and CI clone this repository without a user \
@@ -321,7 +385,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "gh-run-cancel",
-            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+run\s+cancel\b",
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo|gist|release|issue|ssh-key|secret|variable|run|auth|status|api)\b)(?:(?:\x22[^\x22]*\x22)|(?:'[^']*')|(?!--?[A-Za-z])[^\s;&|]+))?)*\s+run\s+cancel(?![\w-])",
             "gh run cancel stops a workflow run and may interrupt deployments.",
             High,
             "Cancelling mid-run can leave a deployment half-applied: a job that has \
@@ -862,6 +926,186 @@ mod tests {
                 pack.check(&command).is_none(),
                 "{name}'s first suggestion is blocked by this same pack, so the \
                  denial is a dead end: {command}"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Issue #380: `delete\b` matched `delete-asset`, and `--help` was denied
+    // =========================================================================
+
+    /// `gh release delete-asset` is a different command from `gh release
+    /// delete`: it must never be attributed to (or explained as) release
+    /// deletion, and it carries its own lower severity.
+    #[test]
+    fn release_delete_asset_is_its_own_rule_issue_380() {
+        let pack = create_pack();
+
+        for command in [
+            "gh release delete-asset v1 file.tgz",
+            "gh release delete-asset v1 file.tgz -y",
+            "gh release delete-asset v1.2.3 dcg-x86_64.tar.xz --yes --repo owner/project",
+            "gh -R owner/project release delete-asset v1 file.tgz",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "gh-release-delete-asset");
+            assert_blocks_with_severity(&pack, command, Severity::Medium);
+        }
+
+        // The whole-release rule keeps its exact spelling and severity.
+        for command in [
+            "gh release delete v1",
+            "gh release delete v1 --yes --cleanup-tag",
+            "gh release delete v1.2.3 --yes --repo owner/project",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "gh-release-delete");
+            assert_blocks_with_severity(&pack, command, Severity::High);
+        }
+    }
+
+    /// `--help` / `-h` print usage and exit before any API call, so every
+    /// guarded `gh` command is inert with them — wherever the flag sits.
+    #[test]
+    fn help_invocations_are_inert_issue_380() {
+        let pack = create_pack();
+
+        for command in [
+            "gh release delete-asset --help",
+            "gh release delete-asset v1 file.tgz --help",
+            "gh release delete --help",
+            "gh release delete v1 --help",
+            "gh release delete v1 --yes --cleanup-tag --help",
+            "gh release delete --help v1",
+            "gh release delete -h",
+            "gh release delete-asset v1 file.tgz -h",
+            "gh repo delete --help",
+            "gh repo delete acme/widgets -h",
+            "gh repo edit --help",
+            "gh repo edit acme/widgets --visibility private --help",
+            "gh repo archive --help",
+            "gh gist delete --help",
+            "gh issue delete 1 --help",
+            "gh ssh-key delete --help",
+            "gh secret delete NAME --help",
+            "gh variable delete NAME -h",
+            "gh repo deploy-key delete --help",
+            "gh run cancel --help",
+            "gh api --help",
+            "gh --help",
+            "gh help release delete",
+            "gh help release delete-asset",
+            "gh help repo delete",
+            "gh release delete 'v1' --help",
+            "gh release delete \"v1\" -h",
+        ] {
+            assert_safe_pattern_matches(&pack, command);
+            assert_allows(&pack, command);
+        }
+    }
+
+    /// The help carve-out is exact about what counts as the help flag.
+    #[test]
+    fn help_lookalikes_do_not_disarm_destructive_rules_issue_380() {
+        let pack = create_pack();
+
+        // After a bare `--`, `--help` is a positional (the tag to delete).
+        assert_no_safe_match(&pack, "gh release delete -- --help");
+        assert_blocks_with_pattern(&pack, "gh release delete -- --help", "gh-release-delete");
+        assert_blocks_with_pattern(
+            &pack,
+            "gh release delete-asset v1 -- --help",
+            "gh-release-delete-asset",
+        );
+
+        // A `--help` inside a quoted argument is argument text, not the flag.
+        assert_no_safe_match(&pack, "gh release delete 'v1 --help'");
+        assert_blocks_with_pattern(&pack, "gh release delete 'v1 --help'", "gh-release-delete");
+        assert_blocks_with_pattern(
+            &pack,
+            "gh release delete \"tag --help\" --yes",
+            "gh-release-delete",
+        );
+
+        // `gh repo edit -h` is `--homepage`, not help.
+        assert_no_safe_match(
+            &pack,
+            "gh repo edit acme/widgets -h https://example.com --visibility private",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gh repo edit acme/widgets -h https://example.com --visibility private",
+            "gh-repo-visibility-change",
+        );
+
+        // A redirection target named `--help` is the shell's, not gh's: the
+        // command still runs `release delete`.
+        for command in [
+            "gh release delete v1 --yes > --help",
+            "gh release delete v1 --yes >--help",
+            "gh release delete v1 --yes 2> --help",
+            "gh release delete v1 --yes < --help",
+            "gh release delete v1 -y > -h",
+        ] {
+            assert_no_safe_match(&pack, command);
+            assert_blocks_with_pattern(&pack, command, "gh-release-delete");
+        }
+
+        // A prefix of the flag is not the flag.
+        assert_blocks_with_pattern(&pack, "gh release delete v1 --hel", "gh-release-delete");
+        assert_blocks_with_pattern(&pack, "gh release delete v1 --helpme", "gh-release-delete");
+
+        // A help invocation in one segment does not shield a real deletion in
+        // the next.
+        assert_blocks_with_pattern(
+            &pack,
+            "gh release view --help && gh release delete v1 --yes",
+            "gh-release-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gh help release delete; gh release delete-asset v1 file.tgz",
+            "gh-release-delete-asset",
+        );
+    }
+
+    /// Every verb in this pack ends on a token boundary that excludes `-`,
+    /// so a hyphenated sibling subcommand can never inherit a rule (the
+    /// `delete\b` / `delete-asset` shape of #380).
+    #[test]
+    fn destructive_verbs_stop_at_hyphenated_siblings_issue_380() {
+        let pack = create_pack();
+        // Invented hyphenated siblings, deliberately without `--help` so the
+        // boundary itself (not the help carve-out) is what keeps them clear.
+        for command in [
+            "gh repo delete-something acme/widgets",
+            "gh repo archive-all acme/widgets",
+            "gh gist delete-x 123",
+            "gh issue delete-y 1",
+            "gh ssh-key delete-old 1",
+            "gh run cancel-all 123456",
+            "gh secret delete-all NAME",
+            "gh variable remove-all NAME",
+            "gh repo deploy-key delete-stale 123",
+        ] {
+            let matched = pack.check(command);
+            assert!(
+                matched.is_none(),
+                "{command} matched {:?} through a hyphenated sibling",
+                matched.map(|m| m.name)
+            );
+        }
+        // The `gh api` rules end on an HTTP method or an endpoint path, not a
+        // subcommand verb, so only the verb-shaped rules are held to this.
+        for pattern in pack
+            .destructive_patterns
+            .iter()
+            .filter(|pattern| !pattern.name.is_some_and(|name| name.starts_with("gh-api-")))
+        {
+            let source = pattern.regex.as_str();
+            assert!(
+                !source.ends_with(r"\b"),
+                "{:?} ends in `\\b`, which matches before `-` and therefore \
+                 also matches hyphenated sibling subcommands",
+                pattern.name
             );
         }
     }

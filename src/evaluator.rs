@@ -10719,6 +10719,10 @@ fn mask_cmd_safe_argument_data<'a>(
     let mut git_subcommand: Option<String> = None;
     let mut git_waiting_for_value = false;
     let mut git_options_ended = false;
+    // Mirrors the generic sanitizer's `gh search` rule (#380): `gh` has no
+    // value-taking global option, so the first non-option token is the
+    // subcommand, and everything after `search` is query text.
+    let mut gh_subcommand_seen = false;
 
     for (index, token) in tokens.iter().enumerate() {
         if token.kind == NormalizeTokenKind::Separator {
@@ -10732,6 +10736,7 @@ fn mask_cmd_safe_argument_data<'a>(
             git_subcommand = None;
             git_waiting_for_value = false;
             git_options_ended = false;
+            gh_subcommand_seen = false;
             continue;
         }
 
@@ -10830,6 +10835,17 @@ fn mask_cmd_safe_argument_data<'a>(
             } else {
                 is_git_subcommand_token = decoded.eq_ignore_ascii_case("grep");
                 git_subcommand = Some(decoded.to_ascii_lowercase());
+            }
+        }
+
+        if !gh_subcommand_seen
+            && command.eq_ignore_ascii_case("gh")
+            && !(decoded.starts_with('-') && decoded != "-")
+        {
+            gh_subcommand_seen = true;
+            if decoded.eq_ignore_ascii_case("search") {
+                all_args_are_data = true;
+                continue;
             }
         }
 
