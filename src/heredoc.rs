@@ -4844,6 +4844,79 @@ mod tests {
             let masked = mask_non_expanding_data_heredocs(quoted);
             assert!(!masked.contains("$(git reset --hard)"), "{masked:?}");
         }
+
+        #[test]
+        fn probe_review_377_substitutions() {
+            let big = format!("tee /private/tmp/s <<EOF\n{}\nEOF\n", "`".repeat(100_000));
+            let deep = format!(
+                "tee /private/tmp/s <<EOF\n{}\nEOF\n",
+                "`echo $(echo `echo $(echo `rm -rf ~/x`)`)`"
+            );
+            let cases: Vec<(&str, String)> = vec![
+                ("H1 multiline backtick", "tee /private/tmp/s <<EOF\n`git reset\n--hard`\nEOF\n".into()),
+                ("H2 line continuation", "tee /private/tmp/s <<EOF\n`git reset \\\n--hard`\nEOF\n".into()),
+                ("H3 escaped dollar paren", "tee /private/tmp/s <<EOF\n\\$(git reset --hard)\nEOF\n".into()),
+                ("H4 two heredocs one line", "cat <<A <<B\n`git reset --hard`\nA\n`rm -rf ~/x`\nB\n".into()),
+                ("H5 two heredocs two cmds", "cat <<A; cat <<B\n`git reset --hard`\nA\n`rm -rf ~/x`\nB\n".into()),
+                ("H6 quoted then unquoted", "cat <<'A' <<B\n`git status`\nA\n`rm -rf ~/x`\nB\n".into()),
+                ("H7 unquoted then quoted", "cat <<A <<'B'\n`rm -rf ~/x`\nA\n`git status`\nB\n".into()),
+                ("H8 heredoc in $( ) in heredoc", "tee /private/tmp/s <<EOF\n$(cat <<IN\n`rm -rf ~/x`\nIN\n)\nEOF\n".into()),
+                ("H9 $'EOF' delim", "tee /private/tmp/s <<$'EOF'\n`rm -rf ~/x`\nEOF\n".into()),
+                ("H10 E\"O\"F delim", "tee /private/tmp/s <<E\"O\"F\n`rm -rf ~/x`\nEOF\n".into()),
+                ("H11 CRLF", "tee /private/tmp/s <<EOF\r\n`rm -rf ~/x`\r\nEOF\r\n".into()),
+                ("H12 CRLF quoted", "tee /private/tmp/s <<'EOF'\r\n`rm -rf ~/x`\r\nEOF\r\n".into()),
+                ("H13 $( spanning backtick", "tee /private/tmp/s <<EOF\n`echo $(foo` bar)\nEOF\n".into()),
+                ("H14 backtick in $( in backtick", "tee /private/tmp/s <<EOF\n`a $(echo `) rm -rf ~/x`\nEOF\n".into()),
+                ("H15 non-ascii", "tee /private/tmp/s <<EOF\nnoté `rm -rf ~/x` 日本 \\é `ls`\nEOF\n".into()),
+                ("H16 backslash multibyte backtick", "tee /private/tmp/s <<EOF\n\\日`rm -rf ~/x`\nEOF\n".into()),
+                ("H18 fd number", "cat 3<<EOF\n`rm -rf ~/x`\nEOF\n".into()),
+                ("H19 pipeline sub", "cat <<EOF | tee $(echo /private/tmp/s)\n`rm -rf ~/x`\nEOF\n".into()),
+                ("H20 mixed", "tee /private/tmp/s <<EOF\n`echo $(ls)` $(pwd)\nEOF\n".into()),
+                ("H21 empty body", "cat <<EOF\nEOF\n".into()),
+                ("H22 only backticks", "cat <<EOF\n``\nEOF\n".into()),
+                ("H23 odd backtick prose", "cat > /private/tmp/n.md <<EOF\nuse the `foo command\nEOF\n".into()),
+                ("H25 herestring", "cat <<< `rm -rf ~/x`".into()),
+                ("H27 escaped backslash newline", "tee /private/tmp/s <<EOF\n\\\\\n`rm -rf ~/x`\nEOF\n".into()),
+                ("H28 heredoc in backtick in heredoc", "tee /private/tmp/s <<EOF\n`bash <<IN\nrm -rf ~/x\nIN\n`\nEOF\n".into()),
+                ("H29 100k backticks", big),
+                ("H30 deep nesting", deep),
+                ("H31 comment quote after delim", "cat <<EOF # 'note'\n$(git reset --hard)\nEOF\n".into()),
+                ("H32 semicolon after delim", "cat <<EOF;\n`rm -rf ~/x`\nEOF\n".into()),
+                ("H33 tab <<- quoted", "tee /private/tmp/s <<-\"EOF\"\n\t`rm -rf ~/x`\n\tEOF\n".into()),
+                ("H34 <<- unquoted tabs", "tee /private/tmp/s <<-EOF\n\t\t`rm -rf ~/x`\n\t\tEOF\n".into()),
+                ("H35 delimiter with backslash inside", "tee /private/tmp/s <<EO\\F\n`rm -rf ~/x`\nEOF\n".into()),
+                ("H36 delim quoted var", "tee /private/tmp/s <<\"$X\"\n`rm -rf ~/x`\n$X\n".into()),
+                ("H37 backslash-escaped `$(` inside backtick", "tee /private/tmp/s <<EOF\n`echo \\$(rm -rf ~/x)`\nEOF\n".into()),
+                ("H38 sub inside body then quoted heredoc later", "cat <<EOF\n`rm -rf ~/x`\nEOF\ncat <<'X'\n`rm -rf ~/y`\nX\n".into()),
+                ("H39 heredoc inside function", "f() {\ncat <<EOF\n`rm -rf ~/x`\nEOF\n}\nf".into()),
+                ("H40 heredoc inside subshell", "(cat <<EOF\n`rm -rf ~/x`\nEOF\n)".into()),
+                ("H41 heredoc in if", "if true; then cat <<EOF\n`rm -rf ~/x`\nEOF\nfi".into()),
+                ("H42 dollar-quoted-like backtick", "tee /private/tmp/s <<EOF\n\"`rm -rf ~/x`\"\nEOF\n".into()),
+                ("H43 sq around backtick", "tee /private/tmp/s <<EOF\n'`rm -rf ~/x`'\nEOF\n".into()),
+                ("H44 arithmetic then backtick", "tee /private/tmp/s <<EOF\n$((1+1)) `rm -rf ~/x`\nEOF\n".into()),
+                ("H45 param exp braces w/ backtick", "tee /private/tmp/s <<EOF\n${X:-`rm -rf ~/x`}\nEOF\n".into()),
+                ("H46 nonascii in delimiter", "tee /private/tmp/s <<ÉOF\n`rm -rf ~/x`\nÉOF\n".into()),
+                ("H47 nonascii quoted delimiter", "tee /private/tmp/s <<'ÉOF'\n`rm -rf ~/x`\nÉOF\n".into()),
+                ("H48 backtick right before EOF marker", "tee /private/tmp/s <<EOF\n`rm -rf ~/x`EOF\nEOF\n".into()),
+                ("H49 CR only", "tee /private/tmp/s <<EOF\r`rm -rf ~/x`\rEOF\r".into()),
+                ("H50 unterminated heredoc", "tee /private/tmp/s <<EOF\n`rm -rf ~/x`\n".into()),
+            ];
+            for (name, content) in &cases {
+                let start = std::time::Instant::now();
+                let result = extract_posix_command_substitutions(content);
+                let elapsed = start.elapsed();
+                let masked = mask_non_expanding_data_heredocs(content);
+                let shown = if content.len() > 200 { format!("{}…", &content[..60]) } else { format!("{content:?}") };
+                match result {
+                    Ok(found) => {
+                        let bodies: Vec<String> = found.iter().map(|s| format!("{:?}@{}..{}", s.body, s.start, s.end)).collect();
+                        let bodies = if bodies.len() > 6 { format!("{} entries, first {:?}", bodies.len(), &bodies[..3]) } else { format!("{bodies:?}") };
+                        eprintln!("PROBE {name}: {shown}\n   => Ok {bodies} [{elapsed:?}] masked_changed={}", masked != *content);
+                    }
+                    Err(e) => eprintln!("PROBE {name}: {shown}\n   => Err {e:?} [{elapsed:?}] masked_changed={}", masked != *content),
+                }
+            }
+        }
     }
 
     // ========================================================================

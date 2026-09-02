@@ -31289,6 +31289,85 @@ mod tests {
     }
 
     #[test]
+    fn probe_review_377_eval() {
+        let packs = ["core.git", "core.filesystem"];
+        let big = format!("tee /private/tmp/s <<EOF\n{}\nEOF\n", "`".repeat(100_000));
+        let ps_issue = "$a=[IO.File]::ReadAllLines('x'); [string]::Join(\"`n\",$a[239..($a.Length-1)])";
+        let cases: Vec<(&str, ShellDialect, String)> = vec![
+            ("E1 multiline backtick", ShellDialect::Posix, "tee /private/tmp/s <<EOF\n`git reset\n--hard`\nEOF\n".into()),
+            ("E2 line continuation", ShellDialect::Posix, "tee /private/tmp/s <<EOF\n`git reset \\\n--hard`\nEOF\n".into()),
+            ("E3 escaped $( (expect allow)", ShellDialect::Posix, "tee /private/tmp/s <<EOF\n\\$(git reset --hard)\nEOF\n".into()),
+            ("E4 two heredocs one line", ShellDialect::Posix, "cat <<A <<B\n`git status`\nA\n`rm -rf ~/x`\nB\n".into()),
+            ("E5 two heredocs two cmds", ShellDialect::Posix, "cat <<A; cat <<B\n`git status`\nA\n`rm -rf ~/x`\nB\n".into()),
+            ("E6 quoted then unquoted", ShellDialect::Posix, "cat <<'A' <<B\n`git status`\nA\n`rm -rf ~/x`\nB\n".into()),
+            ("E7 unquoted then quoted (expect deny)", ShellDialect::Posix, "cat <<A <<'B'\n`rm -rf ~/x`\nA\n`git status`\nB\n".into()),
+            ("E7b unquoted then quoted (expect allow)", ShellDialect::Posix, "cat <<A <<'B'\n`git status`\nA\n`rm -rf ~/x`\nB\n".into()),
+            ("E8 heredoc in $( ) in heredoc", ShellDialect::Posix, "tee /private/tmp/s <<EOF\n$(cat <<IN\n`rm -rf ~/x`\nIN\n)\nEOF\n".into()),
+            ("E9 $'EOF' (expect allow)", ShellDialect::Posix, "tee /private/tmp/s <<$'EOF'\n`rm -rf ~/x`\nEOF\n".into()),
+            ("E11 CRLF", ShellDialect::Posix, "tee /private/tmp/s <<EOF\r\n`rm -rf ~/x`\r\nEOF\r\n".into()),
+            ("E13 $( spanning backtick", ShellDialect::Posix, "tee /private/tmp/s <<EOF\n`echo $(foo` bar)\nEOF\n".into()),
+            ("E14 backtick in $( in backtick", ShellDialect::Posix, "tee /private/tmp/s <<EOF\n`a $(echo `) rm -rf ~/x`\nEOF\n".into()),
+            ("E15 non-ascii", ShellDialect::Posix, "tee /private/tmp/s <<EOF\nnoté `rm -rf ~/x` 日本\nEOF\n".into()),
+            ("E16 backslash multibyte backtick", ShellDialect::Posix, "tee /private/tmp/s <<EOF\n\\日`rm -rf ~/x`\nEOF\n".into()),
+            ("E19 pipeline sub", ShellDialect::Posix, "cat <<EOF | tee $(echo /private/tmp/s)\n`rm -rf ~/x`\nEOF\n".into()),
+            ("E23 odd backtick prose (FP?)", ShellDialect::Posix, "cat > /private/tmp/n.md <<EOF\nuse the `foo command\nEOF\n".into()),
+            ("E23b benign inline code (expect allow)", ShellDialect::Posix, "cat > /private/tmp/n.md <<EOF\nrun `ls -la` then `git status`\nEOF\n".into()),
+            ("E25 herestring", ShellDialect::Posix, "cat <<< `rm -rf ~/x`".into()),
+            ("E28 bash heredoc in backtick in heredoc", ShellDialect::Posix, "tee /private/tmp/s <<EOF\n`bash <<IN\nrm -rf ~/x\nIN\n`\nEOF\n".into()),
+            ("E29 100k backticks", ShellDialect::Posix, big),
+            ("E31 comment quote after delim", ShellDialect::Posix, "cat <<EOF # 'note'\n$(git reset --hard)\nEOF\n".into()),
+            ("E32 semicolon after delim", ShellDialect::Posix, "cat <<EOF;\n`rm -rf ~/x`\nEOF\n".into()),
+            ("E33 tab <<- quoted (expect allow)", ShellDialect::Posix, "tee /private/tmp/s <<-\"EOF\"\n\t`rm -rf ~/x`\n\tEOF\n".into()),
+            ("E35 delim backslash inside (expect allow)", ShellDialect::Posix, "tee /private/tmp/s <<EO\\F\n`rm -rf ~/x`\nEOF\n".into()),
+            ("E37 escaped $( in backtick", ShellDialect::Posix, "tee /private/tmp/s <<EOF\n`echo \\$(rm -rf ~/x)`\nEOF\n".into()),
+            ("E39 heredoc inside function", ShellDialect::Posix, "f() {\ncat <<EOF\n`rm -rf ~/x`\nEOF\n}\nf".into()),
+            ("E40 heredoc inside subshell", ShellDialect::Posix, "(cat <<EOF\n`rm -rf ~/x`\nEOF\n)".into()),
+            ("E41 heredoc in if", ShellDialect::Posix, "if true; then cat <<EOF\n`rm -rf ~/x`\nEOF\nfi".into()),
+            ("E45 param exp w/ backtick", ShellDialect::Posix, "tee /private/tmp/s <<EOF\n${X:-`rm -rf ~/x`}\nEOF\n".into()),
+            ("E46 nonascii delim", ShellDialect::Posix, "tee /private/tmp/s <<ÉOF\n`rm -rf ~/x`\nÉOF\n".into()),
+            ("E49 CR only", ShellDialect::Posix, "tee /private/tmp/s <<EOF\r`rm -rf ~/x`\rEOF\r".into()),
+            ("E50 unterminated heredoc", ShellDialect::Posix, "tee /private/tmp/s <<EOF\n`rm -rf ~/x`\n".into()),
+            ("E51 python heredoc with backtick", ShellDialect::Posix, "python3 - <<EOF\nprint('x')\n`rm -rf ~/x`\nEOF\n".into()),
+            ("E52 python quoted heredoc backtick (expect allow)", ShellDialect::Posix, "python3 - <<'EOF'\nprint('`rm -rf ~/x`')\nEOF\n".into()),
+            ("E53 git commit -F heredoc", ShellDialect::Posix, "git commit -F - <<EOF\nfix: `rm -rf ~/x`\nEOF\n".into()),
+            ("E54 gh body-file heredoc", ShellDialect::Posix, "gh issue comment 1 --body-file - <<EOF\nrun `git reset --hard`\nEOF\n".into()),
+            ("E55 sub in body of bash heredoc to sh", ShellDialect::Posix, "sh <<EOF\necho `rm -rf ~/x`\nEOF\n".into()),
+            ("P1 git reset ps", ShellDialect::PowerShell, "git reset --hard".into()),
+            ("P2 rm -rf ps", ShellDialect::PowerShell, "rm -rf ~/x".into()),
+            ("P3 backtick sub ps", ShellDialect::PowerShell, "echo `rm -rf ~/x`".into()),
+            ("P4 $( ) ps", ShellDialect::PowerShell, "echo $(rm -rf ~/x)".into()),
+            ("P5 heredoc ps", ShellDialect::PowerShell, "cat <<EOF\n$(rm -rf ~/x)\nEOF".into()),
+            ("P6 bash -c ps", ShellDialect::PowerShell, "bash -c 'rm -rf ~/x'".into()),
+            ("P7 heredoc backtick ps", ShellDialect::PowerShell, "tee x <<EOF\n`git reset --hard`\nEOF".into()),
+            ("P8 force push ps", ShellDialect::PowerShell, "git push --force".into()),
+            ("P9 chain ps", ShellDialect::PowerShell, "cd /tmp && rm -rf ~/x".into()),
+            ("P10 semicolon ps", ShellDialect::PowerShell, "rm -rf ~/x; echo".into()),
+            ("P11 issue cmd ps (expect allow)", ShellDialect::PowerShell, ps_issue.into()),
+            ("P12 issue cmd posix (expect deny - the #379 FP)", ShellDialect::Posix, ps_issue.into()),
+            ("P13 posix quoted rm ps", ShellDialect::PowerShell, "sh -c \"rm -rf ~/x\"".into()),
+            ("P14 git checkout -- ps", ShellDialect::PowerShell, "git checkout -- src/main.rs".into()),
+            ("P15 rm with posix escapes ps", ShellDialect::PowerShell, "rm -rf \\~/x".into()),
+            ("P16 wsl passthrough ps", ShellDialect::PowerShell, "wsl rm -rf ~/x".into()),
+            ("P17 bash heredoc under ps", ShellDialect::PowerShell, "bash <<EOF\nrm -rf ~/x\nEOF".into()),
+            ("P18 posix backtick-escaped rm ps", ShellDialect::PowerShell, "echo x `; rm -rf ~/x".into()),
+            ("P19 rm -rf via posix var ps", ShellDialect::PowerShell, "rm -rf \"$HOME/x\"".into()),
+            ("P20 git clean ps", ShellDialect::PowerShell, "git clean -fdx".into()),
+        ];
+        for (name, dialect, command) in &cases {
+            let start = std::time::Instant::now();
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, *dialect);
+            let elapsed = start.elapsed();
+            let shown = if command.len() > 200 { format!("{}…", &command[..60]) } else { format!("{command:?}") };
+            eprintln!(
+                "PROBE {name} [{dialect:?}]: {shown}\n   => denied={} rule={:?} reason={:?} [{elapsed:?}]",
+                result.is_denied(),
+                result.pattern_info.as_ref().and_then(|info| info.pattern_name.clone()),
+                result.pattern_info.as_ref().map(|info| info.reason.clone()),
+            );
+        }
+    }
+
+    #[test]
     fn literal_assignment_proves_variable_redirect_target() {
         // #249-adjacent: a redirect whose `$VAR` target is proven by a single
         // prior literal assignment resolving to a tmp-family or relative path
