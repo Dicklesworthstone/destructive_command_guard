@@ -1083,30 +1083,57 @@ pub(crate) fn shell_dialect_for_tool_name(tool_name: Option<&str>) -> ShellDiale
     }
 }
 
-/// Resolve the dialect a `Bash`-labeled Codex payload actually executes in.
+/// Resolve the dialect a `Bash`-labeled Codex payload is evaluated under.
 ///
 /// Codex names its shell tool `Bash` on every platform (its hooks schema
-/// mirrors Claude Code's), but the command string is run through the user's
-/// default shell, which Codex resolves to PowerShell on Windows
-/// (`codex-rs/shell-command/src/shell_detect.rs`,
-/// `default_user_shell_from_path`: `cfg!(windows)` → `pwsh`, else Windows
-/// PowerShell). Evaluating that payload as POSIX turned PowerShell's backtick
-/// escape (`"`n"`) into an unterminated command substitution and denied a
-/// read-only command (#379). Claude Code's `Bash` tool on Windows is Git
-/// Bash, so the re-mapping is gated on the Codex protocol; and because a hook
-/// always runs on the host that executes the command, `host_is_windows`
-/// (`cfg!(windows)` at the call site) is the platform signal — a Codex
-/// session under WSL runs a Linux dcg and keeps POSIX. Explicit
-/// `powershell`/`pwsh`/`cmd` labels are never touched.
+/// mirrors Claude Code's), but its PreToolUse payload carries only
+/// `{"command": …}` (`codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs`,
+/// `pre_tool_use_payload`) — not the shell the command will run in. On native
+/// Windows that shell is PowerShell by default
+/// (`codex-rs/shell-command/src/shell_detect.rs`), yet the tool's `shell`
+/// parameter lets the model request `bash`/`sh` (Git Bash, or WSL's launcher,
+/// whichever is on `PATH`), and Codex falls back to `cmd.exe` when the
+/// requested shell is missing. The label alone therefore cannot name the
+/// dialect.
+///
+/// Evaluating every such payload as POSIX turned PowerShell's backtick escape
+/// (`"`n"`) into an unterminated command substitution and denied a read-only
+/// command (#379). Evaluating every one as PowerShell instead let the
+/// POSIX-only forms a requested bash would execute — a backquoted
+/// substitution in an expanding heredoc, ``x=`…` ``, `eval '…'`, a
+/// backslash-continued line — pass unseen. The command text separates the
+/// two cases: a command whose POSIX substitution parse fails cannot run under
+/// bash (the shell rejects it as well), so it is evaluated as PowerShell;
+/// anything that parses as POSIX is evaluated as `Unknown`, the fail-closed
+/// union of every dialect, exactly as a mislabeled Agent Host payload is
+/// (#322). A command the parser refuses for its size says nothing about the
+/// shell and keeps the union.
+///
+/// Claude Code's `Bash` tool on Windows is Git Bash, so the resolution is
+/// gated on the Codex protocol; and because a hook always runs on the host
+/// that executes the command, `host_is_windows` (`cfg!(windows)` at the call
+/// site) is the platform signal — a Codex session under WSL runs a Linux dcg
+/// and keeps POSIX. Explicit `powershell`/`pwsh`/`cmd` labels are never
+/// touched.
 #[must_use]
-pub(crate) const fn codex_host_shell_dialect(
+pub(crate) fn codex_host_shell_dialect(
     labeled: ShellDialect,
     protocol: HookProtocol,
     host_is_windows: bool,
+    command: &str,
 ) -> ShellDialect {
-    match (labeled, protocol, host_is_windows) {
-        (ShellDialect::Posix, HookProtocol::Codex, true) => ShellDialect::PowerShell,
-        _ => labeled,
+    if labeled != ShellDialect::Posix || protocol != HookProtocol::Codex || !host_is_windows {
+        return labeled;
+    }
+    if command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
+        return ShellDialect::Unknown;
+    }
+    // The same masked view the POSIX evaluation path parses, so the verdict
+    // here matches the one that path would reach.
+    let posix_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    match crate::heredoc::extract_posix_command_substitutions(posix_view.as_ref()) {
+        Ok(_) => ShellDialect::Unknown,
+        Err(crate::heredoc::PosixCommandSubstitutionParseError) => ShellDialect::PowerShell,
     }
 }
 
@@ -1470,11 +1497,16 @@ fn extract_command_from_tool_args(tool_args: &serde_json::Value) -> Option<Strin
 #[must_use]
 pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCommand> {
     let protocol = detect_protocol(input);
-    let dialect = codex_host_shell_dialect(
-        shell_dialect_for_tool_name(input.tool_name.as_deref()),
-        protocol,
-        cfg!(windows),
-    );
+    let labeled = shell_dialect_for_tool_name(input.tool_name.as_deref());
+    // The label alone cannot name the dialect of a Codex `Bash` payload on
+    // Windows (#379), so each command resolves its own; a Posix label whose
+    // command is unmistakably PowerShell then widens to the union (#322).
+    let resolve = |command: &str, label: ShellDialect| {
+        refine_shell_dialect(
+            command,
+            codex_host_shell_dialect(label, protocol, cfg!(windows), command),
+        )
+    };
 
     // Only process shell-command invocations for supported clients. Copilot
     // can omit toolName and put the shell command directly in toolArgs, so
@@ -1507,16 +1539,14 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
                 continue;
             }
             if let Some(command) = call.args.as_ref().and_then(extract_command_from_tool_args) {
-                let entry_dialect = refine_shell_dialect(
-                    &command,
-                    shell_dialect_for_tool_name(call.name.as_deref()),
-                );
+                let entry_dialect =
+                    resolve(&command, shell_dialect_for_tool_name(call.name.as_deref()));
                 commands.push((command, entry_dialect));
             }
         }
         if let Some(tool_call) = input.tool_call.as_ref() {
             if let Some(command) = extract_command_from_tool_call(tool_call) {
-                let entry_dialect = refine_shell_dialect(&command, dialect);
+                let entry_dialect = resolve(&command, labeled);
                 commands.push((command, entry_dialect));
             }
         }
@@ -1525,7 +1555,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
             .as_ref()
             .and_then(extract_command_from_tool_input)
         {
-            let entry_dialect = refine_shell_dialect(&command, dialect);
+            let entry_dialect = resolve(&command, labeled);
             commands.push((command, entry_dialect));
         }
         if let Some(command) = input
@@ -1533,7 +1563,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
             .as_ref()
             .and_then(extract_command_from_tool_args)
         {
-            let entry_dialect = refine_shell_dialect(&command, dialect);
+            let entry_dialect = resolve(&command, labeled);
             commands.push((command, entry_dialect));
         }
         let mut entries = commands.into_iter();
@@ -1550,7 +1580,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
     // Antigravity CLI (`agy`) nests the command under `toolCall.args.CommandLine`.
     if let Some(tool_call) = input.tool_call.as_ref() {
         if let Some(command) = extract_command_from_tool_call(tool_call) {
-            let dialect = refine_shell_dialect(&command, dialect);
+            let dialect = resolve(&command, labeled);
             return Some(ExtractedHookCommand {
                 command,
                 protocol,
@@ -1562,7 +1592,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
 
     if let Some(tool_input) = input.tool_input.as_ref() {
         if let Some(command) = extract_command_from_tool_input(tool_input) {
-            let dialect = refine_shell_dialect(&command, dialect);
+            let dialect = resolve(&command, labeled);
             return Some(ExtractedHookCommand {
                 command,
                 protocol,
@@ -1574,7 +1604,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
 
     if let Some(tool_args) = input.tool_args.as_ref() {
         if let Some(command) = extract_command_from_tool_args(tool_args) {
-            let dialect = refine_shell_dialect(&command, dialect);
+            let dialect = resolve(&command, labeled);
             return Some(ExtractedHookCommand {
                 command,
                 protocol,
@@ -3014,9 +3044,11 @@ mod tests {
             (
                 r#"{"tool_name":"bash","tool_input":{"command":"git status"},"turn_id":"turn-1"}"#,
                 HookProtocol::Codex,
-                // Codex's `Bash` tool runs PowerShell on native Windows (#379).
+                // Codex's `Bash` tool on native Windows runs PowerShell by
+                // default or a model-requested bash; a POSIX-parseable
+                // command takes the fail-closed union (#379).
                 if cfg!(windows) {
-                    ShellDialect::PowerShell
+                    ShellDialect::Unknown
                 } else {
                     ShellDialect::Posix
                 },
@@ -3044,19 +3076,56 @@ mod tests {
 
     #[test]
     fn test_379_codex_bash_tool_on_windows_host_resolves_powershell() {
-        // Codex labels its shell tool `Bash` everywhere but executes through
-        // PowerShell on native Windows, so a PowerShell backtick escape must
-        // not be parsed as a POSIX command substitution there (#379).
+        // Codex labels its shell tool `Bash` everywhere. On native Windows
+        // the command runs under PowerShell by default, but the model may
+        // request bash through the tool's `shell` parameter, which the hook
+        // payload does not carry (#379). The command text decides.
+        //
+        // The reporter's command: PowerShell's backtick escape is an
+        // unterminated POSIX substitution, so it can only be PowerShell.
+        let ps_only =
+            "$a=[IO.File]::ReadAllLines('x'); [string]::Join(\"`n\",$a[239..($a.Length-1)])";
         assert_eq!(
-            codex_host_shell_dialect(ShellDialect::Posix, HookProtocol::Codex, true),
+            codex_host_shell_dialect(ShellDialect::Posix, HookProtocol::Codex, true, ps_only),
             ShellDialect::PowerShell
         );
-        // The same payload on a Unix host (including Codex under WSL) keeps
-        // the POSIX dialect: Codex runs the user's login shell there.
-        assert_eq!(
-            codex_host_shell_dialect(ShellDialect::Posix, HookProtocol::Codex, false),
-            ShellDialect::Posix
+        // Commands a requested Git Bash would execute parse as POSIX; the
+        // label cannot tell them from PowerShell, so they take the
+        // fail-closed union.
+        let posix_parseable = [
+            "git status",
+            "tee /private/tmp/sink.md <<EOF\n`git reset --hard`\nEOF",
+            "x=`rm -rf ~/x`",
+            "eval 'rm -rf ~/x'",
+            "rm \\\n-rf ~/x",
+            "Get-ChildItem -Recurse | Select-Object Name",
+        ];
+        for command in posix_parseable {
+            assert_eq!(
+                codex_host_shell_dialect(ShellDialect::Posix, HookProtocol::Codex, true, command),
+                ShellDialect::Unknown,
+                "{command:?}"
+            );
+        }
+        // A command the parser refuses for its size keeps the union rather
+        // than trusting a verdict that never looked at the syntax.
+        let oversized = format!(
+            "echo `{}`",
+            "x".repeat(crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES)
         );
+        assert_eq!(
+            codex_host_shell_dialect(ShellDialect::Posix, HookProtocol::Codex, true, &oversized),
+            ShellDialect::Unknown
+        );
+        // The same payloads on a Unix host (including Codex under WSL) keep
+        // the POSIX dialect: Codex runs the user's login shell there.
+        for command in std::iter::once(ps_only).chain(posix_parseable) {
+            assert_eq!(
+                codex_host_shell_dialect(ShellDialect::Posix, HookProtocol::Codex, false, command),
+                ShellDialect::Posix,
+                "{command:?}"
+            );
+        }
         // Claude Code's `Bash` tool on Windows is Git Bash — never re-mapped.
         for protocol in [
             HookProtocol::ClaudeCompatible,
@@ -3066,11 +3135,13 @@ mod tests {
             HookProtocol::Grok,
             HookProtocol::Antigravity,
         ] {
-            assert_eq!(
-                codex_host_shell_dialect(ShellDialect::Posix, protocol, true),
-                ShellDialect::Posix,
-                "{protocol:?} must keep the POSIX label on Windows"
-            );
+            for command in [ps_only, "git status"] {
+                assert_eq!(
+                    codex_host_shell_dialect(ShellDialect::Posix, protocol, true, command),
+                    ShellDialect::Posix,
+                    "{protocol:?} must keep the POSIX label on Windows for {command:?}"
+                );
+            }
         }
         // Explicit labels are authoritative on every host.
         for labeled in [
@@ -3078,14 +3149,19 @@ mod tests {
             ShellDialect::Cmd,
             ShellDialect::Unknown,
         ] {
-            assert_eq!(
-                codex_host_shell_dialect(labeled, HookProtocol::Codex, true),
-                labeled
-            );
-            assert_eq!(
-                codex_host_shell_dialect(labeled, HookProtocol::Codex, false),
-                labeled
-            );
+            for host_is_windows in [true, false] {
+                for command in [ps_only, "git status"] {
+                    assert_eq!(
+                        codex_host_shell_dialect(
+                            labeled,
+                            HookProtocol::Codex,
+                            host_is_windows,
+                            command
+                        ),
+                        labeled
+                    );
+                }
+            }
         }
 
         // End to end through the extractor: the reporter's payload.
@@ -3101,13 +3177,26 @@ mod tests {
                 ShellDialect::Posix
             }
         );
+        // A POSIX-parseable Codex payload takes the union on Windows.
+        let json = r#"{"tool_name":"Bash","turn_id":"turn-379","tool_input":{"command":"tee /private/tmp/sink.md <<EOF\n`git reset --hard`\nEOF"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        let extracted = extract_command_with_context(&input).expect("shell command");
+        assert_eq!(extracted.protocol, HookProtocol::Codex);
+        assert_eq!(
+            extracted.dialect,
+            if cfg!(windows) {
+                ShellDialect::Unknown
+            } else {
+                ShellDialect::Posix
+            }
+        );
         // Without `turn_id` the payload is Claude Code's, whose Windows
         // `Bash` tool is Git Bash: the POSIX label stands on every host.
         let json = r#"{"tool_name":"Bash","tool_input":{"command":"$a=[IO.File]::ReadAllLines('x'); [string]::Join(\"`n\",$a[239..($a.Length-1)])"}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         let extracted = extract_command_with_context(&input).expect("shell command");
         assert_eq!(extracted.protocol, HookProtocol::ClaudeCompatible);
-        assert_ne!(extracted.dialect, ShellDialect::PowerShell);
+        assert_eq!(extracted.dialect, ShellDialect::Posix);
     }
 
     #[test]

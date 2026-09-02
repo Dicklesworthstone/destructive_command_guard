@@ -287,15 +287,24 @@ The dcg engine and its installed hook config are correct for every path Codex
 - `~/.codex/hooks.json` is written as UTF-8 without a BOM on Windows (commits
   `17746e8`, `5703a8a`), so Codex's strict JSON parser accepts it.
 - The matcher is `Bash` (the canonical shell `tool_name`).
-- On native Windows the `Bash`-named Codex payload is evaluated under the
-  **PowerShell** dialect (#379). Codex executes the command through the user's
-  default shell, which it resolves to `pwsh`/Windows PowerShell on Windows
-  (`codex-rs/shell-command/src/shell_detect.rs`), so a PowerShell escape such
-  as `"`n"` must not be read as a POSIX backtick substitution. The re-mapping
-  is keyed on the Codex protocol (`turn_id`) plus dcg running on Windows; a
-  Claude Code `Bash` payload on Windows is Git Bash and stays POSIX, and Codex
-  under WSL runs a Linux dcg and stays POSIX. `dcg test --dialect ps` /
-  `dcg explain --dialect ps` reproduce this hook path from the CLI.
+- On native Windows the `Bash`-named Codex payload does not name its shell
+  (#379). Codex runs the command through the user's default shell, which it
+  resolves to `pwsh`/Windows PowerShell on Windows
+  (`codex-rs/shell-command/src/shell_detect.rs`), but the tool's `shell`
+  parameter lets the model request `bash`/`sh` (Git Bash or WSL's launcher
+  when on `PATH`) and Codex falls back to `cmd.exe` when the requested shell
+  is missing — and the PreToolUse payload carries only `{"command": …}`. dcg
+  therefore resolves the dialect from the command text: a command that does
+  not parse as POSIX (a PowerShell escape such as `"`n"` is an unterminated
+  backtick substitution to bash) cannot run under bash and is evaluated as
+  **PowerShell**; a command that does parse as POSIX is evaluated as
+  **`unknown`**, the fail-closed union of every dialect, so a backquoted
+  substitution in an expanding heredoc or `eval '…'` is caught whichever
+  shell runs it. The resolution is keyed on the Codex protocol (`turn_id`)
+  plus dcg running on Windows; a Claude Code `Bash` payload on Windows is Git
+  Bash and stays POSIX, and Codex under WSL runs a Linux dcg and stays POSIX.
+  `dcg test --dialect ps` / `dcg explain --dialect ps` reproduce the
+  PowerShell path from the CLI and the default `--dialect unknown` the other.
 
 No further dcg-side change can make the `unified_exec` path block until Codex
 fires `PreToolUse` for it. Until then, treat Codex hooks as a guardrail that
