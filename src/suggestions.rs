@@ -490,6 +490,55 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
             .with_command("git stash drop stash@{0}"),
         ],
     );
+
+    // ---- Git LFS (Refs PR #383) --------------------------------------------
+    m.insert(
+        "core.git:lfs-migrate-rewrite",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Report what `git lfs migrate` would convert without rewriting any commit",
+            )
+            .with_command("git lfs migrate info --everything"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Keep a ref to the pre-rewrite history so the old SHAs stay reachable",
+            )
+            .with_command("git branch backup/pre-lfs-migrate"),
+        ],
+    );
+
+    m.insert(
+        "core.git:lfs-prune",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List the LFS objects that would be deleted without deleting them",
+            )
+            .with_command("git lfs prune --dry-run --verbose"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Only prune objects the remote confirms it already has",
+            )
+            .with_command("git lfs prune --verify-remote"),
+        ],
+    );
+
+    m.insert(
+        "core.git:lfs-uninstall",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Show the LFS filters and hooks that would be removed",
+            )
+            .with_command("git lfs env"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Restore the LFS filters and hooks if they were already removed",
+            )
+            .with_command("git lfs install"),
+        ],
+    );
 }
 
 /// Recursive rm rules whose target is a root, home, or sensitive system path.

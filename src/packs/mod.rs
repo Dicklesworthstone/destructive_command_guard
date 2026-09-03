@@ -1379,7 +1379,7 @@ pub fn preset_members(id: &str) -> Option<&'static [&'static str]> {
 
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 102] = [
+static PACK_ENTRIES: [PackEntry; 103] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new(
         "core.filesystem",
@@ -5494,7 +5494,15 @@ mod tests {
     #[test]
     fn core_rules_have_appropriate_severity() {
         // Patterns that should be Medium (recoverable operations)
-        let medium_patterns = [("core.git", "stash-drop")]; // Recoverable via fsck
+        let medium_patterns = [
+            ("core.git", "stash-drop"), // Recoverable via fsck
+            // Git LFS (Refs PR #383). `git lfs prune` deletes local objects
+            // the remote is expected to still have, so the ordinary case is a
+            // re-fetch away; `git lfs uninstall` is undone by
+            // `git lfs install`. Both warn rather than deny.
+            ("core.git", "lfs-prune"),
+            ("core.git", "lfs-uninstall"),
+        ];
 
         for pack_id in ["core.git", "core.filesystem"] {
             let pack = REGISTRY.get(pack_id).expect("Pack should exist");
