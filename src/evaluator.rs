@@ -32097,6 +32097,57 @@ mod tests {
         }
     }
 
+    /// Refs PR #383: `git lfs` is dispatched to the `git-lfs` helper, so it is
+    /// a known subcommand, not an unverifiable alias. Its read-only verbs were
+    /// denied as `core.git:git-alias-semantic-unverified`; its destructive
+    /// verbs now have their own rules instead of relying on that catch-all.
+    #[test]
+    fn git_lfs_is_a_known_subcommand_not_an_unverified_alias() {
+        for command in [
+            "git lfs ls-files",
+            "git lfs ls-files | head -20",
+            "git lfs status",
+            "git lfs env",
+            "git lfs fetch origin main",
+            "git lfs migrate info --everything",
+            "git lfs prune --dry-run --verbose",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &["core.git"], dialect);
+                assert!(
+                    result.is_allowed(),
+                    "a known git-lfs subcommand must not be alias-unverified: \
+                     {command:?} ({dialect:?}): {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+
+        // The destructive LFS verbs are denied by their own rules, so
+        // recognising `lfs` is not a coverage loss.
+        for (command, pattern) in [
+            ("git lfs migrate import --everything", "lfs-migrate-rewrite"),
+            ("git lfs prune --force", "lfs-prune"),
+            ("git lfs uninstall --system", "lfs-uninstall"),
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+            assert!(result.is_denied(), "{command:?} must be denied");
+            let info = result.pattern_info.expect("denial carries pattern info");
+            assert_eq!(info.pack_id.as_deref(), Some("core.git"), "{command:?}");
+            assert_eq!(info.pattern_name.as_deref(), Some(pattern), "{command:?}");
+        }
+
+        // A genuinely unknown subcommand keeps the conservative treatment.
+        let result =
+            evaluate_with_pack_ids_in_dialect("git lg", &["core.git"], ShellDialect::Posix);
+        assert!(
+            result.is_denied(),
+            "an unknown git subcommand must stay unverified: {:?}",
+            result.pattern_info
+        );
+    }
+
     /// #382: `heredoc.shell:launcher-unverified` fired on a QUOTED heredoc
     /// piped to a non-shell interpreter reading stdin. A Markdown fenced block
     /// in the body puts a backtick at the start of a segment, and the

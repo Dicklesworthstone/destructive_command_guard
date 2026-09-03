@@ -2335,6 +2335,14 @@ fn is_known_git_command(command: &str) -> bool {
             | "instaweb"
             | "interpret-trailers"
             | "last-modified"
+            // `git lfs` is not a builtin but is the canonical spelling of the
+            // Git LFS helper (`git-lfs` on PATH), so Git dispatches it without
+            // consulting `alias.lfs`. Treating it as an unverifiable alias
+            // denied every read-only `git lfs ls-files` / `status` / `fetch`
+            // (Refs PR #383). Its own destructive verbs — `migrate`, `prune`,
+            // `uninstall` — carry dedicated rules below, so recognising the
+            // subcommand here is not a coverage loss.
+            | "lfs"
             | "log"
             | "ls-files"
             | "ls-remote"
@@ -4903,6 +4911,14 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "clean-dry-run-long",
             r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*clean\s+--dry-run"
         ),
+        // `git lfs prune --dry-run` reports what it would delete and deletes
+        // nothing (Refs PR #383). The flag must be a whole token — `--dry-runx`
+        // is not it — and quoted argument text cannot supply it, because the
+        // walk stops at a quote or a redirection glyph.
+        safe_pattern!(
+            "lfs-prune-dry-run",
+            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*lfs\s+prune(?:\s+[^\s;&|<>\x22']+)*\s+--dry-run(?![\w-])"
+        ),
     ]
 }
 
@@ -5466,6 +5482,98 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 ]
             }
         ),
+        // ---- Git LFS (Refs PR #383) -----------------------------------------
+        //
+        // `git lfs` is dispatched to the `git-lfs` helper, so it is a known
+        // subcommand rather than an unverifiable alias. Its read-only verbs
+        // (`ls-files`, `status`, `env`, `fetch`, `pull`, `track`, `locks`,
+        // `migrate info`) carry no rule; the three verbs that destroy data or
+        // rewrite history do.
+        destructive_pattern!(
+            "lfs-migrate-rewrite",
+            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*lfs\s+migrate\s+(?:import|export)(?![\w-])",
+            "git lfs migrate import/export rewrites history — every commit in the range gets a new SHA.",
+            High,
+            "git lfs migrate import/export rewrites the commits it touches:\n\n\
+             - Every rewritten commit gets a NEW SHA, so the branch diverges from\n  \
+             every clone and a force-push is required to publish it\n\
+             - Collaborators' branches, open PRs and CI pins all break\n\
+             - `--everything` rewrites every local ref, not just the current branch\n\
+             - The original objects survive only until the next `git gc` prunes\n  \
+             the unreachable ones\n\n\
+             Preview without rewriting anything:\n\
+             - git lfs migrate info: report what WOULD be converted\n\
+             - git lfs migrate info --everything --above=1MB\n\n\
+             Back the refs up first: git branch backup/pre-lfs-migrate",
+            &const {
+                [
+                    PatternSuggestion::new(
+                        "git lfs migrate info",
+                        "Reports what would be converted without rewriting any commit",
+                    ),
+                    PatternSuggestion::new(
+                        "git branch backup/pre-lfs-migrate",
+                        "Keep a ref to the pre-rewrite history before migrating",
+                    ),
+                ]
+            }
+        ),
+        destructive_pattern!(
+            "lfs-prune",
+            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*lfs\s+prune(?![\w-])",
+            "git lfs prune deletes local LFS objects; with --force it deletes objects the remote does not have.",
+            Medium,
+            "git lfs prune deletes local Git LFS objects from .git/lfs/objects:\n\n\
+             - Objects older than the fetch/push retention window are removed\n\
+             - Anything the remote also has is re-downloadable, so the usual\n  \
+             case is recoverable — at the cost of a re-fetch\n\
+             - `--force` / `-f` prunes objects even when the remote is NOT known\n  \
+             to have them, which can destroy the only copy of unpushed content\n\
+             - `--recent` widens what is kept; it does not make the delete safer\n\n\
+             Check what would go first:\n\
+             - git lfs prune --dry-run --verbose\n\
+             - git lfs prune --verify-remote: only prune what the remote confirms",
+            &const {
+                [
+                    PatternSuggestion::new(
+                        "git lfs prune --dry-run --verbose",
+                        "Lists the objects that would be deleted without deleting them",
+                    ),
+                    PatternSuggestion::gated(
+                        "git lfs prune --verify-remote",
+                        "Only prunes objects the remote confirms it has — still a delete, so dcg gates it too",
+                    ),
+                ]
+            }
+        ),
+        destructive_pattern!(
+            "lfs-uninstall",
+            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*lfs\s+uninstall(?![\w-])",
+            "git lfs uninstall removes the LFS filters and hooks, so LFS files check out as pointer text.",
+            Medium,
+            "git lfs uninstall removes Git LFS from the git configuration:\n\n\
+             - The clean/smudge filters go, so tracked binaries check out as\n  \
+             one-line pointer files — and a later `git add`/commit can write\n  \
+             those pointers back over real content\n\
+             - The pre-push hook goes, so LFS objects stop being uploaded and a\n  \
+             push can publish pointers with no objects behind them\n\
+             - `--system` and `--global` affect EVERY repository on the machine,\n  \
+             not just this one\n\n\
+             Check the current configuration first: git lfs env\n\
+             Re-enable with: git lfs install",
+            &const {
+                [
+                    PatternSuggestion::new(
+                        "git lfs env",
+                        "Shows the filters and hooks that would be removed",
+                    ),
+                    PatternSuggestion::new(
+                        "git lfs install",
+                        "Restores the LFS filters and hooks if they were removed",
+                    ),
+                ]
+            }
+        ),
     ]
 }
 
@@ -5480,6 +5588,63 @@ mod tests {
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
     use std::fmt::Write as _;
+
+    // =========================================================================
+    // Git LFS (Refs PR #383): `git lfs` is a known subcommand, and its three
+    // destructive verbs carry their own rules.
+    // =========================================================================
+
+    #[test]
+    fn git_lfs_destructive_verbs_are_covered() {
+        let pack = create_pack();
+
+        for (command, pattern, severity) in [
+            (
+                "git lfs migrate import --everything --above=1MB",
+                "lfs-migrate-rewrite",
+                Severity::High,
+            ),
+            (
+                "git lfs migrate export --include='*.psd'",
+                "lfs-migrate-rewrite",
+                Severity::High,
+            ),
+            ("git lfs prune", "lfs-prune", Severity::Medium),
+            ("git lfs prune --force", "lfs-prune", Severity::Medium),
+            ("git lfs uninstall", "lfs-uninstall", Severity::Medium),
+            ("git lfs uninstall --system", "lfs-uninstall", Severity::Medium),
+            // Global git flags between `git` and `lfs`.
+            (
+                "git -C /srv/repo lfs prune --force",
+                "lfs-prune",
+                Severity::Medium,
+            ),
+        ] {
+            assert_no_safe_match(&pack, command);
+            assert_blocks_with_pattern(&pack, command, pattern);
+            assert_blocks_with_severity(&pack, command, severity);
+        }
+
+        // Read-only and routine LFS verbs stay allowed — `migrate info` in
+        // particular is the recommended preview for `migrate import`.
+        for command in [
+            "git lfs ls-files",
+            "git lfs ls-files --long",
+            "git lfs status",
+            "git lfs env",
+            "git lfs version",
+            "git lfs fetch origin main",
+            "git lfs pull",
+            "git lfs checkout",
+            "git lfs track '*.psd'",
+            "git lfs install",
+            "git lfs locks",
+            "git lfs migrate info --everything --above=1MB",
+            "git lfs prune --dry-run --verbose",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
 
     // =========================================================================
     // PowerShell expression statements are not command invocations (#273)
