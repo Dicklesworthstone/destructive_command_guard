@@ -23,6 +23,9 @@ pub fn create_pack() -> Pack {
             // select this pack even when `az` isn't the first keyword
             // in the command's token list.
             "keyvault", "role", "ad", "dns", "cosmosdb", "monitor", "purge",
+            // `az account` descendants (#384): management-group deletion,
+            // hierarchy settings, subscription removal/cancellation, locks.
+            "account", "management-group", "subscription", "lock", "cancel", "remove", "clear",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -41,39 +44,46 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // `az vm delete --ids show-vm-id`) would match the safe pattern
         // and bypass the destructive check. `(?=\s|$)` closes the trailing
         // side so `show-me-foo` can't pose as the `show` subcommand.
+        // The service-name token may NOT be option-shaped (#384): with a bare
+        // `\S+` there, `az group delete --name prod --yes --query show`
+        // consumed `--name prod` / `--yes` as flag pairs, read `--query` as
+        // the service name and `show` as the subcommand, and the safe match
+        // suppressed `group-delete`. A flag VALUE can never be the service.
         safe_pattern!(
             "az-show",
-            r"az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+\S+\s+show(?=\s|$)"
+            r"az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+[^-\s]\S*\s+show(?![\w-])"
         ),
         safe_pattern!(
             "az-list",
-            r"az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+\S+\s+list(?=\s|$)"
+            r"az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+[^-\s]\S*\s+list(?![\w-])"
         ),
-        // az account is safe.  Require `account` to be preceded by
-        // whitespace so the pattern doesn't false-match `--account-name`
-        // arguments (a common flag on many destructive subcommands,
-        // e.g. `az cosmosdb sql container delete --account-name …`) —
-        // a safe-first match on a flag value would BYPASS the
-        // destructive check. Same care is taken on every similar
-        // `az`/`gcloud` safe pattern below.
+        // NOTE (#384): there is deliberately no blanket `az account` safe
+        // pattern. `az account` is a combined core+extension group whose
+        // descendants include `management-group delete`,
+        // `management-group hierarchy-settings delete`,
+        // `management-group subscription remove`, `alias delete`,
+        // `lock delete` and the extension's `subscription cancel` — a
+        // group-wide whitelist suppressed every one of them. Read-only
+        // `az account show|list|set|get-access-token|…` needs no safe pattern:
+        // no rule in this pack matches them, and an unmatched command is
+        // allowed by default. `az configure`, `az login` and `az version` are
+        // gone for the same reason — they granted nothing and only widened
+        // the whitelist surface.
+        //
+        // Help output (#380 convention). Every `az` command documents
+        // `--help -h  Show this help message and exit`, so help prints usage
+        // and exits before any API call. A quoted token is consumed whole so
+        // a `--help` embedded in an argument (`--name 'x --help'`) never
+        // reads as the flag, and the walk stops at redirection/separator
+        // characters so `az group delete --yes > --help` stays a deletion.
         safe_pattern!(
-            "az-account",
-            r"az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+account(?=\s|$)"
+            "az-help",
+            r"(?<![\w-])az(?:\s+(?:\x22[^\x22]*\x22|'[^']*'|(?!--(?:\s|$))[^\s;&|<>\x22']+))*\s+--help(?![\w-])"
         ),
-        // az configure is safe
         safe_pattern!(
-            "az-configure",
-            r"az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+configure(?=\s|$)"
+            "az-help-short",
+            r"(?<![\w-])az(?:\s+(?:\x22[^\x22]*\x22|'[^']*'|(?!--(?:\s|$))[^\s;&|<>\x22']+))*\s+-h(?![\w-])"
         ),
-        // az login is safe
-        safe_pattern!("az-login", r"az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+login(?=\s|$)"),
-        // az version is safe
-        safe_pattern!(
-            "az-version",
-            r"az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s|$)"
-        ),
-        // az --help is safe
-        safe_pattern!("az-help", r"az\b.*--help"),
         // Azure What-If is a deployment feature, not a universal delete
         // preview flag. Keep it scoped to documented deployment commands so
         // unsupported `--what-if` text cannot bypass destructive `az ... delete`.
@@ -140,10 +150,17 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Point-in-time restore possible within retention period\n\n\
              Create backup: az sql db export --name DB --server SRV --storage-uri URI"
         ),
-        // group delete (resource group)
+        // group delete (resource group).
+        //
+        // `(?<![\w-])` is load-bearing (#384): a bare `\b` sits between `-`
+        // and `group`, so `az account management-group delete` matched this
+        // rule and was explained as deleting a resource group. Management
+        // groups have their own rule below. `az ad group delete` still lands
+        // here — it is genuinely destructive, only the explanation is
+        // resource-group flavoured.
         destructive_pattern!(
             "group-delete",
-            r"az\b.*?\bgroup\s+delete",
+            r"az\b.*?(?<![\w-])group\s+delete(?![\w-])",
             "az group delete removes the entire resource group and ALL resources within it!",
             Critical,
             "group delete removes ENTIRE resource group:\n\n\
@@ -367,6 +384,110 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              az cosmosdb update --name ACCOUNT --resource-group RG \\\n    \
              --backup-policy-type Continuous"
         ),
+        // ---- `az account` descendants (#384) --------------------------------
+        //
+        // Microsoft documents `az account` as a combined core-and-extension
+        // group. Its read-only members (`show`, `list`, `list-locations`,
+        // `set`, `get-access-token`, `tenant list`, `subscription list`, …)
+        // stay allowed by default; only the operations below change or
+        // destroy tenant-level state. Every verb is closed with `(?![\w-])`
+        // so a future hyphenated sibling cannot inherit the rule, and each
+        // group word is opened with `(?<![\w-])` so a longer hyphenated group
+        // name cannot claim it.
+        destructive_pattern!(
+            "account-management-group-delete",
+            r"az\b.*?(?<![\w-])account\s+management-group\s+delete(?![\w-])",
+            "az account management-group delete removes a management group from the tenant hierarchy.",
+            Critical,
+            "account management-group delete removes an Azure management group:\n\n\
+             - Azure Policy and RBAC assignments scoped to the group are lost\n\
+             - Child subscriptions and groups are reparented to the root group,\n  \
+             silently widening or dropping inherited governance\n\
+             - The group must be empty; the CLI deletes it without a second prompt\n\
+             - There is no undelete — the hierarchy must be rebuilt by hand\n\n\
+             Inspect the subtree first:\n  \
+             az account management-group show --name GROUP -e -r"
+        ),
+        destructive_pattern!(
+            "account-management-group-hierarchy-settings-delete",
+            r"az\b.*?(?<![\w-])account\s+management-group\s+hierarchy-settings\s+delete(?![\w-])",
+            "az account management-group hierarchy-settings delete drops tenant-root hierarchy settings.",
+            High,
+            "account management-group hierarchy-settings delete removes settings that\n\
+             can only be defined on the ROOT management group:\n\n\
+             - `requireAuthorizationForGroupCreation` reverts, so any user may\n  \
+             create management groups again\n\
+             - `defaultManagementGroup` reverts to the root group, so NEW\n  \
+             subscriptions land outside their intended policy scope\n\n\
+             Capture the current settings first:\n  \
+             az account management-group hierarchy-settings list --name ROOT-GROUP"
+        ),
+        destructive_pattern!(
+            "account-management-group-subscription-remove",
+            r"az\b.*?(?<![\w-])account\s+management-group\s+subscription\s+remove(?![\w-])",
+            "az account management-group subscription remove detaches a subscription from its management group.",
+            High,
+            "account management-group subscription remove reparents a subscription:\n\n\
+             - The subscription moves to the tenant root group\n\
+             - Policy assignments, initiatives and RBAC inherited from the old\n  \
+             group stop applying immediately — controls silently disappear\n\
+             - Cost/management reporting grouped by the old hierarchy changes\n\n\
+             Re-attach with:\n  \
+             az account management-group subscription add --name GROUP --subscription SUB"
+        ),
+        destructive_pattern!(
+            "account-subscription-cancel",
+            r"az\b.*?(?<![\w-])account\s+subscription\s+cancel(?![\w-])",
+            "az account subscription cancel cancels an entire Azure subscription and everything in it.",
+            Critical,
+            "account subscription cancel (azure-cli `account` extension) cancels a\n\
+             whole subscription:\n\n\
+             - EVERY resource in the subscription is deprovisioned\n\
+             - Resources are retained only for a short grace period, then deleted\n  \
+             permanently\n\
+             - Reactivation is a support/billing operation, not a CLI one\n\n\
+             This is one of the most destructive Azure commands. Confirm the\n\
+             subscription id first:\n  \
+             az account show --subscription SUB --query id"
+        ),
+        destructive_pattern!(
+            "account-alias-delete",
+            r"az\b.*?(?<![\w-])account\s+alias\s+delete(?![\w-])",
+            "az account alias delete removes the subscription alias used to manage a subscription declaratively.",
+            High,
+            "account alias delete removes a subscription alias:\n\n\
+             - The subscription itself survives, but the alias that IaC and\n  \
+             billing automation address it by is gone\n\
+             - Alias names are not reusable immediately, so a re-create may fail\n\
+             - Pipelines that look the subscription up by alias start failing\n\n\
+             List aliases first:\n  \
+             az account alias list"
+        ),
+        destructive_pattern!(
+            "account-lock-delete",
+            r"az\b.*?(?<![\w-])account\s+lock\s+delete(?![\w-])",
+            "az account lock delete removes a subscription-level management lock — the guardrail against deletion.",
+            High,
+            "account lock delete removes a subscription management lock:\n\n\
+             - A `CanNotDelete` / `ReadOnly` lock is the last guardrail against\n  \
+             an accidental `az group delete` across the subscription\n\
+             - Removing it is usually the FIRST step of a destructive sequence\n\
+             - Nothing else is destroyed by this command itself\n\n\
+             Inspect the lock before removing it:\n  \
+             az account lock show --name LOCK"
+        ),
+        destructive_pattern!(
+            "account-clear",
+            r"az\b.*?(?<![\w-])account\s+clear(?![\w-])",
+            "az account clear wipes every cached subscription and credential from the local CLI profile.",
+            Medium,
+            "account clear empties the local Azure CLI account cache:\n\n\
+             - All logged-in accounts and cached subscriptions are removed\n\
+             - Nothing in Azure is destroyed, but every later `az` command in\n  \
+             this environment fails until `az login` runs again\n\
+             - Automation running under a service principal loses its context\n\n\
+             To drop only the current subscription, use `az logout`."
+        ),
     ]
 }
 
@@ -378,12 +499,10 @@ mod tests {
 
     #[test]
     fn azure_safe_pattern_does_not_bypass_via_flag_value() {
-        // Regression: `az-account` safe pattern must NOT match
-        // `--account-name`, `--account-id`, etc. — those are flags on
-        // destructive subcommands, and a false-safe match there would
-        // silently allow destructive commands through. Same concern
-        // for `configure` / `login` / `version` on any destructive
-        // command that happens to carry those words as flag values.
+        // Regression: no safe pattern may match `--account-name`,
+        // `--account-id`, etc. — those are flags on destructive
+        // subcommands, and a false-safe match there would silently allow
+        // destructive commands through.
         let pack = create_pack();
         // Cosmos DB delete with --account-name must still block
         assert_blocks(
@@ -401,6 +520,135 @@ mod tests {
         assert_allows(&pack, "az account list");
         assert_allows(&pack, "az account show");
         assert_allows(&pack, "az --subscription prod account list");
+    }
+
+    /// #384: `az account` is a combined core-and-extension group whose
+    /// descendants delete management groups, drop tenant hierarchy settings,
+    /// detach subscriptions and cancel subscriptions outright. A group-wide
+    /// `az-account` safe pattern suppressed every one of them.
+    #[test]
+    fn azure_account_descendants_are_covered() {
+        let pack = create_pack();
+
+        for (command, pattern) in [
+            (
+                "az account management-group delete --name prod-mg",
+                "account-management-group-delete",
+            ),
+            (
+                "az account management-group hierarchy-settings delete --name root-mg",
+                "account-management-group-hierarchy-settings-delete",
+            ),
+            (
+                "az account management-group subscription remove --name prod-mg --subscription 00000000-0000-0000-0000-000000000000",
+                "account-management-group-subscription-remove",
+            ),
+            (
+                "az account subscription cancel --id 00000000-0000-0000-0000-000000000000",
+                "account-subscription-cancel",
+            ),
+            (
+                "az account alias delete --name prod-alias",
+                "account-alias-delete",
+            ),
+            (
+                "az account lock delete --name do-not-delete",
+                "account-lock-delete",
+            ),
+            ("az account clear", "account-clear"),
+        ] {
+            assert_no_safe_match(&pack, command);
+            assert_blocks_with_pattern(&pack, command, pattern);
+            // Global flags between `az` and the group must not break the rule.
+            let with_globals = command.replacen("az ", "az --only-show-errors --subscription p ", 1);
+            assert_blocks_with_pattern(&pack, &with_globals, pattern);
+        }
+
+        assert_blocks_with_severity(
+            &pack,
+            "az account management-group delete --name prod-mg",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "az account subscription cancel --id 0000",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(&pack, "az account clear", Severity::Medium);
+
+        // Read-only `az account` members stay allowed.
+        for command in [
+            "az account show",
+            "az account list",
+            "az account list-locations",
+            "az account set --subscription prod",
+            "az account get-access-token --resource-type ms-graph",
+            "az account management-group list",
+            "az account management-group show --name prod-mg -e -r",
+            "az account management-group check-name-availability --name prod-mg",
+            "az account management-group entities list",
+            "az account management-group hierarchy-settings list --name root-mg",
+            "az account management-group subscription show --name prod-mg --subscription 0000",
+            "az account management-group tenant-backfill get",
+            "az account alias list",
+            "az account alias show --name prod-alias",
+            "az account lock list",
+            "az account subscription list",
+            "az account tenant list",
+            "az account accept-ownership-status --subscription-id 0000",
+        ] {
+            assert_allows(&pack, command);
+        }
+
+        // Help prints usage and exits before any API call.
+        for command in [
+            "az account management-group delete --help",
+            "az account management-group delete --name prod-mg --help",
+            "az account subscription cancel -h",
+            "az account clear --help",
+        ] {
+            assert_allows(&pack, command);
+        }
+
+        // …but a `--help` buried inside a quoted argument is not the flag.
+        assert_blocks_with_pattern(
+            &pack,
+            "az account management-group delete --name 'prod --help'",
+            "account-management-group-delete",
+        );
+
+        // A management group is not a resource group: the rule that fires
+        // must be the management-group one, not `group-delete` (#384).
+        assert_blocks_with_pattern(
+            &pack,
+            "az account management-group delete --name prod-mg",
+            "account-management-group-delete",
+        );
+        // …and a real resource-group delete still lands on `group-delete`.
+        assert_blocks_with_pattern(&pack, "az group delete --name prod --yes", "group-delete");
+    }
+
+    /// #384: the `az-show` / `az-list` service token may not be option-shaped.
+    /// With a bare `\S+` there, a flag VALUE could pose as the subcommand and
+    /// suppress a real deletion.
+    #[test]
+    fn azure_show_list_safe_patterns_cannot_be_forged_from_flag_values() {
+        let pack = create_pack();
+        for (command, pattern) in [
+            ("az group delete --name prod --yes --query show", "group-delete"),
+            ("az group delete --name prod --yes --query list", "group-delete"),
+            ("az vm delete --name prod-vm -g prod --query show", "vm-delete"),
+            (
+                "az keyvault key purge --name k --vault-name v --query list",
+                "keyvault-item-delete-or-purge",
+            ),
+        ] {
+            assert_no_safe_match(&pack, command);
+            assert_blocks_with_pattern(&pack, command, pattern);
+        }
+        // Genuine read-only forms still match.
+        assert_safe_pattern_matches(&pack, "az vm show --name prod-vm -g prod");
+        assert_safe_pattern_matches(&pack, "az --subscription prod group list");
     }
 
     #[test]
@@ -739,17 +987,13 @@ mod tests {
         assert_safe_pattern_matches(&pack, "az vm show --name my-vm -g rg");
         // az-list: az <svc> list
         assert_safe_pattern_matches(&pack, "az vm list");
-        // az-account
+        // az-show / az-list also cover the `az account` read-only members,
+        // which no longer have a group-wide whitelist of their own (#384).
         assert_safe_pattern_matches(&pack, "az account list");
         assert_safe_pattern_matches(&pack, "az account show");
-        // az-configure
-        assert_safe_pattern_matches(&pack, "az configure --defaults group=mygroup");
-        // az-login
-        assert_safe_pattern_matches(&pack, "az login");
-        // az-version
-        assert_safe_pattern_matches(&pack, "az version");
-        // az-help
+        // az-help / az-help-short
         assert_safe_pattern_matches(&pack, "az vm delete --help");
+        assert_safe_pattern_matches(&pack, "az group delete -h");
         // az-deployment-what-if
         assert_safe_pattern_matches(&pack, "az deployment group what-if --resource-group rg");
         assert_safe_pattern_matches(
