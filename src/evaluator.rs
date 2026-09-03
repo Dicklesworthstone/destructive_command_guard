@@ -21444,6 +21444,135 @@ fn filesystem_pre_rm_pattern_excluding_dynamic(name: Option<&str>) -> bool {
     filesystem_pre_rm_pattern(name) && name != Some("redirect-truncate-dynamic-path")
 }
 
+/// Prove a same-command working directory for rm-target resolution
+/// (fix-dcgrules, 20260903100833): the last top-level `cd <absolute static
+/// literal>` before the rm segment.
+///
+/// Soundness comes from invalidating, not from recognizing: bare, `-`,
+/// dynamic, or multi-argument `cd` resets the proof, as do `pushd`/`popd`,
+/// wrapper/mutator first words (`command`, `builtin`, `env`, `eval`,
+/// `source`, `.`, `exec`), compound openers (`for`, `while`, `if`, `{`),
+/// parentheses/braces first words, alias/function definitions, and a nested
+/// rm segment (a subshell `cd` does not persist to the parent). Plain
+/// commands and pure assignments never touch the cwd and are ignored.
+fn proven_rm_working_directory(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    segment_end: usize,
+) -> Option<String> {
+    if segment_range_is_nested(segment_ranges, segment_start, segment_end) {
+        return None;
+    }
+    let mut cwd: Option<String> = None;
+    for &(start, end) in segment_ranges {
+        if end > segment_start {
+            continue;
+        }
+        if segment_range_is_nested(segment_ranges, start, end) {
+            continue;
+        }
+        let segment = source.get(start..end).map(str::trim)?;
+        if segment.is_empty() {
+            continue;
+        }
+        let first = segment.split_ascii_whitespace().next().unwrap_or("");
+        // Wrapper and mutator first words can change the cwd opaquely
+        // (`command cd /etc`, `eval …`, `. script`); compound openers can
+        // hide a `cd` in a body; alias/function definitions can hijack a
+        // later `cd`. Any of them invalidates the proof.
+        if matches!(
+            first,
+            "pushd"
+                | "popd"
+                | "command"
+                | "builtin"
+                | "env"
+                | "exec"
+                | "eval"
+                | "source"
+                | "."
+                | "time"
+                | "nice"
+                | "nohup"
+                | "sudo"
+                | "alias"
+                | "unalias"
+                | "function"
+                | "for"
+                | "while"
+                | "until"
+                | "select"
+                | "if"
+                | "then"
+                | "elif"
+                | "else"
+                | "fi"
+                | "case"
+                | "{"
+                | "do"
+                | "done"
+        ) || first.contains(['(', ')', '$', '`', '\\'])
+            || segment.contains("cd(")
+        {
+            return None;
+        }
+        let cd_word = first
+            .strip_prefix('\'')
+            .and_then(|rest| rest.strip_suffix('\''))
+            .or_else(|| {
+                first
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix('"'))
+            })
+            .unwrap_or(first);
+        if cd_word != "cd" {
+            continue;
+        }
+        let mut args = segment.split_ascii_whitespace();
+        args.next();
+        let arg = args.next()?;
+        if args.next().is_some() || arg == "-" || arg == "--" {
+            return None;
+        }
+        let literal = arg
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or(arg);
+        if literal.contains('\'')
+            || !literal.starts_with('/')
+            || literal.contains("//")
+            || literal.split('/').any(|part| part == "..")
+            || literal.bytes().any(|byte| {
+                byte.is_ascii_whitespace()
+                    || matches!(
+                        byte,
+                        b'$' | b'`'
+                            | b'*'
+                            | b'?'
+                            | b'['
+                            | b']'
+                            | b'{'
+                            | b'}'
+                            | b';'
+                            | b'|'
+                            | b'&'
+                            | b'('
+                            | b')'
+                            | b'#'
+                            | b'~'
+                            | b'!'
+                            | b'\\'
+                    )
+            })
+        {
+            return None;
+        }
+        cwd = Some(literal.to_string());
+    }
+    cwd
+}
+
 /// Statically prove that a `$VAR`-target redirect resolves to a benign literal
 /// path, so `redirect-truncate-dynamic-path` need not fail closed on it.
 ///
@@ -21590,6 +21719,19 @@ fn resolved_variable_values(
     segment_start: usize,
     name: &str,
 ) -> Option<Vec<String>> {
+    resolved_variable_values_with_depth(source, segment_ranges, segment_start, name, 0)
+}
+
+/// Depth-tracking worker for [`resolved_variable_values`]: transitive
+/// composition consumes one depth per nesting level so reference cycles
+/// terminate as denials instead of overflowing the stack.
+fn resolved_variable_values_with_depth(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    name: &str,
+    depth: usize,
+) -> Option<Vec<String>> {
     let mut values: Option<Vec<String>> = None;
     for &(start, end) in segment_ranges {
         if end > segment_start {
@@ -21617,8 +21759,14 @@ fn resolved_variable_values(
                     return None;
                 }
                 values = Some(vec![
-                    literal_assignment_value(raw)
-                        .or_else(|| mktemp_scratch_assignment_value(raw))?,
+                    resolve_chained_assignment_value(
+                        raw,
+                        source,
+                        segment_ranges,
+                        segment_start,
+                        depth,
+                    )
+                    .or_else(|| mktemp_scratch_assignment_value(raw))?,
                 ]);
                 continue;
             }
@@ -21832,6 +21980,112 @@ fn mktemp_scratch_assignment_value(raw: &str) -> Option<String> {
         return None;
     }
     Some(MKTEMP_SCRATCH_STAND_IN.to_string())
+}
+
+/// Upper bound on transitive variable-composition depth a proof will
+/// follow (`out="$root/…"` with `root=<literal>`). Each nesting level
+/// consumes one depth; reference cycles therefore terminate as denials.
+const MAX_VARIABLE_CHAIN_DEPTH: usize = 4;
+
+/// Upper bound on `$`-references expanded inside one assignment template.
+const MAX_VARIABLE_CHAIN_REFERENCES: usize = 8;
+
+/// Resolve a whole-segment assignment value, following bounded transitive
+/// composition (`out="$root/…"` with `root=<literal>`).
+///
+/// Single-quoted values keep today's exact behavior (contained dollars are
+/// literal text, never expanded). Double-quoted and unquoted values may
+/// embed `$NAME`/`${NAME}` references; each must resolve through
+/// [`resolved_variable_values`] to exactly one literal, consuming chain
+/// depth, so cycles, reassignments, and dynamic inners fail closed. Values
+/// that need no expansion behave exactly like [`literal_assignment_value`].
+fn resolve_chained_assignment_value(
+    raw: &str,
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    depth: usize,
+) -> Option<String> {
+    if depth > MAX_VARIABLE_CHAIN_DEPTH {
+        return None;
+    }
+    let raw = raw.trim();
+    // Single-quoted dollars are literal text: return as-is, never expand.
+    if let Some(inner) = raw
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        if inner.contains(['\'', '\\']) {
+            return None;
+        }
+        return (!inner.is_empty() && !inner.starts_with('~')).then(|| inner.to_string());
+    }
+    let template = if let Some(inner) = raw
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        if inner.contains(['`', '\\', '"']) {
+            return None;
+        }
+        inner
+    } else {
+        if !raw.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'-' | b'.' | b'/' | b':' | b'+' | b'@' | b'$' | b'{' | b'}'
+                )
+        }) {
+            return None;
+        }
+        raw
+    };
+    let mut current = template.to_string();
+    for _ in 0..MAX_VARIABLE_CHAIN_REFERENCES {
+        let Some(dollar) = current.find('$') else {
+            break;
+        };
+        let (name, rest) = parse_chained_variable_reference(&current[dollar + 1..])?;
+        let replacement = match resolved_variable_values_with_depth(
+            source,
+            segment_ranges,
+            segment_start,
+            name,
+            depth + 1,
+        ) {
+            Some(values) if values.len() == 1 => values.into_iter().next()?,
+            _ => return None,
+        };
+        current = format!("{}{}{}", &current[..dollar], replacement, rest);
+    }
+    if current.contains('$') {
+        return None;
+    }
+    (!current.is_empty() && !current.starts_with('~')).then_some(current)
+}
+
+/// Parse one `$NAME` / `${NAME}` reference (text after the `$`); the rest of
+/// the template follows the name. Anything else (`$(…)`, `` `…` ``,
+/// positional `$1`, a trailing bare `$`) is unresolvable and fails closed.
+fn parse_chained_variable_reference(after: &str) -> Option<(&str, &str)> {
+    let (name, rest) = if let Some(body) = after.strip_prefix('{') {
+        let close = body.find('}')?;
+        (&body[..close], &body[close + 1..])
+    } else {
+        let end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        (&after[..end], &after[end..])
+    };
+    let valid = !name.is_empty()
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    valid.then_some((name, rest))
 }
 
 /// A whole-segment assignment value that is one literal shell word.
@@ -22677,6 +22931,42 @@ fn evaluate_core_filesystem_pack(
                 ),
             shell_dialect,
         );
+        // fix-dcgrules (20260830081143, 20260903100833): an rm denied only
+        // because its targets hide behind same-command variables or a
+        // same-command `cd` stands down when every target resolves to an
+        // exempt path. Anything unresolvable keeps the denial.
+        let proven_cwd = proven_rm_working_directory(
+            redirect_source,
+            segment_ranges,
+            segment_start,
+            segment_end,
+        );
+        let rm_decision = if matches!(
+            rm_decision,
+            crate::packs::core::filesystem::RmParseDecision::Deny(_)
+        ) && matches!(
+            shell_dialect,
+            ShellDialect::Posix | ShellDialect::Unknown
+        ) && crate::packs::core::filesystem::rm_segment_targets_proven_exempt(
+            dialect_segment,
+            shell_dialect,
+            &crate::packs::core::filesystem::RmProofContext {
+                resolve_variable: &|name| match resolved_variable_values(
+                    redirect_source,
+                    segment_ranges,
+                    segment_start,
+                    name,
+                ) {
+                    Some(mut values) if values.len() == 1 => values.pop(),
+                    _ => None,
+                },
+                working_directory: proven_cwd.as_deref(),
+            },
+        ) {
+            crate::packs::core::filesystem::RmParseDecision::Allow
+        } else {
+            rm_decision
+        };
         let rm_was_semantically_handled = !matches!(
             &rm_decision,
             crate::packs::core::filesystem::RmParseDecision::NoMatch
@@ -31370,6 +31660,65 @@ mod tests {
     }
 
     #[test]
+    fn chained_assignment_proves_variable_redirect_target() {
+        // fix-dcgrules (20260829150619): one bounded level of transitive
+        // composition — a variable built from another proven literal in the
+        // same command resolves before the benign-path check.
+        for command in [
+            "d=/tmp/reclaim; out=\"$d/run.log\"; my-tool > \"$out\"",
+            "a=/tmp/x; b=\"$a/y\"; c=\"$b/z.log\"; my-tool > \"$c\"",
+            "d=/tmp/reclaim; my-tool > \"$d/run.log\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "proven chained redirect target must be allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Chains that cannot be proven keep the fail-closed denial.
+        for command in [
+            // Reference cycle.
+            "a=\"$b\"; b=\"$a\"; my-tool > \"$a\"",
+            // Reassignment makes the live value ambiguous.
+            "a=/tmp/x; a=/etc/passwd; my-tool > \"$a\"",
+            // Dynamic inner value.
+            "d=$(date +%s); out=\"$d/x\"; my-tool > \"$out\"",
+            // Unbound inner name.
+            "out=\"$missing/x\"; my-tool > \"$out\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "unprovable chained redirect target must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // The 20260829150619 shape resolves the chain, but an absolute HOME
+        // target is outside the benign set (tmp-family or relative only), so
+        // the redirect policy still denies — only the rule attribution is
+        // now precise instead of fail-closed-dynamic.
+        let frog = "root=/Users/gfw/.local/share/example\nout=\"$root/plans/model.md\"\npi --model m -p @prompt.md >\"$out\" 2>\"$root/plans/model.log\"";
+        let result =
+            evaluate_with_pack_ids_in_dialect(frog, &["core.filesystem"], ShellDialect::Posix);
+        assert!(
+            result.is_denied(),
+            "chained HOME redirect target must stay denied: {:?}",
+            result.pattern_info
+        );
+    }
+
+    #[test]
     fn literal_assignment_proves_variable_redirect_target() {
         // #249-adjacent: a redirect whose `$VAR` target is proven by a single
         // prior literal assignment resolving to a tmp-family or relative path
@@ -36548,6 +36897,146 @@ mod tests {
             assert!(
                 result.is_denied(),
                 "name-shaped alias boundary must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    // =========================================================================
+    // fix-dcgrules (20260902033929): `git lfs` is a known subcommand, not an
+    // alias — LFS invocations must not fail closed as
+    // `git-alias-semantic-unverified`.
+    // =========================================================================
+
+    #[test]
+    fn git_lfs_is_known_subcommand_not_alias() {
+        for command in [
+            "git lfs ls-files",
+            "git lfs ls-files | head -20",
+            "git lfs status",
+            "git lfs fetch origin main",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &["core.git"], dialect);
+                assert!(
+                    result.is_allowed(),
+                    "known git-lfs subcommand must not be alias-unverified: \
+                     {command:?} ({dialect:?}): {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+
+        // Unknown names keep the conservative treatment.
+        let result =
+            evaluate_with_pack_ids_in_dialect("git lg", &["core.git"], ShellDialect::Posix);
+        assert!(
+            result.is_denied(),
+            "unknown git subcommand must stay unverified: {:?}",
+            result.pattern_info
+        );
+    }
+
+    // =========================================================================
+    // fix-dcgrules (20260830081143): rm targets proven by same-command
+    // literal assignments to exempt paths.
+    // =========================================================================
+
+    #[test]
+    fn rm_proven_variable_targets_in_scratchpad_are_allowed() {
+        for command in [
+            "S=/private/tmp/claude-501/proj/sess/scratchpad/int1b; rm -rf \"$S/scratch-root\"",
+            "S=/private/tmp/claude-501/proj/sess/scratchpad/int1b; rm -rf \"$S/scratch-root\"; bun x --root \"$S/scratch-root\"",
+            "S=/tmp/work; rm -rf \"$S/out\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "proven rm variable target must be allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        for command in [
+            // Unbound variable.
+            "rm -rf \"$S/scratch-root\"",
+            // Traversal smuggled through the suffix.
+            "S=/private/tmp/claude-501/s; rm -rf \"$S/../../etc\"",
+            // Sensitive resolved target.
+            "S=/etc; rm -rf \"$S/x\"",
+            // Mixed proven + sensitive targets.
+            "S=/private/tmp/claude-501/s; rm -rf \"$S/x\" /etc",
+            // Dynamic inner value.
+            "S=$OTHER/x; rm -rf \"$S/y\"",
+            // Glob through the variable.
+            "S=/private/tmp/claude-501/s; rm -rf $S/*",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "unproven rm variable target must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    // =========================================================================
+    // fix-dcgrules (20260903100833): relative rm targets resolved against a
+    // same-command literal `cd`.
+    // =========================================================================
+
+    #[test]
+    fn rm_relative_targets_after_literal_cd_are_allowed() {
+        for command in [
+            "cd /private/tmp/claude-501/p/s/scratchpad && mkdir x && rm -rf x",
+            "cd /tmp/work && rm -rf x",
+            "cd /tmp/work && rm -rf x/y",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "cd-resolved rm target must be allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        for command in [
+            // No cd: relative target unresolvable.
+            "rm -rf x",
+            // Sensitive cd.
+            "cd /etc && rm -rf x",
+            // Dynamic cd.
+            "cd $X && rm -rf x",
+            "cd && rm -rf x",
+            // Traversal out of the cd directory.
+            "cd /tmp/a && rm -rf ../b",
+            // Last cd wins; a later sensitive cd re-denies.
+            "cd /tmp/a && cd /etc && rm -rf x",
+            // pushd invalidates the proof.
+            "cd /tmp/a && pushd /etc && rm -rf x",
+            // Sensitive resolution through the cd.
+            "cd / && rm -rf x",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "unresolvable cd-relative rm target must stay denied: {command:?}: {:?}",
                 result.pattern_info
             );
         }

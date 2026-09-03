@@ -2335,6 +2335,7 @@ fn is_known_git_command(command: &str) -> bool {
             | "instaweb"
             | "interpret-trailers"
             | "last-modified"
+            | "lfs"
             | "log"
             | "ls-files"
             | "ls-remote"

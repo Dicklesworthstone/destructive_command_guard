@@ -1257,6 +1257,247 @@ pub(crate) fn parse_rm_command_segment_in_dialect(
     parse_unverified_rm_command_segment(command, pipeline_stdin, dialect)
 }
 
+/// Provenance for the same-command rm-target proof (fix-dcgrules):
+/// same-command variable bindings resolved by the caller plus an optional
+/// same-command working directory from a literal `cd`.
+pub(crate) struct RmProofContext<'a> {
+    pub resolve_variable: &'a dyn Fn(&str) -> Option<String>,
+    pub working_directory: Option<&'a str>,
+}
+
+/// Whether an rm segment denied by the parser is nevertheless safe because
+/// every operand resolves to an exempt path: `$VAR[/suffix]` operands
+/// resolve through same-command literal bindings, and static relative
+/// operands resolve against a proven same-command `cd`.
+///
+/// Deliberately narrower than the parser's literal policy: at least one
+/// operand must be proven (non-literal), globs never prove, a
+/// double-quoted proven target only excuses the combined short-flag
+/// spelling (mirroring the parser), and any unclassifiable token fails
+/// closed. Consulted only to flip a parser Deny into an Allow, never to
+/// widen a NoMatch.
+pub(crate) fn rm_segment_targets_proven_exempt(
+    segment: &str,
+    dialect: ShellDialect,
+    context: &RmProofContext<'_>,
+) -> bool {
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return false;
+    }
+    let tokens = tokenize_for_normalization(segment);
+    if tokens
+        .iter()
+        .any(|token| token.kind == NormalizeTokenKind::Separator)
+    {
+        return false;
+    }
+    let mut words: Vec<&str> = tokens
+        .iter()
+        .filter_map(|token| token.text(segment))
+        .collect();
+    // Leading `NAME=value` environment assignments apply to the invocation.
+    while let Some(first) = words.first() {
+        let is_assignment = first
+            .split_once('=')
+            .is_some_and(|(name, _)| rm_proof_name_is_valid(name));
+        if !is_assignment {
+            break;
+        }
+        words.remove(0);
+    }
+    let Some(rm_word) = words.first() else {
+        return false;
+    };
+    if strip_outer_quotes(rm_word).1 != "rm" {
+        return false;
+    }
+    let mut recursive = false;
+    let mut combined_style = false;
+    let mut long_style = false;
+    let mut operands_only = false;
+    let mut targets: Vec<&str> = Vec::new();
+    let mut index = 0usize;
+    let rest = &words[1..];
+    while index < rest.len() {
+        let word = rest[index];
+        index += 1;
+        if !operands_only {
+            if word == "--" {
+                operands_only = true;
+                continue;
+            }
+            if let Some(flags) = word.strip_prefix('-') {
+                if flags.is_empty() || word == "-" {
+                    return false;
+                }
+                if flags.starts_with('-') {
+                    match word {
+                        "--recursive" => {
+                            recursive = true;
+                            long_style = true;
+                        }
+                        "--force" => {
+                            long_style = true;
+                        }
+                        _ => return false,
+                    }
+                    continue;
+                }
+                if !flags.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+                    return false;
+                }
+                let has_recursive = flags.bytes().any(|byte| matches!(byte, b'r' | b'R'));
+                let has_force = flags.bytes().any(|byte| byte == b'f');
+                recursive |= has_recursive;
+                if has_recursive && has_force {
+                    combined_style = true;
+                }
+                continue;
+            }
+        }
+        // Redirect syntax is judged by the dedicated redirect view;
+        // consume a detached target so it is not mistaken for an rm path.
+        if shell_redirection_prefix(word).is_some() {
+            if shell_redirection_consumes_next_word(word) && index < rest.len() {
+                index += 1;
+            }
+            continue;
+        }
+        targets.push(word);
+    }
+    if !recursive || targets.is_empty() {
+        return false;
+    }
+    let mut saw_proven = false;
+    for target in &targets {
+        let (quote, text) = strip_outer_quotes(target);
+        if quote == QuoteKind::Single || text.is_empty() {
+            return false;
+        }
+        if text.bytes().any(|byte| matches!(byte, b'*' | b'?' | b'[')) {
+            return false;
+        }
+        if quote == QuoteKind::Double && (long_style || !combined_style) {
+            return false;
+        }
+        if let Some(after_dollar) = text.strip_prefix('$') {
+            let Some((name, suffix)) = parse_rm_proof_variable(after_dollar) else {
+                return false;
+            };
+            if suffix.split('/').any(|part| part == "..") {
+                return false;
+            }
+            let Some(value) = (context.resolve_variable)(name) else {
+                return false;
+            };
+            if quote == QuoteKind::None
+                && value.bytes().any(|byte| matches!(byte, b'*' | b'?' | b'['))
+            {
+                return false;
+            }
+            let resolved = format!("{value}{suffix}");
+            if resolved.starts_with("//") || !resolved.starts_with('/') {
+                return false;
+            }
+            if !(path_is_safe_unquoted(&resolved)
+                || path_is_regenerable_basename(&resolved)
+                || path_is_updater_cache(&resolved))
+            {
+                return false;
+            }
+            saw_proven = true;
+            continue;
+        }
+        if text.starts_with('/') {
+            if !(path_is_safe_unquoted(text)
+                || path_is_regenerable_basename(text)
+                || path_is_updater_cache(text))
+            {
+                return false;
+            }
+            continue;
+        }
+        let Some(cwd) = context.working_directory else {
+            return false;
+        };
+        if text.starts_with('-')
+            || text.split('/').any(|part| part == "..")
+            || text.bytes().any(|byte| {
+                byte.is_ascii_whitespace()
+                    || matches!(
+                        byte,
+                        b'$' | b'`'
+                            | b'*'
+                            | b'?'
+                            | b'['
+                            | b']'
+                            | b'{'
+                            | b'}'
+                            | b';'
+                            | b'|'
+                            | b'&'
+                            | b'('
+                            | b')'
+                            | b'#'
+                            | b'~'
+                            | b'!'
+                            | b'\\'
+                            | b'\''
+                            | b'"'
+                    )
+            })
+        {
+            return false;
+        }
+        let resolved = format!("{cwd}/{text}");
+        if !(path_is_safe_unquoted(&resolved)
+            || path_is_regenerable_basename(&resolved)
+            || path_is_updater_cache(&resolved))
+        {
+            return false;
+        }
+        saw_proven = true;
+    }
+    saw_proven
+}
+
+/// A valid shell variable name for the rm proof (`$NAME` / `${NAME}`).
+fn rm_proof_name_is_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Parse `$NAME` / `${NAME}` with a literal path suffix (`$dir/out.log`);
+/// anything else (`$(…)`, backticks, positional `$1`, glob metacharacters
+/// in the suffix) fails closed.
+fn parse_rm_proof_variable(after: &str) -> Option<(&str, &str)> {
+    let (name, suffix) = if let Some(body) = after.strip_prefix('{') {
+        let close = body.find('}')?;
+        (&body[..close], &body[close + 1..])
+    } else {
+        let end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        (&after[..end], &after[end..])
+    };
+    if !rm_proof_name_is_valid(name) {
+        return None;
+    }
+    if !suffix
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/'))
+    {
+        return None;
+    }
+    Some((name, suffix))
+}
+
 fn powershell_variable_assignment(command: &str) -> bool {
     let Some(mut tail) = command.trim_start().strip_prefix('$') else {
         return false;
@@ -2700,9 +2941,10 @@ fn parse_rm_segment_with_option_scanning(
     let path_style = flag_state.force_style.unwrap_or(RmFlagStyle::Combined);
     let safe_paths = !paths.is_empty()
         && !flag_state.saw_terminator
-        && paths
-            .iter()
-            .all(|path| path_is_safe_for_style(path, path_style));
+        && paths.iter().all(|path| {
+            path_is_safe_for_style(path, path_style)
+                || path_is_reclaim_exempt_for_style(path, path_style)
+        });
 
     if safe_paths {
         return RmParseDecision::Allow;
@@ -3076,6 +3318,109 @@ fn path_is_safe_for_style(path: &PathToken<'_>, style: RmFlagStyle) -> bool {
     }
 }
 
+/// Reclaim Rules 1–2 path exemption (fix-dcgrules): regenerable
+/// build-output basenames and updater-cache subtrees. Absolute literal
+/// paths only; every guard mirrors the reclaim policy (no globs, no shell
+/// variables, no `..` segments, no `//`). Single-quoted spellings stay
+/// denied to match `path_is_safe_for_style`, and a `~` home spelling is
+/// only meaningful unquoted (the shell does not expand `~` in quotes).
+fn path_is_reclaim_exempt_for_style(path: &PathToken<'_>, style: RmFlagStyle) -> bool {
+    if path.quote == QuoteKind::Double && style != RmFlagStyle::Combined {
+        return false;
+    }
+    if path.quote == QuoteKind::Single {
+        return false;
+    }
+    let text = path.unquoted;
+    if text.starts_with('~') && path.quote != QuoteKind::None {
+        return false;
+    }
+    path_is_regenerable_basename(text) || path_is_updater_cache(text)
+}
+
+/// Regenerable build-output basenames (reclaim Rule 1). Deleting a path
+/// whose final segment is one of these removes output the toolchain
+/// recreates; the over-broad-glob hazard is absent because every target
+/// must match exactly.
+const REGENERABLE_BASENAMES: [&str; 6] = [
+    "node_modules",
+    "dist",
+    ".next",
+    "coverage",
+    "target",
+    "build",
+];
+
+/// One static literal path segment for reclaim matching: non-empty, not
+/// `..`, and free of expansion, glob, quoting, and separator syntax.
+fn reclaim_segment_is_static(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != ".."
+        && !segment.bytes().any(|byte| {
+            matches!(
+                byte,
+                b'$' | b'`'
+                    | b'*'
+                    | b'?'
+                    | b'['
+                    | b']'
+                    | b'{'
+                    | b'}'
+                    | b'\''
+                    | b'"'
+                    | b'\\'
+                    | b';'
+                    | b'|'
+                    | b'&'
+                    | b'('
+                    | b')'
+                    | b'#'
+                    | b'~'
+                    | b'!'
+            )
+        })
+}
+
+fn path_is_regenerable_basename(path: &str) -> bool {
+    if !path.starts_with('/') || path.contains("//") {
+        return false;
+    }
+    let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let [.., basename] = segments.as_slice() else {
+        return false;
+    };
+    REGENERABLE_BASENAMES.contains(basename)
+        && segments.iter().all(|part| reclaim_segment_is_static(part))
+}
+
+fn path_is_updater_cache(path: &str) -> bool {
+    let rest = if let Some(inner) = path
+        .strip_prefix("~/")
+        .and_then(|inner| inner.strip_prefix("Library/Caches/"))
+    {
+        inner
+    } else if let Some(after_users) = path.strip_prefix("/Users/") {
+        let Some(slash) = after_users.find('/') else {
+            return false;
+        };
+        let (user, tail) = after_users.split_at(slash);
+        if !reclaim_segment_is_static(user) {
+            return false;
+        }
+        let Some(inner) = tail.strip_prefix("/Library/Caches/") else {
+            return false;
+        };
+        inner
+    } else {
+        return false;
+    };
+    // Strictly *under* the cache root: at least one real segment.
+    let segments: Vec<&str> = rest.split('/').filter(|part| !part.is_empty()).collect();
+    !segments.is_empty()
+        && !rest.contains("//")
+        && segments.iter().all(|part| reclaim_segment_is_static(part))
+}
+
 /// Literal temp-family prefixes, including macOS's canonical `/private`
 /// forms (`/tmp` and `/var/tmp` are symlinks to them there) (#244).
 const LITERAL_TEMP_PREFIXES: [&str; 4] =
@@ -3361,6 +3706,78 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!(
             "rm-force-recursive-var-tmp",
             r"^rm\s+.*--force.*--recursive\s+(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+        ),
+        // -----------------------------------------------------------------
+        // Reclaim Rules 1–2 (fix-dcgrules): regenerable build-output
+        // basenames and updater-cache subtrees. Whole-command anchored like
+        // the tmp patterns above: every target must match, so a mixed
+        // `rm -rf /proj/dist /etc` falls through to the destructive rules.
+        //
+        // Static-segment shape (SEG): a path component that is not `..` and
+        // carries no expansion, glob, quoting, or separator syntax:
+        //   (?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+
+        // (`\x22` is `"`; backtick is literal inside r-strings.)
+        // -----------------------------------------------------------------
+        // Rule 1: `rm -rf <abs regenerable-basename>` (all flag shapes).
+        safe_pattern!(
+            "rm-rf-reclaim-basename",
+            r"^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:/(?:(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)*(?:node_modules|dist|\.next|coverage|target|build)/?(?:\s+|$))+$"
+        ),
+        safe_pattern!(
+            "rm-fr-reclaim-basename",
+            r"^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:/(?:(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)*(?:node_modules|dist|\.next|coverage|target|build)/?(?:\s+|$))+$"
+        ),
+        safe_pattern!(
+            "rm-r-f-reclaim-basename",
+            r"^rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+(?:/(?:(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)*(?:node_modules|dist|\.next|coverage|target|build)/?(?:\s+|$))+$"
+        ),
+        safe_pattern!(
+            "rm-f-r-reclaim-basename",
+            r"^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:/(?:(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)*(?:node_modules|dist|\.next|coverage|target|build)/?(?:\s+|$))+$"
+        ),
+        safe_pattern!(
+            "rm-recursive-force-reclaim-basename",
+            r"^rm\s+.*--recursive.*--force\s+(?:/(?:(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)*(?:node_modules|dist|\.next|coverage|target|build)/?(?:\s+|$))+$"
+        ),
+        safe_pattern!(
+            "rm-force-recursive-reclaim-basename",
+            r"^rm\s+.*--force.*--recursive\s+(?:/(?:(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)*(?:node_modules|dist|\.next|coverage|target|build)/?(?:\s+|$))+$"
+        ),
+        // Rule 2: `rm -rf` under `~/Library/Caches/` or
+        // `/Users/<name>/Library/Caches/` (all flag shapes). Strictly under
+        // the cache root (at least one subpath segment), `~other` and
+        // `$HOME` spellings excluded.
+        safe_pattern!(
+            "rm-rf-updater-cache",
+            r"^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:(?:~/|/Users/(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)Library/Caches/(?:(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)*(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/?(?:\s+|$))+$"
+        ),
+        safe_pattern!(
+            "rm-fr-updater-cache",
+            r"^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:(?:~/|/Users/(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)Library/Caches/(?:(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)*(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/?(?:\s+|$))+$"
+        ),
+        safe_pattern!(
+            "rm-r-f-updater-cache",
+            r"^rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+(?:(?:~/|/Users/(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)Library/Caches/(?:(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)*(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/?(?:\s+|$))+$"
+        ),
+        safe_pattern!(
+            "rm-f-r-updater-cache",
+            r"^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:(?:~/|/Users/(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)Library/Caches/(?:(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)*(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/?(?:\s+|$))+$"
+        ),
+        safe_pattern!(
+            "rm-recursive-force-updater-cache",
+            r"^rm\s+.*--recursive.*--force\s+(?:(?:~/|/Users/(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)Library/Caches/(?:(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)*(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/?(?:\s+|$))+$"
+        ),
+        safe_pattern!(
+            "rm-force-recursive-updater-cache",
+            r"^rm\s+.*--force.*--recursive\s+(?:(?:~/|/Users/(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)Library/Caches/(?:(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)*(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/?(?:\s+|$))+$"
+        ),
+        // Rule 1 for `find -delete`: only basename-exempt absolute paths
+        // plus optional depth bounds before a terminal `-delete`. No `-exec`,
+        // no extra actions, no variables (mirrors the find-delete-tmp
+        // `(?![^|;&]*[\\$`])` guard).
+        safe_pattern!(
+            "find-delete-reclaim-basename",
+            r"^(?![^|;&]*[\\$`])find\s+(?:/(?:(?!\.\.(?:/|\s|$))[^/\s$\x22*?`'\\\[\]{};|&()#~]+/)*(?:node_modules|dist|\.next|coverage|target|build)/?\s+)+(?:-(?:min|max)depth\s+\d+\s+){0,2}-delete\s*$"
         ),
         // -----------------------------------------------------------------
         // `find ... -delete` safe whitelist for temp directories.
@@ -4667,14 +5084,15 @@ mod tests {
     #[test]
     fn find_delete_blocks_general_high() {
         let pack = create_pack();
-        // Anything that's not under a temp dir and not root/home should
-        // still be blocked (High severity, mirrors rm-rf-general).
+        // Anything that's not under a temp dir, not root/home, and not a
+        // reclaim-exempt regenerable basename should still be blocked (High
+        // severity, mirrors rm-rf-general). `find /workspace/build -delete`
+        // is now allowed by reclaim Rule 1 (fix-dcgrules, 20260831213106).
         for cmd in [
             "find . -delete",
             "find ./node_modules -delete",
             "find . -name '*.pyc' -delete",
             "find /data -delete",
-            "find /workspace/build -delete",
             "find ./target -type f -delete",
         ] {
             assert_blocks_with_severity(&pack, cmd, Severity::High);
@@ -6599,6 +7017,99 @@ mod tests {
         assert_safe_pattern_matches(&pack, "rm -fr /tmp/test");
         assert_safe_pattern_matches(&pack, "rm -r -f /tmp/test");
         assert_safe_pattern_matches(&pack, "rm --recursive --force /tmp/test");
+    }
+
+    // fix-dcgrules (20260831213106, 20260902025725): reclaim Rule 1 —
+    // regenerable build-output basenames. Absolute paths only, every target
+    // must match, no globs/variables/traversal.
+    #[test]
+    fn test_safe_rm_reclaim_basename() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "rm -rf /proj/node_modules");
+        assert_safe_pattern_matches(&pack, "rm -rf /a/b/dist /c/target");
+        assert_safe_pattern_matches(&pack, "rm -rf /a/b/.next/");
+        assert_safe_pattern_matches(&pack, "rm -fr /a/.next");
+        assert_safe_pattern_matches(&pack, "rm -r -f /a/coverage");
+        assert_safe_pattern_matches(&pack, "rm -f -r /a/build");
+        assert_safe_pattern_matches(&pack, "rm --recursive --force /a/target");
+        assert_safe_pattern_matches(&pack, "rm --force --recursive /a/node_modules");
+        // Adversarial shapes must NOT match safe (fall through to deny).
+        assert!(!pack.matches_safe("rm -rf node_modules"));
+        assert!(!pack.matches_safe("rm -rf /proj/dist/*"));
+        assert!(!pack.matches_safe("rm -rf /proj/dist?"));
+        assert!(!pack.matches_safe("rm -rf $HOME/dist"));
+        assert!(!pack.matches_safe("rm -rf /proj/../etc"));
+        assert!(!pack.matches_safe("rm -rf /proj/dist-evil"));
+        assert!(!pack.matches_safe("rm -rf /proj/dist /etc"));
+        assert!(!pack.matches_safe("rm -rf /proj/dist; rm -rf /"));
+        assert!(!pack.matches_safe("rm -rf //proj/dist"));
+        // Mixed targets still denied at pack level.
+        assert_blocks(
+            &pack,
+            "rm -rf /proj/dist /etc",
+            "rm -rf on root or home paths",
+        );
+    }
+
+    // fix-dcgrules (20260902025725): reclaim Rule 2 — updater download
+    // caches. `~` home spelling and absolute `/Users/<name>` spelling only.
+    #[test]
+    fn test_safe_rm_updater_cache() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "rm -rf ~/Library/Caches/Codex");
+        assert_safe_pattern_matches(&pack, "rm -rf /Users/alice/Library/Caches/Codex");
+        assert_safe_pattern_matches(&pack, "rm -fr ~/Library/Caches/x");
+        assert_safe_pattern_matches(&pack, "rm -r -f ~/Library/Caches/x");
+        assert_safe_pattern_matches(
+            &pack,
+            "rm --recursive --force /Users/alice/Library/Caches/x",
+        );
+        assert!(!pack.matches_safe("rm -rf ~/Library/Caches"));
+        assert!(!pack.matches_safe("rm -rf ~other/Library/Caches/x"));
+        assert!(!pack.matches_safe("rm -rf $HOME/Library/Caches/x"));
+        assert!(!pack.matches_safe("rm -rf ~/Library/Caches/../x"));
+        assert!(!pack.matches_safe("rm -rf ~/Library/Caches/*"));
+        assert!(!pack.matches_safe("rm -rf ~/Library/Caches/x /etc"));
+    }
+
+    // fix-dcgrules (20260831213106): reclaim Rule 1 for `find -delete`.
+    // Only basename-exempt absolute paths plus optional depth bounds.
+    #[test]
+    fn test_safe_find_delete_reclaim_basename() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "find /a/.next -mindepth 1 -delete");
+        assert_safe_pattern_matches(&pack, "find /a/dist /b/target -mindepth 1 -delete");
+        assert_safe_pattern_matches(&pack, "find /a/node_modules -delete");
+        assert_safe_pattern_matches(&pack, "find /a/.next -mindepth 1 -maxdepth 3 -delete");
+        assert!(!pack.matches_safe("find /etc -mindepth 1 -delete"));
+        assert!(!pack.matches_safe("find /a/.next -mindepth 1 -delete -print"));
+        assert!(!pack.matches_safe("find /a/.next -exec rm {} ; -delete"));
+        assert!(!pack.matches_safe("find /a/* -mindepth 1 -delete"));
+        assert!(!pack.matches_safe("find $HOME/.next -mindepth 1 -delete"));
+        assert!(!pack.matches_safe("find /a/.next /etc -mindepth 1 -delete"));
+    }
+
+    // fix-dcgrules (20260831213106, 20260902025725): reclaim Rules 1-2 in
+    // the rm parser (the evaluator path consults the parser, not the safe
+    // regexes).
+    #[test]
+    fn test_rm_parser_allows_reclaim_paths() {
+        assert_rm_parser_allows("rm -rf /proj/node_modules");
+        assert_rm_parser_allows("rm -rf /a/b/dist /c/target");
+        assert_rm_parser_allows("rm -r -f /a/coverage");
+        assert_rm_parser_allows("rm --recursive --force /a/target");
+        assert_rm_parser_allows("rm -rf ~/Library/Caches/Codex");
+        assert_rm_parser_allows("rm -rf /Users/alice/Library/Caches/x");
+    }
+
+    #[test]
+    fn test_rm_parser_rejects_non_reclaim_paths() {
+        assert_rm_parser_denies(
+            "rm -rf /proj/dist /etc",
+            RM_RF_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+        assert_rm_parser_denies("rm -rf node_modules", RM_RF_GENERAL_NAME, Severity::High);
     }
 
     #[test]
