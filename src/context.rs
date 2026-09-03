@@ -951,6 +951,20 @@ pub static SAFE_STRING_REGISTRY: SafeStringRegistry = SafeStringRegistry {
         // query; nothing in it is executed (#380). `gh search <kind>` takes
         // its query as positionals and is handled in the sanitizer loop.
         SafeFlagEntry::both("gh", "-S", "--search"),
+        // Azure CLI (#384/#385): `--query` is a JMESPath filter applied to the
+        // RESPONSE, and display names / descriptions / tags / Boards WIQL /
+        // pull-request titles are free text. None of it is executed, and all
+        // of it routinely contains words like `delete` or `account`. Only long
+        // forms are registered: `az` reuses short flags per command (`-d` is
+        // `--display-name` here and `--defaults` under `az devops configure`),
+        // and several short flags carry paths that destructive-redirect rules
+        // must keep seeing.
+        SafeFlagEntry::long("az", "--query"),
+        SafeFlagEntry::long("az", "--display-name"),
+        SafeFlagEntry::long("az", "--description"),
+        SafeFlagEntry::long("az", "--tags"),
+        SafeFlagEntry::long("az", "--wiql"),
+        SafeFlagEntry::long("az", "--title"),
         // curl - request data and headers are not executed
         SafeFlagEntry::both("curl", "-d", "--data"),
         SafeFlagEntry::both("curl", "-H", "--header"),

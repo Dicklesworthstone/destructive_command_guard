@@ -155,12 +155,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `(?<![\w-])` is load-bearing (#384): a bare `\b` sits between `-`
         // and `group`, so `az account management-group delete` matched this
         // rule and was explained as deleting a resource group. Management
-        // groups have their own rule below. `az ad group delete` still lands
-        // here — it is genuinely destructive, only the explanation is
-        // resource-group flavoured.
+        // groups have their own rule below. `(?<!security )` keeps the Azure
+        // DevOps extension's `az devops security group delete` attributed to
+        // `platform.azure_devops`, which explains what it actually does.
+        // `az ad group delete` still lands here — it is genuinely destructive,
+        // only the explanation is resource-group flavoured.
         destructive_pattern!(
             "group-delete",
-            r"az\b.*?(?<![\w-])group\s+delete(?![\w-])",
+            r"az\b.*?(?<![\w-])(?<!security )group\s+delete(?![\w-])",
             "az group delete removes the entire resource group and ALL resources within it!",
             Critical,
             "group delete removes ENTIRE resource group:\n\n\

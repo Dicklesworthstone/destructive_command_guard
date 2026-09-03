@@ -1578,6 +1578,14 @@ static PACK_ENTRIES: [PackEntry; 102] = [
         ],
         platform::railway::create_pack,
     ),
+    // The `azure-devops` Azure CLI extension (#385). Separate from
+    // `cloud.azure`: that pack guards Azure *resources*, this one guards an
+    // Azure DevOps *organization* (projects, repos, pipelines, boards).
+    PackEntry::new(
+        "platform.azure_devops",
+        &["az", "devops", "repos", "pipelines", "boards", "artifacts"],
+        platform::azure_devops::create_pack,
+    ),
     PackEntry::new("platform.modal", &["modal"], platform::modal::create_pack),
     PackEntry::new("platform.kamal", &["kamal"], platform::kamal::create_pack),
     PackEntry::new(
