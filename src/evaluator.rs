@@ -5420,8 +5420,33 @@ fn windows_launcher_envelopes(
     };
     let mut envelopes = Vec::new();
     let mut all_segments_are_envelopes = !segments.is_empty();
+    // #382: a segment lying entirely inside a QUOTED heredoc body handed to a
+    // proven non-shell interpreter (`python3 -`, `node -`, `ruby -`, `perl`,
+    // `php`) is not outer-shell syntax at all: the quoted delimiter stops the
+    // outer shell from expanding it, and the receiver runs it as its own
+    // language, not as shell. The entire evidence this scanner works from is
+    // outer-shell substitution syntax (`$(`, a backtick), so it must be
+    // withdrawn there — a Markdown fence inside a Python program is not a
+    // dynamically assembled shell launcher. Unquoted delimiters (where the
+    // outer shell really does substitute before the interpreter ever sees the
+    // body) and shell receivers (`bash <<'EOF'`) keep the fail-closed
+    // treatment; `range_is_inert_interpreter_stdin` answers `false` in every
+    // ambiguous case.
+    let inert_interpreter_stdin_possible =
+        matches!(outer_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+            && command.contains("<<");
 
     for segment in segments {
+        if inert_interpreter_stdin_possible {
+            let start = segment.as_ptr() as usize - command.as_ptr() as usize;
+            if crate::heredoc::range_is_inert_interpreter_stdin(
+                command,
+                &(start..start + segment.len()),
+            ) {
+                all_segments_are_envelopes = false;
+                continue;
+            }
+        }
         let mut segment_envelopes = Vec::new();
         let mut unverified = None;
         for &candidate in candidate_dialects {
@@ -5933,8 +5958,20 @@ fn evaluate_obfuscated_posix_inline_launchers(
         .limits
         .max_body_bytes
         .min(MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES);
+    // #382: same withdrawal as `windows_launcher_envelopes` — a quoted heredoc
+    // body handed to a non-shell interpreter is that interpreter's source, not
+    // outer-shell launcher assembly.
+    let inert_interpreter_stdin_possible = command.contains("<<");
     for segment in crate::packs::split_command_segments_in_dialect(command, ShellDialect::Posix) {
         let segment_start = segment.as_ptr() as usize - command.as_ptr() as usize;
+        if inert_interpreter_stdin_possible
+            && crate::heredoc::range_is_inert_interpreter_stdin(
+                command,
+                &(segment_start..segment_start + segment.len()),
+            )
+        {
+            continue;
+        }
         let envelope =
             match parse_obfuscated_posix_inline_launcher_segment(segment, max_payload_bytes) {
                 PosixInlineLauncherParse::NotLauncher => continue,
@@ -32058,6 +32095,107 @@ mod tests {
                 info.explanation
             );
         }
+    }
+
+    /// #382: `heredoc.shell:launcher-unverified` fired on a QUOTED heredoc
+    /// piped to a non-shell interpreter reading stdin. A Markdown fenced block
+    /// in the body puts a backtick at the start of a segment, and the
+    /// unresolved-substitution scan cannot rule out that the segment assembles
+    /// `powershell`, so it failed closed. With a quoted delimiter the outer
+    /// shell performs no expansion, and a proven non-shell receiver does not
+    /// run the body as shell either, so no shell anywhere sees those bytes as
+    /// syntax and the finding is withdrawn — for that shape only.
+    #[test]
+    fn quoted_heredoc_into_non_shell_interpreter_is_not_a_shell_launcher() {
+        const FENCED_BODY: &str = "```bash\nls\n```";
+
+        for consumer in [
+            "python3 -",
+            "python -",
+            "ruby -",
+            "node -",
+            "perl -",
+            "php -",
+            "/usr/bin/python3 -",
+            "python3 script.py",
+        ] {
+            let command = format!("{consumer} <<'PY'\n{FENCED_BODY}\nPY\n");
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
+                assert!(
+                    result.is_allowed(),
+                    "inert Markdown in a quoted heredoc to {consumer:?} ({dialect:?}) \
+                     must not read as shell launcher assembly: {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+
+        // A SHELL receiver executes the body, so the same shape keeps the
+        // fail-closed treatment (the #382 report agrees this is correct).
+        for consumer in ["bash", "sh", "zsh", "dash", "ksh"] {
+            let command = format!("{consumer} <<'SH'\n{FENCED_BODY}\nSH\n");
+            let result = evaluate_with_pack_ids_in_dialect(
+                &command,
+                &["core.filesystem"],
+                ShellDialect::Unknown,
+            );
+            assert!(
+                result.is_denied(),
+                "a shell receiver must keep the fail-closed launcher treatment: {consumer:?}"
+            );
+        }
+
+        // An UNQUOTED delimiter expands at heredoc-expansion time, before the
+        // interpreter ever sees the body, so a substitution there really does
+        // execute no matter who consumes the result (#377). Both spellings
+        // stay denied for every consumer.
+        for consumer in ["python3 -", "ruby -", "node -", "cat", "bash"] {
+            for body in [
+                "x = \"$(rm -rf ~/data)\"",
+                "x = \"`rm -rf ~/data`\"",
+                "```bash\n$(rm -rf ~/data)\n```",
+            ] {
+                let command = format!("{consumer} <<PY\n{body}\nPY\n");
+                for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                    let result =
+                        evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
+                    assert!(
+                        result.is_denied(),
+                        "an expanding heredoc body substitution executes regardless of the \
+                         consumer: {consumer:?} / {body:?} ({dialect:?}): {:?}",
+                        result.pattern_info
+                    );
+                }
+            }
+        }
+
+        // The quoted-delimiter exemption covers only the body. A destructive
+        // command chained after the terminator is still evaluated.
+        let command =
+            format!("python3 - <<'PY'\n{FENCED_BODY}\nPY\nrm -rf ~/data\n");
+        let result =
+            evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], ShellDialect::Posix);
+        assert!(
+            result.is_denied(),
+            "a command chained after the heredoc terminator must still be evaluated: {:?}",
+            result.pattern_info
+        );
+
+        // …and only a proven non-shell receiver qualifies: an unknown name
+        // (a wrapper script, `busybox`, …) may well be a shell.
+        let command = format!("mytool - <<'PY'\n{FENCED_BODY}\nPY\n");
+        let result = evaluate_with_pack_ids_in_dialect(
+            &command,
+            &["core.filesystem"],
+            ShellDialect::Unknown,
+        );
+        assert!(
+            result.is_denied(),
+            "an unrecognized receiver must keep the fail-closed treatment: {:?}",
+            result.pattern_info
+        );
     }
 
     #[test]
