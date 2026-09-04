@@ -5437,16 +5437,6 @@ fn windows_launcher_envelopes(
             && command.contains("<<");
 
     for segment in segments {
-        if inert_interpreter_stdin_possible {
-            let start = segment.as_ptr() as usize - command.as_ptr() as usize;
-            if crate::heredoc::range_is_inert_interpreter_stdin(
-                command,
-                &(start..start + segment.len()),
-            ) {
-                all_segments_are_envelopes = false;
-                continue;
-            }
-        }
         let mut segment_envelopes = Vec::new();
         let mut unverified = None;
         for &candidate in candidate_dialects {
@@ -5465,7 +5455,18 @@ fn windows_launcher_envelopes(
         // unverifiable interpretation in another dialect safe: the caller
         // has not supplied enough provenance to choose between them.
         if let Some(reason) = unverified {
-            return Err(reason);
+            // …unless the segment is not outer-shell syntax at all (#382).
+            // Checked only here, on the about-to-deny path, so the ordinary
+            // case never pays for the heredoc re-parse.
+            let start = segment.as_ptr() as usize - command.as_ptr() as usize;
+            if !inert_interpreter_stdin_possible
+                || !crate::heredoc::range_is_inert_interpreter_stdin(
+                    command,
+                    &(start..start + segment.len()),
+                )
+            {
+                return Err(reason);
+            }
         }
         if segment_envelopes.is_empty() {
             all_segments_are_envelopes = false;
@@ -5964,18 +5965,20 @@ fn evaluate_obfuscated_posix_inline_launchers(
     let inert_interpreter_stdin_possible = command.contains("<<");
     for segment in crate::packs::split_command_segments_in_dialect(command, ShellDialect::Posix) {
         let segment_start = segment.as_ptr() as usize - command.as_ptr() as usize;
-        if inert_interpreter_stdin_possible
-            && crate::heredoc::range_is_inert_interpreter_stdin(
-                command,
-                &(segment_start..segment_start + segment.len()),
-            )
-        {
-            continue;
-        }
         let envelope =
             match parse_obfuscated_posix_inline_launcher_segment(segment, max_payload_bytes) {
                 PosixInlineLauncherParse::NotLauncher => continue,
                 PosixInlineLauncherParse::Unverified(reason) => {
+                    // Checked on the about-to-deny path only, so the ordinary
+                    // case never pays for the heredoc re-parse.
+                    if inert_interpreter_stdin_possible
+                        && crate::heredoc::range_is_inert_interpreter_stdin(
+                            command,
+                            &(segment_start..segment_start + segment.len()),
+                        )
+                    {
+                        continue;
+                    }
                     if let Some(denial) = launcher_unverified_denial(
                         POSIX_INLINE_LAUNCHER_UNVERIFIED_RULE,
                         &format!(
@@ -32224,8 +32227,7 @@ mod tests {
 
         // The quoted-delimiter exemption covers only the body. A destructive
         // command chained after the terminator is still evaluated.
-        let command =
-            format!("python3 - <<'PY'\n{FENCED_BODY}\nPY\nrm -rf ~/data\n");
+        let command = format!("python3 - <<'PY'\n{FENCED_BODY}\nPY\nrm -rf ~/data\n");
         let result =
             evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], ShellDialect::Posix);
         assert!(

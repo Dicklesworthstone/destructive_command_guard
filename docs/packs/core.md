@@ -33,6 +33,7 @@ These patterns match safe commands that are always allowed:
 | `restore-staged-short` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\b(?=\s)(?=.*\s-S\b)(?!.*\s(?:--worktree\|-W)\b)` |
 | `clean-dry-run-short` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*clean\s+-[a-z]*n[a-z]*` |
 | `clean-dry-run-long` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*clean\s+--dry-run` |
+| `lfs-prune-dry-run` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*lfs\s+prune(?:\s+[^\s;&\|<>\x22']+)*\s+--dry-run(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -55,6 +56,9 @@ These patterns match potentially destructive commands:
 | `branch-force-delete` | git branch deletion or forced ref updates require explicit user approval. | high |
 | `stash-drop` | git stash drop deletes a single stash. Recoverable via `git fsck` (unreachable objects). | medium |
 | `stash-clear` | git stash clear permanently deletes ALL stashed changes. | critical |
+| `lfs-migrate-rewrite` | git lfs migrate import/export rewrites history — every commit in the range gets a new SHA. | high |
+| `lfs-prune` | git lfs prune deletes local LFS objects; with --force it deletes objects the remote does not have. | medium |
+| `lfs-uninstall` | git lfs uninstall removes the LFS filters and hooks, so LFS files check out as pointer text. | medium |
 
 ### Allowlist Guidance
 

@@ -37,9 +37,7 @@ pub fn create_pack() -> Pack {
         name: "Azure DevOps CLI",
         description: "Protects against destructive Azure DevOps CLI extension operations \
                       like project delete, repos delete, pipeline delete, and permission reset",
-        keywords: &[
-            "az", "devops", "repos", "pipelines", "boards", "artifacts",
-        ],
+        keywords: &["az", "devops", "repos", "pipelines", "boards", "artifacts"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
@@ -58,11 +56,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // `az repos delete --id 1 --yes > --help` stays a deletion.
         safe_pattern!(
             "az-devops-help",
-            r"(?<![\w-])az(?:\s+(?:\x22[^\x22]*\x22|'[^']*'|(?!--(?:\s|$))[^\s;&|<>\x22']+))*\s+--help(?![\w-])"
+            r"(?<![\w-])az(?:\s+(?:\x22[^\x22]*\x22|'[^']*'|(?!--(?:\s|$))[^\s;&|<>\x22']+))*\s+--help(?:\s|$)"
         ),
         safe_pattern!(
             "az-devops-help-short",
-            r"(?<![\w-])az(?:\s+(?:\x22[^\x22]*\x22|'[^']*'|(?!--(?:\s|$))[^\s;&|<>\x22']+))*\s+-h(?![\w-])"
+            r"(?<![\w-])az(?:\s+(?:\x22[^\x22]*\x22|'[^']*'|(?!--(?:\s|$))[^\s;&|<>\x22']+))*\s+-h(?:\s|$)"
         ),
     ]
 }
@@ -400,8 +398,14 @@ mod tests {
                 "az devops project delete --id 00000000-0000-0000-0000-000000000000 --yes",
                 "devops-project-delete",
             ),
-            ("az devops team delete --id team-id --yes", "devops-team-delete"),
-            ("az devops user remove --user user@corp.com --yes", "devops-user-remove"),
+            (
+                "az devops team delete --id team-id --yes",
+                "devops-team-delete",
+            ),
+            (
+                "az devops user remove --user user@corp.com --yes",
+                "devops-user-remove",
+            ),
             (
                 "az devops security group delete --id vssgp.abc --yes",
                 "devops-security-group-delete",
@@ -422,7 +426,10 @@ mod tests {
                 "az devops service-endpoint delete --id 00000000-0000-0000-0000-000000000000 --yes",
                 "devops-service-endpoint-delete",
             ),
-            ("az devops wiki delete --wiki prod.wiki --yes", "devops-wiki-delete"),
+            (
+                "az devops wiki delete --wiki prod.wiki --yes",
+                "devops-wiki-delete",
+            ),
             (
                 "az devops wiki page delete --path /Runbooks --wiki prod.wiki --yes",
                 "devops-wiki-page-delete",
@@ -440,24 +447,36 @@ mod tests {
                 "az devops invoke --area policy --resource configurations --http-method PUT --in-file p.json",
                 "devops-invoke-write",
             ),
-            ("az repos delete --id 00000000-0000-0000-0000-000000000000 --yes", "repos-delete"),
+            (
+                "az repos delete --id 00000000-0000-0000-0000-000000000000 --yes",
+                "repos-delete",
+            ),
             (
                 "az repos ref delete --name heads/main --object-id abc123 --repository prod",
                 "repos-ref-delete",
             ),
             ("az repos policy delete --id 7 --yes", "repos-policy-delete"),
             ("az pipelines delete --id 12 --yes", "pipelines-delete"),
-            ("az pipelines folder delete --path prod --yes", "pipelines-folder-delete"),
+            (
+                "az pipelines folder delete --path prod --yes",
+                "pipelines-folder-delete",
+            ),
             (
                 "az pipelines variable-group delete --group-id 3 --yes",
                 "pipelines-variable-group-delete",
             ),
-            ("az pipelines variable delete --name TOKEN --pipeline-id 12 --yes", "pipelines-variable-delete"),
+            (
+                "az pipelines variable delete --name TOKEN --pipeline-id 12 --yes",
+                "pipelines-variable-delete",
+            ),
             (
                 "az pipelines variable-group variable delete --group-id 3 --name TOKEN --yes",
                 "pipelines-variable-delete",
             ),
-            ("az boards work-item delete --id 42 --destroy --yes", "boards-work-item-delete"),
+            (
+                "az boards work-item delete --id 42 --destroy --yes",
+                "boards-work-item-delete",
+            ),
             (
                 "az boards area project delete --path \\\\Prod\\\\Legacy --yes",
                 "boards-classification-node-delete",
@@ -471,8 +490,7 @@ mod tests {
             assert_blocks_with_pattern(&pack, command, pattern);
 
             // Azure CLI global flags sit between `az` and the command group.
-            let with_globals =
-                command.replacen("az ", "az --only-show-errors --output json ", 1);
+            let with_globals = command.replacen("az ", "az --only-show-errors --output json ", 1);
             assert_blocks_with_pattern(&pack, &with_globals, pattern);
 
             // `--help` prints usage and exits before any REST call.

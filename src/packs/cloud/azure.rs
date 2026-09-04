@@ -18,14 +18,31 @@ pub fn create_pack() -> Pack {
         description: "Protects against destructive Azure CLI operations like vm delete, \
                       storage account delete, and resource group delete",
         keywords: &[
-            "az", "delete", "vm", "storage", "acr", "registry",
+            "az",
+            "delete",
+            "vm",
+            "storage",
+            "acr",
+            "registry",
             // Extra service keywords so newly-added rules reliably
             // select this pack even when `az` isn't the first keyword
             // in the command's token list.
-            "keyvault", "role", "ad", "dns", "cosmosdb", "monitor", "purge",
+            "keyvault",
+            "role",
+            "ad",
+            "dns",
+            "cosmosdb",
+            "monitor",
+            "purge",
             // `az account` descendants (#384): management-group deletion,
             // hierarchy settings, subscription removal/cancellation, locks.
-            "account", "management-group", "subscription", "lock", "cancel", "remove", "clear",
+            "account",
+            "management-group",
+            "subscription",
+            "lock",
+            "cancel",
+            "remove",
+            "clear",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -43,7 +60,9 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // arg value that happens to be `show` or `list` (e.g.
         // `az vm delete --ids show-vm-id`) would match the safe pattern
         // and bypass the destructive check. `(?=\s|$)` closes the trailing
-        // side so `show-me-foo` can't pose as the `show` subcommand.
+        // side so neither `show-me-foo` nor `list-locations` can pose as the
+        // `show` / `list` subcommand.
+        //
         // The service-name token may NOT be option-shaped (#384): with a bare
         // `\S+` there, `az group delete --name prod --yes --query show`
         // consumed `--name prod` / `--yes` as flag pairs, read `--query` as
@@ -51,11 +70,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // suppressed `group-delete`. A flag VALUE can never be the service.
         safe_pattern!(
             "az-show",
-            r"az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+[^-\s]\S*\s+show(?![\w-])"
+            r"az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+[^-\s]\S*\s+show(?=\s|$)"
         ),
         safe_pattern!(
             "az-list",
-            r"az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+[^-\s]\S*\s+list(?![\w-])"
+            r"az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+[^-\s]\S*\s+list(?=\s|$)"
         ),
         // NOTE (#384): there is deliberately no blanket `az account` safe
         // pattern. `az account` is a combined core+extension group whose
@@ -78,11 +97,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // characters so `az group delete --yes > --help` stays a deletion.
         safe_pattern!(
             "az-help",
-            r"(?<![\w-])az(?:\s+(?:\x22[^\x22]*\x22|'[^']*'|(?!--(?:\s|$))[^\s;&|<>\x22']+))*\s+--help(?![\w-])"
+            r"(?<![\w-])az(?:\s+(?:\x22[^\x22]*\x22|'[^']*'|(?!--(?:\s|$))[^\s;&|<>\x22']+))*\s+--help(?:\s|$)"
         ),
         safe_pattern!(
             "az-help-short",
-            r"(?<![\w-])az(?:\s+(?:\x22[^\x22]*\x22|'[^']*'|(?!--(?:\s|$))[^\s;&|<>\x22']+))*\s+-h(?![\w-])"
+            r"(?<![\w-])az(?:\s+(?:\x22[^\x22]*\x22|'[^']*'|(?!--(?:\s|$))[^\s;&|<>\x22']+))*\s+-h(?:\s|$)"
         ),
         // Azure What-If is a deployment feature, not a universal delete
         // preview flag. Keep it scoped to documented deployment commands so
@@ -562,7 +581,8 @@ mod tests {
             assert_no_safe_match(&pack, command);
             assert_blocks_with_pattern(&pack, command, pattern);
             // Global flags between `az` and the group must not break the rule.
-            let with_globals = command.replacen("az ", "az --only-show-errors --subscription p ", 1);
+            let with_globals =
+                command.replacen("az ", "az --only-show-errors --subscription p ", 1);
             assert_blocks_with_pattern(&pack, &with_globals, pattern);
         }
 
@@ -637,9 +657,18 @@ mod tests {
     fn azure_show_list_safe_patterns_cannot_be_forged_from_flag_values() {
         let pack = create_pack();
         for (command, pattern) in [
-            ("az group delete --name prod --yes --query show", "group-delete"),
-            ("az group delete --name prod --yes --query list", "group-delete"),
-            ("az vm delete --name prod-vm -g prod --query show", "vm-delete"),
+            (
+                "az group delete --name prod --yes --query show",
+                "group-delete",
+            ),
+            (
+                "az group delete --name prod --yes --query list",
+                "group-delete",
+            ),
+            (
+                "az vm delete --name prod-vm -g prod --query show",
+                "vm-delete",
+            ),
             (
                 "az keyvault key purge --name k --vault-name v --query list",
                 "keyvault-item-delete-or-purge",

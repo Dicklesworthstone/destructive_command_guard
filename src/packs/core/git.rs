@@ -4917,7 +4917,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // walk stops at a quote or a redirection glyph.
         safe_pattern!(
             "lfs-prune-dry-run",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*lfs\s+prune(?:\s+[^\s;&|<>\x22']+)*\s+--dry-run(?![\w-])"
+            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*lfs\s+prune(?:\s+[^\s;&|<>\x22']+)*\s+--dry-run(?:\s|$)"
         ),
     ]
 }
@@ -5612,7 +5612,11 @@ mod tests {
             ("git lfs prune", "lfs-prune", Severity::Medium),
             ("git lfs prune --force", "lfs-prune", Severity::Medium),
             ("git lfs uninstall", "lfs-uninstall", Severity::Medium),
-            ("git lfs uninstall --system", "lfs-uninstall", Severity::Medium),
+            (
+                "git lfs uninstall --system",
+                "lfs-uninstall",
+                Severity::Medium,
+            ),
             // Global git flags between `git` and `lfs`.
             (
                 "git -C /srv/repo lfs prune --force",

@@ -1,0 +1,322 @@
+# Azure CLI coverage: #384 (`az account` descendants) and #385 (the
+# `azure-devops` extension).
+#
+# Two failure shapes, both fixed at the pack layer:
+# 1. `cloud.azure` carried a group-wide `az-account` safe pattern, so every
+#    `az account management-group delete` / `subscription cancel` / `lock
+#    delete` was whitelisted before any destructive rule ran. The blanket
+#    pattern is gone and each destructive descendant has its own rule.
+# 2. The `azure-devops` extension surface (`az devops`, `az repos`,
+#    `az pipelines`, `az boards`) had no coverage at all.
+#
+# The cases below run with every pack enabled, so they also pin ATTRIBUTION
+# where `cloud.azure` and `platform.azure_devops` both see the command.
+#
+# Source: issues #384, #385
+
+# ---------------------------------------------------------------------------
+# #384 — `az account` descendants are destructive
+# ---------------------------------------------------------------------------
+
+[[case]]
+description = "az account management-group delete removes a management group"
+command = "az account management-group delete --name prod-mg"
+expected = "deny"
+issue = 384
+rule_id = "cloud.azure:account-management-group-delete"
+
+[[case]]
+description = "management-group delete is not a resource-group delete"
+command = "az --subscription prod account management-group delete --name prod-mg --no-register"
+expected = "deny"
+issue = 384
+rule_id = "cloud.azure:account-management-group-delete"
+
+[[case]]
+description = "az account management-group hierarchy-settings delete drops tenant-root settings"
+command = "az account management-group hierarchy-settings delete --name root-mg"
+expected = "deny"
+issue = 384
+rule_id = "cloud.azure:account-management-group-hierarchy-settings-delete"
+
+[[case]]
+description = "az account management-group subscription remove reparents a subscription"
+command = "az account management-group subscription remove --name prod-mg --subscription 00000000-0000-0000-0000-000000000000"
+expected = "deny"
+issue = 384
+rule_id = "cloud.azure:account-management-group-subscription-remove"
+
+[[case]]
+description = "az account subscription cancel cancels a whole subscription"
+command = "az account subscription cancel --id 00000000-0000-0000-0000-000000000000"
+expected = "deny"
+issue = 384
+rule_id = "cloud.azure:account-subscription-cancel"
+
+[[case]]
+description = "az account alias delete removes the subscription alias"
+command = "az account alias delete --name prod-alias"
+expected = "deny"
+issue = 384
+rule_id = "cloud.azure:account-alias-delete"
+
+[[case]]
+description = "az account lock delete removes the subscription's deletion guardrail"
+command = "az account lock delete --name do-not-delete"
+expected = "deny"
+issue = 384
+rule_id = "cloud.azure:account-lock-delete"
+
+[[case]]
+description = "az account clear wipes the local credential cache"
+command = "az account clear"
+expected = "deny"
+issue = 384
+rule_id = "cloud.azure:account-clear"
+
+# Read-only `az account` members stay allowed.
+
+[[case]]
+description = "az account show is read-only"
+command = "az account show --subscription prod"
+expected = "allow"
+issue = 384
+
+[[case]]
+description = "az account list is read-only"
+command = "az account list --all"
+expected = "allow"
+issue = 384
+
+[[case]]
+description = "az account set only changes the active subscription"
+command = "az account set --subscription prod"
+expected = "allow"
+issue = 384
+
+[[case]]
+description = "az account management-group list is read-only"
+command = "az account management-group list"
+expected = "allow"
+issue = 384
+
+[[case]]
+description = "az account management-group show is read-only"
+command = "az account management-group show --name prod-mg -e -r"
+expected = "allow"
+issue = 384
+
+[[case]]
+description = "az account management-group subscription show is read-only"
+command = "az account management-group subscription show --name prod-mg --subscription 0000"
+expected = "allow"
+issue = 384
+
+[[case]]
+description = "az account lock list is read-only"
+command = "az account lock list"
+expected = "allow"
+issue = 384
+
+[[case]]
+description = "az account get-access-token is read-only"
+command = "az account get-access-token --resource-type ms-graph"
+expected = "allow"
+issue = 384
+
+[[case]]
+description = "help on a destructive az account command prints usage and exits"
+command = "az account management-group delete --name prod-mg --help"
+expected = "allow"
+issue = 384
+
+[[case]]
+description = "short help on a destructive az account command"
+command = "az account subscription cancel --id 0000 -h"
+expected = "allow"
+issue = 384
+
+# Controls: the help carve-out and the flag-value guard are exact.
+
+[[case]]
+description = "control: --help inside a quoted argument is not the help flag"
+command = "az account management-group delete --name 'prod --help'"
+expected = "deny"
+issue = 384
+rule_id = "cloud.azure:account-management-group-delete"
+
+[[case]]
+description = "control: a flag value named show cannot forge the az-show safe pattern"
+command = "az group delete --name prod --yes --query show"
+expected = "deny"
+issue = 384
+rule_id = "cloud.azure:group-delete"
+
+[[case]]
+description = "control: a real resource-group delete still lands on group-delete"
+command = "az group delete --name prod --yes"
+expected = "deny"
+issue = 384
+rule_id = "cloud.azure:group-delete"
+
+[[case]]
+description = "control: a help call in one segment does not shield the next"
+command = "az account management-group show --name prod-mg --help && az account management-group delete --name prod-mg"
+expected = "deny"
+issue = 384
+rule_id = "cloud.azure:account-management-group-delete"
+
+# ---------------------------------------------------------------------------
+# #385 — the azure-devops extension surface
+# ---------------------------------------------------------------------------
+
+[[case]]
+description = "az devops project delete destroys a whole team project"
+command = "az devops project delete --id 00000000-0000-0000-0000-000000000000 --yes"
+expected = "deny"
+issue = 385
+rule_id = "platform.azure_devops:devops-project-delete"
+
+[[case]]
+description = "az repos delete destroys a Git repository"
+command = "az repos delete --id 00000000-0000-0000-0000-000000000000 --yes"
+expected = "deny"
+issue = 385
+rule_id = "platform.azure_devops:repos-delete"
+
+[[case]]
+description = "az repos ref delete removes a server-side branch"
+command = "az repos ref delete --name heads/main --object-id abc123 --repository prod"
+expected = "deny"
+issue = 385
+rule_id = "platform.azure_devops:repos-ref-delete"
+
+[[case]]
+description = "az repos policy delete removes branch protection"
+command = "az repos policy delete --id 7 --yes"
+expected = "deny"
+issue = 385
+rule_id = "platform.azure_devops:repos-policy-delete"
+
+[[case]]
+description = "az pipelines delete removes a pipeline and its history"
+command = "az pipelines delete --id 12 --yes"
+expected = "deny"
+issue = 385
+rule_id = "platform.azure_devops:pipelines-delete"
+
+[[case]]
+description = "az pipelines variable-group delete destroys shared pipeline secrets"
+command = "az pipelines variable-group delete --group-id 3 --yes"
+expected = "deny"
+issue = 385
+rule_id = "platform.azure_devops:pipelines-variable-group-delete"
+
+[[case]]
+description = "az boards work-item delete --destroy is permanent"
+command = "az boards work-item delete --id 42 --destroy --yes"
+expected = "deny"
+issue = 385
+rule_id = "platform.azure_devops:boards-work-item-delete"
+
+[[case]]
+description = "az devops service-endpoint delete destroys stored credentials"
+command = "az devops service-endpoint delete --id 00000000-0000-0000-0000-000000000000 --yes"
+expected = "deny"
+issue = 385
+rule_id = "platform.azure_devops:devops-service-endpoint-delete"
+
+[[case]]
+description = "az devops security permission reset-all clears an entire ACL entry"
+command = "az devops security permission reset-all --id ns --subject u --token tok --yes"
+expected = "deny"
+issue = 385
+rule_id = "platform.azure_devops:devops-security-permission-reset-all"
+
+[[case]]
+description = "az devops user remove revokes organization access"
+command = "az devops user remove --user user@corp.com --yes"
+expected = "deny"
+issue = 385
+rule_id = "platform.azure_devops:devops-user-remove"
+
+[[case]]
+description = "az devops invoke can issue an arbitrary DELETE"
+command = "az devops invoke --area git --resource repositories --http-method DELETE --route-parameters project=prod"
+expected = "deny"
+issue = 385
+rule_id = "platform.azure_devops:devops-invoke-delete"
+
+[[case]]
+description = "az devops wiki delete removes a wiki and its pages"
+command = "az devops wiki delete --wiki prod.wiki --yes"
+expected = "deny"
+issue = 385
+rule_id = "platform.azure_devops:devops-wiki-delete"
+
+# Attribution: an Azure DevOps security group is not an Azure resource group.
+
+[[case]]
+description = "control: az devops security group delete is attributed to the DevOps pack"
+command = "az devops security group delete --id vssgp.abc --yes"
+expected = "deny"
+issue = 385
+rule_id = "platform.azure_devops:devops-security-group-delete"
+
+# Read-only and routine development flow stays allowed.
+
+[[case]]
+description = "az repos list is read-only"
+command = "az repos list --project prod"
+expected = "allow"
+issue = 385
+
+[[case]]
+description = "az repos pr create is ordinary development flow"
+command = "az repos pr create --source-branch feature --target-branch main --title 'Add widget delete endpoint'"
+expected = "allow"
+issue = 385
+
+[[case]]
+description = "az pipelines run queues a build"
+command = "az pipelines run --name nightly"
+expected = "allow"
+issue = 385
+
+[[case]]
+description = "az devops invoke with the default GET method is read-only"
+command = "az devops invoke --area wiki --resource wikis --http-method GET --route-parameters project=prod"
+expected = "allow"
+issue = 385
+
+[[case]]
+description = "az boards work-item show is read-only"
+command = "az boards work-item show --id 42"
+expected = "allow"
+issue = 385
+
+[[case]]
+description = "az artifacts universal download is read-only"
+command = "az artifacts universal download --feed f --name pkg --version 1.0.0 --path ."
+expected = "allow"
+issue = 385
+
+[[case]]
+description = "help on a destructive azure-devops command prints usage and exits"
+command = "az repos delete --id 00000000-0000-0000-0000-000000000000 --yes --help"
+expected = "allow"
+issue = 385
+
+[[case]]
+description = "control: --help inside a quoted argument is not the help flag"
+command = "az repos delete --id 'r --help' --yes"
+expected = "deny"
+issue = 385
+rule_id = "platform.azure_devops:repos-delete"
+
+[[case]]
+description = "control: a hyphenated sibling subcommand does not inherit the delete rule"
+command = "az devops security permission reset --id ns --subject u --token tok --permission-bit 4"
+expected = "deny"
+issue = 385
+rule_id = "platform.azure_devops:devops-security-permission-reset"

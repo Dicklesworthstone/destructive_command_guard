@@ -309,6 +309,7 @@ The opt-in `careful_company_running_windows` preset also includes both new packs
 as deliberate members of its pinned secret-store policy.
 
 ### Platform Packs
+- `platform.azure_devops` - Protects against destructive `azure-devops` Azure CLI extension operations across `az devops`, `az repos`, `az pipelines` and `az boards`: deleting team projects, repositories, refs, branch policies, pipelines, variable groups, wikis, teams, service connections and work items, removing users and group memberships, resetting permission ACLs, and issuing arbitrary state-changing `az devops invoke` REST calls. `az artifacts` exposes no destructive command and carries no rule. Read-only verbs and ordinary development flow are untouched.
 - `platform.github` - Protects against destructive GitHub CLI operations like changing repository visibility or deleting repositories, gists, releases, or SSH keys.
 - `platform.gitlab` - Protects against destructive GitLab platform operations like deleting projects, releases, protected branches, and webhooks.
 - `platform.kamal` - Protects against destructive Kamal 2.x operations that tear down the stack (`kamal remove`), delete accessory data directories (`kamal accessory remove`), drop proxy routing, take the app offline, or prune the images that `kamal rollback` relies on.

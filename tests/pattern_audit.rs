@@ -211,12 +211,20 @@ fn test_audit_backtracking_requirements() {
         (
             "cloud.azure",
             HashSet::from([
-                "az-account",
-                "az-configure",
+                "az-help",
+                "az-help-short",
                 "az-list",
-                "az-login",
                 "az-show",
-                "az-version",
+                // `az account` descendants and the management-group guard
+                // on `group-delete` (#384).
+                "group-delete",
+                "account-alias-delete",
+                "account-clear",
+                "account-lock-delete",
+                "account-management-group-delete",
+                "account-management-group-hierarchy-settings-delete",
+                "account-management-group-subscription-remove",
+                "account-subscription-cancel",
             ]),
         ),
         (
@@ -354,6 +362,10 @@ fn test_audit_backtracking_requirements() {
                 "restore-worktree",
                 // Backreference pins redirect target == shown path (#373).
                 "show-redirect-overwrite-source",
+                // Git LFS verb guards (Refs PR #383).
+                "lfs-migrate-rewrite",
+                "lfs-prune",
+                "lfs-uninstall",
             ]),
         ),
         (
@@ -708,6 +720,38 @@ fn test_audit_backtracking_requirements() {
         (
             "payment.stripe",
             HashSet::from(["stripe-api-delete", "stripe-api-get"]),
+        ),
+        (
+            // Azure DevOps CLI extension (#385): every rule uses `(?<![\w-])`
+            // / `(?![\w-])` verb guards, so the whole pack backtracks.
+            "platform.azure_devops",
+            HashSet::from([
+                "az-devops-help",
+                "az-devops-help-short",
+                "boards-classification-node-delete",
+                "boards-work-item-delete",
+                "devops-extension-uninstall",
+                "devops-invoke-delete",
+                "devops-invoke-write",
+                "devops-logout",
+                "devops-project-delete",
+                "devops-security-group-delete",
+                "devops-security-group-membership-remove",
+                "devops-security-permission-reset",
+                "devops-security-permission-reset-all",
+                "devops-service-endpoint-delete",
+                "devops-team-delete",
+                "devops-user-remove",
+                "devops-wiki-delete",
+                "devops-wiki-page-delete",
+                "pipelines-delete",
+                "pipelines-folder-delete",
+                "pipelines-variable-delete",
+                "pipelines-variable-group-delete",
+                "repos-delete",
+                "repos-policy-delete",
+                "repos-ref-delete",
+            ]),
         ),
         (
             "platform.github",
