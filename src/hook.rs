@@ -2852,6 +2852,11 @@ pub fn log_blocked_command(
     let timestamp = chrono_lite_timestamp();
     let pack_str = pack.unwrap_or("unknown");
 
+    // The log file outlives the hook invocation and a blocked command is
+    // exactly where credentials turn up, so recognised secret shapes are
+    // replaced before the line is written (issue #386). This path has no
+    // redaction config of its own; pattern redaction is unconditional here.
+    let command = crate::redaction::redact_secrets(command);
     writeln!(file, "[{timestamp}] [{pack_str}] {reason}")?;
     writeln!(file, "  Command: {command}")?;
     writeln!(file)?;
@@ -2902,6 +2907,8 @@ pub fn log_budget_skip(
         budget.as_millis(),
         elapsed.as_millis()
     )?;
+    // Same unconditional secret redaction as `log_blocked_command`.
+    let command = crate::redaction::redact_secrets(command);
     writeln!(file, "  Command: {command}")?;
     writeln!(file)?;
 
@@ -5851,5 +5858,42 @@ mod tests {
             shell_tool_from_truncated_json(prefix).expect("real shell tool must still be found");
         assert_eq!(name, "Bash");
         assert_eq!(dialect, ShellDialect::Posix);
+    }
+
+    /// Issue #386: `[general] log_file` takes no redaction config and used to
+    /// write `Command: {command}` raw, so a blocked command carrying a token
+    /// landed in the log verbatim. Canaries below are synthetic.
+    #[test]
+    fn blocked_command_log_redacts_secrets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("blocked.log");
+        let path = log.to_str().expect("utf-8 path");
+        let command = "deploy --purge AKIAABCDEFGHIJKLMNOP \
+             ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+        log_blocked_command(path, command, "destructive", Some("core")).expect("write log");
+        log_budget_skip(
+            path,
+            command,
+            "prefilter",
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+        )
+        .expect("write budget log");
+
+        let contents = std::fs::read_to_string(&log).expect("read log");
+        for canary in [
+            "AKIAABCDEFGHIJKLMNOP",
+            "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        ] {
+            assert!(
+                !contents.contains(canary),
+                "canary {canary} survived into the log file: {contents}"
+            );
+        }
+        // The non-secret part of the command must still be legible.
+        assert!(contents.contains("deploy --purge"), "{contents}");
+        assert!(contents.contains("[AWS_ACCESS_KEY]"), "{contents}");
+        assert!(contents.contains("[GITHUB_TOKEN]"), "{contents}");
     }
 }

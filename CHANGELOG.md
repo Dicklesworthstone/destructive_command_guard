@@ -11,6 +11,27 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+### Fixed
+
+- **`redaction_mode = "pattern"` performs secret redaction again (#386).**
+  The pattern redactor added in v0.2.8 was deleted by a tracker-sync commit
+  shortly after v0.2.10 and never restored, so from v0.2.11 onward the
+  `"pattern"` mode — the documented default — only truncated *quoted*
+  arguments longer than `max_argument_len`, and bare credentials were stored
+  byte-for-byte in `history.db`. `src/redaction.rs` reinstates pattern
+  matching over provider API keys, forge and registry tokens, JWTs,
+  `Authorization:` headers, `scheme://user:password@host` URLs, private-key
+  headers, and `password=`/`secret=` assignments, and runs it before argument
+  truncation. `[general] log_file` (`log_blocked_command` and
+  `log_budget_skip`), which took no redaction config and wrote the raw
+  command, and the allow-once pending store now go through the same redactor.
+  Its `***` example in `docs/allow-once-usage.md` never matched the code and
+  now reflects the real placeholders.
+
+---
+
 ## [v0.14.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.14.0) -- 2026-09-01 [Release]
 
 ### Added

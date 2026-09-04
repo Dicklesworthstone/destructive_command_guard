@@ -35,8 +35,7 @@ enable_history = true
 
 [history]
 enabled = true
-max_entries = 10000
-redact_secrets = true
+redaction_mode = "pattern"
 retention_days = 90
 
 [telemetry]

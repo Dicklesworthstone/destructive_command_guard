@@ -94,12 +94,16 @@ The exception only applies to the **exact command text** that was blocked. Even 
 
 ### Default Behavior
 
-By default, dcg redacts potentially sensitive information from commands when displaying them:
+By default, dcg redacts potentially sensitive information from commands when displaying them. Recognised credential shapes (provider API keys, forge tokens, JWTs, `Authorization:` headers, `scheme://user:password@host` URLs, private-key headers, and `password=`/`secret=` assignments) are replaced with a bracketed placeholder, and quoted arguments longer than `max_argument_len` are truncated:
 
 ```bash
 dcg allow-once list
-# Shows: git clone https://***@github.com/...
+# Shows: git clone https://[URL_CREDENTIALS]@github.com/...
 ```
+
+This is a mitigation over known shapes, not a guarantee: a credential in an
+unrecognised format still reaches the store. Use `redaction_mode = "full"` when
+the command text itself must never be persisted.
 
 ### Viewing Raw Commands
 

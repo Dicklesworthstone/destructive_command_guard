@@ -709,7 +709,9 @@ Environment variables override config files (highest priority):
 ### Command History
 
 Command history is **opt-in** (`[history] enabled = true`). When enabled, the
-hook records every evaluated command (redacted per `redaction_mode`) in a
+hook records every evaluated command (redacted per `redaction_mode`; the
+default `"pattern"` replaces recognised credential shapes with placeholders and
+truncates long quoted arguments) in a
 SQLite database that `dcg history`, `dcg stats`, and `dcg suggest-allowlist`
 read.
 

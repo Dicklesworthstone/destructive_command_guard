@@ -1058,12 +1058,16 @@ fn redact_for_history(command: &str, mode: HistoryRedactionMode) -> String {
         HistoryRedactionMode::None => command.to_string(),
         HistoryRedactionMode::Full => "[REDACTED]".to_string(),
         HistoryRedactionMode::Pattern => {
+            // Secrets first, then argument truncation: truncation only ever
+            // shortens *quoted* arguments, so on its own it leaves bare
+            // credentials in the store verbatim (issue #386).
+            let secrets_redacted = crate::redaction::redact_secrets(command);
             let config = RedactionConfig {
                 enabled: true,
                 mode: RedactionMode::Arguments,
                 ..Default::default()
             };
-            crate::logging::redact_command(command, &config)
+            crate::logging::redact_command(&secrets_redacted, &config)
         }
     }
 }
@@ -1071,6 +1075,46 @@ fn redact_for_history(command: &str, mode: HistoryRedactionMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #386: `redaction_mode = "pattern"` is documented as redacting
+    /// sensitive values, but for a long time it only truncated *quoted*
+    /// arguments, so bare credentials were stored byte-for-byte. Every canary
+    /// below is synthetic.
+    #[test]
+    fn pattern_mode_strips_bare_and_quoted_secrets() {
+        let command = "deploy AKIAABCDEFGHIJKLMNOP \
+             ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \
+             sk_live_ABCDEFGHIJKLMNOPQRSTUVWXYZ \
+             \"sk_live_QUOTEDLONGTOKENQUOTEDLONGTOKENQUOTEDLONGTOKENQUOTEDLONGTOKEN\"";
+        let stored = redact_for_history(command, HistoryRedactionMode::Pattern);
+        for canary in [
+            "AKIAABCDEFGHIJKLMNOP",
+            "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+            "sk_live_ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "sk_live_QUOTEDLONGTOKEN",
+        ] {
+            assert!(
+                !stored.contains(canary),
+                "canary {canary} survived pattern redaction: {stored}"
+            );
+        }
+        assert!(stored.starts_with("deploy "), "{stored}");
+    }
+
+    #[test]
+    fn none_mode_stores_verbatim_and_full_mode_stores_nothing() {
+        let command = "psql postgres://admin:hunter2hunter2@db.internal/app";
+        assert_eq!(
+            redact_for_history(command, HistoryRedactionMode::None),
+            command
+        );
+        assert_eq!(
+            redact_for_history(command, HistoryRedactionMode::Full),
+            "[REDACTED]"
+        );
+        let pattern = redact_for_history(command, HistoryRedactionMode::Pattern);
+        assert!(!pattern.contains("hunter2hunter2"), "{pattern}");
+    }
 
     #[test]
     fn worker_config_defensively_clamps_zero_runtime_limits() {
