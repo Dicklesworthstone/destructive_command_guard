@@ -365,6 +365,7 @@ fn test_audit_backtracking_requirements() {
                 // Git LFS verb guards (Refs PR #383).
                 "lfs-migrate-rewrite",
                 "lfs-prune",
+                "lfs-prune-dry-run",
                 "lfs-uninstall",
             ]),
         ),
