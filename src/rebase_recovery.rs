@@ -345,6 +345,154 @@ fn resolve_recovery_cwd_with_home(
     fs::canonicalize(&cwd).ok().filter(|path| path.is_dir())
 }
 
+/// Words that move a POSIX shell's working directory.
+const POSIX_DIRECTORY_CHANGE_WORDS: &[&str] = &["cd", "pushd", "popd"];
+
+/// Words that move the working directory in the dialects dcg does not model
+/// (PowerShell, cmd). Their presence is enough to give up.
+const FOREIGN_DIRECTORY_CHANGE_WORDS: &[&str] = &[
+    "chdir",
+    "sl",
+    "set-location",
+    "push-location",
+    "pop-location",
+];
+
+/// How many times `command` mentions one of `vocabulary`, as a bare word.
+///
+/// Deliberately over-approximates: quoting and nesting are ignored, so the
+/// `cd` inside `bash -c 'cd /elsewhere && …'` is counted even though the
+/// segment walk cannot see it. The walk compares its own tally against this
+/// one and gives up when they disagree, which is what keeps a directory
+/// change hidden inside a nested payload from resolving to the base
+/// directory unchanged. `-` counts as a word character so `git-cd` is one
+/// word, not two.
+fn count_directory_change_words(command: &str, vocabulary: &[&str]) -> usize {
+    command
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .filter(|word| {
+            vocabulary
+                .iter()
+                .any(|candidate| word.eq_ignore_ascii_case(candidate))
+        })
+        .count()
+}
+
+/// Resolve the directory a guarded command will actually run in (issue #387).
+///
+/// `base` is the directory the agent host reported for the tool call — the
+/// hook payload's `cwd`, which is the only authority on where the command
+/// runs; the hook process's own `getcwd()` is unrelated to it. A command can
+/// still move before the guarded call happens (`cd build && rm -rf .`), so
+/// leading static `cd` / `pushd` segments are applied on top of `base`.
+///
+/// This answers *where*, for directory-scoped allowlist entries. Because such
+/// an entry is a permission grant, resolution fails closed — returning `None`,
+/// which makes every `paths = [...]` entry inapplicable — whenever the answer
+/// is not statically knowable:
+///
+/// - a directory change whose target needs the shell to compute (`cd $DIR`,
+///   `cd -`, globs, `~user`), or a `popd`,
+/// - a directory change in a dialect that is not modelled (PowerShell, cmd),
+/// - a subshell or group (`( … )`, `{ … }`), or a separator that runs a
+///   segment in a subshell (`|`, background `&`), anywhere on the line,
+/// - a directory change that follows a real command, which would leave two
+///   commands running in two different directories with only one scope answer
+///   available for both,
+/// - any other mention of a directory-change word that the segment walk did
+///   not consume — a `cd` inside a nested payload (`bash -c '…'`, `eval`,
+///   `xargs`) that the walk cannot see, or even one that is only quoted text,
+/// - a resolved directory that does not exist.
+///
+/// A `cd` out of a scoped tree therefore revokes the grant; it can never
+/// extend it to a directory the grant never named.
+#[must_use]
+pub fn resolve_effective_cwd(
+    base: &Path,
+    command: &str,
+    dialect: crate::normalize::ShellDialect,
+) -> Option<PathBuf> {
+    resolve_effective_cwd_with_home(
+        base,
+        command,
+        dialect,
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+    )
+}
+
+/// [`resolve_effective_cwd`] with an explicit `HOME` (tests must not mutate the
+/// process environment).
+fn resolve_effective_cwd_with_home(
+    base: &Path,
+    command: &str,
+    dialect: crate::normalize::ShellDialect,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    use crate::normalize::ShellDialect;
+
+    let mentions = count_directory_change_words(command, POSIX_DIRECTORY_CHANGE_WORDS);
+    let foreign_mentions = count_directory_change_words(command, FOREIGN_DIRECTORY_CHANGE_WORDS);
+
+    // Nothing on the line can move the shell: the command runs at `base`.
+    if mentions == 0 && foreign_mentions == 0 {
+        return Some(base.to_path_buf());
+    }
+
+    // Only POSIX-style shells are modelled below, and a word out of another
+    // dialect's vocabulary is not something this walk can attribute either.
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) || foreign_mentions > 0 {
+        return None;
+    }
+
+    if has_unquoted_grouping(command) || command_has_subshell_separator(command) {
+        return None;
+    }
+
+    let segments = top_level_segment_ranges(command)?;
+
+    let mut cwd = base.to_path_buf();
+    let mut consumed = 0usize;
+    let mut saw_command = false;
+
+    for &(start, end) in &segments {
+        let words = shell_words(&command[start..end])?;
+        let index = match leading_word(&words) {
+            // An executable only known at run time could itself be a `cd`.
+            Leading::Dynamic => return None,
+            Leading::Empty => continue,
+            Leading::Executable(index) => index,
+        };
+        match words[index].text.as_str() {
+            "cd" | "pushd" => {
+                // A directory change *after* a real command would leave the
+                // two running in different directories, and only one of them
+                // can be the answer.
+                if saw_command {
+                    return None;
+                }
+                let target =
+                    directory_change_target(&words[index].text, &words[index + 1..], home)?;
+                cwd = join_directory(&cwd, &target);
+                consumed += 1;
+            }
+            // `popd` depends on a directory stack dcg does not track.
+            "popd" => return None,
+            _ => saw_command = true,
+        }
+    }
+
+    // Every mention has to be one of the changes just applied. A leftover is a
+    // `cd` the walk could not see — inside `bash -c '…'`, an `eval`, an
+    // argument — and the directory it reaches is unknowable.
+    if consumed != mentions {
+        return None;
+    }
+
+    // Canonicalize so the result is comparable with a scope pattern and `..`
+    // segments collapse the way the shell's `cd -P` would.
+    fs::canonicalize(&cwd).ok().filter(|path| path.is_dir())
+}
+
 /// Whether `command` contains an unquoted subshell-creating separator: a
 /// background `&` or a pipe `|`/`|&`. `&&`, `||`, `;`, newline, and the `&` of
 /// a redirection (`2>&1`, `<&0`, `&>file`) preserve the shell's working
@@ -1086,6 +1234,166 @@ mod tests {
             ShellDialect::Posix,
             Some(&tree.home()),
         )
+    }
+
+    /// Resolve the effective cwd for allowlist scoping (#387).
+    fn effective(tree: &Tree, base: &Path, command: &str) -> Option<PathBuf> {
+        resolve_effective_cwd_with_home(base, command, ShellDialect::Posix, Some(&tree.home()))
+    }
+
+    #[test]
+    fn effective_cwd_without_directory_change_is_the_base() {
+        let tree = Tree::new("eff-no-cd");
+        let base = tree.path("other");
+        assert_eq!(effective(&tree, &base, "rm -rf build"), Some(base.clone()));
+        // Pipes and subshells are only a problem when a `cd` is involved.
+        assert_eq!(
+            effective(&tree, &base, "find . -name '*.log' | xargs rm -f"),
+            Some(base.clone())
+        );
+        assert_eq!(
+            effective(&tree, &base, "(rm -rf build)"),
+            Some(base.clone())
+        );
+    }
+
+    #[test]
+    fn effective_cwd_follows_a_static_cd() {
+        let tree = Tree::new("eff-cd");
+        let base = tree.path("other");
+        let repo = tree.path("repo");
+        assert_eq!(
+            effective(
+                &tree,
+                &base,
+                &format!("cd {} && rm -rf build", repo.display())
+            ),
+            Some(repo.clone())
+        );
+        // Relative, and `..` collapsed the way `cd -P` would.
+        assert_eq!(
+            effective(&tree, &repo, "cd sub && rm -rf build"),
+            Some(repo.join("sub"))
+        );
+        assert_eq!(
+            effective(&tree, &repo, "cd ../other && rm -rf build"),
+            Some(tree.path("other"))
+        );
+    }
+
+    #[test]
+    fn effective_cwd_fails_closed_when_it_cannot_be_known() {
+        let tree = Tree::new("eff-closed");
+        let base = tree.path("other");
+        for command in [
+            "cd \"$DEST\" && rm -rf build",
+            "cd $(cat dir) && rm -rf build",
+            "cd ~someone && rm -rf build",
+            "cd - && rm -rf build",
+            "popd && rm -rf build",
+            "cd nonexistent-directory && rm -rf build",
+            "cd repo | rm -rf build",
+            "(cd repo && rm -rf build)",
+            "$RUNNER && cd repo && rm -rf build",
+        ] {
+            assert_eq!(
+                effective(&tree, &base, command),
+                None,
+                "must fail closed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_cwd_fails_closed_when_a_cd_follows_a_command() {
+        let tree = Tree::new("eff-late-cd");
+        let base = tree.path("other");
+        // Two commands in two directories; one scope answer cannot cover both.
+        assert_eq!(
+            effective(
+                &tree,
+                &base,
+                &format!(
+                    "rm -rf build && cd {} && rm -rf build",
+                    tree.path("repo").display()
+                )
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn effective_cwd_is_unknown_for_unmodelled_dialects_that_move() {
+        let tree = Tree::new("eff-dialect");
+        let base = tree.path("other");
+        assert_eq!(
+            resolve_effective_cwd_with_home(
+                &base,
+                "Set-Location C:\\repo; Remove-Item -Recurse -Force build",
+                ShellDialect::PowerShell,
+                Some(&tree.home()),
+            ),
+            None
+        );
+        // A PowerShell line that cannot move the shell still resolves.
+        assert_eq!(
+            resolve_effective_cwd_with_home(
+                &base,
+                "Remove-Item -Recurse -Force build",
+                ShellDialect::PowerShell,
+                Some(&tree.home()),
+            ),
+            Some(base.clone())
+        );
+    }
+
+    #[test]
+    fn effective_cwd_fails_closed_on_a_hidden_or_stray_cd() {
+        let tree = Tree::new("eff-hidden-cd");
+        let base = tree.path("other");
+        let repo = tree.path("repo");
+        for command in [
+            // A `cd` the segment walk cannot see must not resolve to `base`.
+            format!("bash -c 'cd {} && rm -rf build'", repo.display()),
+            format!("eval \"cd {} && rm -rf build\"", repo.display()),
+            "xargs -I{} sh -c 'cd {} && rm -rf build'".to_string(),
+            // Even an inert mention is a mention: dcg cannot prove it inert.
+            format!("cd {} && rm -rf cd", repo.display()),
+        ] {
+            assert_eq!(
+                effective(&tree, &base, &command),
+                None,
+                "must fail closed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn count_directory_change_words_tallies_bare_words_only() {
+        assert_eq!(
+            count_directory_change_words("cd /tmp && rm -rf .", POSIX_DIRECTORY_CHANGE_WORDS),
+            1
+        );
+        assert_eq!(
+            count_directory_change_words("rm -rf .;CD /tmp", POSIX_DIRECTORY_CHANGE_WORDS),
+            1
+        );
+        assert_eq!(
+            count_directory_change_words("cd a && cd b", POSIX_DIRECTORY_CHANGE_WORDS),
+            2
+        );
+        assert_eq!(
+            count_directory_change_words("git-cd --help", POSIX_DIRECTORY_CHANGE_WORDS),
+            0
+        );
+        assert_eq!(
+            count_directory_change_words("rm -rf build", POSIX_DIRECTORY_CHANGE_WORDS),
+            0
+        );
+        assert_eq!(
+            count_directory_change_words("Set-Location C:\\x", FOREIGN_DIRECTORY_CHANGE_WORDS),
+            1
+        );
     }
 
     #[test]

@@ -18,6 +18,7 @@
 //! - Explicit, testable layering precedence (trusted project > user > system)
 //! - No trust grants from repository contents alone
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -342,8 +343,9 @@ impl LayeredAllowlist {
     /// Note: This performs exact rule ID matching without wildcard expansion.
     /// Use `match_rule` for wildcard-aware matching.
     ///
-    /// This is a backward-compatible wrapper around `lookup_rule_at_path` with `cwd = None`.
-    /// For path-aware matching, use `lookup_rule_at_path` instead.
+    /// Wrapper around `lookup_rule_at_path` with an unknown `cwd`, which makes
+    /// every directory-scoped (`paths = [...]`) entry inapplicable. Callers
+    /// that know where the command runs must use `lookup_rule_at_path`.
     ///
     /// Skips entries that are expired, have unmet conditions, or lack risk ack.
     #[must_use]
@@ -367,8 +369,9 @@ impl LayeredAllowlist {
     ///
     /// * `pack_id` - The pack identifier to match
     /// * `pattern_name` - The pattern name to match (supports wildcard `*`)
-    /// * `cwd` - Optional current working directory for path-based filtering.
-    ///   If None, path restrictions are ignored (backward compatibility).
+    /// * `cwd` - The directory the guarded command runs in. `None` means it
+    ///   could not be determined, and every `paths = [...]` entry then fails
+    ///   closed rather than applying against an unrelated directory (#387).
     #[must_use]
     pub fn match_rule_at_path(
         &self,
@@ -382,12 +385,13 @@ impl LayeredAllowlist {
         }
 
         let mut cached_session_id = SessionIdCache::Unresolved;
+        let cwd = cwd.map(ScopeCwd::new);
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
                 // Skip entries that are invalid or don't match path restrictions
                 let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
+                if !is_entry_valid_at_path_with_session(entry, cwd.as_ref(), current_session_id) {
                     continue;
                 }
 
@@ -411,10 +415,11 @@ impl LayeredAllowlist {
         None
     }
 
-    /// Find the first allowlist entry that matches a rule (backward-compatible, no path filtering).
+    /// Find the first allowlist entry that matches a rule, with no known cwd.
     ///
-    /// This is a convenience wrapper around `match_rule_at_path` with `cwd = None`.
-    /// For path-aware matching, use `match_rule_at_path` instead.
+    /// Wrapper around `match_rule_at_path` with an unknown `cwd`, which makes
+    /// every directory-scoped (`paths = [...]`) entry inapplicable. Callers
+    /// that know where the command runs must use `match_rule_at_path`.
     #[must_use]
     pub fn match_rule(&self, pack_id: &str, pattern_name: &str) -> Option<AllowlistHit<'_>> {
         self.match_rule_at_path(pack_id, pattern_name, None)
@@ -422,8 +427,10 @@ impl LayeredAllowlist {
 
     /// Find the first allowlist entry that matches an exact command string.
     ///
-    /// This is a backward-compatible wrapper around `match_exact_command_at_path` with `cwd = None`.
-    /// For path-aware matching, use `match_exact_command_at_path` instead.
+    /// Wrapper around `match_exact_command_at_path` with an unknown `cwd`,
+    /// which makes every directory-scoped (`paths = [...]`) entry
+    /// inapplicable. Callers that know where the command runs must use
+    /// `match_exact_command_at_path`.
     #[must_use]
     pub fn match_exact_command(&self, command: &str) -> Option<AllowlistHit<'_>> {
         self.match_exact_command_at_path(command, None)
@@ -449,11 +456,12 @@ impl LayeredAllowlist {
         cwd: Option<&Path>,
     ) -> Option<(&AllowEntry, AllowlistLayer)> {
         let mut cached_session_id = SessionIdCache::Unresolved;
+        let cwd = cwd.map(ScopeCwd::new);
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
                 let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
+                if !is_entry_valid_at_path_with_session(entry, cwd.as_ref(), current_session_id) {
                     continue;
                 }
 
@@ -475,11 +483,12 @@ impl LayeredAllowlist {
         cwd: Option<&Path>,
     ) -> Option<AllowlistHit<'_>> {
         let mut cached_session_id = SessionIdCache::Unresolved;
+        let cwd = cwd.map(ScopeCwd::new);
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
                 let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
+                if !is_entry_valid_at_path_with_session(entry, cwd.as_ref(), current_session_id) {
                     continue;
                 }
 
@@ -519,11 +528,12 @@ impl LayeredAllowlist {
         cwd: Option<&Path>,
     ) -> Option<AllowlistHit<'_>> {
         let mut cached_session_id = SessionIdCache::Unresolved;
+        let cwd = cwd.map(ScopeCwd::new);
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
                 let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
+                if !is_entry_valid_at_path_with_session(entry, cwd.as_ref(), current_session_id) {
                     continue;
                 }
 
@@ -587,11 +597,12 @@ impl LayeredAllowlist {
         cwd: Option<&Path>,
     ) -> Option<AllowlistHit<'_>> {
         let mut cached_session_id = SessionIdCache::Unresolved;
+        let cwd = cwd.map(ScopeCwd::new);
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
                 let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id) {
+                if !is_entry_valid_at_path_with_session(entry, cwd.as_ref(), current_session_id) {
                     continue;
                 }
 
@@ -1256,64 +1267,185 @@ pub const fn has_required_risk_ack(entry: &AllowEntry) -> bool {
     }
 }
 
-/// Check if the current working directory matches the path patterns in an allowlist entry.
+/// Whether an entry's grant is restricted to particular directories.
 ///
-/// Returns `true` if:
-/// - No paths are specified (None) - the rule applies globally
-/// - The paths list is empty - the rule applies globally
-/// - Any path pattern matches the given CWD using glob matching
-///
-/// Glob semantics:
-/// - `*` matches any single path component
-/// - `**` matches zero or more path components
-/// - `?` matches any single character
-/// - `[abc]` matches any char in brackets
+/// An absent `paths`, an empty `paths`, and a `paths` containing `"*"` all
+/// mean "everywhere", so those entries are not directory-scoped and need no
+/// working directory to evaluate. Everything else is a grant that only exists
+/// inside the named directories.
 #[must_use]
-pub fn path_matches(entry: &AllowEntry, cwd: &Path) -> bool {
-    let Some(ref patterns) = entry.paths else {
-        // No paths specified = global allow
+pub fn entry_is_path_scoped(entry: &AllowEntry) -> bool {
+    entry
+        .paths
+        .as_ref()
+        .is_some_and(|patterns| !patterns.is_empty() && !patterns.iter().any(|p| p == "*"))
+}
+
+/// The string form of a working directory used for path-scope glob matching.
+///
+/// Symlinks are resolved first. A scope is a claim about a real directory, and
+/// a symlinked name whose target lies outside the scope must not borrow the
+/// grant (`/scoped/link` -> `/etc`). When the directory cannot be
+/// canonicalized — it does not exist, or is unreadable — the literal path is
+/// used; that can only fail to match, never over-match.
+#[must_use]
+pub fn scope_match_path(cwd: &Path) -> String {
+    normalize_resolved_path(&cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()))
+}
+
+/// Render a resolved path in the form scope patterns are written in.
+///
+/// Separators become `/` (patterns are matched that way on every platform),
+/// and Windows' extended-length canonical form is unwrapped: `canonicalize`
+/// returns `\\?\C:\work`, which no user would ever write a `paths = [...]`
+/// pattern against.
+fn normalize_resolved_path(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = text.strip_prefix("//?/UNC/") {
+        return format!("//{rest}");
+    }
+    if let Some(rest) = text.strip_prefix("//?/") {
+        return rest.to_string();
+    }
+    text
+}
+
+/// Canonicalize the leading literal directory prefix of a glob pattern.
+///
+/// Working directories are matched in canonical (symlink-resolved) form, so a
+/// pattern written against a symlinked prefix — `/tmp/scratch/**` on macOS,
+/// where `/tmp` is a symlink to `/private/tmp` — has to be resolved the same
+/// way or it could never match the directory the user meant. Only the leading
+/// components free of glob metacharacters are resolved; the globbed tail is
+/// left untouched.
+///
+/// Returns `None` when there is nothing to resolve (a relative pattern, a
+/// pattern that globs from the root, or a prefix that does not exist), and
+/// when resolution is a no-op.
+fn canonicalize_pattern_prefix(pattern: &str) -> Option<String> {
+    // Patterns are matched with `/` separators on every platform.
+    let pattern = pattern.replace('\\', "/");
+    // A relative pattern has nothing to anchor to, and must not be given one.
+    if !Path::new(&pattern).is_absolute() {
+        return None;
+    }
+
+    let mut literal: Vec<&str> = Vec::new();
+    let mut globbed: Vec<&str> = Vec::new();
+    for component in pattern.split('/') {
+        if globbed.is_empty() && !component.contains(['*', '?', '[', ']']) {
+            literal.push(component);
+        } else {
+            globbed.push(component);
+        }
+    }
+
+    // On POSIX `literal[0]` is the empty string before the leading `/`, on
+    // Windows it is the drive (`C:`); either way a pattern whose very first
+    // real component is globbed has no prefix worth resolving.
+    if literal.len() < 2 {
+        return None;
+    }
+
+    let literal_prefix = literal.join("/");
+    let canonical = normalize_resolved_path(&Path::new(&literal_prefix).canonicalize().ok()?);
+    if canonical == literal_prefix {
+        return None;
+    }
+
+    if globbed.is_empty() {
+        Some(canonical)
+    } else {
+        Some(format!(
+            "{}/{}",
+            canonical.trim_end_matches('/'),
+            globbed.join("/")
+        ))
+    }
+}
+
+// Process-wide cache of canonicalized glob-pattern prefixes. Resolution is a
+// syscall per pattern and the same handful of allowlist patterns are re-tested
+// on every command, so the answer (including "nothing to resolve") is memoized
+// the way compiled `pattern = "..."` regexes are.
+fn scope_prefix_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// [`canonicalize_pattern_prefix`], memoized for the life of the process.
+fn cached_pattern_prefix(pattern: &str) -> Option<String> {
+    let cache = scope_prefix_cache();
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .entry(pattern.to_string())
+        .or_insert_with(|| canonicalize_pattern_prefix(pattern))
+        .clone()
+}
+
+/// A working directory prepared for path-scope matching.
+///
+/// Canonicalizing is a syscall, and a layered lookup tests the scope of every
+/// entry in every layer against the same directory. This resolves it at most
+/// once per lookup, and only if a directory-scoped entry actually needs it.
+pub struct ScopeCwd<'a> {
+    raw: &'a Path,
+    resolved: OnceCell<String>,
+}
+
+impl<'a> ScopeCwd<'a> {
+    /// Prepare `cwd` for scope matching. No work happens until it is used.
+    #[must_use]
+    pub const fn new(cwd: &'a Path) -> Self {
+        Self {
+            raw: cwd,
+            resolved: OnceCell::new(),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        self.resolved.get_or_init(|| scope_match_path(self.raw))
+    }
+}
+
+/// Check whether a working directory falls inside an allowlist entry's scope.
+///
+/// Returns `true` when the entry is not directory-scoped at all, or when the
+/// canonical form of `cwd` matches one of its patterns (each pattern is tried
+/// as written and with its literal prefix canonicalized).
+#[must_use]
+pub fn entry_path_matches_cwd(entry: &AllowEntry, cwd: &Path) -> bool {
+    entry_scope_contains(entry, &ScopeCwd::new(cwd))
+}
+
+/// [`entry_path_matches_cwd`] against an already-prepared working directory.
+#[must_use]
+fn entry_scope_contains(entry: &AllowEntry, cwd: &ScopeCwd<'_>) -> bool {
+    if !entry_is_path_scoped(entry) {
+        return true;
+    }
+    let Some(patterns) = entry.paths.as_deref() else {
         return true;
     };
 
-    if patterns.is_empty() {
-        // Empty paths list = global allow
-        return true;
-    }
+    let cwd = cwd.as_str();
+    patterns.iter().any(|pattern| {
+        path_matches_glob(pattern, cwd)
+            || cached_pattern_prefix(pattern)
+                .is_some_and(|resolved| path_matches_glob(&resolved, cwd))
+    })
+}
 
-    let cwd_str = cwd.to_string_lossy();
-
-    for pattern in patterns {
-        // Handle special case: "*" alone means global allow
-        if pattern == "*" {
-            return true;
-        }
-
-        // Use glob pattern matching
-        match glob::Pattern::new(pattern) {
-            Ok(glob_pattern) => {
-                // Try matching the path directly
-                if glob_pattern.matches(&cwd_str) {
-                    return true;
-                }
-                // Also try with normalized path (resolved symlinks)
-                if let Ok(canonical) = cwd.canonicalize() {
-                    if glob_pattern.matches(&canonical.to_string_lossy()) {
-                        return true;
-                    }
-                }
-            }
-            Err(e) => {
-                // Invalid glob pattern - log warning and continue
-                tracing::warn!(
-                    pattern = pattern,
-                    error = %e,
-                    "invalid glob pattern in allowlist entry, skipping"
-                );
-            }
-        }
-    }
-
-    false
+/// Check if a working directory matches the path patterns in an allowlist entry.
+///
+/// Thin wrapper over [`entry_path_matches_cwd`]; see there for the matching
+/// rules.
+#[must_use]
+pub fn path_matches(entry: &AllowEntry, cwd: &Path) -> bool {
+    entry_path_matches_cwd(entry, cwd)
 }
 
 /// Check if an allowlist entry passes basic validity checks (without path matching).
@@ -1338,11 +1470,14 @@ pub fn is_entry_valid(entry: &AllowEntry) -> bool {
 /// - It passes basic validity checks (not expired, session scope matches, conditions met, risk ack)
 /// - The path matches the entry's path patterns (if specified)
 ///
-/// If `cwd` is None, path matching is skipped (entry applies if basic validity passes).
+/// If `cwd` is `None` the working directory could not be determined, and every
+/// directory-scoped entry fails closed: only entries with no `paths` scope
+/// (or `paths = ["*"]`) can apply.
 #[must_use]
 pub fn is_entry_valid_at_path(entry: &AllowEntry, cwd: Option<&Path>) -> bool {
     let current_session_id = current_session_id();
-    is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref())
+    let cwd = cwd.map(ScopeCwd::new);
+    is_entry_valid_at_path_with_session(entry, cwd.as_ref(), current_session_id.as_deref())
 }
 
 #[must_use]
@@ -1356,21 +1491,22 @@ fn is_entry_valid_with_session(entry: &AllowEntry, current_session_id: Option<&s
 #[must_use]
 fn is_entry_valid_at_path_with_session(
     entry: &AllowEntry,
-    cwd: Option<&Path>,
+    cwd: Option<&ScopeCwd<'_>>,
     current_session_id: Option<&str>,
 ) -> bool {
     if !is_entry_valid_with_session(entry, current_session_id) {
         return false;
     }
 
-    // If no CWD provided, skip path matching (backward compatibility)
+    // No working directory to test against. A `paths = [...]` entry is a
+    // permission granted *for a directory*; with the directory unknown there is
+    // nothing to grant, so the entry does not apply (issue #387). Entries with
+    // no path scope were granted everywhere and are unaffected.
     let Some(cwd) = cwd else {
-        return true;
+        return !entry_is_path_scoped(entry);
     };
 
-    // Convert Path to string for glob matching
-    let cwd_str = cwd.to_string_lossy();
-    entry_path_matches(entry, &cwd_str)
+    entry_scope_contains(entry, cwd)
 }
 
 /// Validate and optionally warn about expiration date format.
@@ -3324,6 +3460,100 @@ mod tests {
 
         assert!(entry_path_matches(&entry, "/home/user/projects/app"));
         assert!(!entry_path_matches(&entry, "/var/log/app.log"));
+    }
+
+    // ---- Issue #387: directory scoping is a grant, so it fails closed. ----
+
+    #[test]
+    fn entry_is_path_scoped_only_for_real_restrictions() {
+        let mut entry = make_test_entry();
+        assert!(!entry_is_path_scoped(&entry), "no paths key = everywhere");
+
+        entry.paths = Some(Vec::new());
+        assert!(!entry_is_path_scoped(&entry), "empty paths = everywhere");
+
+        entry.paths = Some(vec!["*".to_string()]);
+        assert!(!entry_is_path_scoped(&entry), "\"*\" = everywhere");
+
+        entry.paths = Some(vec!["/srv/scratch/**".to_string()]);
+        assert!(entry_is_path_scoped(&entry));
+    }
+
+    #[test]
+    fn unknown_cwd_denies_a_scoped_entry_but_not_an_unscoped_one() {
+        let mut entry = make_test_entry();
+        assert!(
+            is_entry_valid_at_path(&entry, None),
+            "an unscoped grant applies everywhere, including with no cwd"
+        );
+
+        entry.paths = Some(vec!["/srv/scratch/**".to_string()]);
+        assert!(
+            !is_entry_valid_at_path(&entry, None),
+            "a directory-scoped grant cannot apply when the directory is unknown"
+        );
+
+        entry.paths = Some(vec!["*".to_string()]);
+        assert!(
+            is_entry_valid_at_path(&entry, None),
+            "an explicit global scope is not a restriction"
+        );
+    }
+
+    #[test]
+    fn relative_scope_patterns_do_not_match_absolute_directories() {
+        let mut entry = make_test_entry();
+        entry.paths = Some(vec!["projects/**".to_string(), "projects".to_string()]);
+        assert!(!path_matches(&entry, Path::new("/home/user/projects")));
+        assert!(!path_matches(&entry, Path::new("/home/user/projects/app")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scope_matching_resolves_symlinks_on_both_sides() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let inside = root.join("inside");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&inside).expect("mkdir inside");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+
+        let mut entry = make_test_entry();
+        entry.paths = Some(vec![
+            inside.to_string_lossy().to_string(),
+            format!("{}/**", inside.to_string_lossy()),
+        ]);
+
+        assert!(path_matches(&entry, &inside));
+        assert!(!path_matches(&entry, &outside));
+
+        // A symlink whose name sits inside the scope but whose target does not
+        // must not borrow the grant.
+        let escape = inside.join("escape");
+        std::os::unix::fs::symlink(&outside, &escape).expect("symlink");
+        assert!(
+            !path_matches(&entry, &escape),
+            "a symlink out of the scope is out of the scope"
+        );
+
+        // A pattern written against a symlinked prefix names its target.
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&inside, &link).expect("symlink");
+        let mut linked = make_test_entry();
+        linked.paths = Some(vec![link.to_string_lossy().to_string()]);
+        assert!(path_matches(&linked, &inside));
+        assert!(!path_matches(&linked, &outside));
+    }
+
+    #[test]
+    fn canonicalize_pattern_prefix_ignores_unresolvable_patterns() {
+        assert_eq!(canonicalize_pattern_prefix("relative/**"), None);
+        assert_eq!(canonicalize_pattern_prefix("/**"), None);
+        assert_eq!(
+            canonicalize_pattern_prefix("/definitely/not/here/**"),
+            None,
+            "a prefix that does not exist resolves to nothing"
+        );
     }
 
     #[test]

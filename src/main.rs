@@ -527,6 +527,10 @@ fn try_deny_oversized_input(
         // Only the truncated prefix of an oversized payload is available
         // here; its envelope fields were never parsed.
         hook_cwd: None,
+        // With the envelope unparsed the harness-reported cwd is unknown, and
+        // the hook process's own cwd is not a substitute for it, so
+        // directory-scoped allowlist entries fail closed here (#387).
+        scope_base: None,
         working_dir: &working_dir,
         deadline,
         hook_protocol,
@@ -784,6 +788,12 @@ struct HookEvalContext<'a> {
     /// it (#331). Allow-once and history keep using `cwd_path`, the path the
     /// matching CLI commands resolve from.
     hook_cwd: Option<&'a Path>,
+    /// Base directory for matching directory-scoped (`paths = [...]`)
+    /// allowlist entries: the directory the harness says the command runs in,
+    /// before any `cd` on the command line itself is applied (#387). `None`
+    /// means dcg could not determine it, which makes every path-scoped grant
+    /// inapplicable — a grant that cannot be located does not apply.
+    scope_base: Option<&'a Path>,
     working_dir: &'a str,
     deadline: &'a Deadline,
     hook_protocol: hook::HookProtocol,
@@ -870,7 +880,10 @@ fn attempt_rebase_recovery(
         &relaxed,
         ctx.heredoc_settings,
         None,
-        ctx.cwd_path,
+        // The residual scan re-runs the same line, so it must scope
+        // path-aware allowlist entries to the same directory the recovery
+        // probe used — the one the command actually reaches (#387).
+        Some(recovery_cwd.as_path()),
         Some(ctx.deadline),
         shell_dialect,
     );
@@ -937,6 +950,18 @@ fn resolve_hook_command(
         };
     }
 
+    // The directory THIS command runs in: what the harness reported, moved by
+    // any static `cd` on the line (#387). `None` — unknowable — leaves every
+    // `paths = [...]` allowlist entry inapplicable rather than applying it
+    // against a directory that has nothing to do with the command.
+    let scope_cwd = ctx.scope_base.and_then(|base| {
+        destructive_command_guard::rebase_recovery::resolve_effective_cwd(
+            base,
+            command,
+            shell_dialect,
+        )
+    });
+
     // Use the shared evaluator for hook mode parity with `dcg test`.
     let eval_start = Instant::now();
     let mut result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
@@ -947,8 +972,8 @@ fn resolve_hook_command(
         ctx.compiled_overrides,
         ctx.allowlists,
         ctx.heredoc_settings,
-        None,         // allow_once_audit
-        ctx.cwd_path, // project_path: scopes path-aware allowlist entries (#186)
+        None,                 // allow_once_audit
+        scope_cwd.as_deref(), // project_path: scopes path-aware allowlist entries (#186, #387)
         Some(ctx.deadline),
         shell_dialect,
     );
@@ -1677,6 +1702,19 @@ fn main() {
 
     let hook_cwd = hook_input.cwd.as_deref().map(Path::new);
 
+    // Directory-scoped allowlist entries are judged against the directory the
+    // harness says the command will run in, never the hook process's own
+    // `getcwd()` — the two agree only when dcg is run by hand from a prompt
+    // (#387). When the payload reports a cwd dcg cannot use (relative, or not
+    // a directory) the process cwd is not a substitute, so scoping fails
+    // closed. Only when the payload carries no `cwd` at all — protocols that
+    // omit it, and JSON piped in by hand — is the process cwd the sole
+    // available signal.
+    let scope_base = match hook_cwd {
+        Some(path) => Some(path).filter(|path| path.is_absolute() && path.is_dir()),
+        None => cwd_path.as_deref(),
+    };
+
     let eval_context = HookEvalContext {
         config: &config,
         enabled_keywords: &enabled_keywords,
@@ -1687,6 +1725,7 @@ fn main() {
         heredoc_settings: &heredoc_settings,
         cwd_path: cwd_path.as_deref(),
         hook_cwd,
+        scope_base,
         working_dir: &working_dir,
         deadline: &deadline,
         hook_protocol,
