@@ -31,7 +31,20 @@ impl Sandbox {
         let xdg_config = temp.path().join("xdg_config");
         let project = temp.path().join("project");
         std::fs::create_dir_all(home.join(".claude/jobs/abc/tmp")).unwrap();
+        std::fs::create_dir_all(home.join(".claude/jobs/abc/nested/tmp")).unwrap();
         std::fs::create_dir_all(project.join(".git")).unwrap();
+        // Every redirect target these cases use must EXIST: a truncating
+        // redirect to an absent literal file is creation and stands the rule
+        // down before any exemption is consulted (#337, #390), so only an
+        // existing target exercises `exempt_target_globs` at all.
+        for existing in [
+            ".claude/jobs/abc/tmp/log",
+            ".claude/jobs/abc/nested/tmp/log",
+            ".claude/jobs/abc/config",
+            ".bashrc",
+        ] {
+            std::fs::write(home.join(existing), b"keep").unwrap();
+        }
         let user_config_dir = xdg_config.join("dcg");
         std::fs::create_dir_all(&user_config_dir).unwrap();
         if !config_toml.is_empty() {

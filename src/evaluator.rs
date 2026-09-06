@@ -22455,6 +22455,12 @@ fn path_is_new_file_under_home(target: &Path, home: &Path) -> bool {
         return false;
     };
     let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    // A home directory that IS the filesystem root scopes nothing: every
+    // absolute path is "under" it, which would turn this creation carve-out
+    // into an allow for absent files anywhere (`/etc/new-file`).
+    if canonical_home.parent().is_none() {
+        return false;
+    }
     parent.starts_with(&canonical_home)
 }
 
@@ -31642,6 +31648,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_root_home_directory_grants_no_creation_carve_out() {
+        // `HOME=/` would make every absolute parent "under home"; the
+        // predicate must refuse to scope anything to a root home.
+        assert!(!redirect_targets_are_new_home_files_with_home(
+            "echo hi > /etc/definitely-absent-dcg-probe",
+            ShellDialect::Posix,
+            Path::new("/"),
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn new_home_redirect_refuses_existing_symlink_targets() {
         use std::os::unix::fs::symlink;
 
@@ -31729,10 +31747,13 @@ mod tests {
         for command in [
             "bash -c \"cat x > $T\"",
             "bash -c 'cat x > $T'",
-            "sh -c \"echo hi > ~/.ssh/authorized_keys\"",
-            "sh -c 'echo hi > ~/.ssh/authorized_keys'",
+            // System paths and a missing parent are denied on every
+            // machine; a dotfile under the runner's real HOME would only be
+            // denied where it happens to exist (#390 creation carve-out).
+            "sh -c \"echo hi > /etc/passwd\"",
+            "sh -c 'echo hi > /etc/passwd'",
             "echo hi > \"$TARGET\"",
-            "echo hi > ~/data.txt",
+            "echo hi > ~/no-such-parent-dcg/data.txt",
             "cat x > $HOME/y",
             // Real dynamic redirect OUTSIDE the payload must stay caught even
             // though the payload also contains quoted `>` bytes.
@@ -32497,11 +32518,14 @@ mod tests {
         // `redirected_statement` wrapper, and dropping them hid the payload's
         // truncation from the recursive evaluation.
         for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            // Targets chosen to deny on every machine: a system path, and a
+            // home path whose parent cannot exist. A bare `~/.zshrc` is only
+            // denied where the runner's real HOME has one (#390).
             for command in [
-                "sh -c 'echo hi > ~/.zshrc'",
-                "bash -c 'echo hi > ~/.zshrc'",
-                "mise exec -c 'echo hi > ~/.zshrc'",
-                "mise exec -c ': > ~/.bashrc'",
+                "sh -c 'echo hi > /etc/profile'",
+                "bash -c 'echo hi > /etc/profile'",
+                "mise exec -c 'echo hi > ~/no-such-parent-dcg/.zshrc'",
+                "mise exec -c ': > /etc/environment'",
             ] {
                 let result =
                     evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
@@ -37526,7 +37550,8 @@ mod tests {
             "echo x 2>| /etc/passwd",
             ": >| /etc/passwd",
             "cat /dev/null >| /etc/passwd",
-            ">| ~/.zshrc",
+            // A missing parent keeps this a deterministic deny (#390).
+            ">| ~/no-such-parent-dcg/.zshrc",
             ">| $HOME/.zshrc",
             ">| /etc/passwd && echo done",
             "echo x >| /root/.ssh/authorized_keys",
