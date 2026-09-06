@@ -23,6 +23,7 @@
 
 pub mod console;
 pub mod denial;
+pub mod emit;
 pub mod escalation;
 pub mod progress;
 pub mod rich_theme;

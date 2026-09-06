@@ -13,6 +13,7 @@
 //! | 3 | `EXIT_CONFIG_ERROR` | Configuration error |
 //! | 4 | `EXIT_PARSE_ERROR` | Parse/input error |
 //! | 5 | `EXIT_IO_ERROR` | IO error |
+//! | 141 | `EXIT_BROKEN_PIPE` | Output reader went away (`EPIPE`) |
 //!
 //! # Usage
 //!
@@ -78,6 +79,17 @@ pub const EXIT_PARSE_ERROR: i32 = 4;
 /// - Permission denied reading/writing files
 /// - Database access fails
 pub const EXIT_IO_ERROR: i32 = 5;
+
+/// The process's stdout or stderr reader went away mid-write (`EPIPE`).
+///
+/// `128 + SIGPIPE(13)`: the status a shell reports for a C tool killed by
+/// `SIGPIPE`, so `dcg … | head -1` under `set -o pipefail` looks exactly like
+/// `cat … | head -1`. dcg reaches it through a clean `process::exit` from the
+/// broken-pipe panic backstop (issue #389) — never through a signal death,
+/// so there is no core dump and no `SIGABRT`. `SIGPIPE` itself stays
+/// ignored: see `output::emit` for why a hook binary must not die on a
+/// stderr write while its verdict on stdout may still have a reader.
+pub const EXIT_BROKEN_PIPE: i32 = 141;
 
 /// Convert an exit code constant to [`std::process::ExitCode`].
 ///

@@ -16265,7 +16265,7 @@ fn check_hook_registered() -> Result<bool, Box<dyn std::error::Error>> {
 pub fn ensure_hook_registered() {
     if let Err(e) = ensure_hook_registered_inner() {
         // Fail-open: log warning but never block the hook pipeline.
-        eprintln!("[dcg] Warning: self-heal check failed: {e}");
+        crate::emit_stderr!("[dcg] Warning: self-heal check failed: {e}");
     }
 }
 

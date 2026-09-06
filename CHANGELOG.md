@@ -15,6 +15,22 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Fixed
 
+- **A closed output pipe no longer kills dcg with `SIGABRT` (#389).**
+  `dcg --version 2>&1 | head -1` — and, in hook mode, any stderr diagnostic
+  written after the host stopped reading — hit `EPIPE`, which the `println!`
+  family turns into a panic and `panic = "abort"` into a core dump. In hook
+  mode that also dropped the verdict: a config warning on a closed stderr
+  aborted the process before the deny JSON was written to a stdout the host
+  was still reading, which fail-open hosts treat as "proceed". `SIGPIPE`
+  deliberately stays ignored (resetting it to `SIG_DFL` would kill the hook on
+  that same stderr write); instead the hook path, `--version`, and `--help`
+  write through the new non-panicking `emit_stderr!`/`emit_stdout!` helpers
+  (`src/output/emit.rs`), and a panic backstop installed first thing in `main`
+  maps the standard library's broken-pipe print panic on the ordinary CLI
+  surface to a clean exit with the new documented `EXIT_BROKEN_PIPE` (141),
+  never a signal death. `--version` keeps the bare semver as the only stdout
+  line and the provenance banner on stderr, where `scripts/perf_baseline.py`
+  reads it.
 - **`redaction_mode = "pattern"` performs secret redaction again (#386).**
   The pattern redactor added in v0.2.8 was deleted by a tracker-sync commit
   shortly after v0.2.10 and never restored, so from v0.2.11 onward the

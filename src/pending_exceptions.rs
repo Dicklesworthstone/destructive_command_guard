@@ -402,7 +402,7 @@ impl PendingExceptionStore {
         // future allow-once code issuance fails silently.
         let over_watermark = file.metadata()?.len() > PENDING_MAINTENANCE_WATERMARK_BYTES;
         if over_watermark && !allow_maintenance {
-            eprintln!(
+            crate::emit_stderr!(
                 "[dcg] Warning: pending-exceptions store is above the {PENDING_MAINTENANCE_WATERMARK_BYTES}-byte \
                  maintenance watermark; running a prune/rotate pass despite the low deadline budget."
             );

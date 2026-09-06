@@ -30,7 +30,9 @@ use destructive_command_guard::evaluator::{
     EvaluationDecision, evaluate_command_with_pack_order_deadline_at_path_in_dialect,
 };
 #[allow(unused_imports)]
-use destructive_command_guard::exit_codes::{EXIT_DENIED, EXIT_PARSE_ERROR, EXIT_SUCCESS};
+use destructive_command_guard::exit_codes::{
+    EXIT_BROKEN_PIPE, EXIT_DENIED, EXIT_PARSE_ERROR, EXIT_SUCCESS,
+};
 use destructive_command_guard::history::{
     CommandEntry, HistoryWriter, Outcome as HistoryOutcome, ResolvedHistoryPath,
 };
@@ -48,6 +50,7 @@ use destructive_command_guard::pending_exceptions::{
 };
 use destructive_command_guard::perf::{Deadline, HOOK_EVALUATION_BUDGET};
 use destructive_command_guard::update::{GIT_DESCRIBE, GIT_SHA};
+use destructive_command_guard::{emit_stderr, emit_stdout};
 // Import HookInput for parsing stdin JSON in hook mode
 #[cfg(test)]
 use destructive_command_guard::hook::HookInput;
@@ -337,12 +340,12 @@ fn handle_unparseable_hook_input(
         // only under verbose.
         match read_err {
             hook::HookReadError::InputTooLarge { len, .. } => {
-                eprintln!(
+                emit_stderr!(
                     "[dcg] Warning: stdin input ({len} bytes) exceeds limit ({max_input_bytes} bytes); allowing command (fail-open)"
                 );
             }
             _ if config.general.verbose => {
-                eprintln!(
+                emit_stderr!(
                     "[dcg] Warning: could not parse hook input; allowing command (fail-open)"
                 );
             }
@@ -637,10 +640,43 @@ fn install_signal_shutdown_handler() {
     // (in registration order), then exits 130. Code 130 is the canonical
     // "interrupted by SIGINT" status (128 + SIGINT(2)).
     let _ = ctrlc::set_handler(|| {
-        eprintln!("[dcg] Flushing on signal...");
+        emit_stderr!("[dcg] Flushing on signal...");
         run_shutdown_actions();
         std::process::exit(130);
     });
+}
+
+/// Convert the standard library's `EPIPE` print panic into a clean exit.
+///
+/// `SIGPIPE` is deliberately left ignored (see `output::emit` for why a hook
+/// binary must not die on a stderr write while its stdout verdict may still
+/// have a reader), so a `println!`/`eprintln!` to a pipe whose reader has
+/// gone away panics instead. Under the release profile's `panic = "abort"`
+/// that panic used to become `SIGABRT` plus a core dump, and in hook mode it
+/// dropped the verdict on the floor (issue #389). The hook path itself now
+/// writes through the non-panicking `emit_*` helpers; this backstop covers the
+/// CLI surface (`dcg packs | head -1`, …) and any diagnostic that slips
+/// through, and exits with `EXIT_BROKEN_PIPE` — the status of a C tool killed
+/// by `SIGPIPE`, reached without a signal death.
+///
+/// Every other panic still goes to the default hook and keeps its existing
+/// behaviour; only the exact standard-library broken-pipe message is claimed.
+fn install_broken_pipe_backstop() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let is_broken_pipe = info
+            .payload_as_str()
+            .is_some_and(destructive_command_guard::output::emit::is_broken_pipe_print_panic);
+        if is_broken_pipe {
+            // Deliberately no `run_shutdown_actions()` here, unlike the SIGINT
+            // handler: a panic hook can run on a thread that already holds
+            // the shutdown registry (a flush action that itself hit EPIPE),
+            // and a deadlocked panic hook is strictly worse than an unflushed
+            // history row for a process whose reader has already left.
+            std::process::exit(EXIT_BROKEN_PIPE);
+        }
+        default_hook(info);
+    }));
 }
 
 fn install_history_shutdown_handler(
@@ -1066,7 +1102,7 @@ fn resolve_hook_command(
                 // Inform on stderr (visible to the agent and to humans).
                 // Stays silent when stderr isn't a TTY and robot mode is on,
                 // but the message itself is always safe to emit.
-                eprintln!(
+                emit_stderr!(
                     "[dcg] Allowing `{}` → rebase-recovery mode ({})",
                     pattern.as_deref().unwrap_or("<unknown>"),
                     reason.label()
@@ -1277,7 +1313,7 @@ fn publish_decisive_response(
                     // used to be swallowed, so allow-once issuance could stop
                     // silently and permanently. The block still stands; say so.
                     Err(e) => {
-                        eprintln!(
+                        emit_stderr!(
                             "[dcg] Warning: could not record an allow-once code for this block ({e}); the block still stands."
                         );
                     }
@@ -1349,29 +1385,40 @@ fn publish_decisive_response(
 // are now in the hook module. Use hook::output_denial() for all denial responses.
 
 /// Print version information and exit.
+///
+/// Output contract: the bare semver is the ONLY line on stdout (installers
+/// and `dcg update` read it with `--version 2>/dev/null | head -1`), and it is
+/// written first. The banner and the build-provenance lines (`Built:`,
+/// `Commit:`, `Git SHA:`, `Rustc …:`) go to stderr, where
+/// `scripts/perf_baseline.py` and the README's troubleshooting guidance
+/// expect them; they are kept for that reason rather than trimmed to a
+/// one-liner. Every write is best-effort: with `SIGPIPE` ignored, a reader
+/// that stops early (`dcg --version 2>&1 | head -1`) makes the remaining
+/// writes fail with `EPIPE`, and that must end in a normal exit 0 — not the
+/// SIGABRT core dump of issue #389.
 fn print_version() {
     // Machine-readable version on stdout (for scripts, installers, etc.)
-    println!("{PKG_VERSION}");
+    emit_stdout!("{PKG_VERSION}");
 
     // ASCII art logo - compact shield design
-    eprintln!();
-    eprintln!(
+    emit_stderr!();
+    emit_stderr!(
         "  {}",
         "╭─────────────────────────────────────────╮".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "  {}  🛡  {}               {}",
         "│".bright_black(),
         "Destructive Command Guard".white().bold(),
         "│".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "  {}     {}                           {}",
         "│".bright_black(),
         format!("dcg v{PKG_VERSION}").cyan().bold(),
         "│".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "  {}                                         {}",
         "│".bright_black(),
         "│".bright_black()
@@ -1381,7 +1428,7 @@ fn print_version() {
     if let Some(ts) = BUILD_TIMESTAMP {
         // Extract just the date part for cleaner display
         let date = ts.split('T').next().unwrap_or(ts);
-        eprintln!(
+        emit_stderr!(
             "  {}  {} {}                   {}",
             "│".bright_black(),
             "Built:".bright_black(),
@@ -1390,7 +1437,7 @@ fn print_version() {
         );
     }
     if let Some(rustc) = RUSTC_SEMVER {
-        eprintln!(
+        emit_stderr!(
             "  {}  {} {}                      {}",
             "│".bright_black(),
             "Rustc:".bright_black(),
@@ -1409,12 +1456,12 @@ fn print_version() {
     ] {
         if let Some(value) = value {
             if !value.is_empty() && value != "VERGEN_IDEMPOTENT_OUTPUT" {
-                eprintln!("{label}: {value}");
+                emit_stderr!("{label}: {value}");
             }
         }
     }
     if let Some(target) = CARGO_TARGET {
-        eprintln!(
+        emit_stderr!(
             "  {}  {} {}         {}",
             "│".bright_black(),
             "Target:".bright_black(),
@@ -1426,7 +1473,7 @@ fn print_version() {
     // ahead of the tag (`v0.11.0-7-gabc1234` / `-dirty`).
     if let Some(describe) = GIT_DESCRIBE {
         if !describe.is_empty() && describe != "VERGEN_IDEMPOTENT_OUTPUT" {
-            eprintln!(
+            emit_stderr!(
                 "  {}  {} {}                {}",
                 "│".bright_black(),
                 "Commit:".bright_black(),
@@ -1440,30 +1487,35 @@ fn print_version() {
     // stderr so stdout remains the single machine-readable semver line.
     if let Some(sha) = GIT_SHA {
         if !sha.is_empty() && sha != "VERGEN_IDEMPOTENT_OUTPUT" {
-            eprintln!("Git SHA: {sha}");
+            emit_stderr!("Git SHA: {sha}");
         }
     }
 
-    eprintln!(
+    emit_stderr!(
         "  {}                                         {}",
         "│".bright_black(),
         "│".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "  {}  {}  {}",
         "│".bright_black(),
         "Protecting your code from destructive ops".green(),
         "│".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "  {}",
         "╰─────────────────────────────────────────╯".bright_black()
     );
-    eprintln!();
+    emit_stderr!();
 }
 
 #[allow(clippy::too_many_lines)]
 fn main() {
+    // Must run before the first write of any kind: every later `println!` in
+    // the CLI surface relies on it to turn a closed pipe into a clean exit
+    // instead of a SIGABRT core dump (issue #389).
+    install_broken_pipe_backstop();
+
     // Configure colors based on TTY detection
     configure_colors();
 
@@ -1487,7 +1539,7 @@ fn main() {
         Ok(cli) => cli,
         Err(e) => {
             let exit_code = e.exit_code();
-            eprintln!("{e}");
+            emit_stderr!("{e}");
             std::process::exit(exit_code);
         }
     };
@@ -1509,7 +1561,7 @@ fn main() {
     // If there's a subcommand, handle it and exit.
     if cli.command.is_some() {
         if let Err(e) = cli::run_command(cli) {
-            eprintln!("Error: {e}");
+            emit_stderr!("Error: {e}");
             std::process::exit(1);
         }
         return;
@@ -1574,7 +1626,7 @@ fn main() {
     // verbose-only. The store only records warnings on failures, so success
     // stays silent — one stderr line per broken file.
     for warning in external_store.warnings() {
-        eprintln!("[dcg] Warning: {warning}");
+        emit_stderr!("[dcg] Warning: {warning}");
     }
 
     let hook_input = match hook_read {
@@ -1795,241 +1847,241 @@ fn main() {
 /// Print help information.
 #[allow(clippy::too_many_lines)]
 fn print_help() {
-    eprintln!();
-    eprintln!("  🛡  {} {}", "dcg".green().bold(), PKG_VERSION.cyan());
-    eprintln!(
+    emit_stderr!();
+    emit_stderr!("  🛡  {} {}", "dcg".green().bold(), PKG_VERSION.cyan());
+    emit_stderr!(
         "     {}",
         "Destructive Command Guard - multi-agent safety hook".bright_black()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Usage section
-    eprintln!("  {}", "USAGE".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!("    Runs as a pre-execution shell hook for Claude Code, Codex CLI,");
-    eprintln!("    Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent,");
-    eprintln!("    OpenCode, and Oh My Pi (omp).");
-    eprintln!("    Compatible agents, including Codex, receive protocol-specific stdout JSON.");
-    eprintln!();
+    emit_stderr!("  {}", "USAGE".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!("    Runs as a pre-execution shell hook for Claude Code, Codex CLI,");
+    emit_stderr!("    Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent,");
+    emit_stderr!("    OpenCode, and Oh My Pi (omp).");
+    emit_stderr!("    Compatible agents, including Codex, receive protocol-specific stdout JSON.");
+    emit_stderr!();
 
     // Configuration section
-    eprintln!("  {}", "CONFIGURATION".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!("    Installers configure supported agent hooks automatically.");
-    eprintln!(
+    emit_stderr!("  {}", "CONFIGURATION".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!("    Installers configure supported agent hooks automatically.");
+    emit_stderr!(
         "    Common Claude Code config in {}:",
         "~/.claude/settings.json".cyan()
     );
-    eprintln!();
-    eprintln!(
+    emit_stderr!();
+    emit_stderr!(
         "    {}",
         "Hook commands must use the resolved absolute dcg executable path.".white()
     );
-    eprintln!(
+    emit_stderr!(
         "    Run {} to install or repair it safely.",
         "dcg install".green()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Options section
-    eprintln!("  {}", "OPTIONS".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!(
+    emit_stderr!("  {}", "OPTIONS".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!(
         "    {}     Print version information",
         "--version, -V".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}        Print this help message",
         "--help, -h".green()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Commands section
-    eprintln!("  {}", "COMMANDS".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!(
+    emit_stderr!("  {}", "COMMANDS".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!(
         "    {}         Test a command against enabled packs",
         "test".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}      Explain why a command would be blocked/allowed",
         "explain".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}       Check installation and hook registration",
         "doctor".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}        List all available packs and their status",
         "packs".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}         Pack management commands (info, validate)",
         "pack".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}    Manage allowlist entries (add, list, remove)",
         "allowlist".green()
     );
-    eprintln!("    {}        Add a rule to the allowlist", "allow".green());
-    eprintln!(
+    emit_stderr!("    {}        Add a rule to the allowlist", "allow".green());
+    emit_stderr!(
         "    {}      Remove a rule from the allowlist",
         "unallow".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}   Allow a blocked command once via short code",
         "allow-once".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}    Create a new file from stdin without overwriting",
         "create-new".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}         Scan files for destructive commands",
         "scan".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}     Simulate policy evaluation on command logs",
         "simulate".green()
     );
-    eprintln!("    {}       Show current configuration", "config".green());
-    eprintln!(
+    emit_stderr!("    {}       Show current configuration", "config".green());
+    emit_stderr!(
         "    {}         Generate a sample configuration file",
         "init".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}      Install the hook into Claude Code settings",
         "install".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}    Remove the hook from Claude Code settings",
         "uninstall".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}       Update dcg to the latest release",
         "update".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}        Show local statistics from the log file",
         "stats".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}      Query command history database",
         "history".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}  Suggest allowlist patterns from history",
         "suggest-allowlist".green()
     );
-    eprintln!("    {}       Run regression corpus tests", "corpus".green());
-    eprintln!(
+    emit_stderr!("    {}       Run regression corpus tests", "corpus".green());
+    emit_stderr!(
         "    {}         Run in explicit hook mode (batch support)",
         "hook".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}  Generate shell completion scripts",
         "completions".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}          Developer tools for pack development",
         "dev".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}   Start MCP server for agent integration",
         "mcp-server".green()
     );
-    eprintln!();
-    eprintln!(
+    emit_stderr!();
+    emit_stderr!(
         "    Run {} for detailed help on a command.",
         "dcg <command> --help".cyan()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Environment section
-    eprintln!("  {}", "ENVIRONMENT".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!(
+    emit_stderr!("  {}", "ENVIRONMENT".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!(
         "    {}=0-3     Verbosity level (0 = quiet, 3 = trace)",
         "DCG_VERBOSE".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=1       Suppress non-error output",
         "DCG_QUIET".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=1    Disable colored output (same as NO_COLOR)",
         "DCG_NO_COLOR".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=text|json|sarif  Default output format (command-specific).",
         "DCG_FORMAT".green()
     );
-    eprintln!("                          `sarif` is real SARIF only for `dcg scan`; on every");
-    eprintln!("                          other command `sarif`/`structured` is an alias for");
-    eprintln!("                          JSON, and `text` an alias for pretty. Per-command");
-    eprintln!("                          accepted values: see `dcg <command> --help`.");
-    eprintln!(
+    emit_stderr!("                          `sarif` is real SARIF only for `dcg scan`; on every");
+    emit_stderr!("                          other command `sarif`/`structured` is an alias for");
+    emit_stderr!("                          JSON, and `text` an alias for pretty. Per-command");
+    emit_stderr!("                          accepted values: see `dcg <command> --help`.");
+    emit_stderr!(
         "    {}=/path  Use explicit config file",
         "DCG_CONFIG".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=ms  Hook evaluation timeout budget",
         "DCG_HOOK_TIMEOUT_MS".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=1      Robot mode for AI agents (JSON output, no stderr)",
         "DCG_ROBOT".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=1  Block (deny) on unparseable hook input (default: fail-open)",
         "DCG_FAIL_CLOSED".green()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Blocked commands section
-    eprintln!("  {}", "BLOCKED COMMANDS".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!();
-    eprintln!(
+    emit_stderr!("  {}", "BLOCKED COMMANDS".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!();
+    emit_stderr!(
         "    {} {}",
         "Git".red().bold(),
         "(core.git pack)".bright_black()
     );
-    eprintln!("      {} git reset --hard", "•".red());
-    eprintln!("      {} git checkout -- <path>", "•".red());
-    eprintln!("      {} git restore (without --staged)", "•".red());
-    eprintln!("      {} git clean -f", "•".red());
-    eprintln!("      {} git push --force", "•".red());
-    eprintln!("      {} git branch -D", "•".red());
-    eprintln!("      {} git stash drop/clear", "•".red());
-    eprintln!();
-    eprintln!(
+    emit_stderr!("      {} git reset --hard", "•".red());
+    emit_stderr!("      {} git checkout -- <path>", "•".red());
+    emit_stderr!("      {} git restore (without --staged)", "•".red());
+    emit_stderr!("      {} git clean -f", "•".red());
+    emit_stderr!("      {} git push --force", "•".red());
+    emit_stderr!("      {} git branch -D", "•".red());
+    emit_stderr!("      {} git stash drop/clear", "•".red());
+    emit_stderr!();
+    emit_stderr!(
         "    {} {}",
         "Filesystem".red().bold(),
         "(core.filesystem pack)".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "      {} rm -rf outside literal /tmp and /var/tmp subtrees",
         "•".red()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Additional packs note. These IDs must be real pack IDs that resolve via
     // `dcg pack info <id>` — listing non-existent IDs here misleads users into
     // trying to enable packs that don't exist (see issue #152).
-    eprintln!("    📦 Additional packs: containers.docker, kubernetes.kubectl,");
-    eprintln!("       database.postgresql, infrastructure.terraform, and more.");
-    eprintln!();
+    emit_stderr!("    📦 Additional packs: containers.docker, kubernetes.kubectl,");
+    emit_stderr!("       database.postgresql, infrastructure.terraform, and more.");
+    emit_stderr!();
 
     // Links section
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!(
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!(
         "    📖 {}",
         "https://github.com/Dicklesworthstone/destructive_command_guard"
             .blue()
             .underline()
     );
-    eprintln!();
+    emit_stderr!();
 }
 
 #[cfg(test)]

@@ -383,6 +383,7 @@ In robot mode, dcg uses consistent exit codes across all commands:
 | 3 | `EXIT_CONFIG_ERROR` | Configuration error |
 | 4 | `EXIT_PARSE_ERROR` | Parse/input error |
 | 5 | `EXIT_IO_ERROR` | IO error |
+| 141 | `EXIT_BROKEN_PIPE` | stdout/stderr reader went away (`EPIPE`); a clean exit, never a signal death |
 
 ### Robot Mode JSON Output
 

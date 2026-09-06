@@ -71,7 +71,7 @@ pub(crate) fn read_config_file_bounded(path: &Path, source: ConfigSource) -> Opt
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            eprintln!(
+            crate::emit_stderr!(
                 "Warning: refusing to load config file '{}': {}",
                 path.display(),
                 e
@@ -88,7 +88,7 @@ pub(crate) fn read_config_file_bounded(path: &Path, source: ConfigSource) -> Opt
         .take(MAX_CONFIG_BYTES + 1)
         .read_to_string(&mut buf)
     {
-        eprintln!(
+        crate::emit_stderr!(
             "Warning: Failed to read config file '{}': {}",
             path.display(),
             e
@@ -96,7 +96,7 @@ pub(crate) fn read_config_file_bounded(path: &Path, source: ConfigSource) -> Opt
         return None;
     }
     if buf.len() as u64 > MAX_CONFIG_BYTES {
-        eprintln!(
+        crate::emit_stderr!(
             "Warning: refusing to load config '{}' — exceeds {}-byte cap",
             path.display(),
             MAX_CONFIG_BYTES
@@ -319,13 +319,13 @@ fn warn_and_ignore_non_unix_restricted_config(path: &Path, source: ConfigSource)
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Ok(_) => {
-            eprintln!(
+            crate::emit_stderr!(
                 "Warning: ignoring {source_name} config '{}' — native ACL and reparse-point validation is unavailable",
                 path.display()
             );
         }
         Err(error) => {
-            eprintln!(
+            crate::emit_stderr!(
                 "Warning: ignoring {source_name} config '{}' — unable to inspect path safely: {}",
                 path.display(),
                 error
@@ -2175,7 +2175,7 @@ impl PacksConfig {
                 .map(|(pattern, n)| format!("{pattern} ({n} skipped)"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            eprintln!(
+            crate::emit_stderr!(
                 "[dcg] Warning: packs.custom_paths hit the cumulative {MAX_CUSTOM_PACK_FILES}-file cap \
                  (issue #293); {total} matching file(s) were NOT loaded from: {detail}"
             );
@@ -2779,7 +2779,7 @@ pub fn rule_target_exempted(rule_id: &str, raw_target: &str) -> bool {
 /// [`take_rule_target_suppressions`]) and echoed to stderr in verbose mode.
 pub fn note_rule_target_suppression(rule_id: &str, glob: &str, target: &str) {
     if active_rule_target_exemptions().is_some_and(|active| active.verbose) {
-        eprintln!(
+        crate::emit_stderr!(
             "dcg: rule {rule_id} matched but target {target:?} is exempted by \
              [rules.\"{rule_id}\"] exempt_target_globs entry {glob:?}"
         );
@@ -3978,7 +3978,7 @@ impl Config {
         // Apply environment variable overrides (highest priority)
         config.apply_env_overrides();
         if config.history.normalize_runtime_invariants() {
-            eprintln!(
+            crate::emit_stderr!(
                 "Warning: invalid history limits were clamped to safe runtime values \
                  (retention_days=1..={}, max_size_mb>=1, prune_check_interval_hours>=1, \
                  batch_size>=1, batch_flush_interval_ms>=1)",
@@ -4070,7 +4070,7 @@ impl Config {
             ),
             Err(e) if source == ConfigSource::AutoProject => {
                 let detail = safe_auto_project_toml_error(&content, &e);
-                eprintln!("Warning: {}; ignoring it", detail);
+                crate::emit_stderr!("Warning: {}; ignoring it", detail);
                 (
                     None,
                     capture_outcome.then(|| {
@@ -4085,7 +4085,7 @@ impl Config {
                 )
             }
             Err(e) => {
-                eprintln!(
+                crate::emit_stderr!(
                     "Warning: Failed to parse config file '{}': {}",
                     path.display(),
                     e
@@ -4112,7 +4112,7 @@ impl Config {
         let content = read_config_file_bounded(path, ConfigSource::Untrusted)?;
         let mut config: Self = toml::from_str(&content).ok()?;
         if config.history.normalize_runtime_invariants() {
-            eprintln!(
+            crate::emit_stderr!(
                 "Warning: invalid history limits in '{}' were clamped to safe runtime values",
                 path.display()
             );
