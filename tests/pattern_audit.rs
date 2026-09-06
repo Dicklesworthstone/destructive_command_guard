@@ -362,10 +362,12 @@ fn test_audit_backtracking_requirements() {
                 "restore-worktree",
                 // Backreference pins redirect target == shown path (#373).
                 "show-redirect-overwrite-source",
-                // Git LFS verb guards (Refs PR #383).
+                // Git LFS verb guards (Refs PR #383). `lfs-prune-dry-run` is
+                // deliberately absent: 91715d5 replaced its trailing
+                // `(?![\w-])` lookahead with `(?:\s|$)`, so it runs on the
+                // linear engine again.
                 "lfs-migrate-rewrite",
                 "lfs-prune",
-                "lfs-prune-dry-run",
                 "lfs-uninstall",
             ]),
         ),
