@@ -526,6 +526,86 @@ function Unconfigure-HermesHook {
   $removedAny
 }
 
+function Get-CrushConfigPath {
+  # Crush's user config, resolved the way Crush does (#388): the
+  # CRUSH_GLOBAL_CONFIG directory override, else $XDG_CONFIG_HOME/crush, else
+  # ~/.config/crush — on Windows too.
+  param([string]$HomeDir = $HOME)
+  $dir = if (-not [string]::IsNullOrWhiteSpace($env:CRUSH_GLOBAL_CONFIG)) {
+    $env:CRUSH_GLOBAL_CONFIG
+  } elseif (-not [string]::IsNullOrWhiteSpace($env:XDG_CONFIG_HOME)) {
+    Join-Path $env:XDG_CONFIG_HOME 'crush'
+  } else {
+    Join-Path (Join-Path $HomeDir '.config') 'crush'
+  }
+  Join-Path $dir 'crush.json'
+}
+
+function Test-CrushPreToolUseKey {
+  # Crush folds case- and separator-insensitive spellings onto "PreToolUse".
+  param([string]$Key)
+  (($Key -replace '[-_]', '').ToLowerInvariant()) -eq 'pretooluse'
+}
+
+function Remove-DcgHooksFromCrushConfig {
+  # Crush hook entries are FLAT `{name, matcher, command, timeout}` objects
+  # (no inner `hooks` array). Drop only entries whose command is dcg, under
+  # every spelling of the PreToolUse key; keep everything else verbatim.
+  param([string]$Path)
+
+  if (-not (Test-Path $Path -PathType Leaf)) { return $false }
+
+  try {
+    $config = Get-Content -Raw -Path $Path | ConvertFrom-Json
+  } catch {
+    Write-Warn "Could not parse $Path; leaving it unchanged"
+    return $false
+  }
+  if ($null -eq $config -or $config -isnot [psobject]) { return $false }
+
+  $hooks = Get-ObjectPropertyValue $config "hooks"
+  if ($null -eq $hooks -or $hooks -isnot [psobject]) { return $false }
+
+  $removed = $false
+  foreach ($prop in @($hooks.PSObject.Properties)) {
+    if (-not (Test-CrushPreToolUseKey $prop.Name)) { continue }
+    $entries = Get-ObjectPropertyValue $hooks $prop.Name
+    if (-not (Test-JsonArray $entries)) { continue }
+    $kept = @()
+    foreach ($entry in (Get-JsonArray $entries)) {
+      if (Test-DcgHookCommand $entry) { $removed = $true } else { $kept += $entry }
+    }
+    if ($kept.Count -ne (Get-JsonArray $entries).Count) {
+      Set-ObjectPropertyValue $hooks $prop.Name $kept
+    }
+  }
+
+  if (-not $removed) { return $false }
+
+  [System.IO.File]::WriteAllText(
+    $Path,
+    ($config | ConvertTo-Json -Depth 20),
+    (New-Object System.Text.UTF8Encoding $false)
+  )
+  $true
+}
+
+function Unconfigure-CrushHook {
+  # User-level crush.json plus any repo-local crush.json / .crush.json written
+  # by `dcg install --crush --project`.
+  param([string]$HomeDir = $HOME, [string]$RepoRoot = '')
+  $paths = @((Get-CrushConfigPath -HomeDir $HomeDir))
+  if (-not [string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $paths += (Join-Path $RepoRoot 'crush.json')
+    $paths += (Join-Path $RepoRoot '.crush.json')
+  }
+  $removed = $false
+  foreach ($path in $paths) {
+    if (Remove-DcgHooksFromCrushConfig -Path $path) { $removed = $true }
+  }
+  $removed
+}
+
 function Get-DcgRepositoryRoot {
   param([string]$StartDir = (Get-Location).Path)
   try {
@@ -796,6 +876,8 @@ if (Remove-DcgHooksFromJsonFile -Path $agyHooks -DeleteEmptyFile) {
 }
 
 if (Unconfigure-OmpExtension) { Write-Ok "Removed Oh My Pi extension" }
+
+if (Unconfigure-CrushHook -RepoRoot (Get-DcgRepositoryRoot)) { Write-Ok "Removed Crush hook" }
 
 if (Test-Path $binary -PathType Leaf) {
   Remove-Item -Force -Path $binary

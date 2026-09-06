@@ -239,6 +239,7 @@ COPILOT_VERSION=""
 HERMES_VERSION=""
 POSIT_ASSISTANT_VERSION=""
 OPENCODE_VERSION=""
+CRUSH_VERSION=""
 OMP_VERSION=""
 
 print_agent_scan_notice() {
@@ -461,6 +462,18 @@ detect_agents() {
     OPENCODE_VERSION=$(try_version opencode)
   fi
 
+  # Crush (charmbracelet/crush) — global config at
+  # ${CRUSH_GLOBAL_CONFIG:-${XDG_CONFIG_HOME:-~/.config}/crush}, optional
+  # `crush` CLI on PATH. Resolve the exact disk candidate so a shell alias or
+  # function named `crush` cannot masquerade as the agent.
+  local crush_bin
+  crush_bin=$(builtin type -P crush 2>/dev/null || true)
+  if [[ -d "${CRUSH_GLOBAL_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/crush}" ]] \
+    || [[ -n "$crush_bin" && -f "$crush_bin" && -x "$crush_bin" ]]; then
+    DETECTED_AGENTS+=("crush")
+    [[ -n "$crush_bin" ]] && CRUSH_VERSION=$(try_version "$crush_bin")
+  fi
+
   # Oh My Pi (`omp`) — require an external executable on PATH. Config/profile
   # state can outlive an uninstall, while command lookup also accepts aliases
   # and functions that the non-interactive installer cannot safely identify as
@@ -539,6 +552,11 @@ print_detected_agents() {
           [[ -n "$OPENCODE_VERSION" ]] && ver_info=" (${OPENCODE_VERSION})"
           gum style --foreground 42 "  ✓ OpenCode${ver_info}"
           ;;
+        crush)
+          local ver_info=""
+          [[ -n "$CRUSH_VERSION" ]] && ver_info=" (${CRUSH_VERSION})"
+          gum style --foreground 42 "  ✓ Crush${ver_info}"
+          ;;
         omp)
           local ver_info=""
           [[ -n "$OMP_VERSION" ]] && ver_info=" (${OMP_VERSION})"
@@ -601,6 +619,11 @@ print_detected_agents() {
           local ver_info=""
           [[ -n "$OPENCODE_VERSION" ]] && ver_info=" (${OPENCODE_VERSION})"
           echo -e "  \033[0;32m✓\033[0m OpenCode${ver_info}"
+          ;;
+        crush)
+          local ver_info=""
+          [[ -n "$CRUSH_VERSION" ]] && ver_info=" (${CRUSH_VERSION})"
+          echo -e "  \033[0;32m✓\033[0m Crush${ver_info}"
           ;;
         omp)
           local ver_info=""
@@ -1846,6 +1869,8 @@ POSIT_ASSISTANT_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"
 POSIT_ASSISTANT_FAILURE_REASON=""
 OPENCODE_STATUS=""  # "created"|"merged"|"skipped"|"failed"|"conflict"
 OPENCODE_FAILURE_REASON=""
+CRUSH_STATUS=""  # "created"|"merged"|"skipped"|"failed"
+CRUSH_FAILURE_REASON=""
 OMP_STATUS=""  # "created"|"merged"|"skipped"|"failed"|"conflict"
 OMP_FAILURE_REASON=""
 POSIT_ASSISTANT_BACKUP=""
@@ -3970,6 +3995,46 @@ configure_opencode() {
   return 1
 }
 
+configure_crush() {
+  # Crush (charmbracelet/crush) runs Claude-Code-style `PreToolUse` hooks from
+  # the `hooks` object of its crush.json (#388). The freshly installed binary
+  # is the single source of truth for the entry shape: `dcg install --crush`
+  # merges `{"name":"dcg","matcher":"^bash$","command":"<abs dcg>",
+  # "timeout":5}` into ${CRUSH_GLOBAL_CONFIG:-${XDG_CONFIG_HOME:-~/.config}/crush}/crush.json,
+  # preserving every other key and hook, and `--force` refreshes a stale
+  # binary path across upgrades.
+  if ! is_agent_detected "crush"; then
+    CRUSH_STATUS="skipped"
+    return 0
+  fi
+
+  local dcg_bin="$DEST/dcg"
+  if [ ! -x "$dcg_bin" ]; then
+    CRUSH_STATUS="failed"
+    CRUSH_FAILURE_REASON="dcg binary not found at $dcg_bin"
+    return 1
+  fi
+
+  local config_path="${CRUSH_GLOBAL_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/crush}/crush.json"
+  local existed=0
+  [ -f "$config_path" ] && existed=1
+
+  local output
+  if output=$("$dcg_bin" install --crush --force 2>&1); then
+    if [ "$existed" -eq 1 ]; then
+      CRUSH_STATUS="merged"
+    else
+      CRUSH_STATUS="created"
+    fi
+    AUTO_CONFIGURED=1
+    return 0
+  fi
+
+  CRUSH_STATUS="failed"
+  CRUSH_FAILURE_REASON=$(printf '%s' "$output" | tail -n 1)
+  return 1
+}
+
 resolve_omp_agent_dir() {
   # Keep the shell installer's status probe in lock-step with OMP/dcg's active
   # profile resolver. In particular, named profiles ignore the legacy
@@ -4147,6 +4212,10 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
 
   # Configure OpenCode (if installed)
   configure_opencode
+
+  # Configure Crush (if installed). A failure is a terminal CRUSH_STATUS
+  # rendered in the summary; do not let `set -e` abort other install work.
+  configure_crush || true
 
   # Configure Oh My Pi (if installed)
   # A refusal/failure is a terminal OMP_STATUS state rendered in the summary;
@@ -4422,6 +4491,26 @@ case "$OPENCODE_STATUS" in
       summary_lines+=("OpenCode:    Configuration failed ($OPENCODE_FAILURE_REASON)")
     else
       summary_lines+=("OpenCode:    Configuration failed")
+    fi
+    ;;
+esac
+
+case "$CRUSH_STATUS" in
+  created)
+    summary_lines+=("Crush:       Created crush.json with the dcg PreToolUse hook")
+    summary_lines+=("             Restart Crush to load it")
+    ;;
+  merged)
+    summary_lines+=("Crush:       Merged dcg PreToolUse hook into crush.json")
+    ;;
+  skipped|"")
+    summary_lines+=("Crush:       Not installed (skipped)")
+    ;;
+  failed)
+    if [ -n "$CRUSH_FAILURE_REASON" ]; then
+      summary_lines+=("Crush:       Configuration failed ($CRUSH_FAILURE_REASON)")
+    else
+      summary_lines+=("Crush:       Configuration failed")
     fi
     ;;
 esac

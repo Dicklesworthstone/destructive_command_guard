@@ -371,6 +371,17 @@ AGY_ALLOW=$(jq -nc --arg c "$ALLOW_CMD" \
 assert_case agy deny "$AGY_DENY" deny '.decision' block
 assert_case agy allow "$AGY_ALLOW" allow '.' ''
 
+# --- Crush (Charm): flat event/tool_name/tool_input envelope, decision:"deny"
+# The stdin shape is what crush's hooks.BuildPayload marshals (#388). Crush
+# reads `decision`/`reason` on exit 0; an empty stdout is "no opinion".
+$JSON_OUTPUT || echo "Crush (Charm)"
+CRUSH_DENY=$(jq -nc --arg c "$DENY_CMD" \
+  '{event:"PreToolUse",session_id:"sess_e2e",cwd:"/work",tool_name:"bash",tool_input:{command:$c}}')
+CRUSH_ALLOW=$(jq -nc --arg c "$ALLOW_CMD" \
+  '{event:"PreToolUse",session_id:"sess_e2e",cwd:"/work",tool_name:"bash",tool_input:{command:$c}}')
+assert_case crush deny "$CRUSH_DENY" deny '.decision' deny
+assert_case crush allow "$CRUSH_ALLOW" allow '.' ''
+
 # --- Oh My Pi: native ExtensionAPI bridge over robot stdin ------------------
 $JSON_OUTPUT || echo "Oh My Pi (omp)"
 OMP_DENY_OUTPUT='{"decision":"deny","reason":"git reset --hard destroys uncommitted changes. Use '\''git stash'\'' first.","rule_id":"core.git:reset-hard"}'

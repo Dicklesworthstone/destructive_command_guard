@@ -1155,6 +1155,101 @@ unconfigure_opencode() {
     return 0
 }
 
+# Remove dcg's entries from one Crush config file (#388). Crush's hook
+# entries are flat `{name, matcher, command, timeout}` objects under
+# `hooks.PreToolUse` (any case/separator spelling of the event key). Only
+# entries whose command basename is `dcg` are dropped; everything else in the
+# file is preserved byte-for-value.
+unconfigure_crush_file() {
+    local config_file="$1"
+    [ -f "$config_file" ] || return 0
+    grep -q 'dcg' "$config_file" 2>/dev/null || return 0
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 not available - cannot safely edit Crush config"
+        warn "Please manually remove dcg from $config_file"
+        return 1
+    fi
+
+    python3 - "$config_file" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+config_file = sys.argv[1]
+
+def is_dcg_command(cmd):
+    """True iff `cmd` invokes the dcg binary (basename match, not substring)."""
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0].replace('\\', '/'))
+    if name.lower().endswith('.exe'):
+        name = name[:-4]
+    return name.lower() == 'dcg'
+
+def is_pre_tool_use(key):
+    return key.replace('_', '').replace('-', '').lower() == 'pretooluse'
+
+try:
+    with open(config_file, 'r') as f:
+        config = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(0)
+
+hooks = config.get('hooks') if isinstance(config, dict) else None
+if not isinstance(hooks, dict):
+    sys.exit(0)
+
+removed = False
+for key, entries in hooks.items():
+    if not is_pre_tool_use(key) or not isinstance(entries, list):
+        continue
+    kept = [
+        e for e in entries
+        if not (isinstance(e, dict) and is_dcg_command(e.get('command', '')))
+    ]
+    if len(kept) != len(entries):
+        removed = True
+        hooks[key] = kept
+
+if not removed:
+    sys.exit(0)
+
+with open(config_file, 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+
+print("removed", file=sys.stderr)
+PYEOF
+}
+
+unconfigure_crush() {
+    # Crush hook (#388): user-level crush.json (honoring CRUSH_GLOBAL_CONFIG and
+    # XDG_CONFIG_HOME exactly as Crush resolves them) plus any repo-local
+    # crush.json / .crush.json written by `dcg install --crush --project`.
+    # Each file prints its own "removed" marker; report_unconfigure only
+    # needs at least one such line in the combined output.
+    local config_file
+    local repo_root=""
+    local -a configs=(
+        "${CRUSH_GLOBAL_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/crush}/crush.json"
+    )
+    if repo_root=$(current_repo_root); then
+        configs+=("$repo_root/crush.json" "$repo_root/.crush.json")
+    fi
+    for config_file in "${configs[@]}"; do
+        unconfigure_crush_file "$config_file" || true
+    done
+    return 0
+}
+
 # Validate the complete profile value as one ASCII pathname component. A
 # line-oriented grep would accept a valid first line and ignore an injected
 # second line, so keep this check inside Bash's whole-string pattern matcher.
@@ -1672,6 +1767,7 @@ main() {
     report_unconfigure "Hermes Agent hook" unconfigure_hermes
     report_unconfigure "Posit Assistant hook" unconfigure_posit_assistant
     report_unconfigure "OpenCode plugin" unconfigure_opencode
+    report_unconfigure "Crush hook" unconfigure_crush
     report_unconfigure "Oh My Pi extension" unconfigure_omp
 
     # Remove Aider config

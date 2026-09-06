@@ -563,3 +563,55 @@ fn test_antigravity_envelope_allows_safe_command() {
         "safe agy hook output must be silent, got: {stdout}"
     );
 }
+
+// ============================================================================
+// Crush (Charm) protocol (#388): flat `event`/`tool_name`/`tool_input`
+// envelope in, `{"decision":"deny","reason":...}` out.
+// ============================================================================
+
+#[test]
+fn test_crush_envelope_produces_deny_decision() {
+    // Verbatim shape of what crush's hooks.BuildPayload pipes to stdin.
+    let input = r#"{"event":"PreToolUse","session_id":"313909e","cwd":"/home/user/project","tool_name":"bash","tool_input":{"command":"git reset --hard HEAD~1"}}"#;
+
+    let (stdout, stderr, exit_code) = run_hook_mode_raw(input);
+    assert_eq!(
+        exit_code, 0,
+        "Crush parses stdout only on exit 0\nstderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be JSON: {e}\nstdout: {stdout}"));
+
+    assert_eq!(json["decision"], "deny", "payload: {json}");
+    assert!(
+        json["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "deny must carry a non-empty reason, got: {}",
+        json["reason"]
+    );
+    assert_eq!(json["ruleId"], "core.git:reset-hard", "payload: {json}");
+    // Before #388 this payload was routed to the Copilot arm and answered
+    // with a flat `permissionDecision`, which Crush ignores (fail-open).
+    assert!(
+        json.get("permissionDecision").is_none() && json.get("hookSpecificOutput").is_none(),
+        "Crush reads `decision`, not Copilot/Claude spellings: {json}"
+    );
+    assert!(
+        !stderr.trim().is_empty(),
+        "operator-visible denial on stderr"
+    );
+}
+
+#[test]
+fn test_crush_envelope_allows_safe_command_silently() {
+    // No JSON at all: an omitted decision is "no opinion" in Crush and the
+    // call proceeds through its ordinary permission prompt. dcg must never
+    // answer `"allow"`, which would pre-approve the call and skip the prompt.
+    let input = r#"{"event":"PreToolUse","session_id":"313909e","cwd":"/home/user/project","tool_name":"bash","tool_input":{"command":"git status"}}"#;
+
+    let (stdout, stderr, exit_code) = run_hook_mode_raw(input);
+    assert_eq!(exit_code, 0, "safe command must exit 0\nstderr: {stderr}");
+    assert!(
+        stdout.trim().is_empty(),
+        "safe Crush hook output must be silent, got: {stdout}"
+    );
+}

@@ -307,7 +307,7 @@ pub enum Command {
     },
 
     /// Install the hook into Claude Code settings (or another agent with
-    /// `--grok`, `--agy`, `--opencode`, or `--omp`)
+    /// `--grok`, `--agy`, `--opencode`, `--omp`, or `--crush`)
     #[command(name = "install")]
     Install {
         /// Force overwrite existing hook configuration
@@ -324,7 +324,7 @@ pub enum Command {
         /// (when combined with `--project`). Grok also picks up dcg from
         /// `~/.claude/settings.json` via its Claude-Code compatibility layer,
         /// but the native path gives the cleanest doctor output.
-        #[arg(long, conflicts_with_all = ["agy", "opencode", "omp"])]
+        #[arg(long, conflicts_with_all = ["agy", "opencode", "omp", "crush"])]
         grok: bool,
 
         /// Install the dcg PreToolUse hook for the Antigravity CLI (`agy`) at
@@ -332,7 +332,7 @@ pub enum Command {
         /// `<repo>/.gemini/config/hooks.json` (with `--project`). `agy` reads
         /// Claude-Code-compatible `PreToolUse` hooks from this file and aborts
         /// its `run_command` shell tool when dcg returns a block decision.
-        #[arg(long, conflicts_with_all = ["grok", "opencode", "omp"])]
+        #[arg(long, conflicts_with_all = ["grok", "opencode", "omp", "crush"])]
         agy: bool,
 
         /// Install a native OpenCode plugin at
@@ -342,7 +342,7 @@ pub enum Command {
         /// `tool.execute.before` hook: every bash tool call is routed through
         /// dcg's Claude-compatible hook protocol, and a deny aborts the tool
         /// call with dcg's reason. Restart OpenCode after installing (#318).
-        #[arg(long, conflicts_with_all = ["grok", "agy", "omp"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "omp", "crush"])]
         opencode: bool,
 
         /// Install a native Oh My Pi (`omp`) `tool_call` extension at the
@@ -351,8 +351,17 @@ pub enum Command {
         /// `<cwd>/.omp/extensions/dcg-guard.ts` (with `--project`). OMP's
         /// extension discovery is cwd-only and does not walk Git ancestors.
         /// Every OMP bash tool call is routed through dcg before execution.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "crush"])]
         omp: bool,
+
+        /// Install the dcg PreToolUse hook for Charm Crush by merging a
+        /// `hooks.PreToolUse` entry (matcher `^bash$`) into
+        /// `~/.config/crush/crush.json` (user-level; honors `XDG_CONFIG_HOME`
+        /// and `CRUSH_GLOBAL_CONFIG`) or the repo's `crush.json` (with
+        /// `--project`). Crush pipes every bash tool call to dcg's stdin and
+        /// blocks the call when dcg answers `{"decision":"deny"}`.
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp"])]
+        crush: bool,
     },
 
     /// Full setup: install hook + add shell startup check
@@ -375,12 +384,17 @@ pub enum Command {
         no_shell_check: bool,
     },
 
-    /// Remove the hook from Claude Code settings
+    /// Remove the hook from Claude Code settings (or from Crush with `--crush`)
     #[command(name = "uninstall")]
     Uninstall {
         /// Also remove configuration files
         #[arg(long)]
         purge: bool,
+
+        /// Remove the dcg hook entry from `~/.config/crush/crush.json` instead
+        /// of Claude Code settings
+        #[arg(long, conflicts_with = "purge")]
+        crush: bool,
     },
 
     /// Update dcg to the latest release (re-runs the installer)
@@ -2392,6 +2406,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             agy,
             opencode,
             omp,
+            crush,
         }) => {
             if grok {
                 install_grok_hook(force, project)?;
@@ -2401,6 +2416,8 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 install_opencode_plugin(force, project)?;
             } else if omp {
                 install_omp_extension(force, project, true)?;
+            } else if crush {
+                install_crush_hook(force, project)?;
             } else {
                 install_hook(force, project)?;
             }
@@ -2412,8 +2429,12 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }) => {
             run_setup(force, shell_check, no_shell_check)?;
         }
-        Some(Command::Uninstall { purge }) => {
-            uninstall_hook(purge)?;
+        Some(Command::Uninstall { purge, crush }) => {
+            if crush {
+                uninstall_crush_hook()?;
+            } else {
+                uninstall_hook(purge)?;
+            }
         }
         Some(Command::Update(update)) => {
             self_update(update, config.general.update_pin)?;
@@ -10657,6 +10678,46 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         }
     }
 
+    // Check 3b1: Crush hook registration (#388). Crush reads hooks only from
+    // its own crush.json — there is no Claude-settings compatibility layer to
+    // fall back on — so an unregistered hook means the guard is not guarding.
+    //
+    // `collect_doctor_report` carries the same check (id `crush_hook`).
+    if crush_appears_in_use() {
+        print!("Checking Crush hook registration... ");
+        let config_path = crush_user_config_path();
+        match crush_user_config_registers_dcg() {
+            Ok(true) => {
+                println!("{}", "OK".green());
+                println!("  Found: {}", config_path.display());
+            }
+            Ok(false) => {
+                println!("{}", "NOT REGISTERED".yellow());
+                issues += 1;
+                if fix {
+                    println!("  Attempting install...");
+                    if install_crush_hook_at(&config_path, false).is_ok() {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    } else {
+                        println!("  {}", "Failed to fix".red());
+                    }
+                } else {
+                    println!(
+                        "  → Run 'dcg install --crush' to register the hook in {}",
+                        config_path.display()
+                    );
+                }
+            }
+            Err(err) => {
+                println!("{}", "INVALID".red());
+                issues += 1;
+                println!("  {} cannot be parsed: {err}", config_path.display());
+                println!("  → Fix the JSON by hand, then run 'dcg install --crush'");
+            }
+        }
+    }
+
     // Check 3b2: Codex hook registration AND enablement (#368). Codex loads
     // PreToolUse hooks from ~/.codex/hooks.json but only RUNS a hook the user
     // has approved: a `[hooks.state."<file>:pre_tool_use:<i>:<j>"]` entry in
@@ -11891,6 +11952,59 @@ fn collect_doctor_report(
         });
     }
 
+    // Crush hook registration (#388). Mirrored in `doctor_pretty`. Crush reads
+    // only its own crush.json (no Claude settings compatibility layer), so
+    // "not registered" means the guard is wired nowhere for it.
+    if crush_appears_in_use() {
+        let mut crush_fixed = false;
+        let config_path = crush_user_config_path();
+        let (status, message, remediation) = match crush_user_config_registers_dcg() {
+            Ok(true) => (
+                DoctorCheckStatus::Ok,
+                format!("Crush dcg hook registered in {}", config_path.display()),
+                None,
+            ),
+            Ok(false) => {
+                issues += 1;
+                if fix && install_crush_hook_at(&config_path, false).is_ok() {
+                    fixed += 1;
+                    crush_fixed = true;
+                    (
+                        DoctorCheckStatus::Ok,
+                        format!("Installed Crush dcg hook in {}", config_path.display()),
+                        None,
+                    )
+                } else {
+                    (
+                        DoctorCheckStatus::Error,
+                        format!(
+                            "Crush is in use but {} has no dcg PreToolUse hook — its bash \
+                             tool calls are not guarded",
+                            config_path.display()
+                        ),
+                        Some("Run 'dcg install --crush'".to_string()),
+                    )
+                }
+            }
+            Err(err) => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    format!("{} cannot be parsed: {err}", config_path.display()),
+                    Some("Fix the JSON by hand, then run 'dcg install --crush'".to_string()),
+                )
+            }
+        };
+        checks.push(DoctorCheck {
+            id: "crush_hook",
+            name: "Crush hook registration",
+            status,
+            message,
+            remediation,
+            fixed: crush_fixed,
+        });
+    }
+
     // Codex hook registration AND enablement (#368). Mirrored in
     // `doctor_pretty` — see the renderer-parity note above the Grok block. A
     // hook that is registered in hooks.json but untrusted (no [hooks.state]
@@ -12203,7 +12317,6 @@ fn current_dcg_executable() -> std::io::Result<std::path::PathBuf> {
     Ok(executable)
 }
 
-#[cfg(unix)]
 fn posix_quote_hook_program(program: &str) -> String {
     if program.chars().all(|character| {
         character.is_ascii_alphanumeric()
@@ -13031,6 +13144,361 @@ fn project_antigravity_hooks_path() -> Result<std::path::PathBuf, Box<dyn std::e
     let repo_root = find_repo_root_from_cwd()
         .ok_or("Not inside a git repository — cannot determine project root")?;
     Ok(repo_root.join(".gemini").join("config").join("hooks.json"))
+}
+
+/// Regex Crush tests against the tool name; its shell tool is `bash` on
+/// every platform (Crush runs an embedded POSIX shell, so there is no
+/// PowerShell variant to match).
+const CRUSH_SHELL_MATCHER: &str = "^bash$";
+
+/// Canonical Crush hook event key. Crush also accepts case- and
+/// separator-insensitive spellings (`pretooluse`, `pre_tool_use`, …) and folds
+/// them onto this one at load time; see [`is_crush_pre_tool_use_key`].
+const CRUSH_PRE_TOOL_USE_EVENT: &str = "PreToolUse";
+
+/// Keys dcg owns on its Crush hook entry. Everything else (`name`, `timeout`)
+/// is host-owned and survives a reinstall, mirroring [`DCG_OWNED_HOOK_KEYS`]
+/// for Claude-shaped hooks (#345).
+const DCG_OWNED_CRUSH_HOOK_KEYS: &[&str] = &["command", "matcher"];
+
+/// Path to the user-level Crush config Crush reads on every platform:
+/// `$CRUSH_GLOBAL_CONFIG/crush.json` when that override is set, else
+/// `$XDG_CONFIG_HOME/crush/crush.json`, else `~/.config/crush/crush.json`
+/// (Crush uses `~/.config` on Windows too). Verified against
+/// `internal/config/load.go` (`GlobalConfig`) in charmbracelet/crush.
+///
+/// `~/.local/share/crush/crush.json` is Crush's machine-written *data* file
+/// (`GlobalConfigData`) and is deliberately left alone.
+fn crush_user_config_path() -> std::path::PathBuf {
+    crush_user_config_path_for(
+        std::env::var_os("CRUSH_GLOBAL_CONFIG"),
+        std::env::var_os("XDG_CONFIG_HOME"),
+        dirs::home_dir().unwrap_or_default(),
+    )
+}
+
+/// Pure resolver behind [`crush_user_config_path`]: `CRUSH_GLOBAL_CONFIG` is
+/// a *directory* override, `XDG_CONFIG_HOME` replaces `~/.config`.
+fn crush_user_config_path_for(
+    global_config_dir: Option<std::ffi::OsString>,
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: std::path::PathBuf,
+) -> std::path::PathBuf {
+    if let Some(dir) = global_config_dir.filter(|value| !value.is_empty()) {
+        return std::path::PathBuf::from(dir).join("crush.json");
+    }
+    let config_home = xdg_config_home
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| home.join(".config"), std::path::PathBuf::from);
+    config_home.join("crush").join("crush.json")
+}
+
+/// Path to the project-level Crush config. Crush walks from the working
+/// directory up to the Git root looking for `.crush.json` and `crush.json`
+/// (the hidden name wins on conflict, and every file's `hooks` arrays are
+/// concatenated). An existing file at the repo root is edited in place —
+/// `crush.json` first, then `.crush.json` — and the documented `crush.json`
+/// name is created when neither exists.
+///
+/// Returns `Err` if the current directory is not inside a git repository.
+fn project_crush_config_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let repo_root = find_repo_root_from_cwd()
+        .ok_or("Not inside a git repository — cannot determine project root")?;
+    let visible = repo_root.join("crush.json");
+    if visible.exists() {
+        return Ok(visible);
+    }
+    let hidden = repo_root.join(".crush.json");
+    if hidden.exists() {
+        return Ok(hidden);
+    }
+    Ok(visible)
+}
+
+/// Whether a `hooks` key is one of Crush's accepted spellings of `PreToolUse`.
+fn is_crush_pre_tool_use_key(key: &str) -> bool {
+    key.chars()
+        .filter(|character| !matches!(character, '_' | '-'))
+        .flat_map(char::to_lowercase)
+        .eq("pretooluse".chars())
+}
+
+/// The `hooks.PreToolUse[]` entry dcg writes into `crush.json`.
+///
+/// Crush executes `command` through its embedded POSIX shell on every OS, so
+/// the absolute dcg path is POSIX-quoted even on Windows (never the
+/// PowerShell `& '…'` form Claude's installer uses there). Crush pipes the
+/// tool call to the hook's stdin; dcg recognizes the envelope on its own, so
+/// no arguments are needed. The timeout matches the Grok installer and is far
+/// above dcg's hook fast path.
+fn crush_dcg_hook_entry_for_executable(
+    executable: &std::path::Path,
+) -> std::io::Result<serde_json::Value> {
+    if !executable.is_absolute() {
+        return Err(std::io::Error::other(format!(
+            "dcg hook executable path is not absolute: {}",
+            executable.display()
+        )));
+    }
+    let executable = executable.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "dcg hook executable path is not valid UTF-8: {}",
+                executable.display()
+            ),
+        )
+    })?;
+    Ok(serde_json::json!({
+        "name": "dcg",
+        "matcher": CRUSH_SHELL_MATCHER,
+        "command": posix_quote_hook_program(executable),
+        "timeout": 5
+    }))
+}
+
+fn crush_dcg_hook_entry() -> std::io::Result<serde_json::Value> {
+    crush_dcg_hook_entry_for_executable(&current_dcg_executable()?)
+}
+
+fn crush_hook_entry_is_dcg(entry: &serde_json::Value) -> bool {
+    entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(is_dcg_command)
+}
+
+/// Remove every dcg entry from every `PreToolUse` spelling in a Crush
+/// config's `hooks` object, returning the first one removed (the template for
+/// host-owned fields on reinstall).
+///
+/// # Errors
+///
+/// Returns an error if `hooks` is not an object or a `PreToolUse` value is
+/// not an array; dcg never rewrites a shape it does not understand.
+fn remove_dcg_hooks_from_crush_hooks(
+    hooks: &mut serde_json::Value,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    let hooks_obj = hooks
+        .as_object_mut()
+        .ok_or("Invalid hooks format in crush.json (expected JSON object)")?;
+    let mut previous = None;
+    for (key, value) in hooks_obj.iter_mut() {
+        if !is_crush_pre_tool_use_key(key) {
+            continue;
+        }
+        let entries = value.as_array_mut().ok_or_else(|| {
+            format!("Invalid hooks.{key} format in crush.json (expected JSON array)")
+        })?;
+        entries.retain(|entry| {
+            let is_dcg = crush_hook_entry_is_dcg(entry);
+            if is_dcg && previous.is_none() {
+                previous = Some(entry.clone());
+            }
+            !is_dcg
+        });
+    }
+    Ok(previous)
+}
+
+/// Install (or refresh) dcg's hook entry in an in-memory Crush config.
+///
+/// Stale dcg entries under any spelling of the event key are removed, the
+/// fresh entry is inserted at the front of `hooks.PreToolUse` (Crush resolves
+/// hooks in config order; first deny wins), and host-owned fields from the
+/// entry being replaced are kept. Returns `Ok(true)` when the config changed
+/// (always `true` with `force`).
+///
+/// # Errors
+///
+/// Returns an error if the config, its `hooks`, or a `PreToolUse` value has an
+/// unexpected JSON shape.
+fn install_crush_hook_into_config(
+    config: &mut serde_json::Value,
+    force: bool,
+    desired_entry: serde_json::Value,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let config_obj = config
+        .as_object_mut()
+        .ok_or("Invalid crush.json format (expected JSON object)")?;
+    let hooks = config_obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    let original = hooks.clone();
+
+    let previous = remove_dcg_hooks_from_crush_hooks(hooks)?;
+    let mut merged = match previous.as_ref().and_then(serde_json::Value::as_object) {
+        Some(previous) => {
+            let mut merged = previous.clone();
+            for key in DCG_OWNED_CRUSH_HOOK_KEYS {
+                merged.remove(*key);
+            }
+            merged
+        }
+        None => serde_json::Map::new(),
+    };
+    if let serde_json::Value::Object(desired) = desired_entry {
+        for (key, value) in desired {
+            // dcg-owned keys are always refreshed; host-owned defaults
+            // (`name`, `timeout`) only fill gaps so user edits survive.
+            if DCG_OWNED_CRUSH_HOOK_KEYS.contains(&key.as_str()) || !merged.contains_key(&key) {
+                merged.insert(key, value);
+            }
+        }
+    }
+
+    let entries = hooks
+        .as_object_mut()
+        .expect("validated above")
+        .entry(CRUSH_PRE_TOOL_USE_EVENT)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or("Invalid hooks.PreToolUse format in crush.json (expected JSON array)")?;
+    entries.insert(0, serde_json::Value::Object(merged));
+
+    Ok(force || *hooks != original)
+}
+
+/// Remove dcg's hook entries from an in-memory Crush config. Returns
+/// `Ok(true)` when at least one entry was removed.
+fn uninstall_dcg_hook_from_crush_config(
+    config: &mut serde_json::Value,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(hooks) = config.get_mut("hooks") else {
+        return Ok(false);
+    };
+    if hooks.is_null() {
+        return Ok(false);
+    }
+    Ok(remove_dcg_hooks_from_crush_hooks(hooks)?.is_some())
+}
+
+fn read_crush_config(
+    path: &std::path::Path,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    if content.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    Ok(serde_json::from_str(&content)?)
+}
+
+/// Install the dcg hook into Crush's config (#388).
+///
+/// Merges a `hooks.PreToolUse` entry into `~/.config/crush/crush.json`
+/// (user-level) or the repo's `crush.json` (with `--project`), preserving
+/// everything else in the file. Crush deep-merges its config files and
+/// concatenates `hooks` arrays, so a user-level entry coexists with any
+/// project hooks.
+///
+/// Returns `Err` if the file cannot be read/written, has an unexpected shape,
+/// or, for project installs, if the current directory is not inside a git
+/// repository.
+fn install_crush_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let config_path = if project {
+        project_crush_config_path()?
+    } else {
+        crush_user_config_path()
+    };
+
+    if !install_crush_hook_at(&config_path, force)? {
+        println!("{}", "Hook already installed!".yellow());
+        println!("Use --force to reinstall");
+        return Ok(());
+    }
+
+    let level = if project { "project" } else { "user" };
+    println!("{}", "Crush hook installed successfully!".green().bold());
+    println!("Config updated ({level}): {}", config_path.display());
+    println!();
+    println!(
+        "{}",
+        "Restart Crush (or start a new session) for the change to take effect.".yellow()
+    );
+
+    Ok(())
+}
+
+/// Merge dcg's hook entry into the Crush config at `config_path` without
+/// printing (shared by `dcg install --crush` and `dcg doctor --fix`). Returns
+/// `Ok(true)` when the file was (re)written.
+fn install_crush_hook_at(
+    config_path: &std::path::Path,
+    force: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut config = if config_path.exists() {
+        read_crush_config(config_path)?
+    } else {
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        serde_json::json!({})
+    };
+
+    let changed = install_crush_hook_into_config(&mut config, force, crush_dcg_hook_entry()?)?;
+    if changed {
+        let content = serde_json::to_string_pretty(&config)?;
+        std::fs::write(config_path, content)?;
+    }
+    Ok(changed)
+}
+
+/// Remove the dcg hook entry from Crush's user-level config (#388).
+fn uninstall_crush_hook() -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let config_path = crush_user_config_path();
+    if !config_path.exists() {
+        println!(
+            "{} {}",
+            "No Crush config found at".yellow(),
+            config_path.display()
+        );
+        return Ok(());
+    }
+
+    let mut config = read_crush_config(&config_path)?;
+    let removed = uninstall_dcg_hook_from_crush_config(&mut config)?;
+    if removed {
+        let content = serde_json::to_string_pretty(&config)?;
+        std::fs::write(&config_path, content)?;
+        println!("{}", "Crush hook removed successfully!".green().bold());
+        println!("Config updated: {}", config_path.display());
+    } else {
+        println!("{}", "No dcg hook found in Crush config.".yellow());
+    }
+
+    Ok(())
+}
+
+/// Whether the user-level Crush config registers a dcg `PreToolUse` hook.
+/// `Err` means the file exists but cannot be parsed.
+fn crush_user_config_registers_dcg() -> Result<bool, String> {
+    let path = crush_user_config_path();
+    if !path.exists() {
+        return Ok(false);
+    }
+    let config = read_crush_config(&path).map_err(|error| error.to_string())?;
+    let Some(hooks) = config.get("hooks").and_then(serde_json::Value::as_object) else {
+        return Ok(false);
+    };
+    Ok(hooks.iter().any(|(key, value)| {
+        is_crush_pre_tool_use_key(key)
+            && value
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(crush_hook_entry_is_dcg))
+    }))
+}
+
+/// Whether Crush is plausibly in use on this machine: dcg was spawned by
+/// Crush (`CRUSH=1`) or Crush's config directory exists.
+fn crush_appears_in_use() -> bool {
+    std::env::var_os("CRUSH").is_some()
+        || crush_user_config_path()
+            .parent()
+            .is_some_and(std::path::Path::is_dir)
 }
 
 /// Ownership marker embedded in the generated OpenCode plugin (#318).
@@ -19652,6 +20120,203 @@ mod tests {
         assert!(!is_dcg_command(r"& 'C:\unterminated\dcg.exe"));
     }
 
+    // ---- Crush installer (#388) -------------------------------------------
+
+    fn crush_entry_for(path: &str) -> serde_json::Value {
+        crush_dcg_hook_entry_for_executable(std::path::Path::new(path)).expect("entry")
+    }
+
+    fn crush_pre_tool_use(config: &serde_json::Value) -> &Vec<serde_json::Value> {
+        config["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("hooks.PreToolUse array")
+    }
+
+    #[test]
+    fn crush_hook_entry_is_flat_and_posix_quoted() {
+        let entry = crush_entry_for("/opt/tools/dcg");
+        assert_eq!(entry["name"], "dcg");
+        assert_eq!(entry["matcher"], "^bash$");
+        assert_eq!(entry["command"], "/opt/tools/dcg");
+        assert_eq!(entry["timeout"], 5);
+        // Crush's entry is flat: no Claude-style nested `hooks`/`type`.
+        assert!(entry.get("hooks").is_none());
+        assert!(entry.get("type").is_none());
+
+        // Crush runs `command` through its embedded POSIX shell on every OS,
+        // so a path with spaces or backslashes is POSIX-quoted (never the
+        // PowerShell `& '…'` form) and round-trips through the dcg-command
+        // parser used to find stale entries. `is_absolute` is host-specific,
+        // so the Windows spelling is only exercised on Windows.
+        let path = if cfg!(windows) {
+            r"C:\Users\Jane Doe\.local\bin\dcg.exe"
+        } else {
+            "/Users/Jane Doe/.local/bin/dcg"
+        };
+        let entry = crush_entry_for(path);
+        let command = entry["command"].as_str().unwrap();
+        assert!(command.starts_with('"'), "quoted: {command}");
+        assert!(
+            !command.starts_with("& "),
+            "no PowerShell call operator: {command}"
+        );
+        assert_eq!(dcg_command_program(command).as_deref(), Some(path));
+
+        assert!(
+            crush_dcg_hook_entry_for_executable(std::path::Path::new("relative/dcg")).is_err(),
+            "relative executable paths are rejected"
+        );
+    }
+
+    #[test]
+    fn crush_pre_tool_use_key_spellings() {
+        for key in ["PreToolUse", "pretooluse", "PRE_TOOL_USE", "pre-tool-use"] {
+            assert!(is_crush_pre_tool_use_key(key), "{key}");
+        }
+        for key in ["PostToolUse", "PreToolUsed", "hooks", ""] {
+            assert!(!is_crush_pre_tool_use_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn install_crush_creates_hooks_structure() {
+        let mut config = serde_json::json!({ "$schema": "https://charm.land/crush.json" });
+        let changed =
+            install_crush_hook_into_config(&mut config, false, crush_entry_for("/opt/dcg"))
+                .expect("install ok");
+        assert!(changed);
+        assert_eq!(config["$schema"], "https://charm.land/crush.json");
+        let entries = crush_pre_tool_use(&config);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], crush_entry_for("/opt/dcg"));
+    }
+
+    #[test]
+    fn install_crush_is_idempotent_without_force() {
+        let mut config = serde_json::json!({
+            "hooks": { "PreToolUse": [ crush_entry_for("/opt/dcg") ] }
+        });
+        let changed =
+            install_crush_hook_into_config(&mut config, false, crush_entry_for("/opt/dcg"))
+                .expect("install ok");
+        assert!(!changed, "identical entry must be a no-op");
+        assert_eq!(crush_pre_tool_use(&config).len(), 1);
+
+        let changed =
+            install_crush_hook_into_config(&mut config, true, crush_entry_for("/opt/dcg"))
+                .expect("install ok");
+        assert!(changed, "--force always reports a rewrite");
+        assert_eq!(crush_pre_tool_use(&config).len(), 1);
+    }
+
+    #[test]
+    fn install_crush_replaces_stale_entries_and_keeps_host_owned_fields() {
+        // A stale entry under an alternate event spelling, with a user-chosen
+        // name and timeout, plus an unrelated user hook that must survive.
+        let mut config = serde_json::json!({
+            "hooks": {
+                "pre_tool_use": [
+                    { "name": "my-guard", "matcher": "bash", "command": "/old/path/dcg", "timeout": 30 }
+                ],
+                "PreToolUse": [
+                    { "matcher": "^bash$", "command": "./hooks/no-haskell.sh" }
+                ]
+            }
+        });
+        let changed =
+            install_crush_hook_into_config(&mut config, false, crush_entry_for("/new/dcg"))
+                .expect("install ok");
+        assert!(changed);
+
+        let entries = crush_pre_tool_use(&config);
+        assert_eq!(entries.len(), 2, "dcg first, then the user's hook");
+        assert_eq!(entries[0]["command"], "/new/dcg", "dcg-owned: refreshed");
+        assert_eq!(entries[0]["matcher"], "^bash$", "dcg-owned: refreshed");
+        assert_eq!(entries[0]["name"], "my-guard", "host-owned: preserved");
+        assert_eq!(entries[0]["timeout"], 30, "host-owned: preserved");
+        assert_eq!(entries[1]["command"], "./hooks/no-haskell.sh");
+        assert_eq!(
+            config["hooks"]["pre_tool_use"],
+            serde_json::json!([]),
+            "stale dcg entry removed from the alternate spelling"
+        );
+    }
+
+    #[test]
+    fn install_crush_rejects_unexpected_shapes() {
+        let mut config = serde_json::json!([]);
+        assert!(
+            install_crush_hook_into_config(&mut config, false, crush_entry_for("/opt/dcg"))
+                .is_err()
+        );
+        let mut config = serde_json::json!({ "hooks": [] });
+        assert!(
+            install_crush_hook_into_config(&mut config, false, crush_entry_for("/opt/dcg"))
+                .is_err()
+        );
+        let mut config = serde_json::json!({ "hooks": { "PreToolUse": {} } });
+        assert!(
+            install_crush_hook_into_config(&mut config, false, crush_entry_for("/opt/dcg"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn uninstall_crush_removes_only_dcg_entries() {
+        let mut config = serde_json::json!({
+            "options": { "debug": true },
+            "hooks": {
+                "PreToolUse": [
+                    crush_entry_for("/opt/dcg"),
+                    { "matcher": "^bash$", "command": "./hooks/no-haskell.sh" },
+                    { "command": "\"/Users/Jane Doe/.local/bin/dcg\"" }
+                ]
+            }
+        });
+        assert!(uninstall_dcg_hook_from_crush_config(&mut config).expect("uninstall ok"));
+        let entries = crush_pre_tool_use(&config);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["command"], "./hooks/no-haskell.sh");
+        assert_eq!(config["options"]["debug"], true);
+
+        assert!(
+            !uninstall_dcg_hook_from_crush_config(&mut config).expect("uninstall ok"),
+            "second pass finds nothing"
+        );
+        let mut config = serde_json::json!({});
+        assert!(!uninstall_dcg_hook_from_crush_config(&mut config).expect("no hooks key"));
+        let mut config = serde_json::json!({ "hooks": "nope" });
+        assert!(uninstall_dcg_hook_from_crush_config(&mut config).is_err());
+    }
+
+    #[test]
+    fn crush_user_config_path_follows_crush_precedence() {
+        use std::ffi::OsString;
+        let home = std::path::PathBuf::from("/home/jane");
+        assert_eq!(
+            crush_user_config_path_for(None, None, home.clone()),
+            std::path::PathBuf::from("/home/jane/.config/crush/crush.json")
+        );
+        assert_eq!(
+            crush_user_config_path_for(None, Some(OsString::from("/xdg")), home.clone()),
+            std::path::PathBuf::from("/xdg/crush/crush.json")
+        );
+        // CRUSH_GLOBAL_CONFIG names the directory and beats XDG.
+        assert_eq!(
+            crush_user_config_path_for(
+                Some(OsString::from("/override/crush")),
+                Some(OsString::from("/xdg")),
+                home.clone()
+            ),
+            std::path::PathBuf::from("/override/crush/crush.json")
+        );
+        // Empty values are treated as unset, as Crush does.
+        assert_eq!(
+            crush_user_config_path_for(Some(OsString::new()), Some(OsString::new()), home),
+            std::path::PathBuf::from("/home/jane/.config/crush/crush.json")
+        );
+    }
+
     #[test]
     fn install_into_settings_creates_structure() {
         let mut settings = serde_json::json!({});
@@ -20586,6 +21251,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(!force);
@@ -20594,6 +21260,7 @@ if ($errors.Count -ne 0) {
             assert!(!agy);
             assert!(!opencode);
             assert!(!omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
@@ -20609,6 +21276,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(force);
@@ -20617,6 +21285,7 @@ if ($errors.Count -ne 0) {
             assert!(!agy);
             assert!(!opencode);
             assert!(!omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
@@ -20632,6 +21301,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(!force);
@@ -20640,6 +21310,7 @@ if ($errors.Count -ne 0) {
             assert!(!agy);
             assert!(!opencode);
             assert!(!omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
@@ -20655,6 +21326,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(!force);
@@ -20663,6 +21335,7 @@ if ($errors.Count -ne 0) {
             assert!(!agy);
             assert!(!opencode);
             assert!(!omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
@@ -20678,6 +21351,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(!force);
@@ -20686,6 +21360,7 @@ if ($errors.Count -ne 0) {
             assert!(agy);
             assert!(!opencode);
             assert!(!omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
@@ -20701,6 +21376,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(!force);
@@ -20709,6 +21385,7 @@ if ($errors.Count -ne 0) {
             assert!(agy);
             assert!(!opencode);
             assert!(!omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
@@ -20724,6 +21401,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(!force);
@@ -20732,6 +21410,7 @@ if ($errors.Count -ne 0) {
             assert!(!agy);
             assert!(opencode);
             assert!(!omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
@@ -20747,6 +21426,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(force);
@@ -20755,6 +21435,7 @@ if ($errors.Count -ne 0) {
             assert!(!agy);
             assert!(opencode);
             assert!(!omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
@@ -20770,6 +21451,7 @@ if ($errors.Count -ne 0) {
             agy,
             opencode,
             omp,
+            crush,
         }) = cli.command
         {
             assert!(force);
@@ -20778,9 +21460,49 @@ if ($errors.Count -ne 0) {
             assert!(!agy);
             assert!(!opencode);
             assert!(omp);
+            assert!(!crush);
         } else {
             unreachable!("Expected Install command");
         }
+    }
+
+    #[test]
+    fn test_cli_parse_install_crush_with_project_and_force() {
+        let cli = Cli::parse_from(["dcg", "install", "--crush", "--project", "--force"]);
+        if let Some(Command::Install {
+            force,
+            project,
+            grok,
+            agy,
+            opencode,
+            omp,
+            crush,
+        }) = cli.command
+        {
+            assert!(force);
+            assert!(project);
+            assert!(!grok);
+            assert!(!agy);
+            assert!(!opencode);
+            assert!(!omp);
+            assert!(crush);
+        } else {
+            unreachable!("Expected Install command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_uninstall_crush_excludes_purge() {
+        let cli = Cli::parse_from(["dcg", "uninstall", "--crush"]);
+        if let Some(Command::Uninstall { purge, crush }) = cli.command {
+            assert!(!purge);
+            assert!(crush);
+        } else {
+            unreachable!("Expected Uninstall command");
+        }
+        // `--purge` removes dcg's own config dir; it has nothing to do with
+        // Crush's file, so the pairing is rejected rather than half-honored.
+        assert!(Cli::try_parse_from(["dcg", "uninstall", "--crush", "--purge"]).is_err());
     }
 
     #[test]
@@ -20792,6 +21514,10 @@ if ($errors.Count -ne 0) {
             ("--agy", "--opencode"),
             ("--agy", "--omp"),
             ("--opencode", "--omp"),
+            ("--crush", "--grok"),
+            ("--crush", "--agy"),
+            ("--crush", "--opencode"),
+            ("--crush", "--omp"),
         ] {
             assert!(
                 Cli::try_parse_from(["dcg", "install", left, right]).is_err(),

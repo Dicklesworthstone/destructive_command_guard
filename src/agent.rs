@@ -32,6 +32,10 @@
 //! - OpenCode: `OPENCODE=1` env var, set by dcg's generated OpenCode plugin
 //!   (`dcg install --opencode`, a `tool.execute.before` plugin at
 //!   `~/.config/opencode/plugins/dcg-guard.js`) when it spawns dcg (#318).
+//! - Crush (Charm): `CRUSH=1` env var, which Crush sets for every hook it runs
+//!   and every command its `bash` tool executes (alongside `AGENT=crush` /
+//!   `AI_AGENT=crush`, which are too generic to trust). Exact `crush`
+//!   parent-process basename is a fallback (#388).
 //! - Oh My Pi (`omp`): the generated OMP extension invokes dcg with the
 //!   explicit `--agent omp` flag (`dcg install --omp`). Exact `omp` and
 //!   `oh-my-pi` parent-process basenames are also recognized as a fallback.
@@ -111,6 +115,13 @@ pub enum Agent {
     /// Oh My Pi (`omp`). Guarded through a dcg-generated `tool_call` extension
     /// (`dcg install --omp`) that invokes dcg with `--agent omp`.
     Omp,
+    /// Charm Crush (<https://github.com/charmbracelet/crush>). Reads flat
+    /// `hooks.PreToolUse[{command, matcher, name, timeout}]` entries from
+    /// `~/.config/crush/crush.json` (or a project `crush.json` /
+    /// `.crush.json`), pipes `{"event":"PreToolUse","tool_name":"bash",
+    /// "tool_input":{"command":...}}` to the hook's stdin, and sets `CRUSH=1`
+    /// in every hook and `bash`-tool subprocess (#388).
+    Crush,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -140,6 +151,7 @@ impl Agent {
             Self::PositAssistant => "posit-assistant",
             Self::OpenCode => "opencode",
             Self::Omp => "omp",
+            Self::Crush => "crush",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -165,6 +177,7 @@ impl Agent {
                 | Self::PositAssistant
                 | Self::OpenCode
                 | Self::Omp
+                | Self::Crush
         )
     }
 
@@ -189,6 +202,7 @@ impl Agent {
     /// - `"cursor"`, `"cursor-ide"`, `"cursor_ide"` -> `CursorIde`
     /// - `"posit-assistant"`, `"posit_assistant"`, `"posit"`, `"pa"` -> `PositAssistant`
     /// - `"omp"`, `"oh-my-pi"` -> `Omp`
+    /// - `"crush"`, `"charm-crush"` -> `Crush`
     /// - `"unknown"` -> `Unknown`
     /// - Any other value -> `Custom(value)`
     #[must_use]
@@ -210,6 +224,7 @@ impl Agent {
             "positassistant" | "posit" | "pa" => Self::PositAssistant,
             "opencode" | "opencodecli" => Self::OpenCode,
             "omp" | "ohmypi" => Self::Omp,
+            "crush" | "charmcrush" | "crushcli" => Self::Crush,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -234,6 +249,7 @@ impl fmt::Display for Agent {
             Self::PositAssistant => write!(f, "Posit Assistant"),
             Self::OpenCode => write!(f, "OpenCode"),
             Self::Omp => write!(f, "Oh My Pi"),
+            Self::Crush => write!(f, "Crush"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -612,6 +628,20 @@ fn detect_from_environment() -> Option<DetectionResult> {
         ));
     }
 
+    // Crush (Charm) detection. Crush sets `CRUSH=1` (plus `AGENT=crush` and
+    // `AI_AGENT=crush`) in the environment of every hook it runs and every
+    // command its `bash` tool executes — documented under "Execution model"
+    // in Crush's hooks guide and implemented by `shell.CrushEnvMarkers()`.
+    // Presence-only, like the markers above. The generic `AGENT`/`AI_AGENT`
+    // names are deliberately not consulted: other tools may set them.
+    if std::env::var("CRUSH").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::Crush,
+            DetectionMethod::Environment,
+            Some("CRUSH".to_string()),
+        ));
+    }
+
     // Pi (earendil-works) detection. The `pi` coding agent injects
     // `PI_CODING_AGENT=true` into the environment of the subprocesses it
     // spawns. As with the other env markers we only check for the variable's
@@ -858,6 +888,7 @@ fn agent_for_basename(basename: &str) -> Option<Agent> {
         "pi" | "pi-cli" => Some(Agent::Pi),
         "opencode" => Some(Agent::OpenCode),
         "omp" | "oh-my-pi" => Some(Agent::Omp),
+        "crush" => Some(Agent::Crush),
         // "pa" is a dangerous prefix (pacman, pactl, pass, patch, ...); the
         // exact-match table is what keeps those from misclassifying.
         "pa" | "posit-assistant" => Some(Agent::PositAssistant),
@@ -1352,6 +1383,7 @@ mod env_tests {
         "GROK_WORKSPACE_ROOT",
         "ANTIGRAVITY_CONVERSATION_ID",
         "OPENCODE",
+        "CRUSH",
         "PI_CODING_AGENT",
         "PA_PROJECT_DIR",
     ];
@@ -1589,6 +1621,46 @@ mod env_tests {
         assert_eq!(agent_from_process_name("opencode"), Some(Agent::OpenCode));
         // Near-misses must not match the exact-name table.
         assert_eq!(agent_from_process_name("opencoder"), None);
+    }
+
+    #[test]
+    fn test_detect_crush_env() {
+        // #388: Crush sets CRUSH=1 for hook subprocesses (and bash-tool
+        // commands); the generic AGENT/AI_AGENT markers are not consulted.
+        with_env_var("CRUSH", "1", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::Crush);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value, Some("CRUSH".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_crush_env_beats_weak_posit_marker() {
+        // PA_PROJECT_DIR describes the surrounding workspace; a hook that
+        // names itself must win.
+        with_env_vars(&[("PA_PROJECT_DIR", "/work"), ("CRUSH", "1")], || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::Crush);
+        });
+    }
+
+    #[test]
+    fn test_crush_identity_mappings() {
+        assert_eq!(Agent::Crush.config_key(), "crush");
+        assert!(Agent::Crush.is_known());
+        assert_eq!(Agent::from_name("crush"), Agent::Crush);
+        assert_eq!(Agent::from_name("Crush"), Agent::Crush);
+        assert_eq!(Agent::from_name("charm-crush"), Agent::Crush);
+        assert_eq!(format!("{}", Agent::Crush), "Crush");
+        assert_eq!(agent_from_process_name("crush"), Some(Agent::Crush));
+        assert_eq!(
+            agent_from_process_name("/usr/local/bin/crush"),
+            Some(Agent::Crush)
+        );
+        // Near-misses must not match the exact-name table.
+        assert_eq!(agent_from_process_name("crusher"), None);
+        assert_eq!(agent_from_process_name("crush-tui"), None);
     }
 
     #[test]

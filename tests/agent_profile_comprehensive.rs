@@ -285,6 +285,22 @@ mod agent_detection_tests {
         assert_eq!(output["agent"]["detected"], "omp");
         assert_eq!(output["agent"]["detection_method"], "explicit");
     }
+
+    /// #388: Crush sets `CRUSH=1` for hook subprocesses and bash-tool
+    /// commands; that marker alone identifies the agent end to end.
+    #[test]
+    fn test_crush_detected_from_environment_marker() {
+        let (stdout, stderr, exit_code) = run_robot_mode_with_env(
+            &["test", "--dialect", "posix", "git status"],
+            &[("CRUSH", "1")],
+        );
+
+        assert_eq!(exit_code, 0, "safe command should be allowed: {stderr}");
+        let output: serde_json::Value =
+            serde_json::from_str(&stdout).expect("robot test output should be valid JSON");
+        assert_eq!(output["agent"]["detected"], "crush");
+        assert_eq!(output["agent"]["detection_method"], "environment_variable");
+    }
 }
 
 // =============================================================================

@@ -377,6 +377,66 @@ pub struct GrokHookOutput<'a> {
     pub remediation: Option<Remediation>,
 }
 
+/// Crush (Charm) `PreToolUse` output envelope, version 1.
+///
+/// Crush parses stdout only on exit code 0. `decision` is `"allow"`, `"deny"`
+/// or absent; absent means "no opinion" and the call proceeds through Crush's
+/// ordinary permission prompt. dcg never emits `"allow"` — in Crush that is
+/// an *affirmative* pre-approval that skips the user's permission prompt, and
+/// a guard has no business vouching for a command. `reason` is shown to the
+/// model when denying; `context` is appended to what the model sees on any
+/// decision, which is how non-blocking warnings travel. Crush's parser ignores
+/// unknown fields, so dcg's ergonomics fields (`allowOnceCode`, `ruleId`, …)
+/// ride along for tooling that wants them.
+///
+/// See `docs/hooks/README.md` in <https://github.com/charmbracelet/crush>.
+#[derive(Debug, Serialize)]
+pub struct CrushHookOutput<'a> {
+    /// Output envelope version. Crush defaults to 1 when omitted; pinning it
+    /// keeps the payload self-describing if the envelope evolves.
+    pub version: u8,
+
+    /// `"deny"` to block the tool call. Omitted (no opinion) for warnings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision: Option<&'static str>,
+
+    /// Why the call was denied. Surfaced to the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Cow<'a, str>>,
+
+    /// Extra context appended to what the model sees (used for warnings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<Cow<'a, str>>,
+
+    /// Short allow-once code (if a pending exception was recorded).
+    #[serde(rename = "allowOnceCode", skip_serializing_if = "Option::is_none")]
+    pub allow_once_code: Option<String>,
+
+    /// Full hash for allow-once disambiguation (if available).
+    #[serde(rename = "allowOnceFullHash", skip_serializing_if = "Option::is_none")]
+    pub allow_once_full_hash: Option<String>,
+
+    /// Stable rule identifier (e.g., "core.git:reset-hard").
+    #[serde(rename = "ruleId", skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+
+    /// Pack identifier that matched (e.g., "core.git").
+    #[serde(rename = "packId", skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+
+    /// Severity level of the matched pattern.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<crate::packs::Severity>,
+
+    /// Confidence score for this match (0.0-1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+
+    /// Remediation suggestions for the blocked command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<Remediation>,
+}
+
 /// Hook protocol variant for response formatting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookProtocol {
@@ -440,6 +500,27 @@ pub enum HookProtocol {
     /// hook config from `~/.gemini/config/hooks.json` (with
     /// `~/.gemini/antigravity-cli/hooks.json` symlinked to it).
     Antigravity,
+    /// Charm Crush protocol (#388). Wire shape: stdin carries the flat
+    /// snake_case envelope `{"event": "PreToolUse", "session_id": "...",
+    /// "cwd": "...", "tool_name": "bash", "tool_input": {"command": "..."}}`
+    /// — verified against `internal/hooks/input.go` (`BuildPayload`) in
+    /// <https://github.com/charmbracelet/crush>. The shell tool is named
+    /// `bash` on every platform (Crush runs an embedded POSIX shell). Crush
+    /// parses stdout as JSON on exit code 0: `{"decision": "deny", "reason":
+    /// "..."}` blocks the call, an omitted `decision` is "no opinion" (the
+    /// call goes through Crush's normal permission prompt), and `"allow"`
+    /// pre-approves the call and *skips* that prompt — so dcg never emits it.
+    /// Exit code 2 also blocks (stderr as reason) but dcg keeps its exit-0 +
+    /// JSON contract so the ergonomics fields survive; any other non-zero
+    /// exit is logged and fails open. Crush's parser ignores unknown fields.
+    ///
+    /// The `event` field is what Copilot CLI also sends (`"pre-tool-use"`,
+    /// hyphenated, alongside `tool_args`); Crush's PascalCase `"PreToolUse"`
+    /// together with `tool_input` and no `tool_args` is the discriminator.
+    /// Without it the payload fell through to the Copilot arm, whose flat
+    /// `permissionDecision` envelope Crush does not read, so a block was
+    /// silently downgraded to "no opinion" — dcg failed open under Crush.
+    Crush,
 }
 
 /// A shell command extracted from a hook request together with its execution
@@ -871,6 +952,26 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     let is_grok_tool = tool_name == "run_terminal_cmd" || tool_name == "run_terminal_command";
     if (is_grok_event || is_grok_tool) && input.event.is_none() && input.tool_args.is_none() {
         return HookProtocol::Grok;
+    }
+
+    // --- Crush (Charm) indicators (checked before Copilot) ---
+    // Crush's stdin envelope is `{"event": "PreToolUse", "session_id", "cwd",
+    // "tool_name": "bash", "tool_input": {"command": ...}}`. The only other
+    // agent that sends a top-level `event` is Copilot CLI, whose value is the
+    // hyphenated "pre-tool-use" and which carries `tool_args` rather than
+    // `tool_input`. Crush's PascalCase event name is compared byte-for-byte
+    // (case-insensitively) WITHOUT stripping separators — normalizing
+    // "pre-tool-use" would collapse the two. Crush's parser reads
+    // `decision`/`reason`, not Copilot's flat `permissionDecision`, so
+    // misrouting this payload to the Copilot arm turned every block into
+    // "no opinion" (#388). As with Grok, no `CRUSH=1` env fallback is used
+    // here: real Crush hook payloads always carry the wire markers.
+    let is_crush_event = input
+        .event
+        .as_deref()
+        .is_some_and(|event| event.eq_ignore_ascii_case("PreToolUse"));
+    if is_crush_event && input.tool_input.is_some() && input.tool_args.is_none() {
+        return HookProtocol::Crush;
     }
 
     // --- Copilot indicators (checked first) ---
@@ -2084,7 +2185,8 @@ pub fn write_denial_to(
         | HookProtocol::Gemini
         | HookProtocol::Hermes
         | HookProtocol::Grok
-        | HookProtocol::Antigravity => WarningAudience::HumanOperator,
+        | HookProtocol::Antigravity
+        | HookProtocol::Crush => WarningAudience::HumanOperator,
     };
 
     print_colorful_warning_to(
@@ -2269,6 +2371,30 @@ pub fn write_denial_to(
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }
+        HookProtocol::Crush => {
+            // Crush parses stdout JSON on exit 0: `{"decision":"deny","reason":
+            // ...}` blocks the bash tool call and shows `reason` to the model.
+            // Exit code 2 would also block (stderr as the reason) but the JSON
+            // path keeps dcg's ergonomics fields intact; Crush's parser ignores
+            // the ones it does not know. The colored deny message has already
+            // been written to stderr for the human operator.
+            let output = CrushHookOutput {
+                version: 1,
+                decision: Some("deny"),
+                reason: Some(Cow::Owned(message)),
+                context: None,
+                allow_once_code: allow_once.map(|info| info.code.clone()),
+                allow_once_full_hash: allow_once.map(|info| info.full_hash.clone()),
+                rule_id,
+                pack_id: pack.map(String::from),
+                severity,
+                confidence,
+                remediation,
+            };
+
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
     }
 }
 
@@ -2373,7 +2499,8 @@ pub fn write_review_request_to(
         | HookProtocol::Codex
         | HookProtocol::Hermes
         | HookProtocol::Grok
-        | HookProtocol::Antigravity => {
+        | HookProtocol::Antigravity
+        | HookProtocol::Crush => {
             unreachable!("non-review protocols returned through write_denial_to")
         }
     }
@@ -2637,6 +2764,29 @@ pub fn write_indeterminate_to(
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }
+        HookProtocol::Crush => {
+            // Crush has no `ask`: an omitted decision falls through to its
+            // normal permission prompt, which an allowlist or auto-approver
+            // may wave through — exactly the unattended case #338 guards
+            // against. Deny outright with the plain reason, like the other
+            // prompt-less protocols (the `unverified_decision` annotation is
+            // for protocols whose `ask` was downgraded).
+            let output = CrushHookOutput {
+                version: 1,
+                decision: Some("deny"),
+                reason: Some(Cow::Borrowed(reason)),
+                context: None,
+                allow_once_code: None,
+                allow_once_full_hash: None,
+                rule_id: None,
+                pack_id: None,
+                severity: None,
+                confidence: None,
+                remediation: None,
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
     }
 
     // A deadline response is useful only if the hook runner receives it before
@@ -2777,6 +2927,30 @@ pub(crate) fn write_warning_to(
                 decision: "allow",
                 reason: Cow::Owned(warn_reason.clone()),
                 system_message: Some(Cow::Owned(warn_reason)),
+                allow_once_code: None,
+                allow_once_full_hash: None,
+                rule_id,
+                pack_id: pack.map(String::from),
+                severity: None,
+                confidence: None,
+                remediation: None,
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+        HookProtocol::Crush => {
+            // Crush's `"allow"` is an affirmative pre-approval that SKIPS the
+            // user's permission prompt, so unlike Grok/agy a warn must not be
+            // expressed as an explicit allow — dcg would be vouching for a
+            // command it only meant to annotate. Omit `decision` ("no
+            // opinion": the call proceeds through Crush's ordinary permission
+            // flow, exactly as if dcg had stayed silent) and carry the warning
+            // in `context`, which Crush appends to what the model sees.
+            let output = CrushHookOutput {
+                version: 1,
+                decision: None,
+                reason: None,
+                context: Some(Cow::Owned(warn_reason)),
                 allow_once_code: None,
                 allow_once_full_hash: None,
                 rule_id,
@@ -3141,6 +3315,7 @@ mod tests {
             HookProtocol::Hermes,
             HookProtocol::Grok,
             HookProtocol::Antigravity,
+            HookProtocol::Crush,
         ] {
             for command in [ps_only, "git status"] {
                 assert_eq!(
@@ -4517,6 +4692,246 @@ mod tests {
     }
 
     // =========================================================================
+    // Crush (Charm) protocol tests (#388).
+    //
+    // The stdin shape below is what `hooks.BuildPayload` in
+    // charmbracelet/crush (`internal/hooks/input.go`) marshals for a
+    // PreToolUse hook: a flat snake_case envelope whose `event` is the
+    // PascalCase "PreToolUse" and whose `tool_input` is the raw JSON the model
+    // sent to the `bash` tool. Crush parses stdout on exit 0 and honors
+    // `{"decision":"deny","reason":...}`; an omitted `decision` is "no
+    // opinion" and `"allow"` skips the user's permission prompt entirely.
+    // =========================================================================
+
+    /// Verbatim shape of Crush's PreToolUse stdin payload.
+    const CRUSH_DENY_PAYLOAD: &str = r#"{"event":"PreToolUse","session_id":"313909e","cwd":"/home/user/project","tool_name":"bash","tool_input":{"command":"git reset --hard HEAD~1"}}"#;
+
+    #[test]
+    fn test_crush_payload_detected_as_crush_protocol() {
+        let input: HookInput = serde_json::from_str(CRUSH_DENY_PAYLOAD).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Crush);
+    }
+
+    #[test]
+    fn test_crush_payload_command_is_extracted() {
+        let input: HookInput = serde_json::from_str(CRUSH_DENY_PAYLOAD).unwrap();
+        let extracted = extract_command_with_context(&input).expect("command present");
+        assert_eq!(extracted.command, "git reset --hard HEAD~1");
+        assert_eq!(extracted.protocol, HookProtocol::Crush);
+        assert!(extracted.additional_commands.is_empty());
+        assert!(is_supported_shell_tool(input.tool_name.as_deref()));
+    }
+
+    #[test]
+    fn test_crush_event_name_is_case_insensitive_but_separator_sensitive() {
+        // Crush's config loader accepts `pretooluse`; be tolerant of the case
+        // in the payload too. The hyphenated Copilot spelling must NOT match:
+        // stripping separators would fold "pre-tool-use" onto "pretooluse".
+        for event in ["PreToolUse", "pretooluse", "PRETOOLUSE"] {
+            let json = format!(
+                r#"{{"event":"{event}","tool_name":"bash","tool_input":{{"command":"ls"}}}}"#
+            );
+            let input: HookInput = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                detect_protocol(&input),
+                HookProtocol::Crush,
+                "event {event}"
+            );
+        }
+        for event in ["pre-tool-use", "pre_tool_use", "PreToolUsed"] {
+            let json = format!(
+                r#"{{"event":"{event}","tool_name":"bash","tool_input":{{"command":"ls"}}}}"#
+            );
+            let input: HookInput = serde_json::from_str(&json).unwrap();
+            assert_ne!(
+                detect_protocol(&input),
+                HookProtocol::Crush,
+                "event {event}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_copilot_payload_is_not_captured_by_crush() {
+        // Copilot's `event` is hyphenated and it ships `tool_args`, not
+        // `tool_input`. Both must keep routing to the Copilot arm.
+        let json =
+            r#"{"event":"pre-tool-use","tool_name":"bash","tool_args":"{\"command\":\"ls\"}"}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+
+        // Even a PascalCase event loses to Copilot when `tool_args` is present.
+        let json =
+            r#"{"event":"PreToolUse","tool_name":"bash","tool_args":"{\"command\":\"ls\"}"}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+
+        // A bare PascalCase event without any tool input is not Crush's shape.
+        let json = r#"{"event":"PreToolUse","tool_name":"bash"}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+    }
+
+    #[test]
+    fn test_crush_non_shell_tool_is_still_crush_protocol_but_not_evaluated() {
+        // A user may register dcg with a broader matcher; the envelope is
+        // still Crush's, and the non-shell tool is ignored like everywhere else.
+        let json = r#"{"event":"PreToolUse","session_id":"s","cwd":"/p","tool_name":"edit","tool_input":{"file_path":"/p/main.go","old_string":"a","new_string":"b"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Crush);
+        assert!(!is_supported_shell_tool(input.tool_name.as_deref()));
+        assert!(extract_command_with_context(&input).is_none());
+    }
+
+    #[test]
+    fn test_crush_hook_output_deny_json_shape() {
+        let output = CrushHookOutput {
+            version: 1,
+            decision: Some("deny"),
+            reason: Some(Cow::Borrowed(
+                "git reset --hard destroys uncommitted changes",
+            )),
+            context: None,
+            allow_once_code: Some("abc123".to_string()),
+            allow_once_full_hash: None,
+            rule_id: Some("core.git:reset-hard".to_string()),
+            pack_id: Some("core.git".to_string()),
+            severity: Some(crate::packs::Severity::Critical),
+            confidence: None,
+            remediation: None,
+        };
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["decision"], "deny");
+        assert_eq!(
+            json["reason"],
+            "git reset --hard destroys uncommitted changes"
+        );
+        assert!(json.get("context").is_none(), "context omitted when None");
+        assert_eq!(json["allowOnceCode"], "abc123");
+        assert_eq!(json["ruleId"], "core.git:reset-hard");
+        // Never the Claude/Copilot/Hermes spellings.
+        assert!(json.get("hookSpecificOutput").is_none());
+        assert!(json.get("permissionDecision").is_none());
+        assert!(json.get("action").is_none());
+    }
+
+    #[test]
+    fn test_write_denial_crush_produces_deny_json() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_denial_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Crush,
+            "git reset --hard HEAD~1",
+            "git reset --hard destroys uncommitted changes",
+            Some("core.git"),
+            Some("reset-hard"),
+            None,
+            None,
+            None,
+            Some(crate::packs::Severity::Critical),
+            None,
+            &[],
+            None,
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["decision"], "deny");
+        assert!(
+            json["reason"]
+                .as_str()
+                .unwrap()
+                .contains("git reset --hard destroys uncommitted changes"),
+            "reason must carry the human-readable explanation, got: {}",
+            json["reason"]
+        );
+        assert_eq!(json["ruleId"], "core.git:reset-hard");
+        assert_eq!(json["packId"], "core.git");
+        assert!(json.get("hookSpecificOutput").is_none());
+        assert!(json.get("permissionDecision").is_none());
+        assert!(
+            !stderr.is_empty(),
+            "Crush denial must still surface the stderr warning box"
+        );
+    }
+
+    #[test]
+    fn test_write_warning_crush_has_no_decision_and_carries_context() {
+        // In Crush an explicit "allow" is an affirmative pre-approval that
+        // skips the user's permission prompt, so a warn must be expressed as
+        // "no opinion" (decision omitted) with the text in `context`.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Crush,
+            "git stash drop",
+            "drops stashed changes",
+            Some("core.git"),
+            Some("stash-drop"),
+            None,
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+
+        assert!(
+            json.get("decision").is_none(),
+            "warn must not pre-approve (allow) or block (deny) on Crush: {json}"
+        );
+        assert!(
+            json.get("reason").is_none(),
+            "reason is deny/halt-only: {json}"
+        );
+        assert!(
+            json["context"].as_str().unwrap().starts_with("DCG warn:"),
+            "context should be prefixed so the model knows this is advisory"
+        );
+        assert_eq!(json["ruleId"], "core.git:stash-drop");
+        assert!(!stderr.is_empty(), "stderr must contain warn text");
+    }
+
+    #[test]
+    fn test_write_review_request_crush_falls_back_to_deny() {
+        // Crush has no `ask` decision; review policy must not degrade to
+        // "no opinion" (which an allowlist could wave through).
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_review_request_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Crush,
+            "git push --force",
+            "force push rewrites remote history",
+            Some("core.git"),
+            Some("push-force"),
+            None,
+            None,
+            None,
+            Some(crate::packs::Severity::High),
+            None,
+            &[],
+            None,
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+        assert_eq!(json["decision"], "deny");
+    }
+
+    // =========================================================================
     // Antigravity CLI (`agy`) protocol tests.
     //
     // The wire shapes below are taken verbatim from the stdin `agy` passes to a
@@ -5302,6 +5717,7 @@ mod tests {
             (HookProtocol::Hermes, "block"),
             (HookProtocol::Grok, "deny"),
             (HookProtocol::Antigravity, "block"),
+            (HookProtocol::Crush, "deny"),
         ];
 
         for (protocol, expected_decision) in cases {
@@ -5337,7 +5753,8 @@ mod tests {
                 HookProtocol::Gemini
                 | HookProtocol::Hermes
                 | HookProtocol::Grok
-                | HookProtocol::Antigravity => (json["decision"].as_str(), json["reason"].as_str()),
+                | HookProtocol::Antigravity
+                | HookProtocol::Crush => (json["decision"].as_str(), json["reason"].as_str()),
             };
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
@@ -5370,6 +5787,7 @@ mod tests {
             (HookProtocol::Hermes, "block", false),
             (HookProtocol::Grok, "deny", false),
             (HookProtocol::Antigravity, "block", false),
+            (HookProtocol::Crush, "deny", false),
         ];
 
         for (protocol, expected_decision, reason_is_annotated) in cases {
@@ -5394,7 +5812,8 @@ mod tests {
                 HookProtocol::Gemini
                 | HookProtocol::Hermes
                 | HookProtocol::Grok
-                | HookProtocol::Antigravity => (json["decision"].as_str(), json["reason"].as_str()),
+                | HookProtocol::Antigravity
+                | HookProtocol::Crush => (json["decision"].as_str(), json["reason"].as_str()),
             };
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
@@ -5418,6 +5837,7 @@ mod tests {
             (HookProtocol::Hermes, "block"),
             (HookProtocol::Grok, "deny"),
             (HookProtocol::Antigravity, "block"),
+            (HookProtocol::Crush, "deny"),
         ];
         let allow = test_allow_once();
 
@@ -5461,7 +5881,8 @@ mod tests {
                 HookProtocol::Gemini
                 | HookProtocol::Hermes
                 | HookProtocol::Grok
-                | HookProtocol::Antigravity => (json["decision"].as_str(), json["reason"].as_str()),
+                | HookProtocol::Antigravity
+                | HookProtocol::Crush => (json["decision"].as_str(), json["reason"].as_str()),
             };
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");

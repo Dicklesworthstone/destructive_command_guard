@@ -20,6 +20,7 @@ trust to well-behaved agents while maintaining strict controls for unknown ones.
 | Hermes Agent | Environment | `HERMES_AGENT=1` or `HERMES_SESSION_ID` |
 | Grok (xAI) | Environment | `GROK_SESSION_ID`, `GROK_HOOK_EVENT`, or `GROK_WORKSPACE_ROOT` |
 | Oh My Pi (`omp`) | Explicit bridge / process | Generated extension passes `--agent omp`; exact `omp` and `oh-my-pi` process names are fallback matches |
+| Crush | Environment | `CRUSH=1` (set by Crush for hook subprocesses and `bash`-tool commands; the generic `AGENT`/`AI_AGENT` markers are not consulted). Hook payloads are recognized by their `event: "PreToolUse"` + `tool_input` envelope — see [crush-integration.md](crush-integration.md) |
 | Pi | Environment | `PI_CODING_AGENT=true` |
 | Posit Assistant | Environment | `PA_PROJECT_DIR` (set in hook subprocesses; checked last among environment markers so agents with their own markers win — environment detection still precedes parent-process detection) |
 

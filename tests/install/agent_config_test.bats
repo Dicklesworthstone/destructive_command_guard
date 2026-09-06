@@ -4592,3 +4592,172 @@ MOCKEOF
     [[ "$output" == *"Could not inspect Oh My Pi profiles under $profiles_root"* ]]
     [[ $'\n'"$output"$'\n' != *$'\nremoved\n'* ]]
 }
+
+# ============================================================================
+# Crush Configuration Tests (#388)
+# ============================================================================
+
+# The real crush.json merge (flat hooks.PreToolUse entry, host-owned field
+# preservation, CRUSH_GLOBAL_CONFIG/XDG resolution) is covered by Rust tests
+# against the real binary (tests/cli_e2e.rs). These tests cover
+# configure_crush's own logic: detection gating, delegation to
+# `dcg install --crush --force`, and status mapping.
+
+make_crush_mock_dcg() {
+    # $1 = behavior: "ok" writes/merges crush.json and exits 0; "fail" exits 1.
+    export XDG_CONFIG_HOME="$HOME/.config"
+    local behavior="$1"
+    cat > "$DEST/dcg" << MOCKEOF
+#!/bin/bash
+if [ "\$1" = "install" ] && [ "\$2" = "--crush" ]; then
+    case "$behavior" in
+        ok)
+            config_dir="\${CRUSH_GLOBAL_CONFIG:-\${XDG_CONFIG_HOME:-\$HOME/.config}/crush}"
+            mkdir -p "\$config_dir"
+            printf '{"hooks":{"PreToolUse":[{"name":"dcg","matcher":"^bash$","command":"%s","timeout":5}]}}\n' "$DEST/dcg" > "\$config_dir/crush.json"
+            echo "Crush hook installed successfully!"
+            exit 0
+            ;;
+        fail)
+            echo "Invalid crush.json format (expected JSON object)" >&2
+            exit 1
+            ;;
+    esac
+fi
+echo "dcg 1.0.0"
+MOCKEOF
+    chmod +x "$DEST/dcg"
+}
+
+@test "detect_agents: Crush detected from ~/.config/crush" {
+    export XDG_CONFIG_HOME="$HOME/.config"
+    mkdir -p "$HOME/.config/crush"
+    DETECTED_AGENTS=()
+
+    detect_agents
+
+    is_agent_detected "crush"
+}
+
+@test "detect_agents: Crush detected from the CRUSH_GLOBAL_CONFIG directory" {
+    export XDG_CONFIG_HOME="$HOME/.config"
+    export CRUSH_GLOBAL_CONFIG="$TEST_TMPDIR/crush-global"
+    mkdir -p "$CRUSH_GLOBAL_CONFIG"
+    DETECTED_AGENTS=()
+
+    detect_agents
+
+    is_agent_detected "crush"
+    unset CRUSH_GLOBAL_CONFIG
+}
+
+@test "detect_agents: Crush NOT detected without config dir or CLI" {
+    export XDG_CONFIG_HOME="$HOME/.config"
+    unset CRUSH_GLOBAL_CONFIG
+    DETECTED_AGENTS=()
+
+    detect_agents
+
+    ! is_agent_detected "crush"
+}
+
+@test "configure_crush: skipped when Crush not detected" {
+    export XDG_CONFIG_HOME="$HOME/.config"
+    DETECTED_AGENTS=()
+    CRUSH_STATUS=""
+
+    configure_crush
+
+    [ "$CRUSH_STATUS" = "skipped" ]
+    [ ! -f "$HOME/.config/crush/crush.json" ]
+}
+
+@test "configure_crush: delegates to dcg install --crush and reports created" {
+    DETECTED_AGENTS=("crush")
+    CRUSH_STATUS=""
+    AUTO_CONFIGURED=0
+    make_crush_mock_dcg ok
+
+    configure_crush
+
+    log_test "CRUSH_STATUS=$CRUSH_STATUS"
+    [ "$CRUSH_STATUS" = "created" ]
+    [ "$AUTO_CONFIGURED" -eq 1 ]
+    [ -f "$HOME/.config/crush/crush.json" ]
+    grep -q '"matcher": *"^bash\$"' "$HOME/.config/crush/crush.json"
+}
+
+@test "configure_crush: reports merged when crush.json already existed" {
+    DETECTED_AGENTS=("crush")
+    CRUSH_STATUS=""
+    make_crush_mock_dcg ok
+    mkdir -p "$HOME/.config/crush"
+    printf '{"options":{"debug":true}}\n' > "$HOME/.config/crush/crush.json"
+
+    configure_crush
+
+    [ "$CRUSH_STATUS" = "merged" ]
+}
+
+@test "configure_crush: maps failures to failed with reason" {
+    DETECTED_AGENTS=("crush")
+    CRUSH_STATUS=""
+    make_crush_mock_dcg fail
+
+    configure_crush || true
+
+    [ "$CRUSH_STATUS" = "failed" ]
+    [ -n "$CRUSH_FAILURE_REASON" ]
+}
+
+# ============================================================================
+# Crush Uninstall Tests (#388)
+# ============================================================================
+
+@test "unconfigure_crush: removes only dcg entries under every PreToolUse spelling" {
+    export XDG_CONFIG_HOME="$HOME/.config"
+    unset CRUSH_GLOBAL_CONFIG
+    mkdir -p "$HOME/.config/crush"
+    cat > "$HOME/.config/crush/crush.json" << 'JSON'
+{"options":{"debug":true},"hooks":{"pre_tool_use":[{"name":"dcg","matcher":"^bash$","command":"\"/Users/Jane Doe/.local/bin/dcg\"","timeout":5}],"PreToolUse":[{"matcher":"^bash$","command":"./hooks/no-haskell.sh"},{"command":"/opt/dcgrep/bin/scan"},{"command":"/usr/local/bin/dcg"}]}}
+JSON
+
+    run unconfigure_crush
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"removed"* ]]
+    python3 - "$HOME/.config/crush/crush.json" << 'PYEOF'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+assert cfg["options"]["debug"] is True
+assert cfg["hooks"]["pre_tool_use"] == []
+cmds = [e["command"] for e in cfg["hooks"]["PreToolUse"]]
+assert cmds == ["./hooks/no-haskell.sh", "/opt/dcgrep/bin/scan"], cmds
+PYEOF
+}
+
+@test "unconfigure_crush: noop when config missing or has no dcg entry" {
+    export XDG_CONFIG_HOME="$HOME/.config"
+    unset CRUSH_GLOBAL_CONFIG
+    run unconfigure_crush
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"removed"* ]]
+
+    mkdir -p "$HOME/.config/crush"
+    printf '{"hooks":{"PreToolUse":[{"command":"./hooks/mine.sh"}]}}\n' > "$HOME/.config/crush/crush.json"
+    run unconfigure_crush
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"removed"* ]]
+    grep -q 'mine.sh' "$HOME/.config/crush/crush.json"
+}
+
+@test "unconfigure_crush: also cleans a repo-root project crush.json" {
+    export XDG_CONFIG_HOME="$HOME/.config"
+    unset CRUSH_GLOBAL_CONFIG
+    mkdir -p "$TEST_WORKDIR/.git"
+    printf '{"hooks":{"PreToolUse":[{"name":"dcg","matcher":"^bash$","command":"/usr/local/bin/dcg"}]}}\n' > "$TEST_WORKDIR/crush.json"
+
+    run unconfigure_crush
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"removed"* ]]
+    ! grep -q '/usr/local/bin/dcg' "$TEST_WORKDIR/crush.json"
+}

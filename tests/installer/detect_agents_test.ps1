@@ -50,6 +50,8 @@ try {
     $env:LOCALAPPDATA = $null
     $env:OS = $null
     $env:PI_CONFIG_DIR = $null
+    $env:CRUSH_GLOBAL_CONFIG = $null  # no Crush config-path override leaks (#388)
+    $env:XDG_CONFIG_HOME = $null
 
     Write-Host "Test 1: detects only the agents whose config dir is present"
     $h1 = New-TempHome
@@ -67,6 +69,7 @@ try {
     Check ($a['Hermes'] -eq $false) "Hermes NOT detected"
     Check ($a['Posit'] -eq $false) "Posit Assistant NOT detected"
     Check ($a['Omp'] -eq $false) "Oh My Pi NOT detected"
+    Check ($a['Crush'] -eq $false) "Crush NOT detected (no ~/.config/crush, no crush on PATH)"
     $names = Get-DetectedAgentNames $a
     Check (($names -join ',') -eq 'Claude,Gemini,Grok') "summary lists detected agents in config order (got '$($names -join ',')')"
     Remove-Item -Recurse -Force $h1 -ErrorAction SilentlyContinue
@@ -102,6 +105,25 @@ try {
     $names1e = Get-DetectedAgentNames $a1e
     Check (($names1e -join ',') -eq 'Omp') "summary lists only Omp (got '$($names1e -join ',')')"
     Remove-Item -Recurse -Force $h1e -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1g: Crush detected from ~/.config/crush"
+    $h1g = New-TempHome
+    New-Item -ItemType Directory -Force -Path (Join-Path (Join-Path $h1g '.config') 'crush') | Out-Null
+    $a1g = Detect-Agents -HomeDir $h1g
+    Check ($a1g['Crush'] -eq $true) "Crush detected via ~/.config/crush"
+    $names1g = Get-DetectedAgentNames $a1g
+    Check (($names1g -join ',') -eq 'Crush') "summary lists only Crush (got '$($names1g -join ',')')"
+    Remove-Item -Recurse -Force $h1g -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1h: Crush detected from the CRUSH_GLOBAL_CONFIG directory override"
+    $h1h = New-TempHome
+    $crushOverride = Join-Path $h1h 'crush-global'
+    New-Item -ItemType Directory -Force -Path $crushOverride | Out-Null
+    $env:CRUSH_GLOBAL_CONFIG = $crushOverride
+    $a1h = Detect-Agents -HomeDir $h1h
+    Check ($a1h['Crush'] -eq $true) "Crush detected via CRUSH_GLOBAL_CONFIG"
+    $env:CRUSH_GLOBAL_CONFIG = $null
+    Remove-Item -Recurse -Force $h1h -ErrorAction SilentlyContinue
 
     Write-Host "Test 1f: Oh My Pi detected from PI_CONFIG_DIR"
     $h1f = New-TempHome

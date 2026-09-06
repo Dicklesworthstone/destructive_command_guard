@@ -1817,6 +1817,15 @@ function Detect-Agents {
     Test-Path -LiteralPath (Join-Path $HomeDir $name) -PathType Container -ErrorAction SilentlyContinue
   }
   $ompConfigRoot = Get-OmpConfigRootForDetection -HomeDir $HomeDir
+  # Crush (#388) keeps its config under ~/.config/crush on every OS (or the
+  # CRUSH_GLOBAL_CONFIG / XDG_CONFIG_HOME overrides, resolved like Crush does).
+  $crushConfigDir = if (-not [string]::IsNullOrWhiteSpace($env:CRUSH_GLOBAL_CONFIG)) {
+    $env:CRUSH_GLOBAL_CONFIG
+  } elseif (-not [string]::IsNullOrWhiteSpace($env:XDG_CONFIG_HOME)) {
+    Join-Path $env:XDG_CONFIG_HOME 'crush'
+  } else {
+    Join-Path (Join-Path $HomeDir '.config') 'crush'
+  }
   [ordered]@{
     'Claude'  = ((_dir '.claude')  -or (_has 'claude'))
     'Codex'   = ((_dir '.codex')   -or (_has 'codex'))
@@ -1838,6 +1847,8 @@ function Detect-Agents {
       (-not [string]::IsNullOrEmpty($env:PI_CODING_AGENT_DIR) -and
         [System.IO.Directory]::Exists($env:PI_CODING_AGENT_DIR)) -or
       (Test-Path Env:OMP_PROFILE) -or (_has 'omp'))
+    'Crush'   = ((Test-Path -LiteralPath $crushConfigDir -PathType Container -ErrorAction SilentlyContinue) -or
+      (_has 'crush'))
   }
 }
 
@@ -1845,7 +1856,7 @@ function Get-DetectedAgentNames {
   # The display-names of agents Detect-Agents flagged as present, in order.
   param($Agents)
   @(
-    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit', 'Omp')) {
+    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit', 'Omp', 'Crush')) {
       if ($Agents[$name]) { $name }
     }
   )
@@ -1881,6 +1892,7 @@ Configured agents (when detected, or with -Force/-EasyMode):
   Cursor IDE   (~/.cursor/hooks.json)         Hermes      (HERMES_HOME, else %LOCALAPPDATA%\hermes\config.yaml)
   Posit Assistant (~/.posit/assistant/settings.json)
   Oh My Pi     (active profile's extensions/dcg-guard.ts via dcg install --omp)
+  Crush        (~/.config/crush/crush.json hooks.PreToolUse via dcg install --crush)
   Grok / agy   via dcg install --grok / --agy under -EasyMode when detected
 '@
   exit 0
@@ -2298,6 +2310,22 @@ if ($detectedAgents['Omp'] -or $forceConfig) {
   }
 } else {
   Write-Info "Oh My Pi not detected; re-run with -EasyMode to configure its extension anyway"
+}
+
+# Configure Crush through the Rust installer (#388): it resolves Crush's config
+# path exactly as Crush does, merges a flat hooks.PreToolUse entry, and keeps
+# every other key in crush.json.
+if ($detectedAgents['Crush'] -or $forceConfig) {
+  Write-Host ""
+  try {
+    & $dcgExe install --crush --force | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Ok "Configured Crush hook via 'dcg install --crush'" }
+    else { Write-Warn "'dcg install --crush' exited with code $LASTEXITCODE" }
+  } catch {
+    Write-Warn "Crush hook configuration failed: $_"
+  }
+} else {
+  Write-Info "Crush not detected; re-run with -EasyMode to configure its hook anyway"
 }
 
 # Grok (xAI) and Antigravity (agy): configured via the dcg binary itself rather
