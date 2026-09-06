@@ -4401,7 +4401,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "redirect-truncate-root-home",
             r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full|tty)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
-            "shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to an existing sensitive system or home path destroys the previous file contents. A currently absent literal target inside an existing home-directory VCS worktree is allowed; dynamic paths, symlinks, missing parents, system paths, and .git internals stay blocked.",
+            "shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to an existing sensitive system or home path destroys the previous file contents. A currently absent literal target under the home directory with an existing parent is allowed (creation, not truncation — the same thing `>>` would do); existing files, dynamic paths, symlinks, missing parents, system paths, and .git internals stay blocked.",
             Critical,
             "`> /etc/passwd` (or `: > /etc/passwd`, `echo > /etc/passwd`, etc.) opens \
              the target file with O_WRONLY|O_CREAT|O_TRUNC — the contents are destroyed \
@@ -4411,9 +4411,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              There is NO recovery without backups.\n\n\
              Safer alternatives:\n\
              - Use append (`>>`) to preserve existing content: `echo line >> <file>`.\n\
-             - A literal, currently absent destination inside an existing home-directory VCS \
-               worktree is allowed. Existing files, symlinks, dynamic paths, missing parents, \
-               system paths, and `.git` internals remain blocked.\n\
+             - A literal, currently absent destination under your home directory whose parent \
+               directory exists is allowed (nothing to truncate). Existing files, symlinks, \
+               dynamic paths, missing parents, system paths, and `.git` internals remain blocked.\n\
              - For race-free exclusive creation, resolve a literal path and use:\n  \
                `producer | dcg create-new <path>` (existing files, directories, and symlinks are refused).\n\
              - Make a backup, then write via a temp file:\n  \

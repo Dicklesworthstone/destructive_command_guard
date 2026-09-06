@@ -15,6 +15,19 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Fixed
 
+- **`> ~/new-file` outside a VCS worktree is creation, not truncation
+  (#390).** `core.filesystem:redirect-truncate-root-home` allowed a
+  truncating redirect to an absent literal file only when the parent sat
+  inside a home-directory git worktree (#337), so `echo x > ~/.config/new`
+  and `echo x > ~/.claude/notes.md` were denied while `>> ` to the very same
+  absent path was allowed. The worktree predicate was attached to the wrong
+  case: VCS recoverability matters for existing tracked files (still
+  denied), not for a file that does not exist. The carve-out now applies to
+  any absent literal target under the home directory whose parent exists;
+  existing files, symlinks (dangling included), missing parents, dynamic
+  targets, system paths, parents that resolve outside the home directory,
+  and `.git` internals stay blocked. The check-then-open window is unchanged
+  from #337; `dcg create-new` remains the race-free path.
 - **A closed output pipe no longer kills dcg with `SIGABRT` (#389).**
   `dcg --version 2>&1 | head -1` — and, in hook mode, any stderr diagnostic
   written after the host stopped reading — hit `EPIPE`, which the `println!`

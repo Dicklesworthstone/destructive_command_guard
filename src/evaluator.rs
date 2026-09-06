@@ -20610,12 +20610,12 @@ fn evaluate_packs_with_allowlists_at_depth(
                 continue;
             }
 
-            // #337: a literal, currently absent target inside an existing
-            // home-directory worktree creates a new file rather than
-            // truncating one. Existing and unprovable targets stay denied.
+            // #337/#390: a literal, currently absent target under the home
+            // directory creates a new file rather than truncating one.
+            // Existing and unprovable targets stay denied.
             if pattern.name == Some("redirect-truncate-root-home")
                 && pack_id == "core.filesystem"
-                && redirect_targets_are_new_worktree_files(command_for_packs, shell_dialect)
+                && redirect_targets_are_new_home_files(command_for_packs, shell_dialect)
             {
                 continue;
             }
@@ -22425,11 +22425,23 @@ fn literal_home_redirect_path(raw: &str, home: &Path) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
-fn path_is_new_file_in_worktree(target: &Path, home: &Path) -> bool {
+/// Whether `target` is a currently absent literal file whose creation cannot
+/// truncate anything: not present (not even as a dangling symlink), parent
+/// directory exists and resolves inside `home`, and no `.git` component.
+///
+/// The parent is canonicalised so a symlinked parent that escapes the home
+/// directory (`~/link -> /etc`) is judged by where the file would really be
+/// created. The target itself is deliberately NOT canonicalised: a symlink at
+/// the target path is "something exists there" and stays denied, because the
+/// shell's `O_TRUNC` open would follow it.
+fn path_is_new_file_under_home(target: &Path, home: &Path) -> bool {
     match fs::symlink_metadata(target) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         _ => return false,
     }
+    // `.git` internals are VCS state, not user data: even a NEW file there
+    // (`.git/hooks/pre-commit`, `.git/info/exclude`) changes repository
+    // behaviour, so creation is not the harmless act it is elsewhere.
     if target
         .components()
         .any(|component| component.as_os_str() == ".git")
@@ -22443,24 +22455,10 @@ fn path_is_new_file_in_worktree(target: &Path, home: &Path) -> bool {
         return false;
     };
     let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    if !parent.starts_with(&canonical_home) {
-        return false;
-    }
-
-    let mut cursor = Some(parent.as_path());
-    while let Some(directory) = cursor {
-        if !directory.starts_with(&canonical_home) {
-            break;
-        }
-        if fs::symlink_metadata(directory.join(".git")).is_ok() {
-            return true;
-        }
-        cursor = directory.parent();
-    }
-    false
+    parent.starts_with(&canonical_home)
 }
 
-fn redirect_targets_are_new_worktree_files_with_home(
+fn redirect_targets_are_new_home_files_with_home(
     command: &str,
     dialect: ShellDialect,
     home: &Path,
@@ -22470,23 +22468,37 @@ fn redirect_targets_are_new_worktree_files_with_home(
     };
     targets.into_iter().all(|raw| {
         literal_home_redirect_path(&raw, home)
-            .is_some_and(|target| path_is_new_file_in_worktree(&target, home))
+            .is_some_and(|target| path_is_new_file_under_home(&target, home))
     })
 }
 
 /// Suppress the home-path truncation rule only when every redirect target is a
-/// currently absent literal file inside an existing VCS worktree.
+/// currently absent literal file under the home directory whose parent exists.
+///
+/// The hazard this rule models is `O_TRUNC` destroying existing contents. A
+/// target that does not exist has no contents to destroy, so creating it is
+/// exactly what `>>` — allowed everywhere — would do to the same path. The
+/// original carve-out (#337) additionally required the parent to sit inside a
+/// VCS worktree; that predicate was attached to the wrong case (#390): VCS
+/// recoverability matters for EXISTING tracked files (still denied here),
+/// while for an absent file there is nothing to recover. Dropping it makes
+/// `> ~/.config/new.toml` and `> ~/.claude/notes.md` behave like
+/// `> ~/repo/new.md` already did.
 ///
 /// This is intentionally evaluated only after the destructive redirect regex
 /// has matched, so ordinary hook traffic pays no filesystem cost. Existing
-/// files, symlinks, missing parents, dynamic targets, system paths, and `.git`
-/// internals remain denied. The existence check cannot make the shell's later
-/// open atomic; callers needing race-free exclusive creation should use
-/// `dcg create-new`.
-fn redirect_targets_are_new_worktree_files(command: &str, dialect: ShellDialect) -> bool {
-    dirs::home_dir().is_some_and(|home| {
-        redirect_targets_are_new_worktree_files_with_home(command, dialect, &home)
-    })
+/// files, symlinks, missing parents, dynamic targets, system paths, paths
+/// outside the caller's home, and `.git` internals remain denied.
+///
+/// The existence check cannot make the shell's later `open()` atomic: a file
+/// created between this check and the command running would be truncated.
+/// That window is the same one the worktree carve-out has accepted since
+/// #337, it requires a concurrent writer racing the agent's own command, and
+/// it is exactly what `dcg create-new` exists for when exclusive creation must
+/// be guaranteed.
+fn redirect_targets_are_new_home_files(command: &str, dialect: ShellDialect) -> bool {
+    dirs::home_dir()
+        .is_some_and(|home| redirect_targets_are_new_home_files_with_home(command, dialect, &home))
 }
 
 /// Whether a matched `core.filesystem` redirect rule is suppressed by a
@@ -23771,7 +23783,7 @@ fn evaluate_pack_destructive_patterns(
                 continue;
             }
             if pattern.name == Some("redirect-truncate-root-home")
-                && redirect_targets_are_new_worktree_files(redirect_syntax_command, shell_dialect)
+                && redirect_targets_are_new_home_files(redirect_syntax_command, shell_dialect)
             {
                 continue;
             }
@@ -31554,8 +31566,12 @@ mod tests {
         }
     }
 
+    /// #337 / #390: the truncation hazard exists only for a target that
+    /// already exists. A literal absent file with an existing parent under
+    /// the home directory is creation, not truncation, whether or not a VCS
+    /// worktree is anywhere in sight.
     #[test]
-    fn new_literal_home_redirects_are_allowed_only_inside_worktrees() {
+    fn new_literal_home_redirects_are_allowed_with_or_without_a_worktree() {
         let home = tempfile::tempdir().expect("temp home");
         let repo = home.path().join("repo");
         let nested = repo.join("docs");
@@ -31563,68 +31579,120 @@ mod tests {
         fs::create_dir_all(&nested).expect("nested directory");
         let existing = nested.join("existing.md");
         fs::write(&existing, b"keep").expect("existing fixture");
+        // Plain (non-VCS) home directories, the #390 table.
+        for dir in [".claude", ".config", ".ssh"] {
+            fs::create_dir_all(home.path().join(dir)).expect("home subdir");
+        }
+        fs::write(home.path().join(".zshrc"), b"keep").expect("dotfile fixture");
 
-        assert!(redirect_targets_are_new_worktree_files_with_home(
-            "echo hi > ~/repo/docs/new.md",
-            ShellDialect::Posix,
-            home.path(),
+        let allowed = |command: &str| {
+            assert!(
+                redirect_targets_are_new_home_files_with_home(
+                    command,
+                    ShellDialect::Posix,
+                    home.path(),
+                ),
+                "expected creation carve-out for {command:?}"
+            );
+        };
+        let denied = |command: &str| {
+            assert!(
+                !redirect_targets_are_new_home_files_with_home(
+                    command,
+                    ShellDialect::Posix,
+                    home.path(),
+                ),
+                "expected no carve-out for {command:?}"
+            );
+        };
+
+        // Inside a worktree (unchanged from #337).
+        allowed("echo hi > ~/repo/docs/new.md");
+        allowed(&format!(
+            "echo hi > {}/docs/new-absolute.md",
+            repo.display()
         ));
-        assert!(redirect_targets_are_new_worktree_files_with_home(
-            &format!("echo hi > {}/docs/new-absolute.md", repo.display()),
-            ShellDialect::Posix,
-            home.path(),
-        ));
-        assert!(!redirect_targets_are_new_worktree_files_with_home(
-            "echo hi > ~/repo/docs/existing.md",
-            ShellDialect::Posix,
-            home.path(),
-        ));
-        assert!(!redirect_targets_are_new_worktree_files_with_home(
-            "echo hi > ~/repo/missing-parent/new.md",
-            ShellDialect::Posix,
-            home.path(),
-        ));
-        assert!(!redirect_targets_are_new_worktree_files_with_home(
-            "echo hi > ~/repo/.git/new-control-file",
-            ShellDialect::Posix,
-            home.path(),
-        ));
-        assert!(!redirect_targets_are_new_worktree_files_with_home(
-            "echo hi > $TARGET",
-            ShellDialect::Posix,
-            home.path(),
-        ));
-        assert!(!redirect_targets_are_new_worktree_files_with_home(
-            "echo hi > /etc/new-dcg-file",
-            ShellDialect::Posix,
-            home.path(),
-        ));
-        assert!(!redirect_targets_are_new_worktree_files_with_home(
-            "echo hi > ~/repo/docs/new.md > ~/repo/docs/existing.md",
-            ShellDialect::Posix,
-            home.path(),
-        ));
+        // Outside any worktree (#390): same absent-literal shape, same answer.
+        allowed("echo hi > ~/.claude/absent.txt");
+        allowed("echo hi > ~/.config/absent.txt");
+        allowed("echo hi > $HOME/.config/absent.txt");
+        allowed("echo hi > ~/absent-top-level.txt");
+        // No sibling rule guards CREATION of credential files, and `>>` to the
+        // same absent path has always been allowed, so `>` follows suit: an
+        // absent target has nothing to truncate regardless of its name.
+        allowed("echo key > ~/.ssh/authorized_keys");
+
+        // Existing targets: the hazard the rule exists for, in and out of VCS.
+        denied("echo hi > ~/repo/docs/existing.md");
+        denied("echo hi > ~/.zshrc");
+        // Missing parent: the shell would fail, and a parent that does not
+        // exist cannot be proven to land inside the home directory.
+        denied("echo hi > ~/repo/missing-parent/new.md");
+        denied("echo hi > ~/missing-parent/new.md");
+        // `.git` internals, with and without a real repository around them.
+        denied("echo hi > ~/repo/.git/new-control-file");
+        denied("echo hi > ~/.claude/.git/new-control-file");
+        // Dynamic and system targets.
+        denied("echo hi > $TARGET");
+        denied("echo hi > /etc/new-dcg-file");
+        // Every target must qualify, not just the first.
+        denied("echo hi > ~/repo/docs/new.md > ~/repo/docs/existing.md");
+        denied("echo hi > ~/.claude/absent.txt > ~/.zshrc");
     }
 
     #[cfg(unix)]
     #[test]
-    fn new_worktree_redirect_refuses_existing_symlink_targets() {
+    fn new_home_redirect_refuses_existing_symlink_targets() {
         use std::os::unix::fs::symlink;
 
         let home = tempfile::tempdir().expect("temp home");
-        let repo = home.path().join("repo");
-        fs::create_dir_all(repo.join(".git")).expect("git marker");
-        let target = repo.join("real.md");
-        let link = repo.join("new-looking.md");
+        let plain = home.path().join("notes");
+        fs::create_dir_all(&plain).expect("plain directory");
+        let target = plain.join("real.md");
+        let link = plain.join("new-looking.md");
         fs::write(&target, b"keep").expect("target fixture");
         symlink(&target, &link).expect("symlink fixture");
+        // A dangling symlink is still "something exists at that path".
+        symlink(plain.join("nowhere.md"), plain.join("dangling.md")).expect("dangling fixture");
 
-        assert!(!redirect_targets_are_new_worktree_files_with_home(
-            "echo hi > ~/repo/new-looking.md",
+        assert!(!redirect_targets_are_new_home_files_with_home(
+            "echo hi > ~/notes/new-looking.md",
+            ShellDialect::Posix,
+            home.path(),
+        ));
+        assert!(!redirect_targets_are_new_home_files_with_home(
+            "echo hi > ~/notes/dangling.md",
             ShellDialect::Posix,
             home.path(),
         ));
         assert_eq!(fs::read(target).expect("target unchanged"), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_home_redirect_judges_symlinked_parents_by_their_real_location() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().expect("temp home");
+        let outside = tempfile::tempdir().expect("outside directory");
+        let inside = home.path().join("inside");
+        fs::create_dir_all(&inside).expect("inside directory");
+        symlink(outside.path(), home.path().join("escape")).expect("escape link");
+        symlink(&inside, home.path().join("alias")).expect("alias link");
+
+        // Parent resolves outside the home directory: not this rule's
+        // carve-out to grant.
+        assert!(!redirect_targets_are_new_home_files_with_home(
+            "echo hi > ~/escape/new.txt",
+            ShellDialect::Posix,
+            home.path(),
+        ));
+        // Parent resolves to a real directory under home: creation.
+        assert!(redirect_targets_are_new_home_files_with_home(
+            "echo hi > ~/alias/new.txt",
+            ShellDialect::Posix,
+            home.path(),
+        ));
     }
 
     #[test]
