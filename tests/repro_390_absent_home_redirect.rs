@@ -147,7 +147,34 @@ fn absent_literal_home_targets_are_creation_regardless_of_vcs() {
         Verdict::Deny
     );
 
+    // Targets the shell rewrites before `open()` are not literal: the path
+    // dcg would stat is absent while the file the shell truncates exists
+    // (`{c..c}` is a one-word brace sequence in bash and zsh; zsh MULTIOS
+    // writes `{,}` to both words; quote removal turns `.zsh"rc"` into
+    // `.zshrc`). Each of these was allowed between #390 and this fix.
+    for command in [
+        "echo hi > ~/.zshr{c..c}",
+        "echo hi > ~/.zshrc{,}",
+        "echo hi > ~/{.zshrc,absent.txt}",
+        "echo hi > ~/.zsh\"rc\"",
+        "echo hi > ~/'.zshrc'",
+        "echo hi > ~/.zshr(c|d)",
+        "echo hi > \"~/absent.txt\"",
+    ] {
+        assert_eq!(verdict(command, home), Verdict::Deny, "{command}");
+    }
+    // Non-ASCII file names are not shell syntax and stay literal.
+    assert_eq!(
+        verdict("echo hi > ~/.config/héllo-wörld.toml", home),
+        Verdict::Allow
+    );
+
     // Nothing was created by evaluating.
     assert!(!home.join(".claude/absent.txt").exists());
     assert!(!home.join(".config/absent.txt").exists());
+    assert!(!home.join(".config/héllo-wörld.toml").exists());
+    assert_eq!(
+        fs::read(home.join(".zshrc")).expect("dotfile survives"),
+        b"keep"
+    );
 }

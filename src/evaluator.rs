@@ -22365,11 +22365,38 @@ fn powershell_null_device_redirects_only(command: &str, dialect: ShellDialect) -
     })
 }
 
+/// Whether `character` can appear in a redirect target that the shell hands
+/// to `open()` exactly as written.
+///
+/// The carve-out below stats the path dcg reads out of the command, so the
+/// path must be one the shell will not rewrite first. Every ASCII character
+/// that any supported shell expands or removes is excluded: `{`/`}` (brace
+/// expansion — `~/.zshr{c..c}` becomes `~/.zshrc` in bash and zsh, and zsh's
+/// MULTIOS writes `~/.zshrc{,}` to every expansion), `"`/`'` (quote removal
+/// turns `~/.zsh"rc"` into `~/.zshrc`), `(`/`)`/`|` (zsh glob alternation,
+/// and `|` ends the token anyway), `*`/`?`/`[`/`]` (globs), `$`, backticks,
+/// backslashes, `<`/`>`/`&`/`;` and whitespace. Non-ASCII characters are
+/// never shell syntax, so ordinary Unicode file names stay literal.
+fn is_literal_redirect_target_char(character: char) -> bool {
+    !character.is_ascii()
+        || character.is_ascii_alphanumeric()
+        || matches!(
+            character,
+            '/' | '.' | '_' | '-' | '+' | ',' | '@' | '%' | ':' | '=' | '~'
+        )
+}
+
 fn literal_home_redirect_path(raw: &str, home: &Path) -> Option<PathBuf> {
     let (value, expands_home) = if let Some(inner) = raw
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
     {
+        // `$HOME` expands inside double quotes but `~` does not: `"~/x"`
+        // names a cwd-relative path literally spelled `~/x`, which is not a
+        // home path at all and cannot be proven absent here.
+        if inner.contains('~') {
+            return None;
+        }
         (inner, true)
     } else if let Some(inner) = raw
         .strip_prefix('\'')
@@ -22379,20 +22406,22 @@ fn literal_home_redirect_path(raw: &str, home: &Path) -> Option<PathBuf> {
     } else {
         (raw, true)
     };
-    if value.is_empty()
-        || value.contains(['\\', '`', '*', '?', '[', ']'])
-        || value.contains(char::is_whitespace)
-    {
+    if value.is_empty() || value.contains(char::is_whitespace) {
         return None;
     }
+    // The part of the target the shell hands to `open()` verbatim (everything
+    // after a recognised `~/`, `$HOME/`, or `${HOME}/` prefix, or the whole
+    // absolute path) must contain no character any shell rewrites first.
+    let literal = |segment: &str| segment.chars().all(is_literal_redirect_target_char);
+    let join_literal = |suffix: &str| literal(suffix).then(|| home.join(suffix));
 
     let path = if expands_home {
         if value == "~" {
             home.to_path_buf()
         } else if let Some(suffix) = value.strip_prefix("~/") {
-            home.join(suffix)
+            join_literal(suffix)?
         } else if let Some(suffix) = value.strip_prefix("$HOME/") {
-            home.join(suffix)
+            join_literal(suffix)?
         } else if let Some(suffix) = value.strip_prefix("$HOME") {
             if suffix.is_empty() {
                 home.to_path_buf()
@@ -22404,20 +22433,20 @@ fn literal_home_redirect_path(raw: &str, home: &Path) -> Option<PathBuf> {
             .and_then(|suffix| suffix.strip_prefix("{HOME}"))
         {
             if let Some(suffix) = suffix.strip_prefix('/') {
-                home.join(suffix)
+                join_literal(suffix)?
             } else if suffix.is_empty() {
                 home.to_path_buf()
             } else {
                 return None;
             }
         } else {
-            if value.contains(['$', '~']) {
+            if value.contains(['$', '~']) || !literal(value) {
                 return None;
             }
             PathBuf::from(value)
         }
     } else {
-        if value.contains(['$', '~']) {
+        if value.contains(['$', '~']) || !literal(value) {
             return None;
         }
         PathBuf::from(value)
@@ -31644,6 +31673,25 @@ mod tests {
         // Every target must qualify, not just the first.
         denied("echo hi > ~/repo/docs/new.md > ~/repo/docs/existing.md");
         denied("echo hi > ~/.claude/absent.txt > ~/.zshrc");
+
+        // Targets the shell rewrites before `open()`: the path dcg stats is
+        // absent while the file the shell truncates exists. Brace expansion
+        // (`{c..c}` is a one-word sequence in bash and zsh; zsh MULTIOS
+        // writes to every word of `{,}` / `{a,b}`), quote removal, zsh glob
+        // alternation, and escapes all disqualify the target.
+        denied("echo hi > ~/.zshr{c..c}");
+        denied("echo hi > $HOME/.zshr{c..c}");
+        denied("echo hi > ~/.zshrc{,}");
+        denied("echo hi > ~/{.zshrc,absent.txt}");
+        denied("echo hi > ~/.zsh\"rc\"");
+        denied("echo hi > ~/'.zshrc'");
+        denied("echo hi > ~/.zshr(c|d)");
+        denied("echo hi > ~/.zshr\\c");
+        // `~` does not expand inside double quotes: this is a cwd-relative
+        // path, not a home path, and cannot be proven absent.
+        denied("echo hi > \"~/absent.txt\"");
+        // Ordinary punctuation and non-ASCII names are still literal.
+        allowed("echo hi > ~/.config/héllo-wörld+v1,2@x%y=z:w.toml");
     }
 
     #[cfg(unix)]

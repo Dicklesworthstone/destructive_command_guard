@@ -28,6 +28,18 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   targets, system paths, parents that resolve outside the home directory,
   and `.git` internals stay blocked. The check-then-open window is unchanged
   from #337; `dcg create-new` remains the race-free path.
+- **Brace- and quote-obfuscated redirect targets no longer qualify for the
+  absent-file carve-out (follow-up to #390).** The literal-target check
+  rejected globs, backslashes, and backticks but not brace expansion or
+  embedded quotes, so `echo x > ~/.zshr{c..c}` (a one-word sequence
+  expansion in bash and zsh), `echo x > ~/.zshrc{,}` (zsh MULTIOS writes
+  every word), and `echo x > ~/.zsh"rc"` (quote removal) were judged by a
+  path that does not exist while the shell truncated one that does. The
+  #337 worktree carve-out had the same gap inside repositories; #390 widened
+  it to the whole home directory. A redirect target is now literal only when
+  every ASCII character in it is one no supported shell rewrites (letters,
+  digits, `/ . _ - + , @ % : = ~`); non-ASCII names stay literal. `"~/x"` is
+  no longer treated as a home path (`~` does not expand inside double quotes).
 - **A closed output pipe no longer kills dcg with `SIGABRT` (#389).**
   `dcg --version 2>&1 | head -1` — and, in hook mode, any stderr diagnostic
   written after the host stopped reading — hit `EPIPE`, which the `println!`
