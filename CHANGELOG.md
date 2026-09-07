@@ -11,7 +11,53 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## Unreleased
+## [v0.14.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.14.1) -- 2026-09-07 [Release]
+
+Crush support, the closed-pipe / fail-closed hook hardening, the absent-file
+redirect carve-out and its obfuscation follow-ups, and the post-0.14.0 pack
+fixes (git lfs, Azure, Azure DevOps, gh, heredocs, allowlist path scoping).
+
+### Added
+
+- **First-class Charm Crush hook support (#388).** Crush pipes
+  `{"event":"PreToolUse","tool_name":"bash","tool_input":{"command":…}}`
+  to the hook and reads `{"decision":"deny","reason":…}` on exit 0. That
+  payload used to fall through to the Copilot arm and get a flat
+  `permissionDecision` envelope Crush does not read, so a block was silently
+  "no opinion" — dcg failed open under Crush (confirmed against Crush's own
+  parser). New `HookProtocol::Crush` (PascalCase `event` + `tool_input`, no
+  `tool_args`), `CrushHookOutput`, and `Agent::Crush` (`CRUSH=1`). Warnings
+  travel as `context` with no decision, because in Crush `"allow"` is an
+  affirmative pre-approval that skips the user's permission prompt — dcg
+  never emits it. `dcg install --crush` / `dcg uninstall --crush` merge and
+  remove a `matcher: "^bash$"` entry in `crush.json` (`CRUSH_GLOBAL_CONFIG`,
+  `XDG_CONFIG_HOME`, `--project` honored), the installers configure it when
+  Crush is detected, `dcg doctor` reports a `crush_hook` check, and
+  `docs/crush-integration.md` documents the contract.
+- **`platform.azure_devops` pack (#385).** `az devops`, `az repos`,
+  `az pipelines`, `az boards`, and `az artifacts` act on an organization,
+  not Azure resources, and were unmatched (or partially overlapped by the
+  Azure resource safes after #384). GA commands only; `az devops invoke`
+  matches on `--http-method`; `az artifacts` has no destructive verb and no
+  rule pretends otherwise; list/show/search and ordinary create/run stay
+  unmatched. `--query`, display-name, WIQL, and PR-title text are registered
+  as non-executed strings.
+- **`git lfs` is a known subcommand with its own destructive rules
+  (PR #383).** `git lfs` dispatches to the git-lfs helper and never consults
+  `alias.lfs`, so the unverifiable-alias catch-all denied every read-only
+  `git lfs ls-files` / `status` / `fetch`. Those are allowed now, as is
+  `git lfs prune --dry-run` (whole token, not quoted text); `lfs migrate
+  import|export` (history rewrite), `lfs prune`, and `lfs uninstall` are
+  High-severity rules with preview/recover suggestions registered.
+- **`history.db` lives in the XDG state directory and its path is
+  configurable (#381).** History is state, not configuration, so it no
+  longer defaults into `~/.config/dcg` (read-only config mounts could not
+  write it). One resolver decides the path everywhere: `DCG_HISTORY_DB`,
+  then `[history] database_path`, then an existing pre-0.15 `history.db`
+  beside `config.toml` (honored, never moved), then
+  `$XDG_STATE_HOME/dcg/history.db` / `~/.local/state/dcg/history.db`
+  (`%LOCALAPPDATA%\dcg\history.db` on Windows). Directories are created
+  0700; `dcg doctor` gains a `history` check with a writability probe.
 
 ### Fixed
 
@@ -104,6 +150,61 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   command, and the allow-once pending store now go through the same redactor.
   Its `***` example in `docs/allow-once-usage.md` never matched the code and
   now reflects the real placeholders.
+- **`HOME=/` no longer grants the absent-file creation carve-out** (follow-up
+  to #390). `path_is_new_file_under_home` treated every absolute parent as
+  under a root home, which would have allowed `> /etc/new-file`; a home with
+  no parent now scopes nothing.
+- **Allowlist `--path` grants are scoped to the directory the command really
+  runs in, and fail closed without one (#387).** A `paths = [...]` entry was
+  matched against the hook process's own `getcwd()`, which has nothing to do
+  with the guarded tool call: the host reports that directory in the
+  payload's `cwd`, and a leading `cd`/`pushd` can move it again. The hook
+  now resolves the effective cwd from the payload plus any static leading
+  `cd`, compares canonical paths (a symlink out of the scope cannot borrow
+  the grant), lets a `cd` out of the scoped tree revoke the grant but never
+  extend it, and treats anything it cannot resolve statically (dynamic
+  targets, `popd`, subshells, pipes, a nested-payload `cd`, an unknown
+  working directory) as "no directory to test against" — every scoped entry
+  is then inapplicable. Entries without `paths` are unaffected.
+- **Backquoted substitutions inside expanding heredocs are evaluated (#377),
+  and a Codex `Bash` payload on Windows is judged by its command text
+  (#379).** tree-sitter-bash leaves a backquoted substitution in an
+  unquoted-delimiter heredoc body as plain content, so `` `rm -rf ~/x` ``
+  never reached the evaluator while `$(…)` was denied; expanding bodies are
+  now scanned with here-document escape rules, `$(…)` spans are evaluated
+  once, and an unterminated backquote fails closed. Delimiter quoting is
+  judged from the delimiter word only (a trailing `| tee "out"` no longer
+  makes the body look quoted), and backquote bodies carry their post-escape
+  text. Codex labels its shell tool `Bash` on every platform but may run it
+  through PowerShell, Git Bash, WSL, or `cmd.exe`; a command whose POSIX
+  substitution parse fails is evaluated as PowerShell, anything that parses
+  as POSIX as the fail-closed union of dialects, so `"`n"` escapes are
+  allowed and POSIX-only destructive forms are denied whichever shell runs.
+- **`gh release delete` no longer matches `delete-asset`, `--help`, or
+  quoted search text (#380).** Every verb in the GitHub pack ends in
+  `(?![\w-])` instead of `\b`, `gh release delete-asset` is its own Medium
+  rule, `--help`/`-h`/`gh help <cmd>` is a pack safe pattern (quoted tokens
+  consumed whole, walk stops at redirection), and `gh search <kind> …` is
+  query data.
+- **Quoted heredoc bodies handed to a non-shell interpreter are not shell
+  launchers (#382).** `python3 - <<'EOF'` (node/ruby/perl/php too) with a
+  Markdown fence in the body tripped `heredoc.shell:launcher-unverified`; a
+  segment lying entirely inside a quoted body to a proven non-shell
+  interpreter is withdrawn. Unquoted delimiters and shell receivers keep the
+  fail-closed treatment.
+- **Azure group-wide safes no longer hide deletions (#384).** The blanket
+  `az account` safe suppressed management-group, hierarchy-settings,
+  subscription, alias, and lock deletions, and `show`/`list` safes matched
+  flag values (`az group delete --name prod --yes --query show`). The
+  group-wide safes are gone (unmatched read-only commands are allowed by
+  default), show/list require a real service token, and help is a real
+  `--help`/`-h` flag walk.
+
+### Changed
+
+- `self_update` 1.0.0-rc.6 → 1.2.0 (PR #376): only additive API changes for
+  the backends dcg uses.
+- Toolchain pinned to `nightly-2026-08-31` (fleet-wide unification).
 
 ---
 
