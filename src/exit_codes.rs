@@ -15,6 +15,10 @@
 //! | 5 | `EXIT_IO_ERROR` | IO error |
 //! | 141 | `EXIT_BROKEN_PIPE` | Output reader went away (`EPIPE`) |
 //!
+//! Hook mode (no subcommand) has its own contract: the verdict is the JSON on
+//! stdout and the process exits 0 — except when a blocking verdict could not
+//! be written, which exits [`EXIT_HOOK_BLOCK`] (2).
+//!
 //! # Usage
 //!
 //! ```rust,ignore
@@ -90,6 +94,24 @@ pub const EXIT_IO_ERROR: i32 = 5;
 /// ignored: see `output::emit` for why a hook binary must not die on a
 /// stderr write while its verdict on stdout may still have a reader.
 pub const EXIT_BROKEN_PIPE: i32 = 141;
+
+/// Hook mode only: a blocking verdict (deny, ask, or indeterminate) could
+/// not be written to stdout, so the exit status carries the block instead.
+///
+/// Every hook protocol dcg speaks reads its decision from stdout JSON on
+/// exit 0, and every one of them treats exit 0 with *no* JSON as "proceed".
+/// When the stdout write itself fails (`EPIPE` — the host closed the pipe
+/// before the verdict was written) exit 0 would therefore convert a deny
+/// into an allow. Exit 2 is the blocking exit status of the Claude Code hook
+/// contract and of every protocol that copied it (Gemini CLI, Copilot CLI,
+/// Crush, Grok); the remaining protocols log a non-zero exit as a hook
+/// failure and fail open, which is no worse than exit 0. The per-protocol
+/// table lives on `HookProtocol::undeliverable_block_exit_code`.
+///
+/// This is the same number as [`EXIT_WARNING`], which belongs to robot-mode
+/// subcommands (`dcg --robot test --fail-on warn`); the two never share a
+/// process. Hook mode never exits 2 for any other reason.
+pub const EXIT_HOOK_BLOCK: i32 = 2;
 
 /// Convert an exit code constant to [`std::process::ExitCode`].
 ///

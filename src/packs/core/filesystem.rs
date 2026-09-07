@@ -636,6 +636,15 @@ struct PathToken<'a> {
     unquoted: &'a str,
     quote: QuoteKind,
     range: Range<usize>,
+    /// The byte right after the operand is an unquoted `(`.
+    ///
+    /// The tokenizer ends an operand at `(` because it is subshell syntax,
+    /// but zsh reads a `(` glued to a word as glob alternation or a glob
+    /// qualifier: `rm -rf ~/scratch/lo(g|x)` removes `~/scratch/log`, not
+    /// the spelled `~/scratch/lo`. The operand text is therefore not the
+    /// path the shell would hand to `unlink`, and nothing that trusts the
+    /// spelling (the `exempt_target_globs` match) may act on it.
+    glued_to_paren: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2652,10 +2661,12 @@ fn parse_rm_segment_with_option_scanning(
         }
 
         let (quote, unquoted) = strip_outer_quotes(text);
+        let glued_to_paren = command.as_bytes().get(token.byte_range.end) == Some(&b'(');
         paths.push(PathToken {
             unquoted,
             quote,
             range: token.byte_range.clone(),
+            glued_to_paren,
         });
         if option_scanning == RmOptionScanning::AppleStopAtFirstOperand {
             options_ended = true;
@@ -3036,7 +3047,10 @@ fn strip_outer_quotes(token: &str) -> (QuoteKind, &str) {
 /// All-or-nothing on purpose: `rm -rf ~/scratch/a /etc` must stay denied, so a
 /// single unexempted target keeps the rule firing. Single-quoted targets are
 /// never eligible — the shell does not expand `~` inside them, so the literal
-/// spelling names a different path than the glob's author meant.
+/// spelling names a different path than the glob's author meant. Neither is
+/// an operand glued to a `(`: the tokenizer stops the operand there, but zsh
+/// reads `lo(g|x)` as alternation and removes `log`, so the spelled prefix is
+/// not the path removed (bash rejects the same text as a syntax error).
 fn rm_targets_exempted_for_rule(pattern_name: &str, paths: &[PathToken<'_>]) -> bool {
     if paths.is_empty() {
         return false;
@@ -3050,7 +3064,7 @@ fn rm_targets_exempted_for_rule(pattern_name: &str, paths: &[PathToken<'_>]) -> 
     for path in paths {
         // A double-quoted path keeps its literal text; the shared normalizer
         // rejects any remaining expansion syntax either way.
-        if path.quote == QuoteKind::Single {
+        if path.quote == QuoteKind::Single || path.glued_to_paren {
             return false;
         }
         let Some(glob) = crate::config::rule_target_exemption(&rule_id, path.unquoted) else {

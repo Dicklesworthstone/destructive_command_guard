@@ -414,6 +414,30 @@ All robot-mode responses are pure JSON on stdout:
   `hookSpecificOutput` denial on stdout and exits 0.
 - Rich output always goes to stderr for human visibility.
 
+Hook mode carries the verdict in stdout JSON and exits 0 whether the command
+was allowed, warned about, sent for review, or denied. The exit status changes
+only when a blocking verdict could not be delivered:
+
+| Code | Constant | Meaning |
+|------|----------|---------|
+| 0 | `EXIT_SUCCESS` | Verdict delivered on stdout (an allow is empty stdout). Also an allow or a warning whose stdout reader went away: nothing was lost. |
+| 2 | `EXIT_HOOK_BLOCK` | A deny, ask, or indeterminate verdict could not be written to stdout (`EPIPE`: the host closed the pipe early). Exit 0 with nothing on stdout would read as "proceed", so the block travels in the exit status instead, with the reason on stderr. |
+
+How hosts read exit 2 with nothing on stdout:
+
+| Protocol | Effect |
+|----------|--------|
+| Claude Code and Claude-compatible hosts (Posit Assistant, Augment) | Blocks; stderr is fed back to the model as the reason |
+| Gemini CLI | Blocks (exit 2 is its blocking error) |
+| Copilot CLI | Blocks (`preToolUse` hooks that exit 2 deny the call) |
+| Crush | Blocks; stderr is the reason |
+| Grok | Blocks (exit 2 is a documented explicit deny) |
+| Codex CLI, Hermes, Antigravity (`agy`) | Logged as a hook failure, then fails open — the same outcome as exit 0 with no JSON, but visible |
+
+Hook mode never exits 2 for any other reason, and never exits 141: every
+hook-mode write tolerates a closed pipe. `EXIT_BROKEN_PIPE` belongs to the
+CLI surface below.
+
 **Robot mode** with subcommands uses standardized exit codes:
 - Exit 1 for denials (allows scripting with `$?`)
 - Pure JSON on stdout

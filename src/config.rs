@@ -9909,6 +9909,45 @@ exempt_target_globs = ["/srv/jobs/*/tmp/**"]
     }
 
     #[test]
+    fn rule_target_rejects_brace_quote_and_alternation_obfuscation() {
+        // The spellings from the #390 follow-up: brace expansion (`{a..a}`
+        // is a one-word sequence; zsh MULTIOS writes `{,}`/`{a,b}` to every
+        // word), quote removal, zsh glob alternation, and escapes all make
+        // the runtime path differ from the spelled one, so no glob may match
+        // the spelling.
+        let exemptions = exemptions_from(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/*/tmp/**", "/**"]
+"#,
+        );
+        for obfuscated in [
+            "/srv/jobs/abc/tmp/scr{a..a}tch",
+            "/srv/jobs/abc/tmp/scratch{,}",
+            "/srv/jobs/abc/{tmp,etc}/scratch",
+            "/srv/jobs/abc/tmp/scr\"atch\"",
+            "/srv/jobs/abc/tmp/'scratch'",
+            "/srv/jobs/abc/tmp/scr(a|b)tch",
+            #[cfg(not(windows))]
+            "/srv/jobs/abc/tmp/scr\\atch",
+        ] {
+            assert_eq!(
+                exemptions.matching_glob("core.filesystem:rm-rf-general", obfuscated),
+                None,
+                "obfuscated target {obfuscated} must never be exempted"
+            );
+        }
+        // Ordinary punctuation and non-ASCII names remain literal.
+        assert_eq!(
+            exemptions.matching_glob(
+                "core.filesystem:rm-rf-general",
+                "/srv/jobs/abc/tmp/héllo-wörld+v1,2@x.log"
+            ),
+            Some("/srv/jobs/*/tmp/**")
+        );
+    }
+
+    #[test]
     fn rule_target_normalizes_dot_and_duplicate_separators() {
         let exemptions = exemptions_from(
             r#"

@@ -2897,6 +2897,11 @@ rules: a target containing a variable, command substitution, backtick, glob, or
   `rm -rf ~/.claude/jobs/abc/tmp/scratch ~/.ssh` stays denied.
 - Single-quoted `rm` operands are never exempted: the shell does not expand `~`
   inside them, so the literal spelling names a different path.
+- An `rm` operand glued to a `(` is never exempted: zsh reads
+  `~/scratch/lo(g|x)` as glob alternation and removes `~/scratch/log`, not the
+  spelled `~/scratch/lo` (bash rejects the text as a syntax error). Brace
+  expansion (`lo{g..g}`), embedded quotes (`lo"g"`), and escapes disqualify a
+  target the same way, for both `rm` operands and redirect targets.
 
 **Trust boundary.** A target exemption reduces coverage, so it follows the same
 rule as every other trust-reducing setting (see

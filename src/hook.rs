@@ -5,6 +5,7 @@
 //! Agent). It parses incoming hook requests and formats denial responses.
 
 use crate::evaluator::MatchSpan;
+use crate::exit_codes::EXIT_HOOK_BLOCK;
 use crate::highlight::HighlightSpan;
 use crate::normalize::ShellDialect;
 use crate::output::auto_theme;
@@ -521,6 +522,71 @@ pub enum HookProtocol {
     /// `permissionDecision` envelope Crush does not read, so a block was
     /// silently downgraded to "no opinion" — dcg failed open under Crush.
     Crush,
+}
+
+impl HookProtocol {
+    /// Exit status for a blocking verdict (deny, ask, or indeterminate) that
+    /// could not be written to stdout.
+    ///
+    /// Stdout JSON is every protocol's primary channel and dcg exits 0 next
+    /// to it. When that write fails — `EPIPE`, the host closed the pipe
+    /// before the verdict was written — the exit status is the only signal
+    /// left, and exit 0 with no JSON reads as "proceed" on every host. Exit 2
+    /// is the fail-closed answer wherever one exists and no worse than 0
+    /// elsewhere:
+    ///
+    /// | Protocol | Exit 2 with nothing on stdout |
+    /// |----------|-------------------------------|
+    /// | `ClaudeCompatible` (Claude Code, Posit Assistant, Augment) | blocks; stderr is fed back to the model as the reason |
+    /// | `Gemini` | blocks (`packages/core/src/hooks/hookRunner.ts`: exit 2 is the blocking error) |
+    /// | `Copilot` | blocks (`preToolUse` hooks that exit 2 deny the call) |
+    /// | `Crush` | blocks; stderr is the reason (`internal/hooks/runner.go`) |
+    /// | `Grok` | blocks (exit 2 is a documented explicit deny) |
+    /// | `Codex` | logged as a hook failure, then fails open — the same outcome as exit 0 with no JSON |
+    /// | `Hermes` | warning logged, never aborts — same as exit 0 with no JSON |
+    /// | `Antigravity` | logged, does not reliably abort — same as exit 0 with no JSON |
+    ///
+    /// Every arm maps to [`EXIT_HOOK_BLOCK`] today; the match is spelled out
+    /// so a new protocol has to state its contract here rather than inherit
+    /// one. Only the stdout write is judged: a stdout that is `/dev/null` or
+    /// a closed descriptor (`EBADF`, which the standard library reports as
+    /// success) is indistinguishable from a listening host. The OpenCode
+    /// plugin dcg installs also speaks `ClaudeCompatible` but reads stdout
+    /// to completion through a pipe it owns and ignores the exit status; the
+    /// write cannot fail there.
+    #[must_use]
+    // The arms are identical on purpose: the split documents which hosts
+    // honour the status and which merely log it.
+    #[allow(clippy::match_same_arms)]
+    pub const fn undeliverable_block_exit_code(self) -> i32 {
+        match self {
+            // Exit 2 is the blocking status of the protocol itself.
+            Self::ClaudeCompatible | Self::Gemini | Self::Copilot | Self::Crush | Self::Grok => {
+                EXIT_HOOK_BLOCK
+            }
+            // Non-zero is logged and fails open: no worse than exit 0, and
+            // visibly a hook failure rather than a silent allow.
+            Self::Codex | Self::Hermes | Self::Antigravity => EXIT_HOOK_BLOCK,
+        }
+    }
+}
+
+/// Write a rendered verdict to process stdout and report whether it arrived.
+///
+/// The `output_*_for_protocol` wrappers render their JSON into a buffer
+/// first so that one place owns the delivery check. `write_all` is followed
+/// by an explicit `flush`: stdout is line-buffered, the payload ends in a
+/// newline, and a `BufWriter` that hit `EPIPE` keeps the unwritten bytes and
+/// reports the failure again on the next flush, so the combination surfaces
+/// a failed write wherever it happened. `Err` means the host stopped reading
+/// before the verdict was written; the caller turns that into
+/// [`HookProtocol::undeliverable_block_exit_code`] for blocking verdicts and
+/// ignores it for warnings, whose command was going to proceed anyway.
+fn deliver_verdict(payload: &[u8]) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    handle.write_all(payload)?;
+    handle.flush()
 }
 
 /// A shell command extracted from a hook request together with its execution
@@ -2523,13 +2589,12 @@ pub fn output_denial_for_protocol(
     confidence: Option<f64>,
     pattern_suggestions: &[PatternSuggestion],
     branch_context: Option<&crate::evaluator::BranchContext>,
-) {
-    let out = io::stdout();
-    let mut out_handle = out.lock();
+) -> io::Result<()> {
+    let mut verdict = Vec::new();
     let err = io::stderr();
     let mut err_handle = err.lock();
     write_denial_to(
-        &mut out_handle,
+        &mut verdict,
         &mut err_handle,
         protocol,
         command,
@@ -2544,6 +2609,7 @@ pub fn output_denial_for_protocol(
         pattern_suggestions,
         branch_context,
     );
+    deliver_verdict(&verdict)
 }
 
 /// Output an operator-review request using the active hook protocol.
@@ -2563,13 +2629,12 @@ pub fn output_review_request_for_protocol(
     confidence: Option<f64>,
     pattern_suggestions: &[PatternSuggestion],
     branch_context: Option<&crate::evaluator::BranchContext>,
-) {
-    let out = io::stdout();
-    let mut out_handle = out.lock();
+) -> io::Result<()> {
+    let mut verdict = Vec::new();
     let err = io::stderr();
     let mut err_handle = err.lock();
     write_review_request_to(
-        &mut out_handle,
+        &mut verdict,
         &mut err_handle,
         protocol,
         command,
@@ -2584,6 +2649,7 @@ pub fn output_review_request_for_protocol(
         pattern_suggestions,
         branch_context,
     );
+    deliver_verdict(&verdict)
 }
 
 /// Output a denial response to stdout (JSON for hook protocol).
@@ -2601,7 +2667,7 @@ pub fn output_denial(
     severity: Option<crate::packs::Severity>,
     confidence: Option<f64>,
     pattern_suggestions: &[PatternSuggestion],
-) {
+) -> io::Result<()> {
     output_denial_for_protocol(
         HookProtocol::ClaudeCompatible,
         command,
@@ -2615,7 +2681,7 @@ pub fn output_denial(
         confidence,
         pattern_suggestions,
         None,
-    );
+    )
 }
 
 /// Write a safety-evaluation indeterminate response to hook protocol streams.
@@ -2801,12 +2867,16 @@ pub fn write_indeterminate_to(
 /// Emit a safety-evaluation indeterminate response on process stdout/stderr.
 #[cold]
 #[inline(never)]
-pub fn output_indeterminate_for_protocol(protocol: HookProtocol, reason: &str, deny: bool) {
-    let out = io::stdout();
-    let mut out_handle = out.lock();
+pub fn output_indeterminate_for_protocol(
+    protocol: HookProtocol,
+    reason: &str,
+    deny: bool,
+) -> io::Result<()> {
+    let mut verdict = Vec::new();
     let err = io::stderr();
     let mut err_handle = err.lock();
-    write_indeterminate_to(&mut out_handle, &mut err_handle, protocol, reason, deny);
+    write_indeterminate_to(&mut verdict, &mut err_handle, protocol, reason, deny);
+    deliver_verdict(&verdict)
 }
 
 /// Write a warning response to arbitrary stdout/stderr writers (test seam).
@@ -2975,13 +3045,12 @@ pub fn output_warning_for_protocol(
     pack: Option<&str>,
     pattern: Option<&str>,
     explanation: Option<&str>,
-) {
-    let out = io::stdout();
-    let mut out_handle = out.lock();
+) -> io::Result<()> {
+    let mut verdict = Vec::new();
     let err = io::stderr();
     let mut err_handle = err.lock();
     write_warning_to(
-        &mut out_handle,
+        &mut verdict,
         &mut err_handle,
         protocol,
         command,
@@ -2990,6 +3059,7 @@ pub fn output_warning_for_protocol(
         pattern,
         explanation,
     );
+    deliver_verdict(&verdict)
 }
 
 /// Log a blocked command to a file (if logging is enabled).

@@ -217,7 +217,43 @@ fn format_indeterminate_reason(stage: &str, budget: Duration) -> String {
     )
 }
 
-/// Publish one conservative protocol decision for every deadline exit path.
+/// Exit status for a blocking verdict (deny, ask, or indeterminate) after
+/// its publication attempt.
+///
+/// `Ok` means the JSON reached stdout and the protocol's exit-0 contract
+/// applies. `Err` means the host stopped reading before the verdict was
+/// written — with `SIGPIPE` ignored that is an `EPIPE` on the write — and
+/// exit 0 with nothing on stdout reads as "proceed" on every host, so the
+/// protocol's blocking exit status has to carry the verdict instead
+/// (`HookProtocol::undeliverable_block_exit_code`). The stderr line is
+/// best-effort: Claude Code feeds it back to the model on exit 2, and a host
+/// that closed stderr too simply gets the status.
+fn blocking_verdict_exit_code(protocol: hook::HookProtocol, delivery: io::Result<()>) -> i32 {
+    match delivery {
+        Ok(()) => EXIT_SUCCESS,
+        Err(error) => {
+            let exit_code = protocol.undeliverable_block_exit_code();
+            emit_stderr!(
+                "[dcg] BLOCKED: the verdict could not be written to stdout ({error}); exiting {exit_code} so the host fails closed."
+            );
+            exit_code
+        }
+    }
+}
+
+/// Leave hook mode with `exit_code`.
+///
+/// Exit 0 is the ordinary return from `main`. A non-zero status goes through
+/// `process::exit`, which skips `Drop`, so callers must have dropped (and
+/// thereby flushed) the history writer first.
+fn finish_hook_mode(exit_code: i32) {
+    if exit_code != EXIT_SUCCESS {
+        std::process::exit(exit_code);
+    }
+}
+
+/// Publish one conservative protocol decision for every deadline exit path
+/// and return the process exit status (see `blocking_verdict_exit_code`).
 ///
 /// Deadline exhaustion is not an allow: Claude/Copilot can ask the operator,
 /// while protocols without an `ask` decision receive their documented block
@@ -235,12 +271,12 @@ fn handle_indeterminate_evaluation(
     stage: &str,
     deadline: &Deadline,
     deny_unverified: bool,
-) {
+) -> i32 {
     let elapsed = deadline.elapsed();
     let budget = deadline.max_duration();
 
     let reason = format_indeterminate_reason(stage, budget);
-    hook::output_indeterminate_for_protocol(protocol, &reason, deny_unverified);
+    let delivery = hook::output_indeterminate_for_protocol(protocol, &reason, deny_unverified);
 
     if let Some(writer) = history_writer {
         let entry = build_history_entry(
@@ -256,6 +292,7 @@ fn handle_indeterminate_evaluation(
         writer.log(entry);
         writer.detach_worker_on_drop();
     }
+    blocking_verdict_exit_code(protocol, delivery)
 }
 
 /// Handle hook input that could not be parsed (issue #160).
@@ -292,7 +329,7 @@ fn handle_unparseable_hook_input(
     detected_agent: &Agent,
     read_err: &hook::HookReadError,
     max_input_bytes: usize,
-) {
+) -> i32 {
     // Block when fail-closed AND the failure is an attacker-influenceable
     // payload problem: a JSON parse error OR an oversized input (padding a
     // command past the size limit must not skip evaluation under fail-closed —
@@ -351,7 +388,7 @@ fn handle_unparseable_hook_input(
             }
             _ => {}
         }
-        return;
+        return EXIT_SUCCESS;
     }
 
     // Fail-closed: emit an agent-appropriate denial. Without a parsed payload we
@@ -365,7 +402,7 @@ fn handle_unparseable_hook_input(
         "BLOCKED by dcg: the hook input could not be parsed; DCG_FAIL_CLOSED is set \
          (fail-closed mode). Fix the malformed hook payload or unset DCG_FAIL_CLOSED."
     };
-    hook::output_denial_for_protocol(
+    let delivery = hook::output_denial_for_protocol(
         protocol,
         "<unparseable hook input>",
         reason,
@@ -379,6 +416,7 @@ fn handle_unparseable_hook_input(
         &[],
         None,
     );
+    blocking_verdict_exit_code(protocol, delivery)
 }
 
 /// Overlap between consecutive scan windows of an over-limit command, so a
@@ -466,12 +504,10 @@ fn try_deny_oversized_input(
     compiled_overrides: &CompiledOverrides,
     heredoc_settings: &HeredocSettings,
     external_store: &destructive_command_guard::packs::ExternalPackStore,
-) -> bool {
+) -> Option<i32> {
     // Attribute the payload to a shell tool before evaluating anything. The
     // dialect comes from the same mapping the normal parsed path uses.
-    let Some((_tool_name, shell_dialect)) = hook::shell_tool_from_truncated_json(prefix) else {
-        return false;
-    };
+    let (_tool_name, shell_dialect) = hook::shell_tool_from_truncated_json(prefix)?;
 
     // The padding may live INSIDE the command string (the issue's repro
     // shape), either before or after the destructive part. Evaluating an
@@ -485,7 +521,7 @@ fn try_deny_oversized_input(
         push_oversized_scan_windows(&mut commands, &command, max_command_bytes);
     }
     if commands.is_empty() {
-        return false;
+        return None;
     }
 
     // No parsed payload exists, so protocol detection falls back to the
@@ -579,16 +615,19 @@ fn try_deny_oversized_input(
                 } else {
                     None
                 };
-                publish_decisive_response(
+                let exit_code = publish_decisive_response(
                     &eval_context,
                     ResolvedCommandOutcome::DenyFamily(resolved),
                     &mut history_writer,
                 );
-                return true;
+                // Dropped here, before the caller can `process::exit`: the
+                // audit row must be flushed first.
+                drop(history_writer);
+                return Some(exit_code);
             }
         }
     }
-    false
+    None
 }
 
 /// Process-wide registry of shutdown actions.
@@ -1188,27 +1227,32 @@ fn resolve_hook_command(
 /// Publish the single protocol response for the decisive resolved outcome,
 /// with its history row — the decisive entry's row, exactly as the
 /// single-command flow records it.
+///
+/// Returns the process exit status: `EXIT_SUCCESS` whenever the verdict
+/// reached stdout (or needed no stdout), the protocol's blocking status when
+/// a deny, ask, or indeterminate verdict could not be written (see
+/// `blocking_verdict_exit_code`).
 #[allow(clippy::too_many_lines)]
 fn publish_decisive_response(
     ctx: &HookEvalContext<'_>,
     outcome: ResolvedCommandOutcome,
     history_writer: &mut Option<HistoryWriter>,
-) {
+) -> i32 {
     let resolved = match outcome {
         // Never selected as decisive; the caller only publishes non-allow
         // outcomes.
-        ResolvedCommandOutcome::Allow(_) => return,
+        ResolvedCommandOutcome::Allow(_) => return EXIT_SUCCESS,
         ResolvedCommandOutcome::OversizedCommand { command_len } => {
             let reason = format_oversized_command_reason(command_len, ctx.max_command_bytes);
-            hook::output_indeterminate_for_protocol(
+            let delivery = hook::output_indeterminate_for_protocol(
                 ctx.hook_protocol,
                 &reason,
                 ctx.config.unverified_denies(),
             );
-            return;
+            return blocking_verdict_exit_code(ctx.hook_protocol, delivery);
         }
         ResolvedCommandOutcome::DeadlineExhausted { command, stage } => {
-            handle_indeterminate_evaluation(
+            return handle_indeterminate_evaluation(
                 ctx.hook_protocol,
                 history_writer.as_mut(),
                 ctx.history_agent_type,
@@ -1218,7 +1262,6 @@ fn publish_decisive_response(
                 ctx.deadline,
                 ctx.config.unverified_denies(),
             );
-            return;
         }
         ResolvedCommandOutcome::DenyFamily(resolved) => resolved,
     };
@@ -1232,7 +1275,7 @@ fn publish_decisive_response(
     let Some(ref info) = result.pattern_info else {
         // Unreachable by construction: resolve_hook_command only builds a
         // DenyFamily when pattern_info is present.
-        return;
+        return EXIT_SUCCESS;
     };
     let pack = info.pack_id.as_deref();
     let pattern = info.pattern_name.as_deref();
@@ -1325,7 +1368,7 @@ fn publish_decisive_response(
             } else {
                 None
             };
-            if mode == DecisionMode::Ask {
+            let delivery = if mode == DecisionMode::Ask {
                 hook::output_review_request_for_protocol(
                     ctx.hook_protocol,
                     &command,
@@ -1339,7 +1382,7 @@ fn publish_decisive_response(
                     None, // confidence not yet available in PatternMatch
                     info.suggestions,
                     branch_ctx,
-                );
+                )
             } else {
                 hook::output_denial_for_protocol(
                     ctx.hook_protocol,
@@ -1354,8 +1397,8 @@ fn publish_decisive_response(
                     None, // confidence not yet available in PatternMatch
                     info.suggestions,
                     branch_ctx,
-                );
-            }
+                )
+            };
 
             // Log if configured
             if let Some(log_file) = &ctx.config.general.log_file {
@@ -1364,10 +1407,14 @@ fn publish_decisive_response(
 
             // Review-capable clients receive ask; all others receive their
             // ordinary blocking response. Returning normally lets
-            // `HistoryWriter::Drop` flush the buffered audit entry.
+            // `HistoryWriter::Drop` flush the buffered audit entry before the
+            // caller acts on a fail-closed exit status.
+            blocking_verdict_exit_code(ctx.hook_protocol, delivery)
         }
         DecisionMode::Warn => {
-            hook::output_warning_for_protocol(
+            // A warning that never reaches the host is harmless: the command
+            // was going to proceed either way, so this stays exit 0.
+            let _ = hook::output_warning_for_protocol(
                 ctx.hook_protocol,
                 &command,
                 &info.reason,
@@ -1375,9 +1422,10 @@ fn publish_decisive_response(
                 pattern,
                 explanation,
             );
+            EXIT_SUCCESS
         }
         // Unreachable: Log-mode entries are handled at resolve time.
-        DecisionMode::Log => {}
+        DecisionMode::Log => EXIT_SUCCESS,
     }
 }
 
@@ -1646,7 +1694,7 @@ fn main() {
             // normal protocol response; anything else keeps fail-open.
             if !config.is_fail_closed() {
                 if let hook::HookReadError::InputTooLarge { prefix, .. } = &read_err {
-                    if try_deny_oversized_input(
+                    if let Some(exit_code) = try_deny_oversized_input(
                         &config,
                         &detected_agent,
                         prefix,
@@ -1655,11 +1703,14 @@ fn main() {
                         &heredoc_settings,
                         external_store,
                     ) {
+                        finish_hook_mode(exit_code);
                         return;
                     }
                 }
             }
-            handle_unparseable_hook_input(&config, &detected_agent, &read_err, max_input_bytes);
+            let exit_code =
+                handle_unparseable_hook_input(&config, &detected_agent, &read_err, max_input_bytes);
+            finish_hook_mode(exit_code);
             return;
         }
     };
@@ -1692,7 +1743,12 @@ fn main() {
     // bytes are identical either way.
     if additional_commands.is_empty() && command.len() > max_command_bytes {
         let reason = format_oversized_command_reason(command.len(), max_command_bytes);
-        hook::output_indeterminate_for_protocol(hook_protocol, &reason, config.unverified_denies());
+        let delivery = hook::output_indeterminate_for_protocol(
+            hook_protocol,
+            &reason,
+            config.unverified_denies(),
+        );
+        finish_hook_mode(blocking_verdict_exit_code(hook_protocol, delivery));
         return;
     }
 
@@ -1833,15 +1889,23 @@ fn main() {
         }
     }
 
-    if let Some(outcome) = decisive {
-        publish_decisive_response(&eval_context, outcome, &mut history_writer);
-    } else if let Some(entry) = primary_allow_row {
+    let exit_code = if let Some(outcome) = decisive {
+        publish_decisive_response(&eval_context, outcome, &mut history_writer)
+    } else {
         // All-allow request: record exactly one history Allow row, for the
         // primary command, matching the single-command flow.
-        if let Some(writer) = history_writer.as_ref() {
-            writer.log(*entry);
+        if let Some(entry) = primary_allow_row {
+            if let Some(writer) = history_writer.as_ref() {
+                writer.log(*entry);
+            }
         }
-    }
+        EXIT_SUCCESS
+    };
+
+    // A fail-closed exit goes through `process::exit`, which skips `Drop`:
+    // flush the audit row first.
+    drop(history_writer);
+    finish_hook_mode(exit_code);
 }
 
 /// Print help information.

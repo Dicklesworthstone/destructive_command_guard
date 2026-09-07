@@ -56,6 +56,40 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   never a signal death. `--version` keeps the bare semver as the only stdout
   line and the provenance banner on stderr, where `scripts/perf_baseline.py`
   reads it.
+- **A blocking verdict that cannot be written to stdout now fails closed
+  through the exit status (follow-up to #389).** Every hook protocol reads
+  the decision from stdout JSON on exit 0 and treats exit 0 with *no* JSON as
+  "proceed", so when the stdout write itself failed (`EPIPE`: the host closed
+  the pipe before the verdict was written) a deny quietly became an allow.
+  The `output_*_for_protocol` writers now render the verdict into a buffer
+  and report whether the single `write_all` + `flush` to stdout succeeded; a
+  deny, ask, or indeterminate verdict that did not arrive exits with the new
+  documented `EXIT_HOOK_BLOCK` (2) and explains itself on stderr. Exit 2 is
+  the blocking status of the Claude Code contract and of every protocol that
+  copied it (Gemini CLI, Copilot CLI, Crush, Grok — Crush's `runner.go`
+  verified); Codex, Hermes, and Antigravity log a non-zero exit as a hook
+  failure and fail open, which is no worse than the silent exit 0. The
+  per-protocol table lives on `HookProtocol::undeliverable_block_exit_code`
+  and in `docs/agents.md`. An undeliverable allow or warning stays exit 0
+  (nothing was lost), a delivered verdict keeps exit 0 + JSON, and the
+  history row is flushed before the fail-closed exit. The CLI surface keeps
+  `EXIT_BROKEN_PIPE` (141).
+- **An `rm` operand glued to `(` no longer qualifies for
+  `exempt_target_globs` (sibling of the #390 follow-up).** The
+  `[rules."core.filesystem:rm-*"] exempt_target_globs` match (#284) trusts the
+  spelled operand, and the tokenizer ends an operand at `(` because it is
+  subshell syntax — so `rm -rf ~/scratch/lo(g|x)` was matched as
+  `~/scratch/lo`, which a scratch glob exempts, while zsh reads `lo(g|x)` as
+  glob alternation and removes `~/scratch/log` (bash rejects the text as a
+  syntax error). zsh forbids `/` inside alternation, so the reachable file is
+  always a sibling in the same directory; the gap could not escape the
+  exempted subtree, but it did let a narrow exemption cover a neighbouring
+  file. The operand is now ineligible whenever the byte after it is `(`;
+  subshell grouping (`(rm -rf ~/scratch/x)`, `rm -rf ~/scratch/x (echo
+  done)`) is unaffected. The redirect exemption and the #390 absent-file
+  carve-out were audited for the same class (brace expansion, embedded
+  quotes, alternation, escapes) and already reject every such spelling; the
+  new tests pin that.
 - **`redaction_mode = "pattern"` performs secret redaction again (#386).**
   The pattern redactor added in v0.2.8 was deleted by a tracker-sync commit
   shortly after v0.2.10 and never restored, so from v0.2.11 onward the

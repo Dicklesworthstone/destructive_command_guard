@@ -257,6 +257,98 @@ exempt_target_globs = ["**"]
 }
 
 #[test]
+fn brace_and_quote_obfuscated_redirect_targets_are_never_exempted() {
+    // Sibling of the #390 follow-up (ce11b48): the shell rewrites these
+    // targets before `open()`, so the spelled text is not the path written.
+    // `{g..g}` is a one-word brace sequence, `{,}` and `{a,b}` are written
+    // to every word by zsh MULTIOS, quote removal turns `lo"g"` into `log`,
+    // and `(g|x)` is zsh glob alternation. A wide glob must not rescue any
+    // of them: the exemption is matched lexically against the literal
+    // spelling, and none of these spellings are literal.
+    let sandbox = Sandbox::new(
+        r#"
+[packs]
+enabled = ["core"]
+
+[rules."core.filesystem:redirect-truncate-root-home"]
+exempt_target_globs = ["~/.claude/jobs/*/tmp/**", "~/**"]
+"#,
+    );
+    for command in [
+        "echo x > ~/.claude/jobs/abc/tmp/lo{g..g}",
+        "echo x > ~/.claude/jobs/abc/tmp/log{,}",
+        "echo x > ~/.claude/jobs/abc/{tmp,nested}/log",
+        "echo x > ~/.claude/jobs/abc/tmp/lo\"g\"",
+        "echo x > ~/.claude/jobs/abc/tmp/'log'",
+        "echo x > ~/.claude/jobs/abc/tmp/lo(g|x)",
+        "echo x > ~/.claude/jobs/abc/tmp/lo\\g",
+        "echo x > ~/.bashr{c..c}",
+        "echo x > ~/.bash\"rc\"",
+    ] {
+        let output = sandbox.run(command);
+        assert_denied(&output, command);
+    }
+    assert_eq!(
+        std::fs::read(sandbox.home().join(".bashrc")).unwrap(),
+        b"keep",
+        "evaluating must not touch the dotfile"
+    );
+}
+
+#[test]
+fn brace_and_quote_obfuscated_rm_targets_are_never_exempted() {
+    // The rm classifier feeds the same lexical normalizer, so the same
+    // spellings stay outside every glob there too. The `(` rows are the one
+    // shape the normalizer alone did not catch: the tokenizer ends the operand
+    // at `(` (subshell syntax), leaving a clean `~/.claude/jobs/abc/tmp/lo`
+    // that matched the glob, while zsh reads `lo(g|x)` as alternation and
+    // removes `tmp/log` (bash makes it a syntax error). zsh forbids `/`
+    // inside alternation, so the reachable file is always a sibling, but a
+    // narrow exemption for `lo` must not cover `log`.
+    let sandbox = Sandbox::new(
+        r#"
+[packs]
+enabled = ["core"]
+
+[rules."core.filesystem:rm-rf-root-home"]
+exempt_target_globs = ["~/.claude/jobs/*/tmp/**", "~/**"]
+"#,
+    );
+    for command in [
+        "rm -rf ~/.claude/jobs/abc/tmp/lo{g..g}",
+        "rm -rf ~/.claude/jobs/abc/{tmp,nested}",
+        "rm -rf ~/.claude/jobs/abc/tmp/lo\"g\"",
+        "rm -rf ~/.claude/jobs/abc/tmp/lo(g|x)",
+        "rm -rf ~/.claude/jobs/abc/tmp/lo(g",
+        "rm -rf ~/.claude/jobs/abc/tmp/x(|log)",
+        "rm -rf ~/.bashr{c..c}",
+    ] {
+        let output = sandbox.run(command);
+        assert_denied(&output, command);
+    }
+    assert_eq!(
+        std::fs::read(sandbox.home().join(".claude/jobs/abc/tmp/log")).unwrap(),
+        b"keep"
+    );
+}
+
+#[test]
+fn subshell_parentheses_around_an_exempt_rm_are_still_exempt() {
+    // Only a `(` glued to the operand is glob syntax. Subshell grouping and
+    // a following subshell keep the exemption: the operand is still the
+    // spelled path.
+    let sandbox = Sandbox::new(RM_EXEMPTION);
+    for command in [
+        "(rm -rf ~/.claude/jobs/abc/tmp/log)",
+        "rm -rf ~/.claude/jobs/abc/tmp/log (echo done)",
+        "(cd / && rm -rf ~/.claude/jobs/abc/tmp/log)",
+    ] {
+        let output = sandbox.run(command);
+        assert_allowed(&output, command);
+    }
+}
+
+#[test]
 fn traversal_out_of_the_exempt_subtree_is_denied() {
     let sandbox = Sandbox::new(RM_EXEMPTION);
     let output = sandbox.run("rm -rf ~/.claude/jobs/abc/tmp/../../../Documents");
