@@ -10771,21 +10771,83 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                     );
                 }
             }
+            CodexHookProbe::HooksFileMissing => {
+                println!("{}", "NOT REGISTERED".yellow());
+                issues += 1;
+                println!("  Codex is in use but ~/.codex/hooks.json does not exist");
+                println!(
+                    "  → Re-run the dcg install script to register the hook, then start \
+                     Codex once to approve it"
+                );
+                println!("    (Codex shell commands are NOT guarded until then)");
+            }
             CodexHookProbe::NotRegistered => {
                 println!("{}", "NOT REGISTERED".yellow());
                 issues += 1;
-                println!("  Codex is in use but ~/.codex/hooks.json has no dcg PreToolUse hook");
+                println!(
+                    "  ~/.codex/hooks.json loads, but has no dcg PreToolUse command hook \
+                     that selects Bash"
+                );
                 println!(
                     "  → Re-run the dcg install script to register it, then start Codex \
                      once to approve the hook"
                 );
                 println!("    (Codex shell commands are NOT guarded until then)");
             }
+            CodexHookProbe::Misplaced(detail) => {
+                println!("{}", "MISPLACED".red());
+                issues += 1;
+                println!(
+                    "  A dcg hook is in ~/.codex/hooks.json but not where Codex runs it for \
+                     shell commands:"
+                );
+                println!("  {detail}");
+                println!(
+                    "  → Register it under hooks.PreToolUse as {{\"matcher\": \"Bash\", \
+                     \"hooks\": [{{\"type\": \"command\", \"command\": \"<path to dcg>\"}}]}}"
+                );
+                println!(
+                    "    (re-running the installer does this), then start Codex once to \
+                     approve it"
+                );
+            }
+            CodexHookProbe::CommandNotFound { state_key, command } => {
+                println!("{}", "COMMAND NOT FOUND".red());
+                issues += 1;
+                println!("  The dcg hook is registered ({state_key})");
+                println!("  but its command does not exist: {command}");
+                println!(
+                    "  → Re-run the dcg install script so hooks.json points at the installed \
+                     binary, or fix the path by hand"
+                );
+                println!(
+                    "    (a hook whose program is missing fails at run time, and Codex fails open)"
+                );
+            }
             CodexHookProbe::HooksFileInvalid(err) => {
                 println!("{}", "ERROR".red());
                 issues += 1;
-                println!("  ~/.codex/hooks.json cannot be parsed: {err}");
+                println!("  ~/.codex/hooks.json is not valid JSON: {err}");
+                println!("  Codex loads none of its hooks");
                 println!("  → Fix the JSON by hand, or move it aside and re-run the installer");
+            }
+            CodexHookProbe::HooksFileRejected(err) => {
+                println!("{}", "REJECTED BY CODEX".red());
+                issues += 1;
+                println!("  Codex rejects ~/.codex/hooks.json: {err}");
+                println!(
+                    "  It loads NONE of the file's hooks, so the dcg hook never reaches trust \
+                     review"
+                );
+                println!("  and there is no approval prompt to accept");
+                println!(
+                    "  → Make the file match Codex's schema: only a top-level \"hooks\" object \
+                     (plus an optional \"description\")"
+                );
+                println!(
+                    "    — remove keys such as \"version\" — then start Codex once and \
+                     approve the dcg hook"
+                );
             }
         }
     }
@@ -12063,12 +12125,26 @@ fn collect_doctor_report(
                     )
                 }
             }
+            CodexHookProbe::HooksFileMissing => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    "Codex is in use but ~/.codex/hooks.json does not exist — its shell \
+                     commands are not guarded"
+                        .to_string(),
+                    Some(
+                        "Re-run the dcg install script to register the hook, then start \
+                         Codex once to approve it"
+                            .to_string(),
+                    ),
+                )
+            }
             CodexHookProbe::NotRegistered => {
                 issues += 1;
                 (
                     DoctorCheckStatus::Error,
-                    "Codex is in use but ~/.codex/hooks.json has no dcg PreToolUse hook — \
-                     its shell commands are not guarded"
+                    "~/.codex/hooks.json loads, but has no dcg PreToolUse command hook that \
+                     selects Bash — Codex shell commands are not guarded"
                         .to_string(),
                     Some(
                         "Re-run the dcg install script to register it, then start Codex \
@@ -12077,13 +12153,66 @@ fn collect_doctor_report(
                     ),
                 )
             }
+            CodexHookProbe::Misplaced(detail) => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    format!(
+                        "A dcg hook is in ~/.codex/hooks.json but not where Codex runs it \
+                         for shell commands: {detail}"
+                    ),
+                    Some(
+                        "Register it under hooks.PreToolUse as {\"matcher\": \"Bash\", \
+                         \"hooks\": [{\"type\": \"command\", \"command\": \"<path to dcg>\"}]} \
+                         (re-running the installer does this), then start Codex once to \
+                         approve it"
+                            .to_string(),
+                    ),
+                )
+            }
+            CodexHookProbe::CommandNotFound { state_key, command } => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    format!(
+                        "Codex dcg hook is registered ({state_key}) but its command does not \
+                         exist: {command}"
+                    ),
+                    Some(
+                        "Re-run the dcg install script so hooks.json points at the installed \
+                         binary, or fix the path by hand (a hook whose program is missing \
+                         fails at run time, and Codex fails open)"
+                            .to_string(),
+                    ),
+                )
+            }
             CodexHookProbe::HooksFileInvalid(err) => {
                 issues += 1;
                 (
                     DoctorCheckStatus::Error,
-                    format!("~/.codex/hooks.json cannot be parsed: {err}"),
+                    format!(
+                        "~/.codex/hooks.json is not valid JSON ({err}); Codex loads none of \
+                         its hooks"
+                    ),
                     Some(
                         "Fix the JSON by hand, or move it aside and re-run the installer"
+                            .to_string(),
+                    ),
+                )
+            }
+            CodexHookProbe::HooksFileRejected(err) => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    format!(
+                        "Codex rejects ~/.codex/hooks.json ({err}), so it loads NONE of the \
+                         file's hooks — the dcg hook never reaches trust review and there is \
+                         no approval prompt to accept"
+                    ),
+                    Some(
+                        "Make the file match Codex's schema: only a top-level \"hooks\" object \
+                         (plus an optional \"description\") — remove keys such as \
+                         \"version\" — then start Codex once and approve the dcg hook"
                             .to_string(),
                     ),
                 )
@@ -13728,17 +13857,217 @@ enum CodexHookState {
 }
 
 /// Result of probing the Codex dcg hook.
+///
+/// The file-level states are ordered the way Codex's own loader fails
+/// (`codex-rs/hooks/src/engine/discovery.rs::load_hooks_json`): no file, then
+/// not JSON, then JSON that its `HooksFile` schema rejects. Only a loadable
+/// file gets as far as hook lookup and trust review, so each state needs a
+/// different remedy — a schema-rejected file in particular has NO trust
+/// prompt to approve, which is why it must never be reported as "registered
+/// but untrusted" (#391).
 #[derive(Debug, PartialEq, Eq)]
 enum CodexHookProbe {
-    /// hooks.json is missing or contains no dcg PreToolUse Bash hook.
-    NotRegistered,
-    /// hooks.json exists but cannot be parsed.
+    /// `~/.codex/hooks.json` does not exist (or cannot be read).
+    HooksFileMissing,
+    /// hooks.json exists but is not valid JSON.
     HooksFileInvalid(String),
+    /// hooks.json is valid JSON that Codex's `HooksFile` schema rejects (for
+    /// example a stray top-level `"version"` key: the struct is
+    /// `deny_unknown_fields`). Codex logs "failed to parse hooks config" and
+    /// loads NONE of the file's hooks.
+    HooksFileRejected(String),
+    /// Loadable file, but no `type: "command"` dcg hook under `PreToolUse`
+    /// with a matcher that selects `Bash`.
+    NotRegistered,
+    /// A dcg command hook exists, but not where Codex runs it for shell
+    /// commands (under another event, or under a `PreToolUse` matcher that
+    /// excludes `Bash`). The payload describes where it was found.
+    Misplaced(String),
+    /// The dcg hook is registered under the right event and matcher, but the
+    /// program its `command` names does not exist, so it can never run.
+    CommandNotFound { state_key: String, command: String },
     /// The dcg hook is registered; `state_key` is its `[hooks.state]` key.
     Registered {
         state_key: String,
         state: CodexHookState,
     },
+}
+
+/// Mirror of Codex's `HooksFile` (`codex-rs/config/src/hook_config.rs`).
+///
+/// The top level is `deny_unknown_fields` with exactly `description` and
+/// `hooks`, so any other key (`"version": 1`, say) makes Codex reject the
+/// WHOLE file. Event names are fixed fields (unknown event names are ignored,
+/// as in Codex); handlers are tagged by `type`. Fields dcg does not read are
+/// kept so the mirror rejects the same shapes Codex rejects (a string where
+/// `timeout` must be a number, an unknown handler `type`, …).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct CodexHooksFile {
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    hooks: CodexHookEvents,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct CodexHookEvents {
+    #[serde(rename = "PreToolUse", default)]
+    pre_tool_use: Vec<CodexMatcherGroup>,
+    #[serde(rename = "PermissionRequest", default)]
+    permission_request: Vec<CodexMatcherGroup>,
+    #[serde(rename = "PostToolUse", default)]
+    post_tool_use: Vec<CodexMatcherGroup>,
+    #[serde(rename = "PreCompact", default)]
+    pre_compact: Vec<CodexMatcherGroup>,
+    #[serde(rename = "PostCompact", default)]
+    post_compact: Vec<CodexMatcherGroup>,
+    #[serde(rename = "SessionStart", default)]
+    session_start: Vec<CodexMatcherGroup>,
+    #[serde(rename = "SessionEnd", default)]
+    session_end: Vec<CodexMatcherGroup>,
+    #[serde(rename = "UserPromptSubmit", default)]
+    user_prompt_submit: Vec<CodexMatcherGroup>,
+    #[serde(rename = "SubagentStart", default)]
+    subagent_start: Vec<CodexMatcherGroup>,
+    #[serde(rename = "SubagentStop", default)]
+    subagent_stop: Vec<CodexMatcherGroup>,
+    #[serde(rename = "Stop", default)]
+    stop: Vec<CodexMatcherGroup>,
+    #[serde(rename = "Interrupt", default)]
+    interrupt: Vec<CodexMatcherGroup>,
+}
+
+impl CodexHookEvents {
+    /// Every event other than `PreToolUse`, for the misplaced-hook search.
+    fn other_events(&self) -> [(&'static str, &[CodexMatcherGroup]); 11] {
+        [
+            ("PermissionRequest", &self.permission_request),
+            ("PostToolUse", &self.post_tool_use),
+            ("PreCompact", &self.pre_compact),
+            ("PostCompact", &self.post_compact),
+            ("SessionStart", &self.session_start),
+            ("SessionEnd", &self.session_end),
+            ("UserPromptSubmit", &self.user_prompt_submit),
+            ("SubagentStart", &self.subagent_start),
+            ("SubagentStop", &self.subagent_stop),
+            ("Stop", &self.stop),
+            ("Interrupt", &self.interrupt),
+        ]
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct CodexMatcherGroup {
+    #[serde(default)]
+    matcher: Option<String>,
+    #[serde(default)]
+    hooks: Vec<CodexHookHandler>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "type")]
+#[allow(dead_code)]
+enum CodexHookHandler {
+    #[serde(rename = "command")]
+    Command {
+        command: String,
+        #[serde(default, rename = "commandWindows", alias = "command_windows")]
+        command_windows: Option<String>,
+        #[serde(default, rename = "timeout")]
+        timeout_sec: Option<u64>,
+        #[serde(default)]
+        r#async: bool,
+        #[serde(default, rename = "statusMessage")]
+        status_message: Option<String>,
+        #[serde(default, rename = "additionalContextLimit")]
+        additional_context_limit: Option<usize>,
+    },
+    #[serde(rename = "mcp_tool")]
+    McpTool {
+        server: String,
+        tool: String,
+        #[serde(default)]
+        input: serde_json::Map<String, serde_json::Value>,
+        #[serde(default, rename = "timeout")]
+        timeout_sec: Option<u64>,
+        #[serde(default, rename = "statusMessage")]
+        status_message: Option<String>,
+    },
+    #[serde(rename = "prompt")]
+    Prompt {},
+    #[serde(rename = "agent")]
+    Agent {},
+}
+
+impl CodexHookHandler {
+    /// The command line Codex would run on this platform, for command hooks.
+    fn effective_command(&self) -> Option<&str> {
+        match self {
+            Self::Command {
+                command,
+                command_windows,
+                ..
+            } => Some(if cfg!(windows) {
+                command_windows.as_deref().unwrap_or(command)
+            } else {
+                command
+            }),
+            Self::McpTool { .. } | Self::Prompt {} | Self::Agent {} => None,
+        }
+    }
+}
+
+/// Whether a Codex matcher selects the `Bash` tool, mirroring Codex's own
+/// rules (`codex-rs/hooks/src/events/common.rs::matches_matcher`): absent,
+/// empty, or `*` matches every tool; a matcher made only of
+/// `[A-Za-z0-9_|]` is an exact `|`-separated list; anything else is a regex.
+fn codex_matcher_selects_bash(matcher: Option<&str>) -> bool {
+    match matcher {
+        None => true,
+        Some(matcher) if matcher.is_empty() || matcher == "*" => true,
+        Some(matcher)
+            if matcher
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '|') =>
+        {
+            matcher.split('|').any(|candidate| candidate == "Bash")
+        }
+        Some(matcher) => regex::Regex::new(matcher).is_ok_and(|re| re.is_match("Bash")),
+    }
+}
+
+/// The program word of a hook command line: the first token, honoring a
+/// leading double-quoted path (`"C:\Program Files\dcg\dcg.exe" --flag`).
+fn codex_hook_program(command: &str) -> Option<&str> {
+    let trimmed = command.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        return rest.split('"').next();
+    }
+    trimmed.split_whitespace().next()
+}
+
+/// Whether the program a Codex hook names exists: a path with a separator
+/// (or `~/`) must be a file; a bare name must resolve on PATH, which is how
+/// the shell Codex runs hooks through would find it.
+fn codex_hook_command_exists(command: &str) -> bool {
+    let Some(program) = codex_hook_program(command) else {
+        return false;
+    };
+    if program.is_empty() {
+        return false;
+    }
+    if let Some(rest) = program.strip_prefix("~/") {
+        return dirs::home_dir().is_some_and(|home| home.join(rest).is_file());
+    }
+    if program.contains(['/', '\\']) {
+        return std::path::Path::new(program).is_file();
+    }
+    let stem = program
+        .strip_suffix(std::env::consts::EXE_SUFFIX)
+        .unwrap_or(program);
+    which_executable(stem).is_some()
 }
 
 /// Whether a Codex hook `command` string invokes the dcg binary (first-token
@@ -13758,58 +14087,88 @@ fn codex_command_is_dcg(command: &str) -> bool {
 
 /// Probe the user-level Codex hook registration and enablement.
 fn probe_codex_dcg_hook() -> CodexHookProbe {
-    probe_codex_dcg_hook_at(&codex_hooks_json_path(), &codex_config_toml_path())
+    probe_codex_dcg_hook_at(
+        &codex_hooks_json_path(),
+        &codex_config_toml_path(),
+        codex_hook_command_exists,
+    )
 }
 
-/// Testable core of [`probe_codex_dcg_hook`]: explicit file locations.
+/// Testable core of [`probe_codex_dcg_hook`]: explicit file locations and an
+/// injectable "does this hook command's program exist" check.
 fn probe_codex_dcg_hook_at(
     hooks_path: &std::path::Path,
     config_path: &std::path::Path,
+    command_exists: impl Fn(&str) -> bool,
 ) -> CodexHookProbe {
     let raw = match std::fs::read_to_string(hooks_path) {
         Ok(raw) => raw,
-        Err(_) => return CodexHookProbe::NotRegistered,
+        Err(_) => return CodexHookProbe::HooksFileMissing,
     };
-    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(parsed) => parsed,
+    // Two-stage parse so a syntax error and a schema rejection get different
+    // remedies: the first is a broken file, the second is a well-formed file
+    // Codex refuses to load.
+    let json: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(json) => json,
         Err(err) => return CodexHookProbe::HooksFileInvalid(err.to_string()),
+    };
+    let parsed: CodexHooksFile = match serde_json::from_value(json) {
+        Ok(parsed) => parsed,
+        Err(err) => return CodexHookProbe::HooksFileRejected(err.to_string()),
     };
 
     // The state key indexes the PreToolUse array as loaded, so `entry_index`
     // counts EVERY element (including non-Bash matchers), not just Bash ones.
-    let mut found: Option<(usize, usize)> = None;
-    if let Some(entries) = parsed
-        .get("hooks")
-        .and_then(|hooks| hooks.get("PreToolUse"))
-        .and_then(serde_json::Value::as_array)
-    {
-        'outer: for (entry_index, entry) in entries.iter().enumerate() {
-            if entry.get("matcher").and_then(serde_json::Value::as_str) != Some("Bash") {
-                continue;
-            }
-            let Some(hooks) = entry.get("hooks").and_then(serde_json::Value::as_array) else {
+    let mut found: Option<(usize, usize, &str)> = None;
+    let mut misplaced: Option<String> = None;
+    'outer: for (entry_index, group) in parsed.hooks.pre_tool_use.iter().enumerate() {
+        let selects_bash = codex_matcher_selects_bash(group.matcher.as_deref());
+        for (hook_index, hook) in group.hooks.iter().enumerate() {
+            let Some(command) = hook.effective_command() else {
                 continue;
             };
-            for (hook_index, hook) in hooks.iter().enumerate() {
-                if hook
-                    .get("command")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(codex_command_is_dcg)
-                {
-                    found = Some((entry_index, hook_index));
-                    break 'outer;
+            if !codex_command_is_dcg(command) {
+                continue;
+            }
+            if selects_bash {
+                found = Some((entry_index, hook_index, command));
+                break 'outer;
+            }
+            misplaced.get_or_insert_with(|| {
+                format!(
+                    "PreToolUse entry {entry_index} has matcher {:?}, which does not select Bash",
+                    group.matcher.as_deref().unwrap_or_default()
+                )
+            });
+        }
+    }
+    if found.is_none() {
+        for (event, groups) in parsed.hooks.other_events() {
+            for (entry_index, group) in groups.iter().enumerate() {
+                for hook in &group.hooks {
+                    if hook.effective_command().is_some_and(codex_command_is_dcg) {
+                        misplaced.get_or_insert_with(|| {
+                            format!("found under {event} entry {entry_index} instead of PreToolUse")
+                        });
+                    }
                 }
             }
         }
     }
-    let Some((entry_index, hook_index)) = found else {
-        return CodexHookProbe::NotRegistered;
+    let Some((entry_index, hook_index, command)) = found else {
+        return misplaced.map_or(CodexHookProbe::NotRegistered, CodexHookProbe::Misplaced);
     };
 
     let state_key = format!(
         "{}:pre_tool_use:{entry_index}:{hook_index}",
         hooks_path.display()
     );
+    if !command_exists(command) {
+        return CodexHookProbe::CommandNotFound {
+            state_key,
+            command: command.to_string(),
+        };
+    }
 
     let state = match std::fs::read_to_string(config_path)
         .ok()
@@ -21539,8 +21898,9 @@ if ($errors.Count -ne 0) {
             std::fs::write(&config_path, raw).expect("write config.toml");
         }
         // Rewrite the state key to be location-independent for assertions:
-        // callers compare against the returned key when needed.
-        probe_codex_dcg_hook_at(&hooks_path, &config_path)
+        // callers compare against the returned key when needed. The fixture
+        // paths are fictional, so the program-exists check is stubbed true.
+        probe_codex_dcg_hook_at(&hooks_path, &config_path, |_| true)
     }
 
     const CODEX_HOOKS_DCG_FIRST: &str = r#"{
@@ -21566,7 +21926,7 @@ if ($errors.Count -ne 0) {
         )
         .expect("write");
         assert_eq!(
-            probe_codex_dcg_hook_at(&hooks_path, &config_path),
+            probe_codex_dcg_hook_at(&hooks_path, &config_path, |_| true),
             CodexHookProbe::Registered {
                 state_key: key,
                 state: CodexHookState::Enabled,
@@ -21612,7 +21972,7 @@ if ($errors.Count -ne 0) {
         )
         .expect("write");
         assert_eq!(
-            probe_codex_dcg_hook_at(&hooks_path, &config_path),
+            probe_codex_dcg_hook_at(&hooks_path, &config_path, |_| true),
             CodexHookProbe::Registered {
                 state_key: key,
                 state: CodexHookState::Disabled,
@@ -21640,7 +22000,7 @@ if ($errors.Count -ne 0) {
         let hooks_path = dir.path().join("hooks.json");
         std::fs::write(&hooks_path, hooks_json).expect("write");
         let config_path = dir.path().join("config.toml");
-        match probe_codex_dcg_hook_at(&hooks_path, &config_path) {
+        match probe_codex_dcg_hook_at(&hooks_path, &config_path, |_| true) {
             CodexHookProbe::Registered { state_key, .. } => {
                 assert!(
                     state_key.ends_with(":pre_tool_use:1:1"),
@@ -21660,11 +22020,239 @@ if ($errors.Count -ne 0) {
             codex_fixture(Some(stub), None),
             CodexHookProbe::NotRegistered
         );
-        assert_eq!(codex_fixture(None, None), CodexHookProbe::NotRegistered);
+        assert_eq!(codex_fixture(None, None), CodexHookProbe::HooksFileMissing);
         assert!(matches!(
             codex_fixture(Some("{not json"), None),
             CodexHookProbe::HooksFileInvalid(_)
         ));
+    }
+
+    // ---- #391: file-level and placement states --------------------------
+
+    /// The reporter's exact file: a top-level `"version": 1` next to a
+    /// perfectly good dcg hook. Codex's `HooksFile` is `deny_unknown_fields`,
+    /// so it rejects the whole file and never reaches trust review — doctor
+    /// used to call this "registered but untrusted" and point at an approval
+    /// prompt that cannot exist.
+    #[test]
+    fn codex_probe_schema_rejected_file_is_not_untrusted_391() {
+        let reporter = r#"{
+  "version": 1,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Fleet\\bin\\dcg.exe"
+          }
+        ]
+      }
+    ]
+  }
+}"#;
+        match codex_fixture(Some(reporter), Some("[hooks.state]\n")) {
+            CodexHookProbe::HooksFileRejected(err) => {
+                assert!(
+                    err.contains("unknown field `version`"),
+                    "rejection must name the offending key: {err}"
+                );
+            }
+            other => panic!("expected HooksFileRejected, got {other:?}"),
+        }
+
+        // Control: the same file without `version` is a registered hook
+        // awaiting trust (exactly what the reporter observed after the edit).
+        let fixed = reporter.replace("  \"version\": 1,\n", "");
+        assert!(matches!(
+            codex_fixture(Some(&fixed), Some("[hooks.state]\n")),
+            CodexHookProbe::Registered {
+                state: CodexHookState::NoStateEntry,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn codex_probe_distinguishes_invalid_json_from_schema_rejection_391() {
+        // Syntax errors: a broken file.
+        assert!(matches!(
+            codex_fixture(Some("{\"hooks\": {\"PreToolUse\": [}"), None),
+            CodexHookProbe::HooksFileInvalid(_)
+        ));
+        // Well-formed JSON in shapes Codex's loader refuses.
+        for rejected in [
+            // Event value must be a matcher-group list.
+            r#"{"hooks":{"PreToolUse":"not a list"}}"#,
+            // Unknown handler type.
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"bogus","command":"dcg"}]}]}}"#,
+            // Missing handler type tag.
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"command":"dcg"}]}]}}"#,
+            // `timeout` must be a number.
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"dcg","timeout":"30"}]}]}}"#,
+            // Second unknown top-level key spelling.
+            r#"{"schema":"v1","hooks":{}}"#,
+        ] {
+            assert!(
+                matches!(
+                    codex_fixture(Some(rejected), None),
+                    CodexHookProbe::HooksFileRejected(_)
+                ),
+                "must be HooksFileRejected: {rejected}"
+            );
+        }
+        // Shapes Codex accepts: optional description, unknown event names
+        // ignored, extra handler fields tolerated.
+        let accepted = r#"{
+  "description": "fleet hooks",
+  "hooks": {
+    "FutureEvent": [],
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "/opt/dcg", "timeout": 30, "statusMessage": "guard", "extra": true } ] }
+    ]
+  }
+}"#;
+        assert!(matches!(
+            codex_fixture(Some(accepted), None),
+            CodexHookProbe::Registered { .. }
+        ));
+    }
+
+    #[test]
+    fn codex_probe_honors_codex_matcher_semantics_391() {
+        let with_matcher = |matcher: &str| {
+            format!(
+                r#"{{"hooks":{{"PreToolUse":[{{"matcher":{matcher},"hooks":[{{"type":"command","command":"/opt/dcg"}}]}}]}}}}"#
+            )
+        };
+        // Selects Bash: exact list, wildcard, absent, empty, regex.
+        for matcher in [
+            r#""Bash""#,
+            r#""Bash|Edit""#,
+            r#""*""#,
+            r#""""#,
+            r#""^Bash$""#,
+            "null",
+        ] {
+            assert!(
+                matches!(
+                    codex_fixture(Some(&with_matcher(matcher)), None),
+                    CodexHookProbe::Registered { .. }
+                ),
+                "matcher {matcher} selects Bash"
+            );
+        }
+        // Does not select Bash: exact list without it, non-matching regex.
+        for matcher in [r#""Edit|Write""#, r#""^Write$""#, r#""BashOutput""#] {
+            match codex_fixture(Some(&with_matcher(matcher)), None) {
+                CodexHookProbe::Misplaced(detail) => {
+                    assert!(
+                        detail.contains("does not select Bash"),
+                        "detail names the matcher problem: {detail}"
+                    );
+                }
+                other => panic!("matcher {matcher}: expected Misplaced, got {other:?}"),
+            }
+        }
+        let group_without_matcher_field =
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"/opt/dcg"}]}]}}"#;
+        assert!(matches!(
+            codex_fixture(Some(group_without_matcher_field), None),
+            CodexHookProbe::Registered { .. }
+        ));
+    }
+
+    #[test]
+    fn codex_probe_reports_dcg_under_the_wrong_event_as_misplaced_391() {
+        let post_only = r#"{"hooks":{"PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/opt/dcg"}]}]}}"#;
+        match codex_fixture(Some(post_only), None) {
+            CodexHookProbe::Misplaced(detail) => {
+                assert!(detail.contains("PostToolUse"), "{detail}");
+            }
+            other => panic!("expected Misplaced, got {other:?}"),
+        }
+        // A correct PreToolUse hook alongside a PostToolUse one is simply
+        // registered — the extra hook is not a defect.
+        let both = r#"{"hooks":{
+  "PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/opt/dcg"}]}],
+  "PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/opt/dcg"}]}]}}"#;
+        assert!(matches!(
+            codex_fixture(Some(both), None),
+            CodexHookProbe::Registered { .. }
+        ));
+        // A non-command handler is not a dcg registration at all.
+        let prompt_only =
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"prompt"}]}]}}"#;
+        assert_eq!(
+            codex_fixture(Some(prompt_only), None),
+            CodexHookProbe::NotRegistered
+        );
+    }
+
+    #[test]
+    fn codex_probe_reports_missing_program_as_command_not_found_391() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks_path = dir.path().join("hooks.json");
+        std::fs::write(&hooks_path, CODEX_HOOKS_DCG_FIRST).expect("write");
+        let config_path = dir.path().join("config.toml");
+        let key = format!("{}:pre_tool_use:0:0", hooks_path.display());
+        std::fs::write(
+            &config_path,
+            format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"sha256:abc\"\n"),
+        )
+        .expect("write");
+        // Trusted and enabled, yet the program is gone: that outranks the
+        // trust state because nothing can run.
+        assert_eq!(
+            probe_codex_dcg_hook_at(&hooks_path, &config_path, |_| false),
+            CodexHookProbe::CommandNotFound {
+                state_key: key,
+                command: "/home/u/.local/bin/dcg".to_string(),
+            }
+        );
+
+        // The real resolver against the filesystem: a path that exists passes,
+        // a path that does not fails, a bare name goes through PATH lookup.
+        let real = dir.path().join("dcg");
+        std::fs::write(&real, b"#!/bin/sh\n").expect("write stub");
+        assert!(codex_hook_command_exists(&real.display().to_string()));
+        assert!(codex_hook_command_exists(&format!(
+            "\"{}\" --some-flag",
+            real.display()
+        )));
+        assert!(!codex_hook_command_exists(
+            &dir.path().join("missing").join("dcg").display().to_string()
+        ));
+        assert!(!codex_hook_command_exists(""));
+        assert!(!codex_hook_command_exists(
+            "definitely-not-a-real-program-name-dcg-391"
+        ));
+    }
+
+    #[test]
+    fn codex_matcher_and_program_helpers_391() {
+        assert!(codex_matcher_selects_bash(None));
+        assert!(codex_matcher_selects_bash(Some("")));
+        assert!(codex_matcher_selects_bash(Some("*")));
+        assert!(codex_matcher_selects_bash(Some("Bash")));
+        assert!(codex_matcher_selects_bash(Some("Edit|Bash")));
+        assert!(codex_matcher_selects_bash(Some("^Bash$")));
+        assert!(codex_matcher_selects_bash(Some("Ba.h")));
+        assert!(!codex_matcher_selects_bash(Some("Edit|Write")));
+        assert!(!codex_matcher_selects_bash(Some("BashOutput")));
+        assert!(
+            !codex_matcher_selects_bash(Some("[")),
+            "invalid regex never matches"
+        );
+
+        assert_eq!(codex_hook_program("/opt/dcg"), Some("/opt/dcg"));
+        assert_eq!(codex_hook_program("  /opt/dcg --flag"), Some("/opt/dcg"));
+        assert_eq!(
+            codex_hook_program(r#""C:\Program Files\dcg\dcg.exe" --flag"#),
+            Some(r"C:\Program Files\dcg\dcg.exe")
+        );
+        assert_eq!(codex_hook_program(""), None);
     }
 
     #[test]

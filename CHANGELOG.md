@@ -45,6 +45,21 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   after the terminator or on the operator line keep failing closed.
   Regression coverage in `src/heredoc.rs` and
   `tests/repro_393_heredoc_boundary_data_sink.rs`.
+- **`dcg doctor` reported a Codex `hooks.json` that Codex refuses to load as
+  "registered but untrusted" (#391).** Codex's `HooksFile` is
+  `deny_unknown_fields` (`description` and `hooks` only), so a stray
+  top-level `"version": 1` makes it reject the whole file (`failed to parse
+  hooks config … unknown field \`version\``) and load none of its hooks —
+  there is no trust prompt to approve, yet doctor pointed at one. The probe
+  now mirrors Codex's schema and distinguishes: file missing; not JSON;
+  valid JSON the schema rejects (unknown top-level key, non-list event,
+  unknown handler `type`, non-numeric `timeout`); loadable but no dcg
+  `PreToolUse` command hook selecting `Bash` (matcher semantics follow
+  Codex: absent/empty/`*` match all, `[A-Za-z0-9_|]` lists are exact, else
+  regex); dcg present but misplaced (wrong event or a matcher that excludes
+  `Bash`); registered but the command's program does not exist on disk /
+  PATH; and the existing untrusted / disabled / enabled states. Each state
+  carries its own remedy in both the pretty and `--format json` renderers.
 
 ---
 
