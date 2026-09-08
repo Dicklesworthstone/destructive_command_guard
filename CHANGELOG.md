@@ -11,6 +11,15 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+### Changed
+
+- Dependency bumps: toml 1.1.5, smallvec 1.16.0, ast-grep-language 0.45.3,
+  self_update 1.3.0 (99068cc, dependabot `rust-minor-patch` group;
+  `Cargo.lock` only, no source changes). These landed on `main` after the
+  v0.14.1 tag and ship in the next release.
+
 ## [v0.14.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.14.1) -- 2026-09-07 [Release]
 
 Crush support, the closed-pipe / fail-closed hook hardening, the absent-file
