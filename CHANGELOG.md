@@ -20,6 +20,32 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   `Cargo.lock` only, no source changes). These landed on `main` after the
   v0.14.1 tag and ship in the next release.
 
+### Fixed
+
+- **A heredoc body on a `;`-joined operator line was re-scanned as live
+  shell (#393).** The report (`git commit -F - <<EOF` whose message mentions
+  `restore`, matched by `core.git:restore-worktree` across the operator
+  boundary) was filed against 0.4.0; the git stdin-sink model added for #136
+  / #277 already keeps that exact input, and the `cat > file <<EOF` /
+  `tee <<EOF` forms, inert on `main`. Auditing the class found the survivor:
+  tree-sitter-bash rejects a heredoc whose operator line continues with `;`
+  (`cat <<EOF; echo done`, `git commit -F - <<EOF; git push`), and on a
+  parse error the masking view dropped EVERY heredoc in the command, so the
+  data body reached the pack regexes while the identical command joined with
+  `&&` or `|` was allowed. `active_heredocs` now recovers the one unambiguous
+  body span from the tier-2 extractor (single operator, proven active, not
+  commented, simple delimiter, terminator found) for every operator flavor,
+  not just `<<~`; multi-operator or exotic-delimiter failures stay unmasked.
+  The same audit widened the structured stdin sinks: `git commit -aF -` and
+  other glued value-less short flags, `-F /dev/stdin` / `--file=/dev/stdin`,
+  `git merge -F -`, and `gh issue|pr|release … --body-file -` / `-F -` /
+  `--notes-file -` plus `gh api --input -` (`gh api -F` is a typed field and
+  is deliberately excluded). Executing receivers (`bash <<EOF; …`,
+  `cat <<'EOF' | bash`), expanding `$(…)` in unquoted bodies, and commands
+  after the terminator or on the operator line keep failing closed.
+  Regression coverage in `src/heredoc.rs` and
+  `tests/repro_393_heredoc_boundary_data_sink.rs`.
+
 ---
 
 ## [v0.14.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.14.1) -- 2026-09-07 [Release]

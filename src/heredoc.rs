@@ -3250,8 +3250,17 @@ fn is_git_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
     // Only built-in subcommands with a documented data-only stdin contract are
     // eligible. Unknown commands may be persistent or visible shell aliases,
     // and Git passes the heredoc through to those aliases unchanged.
-    let accepts_file_stdin = matches!(subcommand, "commit" | "tag" | "notes");
+    let accepts_file_stdin = matches!(subcommand, "commit" | "tag" | "notes" | "merge");
     let accepts_plain_stdin = matches!(subcommand, "hash-object" | "update-index");
+    // Short boolean flags that may be glued in front of `F` (`-aF -`, `-sF -`).
+    // Only value-less flags qualify: `-cF -` is `-c F` (reuse the message of
+    // commit `F`), so a value-taking letter before `F` disqualifies the token.
+    let glueable_short_flags = match subcommand {
+        "commit" => "aeinopqsv",
+        "tag" => "afs",
+        "merge" => "enqv",
+        _ => "",
+    };
     // `git apply` reads the patch itself from stdin when no file operand (or
     // `-`) is given, and a unified-diff body is data in every mode (--cached,
     // --check, --index, worktree): git parses it as a patch, never executes
@@ -3261,22 +3270,132 @@ fn is_git_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
     if subcommand == "apply" {
         return !subcommand_args.iter().any(|arg| arg == "--unsafe-paths");
     }
+    let next_is_stdin = |i: usize| {
+        subcommand_args
+            .get(i + 1)
+            .is_some_and(|next| is_stdin_file_operand(next))
+    };
     for (i, arg) in subcommand_args.iter().enumerate() {
         match arg.as_str() {
-            // `-F -` / `--file -`: message read from stdin (commit/tag/notes).
+            // `-F -` / `--file -`: message read from stdin (commit/tag/notes/merge).
             "-F" | "--file" if accepts_file_stdin => {
-                if subcommand_args.get(i + 1).map(String::as_str) == Some("-") {
+                if next_is_stdin(i) {
                     return true;
                 }
             }
-            // Glued / `=-` forms of the same.
-            "-F-" | "--file=-" if accepts_file_stdin => return true,
             // Blob/index/object content from stdin (NOT --stdin-paths).
             "--stdin" if accepts_plain_stdin => return true,
+            _ if accepts_file_stdin => {
+                // Glued / `=` forms: `-F-`, `--file=-`, `--file=/dev/stdin`.
+                if let Some(operand) = arg.strip_prefix("--file=") {
+                    if is_stdin_file_operand(operand) {
+                        return true;
+                    }
+                    continue;
+                }
+                // `-aF -` / `-sF-`: boolean short flags glued before `F`.
+                let Some(short) = arg.strip_prefix('-') else {
+                    continue;
+                };
+                if short.starts_with('-') {
+                    continue;
+                }
+                let Some(f_at) = short.find('F') else {
+                    continue;
+                };
+                if !short[..f_at]
+                    .chars()
+                    .all(|flag| glueable_short_flags.contains(flag))
+                {
+                    continue;
+                }
+                let glued_operand = &short[f_at + 1..];
+                if glued_operand.is_empty() {
+                    if next_is_stdin(i) {
+                        return true;
+                    }
+                } else if is_stdin_file_operand(glued_operand) {
+                    return true;
+                }
+            }
             _ => {}
         }
     }
     false
+}
+
+/// Whether a `-F`/`--file`-style operand names the process's own stdin — the
+/// conventional `-` plus the device-path spellings that open the same
+/// descriptor. Every one hands the heredoc body to the program as data.
+fn is_stdin_file_operand(operand: &str) -> bool {
+    matches!(
+        operand,
+        "-" | "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0"
+    )
+}
+
+/// Check whether the heredoc at `heredoc_start` feeds a `gh` built-in through
+/// one of its documented read-text-from-stdin operands: `--body-file -` /
+/// `-F -` (issue/pr comment, create, edit, …), `--notes-file -` (release
+/// create/edit), or `gh api --input -` (the request body). `gh` never
+/// executes stdin as shell, and `gh alias set` refuses to shadow a built-in
+/// command, so the receiver of the body is the built-in itself (#393).
+///
+/// `gh api` is scoped to `--input` only: there `-F` is `--field`, a typed
+/// request field, and `-F -` is not a stdin contract at all.
+fn is_gh_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
+    if heredoc_start == 0 {
+        return false;
+    }
+
+    let prefix = &command[..heredoc_start];
+    let line_start = prefix.rfind(['\n', '\r']).map_or(0, |i| i + 1);
+    let before = prefix[line_start..].trim_end();
+    if before.is_empty() {
+        return false;
+    }
+
+    let mut tokens = tokenize_backwards(before);
+    tokens.reverse();
+
+    let mut idx = 0;
+    while let Some(token) = tokens.get(idx) {
+        if is_shell_env_assignment(token) || SHELL_WRAPPER_COMMANDS.contains(&token.as_str()) {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+
+    let Some(program) = tokens.get(idx) else {
+        return false;
+    };
+    if program.rsplit('/').next().unwrap_or(program) != "gh" {
+        return false;
+    }
+    let Some(subcommand) = tokens.get(idx + 1) else {
+        return false;
+    };
+    let args = &tokens[idx + 2..];
+    let stdin_flags: &[&str] = match subcommand.as_str() {
+        "api" => &["--input"],
+        "issue" | "pr" | "release" => &["--body-file", "-F", "--notes-file"],
+        _ => return false,
+    };
+    args.iter().enumerate().any(|(i, arg)| {
+        if stdin_flags.contains(&arg.as_str()) {
+            return args
+                .get(i + 1)
+                .is_some_and(|next| is_stdin_file_operand(next));
+        }
+        stdin_flags.iter().any(|flag| {
+            flag.starts_with("--")
+                && arg
+                    .strip_prefix(flag)
+                    .and_then(|rest| rest.strip_prefix('='))
+                    .is_some_and(is_stdin_file_operand)
+        })
+    })
 }
 
 /// Resolve a statically visible built-in Git subcommand after bounded global
@@ -3344,7 +3463,7 @@ fn git_builtin_subcommand_and_args(args: &[String]) -> Option<(&str, &[String])>
     let subcommand = args.get(index)?.as_str();
     matches!(
         subcommand,
-        "commit" | "tag" | "notes" | "hash-object" | "update-index" | "apply"
+        "commit" | "tag" | "notes" | "merge" | "hash-object" | "update-index" | "apply"
     )
     .then(|| (subcommand, &args[index + 1..]))
 }
@@ -3400,10 +3519,12 @@ fn is_spx_session_handoff_stdin_data_sink(command: &str, heredoc_start: usize) -
 
 /// Check whether the heredoc/here-string at `heredoc_start` feeds a command
 /// with a documented structured-stdin DATA contract (`git commit -F -` and
-/// friends, `spx session handoff`). Such bodies are consumed as data (a commit
-/// message, a handoff document), never executed as shell (#277).
+/// friends, `gh … --body-file -`, `spx session handoff`). Such bodies are
+/// consumed as data (a commit message, an issue comment, a handoff
+/// document), never executed as shell (#277, #393).
 pub(crate) fn is_structured_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
     is_git_stdin_data_sink(command, heredoc_start)
+        || is_gh_stdin_data_sink(command, heredoc_start)
         || is_spx_session_handoff_stdin_data_sink(command, heredoc_start)
 }
 
@@ -3599,22 +3720,63 @@ fn active_heredocs(command: &str) -> Option<Vec<ActiveHeredoc>> {
     let mut parse_error = false;
     collect_active_heredocs(ast.root(), &mut heredocs, &mut parse_error);
     if parse_error {
-        return active_indent_stripped_heredoc_fallback(command);
+        return active_single_heredoc_fallback(command);
     }
     heredocs.sort_by_key(|heredoc| heredoc.operator_start);
     heredocs.dedup_by_key(|heredoc| heredoc.operator_start);
     Some(heredocs)
 }
 
-/// tree-sitter-bash deliberately rejects Ruby's `<<~` heredoc operator even
-/// though dcg's tier-2 extractor supports it for embedded Ruby/documentation
-/// workflows. Preserve that established masking behavior only when the input
-/// has exactly one heredoc-like operator and the quote-aware trigger scanner
-/// proves it is active shell syntax. Ambiguous multi-operator parse failures
-/// remain unmasked so malformed input cannot erase later executable text.
-fn active_indent_stripped_heredoc_fallback(command: &str) -> Option<Vec<ActiveHeredoc>> {
+/// Recover the one heredoc body span tree-sitter-bash could not give us.
+///
+/// tree-sitter-bash rejects some real shell: Ruby's `<<~` operator, and — the
+/// #393 class — a heredoc whose operator line continues with `;` after the
+/// delimiter (`cat <<EOF; echo done`, `git commit -F - <<EOF; git push`).
+/// A parse error used to drop EVERY heredoc from the masking view, so a
+/// data-sink body (a commit message that merely mentions `git restore`) was
+/// re-scanned as live shell and denied, while the identical command joined
+/// with `&&` or `|` was allowed.
+///
+/// The recovery is deliberately narrow so malformed input can never erase
+/// later executable text: exactly one heredoc-like operator in the whole
+/// input, proven active by the quote-aware trigger scanner, not preceded by
+/// a `#` on its own line (the scanner does not model comments), a simple
+/// delimiter token (no `<<'E'OF`-style concatenation, whose quote removal the
+/// tier-2 extractor does not perform), and a terminator the extractor
+/// actually found. Under those conditions the body is exactly the lines
+/// between the operator's line and the terminator line — the same span the
+/// shell itself feeds the command — and the operator line's own commands,
+/// plus everything after the terminator, stay visible. Anything ambiguous
+/// answers `None`, which keeps the whole input unmasked.
+fn active_single_heredoc_fallback(command: &str) -> Option<Vec<ActiveHeredoc>> {
     if command.match_indices("<<").count() != 1 || !contains_active_heredoc_operator(command) {
         return None;
+    }
+    let operator_start = command.find("<<")?;
+    // Here-strings are not heredocs; only the AST path may classify them.
+    if command[operator_start..].starts_with("<<<") {
+        return None;
+    }
+    let line_start = command[..operator_start]
+        .rfind(['\n', '\r'])
+        .map_or(0, |i| i + 1);
+    if command[line_start..operator_start].contains('#') {
+        return None;
+    }
+    // The delimiter token must end where the extractor's regex says it ends:
+    // a following quote, word byte, or escape means shell quote removal would
+    // change the real delimiter, and the extractor's terminator search would
+    // then be wrong.
+    let delimiter_match = HEREDOC_EXTRACTOR.find_at(command, operator_start)?;
+    if delimiter_match.start() != operator_start {
+        return None;
+    }
+    match command.as_bytes().get(delimiter_match.end()) {
+        None => {}
+        Some(byte)
+            if byte.is_ascii_whitespace()
+                || matches!(byte, b';' | b'&' | b'|' | b')' | b'<' | b'>') => {}
+        Some(_) => return None,
     }
 
     let extracted = match extract_content(command, &ExtractionLimits::default()) {
@@ -3626,15 +3788,22 @@ fn active_indent_stripped_heredoc_fallback(command: &str) -> Option<Vec<ActiveHe
         | ExtractionResult::Failed(_) => return None,
     };
     let mut candidates = extracted.into_iter().filter(|content| {
-        content.heredoc_type == Some(HeredocType::IndentStripped) && content.content_range.is_some()
+        content.byte_range.start == operator_start
+            && content
+                .heredoc_type
+                .is_some_and(|kind| kind != HeredocType::HereString)
+            && content.content_range.is_some()
     });
     let candidate = candidates.next()?;
     if candidates.next().is_some() {
         return None;
     }
     let body_range = candidate.content_range?;
+    if body_range.start < delimiter_match.end() || body_range.end > command.len() {
+        return None;
+    }
     Some(vec![ActiveHeredoc {
-        operator_start: candidate.byte_range.start,
+        operator_start,
         body: ActiveHeredocBody::Heredoc {
             body_start: body_range.start,
             body_end: body_range.end,
@@ -7437,6 +7606,156 @@ EOF";
     /// data sink on a PRIOR line must not mask a later executing `bash` heredoc
     /// body. Heredoc target resolution is bounded to the heredoc's own physical
     /// line, so the target here is `bash` (executing), not `cat` (data sink).
+    #[test]
+    fn semicolon_after_heredoc_operator_keeps_data_sink_masking_393() {
+        // tree-sitter-bash rejects `<<EOF; …` on the operator line; the
+        // masking view used to lose the whole heredoc and re-scan the data
+        // body as shell, while `&&` / `|` joins of the same command masked.
+        let body = "undo with git restore . later";
+        for command in [
+            format!("cat <<EOF; echo done\n{body}\nEOF"),
+            format!("cat <<'EOF'; echo done\n{body}\nEOF"),
+            format!("cat <<\"EOF\"; echo done\n{body}\nEOF"),
+            format!("cat <<-EOF; echo done\n\t{body}\n\tEOF"),
+            format!("cat << EOF ; echo done\n{body}\nEOF"),
+            format!("tee notes.md <<EOF; git status\n{body}\nEOF"),
+            format!("git commit -F - <<EOF; git push\n{body}\nEOF"),
+            format!("git commit -F - <<'EOF'; git push origin HEAD\n{body}\nEOF"),
+            format!("cat <<EOF; echo done\n{body}\nEOF\necho after"),
+        ] {
+            let masked = mask_non_executing_heredocs(&command);
+            assert!(
+                !masked.contains("restore"),
+                "data-sink body must be masked despite `;` on the operator line: {command:?} -> {masked:?}"
+            );
+            assert!(
+                masked.contains("<<") && masked.contains("EOF"),
+                "operator and terminator lines stay intact: {masked:?}"
+            );
+            let operator_line = command.lines().next().expect("operator line");
+            assert!(
+                masked.starts_with(operator_line),
+                "commands on the operator line stay visible: {masked:?}"
+            );
+            if command.ends_with("echo after") {
+                assert!(
+                    masked.ends_with("echo after"),
+                    "text after the terminator stays visible: {masked:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn semicolon_fallback_never_masks_executing_or_ambiguous_input_393() {
+        let destructive = "rm -r ./tree";
+        for command in [
+            // Executing receivers keep their body visible.
+            format!("bash <<EOF; echo done\n{destructive}\nEOF"),
+            format!("sh <<'EOF'; echo done\n{destructive}\nEOF"),
+            format!("python3 - <<'PY'; echo done\nimport os; os.system('{destructive}')\nPY"),
+            // Two operators with a parse error stay fully visible.
+            format!("cat <<A; cat <<B; )\nx\nA\n{destructive}\nB"),
+            // Quote-removal delimiters are not recovered (real terminator is EOF).
+            format!("cat <<'E'OF; echo done\ndata\nEOF\n{destructive}\nE"),
+            format!("cat <<E\\OF; echo done\ndata\nEOF\n{destructive}\nE\\OF"),
+            // A commented-out operator is not a heredoc at all.
+            format!("echo hi; ) # <<EOF\n{destructive}\nEOF"),
+            // Unterminated body: no terminator, no recovery.
+            format!("cat <<EOF; echo done\n{destructive}"),
+        ] {
+            let masked = mask_non_executing_heredocs(&command);
+            assert!(
+                masked.contains(destructive),
+                "fallback must not mask this input: {command:?} -> {masked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_stdin_sink_accepts_glued_flags_and_stdin_device_paths_393() {
+        let body = "undo with git restore . later";
+        for command in [
+            format!("git commit -aF - <<EOF\n{body}\nEOF"),
+            format!("git commit -sF- <<EOF\n{body}\nEOF"),
+            format!("git commit -qaF - <<EOF\n{body}\nEOF"),
+            format!("git commit -F /dev/stdin <<EOF\n{body}\nEOF"),
+            format!("git commit --file=/dev/stdin <<EOF\n{body}\nEOF"),
+            format!("git commit --file /dev/fd/0 <<EOF\n{body}\nEOF"),
+            format!("git merge --no-ff -F - feature <<EOF\n{body}\nEOF"),
+            format!("git merge -eF - feature <<EOF\n{body}\nEOF"),
+            format!("git tag -aF - v1 <<EOF\n{body}\nEOF"),
+        ] {
+            let heredoc_start = command.find("<<").expect("operator");
+            assert!(
+                is_git_stdin_data_sink(&command, heredoc_start),
+                "must be recognized as a git stdin data sink: {command:?}"
+            );
+            let masked = mask_non_executing_heredocs(&command);
+            assert!(
+                !masked.contains("restore"),
+                "commit-message body must be masked: {command:?} -> {masked:?}"
+            );
+        }
+        for command in [
+            // `-c F`: reuse message from commit `F`; `-` is not stdin here.
+            format!("git commit -cF - <<EOF\n{body}\nEOF"),
+            // `-m F`-style value flags glued before F likewise disqualify.
+            format!("git commit -mF - <<EOF\n{body}\nEOF"),
+            // A real file operand is not stdin.
+            format!("git commit -aF msg.txt <<EOF\n{body}\nEOF"),
+            // Unknown subcommands may be aliases.
+            format!("git publish -F - <<EOF\n{body}\nEOF"),
+        ] {
+            let heredoc_start = command.find("<<").expect("operator");
+            assert!(
+                !is_git_stdin_data_sink(&command, heredoc_start),
+                "must NOT be treated as a git stdin data sink: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gh_stdin_text_operands_are_data_sinks_393() {
+        let body = "undo with git restore . later";
+        for command in [
+            format!("gh issue comment 42 --body-file - <<'EOF'\n{body}\nEOF"),
+            format!("gh issue comment 42 -F - <<EOF\n{body}\nEOF"),
+            format!("gh pr create --title t --body-file=- <<'EOF'\n{body}\nEOF"),
+            format!("gh pr comment 7 --body-file /dev/stdin <<'EOF'\n{body}\nEOF"),
+            format!("gh release create v1 --notes-file - <<'EOF'\n{body}\nEOF"),
+            format!("gh api repos/o/r/issues --input - <<'EOF'\n{{\"body\":\"{body}\"}}\nEOF"),
+            format!("GH_TOKEN=x gh issue create -t t -F - <<'EOF'\n{body}\nEOF"),
+        ] {
+            let heredoc_start = command.find("<<").expect("operator");
+            assert!(
+                is_gh_stdin_data_sink(&command, heredoc_start),
+                "must be recognized as a gh stdin data sink: {command:?}"
+            );
+            let masked = mask_non_executing_heredocs(&command);
+            assert!(
+                !masked.contains("restore"),
+                "gh text body must be masked: {command:?} -> {masked:?}"
+            );
+        }
+        for command in [
+            // `gh api -F` is a typed request field, not a file operand.
+            format!("gh api repos/o/r/issues -F - <<'EOF'\n{body}\nEOF"),
+            // No stdin operand at all.
+            format!("gh issue comment 42 <<'EOF'\n{body}\nEOF"),
+            // Extensions and unknown subcommands are not proven data sinks.
+            format!("gh dash --body-file - <<'EOF'\n{body}\nEOF"),
+            // A real file operand is not stdin.
+            format!("gh pr create --body-file body.md <<'EOF'\n{body}\nEOF"),
+        ] {
+            let heredoc_start = command.find("<<").expect("operator");
+            assert!(
+                !is_gh_stdin_data_sink(&command, heredoc_start),
+                "must NOT be treated as a gh stdin data sink: {command:?}"
+            );
+        }
+    }
+
     #[test]
     fn data_sink_mask_does_not_leak_across_lines() {
         let rmrf = format!("{}{}{}", "rm", " -", "rf");
