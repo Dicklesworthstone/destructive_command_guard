@@ -11,14 +11,79 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## Unreleased
+## [v0.14.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.14.2) -- 2026-09-09 [Release]
+
+The credential-file write rule, the `;`-joined heredoc boundary fix (#393),
+the Codex `hooks.json` doctor classification (#391), and the post-0.14.1
+dependency bumps.
+
+### Added
+
+- **`core.filesystem:credential-file-write`: writing a credential, key,
+  login-shell startup, or system authentication file is denied whether or
+  not the file exists yet.** The #390 carve-out made `> ~/absent-file`
+  creation rather than truncation, which was right for `~/.config/new.toml`
+  and wrong for `~/.ssh/authorized_keys`: creating that file grants login,
+  and `>>` to it (or to `~/.zshrc`, `~/.npmrc`, `/etc/sudoers.d/x`) had
+  always been allowed because no rule modelled persistence, only data loss.
+  The new rule covers `~/.ssh/*` (private keys, `authorized_keys`, `config`,
+  `rc`), `~/.aws/credentials` and `config`, `~/.netrc`/`_netrc`,
+  `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.docker/config.json`,
+  `~/.kube/config`, `~/.gnupg/*`, `~/.config/gh/hosts.yml`, the shell rc
+  files (`.bashrc`, `.bash_profile`, `.bash_login`, `.profile`, `.zshrc`,
+  `.zshenv`, `.zprofile`, `.zlogin`) and `~/.bashrc.d/*`/`~/.zshrc.d/*`,
+  plus `/etc/sudoers`, `/etc/sudoers.d/*`, `/etc/passwd`, `/etc/shadow`,
+  `/etc/group`, `/etc/gshadow`, and `/etc/ssh/*`. Writers: every truncating
+  and appending redirect spelling (`>`, `>>`, `>|`, `&>`, `&>>`, `N>`,
+  `{fd}>`, `>&file`), `tee`/`sponge` (with and without `-a`),
+  `cp`/`mv`/`install`/`ln` onto the file or into its directory (`-t DIR`,
+  `-T`, `--`, and a glob, brace, or `dir/.` source that could land on a
+  protected name are all understood), `dd of=`, and `sed -i`/`perl -i`, with
+  `sudo`/`doas`/`env`/`command`/`nohup`/`nice`/`timeout`/`stdbuf` and
+  leading assignments or reserved words stripped, inside `bash -c` payloads,
+  and after `;`/`&&`/`|`. The path is judged as the shell will open it:
+  `~`, `~user`, `$HOME`/`${HOME}`, `/home/<u>`, `/Users/<u>`, `/root`,
+  `/private/etc`, the relocation variables (`ZDOTDIR`, `GNUPGHOME`,
+  `XDG_CONFIG_HOME`, `GH_CONFIG_DIR`, `DOCKER_CONFIG`, `KUBECONFIG`,
+  `AWS_SHARED_CREDENTIALS_FILE`, `AWS_CONFIG_FILE`, `NPM_CONFIG_USERCONFIG`),
+  quote removal and backslash escapes (`~/.zsh"rc"`, `~/.zshr\c`), and
+  lexical `..` are all resolved; a spelling the shell rewrites first (brace
+  expansion, globs, zsh alternation, an embedded expansion) is judged with
+  the literal-token whitelist from ce11b48 and denied when its literal
+  prefix can still complete into a protected path (`~/.zshr{c..c}`,
+  `~/.ssh/id_*`, `~/{.zshrc,x}`), ignored when it cannot
+  (`~/notes-{a,b}.txt`). The rule runs ahead of `redirect-truncate-root-home`
+  and takes precedence over the absent-file carve-out. Untouched: reads
+  (`cat`, `grep`, `diff`, `source`, `ssh -F`), `chmod`/`chown`, `~/.ssh/*.pub`,
+  relative paths, every unlisted file (which keeps its ordinary truncation
+  verdict), and appending to `~/.ssh/known_hosts` — what `ssh` itself does;
+  truncating or replacing the trust store is denied. Each denial names the
+  writer and the file with the remedy (`dcg allow-once`, or allowlisting
+  `core.filesystem:credential-file-write` for a project that manages its own
+  dotfiles — an allowlist entry lifts only this rule). PowerShell and Cmd
+  spellings are not classified by this rule. `tee`, `sponge`, `install`,
+  `sed`, and `perl` join the pack's keyword list, but select the pack only
+  when the command can also spell a protected root (`~`, `$`, `/etc`,
+  `/home/`, `/Users/`, `/root`): `npm install`, `cargo install`, and a
+  `sed … | tee /tmp/out` pipeline never cold-initialise core.filesystem's
+  regex set on this rule's account (hook latency for them is unchanged at
+  ~14 ms; measured, not assumed). Coverage: the classifier's own matrix
+  (`src/packs/core/credential_files.rs`), the evaluator precedence test, and
+  `tests/credential_file_write_e2e.rs` against the real binary in an
+  isolated `HOME` (absent and existing targets, every writer, neighbours,
+  and the allowlist).
 
 ### Changed
 
 - Dependency bumps: toml 1.1.5, smallvec 1.16.0, ast-grep-language 0.45.3,
   self_update 1.3.0 (99068cc, dependabot `rust-minor-patch` group;
-  `Cargo.lock` only, no source changes). These landed on `main` after the
-  v0.14.1 tag and ship in the next release.
+  `Cargo.lock` only, no source changes).
+- `> /etc/passwd`, `mv x ~/.ssh/authorized_keys`, and every other write to a
+  listed file that an existing rule already denied is now attributed to
+  `core.filesystem:credential-file-write` (the more specific rule, with the
+  persistence explanation); the redirect and `mv` rules keep their verdicts
+  for unlisted paths. Allowlist entries and `exempt_target_globs` written
+  for the old rule ids do not apply to listed files.
 
 ### Fixed
 
