@@ -22675,6 +22675,74 @@ fn evaluate_core_filesystem_pack(
             })
             .collect();
 
+        // `core.filesystem:credential-file-write` (semantic, POSIX): a write
+        // to a credential, key, login-shell startup, or system authentication
+        // file is judged before every redirect and command rule below, so it
+        // outranks `redirect-truncate-root-home` and the #390 absent-file
+        // carve-out (which only stands that one rule down). Nested
+        // substitution ranges are evaluated as their own segments.
+        if let Some(hit) = crate::packs::core::credential_files::classify_credential_file_write(
+            mask_nested_segment_ranges(dialect_segment, segment_start, &nested_segment_ranges)
+                .as_ref(),
+            shell_dialect,
+        ) {
+            let rule = crate::packs::core::credential_files::CREDENTIAL_FILE_WRITE_NAME;
+            let severity = crate::packs::Severity::Critical;
+            let (explanation, suggestions) = pack.rule_guidance(rule);
+            let span = MatchSpan {
+                start: hit.span.start + segment_start,
+                end: hit.span.end + segment_start,
+            };
+            let mapped_span = map_span_with_offset(span, normalized_offset, original_len);
+            let preview = mapped_span
+                .as_ref()
+                .map(|span| extract_match_preview(original_command, span));
+            if let Some(allow_hit) = allowlists.match_rule_at_path(pack_id, rule, project_path) {
+                if first_allowlist_hit.is_none() {
+                    *first_allowlist_hit = Some((
+                        PatternMatch {
+                            pack_id: Some(pack_id.to_string()),
+                            pattern_name: Some(rule.to_string()),
+                            severity: Some(severity),
+                            reason: hit.reason.clone(),
+                            source: MatchSource::Pack,
+                            matched_span: mapped_span,
+                            matched_text_preview: preview,
+                            explanation: explanation.map(str::to_string),
+                            suggestions,
+                        },
+                        allow_hit.layer,
+                        allow_hit.entry.reason.clone(),
+                    ));
+                }
+            } else {
+                return Some(mapped_span.map_or_else(
+                    || {
+                        EvaluationResult::denied_by_pack_pattern(
+                            pack_id,
+                            rule,
+                            &hit.reason,
+                            explanation,
+                            severity,
+                            suggestions,
+                        )
+                    },
+                    |mapped_span| {
+                        EvaluationResult::denied_by_pack_pattern_with_span(
+                            pack_id,
+                            rule,
+                            &hit.reason,
+                            explanation,
+                            severity,
+                            suggestions,
+                            original_command,
+                            mapped_span,
+                        )
+                    },
+                ));
+            }
+        }
+
         // A `$VAR` redirect target proven to resolve to a benign literal path
         // (single prior literal assignment in this same command) is exempt
         // from the dynamic-path rule only; every other redirect rule still
@@ -30535,7 +30603,9 @@ mod tests {
                 "redirect-truncate-root-home",
             ),
             ("echo $(rm -r ./tree)", "rm-recursive-general"),
-            ("rm -ri ./tree > /etc/passwd", "redirect-truncate-root-home"),
+            // `/etc/passwd` is a system authentication file, so the
+            // credential rule claims it ahead of the generic truncation rule.
+            ("rm -ri ./tree > /etc/passwd", "credential-file-write"),
             (
                 "rm -ri ./tree 'literal > /etc/passwd",
                 "redirect-truncate-root-home",
@@ -31601,6 +31671,120 @@ mod tests {
         }
     }
 
+    /// `core.filesystem:credential-file-write` runs ahead of the redirect
+    /// rules and the #390 carve-out: a credential, key, login-shell startup,
+    /// or system authentication file is denied by that rule for every writer,
+    /// whether the file exists or not, while reads and neighbours keep their
+    /// ordinary verdicts.
+    #[test]
+    fn credential_file_writes_are_denied_ahead_of_the_redirect_rules() {
+        let rule = |command: &str, dialect: ShellDialect| -> Option<String> {
+            let result = evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+            if !result.is_denied() {
+                return None;
+            }
+            result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.clone())
+        };
+        let credential = Some("credential-file-write".to_string());
+        for command in [
+            "echo x > ~/.ssh/authorized_keys",
+            "echo x >> ~/.ssh/authorized_keys",
+            "echo x > ~/.zshrc",
+            "echo x >> ~/.zshrc",
+            "printf 'export PATH=x' >> ~/.bashrc",
+            "cat <<EOF > ~/.ssh/config\nHost x\nEOF",
+            "echo x | tee -a ~/.npmrc",
+            "echo x | sudo tee -a /etc/sudoers.d/agent",
+            "cp key ~/.ssh/id_ed25519",
+            "cp key ~/.ssh/",
+            "mv ~/Documents/x ~/.ssh/authorized_keys",
+            "install -m 600 creds ~/.aws/credentials",
+            "ln -sf /tmp/rc ~/.zshrc",
+            "dd if=/tmp/x of=~/.ssh/authorized_keys",
+            "sed -i 's/a/b/' ~/.zshrc",
+            "sudo sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config",
+            "echo x >> ~/.zshr{c..c}",
+            "echo x >> ~/.zsh\"rc\"",
+            "echo x >> $HOME/.zshrc",
+            "echo x >> \"$HOME/.zshrc\"",
+            "echo x >> /home/bob/.zshrc",
+            "echo x >> ~root/.ssh/authorized_keys",
+            "echo x | t''ee ~/.zshrc",
+            "bash -c 'echo x >> ~/.zshrc'",
+            "true && echo x >> ~/.zshrc",
+            "echo x > /tmp/ok; echo y >> /etc/passwd",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                assert_eq!(
+                    rule(command, dialect),
+                    credential,
+                    "{command:?} ({dialect:?})"
+                );
+            }
+        }
+        for command in [
+            "cat ~/.ssh/config",
+            "grep -n Host ~/.ssh/config",
+            "chmod 600 ~/.ssh/authorized_keys",
+            "chown bob ~/.zshrc",
+            "echo x >> ~/.ssh/known_hosts",
+            "ssh-keyscan host >> ~/.ssh/known_hosts",
+            "echo x >> ~/.ssh/id_ed25519.pub",
+            "echo x >> ~/.claude/notes.md",
+            "cp report.txt ~/",
+            "cp *.png ~/Pictures/",
+            "sed -n '/PATH/p' ~/.zshrc",
+            "sed -i 's/a/b/' ~/notes.txt",
+            "echo 'echo x >> ~/.zshrc'",
+            "cat <<'EOF'\necho x >> ~/.zshrc\nEOF",
+            "echo x > /tmp/scratch/out",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "{command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        // PowerShell spellings are not classified by this rule; the redirect
+        // rules keep judging them on their own terms.
+        assert_ne!(
+            rule("echo x >> ~/.zshrc", ShellDialect::PowerShell),
+            credential
+        );
+        // Neighbours keep the ordinary truncation verdict; the trust store
+        // may be appended to but not replaced.
+        assert_eq!(
+            rule("echo x > /etc/hosts", ShellDialect::Posix),
+            Some("redirect-truncate-root-home".to_string())
+        );
+        assert_eq!(
+            rule("echo x > ~/.ssh/known_hosts", ShellDialect::Posix),
+            credential
+        );
+        // The hit names the writer and the file.
+        let result = evaluate_with_pack_ids_in_dialect(
+            "echo x | tee -a ~/.npmrc",
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        let info = result.pattern_info.expect("denied with pattern info");
+        assert!(
+            info.reason.contains("`tee -a` appends to ~/.npmrc"),
+            "{}",
+            info.reason
+        );
+        assert!(info.explanation.is_some(), "authored guidance is attached");
+        assert!(!info.suggestions.is_empty(), "suggestions are attached");
+    }
+
     /// #337 / #390: the truncation hazard exists only for a target that
     /// already exists. A literal absent file with an existing parent under
     /// the home directory is creation, not truncation, whether or not a VCS
@@ -31652,9 +31836,10 @@ mod tests {
         allowed("echo hi > ~/.config/absent.txt");
         allowed("echo hi > $HOME/.config/absent.txt");
         allowed("echo hi > ~/absent-top-level.txt");
-        // No sibling rule guards CREATION of credential files, and `>>` to the
-        // same absent path has always been allowed, so `>` follows suit: an
-        // absent target has nothing to truncate regardless of its name.
+        // This carve-out judges existence only: an absent target has nothing
+        // to truncate regardless of its name. Credential files are guarded
+        // by `credential-file-write`, which the evaluator consults first, so
+        // this answer never reaches the verdict for them.
         allowed("echo key > ~/.ssh/authorized_keys");
 
         // Existing targets: the hazard the rule exists for, in and out of VCS.
@@ -37292,10 +37477,16 @@ mod tests {
                 &["mv-dynamic-path"],
             ),
             ("for f in *; do mv \"$f\" d/; done", &["mv-dynamic-path"]),
-            // A sensitive literal destination is denied outright.
+            // A sensitive literal destination is denied outright. (An unknown
+            // file moved into `/etc/` may land on `sudoers` or `passwd`, so
+            // `credential-file-write` claims it first.)
             (
                 "for f in a b; do mv \"$f\" /etc/; done",
-                &["mv-sensitive-source-root-home", "mv-dynamic-path"],
+                &[
+                    "credential-file-write",
+                    "mv-sensitive-source-root-home",
+                    "mv-dynamic-path",
+                ],
             ),
             // The case proving per-candidate re-evaluation is mandatory: the
             // body segment has no sensitive literal, so only substituting

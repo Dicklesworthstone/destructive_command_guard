@@ -2881,6 +2881,17 @@ denied no matter what is configured. The same rule applies inside the supported
 rules: a target containing a variable, command substitution, backtick, glob, or
 `%VAR%` is not a literal, and is never matched against an exemption glob.
 
+**Credential and login files are never exempted by path.**
+`core.filesystem:credential-file-write` (writes to `~/.ssh/*`,
+`~/.aws/credentials`, `~/.netrc`, `~/.npmrc`, the shell rc files,
+`/etc/sudoers*`, `/etc/passwd`, and the rest of its list, by `>`/`>>`, `tee`,
+`cp`/`mv`/`install`/`ln`, `dd`, or `sed -i`) has no target-glob setting: the
+files are the point, so there is no "scratch" subset to carve out. Reads,
+`chmod`/`chown`, and appending to `~/.ssh/known_hosts` are already allowed;
+for a project that legitimately manages one of these files, allowlist the rule
+id with a reason (that lifts only this rule — an existing file is still judged
+by `redirect-truncate-root-home`), or use `dcg allow-once` for a one-off.
+
 **Glob semantics.**
 
 - `~` and `~/` expand to the user's home directory; `~user` is not supported.

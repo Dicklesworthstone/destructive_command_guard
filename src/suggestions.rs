@@ -932,6 +932,30 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         ),
     ];
     m.insert(
+        "core.filesystem:credential-file-write",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Read the current content first; reads of credential and login files are never blocked",
+            )
+            .with_command("cat ~/.ssh/config"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Stage the proposed content in a scratch file and let the user apply it",
+            )
+            .with_command("echo data > /tmp/scratch/proposed && cat /tmp/scratch/proposed"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Appending a host key to known_hosts is allowed (what ssh itself does)",
+            )
+            .with_command("ssh-keyscan host >> ~/.ssh/known_hosts"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "For a change the user has approved, grant this one command with `dcg allow-once`, or allowlist `core.filesystem:credential-file-write` in the project config with a reason",
+            ),
+        ],
+    );
+    m.insert(
         "core.filesystem:redirect-truncate-root-home",
         redirect_truncate_suggestions.clone(),
     );
@@ -2053,6 +2077,7 @@ mod tests {
             "core.filesystem:cp-sensitive-then-delete",
             "core.filesystem:ln-symlink-sensitive-then-delete",
             "core.filesystem:rsync-sensitive-then-delete",
+            "core.filesystem:credential-file-write",
             "core.filesystem:redirect-truncate-root-home",
             "core.filesystem:redirect-truncate-dynamic-path",
         ];

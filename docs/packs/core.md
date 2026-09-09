@@ -102,6 +102,11 @@ Commands containing these keywords are checked against this pack:
 - `cp`
 - `ln`
 - `rsync`
+- `tee`
+- `sponge`
+- `install`
+- `sed`
+- `perl`
 - `>/`
 - `> /`
 - `>~`
@@ -197,6 +202,7 @@ These patterns match potentially destructive commands:
 | `dd-overwrite-general` | dd with of=<file> overwrites file contents and requires human approval. | high |
 | `mv-sensitive-source-root-home` | mv touching a sensitive system or home path is the cross-segment recursive-force-delete bypass. EXTREMELY DANGEROUS. | critical |
 | `mv-dynamic-path` | mv with a shell-expanded or escaped path cannot be verified before execution. | high |
+| `credential-file-write` | writing a credential, private-key, login-shell startup, or system authentication file (`~/.ssh/*`, `~/.aws/credentials`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.docker/config.json`, `~/.kube/config`, `~/.gnupg/*`, `~/.config/gh/hosts.yml`, the shell rc files and `~/.bashrc.d`/`~/.zshrc.d`, `/etc/sudoers*`, `/etc/passwd`, `/etc/shadow`, `/etc/group`, `/etc/ssh/*`) with `>`, `>>`, `tee`, `cp`/`mv`/`install`/`ln`, `dd of=`, or `sed -i` installs persistent access or replaces the trust this machine runs on, whether or not the file exists yet. Reads and `chmod`/`chown` are unaffected; appending to `~/.ssh/known_hosts` stays allowed. | critical |
 | `redirect-truncate-root-home` | shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to an existing sensitive system or home path destroys the previous file contents. A currently absent literal target under the home directory with an existing parent is allowed (creation, not truncation — the same thing `>>` would do); existing files, dynamic paths, symlinks, missing parents, system paths, and .git internals stay blocked. | critical |
 | `redirect-truncate-dynamic-path` | shell redirect to a dynamic or escaped path may truncate a sensitive file and requires human approval. | high |
 | `fork-bomb` | This is a fork bomb: it recursively spawns processes until the system is unusable. | critical |

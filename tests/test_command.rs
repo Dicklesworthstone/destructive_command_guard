@@ -228,6 +228,14 @@ fn test_stdout_stderr_redirect_truncate_is_blocked() {
     let json = parse_json(&output);
     assert_eq!(json["decision"], "deny");
     assert_eq!(json["pack_id"], "core.filesystem");
+    // `/etc/passwd` is a system authentication file, so the credential rule
+    // (which sees every `>&word` spelling) claims it ahead of the generic
+    // truncation rule; the generic rule still covers unlisted paths.
+    assert_eq!(json["pattern_name"], "credential-file-write");
+
+    let output = run_dcg_isolated(&["test", "--format", "json", ": >&/etc/hosts"], None);
+    assert_eq!(output.status.code(), Some(1));
+    let json = parse_json(&output);
     assert_eq!(json["pattern_name"], "redirect-truncate-root-home");
 }
 

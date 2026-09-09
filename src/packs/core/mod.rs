@@ -7,5 +7,6 @@
 //! - Git commands that destroy stashes
 //! - Filesystem commands that recursively delete outside temp directories
 
+pub(crate) mod credential_files;
 pub mod filesystem;
 pub mod git;

@@ -5,6 +5,12 @@
 //! Runs the real binary in hook mode against an isolated `HOME` so every row
 //! of the report's table is exercised end to end, including the `~`
 //! expansion and the two evaluator call sites that consult the carve-out.
+//!
+//! The existing-file fixture is `~/.vimrc`: since v0.14.2 the shell rc files
+//! and the credential files are guarded by
+//! `core.filesystem:credential-file-write`, which outranks this carve-out
+//! (see `tests/credential_file_write_e2e.rs`), so a neutral dotfile is what
+//! proves the truncation verdict itself.
 
 #![cfg(unix)]
 
@@ -20,8 +26,10 @@ fn dcg_binary() -> PathBuf {
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
     Allow,
-    Deny,
+    Deny(&'static str),
 }
+
+const RULES: &[&str] = &["redirect-truncate-root-home", "credential-file-write"];
 
 /// Evaluate one shell command in hook mode with `home` as `$HOME`.
 fn verdict(command: &str, home: &Path) -> Verdict {
@@ -64,11 +72,12 @@ fn verdict(command: &str, home: &Path) -> Verdict {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     if stdout.contains(r#""permissionDecision":"deny""#) {
-        assert!(
-            stdout.contains("redirect-truncate-root-home"),
-            "unexpected rule for {command:?}: {stdout}"
-        );
-        Verdict::Deny
+        let rule = RULES
+            .iter()
+            .copied()
+            .find(|rule| stdout.contains(rule))
+            .unwrap_or_else(|| panic!("unexpected rule for {command:?}: {stdout}"));
+        Verdict::Deny(rule)
     } else {
         assert!(
             stdout.trim().is_empty(),
@@ -85,7 +94,7 @@ fn absent_literal_home_targets_are_creation_regardless_of_vcs() {
     for dir in [".claude", ".config", ".ssh", "repo/docs", "repo/.git"] {
         fs::create_dir_all(home.join(dir)).expect("fixture dir");
     }
-    fs::write(home.join(".zshrc"), b"keep").expect("dotfile");
+    fs::write(home.join(".vimrc"), b"keep").expect("dotfile");
     fs::write(home.join("repo/docs/README.md"), b"keep").expect("tracked file");
 
     // The report's table, in order.
@@ -102,10 +111,13 @@ fn absent_literal_home_targets_are_creation_regardless_of_vcs() {
         verdict("echo hi >> ~/.claude/absent.txt", home),
         Verdict::Allow
     );
-    assert_eq!(verdict("echo hi > ~/.zshrc", home), Verdict::Deny);
+    assert_eq!(
+        verdict("echo hi > ~/.vimrc", home),
+        Verdict::Deny("redirect-truncate-root-home")
+    );
     assert_eq!(
         verdict("echo hi > ~/repo/docs/README.md", home),
-        Verdict::Deny
+        Verdict::Deny("redirect-truncate-root-home")
     );
 
     // A top-level file takes the same path as a dotdir. (`$HOME/...` is not
@@ -113,55 +125,63 @@ fn absent_literal_home_targets_are_creation_regardless_of_vcs() {
     // `$`-bearing target by design, #249, independent of this carve-out.)
     assert_eq!(verdict("echo hi > ~/absent-note.md", home), Verdict::Allow);
 
-    // Credential-directory creation follows `>>`, which has always been
-    // allowed there; no rule in the set guards creation of these files.
+    // Credential files are not "creation like any other": the carve-out
+    // would call the absent `authorized_keys` harmless, but
+    // `credential-file-write` is consulted first and denies the write whether
+    // the file exists or not (v0.14.2).
     assert_eq!(
         verdict("echo key > ~/.ssh/authorized_keys", home),
-        Verdict::Allow
+        Verdict::Deny("credential-file-write")
     );
     fs::write(home.join(".ssh/authorized_keys"), b"keep").expect("keys");
     assert_eq!(
         verdict("echo key > ~/.ssh/authorized_keys", home),
-        Verdict::Deny
+        Verdict::Deny("credential-file-write")
     );
 
     // Every other guard stays exactly as it was.
     assert_eq!(
         verdict("echo hi > ~/missing-parent/absent.txt", home),
-        Verdict::Deny
+        Verdict::Deny("redirect-truncate-root-home")
     );
     assert_eq!(
         verdict("echo hi > ~/repo/.git/HEAD-new", home),
-        Verdict::Deny
+        Verdict::Deny("redirect-truncate-root-home")
     );
     assert_eq!(
         verdict("echo hi > ~/.claude/.git/config", home),
-        Verdict::Deny
+        Verdict::Deny("redirect-truncate-root-home")
     );
     assert_eq!(
-        verdict("echo hi > ~/.claude/absent.txt > ~/.zshrc", home),
-        Verdict::Deny
+        verdict("echo hi > ~/.claude/absent.txt > ~/.vimrc", home),
+        Verdict::Deny("redirect-truncate-root-home")
     );
     assert_eq!(
         verdict("echo hi > /etc/absent-dcg-probe", home),
-        Verdict::Deny
+        Verdict::Deny("redirect-truncate-root-home")
     );
 
     // Targets the shell rewrites before `open()` are not literal: the path
     // dcg would stat is absent while the file the shell truncates exists
     // (`{c..c}` is a one-word brace sequence in bash and zsh; zsh MULTIOS
-    // writes `{,}` to both words; quote removal turns `.zsh"rc"` into
-    // `.zshrc`). Each of these was allowed between #390 and this fix.
+    // writes `{,}` to both words; quote removal turns `.vim"rc"` into
+    // `.vimrc`). Each of these was allowed between #390 and this fix. (A
+    // brace at the home root, `~/{.vimrc,x}`, can expand to a credential
+    // file and is `credential-file-write`'s call instead.)
     for command in [
-        "echo hi > ~/.zshr{c..c}",
-        "echo hi > ~/.zshrc{,}",
-        "echo hi > ~/{.zshrc,absent.txt}",
-        "echo hi > ~/.zsh\"rc\"",
-        "echo hi > ~/'.zshrc'",
-        "echo hi > ~/.zshr(c|d)",
+        "echo hi > ~/.vimr{c..c}",
+        "echo hi > ~/.vimrc{,}",
+        "echo hi > ~/.vim{rc,absent.txt}",
+        "echo hi > ~/.vim\"rc\"",
+        "echo hi > ~/'.vimrc'",
+        "echo hi > ~/.vimr(c|d)",
         "echo hi > \"~/absent.txt\"",
     ] {
-        assert_eq!(verdict(command, home), Verdict::Deny, "{command}");
+        assert_eq!(
+            verdict(command, home),
+            Verdict::Deny("redirect-truncate-root-home"),
+            "{command}"
+        );
     }
     // Non-ASCII file names are not shell syntax and stay literal.
     assert_eq!(
@@ -174,7 +194,7 @@ fn absent_literal_home_targets_are_creation_regardless_of_vcs() {
     assert!(!home.join(".config/absent.txt").exists());
     assert!(!home.join(".config/héllo-wörld.toml").exists());
     assert_eq!(
-        fs::read(home.join(".zshrc")).expect("dotfile survives"),
+        fs::read(home.join(".vimrc")).expect("dotfile survives"),
         b"keep"
     );
 }
