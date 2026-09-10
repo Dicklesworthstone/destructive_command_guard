@@ -5672,6 +5672,11 @@ fn evaluate_windows_launcher_envelopes(
 struct PosixInlineLauncherEnvelope {
     command: String,
     launcher: String,
+    /// Dialect the envelope's command is written in. Inline `sh -c`/`python -c`
+    /// payloads are POSIX; a PowerShell assignment's right-hand side is not,
+    /// and evaluating it as POSIX would hide every rule that models a Windows
+    /// shell (issue #401).
+    dialect: ShellDialect,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5800,34 +5805,28 @@ fn is_powershell_variable_reference(word: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b':'))
 }
 
-/// Number of leading words that form a PowerShell assignment prefix
-/// (`$name =`, `$name +=`, or the glued `$name=`), or `0` when the segment
-/// does not start with one. See the call site in
-/// `parse_obfuscated_posix_inline_launcher_segment` (issue #401).
-fn powershell_assignment_prefix_words(words: &[&str]) -> usize {
-    let Some(first) = words.first().copied() else {
-        return 0;
-    };
-    if let Some((name, rest)) = first.split_once('=')
-        && is_powershell_variable_reference(name.trim_end_matches(['+', '-', '*', '/', '%']))
-    {
-        // `$name=<rhs>` glues the right-hand side onto the assignment word, so
-        // the word itself is the whole statement; only the separated spelling
-        // leaves a following command to analyse.
-        return usize::from(rest.is_empty());
-    }
+/// The command on the right of a PowerShell assignment (`$name = <command>`,
+/// `$name += <command>`), as a slice of `segment`, or `None` when `words` does
+/// not begin with one.
+///
+/// `words` must be tokens of `segment`, so the returned slice covers the rest
+/// of the statement verbatim — quoting, redirects and all. See the call site
+/// in `parse_obfuscated_posix_inline_launcher_segment` (issue #401).
+fn powershell_assignment_right_hand_side<'a>(segment: &'a str, words: &[&str]) -> Option<&'a str> {
+    let first = words.first().copied()?;
     if !is_powershell_variable_reference(first) {
-        return 0;
+        // `$name=<rhs>` glues the right-hand side onto the assignment word.
+        // The POSIX reading of that is a single word, not an executable
+        // followed by arguments, so nothing here misreads it as a launcher.
+        return None;
     }
-    let Some(operator) = words.get(1).copied() else {
-        return 0;
-    };
-    let is_assignment_operator = matches!(operator, "=" | "+=" | "-=" | "*=" | "/=" | "%=");
-    if is_assignment_operator && words.len() > 2 {
-        2
-    } else {
-        0
+    let operator = words.get(1).copied()?;
+    if !matches!(operator, "=" | "+=" | "-=" | "*=" | "/=" | "%=") {
+        return None;
     }
+    let rhs = words.get(2).copied()?;
+    let offset = (rhs.as_ptr() as usize).checked_sub(segment.as_ptr() as usize)?;
+    segment.get(offset..).map(str::trim_end)
 }
 
 /// Whether a `-Word` token is a CamelCase *long* parameter name rather than a
@@ -5841,9 +5840,19 @@ fn powershell_assignment_prefix_words(words: &[&str]) -> usize {
 /// #401). A genuine POSIX cluster is a short run of single-letter flags
 /// (`-c`, `-xc`, `-lc`); it is never a capitalised multi-letter word.
 fn posix_cluster_is_camel_case_long_parameter(cluster: &str) -> bool {
-    cluster.len() >= 3
-        && cluster.starts_with(|c: char| c.is_ascii_uppercase())
-        && cluster[1..].contains(|c: char| c.is_ascii_lowercase())
+    if cluster.len() < 3
+        || !cluster.starts_with(|c: char| c.is_ascii_uppercase())
+        || !cluster[1..].contains(|c: char| c.is_ascii_lowercase())
+    {
+        return false;
+    }
+    // `-Command` and `-EncodedCommand` are CamelCase *and* genuinely
+    // inline-code flags — PowerShell's own spelling of `-c`. They (and the
+    // abbreviations PowerShell accepts for them) must keep counting.
+    let lowered = cluster.to_ascii_lowercase();
+    !["command", "encodedcommand"]
+        .iter()
+        .any(|parameter| parameter.starts_with(lowered.as_str()))
 }
 
 /// A short-flag cluster that carries an interpreter flag letter, with
@@ -5940,12 +5949,27 @@ fn parse_obfuscated_posix_inline_launcher_segment(
         .unwrap_or(0);
     // PowerShell spells an assignment `$name = <command>`, which a POSIX
     // tokenizer reads as the command `$name` with `=` as its first argument —
-    // a "dynamically assembled executable". The POSIX reading is nonsense (no
-    // shell runs a command whose argv[1] is a bare `=`), so treat the pair as
-    // the assignment it is and analyse the right-hand side, which is where a
-    // real launcher would live (`$x = sh -c '<payload>'` still resolves to
-    // `sh`). Issue #401.
-    let exec_index = exec_index + powershell_assignment_prefix_words(&all_words[exec_index..]);
+    // a "dynamically assembled executable", which is why every read-only
+    // `$residue = Get-ChildItem … -Directory` denied (issue #401). No shell
+    // runs a command whose argv[1] is a bare `=`; the PowerShell reading is
+    // the only sensible one, and under it the right-hand side is a command.
+    //
+    // Hand it back as an envelope rather than skipping it. The caller
+    // evaluates an envelope's command through the whole pipeline, so the RHS
+    // keeps every check it would have had on its own — `$x = powershell
+    // -EncodedCommand <b64>` reaches the Windows launcher verifier, and
+    // `$residue = Remove-Item -Recurse -Force C:\Windows` reaches the Windows
+    // filesystem pack — instead of resting on the blanket denial this shape
+    // used to collect.
+    if let Some(rhs) = powershell_assignment_right_hand_side(segment, &all_words[exec_index..])
+        && rhs.len() <= max_payload_bytes
+    {
+        return PosixInlineLauncherParse::Envelope(PosixInlineLauncherEnvelope {
+            command: rhs.to_string(),
+            launcher: "a PowerShell assignment's right-hand side".to_string(),
+            dialect: ShellDialect::PowerShell,
+        });
+    }
     let words: &[&str] = &all_words[exec_index..];
     let Some(raw_executable) = words.first().copied() else {
         return PosixInlineLauncherParse::NotLauncher;
@@ -6013,6 +6037,7 @@ fn parse_obfuscated_posix_inline_launcher_segment(
         Ok(command) => PosixInlineLauncherParse::Envelope(PosixInlineLauncherEnvelope {
             command,
             launcher: format!("obfuscated {name} inline launcher"),
+            dialect: ShellDialect::Posix,
         }),
         Err(reason) => PosixInlineLauncherParse::Unverified(reason),
     }
@@ -6097,7 +6122,7 @@ fn evaluate_obfuscated_posix_inline_launchers(
             allow_once_audit,
             project_path,
             deadline,
-            ShellDialect::Posix,
+            envelope.dialect,
             nested_command_depth + 1,
             envelope_automated_stdin,
         );
@@ -25534,6 +25559,13 @@ mod tests {
         assert_eq!(posix_inline_code_flag_cluster("-Directory"), None);
         assert_eq!(posix_inline_code_flag_cluster("-Recurse"), None);
         assert_eq!(posix_inline_code_flag_cluster("-Confirm"), None);
+        // PowerShell's own inline-code parameters are CamelCase *and* real
+        // inline-code flags, so they must keep counting.
+        assert_eq!(
+            posix_inline_code_flag_cluster("-EncodedCommand"),
+            Some("EncodedCommand")
+        );
+        assert_eq!(posix_inline_code_flag_cluster("-Command"), Some("Command"));
         // Genuine clusters are untouched, including the decoded glued form.
         assert_eq!(posix_inline_code_flag_cluster("-c"), Some("c"));
         assert_eq!(posix_inline_code_flag_cluster("-xc"), Some("xc"));
@@ -25542,20 +25574,26 @@ mod tests {
     }
 
     #[test]
-    fn powershell_assignment_prefix_is_recognised() {
-        assert_eq!(powershell_assignment_prefix_words(&["$x", "=", "ls"]), 2);
+    fn powershell_assignment_right_hand_side_is_the_rest_of_the_statement() {
+        fn rhs(segment: &'static str) -> Option<&'static str> {
+            let words: Vec<&str> = segment.split_whitespace().collect();
+            powershell_assignment_right_hand_side(segment, &words)
+        }
+        assert_eq!(rhs("$x = ls -la"), Some("ls -la"));
+        assert_eq!(rhs("$env:PATH = C:\\bin"), Some("C:\\bin"));
         assert_eq!(
-            powershell_assignment_prefix_words(&["$env:PATH", "=", "x"]),
-            2
+            rhs("${x} += Get-ChildItem -Force"),
+            Some("Get-ChildItem -Force")
         );
-        assert_eq!(powershell_assignment_prefix_words(&["${x}", "+=", "ls"]), 2);
         // A POSIX `NAME=value` is handled by its own helper, not this one.
-        assert_eq!(powershell_assignment_prefix_words(&["FOO=bar", "ls"]), 0);
+        assert_eq!(rhs("FOO=bar ls"), None);
         // No right-hand side to analyse, or not an assignment at all.
-        assert_eq!(powershell_assignment_prefix_words(&["$x", "="]), 0);
-        assert_eq!(powershell_assignment_prefix_words(&["$x", "ls"]), 0);
-        assert_eq!(powershell_assignment_prefix_words(&["$x=ls"]), 0);
-        assert_eq!(powershell_assignment_prefix_words(&[]), 0);
+        assert_eq!(rhs("$x ="), None);
+        assert_eq!(rhs("$x ls"), None);
+        // The glued spelling is one POSIX word, so nothing misreads it as an
+        // executable followed by arguments.
+        assert_eq!(rhs("$x=ls"), None);
+        assert_eq!(rhs(""), None);
     }
 
     #[test]
@@ -25581,17 +25619,37 @@ mod tests {
     }
 
     #[test]
-    fn assignment_right_hand_side_still_reaches_the_launcher_verifier() {
-        // Skipping the assignment prefix analyses the RHS — it does not skip
-        // the segment. A real launcher on the right stays gated, and a bare
-        // dynamic executable with an inline-code flag still denies.
-        let result = evaluate_with_pack_ids_in_dialect(
-            "$x = sh -c \"rm -rf /\"",
-            &["core.filesystem"],
-            ShellDialect::Unknown,
-        );
-        assert!(result.is_denied(), "assignment RHS launcher must be gated");
+    fn assignment_right_hand_side_is_evaluated_as_a_command() {
+        // The RHS is handed back as an envelope, so it keeps every check it
+        // would have had on its own. Before #401 this shape rested on a
+        // blanket "dynamic executable followed by a flag containing `c`"
+        // denial — which is what produced the false positive, and what these
+        // rows would silently lose if the assignment were merely skipped.
+        for (command, packs) in [
+            ("$x = sh -c \"rm -rf /\"", &["core.filesystem"][..]),
+            ("$x = bash -c \"rm -rf ~/data\"", &["core.filesystem"][..]),
+            (
+                "$x = powershell -EncodedCommand JABzAD0A",
+                &["core.filesystem"][..],
+            ),
+            (
+                "$x = powershell -EncodedCommand %%%",
+                &["core.filesystem"][..],
+            ),
+            (
+                "$residue = Remove-Item -Recurse -Force C:\\Windows",
+                &["core.filesystem", "windows.filesystem"][..],
+            ),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, packs, ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "{command} must stay denied: {:?}",
+                result.pattern_info
+            );
+        }
 
+        // A bare dynamic executable with a real inline-code flag still denies.
         let result = evaluate_with_pack_ids_in_dialect(
             "$tool -c 'echo safe'",
             &["core.filesystem"],
