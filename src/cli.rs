@@ -2602,6 +2602,10 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             None => {
                 if !verbosity.quiet {
+                    // The listing reports what actually evaluates, which
+                    // requires the external store (issue #402).
+                    let external_paths = config.packs.expand_custom_paths();
+                    let _ = load_external_packs(&external_paths);
                     match format {
                         ConfigFormat::Json => show_config_json(
                             &config,
@@ -3969,15 +3973,20 @@ fn pack_validate(
 
     // === Suggestions (informational) ===
 
-    // Suggest adding keywords if none defined
+    // A pack with no keywords is still fully evaluated (`Pack::might_match`),
+    // but it costs the process its global quick-reject fast path — a runtime
+    // property an operator should be told about, so this is a warning rather
+    // than the performance "suggestion" it used to be (issue #402).
     if pack.keywords.is_empty()
         && (!pack.destructive_patterns.is_empty() || !pack.safe_patterns.is_empty())
     {
-        result.suggestions.push(PackValidationIssue {
+        result.warnings.push(PackValidationIssue {
             code: "S001".to_string(),
             message: "No keywords defined".to_string(),
             suggestion: Some(
-                "Adding keywords improves performance by enabling quick-reject filtering"
+                "This pack is evaluated on every command, which disables dcg's global \
+                 quick-reject fast path for the whole process. Declaring keywords restores \
+                 it and does not change which commands the pack can block."
                     .to_string(),
             ),
         });
@@ -6364,6 +6373,54 @@ fn config_sources_json(sources: &[ConfigSourceOutcome]) -> Vec<serde_json::Value
         .collect()
 }
 
+/// Every pack id the runtime will actually evaluate, plus the configured ids
+/// that never loaded.
+///
+/// `dcg config` used to print `config.enabled_pack_ids()` verbatim, which is
+/// the *requested* set. That answered a different question from `dcg packs`
+/// and `dcg doctor`, so three of dcg's own surfaces reported three different
+/// answers about the same configuration (issue #402): a pack enabled only via
+/// `packs.custom_paths` was omitted even though it was firing, and a pack whose
+/// YAML failed to parse was listed as enabled even though it contributed
+/// nothing. Both halves are answered here, from the loaded store.
+///
+/// Returns `(active, unloaded)`, each sorted. `active` includes external packs
+/// that loaded; `unloaded` holds configured ids that are neither a registry
+/// pack nor a loaded external pack.
+fn resolved_pack_listing(config: &Config) -> (Vec<String>, Vec<String>) {
+    let external = get_external_packs();
+    let requested = config.enabled_pack_ids();
+    // Registry categories expand to the leaves that actually evaluate, which is
+    // what `dcg packs` ticks and `dcg doctor` counts.
+    let mut active: Vec<String> = crate::packs::REGISTRY.expand_enabled_ordered(&requested);
+    let mut unloaded: Vec<String> = Vec::new();
+    for id in requested {
+        let known_to_registry = id == "core"
+            || crate::packs::REGISTRY.get_entry(&id).is_some()
+            || !crate::packs::REGISTRY.packs_in_category(&id).is_empty();
+        if known_to_registry {
+            continue;
+        }
+        if external.is_some_and(|store| store.get(&id).is_some()) {
+            active.push(id);
+        } else {
+            unloaded.push(id);
+        }
+    }
+    if let Some(store) = external {
+        for id in store.pack_ids() {
+            if !active.iter().any(|existing| existing == id) {
+                active.push(id.clone());
+            }
+        }
+    }
+    active.sort();
+    active.dedup();
+    unloaded.sort();
+    unloaded.dedup();
+    (active, unloaded)
+}
+
 /// Show the current configuration and the exact source outcomes that produced it.
 fn show_config(config: &Config, sources: &[ConfigSourceOutcome]) {
     println!("Current configuration:");
@@ -6389,9 +6446,30 @@ fn show_config(config: &Config, sources: &[ConfigSourceOutcome]) {
     println!("  Hook self-heal: {}", config.general.self_heal_hook);
     println!("  Fail closed: {}", config.general.fail_closed);
     println!();
+    let (active_packs, unloaded_packs) = resolved_pack_listing(config);
+    let keywordless: &[String] =
+        get_external_packs().map_or(&[], crate::packs::ExternalPackStore::keywordless_pack_ids);
     println!("Enabled packs:");
-    for pack in config.enabled_pack_ids() {
-        println!("  - {pack}");
+    for pack in &active_packs {
+        if keywordless.iter().any(|id| id == pack) {
+            println!("  - {pack} (external, no keywords: evaluated on every command)");
+        } else if get_external_packs().is_some_and(|store| store.get(pack).is_some()) {
+            println!("  - {pack} (external)");
+        } else {
+            println!("  - {pack}");
+        }
+    }
+    for pack in &unloaded_packs {
+        println!("  - {pack} (configured but NOT loaded - contributes no rules)");
+    }
+    if let Some(warnings) = get_external_packs().map(crate::packs::ExternalPackStore::warnings)
+        && !warnings.is_empty()
+    {
+        println!();
+        println!("Pack load warnings:");
+        for warning in warnings {
+            println!("  - {warning}");
+        }
     }
     println!();
     println!("Disabled packs:");
@@ -6485,8 +6563,16 @@ fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
     );
 
     // Sort enabled packs for deterministic JSON output (the set is unordered).
-    let mut enabled_packs: Vec<String> = config.enabled_pack_ids().into_iter().collect();
-    enabled_packs.sort();
+    // `resolved_pack_listing` reports what actually evaluates, so a custom pack
+    // reached only through `packs.custom_paths` appears and a pack that failed
+    // to load does not (issue #402).
+    let (enabled_packs, unloaded_packs) = resolved_pack_listing(config);
+    let pack_load_warnings: Vec<String> = get_external_packs()
+        .map(|store| store.warnings().to_vec())
+        .unwrap_or_default();
+    let keywordless_packs: Vec<String> = get_external_packs()
+        .map(|store| store.keywordless_pack_ids().to_vec())
+        .unwrap_or_default();
 
     // Echo the enforcement-relevant sections so an automated check can assert
     // what is actually loaded (#327): before this, `jq '.overrides'` returned
@@ -6522,6 +6608,9 @@ fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
         "packs": {
             "enabled": enabled_packs,
             "disabled": config.packs.disabled,
+            "configured_but_not_loaded": unloaded_packs,
+            "external_without_keywords": keywordless_packs,
+            "load_warnings": pack_load_warnings,
         },
         "heredoc": {
             "enabled": heredoc.enabled,
@@ -11115,8 +11204,30 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     // `dcg packs --enabled` lists. `enabled_pack_ids` deliberately keeps the
     // bare `core` category marker for registry callers to expand, so counting
     // the raw set reported one fewer pack than the listing every time (#335).
-    let enabled_leaf_count = REGISTRY.expand_enabled_ordered(&enabled).len();
-    println!("{} ({} enabled)", "OK".green(), enabled_leaf_count);
+    let external_store = {
+        let external_paths = config.packs.expand_custom_paths();
+        load_external_packs(&external_paths)
+    };
+    // `expand_enabled_ordered` filters to registry entries, so external packs
+    // were invisible here while `dcg packs` ticked them — one of the three
+    // disagreeing counts in issue #402.
+    let enabled_leaf_count = REGISTRY.expand_enabled_ordered(&enabled).len() + external_store.len();
+    if external_store.warnings().is_empty() {
+        println!("{} ({} enabled)", "OK".green(), enabled_leaf_count);
+    } else {
+        issues += 1;
+        println!("{} ({} enabled)", "WARNING".yellow(), enabled_leaf_count);
+        for warning in external_store.warnings() {
+            println!("  {warning}");
+        }
+        println!("  A pack that fails to load contributes no rules.");
+    }
+    for pack_id in external_store.keywordless_pack_ids() {
+        println!(
+            "  Note: external pack '{pack_id}' declares no keywords, so it is evaluated on \
+             every command and the global quick-reject fast path is disabled."
+        );
+    }
     println!(
         "  Hook evaluation budget: {} ms ({})",
         config.effective_hook_timeout_ms(),

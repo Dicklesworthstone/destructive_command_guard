@@ -2683,6 +2683,17 @@ pub struct ExternalPackStore {
     keywords: Vec<&'static str>,
     /// Warnings from pack loading (for diagnostics).
     warnings: Vec<String>,
+    /// Whether any loaded pack declares no keywords.
+    ///
+    /// [`Pack::might_match`] documents that a keyword-less pack is always
+    /// checked, but the *global* quick reject runs before that and is built
+    /// from the union of every enabled pack's keywords — to which such a pack
+    /// contributes nothing. The pack was therefore evaluated only when some
+    /// unrelated pack's keyword happened to appear in the command, which made
+    /// its coverage depend on the rest of the command line rather than on the
+    /// configuration (issue #402). Recording it here lets the global reject
+    /// stand down, restoring the documented contract.
+    keywordless_pack_ids: Vec<String>,
 }
 
 impl ExternalPackStore {
@@ -2692,6 +2703,7 @@ impl ExternalPackStore {
             packs: HashMap::new(),
             keywords: Vec::new(),
             warnings: Vec::new(),
+            keywordless_pack_ids: Vec::new(),
         }
     }
 
@@ -2721,6 +2733,23 @@ impl ExternalPackStore {
     #[must_use]
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    /// IDs of loaded packs that declare no keywords, sorted.
+    ///
+    /// Such a pack is evaluated on every command (see
+    /// [`Pack::might_match`]), which is correct but costs the global
+    /// quick-reject fast path for the whole process — so `dcg doctor`,
+    /// `dcg packs` and `dcg pack validate` report it.
+    #[must_use]
+    pub fn keywordless_pack_ids(&self) -> &[String] {
+        &self.keywordless_pack_ids
+    }
+
+    /// Whether any loaded pack must be evaluated regardless of keywords.
+    #[must_use]
+    pub fn has_keywordless_pack(&self) -> bool {
+        !self.keywordless_pack_ids.is_empty()
     }
 
     /// Check if any external packs are loaded.
@@ -2861,9 +2890,13 @@ pub fn load_external_packs(paths: &[String]) -> &'static ExternalPackStore {
                     store.keywords.push(kw);
                 }
             }
+            if pack.keywords.is_empty() {
+                store.keywordless_pack_ids.push(id.clone());
+            }
 
             store.packs.insert(id, pack);
         }
+        store.keywordless_pack_ids.sort();
 
         store
     })
@@ -3737,7 +3770,7 @@ pub fn pack_aware_quick_reject_with_normalized<'a>(
     // Conservative: if the caller provides no keywords, we cannot safely conclude
     // that pack evaluation can be skipped (a pack may have empty/incorrect keywords).
     // Returning false forces evaluation rather than silently allowing everything.
-    if enabled_keywords.is_empty() {
+    if enabled_keywords.is_empty() || external_pack_forces_full_evaluation() {
         return (false, normalize_command(cmd));
     }
 
@@ -3769,6 +3802,26 @@ pub fn pack_aware_quick_reject_with_normalized<'a>(
     (should_reject, normalized)
 }
 
+/// Whether a *loaded* external pack declares no keywords and therefore must be
+/// evaluated on every command.
+///
+/// [`Pack::might_match`] documents that contract at the per-pack level; the
+/// global quick reject runs *before* it and is built from the union of every
+/// enabled pack's keywords, to which a keyword-less pack contributes nothing.
+/// Honouring the contract here is what makes such a pack's coverage depend on
+/// the configuration rather than on whichever other pack's keyword happens to
+/// appear in the command (issue #402).
+///
+/// The test is deliberately "loaded", not "enabled": the store is built from
+/// `packs.custom_paths` before enablement is resolved, and standing the fast
+/// path down for a pack that turns out to be disabled costs throughput, never
+/// a verdict. `dcg doctor` names the pack so the cost is not invisible.
+#[inline]
+#[must_use]
+fn external_pack_forces_full_evaluation() -> bool {
+    get_external_packs().is_some_and(ExternalPackStore::has_keywordless_pack)
+}
+
 /// Apply full-command keyword gating to a command that the caller has already
 /// normalized and safe-data-masked with its proven shell dialect.
 ///
@@ -3785,7 +3838,9 @@ pub(crate) fn pack_aware_quick_reject_pre_normalized(
     normalized: &str,
     enabled_keywords: &[&str],
 ) -> bool {
-    !enabled_keywords.is_empty() && !span_matches_any_keyword(normalized, enabled_keywords)
+    !enabled_keywords.is_empty()
+        && !external_pack_forces_full_evaluation()
+        && !span_matches_any_keyword(normalized, enabled_keywords)
 }
 
 #[inline]
@@ -3793,7 +3848,7 @@ fn pack_aware_quick_reject_from_normalized_spans(
     normalized: &str,
     enabled_keywords: &[&str],
 ) -> bool {
-    if enabled_keywords.is_empty() {
+    if enabled_keywords.is_empty() || external_pack_forces_full_evaluation() {
         return false;
     }
 

@@ -2349,7 +2349,7 @@ Pack {
 
 **Two-Level Filtering**:
 
-1. **Global Quick Reject**: Before any pack evaluation, dcg checks if the command contains *any* keyword from *any* enabled pack. If not, the entire pack evaluation is skipped.
+1. **Global Quick Reject**: Before any pack evaluation, dcg checks if the command contains *any* keyword from *any* enabled pack. If not, the entire pack evaluation is skipped. A pack that declares **no** keywords stands this level down for the whole process, so it keeps the `might_match` contract below ("no keywords = always check patterns") rather than being silently skipped; `dcg doctor` and `dcg pack validate` name any pack in that state, because the cost is paid by every command.
 
 2. **Per-Pack Quick Reject**: For each enabled pack, dcg checks if the command contains any of that pack's keywords before running expensive regex patterns.
 
