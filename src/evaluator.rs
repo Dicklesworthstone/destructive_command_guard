@@ -5783,6 +5783,77 @@ fn posix_short_flag_cluster(flag: &str) -> Option<&str> {
     (end > 0).then_some(&short[..end])
 }
 
+/// Whether `word` is a PowerShell variable reference (`$x`, `${x}`,
+/// `$env:TEMP`, `$script:count`) with no command substitution inside it.
+fn is_powershell_variable_reference(word: &str) -> bool {
+    let Some(rest) = word.strip_prefix('$') else {
+        return false;
+    };
+    let rest = rest
+        .strip_prefix('{')
+        .and_then(|inner| inner.strip_suffix('}'))
+        .unwrap_or(rest);
+    !rest.is_empty()
+        && !rest.starts_with(|c: char| c.is_ascii_digit())
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b':'))
+}
+
+/// Number of leading words that form a PowerShell assignment prefix
+/// (`$name =`, `$name +=`, or the glued `$name=`), or `0` when the segment
+/// does not start with one. See the call site in
+/// `parse_obfuscated_posix_inline_launcher_segment` (issue #401).
+fn powershell_assignment_prefix_words(words: &[&str]) -> usize {
+    let Some(first) = words.first().copied() else {
+        return 0;
+    };
+    if let Some((name, rest)) = first.split_once('=')
+        && is_powershell_variable_reference(name.trim_end_matches(['+', '-', '*', '/', '%']))
+    {
+        // `$name=<rhs>` glues the right-hand side onto the assignment word, so
+        // the word itself is the whole statement; only the separated spelling
+        // leaves a following command to analyse.
+        return usize::from(rest.is_empty());
+    }
+    if !is_powershell_variable_reference(first) {
+        return 0;
+    }
+    let Some(operator) = words.get(1).copied() else {
+        return 0;
+    };
+    let is_assignment_operator = matches!(operator, "=" | "+=" | "-=" | "*=" | "/=" | "%=");
+    if is_assignment_operator && words.len() > 2 {
+        2
+    } else {
+        0
+    }
+}
+
+/// Whether a `-Word` token is a CamelCase *long* parameter name rather than a
+/// POSIX cluster of one-letter flags.
+///
+/// PowerShell spells every parameter with a single dash and a CamelCase name
+/// (`-Directory`, `-Recurse`, `-Force`, `-Confirm`), which
+/// [`posix_short_flag_cluster`] happily reads as a run of short flags — and
+/// several of those names contain a `c`, which is how `$x = Get-ChildItem
+/// "$env:TEMP" -Directory` came to look like an inline-code launcher (issue
+/// #401). A genuine POSIX cluster is a short run of single-letter flags
+/// (`-c`, `-xc`, `-lc`); it is never a capitalised multi-letter word.
+fn posix_cluster_is_camel_case_long_parameter(cluster: &str) -> bool {
+    cluster.len() >= 3
+        && cluster.starts_with(|c: char| c.is_ascii_uppercase())
+        && cluster[1..].contains(|c: char| c.is_ascii_lowercase())
+}
+
+/// A short-flag cluster that carries an interpreter flag letter, with
+/// PowerShell parameter names excluded. See
+/// [`posix_cluster_is_camel_case_long_parameter`].
+fn posix_inline_code_flag_cluster(flag: &str) -> Option<&str> {
+    posix_short_flag_cluster(flag)
+        .filter(|cluster| !posix_cluster_is_camel_case_long_parameter(cluster))
+}
+
 fn posix_inline_flag_position(name: Option<&str>, words: &[&str]) -> Option<usize> {
     words.iter().enumerate().skip(1).find_map(|(index, raw)| {
         let flag = shell_word_value(raw, ShellDialect::Posix)?;
@@ -5792,6 +5863,9 @@ fn posix_inline_flag_position(name: Option<&str>, words: &[&str]) -> Option<usiz
         let lower = flag.to_ascii_lowercase();
         let is_inline = if let Some(name) = name {
             if posix_inline_shell_name(name) {
+                // A proven shell keeps the permissive cluster reading: its
+                // flags really are one-letter, so `sh -Bec '<payload>'` must
+                // stay an inline-code launcher.
                 lower == "--command"
                     || posix_short_flag_cluster(&lower).is_some_and(|cluster| cluster.contains('c'))
             } else if name.starts_with("python") {
@@ -5813,7 +5887,8 @@ fn posix_inline_flag_position(name: Option<&str>, words: &[&str]) -> Option<usiz
             matches!(
                 lower.as_str(),
                 "-c" | "-e" | "-p" | "-r" | "--eval" | "--print" | "--command"
-            ) || posix_short_flag_cluster(&lower).is_some_and(|cluster| cluster.contains('c'))
+            ) || posix_inline_code_flag_cluster(&flag)
+                .is_some_and(|cluster| cluster.to_ascii_lowercase().contains('c'))
         };
         is_inline.then_some(index)
     })
@@ -5863,6 +5938,14 @@ fn parse_obfuscated_posix_inline_launcher_segment(
         .iter()
         .position(|word| !posix_word_is_assignment_prefix(word))
         .unwrap_or(0);
+    // PowerShell spells an assignment `$name = <command>`, which a POSIX
+    // tokenizer reads as the command `$name` with `=` as its first argument —
+    // a "dynamically assembled executable". The POSIX reading is nonsense (no
+    // shell runs a command whose argv[1] is a bare `=`), so treat the pair as
+    // the assignment it is and analyse the right-hand side, which is where a
+    // real launcher would live (`$x = sh -c '<payload>'` still resolves to
+    // `sh`). Issue #401.
+    let exec_index = exec_index + powershell_assignment_prefix_words(&all_words[exec_index..]);
     let words: &[&str] = &all_words[exec_index..];
     let Some(raw_executable) = words.first().copied() else {
         return PosixInlineLauncherParse::NotLauncher;
@@ -13140,7 +13223,14 @@ fn evaluate_command_in_single_dialect_view(
     // keyword appears in the raw command, we can skip the more expensive
     // normalize+span-classify path in pack_aware_quick_reject entirely.
     if let Some(index) = keyword_index {
+        // An enabled external pack with no keywords must be evaluated on every
+        // command (`Pack::might_match`), and the AC index cannot represent
+        // "always" — an external pack has no registry entry to set a bit for.
+        // The hook path already disables the index when external packs exist;
+        // this keeps every other entry point honest too (issue #402).
         if sed_shell_sources.is_empty()
+            && !crate::packs::get_external_packs()
+                .is_some_and(crate::packs::ExternalPackStore::has_keywordless_pack)
             && !index.has_any_keyword(command)
             && !contains_shell_word_obfuscation(command, shell_dialect)
             && !force_core_git
@@ -20590,7 +20680,22 @@ fn evaluate_packs_with_allowlists_at_depth(
             if is_core_filesystem_redirect_rule(pack_id, pattern.name)
                 && (crate::context::offset_is_quoted_data(command_for_packs, span.start)
                     || first_unquoted_output_redirect(command_for_packs, shell_dialect).is_none()
-                    || inline_payload_offset_is_quoted_redirect_data(command_for_packs, span.start))
+                    || inline_payload_offset_is_quoted_redirect_data(
+                        command_for_packs,
+                        span.start,
+                        &pattern.regex,
+                    )
+                    || (normalized_offset == Some(0)
+                        && inline_payload_offset_is_quoted_redirect_data(
+                            original_command,
+                            span.start,
+                            &pattern.regex,
+                        ))
+                    || redirect_match_is_cross_dialect_quote_artifact(
+                        command_for_packs,
+                        span,
+                        shell_dialect,
+                    ))
             {
                 continue;
             }
@@ -23174,10 +23279,82 @@ fn shell_inline_payload_offset_is_quoted_data(command: &str, offset: usize) -> O
     None
 }
 
+/// Prefix every embedded-shell denial carries, so nesting can be detected.
+const EMBEDDED_SHELL_DENIAL_PREFIX: &str = "Embedded shell command blocked: ";
+
+/// Frame an inner denial with where the offending text actually came from.
+///
+/// This used to hardcode `(line N of heredoc)` for every extracted payload,
+/// which sent anyone triaging `ssh h "a 2>/dev/null" 2>&1` — a command with no
+/// heredoc anywhere — into the heredoc extractor to look for behaviour that
+/// lives in argument handling. It also re-wrapped an already-wrapped reason,
+/// producing `Embedded shell command blocked: Embedded shell command blocked:
+/// … (line 1 of heredoc) (line 1 of heredoc)`. Both cost the reporter of #404
+/// days of misdirected diagnosis, so: name the real carrier, and let the
+/// innermost frame stand.
+fn wrap_embedded_shell_denial_reason(
+    reason: &str,
+    from_heredoc: bool,
+    target_command: Option<&str>,
+    line_number: usize,
+) -> String {
+    if reason.starts_with(EMBEDDED_SHELL_DENIAL_PREFIX) {
+        return reason.to_string();
+    }
+    let frame = if from_heredoc {
+        format!(" (line {line_number} of heredoc)")
+    } else {
+        let carrier = target_command
+            .map(|command| format!("{command} "))
+            .unwrap_or_default();
+        if line_number > 1 {
+            format!(" (line {line_number} of the {carrier}inline script)")
+        } else if carrier.is_empty() {
+            " (inline script)".to_string()
+        } else {
+            format!(" ({carrier}inline script)")
+        }
+    };
+    format!("{EMBEDDED_SHELL_DENIAL_PREFIX}{reason}{frame}")
+}
+
+/// Whether a `core.filesystem` redirect match is an artifact of dcg's
+/// cross-dialect union rather than a redirect any single shell would perform.
+///
+/// With no proven dialect, "is this `>` a real redirect?" is answered by the
+/// union of the POSIX, PowerShell and Cmd views. Cmd has no single-quote
+/// literal, so in a POSIX single-quoted payload it reads the bytes as live
+/// syntax *and* lets the closing `'` glue itself onto the redirect target —
+/// which is the only reason the target then looks "dynamic". That mixes two
+/// dialects in one finding: no shell both performs the redirect and sees the
+/// quote as part of the path.
+///
+/// The two conditions below are the signature of exactly that mix: the match
+/// swallowed a quote byte, and POSIX — the dialect whose quoting produced it —
+/// sees no unquoted output redirect anywhere in the command, which also means
+/// the operator itself is inside a POSIX-quoted region. A real redirect
+/// (`"git">/dev/null reset --hard`, `echo x > "C:\\Users\\me\\f"`) keeps its
+/// operator outside the quotes, so POSIX finds it and the guard stands down.
+/// Issue #404.
+fn redirect_match_is_cross_dialect_quote_artifact(
+    command: &str,
+    span: MatchSpan,
+    dialect: ShellDialect,
+) -> bool {
+    if dialect == ShellDialect::Posix {
+        return false;
+    }
+    let Some(text) = command.get(span.start..span.end) else {
+        return false;
+    };
+    text.bytes().any(|byte| matches!(byte, b'\'' | b'"'))
+        && first_unquoted_output_redirect(command, ShellDialect::Posix).is_none()
+}
+
 /// Redirect-rule variant of [`shell_inline_payload_offset_is_quoted_data`]
 /// (issue #317): when a `core.filesystem` redirect rule's match offset falls
-/// inside an inline interpreter payload, decide from the payload's own
-/// quoting whether the matched `>` is string-literal bytes or live syntax.
+/// inside an inline interpreter payload, decide the question in the payload's
+/// own coordinates rather than the enclosing command's.
 ///
 /// Unlike the command-oriented helper this one is NOT limited to Bash
 /// payloads: the redirect rules judge OUTER-shell redirect syntax, and inside
@@ -23185,12 +23362,25 @@ fn shell_inline_payload_offset_is_quoted_data(command: &str, offset: usize) -> O
 /// language whose string literals use POSIX-style quotes. The #136
 /// conservative treatment does not apply here — that class is about quoted
 /// COMMAND strings flowing to execution sinks, which the command-oriented
-/// rules and the recursive launcher analysis keep covering. An UNQUOTED `>`
-/// in any payload still returns false (fail closed): for shell payloads it is
-/// a real redirect, and for other languages the conservative deny is the
-/// safe direction. Multi-segment payloads keep the conservative
-/// classification for the same reason as the Bash helper (`eval` routing).
-fn inline_payload_offset_is_quoted_redirect_data(command: &str, offset: usize) -> bool {
+/// rules and the recursive launcher analysis keep covering.
+///
+/// Two answers stand the rule down. Either the payload's own quoting proves
+/// the `>` is string-literal bytes, or — the #404 addition — the same
+/// expression does not match the payload text at all, which means the outer
+/// hit was assembled from bytes the payload does not contain: typically the
+/// closing quote glued onto an otherwise harmless target (`sh -c "a
+/// 2>/dev/null" 2>&1` matched on `2>/dev/null"`). Multi-segment payloads used
+/// to bail here and keep the outer match; they now get the same treatment,
+/// which is what made the reporter's composition case impossible to minimise.
+///
+/// A payload that really does carry the matching syntax (`bash -c "cat x >
+/// $T"`) matches here and keeps the deny, and the recursive evaluation of the
+/// payload judges it on its own merits either way.
+fn inline_payload_offset_is_quoted_redirect_data(
+    command: &str,
+    offset: usize,
+    regex: &crate::packs::regex_engine::LazyCompiledRegex,
+) -> bool {
     if crate::heredoc::check_triggers(command) == crate::heredoc::TriggerResult::NoTrigger {
         return false;
     }
@@ -23211,10 +23401,23 @@ fn inline_payload_offset_is_quoted_redirect_data(command: &str, offset: usize) -
         let Some(payload) = command.get(range.clone()) else {
             return false;
         };
-        if crate::packs::split_command_segments(payload).len() != 1 {
-            return false;
+        if crate::packs::split_command_segments(payload).len() == 1
+            && crate::context::offset_is_quoted_data(payload, offset - range.start)
+        {
+            return true;
         }
-        return crate::context::offset_is_quoted_data(payload, offset - range.start);
+        // The finding is *outer-shell redirect syntax*, but these bytes are
+        // the payload's syntax, and the payload is evaluated on its own terms
+        // by the recursive pass. So ask the rule the question in the payload's
+        // coordinates: if the same expression does not match the payload text,
+        // the outer hit is an artifact of the enclosing quotes — typically the
+        // closing quote gluing itself onto an otherwise harmless target
+        // (`sh -c "a 2>/dev/null" 2>&1` matched on `2>/dev/null"`), or a
+        // multi-segment payload the older single-segment check discarded
+        // wholesale (issue #404). A payload that really does carry the
+        // matching syntax (`bash -c "cat x > $T"`) still matches here and
+        // keeps the deny.
+        return !regex.is_match(payload);
     }
     false
 }
@@ -23870,7 +24073,46 @@ fn evaluate_pack_destructive_patterns(
                 // bytes, not redirect syntax (issue #317). A live `>` in the
                 // payload (`bash -c "cat x > $T"`) classifies as code there
                 // and keeps the deny.
-                if inline_payload_offset_is_quoted_redirect_data(redirect_syntax_command, raw_start)
+                if inline_payload_offset_is_quoted_redirect_data(
+                    redirect_syntax_command,
+                    raw_start,
+                    &pattern.regex,
+                ) {
+                    continue;
+                }
+                // The slice above is a sanitized, possibly per-segment view, in
+                // which the inline payload may be masked or cut in half. When
+                // normalization was the identity the original command is the
+                // authoritative text for "which payload do these bytes belong
+                // to", so ask it too (issue #404).
+                if normalized_offset == Some(0)
+                    && inline_payload_offset_is_quoted_redirect_data(
+                        original_command,
+                        span.start,
+                        &pattern.regex,
+                    )
+                {
+                    continue;
+                }
+                if redirect_match_is_cross_dialect_quote_artifact(
+                    redirect_syntax_command,
+                    MatchSpan {
+                        start: raw_start,
+                        end: span.end.saturating_sub(slice_offset),
+                    },
+                    shell_dialect,
+                ) {
+                    continue;
+                }
+                // Same reason as the payload guard above: this slice is a
+                // sanitized, possibly per-segment view, and the quoting that
+                // produced the artifact is a property of the whole command.
+                if normalized_offset == Some(0)
+                    && redirect_match_is_cross_dialect_quote_artifact(
+                        original_command,
+                        *span,
+                        shell_dialect,
+                    )
                 {
                     continue;
                 }
@@ -24511,9 +24753,11 @@ fn evaluate_heredoc(
                     if result.is_denied() {
                         // Propagate denial, wrapping the reason context
                         if let Some(mut info) = result.pattern_info {
-                            info.reason = format!(
-                                "Embedded shell command blocked: {} (line {} of heredoc)",
-                                info.reason, inner.line_number
+                            info.reason = wrap_embedded_shell_denial_reason(
+                                &info.reason,
+                                content.heredoc_type.is_some(),
+                                content.target_command.as_deref(),
+                                inner.line_number,
                             );
                             info.source = MatchSource::HeredocAst; // Mark as heredoc source
                             if let Some(span) = info.matched_span {
@@ -25275,6 +25519,253 @@ mod tests {
 
     fn evaluate_with_pack_ids(command: &str, pack_ids: &[&str]) -> EvaluationResult {
         evaluate_with_pack_ids_at_path(command, pack_ids, None)
+    }
+
+    // =========================================================================
+    // Issue #401: a PowerShell assignment is not a POSIX launcher, and a
+    // CamelCase parameter is not a cluster of short flags.
+    // =========================================================================
+
+    #[test]
+    fn powershell_parameter_names_are_not_inline_code_flags() {
+        // `-Directory` contains a `c`, which the short-flag cluster reading
+        // turned into "an inline-code flag follows a dynamically assembled
+        // executable" for every `$x = Get-ChildItem … -Directory`.
+        assert_eq!(posix_inline_code_flag_cluster("-Directory"), None);
+        assert_eq!(posix_inline_code_flag_cluster("-Recurse"), None);
+        assert_eq!(posix_inline_code_flag_cluster("-Confirm"), None);
+        // Genuine clusters are untouched, including the decoded glued form.
+        assert_eq!(posix_inline_code_flag_cluster("-c"), Some("c"));
+        assert_eq!(posix_inline_code_flag_cluster("-xc"), Some("xc"));
+        assert_eq!(posix_inline_code_flag_cluster("-cecho hi"), Some("cecho"));
+        assert_eq!(posix_inline_code_flag_cluster("-lc"), Some("lc"));
+    }
+
+    #[test]
+    fn powershell_assignment_prefix_is_recognised() {
+        assert_eq!(powershell_assignment_prefix_words(&["$x", "=", "ls"]), 2);
+        assert_eq!(
+            powershell_assignment_prefix_words(&["$env:PATH", "=", "x"]),
+            2
+        );
+        assert_eq!(powershell_assignment_prefix_words(&["${x}", "+=", "ls"]), 2);
+        // A POSIX `NAME=value` is handled by its own helper, not this one.
+        assert_eq!(powershell_assignment_prefix_words(&["FOO=bar", "ls"]), 0);
+        // No right-hand side to analyse, or not an assignment at all.
+        assert_eq!(powershell_assignment_prefix_words(&["$x", "="]), 0);
+        assert_eq!(powershell_assignment_prefix_words(&["$x", "ls"]), 0);
+        assert_eq!(powershell_assignment_prefix_words(&["$x=ls"]), 0);
+        assert_eq!(powershell_assignment_prefix_words(&[]), 0);
+    }
+
+    #[test]
+    fn pwsh_read_only_assignments_are_not_inline_launchers() {
+        for command in [
+            "$residue = Get-ChildItem \"$env:TEMP\" -Directory",
+            "$a = Get-ChildItem -Recurse",
+            "$x = Get-ChildItem -Force",
+            "$count += Get-ChildItem -Directory",
+            "$s = Get-Service -Name w32time",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem", "core.git"],
+                ShellDialect::Unknown,
+            );
+            assert!(
+                result.is_allowed(),
+                "{command} must be allowed: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_right_hand_side_still_reaches_the_launcher_verifier() {
+        // Skipping the assignment prefix analyses the RHS — it does not skip
+        // the segment. A real launcher on the right stays gated, and a bare
+        // dynamic executable with an inline-code flag still denies.
+        let result = evaluate_with_pack_ids_in_dialect(
+            "$x = sh -c \"rm -rf /\"",
+            &["core.filesystem"],
+            ShellDialect::Unknown,
+        );
+        assert!(result.is_denied(), "assignment RHS launcher must be gated");
+
+        let result = evaluate_with_pack_ids_in_dialect(
+            "$tool -c 'echo safe'",
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        let info = result
+            .pattern_info
+            .expect("dynamic executable + inline flag still denies");
+        assert_eq!(info.pack_id.as_deref(), Some("heredoc.posix"));
+        assert_eq!(
+            info.pattern_name.as_deref(),
+            Some("inline-launcher-unverified")
+        );
+    }
+
+    // =========================================================================
+    // Issue #404: an inline payload's redirect is judged in the payload's own
+    // coordinates, and a denial names the carrier it actually came from.
+    // =========================================================================
+
+    #[test]
+    fn outer_redirect_does_not_change_an_inline_payloads_verdict() {
+        // The inner redirect is byte-for-byte identical in every row; only the
+        // outer command changes. Before the fix the local `2>` joined the
+        // payload token run, which stopped the quote stripping and glued the
+        // closing quote onto `/dev/null`.
+        for command in [
+            "ssh h \"a 2>/dev/null\"",
+            "ssh h \"a 2>/dev/null\" 2>&1",
+            "ssh h \"a 2>/dev/null\" 1>&2",
+            "ssh h \"a 2>/dev/null\" >/tmp/out",
+            "ssh h \"a 2>/dev/null\" >>/tmp/out",
+            "ssh h \"a 2>/dev/null\" | head -2",
+            "sh -c \"a 2>/dev/null\" 2>&1",
+            "bash -lc \"a 2>/dev/null\" 2>&1",
+            // Multi-segment payloads: the old guard bailed on anything with a
+            // `|` or `;` inside, which is what made the report's composition
+            // case so hard to minimise.
+            "ssh host 'ls *.py 2>/dev/null | head; git log -1 2>/dev/null'",
+            "ssh host 'a | b 2>/dev/null'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Unknown,
+            );
+            assert!(
+                result.is_allowed(),
+                "{command} must be allowed: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_payload_redirect_still_denies() {
+        for command in [
+            "bash -c \"cat x > $T\"",
+            "sh -c \"echo hi > /etc/passwd\"",
+            "ssh h \"cat x > /etc/passwd\" 2>&1",
+            "ssh h \"rm -rf /data\"",
+            // The anti-bypass shape keeps its operator outside the quotes.
+            "\"git\">/dev/null reset --hard",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem", "core.git"],
+                ShellDialect::Unknown,
+            );
+            assert!(result.is_denied(), "{command} must stay denied");
+        }
+    }
+
+    #[test]
+    fn cross_dialect_closing_quote_is_not_a_dynamic_target() {
+        // Cmd has no single-quote literal, so its view of a POSIX-quoted
+        // argument both performs the redirect and swallows the closing `'`
+        // into the target. No single shell does both.
+        let result = evaluate_with_pack_ids_in_dialect(
+            "echo 'a | b 2>/dev/null'",
+            &["core.filesystem"],
+            ShellDialect::Unknown,
+        );
+        assert!(
+            result.is_allowed(),
+            "quoted echo data must not be a redirect: {:?}",
+            result.pattern_info
+        );
+        // A Cmd command whose redirect operator really is outside the quotes
+        // keeps its finding.
+        let span = MatchSpan { start: 0, end: 12 };
+        assert!(!redirect_match_is_cross_dialect_quote_artifact(
+            "echo x > '$HOME/f'",
+            span,
+            ShellDialect::Cmd
+        ));
+        assert!(!redirect_match_is_cross_dialect_quote_artifact(
+            "echo 'a | b 2>/dev/null'",
+            span,
+            ShellDialect::Posix
+        ));
+    }
+
+    #[test]
+    fn bash_socket_pseudo_devices_are_not_truncatable_files() {
+        for command in [
+            "bash -c \"echo > /dev/tcp/172.20.0.2/2222\"",
+            "bash -c \"echo ping > /dev/udp/172.20.0.2/53\"",
+            "echo > /dev/tcp/example.test/22",
+            "echo > /dev/tcp/host/http",
+            "echo > /dev/tcp/h/22 && echo open",
+            "echo > /dev/udp/h/53; echo done",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Unknown,
+            );
+            assert!(
+                result.is_allowed(),
+                "{command} opens a socket, not a file: {:?}",
+                result.pattern_info
+            );
+        }
+        // The carve-out stops at the two socket prefixes, and only for the
+        // exact `host/port` shape bash recognises. `/dev/stdout` and
+        // `/dev/fd/N` are symlinks to whatever the descriptor currently points
+        // at — possibly a regular file — and `/dev/sda` is the whole point of
+        // the rule. The traversal rows matter because only *bash* intercepts
+        // these paths: under `sh`/`dash` the same word is an ordinary
+        // filename, so a `..` segment really would open the file it walks to.
+        for command in [
+            "echo hi > /dev/stdout",
+            "echo hi > /dev/fd/3",
+            "echo x > /dev/sda",
+            "echo x > /dev/tcpdump",
+            "echo x > /dev/tcp",
+            "echo x > /dev/tcp/h",
+            "echo x > /dev/tcp/../../etc/passwd",
+            "echo x > /dev/tcp/h/../../etc/passwd",
+            "echo x > /dev/udp/./x/y",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Unknown,
+            );
+            assert!(result.is_denied(), "{command} must stay denied");
+        }
+    }
+
+    #[test]
+    fn embedded_denial_reasons_name_the_real_carrier() {
+        // The frame used to say "(line 1 of heredoc)" for every payload, which
+        // sent triage into the heredoc extractor for behaviour that lives in
+        // argument handling, and re-wrapping doubled the whole prefix.
+        assert_eq!(
+            wrap_embedded_shell_denial_reason("boom", false, Some("ssh"), 1),
+            "Embedded shell command blocked: boom (ssh inline script)"
+        );
+        assert_eq!(
+            wrap_embedded_shell_denial_reason("boom", false, None, 3),
+            "Embedded shell command blocked: boom (line 3 of the inline script)"
+        );
+        assert_eq!(
+            wrap_embedded_shell_denial_reason("boom", true, Some("bash"), 2),
+            "Embedded shell command blocked: boom (line 2 of heredoc)"
+        );
+        let once = wrap_embedded_shell_denial_reason("boom", true, None, 1);
+        assert_eq!(
+            wrap_embedded_shell_denial_reason(&once, true, None, 1),
+            once,
+            "an already-framed reason must not be framed again"
+        );
     }
 
     fn evaluate_with_pack_ids_in_dialect(

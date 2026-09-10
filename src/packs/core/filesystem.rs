@@ -4468,6 +4468,25 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //      keeps `/dev/tty0`..`/dev/ttyN` (consoles / other terminals)
         //      blocked as before.
         //
+        //      `/dev/tcp/<host>/<port>` and `/dev/udp/<host>/<port>` join the
+        //      carve-out for a different reason (#404): they are not files at
+        //      all. Bash intercepts those two prefixes in its *own* redirect
+        //      parser and opens a socket — no `open(2)`, no `O_TRUNC`, and no
+        //      such path exists on disk to truncate. `echo > /dev/tcp/h/p` is
+        //      the standard "is this port open" idiom on a host without `nc`,
+        //      and denying it as file destruction sent operators to rewrite it
+        //      in Python.
+        //
+        //      The exemption is scoped to the exact shape bash recognises —
+        //      one host segment, one port/service segment, nothing after it —
+        //      and refuses a `.`/`..` segment. That matters because only
+        //      *bash* intercepts these paths: under `sh`/`dash` the same word
+        //      is an ordinary filename, so `> /dev/tcp/../../etc/passwd`
+        //      would really open `/etc/passwd` with `O_TRUNC`. It stays
+        //      denied, as does `/dev/tcpdump` and every other real node under
+        //      `/dev` — `/dev/sda` is exactly what this rule exists to
+        //      protect.
+        //
         //   2. `(?:['"\\]|\$['"])?` — extends the historical optional
         //      single-char quote prefix to also accept the two-byte
         //      Bash quoting introducers `$'` (ANSI-C) and `$"`
@@ -4475,7 +4494,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //      bypass with `> $'/etc/passwd'` or `> $"/etc/passwd"`.
         destructive_pattern!(
             "redirect-truncate-root-home",
-            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full|tty)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:(?:null|zero|full|tty)\b|(?:tcp|udp)/(?!\.\.?(?:/|$))[^/\s]+/[A-Za-z0-9_-]+(?=[\s;|&)'"]|$)))(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
             "shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to an existing sensitive system or home path destroys the previous file contents. A currently absent literal target under the home directory with an existing parent is allowed (creation, not truncation — the same thing `>>` would do); existing files, dynamic paths, symlinks, missing parents, system paths, and .git internals stay blocked.",
             Critical,
             "`> /etc/passwd` (or `: > /etc/passwd`, `echo > /etc/passwd`, etc.) opens \

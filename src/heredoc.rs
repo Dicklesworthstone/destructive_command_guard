@@ -1895,6 +1895,27 @@ fn dequoted_flag_word(text: &str, start: usize, end: usize) -> (&str, usize, usi
     (text, start, end)
 }
 
+/// Whether a `Word` token actually opens a redirection of the *local* command
+/// (`>file`, `2>`, `>>out`, `&>log`, `<in`).
+///
+/// The normalizer keeps `>` inside words, so a redirect reaches the token
+/// stream as a Word rather than a Separator. A quoted or escaped leading byte
+/// means the glyph is data, not syntax, so only a bare operator counts.
+fn word_token_starts_local_redirect(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+        index += 1;
+    }
+    match bytes.get(index) {
+        Some(b'>' | b'<') => true,
+        // `&>`/`&>>` (bash) redirect both streams; `&` alone is a separator
+        // and never reaches this function as part of a Word.
+        Some(b'&') if index == 0 => bytes.get(1) == Some(&b'>'),
+        _ => false,
+    }
+}
+
 /// Byte spans of one `ssh … destination <command…>` remote payload.
 struct SshRemotePayload {
     /// Payload text: for a single payload word, one layer of matching
@@ -2077,11 +2098,25 @@ fn ssh_remote_payload(
     }
 
     // Phase 2: the payload is the run of Word tokens after the destination,
-    // up to the next shell separator (which belongs to the LOCAL shell).
+    // up to the next shell separator (which belongs to the LOCAL shell) or the
+    // first redirect operator (which also belongs to the LOCAL shell — a
+    // redirect always applies to the `ssh` process, never to the remote
+    // command). Stopping at the redirect is what keeps the payload a single
+    // token in `ssh h "a 2>/dev/null" 2>&1`, so the quote-stripping branch
+    // below still fires: without it the run swallowed the local `2>` and the
+    // retained closing quote glued itself onto the remote target, producing
+    // `/dev/null"` and a `redirect-truncate-dynamic-path` deny for an
+    // unchanged, harmless inner redirect (issue #404).
     let payload_start = index;
     let mut payload_end = index;
     while let Some(token) = tokens.get(payload_end) {
         if token.kind != NormalizeTokenKind::Word {
+            break;
+        }
+        if token
+            .text(command)
+            .is_some_and(word_token_starts_local_redirect)
+        {
             break;
         }
         payload_end += 1;
