@@ -49,6 +49,7 @@ beads.right.meta.json
 *.tmp
 .br-db-write-*.lock
 .br-jsonl-write-*.lock
+.br-db-openers-*.lock
 
 # Schema-migration recovery bundles (local safety copies)
 .br_recovery/
