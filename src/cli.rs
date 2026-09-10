@@ -445,6 +445,17 @@ pub enum Command {
     },
 
     /// Test a command against enabled packs
+    ///
+    /// Two differences from the hook are worth knowing before you use this to
+    /// validate an override or replay a corpus of real blocks (#402):
+    ///
+    /// The hook evaluates the full tool payload, including heredoc bodies;
+    /// `dcg test` evaluates the command line you give it.
+    ///
+    /// The hook is told which tool it is gating, so a `Bash` payload is
+    /// evaluated as POSIX. `dcg test` has no such context and evaluates the
+    /// conservative union of the POSIX, PowerShell and Cmd views, which can
+    /// deny where the hook allows.
     #[command(name = "test")]
     TestCommand {
         /// Command to test
