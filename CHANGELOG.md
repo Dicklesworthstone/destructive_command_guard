@@ -124,8 +124,12 @@ stop.
   statement is now analysed as the assignment it is — the right-hand side is
   still analysed, so `$x = sh -c "<payload>"` stays gated — and a CamelCase
   long parameter is no longer read as a short-flag cluster when the executable
-  is unknown. A proven shell keeps the permissive cluster reading, so
-  `sh -Bec '<payload>'` is still an inline-code launcher.
+  is unknown, unless it is one of PowerShell's own inline-code parameters
+  (`-Command`, `-EncodedCommand`). A proven shell keeps the permissive
+  cluster reading, so `sh -Bec '<payload>'` is still an inline-code launcher.
+  The right-hand side is handed to the whole pipeline rather than skipped, so
+  it is judged by the rule that actually describes it — which also closes a
+  gap v0.14.2 had: `$x = cmd /c "del /f /s /q C:\Windows"` is now denied.
 
 - **An unresolvable executable is not upgraded into `git branch` (#401
   class).** A bare expansion may equal any name, so asking whether it equals
