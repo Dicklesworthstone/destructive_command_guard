@@ -11,6 +11,145 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+Five false-positive reports arrived within twenty-four hours (#401, #402, #403,
+#404, #405). Each had its own mechanism, but four of the five shared a shape:
+an operand dcg could not resolve was allowed to condemn a command whose *verb*
+was plainly read-only. Every fix below narrows the evidence to what was
+actually seen; none of them relaxes a rule's coverage of the thing it exists to
+stop.
+
+### Fixed
+
+- **A read-only `git` subcommand survives an unresolvable `-C` / `--git-dir`
+  path (#405).** `git -C $d status` — and therefore every `for d in ...; do
+  git -C $d status; done` sweep — denied as
+  `core.git:git-alias-semantic-unverified`, a rule whose job is to refuse a
+  Git invocation whose *alias chain* cannot be resolved. A path is not an
+  alias: a dynamic, field-splitting value for `-C`, `--git-dir`,
+  `--work-tree`, `--namespace`, `--super-prefix`, `--shallow-file` or
+  `--attr-source` (separated or glued, `-C$d` / `--git-dir=$d/.git`) no longer
+  ends the walk. The subcommand decides instead — a builtin resolves the
+  dispatch and its own pack rules still see the command (`git -C $d clean
+  -fdx`, `git -C $d reset --hard` and `git -C $d checkout -- .` stay denied),
+  and a non-builtin word still returns `Unverified`. A bare dynamic word in
+  the options region (`git $flag status`) and a dynamic `--exec-path=` — which
+  really can redirect dispatch to another `git-<name>` helper — keep their
+  denial.
+
+- **A keyword-less external pack is evaluated (#402).** `Pack::might_match`
+  documents that a pack declaring no `keywords` is always checked, but the
+  *global* quick reject runs before it and is built from the union of every
+  enabled pack's keywords — to which such a pack contributes nothing. The pack
+  therefore fired only when some unrelated pack's keyword happened to appear
+  in the command, which made its coverage depend on the rest of the command
+  line rather than on the configuration, on every surface including the hook.
+  A loaded pack with no keywords now stands the global reject down for the
+  process, honouring the documented contract. `dcg pack validate` reports
+  `[S001]` as a warning that names the runtime consequence instead of a
+  performance suggestion, and `dcg doctor` names the pack.
+
+- **`dcg config` lists the packs that evaluate (#402).** The listing printed
+  the *requested* set, so it disagreed with `dcg packs` and `dcg doctor`: a
+  pack reached only through `packs.custom_paths` was missing even though it
+  was firing, and a pack whose YAML failed to parse was presented as coverage.
+  All three surfaces now report the same set; an external pack is marked as
+  such, a configured id that never loaded is marked `configured but NOT
+  loaded`, and the load warnings are printed. `dcg doctor` counts external
+  packs and fails its pack check when one could not be loaded. The JSON form
+  gains `packs.configured_but_not_loaded`,
+  `packs.external_without_keywords` and `packs.load_warnings`.
+
+- **Tailwind's `truncate` class is not SQL DDL (#403).** The
+  `database.mysql` and `database.postgresql` `truncate-table` rules matched
+  "the word `truncate`, whitespace, a letter", which every Tailwind class list
+  satisfies — `class="min-w-0 truncate line-through"` read as
+  `TRUNCATE <tablename>` and blocked ordinary React/TypeScript edits in any
+  project using the utility class. The expression now requires the keyword to
+  start a word (a punctuation-aware lookbehind: `\b` alone also matches after
+  `.` and `-`, so `s.truncate` and `--truncate` matched), a full SQL
+  identifier that is not followed by a hyphen (an unquoted SQL identifier
+  cannot contain one), and a statement end after it. Every real spelling still
+  blocks, including `TRUNCATE TABLE db.t`, `truncate foo CASCADE`,
+  `TRUNCATE users RESTART IDENTITY` and the `psql -c` / `mysql -e` forms. The
+  sibling rules in these packs were audited for the same `\b`-after-punctuation
+  defect; `delete-without-where` and `grant-all` gained the word boundary they
+  never had.
+
+- **An inline payload's redirect is judged in the payload's own coordinates
+  (#404).** `ssh h "a 2>/dev/null"` was allowed and `ssh h "a 2>/dev/null"
+  2>&1` was denied, for a byte-identical inner redirect: the local `2>` joined
+  the `ssh` payload token run, which stopped the quote stripping and glued the
+  closing quote onto the target, producing `/dev/null"`. A redirect always
+  belongs to the local command, so the payload run now stops at one. The
+  redirect guard also asks the rule its own question against the payload text:
+  if the expression does not match there, the outer hit was assembled from
+  bytes the payload does not contain. Multi-segment payloads used to bail out
+  of that guard entirely, which is why the reporter's composition case
+  disappeared under simplification. A payload that really does carry the
+  syntax (`bash -c "cat x > $T"`) still denies.
+
+- **A cross-dialect quote artifact is not a dynamic redirect target (#404).**
+  With no proven dialect dcg unions the POSIX, PowerShell and Cmd views. Cmd
+  has no single-quote literal, so in a POSIX single-quoted argument it read
+  the bytes as live syntax *and* swallowed the closing `'` into the redirect
+  target — the only reason the target then looked "dynamic". No shell does
+  both, so that combination no longer denies. A real redirect keeps its
+  operator outside the quotes and is unaffected.
+
+- **`/dev/tcp/<host>/<port>` and `/dev/udp/<host>/<port>` are sockets, not
+  files (#404).** Bash intercepts those two prefixes in its own redirect
+  parser and opens a socket; no file is opened and nothing can be truncated.
+  `echo > /dev/tcp/host/22`, the standard port probe on a host without `nc`,
+  is allowed. The exemption is scoped to the exact `host/port` shape bash
+  recognises and refuses a `.`/`..` segment, because under `sh`/`dash` the
+  same word is an ordinary filename. `/dev/stdout`, `/dev/stderr` and
+  `/dev/fd/N` deliberately stay denied: they are symlinks to whatever the
+  descriptor currently points at, which may be a regular file.
+
+- **An embedded denial names the carrier it came from (#404).** The reason
+  string hardcoded `(line N of heredoc)` for every extracted payload, sending
+  anyone triaging `ssh h "a 2>/dev/null" 2>&1` — a command with no heredoc
+  anywhere — into the heredoc extractor for behaviour that lives in argument
+  handling, and re-wrapping an already-wrapped reason doubled the entire
+  prefix. The frame now names the real carrier (`(ssh inline script)`,
+  `(line 2 of heredoc)`) and an inner frame is kept rather than repeated.
+
+- **A PowerShell assignment is not a POSIX launcher (#401).** `$residue =
+  Get-ChildItem "$env:TEMP" -Directory` denied as
+  `heredoc.posix:inline-launcher-unverified`: the POSIX reading made `$residue`
+  a "dynamically assembled executable", and `-Directory` was read as a cluster
+  of short flags one of which is `c`, the inline-code flag. A `$name = <rhs>`
+  statement is now analysed as the assignment it is — the right-hand side is
+  still analysed, so `$x = sh -c "<payload>"` stays gated — and a CamelCase
+  long parameter is no longer read as a short-flag cluster when the executable
+  is unknown. A proven shell keeps the permissive cluster reading, so
+  `sh -Bec '<payload>'` is still an inline-code launcher.
+
+- **An unresolvable executable is not upgraded into `git branch` (#401
+  class).** A bare expansion may equal any name, so asking whether it equals
+  `git-branch` always said yes, and the synthesized pattern-matching view read
+  `git branch <the whole argv>` — which handed `branch-force-delete` a
+  `-D`-looking token from an unrelated command. That is how `$items =
+  Get-ChildItem C:\temp -Recurse -Directory` came to be denied as a forced
+  branch deletion. An unbounded executable now synthesizes plain `git`;
+  literal branch evidence after it is still caught, and attributed to
+  `branch-dynamic-token`, the rule that describes what was actually seen.
+
+### Added
+
+- **A corpus of ordinary developer command lines that must never be denied**
+  (`tests/false_positive_corpus.rs`): git read-only operations including the
+  directory-loop shapes, npm/bun/pnpm/pip/cargo installs and builds, Tailwind
+  class edits, `docker ps`, `kubectl get`, PowerShell read-only assignments,
+  remote payloads carrying `2>/dev/null`, and everyday shell. It runs the real
+  binary in hook mode with **every** pack category enabled, and carries a
+  control list of destructive commands so it cannot pass by weakening dcg.
+  This is the guard against the class, rather than against the five instances.
+
+---
+
 ## [v0.14.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.14.2) -- 2026-09-09 [Release]
 
 The credential-file write rule, the `;`-joined heredoc boundary fix (#393),
