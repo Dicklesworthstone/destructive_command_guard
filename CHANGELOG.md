@@ -11,7 +11,7 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## Unreleased
+## [v0.14.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.14.3) -- 2026-09-10 [Release]
 
 Five false-positive reports arrived within twenty-four hours (#401, #402, #403,
 #404, #405). Each had its own mechanism, but four of the five shared a shape:
