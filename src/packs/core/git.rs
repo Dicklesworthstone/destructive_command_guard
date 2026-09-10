@@ -706,6 +706,24 @@ fn literal_argv_proves_branch_mutation(words: &[SymbolicPosixWord]) -> bool {
     literal_branch_tokens_prove_mutation(words.iter().map(SymbolicPosixWord::exact))
 }
 
+/// Whether `token` is a single-dash CamelCase *long* parameter name
+/// (`-Directory`, `-Recurse`, `-Confirm`) rather than a POSIX cluster of
+/// one-letter flags. Requires at least three characters after the dash, an
+/// initial ASCII uppercase letter, and a following lowercase letter, so
+/// `-D`, `-Df`, `-DF` and every lowercase cluster stay short flags.
+fn camel_case_long_parameter_name(token: &str) -> bool {
+    let Some(name) = token.strip_prefix('-') else {
+        return false;
+    };
+    if name.starts_with('-') {
+        return false;
+    }
+    name.len() >= 3
+        && name.starts_with(|c: char| c.is_ascii_uppercase())
+        && name[1..].contains(|c: char| c.is_ascii_lowercase())
+        && name.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 /// Shared literal-evidence scan behind [`literal_argv_proves_branch_mutation`]
 /// and its `GitSemanticWord` counterpart. `None` marks a dynamic word, which
 /// contributes no evidence but does not stop the scan.
@@ -731,6 +749,18 @@ fn literal_branch_tokens_prove_mutation<'a>(tokens: impl Iterator<Item = Option<
                 "force" => mutation.force = !resolved.negated,
                 _ => {}
             }
+            continue;
+        }
+        if camel_case_long_parameter_name(token) {
+            // PowerShell spells every parameter `-CamelCase` with a single
+            // dash, so a POSIX short-flag reading turns `-Directory` into
+            // `-D` (branch delete) and `-Confirm` into `-C` (forced copy).
+            // This scan only ever runs when the executable slot is a bare
+            // expansion, which is exactly the shape a PowerShell assignment
+            // (`$items = Get-ChildItem -Directory`) presents to a POSIX
+            // tokenizer — issue #401. Git's own short options are never
+            // capitalised multi-letter words, and `git branch -Dxx` is a
+            // usage error rather than a deletion, so nothing real is lost.
             continue;
         }
         if let Some(flags) = token.strip_prefix('-').filter(|flags| !flags.is_empty()) {
@@ -2260,6 +2290,28 @@ fn git_subcommand_token_is_dispatchable(token: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
 }
 
+/// Whether a token is a Git global option that carries a *path* value glued to
+/// the option name (`-C<path>`, `--git-dir=<path>`, …).
+///
+/// The option name is literal text, so a runtime expansion inside such a token
+/// can only make the path unresolvable — never the subcommand, and never an
+/// `alias.*` definition. `--exec-path=` is deliberately absent: it redirects
+/// where Git looks for `git-<name>` helpers, so a dynamic value there really
+/// can change what dispatch runs.
+fn git_attached_path_option_prefix(token: &str) -> bool {
+    (token.starts_with("-C") && token.len() > 2)
+        || [
+            "--git-dir=",
+            "--work-tree=",
+            "--namespace=",
+            "--super-prefix=",
+            "--attr-source=",
+            "--shallow-file=",
+        ]
+        .iter()
+        .any(|prefix| token.starts_with(prefix))
+}
+
 fn is_known_git_command(command: &str) -> bool {
     matches!(
         command,
@@ -2518,6 +2570,16 @@ fn invoked_git_alias_segment_in_dialect(
         let Some(word) = words.get(index) else {
             return InvokedGitAliasDecision::NoMatch;
         };
+        // A dynamic *value* glued to a statically visible path option
+        // (`-C$dir`, `--git-dir=$d/.git`) says nothing about which subcommand
+        // Git will dispatch: the option name is literal, and only the path it
+        // names is unresolvable. Alias resolution depends on the subcommand
+        // word, so it can continue (issue #405). A bare dynamic word here is
+        // still unverifiable — it could expand to `-c alias.st=!rm -rf .`.
+        if word.dynamic && git_attached_path_option_prefix(&word.decoded) {
+            index += 1;
+            continue;
+        }
         if word.dynamic {
             return InvokedGitAliasDecision::Unverified;
         }
@@ -2592,12 +2654,20 @@ fn invoked_git_alias_segment_in_dialect(
                 | "--shallow-file"
                 | "--attr-source"
         ) {
-            let Some(value) = words.get(index + 1) else {
+            if words.get(index + 1).is_none() {
+                // The option is the last word, so Git would reject the
+                // invocation before dispatching anything.
                 return InvokedGitAliasDecision::NoMatch;
-            };
-            if value.dynamic && value.may_split {
-                return InvokedGitAliasDecision::Unverified;
             }
+            // A dynamic, field-splitting path (`git -C $d status`) used to end
+            // the walk here, which denied every read-only `git -C $d status` /
+            // `git -C $r log` in a directory loop as an unverifiable alias
+            // (issue #405). The path is not an alias, and the subcommand that
+            // *is* one stays visible: keep walking and let the subcommand
+            // decide. A builtin (`status`, `log`) resolves to `NoMatch`, its
+            // own pack rules still see the command, and a non-builtin word
+            // still falls through to `resolve_visible_alias_invocation`, which
+            // returns `Unverified` for an alias it cannot resolve.
             index += 2;
             continue;
         }
@@ -4452,8 +4522,25 @@ pub(crate) fn syntax_view_for_pattern_matching(
     }
 
     let executable = &decoded.words[executable_index];
-    let mut synthetic = if git_semantic_executable_may_equal(executable, dialect, "git-branch")
-        || git_semantic_executable_may_equal(executable, dialect, "git-branch.exe")
+    // A bare expansion (`$items`, `$g`) *may* equal any name, so asking
+    // `may_equal("git-branch")` about one always says yes — and the synthesized
+    // view then reads `git branch <rest of the command line>`, which hands the
+    // `branch-force-delete` regex a `-D`-looking token from argv that has
+    // nothing to do with Git. That is how `$items = Get-ChildItem C:\temp
+    // -Recurse -Directory` came to be denied as a forced branch deletion: the
+    // unresolvable executable was upgraded into the most dangerous reading, and
+    // `-Directory` supplied the `D` (issue #401 class).
+    //
+    // Two unknowns are not evidence (#281). An unbounded executable synthesizes
+    // plain `git`, exactly as it does elsewhere; a *proven* `git-branch` still
+    // gets the subcommand spelled out. Nothing is lost: literal branch evidence
+    // after an unbounded executable is still caught by
+    // `dynamic_git_branch_may_mutate`, which attributes it to
+    // `branch-dynamic-token` — the rule that describes what was actually seen.
+    let executable_unbounded = git_semantic_executable_is_unbounded(executable, dialect);
+    let mut synthetic = if !executable_unbounded
+        && (git_semantic_executable_may_equal(executable, dialect, "git-branch")
+            || git_semantic_executable_may_equal(executable, dialect, "git-branch.exe"))
     {
         String::from("git branch")
     } else {
@@ -5593,6 +5680,123 @@ mod tests {
     // Git LFS (Refs PR #383): `git lfs` is a known subcommand, and its three
     // destructive verbs carry their own rules.
     // =========================================================================
+
+    // =========================================================================
+    // Issue #405: a read-only `git` subcommand must resolve independently of a
+    // path argument dcg cannot resolve.
+    // =========================================================================
+
+    #[test]
+    fn dynamic_path_options_do_not_make_the_subcommand_unverifiable() {
+        // `-C $d` / `--git-dir=$d/.git` name a *path*, never an alias, and the
+        // subcommand stays in plain sight. Every one of these used to deny as
+        // `git-alias-semantic-unverified`, which made a read-only status/log
+        // sweep over a directory list unusable.
+        for command in [
+            "git -C $d status --short",
+            "git -C $d log -1",
+            "git -C$d status",
+            "git --git-dir=$d/.git status",
+            "git --work-tree=$w --git-dir=$d/.git diff",
+            "git -C \"$r\" log --oneline -5",
+            "git -C $d rev-parse --abbrev-ref HEAD",
+        ] {
+            assert_eq!(
+                invoked_visible_git_alias_in_dialect(command, ShellDialect::Posix),
+                InvokedGitAliasDecision::NoMatch,
+                "{command} must resolve its subcommand"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_path_options_do_not_weaken_alias_or_dispatch_checks() {
+        // What the rule is actually for stays denied: a dynamic *subcommand*,
+        // a dynamic `-c alias.…` definition, an unresolvable alias name, and a
+        // dynamic `--exec-path` (which really can redirect dispatch to another
+        // `git-<name>` helper).
+        for command in [
+            "git $sub status",
+            "git -C $d st",
+            "git -c alias.st=$x st",
+            "git --exec-path=$evil status",
+            "git $flag status",
+        ] {
+            assert_eq!(
+                invoked_visible_git_alias_in_dialect(command, ShellDialect::Posix),
+                InvokedGitAliasDecision::Unverified,
+                "{command} must stay unverifiable"
+            );
+        }
+    }
+
+    #[test]
+    fn camel_case_parameters_are_not_git_short_flag_clusters() {
+        // #401: PowerShell writes `-Directory`, `-Confirm`, `-Recurse`; a POSIX
+        // short-flag reading turns those into `-D` (branch delete) and `-C`
+        // (forced copy). Only the literal-evidence scan behind an unbounded
+        // executable consults this, which is exactly where a PowerShell
+        // assignment lands, so `$items = Get-ChildItem -Directory` used to be
+        // a `branch-dynamic-token` deny.
+        assert!(camel_case_long_parameter_name("-Directory"));
+        assert!(camel_case_long_parameter_name("-Confirm"));
+        assert!(camel_case_long_parameter_name("-Recurse"));
+        assert!(camel_case_long_parameter_name("-Descending"));
+        // Real short-flag clusters and their capitalised forms stay flags.
+        assert!(!camel_case_long_parameter_name("-D"));
+        assert!(!camel_case_long_parameter_name("-Df"));
+        assert!(!camel_case_long_parameter_name("-DF"));
+        assert!(!camel_case_long_parameter_name("-fd"));
+        assert!(!camel_case_long_parameter_name("--delete"));
+        assert!(!camel_case_long_parameter_name("main"));
+
+        assert!(!dynamic_git_branch_may_mutate(
+            "$items = Get-ChildItem C:\\temp -Recurse -Directory",
+            ShellDialect::Unknown
+        ));
+        // Literal branch evidence after an unknown executable still denies.
+        assert!(dynamic_git_branch_may_mutate(
+            "$g $sub -D main",
+            ShellDialect::Posix
+        ));
+    }
+
+    #[test]
+    fn an_unbounded_executable_is_not_synthesized_into_git_branch() {
+        // `$items` may equal any name, so `may_equal("git-branch")` says yes
+        // about every bare expansion. Synthesizing `git branch <argv>` from
+        // that handed the `branch-force-delete` regex an unrelated argument to
+        // read as `-D`: `$items = Get-ChildItem C:\temp -Recurse -Directory`
+        // was denied as a forced branch deletion.
+        for command in [
+            "$items = Get-ChildItem C:\\temp -Recurse -Directory",
+            "$count += Get-ChildItem -Directory",
+            "$tool -Confirm build",
+        ] {
+            let sanitized = crate::context::sanitize_for_pattern_matching(command);
+            let view =
+                syntax_view_for_pattern_matching(command, sanitized.as_ref(), ShellDialect::Posix);
+            assert!(
+                !view
+                    .as_deref()
+                    .is_some_and(|view| view.contains("git branch")),
+                "{command} must not synthesize a branch subcommand: {view:?}"
+            );
+        }
+
+        // A statically proven `git-branch` still spells its subcommand out.
+        let sanitized = crate::context::sanitize_for_pattern_matching("git-branch -D main");
+        let view = syntax_view_for_pattern_matching(
+            "git-branch -D main",
+            sanitized.as_ref(),
+            ShellDialect::Posix,
+        );
+        assert!(
+            view.as_deref()
+                .is_some_and(|view| view.contains("git branch")),
+            "proven git-branch keeps its synthesis: {view:?}"
+        );
+    }
 
     #[test]
     fn git_lfs_destructive_verbs_are_covered() {
