@@ -381,8 +381,19 @@ fn test_audit_backtracking_requirements() {
                 "mongodump-no-drop",
             ]),
         ),
-        ("database.mysql", HashSet::from(["mysqldump-no-drop"])),
-        ("database.postgresql", HashSet::from(["pg-dump-no-clean"])),
+        // `truncate-table` needs the backtracking engine on purpose: separating
+        // SQL DDL from Tailwind's `truncate` utility class costs a
+        // punctuation-aware lookbehind and a "not followed by a hyphenated
+        // token" lookahead (issue #403). These packs are opt-in and the
+        // expression is anchored on a literal keyword, so the cost is bounded.
+        (
+            "database.mysql",
+            HashSet::from(["mysqldump-no-drop", "truncate-table"]),
+        ),
+        (
+            "database.postgresql",
+            HashSet::from(["pg-dump-no-clean", "truncate-table"]),
+        ),
         (
             "database.redis",
             HashSet::from([

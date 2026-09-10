@@ -273,7 +273,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // TRUNCATE TABLE
         destructive_pattern!(
             "truncate-table",
-            r"(?i)TRUNCATE\s+(?:TABLE\s+)?[a-zA-Z_]",
+            // Keep byte-identical to `crate::packs::database::TRUNCATE_TABLE_PATTERN`
+            // (asserted by `truncate_table_pattern_is_shared`); the rationale
+            // for every constraint lives on that constant. Issue #403.
+            r#"(?i)(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#,
             "TRUNCATE permanently deletes all rows. Cannot be rolled back in MySQL.",
             High,
             "TRUNCATE is faster than DELETE but more dangerous in MySQL:\n\n\
@@ -294,7 +297,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // DELETE without WHERE
         destructive_pattern!(
             "delete-without-where",
-            r"(?i)DELETE\s+FROM\s+(?:(?:[a-zA-Z_][a-zA-Z0-9_]*|`[^`]+`)(?:\.(?:[a-zA-Z_][a-zA-Z0-9_]*|`[^`]+`))?)\s*(?:;|$)",
+            r"(?i)\bDELETE\s+FROM\s+(?:(?:[a-zA-Z_][a-zA-Z0-9_]*|`[^`]+`)(?:\.(?:[a-zA-Z_][a-zA-Z0-9_]*|`[^`]+`))?)\s*(?:;|$)",
             "DELETE without WHERE clause deletes ALL rows. Add a WHERE clause.",
             High,
             "DELETE without WHERE removes ALL rows from the table:\n\n\
@@ -375,7 +378,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // GRANT ALL PRIVILEGES
         destructive_pattern!(
             "grant-all",
-            r"(?i)GRANT\s+ALL\s+(?:PRIVILEGES\s+)?ON\s+\*\.\*",
+            r"(?i)\bGRANT\s+ALL\s+(?:PRIVILEGES\s+)?ON\s+\*\.\*",
             "GRANT ALL ON *.* gives unrestricted access to all databases.",
             High,
             "GRANT ALL PRIVILEGES ON *.* gives the user complete control:\n\n\
@@ -439,6 +442,50 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 mod tests {
     use super::*;
     use crate::packs::test_helpers::*;
+
+    /// Issue #403: Tailwind's `truncate` utility class is not SQL DDL.
+    ///
+    /// The class list is the overwhelmingly common spelling in current
+    /// frontend code, and `truncate` followed by another class satisfied the
+    /// old "word, whitespace, letter" pattern, so ordinary React/TypeScript
+    /// edits could not be made through any shell command.
+    #[test]
+    fn tailwind_truncate_class_is_not_ddl() {
+        let pack = create_pack();
+        for command in [
+            "truncate line-through",
+            "TRUNCATE line-through",
+            "truncate text-sm",
+            "truncate flex-1",
+            "echo class=\"min-w-0 truncate line-through\"",
+            "bun run build -- --class truncate line-through",
+            // The `\b`-after-punctuation class: a word boundary also exists
+            // after `.` and `-`, so these used to match.
+            "x.truncate 5",
+            "cargo run -- --no-truncate output",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
+    /// The same expression must still see every real spelling of the DDL.
+    #[test]
+    fn truncate_ddl_spellings_still_block() {
+        let pack = create_pack();
+        for command in [
+            "truncate table users",
+            "TRUNCATE TABLE users",
+            "truncate users",
+            "truncate users;",
+            "truncate only users",
+            "TRUNCATE TABLE public.users",
+            "truncate foo CASCADE",
+            "truncate table a, b",
+            "TRUNCATE users RESTART IDENTITY",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "truncate-table");
+        }
+    }
 
     #[test]
     fn test_drop_database() {
