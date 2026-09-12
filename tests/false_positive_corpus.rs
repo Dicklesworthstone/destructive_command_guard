@@ -150,6 +150,11 @@ const MUST_ALLOW: &[&str] = &[
     "grep -oE '<a [^>]*>' page.html; ssh host 'git log -1 2>/dev/null | head'",
     "echo 'a | b 2>/dev/null'",
     "bash -c \"echo > /dev/tcp/example.test/22\"",
+    concat!(
+        "ssh aiden@neon \"F=/run/current-system/sw/bin/ffmpeg; ls -la $F; ",
+        "timeout 6 $F -hide_banner -f pulse -i default -t 1 -f null - ",
+        "2>&1 | tail -4; $F -hide_banner -devices 2>&1 | head -20\"",
+    ),
     // --- everyday shell -----------------------------------------------------
     "ls -la",
     "find . -name '*.rs' -newer Cargo.toml",
@@ -184,6 +189,9 @@ const MUST_DENY: &[&str] = &[
     "bash -c \"cat x > $HOME/notes\"",
     "echo x > /dev/sda",
     "git -C $d clean -fdx",
+    "git branch $branch",
+    "G=git; timeout 6 $G branch $branch",
+    "ssh h 'G=git; timeout 6 $G branch $branch'",
     "$x = sh -c \"rm -rf /\"",
 ];
 

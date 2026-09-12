@@ -11983,12 +11983,19 @@ fn literal_posix_executable_assignment(segment: &str) -> Option<(String, String)
     Some((name.to_string(), raw_value.to_string()))
 }
 
-/// Return an exact executable-position variable reference.
+/// Return an exact executable-position variable reference after any bounded
+/// POSIX execution frontends.
 fn posix_variable_argv0(segment: &str) -> Option<(String, std::ops::Range<usize>)> {
-    let token = tokenize_for_shell_dialect(segment, ShellDialect::Posix)
+    let mut command = segment;
+    let mut command_offset = 0usize;
+    while let Some((remaining, _)) = crate::normalize::strip_posix_execution_frontend(command) {
+        command_offset = command_offset.checked_add(command.len() - remaining.len())?;
+        command = remaining;
+    }
+    let token = tokenize_for_shell_dialect(command, ShellDialect::Posix)
         .into_iter()
         .find(|token| token.kind == NormalizeTokenKind::Word)?;
-    let raw = token.text(segment)?;
+    let raw = token.text(command)?;
     let expansion = if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
         inner
     } else if raw.starts_with('\'') {
@@ -12008,7 +12015,10 @@ fn posix_variable_argv0(segment: &str) -> Option<(String, std::ops::Range<usize>
     {
         return None;
     }
-    Some((name.to_string(), token.byte_range))
+    Some((
+        name.to_string(),
+        token.byte_range.start + command_offset..token.byte_range.end + command_offset,
+    ))
 }
 
 /// Build the bounded literal-assignment portion of #289's command model.
@@ -24744,7 +24754,21 @@ fn evaluate_heredoc(
             );
 
             if body_has_keywords {
-                let inner_commands = crate::heredoc::extract_shell_commands(&content.content);
+                // ssh hands its complete payload to one remote login shell.
+                // Preserve that shell's straight-line assignment context:
+                // splitting `f=ffmpeg; timeout 6 $f ...` into AST command
+                // nodes discards the binding and can make a later `$f`
+                // expansion look like a dynamic `git branch` invocation.
+                let inner_commands = if content.target_command.as_deref() == Some("ssh") {
+                    vec![crate::heredoc::ExtractedShellCommand {
+                        text: content.content.clone(),
+                        start: 0,
+                        end: content.content.len(),
+                        line_number: 1,
+                    }]
+                } else {
+                    crate::heredoc::extract_shell_commands(&content.content)
+                };
                 for inner in inner_commands {
                     if deadline_exceeded(context.deadline) {
                         return Some(EvaluationResult::indeterminate_due_to_budget());
@@ -32157,6 +32181,12 @@ mod tests {
                 "core.git",
                 "reset-hard",
             ),
+            (
+                "g=git; timeout 6 $g branch $branch",
+                &["core.git", "containers.docker"][..],
+                "core.git",
+                "branch-dynamic-token",
+            ),
         ];
         for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
             for (command, packs, expected_pack, expected_rule) in cases {
@@ -32180,6 +32210,17 @@ mod tests {
     #[test]
     fn literal_assignment_argv0_model_preserves_benign_and_chained_controls() {
         for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                "f=/run/current-system/sw/bin/ffmpeg; timeout 6 $f -hide_banner -f pulse -i default -t 1 -f null -",
+                &["core.git"],
+                dialect,
+            );
+            assert!(
+                result.is_allowed(),
+                "resolved wrapped non-Git executable must not be attributed to Git ({dialect:?}): {:?}",
+                result.pattern_info
+            );
+
             let result = evaluate_with_pack_ids_in_dialect(
                 "x=echo; $x 'docker system prune -af'",
                 &["core.git", "core.filesystem", "containers.docker"],
