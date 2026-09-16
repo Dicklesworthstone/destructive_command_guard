@@ -3730,6 +3730,35 @@ mod tests {
             );
         }
 
+        // A quoted heredoc body is literal stdin data, so a verb-noun word in a
+        // commit message must not down-trust real Bash (issue #412). Bodies the
+        // masker cannot delimit — an unbalanced quote inside `"$(…)"` defeats
+        // the trigger scanner — still widen; that residue is tracked in #412.
+        for command in [
+            "git commit -q -F - <<'EOF'\na \" b\nRead-only\nEOF",
+            "cat > msg.txt <<'EOF'\nRemove-Item -Recurse -Force C:\\x\nEOF",
+            "git commit -q -m \"$(cat <<'EOF'\nRead-only\nEOF\n)\"",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "quoted heredoc data must not widen: {command:?}"
+            );
+        }
+
+        // An UNquoted heredoc expands, and anything outside any heredoc body is
+        // still command text, so both still widen.
+        for command in [
+            "cat <<EOF\nRemove-Item -Recurse -Force C:\\x\nEOF",
+            "Remove-Item -Recurse -Force C:\\x; cat <<'EOF'\nRead-only\nEOF",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "executable PowerShell shape must still widen: {command:?}"
+            );
+        }
+
         // Destructive PowerShell/cmd ALIASES with a Windows-shell-only
         // argument widen too (fresh-eyes follow-up to #322): the alias name
         // alone is ambiguous with POSIX, but `-Recurse`/`-Force`/`/s` are not.
