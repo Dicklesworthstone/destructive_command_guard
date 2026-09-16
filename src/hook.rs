@@ -1748,7 +1748,19 @@ fn command_has_powershell_shape(command: &str) -> bool {
 /// the dialect the command will run under), and non-cmdlet POSIX commands are
 /// unaffected.
 pub fn refine_shell_dialect(command: &str, labeled: ShellDialect) -> ShellDialect {
-    if labeled == ShellDialect::Posix && command_has_powershell_shape(command) {
+    if labeled != ShellDialect::Posix {
+        return labeled;
+    }
+    // A quoted heredoc body (`<<'EOF'`) is literal stdin data that no shell
+    // executes, and it is a POSIX construct PowerShell does not have — its
+    // presence corroborates the Bash label rather than contradicting it. Read
+    // as command text, an ordinary hyphenated word in a commit message
+    // (`Read-only`) looked like a verb-noun and down-trusted real Bash to
+    // Unknown, where the fail-closed union denied the commit (issue #412).
+    // Everything outside the body is still judged, so a genuinely mislabeled
+    // `Remove-Item -Recurse -Force` is down-trusted exactly as before.
+    let visible = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    if command_has_powershell_shape(visible.as_ref()) {
         ShellDialect::Unknown
     } else {
         labeled
