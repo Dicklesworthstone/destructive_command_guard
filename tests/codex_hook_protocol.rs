@@ -16,8 +16,20 @@ use std::process::{Command, Stdio};
 
 /// Semantic protocol tests must not accidentally become deadline tests when
 /// the host is busy or the full integration suite runs in parallel. Tests that
-/// exercise the production deadline pass their own explicit value instead.
-const SEMANTIC_TEST_TIMEOUT_MS: &str = "5000";
+/// exercise the production deadline pass their own explicit value instead — see
+/// `codex_hook_deadline_exhaustion_is_indeterminate`, which uses 200ms — so
+/// raising this constant cannot weaken the deadline coverage.
+///
+/// 5000ms was not enough. These tests spawn the real binary, which costs ~50ms
+/// unloaded; but on a many-core CI or developer host running all 114 test
+/// binaries in parallel, one spawn can lose two orders of magnitude to
+/// contention. When it does, evaluation hits the hook deadline and dcg returns
+/// its bounded fallback — still a DENY, so the guard behaves correctly, but a
+/// deny with no rule attribution. The assertions here check *which* rule fired,
+/// so they failed intermittently while the product was working exactly as
+/// designed. Observed twice in one session, on different tests, with the
+/// pre-change binary measuring identical latency.
+const SEMANTIC_TEST_TIMEOUT_MS: &str = "30000";
 
 // ---------------------------------------------------------------------------
 // HookOutcome — typed subprocess result with postmortem diagnostics
@@ -554,7 +566,10 @@ fn explicit_powershell_tool_decodes_backticks_only_in_shell_syntax() {
         "tool_input": { "command": "g`it branch -`d feature" },
     })
     .to_string();
-    let blocked = run_hook_raw(destructive.as_bytes(), &[("DCG_HOOK_TIMEOUT_MS", "5000")]);
+    let blocked = run_hook_raw(
+        destructive.as_bytes(),
+        &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+    );
     assert!(
         blocked.is_codex_block_shape(),
         "PowerShell syntax escapes must not hide git branch -d\n{blocked}"
@@ -569,7 +584,7 @@ fn explicit_powershell_tool_decodes_backticks_only_in_shell_syntax() {
     .to_string();
     let allowed = run_hook_raw(
         option_operand.as_bytes(),
-        &[("DCG_HOOK_TIMEOUT_MS", "5000")],
+        &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
     );
     assert!(
         allowed.is_allow_shape(),
@@ -586,7 +601,10 @@ fn explicit_cmd_tool_decodes_carets_only_in_shell_syntax() {
         "tool_input": { "command": "g^it branch ^-d feature" },
     })
     .to_string();
-    let blocked = run_hook_raw(destructive.as_bytes(), &[("DCG_HOOK_TIMEOUT_MS", "5000")]);
+    let blocked = run_hook_raw(
+        destructive.as_bytes(),
+        &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+    );
     assert!(
         blocked.is_codex_block_shape(),
         "cmd.exe syntax escapes must not hide git branch -d\n{blocked}"
@@ -601,7 +619,7 @@ fn explicit_cmd_tool_decodes_carets_only_in_shell_syntax() {
     .to_string();
     let allowed = run_hook_raw(
         option_operand.as_bytes(),
-        &[("DCG_HOOK_TIMEOUT_MS", "5000")],
+        &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
     );
     assert!(
         allowed.is_allow_shape(),
@@ -632,8 +650,10 @@ fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
             "tool_input": { "command": command },
         })
         .to_string();
-        let bash_outcome =
-            run_hook_raw(bash_payload.as_bytes(), &[("DCG_HOOK_TIMEOUT_MS", "5000")]);
+        let bash_outcome = run_hook_raw(
+            bash_payload.as_bytes(),
+            &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+        );
         assert!(
             bash_outcome.is_allow_shape(),
             "Bash must not reinterpret Windows shell escapes in {command:?}\n{bash_outcome}"
@@ -647,7 +667,7 @@ fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
         .to_string();
         let unknown_outcome = run_hook_raw(
             unknown_payload.as_bytes(),
-            &[("DCG_HOOK_TIMEOUT_MS", "5000")],
+            &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
         );
         assert!(
             unknown_outcome.is_claude_block_shape(),
@@ -3023,8 +3043,8 @@ fn run_codex_heredoc(command: &str) -> HookOutcome {
     run_hook_raw(
         payload.as_bytes(),
         &[
-            ("DCG_HEREDOC_TIMEOUT_MS", "5000"),
-            ("DCG_HOOK_TIMEOUT_MS", "5000"),
+            ("DCG_HEREDOC_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS),
+            ("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS),
         ],
     )
 }
@@ -3035,8 +3055,8 @@ fn run_claude_heredoc(command: &str) -> HookOutcome {
     run_hook_raw(
         payload.as_bytes(),
         &[
-            ("DCG_HEREDOC_TIMEOUT_MS", "5000"),
-            ("DCG_HOOK_TIMEOUT_MS", "5000"),
+            ("DCG_HEREDOC_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS),
+            ("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS),
         ],
     )
 }
