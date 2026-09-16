@@ -1,7 +1,8 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "command": "git status --short",
   "decision": "allow",
+  "outcome": "allow",
   "total_duration_us": "<duration_us>",
   "steps": [
     {

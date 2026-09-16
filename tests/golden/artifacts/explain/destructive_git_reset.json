@@ -1,7 +1,9 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "command": "git reset --hard HEAD~1",
   "decision": "deny",
+  "mode": "deny",
+  "outcome": "deny",
   "total_duration_us": "<duration_us>",
   "steps": [
     {
