@@ -7609,7 +7609,11 @@ git x",
     fn dashed_spellings_reach_the_same_rule_as_spaced_ones() {
         let pack = create_pack();
         for (spaced, dashed, rule) in [
-            ("git reset --hard HEAD~1", "git-reset --hard HEAD~1", "reset-hard"),
+            (
+                "git reset --hard HEAD~1",
+                "git-reset --hard HEAD~1",
+                "reset-hard",
+            ),
             ("git reset --merge", "git-reset --merge", "reset-merge"),
             ("git clean -fdx", "git-clean -fdx", "clean-force"),
             (
@@ -7638,7 +7642,11 @@ git x",
                 "push-force-short",
             ),
             ("git stash clear", "git-stash clear", "stash-clear"),
-            ("git branch -D feature", "git-branch -D feature", "branch-force-delete"),
+            (
+                "git branch -D feature",
+                "git-branch -D feature",
+                "branch-force-delete",
+            ),
         ] {
             assert_blocks_with_pattern(&pack, spaced, rule);
             assert_blocks_with_pattern(&pack, dashed, rule);
