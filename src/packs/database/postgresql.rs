@@ -450,6 +450,35 @@ mod tests {
     }
 
     #[test]
+    fn truncate_pattern_requires_statement_position() {
+        // Regression #394: the rule matched the word `truncate` anywhere in
+        // argv, so a plain file read whose operand happened to be named like a
+        // SQL identifier was denied as "would delete database rows". An operand
+        // of another command is never in statement position.
+        let pack = create_pack();
+        for command in [
+            "cat truncate x",
+            "sort truncate b",
+            "wc -l truncate x",
+            "ls truncate x",
+            "head -5 truncate x",
+            "diff truncate other",
+            "cp truncate backup",
+        ] {
+            assert_no_match(&pack, command);
+        }
+
+        // Every real execution path opens the statement where SQL can start:
+        // text start (a heredoc body or a reconstructed pipeline payload), an
+        // opening quote, or the previous statement's `;`.
+        assert_blocks(&pack, "TRUNCATE TABLE users", "TRUNCATE");
+        assert_blocks(&pack, "psql -c \"TRUNCATE TABLE users\"", "TRUNCATE");
+        assert_blocks(&pack, "psql --command 'TRUNCATE users'", "TRUNCATE");
+        assert_blocks(&pack, "psql -c \"BEGIN; TRUNCATE users; COMMIT;\"", "TRUNCATE");
+        assert_blocks(&pack, "TRUNCATE TABLE public.users CASCADE", "TRUNCATE");
+    }
+
+    #[test]
     fn dropdb_pattern_requires_word_boundary() {
         // Regression: `dropdb-cli` regex previously was `dropdb\s+`, so any
         // word ending in `dropdb` (e.g. `superdropdb mydb` or
