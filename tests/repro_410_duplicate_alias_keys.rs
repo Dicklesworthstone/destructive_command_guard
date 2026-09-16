@@ -199,7 +199,10 @@ fn genuinely_malformed_input_keeps_fail_open_default_but_says_so() {
     // Posture is unchanged: unparseable input is still allowed by default. What
     // changes is that it is no longer silent, so an operator can tell dcg is
     // not protecting them.
-    let out = run_hook(r#"{"session_id":"s1","tool_name":"Bash","tool_input":}"#, &[]);
+    let out = run_hook(
+        r#"{"session_id":"s1","tool_name":"Bash","tool_input":}"#,
+        &[],
+    );
     assert!(out.status.success(), "default posture is fail-open");
     assert!(
         String::from_utf8_lossy(&out.stdout).trim().is_empty(),

@@ -474,7 +474,11 @@ mod tests {
         assert_blocks(&pack, "TRUNCATE TABLE users", "TRUNCATE");
         assert_blocks(&pack, "psql -c \"TRUNCATE TABLE users\"", "TRUNCATE");
         assert_blocks(&pack, "psql --command 'TRUNCATE users'", "TRUNCATE");
-        assert_blocks(&pack, "psql -c \"BEGIN; TRUNCATE users; COMMIT;\"", "TRUNCATE");
+        assert_blocks(
+            &pack,
+            "psql -c \"BEGIN; TRUNCATE users; COMMIT;\"",
+            "TRUNCATE",
+        );
         assert_blocks(&pack, "TRUNCATE TABLE public.users CASCADE", "TRUNCATE");
     }
 

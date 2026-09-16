@@ -92,7 +92,7 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 21] = [
     r#"\b(?:bun|deno)[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
     // Bun's `exec` subcommand hands its argument to a shell, so it is an inline
     // shell payload under a subcommand rather than a flag (issue #397).
-    r#"\bbun[0-9.]*(?:\.exe)?\s+exec\b"#,
+    r"\bbun[0-9.]*(?:\.exe)?\s+exec\b",
     // PHP inline execution
     r#"\bphp[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*r[A-Za-z]*(?:\s|['"]|$)"#,
     // Lua inline execution
@@ -2084,21 +2084,18 @@ fn bun_exec_inline_payload(
 
     // Phase 1: reach the `exec` subcommand. Quoting a subcommand does not change
     // the argv Bun receives, so `bun "exec" '<payload>'` walks the same grammar.
-    loop {
-        let token = tokens.get(index)?;
-        if token.kind != NormalizeTokenKind::Word {
-            return None;
-        }
-        let (word, _, _) = dequoted_flag_word(
-            token.text(command)?,
-            token.byte_range.start,
-            token.byte_range.end,
-        );
-        if word == "exec" {
-            break;
-        }
-        // Any other word is a different subcommand (`bun run`, `bun install`),
-        // and any option before the subcommand has unmodeled arity.
+    let token = tokens.get(index)?;
+    if token.kind != NormalizeTokenKind::Word {
+        return None;
+    }
+    let (word, _, _) = dequoted_flag_word(
+        token.text(command)?,
+        token.byte_range.start,
+        token.byte_range.end,
+    );
+    // Any other word is a different subcommand (`bun run`, `bun install`), and
+    // any option before the subcommand has unmodeled arity.
+    if word != "exec" {
         return None;
     }
     index += 1;

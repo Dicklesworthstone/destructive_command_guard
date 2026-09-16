@@ -827,7 +827,9 @@ fn decoded_words_execute_git(words: &[String]) -> bool {
                 .unwrap_or(executable);
         }
         return executable.eq_ignore_ascii_case("git")
-            || executable.eq_ignore_ascii_case("git-branch");
+            || CORE_GIT_DASHED_BUILTINS
+                .iter()
+                .any(|builtin| executable.eq_ignore_ascii_case(builtin));
     }
     false
 }
@@ -894,10 +896,14 @@ fn first_literal_posix_git_token_offset(segment: &str) -> Option<usize> {
             let raw = token.text(segment)?;
             let decoded = decoder.decode(raw, ShellTokenRole::Syntax)?;
             let executable = decoded.rsplit(['/', '\\']).next()?;
-            matches!(
-                executable,
-                "git" | "git.exe" | "git-branch" | "git-branch.exe"
-            )
+            let stripped = executable
+                .strip_suffix(".exe")
+                .or_else(|| executable.strip_suffix(".EXE"))
+                .unwrap_or(executable);
+            (stripped.eq_ignore_ascii_case("git")
+                || CORE_GIT_DASHED_BUILTINS
+                    .iter()
+                    .any(|builtin| stripped.eq_ignore_ascii_case(builtin)))
             .then_some(token.byte_range.start)
         })
 }
@@ -1123,14 +1129,24 @@ const CORE_GIT_DASHED_BUILTINS: &[&str] = &[
 /// [`CORE_GIT_DASHED_BUILTINS`]. `.exe` variants are accepted for every name so
 /// a Windows spelling cannot skip the pack.
 fn git_semantic_word_is_git_executable(word: &GitSemanticWord, dialect: ShellDialect) -> bool {
-    if git_semantic_executable_may_equal(word, dialect, "git")
+    git_semantic_executable_may_equal(word, dialect, "git")
         || git_semantic_executable_may_equal(word, dialect, "git.exe")
-    {
-        return true;
-    }
-    CORE_GIT_DASHED_BUILTINS.iter().any(|builtin| {
-        git_semantic_executable_may_equal(word, dialect, builtin)
-            || git_semantic_executable_may_equal(word, dialect, &format!("{builtin}.exe"))
+        || dashed_git_builtin_subcommand(word, dialect).is_some()
+}
+
+/// The subcommand a dashed Git built-in stands for, if this executable word is
+/// one: `git-reset` → `reset`.
+///
+/// Used to spell the subcommand back out when the pattern-matching view is
+/// synthesized, so a dashed spelling reaches the same rule as the spaced one.
+fn dashed_git_builtin_subcommand(
+    word: &GitSemanticWord,
+    dialect: ShellDialect,
+) -> Option<&'static str> {
+    CORE_GIT_DASHED_BUILTINS.iter().find_map(|builtin| {
+        let matches_name = git_semantic_executable_may_equal(word, dialect, builtin)
+            || git_semantic_executable_may_equal(word, dialect, &format!("{builtin}.exe"));
+        matches_name.then(|| builtin.strip_prefix("git-").unwrap_or(builtin))
     })
 }
 
@@ -4579,14 +4595,20 @@ pub(crate) fn syntax_view_for_pattern_matching(
     // after an unbounded executable is still caught by
     // `dynamic_git_branch_may_mutate`, which attributes it to
     // `branch-dynamic-token` — the rule that describes what was actually seen.
+    //
+    // A proven dashed built-in spells its subcommand out, so `git-reset --hard`
+    // synthesizes `git reset --hard` and reaches the same rule the spaced
+    // spelling does (issue #400). Only `git-branch` used to be spelled out;
+    // every other dashed built-in synthesized a bare `git` and *dropped its
+    // subcommand*, which is why `git-reset --hard` was read as `git --hard` and
+    // matched nothing at all.
     let executable_unbounded = git_semantic_executable_is_unbounded(executable, dialect);
-    let mut synthetic = if !executable_unbounded
-        && (git_semantic_executable_may_equal(executable, dialect, "git-branch")
-            || git_semantic_executable_may_equal(executable, dialect, "git-branch.exe"))
-    {
-        String::from("git branch")
-    } else {
-        String::from("git")
+    let mut synthetic = match (
+        executable_unbounded,
+        dashed_git_builtin_subcommand(executable, dialect),
+    ) {
+        (false, Some(subcommand)) => format!("git {subcommand}"),
+        _ => String::from("git"),
     };
     for word in decoded.words.iter().skip(executable_index + 1) {
         synthetic.push(' ');
@@ -7552,6 +7574,124 @@ git x",
             assert!(
                 !git_subcommand_token_is_dispatchable(token),
                 "expected {token:?} to be rejected as a tokenizer artifact"
+            );
+        }
+    }
+
+    /// Issue #400: Git ships each built-in subcommand as its own `git-<sub>`
+    /// executable, so the dashed spelling runs the identical operation. The
+    /// pack's gate recognised only `git` and `git-branch`, so every other rule
+    /// was one rename away from a bypass.
+    #[test]
+    fn dashed_git_builtins_are_recognised_as_git_executables() {
+        for command in [
+            "git-reset --hard HEAD~1",
+            "git-clean -fdx",
+            "git-checkout HEAD -- src/foo.py",
+            "git-restore src/foo.py",
+            "git-push --force origin main",
+            "git-stash drop",
+            "git-branch -D feature",
+            "/usr/libexec/git-core/git-reset --hard HEAD~1",
+        ] {
+            assert!(
+                command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "{command:?} must be recognised as executing git"
+            );
+        }
+    }
+
+    /// End-to-end parity: each dashed spelling must reach the same rule id the
+    /// spaced spelling does. Before the fix, the synthesized pattern view
+    /// dropped the subcommand entirely (`git-reset --hard` became `git --hard`),
+    /// so every rule but `branch-force-delete` matched nothing.
+    #[test]
+    fn dashed_spellings_reach_the_same_rule_as_spaced_ones() {
+        let pack = create_pack();
+        for (spaced, dashed, rule) in [
+            ("git reset --hard HEAD~1", "git-reset --hard HEAD~1", "reset-hard"),
+            ("git reset --merge", "git-reset --merge", "reset-merge"),
+            ("git clean -fdx", "git-clean -fdx", "clean-force"),
+            (
+                "git checkout -- src/foo.py",
+                "git-checkout -- src/foo.py",
+                "checkout-discard",
+            ),
+            (
+                "git checkout HEAD -- src/foo.py",
+                "git-checkout HEAD -- src/foo.py",
+                "checkout-ref-discard",
+            ),
+            (
+                "git restore src/foo.py",
+                "git-restore src/foo.py",
+                "restore-worktree",
+            ),
+            (
+                "git push --force origin main",
+                "git-push --force origin main",
+                "push-force-long",
+            ),
+            (
+                "git push -f origin main",
+                "git-push -f origin main",
+                "push-force-short",
+            ),
+            ("git stash clear", "git-stash clear", "stash-clear"),
+            ("git branch -D feature", "git-branch -D feature", "branch-force-delete"),
+        ] {
+            assert_blocks_with_pattern(&pack, spaced, rule);
+            assert_blocks_with_pattern(&pack, dashed, rule);
+        }
+
+        // Git's own exec-path layout is reachable, so the path-qualified dashed
+        // spelling must be covered too.
+        assert_blocks_with_pattern(
+            &pack,
+            "/usr/libexec/git-core/git-reset --hard HEAD~1",
+            "reset-hard",
+        );
+    }
+
+    /// The dashed extension must not cost a safe pattern its exemption: the
+    /// dry-run and branch-creating spellings stay allowed under both forms.
+    #[test]
+    fn dashed_safe_spellings_keep_their_exemption() {
+        let pack = create_pack();
+        for command in [
+            "git-checkout -b feature",
+            "git-checkout --orphan gh-pages",
+            "git-restore --staged src/foo.py",
+            "git-clean -n",
+            "git-clean --dry-run",
+            "git-lfs prune --dry-run",
+            "git-push --force-with-lease origin main",
+            // Third-party `git-*` programs are not built-ins at all.
+            "git-lfs install",
+            "git-crypt unlock",
+            "git-flow init",
+            // Prose and path text that merely contains a builtin name.
+            "cat mygit-reset-notes.txt",
+            "./scripts/no-git-reset.sh",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
+    /// A third-party `git-*` program is not a Git built-in and must stay
+    /// outside the pack, as must a word that merely ends in a builtin name.
+    #[test]
+    fn third_party_git_prefixed_programs_are_not_git_builtins() {
+        for command in [
+            "git-crypt unlock",
+            "git-flow init",
+            "git-town sync",
+            "mygit-reset --hard",
+            "./scripts/no-git-reset.sh",
+        ] {
+            assert!(
+                !command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "{command:?} must not be treated as a git built-in"
             );
         }
     }
