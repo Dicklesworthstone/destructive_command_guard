@@ -61,7 +61,6 @@ fn programs_without_a_shell_sink_yield_nothing() {
         "osascript -e 'display notification \"done\"'",
         // A program file is not opened.
         "osascript /usr/local/scripts/notify.applescript",
-        "awk -f prog.awk data.txt",
     ] {
         assert!(
             payloads(command).is_empty(),
@@ -69,6 +68,42 @@ fn programs_without_a_shell_sink_yield_nothing() {
             payloads(command)
         );
     }
+}
+
+/// `-f progfile` reads the program from a file, and it also changes what the
+/// remaining operands mean: without `-f` the first operand is the program, with
+/// `-f` every operand is a data file or a `var=value` assignment.
+///
+/// Regression: the separate spelling used to skip the flag and its value and
+/// then hand the next operand to the program scanner as if it were awk source,
+/// so a data file whose *name* looked like a program was mined for sinks. The
+/// glued spelling was already correct, which is what made the asymmetry easy to
+/// miss — a test using a benign data filename passes either way.
+#[test]
+fn a_program_file_invocation_never_yields_an_inline_payload() {
+    for command in [
+        "awk -f prog.awk data.txt",
+        "awk --file prog.awk data.txt",
+        "awk -fprog.awk data.txt",
+        // The operand is a FILE NAME here, not a program, however it is shaped.
+        "awk -f prog.awk 'BEGIN{ system(\"rm -rf /\") }'",
+        "awk --file prog.awk 'BEGIN{ system(\"rm -rf /\") }'",
+        "awk -fprog.awk 'BEGIN{ system(\"rm -rf /\") }'",
+        "awk --file=prog.awk 'BEGIN{ system(\"rm -rf /\") }'",
+    ] {
+        assert!(
+            payloads(command).is_empty(),
+            "a -f invocation has no inline program: {command:?} yielded {:?}",
+            payloads(command)
+        );
+    }
+
+    // `-v` does NOT consume the program, so the sink is still found.
+    assert_eq!(
+        payloads("awk -v n=1 'BEGIN{ system(\"rm -rf /tmp/z\") }'"),
+        vec!["rm -rf /tmp/z".to_string()],
+        "-v takes a value but leaves the program in place"
+    );
 }
 
 #[test]

@@ -75,13 +75,22 @@ safe_patterns:                       # Patterns that explicitly allow
 | `description` | string | no | Short reason shown on denial |
 | `explanation` | string | no | Detailed explanation for verbose output |
 | `executables` | array | no | Restrict the rule to segments run by these programs (see below) |
-| `suggestions` | array | no | Safer alternatives shown with the denial (see below) |
+| `suggestions` | array | no | Safer alternatives. Accepted and validated, **not yet rendered** (see below) |
 
 ### Offering Safer Alternatives
 
-A denial that only says "no" leaves the caller guessing. `suggestions` attaches
-the commands you want them to reach for instead, and they are rendered with the
-denial:
+> **Status: accepted but not yet rendered.** A `suggestions` array is parsed,
+> validated by `dcg pack validate`, and carried on the compiled rule, but no
+> output path reads it today. Built-in rules render their suggestions from an
+> internal registry keyed by rule id, and an external rule id is not in that
+> registry, so nothing appears in `dcg test`, `dcg explain`, or the hook
+> denial's `remediation`. Authoring the field now is harmless and future-proof;
+> just do not rely on a caller seeing it yet. Put the guidance your users need
+> in `description` and `explanation`, which *are* rendered. Tracked with the
+> denial-text work in
+> [#416](https://github.com/Dicklesworthstone/destructive_command_guard/issues/416).
+
+The intended shape:
 
 ```yaml
 destructive_patterns:
@@ -109,9 +118,10 @@ destructive_patterns:
 | `gated` | bool | no | `true` marks an alternative dcg *also* gates (default `false`) |
 | `platform` | string | no | `all` (default), `linux`, `macos`, `windows`, `bsd` |
 
-Set `gated: true` on any alternative dcg would itself deny. The denial then
-marks it as still requiring approval, so an agent does not retry it expecting
-an allow and burn a turn discovering otherwise.
+Set `gated: true` on any alternative dcg would itself deny. The intent is that
+a rendered denial marks it as still requiring approval, so an agent does not
+retry it expecting an allow and burn a turn discovering otherwise — which is
+why the flag is worth setting correctly now even while rendering is pending.
 
 ### Scoping a Rule to Its Executables
 
@@ -406,6 +416,7 @@ dcg pack validate mypack.yaml
 
 # Test against specific commands: point a throwaway config at the pack,
 # then select it for the one invocation.
+mkdir -p /tmp/dcg-packtest
 cat > /tmp/dcg-packtest/config.toml <<'TOML'
 [packs]
 custom_paths = ["/abs/path/to/mypack.yaml"]

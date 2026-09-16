@@ -829,7 +829,7 @@ fn decoded_words_execute_git(words: &[String]) -> bool {
         return executable.eq_ignore_ascii_case("git")
             || CORE_GIT_DASHED_BUILTINS
                 .iter()
-                .any(|builtin| executable.eq_ignore_ascii_case(builtin));
+                .any(|(bare, _, _)| executable.eq_ignore_ascii_case(bare));
     }
     false
 }
@@ -903,7 +903,7 @@ fn first_literal_posix_git_token_offset(segment: &str) -> Option<usize> {
             (stripped.eq_ignore_ascii_case("git")
                 || CORE_GIT_DASHED_BUILTINS
                     .iter()
-                    .any(|builtin| stripped.eq_ignore_ascii_case(builtin)))
+                    .any(|(bare, _, _)| stripped.eq_ignore_ascii_case(bare)))
             .then_some(token.byte_range.start)
         })
 }
@@ -1112,16 +1112,24 @@ fn command_after_posix_control_prefixes_bounded(
 /// and stays outside the pack entirely. `git-lfs` IS listed because the pack
 /// carries `lfs-migrate-rewrite` / `lfs-prune` / `lfs-uninstall` rules; entering
 /// the pack is harmless for `git-lfs install`, which matches no rule.
-const CORE_GIT_DASHED_BUILTINS: &[&str] = &[
-    "git-branch",
-    "git-checkout",
-    "git-clean",
-    "git-lfs",
-    "git-push",
-    "git-reset",
-    "git-restore",
-    "git-show",
-    "git-stash",
+/// Each entry is a triple: the bare name, the `.exe` spelling, and the
+/// subcommand the dashed builtin stands for.
+///
+/// The `.exe` spelling is stored rather than built on demand: this table is
+/// consulted on the hook's hot path for every command that reaches `core.git`
+/// executable resolution, and formatting nine strings per call to append a
+/// constant suffix is pure waste. Storing the subcommand explicitly also keeps
+/// a future entry from silently deriving the wrong one by prefix-stripping.
+const CORE_GIT_DASHED_BUILTINS: &[(&str, &str, &str)] = &[
+    ("git-branch", "git-branch.exe", "branch"),
+    ("git-checkout", "git-checkout.exe", "checkout"),
+    ("git-clean", "git-clean.exe", "clean"),
+    ("git-lfs", "git-lfs.exe", "lfs"),
+    ("git-push", "git-push.exe", "push"),
+    ("git-reset", "git-reset.exe", "reset"),
+    ("git-restore", "git-restore.exe", "restore"),
+    ("git-show", "git-show.exe", "show"),
+    ("git-stash", "git-stash.exe", "stash"),
 ];
 
 /// Whether a decoded executable word can resolve to Git, under either the bare
@@ -1143,11 +1151,13 @@ fn dashed_git_builtin_subcommand(
     word: &GitSemanticWord,
     dialect: ShellDialect,
 ) -> Option<&'static str> {
-    CORE_GIT_DASHED_BUILTINS.iter().find_map(|builtin| {
-        let matches_name = git_semantic_executable_may_equal(word, dialect, builtin)
-            || git_semantic_executable_may_equal(word, dialect, &format!("{builtin}.exe"));
-        matches_name.then(|| builtin.strip_prefix("git-").unwrap_or(builtin))
-    })
+    CORE_GIT_DASHED_BUILTINS
+        .iter()
+        .find_map(|(bare, exe, subcommand)| {
+            let matches_name = git_semantic_executable_may_equal(word, dialect, bare)
+                || git_semantic_executable_may_equal(word, dialect, exe);
+            matches_name.then_some(*subcommand)
+        })
 }
 
 fn semantic_git_executable_index(

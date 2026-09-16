@@ -2416,7 +2416,15 @@ fn awk_next_operator_is_pipe_getline(program: &str, start: usize) -> bool {
         return false;
     }
     let after_pipe = after_pipe.strip_prefix('&').unwrap_or(after_pipe);
-    after_pipe.trim_start().starts_with("getline")
+    let after_pipe = after_pipe.trim_start();
+    // Whole word only: `getlinefoo` is an ordinary variable name, not awk's
+    // `getline` keyword, so it is not a command pipe. Matches the `\bgetline\b`
+    // tier-1 trigger rather than being looser than it.
+    after_pipe.strip_prefix("getline").is_some_and(|rest| {
+        rest.chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+    })
 }
 
 /// Extract the shell payloads an `osascript` program hands to `/bin/sh`

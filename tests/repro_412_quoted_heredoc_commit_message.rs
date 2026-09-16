@@ -159,3 +159,34 @@ fn a_rebindable_data_sink_still_denies() {
         assert_eq!(decision(command), "deny", "{command:?}");
     }
 }
+
+/// The cases above parse cleanly, so they never reach the blanking retry. These
+/// force it: an unbalanced `"` in the body is what makes the whole-command parse
+/// fail, which is the *only* way into the new code path. A rebinding outside the
+/// body must still be seen after blanking.
+#[test]
+fn a_rebinding_outside_the_body_survives_the_blanking_retry() {
+    for command in [
+        "cat(){ bash; }; cat <<'EOF'\na \" b\nrm -rf /\nEOF",
+        "./cat <<'EOF'\na \" b\nrm -rf /\nEOF",
+    ] {
+        assert_eq!(
+            decision(command),
+            "deny",
+            "blanking must not hide a rebinding that lives outside the body: {command:?}"
+        );
+    }
+}
+
+/// The converse, which is the soundness claim the retry rests on: a function
+/// definition appearing *inside* a quoted body is literal text the shell never
+/// executes, so it is not a rebinding and must not make the body scannable.
+#[test]
+fn a_rebinding_shaped_string_inside_the_body_is_still_data() {
+    let command = "cat > /tmp/notes.md <<'EOF'\na \" b\ncat(){ bash; }\nRead-only\nEOF";
+    assert_eq!(
+        decision(command),
+        "allow",
+        "a quoted body is data even when it quotes shell syntax: {command:?}"
+    );
+}
