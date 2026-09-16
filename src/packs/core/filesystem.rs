@@ -3954,13 +3954,22 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         // ----- `find ... -delete` (Critical: root/home target) -----
         //
-        // `find <sensitive-path> -delete` recursively removes everything
-        // under the path — bytewise-equivalent to `rm -rf <sensitive-path>`.
+        // `find <sensitive-path> -delete` removes everything its predicate
+        // matches under the path; unfiltered, that is `rm -rf <sensitive-path>`.
         // This rule exists to close the most common dcg-bypass pattern in
         // the wild: agents that learn `rm -rf` is blocked simply swap it
         // for `find -delete`. Without this rule, dcg's protection against
         // catastrophic root/home deletion is one Google search away from
         // useless.
+        //
+        // The rule is decided by the SEARCH ROOT, not by the predicate: dcg
+        // does not evaluate `-name`/`-maxdepth`/`-type`, so a narrowly scoped
+        // delete under home is gated like an unfiltered one (#418). Keep the
+        // reason and explanation honest about that — claiming the scoped form
+        // is "bytewise-equivalent to rm -rf on root/home" is false, and the
+        // old text additionally advised re-rooting "under a more specific
+        // subdir", which does not lift the rule while that subdir is still
+        // under home. Both cost the reporter of #418 real diagnosis time.
         //
         // The regex matches `find` at any word boundary (so it fires
         // inside compound commands like `echo foo; find /etc -delete`,
@@ -3981,20 +3990,31 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // both fire. Without `)` in the set, subshell forms
             // silently bypass.
             r#"\bfind\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s-delete(?:\s|$|[;&|)\n])"#,
-            "find <sensitive-path> -delete is bytewise-equivalent to rm -rf on root/home and is EXTREMELY DANGEROUS. This command will NOT be executed.",
+            "find -delete rooted at root, home, or a system directory requires explicit approval. dcg gates this on the search root, not on the -name/-maxdepth filters that may narrow it. This command will NOT be executed.",
             Critical,
-            "`find <path> -delete` is the bytewise-equivalent of `rm -rf <path>`: \
-             it recursively removes every file and (when -depth is implied) every \
-             directory matched by the predicate. Targeting `/`, `~`, `$HOME`, or any \
-             top-level system directory (`/etc`, `/usr`, `/var`, `/home`, `/boot`, \
-             `/dev`, `/proc`, `/sys`, `/lib`, `/lib64`, `/opt`, `/root`) destroys \
-             the operating system or user data the same way `rm -rf` would.\n\n\
-             There is NO recovery without backups.\n\n\
-             If you only need to delete files matching a pattern, use a much more \
-             specific path:\n  \
-             find /path/to/specific/subdir -name '*.tmp' -delete\n\n\
+            "`find <path> -delete` removes every file the predicate matches beneath \
+             `<path>`, and with `-depth` implied it removes matched directories too. \
+             Rooted at `/`, `~`, `$HOME`, or a top-level system directory (`/etc`, \
+             `/usr`, `/var`, `/home`, `/boot`, `/dev`, `/proc`, `/sys`, `/lib`, \
+             `/lib64`, `/opt`, `/root`), the unfiltered form destroys the operating \
+             system or the user's data exactly as `rm -rf` would, and there is NO \
+             recovery without backups. It is also the most common way an agent \
+             works around a blocked `rm -rf`.\n\n\
+             This rule is decided by the SEARCH ROOT alone. dcg does not evaluate \
+             `-name`, `-maxdepth`, `-type`, or any other predicate, so a narrowly \
+             filtered command rooted under home is gated the same way an unfiltered \
+             one is. That is deliberate — a predicate is easy to get wrong, and the \
+             blast radius of a wrong one is the whole subtree — but it does mean a \
+             denial here is NOT a claim that this particular command would have \
+             deleted your home directory.\n\n\
+             To delete inside root or home, pick one:\n  \
+             find /tmp/<subdir> -delete                       # literal temp roots are allowed\n  \
+             dcg allow-once <code>                            # one-shot, from the code in this denial\n  \
+             dcg allowlist add-command '<exact command>' -r \"reviewed\" --user\n\n\
+             Re-rooting under a more specific subdirectory does NOT lift this rule \
+             while that subdirectory is still under root or home.\n\n\
              Always preview first:\n  \
-             find /path -type f | head -20",
+             find <path> -type f | head -20",
             FIND_DELETE_SUGGESTIONS
         ),
         // ----- `find ... -delete` (High: any other target) -----

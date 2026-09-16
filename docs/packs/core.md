@@ -188,7 +188,7 @@ These patterns match potentially destructive commands:
 | `rm-glob-home` | rm with an unexpanded glob under a home directory deletes an unbounded, shell-chosen file set and requires human approval. | high |
 | `rm-r-f-separate` | rm with separate -r -f flags is destructive and requires human approval. | high |
 | `rm-recursive-force-long` | rm --recursive --force is destructive and requires human approval. | high |
-| `find-delete-root-home` | find <sensitive-path> -delete is bytewise-equivalent to rm -rf on root/home and is EXTREMELY DANGEROUS. This command will NOT be executed. | critical |
+| `find-delete-root-home` | find -delete rooted at root, home, or a system directory requires explicit approval. dcg gates this on the search root, not on the -name/-maxdepth filters that may narrow it. This command will NOT be executed. | critical |
 | `find-delete-general` | find ... -delete is destructive (bytewise-equivalent to rm -rf on the matched tree) and requires human approval. | high |
 | `unlink-root-home` | unlink on a sensitive system or home path is one-shot data destruction with no recovery. EXTREMELY DANGEROUS. | critical |
 | `unlink-general` | unlink is destructive (POSIX equivalent of rm on a single file) and requires human approval. | high |
