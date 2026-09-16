@@ -24736,9 +24736,17 @@ fn evaluate_heredoc(
                 cmd,
             )
         };
-        let non_executing_target = content.target_command.as_deref().is_some_and(|cmd| {
-            crate::heredoc::is_non_executing_heredoc_command(cmd) && target_not_overridden(cmd)
-        });
+        // `cat`/`awk`/`sed`/… do not execute what arrives on their STDIN, which
+        // is what a heredoc or here-string body is. An *inline* payload is not
+        // stdin at all: awk's `system("…")` argument is a command awk hands to
+        // /bin/sh, and skipping it because awk happens to be a data sink for
+        // its stdin conflated the two channels and let the payload through
+        // (#399). Gate on the body actually being stdin-bound, exactly as the
+        // structured-sink branch below already does.
+        let non_executing_target = content.heredoc_type.is_some()
+            && content.target_command.as_deref().is_some_and(|cmd| {
+                crate::heredoc::is_non_executing_heredoc_command(cmd) && target_not_overridden(cmd)
+            });
         // Structured stdin data sinks (`git commit -F - <<'EOF'`, `spx session
         // handoff <<EOF`) likewise consume the body as DATA — a commit message
         // is read by git, never executed (#277). Mirror the masking path's

@@ -3843,6 +3843,45 @@ pub(crate) fn pack_aware_quick_reject_pre_normalized(
         && !span_matches_any_keyword(normalized, enabled_keywords)
 }
 
+/// Whether the command carries a shell sink that an interpreter reaches from a
+/// *positional* program argument (#399, #398).
+///
+/// Each of these hands a string to `/bin/sh`: awk's `system(…)` and its two
+/// command-pipe forms, and osascript's AppleScript `do shell script "…"` and
+/// JXA `$.system(…)`. Matching the sink rather than the interpreter keeps the
+/// exemption narrow — an ordinary `awk '{print $1}' file.txt` has none of them
+/// and stays on the fast path.
+#[inline]
+fn command_carries_interpreter_shell_sink(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    // `$.system(` is a superstring of `system(`, so the awk and JXA call sinks
+    // share one check. Whitespace before the paren is legal in both languages.
+    if let Some(index) = find_ascii_case_insensitive(bytes, b"system", 0) {
+        let after = command[index + "system".len()..].trim_start();
+        if after.starts_with('(') {
+            return true;
+        }
+    }
+    if find_ascii_case_insensitive(bytes, b"getline", 0).is_some() && command.contains('|') {
+        return true;
+    }
+    // awk's `print … | "cmd"`: a pipe whose right-hand side opens with a double
+    // quote. A POSIX shell pipeline names a command there, not a quoted string,
+    // so this shape is awk's command pipe in practice. Costing it a slow-path
+    // scan is the whole price of being wrong.
+    let mut search = 0usize;
+    while let Some(pipe) = command[search..].find('|') {
+        let index = search + pipe;
+        let after = &command[index + 1..];
+        let after = after.strip_prefix('&').unwrap_or(after);
+        if !after.starts_with('|') && after.trim_start().starts_with('"') {
+            return true;
+        }
+        search = index + 1;
+    }
+    find_ascii_case_insensitive(bytes, b"do shell script", 0).is_some()
+}
+
 #[inline]
 fn pack_aware_quick_reject_from_normalized_spans(
     normalized: &str,
@@ -3859,6 +3898,19 @@ fn pack_aware_quick_reject_from_normalized_spans(
     // heredoc syntax must reach the full evaluator. Data-only heredocs are
     // masked later; the conservative choice here costs only a slow-path scan.
     if normalized.contains("<<") && span_matches_any_keyword(normalized, enabled_keywords) {
+        return false;
+    }
+
+    // An interpreter program that is a *positional* argument is quoted data by
+    // span classification, so a keyword inside it never counts as executable —
+    // yet awk's `system(…)` and osascript's `do shell script "…"` hand that
+    // text straight to /bin/sh (#399, #398). The inline-code span rules key on
+    // `-c`/`-e` flags and cannot see a positional program, so gate on the sink
+    // shapes themselves: they are the only reason this text would execute, and
+    // an ordinary `awk '{print $1}'` carries none of them.
+    if command_carries_interpreter_shell_sink(normalized)
+        && span_matches_any_keyword(normalized, enabled_keywords)
+    {
         return false;
     }
 
