@@ -237,7 +237,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              -- verify, then COMMIT or ROLLBACK\n\n\
              Check row count first:\n  \
              SELECT COUNT(*) FROM tablename;",
-            TRUNCATE_TABLE_SUGGESTIONS
+            TRUNCATE_TABLE_SUGGESTIONS,
+            executables = ["psql", "pg_dump", "pg_restore", "postgres"]
         ),
         // DELETE without WHERE (deletes all rows)
         destructive_pattern!(
