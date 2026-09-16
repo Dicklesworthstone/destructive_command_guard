@@ -22057,6 +22057,95 @@ fn resolved_redirect_target_is_benign(path: &str) -> bool {
     !path.is_empty() && !path.starts_with(['/', '~', '-']) && no_traversal(path)
 }
 
+/// A proven value safe to splice into the segment text verbatim: no byte that
+/// the shell would treat as anything but path characters, so substituting it
+/// cannot change word splitting, quoting or expansion. This is stricter than
+/// what `literal_assignment_value` accepts, because a quoted assignment may
+/// legitimately hold spaces that would word-split at an unquoted use site.
+fn value_is_inert_when_substituted(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'+' | b'@')
+        })
+}
+
+/// Rewrite `$NAME` / `${NAME}` in `segment` to the single literal value each one
+/// is provably bound to earlier in this same command. Returns None when any
+/// reference is unprovable, multi-valued, or not inert to splice.
+fn resolve_proven_variables_in_segment(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    segment: &str,
+) -> Option<String> {
+    let mut out = String::with_capacity(segment.len());
+    let mut rest = segment;
+    let mut substituted = false;
+    while let Some(index) = rest.find('$') {
+        out.push_str(&rest[..index]);
+        let tail = &rest[index..];
+        let Some((name, consumed)) = parse_leading_posix_variable(tail) else {
+            // Not a plain variable reference (`$(`, `$'`, a bare `$`): leave it
+            // and let the caller's proof fail if it mattered.
+            out.push('$');
+            rest = &tail[1..];
+            continue;
+        };
+        let values = resolved_variable_values(source, segment_ranges, segment_start, name)?;
+        let [value] = values.as_slice() else {
+            return None;
+        };
+        if !value_is_inert_when_substituted(value) {
+            return None;
+        }
+        out.push_str(value);
+        rest = &tail[consumed..];
+        substituted = true;
+    }
+    out.push_str(rest);
+    substituted.then_some(out)
+}
+
+/// Statically prove that a `$VAR`-operand `rm` is the very command the literal
+/// temp exemption already allows (#396).
+///
+/// dcg has folded a single literal assignment for the redirect rule since #275,
+/// so `D=/tmp/x; echo a > "$D/f"` is allowed while `D=/tmp/x; rm -rf "$D/f"` was
+/// denied — the same value, proven by the same machinery, judged differently.
+/// That inversion pushes agents away from `mktemp -d` and toward hard-coded
+/// temp paths, which is the opposite of what the guard wants.
+///
+/// Rather than re-derive rm's operand semantics here, the proven values are
+/// spliced into the segment and the real rm classifier is asked again. Only an
+/// independent `Allow` on that resolved text lifts the denial, so traversal,
+/// flag parsing, non-temp operands and every other rm rule still decide the
+/// command that would actually run.
+fn rm_segment_resolves_to_allowed_literals(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    segment: &str,
+    automated_stdin: bool,
+    dialect: ShellDialect,
+) -> bool {
+    if dialect == ShellDialect::PowerShell {
+        return false;
+    }
+    let Some(resolved) =
+        resolve_proven_variables_in_segment(source, segment_ranges, segment_start, segment)
+    else {
+        return false;
+    };
+    matches!(
+        crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
+            &resolved,
+            automated_stdin,
+            dialect,
+        ),
+        crate::packs::core::filesystem::RmParseDecision::Allow
+    )
+}
+
 fn filesystem_non_pre_rm_non_redirect_pattern(name: Option<&str>) -> bool {
     filesystem_non_pre_rm_pattern(name) && !filesystem_redirect_pattern(name)
 }
@@ -22952,16 +23041,34 @@ fn evaluate_core_filesystem_pack(
             }
         }
 
-        let rm_decision = crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
+        let rm_automated_stdin = inherited_automated_stdin
+            || crate::packs::core::filesystem::rm_segment_receives_automated_stdin(
+                command_for_packs,
+                segment_start,
+                shell_dialect,
+            );
+        let mut rm_decision = crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
             dialect_segment,
-            inherited_automated_stdin
-                || crate::packs::core::filesystem::rm_segment_receives_automated_stdin(
-                    command_for_packs,
-                    segment_start,
-                    shell_dialect,
-                ),
+            rm_automated_stdin,
             shell_dialect,
         );
+        // A `$VAR` operand proven to resolve to the literal path the temp
+        // exemption already allows is not a dynamic path (#396). The proof runs
+        // the same classifier over the resolved text, so only a command that
+        // would independently be allowed is allowed here.
+        if matches!(
+            &rm_decision,
+            crate::packs::core::filesystem::RmParseDecision::Deny(_)
+        ) && rm_segment_resolves_to_allowed_literals(
+            command_for_packs,
+            segment_ranges,
+            segment_start,
+            dialect_segment,
+            rm_automated_stdin,
+            shell_dialect,
+        ) {
+            rm_decision = crate::packs::core::filesystem::RmParseDecision::Allow;
+        }
         let rm_was_semantically_handled = !matches!(
             &rm_decision,
             crate::packs::core::filesystem::RmParseDecision::NoMatch
@@ -32652,6 +32759,120 @@ mod tests {
             assert!(
                 result.is_denied(),
                 "non-qualifying scratch shapes must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn proven_variable_rm_operands_get_the_literal_temp_exemption_issue_396() {
+        // #396: the same value, proven by the same machinery, was allowed as a
+        // redirect target (#275) and denied as an rm operand. That inversion
+        // rewards hard-coding a temp path over `mktemp -d`, which is backwards.
+        // A proven operand is now judged exactly as its literal spelling is.
+        for command in [
+            "D=/private/tmp/scratch; rm -rf \"$D/work\"",
+            "D=/tmp/build; rm -rf \"$D\"",
+            "D=/tmp/build; rm -rf \"$D/artifacts\"",
+            "D=/tmp/build; rm -rf \"${D}/artifacts\"",
+            "D=/tmp/build; rm -rf $D",
+            "W=$(mktemp -d); rm -rf \"$W\"",
+            "W=$(mktemp -d); rm -rf \"$W/work\"",
+            "A=/tmp/one; B=/tmp/two; rm -rf \"$A\" \"$B\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "proven literal temp rm operand must be allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // The proof only ever restates what the command would actually run, so
+        // everything the literal exemption refuses is still refused: a value
+        // outside the temp roots, traversal past it, a second non-temp operand,
+        // an unprovable or re-bound name, a subshell binding, a value that is
+        // not inert to splice (a space would word-split, a glob would expand),
+        // and the ambient $TMPDIR that has always been untrusted.
+        for command in [
+            "D=/home/user/project; rm -rf \"$D/work\"",
+            "D=/; rm -rf \"$D\"",
+            "D=/etc; rm -rf \"$D\"",
+            "D=/tmp/build; rm -rf \"$D/../../etc\"",
+            "D=/tmp/build; rm -rf \"$D\" /etc",
+            "A=/tmp/one; B=/etc; rm -rf \"$A\" \"$B\"",
+            "rm -rf \"$D/work\"",
+            "D=$1; rm -rf \"$D/work\"",
+            "D=/tmp/a; D=/etc; rm -rf \"$D\"",
+            "read D; rm -rf \"$D\"",
+            "(D=/tmp/ok); rm -rf \"$D\"",
+            "D=\"/tmp/a b\"; rm -rf \"$D\"",
+            "D=/tmp/a*; rm -rf $D",
+            "D=/tmp/a*; rm -rf \"$D\"",
+            "rm -rf \"$TMPDIR/x\"",
+            "W=$(mktemp -u); rm -rf \"$W\"",
+            "W=$(mktemp -p /etc); rm -rf \"$W\"",
+            "rm -rf \"$(cat target.txt)\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "unproven or non-temp rm operand must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn end_of_options_marker_keeps_the_rm_temp_exemption_issue_395() {
+        // #395: `--` is what a careful script writes so an operand starting
+        // with `-` cannot be read as a flag. It makes the command strictly
+        // safer and never changes what an operand names, so it must not cost
+        // the literal-temp exemption.
+        for command in [
+            "rm -rf -- /tmp/scratch/work",
+            "rm -rf -- /private/tmp/scratch/work",
+            "rm -rf -- /var/tmp/scratch/work",
+            "rm -fr -- /tmp/scratch/work",
+            "rm -r -f -- /tmp/scratch/work",
+            "rm --recursive --force -- /tmp/scratch/work",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "`--` before a temp operand must keep the exemption: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // `--` widens the accepted syntax, not the eligible operands.
+        for command in [
+            "rm -rf -- /Users/z/x",
+            "rm -rf -- ~/project",
+            "rm -rf -- /tmp/../etc",
+            "rm -rf -- /etc",
+            "rm -rf -- -- /tmp/x",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "`--` must not widen which operands qualify: {command:?}: {:?}",
                 result.pattern_info
             );
         }

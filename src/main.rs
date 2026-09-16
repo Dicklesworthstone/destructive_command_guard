@@ -372,21 +372,33 @@ fn handle_unparseable_hook_input(
     }
 
     if !block {
-        // Fail-open (default). Keep the historic oversized-input warning so an
-        // operator can see why a large command was allowed; other errors warn
-        // only under verbose.
+        // Fail-open (default), but never silently: a hook whose input it cannot
+        // read is providing no protection at all, and the operator has to be
+        // able to see that from the terminal. The audit row above needs
+        // `[history] enabled = true`, so with history off a silent exit left no
+        // trace anywhere — dcg looked installed and working while allowing
+        // every command (issue #410). Both arms therefore warn unconditionally,
+        // matching what README's bounded-failure table already promises
+        // ("Allow with an audit warning").
         match read_err {
             hook::HookReadError::InputTooLarge { len, .. } => {
                 emit_stderr!(
                     "[dcg] Warning: stdin input ({len} bytes) exceeds limit ({max_input_bytes} bytes); allowing command (fail-open)"
                 );
             }
-            _ if config.general.verbose => {
+            hook::HookReadError::Json(err) => {
                 emit_stderr!(
-                    "[dcg] Warning: could not parse hook input; allowing command (fail-open)"
+                    "[dcg] Warning: could not parse hook input ({err}); allowing command (fail-open). Set DCG_FAIL_CLOSED=1 to block instead."
                 );
             }
-            _ => {}
+            // A transient stdin read error is not an attacker-controlled
+            // payload and always fails open; say so rather than implying the
+            // envelope was malformed.
+            hook::HookReadError::Io(err) => {
+                emit_stderr!(
+                    "[dcg] Warning: could not read hook input ({err}); allowing command (fail-open)"
+                );
+            }
         }
         return EXIT_SUCCESS;
     }

@@ -696,18 +696,30 @@ pub fn explain_trace_tree(trace: &ExplainTrace) -> DcgTree {
 }
 
 fn decision_node(trace: &ExplainTrace) -> TreeNode {
-    let (decision, style) = match trace.decision {
-        EvaluationDecision::Allow => ("ALLOW", "[bold green]"),
-        EvaluationDecision::Deny => ("DENY", "[bold red]"),
-        EvaluationDecision::Indeterminate => ("INDETERMINATE", "[bold yellow]"),
+    // The resolved outcome, not the raw evaluator finding: a rule configured to
+    // `warn`/`ask`/`log` must not render as DENY here either (issue #417).
+    let decision = trace.outcome_label();
+    let style = match decision {
+        "ALLOW" => "[bold green]",
+        "DENY" => "[bold red]",
+        _ => "[bold yellow]",
     };
 
-    TreeNode::new(format!("Decision: {decision}"))
+    let mut node = TreeNode::new(format!("Decision: {decision}"))
         .styled(style)
         .child(TreeNode::new(format!(
             "Latency: {:.2}ms",
             trace.total_duration_us as f64 / 1000.0
-        )))
+        )));
+    if let Some(mode) = trace.effective_mode {
+        if trace.decision == EvaluationDecision::Deny && mode != crate::packs::DecisionMode::Deny {
+            node = node.child(TreeNode::new(format!(
+                "Policy: rule matched, [policy] mode {}",
+                mode.label()
+            )));
+        }
+    }
+    node
 }
 
 fn command_node(trace: &ExplainTrace) -> TreeNode {
@@ -1551,6 +1563,7 @@ mod tests {
             normalized_command: Some("git reset --hard HEAD".to_string()),
             sanitized_command: None,
             decision: EvaluationDecision::Deny,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 1_250,
             steps: vec![TraceStep {
@@ -1613,6 +1626,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Indeterminate,
+            effective_mode: None,
             skipped_due_to_budget: true,
             total_duration_us: 200_000,
             steps: vec![TraceStep {

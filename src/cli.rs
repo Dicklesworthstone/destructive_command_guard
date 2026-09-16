@@ -3087,7 +3087,12 @@ fn evaluate_batch_line(
     // Parse JSON input. A malformed line yields an `error` result; whether
     // processing continues or halts after it is decided by the caller based on
     // `--continue-on-error` (see `run_hook_command`, issue #165).
-    let hook_input: crate::hook::HookInput = match serde_json::from_str(line) {
+    // `parse_hook_input` (not a bare `from_str`) so a host that spells the same
+    // field in both snake_case and camelCase — Grok Build and ZCode desktop both
+    // do, on every tool call — is reconciled instead of reported as a duplicate
+    // field, which made every command unusable under `--continue-on-error`
+    // (issue #410).
+    let hook_input: crate::hook::HookInput = match crate::hook::parse_hook_input(line) {
         Ok(input) => input,
         Err(e) => {
             return BatchHookOutput {
@@ -8010,7 +8015,14 @@ fn handle_explain(
     }
 
     // Finish and get trace
-    let trace = collector.finish(result.decision);
+    let mut trace = collector.finish(result.decision);
+
+    // Resolve the `[policy]` mode for the finding, exactly as `dcg test` and the
+    // live hook do. Without this, explain printed the rule's severity-default
+    // DENY and contradicted both of them for every rule configured to
+    // warn/ask/log (issue #417). #330 fixed the hook and `dcg test`; explain was
+    // never touched.
+    trace.set_effective_mode(resolve_mode_for_cli(&effective_config, command, &result));
 
     // A rule that matched but was stood down by a configured target exemption
     // is an allow that came from configuration, so explain must say so (#284).

@@ -276,7 +276,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // Keep byte-identical to `crate::packs::database::TRUNCATE_TABLE_PATTERN`
             // (asserted by `truncate_table_pattern_is_shared`); the rationale
             // for every constraint lives on that constant. Issue #403.
-            r#"(?i)(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#,
+            r#"(?i)(?:^|[;"'`])\s*(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#,
             "TRUNCATE permanently deletes all rows. Cannot be rolled back in MySQL.",
             High,
             "TRUNCATE is faster than DELETE but more dangerous in MySQL:\n\n\
@@ -482,6 +482,46 @@ mod tests {
             "truncate foo CASCADE",
             "truncate table a, b",
             "TRUNCATE users RESTART IDENTITY",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "truncate-table");
+        }
+    }
+
+    /// Issue #394: the word `truncate` as an operand of another command is not
+    /// DDL. The `truncate-table` rule denied `cat truncate x`, `sort truncate b`
+    /// and `wc -l truncate x` — plain file reads whose operands happen to be
+    /// named like SQL identifiers — as "would delete database rows".
+    #[test]
+    fn truncate_as_another_commands_operand_is_not_ddl() {
+        let pack = create_pack();
+        for command in [
+            "cat truncate x",
+            "sort truncate b",
+            "wc -l truncate x",
+            "ls truncate x",
+            "diff truncate other",
+            "cp truncate backup",
+            "mv truncate archive",
+            "stat truncate x",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
+    /// The statement-position constraint must not cost a single real execution
+    /// path: a quoted client argument, a `;`-separated later statement, or text
+    /// start (which is what a heredoc body and a reconstructed `echo … | mysql`
+    /// payload both look like by the time they reach the pattern).
+    #[test]
+    fn truncate_statement_openers_still_block() {
+        let pack = create_pack();
+        for command in [
+            "TRUNCATE TABLE users",
+            "mysql -e \"TRUNCATE TABLE users\"",
+            "mysql --execute=\"TRUNCATE users\"",
+            "mysql -u root -p db -e 'TRUNCATE TABLE users;'",
+            "mysql -e \"DELETE FROM a WHERE id=1; TRUNCATE TABLE b;\"",
+            "mariadb -e \"TRUNCATE TABLE users\"",
         ] {
             assert_blocks_with_pattern(&pack, command, "truncate-table");
         }

@@ -2726,9 +2726,16 @@ fn parse_rm_segment_with_option_scanning(
     // Recursive-only commands use the combined-style literal-temp policy:
     // double quotes preserve a static /tmp path, while expansions and
     // traversal remain denied. Existing force-form behavior is unchanged.
+    //
+    // `--` deliberately does NOT disqualify the temp exemption (issue #395).
+    // The POSIX end-of-options marker is what a careful script writes so an
+    // operand beginning with `-` cannot be read as a flag; it makes the command
+    // strictly safer and never changes what an operand names. The exemption is
+    // decided entirely by operand content below, so `rm -rf -- /tmp/build` is
+    // judged exactly like `rm -rf /tmp/build`, while `rm -rf -- ~/x` and
+    // `rm -rf -- -rf /tmp/x` still deny — neither operand set is all-temp.
     let path_style = flag_state.force_style.unwrap_or(RmFlagStyle::Combined);
     let safe_paths = !paths.is_empty()
-        && !flag_state.saw_terminator
         && paths
             .iter()
             .all(|path| path_is_safe_for_style(path, path_style));
@@ -3343,60 +3350,68 @@ pub fn create_pack() -> Pack {
 
 #[allow(clippy::too_many_lines)]
 fn create_safe_patterns() -> Vec<SafePattern> {
+    // Every temp exemption below carries an optional `(?:--\s+)?` immediately
+    // before its operand list (issue #395). `--` is the POSIX end-of-options
+    // marker a careful script writes so an operand beginning with `-` cannot be
+    // read as a flag; it makes the command strictly safer and must not cost the
+    // exemption. The trailing `\s+` means only a bare `--` matches, so
+    // `--no-preserve-root` and every other long option still fall through to the
+    // destructive rules, and a second `--` would have to satisfy the
+    // temp-operand group (it cannot), so `rm -rf -- -- /tmp/x` keeps denying.
     vec![
         // rm -rf in /tmp (combined flags)
         safe_pattern!(
             "rm-rf-tmp",
-            r"^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         safe_pattern!(
             "rm-fr-tmp",
-            r"^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         // rm -rf in /var/tmp (combined flags)
         safe_pattern!(
             "rm-rf-var-tmp",
-            r"^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         safe_pattern!(
             "rm-fr-var-tmp",
-            r"^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         // rm -r -f (separate flags) in /tmp
         safe_pattern!(
             "rm-r-f-tmp",
-            r"^rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         safe_pattern!(
             "rm-f-r-tmp",
-            r"^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         // rm -r -f (separate flags) in /var/tmp
         safe_pattern!(
             "rm-r-f-var-tmp",
-            r"^rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         safe_pattern!(
             "rm-f-r-var-tmp",
-            r"^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         // rm --recursive --force (long flags) in /tmp
         safe_pattern!(
             "rm-recursive-force-tmp",
-            r"^rm\s+.*--recursive.*--force\s+(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+.*--recursive.*--force\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         safe_pattern!(
             "rm-force-recursive-tmp",
-            r"^rm\s+.*--force.*--recursive\s+(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+.*--force.*--recursive\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         // rm --recursive --force (long flags) in /var/tmp
         safe_pattern!(
             "rm-recursive-force-var-tmp",
-            r"^rm\s+.*--recursive.*--force\s+(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+.*--recursive.*--force\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         safe_pattern!(
             "rm-force-recursive-var-tmp",
-            r"^rm\s+.*--force.*--recursive\s+(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+.*--force.*--recursive\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         // -----------------------------------------------------------------
         // `find ... -delete` safe whitelist for temp directories.
@@ -6845,9 +6860,24 @@ mod tests {
 
     #[test]
     fn test_rm_parser_option_terminator() {
+        // `--` before the flags means `-rf` is an operand (a file literally named
+        // `-rf`), so no recursive flag is set and nothing matches.
         assert_rm_parser_no_match("rm -- -rf /tmp/safe");
-        assert_rm_parser_denies("rm -rf -- /tmp/safe", RM_RF_GENERAL_NAME, Severity::High);
+
+        // `--` after the flags does NOT cost the literal-temp exemption (#395).
+        // It is the POSIX end-of-options marker a careful script writes so an
+        // operand beginning with `-` cannot be read as a flag; it makes the
+        // command strictly safer and never changes what an operand names, so the
+        // terminator spelling must match the bare spelling exactly.
+        assert_rm_parser_allows("rm -rf -- /tmp/safe");
+        assert_rm_parser_allows("rm -fr -- /var/tmp/safe");
+        assert_rm_parser_allows("rm -r -f -- /tmp/safe");
+        assert_rm_parser_allows("rm --recursive --force -- /private/tmp/safe");
+
+        // Criticality is decided by operand content, so a root or home operand
+        // after the terminator keeps its Critical rule id (5f8bcad).
         assert_rm_parser_denies("rm -rf -- /", RM_RF_ROOT_HOME_NAME, Severity::Critical);
+        assert_rm_parser_denies("rm -rf -- /etc", RM_RF_ROOT_HOME_NAME, Severity::Critical);
         assert_rm_parser_denies(
             "rm -r -f -- /",
             RM_R_F_SEPARATE_ROOT_HOME_NAME,
@@ -6856,6 +6886,20 @@ mod tests {
         assert_rm_parser_denies(
             "rm --recursive --force -- /",
             RM_RECURSIVE_FORCE_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+
+        // A non-temp operand after the terminator still denies, which is what
+        // keeps the widened syntax from widening the exemption: only the operand
+        // set decides, and every operand must be a literal temp path.
+        assert_rm_parser_denies("rm -rf -- ./build", RM_RF_GENERAL_NAME, Severity::High);
+        assert_rm_parser_denies("rm -rf -- /tmp/x /etc", RM_RF_ROOT_HOME_NAME, Severity::Critical);
+        // A second `--` is an ordinary operand named `--`, not a temp path.
+        assert_rm_parser_denies("rm -rf -- -- /tmp/x", RM_RF_GENERAL_NAME, Severity::High);
+        // Traversal out of the temp root is still refused.
+        assert_rm_parser_denies(
+            "rm -rf -- /tmp/../etc",
+            RM_RF_ROOT_HOME_NAME,
             Severity::Critical,
         );
     }
@@ -6965,8 +7009,11 @@ mod tests {
             assert_rm_parser_no_match(command);
         }
 
+        // Parity with the bare spelling above: the end-of-options marker does not
+        // cost the literal-temp exemption (#395).
+        assert_rm_parser_allows("rm -r -- /tmp/build");
         assert_rm_parser_denies(
-            "rm -r -- /tmp/build",
+            "rm -r -- ./build",
             RM_RECURSIVE_GENERAL_NAME,
             Severity::High,
         );

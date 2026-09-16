@@ -63,7 +63,7 @@ use tracing::{debug, instrument, trace, warn};
 /// quote-aware scanner so we can suppress obvious false positives inside quoted
 /// literals (commit messages, search patterns, etc.) without introducing false
 /// negatives for real shell syntax (including `$()`/backtick substitutions).
-const HEREDOC_TRIGGER_PATTERNS: [&str; 19] = [
+const HEREDOC_TRIGGER_PATTERNS: [&str; 21] = [
     // Inline interpreter execution. These patterns intentionally allow:
     // - interleaved flags (python -I -c, bash --norc -c)
     // - combined short-flag clusters (bash -lc, node -pe, perl -pi -e)
@@ -86,6 +86,13 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 19] = [
     r#"\bperl[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*[eE][A-Za-z]*(?:\s|['"]|$)"#,
     // Node.js inline execution (matches node, node18, nodejs, node.exe, etc.)
     r#"\bnode(?:js)?[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
+    // Bun and Deno inline execution (issue #397). Bun runs `-e`/`-p` exactly as
+    // Node does, so the identical payload must reach the identical rules; before
+    // this, swapping `node` for `bun` was a one-word bypass of a live deny.
+    r#"\b(?:bun|deno)[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
+    // Bun's `exec` subcommand hands its argument to a shell, so it is an inline
+    // shell payload under a subcommand rather than a flag (issue #397).
+    r#"\bbun[0-9.]*(?:\.exe)?\s+exec\b"#,
     // PHP inline execution
     r#"\bphp[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*r[A-Za-z]*(?:\s|['"]|$)"#,
     // Lua inline execution
@@ -1035,7 +1042,7 @@ static INLINE_SCRIPT_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // `(?i:powershell|pwsh)` matches the Windows PowerShell host case-insensitively;
     // `["']?` after the interpreter swallows the closing quote of a quoted full
     // path (e.g. `"...\powershell.exe" -Command '...'`) before flags (#125).
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*'([^']*)'"#)
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*'([^']*)'"#)
         .expect("inline script single-quote regex compiles")
 });
 
@@ -1047,7 +1054,7 @@ static INLINE_SCRIPT_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // Supports Windows .exe extensions: python.exe, python3.11.exe, etc.
     // PowerShell host + quoted-path closing quote handled as in the single-quote
     // variant above (#125).
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*"([^"]*)""#)
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*"([^"]*)""#)
         .expect("inline script double-quote regex compiles")
 });
 
@@ -1294,6 +1301,23 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         };
     }
 
+    // Extract `bun exec <payload>` inline shell payloads (#397)
+    extract_bun_exec_inline_scripts(
+        command,
+        limits,
+        start_time,
+        timeout,
+        &mut extracted,
+        &mut skip_reasons,
+    );
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, &mut skip_reasons) {
+        return if extracted.is_empty() {
+            ExtractionResult::Skipped(skip_reasons)
+        } else {
+            ExtractionResult::Extracted(extracted)
+        };
+    }
+
     // Extract `ssh … destination <command…>` remote payloads (#326)
     extract_ssh_inline_scripts(
         command,
@@ -1426,6 +1450,9 @@ fn extract_inline_scripts(
             } else if cmd_name.starts_with("perl") {
                 flag.contains('e') || flag.contains('E')
             } else if cmd_name.starts_with("node") {
+                flag.contains('e') || flag.contains('p')
+            } else if cmd_name.starts_with("bun") || cmd_name.starts_with("deno") {
+                // Bun and Deno accept Node's inline-evaluation flags (issue #397).
                 flag.contains('e') || flag.contains('p')
             } else if cmd_name.starts_with("php") {
                 flag.contains('r')
@@ -1976,6 +2003,122 @@ fn classify_ssh_option(word: &str) -> SshOptionShape {
 
 /// Extract the remote command payload of `ssh` invocations (#326).
 ///
+/// `bun exec <payload>` hands `<payload>` to Bun's shell, so it is an
+/// inline-shell wrapper exactly like `sh -c` (issue #397). The payload is
+/// positional rather than flag-introduced, hence its own walk.
+///
+/// Conservative in the accuracy-preserving direction: the payload must be the
+/// first non-option word after the `exec` subcommand. An option whose arity dcg
+/// does not model would make that word ambiguous, so any unmodeled option ends
+/// the walk with no extraction and the command keeps exactly today's raw-token
+/// visibility. `bun exec` takes no options of its own in current Bun, so the
+/// modeled set is deliberately small.
+fn extract_bun_exec_inline_scripts(
+    command: &str,
+    limits: &ExtractionLimits,
+    start_time: Instant,
+    timeout: Duration,
+    extracted: &mut Vec<ExtractedContent>,
+    skip_reasons: &mut Vec<SkipReason>,
+) {
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+        return;
+    }
+    if !command.contains("bun") {
+        return;
+    }
+
+    let tokens = crate::normalize::tokenize_for_normalization(command);
+    for index in 0..tokens.len() {
+        if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+            return;
+        }
+        let token = &tokens[index];
+        if token.kind != crate::normalize::NormalizeTokenKind::Word {
+            continue;
+        }
+        let Some(word) = token.text(command) else {
+            continue;
+        };
+        // Path-qualified spellings (`/usr/local/bin/bun`, `bun.exe`) are the
+        // same program.
+        let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
+        let basename = basename
+            .strip_suffix(".exe")
+            .or_else(|| basename.strip_suffix(".EXE"))
+            .unwrap_or(basename);
+        if basename != "bun" {
+            continue;
+        }
+        let Some(payload) = bun_exec_inline_payload(command, &tokens, index) else {
+            continue;
+        };
+        let Some(content) = command.get(payload.content.clone()) else {
+            continue;
+        };
+        if !push_windows_inner(
+            extracted,
+            skip_reasons,
+            limits,
+            content,
+            payload.full,
+            Some(payload.content),
+            "bun",
+        ) {
+            return;
+        }
+    }
+}
+
+/// Locate the shell payload of the `bun exec` invocation whose executable token
+/// is at `start`. See [`extract_bun_exec_inline_scripts`] for the grammar.
+fn bun_exec_inline_payload(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    start: usize,
+) -> Option<MiseInlinePayload> {
+    use crate::normalize::NormalizeTokenKind;
+
+    let full_start = tokens.get(start)?.byte_range.start;
+    let mut index = start + 1;
+
+    // Phase 1: reach the `exec` subcommand. Quoting a subcommand does not change
+    // the argv Bun receives, so `bun "exec" '<payload>'` walks the same grammar.
+    loop {
+        let token = tokens.get(index)?;
+        if token.kind != NormalizeTokenKind::Word {
+            return None;
+        }
+        let (word, _, _) = dequoted_flag_word(
+            token.text(command)?,
+            token.byte_range.start,
+            token.byte_range.end,
+        );
+        if word == "exec" {
+            break;
+        }
+        // Any other word is a different subcommand (`bun run`, `bun install`),
+        // and any option before the subcommand has unmodeled arity.
+        return None;
+    }
+    index += 1;
+
+    // Phase 2: the payload is the next word. An option token there is unmodeled
+    // grammar, so extract nothing rather than guess.
+    let value = tokens.get(index)?;
+    if value.kind != NormalizeTokenKind::Word {
+        return None;
+    }
+    let text = command.get(value.byte_range.clone())?;
+    if text.starts_with('-') {
+        return None;
+    }
+    Some(MiseInlinePayload {
+        content: unquoted_payload_range(text, value.byte_range.start),
+        full: full_start..value.byte_range.end,
+    })
+}
+
 /// `ssh [options] destination [command [argument …]]` concatenates every argv
 /// word after the destination with spaces and hands the result to the remote
 /// login shell — it is an inline-shell wrapper exactly like `sh -c`, minus the

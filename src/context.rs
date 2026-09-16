@@ -231,10 +231,16 @@ impl ContextClassifier {
                 "bash", "sh", "zsh", "ksh", "dash", // shells with -c
                 "python", "python3", "python2", // python with -c
                 "node", "nodejs", // node with -e
-                "ruby",   // ruby with -e
-                "perl",   // perl with -e
-                "php",    // php with -r
-                "lua",    // lua with -e
+                // Bun and Deno accept Node's inline-evaluation flags, so their
+                // payloads are executed code too. Omitting them made the
+                // single-quoted payload read as argv data, which quick-rejected
+                // `bun -e '<destructive>'` while the identical `node -e`
+                // spelling was denied (issue #397).
+                "bun", "deno", //
+                "ruby", // ruby with -e
+                "perl", // perl with -e
+                "php",  // php with -r
+                "lua",  // lua with -e
             ],
         }
     }
@@ -2784,10 +2790,17 @@ fn is_inline_code_flag(word: &str) -> bool {
         return false;
     }
 
+    // `p` covers Node's (and Bun's) `-p`/`--print`, which evaluates its argument
+    // exactly as `-e` does and then prints the result (issue #397). This is only
+    // a cheap pre-filter: `check_inline_code_context` still requires the
+    // segment's executable to be one of `inline_code_commands`, so `cp -p`,
+    // `mkdir -p`, and `rsync -p` are untouched. Over-classifying an
+    // interpreter's argument as code only widens what gets scanned, which is the
+    // safe direction for a guard.
     word.as_bytes()
         .iter()
         .skip(1)
-        .any(|b| matches!(b.to_ascii_lowercase(), b'c' | b'e' | b'r'))
+        .any(|b| matches!(b.to_ascii_lowercase(), b'c' | b'e' | b'p' | b'r'))
 }
 
 #[must_use]

@@ -699,7 +699,7 @@ mod explain_tests {
         let json: serde_json::Value =
             serde_json::from_str(&stdout).expect("explain --format json should produce valid JSON");
 
-        assert_eq!(json["schema_version"], 3, "should have schema_version");
+        assert_eq!(json["schema_version"], 4, "should have schema_version");
         assert!(json["command"].is_string(), "should have command field");
         assert!(json["decision"].is_string(), "should have decision field");
         assert!(
@@ -707,6 +707,14 @@ mod explain_tests {
             "should have duration"
         );
         assert!(json["steps"].is_array(), "should have steps array");
+        // Schema v4 (#417): the resolved `[policy]` mode and the outcome that
+        // collapses it with the evaluator finding. `decision` alone made explain
+        // report DENY for a rule configured to warn/ask/log.
+        assert!(json["mode"].is_string(), "v4 should carry the policy mode");
+        assert!(json["outcome"].is_string(), "v4 should carry the outcome");
+        assert_eq!(json["decision"], "deny");
+        assert_eq!(json["mode"], "deny");
+        assert_eq!(json["outcome"], "deny");
     }
 
     #[test]
