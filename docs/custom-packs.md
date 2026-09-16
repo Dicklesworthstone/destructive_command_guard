@@ -75,6 +75,43 @@ safe_patterns:                       # Patterns that explicitly allow
 | `description` | string | no | Short reason shown on denial |
 | `explanation` | string | no | Detailed explanation for verbose output |
 | `executables` | array | no | Restrict the rule to segments run by these programs (see below) |
+| `suggestions` | array | no | Safer alternatives shown with the denial (see below) |
+
+### Offering Safer Alternatives
+
+A denial that only says "no" leaves the caller guessing. `suggestions` attaches
+the commands you want them to reach for instead, and they are rendered with the
+denial:
+
+```yaml
+destructive_patterns:
+  - name: mytool-force-wipe
+    pattern: mytool\s+.*--force
+    executables: [mytool]
+    description: mytool --force wipes the workspace without confirmation
+    suggestions:
+      - command: mytool status
+        description: Show what --force would remove
+      - command: mytool clean --dry-run
+        description: Preview the removal
+      - command: mytool clean --force
+        description: The narrower removal — still gated, so it needs approval too
+        gated: true
+      - command: mytool wipe --confirm
+        description: Windows-only recovery path
+        platform: windows
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `command` | string | yes | The alternative to run |
+| `description` | string | yes | Why it is safer, in one line |
+| `gated` | bool | no | `true` marks an alternative dcg *also* gates (default `false`) |
+| `platform` | string | no | `all` (default), `linux`, `macos`, `windows`, `bsd` |
+
+Set `gated: true` on any alternative dcg would itself deny. The denial then
+marks it as still requiring approval, so an agent does not retry it expecting
+an allow and burn a turn discovering otherwise.
 
 ### Scoping a Rule to Its Executables
 
@@ -367,9 +404,21 @@ reason = "Force push allowed on feature branches"
 # Validate syntax and patterns
 dcg pack validate mypack.yaml
 
-# Test against specific commands
-dcg test --pack-path mypack.yaml "dangerous-command"
+# Test against specific commands: point a throwaway config at the pack,
+# then select it for the one invocation.
+cat > /tmp/dcg-packtest/config.toml <<'TOML'
+[packs]
+custom_paths = ["/abs/path/to/mypack.yaml"]
+TOML
+DCG_CONFIG=/tmp/dcg-packtest/config.toml dcg test "dangerous-command"
+
+# Same route with the full decision trace:
+DCG_CONFIG=/tmp/dcg-packtest/config.toml dcg explain "dangerous-command"
 ```
+
+There is no `--pack-path` flag. A custom pack is loaded through `custom_paths`
+in a config file, and `DCG_CONFIG` is what selects that file for a single
+invocation without touching your real configuration.
 
 ### Q: What happens if schema_version is higher than supported?
 

@@ -197,9 +197,27 @@ real pack or category IDs from `dcg packs` / `docs/packs/README.md` — a name l
 With **no config file present**, dcg enables only the packs that guard against the
 most catastrophic, unrecoverable mistakes:
 
-- `core.filesystem` - Dangerous recursive `rm` operations and equivalent filesystem destruction outside literal temp subdirectories *(always on; cannot be disabled)*
-- `core.git` - Destructive git commands that lose uncommitted work, rewrite history, or destroy stashes *(always on; cannot be disabled)*
+- `core.filesystem` - Dangerous recursive `rm` operations and equivalent filesystem destruction outside literal temp subdirectories *(always enabled; cannot be removed from evaluation)*
+- `core.git` - Destructive git commands that lose uncommitted work, rewrite history, or destroy stashes *(always enabled; cannot be removed from evaluation)*
 - `system.disk` - `mkfs`, `dd`-to-device, `fdisk`, `parted`, `mdadm`, `lvm` removal, `wipefs` *(on by default; opt out with `disabled = ["system.disk"]`)*
+
+**"Cannot be removed" is not the same as "cannot be relaxed."** A `core.*` pack
+always evaluates, so `disabled = ["core.filesystem"]` is ignored — but what
+dcg *does* with a match is policy, and policy is yours. To keep git and database
+protection while letting filesystem operations through with a recorded warning
+(the sandboxed-agent case), set the pack's decision mode rather than trying to
+unload it:
+
+```toml
+[policy.packs]
+"core.filesystem" = "warn"   # matches are recorded and the command proceeds
+```
+
+`warn` lets the command run and records the decision; `log` does the same
+silently; `ask` requests operator review where the hook protocol supports it.
+Per-rule entries are finer still — `[policy.rules] "core.filesystem:rm-rf-general" = "warn"`
+relaxes one rule and leaves the rest of the pack blocking. See
+[Graduated Response](docs/graduated-response.md).
 
 On **Windows**, two additional packs are on by default so a fresh install blocks the
 catastrophic native-Windows operations with no config:
