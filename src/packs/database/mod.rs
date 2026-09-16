@@ -43,13 +43,27 @@
 ///    command is never in statement position, so this separates them without
 ///    touching a single real invocation.
 ///
-///    The three accepted openers are what every real execution path produces:
-///    a heredoc body or a reconstructed `echo … | mysql` payload starts at text
-///    start; `mysql -e "TRUNCATE …"`, `--execute="…"`, and `psql -c '…'` open
-///    with a quote; and a later statement in a multi-statement payload follows
-///    the previous statement's `;`. A bare newline is deliberately NOT an
-///    opener — that would re-admit the #403 class-list false positive, where a
-///    wrapped `class="… truncate\n flex"` reads as `TRUNCATE flex"`.
+///    The three unconditional openers are what every real execution path
+///    produces: a heredoc body or a reconstructed `echo … | mysql` payload
+///    starts at text start; `mysql -e "TRUNCATE …"`, `--execute="…"`, and
+///    `psql -c '…'` open with a quote; and a later statement in a
+///    multi-statement payload follows the previous statement's `;`.
+///
+///    A bare newline is a *conditional* opener: it counts only when the
+///    explicit `TRUNCATE TABLE` spelling follows it. A newline alone would
+///    re-admit the #403 class-list false positive, where a wrapped
+///    `class="… truncate\n flex"` reads as `TRUNCATE flex"`; requiring the
+///    `TABLE` keyword is evidence no class list carries. This exists because
+///    the first, quote-only form of constraint 4 under-blocked a real shape:
+///    `mysql -e "-- comment\nTRUNCATE TABLE users"` puts the statement on a
+///    continuation line after a SQL comment, so it has no `;` before it and is
+///    not at text start. Multi-line heredoc payloads were never affected —
+///    their bodies are evaluated per line — but the `-e` route was.
+///
+///    Residual, deliberately accepted: the same continuation-line shape with
+///    the optional `TABLE` keyword omitted (`-- comment\nTRUNCATE users`) is
+///    not matched. Closing it needs a newline opener with no keyword evidence,
+///    which is exactly what #403 showed is too broad.
 ///
 /// `TRUNCATE TABLE …` (the explicit-keyword spelling) is covered by the same
 /// expression; nothing about it is relaxed.
@@ -59,7 +73,7 @@
 /// `destructive_pattern!` takes a literal, so the packs spell the expression
 /// out rather than referencing this constant.
 #[cfg(test)]
-pub(crate) const TRUNCATE_TABLE_PATTERN: &str = r#"(?i)(?:^|[;"'`])\s*(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#;
+pub(crate) const TRUNCATE_TABLE_PATTERN: &str = r#"(?i)(?:(?:^|[;"'`])\s*|\r?\n\s*(?=TRUNCATE\s+TABLE\b))(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#;
 
 pub mod bigquery;
 pub mod databricks;

@@ -276,7 +276,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // Keep byte-identical to `crate::packs::database::TRUNCATE_TABLE_PATTERN`
             // (asserted by `truncate_table_pattern_is_shared`); the rationale
             // for every constraint lives on that constant. Issue #403.
-            r#"(?i)(?:^|[;"'`])\s*(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#,
+            r#"(?i)(?:(?:^|[;"'`])\s*|\r?\n\s*(?=TRUNCATE\s+TABLE\b))(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#,
             "TRUNCATE permanently deletes all rows. Cannot be rolled back in MySQL.",
             High,
             "TRUNCATE is faster than DELETE but more dangerous in MySQL:\n\n\
@@ -524,6 +524,34 @@ mod tests {
             "mariadb -e \"TRUNCATE TABLE users\"",
         ] {
             assert_blocks_with_pattern(&pack, command, "truncate-table");
+        }
+    }
+
+    /// A continuation line is a conditional opener: it counts when the explicit
+    /// `TRUNCATE TABLE` spelling follows it.
+    ///
+    /// Regression: constraint 4 originally accepted only text start, `;`, and a
+    /// quote, which under-blocked a statement sitting on a continuation line
+    /// after a SQL comment — it has no `;` before it and is not at text start.
+    /// A bare newline opener would instead re-admit #403, so the `TABLE` keyword
+    /// is the evidence that separates SQL from a wrapped class list.
+    #[test]
+    fn a_continuation_line_opens_a_statement_when_table_is_explicit() {
+        let pack = create_pack();
+        for command in [
+            "mysql -e \"-- clean the table\nTRUNCATE TABLE users\"",
+            "mysql -e \"SET foreign_key_checks=0\nTRUNCATE TABLE users\"",
+            "mysql -e \"-- clean\r\nTRUNCATE TABLE users\"",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "truncate-table");
+        }
+
+        // The #403 class must stay out: a wrapped class list has no `TABLE`.
+        for command in [
+            "echo \"<div class=\\\"p-2\ntruncate flex\\\">\"",
+            "echo \"class=\\\"min-w-0\ntruncate line-through\\\"\"",
+        ] {
+            assert_allows(&pack, command);
         }
     }
 
