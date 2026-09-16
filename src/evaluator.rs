@@ -22081,26 +22081,57 @@ fn resolve_proven_variables_in_segment(
     let mut out = String::with_capacity(segment.len());
     let mut rest = segment;
     let mut substituted = false;
-    while let Some(index) = rest.find('$') {
+    // Only a `$` the shell would actually expand may be replaced. Inside single
+    // quotes, and after a backslash, a dollar is literal text — `rm -rf '$D'`
+    // deletes a file named `$D`, so resolving it would describe a different
+    // command than the one that runs.
+    let mut in_single_quote = false;
+    while let Some(index) = rest.find(['$', '\'', '\\']) {
         out.push_str(&rest[..index]);
         let tail = &rest[index..];
-        let Some((name, consumed)) = parse_leading_posix_variable(tail) else {
-            // Not a plain variable reference (`$(`, `$'`, a bare `$`): leave it
-            // and let the caller's proof fail if it mattered.
-            out.push('$');
-            rest = &tail[1..];
-            continue;
-        };
-        let values = resolved_variable_values(source, segment_ranges, segment_start, name)?;
-        let [value] = values.as_slice() else {
-            return None;
-        };
-        if !value_is_inert_when_substituted(value) {
-            return None;
+        match tail.as_bytes()[0] {
+            b'\'' => {
+                in_single_quote = !in_single_quote;
+                out.push('\'');
+                rest = &tail[1..];
+            }
+            b'\\' => {
+                out.push('\\');
+                if in_single_quote {
+                    // A backslash is an ordinary character inside single quotes.
+                    rest = &tail[1..];
+                } else {
+                    let after = &tail[1..];
+                    let escaped = after.chars().next().map_or(0, char::len_utf8);
+                    out.push_str(&after[..escaped]);
+                    rest = &after[escaped..];
+                }
+            }
+            _ => {
+                if in_single_quote {
+                    out.push('$');
+                    rest = &tail[1..];
+                    continue;
+                }
+                let Some((name, consumed)) = parse_leading_posix_variable(tail) else {
+                    // Not a plain variable reference (`$(`, `$'`, a bare `$`):
+                    // leave it and let the caller's proof fail if it mattered.
+                    out.push('$');
+                    rest = &tail[1..];
+                    continue;
+                };
+                let values = resolved_variable_values(source, segment_ranges, segment_start, name)?;
+                let [value] = values.as_slice() else {
+                    return None;
+                };
+                if !value_is_inert_when_substituted(value) {
+                    return None;
+                }
+                out.push_str(value);
+                rest = &tail[consumed..];
+                substituted = true;
+            }
         }
-        out.push_str(value);
-        rest = &tail[consumed..];
-        substituted = true;
     }
     out.push_str(rest);
     substituted.then_some(out)
@@ -32825,6 +32856,13 @@ mod tests {
             "W=$(mktemp -u); rm -rf \"$W\"",
             "W=$(mktemp -p /etc); rm -rf \"$W\"",
             "rm -rf \"$(cat target.txt)\"",
+            // Quoting that suppresses expansion. These delete a file literally
+            // named `$D`, so reading the proven value into them would describe
+            // a different command than the one that runs.
+            "D=/tmp/x; rm -rf '$D'",
+            "D=/tmp/x; rm -rf '$D/work'",
+            "D=/tmp/x; rm -rf \\$D",
+            "D=/tmp/x; rm -rf \"\\$D\"",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,
