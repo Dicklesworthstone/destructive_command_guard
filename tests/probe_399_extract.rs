@@ -106,6 +106,38 @@ fn a_program_file_invocation_never_yields_an_inline_payload() {
     );
 }
 
+/// Only a `#` in statement position starts an awk comment.
+///
+/// Regression: treating every `#` as a comment let a regex literal containing a
+/// literal hash — `/x#/`, `!/^#/`, both ordinary awk idioms — swallow the rest
+/// of its line, hiding a real `system()` call after it. That is an under-block,
+/// which is the direction that matters for a guard.
+#[test]
+fn a_hash_inside_a_regex_literal_does_not_hide_the_rest_of_the_line() {
+    for command in [
+        "awk '/x#/ { system(\"rm -rf /tmp/z\") }'",
+        "awk '!/^#/ { system(\"rm -rf /tmp/z\") }'",
+        "awk '$0 ~ /a#b/ { system(\"rm -rf /tmp/z\") }'",
+    ] {
+        assert_eq!(
+            payloads(command),
+            vec!["rm -rf /tmp/z".to_string()],
+            "a hash in a regex is data, not a comment: {command:?}"
+        );
+    }
+
+    // A comment in statement position still hides what follows on its line.
+    for command in [
+        "awk 'BEGIN{ # system(\"rm -rf /tmp/z\")\nprint 1 }'",
+        "awk 'BEGIN{ print 1;\n# system(\"rm -rf /tmp/z\")\n}'",
+    ] {
+        assert!(
+            payloads(command).is_empty(),
+            "a commented-out sink is not executed: {command:?}"
+        );
+    }
+}
+
 #[test]
 fn only_a_literal_string_supplies_a_payload() {
     // A concatenation or a variable is not statically known. Extracting the

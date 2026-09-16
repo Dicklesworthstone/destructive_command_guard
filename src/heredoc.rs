@@ -2314,8 +2314,15 @@ fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
 
     while index < bytes.len() {
         match bytes[index] {
-            // An awk comment runs to end of line and executes nothing.
-            b'#' => {
+            // An awk comment runs to end of line and executes nothing — but
+            // only a `#` in statement position starts one. A `#` inside a regex
+            // literal (`/x#/`, `!/^#/` — both ordinary awk idioms for matching
+            // a literal hash) is data, and treating it as a comment swallowed
+            // the rest of the line, hiding a real `system()` call after it.
+            // That is an under-block, so the test is deliberately narrow: an
+            // unrecognised `#` just means the scanner keeps reading, which can
+            // only over-extract.
+            b'#' if awk_hash_starts_comment(bytes, index) => {
                 index = program[index..]
                     .find('\n')
                     .map_or(bytes.len(), |newline| index + newline + 1);
@@ -2373,6 +2380,23 @@ fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
         }
     }
     payloads
+}
+
+/// Whether the `#` at `index` begins an awk comment rather than being a literal
+/// hash inside a regex.
+///
+/// True only in statement position: the nearest preceding byte that is not a
+/// space or tab must be a newline, `;`, `{`, or `}`, or there must be none.
+/// `/x#/` and `!/^#/` therefore keep scanning, while `BEGIN{ # note` and a
+/// comment on its own line are recognised. A trailing comment after code
+/// (`print 1 # note`) is deliberately NOT recognised — reading it costs at most
+/// an over-extraction, whereas mistaking regex data for a comment hides
+/// whatever follows on that line.
+fn awk_hash_starts_comment(bytes: &[u8], index: usize) -> bool {
+    bytes[..index]
+        .iter()
+        .rposition(|b| !matches!(b, b' ' | b'\t'))
+        .is_none_or(|position| matches!(bytes[position], b'\n' | b'\r' | b';' | b'{' | b'}'))
 }
 
 /// End index (the closing quote) of the awk string literal opening at `start`.
