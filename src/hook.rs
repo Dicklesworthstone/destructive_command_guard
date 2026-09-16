@@ -701,6 +701,17 @@ pub enum HookReadError {
         /// The raw input prefix that was read (up to the scan cap).
         prefix: String,
     },
+    /// The payload bytes were not valid UTF-8.
+    ///
+    /// Distinct from [`HookReadError::Io`] because the two have opposite trust
+    /// properties, and conflating them disabled the guard. A transient stdin
+    /// read failure is not attacker-influenceable and rightly fails open; the
+    /// *content* of the payload is exactly what an attacker controls. While
+    /// this was reported as an `Io(InvalidData)`, it inherited the always-open
+    /// posture, so appending one stray `0xFF` to any payload allowed the
+    /// command even under `DCG_FAIL_CLOSED=1` — the same class of evasion
+    /// #160 closed for oversized input.
+    InvalidUtf8(std::str::Utf8Error),
     /// Failed to parse JSON input.
     Json(serde_json::Error),
 }
@@ -728,9 +739,10 @@ pub const MAX_OVERSIZED_SCAN_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// # Errors
 ///
-/// Returns [`HookReadError::Io`] if stdin cannot be read, [`HookReadError::Json`]
-/// if the input is not valid hook JSON, or [`HookReadError::InputTooLarge`] if
-/// the input exceeds `max_bytes`.
+/// Returns [`HookReadError::Io`] if stdin cannot be read,
+/// [`HookReadError::InvalidUtf8`] if the bytes are not valid UTF-8,
+/// [`HookReadError::Json`] if the input is not valid hook JSON, or
+/// [`HookReadError::InputTooLarge`] if the input exceeds `max_bytes`.
 pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     {
@@ -760,8 +772,7 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
         });
     }
 
-    let input = String::from_utf8(buf)
-        .map_err(|e| HookReadError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
+    let input = String::from_utf8(buf).map_err(|e| HookReadError::InvalidUtf8(e.utf8_error()))?;
 
     // Strip a leading UTF-8 BOM (U+FEFF) before parsing. Some text tools prepend
     // a BOM; without this, BOM-prefixed but otherwise-valid hook input would
@@ -784,9 +795,18 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
 /// *zero* protection under either one (issue #410). This table is what
 /// [`parse_hook_input`] uses to reconcile those envelopes.
 ///
-/// Only aliased fields belong here. `transcript_path`, `permission_mode`, and
-/// `tool_use_id` declare no alias, so their camelCase spellings are ordinary
-/// unknown keys that serde already ignores.
+/// Only fields that both exist on [`HookInput`] and declare a `serde(alias)`
+/// belong here. A camelCase spelling of anything else — including keys dcg does
+/// not model at all, such as `transcript_path`, `permission_mode` and
+/// `tool_use_id` — is an ordinary unknown key that serde already ignores, and
+/// an unknown key cannot produce the `duplicate field` abort this table exists
+/// to repair.
+///
+/// Known residual: two *identical* key spellings (`"tool_input"` twice) are not
+/// reconciled. `serde_json::Value` resolves same-key duplicates last-wins, so
+/// the earlier value is gone before this table is consulted. Such a payload
+/// still warns on stderr and still blocks under `DCG_FAIL_CLOSED=1`; catching
+/// the displaced value would require a duplicate-preserving JSON reader.
 const HOOK_INPUT_ALIAS_GROUPS: &[(&str, &[&str])] = &[
     ("hook_event_name", &["hookEventName"]),
     ("session_id", &["sessionId"]),
@@ -831,6 +851,17 @@ pub fn parse_hook_input(json: &str) -> Result<HookInput, serde_json::Error> {
     // inspecting the error message: `duplicate field` is not a stable,
     // machine-checkable contract, and a `Value` parse resolves nothing about
     // the alias groups on its own (the two spellings are distinct JSON keys).
+    //
+    // Bounded on purpose: this re-read keeps serde_json's 128-level recursion
+    // limit. A payload whose *unrelated* sibling key nests deeper than that is
+    // reconcilable in principle — the typed parse aborted earlier, at the
+    // duplicate field — but it stops being reconciled here and is reported as
+    // the original parse error instead. That is the documented malformed-input
+    // path, not a silent hole: it warns on stderr and blocks under
+    // `DCG_FAIL_CLOSED=1`. Lifting the limit would mean parsing (and dropping)
+    // an arbitrarily deep `Value` recursively, and with `panic = "abort"` a
+    // stack overflow on a 256 KiB payload is a worse failure than a warned
+    // fail-open.
     let Ok(serde_json::Value::Object(mut object)) = serde_json::from_str::<serde_json::Value>(json)
     else {
         return Err(first_error);
@@ -1881,7 +1912,36 @@ fn extract_command_from_tool_args(tool_args: &serde_json::Value) -> Option<Strin
 /// deny on any of them answers for the payload.
 #[must_use]
 pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCommand> {
-    let mut extracted = extract_command_with_context_inner(input)?;
+    let mut extracted = match extract_command_with_context_inner(input) {
+        Some(extracted) => extracted,
+        // The retained spelling of a conflicting alias pair carried no command,
+        // but a displaced one did. Returning `None` here dropped it silently:
+        // the payload PARSES, so there is no read error, no stderr warning, no
+        // history row, and `DCG_FAIL_CLOSED` cannot catch it either — strictly
+        // worse than the pre-#410 behaviour, where the duplicate key produced a
+        // parse error that fail-closed operators did block. `{"tool_input":{},
+        // "toolInput":{"command":"rm -rf /"}}` is the whole exploit.
+        //
+        // The `is_shell_hook_candidate` gate still applies, so a non-shell tool
+        // is as ignored as it ever was.
+        None => {
+            let first = input
+                .alias_conflict_commands
+                .first()
+                .filter(|_| is_shell_hook_candidate(input))?;
+            let labeled = shell_dialect_for_tool_name(input.tool_name.as_deref());
+            let protocol = detect_protocol(input);
+            ExtractedHookCommand {
+                command: first.clone(),
+                protocol,
+                dialect: refine_shell_dialect(
+                    first,
+                    codex_host_shell_dialect(labeled, protocol, cfg!(windows), first),
+                ),
+                additional_commands: Vec::new(),
+            }
+        }
+    };
     if !input.alias_conflict_commands.is_empty() {
         let labeled = shell_dialect_for_tool_name(input.tool_name.as_deref());
         for command in &input.alias_conflict_commands {
