@@ -51,6 +51,51 @@ fn osascript_shell_sinks_yield_their_payload() {
     );
 }
 
+/// AppleScript keyword matching is whitespace-flexible and case-insensitive.
+///
+/// Regression: a fixed `"do shell script"` literal missed `do  shell  script`,
+/// which is valid AppleScript and trivially evades a single-space match. It was
+/// also inconsistent with the `\bdo\s+shell\s+script\b` tier-1 trigger that
+/// routes the command to extraction in the first place.
+#[test]
+fn do_shell_script_matching_is_whitespace_flexible_and_bounded() {
+    for program in [
+        "do shell script \"rm -rf /tmp/z\"",
+        "do   shell   script  \"rm -rf /tmp/z\"",
+        "do\tshell\tscript \"rm -rf /tmp/z\"",
+        "do\nshell\nscript \"rm -rf /tmp/z\"",
+        "Do Shell Script \"rm -rf /tmp/z\"",
+        "DO SHELL SCRIPT \"rm -rf /tmp/z\"",
+    ] {
+        let command = format!("osascript -e '{program}'");
+        assert_eq!(
+            payloads(&command),
+            vec!["rm -rf /tmp/z".to_string()],
+            "whitespace/case variant must still yield the payload: {program:?}"
+        );
+    }
+
+    // Word boundaries: a longer word containing a keyword is not the keyword.
+    for program in [
+        "redo shell script \"rm -rf /tmp/z\"",
+        "doshellscript \"rm -rf /tmp/z\"",
+        "do shell scripted \"rm -rf /tmp/z\"",
+        "do shellscript \"rm -rf /tmp/z\"",
+    ] {
+        let command = format!("osascript -e '{program}'");
+        assert!(
+            payloads(&command).is_empty(),
+            "not the keyword sequence: {program:?}"
+        );
+    }
+
+    // A near miss must not stop the scan finding a real one after it.
+    assert_eq!(
+        payloads("osascript -e 'redo shell script x\ndo shell script \"rm -rf /tmp/z\"'"),
+        vec!["rm -rf /tmp/z".to_string()],
+    );
+}
+
 #[test]
 fn programs_without_a_shell_sink_yield_nothing() {
     for command in [

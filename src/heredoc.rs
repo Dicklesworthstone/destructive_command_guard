@@ -2571,10 +2571,12 @@ fn osascript_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usi
     let lowered = program.to_ascii_lowercase();
     let mut search = 0usize;
 
-    // AppleScript: `do shell script "<command>"`, whitespace-flexible and
-    // case-insensitive (AppleScript keywords are).
-    while let Some(found) = lowered[search..].find("do shell script") {
-        let after = search + found + "do shell script".len();
+    // AppleScript: `do shell script "<command>"`. Whitespace between the three
+    // keywords is flexible and the keywords are case-insensitive, so a fixed
+    // `"do shell script"` literal would miss `do  shell  script` — trivially
+    // evadable, and inconsistent with the `\bdo\s+shell\s+script\b` tier-1
+    // trigger that got the command here in the first place.
+    while let Some(after) = find_applescript_do_shell_script(&lowered, search) {
         if let Some(literal) = applescript_leading_string_literal(program, after) {
             payloads.push(offset + literal.start..offset + literal.end);
             search = literal.end;
@@ -2610,6 +2612,53 @@ fn osascript_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usi
     payloads.sort_by_key(|range| range.start);
     payloads.dedup();
     payloads
+}
+
+/// Index just past the next `do shell script` keyword sequence in `lowered`
+/// (already ASCII-lowercased), searching from `from`.
+///
+/// Whitespace between the three keywords is flexible, matching AppleScript and
+/// the tier-1 trigger. Word boundaries are required so `redo`, `doshell`, and
+/// `scripted` cannot satisfy it.
+fn find_applescript_do_shell_script(lowered: &str, from: usize) -> Option<usize> {
+    const WORDS: [&str; 3] = ["do", "shell", "script"];
+    let bytes = lowered.as_bytes();
+    let is_word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    let mut search = from;
+    loop {
+        let rest = lowered.get(search..)?;
+        let found = search + rest.find(WORDS[0])?;
+        let mut cursor = found;
+        let mut matched = true;
+        for (position, word) in WORDS.iter().enumerate() {
+            if position > 0 {
+                let skipped = lowered
+                    .get(cursor..)
+                    .and_then(|tail| tail.find(|c: char| !c.is_ascii_whitespace()))?;
+                if skipped == 0 {
+                    // The keywords must be separated by whitespace.
+                    matched = false;
+                    break;
+                }
+                cursor += skipped;
+            }
+            if !lowered.get(cursor..).is_some_and(|t| t.starts_with(word)) {
+                matched = false;
+                break;
+            }
+            cursor += word.len();
+        }
+        let starts_on_boundary = found
+            .checked_sub(1)
+            .and_then(|i| bytes.get(i))
+            .is_none_or(|b| !is_word_byte(*b));
+        let ends_on_boundary = bytes.get(cursor).is_none_or(|b| !is_word_byte(*b));
+        if matched && starts_on_boundary && ends_on_boundary {
+            return Some(cursor);
+        }
+        search = found + WORDS[0].len();
+    }
 }
 
 /// The first double-quoted literal at or after `start`, skipping whitespace.
