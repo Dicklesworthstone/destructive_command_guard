@@ -2812,7 +2812,82 @@ pub(crate) fn stdin_data_sink_may_be_overridden(
     let mut overridden = false;
     let mut parse_error = false;
     find_shell_name_override_deep(ast.root(), target, &mut overridden, &mut parse_error);
+    if !parse_error {
+        return overridden;
+    }
+    // The whole command can still fail to parse because of bytes inside a
+    // *quoted* heredoc body, which are literal stdin data the shell never
+    // parses as grammar (issue #412). Retry once with only those bodies
+    // blanked: if the command then parses and shows no override, the parse
+    // error came from inert data and cannot have hidden one. Anything else
+    // keeps the fail-closed answer.
+    //
+    // The failed parse's own `overridden` is deliberately NOT consulted: a
+    // mis-parse can invent an assignment out of body text (`Read-only` inside a
+    // commit message), and a verdict read off a tree the parser already
+    // rejected is exactly as untrustworthy as the rejection.
+    let Some(blanked) = quoted_heredoc_bodies_blanked(command) else {
+        return true;
+    };
+    let ast = AstGrep::new(blanked.as_str(), SupportLang::Bash);
+    let mut overridden = false;
+    let mut parse_error = false;
+    find_shell_name_override_deep(ast.root(), target, &mut overridden, &mut parse_error);
     overridden || parse_error
+}
+
+/// The command with every *quoted-delimiter* heredoc body replaced by blanks,
+/// or `None` when there is no such body to blank (issue #412).
+///
+/// A `<<'EOF'` body is literal stdin data: the shell performs no expansion in
+/// it and never parses it as grammar, so its bytes cannot rebind a name in the
+/// shell that feeds the heredoc. They can, however, stop tree-sitter-bash
+/// parsing the enclosing command — an unbalanced `"` in a German commit message
+/// (`„Messen"`) nested inside `"$(cat <<'EOF' … )"` is the reported case — and a
+/// parse error is answered fail-closed, which suppressed the very masking the
+/// body was eligible for.
+///
+/// Blanking preserves every byte offset and every newline, so the retry parses
+/// the same command with only inert data neutralized. Expanding heredocs are
+/// deliberately left alone: the shell *does* evaluate `$(…)` inside them, so
+/// their bytes can carry a real override.
+fn quoted_heredoc_bodies_blanked(command: &str) -> Option<String> {
+    let extracted = match extract_content(command, &ExtractionLimits::default()) {
+        ExtractionResult::Extracted(extracted) | ExtractionResult::Partial { extracted, .. } => {
+            extracted
+        }
+        ExtractionResult::NoContent
+        | ExtractionResult::Skipped(_)
+        | ExtractionResult::Failed(_) => return None,
+    };
+    let mut ranges: Vec<std::ops::Range<usize>> = extracted
+        .into_iter()
+        .filter(|content| {
+            content.quoted
+                && content
+                    .heredoc_type
+                    .is_some_and(|kind| kind != HeredocType::HereString)
+        })
+        .filter_map(|content| content.content_range)
+        .filter(|range| range.end <= command.len() && range.start <= range.end)
+        .collect();
+    if ranges.is_empty() {
+        return None;
+    }
+    ranges.sort_by_key(|range| range.start);
+
+    let mut out = String::with_capacity(command.len());
+    let mut pos = 0usize;
+    for range in ranges {
+        if range.start < pos {
+            continue;
+        }
+        out.push_str(command.get(pos..range.start)?);
+        out.push_str(&mask_preserve_newlines(command.get(range.clone())?));
+        pos = range.end;
+    }
+    out.push_str(command.get(pos..)?);
+    Some(out)
 }
 
 /// The whole-command retry walker for [`stdin_data_sink_may_be_overridden`].
@@ -4836,6 +4911,68 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use proptest::prelude::*;
+
+    /// Issue #412: data bytes inside a quoted heredoc body must not decide
+    /// whether the body gets masked.
+    ///
+    /// `„Messen"` in a German commit message leaves an odd number of `"` in the
+    /// body. Inside `"$(cat <<'EOF' … )"` that defeated tree-sitter-bash on the
+    /// whole command, and the fail-closed answer to a parse error suppressed
+    /// masking — so the body was rescanned as live shell, `Read-only` read as a
+    /// PowerShell verb-noun, and the commit was denied.
+    #[test]
+    fn quoted_heredoc_body_bytes_do_not_decide_the_override_answer() {
+        let balanced = "git commit -q -m \"$(cat <<'EOF'\na \"b\" c\nRead-only\nEOF\n)\"";
+        let unbalanced = "git commit -q -m \"$(cat <<'EOF'\n\u{201e}Messen\"\nRead-only\nEOF\n)\"";
+        for command in [balanced, unbalanced] {
+            let heredocs = active_heredocs(command).expect("heredoc is delimitable");
+            let [heredoc] = heredocs.as_slice() else {
+                panic!("expected exactly one heredoc in {command:?}");
+            };
+            let target = extract_heredoc_target_command(command, heredoc.operator_start)
+                .expect("target command");
+            assert_eq!(target, "cat");
+            assert!(
+                !stdin_data_sink_may_be_overridden(command, heredoc.operator_start, &target),
+                "an unbalanced quote inside the body is data, not a rebinding: {command:?}"
+            );
+            assert_ne!(
+                mask_non_expanding_data_heredocs(command).as_ref(),
+                command,
+                "the body must be masked out of the raw-shell rescan: {command:?}"
+            );
+        }
+    }
+
+    /// The blanking retry only neutralizes *quoted* bodies, and preserves every
+    /// byte offset so the retry parses the same command.
+    #[test]
+    fn blanking_preserves_offsets_and_skips_expanding_bodies() {
+        let quoted = "git commit -q -m \"$(cat <<'EOF'\n\u{201e}Messen\"\nRead-only\nEOF\n)\"";
+        let blanked = quoted_heredoc_bodies_blanked(quoted).expect("quoted body is blanked");
+        assert_eq!(
+            blanked.len(),
+            quoted.len(),
+            "blanking must preserve byte offsets"
+        );
+        assert_eq!(
+            blanked.matches('\n').count(),
+            quoted.matches('\n').count(),
+            "blanking must preserve newlines"
+        );
+        assert!(!blanked.contains("Read-only"));
+        assert!(
+            blanked.contains("<<'EOF'") && blanked.contains("EOF\n)"),
+            "only the body is blanked, not the operator or terminator: {blanked:?}"
+        );
+
+        // An expanding heredoc body is evaluated by the shell, so its bytes can
+        // carry a real override and must be left alone.
+        assert!(
+            quoted_heredoc_bodies_blanked("cat <<EOF\n$(rm -rf /)\nEOF").is_none(),
+            "an unquoted delimiter must not be blanked"
+        );
+    }
 
     // ========================================================================
     // ssh remote-payload extraction (#326)
