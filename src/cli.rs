@@ -8015,7 +8015,14 @@ fn handle_explain(
     }
 
     // Finish and get trace
-    let trace = collector.finish(result.decision);
+    let mut trace = collector.finish(result.decision);
+
+    // Resolve the `[policy]` mode for the finding, exactly as `dcg test` and the
+    // live hook do. Without this, explain printed the rule's severity-default
+    // DENY and contradicted both of them for every rule configured to
+    // warn/ask/log (issue #417). #330 fixed the hook and `dcg test`; explain was
+    // never touched.
+    trace.set_effective_mode(resolve_mode_for_cli(&effective_config, command, &result));
 
     // A rule that matched but was stood down by a configured target exemption
     // is an allow that came from configuration, so explain must say so (#284).
