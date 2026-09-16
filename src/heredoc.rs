@@ -2269,18 +2269,23 @@ fn awk_program_token(
             token.byte_range.start,
             token.byte_range.end,
         );
-        // `-f progfile` and `-v var=value` take a separate value; `--` ends
-        // options. Any other option is unmodeled arity, so stop rather than
-        // mistake a value for the program.
+        // `-v var=value` takes a separate value and does not consume the
+        // program; `--` ends options. Any other option is unmodeled arity, so
+        // stop rather than mistake a value for the program.
         match word {
-            "-f" | "--file" | "-v" | "--assign" => index += 2,
+            // `-f progfile` reads the program from a FILE dcg will not open,
+            // and it also changes what the remaining operands mean: without
+            // `-f` the first operand is the program, with `-f` every operand
+            // is a data file or a `var=value` assignment. Skipping the flag and
+            // its value would hand the next operand to the program scanner as
+            // if it were awk source, so both spellings must yield nothing.
+            "-f" | "--file" => return None,
+            _ if word.starts_with("-f") || word.starts_with("--file=") => return None,
+            "-v" | "--assign" => index += 2,
             "--" => {
                 index += 1;
                 break;
             }
-            // A glued `-f progfile` reads the program from a file dcg will not
-            // open, so there is nothing to extract.
-            _ if word.starts_with("-f") || word.starts_with("--file=") => return None,
             _ if word.starts_with("-v") || word.starts_with("--assign=") => index += 1,
             _ if word.starts_with('-') && word != "-" => return None,
             _ => break,
