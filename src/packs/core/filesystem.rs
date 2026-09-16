@@ -6893,7 +6893,11 @@ mod tests {
         // keeps the widened syntax from widening the exemption: only the operand
         // set decides, and every operand must be a literal temp path.
         assert_rm_parser_denies("rm -rf -- ./build", RM_RF_GENERAL_NAME, Severity::High);
-        assert_rm_parser_denies("rm -rf -- /tmp/x /etc", RM_RF_ROOT_HOME_NAME, Severity::Critical);
+        assert_rm_parser_denies(
+            "rm -rf -- /tmp/x /etc",
+            RM_RF_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
         // A second `--` is an ordinary operand named `--`, not a temp path.
         assert_rm_parser_denies("rm -rf -- -- /tmp/x", RM_RF_GENERAL_NAME, Severity::High);
         // Traversal out of the temp root is still refused.

@@ -123,10 +123,7 @@ fn explain_agrees_with_dcg_test_and_the_live_hook() {
     let test = run(&fixture, &["test", COMMAND]);
     let test_out =
         String::from_utf8_lossy(&test.stdout).to_string() + &String::from_utf8_lossy(&test.stderr);
-    assert!(
-        test_out.contains("Result: WARN"),
-        "dcg test: {test_out}"
-    );
+    assert!(test_out.contains("Result: WARN"), "dcg test: {test_out}");
 
     // Live hook: a warn-mode rule exits 0 with no denial document on stdout and
     // a warning on stderr.

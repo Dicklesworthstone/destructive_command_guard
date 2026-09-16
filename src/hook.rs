@@ -930,10 +930,7 @@ fn canonicalize_hook_input_aliases(
 /// Best effort by design: a shape this cannot interpret contributes nothing
 /// (the retained spelling is still evaluated normally), and it never fails the
 /// parse.
-fn commands_in_displaced_alias_value(
-    canonical: &str,
-    value: &serde_json::Value,
-) -> Vec<String> {
+fn commands_in_displaced_alias_value(canonical: &str, value: &serde_json::Value) -> Vec<String> {
     match canonical {
         "tool_input" => serde_json::from_value::<ToolInput>(value.clone())
             .ok()
@@ -5557,10 +5554,7 @@ mod tests {
             "[1,2,3]",
             r#"{"tool_name":{"nested":true},"tool_input":{"command":"ls"}}"#,
         ] {
-            assert!(
-                parse_hook_input(json).is_err(),
-                "must still reject: {json}"
-            );
+            assert!(parse_hook_input(json).is_err(), "must still reject: {json}");
         }
     }
 

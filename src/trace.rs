@@ -396,11 +396,14 @@ impl ExplainTrace {
     #[must_use]
     pub fn outcome_permits_execution(&self) -> bool {
         use crate::packs::DecisionMode;
-        match (self.decision, self.effective_mode) {
-            (EvaluationDecision::Allow, _) => true,
-            (EvaluationDecision::Deny, Some(DecisionMode::Warn | DecisionMode::Log)) => true,
-            _ => false,
-        }
+        matches!(
+            (self.decision, self.effective_mode),
+            (EvaluationDecision::Allow, _)
+                | (
+                    EvaluationDecision::Deny,
+                    Some(DecisionMode::Warn | DecisionMode::Log)
+                )
+        )
     }
 
     /// Get the stable rule ID (if a match occurred).
@@ -769,9 +772,7 @@ impl ExplainTrace {
                 EvaluationDecision::Deny => "deny".to_string(),
                 EvaluationDecision::Indeterminate => "indeterminate".to_string(),
             },
-            mode: self
-                .effective_mode
-                .map(|mode| mode.label().to_string()),
+            mode: self.effective_mode.map(|mode| mode.label().to_string()),
             outcome: self.outcome_label().to_ascii_lowercase(),
             skipped_due_to_budget: self.skipped_due_to_budget.then_some(true),
             total_duration_us: self.total_duration_us,
