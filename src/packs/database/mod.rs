@@ -60,6 +60,15 @@
 ///    not at text start. Multi-line heredoc payloads were never affected —
 ///    their bodies are evaluated per line — but the `-e` route was.
 ///
+///    A SQL comment between the opener and the keyword is skipped the same way
+///    whitespace is, because it is invisible to the server: `mysql -e "/* clean
+///    */ TRUNCATE TABLE users"` executes exactly as the bare statement does.
+///    Skipping only whitespace silently lost that whole shape — the same class
+///    the newline branch was added for, and carrying the same explicit `TABLE`
+///    evidence. MySQL's *executable* comment `/*!40000 TRUNCATE TABLE users */`
+///    is the inverse: its contents do run, so `/*!` is an opener in its own
+///    right rather than something to skip, and the skip group excludes it.
+///
 ///    Residual, deliberately accepted: the same continuation-line shape with
 ///    the optional `TABLE` keyword omitted (`-- comment\nTRUNCATE users`) is
 ///    not matched. Closing it needs a newline opener with no keyword evidence,
@@ -73,7 +82,7 @@
 /// `destructive_pattern!` takes a literal, so the packs spell the expression
 /// out rather than referencing this constant.
 #[cfg(test)]
-pub(crate) const TRUNCATE_TABLE_PATTERN: &str = r#"(?i)(?:(?:^|[;"'`])\s*|\r?\n\s*(?=TRUNCATE\s+TABLE\b))(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#;
+pub(crate) const TRUNCATE_TABLE_PATTERN: &str = r#"(?i)(?:(?:^|[;"'`])(?:\s|/\*(?!!)(?s:.*?)\*/)*|\r?\n(?:\s|/\*(?!!)(?s:.*?)\*/)*(?=TRUNCATE\s+TABLE\b)|/\*!\d*\s*)(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|\*/|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#;
 
 pub mod bigquery;
 pub mod databricks;
@@ -98,9 +107,19 @@ mod tests {
             .as_str()
     }
 
-    /// The `TRUNCATE` false positive in #403 reproduced in three packs because
-    /// each carried its own copy of the expression. Keep the copies identical
-    /// so a future narrowing cannot fix one dialect and leave the others.
+    /// The `TRUNCATE` false positive in #403 reproduced in `database.mysql` and
+    /// `database.postgresql`, because each carried its own copy of this
+    /// expression. Keep the copies identical so a future narrowing cannot fix
+    /// one dialect and leave the other.
+    ///
+    /// The reporter also named `database.bigquery` as carrying the "same
+    /// shape". It does not, and never has: its rule is `\bTRUNCATE\s+TABLE\b`,
+    /// which requires the literal `TABLE` keyword and so cannot read a Tailwind
+    /// class list as SQL. It is deliberately outside this loop — asserting it
+    /// against the shared pattern would fail, and widening it to match would
+    /// import the very false positive #403 is about. `database.snowflake`
+    /// stubs its regex to `(?!)` and decides `truncate-table` semantically, so
+    /// it is likewise not a copy of this expression.
     #[test]
     fn truncate_table_pattern_is_shared() {
         for pack in [
