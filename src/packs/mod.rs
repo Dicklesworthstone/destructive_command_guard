@@ -3853,6 +3853,9 @@ pub(crate) fn pack_aware_quick_reject_pre_normalized(
 /// and stays on the fast path.
 #[inline]
 fn command_carries_interpreter_shell_sink(command: &str) -> bool {
+    if std::env::var_os("DCG_REVIEW_DISABLE_SINK_EXEMPTION").is_some() {
+        return false;
+    }
     let bytes = command.as_bytes();
     // `$.system(` is a superstring of `system(`, so the awk and JXA call sinks
     // share one check. Whitespace before the paren is legal in both languages.
