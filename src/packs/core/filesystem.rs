@@ -674,7 +674,6 @@ struct RmFlagState {
     force_style: Option<RmFlagStyle>,
     recursive_span: Option<Range<usize>>,
     span: Option<Range<usize>>,
-    saw_terminator: bool,
     interactive_mode: RmInteractiveMode,
 }
 
@@ -690,7 +689,6 @@ struct RmFlagTracker {
     long_recursive_span: Option<Range<usize>>,
     seen_long_force: bool,
     long_force_span: Option<Range<usize>>,
-    saw_terminator: bool,
     interactive_mode: RmInteractiveMode,
 }
 
@@ -725,7 +723,6 @@ impl RmFlagTracker {
             force_style,
             recursive_span,
             span,
-            saw_terminator: self.saw_terminator,
             interactive_mode: self.interactive_mode,
         })
     }
@@ -2651,8 +2648,13 @@ fn parse_rm_segment_with_option_scanning(
 
         if !options_ended {
             if flag_text == "--" {
+                // `options_ended` is the whole effect: everything after the
+                // POSIX end-of-options marker is an operand. The marker itself
+                // deliberately does NOT feed the verdict — it makes a command
+                // strictly safer to parse and never changes what an operand
+                // names, so the temp exemption is decided by operand content
+                // alone (#395).
                 options_ended = true;
-                flags.saw_terminator = true;
                 continue;
             }
 
@@ -3962,14 +3964,23 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // catastrophic root/home deletion is one Google search away from
         // useless.
         //
-        // The rule is decided by the SEARCH ROOT, not by the predicate: dcg
-        // does not evaluate `-name`/`-maxdepth`/`-type`, so a narrowly scoped
-        // delete under home is gated like an unfiltered one (#418). Keep the
-        // reason and explanation honest about that — claiming the scoped form
-        // is "bytewise-equivalent to rm -rf on root/home" is false, and the
-        // old text additionally advised re-rooting "under a more specific
-        // subdir", which does not lift the rule while that subdir is still
-        // under home. Both cost the reporter of #418 real diagnosis time.
+        // What the rule actually keys on is a sensitive path token appearing
+        // anywhere between `find` and `-delete`. That is deliberately coarse in
+        // two directions, and the user-facing text must not overstate either:
+        //
+        //   - It does not evaluate `-name`/`-maxdepth`/`-type`, so a narrowly
+        //     scoped delete under home is gated like an unfiltered one (#418).
+        //   - It does not require the sensitive path to be the search ROOT, so
+        //     `find /tmp/x -newer /etc/passwd -delete` denies even though only
+        //     `/tmp/x` is searched.
+        //
+        // Claiming the scoped form is "bytewise-equivalent to rm -rf on
+        // root/home" was false, and the old text additionally advised
+        // re-rooting "under a more specific subdir", which does not lift the
+        // rule while that subdir is still under home. Both cost the reporter of
+        // #418 real diagnosis time, so say what is true: dcg gates on the paths
+        // the command names, and a denial is not a measurement of its blast
+        // radius.
         //
         // The regex matches `find` at any word boundary (so it fires
         // inside compound commands like `echo foo; find /etc -delete`,
@@ -3990,7 +4001,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // both fire. Without `)` in the set, subshell forms
             // silently bypass.
             r#"\bfind\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s-delete(?:\s|$|[;&|)\n])"#,
-            "find -delete rooted at root, home, or a system directory requires explicit approval. dcg gates this on the search root, not on the -name/-maxdepth filters that may narrow it. This command will NOT be executed.",
+            "find ... -delete naming root, home, or a system directory requires explicit approval. dcg gates on the paths the command names, not on the -name/-maxdepth filters that may narrow what it deletes. This command will NOT be executed.",
             Critical,
             "`find <path> -delete` removes every file the predicate matches beneath \
              `<path>`, and with `-depth` implied it removes matched directories too. \
@@ -4000,13 +4011,16 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              system or the user's data exactly as `rm -rf` would, and there is NO \
              recovery without backups. It is also the most common way an agent \
              works around a blocked `rm -rf`.\n\n\
-             This rule is decided by the SEARCH ROOT alone. dcg does not evaluate \
-             `-name`, `-maxdepth`, `-type`, or any other predicate, so a narrowly \
-             filtered command rooted under home is gated the same way an unfiltered \
-             one is. That is deliberate — a predicate is easy to get wrong, and the \
-             blast radius of a wrong one is the whole subtree — but it does mean a \
-             denial here is NOT a claim that this particular command would have \
-             deleted your home directory.\n\n\
+             This rule fires on a sensitive path appearing anywhere between `find` \
+             and `-delete`, and it is deliberately coarse in two ways. It does not \
+             evaluate `-name`, `-maxdepth`, `-type`, or any other predicate, so a \
+             narrowly filtered delete under home is gated like an unfiltered one — \
+             a predicate is easy to get wrong, and the blast radius of a wrong one \
+             is the whole subtree. It also does not require the sensitive path to be \
+             the search root, so `find /tmp/x -newer /etc/passwd -delete` is gated \
+             even though only `/tmp/x` is searched.\n\n\
+             So a denial here is NOT a measurement of what this particular command \
+             would have removed. It reports which paths the command names.\n\n\
              To delete inside root or home, pick one:\n  \
              find /tmp/<subdir> -delete                       # literal temp roots are allowed\n  \
              dcg allow-once <code>                            # one-shot, from the code in this denial\n  \
