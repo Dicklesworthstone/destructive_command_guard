@@ -51,6 +51,51 @@ fn osascript_shell_sinks_yield_their_payload() {
     );
 }
 
+/// AppleScript keyword matching is whitespace-flexible and case-insensitive.
+///
+/// Regression: a fixed `"do shell script"` literal missed `do  shell  script`,
+/// which is valid AppleScript and trivially evades a single-space match. It was
+/// also inconsistent with the `\bdo\s+shell\s+script\b` tier-1 trigger that
+/// routes the command to extraction in the first place.
+#[test]
+fn do_shell_script_matching_is_whitespace_flexible_and_bounded() {
+    for program in [
+        "do shell script \"rm -rf /tmp/z\"",
+        "do   shell   script  \"rm -rf /tmp/z\"",
+        "do\tshell\tscript \"rm -rf /tmp/z\"",
+        "do\nshell\nscript \"rm -rf /tmp/z\"",
+        "Do Shell Script \"rm -rf /tmp/z\"",
+        "DO SHELL SCRIPT \"rm -rf /tmp/z\"",
+    ] {
+        let command = format!("osascript -e '{program}'");
+        assert_eq!(
+            payloads(&command),
+            vec!["rm -rf /tmp/z".to_string()],
+            "whitespace/case variant must still yield the payload: {program:?}"
+        );
+    }
+
+    // Word boundaries: a longer word containing a keyword is not the keyword.
+    for program in [
+        "redo shell script \"rm -rf /tmp/z\"",
+        "doshellscript \"rm -rf /tmp/z\"",
+        "do shell scripted \"rm -rf /tmp/z\"",
+        "do shellscript \"rm -rf /tmp/z\"",
+    ] {
+        let command = format!("osascript -e '{program}'");
+        assert!(
+            payloads(&command).is_empty(),
+            "not the keyword sequence: {program:?}"
+        );
+    }
+
+    // A near miss must not stop the scan finding a real one after it.
+    assert_eq!(
+        payloads("osascript -e 'redo shell script x\ndo shell script \"rm -rf /tmp/z\"'"),
+        vec!["rm -rf /tmp/z".to_string()],
+    );
+}
+
 #[test]
 fn programs_without_a_shell_sink_yield_nothing() {
     for command in [
@@ -61,12 +106,79 @@ fn programs_without_a_shell_sink_yield_nothing() {
         "osascript -e 'display notification \"done\"'",
         // A program file is not opened.
         "osascript /usr/local/scripts/notify.applescript",
-        "awk -f prog.awk data.txt",
     ] {
         assert!(
             payloads(command).is_empty(),
             "expected no payload from {command:?}, got {:?}",
             payloads(command)
+        );
+    }
+}
+
+/// `-f progfile` reads the program from a file, and it also changes what the
+/// remaining operands mean: without `-f` the first operand is the program, with
+/// `-f` every operand is a data file or a `var=value` assignment.
+///
+/// Regression: the separate spelling used to skip the flag and its value and
+/// then hand the next operand to the program scanner as if it were awk source,
+/// so a data file whose *name* looked like a program was mined for sinks. The
+/// glued spelling was already correct, which is what made the asymmetry easy to
+/// miss — a test using a benign data filename passes either way.
+#[test]
+fn a_program_file_invocation_never_yields_an_inline_payload() {
+    for command in [
+        "awk -f prog.awk data.txt",
+        "awk --file prog.awk data.txt",
+        "awk -fprog.awk data.txt",
+        // The operand is a FILE NAME here, not a program, however it is shaped.
+        "awk -f prog.awk 'BEGIN{ system(\"rm -rf /\") }'",
+        "awk --file prog.awk 'BEGIN{ system(\"rm -rf /\") }'",
+        "awk -fprog.awk 'BEGIN{ system(\"rm -rf /\") }'",
+        "awk --file=prog.awk 'BEGIN{ system(\"rm -rf /\") }'",
+    ] {
+        assert!(
+            payloads(command).is_empty(),
+            "a -f invocation has no inline program: {command:?} yielded {:?}",
+            payloads(command)
+        );
+    }
+
+    // `-v` does NOT consume the program, so the sink is still found.
+    assert_eq!(
+        payloads("awk -v n=1 'BEGIN{ system(\"rm -rf /tmp/z\") }'"),
+        vec!["rm -rf /tmp/z".to_string()],
+        "-v takes a value but leaves the program in place"
+    );
+}
+
+/// Only a `#` in statement position starts an awk comment.
+///
+/// Regression: treating every `#` as a comment let a regex literal containing a
+/// literal hash — `/x#/`, `!/^#/`, both ordinary awk idioms — swallow the rest
+/// of its line, hiding a real `system()` call after it. That is an under-block,
+/// which is the direction that matters for a guard.
+#[test]
+fn a_hash_inside_a_regex_literal_does_not_hide_the_rest_of_the_line() {
+    for command in [
+        "awk '/x#/ { system(\"rm -rf /tmp/z\") }'",
+        "awk '!/^#/ { system(\"rm -rf /tmp/z\") }'",
+        "awk '$0 ~ /a#b/ { system(\"rm -rf /tmp/z\") }'",
+    ] {
+        assert_eq!(
+            payloads(command),
+            vec!["rm -rf /tmp/z".to_string()],
+            "a hash in a regex is data, not a comment: {command:?}"
+        );
+    }
+
+    // A comment in statement position still hides what follows on its line.
+    for command in [
+        "awk 'BEGIN{ # system(\"rm -rf /tmp/z\")\nprint 1 }'",
+        "awk 'BEGIN{ print 1;\n# system(\"rm -rf /tmp/z\")\n}'",
+    ] {
+        assert!(
+            payloads(command).is_empty(),
+            "a commented-out sink is not executed: {command:?}"
         );
     }
 }
