@@ -276,7 +276,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // Keep byte-identical to `crate::packs::database::TRUNCATE_TABLE_PATTERN`
             // (asserted by `truncate_table_pattern_is_shared`); the rationale
             // for every constraint lives on that constant. Issue #403.
-            r#"(?i)(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#,
+            r#"(?i)(?:^|[;"'`])\s*(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#,
             "TRUNCATE permanently deletes all rows. Cannot be rolled back in MySQL.",
             High,
             "TRUNCATE is faster than DELETE but more dangerous in MySQL:\n\n\
@@ -292,8 +292,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              If you need rollback capability, use:\n  \
              DELETE FROM tablename;  -- Slower but transactional (dcg gates an \
              unfiltered DELETE too, so this form also needs approval)",
-            TRUNCATE_TABLE_SUGGESTIONS,
-            executables = ["mysql", "mariadb", "mysqladmin", "mysqldump"]
+            TRUNCATE_TABLE_SUGGESTIONS
         ),
         // DELETE without WHERE
         destructive_pattern!(

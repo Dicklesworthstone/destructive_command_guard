@@ -34,6 +34,22 @@
 /// 3. The statement must *end* after the identifier — end of input, `;`, `,`,
 ///    `)`, a closing quote, or one of `TRUNCATE`'s own trailing clauses.
 ///    A class list continues with more class tokens instead.
+/// 4. The statement must also *begin* where a SQL statement can begin — the
+///    start of the evaluated text, just after a `;`, or just inside an opening
+///    quote (issue #394). Without this, the word `truncate` anywhere in argv
+///    read as DDL: `cat truncate x`, `sort truncate b`, and `wc -l truncate x`
+///    are file reads whose operands happen to be named like SQL, and all three
+///    were denied as "would delete database rows". An operand of another
+///    command is never in statement position, so this separates them without
+///    touching a single real invocation.
+///
+///    The three accepted openers are what every real execution path produces:
+///    a heredoc body or a reconstructed `echo … | mysql` payload starts at text
+///    start; `mysql -e "TRUNCATE …"`, `--execute="…"`, and `psql -c '…'` open
+///    with a quote; and a later statement in a multi-statement payload follows
+///    the previous statement's `;`. A bare newline is deliberately NOT an
+///    opener — that would re-admit the #403 class-list false positive, where a
+///    wrapped `class="… truncate\n flex"` reads as `TRUNCATE flex"`.
 ///
 /// `TRUNCATE TABLE …` (the explicit-keyword spelling) is covered by the same
 /// expression; nothing about it is relaxed.
@@ -43,7 +59,7 @@
 /// `destructive_pattern!` takes a literal, so the packs spell the expression
 /// out rather than referencing this constant.
 #[cfg(test)]
-pub(crate) const TRUNCATE_TABLE_PATTERN: &str = r#"(?i)(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#;
+pub(crate) const TRUNCATE_TABLE_PATTERN: &str = r#"(?i)(?:^|[;"'`])\s*(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#;
 
 pub mod bigquery;
 pub mod databricks;
