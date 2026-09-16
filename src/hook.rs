@@ -96,6 +96,20 @@ pub struct HookInput {
         deserialize_with = "deserialize_tool_calls_tolerant"
     )]
     pub tool_calls: Option<Vec<ToolCall>>,
+
+    /// Command strings displaced by a *conflicting* snake_case/camelCase alias
+    /// pair in the raw envelope (issue #410).
+    ///
+    /// Never deserialized from the wire — [`parse_hook_input`] populates it
+    /// after canonicalizing duplicate alias spellings. When a host sends both
+    /// `tool_input` and `toolInput` (or the `tool_args` / `toolCall` /
+    /// `toolCalls` equivalents) with *different* values, one spelling has to
+    /// win the typed field, and picking either one silently discards a command
+    /// that the host might be the one about to run. Every discarded command is
+    /// recorded here and evaluated as an additional entry, so a destructive
+    /// spelling cannot hide behind a benign sibling.
+    #[serde(skip)]
+    pub alias_conflict_commands: Vec<String>,
 }
 
 /// Tool-specific input containing the command to execute.
@@ -756,7 +770,198 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
     // not skip a leading BOM on its own.
     let to_parse = input.strip_prefix('\u{feff}').unwrap_or(input.as_str());
 
-    serde_json::from_str(to_parse).map_err(HookReadError::Json)
+    parse_hook_input(to_parse).map_err(HookReadError::Json)
+}
+
+/// Snake_case hook fields that also accept a camelCase spelling, with every
+/// alias [`HookInput`] declares for them.
+///
+/// Serde maps an alias onto the same struct field as its canonical name, so a
+/// payload carrying BOTH spellings aborts the whole parse with
+/// `duplicate field`. Two shipping hosts do exactly that on every single tool
+/// call — Grok Build emits the full camelCase/snake_case pair set, and ZCode
+/// desktop does the same — and an aborted parse fails open, so dcg provided
+/// *zero* protection under either one (issue #410). This table is what
+/// [`parse_hook_input`] uses to reconcile those envelopes.
+///
+/// Only aliased fields belong here. `transcript_path`, `permission_mode`, and
+/// `tool_use_id` declare no alias, so their camelCase spellings are ordinary
+/// unknown keys that serde already ignores.
+const HOOK_INPUT_ALIAS_GROUPS: &[(&str, &[&str])] = &[
+    ("hook_event_name", &["hookEventName"]),
+    ("session_id", &["sessionId"]),
+    ("tool_name", &["toolName"]),
+    ("tool_input", &["toolInput"]),
+    ("tool_args", &["toolArgs"]),
+    ("turn_id", &["turnId"]),
+    ("tool_call", &["toolCall"]),
+    ("tool_calls", &["toolCalls", "toolcalls"]),
+];
+
+/// Parse hook JSON, reconciling duplicate snake_case/camelCase alias spellings.
+///
+/// The fast path is a plain `serde_json::from_str`, so a normal single-spelling
+/// payload costs nothing extra. Only when that fails does this re-read the
+/// envelope as a generic object and retry after canonicalizing the alias groups
+/// in [`HOOK_INPUT_ALIAS_GROUPS`]:
+///
+/// - **Equal pair** (`"tool_name":"Bash"` + `"toolName":"Bash"`): the alias key
+///   is dropped and the payload parses exactly as the single-spelling form.
+///   This is the whole of the observed Grok/ZCode breakage.
+/// - **Conflicting pair**: one value must win the typed field, so the canonical
+///   snake_case spelling is kept — it is the spelling every hook contract
+///   documents — and the ambiguity is *not* discarded. A displaced command
+///   lands in [`HookInput::alias_conflict_commands`] and is evaluated as an
+///   additional entry, and a displaced `tool_name` that names a shell tool
+///   beats a canonical one that does not, so a benign spelling cannot steer
+///   evaluation away from the shell path.
+///
+/// # Errors
+///
+/// Returns the original `serde_json` error when the payload is not an object,
+/// carries no reconcilable alias conflict, or still does not fit [`HookInput`]
+/// after canonicalization. Behaviour for those inputs is unchanged.
+pub fn parse_hook_input(json: &str) -> Result<HookInput, serde_json::Error> {
+    let first_error = match serde_json::from_str::<HookInput>(json) {
+        Ok(input) => return Ok(input),
+        Err(err) => err,
+    };
+
+    // The retry deliberately re-reads from the original text rather than
+    // inspecting the error message: `duplicate field` is not a stable,
+    // machine-checkable contract, and a `Value` parse resolves nothing about
+    // the alias groups on its own (the two spellings are distinct JSON keys).
+    let Ok(serde_json::Value::Object(mut object)) = serde_json::from_str::<serde_json::Value>(json)
+    else {
+        return Err(first_error);
+    };
+
+    let displaced = canonicalize_hook_input_aliases(&mut object);
+    if displaced.is_none() {
+        // No alias group had more than one spelling present, so canonicalizing
+        // changed nothing and the payload is malformed for some other reason.
+        return Err(first_error);
+    }
+    let displaced_commands = displaced.unwrap_or_default();
+
+    match serde_json::from_value::<HookInput>(serde_json::Value::Object(object)) {
+        Ok(mut input) => {
+            input.alias_conflict_commands = displaced_commands;
+            Ok(input)
+        }
+        Err(_) => Err(first_error),
+    }
+}
+
+/// Collapse duplicate alias spellings in a raw hook envelope.
+///
+/// Returns `None` when no alias group had more than one spelling present (so
+/// the caller knows canonicalization was a no-op and the original parse error
+/// stands), otherwise the command strings displaced by a conflicting pair.
+fn canonicalize_hook_input_aliases(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+) -> Option<Vec<String>> {
+    let mut canonicalized_any = false;
+    let mut displaced_commands: Vec<String> = Vec::new();
+
+    for (canonical, aliases) in HOOK_INPUT_ALIAS_GROUPS {
+        let present_aliases: Vec<&str> = aliases
+            .iter()
+            .copied()
+            .filter(|alias| object.contains_key(*alias))
+            .collect();
+        if present_aliases.is_empty() {
+            continue;
+        }
+        let canonical_present = object.contains_key(*canonical);
+        if !canonical_present && present_aliases.len() == 1 {
+            // A single alias spelling on its own is what serde already handles.
+            continue;
+        }
+        canonicalized_any = true;
+
+        // Promote the first present alias when the canonical key is absent, so
+        // a camelCase-only host that spells the same field twice still parses.
+        let mut retained = if canonical_present {
+            object.get(*canonical).cloned()
+        } else {
+            object.remove(present_aliases[0])
+        };
+
+        for alias in &present_aliases {
+            let Some(alias_value) = object.remove(*alias) else {
+                continue;
+            };
+            if retained.as_ref() == Some(&alias_value) {
+                continue;
+            }
+            if *canonical == "tool_name" {
+                // A conflicting tool name decides whether the payload is
+                // evaluated at all. Keep whichever spelling names a shell tool
+                // rather than letting a non-shell spelling suppress the
+                // evaluation entirely.
+                let retained_is_shell = retained
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str)
+                    .map(|name| is_supported_shell_tool(Some(name)))
+                    .unwrap_or(false);
+                let alias_is_shell = alias_value
+                    .as_str()
+                    .map(|name| is_supported_shell_tool(Some(name)))
+                    .unwrap_or(false);
+                if alias_is_shell && !retained_is_shell {
+                    retained = Some(alias_value);
+                }
+                continue;
+            }
+            displaced_commands.extend(commands_in_displaced_alias_value(canonical, &alias_value));
+        }
+
+        if let Some(value) = retained {
+            object.insert((*canonical).to_string(), value);
+        }
+    }
+
+    canonicalized_any.then_some(displaced_commands)
+}
+
+/// Pull every command string out of an alias value that lost the typed field.
+///
+/// Best effort by design: a shape this cannot interpret contributes nothing
+/// (the retained spelling is still evaluated normally), and it never fails the
+/// parse.
+fn commands_in_displaced_alias_value(
+    canonical: &str,
+    value: &serde_json::Value,
+) -> Vec<String> {
+    match canonical {
+        "tool_input" => serde_json::from_value::<ToolInput>(value.clone())
+            .ok()
+            .and_then(|tool_input| extract_command_from_tool_input(&tool_input))
+            .into_iter()
+            .collect(),
+        "tool_args" => extract_command_from_tool_args(value).into_iter().collect(),
+        "tool_call" => serde_json::from_value::<ToolCall>(value.clone())
+            .ok()
+            .and_then(|tool_call| extract_command_from_tool_call(&tool_call))
+            .into_iter()
+            .collect(),
+        "tool_calls" => value
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| serde_json::from_value::<ToolCall>(entry.clone()).ok())
+                    .filter(is_batch_shell_call)
+                    .filter_map(|call| extract_command_from_tool_call(&call))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // A conflicting session id, event name, or turn id steers protocol
+        // selection, not which command runs; the documented snake_case
+        // spelling wins and there is nothing to carry forward.
+        _ => Vec::new(),
+    }
 }
 
 /// Best-effort extraction of a shell command from a truncated JSON prefix
@@ -1661,8 +1866,37 @@ fn extract_command_from_tool_args(tool_args: &serde_json::Value) -> Option<Strin
 
 /// Extract a command and its independent protocol/dialect context from hook
 /// input.
+///
+/// Commands displaced by a conflicting alias pair (issue #410) ride along in
+/// `additional_commands`, so every spelling the host sent is evaluated and a
+/// deny on any of them answers for the payload.
 #[must_use]
 pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCommand> {
+    let mut extracted = extract_command_with_context_inner(input)?;
+    if !input.alias_conflict_commands.is_empty() {
+        let labeled = shell_dialect_for_tool_name(input.tool_name.as_deref());
+        for command in &input.alias_conflict_commands {
+            let already_present = extracted.command == *command
+                || extracted
+                    .additional_commands
+                    .iter()
+                    .any(|(existing, _)| existing == command);
+            if already_present {
+                continue;
+            }
+            let dialect = refine_shell_dialect(
+                command,
+                codex_host_shell_dialect(labeled, extracted.protocol, cfg!(windows), command),
+            );
+            extracted
+                .additional_commands
+                .push((command.clone(), dialect));
+        }
+    }
+    Some(extracted)
+}
+
+fn extract_command_with_context_inner(input: &HookInput) -> Option<ExtractedHookCommand> {
     let protocol = detect_protocol(input);
     let labeled = shell_dialect_for_tool_name(input.tool_name.as_deref());
     // The label alone cannot name the dialect of a Codex `Bash` payload on
@@ -5176,6 +5410,173 @@ mod tests {
             vec![("rm -rf /".to_string(), ShellDialect::Posix)],
             "the tool_args sibling must ride along as another entry"
         );
+    }
+
+    #[test]
+    fn duplicate_snake_and_camel_alias_pair_parses_instead_of_failing_open() {
+        // Regression #410: Grok Build and ZCode desktop send BOTH spellings of
+        // every aliased field on every tool call. Serde maps an alias onto the
+        // same field, so the pair aborted the parse with `duplicate field`, and
+        // an aborted parse fails open — dcg provided zero protection under
+        // either host.
+        let json = r#"{"session_id":"s1","tool_name":"Bash",
+                       "tool_input":{"command":"rm -rf ~/file_not_exist"},
+                       "sessionId":"s1","toolName":"Bash",
+                       "toolInput":{"command":"rm -rf ~/file_not_exist"}}"#;
+        assert!(
+            serde_json::from_str::<HookInput>(json).is_err(),
+            "the raw serde path is still expected to reject the duplicate pair"
+        );
+
+        let input = parse_hook_input(json).expect("equal alias pairs must reconcile");
+        assert_eq!(input.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(input.session_id.as_deref(), Some("s1"));
+        assert!(
+            input.alias_conflict_commands.is_empty(),
+            "equal values are not a conflict and carry nothing forward"
+        );
+        let extracted = extract_command_with_context(&input).expect("must extract");
+        assert_eq!(extracted.command, "rm -rf ~/file_not_exist");
+        assert!(extracted.additional_commands.is_empty());
+    }
+
+    #[test]
+    fn grok_full_alias_pair_envelope_reconciles() {
+        // The exact payload reported from Grok Build 1.0.30 on Windows: every
+        // documented field spelled twice.
+        let json = r#"{"hookEventName":"pre_tool_use","hook_event_name":"pre_tool_use",
+                       "sessionId":"s","session_id":"s",
+                       "transcriptPath":"t","transcript_path":"t",
+                       "permissionMode":"default","permission_mode":"default",
+                       "toolName":"run_terminal_command","tool_name":"run_terminal_command",
+                       "toolInput":{"command":"git reset --hard"},
+                       "tool_input":{"command":"git reset --hard"},
+                       "toolUseId":"u","tool_use_id":"u"}"#;
+        let input = parse_hook_input(json).expect("Grok's envelope must reconcile");
+        assert_eq!(detect_protocol(&input), HookProtocol::Grok);
+        let extracted = extract_command_with_context(&input).expect("must extract");
+        assert_eq!(extracted.command, "git reset --hard");
+    }
+
+    #[test]
+    fn conflicting_alias_values_are_all_evaluated_rather_than_one_discarded() {
+        // One spelling has to win the typed field, but discarding the other is
+        // a silent fail-open when the discarded one is the destructive
+        // spelling. Both orders must reach the evaluator.
+        let benign_first = parse_hook_input(
+            r#"{"tool_name":"Bash","toolName":"Bash",
+                "tool_input":{"command":"echo hello"},
+                "toolInput":{"command":"rm -rf /"}}"#,
+        )
+        .expect("must reconcile");
+        let extracted = extract_command_with_context(&benign_first).expect("must extract");
+        assert_eq!(extracted.command, "echo hello");
+        assert_eq!(
+            extracted.additional_commands,
+            vec![("rm -rf /".to_string(), ShellDialect::Posix)],
+            "the displaced camelCase command must ride along"
+        );
+
+        let destructive_first = parse_hook_input(
+            r#"{"tool_name":"Bash",
+                "tool_input":{"command":"rm -rf /"},
+                "toolInput":{"command":"echo hello"}}"#,
+        )
+        .expect("must reconcile");
+        let extracted = extract_command_with_context(&destructive_first).expect("must extract");
+        assert_eq!(extracted.command, "rm -rf /");
+        assert_eq!(
+            extracted.additional_commands,
+            vec![("echo hello".to_string(), ShellDialect::Posix)]
+        );
+    }
+
+    #[test]
+    fn conflicting_tool_name_keeps_the_shell_spelling() {
+        // A non-shell canonical spelling would suppress evaluation entirely,
+        // so the spelling that names a shell tool wins the field.
+        let input = parse_hook_input(
+            r#"{"tool_name":"Read","toolName":"Bash",
+                "tool_input":{"command":"rm -rf /"}}"#,
+        )
+        .expect("must reconcile");
+        assert_eq!(input.tool_name.as_deref(), Some("Bash"));
+        let extracted = extract_command_with_context(&input).expect("must extract");
+        assert_eq!(extracted.command, "rm -rf /");
+    }
+
+    #[test]
+    fn non_shell_tool_in_both_spellings_is_still_ignored() {
+        // Reconciling aliases must not resurrect a payload that is not a shell
+        // invocation at all.
+        let input = parse_hook_input(
+            r#"{"tool_name":"Read","toolName":"Read",
+                "tool_input":{"command":"rm -rf /"},
+                "toolInput":{"command":"rm -rf /tmp/x"}}"#,
+        )
+        .expect("must reconcile");
+        assert!(
+            extract_command_with_context(&input).is_none(),
+            "a non-shell tool stays outside dcg's scope"
+        );
+    }
+
+    #[test]
+    fn camel_only_duplicate_alias_spellings_reconcile() {
+        // `tool_calls` declares two aliases, so a host can collide without ever
+        // writing the canonical snake_case key.
+        let input = parse_hook_input(
+            r#"{"toolName":"bash","toolInput":{"command":"ls"},
+                "toolCalls":[{"name":"bash","args":"{\"command\":\"rm -rf /\"}"}],
+                "toolcalls":[{"name":"bash","args":"{\"command\":\"ls\"}"}]}"#,
+        )
+        .expect("must reconcile");
+        let extracted = extract_command_with_context(&input).expect("must extract");
+        let all: Vec<&str> = std::iter::once(extracted.command.as_str())
+            .chain(
+                extracted
+                    .additional_commands
+                    .iter()
+                    .map(|(command, _)| command.as_str()),
+            )
+            .collect();
+        assert!(
+            all.contains(&"rm -rf /"),
+            "the destructive spelling must be evaluated, got {all:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_json_without_an_alias_conflict_keeps_its_original_error() {
+        // Canonicalization is a targeted retry, not a general tolerance knob:
+        // input that is not an object, or that has no colliding alias group,
+        // must still be reported as the parse failure it is.
+        for json in [
+            r#"{"session_id":"s1","tool_name":"Bash","tool_input":}"#,
+            "not json at all",
+            "[1,2,3]",
+            r#"{"tool_name":{"nested":true},"tool_input":{"command":"ls"}}"#,
+        ] {
+            assert!(
+                parse_hook_input(json).is_err(),
+                "must still reject: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_spelling_payloads_are_unaffected_by_canonicalization() {
+        for json in [
+            r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#,
+            r#"{"toolName":"Bash","toolInput":{"command":"rm -rf /"}}"#,
+            r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"foo":"bar"}"#,
+        ] {
+            let input = parse_hook_input(json).expect("must parse");
+            assert!(input.alias_conflict_commands.is_empty());
+            let extracted = extract_command_with_context(&input).expect("must extract");
+            assert_eq!(extracted.command, "rm -rf /");
+            assert!(extracted.additional_commands.is_empty());
+        }
     }
 
     #[test]
