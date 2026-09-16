@@ -2790,13 +2790,21 @@ fn is_inline_code_flag(word: &str) -> bool {
         return false;
     }
 
-    // `p` covers Node's (and Bun's) `-p`/`--print`, which evaluates its argument
+    // `p` covers the SHORT `-p` of Node and Bun, which evaluates its argument
     // exactly as `-e` does and then prints the result (issue #397). This is only
     // a cheap pre-filter: `check_inline_code_context` still requires the
     // segment's executable to be one of `inline_code_commands`, so `cp -p`,
     // `mkdir -p`, and `rsync -p` are untouched. Over-classifying an
     // interpreter's argument as code only widens what gets scanned, which is the
     // safe direction for a guard.
+    //
+    // The long spellings are deliberately NOT covered here, and saying so
+    // matters because the guard above rejects every `--` word before the byte
+    // scan can see it: `--eval`, `--print` and `--command` do not reach this
+    // function at all. Closing that gap needs the tier-1 heredoc triggers to
+    // learn the long forms too — each interpreter has its own vocabulary — so
+    // it is tracked as its own issue rather than half-done here. Do not read
+    // the `p` above as covering `--print`.
     word.as_bytes()
         .iter()
         .skip(1)

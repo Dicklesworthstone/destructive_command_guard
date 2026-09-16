@@ -203,21 +203,32 @@ most catastrophic, unrecoverable mistakes:
 
 **"Cannot be removed" is not the same as "cannot be relaxed."** A `core.*` pack
 always evaluates, so `disabled = ["core.filesystem"]` is ignored — but what
-dcg *does* with a match is policy, and policy is yours. To keep git and database
-protection while letting filesystem operations through with a recorded warning
-(the sandboxed-agent case), set the pack's decision mode rather than trying to
-unload it:
+dcg *does* with a match is policy, and policy is yours.
+
+**Relaxing a `critical` rule takes a per-rule entry.** A broad `warn` or `log` —
+whether written as `[policy.packs]` or as `[policy] default_mode` — is silently
+raised back to `deny` for any rule whose severity is `critical`, and dcg does
+not report that it ignored the setting. Most of what `core.filesystem` and
+`core.git` exist to stop is exactly that severity, so the broad form alone will
+not do what it looks like it does:
 
 ```toml
+# Relaxes only the high/medium rules. `rm -rf ~/work` still hard-denies,
+# because core.filesystem:rm-rf-root-home is critical.
 [policy.packs]
-"core.filesystem" = "warn"   # matches are recorded and the command proceeds
+"core.filesystem" = "warn"
+
+# Relaxes that one critical rule. This is the form that actually works.
+[policy.rules]
+"core.filesystem:rm-rf-root-home" = "warn"
 ```
 
 `warn` lets the command run and records the decision; `log` does the same
 silently; `ask` requests operator review where the hook protocol supports it.
-Per-rule entries are finer still — `[policy.rules] "core.filesystem:rm-rf-general" = "warn"`
-relaxes one rule and leaves the rest of the pack blocking. See
-[Graduated Response](docs/graduated-response.md).
+Use `dcg explain --format json '<command>'` and read `mode` to confirm which
+mode a rule actually resolved to before relying on it. See
+[Configuration](docs/configuration.md) for the constraint and
+[Graduated Response](docs/graduated-response.md) for the severity ladder.
 
 On **Windows**, two additional packs are on by default so a fresh install blocks the
 catastrophic native-Windows operations with no config:
@@ -1507,6 +1518,17 @@ into the one answer to gate on:
 | `deny` | `warn` | `warn` | Yes, with a warning |
 | `deny` | `log` | `log` | Yes, silently recorded |
 | `allow` | absent | `allow` | Yes |
+| `indeterminate` | absent | `indeterminate` | No — evaluation did not finish |
+
+`indeterminate` is the value a consumer is most likely to forget and least able
+to afford forgetting. dcg emits it when the hook deadline is exhausted or a
+nested payload could not be fully evaluated, and it means *do not run this*:
+the guard never downgrades an unfinished evaluation to `allow`. Treat any
+unrecognised `outcome` the same way.
+
+Note that `dcg test --format json` is a different, separately versioned surface
+whose `decision` field already carries the resolved outcome, so it has no
+`outcome` field. The table above describes `dcg explain --format json` only.
 
 The human-readable output reports the same resolved outcome, so
 `dcg explain`, `dcg test`, and the live hook agree on every rule.
