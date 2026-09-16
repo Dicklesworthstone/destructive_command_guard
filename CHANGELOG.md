@@ -11,6 +11,83 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.14.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.14.4) -- 2026-09-16 [Release]
+
+Seven reported defects, six of them false positives or negatives in the same
+family: dcg was judging the *text* of a command rather than what the command
+would actually do. A SQL keyword that was only ever a filename, a POSIX
+end-of-options marker, a variable dcg had already proven elsewhere in the same
+command, a German commit message -- each was read as evidence of something it
+was not.
+
+### Fixed
+
+- **A SQL keyword used as an ordinary filename no longer denies (#394).**
+  `cat truncate x`, `sort truncate b` and `wc -l truncate x` were denied as
+  `database.mysql:truncate-table`, because the rule matched the bare word
+  `TRUNCATE` followed by an identifier with no SQL execution context at all.
+  Both the MySQL and PostgreSQL TRUNCATE rules now require the statement to
+  start in statement position under a SQL client, so `mysql -e` and `psql -c`
+  forms still deny while file readers pass.
+
+- **The POSIX end-of-options marker keeps the literal temp exemption (#395).**
+  `rm -rf -- /tmp/foo` is what a careful script writes so an operand beginning
+  with `-` cannot be parsed as a flag -- strictly safer than the spelling dcg
+  already allowed, and it was denied by `core.filesystem:rm-rf-general`. Every
+  temp-dir rm safe pattern now admits an optional bare `--`. It widens the
+  accepted syntax, not the eligible operands: a home-directory operand and a
+  traversal out of `/tmp` still deny, and `--no-preserve-root` is not a bare
+  `--`.
+
+- **A proven `$VAR` rm operand gets the same exemption its literal value gets
+  (#396).** dcg has folded a single literal assignment for the redirect rule
+  since #275, so a redirect into `"$D/f"` was allowed while a recursive delete
+  of the same proven path was denied -- the same value, proven by the same
+  machinery, judged differently. That inversion rewarded hard-coding a temp
+  path over `mktemp -d`, which is backwards. The proven value is now spliced
+  into the segment and the real rm classifier is asked again, so only a command
+  that would independently be allowed is allowed: a non-temp value, traversal
+  past it, a second non-temp operand, a re-bound or subshell-bound name, a
+  value carrying a space or a glob, and the ambient `$TMPDIR` all still deny.
+
+- **`bun -e`, `bun -p`, `deno -e` and `bun exec` payloads are extracted like
+  `node -e` (#397).** An identical inline payload was denied under `node` and
+  allowed under `bun`; `bun exec` hands its argument to a shell and was not
+  modeled as an inline payload at all.
+
+- **Dashed `git-<sub>` executables are treated as git (#400).** `git-reset
+  --hard`, `git-clean -fdx` and `git-checkout` are the real dashed builtins and
+  bypassed the `core.git` rules that their spaced spellings hit.
+
+- **Duplicate snake_case and camelCase keys in hook input no longer fail open
+  (#410).** A payload carrying both `tool_input` and `toolInput` failed
+  deserialization, and the failure defaulted to allow. Conflicting spellings
+  are now reconciled and evaluated; genuinely malformed input still takes the
+  documented default, and says so.
+
+- **`dcg explain` reports the resolved outcome, not the rule default (#417).**
+  `explain` and `dcg test -vvv` skipped policy resolution, so a rule overridden
+  to `warn`, `ask` or `log` was still reported as `DENY` -- the one command
+  whose job is to tell you what will happen disagreed with what happened.
+
+### Partially fixed
+
+- **A quoted heredoc body is no longer read as PowerShell shape (#412).** An
+  ordinary hyphenated word at the start of a line in a commit message
+  (`Read-only`) looked like a verb-noun cmdlet and down-trusted a `Bash`-labeled
+  command to `Unknown`, where the fail-closed union denied it. The shape test
+  now runs on the heredoc-masked view. The reported command remains denied: it
+  embeds the heredoc in `"$(...)"` and its body carries an unbalanced `"`,
+  which defeats the trigger scanner behind the mask, so the body is never
+  delimited. #412 stays open with the root cause recorded.
+
+### Internal
+
+- `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` are clean
+  again; both are release gates and both were failing on main.
+
+---
+
 ## [v0.14.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.14.3) -- 2026-09-10 [Release]
 
 Five false-positive reports arrived within twenty-four hours (#401, #402, #403,
