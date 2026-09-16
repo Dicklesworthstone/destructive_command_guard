@@ -337,7 +337,9 @@ fn handle_unparseable_hook_input(
     // malformed payloads.
     let blockable = matches!(
         read_err,
-        hook::HookReadError::Json(_) | hook::HookReadError::InputTooLarge { .. }
+        hook::HookReadError::Json(_)
+            | hook::HookReadError::InputTooLarge { .. }
+            | hook::HookReadError::InvalidUtf8(_)
     );
     let block = blockable && config.is_fail_closed();
 
@@ -389,6 +391,13 @@ fn handle_unparseable_hook_input(
             hook::HookReadError::Json(err) => {
                 emit_stderr!(
                     "[dcg] Warning: could not parse hook input ({err}); allowing command (fail-open). Set DCG_FAIL_CLOSED=1 to block instead."
+                );
+            }
+            // The payload bytes are attacker-controlled, so this is a malformed
+            // envelope and blocks under fail-closed alongside `Json`.
+            hook::HookReadError::InvalidUtf8(err) => {
+                emit_stderr!(
+                    "[dcg] Warning: hook input is not valid UTF-8 ({err}); allowing command (fail-open). Set DCG_FAIL_CLOSED=1 to block instead."
                 );
             }
             // A transient stdin read error is not an attacker-controlled

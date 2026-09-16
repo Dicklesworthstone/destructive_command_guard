@@ -27,13 +27,13 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `checkout-new-branch` | `(?:^\|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*\|-)checkout\s+-b\s+` |
-| `checkout-orphan` | `(?:^\|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*\|-)checkout\s+--orphan\s+` |
-| `restore-staged-long` | `(?:^\|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*\|-)restore\b(?=\s)(?=.*\s--staged\b)(?!.*\s(?:--worktree\|-W)\b)` |
-| `restore-staged-short` | `(?:^\|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*\|-)restore\b(?=\s)(?=.*\s-S\b)(?!.*\s(?:--worktree\|-W)\b)` |
-| `clean-dry-run-short` | `(?:^\|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*\|-)clean\s+-[a-z]*n[a-z]*` |
-| `clean-dry-run-long` | `(?:^\|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*\|-)clean\s+--dry-run` |
-| `lfs-prune-dry-run` | `(?:^\|[^[:alnum:]_-])git(?:\s+(?:\S+\s+)*\|-)lfs\s+prune(?:\s+[^\s;&\|<>\x22']+)*\s+--dry-run(?:\s\|$)` |
+| `checkout-new-branch` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*\|(?:^\|[;&\|(\n]\s*)(?:[^\s;&\|<>()]*/)?git-)checkout\s+-b\s+` |
+| `checkout-orphan` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*\|(?:^\|[;&\|(\n]\s*)(?:[^\s;&\|<>()]*/)?git-)checkout\s+--orphan\s+` |
+| `restore-staged-long` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*\|(?:^\|[;&\|(\n]\s*)(?:[^\s;&\|<>()]*/)?git-)restore\b(?=\s)(?=.*\s--staged\b)(?!.*\s(?:--worktree\|-W)\b)` |
+| `restore-staged-short` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*\|(?:^\|[;&\|(\n]\s*)(?:[^\s;&\|<>()]*/)?git-)restore\b(?=\s)(?=.*\s-S\b)(?!.*\s(?:--worktree\|-W)\b)` |
+| `clean-dry-run-short` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*\|(?:^\|[;&\|(\n]\s*)(?:[^\s;&\|<>()]*/)?git-)clean\s+-[a-z]*n[a-z]*` |
+| `clean-dry-run-long` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*\|(?:^\|[;&\|(\n]\s*)(?:[^\s;&\|<>()]*/)?git-)clean\s+--dry-run` |
+| `lfs-prune-dry-run` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*\|(?:^\|[;&\|(\n]\s*)(?:[^\s;&\|<>()]*/)?git-)lfs\s+prune(?:\s+[^\s;&\|<>\x22']+)*\s+--dry-run(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -147,15 +147,15 @@ These patterns match safe commands that are always allowed:
 | `rm-force-recursive-tmp` | `^rm\s+.*--force.*--recursive\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
 | `rm-recursive-force-var-tmp` | `^rm\s+.*--recursive.*--force\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
 | `rm-force-recursive-var-tmp` | `^rm\s+.*--force.*--recursive\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
-| `find-delete-tmp` | `^(?![^\|;&]*[\\$`])find\s+/tmp(?:/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*)?(?:\s+(?:/tmp(?:/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*)?\|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?)*\s*$` |
-| `find-delete-var-tmp` | `^(?![^\|;&]*[\\$`])find\s+/var/tmp(?:/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*)?(?:\s+(?:/var/tmp(?:/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*)?\|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?)*\s*$` |
-| `unlink-tmp` | `^(?![^\|;&]*[\\$`])unlink\s+(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
-| `unlink-var-tmp` | `^(?![^\|;&]*[\\$`])unlink\s+(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
+| `find-delete-tmp` | `^(?![^\|;&]*[\\$`])find\s+(?:--\s+)?/tmp(?:/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*)?(?:\s+(?:/tmp(?:/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*)?\|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?)*\s*$` |
+| `find-delete-var-tmp` | `^(?![^\|;&]*[\\$`])find\s+(?:--\s+)?/var/tmp(?:/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*)?(?:\s+(?:/var/tmp(?:/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*)?\|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?)*\s*$` |
+| `unlink-tmp` | `^(?![^\|;&]*[\\$`])unlink\s+(?:--\s+)?(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
+| `unlink-var-tmp` | `^(?![^\|;&]*[\\$`])unlink\s+(?:--\s+)?(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
 | `unlink-help` | `^unlink\s+(?:--help\|--version)\s*$` |
 | `truncate-help` | `^truncate\s+(?:--help\|--version)\s*$` |
 | `truncate-grow` | `^truncate\s+(?:-s\s+\+\S+\|--size=\+\S+)\s+\S+\s*$` |
-| `truncate-tmp` | `^(?![^\|;&]*[\\$`])truncate\s+(?:-s\s+\S+\|--size=\S+)\s+(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
-| `truncate-var-tmp` | `^(?![^\|;&]*[\\$`])truncate\s+(?:-s\s+\S+\|--size=\S+)\s+(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
+| `truncate-tmp` | `^(?![^\|;&]*[\\$`])truncate\s+(?:-s\s+\S+\|--size=\S+)\s+(?:--\s+)?(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
+| `truncate-var-tmp` | `^(?![^\|;&]*[\\$`])truncate\s+(?:-s\s+\S+\|--size=\S+)\s+(?:--\s+)?(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
 | `shred-help` | `^shred\s+(?:--help\|--version)\s*$` |
 | `shred-tmp` | `^(?![^\|;&]*[\\$`])shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s+(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s*$` |
 | `shred-var-tmp` | `^(?![^\|;&]*[\\$`])shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s+(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s*$` |

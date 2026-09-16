@@ -11,6 +11,65 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [Unreleased]
+
+Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
+
+### Fixed
+
+- **#412 is now fully closed.** The v0.14.4 notes below record it as partially
+  fixed because the reported command was still denied. `stdin_data_sink_may_be_overridden`
+  no longer lets the *bytes of a quoted heredoc body* decide whether a data sink
+  could have been overridden: the body is blanked before the retry, so an
+  unbalanced `"` inside a commit message can no longer defeat the scanner behind
+  the mask. The reported command is allowed, and the security controls that
+  depend on detecting a real override are unchanged.
+
+- **awk and osascript shell sinks are extracted (#399, #398).** `awk`'s
+  `system(…)`, `print … | "cmd"` and `"cmd" | getline`, and `osascript`'s
+  AppleScript `do shell script "…"` and JXA `$.system(…)` / `.doShellScript(…)`
+  all hand a string to `/bin/sh`, so their payloads are now evaluated as the
+  inline shell commands they are. Keyed on the sink shapes rather than the
+  interpreter, so an ordinary `awk '{print $1}' file.txt` extracts nothing.
+
+  The option grammar is modeled rather than abandoned at the first unfamiliar
+  flag: `-F`, `-v`, `-i`, `-l` and `-W` take a value that is not program text,
+  `-e`/`--source` supplies the program *as the flag value*, `-f`/`-E` read it
+  from a file dcg will not open (and turn every remaining operand into data),
+  and anything else is assumed to take no separate value so the walk continues.
+  The awk program scanner also tracks regex literals, so the everyday
+  `gsub(/"/, "")` no longer desynchronizes the string walk, and only a `#` that
+  opens a line is treated as a comment.
+
+- **Dashed git builtins are treated as git (#400).** `git-reset --hard`,
+  `git-clean -fdx` and the rest of the `git-<subcommand>` spellings — the form
+  `/usr/libexec/git-core/` ships — now enter `core.git` instead of bypassing it.
+
+- **A continuation line opens a TRUNCATE statement when `TABLE` is explicit
+  (#394 follow-up).** `mysql -e "-- comment\nTRUNCATE TABLE users"` has no `;`
+  before the statement and is not at text start, so the statement-position rule
+  missed it. A newline now counts as an opener when the explicit `TRUNCATE
+  TABLE` spelling follows, which is evidence no Tailwind class list carries.
+
+- **`find … -delete` explains itself honestly (#418).** The rule text claimed
+  the decision was made on the search root and that the scoped form was
+  "bytewise-equivalent to `rm -rf`". Neither was true. It now says what it does:
+  it gates on the paths the command names, and a denial is not a measurement of
+  the command's blast radius.
+
+- **Only a dollar the shell would actually expand is resolved (#396).**
+
+### Documentation
+
+- The README's core-pack relaxation recipe was wrong. A broad `warn`/`log` set
+  through `[policy.packs]` or `[policy] default_mode` is silently raised back to
+  `deny` for `critical` rules, which is most of what `core.filesystem` and
+  `core.git` exist to stop. Only a `[policy.rules]` entry relaxes one. The
+  explain-schema table also omitted `indeterminate`, the one outcome that means
+  "do not run this".
+
+---
+
 ## [v0.14.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.14.4) -- 2026-09-16 [Release]
 
 Seven reported defects, six of them false positives or negatives in the same

@@ -151,18 +151,27 @@ fn a_program_file_invocation_never_yields_an_inline_payload() {
     );
 }
 
-/// Only a `#` in statement position starts an awk comment.
+/// Only a `#` that opens a line starts an awk comment.
 ///
 /// Regression: treating every `#` as a comment let a regex literal containing a
 /// literal hash — `/x#/`, `!/^#/`, both ordinary awk idioms — swallow the rest
 /// of its line, hiding a real `system()` call after it. That is an under-block,
 /// which is the direction that matters for a guard.
+///
+/// The first attempt at a fix accepted `;`, `{` and `}` as statement markers
+/// too, which left the same hole open one character further along: `/;#/` and
+/// `/{#/` are equally ordinary regexes and put a `#` in exactly that position.
+/// Line start is the only position that is *provably* a comment, because an awk
+/// regex literal and an awk string literal may not contain a raw newline.
 #[test]
 fn a_hash_inside_a_regex_literal_does_not_hide_the_rest_of_the_line() {
     for command in [
         "awk '/x#/ { system(\"rm -rf /tmp/z\") }'",
         "awk '!/^#/ { system(\"rm -rf /tmp/z\") }'",
         "awk '$0 ~ /a#b/ { system(\"rm -rf /tmp/z\") }'",
+        // The residue the narrower rule closes.
+        "awk '$0 ~ /;#/ { system(\"rm -rf /tmp/z\") }'",
+        "awk '{ /{#/ ; system(\"rm -rf /tmp/z\") }'",
     ] {
         assert_eq!(
             payloads(command),
@@ -171,16 +180,124 @@ fn a_hash_inside_a_regex_literal_does_not_hide_the_rest_of_the_line() {
         );
     }
 
-    // A comment in statement position still hides what follows on its line.
+    // A comment that OPENS A LINE still hides what follows on that line.
+    assert!(
+        payloads("awk 'BEGIN{ print 1;\n# system(\"rm -rf /tmp/z\")\n}'").is_empty(),
+        "a sink commented out at line start is not executed"
+    );
+
+    // A trailing comment is deliberately NOT recognised, so its text is still
+    // scanned. Over-extraction is the recoverable direction; the guard will not
+    // trade it for a rule that cannot tell a comment from regex data.
+    assert_eq!(
+        payloads("awk 'BEGIN{ # system(\"rm -rf /tmp/z\")\nprint 1 }'"),
+        vec!["rm -rf /tmp/z".to_string()],
+        "a mid-line hash is not proof of a comment, so the sink is still read"
+    );
+}
+
+/// awk's option grammar decides what its operands mean, and an unfamiliar flag
+/// must not abandon the scan.
+///
+/// Regression: every unmodeled option returned `None`, so a single `-F:` — the
+/// most common awk flag there is — meant no program text was scanned at all.
+#[test]
+fn an_unfamiliar_option_does_not_abandon_the_program_scan() {
     for command in [
-        "awk 'BEGIN{ # system(\"rm -rf /tmp/z\")\nprint 1 }'",
-        "awk 'BEGIN{ print 1;\n# system(\"rm -rf /tmp/z\")\n}'",
+        "awk -F: 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        "awk -F, 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        "awk --field-separator=, 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        "gawk --posix 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        "mawk -W version 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        // `-e`/`--source` supply the program AS THE FLAG VALUE.
+        "gawk -e 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        "gawk --source 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
     ] {
-        assert!(
-            payloads(command).is_empty(),
-            "a commented-out sink is not executed: {command:?}"
+        assert_eq!(
+            payloads(command),
+            vec!["rm -rf /tmp/z".to_string()],
+            "the program is still reachable past this option: {command:?}"
         );
     }
+
+    // An ordinary field-separator run still extracts nothing.
+    assert!(payloads("awk -F, '{print $2}' data.csv").is_empty());
+}
+
+/// A quote inside a regex literal must not desynchronize the string walk.
+///
+/// Regression: `gsub(/"/, "")` — one of the most common awk idioms there is —
+/// paired the regex's quote with a later string quote, so every literal after
+/// it shifted by one and the `system()` call that followed was read as string
+/// content. The scanner now tracks regex literals.
+#[test]
+fn a_quote_inside_a_regex_literal_does_not_hide_a_later_sink() {
+    for command in [
+        "awk '{ gsub(/\"/, \"\"); system(\"rm -rf /tmp/z\") }'",
+        "awk '/\"/ { system(\"rm -rf /tmp/z\") }'",
+        "awk '$0 ~ /[\"]/ { system(\"rm -rf /tmp/z\") }'",
+    ] {
+        assert_eq!(
+            payloads(command),
+            vec!["rm -rf /tmp/z".to_string()],
+            "a quote in a regex is data: {command:?}"
+        );
+    }
+
+    // Division is not a regex, so the scan must not skip over the sink.
+    assert_eq!(
+        payloads("awk 'BEGIN{ x = 4 / 2; system(\"rm -rf /tmp/z\") }'"),
+        vec!["rm -rf /tmp/z".to_string()],
+    );
+}
+
+/// A program written inside shell DOUBLE quotes arrives with its own quotes
+/// backslash-escaped, and the shell removes those before the interpreter runs.
+#[test]
+fn an_escaped_quote_opens_a_literal_just_as_a_bare_one_does() {
+    assert_eq!(
+        payloads("awk \"BEGIN{ system(\\\"rm -rf /tmp/z\\\") }\""),
+        vec!["rm -rf /tmp/z".to_string()],
+    );
+    assert_eq!(
+        payloads("osascript -e \"do shell script \\\"rm -rf /tmp/z\\\"\""),
+        vec!["rm -rf /tmp/z".to_string()],
+    );
+}
+
+/// Quoting or case-varying an executable is invisible to the kernel, and macOS
+/// — the only platform that ships `osascript` — is case-insensitive by default.
+#[test]
+fn a_quoted_or_cased_executable_is_still_the_interpreter() {
+    assert_eq!(
+        payloads("\"awk\" 'BEGIN{ system(\"rm -rf /tmp/z\") }'"),
+        vec!["rm -rf /tmp/z".to_string()],
+    );
+    assert_eq!(
+        payloads("\"osascript\" -e 'do shell script \"rm -rf /tmp/z\"'"),
+        vec!["rm -rf /tmp/z".to_string()],
+    );
+    assert_eq!(
+        payloads("OSASCRIPT -e 'do shell script \"rm -rf /tmp/z\"'"),
+        vec!["rm -rf /tmp/z".to_string()],
+    );
+}
+
+/// `osascript -e<program>` (glued) and JXA's `doShellScript` are both real
+/// spellings that reached no extractor before.
+#[test]
+fn glued_dash_e_and_do_shell_script_method_are_covered() {
+    assert_eq!(
+        payloads("osascript -e'do shell script \"rm -rf /tmp/z\"'"),
+        vec!["rm -rf /tmp/z".to_string()],
+    );
+    assert_eq!(
+        payloads(
+            "osascript -l JavaScript -e 'var a=Application.currentApplication(); \
+             a.includeStandardAdditions=true; a.doShellScript(\"rm -rf /tmp/z\")'"
+        ),
+        vec!["rm -rf /tmp/z".to_string()],
+    );
 }
 
 #[test]

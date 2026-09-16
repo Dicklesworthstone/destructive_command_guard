@@ -22085,6 +22085,13 @@ fn resolve_proven_variables_in_segment(
     // quotes, and after a backslash, a dollar is literal text — `rm -rf '$D'`
     // deletes a file named `$D`, so resolving it would describe a different
     // command than the one that runs.
+    //
+    // The quote tracking is deliberately one-sided: a `'` inside double quotes
+    // is literal to the shell but is read here as a toggle, so `"it's $D"`
+    // stops resolving. That direction is safe — failing to resolve can only
+    // withhold a substitution, and a withheld substitution can only withhold an
+    // allow. The converse (resolving something the shell would not expand) is
+    // what must never happen.
     let mut in_single_quote = false;
     while let Some(index) = rest.find(['$', '\'', '\\']) {
         out.push_str(&rest[..index]);
@@ -32863,6 +32870,13 @@ mod tests {
             "D=/tmp/x; rm -rf '$D/work'",
             "D=/tmp/x; rm -rf \\$D",
             "D=/tmp/x; rm -rf \"\\$D\"",
+            // A `'` inside double quotes is literal to the shell; reading it as
+            // a toggle stops resolution, which withholds an allow rather than
+            // inventing one.
+            "D=/tmp/x; rm -rf \"'$D'\"",
+            "D=/tmp/x; rm -rf \"it's $D\"",
+            "D=/tmp/x; rm -rf '\"$D\"'",
+            "A=/tmp/a; D=/tmp/x; rm -rf '$A' \"$D\"",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,

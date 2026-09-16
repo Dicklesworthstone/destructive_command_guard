@@ -63,7 +63,7 @@ use tracing::{debug, instrument, trace, warn};
 /// quote-aware scanner so we can suppress obvious false positives inside quoted
 /// literals (commit messages, search patterns, etc.) without introducing false
 /// negatives for real shell syntax (including `$()`/backtick substitutions).
-const HEREDOC_TRIGGER_PATTERNS: [&str; 26] = [
+const HEREDOC_TRIGGER_PATTERNS: [&str; 27] = [
     // Inline interpreter execution. These patterns intentionally allow:
     // - interleaved flags (python -I -c, bash --norc -c)
     // - combined short-flag clusters (bash -lc, node -pe, perl -pi -e)
@@ -92,7 +92,11 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 26] = [
     r#"\b(?:bun|deno)[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
     // Bun's `exec` subcommand hands its argument to a shell, so it is an inline
     // shell payload under a subcommand rather than a flag (issue #397).
-    r"\bbun[0-9.]*(?:\.exe)?\s+exec\b",
+    // The optional quote matches `bun_exec_inline_payload`, which dequotes the
+    // subcommand because quoting it does not change the argv Bun receives.
+    // Without it, tier 1 rejected `bun "exec" '<payload>'` and the tier-2
+    // walker that handles that spelling was unreachable.
+    r#"\bbun[0-9.]*(?:\.exe)?\s+['"]?exec\b"#,
     // awk hands `system(…)` and its two command-pipe forms to /bin/sh (#399).
     // Keyed on the awk-program shapes, not the executable, so an ordinary
     // `awk '{print $1}' file.txt` never reaches extraction.
@@ -102,9 +106,12 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 26] = [
     // a quoted string, so this shape is awk's command pipe in practice; tier 1
     // deliberately over-matches and costs only a tier-2 extraction attempt.
     r#"\|\s*&?\s*""#,
-    // osascript's AppleScript and JXA shell sinks (#398).
+    // osascript's AppleScript and JXA shell sinks (#398). `doShellScript` is
+    // the Standard Additions method every JXA example uses, so it needs its own
+    // trigger: the spaced AppleScript keywords above do not match it.
     r"(?i)\bdo\s+shell\s+script\b",
     r"\$\.system\s*\(",
+    r"\.doShellScript\s*\(",
     // PHP inline execution
     r#"\bphp[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*r[A-Za-z]*(?:\s|['"]|$)"#,
     // Lua inline execution
@@ -1968,6 +1975,42 @@ fn dequoted_flag_word(text: &str, start: usize, end: usize) -> (&str, usize, usi
     (text, start, end)
 }
 
+/// The basename an executable token actually launches: one layer of whole-token
+/// quoting removed, directories stripped, and a trailing `.exe` removed in any
+/// case. Callers compare the result with `eq_ignore_ascii_case`.
+///
+/// Quoting an executable is invisible to the kernel — `"awk" 'prog'` and
+/// `awk 'prog'` produce identical argv — and macOS, the only platform that
+/// ships `osascript`, is case-insensitive by default, so `OSASCRIPT` really
+/// does run. Matching the raw token missed every one of those spellings.
+fn interpreter_basename(word: &str) -> &str {
+    let (word, _, _) = dequoted_flag_word(word, 0, word.len());
+    let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    if basename.len() > 4 {
+        let split = basename.len() - 4;
+        if basename.is_char_boundary(split) {
+            let (stem, extension) = basename.split_at(split);
+            if extension.eq_ignore_ascii_case(".exe") {
+                return stem;
+            }
+        }
+    }
+    basename
+}
+
+/// Whether `haystack` contains `needle` (ASCII, already lowercase) ignoring
+/// case. Used by the inline-script extractors' cheap pre-gate, which a
+/// case-varied spelling such as `AWK` would otherwise skip entirely.
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return needle.is_empty();
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 /// Whether a `Word` token actually opens a redirection of the *local* command
 /// (`>file`, `2>`, `>>out`, `&>log`, `<in`).
 ///
@@ -2188,7 +2231,7 @@ fn extract_awk_inline_scripts(
     if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
         return;
     }
-    if !command.contains("awk") {
+    if !contains_ascii_case_insensitive(command, "awk") {
         return;
     }
 
@@ -2197,107 +2240,191 @@ fn extract_awk_inline_scripts(
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
-        let Some(program) = awk_program_token(command, &tokens, index) else {
-            continue;
-        };
-        let Some(program_text) = command.get(program.clone()) else {
-            continue;
-        };
-        for payload in awk_shell_payload_ranges(program_text, program.start) {
-            let Some(content) = command.get(payload.clone()) else {
+        for program in awk_program_tokens(command, &tokens, index) {
+            let Some(program_text) = command.get(program.clone()) else {
                 continue;
             };
-            if !push_windows_inner(
-                extracted,
-                skip_reasons,
-                limits,
-                content,
-                program.clone(),
-                Some(payload),
-                "awk",
-            ) {
-                return;
+            for payload in awk_shell_payload_ranges(program_text, program.start) {
+                let Some(content) = command.get(payload.clone()) else {
+                    continue;
+                };
+                if !push_windows_inner(
+                    extracted,
+                    skip_reasons,
+                    limits,
+                    content,
+                    program.clone(),
+                    Some(payload),
+                    "awk",
+                ) {
+                    return;
+                }
             }
         }
     }
 }
 
-/// The byte range of the awk program argument when the executable token at
-/// `start` is an awk, or `None`.
+/// Byte ranges of the awk program text when the executable token at `start` is
+/// an awk, or an empty vector.
 ///
-/// Deliberately narrow: only the first non-option word is taken as the program,
-/// and a `-f progfile` invocation reads its program from a file dcg will not
-/// open, so it yields nothing.
-fn awk_program_token(
+/// awk's option grammar decides what its operands mean, so this walks the
+/// grammar rather than giving up at the first flag it does not recognise:
+///
+/// - `-e 'prog'` / `--source 'prog'` supply the program **as the flag value**.
+///   That is gawk's documented way to pass a program on the command line, and
+///   it may be repeated, so every value is collected.
+/// - `-f progfile` / `-E progfile` read the program from a FILE dcg will not
+///   open, and they also change what the remaining operands mean: every operand
+///   becomes a data file or a `var=value` assignment rather than program text.
+///   They contribute no inline program and suppress the positional one, so a
+///   data file whose *name* looks like a program is never mined for sinks.
+/// - `-F`, `-v`, `-i`, `-l`, `-W` and their long forms take a separate value
+///   that is not program text; both words are skipped.
+/// - Anything else starting with `-` is an unmodeled option.
+///
+/// That last case is why this function exists in this shape. It used to
+/// `return None` — abandoning the scan — so one `-F:`, the single most common
+/// awk flag there is, turned `awk -F: 'BEGIN{ system("rm -rf …") }'` from
+/// blocked into allowed. Giving up is the one unrecoverable direction for a
+/// guard, so an unmodeled option is now assumed to take no separate value and
+/// the walk continues. If such an option really does take one, its value is
+/// mistaken for the program; `saw_unmodeled_option` therefore also admits the
+/// operand after it, so the real program is still scanned. Both effects are
+/// over-extraction, which costs a wasted scan and nothing else.
+fn awk_program_tokens(
     command: &str,
     tokens: &[crate::normalize::NormalizeToken],
     start: usize,
-) -> Option<Range<usize>> {
+) -> Vec<Range<usize>> {
     use crate::normalize::NormalizeTokenKind;
 
-    let token = tokens.get(start)?;
+    let mut programs = Vec::new();
+    let Some(token) = tokens.get(start) else {
+        return programs;
+    };
     if token.kind != NormalizeTokenKind::Word {
-        return None;
+        return programs;
     }
-    let word = token.text(command)?;
-    let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
-    let basename = basename
-        .strip_suffix(".exe")
-        .or_else(|| basename.strip_suffix(".EXE"))
-        .unwrap_or(basename);
-    if !AWK_EXECUTABLES.contains(&basename) {
-        return None;
+    let Some(word) = token.text(command) else {
+        return programs;
+    };
+    let basename = interpreter_basename(word);
+    if !AWK_EXECUTABLES
+        .iter()
+        .any(|executable| basename.eq_ignore_ascii_case(executable))
+    {
+        return programs;
     }
 
     let mut index = start + 1;
     // `busybox awk …` needs its applet name consumed first.
-    if basename == "busybox" {
-        let applet = tokens.get(index)?;
-        if applet.kind != NormalizeTokenKind::Word || applet.text(command)? != "awk" {
-            return None;
+    if basename.eq_ignore_ascii_case("busybox") {
+        match tokens.get(index) {
+            Some(applet)
+                if applet.kind == NormalizeTokenKind::Word
+                    && applet
+                        .text(command)
+                        .is_some_and(|text| text.eq_ignore_ascii_case("awk")) => {}
+            _ => return programs,
         }
         index += 1;
     }
 
-    loop {
-        let token = tokens.get(index)?;
-        if token.kind != NormalizeTokenKind::Word {
+    // Set by `-f`/`-E`: the program lives in a file, so no operand is one.
+    let mut program_is_in_a_file = false;
+    let mut saw_unmodeled_option = false;
+
+    let value_range = |at: usize| -> Option<Range<usize>> {
+        let value = tokens.get(at)?;
+        if value.kind != NormalizeTokenKind::Word {
             return None;
         }
-        let (word, _, _) = dequoted_flag_word(
-            token.text(command)?,
-            token.byte_range.start,
-            token.byte_range.end,
-        );
-        // `-v var=value` takes a separate value and does not consume the
-        // program; `--` ends options. Any other option is unmodeled arity, so
-        // stop rather than mistake a value for the program.
+        let text = command.get(value.byte_range.clone())?;
+        Some(unquoted_payload_range(text, value.byte_range.start))
+    };
+
+    loop {
+        let Some(token) = tokens.get(index) else {
+            return programs;
+        };
+        if token.kind != NormalizeTokenKind::Word {
+            return programs;
+        }
+        let Some(raw) = token.text(command) else {
+            return programs;
+        };
+        let (word, word_start, word_end) =
+            dequoted_flag_word(raw, token.byte_range.start, token.byte_range.end);
         match word {
-            // `-f progfile` reads the program from a FILE dcg will not open,
-            // and it also changes what the remaining operands mean: without
-            // `-f` the first operand is the program, with `-f` every operand
-            // is a data file or a `var=value` assignment. Skipping the flag and
-            // its value would hand the next operand to the program scanner as
-            // if it were awk source, so both spellings must yield nothing.
-            "-f" | "--file" => return None,
-            _ if word.starts_with("-f") || word.starts_with("--file=") => return None,
-            "-v" | "--assign" => index += 2,
+            // The program comes from a file; operands are data from here on.
+            "-f" | "--file" | "-E" | "--exec" => {
+                program_is_in_a_file = true;
+                index += 2;
+            }
+            _ if word.starts_with("--file=")
+                || word.starts_with("--exec=")
+                || (word.starts_with("-f") && word != "-f")
+                || (word.starts_with("-E") && word != "-E") =>
+            {
+                program_is_in_a_file = true;
+                index += 1;
+            }
+
+            // The flag VALUE is program text.
+            "-e" | "--source" => {
+                if let Some(range) = value_range(index + 1) {
+                    programs.push(range);
+                }
+                index += 2;
+            }
             "--" => {
                 index += 1;
                 break;
             }
-            _ if word.starts_with("-v") || word.starts_with("--assign=") => index += 1,
-            _ if word.starts_with('-') && word != "-" => return None,
+            _ if word.starts_with("--source=") => {
+                if let Some(equals) = word.find('=') {
+                    programs.push(word_start + equals + 1..word_end);
+                }
+                index += 1;
+            }
+            _ if word.starts_with("-e") => {
+                programs.push(word_start + 2..word_end);
+                index += 1;
+            }
+
+            // A separate value that is never program text.
+            "-F" | "--field-separator" | "-v" | "--assign" | "-i" | "--include" | "-l"
+            | "--load" | "-W" => index += 2,
+            _ if word.starts_with("--field-separator=")
+                || word.starts_with("--assign=")
+                || word.starts_with("--include=")
+                || word.starts_with("--load=")
+                || word.starts_with("-F")
+                || word.starts_with("-v")
+                || word.starts_with("-i")
+                || word.starts_with("-l")
+                || word.starts_with("-W") =>
+            {
+                index += 1;
+            }
+
+            _ if word.starts_with('-') && word != "-" => {
+                saw_unmodeled_option = true;
+                index += 1;
+            }
             _ => break,
         }
     }
 
-    let program = tokens.get(index)?;
-    if program.kind != NormalizeTokenKind::Word {
-        return None;
+    if !program_is_in_a_file {
+        if let Some(range) = value_range(index) {
+            programs.push(range);
+        }
+        if saw_unmodeled_option && let Some(range) = value_range(index + 1) {
+            programs.push(range);
+        }
     }
-    let text = command.get(program.byte_range.clone())?;
-    Some(unquoted_payload_range(text, program.byte_range.start))
+    programs
 }
 
 /// Byte ranges (in whole-command coordinates) of every shell command an awk
@@ -2329,7 +2456,16 @@ fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
             }
             b'"' => {
                 let Some(end) = awk_string_literal_end(program, index) else {
-                    break;
+                    // An unpaired `"` means this scanner's idea of where
+                    // strings begin has desynchronized from awk's — the usual
+                    // cause is a quote inside a regex literal, as in the very
+                    // ordinary `gsub(/"/, "")`. Abandoning the scan here threw
+                    // away every sink later in the program, which is an
+                    // under-block. Skip the one byte and keep reading instead:
+                    // the worst case is that a span of code is read as a string
+                    // (or the reverse), which can only over-extract.
+                    index += 1;
+                    continue;
                 };
                 let literal = index + 1..end;
                 // `"cmd" | getline` executes the string on the left.
@@ -2337,6 +2473,19 @@ fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
                     payloads.push(offset + literal.start..offset + literal.end);
                 }
                 index = end + 1;
+            }
+            // An awk regex literal. Its bytes are data, so a `"` inside one —
+            // `gsub(/"/, "")`, `/["]/`, both everyday awk — must not be paired
+            // with a real string quote later in the program. When it was, every
+            // literal after it shifted by one and the `system()` call that
+            // followed was read as string content instead of a sink.
+            b'/' if awk_slash_opens_regex(bytes, index) => {
+                match awk_regex_literal_end(program, index) {
+                    Some(end) => index = end + 1,
+                    // Not a terminated regex after all. Treat the byte as
+                    // ordinary code rather than abandoning the rest.
+                    None => index += 1,
+                }
             }
             // `||` is logical or, not a command pipe.
             b'|' if bytes.get(index + 1) == Some(&b'|') => index += 2,
@@ -2382,21 +2531,69 @@ fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
     payloads
 }
 
-/// Whether the `#` at `index` begins an awk comment rather than being a literal
-/// hash inside a regex.
+/// Whether the `/` at `index` opens an awk regex literal rather than being the
+/// division operator.
 ///
-/// True only in statement position: the nearest preceding byte that is not a
-/// space or tab must be a newline, `;`, `{`, or `}`, or there must be none.
-/// `/x#/` and `!/^#/` therefore keep scanning, while `BEGIN{ # note` and a
-/// comment on its own line are recognised. A trailing comment after code
-/// (`print 1 # note`) is deliberately NOT recognised — reading it costs at most
-/// an over-extraction, whereas mistaking regex data for a comment hides
-/// whatever follows on that line.
+/// awk resolves this the way every language with bare regex literals does: a
+/// `/` opens a regex where an operand is expected and divides where a value has
+/// just been produced. The nearest preceding non-blank byte settles it, because
+/// division can only follow a name, a number, `)`, `]`, or a closing quote.
+///
+/// Misreading a division as a regex costs at most the rest of that line, since
+/// `awk_regex_literal_end` refuses to cross a newline; misreading a regex as
+/// code is what desynchronized the string walk in the first place.
+fn awk_slash_opens_regex(bytes: &[u8], index: usize) -> bool {
+    bytes[..index]
+        .iter()
+        .rposition(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        .is_none_or(|position| {
+            let previous = bytes[position];
+            !previous.is_ascii_alphanumeric() && !matches!(previous, b')' | b']' | b'"' | b'_')
+        })
+}
+
+/// Index of the `/` closing the awk regex literal that opens at `start`.
+///
+/// A regex literal cannot contain a raw newline, so an unterminated one stops
+/// at the end of its line rather than swallowing the rest of the program.
+fn awk_regex_literal_end(program: &str, start: usize) -> Option<usize> {
+    let bytes = program.as_bytes();
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'\n' | b'\r' => return None,
+            b'/' => return Some(index),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Whether the `#` at `index` begins an awk comment rather than being a literal
+/// hash inside a regex or a string.
+///
+/// True only at the start of a line: the nearest preceding byte that is not a
+/// space or tab must be a newline, or there must be none.
+///
+/// This is not merely conservative, it is exact in the one direction that
+/// matters. Neither an awk regex literal nor an awk string literal may contain
+/// a raw newline, so a `#` that opens a line cannot be inside either — it is
+/// always a comment. Every other position is ambiguous without lexing awk, and
+/// guessing there is what caused the bug this replaced: `;`, `{` and `}` were
+/// also accepted as statement markers, so the perfectly ordinary regexes
+/// `/;#/` and `/{#/` put a `#` in "statement position", swallowed the rest of
+/// the line, and hid a real `system()` call behind it.
+///
+/// The cost is that a trailing comment after code (`print 1 # note`) is not
+/// recognised, so the scanner keeps reading it. That can only over-extract,
+/// which is the recoverable direction; mistaking regex data for a comment
+/// hides whatever follows, which is not.
 fn awk_hash_starts_comment(bytes: &[u8], index: usize) -> bool {
     bytes[..index]
         .iter()
         .rposition(|b| !matches!(b, b' ' | b'\t'))
-        .is_none_or(|position| matches!(bytes[position], b'\n' | b'\r' | b';' | b'{' | b'}'))
+        .is_none_or(|position| matches!(bytes[position], b'\n' | b'\r'))
 }
 
 /// End index (the closing quote) of the awk string literal opening at `start`.
@@ -2413,16 +2610,57 @@ fn awk_string_literal_end(program: &str, start: usize) -> Option<usize> {
     None
 }
 
+/// Index of the `\` opening the closing `\"` of an escaped string literal whose
+/// content begins at `start`.
+fn escaped_string_literal_end(program: &str, start: usize) -> Option<usize> {
+    let bytes = program.as_bytes();
+    let mut index = start;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'\\' {
+            if bytes[index + 1] == b'"' {
+                return Some(index);
+            }
+            // `\\` is an escaped backslash, not the start of a closing quote.
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
 /// The first string literal at or after `start`, skipping only whitespace.
-fn awk_leading_string_literal(program: &str, start: usize) -> Option<Range<usize>> {
+///
+/// Handles both spellings an interpreter can receive. A program written inside
+/// shell *single* quotes keeps its double quotes bare, while the same program
+/// written inside shell *double* quotes arrives with every inner quote
+/// backslash-escaped — `awk "BEGIN{ system(\"rm -rf …\") }"` and
+/// `osascript -e "do shell script \"rm -rf …\""`. The shell strips those
+/// backslashes before the interpreter runs, so `\"` opens a literal here just
+/// as `"` does. Requiring a bare quote missed the escaped spelling entirely,
+/// which is the spelling you are forced into whenever the payload interpolates
+/// a shell variable.
+fn inline_string_literal_at(program: &str, start: usize) -> Option<Range<usize>> {
     let rest = program.get(start..)?;
     let skip = rest.find(|c: char| !c.is_ascii_whitespace())?;
     let quote = start + skip;
-    if program.as_bytes().get(quote) != Some(&b'"') {
-        return None;
+    let bytes = program.as_bytes();
+    match bytes.get(quote) {
+        Some(b'"') => {
+            let end = awk_string_literal_end(program, quote)?;
+            Some(quote + 1..end)
+        }
+        Some(b'\\') if bytes.get(quote + 1) == Some(&b'"') => {
+            let end = escaped_string_literal_end(program, quote + 2)?;
+            Some(quote + 2..end)
+        }
+        _ => None,
     }
-    let end = awk_string_literal_end(program, quote)?;
-    Some(quote + 1..end)
+}
+
+/// The first awk string literal at or after `start`, skipping only whitespace.
+fn awk_leading_string_literal(program: &str, start: usize) -> Option<Range<usize>> {
+    inline_string_literal_at(program, start)
 }
 
 /// Whether the tokens after `start` are `| getline`, making the string literal
@@ -2475,7 +2713,7 @@ fn extract_osascript_inline_scripts(
     if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
         return;
     }
-    if !command.contains("osascript") {
+    if !contains_ascii_case_insensitive(command, "osascript") {
         return;
     }
 
@@ -2491,8 +2729,7 @@ fn extract_osascript_inline_scripts(
         let Some(word) = token.text(command) else {
             continue;
         };
-        let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
-        if basename != "osascript" {
+        if !interpreter_basename(word).eq_ignore_ascii_case("osascript") {
             continue;
         }
         for program in osascript_program_ranges(command, &tokens, index) {
@@ -2539,7 +2776,8 @@ fn osascript_program_ranges(
         let Some(raw) = token.text(command) else {
             break;
         };
-        let (word, _, _) = dequoted_flag_word(raw, token.byte_range.start, token.byte_range.end);
+        let (word, word_start, word_end) =
+            dequoted_flag_word(raw, token.byte_range.start, token.byte_range.end);
         match word {
             "-e" => {
                 let Some(value) = tokens.get(index + 1) else {
@@ -2556,6 +2794,13 @@ fn osascript_program_ranges(
             }
             // `-l <language>` and `-s <flags>` take a separate value.
             "-l" | "-s" => index += 2,
+            // Glued `-e<program>`. getopt accepts it, so osascript does too,
+            // and it used to fall through to the skip-any-option arm below —
+            // the program was never collected and the sink never seen.
+            _ if word.starts_with("-e") => {
+                programs.push(word_start + 2..word_end);
+                index += 1;
+            }
             _ if word.starts_with('-') && word != "-" => index += 1,
             // The first bare word is a script FILE, which dcg will not open.
             _ => break,
@@ -2588,24 +2833,32 @@ fn osascript_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usi
         }
     }
 
-    // JXA: `$.system("<command>")`.
-    let mut search = 0usize;
-    while let Some(found) = program[search..].find("$.system") {
-        let after = search + found + "$.system".len();
-        let open = program[after..]
-            .find(|c: char| !c.is_ascii_whitespace())
-            .map(|skip| after + skip);
-        if let Some(open) = open
-            && program.as_bytes().get(open) == Some(&b'(')
-            && let Some(literal) = applescript_leading_string_literal(program, open + 1)
-        {
-            payloads.push(offset + literal.start..offset + literal.end);
-            search = literal.end;
-        } else {
-            search = after;
-        }
-        if search >= program.len() {
-            break;
+    // JXA call sinks: `$.system("<command>")` reaches libc directly, and
+    // `app.doShellScript("<command>")` is the Standard Additions bridge to the
+    // same `do shell script` AppleScript command. The latter is the idiom every
+    // JXA example uses (`Application.currentApplication()` with
+    // `includeStandardAdditions = true`), so covering only `$.system` left the
+    // documented spelling unguarded. The receiver is an arbitrary expression,
+    // so match on the method name and require the call parenthesis.
+    for name in ["$.system", ".doShellScript"] {
+        let mut search = 0usize;
+        while let Some(found) = program[search..].find(name) {
+            let after = search + found + name.len();
+            let open = program[after..]
+                .find(|c: char| !c.is_ascii_whitespace())
+                .map(|skip| after + skip);
+            if let Some(open) = open
+                && program.as_bytes().get(open) == Some(&b'(')
+                && let Some(literal) = applescript_leading_string_literal(program, open + 1)
+            {
+                payloads.push(offset + literal.start..offset + literal.end);
+                search = literal.end;
+            } else {
+                search = after;
+            }
+            if search >= program.len() {
+                break;
+            }
         }
     }
 
@@ -2666,14 +2919,7 @@ fn find_applescript_do_shell_script(lowered: &str, from: usize) -> Option<usize>
 /// AppleScript and JXA both use `\` escapes inside double quotes, so the same
 /// scanner serves both.
 fn applescript_leading_string_literal(program: &str, start: usize) -> Option<Range<usize>> {
-    let rest = program.get(start..)?;
-    let skip = rest.find(|c: char| !c.is_ascii_whitespace())?;
-    let quote = start + skip;
-    if program.as_bytes().get(quote) != Some(&b'"') {
-        return None;
-    }
-    let end = awk_string_literal_end(program, quote)?;
-    Some(quote + 1..end)
+    inline_string_literal_at(program, start)
 }
 
 /// `ssh [options] destination [command [argument …]]` concatenates every argv

@@ -19,13 +19,39 @@ fn dcg_binary() -> std::path::PathBuf {
 }
 
 /// Helper to run dcg with arguments and capture output.
+///
+/// Hermetic, for the same reason `tests/golden_artifacts.rs` is: without an
+/// isolated `HOME`/`XDG_CONFIG_HOME`, dcg reads the developer's real
+/// `~/.config/dcg/config.toml`. That made assertions here depend on the
+/// machine — a maintainer with `[policy.rules] "core.git:reset-hard" = "warn"`
+/// (a documented, supported setting, and precisely the one #417 exists to
+/// support) saw `explain_json_format_is_valid` fail on `mode`, while CI stayed
+/// green. Clear the environment, then re-export only what the binary needs.
 fn run_dcg(args: &[&str]) -> std::process::Output {
-    Command::new(dcg_binary())
-        .args(args)
+    let home = tempfile::tempdir().expect("create isolated HOME for run_dcg");
+    std::fs::create_dir_all(home.path().join(".config/dcg"))
+        .expect("create XDG_CONFIG_HOME/dcg under isolated HOME");
+    std::fs::create_dir_all(home.path().join("tmp")).expect("create isolated TMPDIR");
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.args(args).env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
+    }
+    cmd.env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("TMPDIR", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("DCG_NO_SELF_HEAL", "1")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0")
+        .env("TERM", "dumb")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("failed to execute dcg")
+        .stderr(Stdio::piped());
+
+    cmd.output().expect("failed to execute dcg")
 }
 
 /// Run `dcg create-new` with byte-exact piped input and capture every output

@@ -276,7 +276,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // Keep byte-identical to `crate::packs::database::TRUNCATE_TABLE_PATTERN`
             // (asserted by `truncate_table_pattern_is_shared`); the rationale
             // for every constraint lives on that constant. Issue #403.
-            r#"(?i)(?:(?:^|[;"'`])\s*|\r?\n\s*(?=TRUNCATE\s+TABLE\b))(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#,
+            r#"(?i)(?:(?:^|[;"'`])(?:\s|/\*(?!!)(?s:.*?)\*/)*|\r?\n(?:\s|/\*(?!!)(?s:.*?)\*/)*(?=TRUNCATE\s+TABLE\b)|/\*!\d*\s*)(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|\*/|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#,
             "TRUNCATE permanently deletes all rows. Cannot be rolled back in MySQL.",
             High,
             "TRUNCATE is faster than DELETE but more dangerous in MySQL:\n\n\

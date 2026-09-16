@@ -65,9 +65,15 @@ storage.sqlite3
 storage.sqlite3-*
 *.sqlite3.bak
 
+# Editor/tool backup snapshots. These are stale duplicates of a source file,
+# so committing one is never intended — and `git add -A` (which the release
+# process in AGENTS.md uses) would otherwise sweep one straight into the tree.
+*.bak
+
 # Remote compilation helper artifacts
 .rch-target/
 .rch-deploy-root/
+.rch-target-*/
 rch-bin/
 rch-install/
 
