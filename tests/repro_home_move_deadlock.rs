@@ -290,3 +290,62 @@ fn relative_source_rescue_keeps_its_boundaries() {
         assert_denied(command);
     }
 }
+
+// ---------------------------------------------------------------------------
+// GitHub #407: a relative redirect names the same file an absolute one does
+// ---------------------------------------------------------------------------
+//
+// `redirect-truncate-root-home` matches the literal text of the target, so it
+// only saw the absolute spelling. The same write to the same file was allowed
+// the moment it was written relatively — including the `.git` internals that
+// rule's reason text promises to protect.
+//
+// A relative target cannot be resolved in general (dcg does not know the
+// working directory, and denying every relative redirect would deny
+// `> out.txt`). A `.git/` path component is the case that does not need the
+// cwd: it names a git internal wherever the shell is standing.
+
+#[test]
+fn relative_redirect_into_git_internals_is_denied_issue_407() {
+    for command in [
+        // The reported shapes.
+        "cat > .git/config",
+        "cat > ./.git/config",
+        "cat > .git/HEAD",
+        // Writing a hook is code execution on the next commit.
+        "echo x > .git/hooks/pre-commit",
+        // Deeper in a relative path, and in a sibling checkout.
+        "cat > sub/.git/config",
+        "cat > proj/.git/refs/heads/main",
+        // The redirect operator variants the sibling rules already cover.
+        "cat >| .git/config",
+        "cat 1> .git/config",
+        "cat &> .git/config",
+        r#"cat > "./.git/config""#,
+        // A safe rm in the same segment must not shadow the redirect.
+        "rm -f /tmp/x && cat > .git/config",
+    ] {
+        assert_denied(command);
+    }
+}
+
+/// The neighbours of `.git` are ordinary files and must stay writable, and an
+/// append does not truncate.
+#[test]
+fn relative_redirect_git_rule_does_not_overreach_issue_407() {
+    for command in [
+        "cat > .gitignore",
+        "cat > .gitattributes",
+        "cat > .gitmodules",
+        "cat > .github/workflows/ci.yml",
+        "cat > out.txt",
+        "cat > git/config",
+        "cat > mygit/config",
+        // Append leaves the previous contents in place.
+        "cat >> .git/config",
+        // Reading is not writing.
+        "cat < .git/config",
+    ] {
+        assert_allowed(command);
+    }
+}

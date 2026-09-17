@@ -961,6 +961,14 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
     );
     m.insert(
         "core.filesystem:redirect-truncate-dynamic-path",
+        redirect_truncate_suggestions.clone(),
+    );
+    m.insert(
+        "core.filesystem:redirect-truncate-git-internals-relative",
+        // The generic redirect advice applies — resolve the target, use a temp
+        // path, prefer append — and the rule's own explanation adds the git
+        // routes (`git config`, `git update-ref`) that write these files
+        // safely.
         redirect_truncate_suggestions,
     );
     m.insert(
@@ -2080,6 +2088,7 @@ mod tests {
             "core.filesystem:credential-file-write",
             "core.filesystem:redirect-truncate-root-home",
             "core.filesystem:redirect-truncate-dynamic-path",
+            "core.filesystem:redirect-truncate-git-internals-relative",
         ];
 
         for rule in expected_rules {

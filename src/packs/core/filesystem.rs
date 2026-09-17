@@ -598,6 +598,7 @@ pub(crate) fn is_pre_rm_propagation_rule(name: Option<&str>) -> bool {
                 // of the rm Allow fast path as well.
                 | "redirect-truncate-root-home"
                 | "redirect-truncate-dynamic-path"
+                | "redirect-truncate-git-internals-relative"
         )
     )
 }
@@ -3336,11 +3337,18 @@ pub fn create_pack() -> Pack {
         // `tee`, `sponge`, `install`, `sed`, and `perl` are the non-redirect
         // writers `credential-file-write` classifies (`cp`, `mv`, `ln`, and
         // `dd` are already here).
+        // These gate whether the pack is consulted at all, so a shape missing
+        // from here is invisible to every pattern below it. `.git/` is listed
+        // for `redirect-truncate-git-internals-relative`: a relative target
+        // carries none of the other redirect keywords, because it starts with
+        // a dot or a directory name rather than `/`, `~`, `$` or a quote, so
+        // `cat > .git/config` and `cat > sub/.git/config` reached no pattern at
+        // all and the rule never ran (GitHub #407).
         keywords: &[
             "rm", "find", "unlink", "truncate", "shred", "tar", "dd", "mv", "cp", "ln", "rsync",
-            "tee", "sponge", "install", "sed", "perl", ">/", "> /", ">~", "> ~", ">$", "> $",
-            ">\"", "> \"", ">'", "> '", "&>", ">&", ">|", "1>", "2>", ">%", "> %", ">!", "> !",
-            ">^", "> ^",
+            "tee", "sponge", "install", "sed", "perl", ".git/", ">/", "> /", ">~", "> ~", ">$",
+            "> $", ">\"", "> \"", ">'", "> '", "&>", ">&", ">|", "1>", "2>", ">%", "> %", ">!",
+            "> !", ">^", "> ^",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -4610,6 +4618,51 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                by this same rule).\n\
              - For temp scratch: `> /tmp/<subdir>/scratch` is allowed.\n\
              - Read redirects (`< <file>`) are not affected — they don't truncate.",
+            REDIRECT_TRUNCATE_SUGGESTIONS
+        ),
+        // A truncating redirect into a `.git` directory, named relatively.
+        //
+        // `redirect-truncate-root-home` matches the literal text of the
+        // target, so it only ever saw the absolute spelling. The same write to
+        // the same file was allowed the moment it was written relatively, which
+        // included the `.git` internals that rule's own reason promises to
+        // protect (GitHub #407):
+        //
+        //     cat > /home/u/proj/.git/config     denied
+        //     cat > .git/config                  ALLOWED, same file
+        //     echo x > .git/hooks/pre-commit     ALLOWED, and that one executes
+        //
+        // A relative target cannot be resolved in general — dcg does not know
+        // the working directory, and denying every relative redirect would
+        // deny `> out.txt`. But a `.git/` path *component* names a git
+        // internal wherever the shell happens to be standing, so this one case
+        // is decidable without the cwd and is worth deciding.
+        //
+        // `.gitignore`, `.gitattributes` and `.github/` are untouched: the
+        // component must be exactly `.git` followed by a separator. Append
+        // (`>>`) does not truncate and is not matched.
+        destructive_pattern!(
+            "redirect-truncate-git-internals-relative",
+            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?:\./)?(?:[^\s;&|'"]*/)?\.git/"#,
+            "shell truncating redirect into a .git directory rewrites repository internals; a relative spelling names the same file an absolute one does.",
+            Critical,
+            "`> .git/<path>` opens the file with O_WRONLY|O_CREAT|O_TRUNC, so the \
+             previous contents are gone before anything is written. Inside `.git` that \
+             means repository state, not a working file:\n\
+             - `.git/config` carries remotes, hooks configuration and credentials helpers.\n\
+             - `.git/HEAD` and `.git/refs/**` decide which commits are reachable; \
+               truncating them can orphan history that only the reflog still names.\n\
+             - `.git/hooks/**` is executed by git, so a write there is code execution \
+               on the next commit, merge or checkout.\n\n\
+             The absolute spelling of this same path is already denied; naming it \
+             relatively does not make it a different file.\n\n\
+             Safer alternatives:\n\
+             - Change configuration through git, which writes atomically and validates: \
+               `git config <key> <value>`, `git remote set-url <name> <url>`.\n\
+             - Move a ref with `git update-ref <ref> <sha>` rather than by writing the file.\n\
+             - To inspect rather than replace, read it: `cat .git/config`.\n\
+             - If a file genuinely must be rewritten, write it beside the repository and \
+               copy it in after review: `… > /tmp/<subdir>/config && cp /tmp/<subdir>/config .git/config`.",
             REDIRECT_TRUNCATE_SUGGESTIONS
         ),
         // The shell expands redirect targets at runtime. A variable, command
@@ -6008,6 +6061,7 @@ mod tests {
         for rule_name in [
             "redirect-truncate-root-home",
             "redirect-truncate-dynamic-path",
+            "redirect-truncate-git-internals-relative",
         ] {
             let rule = pack
                 .destructive_patterns

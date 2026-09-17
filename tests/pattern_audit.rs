@@ -325,6 +325,10 @@ fn test_audit_backtracking_requirements() {
                 "mv-var-tmp",
                 "mv-within-home",
                 "redirect-truncate-dynamic-path",
+                // Shares the `(?<![<>])` lookbehind its siblings use, so a
+                // read redirect (`<`) or an append (`>>`) is not read as a
+                // truncating one.
+                "redirect-truncate-git-internals-relative",
                 "redirect-truncate-root-home",
                 "rsync-sensitive-then-delete",
                 "shred-root-home",
