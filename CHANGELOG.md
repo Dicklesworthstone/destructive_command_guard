@@ -15,6 +15,39 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
+### Security
+
+- **A padded SQL comment could silently switch the TRUNCATE rule off.** The
+  comment-skip group added to the statement-position opener was written with a
+  lazy body that merges across `*/`, so M adjacent `/**/` units gave the
+  backtracking engine 2^(M-1) ways to tile the prefix. `RegexEngine::is_match`
+  reports `false` when fancy-regex hits its backtrack limit, so from 13 units
+  onward `mysql -e "/**/…/**/Q; TRUNCATE TABLE users;"` was allowed — a
+  fail-open an attacker steers with 52 bytes of padding. The expression is now
+  the unambiguous non-merging form, verified to 2000 units. A guard must not be
+  able to reach a resource limit it fails open on.
+
+- **One stray byte no longer skips evaluation.** Invalid UTF-8 in a hook payload
+  is attacker-controlled content, not a transient read error, so it now blocks
+  under `DCG_FAIL_CLOSED=1` *and* carries its lossy decoding into the same
+  best-effort scanner oversized input uses. Appending `0xFF` to an otherwise
+  ordinary destructive payload is far cheaper than padding past the size limit,
+  and until now it worked in the default posture.
+
+- **Six further escapes from the awk and osascript extractors**, each verified
+  against the real interpreter: a glued flag value kept its shell quoting so
+  `awk -e"BEGIN{…}"` read the whole program as one string; the scanner did not
+  know the escaped `\"` spelling, hiding the `"cmd" | getline` sink whenever the
+  program arrived in shell double quotes; a `/` after `y++`, `y--` or a trailing
+  decimal point is division, and misreading it as a regex skipped forward to the
+  next `/` — usually the one inside the payload path — stepping over the sink;
+  quoting spliced into the middle of an executable name (`a"wk"`, `aw\k`,
+  `$'awk'`, `osa"script"`) was rejected by the cheap pre-gate before the matcher
+  that understands it ever ran; the glued long progfile flags are a GNU
+  extension, so an awk that does not implement them leaves the following operand
+  as its program; and `original-awk`, `goawk` and `frawk` were not recognised at
+  all.
+
 ### Fixed
 
 - **#412 is now fully closed.** The v0.14.4 notes below record it as partially
