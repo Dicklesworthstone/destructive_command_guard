@@ -21875,10 +21875,15 @@ fn hazard_first_word(segment: &str) -> &str {
 /// was allowed — grouping is what puts the printf in its own preceding
 /// segment, so the hazard scan saw it at all (GitHub #422).
 ///
-/// Fail-closed on anything this cannot read statically. An expansion or quote
-/// in the argument list could supply `-v` at run time, and bash's printf has
-/// no `--` end-of-options terminator to rule it out, so only a plain literal
-/// argument list with no `-v` counts as inert.
+/// Fail-closed on anything this cannot read statically: an expansion, a quote
+/// or a backslash in the argument list could all supply `-v` at run time, so
+/// only a plain literal argument list with no `-v` counts as inert.
+///
+/// bash's printf *does* honour `--` (`printf -- -v l /x` prints `-v` and leaves
+/// `l` alone), so a `--` before the flag would make the segment genuinely inert.
+/// That is deliberately not modeled: over-blocking there costs one denial, and
+/// the earlier version of this comment claimed the opposite, which is the kind
+/// of wrong justification that invites someone to loosen the wrong thing.
 /// Read the *command*, not the segment: printf's arguments are classified as
 /// data and stripped before the hazard scan runs, so the segment for
 /// `printf -v p /etc/passwd` arrives as the single word `printf`. A
@@ -21886,6 +21891,27 @@ fn hazard_first_word(segment: &str) -> &str {
 /// silently report the write as inert. Scanning the original text is coarser
 /// — any `-v` printf anywhere in the command makes every printf in it a
 /// hazard — which is the safe direction to be wrong in.
+/// Byte offset where a `printf` command's own arguments end.
+///
+/// A backslash escapes the byte after it, which matters most for the newline:
+/// `printf \<newline> -v p /etc` is a line continuation that bash splices away
+/// before the builtin runs, so it binds `p` exactly as the one-line spelling
+/// does. Treating that newline as a terminator ended the scan at the backslash
+/// and walked straight past the `-v`.
+fn printf_argument_end(after: &str) -> usize {
+    let bytes = after.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            // Only ever returned at an ASCII byte, so always a char boundary.
+            b';' | b'|' | b'&' | b'\n' | b')' | b'}' => return index,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
 fn printf_can_bind_variable(source: &str) -> bool {
     let mut rest = source;
     while let Some(index) = rest.find("printf") {
@@ -21901,20 +21927,60 @@ fn printf_can_bind_variable(source: &str) -> bool {
             .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_'));
         if !joined_left && !joined_right {
             // printf's own arguments end at the next command separator.
-            let end = after
-                .find([';', '|', '&', '\n', ')', '}'])
-                .unwrap_or(after.len());
-            for word in after[..end].split_ascii_whitespace() {
-                // A redirect ends the argument list.
-                if word.starts_with(['>', '<']) {
-                    break;
-                }
+            let end = printf_argument_end(after);
+            let args = after[..end].trim();
+            // No visible arguments means one of two things: printf really had
+            // none, or they were classified as data and stripped before this
+            // text reached us. Which of the two it is cannot be told from
+            // here, and one of them is hiding a `-v`, so refuse. Whether the
+            // arguments survive depends on which rendering of the command the
+            // caller passes, so this is not a hypothetical: the same command
+            // arrives with them under one dialect and without under another.
+            if args.is_empty() {
+                return true;
+            }
+            // A redirect among the visible arguments means the same thing.
+            // Redirects survive the data-stripping that removes printf's
+            // operands, so `printf > /dev/null -v p /etc/passwd` can arrive
+            // here as `printf > /dev/null` — non-empty, no `-v` in sight, and
+            // the binding invisible. Anything with a redirect in it is
+            // therefore unreadable for this purpose too.
+            if args
+                .split_ascii_whitespace()
+                .any(|word| word.contains(['>', '<']))
+            {
+                return true;
+            }
+            // Every word is inspected, including anything that looks like a
+            // redirect. A redirect may legally precede the arguments —
+            // `printf > /dev/null -v p /etc/passwd` binds `p` in bash — so
+            // stopping at the first `>` would walk straight past the flag that
+            // matters. Scanning through costs only a false *hazard* when
+            // printf's own redirect target is dynamic, which denies, and
+            // denying is the safe direction here.
+            for word in args.split_ascii_whitespace() {
                 // `-v NAME` and the concatenated `-vNAME` both bind, and an
                 // expansion could become either at run time.
-                if word.starts_with("-v") || word.contains(['$', '`']) {
+                //
+                // The quote and backslash bytes belong here too: bash strips
+                // them before the builtin sees its argv, so `printf "-v" p /x`,
+                // `printf '-v' p /x`, `printf -"v" p /x` and `printf \-v p /x`
+                // all bind exactly as the bare spelling does — verified in bash
+                // 5.3. Dropping them from this set turned each into an allowed
+                // `rm -rf`. Fail closed on anything this cannot read literally.
+                if word.starts_with("-v") || word.contains(['$', '`', '\\', '\'', '"']) {
                     return true;
                 }
             }
+            // Resume AFTER this printf's own arguments, not just after the word.
+            // A `printf` inside another printf's argument list is that printf's
+            // data, not a second command, and its `-v` would already have been
+            // seen by the scan just done. Restarting at `after` instead re-read
+            // the same argument span once per occurrence, which is quadratic:
+            // 8000 repetitions of `printf ` took 3.8s, past the 1000ms hook
+            // budget. `end` is always a char boundary.
+            rest = &after[end..];
+            continue;
         }
         rest = after;
     }
@@ -23160,7 +23226,15 @@ fn evaluate_core_filesystem_pack(
             &rm_decision,
             crate::packs::core::filesystem::RmParseDecision::Deny(_)
         ) && rm_segment_resolves_to_allowed_literals(
-            command_for_packs,
+            // The SAME source the redirect proof uses, and for the same reason.
+            // `command_for_packs` has already been through
+            // `sanitize_for_pattern_matching`, which blanks the arguments of
+            // every `all_args_data` command — `printf` among them. Handing that
+            // to the binding proof meant `printf_can_bind_variable` could never
+            // see a `-v`, so EVERY printf was judged inert and
+            // `p=/tmp/safe; printf -v p /; rm -rf "$p"` was allowed. Real bash
+            // rebinds `p` to `/` there, so that is `rm -rf /`.
+            redirect_source,
             segment_ranges,
             segment_start,
             dialect_segment,
@@ -25687,7 +25761,6 @@ mod tests {
     fn printf_binds_only_with_dash_v() {
         for inert in [
             "printf probe",
-            "printf",
             "{ printf probe",
             "printf %s hello",
             "printf hello world",
@@ -25712,6 +25785,18 @@ mod tests {
             "{ printf -v p /etc/passwd",
             "printf -vp /etc/passwd",
             "printf -v",
+            // No visible arguments is indistinguishable from arguments that
+            // were stripped as data before this text arrived, and one of those
+            // hides a `-v`. Refuse rather than guess.
+            "printf",
+            "printf ",
+            "{ printf; }",
+            "p=/tmp/x.txt; printf; echo hi > \"$p\"",
+            // Redirects survive the stripping that removes the operands, so
+            // args that are only a redirect are just as unreadable as none.
+            "printf > /dev/null",
+            "printf 2>&1",
+            "printf hello > /tmp/out",
             // Anything dynamic could supply -v at run time.
             "printf $flag hello",
             "printf \"$fmt\"",
@@ -25722,6 +25807,14 @@ mod tests {
             "p=/tmp/x.txt; { printf -v p /etc/passwd; } > \"$p\"",
             // A later printf binding still taints an earlier inert one.
             "p=/tmp/x.txt; printf ok; printf -v p /etc/passwd; echo hi > \"$p\"",
+            // A redirect may legally precede the arguments, and bash still
+            // binds: `printf > /dev/null -v p /etc/passwd` sets p. Stopping
+            // the scan at the first `>` walked past the flag.
+            "printf > /dev/null -v p /etc/passwd",
+            "printf >/dev/null -v p /etc/passwd",
+            "printf 2>/dev/null -v p /etc/passwd",
+            "printf >>/dev/null -v p /etc/passwd",
+            "p=/tmp/x.txt; printf > /dev/null -v p /etc/passwd; echo hi > \"$p\"",
         ] {
             assert!(
                 printf_can_bind_variable(binds),
