@@ -25905,6 +25905,39 @@ mod tests {
         }
     }
 
+    /// A binding only proves anything if the parent shell actually performs it,
+    /// before the use (#426).
+    ///
+    /// Regression: any top-level segment counted, so a pipeline stage, a
+    /// backgrounded command and the conditional side of `&&`/`||` were all
+    /// trusted. Real bash leaves the variable holding whatever it held before in
+    /// every one of them, so dcg proved a temp path and allowed an `rm -rf` of
+    /// the ambient value instead.
+    #[test]
+    fn a_binding_the_parent_shell_never_performs_proves_nothing() {
+        // `start`/`end` bound the binding segment inside each source.
+        for (source, binding, reaches) in [
+            ("D=/tmp/x; rm -rf \"$D\"", "D=/tmp/x", true),
+            ("echo hi | D=/tmp/x; rm -rf \"$D\"", "D=/tmp/x", false),
+            ("D=/tmp/x | true; rm -rf \"$D\"", "D=/tmp/x", false),
+            ("D=/tmp/x & rm -rf \"$D\"", "D=/tmp/x", false),
+            ("false && D=/tmp/x; rm -rf \"$D\"", "D=/tmp/x", false),
+            ("true || D=/tmp/x; rm -rf \"$D\"", "D=/tmp/x", false),
+            // `&&` AFTER the binding means the binding already ran.
+            ("D=/tmp/x && rm -rf \"$D\"", "D=/tmp/x", true),
+            // A single `&` BEFORE it backgrounds the previous command only.
+            ("sleep 1 & D=/tmp/x; rm -rf \"$D\"", "D=/tmp/x", true),
+        ] {
+            let start = source.find(binding).expect("binding present");
+            let end = start + binding.len();
+            assert_eq!(
+                segment_binding_reaches_parent_shell(source, start, end),
+                reaches,
+                "{source:?}: binding {binding:?} reaches parent = {reaches}"
+            );
+        }
+    }
+
     /// A redirection, an environment assignment, and shell quoting can all sit
     /// between the segment start and the command word without changing which
     /// command runs.
