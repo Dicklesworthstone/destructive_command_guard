@@ -21778,7 +21778,14 @@ fn resolved_variable_values(
         // never binding sources but still run the mutation-hazard check
         // below, keeping a nested `NAME=` an outright refusal.
         let nested = segment_range_is_nested(segment_ranges, start, end);
-        if !nested {
+        // Being a top-level segment is not enough: the shell must actually
+        // perform the assignment, in this shell, before the use (#426). A
+        // segment that fails this still falls through to the hazard checks
+        // below, where `segment_text_may_assign` refuses the proof outright —
+        // which is the right answer, because an unprovable binding is exactly
+        // the case the exemption must not cover.
+        let binds_in_parent = !nested && segment_binding_reaches_parent_shell(source, start, end);
+        if binds_in_parent {
             if let Some(raw) = segment
                 .strip_prefix(name)
                 .and_then(|rest| rest.strip_prefix('='))
@@ -22063,6 +22070,82 @@ fn segment_range_is_nested(segment_ranges: &[(usize, usize)], start: usize, end:
     segment_ranges.iter().any(|&(other_start, other_end)| {
         other_start <= start && end <= other_end && (other_start != start || other_end != end)
     })
+}
+
+/// Whether an assignment in this segment is one the PARENT shell performs,
+/// unconditionally, before the segment that uses the value (#426).
+///
+/// `segment_range_is_nested` already rejects a binding inside `$( )`, and an
+/// explicit `( … )` subshell is refused elsewhere. Three more shapes run the
+/// assignment somewhere the later `$NAME` cannot see, and all three were
+/// trusted:
+///
+/// ```text
+/// echo hi | D=/tmp/x;  rm -rf "$D"    every pipeline stage is a subshell
+/// D=/tmp/x &;          rm -rf "$D"    backgrounded, likewise
+/// false && D=/tmp/x;   rm -rf "$D"    never runs at all
+/// ```
+///
+/// In each one bash leaves `D` holding whatever it held before — the ambient or
+/// exported value — while dcg proved it to be `/tmp/x` and allowed the delete.
+/// On a host that keeps one shell across turns (Claude Code's Bash tool does)
+/// an earlier `export D=$HOME` makes that `rm -rf "$HOME"`.
+///
+/// Decided from the separators either side of the segment:
+///
+/// | before | meaning | verdict |
+/// |--------|---------|---------|
+/// | `\|` or `\|\|` or `&&` | pipeline stage, or conditional | reject |
+/// | single `&` | the PREVIOUS command was backgrounded | accept |
+/// | `;`, newline, start | ordinary sequencing | accept |
+///
+/// | after | meaning | verdict |
+/// |-------|---------|---------|
+/// | single `\|` | this segment is a pipeline stage | reject |
+/// | single `&` | this segment is backgrounded | reject |
+/// | `\|\|` or `&&` | this segment ran; the NEXT one is conditional | accept |
+/// | `;`, newline, end | ordinary sequencing | accept |
+///
+/// `false \|\| D=/tmp/x` is rejected although bash does run it. That is an
+/// over-block, which costs one denial; the direction that matters is not
+/// trusting a value the shell never assigned.
+fn segment_binding_reaches_parent_shell(source: &str, start: usize, end: usize) -> bool {
+    let bytes = source.as_bytes();
+
+    // Separator immediately before the segment.
+    let mut index = start;
+    while index > 0 && bytes[index - 1].is_ascii_whitespace() {
+        index -= 1;
+    }
+    if index > 0 {
+        let previous = bytes[index - 1];
+        let doubled = index >= 2 && bytes[index - 2] == previous;
+        match previous {
+            // A pipe in either spelling, and `&&`, all disqualify.
+            b'|' => return false,
+            b'&' if doubled => return false,
+            _ => {}
+        }
+    }
+
+    // Separator immediately after the segment.
+    let mut index = end;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    if index < bytes.len() {
+        let next = bytes[index];
+        let doubled = index + 1 < bytes.len() && bytes[index + 1] == next;
+        match next {
+            // `|` alone is a pipe; `||` means this segment already ran.
+            b'|' if !doubled => return false,
+            // `&` alone backgrounds this segment; `&&` means it already ran.
+            b'&' if !doubled => return false,
+            _ => {}
+        }
+    }
+
+    true
 }
 
 /// Whether a segment's text could assign or mutate `NAME` in a form the
