@@ -303,6 +303,44 @@ fn a_misread_slash_cannot_skip_over_a_sink() {
     }
 }
 
+/// A regex literal is a VALUE, so the `/` that follows one is division.
+///
+/// Regression: the value set had no `/`, so in `n = /a/ / 2` the second `/` was
+/// read as opening a fresh regex. The scan then ran forward to the next `/` in
+/// the program — usually the one inside the payload's own path — which ended
+/// the bogus span BEFORE any sink keyword, so `awk_span_carries_a_sink` never
+/// got the chance to veto the skip. Every program below runs on gawk, mawk and
+/// busybox awk; one extra `/` in code position was the whole bypass.
+#[test]
+fn a_slash_after_a_regex_literal_is_division() {
+    for command in [
+        "awk 'BEGIN{ n = /a/ / 2; system(\"rm -rf /tmp/z\") }'",
+        "awk 'BEGIN{ n = /a/ / 2; print \"x\" | \"rm -rf /tmp/z\" }'",
+        "awk 'BEGIN{ n = /a/ / 2; \"rm -rf /tmp/z\" | getline y }'",
+        "awk '{ r = /x/ / NF; print \"a\" | \"rm -rf /tmp/z\" }'",
+        "awk 'BEGIN{ rate = /x/ / 100; print \"audit\" | \"rm -rf /tmp/z\"; m = /y/ }'",
+    ] {
+        assert_eq!(
+            payloads(command),
+            vec!["rm -rf /tmp/z".to_string()],
+            "a sink after regex-then-division must still be seen: {command:?}"
+        );
+    }
+
+    // The same programs without a sink extract nothing, and an empty regex
+    // literal is still a regex rather than two division operators.
+    for command in [
+        "awk 'BEGIN{ n = /a/ / 2; print n }'",
+        "awk '/a/ && /b/ { print }' f.txt",
+        "awk 'BEGIN{ if (\"\" ~ //) print 1 }'",
+    ] {
+        assert!(
+            payloads(command).is_empty(),
+            "ordinary awk yields no payload: {command:?}"
+        );
+    }
+}
+
 /// A program written inside shell DOUBLE quotes arrives with its own quotes
 /// backslash-escaped, and the shell removes those before the interpreter runs.
 ///

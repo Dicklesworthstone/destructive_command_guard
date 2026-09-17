@@ -5054,8 +5054,8 @@ pub fn create_pack() -> Pack {
 /// Most rules in this pack spell their executable as two alternatives (#400):
 ///
 /// ```text
-/// (?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*          the spaced spelling
-/// (?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-       the dashed builtin
+/// (?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*   the spaced spelling
+/// (?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-                 the dashed builtin
 /// ```
 ///
 /// Git ships its subcommands as dashed helper executables under
@@ -5079,6 +5079,42 @@ pub fn create_pack() -> Pack {
 /// `clean-dry-run-short` and the genuinely destructive `git clean -fdx -- .`
 /// rode through on the exemption.
 ///
+/// **The spaced branch models Git's actual grammar rather than accepting any
+/// token.** It used to skip `(?:\S+\s+)*` — *anything* — between `git` and the
+/// subcommand, which is how the same re-anchoring worked without a dashed
+/// spelling at all: `git clean -fdx -- . clean -n` let `clean-dry-run-short`
+/// match starting at the SECOND `clean`, past the `-fdx` that should have
+/// disqualified it, and a safe match shadows every destructive pattern in the
+/// pack. Real git accepts the trailing tokens as pathspecs and deletes the tree.
+///
+/// Git's grammar is `git [global-options] <subcommand> [args]`, and the first
+/// non-option token IS the subcommand, so an intermediate word is only ever one
+/// of two things:
+///
+/// - **A global option.** Only `-C` and `-c` take a SEPARATE value; every other
+///   one is glued (`--git-dir=…`) or takes none (`-p`, `--no-pager`,
+///   `--literal-pathspecs`).
+/// - **A shell redirect.** The view these patterns match still carries redirect
+///   tokens, so `git >/dev/null reset --hard` and `git 2>&1 reset --hard` have
+///   one sitting exactly where a subcommand would. `\S*[<>]\S*` admits them and
+///   cannot be confused with a subcommand, because no git subcommand name
+///   contains `<` or `>`. Omitting this was a real under-block: the first
+///   version of this prefix let the whole anti-bypass redirect family through.
+///
+/// Spelling the grammar exactly costs nothing — `git -C dir clean -n`,
+/// `git -c a=b reset --hard` and `git --git-dir=/x reset --hard` all still match
+/// — and it additionally stops three false positives the old walker produced,
+/// where the subcommand name was ordinary argv data: `git help reset --hard`,
+/// `git log --grep reset --hard` and `git commit -m reset --hard`.
+///
+/// Keep the alternation in this order. `-[Cc]\s+\S+` is tried before `-\S+`, so
+/// the common two-token form matches without backtracking, and a failure is
+/// detected at the next iteration rather than accumulating parses. Every branch
+/// except `-[Cc]\s+\S+` is confined to a single token by `\S`, so the group
+/// cannot blow up. Measured flat from 200 to 4000 intermediate tokens, and that
+/// property is not optional: a pack pattern that reaches `BACKTRACK_LIMIT` fails
+/// OPEN.
+///
 /// The dashed branch takes no intermediate words on purpose: a dashed builtin
 /// carries its options *after* the subcommand, so `git-<sub>` must be followed
 /// immediately by that rule's own argument shape. That, plus the
@@ -5099,11 +5135,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // Branch creation is safe
         safe_pattern!(
             "checkout-new-branch",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+-b\s+"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+-b\s+"
         ),
         safe_pattern!(
             "checkout-orphan",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+--orphan\s+"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+--orphan\s+"
         ),
         // restore --staged only affects the index, not the working tree, so it
         // is safe. `--staged`/`-S` is a flag that may appear in ANY position
@@ -5113,20 +5149,20 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // the restore touch the working tree (handled by `restore-worktree-explicit`).
         safe_pattern!(
             "restore-staged-long",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)restore\b(?=\s)(?=.*\s--staged\b)(?!.*\s(?:--worktree|-W)\b)"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)restore\b(?=\s)(?=.*\s--staged\b)(?!.*\s(?:--worktree|-W)\b)"
         ),
         safe_pattern!(
             "restore-staged-short",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)restore\b(?=\s)(?=.*\s-S\b)(?!.*\s(?:--worktree|-W)\b)"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)restore\b(?=\s)(?=.*\s-S\b)(?!.*\s(?:--worktree|-W)\b)"
         ),
         // clean dry-run just previews, doesn't delete
         safe_pattern!(
             "clean-dry-run-short",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)clean\s+-[a-z]*n[a-z]*"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)clean\s+-[a-z]*n[a-z]*"
         ),
         safe_pattern!(
             "clean-dry-run-long",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)clean\s+--dry-run"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)clean\s+--dry-run"
         ),
         // `git lfs prune --dry-run` reports what it would delete and deletes
         // nothing (Refs PR #383). The flag must be a whole token — `--dry-runx`
@@ -5134,7 +5170,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // walk stops at a quote or a redirection glyph.
         safe_pattern!(
             "lfs-prune-dry-run",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)lfs\s+prune(?:\s+[^\s;&|<>\x22']+)*\s+--dry-run(?:\s|$)"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)lfs\s+prune(?:\s+[^\s;&|<>\x22']+)*\s+--dry-run(?:\s|$)"
         ),
     ]
 }
@@ -5206,7 +5242,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // checkout -- discards uncommitted changes
         destructive_pattern!(
             "checkout-discard",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+--\s+",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+--\s+",
             "git checkout -- discards uncommitted changes permanently. Use 'git stash' first.",
             High,
             "git checkout -- <path> discards all uncommitted changes to the specified files \
@@ -5237,7 +5273,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "checkout-ref-discard",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+(?!-b\b)(?!--orphan\b)[^\s]+\s+--\s+",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+(?!-b\b)(?!--orphan\b)[^\s]+\s+--\s+",
             "git checkout <ref> -- <path> overwrites working tree. Use 'git stash' first.",
             High,
             "git checkout <ref> -- <path> replaces your working tree files with versions from \
@@ -5280,7 +5316,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // it instead.
         destructive_pattern!(
             "show-redirect-overwrite-source",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)show\s+[^\s:]+:(\S+)\s*(?:>>|>\|?)\s*(?:\./)?\1(?:[\s;&|)]|$)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)show\s+[^\s:]+:(\S+)\s*(?:>>|>\|?)\s*(?:\./)?\1(?:[\s;&|)]|$)",
             "git show <ref>:<path> redirected onto the same <path> overwrites the working tree file, exactly like the denied 'git checkout <ref> -- <path>'.",
             High,
             "Redirecting `git show <ref>:<path>` back onto `<path>` replaces the working-tree \
@@ -5319,7 +5355,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `restore-worktree-explicit` below regardless of `--staged`.
         destructive_pattern!(
             "restore-worktree",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)restore\b(?=\s)(?!.*\s(?:--staged|-S)\b)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)restore\b(?=\s)(?!.*\s(?:--staged|-S)\b)",
             "git restore discards uncommitted changes. Use 'git stash' or 'git diff' first.",
             High,
             "git restore <path> discards uncommitted changes in your working directory, \
@@ -5355,7 +5391,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "restore-worktree-explicit",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)restore\s+.*(?:--worktree|-W\b)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)restore\s+.*(?:--worktree|-W\b)",
             "git restore --worktree/-W discards uncommitted changes permanently.",
             High,
             "git restore --worktree (or -W) explicitly targets your working directory, \
@@ -5385,7 +5421,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // reset --hard destroys uncommitted work (CRITICAL - extremely common mistake)
         destructive_pattern!(
             "reset-hard",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\s+--hard",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\s+--hard",
             "git reset --hard destroys uncommitted changes. Use 'git stash' first.",
             Critical,
             "git reset --hard discards ALL uncommitted changes in your working directory \
@@ -5423,7 +5459,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "reset-merge",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\s+--merge",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\s+--merge",
             "git reset --merge can lose uncommitted changes.",
             High,
             "git reset --merge resets the index and updates files in the working tree that \
@@ -5451,7 +5487,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // clean -f deletes untracked files (CRITICAL - permanently removes files)
         destructive_pattern!(
             "clean-force",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)clean\s+(?:-[a-z]*f|--force\b)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)clean\s+(?:-[a-z]*f|--force\b)",
             "git clean -f/--force removes untracked files permanently. Review with 'git clean -n' first.",
             Critical,
             "git clean -f permanently deletes untracked files from your working directory. \
@@ -5633,7 +5669,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // stash destruction (Medium: single stash, recoverable via fsck/unreachable objects)
         destructive_pattern!(
             "stash-drop",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)stash\s+drop",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)stash\s+drop",
             "git stash drop deletes a single stash. Recoverable via `git fsck` (unreachable objects).",
             Medium,
             "git stash drop removes a specific stash entry from your stash list. The stashed \
@@ -5670,7 +5706,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // stash clear destroys ALL stashes (CRITICAL)
         destructive_pattern!(
             "stash-clear",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)stash\s+clear",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)stash\s+clear",
             "git stash clear permanently deletes ALL stashed changes.",
             Critical,
             "git stash clear removes ALL stash entries at once. Unlike git stash drop, \
@@ -5708,7 +5744,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rewrite history do.
         destructive_pattern!(
             "lfs-migrate-rewrite",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)lfs\s+migrate\s+(?:import|export)(?![\w-])",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)lfs\s+migrate\s+(?:import|export)(?![\w-])",
             "git lfs migrate import/export rewrites history — every commit in the range gets a new SHA.",
             High,
             "git lfs migrate import/export rewrites the commits it touches:\n\n\
@@ -5737,7 +5773,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "lfs-prune",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)lfs\s+prune(?![\w-])",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)lfs\s+prune(?![\w-])",
             "git lfs prune deletes local LFS objects; with --force it deletes objects the remote does not have.",
             Medium,
             "git lfs prune deletes local Git LFS objects from .git/lfs/objects:\n\n\
@@ -5765,7 +5801,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "lfs-uninstall",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)lfs\s+uninstall(?![\w-])",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[Cc]\s+\S+|-\S+|\S*[<>]\S*)\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)lfs\s+uninstall(?![\w-])",
             "git lfs uninstall removes the LFS filters and hooks, so LFS files check out as pointer text.",
             Medium,
             "git lfs uninstall removes Git LFS from the git configuration:\n\n\

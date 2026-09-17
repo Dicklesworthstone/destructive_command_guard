@@ -2739,8 +2739,18 @@ fn awk_slash_opens_regex(bytes: &[u8], index: usize) -> bool {
             // `.` is here for a trailing decimal point: `x = 1. / 2` is
             // division, and awk has no operator that would put a bare `.`
             // before a regex.
+            //
+            // `/` is here because a regex literal IS a value, so the `/` after
+            // one closes-then-divides: `n = /a/ / 2` is division by 2. Omitting
+            // it made that second `/` look like a fresh regex opener, and the
+            // scan then ran forward to the next `/` in the program — usually
+            // the one inside the payload's own path — which truncated the span
+            // before any sink keyword, so `awk_span_carries_a_sink` never got
+            // the chance to veto it. `awk 'BEGIN{ n = /a/ / 2; print "x" |
+            // "rm -rf ~/Documents" }'` runs on gawk, mawk and busybox awk, and
+            // one extra `/` in code position was the whole bypass.
             if previous.is_ascii_alphanumeric()
-                || matches!(previous, b')' | b']' | b'"' | b'_' | b'.')
+                || matches!(previous, b')' | b']' | b'"' | b'_' | b'.' | b'/')
             {
                 return false;
             }
@@ -2766,7 +2776,14 @@ fn awk_slash_opens_regex(bytes: &[u8], index: usize) -> bool {
 /// `system` or `getline`; a span that does is evidence the scanner misread the
 /// opening `/`, and skipping it would hide the sink.
 fn awk_span_carries_a_sink(span: &str) -> bool {
-    span.contains("system") || span.contains("getline")
+    span.contains("system")
+        || span.contains("getline")
+        // `print … | "cmd"` names no keyword, so the two call sinks above miss
+        // it. A pipe and a double quote together inside what claims to be a
+        // regex body are evidence enough: `/a|b/` has the pipe without the
+        // quote and `gsub(/"/, "")` has the quote without the pipe, so real
+        // regexes stay skippable.
+        || (span.contains('|') && span.contains('"'))
 }
 
 /// Index of the `/` closing the awk regex literal that opens at `start`.
