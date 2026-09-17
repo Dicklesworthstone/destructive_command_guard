@@ -108,9 +108,36 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // and falls through to the destructive rules (fail closed). The walk
         // also stops at `<`/`>`: a redirection target is the shell's, so
         // `... --yes > --help` is a real deletion writing to a file, not help.
+        //
+        // "`--help` anywhere is inert" is not quite true, though, and the gap
+        // was a live false negative (GitHub #423). cobra binds `--help` as the
+        // *value* of a preceding flag that takes one, and it is then not the
+        // help flag at all — the command runs:
+        //
+        //     $ gh pr list --search --help --state all --json number
+        //     [{"number":214},{"number":254}]
+        //
+        // That searched for the literal string `--help`. The same shape let
+        // `gh repo edit --description --help --visibility public` through
+        // while the bare `gh repo edit --visibility public` was denied, so the
+        // repository really did go public.
+        //
+        // Telling a swallowed `--help` from a real one by looking at the token
+        // before it does not work: `--cleanup-tag` and `--yes` are boolean, so
+        // `gh release delete v1 --yes --cleanup-tag --help` is genuine help,
+        // while `--description` and `--homepage` take a value and swallow it.
+        // Enumerating which gh flags take values would track a moving target
+        // across gh releases.
+        //
+        // The exploit has a simpler shape. In real help cobra exits before
+        // acting, so nothing destructive ever needs to trail the `--help`;
+        // in the swallowed form the flag that acts is precisely what comes
+        // after. So `--help` stops rescuing once a guarded value-taking flag
+        // follows it in the same segment. `gh repo edit … --visibility private
+        // --help` keeps working, because there the flag precedes.
         safe_pattern!(
             "gh-help",
-            r"gh(?:\s+(?:\x22[^\x22]*\x22|'[^']*'|(?!--(?:\s|$))[^\s;&|<>\x22']+))*\s+--help(?:\s|$)"
+            r"gh(?:\s+(?:\x22[^\x22]*\x22|'[^']*'|(?!--(?:\s|$))[^\s;&|<>\x22']+))*\s+--help(?:\s|$)(?![^;&|]*--visibility(?:=|\s))"
         ),
         // `-h` is cobra's short help flag for every `gh` command that does not
         // reuse the letter. `gh repo edit` does (`-h` = `--homepage`), and it is
@@ -998,6 +1025,43 @@ mod tests {
             "gh release delete \"v1\" -h",
         ] {
             assert_safe_pattern_matches(&pack, command);
+            assert_allows(&pack, command);
+        }
+    }
+
+    /// GitHub #423: `--help` is only the help flag when cobra reads it as one.
+    /// A flag that takes a value binds it instead, and the command then runs:
+    ///
+    /// ```text
+    /// $ gh pr list --search --help --state all --json number
+    /// [{"number":214},{"number":254}]
+    /// ```
+    ///
+    /// That searched for the literal string `--help`. The same shape let
+    /// `gh repo edit --description --help --visibility public` through while
+    /// the bare `gh repo edit --visibility public` was denied, so the
+    /// repository really did change visibility.
+    #[test]
+    fn swallowed_help_does_not_rescue_a_visibility_change_issue_423() {
+        let pack = create_pack();
+
+        for command in [
+            "gh repo edit --description --help --visibility public",
+            "gh repo edit --homepage --help --visibility public",
+            "gh repo edit --default-branch --help --visibility=public",
+            "gh repo edit -d --help --visibility public",
+            "gh repo edit acme/widgets --description --help --visibility internal",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "gh-repo-visibility-change");
+        }
+
+        // The flag preceding the help, rather than following it, is the
+        // ordinary spelling and stays inert: cobra exits before acting, so
+        // nothing destructive trails the `--help`.
+        for command in [
+            "gh repo edit acme/widgets --visibility private --help",
+            "gh release delete v1 --yes --cleanup-tag --help",
+        ] {
             assert_allows(&pack, command);
         }
     }
