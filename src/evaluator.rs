@@ -21809,13 +21809,12 @@ fn resolved_variable_values(
             }
         }
         let first = hazard_first_word(segment);
-        if std::env::var_os("DCG_PROBE_422").is_some() {
-            eprintln!("[probe] segment={segment:?} first={first:?}");
-        }
         let may_mutate_shell_variables = match first {
             // Only `printf -v NAME` binds; a plain printf writes to stdout
             // and cannot change what a later `$NAME` expands to (#422).
-            "printf" => printf_can_bind_variable(segment),
+            // Checked against `source`, not `segment`: printf's arguments are
+            // stripped as data before this scan, so the segment is bare.
+            "printf" => printf_can_bind_variable(source),
             other => matches!(
                 other,
                 "read"
@@ -21880,28 +21879,44 @@ fn hazard_first_word(segment: &str) -> &str {
 /// in the argument list could supply `-v` at run time, and bash's printf has
 /// no `--` end-of-options terminator to rule it out, so only a plain literal
 /// argument list with no `-v` counts as inert.
-fn printf_can_bind_variable(segment: &str) -> bool {
-    let mut words = segment
-        .split_ascii_whitespace()
-        .skip_while(|word| *word != "printf");
-    // Consume `printf` itself. Its absence means the caller identified the
-    // hazard word some other way; stay conservative.
-    if words.next().is_none() {
-        return true;
-    }
-    for word in words {
-        // A redirect or separator ends printf's argument list; what follows
-        // belongs to the redirect or the next command.
-        if word.starts_with(['>', '<', ';', '|', '&', ')', '}']) {
-            break;
+/// Read the *command*, not the segment: printf's arguments are classified as
+/// data and stripped before the hazard scan runs, so the segment for
+/// `printf -v p /etc/passwd` arrives as the single word `printf`. A
+/// segment-local check could never see the `-v` it needs to refuse, and would
+/// silently report the write as inert. Scanning the original text is coarser
+/// — any `-v` printf anywhere in the command makes every printf in it a
+/// hazard — which is the safe direction to be wrong in.
+fn printf_can_bind_variable(source: &str) -> bool {
+    let mut rest = source;
+    while let Some(index) = rest.find("printf") {
+        let after = &rest[index + "printf".len()..];
+        // Only a real command word counts; `sprintf` and `printfoo` do not.
+        let joined_left = rest[..index]
+            .bytes()
+            .next_back()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+        let joined_right = after
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_'));
+        if !joined_left && !joined_right {
+            // printf's own arguments end at the next command separator.
+            let end = after
+                .find([';', '|', '&', '\n', ')', '}'])
+                .unwrap_or(after.len());
+            for word in after[..end].split_ascii_whitespace() {
+                // A redirect ends the argument list.
+                if word.starts_with(['>', '<']) {
+                    break;
+                }
+                // `-v NAME` and the concatenated `-vNAME` both bind, and an
+                // expansion could become either at run time.
+                if word.starts_with("-v") || word.contains(['$', '`']) {
+                    return true;
+                }
+            }
         }
-        // `-v NAME` and the concatenated `-vNAME` both bind.
-        if word.starts_with("-v") {
-            return true;
-        }
-        if word.contains(['$', '`', '\\', '\'', '"']) {
-            return true;
-        }
+        rest = after;
     }
     false
 }
@@ -25678,6 +25693,14 @@ mod tests {
             "printf hello world",
             // A value that merely starts with `-` is not the -v flag.
             "printf -n hello",
+            // Whole commands, which is what this actually receives.
+            "p=/tmp/x.txt; { printf probe; } > \"$p\"",
+            "p=/tmp/x.txt; printf hello; echo hi > \"$p\"",
+            // Not printf at all.
+            "sprintf -v p x",
+            "my_printf -v p x",
+            "printfoo -v p x",
+            "p=/tmp/x.txt; echo hi > \"$p\"",
         ] {
             assert!(
                 !printf_can_bind_variable(inert),
@@ -25692,8 +25715,13 @@ mod tests {
             // Anything dynamic could supply -v at run time.
             "printf $flag hello",
             "printf \"$fmt\"",
-            "printf '%s' \"$x\"",
             "printf `cat f`",
+            // The shapes that actually reach this, where the segment the
+            // hazard scan sees has already lost these arguments.
+            "p=/tmp/x.txt; printf -v p /etc/passwd; echo hi > \"$p\"",
+            "p=/tmp/x.txt; { printf -v p /etc/passwd; } > \"$p\"",
+            // A later printf binding still taints an earlier inert one.
+            "p=/tmp/x.txt; printf ok; printf -v p /etc/passwd; echo hi > \"$p\"",
         ] {
             assert!(
                 printf_can_bind_variable(binds),
