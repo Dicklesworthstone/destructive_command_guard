@@ -25815,6 +25815,17 @@ mod tests {
             "printf 2>/dev/null -v p /etc/passwd",
             "printf >>/dev/null -v p /etc/passwd",
             "p=/tmp/x.txt; printf > /dev/null -v p /etc/passwd; echo hi > \"$p\"",
+            // bash strips quotes and backslashes before the builtin sees its
+            // argv, so every one of these binds exactly like the bare
+            // spelling — verified against bash 5.3.9. They are caught by the
+            // quote/backslash bytes in the hazard set, and an earlier revision
+            // of this function dropped those bytes while being rewritten,
+            // which turned each of these back into an allowed write. Pin them.
+            "printf \"-v\" p /etc/passwd",
+            "printf '-v' p /etc/passwd",
+            "printf -\"v\" p /etc/passwd",
+            "printf \\-v p /etc/passwd",
+            "p=/tmp/x.txt; printf \"-v\" p /etc/passwd; echo hi > \"$p\"",
         ] {
             assert!(
                 printf_can_bind_variable(binds),
