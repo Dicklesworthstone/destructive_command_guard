@@ -315,6 +315,7 @@ fn test_audit_backtracking_requirements() {
                 "find-delete-tmpdir-brace",
                 "find-delete-var-tmp",
                 "ln-symlink-sensitive-then-delete",
+                "mv-relative-into-home",
                 "mv-sensitive-source-root-home",
                 "mv-tmp",
                 "mv-tmpdir",
