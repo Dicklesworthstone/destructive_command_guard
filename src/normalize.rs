@@ -32,6 +32,17 @@ pub struct NormalizedCommand<'a> {
     pub normalized: Cow<'a, str>,
     /// List of wrappers that were stripped (for explain/debug output).
     pub stripped_wrappers: Vec<StrippedWrapper>,
+    /// Whether the walk stopped on its own iteration bound rather than because
+    /// no wrapper was left.
+    ///
+    /// When this is set, `normalized` still begins with a wrapper word, so the
+    /// real executable is further right and unknown. A caller that resolves
+    /// argv0 has to treat that as "unresolved" rather than as an answer (#424):
+    /// `command … × 97 … gh repo edit --visibility public` left `command` in
+    /// the executable slot, an `executables = ["gh"]` rule was skipped for not
+    /// being about `command`, and the command was allowed — while 96 wrappers
+    /// denied, and the same rule without the scope denied at any depth.
+    pub wrapper_limit_reached: bool,
 }
 
 /// A wrapper that was stripped from the command.
@@ -52,6 +63,7 @@ impl<'a> NormalizedCommand<'a> {
             original: command,
             normalized: Cow::Borrowed(command),
             stripped_wrappers: Vec::new(),
+            wrapper_limit_reached: false,
         }
     }
 
@@ -88,10 +100,14 @@ pub fn strip_wrapper_prefixes(command: &str) -> NormalizedCommand<'_> {
     // Limit iterations to prevent DoS from maliciously crafted commands
     const MAX_WRAPPER_ITERATIONS: usize = 32;
     let mut iteration_count = 0;
+    let mut limit_reached = false;
     loop {
         iteration_count += 1;
         if iteration_count > MAX_WRAPPER_ITERATIONS {
-            // Too many wrapper layers - treat as suspicious and stop stripping
+            // Too many wrapper layers - treat as suspicious and stop stripping.
+            // The caller is told, because what is left in the executable slot
+            // is a wrapper word rather than the executable (#424).
+            limit_reached = true;
             break;
         }
         let before_len = current.len();
@@ -146,6 +162,7 @@ pub fn strip_wrapper_prefixes(command: &str) -> NormalizedCommand<'_> {
             original: command,
             normalized: Cow::Owned(current),
             stripped_wrappers,
+            wrapper_limit_reached: limit_reached,
         }
     }
 }

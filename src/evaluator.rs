@@ -24229,14 +24229,48 @@ fn cmd_segment_executable_name_at_depth(segment: &str, depth: usize) -> Option<S
     (!basename.is_empty()).then_some(basename)
 }
 
+/// What resolving a segment's argv0 produced.
+///
+/// The two failure cases are not interchangeable, which is why this is not an
+/// `Option` (#424). `Unresolvable` means the executable is genuinely unknowable
+/// from the text — a variable, a substitution — and a rule scoped to named
+/// executables cannot claim it. `WrapperChainTruncated` means the wrapper walk
+/// hit its own iteration bound, so the word left in the executable slot is one
+/// we already know is *not* the executable; skipping a scoped rule on the
+/// strength of that word is how `command … × 97 … gh repo edit --visibility
+/// public` was allowed while 96 wrappers denied.
+enum SegmentExecutable {
+    Name(String),
+    Unresolvable,
+    WrapperChainTruncated,
+}
+
+/// The resolved argv0, with both failure cases flattened to `None`.
+///
+/// Only the tests want that flattening; the scope gate needs the distinction
+/// (see [`SegmentExecutable`]), so this is deliberately not on the hot path.
+#[cfg(test)]
 fn segment_executable_name_in_dialect(segment: &str, dialect: ShellDialect) -> Option<String> {
+    match segment_executable_in_dialect(segment, dialect) {
+        SegmentExecutable::Name(name) => Some(name),
+        SegmentExecutable::Unresolvable | SegmentExecutable::WrapperChainTruncated => None,
+    }
+}
+
+fn segment_executable_in_dialect(segment: &str, dialect: ShellDialect) -> SegmentExecutable {
     if dialect == ShellDialect::Cmd {
-        return cmd_segment_executable_name_at_depth(segment, 0);
+        return cmd_segment_executable_name_at_depth(segment, 0)
+            .map_or(SegmentExecutable::Unresolvable, SegmentExecutable::Name);
     }
 
     let stripped = crate::normalize::strip_wrapper_prefixes(segment);
+    if stripped.wrapper_limit_reached {
+        return SegmentExecutable::WrapperChainTruncated;
+    }
     let normalized = stripped.normalized.as_ref();
-    let leading = normalized.split_whitespace().next()?;
+    let Some(leading) = normalized.split_whitespace().next() else {
+        return SegmentExecutable::Unresolvable;
+    };
     // Fast path: the overwhelmingly common segment already starts with its own
     // command word, so no prefix walk (and no extra allocation) is needed. Only
     // a leading grouping character or reserved word pays for the tokenizing
@@ -24244,13 +24278,16 @@ fn segment_executable_name_in_dialect(segment: &str, dialect: ShellDialect) -> O
     let walked;
     let word =
         if word_is_command_prefix_syntax(leading) || crate::normalize::is_env_assignment(leading) {
-            walked = command_word_after_prefix_syntax(normalized)?;
+            let Some(found) = command_word_after_prefix_syntax(normalized) else {
+                return SegmentExecutable::Unresolvable;
+            };
+            walked = found;
             walked.as_str()
         } else {
             leading
         };
     if word.contains(['$', '`', '%']) {
-        return None;
+        return SegmentExecutable::Unresolvable;
     }
     // Quotes around (or inside) argv0 are removed by the shell before exec:
     // `"chmod"` and `ch"mod"` both run chmod.
@@ -24263,17 +24300,17 @@ fn segment_executable_name_in_dialect(segment: &str, dialect: ShellDialect) -> O
         .next()
         .unwrap_or(unquoted.as_str());
     if basename.is_empty() {
-        return None;
+        return SegmentExecutable::Unresolvable;
     }
     let lowered = basename.to_ascii_lowercase();
     for extension in [".exe", ".cmd", ".bat", ".com"] {
         if let Some(base) = lowered.strip_suffix(extension)
             && !base.is_empty()
         {
-            return Some(base.to_string());
+            return SegmentExecutable::Name(base.to_string());
         }
     }
-    Some(lowered)
+    SegmentExecutable::Name(lowered)
 }
 
 #[cfg(test)]
@@ -24282,16 +24319,26 @@ fn segment_executable_name(segment: &str) -> Option<String> {
 }
 
 /// Whether a segment's resolved argv0 is one of the rule's declared executables.
+///
+/// A truncated wrapper chain counts as governed (#424). The alternative is to
+/// let a long enough chain of `command`/`env`/`sudo` words disable every
+/// `executables`-scoped rule while leaving the unscoped ones matching, which
+/// makes the scope a bypass primitive: the same rule denied at 96 wrappers and
+/// allowed at 97, and its unscoped twin denied at both. Answering "yes" there
+/// makes a scoped rule at least as strict as the unscoped rule it refines,
+/// which is the only defensible direction for a guard.
 fn segment_invokes_executable_in_dialect(
     segment: &str,
     executables: &[&str],
     dialect: ShellDialect,
 ) -> bool {
-    segment_executable_name_in_dialect(segment, dialect).is_some_and(|argv0| {
-        executables
+    match segment_executable_in_dialect(segment, dialect) {
+        SegmentExecutable::Name(argv0) => executables
             .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(&argv0))
-    })
+            .any(|candidate| candidate.eq_ignore_ascii_case(&argv0)),
+        SegmentExecutable::WrapperChainTruncated => true,
+        SegmentExecutable::Unresolvable => false,
+    }
 }
 
 fn segment_invokes_executable(segment: &str, executables: &[&str]) -> bool {
@@ -34726,6 +34773,85 @@ mod tests {
                 "dynamic argv0 must not fire an executable-scoped rule: {command:?}"
             );
         }
+    }
+
+    /// #424: the wrapper walk has an iteration bound, and past it the word in
+    /// the executable slot is a wrapper rather than the executable. A scoped
+    /// rule used to be skipped on the strength of that word, so a long enough
+    /// `command` chain disabled it while the unscoped rules kept matching —
+    /// the scope became a bypass primitive. Reported as deny at 96 wrappers
+    /// and allow at 97, reproduced exactly.
+    #[test]
+    fn a_wrapper_chain_past_the_walk_bound_does_not_disable_a_scoped_rule_issue_424() {
+        for depth in [0_usize, 1, 31, 32, 33, 96, 97, 128, 512] {
+            let command = format!("{}chmod -R 755 /etc", "command ".repeat(depth));
+            let result = evaluate_with_pack_ids_in_dialect(
+                &command,
+                &["system.permissions"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "a {depth}-deep wrapper chain must not disable the scoped rule: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // The other wrapper words reach the same bound, so none of them is a
+        // way around the scope either.
+        for wrapper in ["command ", "env ", "sudo ", "FOO=bar "] {
+            let command = format!("{}chmod -R 755 /etc", wrapper.repeat(97));
+            let result = evaluate_with_pack_ids_in_dialect(
+                &command,
+                &["system.permissions"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "97 {wrapper:?} wrappers must not disable the scoped rule: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Answering "governed" for a truncated chain must not extend to a
+        // foreign argv0 behind a *short* chain, which is resolvable and is not
+        // chmod.
+        for command in [
+            "command command grep -R \"chmod -R 755 /etc\" .",
+            "env sudo echo \"chmod -R 755 /etc\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["system.permissions"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                !result.is_denied(),
+                "a resolvable foreign argv0 must still stand the rule down: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn the_wrapper_walk_reports_its_own_bound_issue_424() {
+        // The bound itself is reported, so a caller can tell "this is the
+        // executable" from "the walk gave up before finding it".
+        let shallow = crate::normalize::strip_wrapper_prefixes("command chmod 777 /etc");
+        assert!(!shallow.wrapper_limit_reached);
+        assert_eq!(shallow.normalized.as_ref(), "chmod 777 /etc");
+
+        let deep_command = format!("{}chmod 777 /etc", "command ".repeat(97));
+        let deep = crate::normalize::strip_wrapper_prefixes(&deep_command);
+        assert!(
+            deep.wrapper_limit_reached,
+            "97 wrappers outrun the 32-iteration bound"
+        );
+        assert!(
+            deep.normalized.as_ref().starts_with("command "),
+            "the executable slot still holds a wrapper word: {:?}",
+            deep.normalized
+        );
     }
 
     #[test]
