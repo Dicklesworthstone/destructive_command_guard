@@ -17,6 +17,16 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Security
 
+- **A `/` after an awk regex literal is division, and reading it as a new regex
+  hid the sink behind it.** A regex literal is a value, so the slash following
+  one divides. The scanner's value set had no `/`, so in `n = /a/ / 2` the second
+  slash opened a phantom regex and the scan ran forward to the next `/` in the
+  program — usually the one inside the payload's own path. That ended the bogus
+  span before any sink keyword, so the span-carries-a-sink veto never fired.
+  Nine variants were allowed, and gawk, mawk and busybox awk all execute them.
+  The veto now also recognises the `print … | "cmd"` pipe form, which names no
+  keyword at all.
+
 - **A padded SQL comment could silently switch the TRUNCATE rule off.** The
   comment-skip group added to the statement-position opener was written with a
   lazy body that merges across `*/`, so M adjacent `/**/` units gave the
@@ -91,6 +101,18 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   the command's blast radius.
 
 - **Only a dollar the shell would actually expand is resolved (#396).**
+
+### Known open
+
+- **A `core.git` safe pattern can still match starting at a later argv token**
+  (#429), so `git clean -fdx -- . clean -n` is allowed and real git removes every
+  untracked and ignored file under `.`. A grammar-accurate executable prefix
+  closes all seven shapes, but was tried and reverted: these patterns run against
+  a synthesized view that can carry bare decoded fragments, so narrowing the
+  intermediate group re-opened a proven escape-sequence bypass. A real fix has to
+  constrain where a safe pattern may anchor rather than what the tokens between
+  `git` and its subcommand look like. The *dashed* spelling of the same shape is
+  fixed.
 
 ### Documentation
 
