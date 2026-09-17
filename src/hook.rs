@@ -711,7 +711,18 @@ pub enum HookReadError {
     /// posture, so appending one stray `0xFF` to any payload allowed the
     /// command even under `DCG_FAIL_CLOSED=1` — the same class of evasion
     /// #160 closed for oversized input.
-    InvalidUtf8(std::str::Utf8Error),
+    InvalidUtf8 {
+        /// Where decoding failed, for the operator-facing diagnostic.
+        error: std::str::Utf8Error,
+        /// The payload decoded lossily.
+        ///
+        /// Carried for the same reason [`HookReadError::InputTooLarge`] carries
+        /// its prefix: without bytes to look at, the best-effort scanner cannot
+        /// run and appending one stray byte to an otherwise ordinary payload
+        /// silently skips every pack in the DEFAULT posture. Making the variant
+        /// merely blockable only closed the `DCG_FAIL_CLOSED=1` half.
+        lossy: String,
+    },
     /// Failed to parse JSON input.
     Json(serde_json::Error),
 }
@@ -772,7 +783,10 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
         });
     }
 
-    let input = String::from_utf8(buf).map_err(|e| HookReadError::InvalidUtf8(e.utf8_error()))?;
+    let input = String::from_utf8(buf).map_err(|e| HookReadError::InvalidUtf8 {
+        error: e.utf8_error(),
+        lossy: String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })?;
 
     // Strip a leading UTF-8 BOM (U+FEFF) before parsing. Some text tools prepend
     // a BOM; without this, BOM-prefixed but otherwise-valid hook input would

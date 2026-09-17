@@ -339,7 +339,7 @@ fn handle_unparseable_hook_input(
         read_err,
         hook::HookReadError::Json(_)
             | hook::HookReadError::InputTooLarge { .. }
-            | hook::HookReadError::InvalidUtf8(_)
+            | hook::HookReadError::InvalidUtf8 { .. }
     );
     let block = blockable && config.is_fail_closed();
 
@@ -395,9 +395,9 @@ fn handle_unparseable_hook_input(
             }
             // The payload bytes are attacker-controlled, so this is a malformed
             // envelope and blocks under fail-closed alongside `Json`.
-            hook::HookReadError::InvalidUtf8(err) => {
+            hook::HookReadError::InvalidUtf8 { error, .. } => {
                 emit_stderr!(
-                    "[dcg] Warning: hook input is not valid UTF-8 ({err}); allowing command (fail-open). Set DCG_FAIL_CLOSED=1 to block instead."
+                    "[dcg] Warning: hook input is not valid UTF-8 ({error}); allowing command (fail-open). Set DCG_FAIL_CLOSED=1 to block instead."
                 );
             }
             // A transient stdin read error is not an attacker-controlled
@@ -515,9 +515,15 @@ fn push_oversized_scan_windows(out: &mut Vec<String>, command: &str, max_command
 ///   unrelated object can carry a decoy, so judging one occurrence would let
 ///   a benign decoy suppress the real command.
 ///
-/// Only called under fail-open; fail-closed oversized input still denies
+/// Only called under fail-open; fail-closed unparseable input still denies
 /// unconditionally in `handle_unparseable_hook_input` (issue #160).
-fn try_deny_oversized_input(
+///
+/// Serves every unparseable-payload kind that still carries bytes: oversized
+/// input hands over its truncated prefix, and invalid UTF-8 hands over its
+/// lossy decoding. The two differ only in how the bytes became unusable, and an
+/// attacker picks whichever is cheaper — appending one `0xFF` is a great deal
+/// cheaper than padding past the size limit.
+fn try_deny_unparseable_payload(
     config: &Config,
     detected_agent: &Agent,
     prefix: &str,
@@ -1714,8 +1720,17 @@ fn main() {
             // every pack. A proven deny/ask on the embedded command emits the
             // normal protocol response; anything else keeps fail-open.
             if !config.is_fail_closed() {
-                if let hook::HookReadError::InputTooLarge { prefix, .. } = &read_err {
-                    if let Some(exit_code) = try_deny_oversized_input(
+                // Both unparseable-payload kinds that still carry bytes get the
+                // same best-effort scan. Invalid UTF-8 needs it as much as
+                // oversized input does: one stray byte appended to an ordinary
+                // envelope is far cheaper to write than megabytes of padding.
+                let salvageable = match &read_err {
+                    hook::HookReadError::InputTooLarge { prefix, .. } => Some(prefix.as_str()),
+                    hook::HookReadError::InvalidUtf8 { lossy, .. } => Some(lossy.as_str()),
+                    hook::HookReadError::Io(_) | hook::HookReadError::Json(_) => None,
+                };
+                if let Some(prefix) = salvageable {
+                    if let Some(exit_code) = try_deny_unparseable_payload(
                         &config,
                         &detected_agent,
                         prefix,

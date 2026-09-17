@@ -134,7 +134,10 @@ fn a_program_file_invocation_never_yields_an_inline_payload() {
         "awk -f prog.awk 'BEGIN{ system(\"rm -rf /\") }'",
         "awk --file prog.awk 'BEGIN{ system(\"rm -rf /\") }'",
         "awk -fprog.awk 'BEGIN{ system(\"rm -rf /\") }'",
-        "awk --file=prog.awk 'BEGIN{ system(\"rm -rf /\") }'",
+        // `--file=prog.awk` is deliberately NOT here: it is a GNU extension, and
+        // an awk that does not implement it runs the following operand as its
+        // program. See
+        // `a_glued_long_progfile_flag_keeps_the_positional_operand_admissible`.
     ] {
         assert!(
             payloads(command).is_empty(),
@@ -251,18 +254,167 @@ fn a_quote_inside_a_regex_literal_does_not_hide_a_later_sink() {
     );
 }
 
+/// Tracking regex literals introduced its own hazard: a `/` the heuristic reads
+/// as a regex opener, whose "closing" slash is really a path separator inside
+/// the payload, would skip straight over the sink.
+///
+/// Two independent guards close it. `x++ / 2` and `x-- / 2` are recognised as
+/// division, because the doubled operator is what distinguishes them from
+/// `a + /re/` (awk reads a bare regex in expression position as `$0 ~ /re/`, so
+/// a single `+` legitimately precedes one). And any candidate regex body that
+/// spells a sink keyword vetoes the skip outright, on the grounds that a real
+/// regex almost never does and the span is therefore evidence of a misread.
+#[test]
+fn a_misread_slash_cannot_skip_over_a_sink() {
+    for command in [
+        "awk 'BEGIN{ x = y++ / 2; system(\"rm -rf /tmp/z\") }'",
+        "awk 'BEGIN{ x = y-- / 2; system(\"rm -rf /tmp/z\") }'",
+        "awk 'BEGIN{ x = a + /re/; system(\"rm -rf /tmp/z\") }'",
+        "awk 'BEGIN{ x = 1/2/3/4; system(\"rm -rf /tmp/z\") }'",
+    ] {
+        assert_eq!(
+            payloads(command),
+            vec!["rm -rf /tmp/z".to_string()],
+            "a misread slash must not hide the sink after it: {command:?}"
+        );
+    }
+
+    // The pipe sinks travel the same path and must survive it too.
+    assert_eq!(
+        payloads("awk 'BEGIN{ x = 1/2; print \"a\" | \"rm -rf /tmp/z\" }'"),
+        vec!["rm -rf /tmp/z".to_string()],
+    );
+    assert_eq!(
+        payloads("awk 'BEGIN{ x = 1/2; \"rm -rf /tmp/z\" | getline line }'"),
+        vec!["rm -rf /tmp/z".to_string()],
+    );
+
+    // Ordinary division and ordinary regexes still extract nothing.
+    for command in [
+        "awk 'BEGIN{ x = 10 / 2; print x }'",
+        "awk 'BEGIN{ x = y++ / 2; print x }'",
+        "awk '/a|b/ { print }' f.txt",
+        "awk -F/ '{print $2}' paths.txt",
+    ] {
+        assert!(
+            payloads(command).is_empty(),
+            "ordinary awk yields no payload: {command:?}"
+        );
+    }
+}
+
 /// A program written inside shell DOUBLE quotes arrives with its own quotes
 /// backslash-escaped, and the shell removes those before the interpreter runs.
+///
+/// All three sinks travel that path, not just the call form: the two pipe sinks
+/// are decided by the scanner loop pairing a string literal, so the loop needs
+/// the escaped spelling too, and tier 1 has to admit it before tier 2 ever runs.
 #[test]
 fn an_escaped_quote_opens_a_literal_just_as_a_bare_one_does() {
-    assert_eq!(
-        payloads("awk \"BEGIN{ system(\\\"rm -rf /tmp/z\\\") }\""),
-        vec!["rm -rf /tmp/z".to_string()],
-    );
-    assert_eq!(
-        payloads("osascript -e \"do shell script \\\"rm -rf /tmp/z\\\"\""),
-        vec!["rm -rf /tmp/z".to_string()],
-    );
+    for command in [
+        "awk \"BEGIN{ system(\\\"rm -rf /tmp/z\\\") }\"",
+        "awk \"BEGIN{ print 1 | \\\"rm -rf /tmp/z\\\" }\"",
+        "awk \"BEGIN{ print 1 |& \\\"rm -rf /tmp/z\\\" }\"",
+        "awk \"BEGIN{ \\\"rm -rf /tmp/z\\\" | getline x }\"",
+        "osascript -e \"do shell script \\\"rm -rf /tmp/z\\\"\"",
+    ] {
+        assert_eq!(
+            payloads(command),
+            vec!["rm -rf /tmp/z".to_string()],
+            "escaped quotes still delimit the payload: {command:?}"
+        );
+    }
+}
+
+/// A glued flag value carries its own shell quoting, which the separate spelling
+/// gets stripped for it.
+///
+/// Regression: the glued arms pushed the raw range, so `awk -e"BEGIN{…}"` handed
+/// the scanner a program whose first byte was a quote. The whole program was
+/// then read as one string literal and the sink inside it never seen.
+#[test]
+fn a_glued_flag_value_is_unquoted_like_a_separate_one() {
+    for command in [
+        "awk -e\"BEGIN{ system(\\\"rm -rf /tmp/z\\\") }\"",
+        "awk --source=\"BEGIN{ system(\\\"rm -rf /tmp/z\\\") }\"",
+        "awk -e'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        "gawk --source='BEGIN{ system(\"rm -rf /tmp/z\") }'",
+    ] {
+        assert_eq!(
+            payloads(command),
+            vec!["rm -rf /tmp/z".to_string()],
+            "the glued value is program text either way: {command:?}"
+        );
+    }
+}
+
+/// Shell quoting spliced into the middle of an executable name is invisible to
+/// the kernel, so it must be invisible to the extractor too.
+///
+/// Regression: the cheap pre-gate searched for a CONTIGUOUS `awk`/`osascript`,
+/// so `a"wk"` was rejected before tokenization even though the executable
+/// matcher behind it resolves the word correctly. A gate must be at least as
+/// permissive as the matcher it guards.
+#[test]
+fn quoting_spliced_into_an_executable_name_is_seen_through() {
+    for command in [
+        "a\"wk\" 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        "aw\\k 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        "$'awk' 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        "g\"awk\" 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        "busybox a\"wk\" 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        "osa\"script\" -e 'do shell script \"rm -rf /tmp/z\"'",
+        "osa\\script -e 'do shell script \"rm -rf /tmp/z\"'",
+    ] {
+        assert_eq!(
+            payloads(command),
+            vec!["rm -rf /tmp/z".to_string()],
+            "quoting does not change which program runs: {command:?}"
+        );
+    }
+
+    // A word that merely contains the letters is still not the interpreter.
+    for command in [
+        "hawking 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        "mawkish 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+    ] {
+        assert!(
+            payloads(command).is_empty(),
+            "not an awk: {command:?} yielded {:?}",
+            payloads(command)
+        );
+    }
+}
+
+/// The glued long forms are a GNU extension. gawk reads each as a source file,
+/// but an awk that does not implement them leaves the following operand as its
+/// program, so the operand stays admissible and the sink is still scanned.
+#[test]
+fn a_glued_long_progfile_flag_keeps_the_positional_operand_admissible() {
+    for command in [
+        "awk -Eprog.awk 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        "awk --exec=prog.awk 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        "awk --file=prog.awk 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+    ] {
+        assert_eq!(
+            payloads(command),
+            vec!["rm -rf /tmp/z".to_string()],
+            "an unimplemented option leaves the operand as the program: {command:?}"
+        );
+    }
+
+    // The separated spellings consume the progfile name on every awk, so the
+    // operand after them is data and yields nothing.
+    for command in [
+        "awk -E prog.awk 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        "awk -f prog.awk 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+        "awk -fprog.awk 'BEGIN{ system(\"rm -rf /tmp/z\") }'",
+    ] {
+        assert!(
+            payloads(command).is_empty(),
+            "the program comes from a file here: {command:?}"
+        );
+    }
 }
 
 /// Quoting or case-varying an executable is invisible to the kernel, and macOS

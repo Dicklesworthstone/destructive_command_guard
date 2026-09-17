@@ -65,9 +65,33 @@
 ///    */ TRUNCATE TABLE users"` executes exactly as the bare statement does.
 ///    Skipping only whitespace silently lost that whole shape — the same class
 ///    the newline branch was added for, and carrying the same explicit `TABLE`
-///    evidence. MySQL's *executable* comment `/*!40000 TRUNCATE TABLE users */`
-///    is the inverse: its contents do run, so `/*!` is an opener in its own
-///    right rather than something to skip, and the skip group excludes it.
+///    evidence.
+///
+///    **The comment body must be unambiguous.** It is spelled
+///    `/\*(?:[^*]|\*+[^*/])*\*+/`, the classic non-merging C-comment form, and
+///    NOT `/\*(?s:.*?)\*/`. The lazy version can merge across a `*/` boundary,
+///    so over M adjacent `/**/` units there are 2^(M-1) ways to tile the
+///    prefix. That is not merely slow: `RegexEngine::is_match` returns `false`
+///    when fancy-regex reports `BacktrackLimitExceeded`, so at 13 units the
+///    rule silently stopped matching and
+///    `mysql -e "/**//**/…/**/Q; TRUNCATE TABLE users;"` was ALLOWED. A
+///    fail-open on a resource limit is attacker-steerable, so the expression
+///    must not be able to reach the limit in the first place.
+///
+///    MySQL's *executable* comment `/*!40000 …*/` is a wrapper, not a comment:
+///    its contents run. It is therefore skippable like any other comment when
+///    the statement follows it (`/*!40000 SET … */ TRUNCATE TABLE users`), and
+///    `/\*!\d*\s*` is additionally an opener in its own right for when the
+///    statement sits INSIDE it (`/*!40000 TRUNCATE TABLE users */`). The `\*/`
+///    terminator exists for that second form.
+///
+///    Two accepted over-blocks come with the `\*/` terminator, both in the
+///    safe direction and both inside an opt-in pack: a TRUNCATE named only
+///    inside a non-executing comment after a `;` (`mysql -e "SELECT 1 /* a;
+///    TRUNCATE b */"`) is denied, and PostgreSQL inherits the MySQL `/*!`
+///    opener because all three copies are byte-identical, so
+///    `psql -c "/*! TRUNCATE TABLE users */"` is denied although Postgres
+///    treats that as an ordinary comment.
 ///
 ///    Residual, deliberately accepted: the same continuation-line shape with
 ///    the optional `TABLE` keyword omitted (`-- comment\nTRUNCATE users`) is
@@ -82,7 +106,7 @@
 /// `destructive_pattern!` takes a literal, so the packs spell the expression
 /// out rather than referencing this constant.
 #[cfg(test)]
-pub(crate) const TRUNCATE_TABLE_PATTERN: &str = r#"(?i)(?:(?:^|[;"'`])(?:\s|/\*(?!!)(?s:.*?)\*/)*|\r?\n(?:\s|/\*(?!!)(?s:.*?)\*/)*(?=TRUNCATE\s+TABLE\b)|/\*!\d*\s*)(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|\*/|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#;
+pub(crate) const TRUNCATE_TABLE_PATTERN: &str = r#"(?i)(?:(?:^|[;"'`])(?:\s|/\*(?:[^*]|\*+[^*/])*\*+/)*|\r?\n(?:\s|/\*(?:[^*]|\*+[^*/])*\*+/)*(?=TRUNCATE\s+TABLE\b)|/\*!\d*\s*)(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|\*/|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#;
 
 pub mod bigquery;
 pub mod databricks;
