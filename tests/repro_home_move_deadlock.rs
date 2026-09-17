@@ -218,3 +218,75 @@ fn prose_remediations_are_executable_for_a_home_path() {
         assert_allowed(command);
     }
 }
+
+// ---------------------------------------------------------------------------
+// GitHub #422: the same rename written with a relative source
+// ---------------------------------------------------------------------------
+//
+// `mv-within-home` requires BOTH operands to be home-rooted, so moving a file
+// into a home directory from the directory it already sits in fell through to
+// the broad denial while the identical move with an absolute source was
+// allowed. `mv-relative-into-home` closes that.
+//
+// The boundary it relaxes was already not holding: `mv Documents backup/` run
+// from `$HOME` moves a top-level home directory and is allowed today, because
+// no absolute home path appears in the command. The rule was keying on a
+// spelling, not on a risk.
+
+/// The reported case, and the two spellings that already worked.
+#[test]
+fn relative_source_into_a_home_destination_is_allowed() {
+    for command in [
+        "mv a.md /home/ubuntu/project/dcg-repro.aBcDeF/docs/a.md",
+        "mv a.md /Users/merlin/Documents/Personal/a.md",
+        "mv ./a.md /home/ubuntu/project/x/a.md",
+        "mv docs/a.md /home/ubuntu/project/x/a.md",
+        "mv -n a.md /home/ubuntu/project/x/a.md",
+        "mv a.md b.md /home/ubuntu/project/x/",
+        "mv a.md ~/project/x/a.md",
+        r#"mv "my notes.md" /home/ubuntu/project/x/notes.md"#,
+        // Unchanged, and still allowed by the older rules.
+        "mv /home/ubuntu/project/x/a.md /home/ubuntu/project/x/docs/a.md",
+        "mv a.md docs/a.md",
+    ] {
+        assert_allowed(command);
+    }
+}
+
+/// Every boundary on the new source side, each load-bearing. A miss here is a
+/// path out of the working directory, a hidden tree, or an escape from the
+/// whole-command anchor.
+#[test]
+fn relative_source_rescue_keeps_its_boundaries() {
+    for command in [
+        // `..` must not climb out of the tree the source names.
+        "mv ../../secrets /home/ubuntu/project/x/s",
+        "mv a/../../b /home/ubuntu/project/x/b",
+        // Dotfile trees stay denied on the source side.
+        "mv .ssh /home/ubuntu/backup/ssh",
+        "mv .aws/credentials /home/ubuntu/x/c",
+        // A home-rooted or absolute source belongs to the other rules, which
+        // enforce the two-components-below-home floor.
+        "mv ~/Documents /home/ubuntu/backup/d",
+        "mv /etc/passwd /home/ubuntu/x/p",
+        // A flag must not be read as a relative source.
+        "mv -t /etc a.md /home/ubuntu/x/a.md",
+        // The destination still has to be a real home path, not a home root,
+        // not a top-level home directory, and not a dotfile tree.
+        "mv a.md /etc/passwd",
+        "mv a.md /home/ubuntu",
+        "mv a.md ~",
+        "mv a.md /home/ubuntu/.ssh/authorized_keys",
+        // Traversal hidden in the destination.
+        "mv a.md /home/ubuntu/x/../../../etc/passwd",
+        // Dynamic expansion on either side.
+        "mv $f /home/ubuntu/project/x/a.md",
+        "mv a.md /home/ubuntu/project/$d/a.md",
+        "mv a.md `cat f`",
+        // Anchored whole-command: a destructive second segment is not rescued.
+        "mv a.md /home/ubuntu/x/a.md; rm -rf /",
+        "mv a.md /home/ubuntu/x/a.md && rm -rf ~",
+    ] {
+        assert_denied(command);
+    }
+}
