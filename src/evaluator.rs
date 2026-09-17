@@ -21809,12 +21809,19 @@ fn resolved_variable_values(
             }
         }
         let first = hazard_first_word(segment);
-        let may_mutate_shell_variables = match first {
+        // `Owned` means the command word carried shell quoting that had to be
+        // removed to recognise it. `printf_can_bind_variable` scans the raw
+        // source for the literal word, which a quoted spelling like `pri"ntf"`
+        // does not contain — so the argument scan would find nothing and report
+        // the segment inert. Fail closed instead, matching what that function
+        // already does for any argument list it cannot read statically.
+        let command_word_was_quoted = matches!(first, Cow::Owned(_));
+        let may_mutate_shell_variables = match first.as_ref() {
             // Only `printf -v NAME` binds; a plain printf writes to stdout
             // and cannot change what a later `$NAME` expands to (#422).
             // Checked against `source`, not `segment`: printf's arguments are
             // stripped as data before this scan, so the segment is bare.
-            "printf" => printf_can_bind_variable(source),
+            "printf" => command_word_was_quoted || printf_can_bind_variable(source),
             other => matches!(
                 other,
                 "read"
@@ -21851,7 +21858,7 @@ fn resolved_variable_values(
 /// and the `command`/`builtin` wrappers all still run the mutating word in
 /// the parent shell (v0.9.1 review false negative — `while read f; …` was
 /// invisible to the first-word hazard scan).
-fn hazard_first_word(segment: &str) -> &str {
+fn hazard_first_word(segment: &str) -> Cow<'_, str> {
     let mut words = segment.split_ascii_whitespace();
     loop {
         match words.next() {
@@ -21859,10 +21866,72 @@ fn hazard_first_word(segment: &str) -> &str {
                 "do" | "then" | "else" | "while" | "until" | "if" | "elif" | "{" | "!" | "command"
                 | "builtin" | "time",
             ) => {}
-            Some(word) => return word,
-            None => return "",
+            // A redirection and an environment assignment may both precede the
+            // command word, and neither changes which command runs:
+            // `2>/dev/null printf -v p /etc` and `LC_ALL=C printf -v p /etc`
+            // rebind `p` exactly as the bare spelling does. Skipping them costs
+            // nothing, because neither shape can itself be a mutator name.
+            Some(word) if word_is_redirect_or_assignment_prefix(word) => {}
+            Some(word) => return dequoted_command_word(word),
+            None => return Cow::Borrowed(""),
         }
     }
+}
+
+/// Whether a word sits before the command word without being it: a redirection
+/// (`2>/dev/null`, `>out`, `<in`) or an environment assignment (`LC_ALL=C`).
+fn word_is_redirect_or_assignment_prefix(word: &str) -> bool {
+    if word.contains(['<', '>']) {
+        return true;
+    }
+    // `NAME=value`, with a name that is a plain shell identifier. `=` anywhere
+    // else (a path, an option value) is not an assignment.
+    match word.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
+/// A command word with shell quoting removed, so the hazard scan dispatches on
+/// the program that actually runs.
+///
+/// `'printf'`, `"printf"`, `\printf` and `pri"ntf"` all execute printf, and the
+/// scan compares against bare names — so every one of them silently skipped the
+/// check and left a stale variable proof standing. Returns `Borrowed` for the
+/// overwhelmingly common unquoted case.
+fn dequoted_command_word(word: &str) -> Cow<'_, str> {
+    if !word.bytes().any(|b| matches!(b, b'"' | b'\'' | b'\\')) {
+        return Cow::Borrowed(word);
+    }
+    let mut out = String::with_capacity(word.len());
+    let bytes = word.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if index + 1 < bytes.len() => {
+                let next = index + 1;
+                let end = word[next..]
+                    .chars()
+                    .next()
+                    .map_or(next, |c| next + c.len_utf8());
+                out.push_str(&word[next..end]);
+                index = end;
+            }
+            b'"' | b'\'' => index += 1,
+            _ => {
+                let Some(c) = word[index..].chars().next() else {
+                    break;
+                };
+                out.push(c);
+                index += c.len_utf8();
+            }
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// Whether a `printf` segment could bind a shell variable.
@@ -25751,6 +25820,47 @@ mod tests {
                 "segment {segment:?} must dispatch to the printf arm"
             );
         }
+    }
+
+    /// A redirection, an environment assignment, and shell quoting can all sit
+    /// between the segment start and the command word without changing which
+    /// command runs.
+    ///
+    /// Regression: the scan took the first whitespace-delimited word verbatim,
+    /// so `2>/dev/null printf -v p /etc`, `LC_ALL=C printf -v p /etc`,
+    /// `'printf' -v p /etc` and `pri"ntf" -v p /etc` all reported something
+    /// other than `printf`, never reached the `-v` check, and left a stale
+    /// variable proof standing. Real bash rebinds `p` in every one of them.
+    #[test]
+    fn hazard_first_word_sees_past_prefixes_and_quoting() {
+        for segment in [
+            "2>/dev/null printf -v p /etc",
+            ">/dev/null printf -v p /etc",
+            "q=1 printf -v p /etc",
+            "LC_ALL=C printf -v p /etc",
+            "'printf' -v p /etc",
+            "\"printf\" -v p /etc",
+            "\\printf -v p /etc",
+            "pri\"ntf\" -v p /etc",
+            // The prefixes compose, and the existing wrapper list still works.
+            "while LC_ALL=C 'printf' -v p /etc",
+            "{ 2>/dev/null command printf -v p /etc",
+        ] {
+            assert_eq!(
+                hazard_first_word(segment),
+                "printf",
+                "segment {segment:?} must dispatch to the printf arm"
+            );
+        }
+
+        // An `=` that is not an assignment must not be mistaken for one, and a
+        // word with no quoting is returned borrowed rather than rebuilt.
+        assert_eq!(hazard_first_word("./a=b/tool --flag"), "./a=b/tool");
+        assert_eq!(hazard_first_word("2tool=x read p"), "2tool=x");
+        assert!(matches!(
+            hazard_first_word("printf -v p /etc"),
+            Cow::Borrowed(_)
+        ));
     }
 
     /// GitHub #422: only `printf -v NAME` binds a shell variable. Treating
