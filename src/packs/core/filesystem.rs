@@ -3720,6 +3720,48 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "mv-within-home",
             r#"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)+/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)+/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)+/?'))+[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?')[ \t]*$"#
         ),
+        // -----------------------------------------------------------------
+        // The same ordinary rename, written with a relative source.
+        //
+        // `mv-sensitive-source-root-home` fires on any mv whose command line
+        // *mentions* a home path, and `mv-within-home` above only rescues the
+        // command when BOTH operands are home-rooted. So moving a file into a
+        // home directory from the directory it already sits in was denied
+        // while the identical move with an absolute source was allowed
+        // (GitHub #422):
+        //
+        //     mv a.md /home/u/project/x/docs/a.md            denied
+        //     mv /home/u/project/x/a.md /home/u/project/x/docs/a.md   allowed
+        //     mv a.md docs/a.md                              allowed
+        //
+        // The rule keys on a spelling, not on a risk. The boundary it states
+        // — that a top-level home directory can never be the thing being
+        // moved — does not hold today either: `mv Documents backup/` run from
+        // `$HOME` does exactly that and is allowed, because no absolute home
+        // path appears in it. Accepting a relative source here therefore adds
+        // no exposure that spelling both operands relatively does not already
+        // have.
+        //
+        // The source side is constrained to what cannot reach out of the
+        // working directory or name a hidden tree:
+        // - `(?![-~.])` on the first component refuses a flag (`-t`), a
+        //   home-rooted path (`~/...`), and every dotfile tree (`.ssh`,
+        //   `.aws`), while `(?:\./)?` still permits the ordinary `./x`.
+        // - A leading `/` cannot match at all: the component class excludes
+        //   it, so absolute sources keep going through `mv-within-home`.
+        // - `..` is refused in every later component, so no source can climb
+        //   out of the tree it names.
+        // - Dynamic expansion is excluded globally and inside every token,
+        //   and the whole command is anchored, so a compound that appends a
+        //   destructive second segment is not rescued.
+        // The destination alternation is lifted verbatim from
+        // `mv-within-home` so the two cannot disagree about what a
+        // home-rooted target is.
+        // -----------------------------------------------------------------
+        safe_pattern!(
+            "mv-relative-into-home",
+            r#"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:\./)?(?![-~.])[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:\./)?(?![-~.])[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:\./)?(?![-~.])[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?'))+[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?')[ \t]*$"#
+        ),
     ]
 }
 
