@@ -22349,14 +22349,53 @@ fn value_is_inert_when_substituted(value: &str) -> bool {
         })
 }
 
+/// A value safe to splice when the result can only ADD a denial.
+///
+/// Same set as [`value_is_inert_when_substituted`] plus blanks. A value holding
+/// a space really does word-split at an unquoted use site — `F="-r -f"; rm $F /`
+/// hands rm two flag words — so splicing it is faithful to what the shell does,
+/// and the extra words can only reveal a rule, never hide one. Shell
+/// metacharacters stay excluded in both directions: a value carrying `;` or `|`
+/// would restructure the command rather than fill a word in it.
+fn value_is_safe_to_splice_for_denial(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'_' | b'-' | b'.' | b'/' | b':' | b'+' | b'@' | b' ' | b'\t'
+                )
+        })
+}
+
+/// Which way a resolution may move the verdict, which decides how strict it has
+/// to be about what it cannot prove.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResolutionDirection {
+    /// The resolved text may LIFT a denial (#275, #396). Everything must be
+    /// provable: a word left unresolved could hold anything, so a partial
+    /// reading is not the command that runs, and allowing on it would be
+    /// guessing.
+    MayAllow,
+    /// The resolved text may only ADD a denial (#421). An unprovable reference
+    /// is left exactly as written and the walk continues, because substituting
+    /// what IS known can only reveal a rule the literal text hid — and the words
+    /// left unresolved still face the dynamic-path rules they always did.
+    DenyOnly,
+}
+
 /// Rewrite `$NAME` / `${NAME}` in `segment` to the single literal value each one
-/// is provably bound to earlier in this same command. Returns None when any
-/// reference is unprovable, multi-valued, or not inert to splice.
+/// is provably bound to earlier in this same command.
+///
+/// Returns None when nothing was substituted, and — under
+/// [`ResolutionDirection::MayAllow`] — when any reference is unprovable,
+/// multi-valued, or not inert to splice.
 fn resolve_proven_variables_in_segment(
     source: &str,
     segment_ranges: &[(usize, usize)],
     segment_start: usize,
     segment: &str,
+    direction: ResolutionDirection,
 ) -> Option<String> {
     let mut out = String::with_capacity(segment.len());
     let mut rest = segment;
@@ -22407,11 +22446,37 @@ fn resolve_proven_variables_in_segment(
                     rest = &tail[1..];
                     continue;
                 };
-                let values = resolved_variable_values(source, segment_ranges, segment_start, name)?;
+                // `keep` leaves the reference exactly as the author wrote it, so
+                // the resolved text still describes that word as unresolved.
+                let keep = |out: &mut String| {
+                    out.push_str(&tail[..consumed]);
+                    &tail[consumed..]
+                };
+                let values =
+                    match resolved_variable_values(source, segment_ranges, segment_start, name) {
+                        Some(values) => values,
+                        None if direction == ResolutionDirection::DenyOnly => {
+                            rest = keep(&mut out);
+                            continue;
+                        }
+                        None => return None,
+                    };
                 let [value] = values.as_slice() else {
+                    if direction == ResolutionDirection::DenyOnly {
+                        rest = keep(&mut out);
+                        continue;
+                    }
                     return None;
                 };
-                if !value_is_inert_when_substituted(value) {
+                let splicable = match direction {
+                    ResolutionDirection::MayAllow => value_is_inert_when_substituted(value),
+                    ResolutionDirection::DenyOnly => value_is_safe_to_splice_for_denial(value),
+                };
+                if !splicable {
+                    if direction == ResolutionDirection::DenyOnly {
+                        rest = keep(&mut out);
+                        continue;
+                    }
                     return None;
                 }
                 out.push_str(value);
@@ -22449,9 +22514,13 @@ fn rm_segment_resolves_to_allowed_literals(
     if dialect == ShellDialect::PowerShell {
         return false;
     }
-    let Some(resolved) =
-        resolve_proven_variables_in_segment(source, segment_ranges, segment_start, segment)
-    else {
+    let Some(resolved) = resolve_proven_variables_in_segment(
+        source,
+        segment_ranges,
+        segment_start,
+        segment,
+        ResolutionDirection::MayAllow,
+    ) else {
         return false;
     };
     matches!(
@@ -22462,6 +22531,53 @@ fn rm_segment_resolves_to_allowed_literals(
         ),
         crate::packs::core::filesystem::RmParseDecision::Allow
     )
+}
+
+/// The rm decision for a segment once its proven `$VAR`s are spliced in, when
+/// that decision is a DENY the unresolved text did not produce (#421).
+///
+/// The mirror of [`rm_segment_resolves_to_allowed_literals`], and it closes the
+/// asymmetry that function created. Every rm rule keys off literal flag text, so
+/// flags arriving through a variable made the classifier miss the command
+/// entirely: `F=-rf; rm $F /` was allowed with no rule id at all, while
+/// `rm -rf /` is the exact command `rm-rf-root-home` exists to stop.
+///
+/// The usual objection to resolving a dynamic word — that static analysis cannot
+/// know the value — does not apply. `F=-rf` is exactly as provable as the
+/// `D=/tmp/x` that #275 and #396 already resolve, and the proof machinery is
+/// position-agnostic: it substitutes into the flag word and the operand alike.
+/// So this was an asymmetry in what the existing proof was consulted for, not a
+/// limit of what could be known.
+///
+/// Only a DENY is promoted. A resolved text that classifies as Allow or NoMatch
+/// changes nothing, so resolution can never make a command *more* permitted than
+/// its literal reading.
+fn rm_segment_resolves_to_denied_literals(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    segment: &str,
+    automated_stdin: bool,
+    dialect: ShellDialect,
+) -> Option<crate::packs::core::filesystem::RmParseDecision> {
+    if dialect == ShellDialect::PowerShell {
+        return None;
+    }
+    let resolved = resolve_proven_variables_in_segment(
+        source,
+        segment_ranges,
+        segment_start,
+        segment,
+        ResolutionDirection::DenyOnly,
+    )?;
+    match crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
+        &resolved,
+        automated_stdin,
+        dialect,
+    ) {
+        deny @ crate::packs::core::filesystem::RmParseDecision::Deny(_) => Some(deny),
+        _ => None,
+    }
 }
 
 fn filesystem_non_pre_rm_non_redirect_pattern(name: Option<&str>) -> bool {
@@ -23394,6 +23510,20 @@ fn evaluate_core_filesystem_pack(
             shell_dialect,
         ) {
             rm_decision = crate::packs::core::filesystem::RmParseDecision::Allow;
+        } else if let Some(denied) = rm_segment_resolves_to_denied_literals(
+            // Same source, same proof, opposite direction (#421). Every rm rule
+            // keys off literal flag text, so `F=-rf; rm $F /` classified as no
+            // rm at all and rode through with no rule id. Only reached when the
+            // unresolved text did NOT already deny, so this cannot loosen
+            // anything.
+            redirect_source,
+            segment_ranges,
+            segment_start,
+            dialect_segment,
+            rm_automated_stdin,
+            shell_dialect,
+        ) {
+            rm_decision = denied;
         }
         let rm_was_semantically_handled = !matches!(
             &rm_decision,
@@ -25902,6 +26032,65 @@ mod tests {
                 "printf",
                 "segment {segment:?} must dispatch to the printf arm"
             );
+        }
+    }
+
+    /// rm flags arriving through a variable must be resolved too (#421).
+    ///
+    /// Regression: every rm rule keys off literal flag text, so the classifier
+    /// did not recognise `F=-rf; rm $F /` as a destructive rm at all and no regex
+    /// matched either — allowed, with no rule id. The proof that already resolves
+    /// rm OPERANDS (#396) and redirect targets (#275) is position-agnostic; it
+    /// simply was not consulted in the deny direction.
+    #[test]
+    fn rm_flags_supplied_through_a_variable_are_resolved() {
+        // Direction matters: an unprovable reference is kept under `DenyOnly`
+        // and refuses the whole resolution under `MayAllow`.
+        let source = "F=-rf; rm $F \"$HOME\"";
+        let ranges = [(0usize, 5usize), (7usize, source.len())];
+        assert_eq!(
+            resolve_proven_variables_in_segment(
+                source,
+                &ranges,
+                7,
+                "rm $F \"$HOME\"",
+                ResolutionDirection::DenyOnly,
+            )
+            .as_deref(),
+            Some("rm -rf \"$HOME\""),
+            "the provable flag resolves; the unprovable $HOME stays as written"
+        );
+        assert_eq!(
+            resolve_proven_variables_in_segment(
+                source,
+                &ranges,
+                7,
+                "rm $F \"$HOME\"",
+                ResolutionDirection::MayAllow,
+            ),
+            None,
+            "lifting a denial requires every reference to be provable"
+        );
+
+        // A value that word-splits is faithful in the deny direction only.
+        assert!(value_is_safe_to_splice_for_denial("-r -f"));
+        assert!(!value_is_inert_when_substituted("-r -f"));
+        // Shell metacharacters are refused in BOTH directions: such a value
+        // restructures the command rather than filling a word in it.
+        for hostile in [
+            "-rf; echo",
+            "-rf|tee",
+            "-rf&",
+            "$(id)",
+            "`id`",
+            "a'b",
+            "a\"b",
+        ] {
+            assert!(
+                !value_is_safe_to_splice_for_denial(hostile),
+                "{hostile:?} must not be spliced"
+            );
+            assert!(!value_is_inert_when_substituted(hostile));
         }
     }
 
