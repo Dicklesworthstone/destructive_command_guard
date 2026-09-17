@@ -965,6 +965,37 @@ pub enum SkipReason {
     MalformedInput { reason: String },
 }
 
+impl SkipReason {
+    /// Whether this reason means the reading stopped early, so payloads that
+    /// are present in the command were never read (#427).
+    ///
+    /// Every budget and abort qualifies: the extractor gave up with work left
+    /// to do, which is what makes the result an incomplete reading and the
+    /// caller's problem rather than the extractor's.
+    ///
+    /// `UnterminatedHeredoc` deliberately does not. It reports a shape — a
+    /// `<<` with no terminator line — and nothing was dropped on account of
+    /// it; the text is still in the command every pattern is matched against.
+    /// It is also routinely a *misread* of ordinary data, because the operator
+    /// appears in arithmetic (`$((1<<3))`), in prose that a rule is documented
+    /// with (`git commit -m "explain <<EOF"`), and historically in the tail of
+    /// a here-string. Treating it as an incomplete reading would put all of
+    /// those on the bounded-fallback path and deny them outright under
+    /// `fallback_on_parse_error=false`.
+    #[must_use]
+    pub fn stopped_early(&self) -> bool {
+        match self {
+            Self::ExceededSizeLimit { .. }
+            | Self::ExceededLineLimit { .. }
+            | Self::ExceededHeredocLimit { .. }
+            | Self::BinaryContent { .. }
+            | Self::Timeout { .. }
+            | Self::MalformedInput { .. } => true,
+            Self::UnterminatedHeredoc { .. } => false,
+        }
+    }
+}
+
 impl std::fmt::Display for SkipReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1222,6 +1253,11 @@ fn record_timeout_if_needed(
 ///
 /// - Bounded memory usage (never allocate >`max_body_bytes` per heredoc)
 /// - Graceful degradation on malformed input (fail-open with warning)
+/// - `Extracted` means nothing was dropped. A budget or an abort that stops an
+///   extractor — see [`SkipReason::stopped_early`] — yields `Partial` instead,
+///   even when other payloads were read successfully, because the caller
+///   decides what an incomplete reading is worth and cannot decide that if it
+///   is told the reading was complete (#427).
 ///
 /// # Examples
 ///
@@ -1286,7 +1322,10 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         return if extracted.is_empty() {
             ExtractionResult::Skipped(skip_reasons)
         } else {
-            ExtractionResult::Extracted(extracted)
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
         };
     }
 
@@ -1303,7 +1342,10 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         return if extracted.is_empty() {
             ExtractionResult::Skipped(skip_reasons)
         } else {
-            ExtractionResult::Extracted(extracted)
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
         };
     }
 
@@ -1320,7 +1362,10 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         return if extracted.is_empty() {
             ExtractionResult::Skipped(skip_reasons)
         } else {
-            ExtractionResult::Extracted(extracted)
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
         };
     }
 
@@ -1337,7 +1382,10 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         return if extracted.is_empty() {
             ExtractionResult::Skipped(skip_reasons)
         } else {
-            ExtractionResult::Extracted(extracted)
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
         };
     }
 
@@ -1354,7 +1402,10 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         return if extracted.is_empty() {
             ExtractionResult::Skipped(skip_reasons)
         } else {
-            ExtractionResult::Extracted(extracted)
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
         };
     }
 
@@ -1371,7 +1422,10 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         return if extracted.is_empty() {
             ExtractionResult::Skipped(skip_reasons)
         } else {
-            ExtractionResult::Extracted(extracted)
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
         };
     }
 
@@ -1388,7 +1442,10 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         return if extracted.is_empty() {
             ExtractionResult::Skipped(skip_reasons)
         } else {
-            ExtractionResult::Extracted(extracted)
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
         };
     }
 
@@ -1405,7 +1462,10 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         return if extracted.is_empty() {
             ExtractionResult::Skipped(skip_reasons)
         } else {
-            ExtractionResult::Extracted(extracted)
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
         };
     }
 
@@ -1443,14 +1503,39 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
             ExtractionResult::Extracted(extracted)
         }
         (false, false) => {
-            // Partial extraction with some skips - return what we got
+            // Something was extracted and something was skipped. When the skip
+            // means the reading stopped early — a budget or an abort, see
+            // `SkipReason::stopped_early` — this is not a complete reading of
+            // the command and must not be reported as one (#427).
+            // `Extracted` told the evaluator "here is all of
+            // the embedded code", which skipped the bounded fallback and let
+            // ten benign payloads hide an eleventh: `awk` with ten
+            // `system("echo N")` calls followed by one `system("rm -rf ~/Documents")`
+            // filled `max_heredocs` and was allowed, while nine pads were
+            // blocked. The same padding starved the ssh/herestring/heredoc
+            // extractors that run after the awk one.
+            //
+            // `Partial` is the case the evaluator already models: it analyses
+            // what was extracted, then runs the bounded fallback over the whole
+            // command because a source was skipped, and honours
+            // `fallback_on_timeout` / `fallback_on_parse_error` for callers who
+            // want an incomplete reading to be a denial outright.
             debug!(
                 elapsed_us,
                 count = extracted.len(),
                 skip_count = skip_reasons.len(),
                 "tier2_complete: partial extraction with skips"
             );
-            ExtractionResult::Extracted(extracted)
+            if skip_reasons.iter().any(SkipReason::stopped_early) {
+                ExtractionResult::Partial {
+                    extracted,
+                    skipped: skip_reasons,
+                }
+            } else {
+                // Only shape observations, nothing dropped — see
+                // `SkipReason::stopped_early`.
+                ExtractionResult::Extracted(extracted)
+            }
         }
     }
 }
@@ -3442,6 +3527,23 @@ fn extract_heredocs(
         if extracted.len() >= limits.max_heredocs {
             hit_limit = true;
             break;
+        }
+
+        // `<<<` is a here-string, not a heredoc, and `extract_herestrings`
+        // already handled it. The regex anchors on `<<`, so it also matches the
+        // last two `<` of `<<<` and reads the here-string's own text as a
+        // heredoc delimiter — `cat <<< 'hello world'` produced a phantom
+        // heredoc with delimiter `hello world`, which has no terminator line
+        // and so recorded `UnterminatedHeredoc`. That reason was invisible
+        // while a partial extraction was reported as complete; now that it is
+        // not (#427), a phantom reason would put every here-string on the
+        // bounded-fallback path, and deny it outright under
+        // `fallback_on_parse_error=false`.
+        if command.as_bytes()[..cap.get(0).map_or(0, |m| m.start())]
+            .last()
+            .is_some_and(|byte| *byte == b'<')
+        {
+            continue;
         }
 
         let operator_variant = cap.get(1).map(|m| m.as_str());
@@ -7307,7 +7409,7 @@ mod tests {
                 assert_eq!(contents[0].content, "hello world");
                 assert_eq!(contents[0].heredoc_type, Some(HeredocType::HereString));
             } else {
-                panic!("Expected Extracted result");
+                panic!("Expected Extracted result, got {result:?}");
             }
         }
 
@@ -8178,10 +8280,62 @@ mod tests {
                 ..Default::default()
             };
             let result = extract_content(cmd, &limits);
-            if let ExtractionResult::Extracted(contents) = result {
-                assert!(contents.len() <= limits.max_heredocs);
+            // The budget is never reached here: the delimiter lines carry
+            // trailing text (`A && cmd2 << B`), so only the last heredoc is
+            // terminated and one payload comes out. The other two are reported
+            // as unterminated, which is a shape observation rather than an
+            // early stop, so the reading is still complete — see
+            // `SkipReason::stopped_early` and, for the budget itself,
+            // `a_filled_heredoc_budget_is_reported_as_partial` (#427).
+            match result {
+                ExtractionResult::Extracted(contents) => {
+                    assert!(contents.len() <= limits.max_heredocs);
+                }
+                other => panic!("Expected Extracted result, got {other:?}"),
             }
-            // Otherwise, skip result is also acceptable
+        }
+
+        /// The budget itself, with terminators the extractor can actually find
+        /// (#427). Three complete heredocs against a budget of two: two are
+        /// read, the third is dropped, and the drop is reported.
+        #[test]
+        fn a_filled_heredoc_budget_is_reported_as_partial() {
+            let cmd = "cmd1 << A\na\nA\ncmd2 << B\nb\nB\ncmd3 << C\nc\nC";
+            let limits = ExtractionLimits {
+                max_heredocs: 2,
+                ..Default::default()
+            };
+            match extract_content(cmd, &limits) {
+                ExtractionResult::Partial { extracted, skipped } => {
+                    assert_eq!(extracted.len(), 2, "the budget should be filled");
+                    assert!(
+                        skipped
+                            .iter()
+                            .any(|r| matches!(r, SkipReason::ExceededHeredocLimit { .. })),
+                        "should report ExceededHeredocLimit, got {skipped:?}"
+                    );
+                }
+                other => panic!("Expected Partial(limit) result, got {other:?}"),
+            }
+        }
+
+        /// A here-string is not an unterminated heredoc (#427). The heredoc
+        /// regex anchors on `<<`, which also matches the tail of `<<<`; the
+        /// phantom reason it produced was harmless only while partial
+        /// extractions were reported as complete.
+        #[test]
+        fn a_here_string_produces_no_phantom_heredoc_reason() {
+            for cmd in [
+                "cat <<< 'hello world'",
+                "cat <<< \"hello world\"",
+                "cat <<< plain",
+                "grep foo <<< \"$payload\"",
+            ] {
+                match extract_content(cmd, &ExtractionLimits::default()) {
+                    ExtractionResult::Extracted(_) | ExtractionResult::NoContent => {}
+                    other => panic!("{cmd:?} must extract completely, got {other:?}"),
+                }
+            }
         }
 
         #[test]

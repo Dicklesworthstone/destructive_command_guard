@@ -730,3 +730,96 @@ fn only_a_literal_string_supplies_a_payload() {
         "a variable argument supplies no literal payload, got {extracted:?}"
     );
 }
+
+// ===========================================================================
+// #427: padding the extractor's slot budget must not buy an allow.
+//
+// `ExtractionLimits::max_heredocs` (default 10) truncates the payload list, and
+// `extract_content` used to report the truncated list as `Extracted` — a
+// complete reading. That skipped the bounded fallback, so ten benign payloads
+// hid an eleventh, and the padding also starved the ssh/herestring/heredoc
+// extractors that run after the awk and osascript ones.
+//
+// Both layers are asserted: the decision, and that the extraction now reports
+// itself as incomplete. A decision test alone cannot tell "the sink was read
+// and judged" from "the fallback happened to catch the text".
+// ===========================================================================
+
+/// Ten `system()` pads plus one real sink, the shape from the report.
+fn awk_with_pads(pad_count: usize, sink: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut program = String::from("BEGIN{");
+    for index in 0..pad_count {
+        let _ = write!(program, "system(\"echo {index}\");");
+    }
+    let _ = write!(program, "system(\"{sink}\")");
+    program.push('}');
+    format!("awk '{program}'")
+}
+
+#[test]
+fn padding_the_extraction_budget_does_not_hide_a_later_sink() {
+    // Nine pads fit inside the budget and were always blocked; ten filled it.
+    for pad_count in [0, 8, 9, 10, 11, 20] {
+        let command = awk_with_pads(pad_count, "rm -rf /Users/x/Documents");
+        assert_eq!(
+            verdict(&command),
+            "BLOCKED",
+            "{pad_count} pads hid the sink"
+        );
+    }
+}
+
+#[test]
+fn padding_one_extractor_does_not_starve_the_next() {
+    // The awk extractor runs before the ssh one, so a filled budget used to
+    // mean the ssh payload was never looked at.
+    let mut command = awk_with_pads(10, "echo done");
+    command.push_str(" ; ssh host 'rm -rf /Users/x/Documents'");
+    assert_eq!(verdict(&command), "BLOCKED");
+}
+
+#[test]
+fn a_truncated_extraction_reports_itself_as_partial() {
+    let command = awk_with_pads(10, "rm -rf /Users/x/Documents");
+    match extract_content(&command, &ExtractionLimits::default()) {
+        ExtractionResult::Partial { extracted, skipped } => {
+            assert_eq!(
+                extracted.len(),
+                ExtractionLimits::default().max_heredocs,
+                "the budget should be filled, not exceeded"
+            );
+            assert!(
+                skipped
+                    .iter()
+                    .any(|reason| { reason.to_string().to_ascii_lowercase().contains("limit") }),
+                "the skip reason should name the limit, got {skipped:?}"
+            );
+        }
+        other => panic!(
+            "a truncated extraction must not be reported as complete, got {}",
+            match other {
+                ExtractionResult::Extracted(items) => format!("Extracted({} items)", items.len()),
+                ExtractionResult::NoContent => "NoContent".to_string(),
+                ExtractionResult::Skipped(reasons) => format!("Skipped({reasons:?})"),
+                ExtractionResult::Failed(message) => format!("Failed({message})"),
+                ExtractionResult::Partial { .. } => unreachable!(),
+            }
+        ),
+    }
+}
+
+#[test]
+fn an_untruncated_extraction_is_still_reported_as_complete() {
+    // The distinction has to stay meaningful: a command whose payloads all fit
+    // must report `Extracted`, or every caller pays for the fallback.
+    let command = awk_with_pads(3, "rm -rf /Users/x/Documents");
+    assert!(
+        matches!(
+            extract_content(&command, &ExtractionLimits::default()),
+            ExtractionResult::Extracted(_)
+        ),
+        "a complete extraction must not be downgraded to partial"
+    );
+}
