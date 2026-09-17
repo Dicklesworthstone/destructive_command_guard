@@ -27,13 +27,13 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `checkout-new-branch` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*\|(?:^\|[;&\|(\n]\s*)(?:[^\s;&\|<>()]*/)?git-)checkout\s+-b\s+` |
-| `checkout-orphan` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*\|(?:^\|[;&\|(\n]\s*)(?:[^\s;&\|<>()]*/)?git-)checkout\s+--orphan\s+` |
-| `restore-staged-long` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*\|(?:^\|[;&\|(\n]\s*)(?:[^\s;&\|<>()]*/)?git-)restore\b(?=\s)(?=.*\s--staged\b)(?!.*\s(?:--worktree\|-W)\b)` |
-| `restore-staged-short` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*\|(?:^\|[;&\|(\n]\s*)(?:[^\s;&\|<>()]*/)?git-)restore\b(?=\s)(?=.*\s-S\b)(?!.*\s(?:--worktree\|-W)\b)` |
-| `clean-dry-run-short` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*\|(?:^\|[;&\|(\n]\s*)(?:[^\s;&\|<>()]*/)?git-)clean\s+-[a-z]*n[a-z]*` |
-| `clean-dry-run-long` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*\|(?:^\|[;&\|(\n]\s*)(?:[^\s;&\|<>()]*/)?git-)clean\s+--dry-run` |
-| `lfs-prune-dry-run` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*\|(?:^\|[;&\|(\n]\s*)(?:[^\s;&\|<>()]*/)?git-)lfs\s+prune(?:\s+[^\s;&\|<>\x22']+)*\s+--dry-run(?:\s\|$)` |
+| `checkout-new-branch` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:(?:-[cC]\|--git-dir\|--work-tree\|--namespace\|--super-prefix\|--shallow-file\|--attr-source\|--exec-path\|--config-env)\s+[^\s;&\|<>()]+\s+\|-[^\s;&\|<>()]*\s+)*\|^\s*(?:[^\s;&\|<>()]*/)?git-)checkout\s+-b\s+` |
+| `checkout-orphan` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:(?:-[cC]\|--git-dir\|--work-tree\|--namespace\|--super-prefix\|--shallow-file\|--attr-source\|--exec-path\|--config-env)\s+[^\s;&\|<>()]+\s+\|-[^\s;&\|<>()]*\s+)*\|^\s*(?:[^\s;&\|<>()]*/)?git-)checkout\s+--orphan\s+` |
+| `restore-staged-long` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:(?:-[cC]\|--git-dir\|--work-tree\|--namespace\|--super-prefix\|--shallow-file\|--attr-source\|--exec-path\|--config-env)\s+[^\s;&\|<>()]+\s+\|-[^\s;&\|<>()]*\s+)*\|^\s*(?:[^\s;&\|<>()]*/)?git-)restore\b(?=\s)(?=(?:\s+(?!--(?:\s\|$))[^\s;&\|<>()\x22']+)*\s+--staged\b)(?!.*\s(?:--worktree\|-W)\b)` |
+| `restore-staged-short` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:(?:-[cC]\|--git-dir\|--work-tree\|--namespace\|--super-prefix\|--shallow-file\|--attr-source\|--exec-path\|--config-env)\s+[^\s;&\|<>()]+\s+\|-[^\s;&\|<>()]*\s+)*\|^\s*(?:[^\s;&\|<>()]*/)?git-)restore\b(?=\s)(?=(?:\s+(?!--(?:\s\|$))[^\s;&\|<>()\x22']+)*\s+-S\b)(?!.*\s(?:--worktree\|-W)\b)` |
+| `clean-dry-run-short` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:(?:-[cC]\|--git-dir\|--work-tree\|--namespace\|--super-prefix\|--shallow-file\|--attr-source\|--exec-path\|--config-env)\s+[^\s;&\|<>()]+\s+\|-[^\s;&\|<>()]*\s+)*\|^\s*(?:[^\s;&\|<>()]*/)?git-)clean(?:\s+(?!--(?:\s\|$))[^\s;&\|<>()\x22']+)*\s+-[a-z]*n[a-z]*` |
+| `clean-dry-run-long` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:(?:-[cC]\|--git-dir\|--work-tree\|--namespace\|--super-prefix\|--shallow-file\|--attr-source\|--exec-path\|--config-env)\s+[^\s;&\|<>()]+\s+\|-[^\s;&\|<>()]*\s+)*\|^\s*(?:[^\s;&\|<>()]*/)?git-)clean(?:\s+(?!--(?:\s\|$))[^\s;&\|<>()\x22']+)*\s+--dry-run` |
+| `lfs-prune-dry-run` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:(?:-[cC]\|--git-dir\|--work-tree\|--namespace\|--super-prefix\|--shallow-file\|--attr-source\|--exec-path\|--config-env)\s+[^\s;&\|<>()]+\s+\|-[^\s;&\|<>()]*\s+)*\|^\s*(?:[^\s;&\|<>()]*/)?git-)lfs\s+prune(?:\s+(?!--(?:\s\|$))[^\s;&\|<>()\x22']+)*\s+--dry-run(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 

@@ -361,17 +361,26 @@ fn test_audit_backtracking_requirements() {
             "core.git",
             HashSet::from([
                 "checkout-ref-discard",
+                // The clean rules walk from the subcommand to their flag over
+                // git's real option-parsing window, which ends at a bare `--`
+                // (#429, #434). "Not a bare `--`" is a negative lookahead, so
+                // these three moved off the linear engine.
+                "clean-dry-run-long",
+                "clean-dry-run-short",
+                "clean-force",
                 "push-force-long",
                 "restore-staged-long",
                 "restore-staged-short",
                 "restore-worktree",
                 // Backreference pins redirect target == shown path (#373).
                 "show-redirect-overwrite-source",
-                // Git LFS verb guards (Refs PR #383). `lfs-prune-dry-run` is
-                // deliberately absent: 91715d5 replaced its trailing
-                // `(?![\w-])` lookahead with `(?:\s|$)`, so it runs on the
-                // linear engine again.
+                // Git LFS verb guards (Refs PR #383). `lfs-prune-dry-run` ran
+                // on the linear engine after 91715d5 replaced its trailing
+                // `(?![\w-])` lookahead with `(?:\s|$)`; it is back here
+                // because its walk to `--dry-run` now stops at a bare `--`
+                // (#429), which is a negative lookahead.
                 "lfs-migrate-rewrite",
+                "lfs-prune-dry-run",
                 "lfs-prune",
                 "lfs-uninstall",
             ]),

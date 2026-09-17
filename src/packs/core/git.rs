@@ -5079,34 +5079,43 @@ pub fn create_pack() -> Pack {
 /// `clean-dry-run-short` and the genuinely destructive `git clean -fdx -- .`
 /// rode through on the exemption.
 ///
-/// **The spaced branch's `(?:\S+\s+)*` accepts any token, and that is a known
-/// hole — but narrowing it to Git's grammar does NOT work here.** See #429: the
-/// walker lets a SAFE pattern match starting at a later argv token, past the
-/// flag that should have disqualified it, and a safe match shadows every
-/// destructive pattern in the pack. `git clean -fdx -- . clean -n` is allowed,
-/// and real git accepts the trailing tokens as pathspecs and deletes the tree.
+/// **The spaced branch's `(?:\S+\s+)*` accepts any token. That is a hole in the
+/// SAFE direction only, and the two directions are now spelled differently.**
+/// See #429: the wildcard swallows the real subcommand, so a safe pattern can
+/// match a flag that belongs to a later pathspec — `git clean -fdx -- . clean
+/// -n` matched `clean-dry-run-short` and the destructive `git clean -fdx -- .`
+/// rode through on the exemption, while real git accepted the trailing tokens
+/// as pathspecs and deleted the tree.
 ///
-/// The obvious fix is to spell Git's real grammar — `git [global-options]
-/// <subcommand>`, where the first non-option token IS the subcommand, so an
-/// intermediate word can only be a global option or a shell redirect. That was
-/// tried and reverted, because **these patterns do not run against a command
-/// line.** They run against a synthesized/sanitized view, and for a
-/// variable-spliced executable that view carries a token between `git` and the
-/// subcommand that is none of those things.
-///
-/// What was measured, rather than inferred: with a grammar-accurate prefix,
-/// `evaluator::tests::explicit_shell_dialects_close_core_git_escape_bypasses`
+/// Narrowing the prefix for *every* rule was tried in a887a5f and reverted in
+/// 58daf61, and the measurement is worth keeping: with a grammar-accurate
+/// prefix, `evaluator::tests::explicit_shell_dialects_close_core_git_escape_bypasses`
 /// stops denying `PART=i; g${PART}t reset --hard` under Posix, re-opening a
 /// proven escape-sequence bypass. Reverting *only* the `reset-hard` prefix makes
-/// it pass again, so the prefix is the cause. Additionally admitting
-/// assignment-shaped tokens (`\S+=\S*`) does NOT fix it, which rules out the
-/// leftover being the `PART=i` assignment itself.
+/// it pass again, so the prefix is the cause; admitting assignment-shaped tokens
+/// (`\S+=\S*`) as well does not fix it, because the leftover is a bare word.
+/// These patterns do not run against a command line — they run against a
+/// synthesized view, and for a variable-spliced executable that view carries a
+/// bare fragment where a subcommand would be.
 ///
-/// So any real fix for #429 has to constrain *where a safe pattern may anchor*,
-/// not what the intermediate tokens look like. Do not re-narrow this group
-/// without first checking
-/// `evaluator::tests::explicit_shell_dialects_close_core_git_escape_bypasses`,
-/// which is what catches the regression.
+/// **The asymmetry is what makes the narrow prefix safe on the allow side.** A
+/// destructive pattern that stops matching is a missed denial, so its prefix
+/// stays permissive and keeps the bypass guard above. A safe pattern that stops
+/// matching only withdraws an exemption: the command then faces the pack's
+/// destructive rules, which is the conservative direction. So `create_safe_patterns`
+/// spells Git's real grammar — `git [global-options] <subcommand>`, where an
+/// intermediate word is an option or the value of one of the global options that
+/// take a separate value (the same set `resolve_visible_alias_invocation` walks)
+/// — and `create_destructive_patterns` keeps `(?:\S+\s+)*`. Do not unify them.
+///
+/// The safe patterns whose evidence is a *flag* carry a second constraint for
+/// the same reason. Git's `parse_options` permutes, so `git clean . -n` really
+/// is a dry run and the flag cannot be required to sit immediately after the
+/// subcommand; but a bare `--` ends option parsing, so everything after it is a
+/// pathspec and `git clean -fdx -- . clean -n` deletes. The walk from the
+/// subcommand to the flag therefore accepts any token except a bare `--`, and
+/// stops at a quote as well: a quoted `'--'` is still the separator to git,
+/// and the walk runs on a view that may have lost the quotes.
 ///
 /// The dashed branch takes no intermediate words on purpose: a dashed builtin
 /// carries its options *after* the subcommand, so `git-<sub>` must be followed
@@ -5120,19 +5129,26 @@ pub fn create_pack() -> Pack {
 /// `(?i:…|git-branch(?:\.exe)?)` alternation, and the `push-force-*` rules use
 /// `[^\s&;|`()<>]+` rather than `\S+`.
 ///
-/// Safe patterns carry the same prefix, so the dry-run spellings
+/// Safe patterns keep a dashed branch too, so the dry-run spellings
 /// (`git-clean -n`, `git-lfs prune --dry-run`) keep their exemption rather than
-/// falling through to the destructive rule.
+/// falling through to the destructive rule — but it anchors at the start of the
+/// text only, where the destructive branch also accepts `;`, `&`, `|`, `(` and a
+/// newline. #431: safe matching runs on a view with the quotes removed, so a
+/// *quoted* separator arrives as a bare one and satisfies a guard that means "a
+/// command really starts here"; `git clean -fdx -- . '(' git-clean -n` was
+/// allowed, and git treats the extra tokens as pathspecs. Quote removal cannot
+/// manufacture a string start, and safe matching is per segment, so a dashed
+/// builtin in real command position is the segment's first word.
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
         // Branch creation is safe
         safe_pattern!(
             "checkout-new-branch",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+-b\s+"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)checkout\s+-b\s+"
         ),
         safe_pattern!(
             "checkout-orphan",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+--orphan\s+"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)checkout\s+--orphan\s+"
         ),
         // restore --staged only affects the index, not the working tree, so it
         // is safe. `--staged`/`-S` is a flag that may appear in ANY position
@@ -5142,20 +5158,20 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // the restore touch the working tree (handled by `restore-worktree-explicit`).
         safe_pattern!(
             "restore-staged-long",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)restore\b(?=\s)(?=.*\s--staged\b)(?!.*\s(?:--worktree|-W)\b)"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)restore\b(?=\s)(?=(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+--staged\b)(?!.*\s(?:--worktree|-W)\b)"
         ),
         safe_pattern!(
             "restore-staged-short",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)restore\b(?=\s)(?=.*\s-S\b)(?!.*\s(?:--worktree|-W)\b)"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)restore\b(?=\s)(?=(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+-S\b)(?!.*\s(?:--worktree|-W)\b)"
         ),
         // clean dry-run just previews, doesn't delete
         safe_pattern!(
             "clean-dry-run-short",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)clean\s+-[a-z]*n[a-z]*"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)clean(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+-[a-z]*n[a-z]*"
         ),
         safe_pattern!(
             "clean-dry-run-long",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)clean\s+--dry-run"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)clean(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+--dry-run"
         ),
         // `git lfs prune --dry-run` reports what it would delete and deletes
         // nothing (Refs PR #383). The flag must be a whole token — `--dry-runx`
@@ -5163,7 +5179,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // walk stops at a quote or a redirection glyph.
         safe_pattern!(
             "lfs-prune-dry-run",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)lfs\s+prune(?:\s+[^\s;&|<>\x22']+)*\s+--dry-run(?:\s|$)"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)lfs\s+prune(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+--dry-run(?:\s|$)"
         ),
     ]
 }
@@ -5480,7 +5496,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // clean -f deletes untracked files (CRITICAL - permanently removes files)
         destructive_pattern!(
             "clean-force",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)clean\s+(?:-[a-z]*f|--force\b)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)clean(?:\s+(?!--(?:\s|$))[^\s;&|<>()]+)*\s+(?:-[a-z]*f|--force\b)",
             "git clean -f/--force removes untracked files permanently. Review with 'git clean -n' first.",
             Critical,
             "git clean -f permanently deletes untracked files from your working directory. \
@@ -6972,6 +6988,81 @@ git x",
         );
     }
 
+    /// #429 and #431: a safe pattern shadows every destructive pattern in the
+    /// pack, so anything that lets one match past the flag that should have
+    /// disqualified it is an under-block. Both doors are pinned here, including
+    /// the de-quoted spelling the evaluator hands the pack for #431 — quote
+    /// removal is what turned `'('` into a command boundary.
+    #[test]
+    fn a_safe_pattern_cannot_be_reached_past_a_pathspec_separator() {
+        let pack = create_pack();
+
+        for command in [
+            "git clean -fdx -- . clean -n",
+            "git clean -xfd -- . clean --dry-run",
+            "git clean -fdx -- . lfs prune --dry-run",
+            "git clean -fdx -- . restore --staged x",
+            "git clean -fdx -- . checkout -b x",
+            "git clean -fdx --quiet -- . clean -n",
+            // #431, as the pack receives it: the quotes are already gone.
+            "git clean -fdx -- . ( git-clean -n",
+            "git clean -fdx -- . & git-clean -n",
+            "git clean -fdx -- . | git-clean -n",
+            "git clean -fdx -- . ; git-clean -n",
+            // A quoted bare `--` is still the separator to git, and the walk to
+            // the flag stops at a quote rather than reading through it.
+            "git clean -fdx '--' . -n",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "clean-force");
+        }
+    }
+
+    /// The exemptions the fix above must leave intact. `parse_options` permutes,
+    /// so a dry-run flag after a pathspec is still a dry run; and a global
+    /// option — including the ones that take a separate value — does not change
+    /// which subcommand runs.
+    #[test]
+    fn a_permuted_dry_run_flag_still_earns_its_exemption() {
+        let pack = create_pack();
+
+        for command in [
+            "git clean -n",
+            "git clean --dry-run",
+            "git clean -fdxn",
+            "git clean -fdx -n",
+            "git clean . -n",
+            "git clean -fdx src -n",
+            "git clean -fdx src --dry-run",
+            "git -C /tmp/repo clean -n",
+            "git -c core.pager=cat clean --dry-run",
+            "git --no-pager clean -n",
+            "git --git-dir=/tmp/repo/.git clean -n",
+            "git --git-dir /tmp/repo/.git clean -n",
+            "git --work-tree /tmp/repo clean -n",
+            "git restore --staged file.txt",
+            "git restore . --staged",
+            "git checkout -b feature/x",
+            "git checkout --orphan gh-pages",
+            "git lfs prune --dry-run",
+            "git-clean -n",
+            "/usr/libexec/git-core/git-clean -n",
+        ] {
+            assert_allows(&pack, command);
+        }
+
+        // For these the exemption is load-bearing: `clean-force` matches the
+        // same text, so `assert_allows` alone would also pass if the safe
+        // pattern had stopped matching and the destructive one had too.
+        for command in [
+            "git clean -fdx -n",
+            "git clean -fdx src -n",
+            "git clean -fdx src --dry-run",
+            "git -C /tmp/repo clean -fdx -n",
+        ] {
+            assert_safe_pattern_matches(&pack, command);
+        }
+    }
+
     #[test]
     fn test_clean_force_critical() {
         let pack = create_pack();
@@ -6980,6 +7071,26 @@ git x",
         assert_blocks_with_pattern(&pack, "git clean -f", "clean-force");
         assert_blocks(&pack, "git clean -fd", "removes untracked files");
         assert_blocks(&pack, "git clean -xf", "removes untracked files");
+
+        // #434: git's `parse_options` permutes, so a force flag after a
+        // pathspec is still a force flag and the tree is still deleted. Proven
+        // against git 2.55.0 with an invalid switch, which git reports as an
+        // unknown switch only if it parsed the token as an option at all:
+        // `git clean . -Z -n` -> "error: unknown switch `Z'".
+        assert_blocks_with_pattern(&pack, "git clean . -f", "clean-force");
+        assert_blocks_with_pattern(&pack, "git clean src -fdx", "clean-force");
+        assert_blocks_with_pattern(&pack, "git clean . --force", "clean-force");
+
+        // A bare `--` ends option parsing, so what follows cannot be a force
+        // flag; git refuses the command instead of deleting. It is still
+        // reported, because the flag before the `--` is genuine.
+        assert_blocks_with_pattern(&pack, "git clean -fdx -- . -f", "clean-force");
+
+        // The dry-run exemption is evaluated first, so the shapes where git
+        // itself would not delete stay allowed even though a force flag is
+        // present.
+        assert_allows(&pack, "git clean -n . -f");
+        assert_allows(&pack, "git clean --dry-run . --force");
     }
 
     #[test]
