@@ -190,3 +190,47 @@ fn a_rebinding_shaped_string_inside_the_body_is_still_data() {
         "a quoted body is data even when it quotes shell syntax: {command:?}"
     );
 }
+
+/// The same property one level down, against the exported masking function
+/// rather than the hook decision.
+///
+/// The in-crate unit tests in `src/heredoc.rs` cover the two command shapes from
+/// the report; these add the third spelling (the heredoc reaching `git`
+/// directly, with no command substitution) and pin the behaviour through the
+/// PUBLIC API, so a change to what the crate exports cannot quietly move it.
+#[test]
+fn masking_is_decided_by_the_delimiter_not_by_the_body_bytes() {
+    for command in [
+        // Balanced quotes: worked before the fix.
+        "git commit -q -m \"$(cat <<'EOF'\na \"b\" c\nRead-only\nEOF\n)\"",
+        // Unbalanced quote nested in a command substitution: the reported case.
+        "git commit -q -m \"$(cat <<'EOF'\n\u{201e}Messen\"\nRead-only\nEOF\n)\"",
+        // The same body reaching git directly, which also worked before.
+        "git commit -q -F - <<'EOF'\na \" b\nRead-only\nEOF",
+    ] {
+        let masked = destructive_command_guard::heredoc::mask_non_expanding_data_heredocs(command);
+        assert_ne!(
+            masked.as_ref(),
+            command,
+            "a quoted heredoc body must be masked: {command:?}"
+        );
+        assert!(
+            !masked.contains("Read-only"),
+            "the verb-noun-shaped word must not survive into the rescan view: {masked:?}"
+        );
+        assert_eq!(
+            masked.len(),
+            command.len(),
+            "masking preserves byte offsets: {command:?}"
+        );
+    }
+
+    // An expanding body is evaluated by the shell, so it is never masked. The
+    // fix must not have widened that.
+    let expanding = "cat <<EOF\n$(rm -rf /)\nEOF";
+    assert_eq!(
+        destructive_command_guard::heredoc::mask_non_expanding_data_heredocs(expanding).as_ref(),
+        expanding,
+        "an unquoted delimiter expands and must stay visible"
+    );
+}
