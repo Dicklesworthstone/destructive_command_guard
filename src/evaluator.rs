@@ -21809,25 +21809,32 @@ fn resolved_variable_values(
             }
         }
         let first = hazard_first_word(segment);
-        let may_mutate_shell_variables = matches!(
-            first,
-            "read"
-                | "readonly"
-                | "declare"
-                | "typeset"
-                | "local"
-                | "export"
-                | "let"
-                | "eval"
-                | "source"
-                | "."
-                | "mapfile"
-                | "readarray"
-                | "unset"
-                | "printf"
-                | "getopts"
-                | "select"
-        );
+        if std::env::var_os("DCG_PROBE_422").is_some() {
+            eprintln!("[probe] segment={segment:?} first={first:?}");
+        }
+        let may_mutate_shell_variables = match first {
+            // Only `printf -v NAME` binds; a plain printf writes to stdout
+            // and cannot change what a later `$NAME` expands to (#422).
+            "printf" => printf_can_bind_variable(segment),
+            other => matches!(
+                other,
+                "read"
+                    | "readonly"
+                    | "declare"
+                    | "typeset"
+                    | "local"
+                    | "export"
+                    | "let"
+                    | "eval"
+                    | "source"
+                    | "."
+                    | "mapfile"
+                    | "readarray"
+                    | "unset"
+                    | "getopts"
+                    | "select"
+            ),
+        };
         // A changed IFS alters how an unquoted use word-splits, which the
         // substitution proof cannot reproduce (v0.9.1 review).
         if may_mutate_shell_variables
@@ -21857,6 +21864,46 @@ fn hazard_first_word(segment: &str) -> &str {
             None => return "",
         }
     }
+}
+
+/// Whether a `printf` segment could bind a shell variable.
+///
+/// Only bash's `printf -v NAME ...` writes to a variable; every other printf
+/// writes to stdout and cannot change what a later `$NAME` expands to.
+/// Treating every `printf` as a mutator denied ordinary writes whose redirect
+/// target was a proven literal: `p=/tmp/x; { printf probe; } > "$p"` was
+/// refused while the same command with `echo`, or without the brace group,
+/// was allowed — grouping is what puts the printf in its own preceding
+/// segment, so the hazard scan saw it at all (GitHub #422).
+///
+/// Fail-closed on anything this cannot read statically. An expansion or quote
+/// in the argument list could supply `-v` at run time, and bash's printf has
+/// no `--` end-of-options terminator to rule it out, so only a plain literal
+/// argument list with no `-v` counts as inert.
+fn printf_can_bind_variable(segment: &str) -> bool {
+    let mut words = segment
+        .split_ascii_whitespace()
+        .skip_while(|word| *word != "printf");
+    // Consume `printf` itself. Its absence means the caller identified the
+    // hazard word some other way; stay conservative.
+    if words.next().is_none() {
+        return true;
+    }
+    for word in words {
+        // A redirect or separator ends printf's argument list; what follows
+        // belongs to the redirect or the next command.
+        if word.starts_with(['>', '<', ';', '|', '&', ')', '}']) {
+            break;
+        }
+        // `-v NAME` and the concatenated `-vNAME` both bind.
+        if word.starts_with("-v") {
+            return true;
+        }
+        if word.contains(['$', '`', '\\', '\'', '"']) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether a segment range is nested inside another extracted segment (the
@@ -25598,6 +25645,63 @@ pub fn apply_branch_strictness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hazard scan dispatches on this exact word, so a printf segment has
+    /// to report itself as `printf` for the `-v` check to run at all.
+    #[test]
+    fn hazard_first_word_reports_printf() {
+        for segment in [
+            "printf -v p /etc/passwd",
+            "{ printf -v p /etc/passwd",
+            "printf hello",
+            "command printf -v p x",
+        ] {
+            assert_eq!(
+                hazard_first_word(segment),
+                "printf",
+                "segment {segment:?} must dispatch to the printf arm"
+            );
+        }
+    }
+
+    /// GitHub #422: only `printf -v NAME` binds a shell variable. Treating
+    /// every printf as a mutator denied ordinary grouped writes to a proven
+    /// literal redirect target; treating none of them as one would let a real
+    /// rebinding through, so the `-v` detection is the whole boundary.
+    #[test]
+    fn printf_binds_only_with_dash_v() {
+        for inert in [
+            "printf probe",
+            "printf",
+            "{ printf probe",
+            "printf %s hello",
+            "printf hello world",
+            // A value that merely starts with `-` is not the -v flag.
+            "printf -n hello",
+        ] {
+            assert!(
+                !printf_can_bind_variable(inert),
+                "{inert:?} cannot bind a variable"
+            );
+        }
+        for binds in [
+            "printf -v p /etc/passwd",
+            "{ printf -v p /etc/passwd",
+            "printf -vp /etc/passwd",
+            "printf -v",
+            // Anything dynamic could supply -v at run time.
+            "printf $flag hello",
+            "printf \"$fmt\"",
+            "printf '%s' \"$x\"",
+            "printf `cat f`",
+        ] {
+            assert!(
+                printf_can_bind_variable(binds),
+                "{binds:?} must stay a mutation hazard"
+            );
+        }
+    }
+
     use crate::allowlist::{
         AllowEntry, AllowSelector, AllowlistFile, LoadedAllowlistLayer, RuleId,
     };
