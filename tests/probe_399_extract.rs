@@ -303,6 +303,89 @@ fn a_misread_slash_cannot_skip_over_a_sink() {
     }
 }
 
+/// A `/` can be a regex CLOSE or the division OPERATOR, and the previous byte
+/// alone cannot tell them apart.
+///
+/// ```text
+/// n = /a/ / 2      the `/` before is a regex close — a VALUE — so this divides
+/// x = 4 / /re/     the `/` before is the division operator, so this OPENS
+/// ```
+///
+/// Regression: treating every preceding `/` as a value got the first right and
+/// the second exactly backwards. The regex body was then scanned as code, an odd
+/// `"` inside it paired with a later string quote, and the desync hid every sink
+/// after it. gawk and mawk both run these. The scanner now remembers where it
+/// actually proved a regex closed, and only that offset counts as a value.
+#[test]
+fn division_before_a_regex_does_not_hide_the_sink_after_it() {
+    for program in [
+        "{ x = 4 / /^|\"/ ; system(\"rm -rf /tmp/z\") }",
+        "{ if (0) x = 4 / /\"/ ; system(\"rm -rf /tmp/z\") }",
+        "{ x = 4 / /a+/ ; print \"z\" | \"rm -rf /tmp/z\" }",
+        "{ x = 4 / /a*/ ; \"rm -rf /tmp/z\" | getline q }",
+        "{ x = $1 / /\"/ ; system(\"rm -rf /tmp/z\") }",
+        "{ x = (1) / /\"/ ; system(\"rm -rf /tmp/z\") }",
+    ] {
+        let command = format!("awk '{program}'");
+        assert_eq!(
+            payloads(&command),
+            vec!["rm -rf /tmp/z".to_string()],
+            "a regex opened after division must not swallow the sink: {program:?}"
+        );
+    }
+
+    // The regex-close-then-division reading must survive alongside it.
+    assert_eq!(
+        payloads("awk 'BEGIN{ n = /a/ / 2; system(\"rm -rf /tmp/z\") }'"),
+        vec!["rm -rf /tmp/z".to_string()],
+    );
+
+    // And neither reading may invent a payload for ordinary arithmetic.
+    for program in [
+        "{ x = 4 / /a+/ ; print x }",
+        "BEGIN{ n = /a/ / 2; print n }",
+        "{ s += $1/$2 } END { print s }",
+    ] {
+        let command = format!("awk '{program}'");
+        assert!(
+            payloads(&command).is_empty(),
+            "ordinary arithmetic yields nothing: {program:?}"
+        );
+    }
+}
+
+/// A regex body that happens to carry a pipe and a quote is still just a regex.
+///
+/// Regression: `awk_span_carries_a_sink` briefly vetoed a regex skip whenever
+/// the candidate body held both `|` and `"`, reaching for the third sink
+/// (`print … | "cmd"`) which names no keyword. Real awk regexes carry both —
+/// `/["|]/`, `/[|"]/` and `/"|,/` are ordinary and gawk runs all three — so the
+/// veto fired on genuine regexes, refused the skip, and let the body be scanned
+/// as code. Its `"` then paired with a later string quote, restoring the very
+/// desync regex tracking exists to prevent, and the sink after it was lost.
+#[test]
+fn a_regex_body_holding_a_pipe_and_a_quote_is_still_skipped() {
+    // Bodies expressible inside a single-quoted shell word. An apostrophe is
+    // deliberately absent: it would close the quote, so `awk '… /"|'"'"'/ …'`
+    // is not a program the shell can deliver in one token anyway.
+    for body in ["[\"|]", "[|\"]", "^\"|\"$", "\"|,"] {
+        let command = format!(
+            "awk 'BEGIN{{ x = \"a\"; gsub(/{body}/, \"\", x); system(\"rm -rf /tmp/z\") }}'"
+        );
+        assert_eq!(
+            payloads(&command),
+            vec!["rm -rf /tmp/z".to_string()],
+            "the sink after this regex must still be seen: /{body}/"
+        );
+
+        let benign = format!("awk 'BEGIN{{ x = \"a\"; gsub(/{body}/, \"\", x); print x }}'");
+        assert!(
+            payloads(&benign).is_empty(),
+            "the same regex without a sink yields nothing: /{body}/"
+        );
+    }
+}
+
 /// A regex literal is a VALUE, so the `/` that follows one is division.
 ///
 /// Regression: the value set had no `/`, so in `n = /a/ / 2` the second `/` was

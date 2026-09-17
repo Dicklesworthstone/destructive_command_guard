@@ -2595,6 +2595,11 @@ fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
     let bytes = program.as_bytes();
     let mut payloads = Vec::new();
     let mut index = 0usize;
+    // Byte offset of the `/` that closed the most recently skipped regex
+    // literal. `awk_slash_opens_regex` needs it to tell a regex CLOSE (a value,
+    // so the next `/` divides) from the division OPERATOR (after which a regex
+    // may legally open). The previous byte alone cannot distinguish them.
+    let mut last_regex_close: Option<usize> = None;
 
     while index < bytes.len() {
         match bytes[index] {
@@ -2654,7 +2659,7 @@ fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
             // with a real string quote later in the program. When it was, every
             // literal after it shifted by one and the `system()` call that
             // followed was read as string content instead of a sink.
-            b'/' if awk_slash_opens_regex(bytes, index) => {
+            b'/' if awk_slash_opens_regex(bytes, index, last_regex_close) => {
                 match awk_regex_literal_end(program, index) {
                     // Refuse to skip a span that carries a sink keyword. Such a
                     // span is proof this `/` was misread — either an
@@ -2663,11 +2668,19 @@ fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
                     // heuristic called a regex — and skipping it would hide the
                     // one thing this scanner exists to find. Reading the span as
                     // code instead can only over-extract.
+                    //
+                    // `get` returning None would mean a non-boundary index,
+                    // which cannot happen here (both ends are ASCII `/`), but
+                    // default it to "carries a sink" so the fail direction is
+                    // the scanning one rather than the skipping one.
                     Some(end)
                         if program
                             .get(index..=end)
-                            .is_none_or(|span| !awk_span_carries_a_sink(span)) =>
+                            .is_some_and(|span| !awk_span_carries_a_sink(span)) =>
                     {
+                        // Remember where this literal closed. That is the only
+                        // `/` a following `/` may treat as a value.
+                        last_regex_close = Some(end);
                         index = end + 1;
                     }
                     // Not a terminated regex after all. Treat the byte as
@@ -2730,7 +2743,7 @@ fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
 /// Misreading a division as a regex costs at most the rest of that line, since
 /// `awk_regex_literal_end` refuses to cross a newline; misreading a regex as
 /// code is what desynchronized the string walk in the first place.
-fn awk_slash_opens_regex(bytes: &[u8], index: usize) -> bool {
+fn awk_slash_opens_regex(bytes: &[u8], index: usize, last_regex_close: Option<usize>) -> bool {
     bytes[..index]
         .iter()
         .rposition(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
@@ -2739,20 +2752,28 @@ fn awk_slash_opens_regex(bytes: &[u8], index: usize) -> bool {
             // `.` is here for a trailing decimal point: `x = 1. / 2` is
             // division, and awk has no operator that would put a bare `.`
             // before a regex.
-            //
-            // `/` is here because a regex literal IS a value, so the `/` after
-            // one closes-then-divides: `n = /a/ / 2` is division by 2. Omitting
-            // it made that second `/` look like a fresh regex opener, and the
-            // scan then ran forward to the next `/` in the program — usually
-            // the one inside the payload's own path — which truncated the span
-            // before any sink keyword, so `awk_span_carries_a_sink` never got
-            // the chance to veto it. `awk 'BEGIN{ n = /a/ / 2; print "x" |
-            // "rm -rf ~/Documents" }'` runs on gawk, mawk and busybox awk, and
-            // one extra `/` in code position was the whole bypass.
             if previous.is_ascii_alphanumeric()
-                || matches!(previous, b')' | b']' | b'"' | b'_' | b'.' | b'/')
+                || matches!(previous, b')' | b']' | b'"' | b'_' | b'.')
             {
                 return false;
+            }
+            // A preceding `/` is ambiguous and the byte alone cannot settle it:
+            //
+            //   n = /a/ / 2      the `/` before is a regex CLOSE — a value — so
+            //                    this one divides.
+            //   x = 4 / /re/     the `/` before is the division OPERATOR, so
+            //                    this one opens a regex.
+            //
+            // Treating every preceding `/` as a value got the first right and
+            // the second exactly backwards: the regex body was then scanned as
+            // code, an odd `"` inside it paired with a later string quote, and
+            // the desync hid every sink after it. `awk '{ x = 4 / /^|"/ ;
+            // system("rm -rf …") }'` runs on gawk, mawk and busybox awk.
+            //
+            // `last_regex_close` is the only `/` this scanner actually proved
+            // to be a close, so it is the only one that counts as a value.
+            if previous == b'/' {
+                return last_regex_close != Some(position);
             }
             // `x++ / 2` and `x-- / 2` are division: the operand is the value the
             // increment produced. A single `+` or `-` is not, because awk reads
@@ -2775,15 +2796,19 @@ fn awk_slash_opens_regex(bytes: &[u8], index: usize) -> bool {
 /// Used to veto a regex skip. A genuine regex literal almost never spells
 /// `system` or `getline`; a span that does is evidence the scanner misread the
 /// opening `/`, and skipping it would hide the sink.
+/// Deliberately keyed on the two sink KEYWORDS and nothing else.
+///
+/// A "pipe and a quote together" clause was tried here, to reach the third sink
+/// (`print … | "cmd"`, which names no keyword). It made things worse: a real awk
+/// regex can carry both characters — `/["|]/`, `/[|"]/` and `/"|,/` are all
+/// ordinary, and gawk runs them — so the veto fired on genuine regexes, refused
+/// the skip, and let the body be scanned as code. Its `"` then paired with a
+/// later string quote and the desync that regex tracking exists to prevent came
+/// back, losing the sink that followed. Three confirmed under-blocks, against
+/// zero cases it saved once `awk_slash_opens_regex` learned that a `/` after a
+/// regex literal is division.
 fn awk_span_carries_a_sink(span: &str) -> bool {
-    span.contains("system")
-        || span.contains("getline")
-        // `print … | "cmd"` names no keyword, so the two call sinks above miss
-        // it. A pipe and a double quote together inside what claims to be a
-        // regex body are evidence enough: `/a|b/` has the pipe without the
-        // quote and `gsub(/"/, "")` has the quote without the pipe, so real
-        // regexes stay skippable.
-        || (span.contains('|') && span.contains('"'))
+    span.contains("system") || span.contains("getline")
 }
 
 /// Index of the `/` closing the awk regex literal that opens at `start`.

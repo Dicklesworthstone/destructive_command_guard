@@ -5090,12 +5090,17 @@ pub fn create_pack() -> Pack {
 /// <subcommand>`, where the first non-option token IS the subcommand, so an
 /// intermediate word can only be a global option or a shell redirect. That was
 /// tried and reverted, because **these patterns do not run against a command
-/// line.** They run against a synthesized/sanitized view, and that view can
-/// carry decoded fragments that are neither. Concretely,
-/// `PART=i; g${PART}t reset --hard` reaches the pattern with a bare `i` sitting
-/// where a subcommand would be, so a grammar-accurate prefix stops matching it
-/// and a proven escape-sequence bypass is re-opened. Admitting assignment-shaped
-/// tokens as well is not enough; the leftover is a bare word.
+/// line.** They run against a synthesized/sanitized view, and for a
+/// variable-spliced executable that view carries a token between `git` and the
+/// subcommand that is none of those things.
+///
+/// What was measured, rather than inferred: with a grammar-accurate prefix,
+/// `evaluator::tests::explicit_shell_dialects_close_core_git_escape_bypasses`
+/// stops denying `PART=i; g${PART}t reset --hard` under Posix, re-opening a
+/// proven escape-sequence bypass. Reverting *only* the `reset-hard` prefix makes
+/// it pass again, so the prefix is the cause. Additionally admitting
+/// assignment-shaped tokens (`\S+=\S*`) does NOT fix it, which rules out the
+/// leftover being the `PART=i` assignment itself.
 ///
 /// So any real fix for #429 has to constrain *where a safe pattern may anchor*,
 /// not what the intermediate tokens look like. Do not re-narrow this group

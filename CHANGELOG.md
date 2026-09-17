@@ -17,6 +17,19 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Security
 
+- **`printf -v` could rebind a proven variable without the guard noticing, and
+  `p=/tmp/safe; printf -v p /; rm -rf "$p"` reached `rm -rf /`.** Narrowing the
+  variable-mutator list so a plain `printf` no longer blocks an ordinary write
+  left three holes, each confirmed against real bash and each blocked by the
+  previous release. The rm proof was handed the argument-masked view, in which
+  every `printf` argument is already blanked, so the `-v` was invisible and
+  every printf was judged inert; bash strips quotes and backslashes before the
+  builtin sees its argv, so `printf "-v"`, `printf '-v'`, `printf -"v"` and
+  `printf \-v` all bind exactly as the bare spelling does; and a `\` line
+  continuation ended the argument scan before it reached the flag. The scan is
+  also linear again — 8000 repetitions of `printf ` took 3.8s against a 1000ms
+  hook budget, and now take 235ms.
+
 - **A `/` after an awk regex literal is division, and reading it as a new regex
   hid the sink behind it.** A regex literal is a value, so the slash following
   one divides. The scanner's value set had no `/`, so in `n = /a/ / 2` the second
@@ -24,8 +37,24 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   program — usually the one inside the payload's own path. That ended the bogus
   span before any sink keyword, so the span-carries-a-sink veto never fired.
   Nine variants were allowed, and gawk, mawk and busybox awk all execute them.
-  The veto now also recognises the `print … | "cmd"` pipe form, which names no
-  keyword at all.
+
+  Deciding that from the previous byte alone was itself wrong in the other
+  direction, and a follow-up review caught it: a `/` is a regex CLOSE (a value,
+  so the next one divides) or the division OPERATOR (after which a regex may
+  legally open), and `x = 4 / /^"|/ ; system(…)` needs the second reading.
+  Treating every preceding `/` as a value scanned that regex body as code, where
+  an odd `"` desynced the literal walk and hid the sink — 64 awk-valid variants.
+  The scanner now records the offset where it actually proved a literal closed,
+  and only that offset counts as a value.
+
+  A second clause was added to that veto at the same time, firing whenever a
+  candidate regex body held both a pipe and a quote, to reach the third sink
+  (`print … | "cmd"`) which names no keyword. It was removed again: real awk
+  regexes carry both — `/["|]/`, `/[|"]/` and `/"|,/` are ordinary and gawk runs
+  all three — so it vetoed genuine regexes, refused the skip, and let the body be
+  scanned as code, where its quote paired with a later string quote and restored
+  the exact desync regex tracking exists to prevent. Three confirmed
+  under-blocks, against zero cases it saved once the value set was corrected.
 
 - **A padded SQL comment could silently switch the TRUNCATE rule off.** The
   comment-skip group added to the statement-position opener was written with a
@@ -108,8 +137,10 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   (#429), so `git clean -fdx -- . clean -n` is allowed and real git removes every
   untracked and ignored file under `.`. A grammar-accurate executable prefix
   closes all seven shapes, but was tried and reverted: these patterns run against
-  a synthesized view that can carry bare decoded fragments, so narrowing the
-  intermediate group re-opened a proven escape-sequence bypass. A real fix has to
+  a synthesized view, not a command line, and for a variable-spliced executable
+  that view carries a token between `git` and the subcommand which is neither a
+  global option, a redirect, nor an assignment — so narrowing the intermediate
+  group re-opened a proven escape-sequence bypass. A real fix has to
   constrain where a safe pattern may anchor rather than what the tokens between
   `git` and its subcommand look like. The *dashed* spelling of the same shape is
   fixed.
