@@ -5,8 +5,57 @@
 //! - rollback without dry-run
 //! - delete commands
 
+use crate::destructive_pattern;
+use crate::packs::regex_engine::LazyCompiledRegex;
 use crate::packs::{DestructivePattern, Pack, SafePattern};
-use crate::{destructive_pattern, safe_pattern};
+
+// These grammars are for exemptions ONLY (#429/#435). Never use them to
+// narrow the destructive expressions: those also see synthesized shell
+// views, where a stricter grammar could lose a denial.
+//
+// A required pflag value consumes the following token even when it begins
+// with `--`. It must not be optional, or a description/context/value can
+// supply the apparent dry-run flag. Unknown options, quoting, shell syntax,
+// and a bare `--` conservatively withdraw the regex exemption. Expansions
+// are excluded because one apparent value can expand into several flags.
+macro_rules! helm_global_option {
+    () => {
+        concat!(
+            r"(?:--(?:burst-limit|kube-apiserver|kube-as-group|kube-as-user|kube-ca-file|kube-context|kube-tls-server-name|kube-token|kubeconfig|namespace|qps|registry-config|repository-cache|repository-config)",
+            r"(?:=[^\s;&|<>()\x22'\\$`*?\[\]{}~]+|[ \t]+[^\s;&|<>()\x22'\\$`*?\[\]{}~]+)",
+            r"|-n(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+|[ \t]+[^\s;&|<>()\x22'\\$`*?\[\]{}~]+)",
+            r"|--(?:debug|kube-insecure-skip-tls-verify)(?:=(?:true|false))?)"
+        )
+    };
+}
+
+macro_rules! helm_argument {
+    () => {
+        concat!(
+            r"(?:",
+            helm_global_option!(),
+            r"|--(?:description|cascade|timeout|history-max|output|version|repo|username|password|ca-file|cert-file|key-file|keyring|post-renderer|post-renderer-args|values|set|set-file|set-json|set-literal|set-string|labels)",
+            r"(?:=[^\s;&|<>()\x22'\\$`*?\[\]{}~]+|[ \t]+[^\s;&|<>()\x22'\\$`*?\[\]{}~]+)",
+            r"|-[fo](?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+|[ \t]+[^\s;&|<>()\x22'\\$`*?\[\]{}~]+)",
+            r"|--(?:no-hooks|ignore-not-found|keep-history|force|force-replace|force-conflicts|reset-values|reuse-values|reset-then-reuse-values|install|atomic|cleanup-on-fail|disable-openapi-validation|skip-schema-validation|skip-crds|create-namespace|verify|wait|wait-for-jobs|devel|dependency-update|enable-dns|hide-notes|hide-secret|insecure-skip-tls-verify|plain-http|render-subchart-notes|take-ownership)(?:=(?:true|false|watcher|hookOnly|legacy))?",
+            r"|-i|[^\s;&|<>()\x22'\\$`*?\[\]{}~-][^\s;&|<>()\x22'\\$`*?\[\]{}~]*|-)"
+        )
+    };
+}
+
+macro_rules! helm_safe_pattern {
+    ($name:literal, $suffix:expr) => {
+        SafePattern {
+            name: $name,
+            regex: LazyCompiledRegex::new(concat!(
+                r"^[ \t]*(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+/)?helm[ \t]+(?:",
+                helm_global_option!(),
+                r"[ \t]+)*",
+                $suffix
+            )),
+        }
+    };
+}
 
 /// Create the Helm pack.
 #[must_use]
@@ -26,75 +75,47 @@ pub fn create_pack() -> Pack {
 }
 
 fn create_safe_patterns() -> Vec<SafePattern> {
-    // `(?=\s|$)` on each read-only subcommand stops a release name that
-    // contains the subcommand keyword as a substring from making a
-    // destructive command short-circuit as safe. Without this anchor,
-    // `helm uninstall get-operator` would match the `helm-get` safe rule
-    // via `get` in `get-operator` and bypass the uninstall check.
     vec![
-        // list/status/history are safe (read-only)
-        safe_pattern!(
-            "helm-list",
-            r"helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+list(?=\s|$)"
-        ),
-        safe_pattern!(
-            "helm-status",
-            r"helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+status(?=\s|$)"
-        ),
-        safe_pattern!(
-            "helm-history",
-            r"helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+history(?=\s|$)"
-        ),
-        // show/inspect are safe (read-only)
-        safe_pattern!(
-            "helm-show",
-            r"helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s|$)"
-        ),
-        safe_pattern!(
-            "helm-inspect",
-            r"helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+inspect(?=\s|$)"
-        ),
-        // get is safe (read-only)
-        safe_pattern!("helm-get", r"helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+get(?=\s|$)"),
-        // search is safe
-        safe_pattern!(
-            "helm-search",
-            r"helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+search(?=\s|$)"
-        ),
-        // repo operations are generally safe
-        safe_pattern!(
-            "helm-repo",
-            r"helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+repo(?=\s|$)"
-        ),
-        // dry-run flags
-        safe_pattern!(
+        // Read-only verbs must be the actual subcommand, not release names
+        // or words skipped as the fictitious value of a boolean option.
+        helm_safe_pattern!("helm-list", r"list(?=\s|$)"),
+        helm_safe_pattern!("helm-status", r"status(?=\s|$)"),
+        helm_safe_pattern!("helm-history", r"history(?=\s|$)"),
+        helm_safe_pattern!("helm-show", r"show(?=\s|$)"),
+        helm_safe_pattern!("helm-inspect", r"inspect(?=\s|$)"),
+        helm_safe_pattern!("helm-get", r"get(?=\s|$)"),
+        helm_safe_pattern!("helm-search", r"search(?=\s|$)"),
+        helm_safe_pattern!("helm-repo", r"repo(?=\s|$)"),
+        // Consume complete arguments on BOTH sides of the evidence. In
+        // particular, a later `--dry-run=false` must revoke an earlier
+        // preview. Mixed disabling/enabling flags are conservatively denied;
+        // positive repeats and dry-run text consumed as data remain valid.
+        // This expression remains compatible with the linear regex engine.
+        helm_safe_pattern!(
             "helm-dry-run",
-            r"helm\b.*--dry-run(?:=(?:true|client|server))?(?:\s|$)"
+            concat!(
+                r"(?:uninstall|delete|rollback|upgrade)(?:[ \t]+",
+                helm_argument!(),
+                r")*[ \t]+--dry-run(?:=(?:true|client|server))?(?:[ \t]+(?:",
+                helm_argument!(),
+                r"|--dry-run(?:=(?:true|client|server))?))*[ \t]*$"
+            )
         ),
-        // template only generates manifests
-        safe_pattern!(
-            "helm-template",
-            r"helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+template(?=\s|$)"
-        ),
-        // lint is safe (validation)
-        safe_pattern!(
-            "helm-lint",
-            r"helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+lint(?=\s|$)"
-        ),
-        // diff plugin is safe
-        safe_pattern!(
-            "helm-diff",
-            r"helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+diff(?=\s|$)"
-        ),
+        helm_safe_pattern!("helm-template", r"template(?=\s|$)"),
+        helm_safe_pattern!("helm-lint", r"lint(?=\s|$)"),
+        helm_safe_pattern!("helm-diff", r"diff(?=\s|$)"),
     ]
 }
 
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
+    // Preview exemptions live on the safe side only. The old negative
+    // lookaheads repeated the same argument-data bug and would still miss
+    // uninstall/rollback after the safe pattern correctly refused to match.
     vec![
         // uninstall / delete
         destructive_pattern!(
             "uninstall",
-            r"helm\b.*?\b(?:uninstall|delete)\b(?!.*--dry-run(?:=(?:true|client|server))?(?:\s|$))",
+            r"helm\b.*?\b(?:uninstall|delete)\b",
             "helm uninstall removes the release and all its resources. Use --dry-run first.",
             Critical,
             "helm uninstall deletes the release and ALL Kubernetes resources created by it:\n\n\
@@ -111,7 +132,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rollback without dry-run
         destructive_pattern!(
             "rollback",
-            r"helm\b.*?\brollback\b(?!.*--dry-run(?:=(?:true|client|server))?(?:\s|$))",
+            r"helm\b.*?\brollback\b",
             "helm rollback reverts to a previous release. Use --dry-run to preview changes.",
             High,
             "helm rollback reverts the release to a previous revision. This can cause unexpected \
@@ -170,10 +191,7 @@ mod tests {
 
     #[test]
     fn helm_patterns_match_with_global_flags() {
-        // Helm global flags (`--kube-context`, `--kubeconfig`,
-        // `--namespace`/`-n`, `--debug`, `--registry-config`, …)
-        // between `helm` and the subcommand broke every `helm\s+<sub>`
-        // pattern until the `helm\b.*?\b<sub>` sweep.
+        // Destructive matching must remain permissive in synthesized views.
         let pack = create_pack();
         assert_blocks(
             &pack,
@@ -199,14 +217,20 @@ mod tests {
 
     #[test]
     fn helm_safe_patterns_do_not_bypass_via_flag_value() {
-        // Flag-value bypass class: `--get-values`, `--list-all` etc.
-        // must not match safe patterns.  `\s+<sub>\b` form enforces
-        // that the subcommand is preceded by whitespace (not `-`).
         let pack = create_pack();
         assert_allows(&pack, "helm list");
         assert_allows(&pack, "helm --kube-context prod list");
         assert_allows(&pack, "helm get values prod-release");
         assert_allows(&pack, "helm status prod-release");
+        for command in [
+            "helm --debug uninstall list",
+            "helm --kube-context prod uninstall list",
+            "helm uninstall my-release --description helm list",
+            "helm uninstall my-release --description 'helm list'",
+        ] {
+            assert_no_safe_match(&pack, command);
+            assert_blocks(&pack, command, "uninstall");
+        }
     }
 
     #[test]
@@ -254,37 +278,110 @@ mod tests {
         assert_safe_pattern_matches(&pack, "helm template my-release ./chart");
         assert_safe_pattern_matches(&pack, "helm lint ./chart");
         assert_safe_pattern_matches(&pack, "helm diff upgrade my-release ./chart");
+        assert_safe_pattern_matches(&pack, "helm --debug --kube-context prod list");
     }
 
     #[test]
     fn helm_dry_run_overrides_destructive() {
         let pack = create_pack();
-        assert_allows(&pack, "helm uninstall my-release --dry-run");
-        assert_allows(&pack, "helm uninstall my-release --dry-run=true");
-        assert_allows(&pack, "helm rollback my-release 3 --dry-run");
+        for command in [
+            "helm uninstall my-release --dry-run",
+            "helm uninstall my-release --dry-run=true",
+            "helm rollback my-release 3 --dry-run",
+            "helm --kube-context prod uninstall my-release --dry-run",
+            "helm uninstall my-release --description note --dry-run",
+            "helm uninstall my-release --description=note --dry-run",
+            "helm uninstall my-release --dry-run --kube-context prod",
+            "helm uninstall my-release --dry-run --dry-run=true",
+            "helm uninstall my-release --dry-run --description --dry-run=false",
+            "helm upgrade my-release ./chart --force --dry-run=client",
+            "helm upgrade my-release ./chart -fvalues.yaml --reset-values --dry-run=server",
+        ] {
+            assert_safe_pattern_matches(&pack, command);
+            assert_allows(&pack, command);
+        }
+    }
+
+    #[test]
+    fn helm_dry_run_evidence_must_be_an_option() {
+        let pack = create_pack();
+        for command in [
+            "helm uninstall my-release --kube-context --dry-run",
+            "helm uninstall my-release --description --dry-run",
+            "helm uninstall my-release --description=--dry-run",
+            "helm uninstall my-release --namespace=--dry-run",
+            "helm uninstall my-release -n --dry-run",
+            "helm uninstall my-release -n--dry-run",
+            "helm uninstall my-release -- --dry-run",
+            "helm uninstall my-release --description 'note --dry-run'",
+            "helm uninstall my-release --unknown-option --dry-run",
+            "helm uninstall my-release; echo --dry-run",
+            "helm uninstall my-release && echo --dry-run",
+            "helm uninstall my-release | grep -- --dry-run",
+            "helm uninstall my-release\necho --dry-run",
+            "helm uninstall my-release -n \"$(echo --dry-run)\"",
+            "helm uninstall my-release --dry-run --description *",
+            "helm uninstall my-release --dry-run --description file?",
+            "helm uninstall my-release --dry-run --description {a,b}",
+            "helm uninstall my-release --dry-run --description ${ARGS}",
+        ] {
+            assert_no_safe_match(&pack, command);
+            assert_blocks(&pack, command, "uninstall");
+        }
+        assert_blocks(
+            &pack,
+            "helm rollback my-release 1 --kube-context --dry-run",
+            "rollback",
+        );
+        assert_blocks(
+            &pack,
+            "helm upgrade my-release ./chart --force --set-string note=--dry-run",
+            "force",
+        );
     }
 
     #[test]
     fn helm_false_or_none_dry_run_values_do_not_bypass() {
         let pack = create_pack();
-        assert_blocks(
-            &pack,
+        for command in [
             "helm uninstall my-release --dry-run=false",
-            "uninstall",
-        );
-        assert_blocks(&pack, "helm delete my-release --dry-run=false", "uninstall");
+            "helm delete my-release --dry-run=false",
+            "helm uninstall my-release --dry-run=none",
+            "helm uninstall my-release --dry-run --dry-run=false",
+            "helm uninstall my-release --dry-run=true --dry-run=none",
+            "helm uninstall my-release --dry-run --dry-run=0",
+            "helm uninstall my-release --dry-run=false --dry-run",
+        ] {
+            assert_no_safe_match(&pack, command);
+            assert_blocks(&pack, command, "uninstall");
+        }
         assert_blocks(
             &pack,
             "helm rollback my-release 3 --dry-run=false",
             "rollback",
         );
-        assert_blocks(
-            &pack,
-            "helm uninstall my-release --dry-run=none",
-            "uninstall",
+    }
+
+    #[test]
+    fn helm_long_argument_list_cannot_supply_preview_evidence() {
+        let pack = create_pack();
+        let command = format!(
+            "helm uninstall {}--description --dry-run",
+            "release ".repeat(4_000)
         );
-        assert_no_safe_match(&pack, "helm uninstall my-release --dry-run=false");
-        assert_no_safe_match(&pack, "helm uninstall my-release --dry-run=none");
+        assert_no_safe_match(&pack, &command);
+        assert_blocks(&pack, &command, "uninstall");
+        let dry_run = pack
+            .safe_patterns
+            .iter()
+            .find(|pattern| pattern.name == "helm-dry-run")
+            .expect("dry-run rule exists");
+        let compiled = crate::packs::regex_engine::CompiledRegex::new(dry_run.regex.as_str())
+            .expect("valid dry-run regex");
+        assert!(matches!(
+            compiled,
+            crate::packs::regex_engine::CompiledRegex::Linear(_)
+        ));
     }
 
     #[test]
