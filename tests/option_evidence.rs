@@ -7,8 +7,8 @@
 use std::collections::HashSet;
 
 use destructive_command_guard::hook::{HookInput, extract_command_with_protocol};
-use destructive_command_guard::packs::REGISTRY;
-use destructive_command_guard::{
+use destructive_command_guard::packs::{Pack, REGISTRY};
+use destructive_command_guard::{destructive_pattern, safe_pattern,
     Config, EvaluationDecision, LayeredAllowlist, evaluate_command_with_pack_order,
 };
 
@@ -199,6 +199,38 @@ fn kustomize_previews_survive_the_whole_command_fallback() {
         "kubectl delete --kustomize=./prod --dry-run=server",
     ] {
         assert_decision("kubernetes.kustomize", command, EvaluationDecision::Allow);
+    }
+}
+
+#[test]
+fn database_safe_shadow_veto_is_structural_not_list_driven() {
+    for pack_id in ["database.mongodb", "database.redis"] {
+        let pack = Pack {
+            id: pack_id.to_string(),
+            name: "synthetic safe-shadow regression",
+            description: "proves #435 destructive veto is independent of authored lookaheads",
+            keywords: &["DESTROY", "READ"],
+            safe_patterns: vec![safe_pattern!("synthetic-read", r"READ")],
+            destructive_patterns: vec![destructive_pattern!(
+                "synthetic-destroy",
+                r"DESTROY",
+                "synthetic destructive rule",
+                High
+            )],
+            keyword_matcher: None,
+            safe_regex_set: None,
+            safe_regex_set_is_complete: false,
+        };
+
+        assert!(pack.matches_safe("READ"));
+        assert!(
+            !pack.matches_safe("DESTROY READ"),
+            "{pack_id} must withhold a safe exemption when any destructive rule matches"
+        );
+        assert!(
+            pack.matches_destructive("DESTROY READ").is_some(),
+            "{pack_id} destructive rule must remain visible"
+        );
     }
 }
 
