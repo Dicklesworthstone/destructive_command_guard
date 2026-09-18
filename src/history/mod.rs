@@ -64,6 +64,24 @@ pub const ENV_HISTORY_DB_PATH: &str = "DCG_HISTORY_DB";
 /// Environment variable to disable history collection entirely.
 pub const ENV_HISTORY_DISABLED: &str = "DCG_HISTORY_DISABLED";
 
+/// Opt in to terse history lifecycle diagnostics on stderr (`1` or `true`).
+///
+/// These report acknowledgement deadlines and intentional busy drops without
+/// recording commands or changing the hook's timeout, retry, or drop policy.
+/// They also let subprocess persistence tests distinguish a known best-effort
+/// omission from unexplained data loss. Normal robot/hook output stays silent.
+pub const ENV_HISTORY_DIAGNOSTICS: &str = "DCG_HISTORY_DIAGNOSTICS";
+
+fn history_diagnostic(status: &str, detail: std::fmt::Arguments<'_>) {
+    if env::var(ENV_HISTORY_DIAGNOSTICS)
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    {
+        use std::io::Write as _;
+        // Diagnostics must never turn a closed stderr pipe into a hook panic.
+        let _ = writeln!(std::io::stderr(), "[dcg-history] status={status} {detail}");
+    }
+}
+
 /// Whether [`ENV_HISTORY_DISABLED`] is set to `1` or `true` (case-insensitive).
 #[must_use]
 pub fn history_disabled_by_env() -> bool {
@@ -306,7 +324,8 @@ impl HistoryFlushHandle {
     /// Request a flush and wait for at most `timeout`.
     ///
     /// Returns `true` only when the worker acknowledged that every entry
-    /// queued before this request was processed.
+    /// queued before this request was processed. Processing can intentionally
+    /// drop best-effort telemetry; this is not a durability acknowledgement.
     #[must_use]
     pub fn flush_sync_with_timeout(&self, timeout: Duration) -> bool {
         let (ack_tx, ack_rx) = mpsc::channel();
@@ -352,6 +371,12 @@ impl HistoryWriter {
                     Ok(db) => history_worker(db, receiver, worker_config),
                     Err(e) => {
                         error!(error = %e, "Failed to open history DB in worker thread");
+                        let status = if is_contention_error(&e) {
+                            "busy_drop"
+                        } else {
+                            "storage_error"
+                        };
+                        history_diagnostic(status, format_args!("phase=open"));
                         // Drain the receiver so senders don't block
                         drop(receiver);
                     }
@@ -365,6 +390,7 @@ impl HistoryWriter {
                     error = %e,
                     "Failed to spawn history writer thread - history collection disabled"
                 );
+                history_diagnostic("worker_error", format_args!("phase=spawn"));
                 return Self::disabled();
             }
         };
@@ -440,7 +466,7 @@ impl HistoryWriter {
     /// Request a flush and wait for at most `timeout`.
     ///
     /// Returns `true` for a disabled writer or when the storage worker
-    /// acknowledges the flush before the deadline.
+    /// acknowledges processing before the deadline, not necessarily persistence.
     #[must_use]
     pub fn flush_sync_with_timeout(&self, timeout: Duration) -> bool {
         self.flush_handle()
@@ -477,8 +503,21 @@ impl Drop for HistoryWriter {
                 if let Some(deadline) = self.drop_wait_deadline {
                     // Hook mode never lets best-effort telemetry extend the
                     // guarded decision beyond its absolute deadline.
-                    let timeout = deadline.saturating_duration_since(Instant::now());
-                    let _ = ack_rx.recv_timeout(timeout);
+                    let started = Instant::now();
+                    let timeout = deadline.saturating_duration_since(started);
+                    let status = match ack_rx.recv_timeout(timeout) {
+                        Ok(()) => "shutdown_complete",
+                        Err(mpsc::RecvTimeoutError::Timeout) => "shutdown_timeout",
+                        Err(mpsc::RecvTimeoutError::Disconnected) => "worker_disconnected",
+                    };
+                    history_diagnostic(
+                        status,
+                        format_args!(
+                            "timeout_ms={} elapsed_ms={}",
+                            timeout.as_millis(),
+                            started.elapsed().as_millis()
+                        ),
+                    );
                 } else {
                     // Library and CLI callers without a hook deadline receive
                     // the conventional writer guarantee: queued entries are
@@ -556,6 +595,7 @@ fn history_worker(
                 max_size_bytes = config.max_size_bytes,
                 "Failed to enforce history max_size_mb; disabling writes"
             );
+            history_diagnostic("storage_error", format_args!("phase=size_limit"));
             true
         }
     };
@@ -777,13 +817,16 @@ fn flush_batch_with_recovery(
         FlushOutcome::Contended => {
             batch.clear();
             debug!("History database is busy; dropped best-effort telemetry batch");
+            history_diagnostic("busy_drop", format_args!("phase=write"));
         }
         FlushOutcome::CapacityReached => {
             *history_disabled = true;
             batch.clear();
             warn!("History max_size_mb reached; disabling history writes for this process");
+            history_diagnostic("storage_error", format_args!("phase=capacity"));
         }
         FlushOutcome::Fatal => {
+            history_diagnostic("storage_error", format_args!("phase=recovery"));
             warn!("Detected fatal history storage error; attempting DB recovery");
             if recover_history_db(db, db_path, max_size_bytes) {
                 match flush_batch(db, batch) {
@@ -795,6 +838,7 @@ fn flush_batch_with_recovery(
                         debug!(
                             "Recovered history database is busy; dropped best-effort telemetry batch"
                         );
+                        history_diagnostic("busy_drop", format_args!("phase=recovery"));
                     }
                     FlushOutcome::Fatal => {
                         *history_disabled = true;
@@ -957,6 +1001,7 @@ fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
                                 return FlushOutcome::Fatal;
                             }
                             error_count += 1;
+                            history_diagnostic("storage_error", format_args!("phase=insert"));
                             // Log first few errors, then summarize
                             if error_count <= 3 {
                                 error!(
@@ -1009,6 +1054,7 @@ fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
                         command = %entry.command,
                         "Failed to insert history entry"
                     );
+                    history_diagnostic("storage_error", format_args!("phase=insert"));
                 }
             }
         }
@@ -1075,6 +1121,30 @@ fn redact_for_history(command: &str, mode: HistoryRedactionMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flush_timeout_does_not_consume_or_replay_queued_entries() {
+        let (sender, receiver) = mpsc::channel();
+        let flush = HistoryFlushHandle { sender: sender.clone() };
+        sender
+            .send(HistoryMessage::Entry(Box::new(CommandEntry {
+                command: "queued exactly once".to_string(),
+                ..Default::default()
+            })))
+            .unwrap();
+
+        // No worker is running: this must time out, regardless of host speed.
+        assert!(!flush.flush_sync_with_timeout(Duration::ZERO));
+        let HistoryMessage::Entry(entry) = receiver.try_recv().unwrap() else {
+            panic!("timing out must leave the original entry queued");
+        };
+        assert_eq!(entry.command, "queued exactly once");
+        let HistoryMessage::Flush(ack) = receiver.try_recv().unwrap() else {
+            panic!("flush request must follow the entry");
+        };
+        assert!(ack.send(()).is_err(), "expired waiter must be disconnected");
+        assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
 
     /// Issue #386: `redaction_mode = "pattern"` is documented as redacting
     /// sensitive values, but for a long time it only truncated *quoted*

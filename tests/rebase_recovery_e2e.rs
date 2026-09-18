@@ -7,11 +7,14 @@
 //! - Consumes the permit after a single successful allow.
 //! - Does NOT unblock unrelated destructive commands (e.g. `git reset --hard`).
 
+#[path = "common/history.rs"]
+mod history_test;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use destructive_command_guard::history::{HistoryDb, SqliteValue};
+use destructive_command_guard::history::{ENV_HISTORY_DIAGNOSTICS, HistoryDb, SqliteValue};
 
 fn dcg_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
@@ -36,7 +39,9 @@ fn run_hook_in_with_env(
 
     let mut cmd = Command::new(dcg_binary());
     cmd.current_dir(cwd)
-        // Keep tests hermetic: don't share the test user's real dcg state.
+        // Keep tests hermetic: don't share the test user's real dcg state
+        // or inherit a history-disable / hook-timeout override from the host.
+        .env_clear()
         .env("HOME", cwd)
         .env("USERPROFILE", cwd)
         .env("XDG_CONFIG_HOME", cwd.join("xdg"))
@@ -155,12 +160,19 @@ fn allows_checkout_discard_during_rebase() {
 
 #[test]
 fn rebase_recovery_history_records_final_allow_only() {
+    history_test::retry_history_scenario("rebase recovery history", rebase_history_attempt);
+}
+
+fn rebase_history_attempt() -> Result<(), history_test::IncompleteHistoryFlush> {
     let repo = TempRepo::new("history-final-outcome");
     repo.start_rebase_merge();
 
     let config_path = repo.root.join("config.toml");
     let history_path = repo.root.join("history.db");
     fs::write(&config_path, "[history]\nenabled = true\n").unwrap();
+    // Schema creation is covered by history_integration. Close setup before
+    // spawning the real hook, which keeps its unmodified production deadline.
+    drop(HistoryDb::open(Some(history_path.clone())).expect("initialize history"));
 
     let output = run_hook_in_with_env(
         &repo.root,
@@ -168,6 +180,7 @@ fn rebase_recovery_history_records_final_allow_only() {
         &[
             ("DCG_CONFIG", &config_path),
             ("DCG_HISTORY_DB", &history_path),
+            (ENV_HISTORY_DIAGNOSTICS, Path::new("1")),
         ],
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -181,6 +194,7 @@ fn rebase_recovery_history_records_final_allow_only() {
         stdout.trim().is_empty(),
         "expected allow (empty output), got: {stdout}"
     );
+    history_test::check_history_after_exit(&history_path, 1, &output, "rebase final allow")?;
 
     let db = HistoryDb::open(Some(history_path)).expect("open history db");
     assert_eq!(db.count_commands().expect("count commands"), 1);
@@ -193,6 +207,7 @@ fn rebase_recovery_history_records_final_allow_only() {
 
     assert_eq!(sv_to_string(&values[0]), "allow");
     assert_eq!(sv_to_string(&values[1]), "rebase-recovery");
+    Ok(())
 }
 
 #[test]

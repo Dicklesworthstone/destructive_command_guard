@@ -11,11 +11,16 @@
 //!   - 4: Parse/input error
 //!   - 5: IO error
 
+#[path = "common/history.rs"]
+mod history_test;
+
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use destructive_command_guard::history::{HistoryConnection, SqliteValue};
+use destructive_command_guard::history::{
+    ENV_HISTORY_DIAGNOSTICS, HistoryConnection, HistoryDb, SqliteValue,
+};
 
 fn history_text(value: &SqliteValue) -> &str {
     match value {
@@ -444,6 +449,10 @@ reason = "robot profile regression fixture"
 /// test cannot prove that the asynchronous writer drains before `process::exit`.
 #[test]
 fn test_omp_robot_boundary_persists_history_before_block_exit_and_isolates_agents() {
+    history_test::retry_history_scenario("OMP robot history", omp_history_attempt);
+}
+
+fn omp_history_attempt() -> Result<(), history_test::IncompleteHistoryFlush> {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let xdg = temp.path().join("xdg");
@@ -463,6 +472,23 @@ fn test_omp_robot_boundary_persists_history_before_block_exit_and_isolates_agent
         ),
     )
     .expect("history config");
+    // Exclude schema setup from the hook's timing budget; fresh-database
+    // creation remains covered by history_integration. Close before spawning.
+    drop(HistoryDb::open(Some(history_path.clone())).expect("initialize robot history"));
+
+    // macOS resolves /var to /private/var in the child's current_dir().
+    let recorded_cwd = temp
+        .path()
+        .canonicalize()
+        .expect("canonicalize history cwd");
+    let assert_omp_row = |values: &[SqliteValue]| {
+        assert_eq!(history_text(&values[0]), "omp");
+        assert_eq!(history_text(&values[1]), recorded_cwd.to_string_lossy());
+        assert_eq!(history_text(&values[2]), "git reset --hard HEAD");
+        assert_eq!(history_text(&values[3]), "deny");
+        assert_eq!(history_text(&values[4]), "core.git");
+        assert_eq!(history_text(&values[5]), "reset-hard");
+    };
 
     let run = |robot: bool, agent: &str, command: &str| {
         let mut process = Command::new(dcg_binary());
@@ -480,6 +506,7 @@ fn test_omp_robot_boundary_persists_history_before_block_exit_and_isolates_agent
             .env("TMP", &scratch)
             .env("DCG_CONFIG", &config_path)
             .env("DCG_HISTORY_DB", &history_path)
+            .env(ENV_HISTORY_DIAGNOSTICS, "1")
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
             .current_dir(temp.path())
             .stdin(Stdio::piped())
@@ -505,8 +532,35 @@ fn test_omp_robot_boundary_persists_history_before_block_exit_and_isolates_agent
         "denied OMP command must cross the dispatch exit path: {}",
         String::from_utf8_lossy(&omp.stderr)
     );
+    let omp_json: serde_json::Value =
+        serde_json::from_slice(&omp.stdout).expect("OMP history JSON");
+    assert_eq!(omp_json["decision"], "deny");
+    assert!(
+        !decoy_path.exists(),
+        "the environment database override must outrank configured database_path"
+    );
+    history_test::check_history_after_exit(&history_path, 1, &omp, "OMP deny")?;
+    {
+        // Validate the first row before a later child's timeout can cause a
+        // retry, and close this reader before starting the next writer.
+        let connection = HistoryConnection::open(&history_path).expect("open OMP history");
+        let rows = connection
+            .query(
+                "SELECT agent_type, working_dir, command, outcome, pack_id, pattern_name \
+                 FROM commands ORDER BY id",
+            )
+            .expect("query OMP history");
+        assert_eq!(rows.len(), 1);
+        assert_omp_row(rows[0].values());
+    }
+
     let codex = run(true, "codex", "git status");
     assert_eq!(codex.status.code(), Some(0));
+    let codex_json: serde_json::Value =
+        serde_json::from_slice(&codex.stdout).expect("Codex history JSON");
+    assert_eq!(codex_json["decision"], "allow");
+    history_test::check_history_after_exit(&history_path, 2, &codex, "Codex allow")?;
+
     let human = run(false, "omp", "git status");
     assert_eq!(human.status.code(), Some(0));
 
@@ -532,21 +586,7 @@ fn test_omp_robot_boundary_persists_history_before_block_exit_and_isolates_agent
         "two robot evaluations must persist while the human diagnostic stays out"
     );
 
-    // The child process records its own current_dir(), which the OS reports
-    // in canonical form (macOS resolves the /var -> /private/var symlink), so
-    // canonicalize the expectation instead of comparing the raw tempdir path.
-    let recorded_cwd = temp
-        .path()
-        .canonicalize()
-        .expect("canonicalize history cwd");
-    let omp_values = rows[0].values();
-    assert_eq!(history_text(&omp_values[0]), "omp");
-    assert_eq!(history_text(&omp_values[1]), recorded_cwd.to_string_lossy());
-    assert_eq!(history_text(&omp_values[2]), "git reset --hard HEAD");
-    assert_eq!(history_text(&omp_values[3]), "deny");
-    assert_eq!(history_text(&omp_values[4]), "core.git");
-    assert_eq!(history_text(&omp_values[5]), "reset-hard");
-
+    assert_omp_row(rows[0].values());
     let codex_values = rows[1].values();
     assert_eq!(history_text(&codex_values[0]), "codex-cli");
     assert_eq!(
@@ -557,6 +597,7 @@ fn test_omp_robot_boundary_persists_history_before_block_exit_and_isolates_agent
     assert_eq!(history_text(&codex_values[3]), "allow");
     assert_eq!(codex_values[4], SqliteValue::Null);
     assert_eq!(codex_values[5], SqliteValue::Null);
+    Ok(())
 }
 
 /// The process cwd is the authority used by dcg's project-config discovery.
