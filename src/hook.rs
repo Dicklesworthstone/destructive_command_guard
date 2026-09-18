@@ -2016,8 +2016,23 @@ fn extract_command_with_context_inner(input: &HookInput) -> Option<ExtractedHook
     // "tool_input":{"command":"rm -rf /"},"toolCalls":[{"name":"bash",
     // "args":"{\"command\":\"ls -la\"}"}]}` was silently allowed because the
     // benign batch entry answered for the whole payload.
+    // One collection for every envelope shape (#428). The batch branch used to
+    // be the only one that gathered the sibling fields; the fall-through
+    // returned on the first field it found, so a command in a
+    // lower-precedence field was never evaluated:
+    //
+    //   {"tool_name":"Bash","tool_input":{"command":"ls"},
+    //    "tool_args":{"command":"rm -rf /"}}                 -> was allowed
+    //   {"tool_name":"Bash","tool_calls":[], …same fields…}   -> denied
+    //
+    // Adding an *empty* `tool_calls` array flipped the verdict, which is what
+    // showed the difference was accidental. Collecting in one place keeps the
+    // primary command exactly where it was for every existing shape —
+    // `toolCalls[]` entries, then a singular `toolCall` (Antigravity nests the
+    // command under `toolCall.args.CommandLine`), then `tool_input`, then
+    // `tool_args` — and stops dropping the rest.
+    let mut commands: Vec<(String, ShellDialect)> = Vec::new();
     if let Some(calls) = input.tool_calls.as_ref() {
-        let mut commands: Vec<(String, ShellDialect)> = Vec::new();
         for call in calls {
             if !is_batch_shell_call(call) {
                 continue;
@@ -2028,77 +2043,40 @@ fn extract_command_with_context_inner(input: &HookInput) -> Option<ExtractedHook
                 commands.push((command, entry_dialect));
             }
         }
-        if let Some(tool_call) = input.tool_call.as_ref() {
-            if let Some(command) = extract_command_from_tool_call(tool_call) {
-                let entry_dialect = resolve(&command, labeled);
-                commands.push((command, entry_dialect));
-            }
-        }
-        if let Some(command) = input
-            .tool_input
-            .as_ref()
-            .and_then(extract_command_from_tool_input)
-        {
-            let entry_dialect = resolve(&command, labeled);
-            commands.push((command, entry_dialect));
-        }
-        if let Some(command) = input
-            .tool_args
-            .as_ref()
-            .and_then(extract_command_from_tool_args)
-        {
-            let entry_dialect = resolve(&command, labeled);
-            commands.push((command, entry_dialect));
-        }
-        let mut entries = commands.into_iter();
-        if let Some((command, primary_dialect)) = entries.next() {
-            return Some(ExtractedHookCommand {
-                command,
-                protocol,
-                dialect: primary_dialect,
-                additional_commands: entries.collect(),
-            });
-        }
+    }
+    if let Some(command) = input
+        .tool_call
+        .as_ref()
+        .and_then(extract_command_from_tool_call)
+    {
+        let entry_dialect = resolve(&command, labeled);
+        commands.push((command, entry_dialect));
+    }
+    if let Some(command) = input
+        .tool_input
+        .as_ref()
+        .and_then(extract_command_from_tool_input)
+    {
+        let entry_dialect = resolve(&command, labeled);
+        commands.push((command, entry_dialect));
+    }
+    if let Some(command) = input
+        .tool_args
+        .as_ref()
+        .and_then(extract_command_from_tool_args)
+    {
+        let entry_dialect = resolve(&command, labeled);
+        commands.push((command, entry_dialect));
     }
 
-    // Antigravity CLI (`agy`) nests the command under `toolCall.args.CommandLine`.
-    if let Some(tool_call) = input.tool_call.as_ref() {
-        if let Some(command) = extract_command_from_tool_call(tool_call) {
-            let dialect = resolve(&command, labeled);
-            return Some(ExtractedHookCommand {
-                command,
-                protocol,
-                dialect,
-                additional_commands: Vec::new(),
-            });
-        }
-    }
-
-    if let Some(tool_input) = input.tool_input.as_ref() {
-        if let Some(command) = extract_command_from_tool_input(tool_input) {
-            let dialect = resolve(&command, labeled);
-            return Some(ExtractedHookCommand {
-                command,
-                protocol,
-                dialect,
-                additional_commands: Vec::new(),
-            });
-        }
-    }
-
-    if let Some(tool_args) = input.tool_args.as_ref() {
-        if let Some(command) = extract_command_from_tool_args(tool_args) {
-            let dialect = resolve(&command, labeled);
-            return Some(ExtractedHookCommand {
-                command,
-                protocol,
-                dialect,
-                additional_commands: Vec::new(),
-            });
-        }
-    }
-
-    None
+    let mut entries = commands.into_iter();
+    let (command, primary_dialect) = entries.next()?;
+    Some(ExtractedHookCommand {
+        command,
+        protocol,
+        dialect: primary_dialect,
+        additional_commands: entries.collect(),
+    })
 }
 
 /// Extract command and protocol from hook input.

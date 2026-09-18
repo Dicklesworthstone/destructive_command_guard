@@ -19755,6 +19755,18 @@ fn evaluate_packs_with_allowlists_at_depth(
         return EvaluationResult::indeterminate_due_to_budget();
     }
 
+    // The SQL dialect that will actually execute a heredoc payload answers for
+    // it first (#428). `database.mysql` and `database.postgresql` carry a
+    // byte-identical `truncate-table`, so with both enabled
+    // `psql db <<SQL … TRUNCATE users; … SQL` was denied as
+    // `database.mysql:truncate-table` — the right decision under the wrong
+    // rule id, and rule ids are the stable allowlist key. Only the order
+    // within the database family changes, so every pack still runs and no
+    // denial can be lost; first match wins, so the carrier's own dialect is
+    // the one named.
+    let carrier_ordered_packs = database_carrier_first(ordered_packs, original_command);
+    let ordered_packs = carrier_ordered_packs.as_deref().unwrap_or(ordered_packs);
+
     // Pre-compute which packs might match.
     //
     // When a keyword index is available, use a single global substring scan to
@@ -24412,6 +24424,56 @@ pub(crate) fn executable_scoped_pattern_matches(
     })
 }
 
+/// Move the heredoc carrier's own database pack ahead of its siblings (#428).
+///
+/// Returns `None` — meaning "use the order as configured" — unless the command
+/// carries a heredoc, its target resolves to a client whose dialect is
+/// unambiguous, that dialect's pack is enabled, and another database pack would
+/// otherwise be consulted first. Nothing outside the database family moves, so
+/// a reorder cannot change which family answers, only which dialect within it.
+fn database_carrier_first(ordered_packs: &[String], command: &str) -> Option<Vec<String>> {
+    if !command.contains("<<") {
+        return None;
+    }
+    let owner = crate::heredoc::first_heredoc_target_command(command)
+        .as_deref()
+        .and_then(database_pack_for_client)?;
+    let owner_position = ordered_packs.iter().position(|id| id == owner)?;
+    let first_database = ordered_packs
+        .iter()
+        .position(|id| id.starts_with("database."))?;
+    if first_database >= owner_position {
+        return None;
+    }
+    let mut reordered = ordered_packs.to_vec();
+    let owner_id = reordered.remove(owner_position);
+    reordered.insert(first_database, owner_id);
+    Some(reordered)
+}
+
+/// The database pack that owns a client executable (#428).
+///
+/// Used to attribute a payload that arrives on that client's stdin to its own
+/// SQL dialect. The mapping is deliberately narrow: only clients whose dialect
+/// is unambiguous from the executable name, so a generic runner never
+/// reorders anything.
+fn database_pack_for_client(client: &str) -> Option<&'static str> {
+    let basename = client.rsplit(['/', '\\']).next().unwrap_or(client);
+    let name = basename
+        .strip_suffix(".exe")
+        .unwrap_or(basename)
+        .to_ascii_lowercase();
+    Some(match name.as_str() {
+        "psql" | "pgcli" | "pg_dump" | "pg_restore" => "database.postgresql",
+        "mysql" | "mariadb" | "mycli" | "mysqldump" => "database.mysql",
+        "sqlite3" | "litecli" => "database.sqlite",
+        "mongosh" | "mongo" => "database.mongodb",
+        "redis-cli" => "database.redis",
+        "snowsql" => "database.snowflake",
+        _ => return None,
+    })
+}
+
 /// Coarse executable-scope gate for semantic matches that have no regex span.
 /// This is the same fallback used by the primary evaluator when a parser-only
 /// rule cannot attribute a more precise byte range.
@@ -25362,6 +25424,37 @@ fn evaluate_heredoc(
             );
 
             if body_has_keywords {
+                // A payload arriving on `psql`'s stdin is PostgreSQL, and the
+                // denial should say so (#428). The two SQL packs carry a
+                // byte-identical `truncate-table`, so with both enabled
+                // `psql db <<SQL … TRUNCATE users; … SQL` was denied as
+                // `database.mysql:truncate-table` — the right decision under
+                // the wrong rule id, and rule ids are the stable allowlist
+                // key, so a user who allowlists what the denial names gets a
+                // surprise. The carrier's own pack is moved to the front of
+                // the order rather than the siblings being dropped: first
+                // match wins, so this fixes the attribution, and no pack loses
+                // its chance to deny something its sibling does not cover.
+                let carrier_first_packs = content
+                    .target_command
+                    .as_deref()
+                    .and_then(database_pack_for_client)
+                    .filter(|owner| context.ordered_packs.iter().any(|id| id == owner))
+                    .map(|owner| {
+                        let mut ids = Vec::with_capacity(context.ordered_packs.len());
+                        ids.push(owner.to_string());
+                        ids.extend(
+                            context
+                                .ordered_packs
+                                .iter()
+                                .filter(|id| id.as_str() != owner)
+                                .cloned(),
+                        );
+                        ids
+                    });
+                let inner_ordered_packs = carrier_first_packs
+                    .as_deref()
+                    .unwrap_or(context.ordered_packs);
                 let inner_commands = crate::heredoc::extract_shell_commands(&content.content);
                 for inner in inner_commands {
                     if deadline_exceeded(context.deadline) {
@@ -25371,7 +25464,7 @@ fn evaluate_heredoc(
                     let result = evaluate_command_with_pack_order_deadline_at_path_inner(
                         &inner.text,
                         context.enabled_keywords,
-                        context.ordered_packs,
+                        inner_ordered_packs,
                         context.keyword_index,
                         context.compiled_overrides,
                         context.allowlists,
@@ -34829,6 +34922,52 @@ mod tests {
                 !result.is_denied(),
                 "a resolvable foreign argv0 must still stand the rule down: {command:?}: {:?}",
                 result.pattern_info
+            );
+        }
+    }
+
+    /// #428: with both SQL packs enabled, a heredoc payload was attributed to
+    /// whichever pack the order listed first, so `psql` payloads were denied as
+    /// `database.mysql:truncate-table`. The decision was right and the rule id
+    /// was not, and rule ids are the stable allowlist key.
+    #[test]
+    fn a_sql_payload_is_attributed_to_its_carriers_dialect_issue_428() {
+        let both = [
+            "database.mysql".to_string(),
+            "database.postgresql".to_string(),
+        ];
+        let both: Vec<&str> = both.iter().map(String::as_str).collect();
+        for (command, expected) in [
+            ("psql db <<SQL\nTRUNCATE users;\nSQL", "database.postgresql"),
+            ("mysql db <<SQL\nTRUNCATE users;\nSQL", "database.mysql"),
+            (
+                "/usr/bin/psql db <<SQL\nTRUNCATE users;\nSQL",
+                "database.postgresql",
+            ),
+            ("mariadb db <<SQL\nTRUNCATE users;\nSQL", "database.mysql"),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &both, ShellDialect::Posix);
+            assert!(result.is_denied(), "{command:?} must still deny");
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pack_id.as_deref()),
+                Some(expected),
+                "{command:?} must be attributed to the dialect that runs it"
+            );
+        }
+
+        // A carrier with no unambiguous dialect leaves the configured order
+        // alone, and so does a command with no heredoc at all.
+        for command in [
+            "sh db <<SQL\nTRUNCATE users;\nSQL",
+            "psql -c 'TRUNCATE users;'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &both, ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "{command:?} must still deny under some dialect's rule"
             );
         }
     }

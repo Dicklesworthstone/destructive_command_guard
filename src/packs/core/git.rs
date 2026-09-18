@@ -10,10 +10,17 @@ use crate::normalize::{
 };
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
+use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 
 const MAX_GIT_SEMANTIC_BYTES: usize = 64 * 1024;
 const MAX_GIT_SEMANTIC_TOKENS: usize = 512;
+
+/// This pack, used to decide which reading of an ambiguous dashed built-in to
+/// present in the matching view (#428). Built once: the path is rare (it needs
+/// a symbolic executable with a `git-` prefix) but must not pay for pack
+/// construction each time it is taken.
+static AMBIGUITY_ARBITER: std::sync::LazyLock<Pack> = std::sync::LazyLock::new(create_pack);
 const MAX_GIT_ALIAS_DEPTH: usize = 64;
 
 pub(crate) const GIT_ALIAS_UNVERIFIED_RULE: &str = "git-alias-semantic-unverified";
@@ -1139,25 +1146,44 @@ const CORE_GIT_DASHED_BUILTINS: &[(&str, &str, &str)] = &[
 fn git_semantic_word_is_git_executable(word: &GitSemanticWord, dialect: ShellDialect) -> bool {
     git_semantic_executable_may_equal(word, dialect, "git")
         || git_semantic_executable_may_equal(word, dialect, "git.exe")
-        || dashed_git_builtin_subcommand(word, dialect).is_some()
+        || is_dashed_git_builtin(word, dialect)
 }
 
-/// The subcommand a dashed Git built-in stands for, if this executable word is
-/// one: `git-reset` → `reset`.
+/// Whether this executable word can be one of the dashed built-ins. Short
+/// circuits and allocates nothing, because this runs per word while resolving
+/// the executable index.
+fn is_dashed_git_builtin(word: &GitSemanticWord, dialect: ShellDialect) -> bool {
+    CORE_GIT_DASHED_BUILTINS.iter().any(|(bare, exe, _)| {
+        git_semantic_executable_may_equal(word, dialect, bare)
+            || git_semantic_executable_may_equal(word, dialect, exe)
+    })
+}
+
+/// Every subcommand a dashed Git built-in word can stand for: `git-reset` →
+/// `[reset]`.
 ///
 /// Used to spell the subcommand back out when the pattern-matching view is
 /// synthesized, so a dashed spelling reaches the same rule as the spaced one.
-fn dashed_git_builtin_subcommand(
+///
+/// **All of them, not the first one (#428).** A literal word equals exactly one
+/// entry, but a *bounded symbolic* word can equal several: `git-c$X` may be
+/// `git-checkout` or `git-clean`, and taking the first table match resolved it
+/// to `checkout`, synthesized `git checkout -fdx`, and matched nothing — while
+/// `git-cl$X -fdx` was unambiguous and denied. Reading an unknown as whichever
+/// candidate the table happens to list first is a fail-open, so the caller is
+/// given every candidate and spells out every reading.
+fn dashed_git_builtin_subcommands(
     word: &GitSemanticWord,
     dialect: ShellDialect,
-) -> Option<&'static str> {
+) -> SmallVec<[&'static str; 4]> {
     CORE_GIT_DASHED_BUILTINS
         .iter()
-        .find_map(|(bare, exe, subcommand)| {
+        .filter_map(|(bare, exe, subcommand)| {
             let matches_name = git_semantic_executable_may_equal(word, dialect, bare)
                 || git_semantic_executable_may_equal(word, dialect, exe);
             matches_name.then_some(*subcommand)
         })
+        .collect()
 }
 
 fn semantic_git_executable_index(
@@ -4625,18 +4651,55 @@ pub(crate) fn syntax_view_for_pattern_matching(
     // every other dashed built-in synthesized a bare `git` and *dropped its
     // subcommand*, which is why `git-reset --hard` was read as `git --hard` and
     // matched nothing at all.
+    // A bounded symbolic word can stand for several built-ins, and picking the
+    // first table entry is a guess that lands on the benign reading (#428):
+    // `git-c$X` resolved to `checkout`, synthesized `git checkout -fdx`, and
+    // matched nothing, while the unambiguous `git-cl$X -fdx` denied.
+    //
+    // The view has to stay a single command — `syntax_view_in_dialect` drops
+    // any view carrying a separator, so the candidate readings cannot simply be
+    // joined — so the ambiguity is resolved by the pack's own verdict rather
+    // than by table order: the reading presented is one this pack would deny,
+    // if any candidate reading is. `check` is safe-patterns-first, so
+    // `git-c$X -n` still presents a benign reading (`git clean -n` is exempt,
+    // and `checkout -n` is nothing), while `git-c$X -fdx` presents
+    // `git clean -fdx`. Every argv word here is literal — a dynamic one
+    // returned the sanitized view above — so each reading is a faithful
+    // spelling of what that candidate would run.
     let executable_unbounded = git_semantic_executable_is_unbounded(executable, dialect);
-    let mut synthetic = match (
-        executable_unbounded,
-        dashed_git_builtin_subcommand(executable, dialect),
-    ) {
-        (false, Some(subcommand)) => format!("git {subcommand}"),
-        _ => String::from("git"),
-    };
+    let mut args = String::new();
     for word in decoded.words.iter().skip(executable_index + 1) {
-        synthetic.push(' ');
-        synthetic.push_str(&shell_words::quote(&word.decoded));
+        args.push(' ');
+        args.push_str(&shell_words::quote(&word.decoded));
     }
+    let subcommands = if executable_unbounded {
+        SmallVec::<[&'static str; 4]>::new()
+    } else {
+        dashed_git_builtin_subcommands(executable, dialect)
+    };
+    let synthetic = match subcommands.as_slice() {
+        [] => format!("git{args}"),
+        [only] => format!("git {only}{args}"),
+        candidates => {
+            let readings = candidates
+                .iter()
+                .map(|subcommand| format!("git {subcommand}{args}"));
+            let mut fallback = None;
+            let mut destructive = None;
+            for reading in readings {
+                if AMBIGUITY_ARBITER.check(&reading).is_some() {
+                    destructive = Some(reading);
+                    break;
+                }
+                if fallback.is_none() {
+                    fallback = Some(reading);
+                }
+            }
+            destructive
+                .or(fallback)
+                .unwrap_or_else(|| format!("git{args}"))
+        }
+    };
     let sanitized = crate::context::sanitize_for_pattern_matching(&synthetic);
     syntax_view_in_dialect(sanitized.as_ref(), ShellDialect::Posix)
 }
@@ -5971,6 +6034,65 @@ mod tests {
                 .is_some_and(|view| view.contains("git branch")),
             "proven git-branch keeps its synthesis: {view:?}"
         );
+    }
+
+    /// #428: a bounded symbolic executable can stand for several dashed
+    /// built-ins, and the first table match is a guess. `git-c$X` resolved to
+    /// `checkout`, synthesized `git checkout -fdx`, and matched nothing —
+    /// while the unambiguous `git-cl$X -fdx` denied. Every candidate reading
+    /// is now spelled out, so the destructive one is still seen.
+    #[test]
+    fn an_ambiguous_dashed_builtin_spells_out_every_candidate() {
+        let command = "git-c$X -fdx";
+        let sanitized = crate::context::sanitize_for_pattern_matching(command);
+        let view =
+            syntax_view_for_pattern_matching(command, sanitized.as_ref(), ShellDialect::Posix)
+                .expect("a bounded symbolic git executable synthesizes a view");
+        assert!(
+            view.contains("git clean -fdx"),
+            "the destructive reading must be the one presented: {view:?}"
+        );
+
+        // The benign candidate is still presented when no reading is
+        // destructive, so this is not "always pick the scariest subcommand":
+        // `git clean -n` is exempt and `git checkout -n` is nothing.
+        let benign = "git-c$X -n";
+        let sanitized_benign = crate::context::sanitize_for_pattern_matching(benign);
+        let benign_view = syntax_view_for_pattern_matching(
+            benign,
+            sanitized_benign.as_ref(),
+            ShellDialect::Posix,
+        )
+        .expect("a bounded symbolic git executable synthesizes a view");
+        assert!(
+            AMBIGUITY_ARBITER.check(&benign_view).is_none(),
+            "a dry-run reading must not be presented as destructive: {benign_view:?}"
+        );
+
+        // An unambiguous word still resolves to exactly one subcommand, and a
+        // proven literal is unaffected.
+        for (command, expected, unexpected) in [
+            ("git-cl$X -fdx", "git clean -fdx", "git checkout"),
+            ("git-clean -fdx", "git clean -fdx", "git checkout"),
+            (
+                "git-checkout -- src/f",
+                "git checkout -- src/f",
+                "git clean",
+            ),
+        ] {
+            let sanitized = crate::context::sanitize_for_pattern_matching(command);
+            let view =
+                syntax_view_for_pattern_matching(command, sanitized.as_ref(), ShellDialect::Posix)
+                    .unwrap_or_else(|| panic!("{command} synthesizes a view"));
+            assert!(
+                view.contains(expected),
+                "{command} must read as {expected:?}: {view:?}"
+            );
+            assert!(
+                !view.contains(unexpected),
+                "{command} must not also read as {unexpected:?}: {view:?}"
+            );
+        }
     }
 
     #[test]

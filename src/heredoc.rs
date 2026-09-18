@@ -3637,6 +3637,18 @@ fn extract_heredoc_target_command(command: &str, heredoc_start: usize) -> Option
     })
 }
 
+/// The command that receives the first heredoc in `command`, by basename.
+///
+/// Exposed for pack ordering (#428): the dialect that will actually execute a
+/// SQL payload is the one that should answer for it, and that is decided by the
+/// carrier rather than by which pack the configuration happens to list first.
+/// Cheap by construction — one substring search plus the backward walk — and
+/// callers gate it on the command carrying a heredoc at all.
+pub(crate) fn first_heredoc_target_command(command: &str) -> Option<String> {
+    let operator = memchr::memmem::find(command.as_bytes(), b"<<")?;
+    extract_heredoc_target_command(command, operator)
+}
+
 /// Extract the lexical command token that owns a heredoc, preserving an
 /// explicit path. Most callers need only the basename, but shell-name override
 /// analysis must distinguish a bare `cat` (subject to function/alias lookup)
