@@ -3552,9 +3552,14 @@ fn pack_info(
     pack_id: &str,
     show_patterns: bool,
     json_output: bool,
+    external_store: &ExternalPackStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // External packs participate in evaluation and `dcg packs`; `pack info`
+    // must resolve against the same loaded store rather than consulting only
+    // the built-in registry (#437).
     let pack = REGISTRY
         .get(pack_id)
+        .or_else(|| external_store.get(pack_id))
         .ok_or_else(|| format!("Pack not found: {pack_id}"))?;
 
     if json_output {
@@ -3705,7 +3710,7 @@ fn pack_info(
 
 /// Handle all `dcg pack` subcommands
 fn handle_pack_command(
-    _config: &Config,
+    config: &Config,
     action: PackAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
@@ -3714,7 +3719,9 @@ fn handle_pack_command(
             no_patterns,
             json,
         } => {
-            pack_info(&pack_id, !no_patterns, json)?;
+            let external_paths = config.packs.expand_custom_paths();
+            let external_store = load_external_packs(&external_paths);
+            pack_info(&pack_id, !no_patterns, json, &external_store)?;
         }
         PackAction::Validate {
             file_path,
