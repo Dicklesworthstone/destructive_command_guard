@@ -10977,7 +10977,21 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     if opencode_appears_in_use() {
         print!("Checking OpenCode plugin registration... ");
         let plugin_path = opencode_user_plugin_path();
-        match probe_opencode_plugin(&plugin_path) {
+        if let Some(major) = unsupported_opencode_major_version() {
+            println!("{}", "UNSUPPORTED RUNTIME".red());
+            issues += 1;
+            println!(
+                "  OpenCode v{major} is detected, but this dcg build only has the legacy v1 plugin bridge"
+            );
+            println!(
+                "  The v1 module shape/runtime is incompatible with OpenCode v2+, so a present dcg-guard.js"
+            );
+            println!("  must NOT be interpreted as protection.");
+            println!(
+                "  → Treat OpenCode v{major} shell commands as UNGUARDED until native v2 veto semantics are verified (#419)"
+            );
+        } else {
+            match probe_opencode_plugin(&plugin_path) {
             OpencodePluginProbe::Current => {
                 println!("{}", "OK".green());
                 println!("  Found: {}", plugin_path.display());
@@ -11019,6 +11033,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                     println!("    (OpenCode shell commands are NOT guarded until it is installed)");
                 }
             }
+        }
         }
     }
 
@@ -12367,7 +12382,20 @@ fn collect_doctor_report(
     if opencode_appears_in_use() {
         let plugin_path = opencode_user_plugin_path();
         let mut opencode_fixed = false;
-        let (status, message, remediation) = match probe_opencode_plugin(&plugin_path) {
+        let (status, message, remediation) = if let Some(major) = unsupported_opencode_major_version() {
+            issues += 1;
+            (
+                DoctorCheckStatus::Error,
+                format!(
+                    "OpenCode v{major} is detected, but dcg's legacy v1 plugin bridge is incompatible \
+                     with v2+; a present plugin must not be interpreted as protection"
+                ),
+                Some(format!(
+                    "Treat OpenCode v{major} shell commands as UNGUARDED until native v2 veto semantics are verified (#419)"
+                )),
+            )
+        } else {
+            match probe_opencode_plugin(&plugin_path) {
             OpencodePluginProbe::Current => (
                 DoctorCheckStatus::Ok,
                 format!("Native OpenCode plugin found at {}", plugin_path.display()),
@@ -12424,6 +12452,7 @@ fn collect_doctor_report(
                     )
                 }
             }
+        }
         };
         checks.push(DoctorCheck {
             id: "opencode_plugin",
@@ -13799,13 +13828,15 @@ fn project_opencode_plugin_path() -> Result<std::path::PathBuf, Box<dyn std::err
 
 /// Generate the OpenCode `tool.execute.before` plugin source (#318).
 ///
-/// The plugin routes every OpenCode `bash` tool call through dcg's
+/// The legacy OpenCode v1 plugin routes every `bash` tool call through dcg's
 /// Claude-compatible hook protocol: an empty stdout means allow; a
 /// `hookSpecificOutput.permissionDecision` of `deny` (or `ask`, since
-/// OpenCode has no operator-review state) aborts the tool call by throwing,
-/// which is OpenCode's documented veto mechanism. Infrastructure failures
-/// (dcg missing/unrunnable) fail open with a stderr notice, matching the
-/// hook-envelope failure policy; the *evaluation* itself stays fail-closed
+/// OpenCode has no operator-review state) aborts the v1 tool hook by throwing.
+/// OpenCode v2 changed both its module/runtime contract and its interception
+/// APIs; dcg refuses to install or bless this v1 bridge when v2+ is detected
+/// until an authoritative veto path is verified (#419). Infrastructure
+/// failures (dcg missing/unrunnable) fail open with a stderr notice, matching
+/// the hook-envelope failure policy; the *evaluation* itself stays fail-closed
 /// inside dcg.
 ///
 /// The dcg binary path is embedded as a JSON string literal (valid JSON
@@ -13891,6 +13922,39 @@ fn opencode_appears_in_use() -> bool {
         .parent()
         .and_then(std::path::Path::parent)
         .is_some_and(std::path::Path::is_dir)
+}
+
+/// Extract the first dotted-version major from OpenCode's CLI version text.
+///
+/// OpenCode has emitted both bare versions (for example `2.0.4`) and
+/// decorated forms. Keep the parser deliberately small and independent of a
+/// semver dependency: the only policy boundary here is v1 versus v2+.
+fn parse_opencode_major_version(raw: &str) -> Option<u64> {
+    raw.split(|character: char| !character.is_ascii_digit())
+        .find(|part| !part.is_empty())
+        .and_then(|part| part.parse().ok())
+}
+
+/// Detect the installed OpenCode CLI major version when it can be executed.
+///
+/// Failure to execute or parse is not treated as v1: it is simply unknown and
+/// preserves the existing behavior. When v2+ is positively identified, dcg
+/// must not write or bless the legacy v1 bridge (#419).
+fn detected_opencode_major_version() -> Option<u64> {
+    let output = std::process::Command::new("opencode")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_opencode_major_version(&String::from_utf8_lossy(&output.stdout)).or_else(|| {
+        parse_opencode_major_version(&String::from_utf8_lossy(&output.stderr))
+    })
+}
+
+fn unsupported_opencode_major_version() -> Option<u64> {
+    detected_opencode_major_version().filter(|major| *major >= 2)
 }
 
 /// Fidelity of an installed OpenCode plugin against the canonical source
@@ -15489,6 +15553,16 @@ fn build_provenance_doctor_parts(config: &Config) -> (DoctorCheckStatus, String,
 /// Install the native OpenCode plugin (#318).
 fn install_opencode_plugin(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
+
+    if let Some(major) = unsupported_opencode_major_version() {
+        return Err(format!(
+            "OpenCode v{major} is installed, but dcg's current OpenCode bridge targets v1. \
+             Refusing to install or refresh a plugin that v2+ cannot load reliably or whose \
+             veto semantics have not been verified. OpenCode v2 shell commands must be \
+             treated as UNGUARDED by dcg until native v2 support lands (#419)."
+        )
+        .into());
+    }
 
     let plugin_path = if project {
         project_opencode_plugin_path()?
@@ -22478,6 +22552,14 @@ if ($errors.Count -ne 0) {
             probe_opencode_plugin(&dir.path().join("absent.js")),
             OpencodePluginProbe::MissingOrUnowned
         );
+    }
+
+    #[test]
+    fn opencode_version_parser_distinguishes_v1_from_v2_419() {
+        assert_eq!(parse_opencode_major_version("1.2.3"), Some(1));
+        assert_eq!(parse_opencode_major_version("opencode 2.0.4"), Some(2));
+        assert_eq!(parse_opencode_major_version("OpenCode v12.7.1\n"), Some(12));
+        assert_eq!(parse_opencode_major_version("version unknown"), None);
     }
 
     /// #318: the generated OpenCode plugin embeds the absolute dcg path as a
