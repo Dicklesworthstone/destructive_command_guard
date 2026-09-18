@@ -636,12 +636,52 @@ impl Pack {
             .any(|kw| keyword_matches_substring(cmd, kw))
     }
 
+    /// Some read-only database exemptions intentionally match anywhere in a
+    /// command string. For these packs, a safe read may coexist with a
+    /// destructive operation, so safe matching must never shadow a destructive
+    /// rule from the same pack. Keep this structural veto in addition to the
+    /// authored negative lookaheads: the regex lists are documentation and
+    /// fast rejection, while this guard makes future destructive-rule additions
+    /// fail conservative instead of silently creating an exemption (#435).
+    fn destructive_match_vetoes_safe(&self, cmd: &str) -> bool {
+        matches!(self.id.as_str(), "database.mongodb" | "database.redis")
+            && self
+                .destructive_patterns
+                .iter()
+                .any(|pattern| pattern.matches_command(cmd))
+    }
+
+    fn destructive_match_vetoes_safe_with_deadline(
+        &self,
+        cmd: &str,
+        deadline: Option<&crate::perf::Deadline>,
+    ) -> bool {
+        if !matches!(self.id.as_str(), "database.mongodb" | "database.redis") {
+            return false;
+        }
+        for pattern in &self.destructive_patterns {
+            if deadline.is_some_and(crate::perf::Deadline::is_exceeded) {
+                // Withhold the exemption on uncertainty. The evaluator's
+                // surrounding deadline checks convert an exhausted budget into
+                // an indeterminate result rather than treating time as safety.
+                return true;
+            }
+            if pattern.matches_command(cmd) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Check if a command matches any safe pattern.
     ///
     /// Uses `RegexSet` for O(n) matching when available (fast path).
     /// Falls back to individual pattern checks for backtracking patterns.
     #[must_use]
     pub fn matches_safe(&self, cmd: &str) -> bool {
+        if self.destructive_match_vetoes_safe(cmd) {
+            return false;
+        }
         if self.id == "kubernetes.kubectl"
             && crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd)
         {
@@ -684,8 +724,8 @@ impl Pack {
     /// Deadline-aware safe pattern matching.
     ///
     /// Like [`matches_safe`], but polls the deadline between individual
-    /// backtracking-engine pattern evaluations. Returns `None` (no match) if
-    /// the deadline expires mid-scan, letting the caller return its bounded
+    /// backtracking-engine pattern evaluations. Returns no safe match if the
+    /// deadline expires mid-scan, letting the caller return its bounded
     /// outcome (hook evaluation treats this as indeterminate).
     #[must_use]
     pub fn matches_safe_with_deadline(
@@ -694,6 +734,9 @@ impl Pack {
         deadline: Option<&crate::perf::Deadline>,
     ) -> bool {
         if deadline.is_some_and(crate::perf::Deadline::is_exceeded) {
+            return false;
+        }
+        if self.destructive_match_vetoes_safe_with_deadline(cmd, deadline) {
             return false;
         }
         if self.id == "kubernetes.kubectl"
