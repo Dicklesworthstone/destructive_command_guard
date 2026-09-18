@@ -73,6 +73,35 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   ordinary destructive payload is far cheaper than padding past the size limit,
   and until now it worked in the default posture.
 
+- **One stray byte also truncated a whole `dcg hook --batch` run, and the run
+  still reported success (#430).** The parallel path read stdin with
+  `map_while(Result::ok)`, which stops at the first line stdin cannot decode and
+  discards every line after it. No result was emitted for the discarded lines, so
+  nothing set `any_blocked`: a three-line batch with one `0xFF` byte on line two
+  returned a single result and exit 0, with the `rm -rf /Users/x/Documents` on
+  line three neither evaluated nor reported. Both batch paths now emit an `error`
+  result for an undecodable line, keep evaluating the rest under
+  `--continue-on-error`, upgrade it to `deny` under `DCG_FAIL_CLOSED=1`, and exit
+  non-zero. The sequential path shared half the defect: it built that result by
+  hand, so it skipped the fail-closed upgrade and left the exit code at 0, and
+  without `--continue-on-error` it returned a bare error with no result line
+  naming the failing index.
+
+  Keeping *every* read error would have traded that bug for a worse one: on a
+  persistent I/O error `Lines` hands back the same failure forever, so an
+  unconditional keep-and-continue is an unbounded loop. Only `InvalidData` is
+  resumable — `read_line` reports it *after* `read_until` has consumed the
+  offending bytes — so any other error is reported and then stops the run with the
+  parse-halt exit code, which tells the caller the batch is short of its input.
+
+- **Plain `dcg hook` was not the hook mode its `--help` promised (#430).** It read
+  stdin through the batch reader, so it missed the bounded byte reader, the
+  invalid-UTF-8 classification, the oversized-payload salvage scan and the
+  fail-open/fail-closed policy that bare `dcg` applies — and it answered in JSONL
+  with exit 1, which an agent expecting the `PreToolUse` protocol does not read as
+  a denial. It now routes into the same path as bare `dcg`; any batch option keeps
+  the JSONL contract.
+
 - **Six further escapes from the awk and osascript extractors**, each verified
   against the real interpreter: a glued flag value kept its shell quoting so
   `awk -e"BEGIN{…}"` read the whole program as one string; the scanner did not
@@ -153,6 +182,12 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   `core.git` exist to stop. Only a `[policy.rules]` entry relaxes one. The
   explain-schema table also omitted `indeterminate`, the one outcome that means
   "do not run this".
+
+- `dcg hook --help` claimed that without `--batch` it "behaves identically to
+  running `dcg` with no subcommand". `--parallel`, `--workers`,
+  `--continue-on-error` and `--with-packs` each route to the JSONL batch contract
+  on their own, so the text now names the actual condition and the exit-code
+  difference between the two contracts.
 
 ---
 

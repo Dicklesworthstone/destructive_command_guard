@@ -216,11 +216,14 @@ pub enum Command {
 
     /// Run in hook mode with batch processing support
     ///
-    /// Explicit hook mode for processing commands from stdin. When `--batch` is
-    /// specified, reads JSONL (one JSON hook input per line) and outputs JSONL
-    /// with decisions.
+    /// Explicit hook mode for processing commands from stdin. Any batch option
+    /// — `--batch`, `--parallel`, `--workers`, `--continue-on-error` or
+    /// `--with-packs` — reads JSONL (one JSON hook input per line), outputs
+    /// JSONL with decisions, and exits non-zero if any line was denied.
     ///
-    /// Without `--batch`, behaves identically to running `dcg` with no subcommand.
+    /// With no batch option, `dcg hook` behaves identically to running `dcg`
+    /// with no subcommand: one hook payload in, one agent-protocol response out,
+    /// carrying a denial on stdout with exit 0.
     #[command(name = "hook")]
     Hook(HookCommand),
 
@@ -2898,7 +2901,8 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
     //   definitive decision, the process exits non-zero so a caller can gate
     //   on the exit code, like `dcg test` does (issues #148, #213).
     // - `parse_halt`: without `--continue-on-error`, the first malformed line
-    //   emits an `error` result and then halts processing (issue #165).
+    //   emits an `error` result and then halts processing (issue #165). A line
+    //   stdin could not decode counts as malformed here (issue #430).
     let mut emit_index = 0usize;
     let mut any_blocked = false;
     let mut parse_halt = false;
@@ -2907,13 +2911,23 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
         // Parallel processing: collect all non-blank lines, evaluate in
         // parallel, then emit in input order. Blank lines are dropped here so
         // they neither create indexed entries nor consume an index (#154).
-        let lines: Vec<(usize, String)> = stdin
-            .lock()
-            .lines()
-            .map_while(std::result::Result::ok)
-            .filter(|l| !l.trim().is_empty())
-            .enumerate()
-            .collect();
+        // A decode failure is KEPT so it becomes an `error` result. Dropping it
+        // (and, with `map_while`, everything after it) silently shortened the
+        // batch and still exited 0 — see `batch_line_outcome`.
+        let mut lines: Vec<(usize, std::io::Result<String>)> = Vec::new();
+        let mut read_halt = false;
+        for line in stdin.lock().lines() {
+            // Blank lines are skipped entirely: no output, no index (#154).
+            if line.as_ref().is_ok_and(|text| text.trim().is_empty()) {
+                continue;
+            }
+            let can_continue = batch_read_can_continue(&line);
+            lines.push((lines.len(), line));
+            if !can_continue {
+                read_halt = true;
+                break;
+            }
+        }
 
         #[cfg(feature = "rayon")]
         let mut results: Vec<(usize, BatchHookOutput)> = {
@@ -2924,9 +2938,9 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
                 .map(|(order, line)| {
                     (
                         order,
-                        evaluate_batch_line(
+                        batch_line_outcome(
                             config,
-                            &line,
+                            line,
                             &enabled_keywords,
                             &ordered_packs,
                             keyword_index.as_ref(),
@@ -2945,9 +2959,9 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
             .map(|(order, line)| {
                 (
                     order,
-                    evaluate_batch_line(
+                    batch_line_outcome(
                         config,
-                        &line,
+                        line,
                         &enabled_keywords,
                         &ordered_packs,
                         keyword_index.as_ref(),
@@ -2979,37 +2993,31 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
                 break;
             }
         }
+
+        // Reading stopped before EOF, so the batch is short of the input even
+        // though every collected line was emitted. Report that as a halt rather
+        // than exiting 0 on a truncated batch (#430).
+        if read_halt {
+            parse_halt = true;
+        }
     } else {
         // Sequential processing: stream input to output.
         for line in stdin.lock().lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(e) => {
-                    if cmd.continue_on_error {
-                        let result = BatchHookOutput {
-                            index: emit_index,
-                            decision: "error",
-                            mode: None,
-                            rule_id: None,
-                            pack_id: None,
-                            error: Some(format!("IO error: {e}")),
-                        };
-                        emit_index += 1;
-                        writeln!(stdout_lock, "{}", serde_json::to_string(&result)?)?;
-                        continue;
-                    }
-                    return Err(e.into());
-                }
-            };
-
             // Blank lines are skipped entirely: no output, no index (#154).
-            if line.trim().is_empty() {
+            if line.as_ref().is_ok_and(|text| text.trim().is_empty()) {
                 continue;
             }
 
-            let mut result = evaluate_batch_line(
+            // A decode failure is an `error` result on exactly the same footing
+            // as a malformed line: reported with its index, upgraded to `deny`
+            // under fail-closed, and halting unless `--continue-on-error`
+            // (#430). Handling it separately here meant `--continue-on-error`
+            // skipped the fail-closed upgrade and left the exit code at 0, and
+            // the default path returned a bare `Err` with no result line at all.
+            let can_continue = batch_read_can_continue(&line);
+            let mut result = batch_line_outcome(
                 config,
-                &line,
+                line,
                 &enabled_keywords,
                 &ordered_packs,
                 keyword_index.as_ref(),
@@ -3027,7 +3035,10 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
             if matches!(result.decision, "deny" | "indeterminate") {
                 any_blocked = true;
             }
-            let halt = result.decision == "error" && !cmd.continue_on_error;
+            // `!can_continue` also halts: reading cannot make progress, so
+            // stopping here is the only option, and the truncated batch must not
+            // exit 0 (#430).
+            let halt = (result.decision == "error" && !cmd.continue_on_error) || !can_continue;
             writeln!(stdout_lock, "{}", serde_json::to_string(&result)?)?;
             if halt {
                 parse_halt = true;
@@ -3039,7 +3050,8 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
     // Exit code contract for `dcg hook` (issues #148, #165):
     // - any deny/indeterminate -> EXIT_DENIED (1): callers can gate on the
     //   exit code, and incomplete safety analysis never becomes success.
-    // - parse halt -> EXIT_PARSE_ERROR (4): a malformed line stopped processing.
+    // - parse halt -> EXIT_PARSE_ERROR (4): a malformed or undecodable line
+    //   stopped processing before the end of the input.
     // - otherwise  -> EXIT_SUCCESS (0).
     let exit_code = if any_blocked {
         crate::exit_codes::EXIT_DENIED
@@ -3049,6 +3061,75 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
         crate::exit_codes::EXIT_SUCCESS
     };
     Ok(exit_code)
+}
+
+/// Whether `BufRead::lines()` can still make progress after this outcome.
+///
+/// `read_line` reports `InvalidData` only after `read_until` has already
+/// consumed the offending bytes, so the next call reads the following line and
+/// the undecodable one can be reported as an `error` result and left behind.
+/// Any other I/O error may have consumed nothing, in which case `Lines` hands
+/// back the same failure on every subsequent call — so reading stops instead of
+/// spinning, and the caller learns the batch was truncated through the
+/// `parse_halt` exit code (#430).
+fn batch_read_can_continue(line: &std::io::Result<String>) -> bool {
+    match line {
+        Ok(_) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::InvalidData,
+    }
+}
+
+/// One batch result for one input line, including a line stdin could not decode.
+///
+/// A line stdin cannot decode must produce an `error` result rather than vanish,
+/// and both batch paths route through here so they agree on it (issue #430).
+///
+/// The parallel path used `map_while(Result::ok)`, which stops at the first
+/// decode failure and discards every line after it, so one stray byte silently
+/// truncated the batch — and because no `error` result was emitted,
+/// `any_blocked` stayed false and the process exited 0. A caller saw success
+/// plus fewer result lines than it sent, with the unevaluated commands
+/// unreported. The sequential path did report the line under
+/// `--continue-on-error`, but built the result by hand and so skipped the
+/// fail-closed upgrade to `deny` and the non-zero exit; without that flag it
+/// returned a bare `Err` and emitted no result line at all.
+///
+/// Returning the result instead lets the shared emit loop apply fail-closed,
+/// assign the index, and decide the exit code, exactly as it does for a
+/// syntactically malformed line.
+#[allow(clippy::too_many_arguments)]
+fn batch_line_outcome(
+    config: &Config,
+    line: std::io::Result<String>,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &crate::allowlist::LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+) -> BatchHookOutput {
+    match line {
+        Ok(text) => evaluate_batch_line(
+            config,
+            &text,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+        ),
+        // `index` is assigned by the emit loop, which also applies fail-closed
+        // and sets the non-zero exit.
+        Err(error) => BatchHookOutput {
+            index: 0,
+            decision: "error",
+            mode: None,
+            rule_id: None,
+            pack_id: None,
+            error: Some(format!("IO error: {error}")),
+        },
+    }
 }
 
 /// Evaluate a single batch line and return the result.
@@ -3721,7 +3802,7 @@ fn handle_pack_command(
         } => {
             let external_paths = config.packs.expand_custom_paths();
             let external_store = load_external_packs(&external_paths);
-            pack_info(&pack_id, !no_patterns, json, &external_store)?;
+            pack_info(&pack_id, !no_patterns, json, external_store)?;
         }
         PackAction::Validate {
             file_path,
@@ -10999,48 +11080,50 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             );
         } else {
             match probe_opencode_plugin(&plugin_path) {
-            OpencodePluginProbe::Current => {
-                println!("{}", "OK".green());
-                println!("  Found: {}", plugin_path.display());
-            }
-            OpencodePluginProbe::OwnedStale => {
-                println!("{}", "OUTDATED OR MODIFIED".red());
-                issues += 1;
-                println!(
-                    "  {} is dcg-owned but does not match the canonical plugin \
+                OpencodePluginProbe::Current => {
+                    println!("{}", "OK".green());
+                    println!("  Found: {}", plugin_path.display());
+                }
+                OpencodePluginProbe::OwnedStale => {
+                    println!("{}", "OUTDATED OR MODIFIED".red());
+                    issues += 1;
+                    println!(
+                        "  {} is dcg-owned but does not match the canonical plugin \
                      (edited, stubbed, or generated by another dcg version)",
-                    plugin_path.display()
-                );
-                if fix {
-                    println!("  Attempting plugin refresh...");
-                    if install_opencode_plugin(true, false).is_ok() {
-                        println!("  {}", "Fixed!".green());
-                        fixed += 1;
+                        plugin_path.display()
+                    );
+                    if fix {
+                        println!("  Attempting plugin refresh...");
+                        if install_opencode_plugin(true, false).is_ok() {
+                            println!("  {}", "Fixed!".green());
+                            fixed += 1;
+                        } else {
+                            println!("  {}", "Failed to fix".red());
+                        }
                     } else {
-                        println!("  {}", "Failed to fix".red());
+                        println!("  → Run 'dcg install --opencode --force' to restore it");
+                        println!("    (a modified plugin may guard nothing)");
                     }
-                } else {
-                    println!("  → Run 'dcg install --opencode --force' to restore it");
-                    println!("    (a modified plugin may guard nothing)");
+                }
+                OpencodePluginProbe::MissingOrUnowned => {
+                    println!("{}", "NOT REGISTERED".yellow());
+                    issues += 1;
+                    if fix {
+                        println!("  Attempting plugin install...");
+                        if install_opencode_plugin(false, false).is_ok() {
+                            println!("  {}", "Fixed!".green());
+                            fixed += 1;
+                        } else {
+                            println!("  {}", "Failed to fix".red());
+                        }
+                    } else {
+                        println!("  → Run 'dcg install --opencode' to install the native plugin");
+                        println!(
+                            "    (OpenCode shell commands are NOT guarded until it is installed)"
+                        );
+                    }
                 }
             }
-            OpencodePluginProbe::MissingOrUnowned => {
-                println!("{}", "NOT REGISTERED".yellow());
-                issues += 1;
-                if fix {
-                    println!("  Attempting plugin install...");
-                    if install_opencode_plugin(false, false).is_ok() {
-                        println!("  {}", "Fixed!".green());
-                        fixed += 1;
-                    } else {
-                        println!("  {}", "Failed to fix".red());
-                    }
-                } else {
-                    println!("  → Run 'dcg install --opencode' to install the native plugin");
-                    println!("    (OpenCode shell commands are NOT guarded until it is installed)");
-                }
-            }
-        }
         }
     }
 
@@ -12389,7 +12472,9 @@ fn collect_doctor_report(
     if opencode_appears_in_use() {
         let plugin_path = opencode_user_plugin_path();
         let mut opencode_fixed = false;
-        let (status, message, remediation) = if let Some(major) = unsupported_opencode_major_version() {
+        let (status, message, remediation) = if let Some(major) =
+            unsupported_opencode_major_version()
+        {
             issues += 1;
             (
                 DoctorCheckStatus::Error,
@@ -12403,63 +12488,63 @@ fn collect_doctor_report(
             )
         } else {
             match probe_opencode_plugin(&plugin_path) {
-            OpencodePluginProbe::Current => (
-                DoctorCheckStatus::Ok,
-                format!("Native OpenCode plugin found at {}", plugin_path.display()),
-                None,
-            ),
-            OpencodePluginProbe::OwnedStale => {
-                issues += 1;
-                if fix && install_opencode_plugin(true, false).is_ok() {
-                    fixed += 1;
-                    opencode_fixed = true;
-                    (
-                        DoctorCheckStatus::Ok,
-                        format!(
-                            "Refreshed native OpenCode plugin at {}",
-                            plugin_path.display()
-                        ),
-                        None,
-                    )
-                } else {
-                    (
-                        DoctorCheckStatus::Error,
-                        format!(
-                            "OpenCode plugin at {} is dcg-owned but does not match the \
+                OpencodePluginProbe::Current => (
+                    DoctorCheckStatus::Ok,
+                    format!("Native OpenCode plugin found at {}", plugin_path.display()),
+                    None,
+                ),
+                OpencodePluginProbe::OwnedStale => {
+                    issues += 1;
+                    if fix && install_opencode_plugin(true, false).is_ok() {
+                        fixed += 1;
+                        opencode_fixed = true;
+                        (
+                            DoctorCheckStatus::Ok,
+                            format!(
+                                "Refreshed native OpenCode plugin at {}",
+                                plugin_path.display()
+                            ),
+                            None,
+                        )
+                    } else {
+                        (
+                            DoctorCheckStatus::Error,
+                            format!(
+                                "OpenCode plugin at {} is dcg-owned but does not match the \
                              canonical plugin (edited, stubbed, or generated by another \
                              dcg version) — it may guard nothing",
-                            plugin_path.display()
-                        ),
-                        Some("Run 'dcg install --opencode --force'".to_string()),
-                    )
+                                plugin_path.display()
+                            ),
+                            Some("Run 'dcg install --opencode --force'".to_string()),
+                        )
+                    }
                 }
-            }
-            OpencodePluginProbe::MissingOrUnowned => {
-                // OpenCode has no Claude-compatibility fallback: without the
-                // plugin, its shell calls never reach dcg at all.
-                issues += 1;
-                if fix && install_opencode_plugin(false, false).is_ok() {
-                    fixed += 1;
-                    opencode_fixed = true;
-                    (
-                        DoctorCheckStatus::Ok,
-                        format!(
-                            "Installed native OpenCode plugin at {}",
-                            plugin_path.display()
-                        ),
-                        None,
-                    )
-                } else {
-                    (
+                OpencodePluginProbe::MissingOrUnowned => {
+                    // OpenCode has no Claude-compatibility fallback: without the
+                    // plugin, its shell calls never reach dcg at all.
+                    issues += 1;
+                    if fix && install_opencode_plugin(false, false).is_ok() {
+                        fixed += 1;
+                        opencode_fixed = true;
+                        (
+                            DoctorCheckStatus::Ok,
+                            format!(
+                                "Installed native OpenCode plugin at {}",
+                                plugin_path.display()
+                            ),
+                            None,
+                        )
+                    } else {
+                        (
                         DoctorCheckStatus::Error,
                         "OpenCode is in use but has no dcg plugin — its shell commands are not \
                          guarded"
                             .to_string(),
                         Some("Run 'dcg install --opencode'".to_string()),
                     )
+                    }
                 }
             }
-        }
         };
         checks.push(DoctorCheck {
             id: "opencode_plugin",
@@ -13956,9 +14041,8 @@ fn detected_opencode_major_version() -> Option<u64> {
     if !output.status.success() {
         return None;
     }
-    parse_opencode_major_version(&String::from_utf8_lossy(&output.stdout)).or_else(|| {
-        parse_opencode_major_version(&String::from_utf8_lossy(&output.stderr))
-    })
+    parse_opencode_major_version(&String::from_utf8_lossy(&output.stdout))
+        .or_else(|| parse_opencode_major_version(&String::from_utf8_lossy(&output.stderr)))
 }
 
 fn unsupported_opencode_major_version() -> Option<u64> {

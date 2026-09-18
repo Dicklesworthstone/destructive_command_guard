@@ -25,6 +25,19 @@ fn run_dcg_batch(input: &str) -> std::process::Output {
 
 /// Run dcg in batch hook mode with additional CLI arguments.
 fn run_dcg_batch_with_args(input: &str, extra_args: &[&str]) -> std::process::Output {
+    run_dcg_batch_bytes_full(input.as_bytes(), extra_args, &[])
+}
+
+/// Run `dcg hook --batch` over raw stdin bytes, with extra CLI arguments and
+/// extra environment variables. Every other runner in this file delegates here.
+///
+/// Raw bytes matter for input a `&str` cannot express: a batch line that is not
+/// valid UTF-8 must still be reported rather than silently dropped (#430).
+fn run_dcg_batch_bytes_full(
+    input: &[u8],
+    extra_args: &[&str],
+    envs: &[(&str, &str)],
+) -> std::process::Output {
     let temp = tempfile::tempdir().expect("failed to create temp dir");
     std::fs::create_dir_all(temp.path().join(".git")).expect("failed to create .git dir");
 
@@ -48,14 +61,15 @@ fn run_dcg_batch_with_args(input: &str, extra_args: &[&str]) -> std::process::Ou
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
 
     let mut child = cmd.spawn().expect("failed to spawn dcg batch mode");
 
     {
         let stdin = child.stdin.as_mut().expect("failed to open stdin");
-        stdin
-            .write_all(input.as_bytes())
-            .expect("failed to write batch input");
+        stdin.write_all(input).expect("failed to write batch input");
     }
 
     child.wait_with_output().expect("failed to wait for dcg")
@@ -242,6 +256,136 @@ not valid json
 }
 
 // ============================================================================
+// Test: a line stdin cannot decode is reported, never silently dropped (#430)
+// ============================================================================
+
+/// Three batch lines where the middle one carries a byte stdin cannot decode.
+///
+/// The trailing `git reset --hard` is what the parallel path used to lose: with
+/// `map_while(Result::ok)` it was never evaluated and never reported (#430).
+fn batch_input_with_undecodable_middle_line() -> Vec<u8> {
+    let mut input = Vec::new();
+    input.extend_from_slice(br#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#);
+    input.push(b'\n');
+    input.extend_from_slice(br#"{"tool_name":"Bash","tool_input":{"command":"echo "#);
+    input.push(0xff);
+    input.extend_from_slice(br#""}}"#);
+    input.push(b'\n');
+    input.extend_from_slice(br#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#);
+    input.push(b'\n');
+    input
+}
+
+#[test]
+fn test_batch_parallel_keeps_evaluating_after_undecodable_line_430() {
+    let input = batch_input_with_undecodable_middle_line();
+    // `--workers` is pinned above 1 so the parallel branch is actually taken:
+    // it is skipped when `available_parallelism()` reports a single CPU.
+    let output = run_dcg_batch_bytes_full(
+        &input,
+        &["--parallel", "--workers", "4", "--continue-on-error"],
+        &[],
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = parse_jsonl_output(&stdout);
+
+    // The old parallel path stopped reading at the undecodable line and dropped
+    // everything after it, so the caller got ONE result for three input lines.
+    assert_eq!(
+        results.len(),
+        3,
+        "every input line must produce a result: {stdout}"
+    );
+    assert_eq!(results[0]["decision"], "allow");
+    assert_eq!(results[1]["decision"], "error");
+    assert_eq!(results[1]["index"], 1);
+
+    // The destructive command AFTER the undecodable line must still be judged.
+    assert_eq!(
+        results[2]["decision"], "deny",
+        "a destructive command after an undecodable line must still be denied"
+    );
+    assert!(
+        results[2]["rule_id"]
+            .as_str()
+            .is_some_and(|rule| rule.contains("reset-hard"))
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a denial anywhere in the batch must exit non-zero"
+    );
+}
+
+#[test]
+fn test_batch_parallel_undecodable_line_halts_without_continue_430() {
+    let input = batch_input_with_undecodable_middle_line();
+    let output = run_dcg_batch_bytes_full(&input, &["--parallel", "--workers", "4"], &[]);
+
+    // Same contract as a syntactically malformed line (#165): emit the `error`
+    // result, then halt. Previously the line vanished and the process exited 0.
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "an undecodable line without --continue-on-error must halt with exit 4"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = parse_jsonl_output(&stdout);
+    assert_eq!(results.len(), 2, "processing must stop at the bad line");
+    assert_eq!(results[0]["decision"], "allow");
+    assert_eq!(results[1]["decision"], "error");
+    assert_eq!(results[1]["index"], 1);
+}
+
+#[test]
+fn test_batch_sequential_reports_undecodable_line_430() {
+    let input = batch_input_with_undecodable_middle_line();
+    let output = run_dcg_batch_bytes_full(&input, &[], &[]);
+
+    // The sequential path used to return a bare `Err` here: nothing on stdout
+    // said which line failed. It now matches the malformed-line contract.
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "an undecodable line without --continue-on-error must halt with exit 4"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = parse_jsonl_output(&stdout);
+    assert_eq!(results.len(), 2, "the failing line must be reported");
+    assert_eq!(results[0]["decision"], "allow");
+    assert_eq!(results[1]["decision"], "error");
+    assert_eq!(results[1]["index"], 1);
+}
+
+#[test]
+fn test_batch_fail_closed_denies_undecodable_line_430() {
+    let input = batch_input_with_undecodable_middle_line();
+
+    // Fail-closed must upgrade the `error` to `deny` on BOTH paths. The
+    // sequential path built its decode-error result by hand and so skipped this
+    // upgrade entirely, leaving the exit code at 0 under --continue-on-error.
+    for extra_args in [
+        vec!["--continue-on-error"],
+        vec!["--parallel", "--workers", "4", "--continue-on-error"],
+    ] {
+        let output = run_dcg_batch_bytes_full(&input, &extra_args, &[("DCG_FAIL_CLOSED", "1")]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let results = parse_jsonl_output(&stdout);
+        assert_eq!(results.len(), 3, "{extra_args:?}: {stdout}");
+        assert_eq!(
+            results[1]["decision"], "deny",
+            "{extra_args:?}: DCG_FAIL_CLOSED=1 must deny an undecodable line"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{extra_args:?}: a denied line must exit non-zero"
+        );
+    }
+}
+
+// ============================================================================
 // Test: Blank lines are skipped entirely (no phantom indexed entries)
 // ============================================================================
 
@@ -341,10 +485,7 @@ fn test_hook_without_batch_reads_single_json() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let result: serde_json::Value =
         serde_json::from_str(&stdout).expect("plain hook must emit one protocol response");
-    assert_eq!(
-        result["hookSpecificOutput"]["permissionDecision"],
-        "deny"
-    );
+    assert_eq!(result["hookSpecificOutput"]["permissionDecision"], "deny");
     assert!(
         result["hookSpecificOutput"]["ruleId"]
             .as_str()
@@ -374,8 +515,7 @@ fn test_hook_without_batch_salvages_destructive_invalid_utf8_430() {
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("failed to spawn dcg hook");
 
-    let mut input =
-        br#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#.to_vec();
+    let mut input = br#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#.to_vec();
     input.push(0xff);
     child
         .stdin
@@ -393,10 +533,7 @@ fn test_hook_without_batch_salvages_destructive_invalid_utf8_430() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let result: serde_json::Value =
         serde_json::from_str(&stdout).expect("salvage scan must emit a blocking response");
-    assert_eq!(
-        result["hookSpecificOutput"]["permissionDecision"],
-        "deny"
-    );
+    assert_eq!(result["hookSpecificOutput"]["permissionDecision"], "deny");
     assert!(
         result["hookSpecificOutput"]["ruleId"]
             .as_str()
@@ -426,8 +563,7 @@ fn test_hook_without_batch_salvages_destructive_oversized_input_430() {
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("failed to spawn dcg hook");
 
-    let mut input =
-        br#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#.to_vec();
+    let mut input = br#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#.to_vec();
     input.extend(vec![b' '; 270_000]); // default max_hook_input_bytes is 256 KiB
     child
         .stdin
@@ -441,10 +577,7 @@ fn test_hook_without_batch_salvages_destructive_oversized_input_430() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let result: serde_json::Value =
         serde_json::from_str(&stdout).expect("oversized salvage must emit a blocking response");
-    assert_eq!(
-        result["hookSpecificOutput"]["permissionDecision"],
-        "deny"
-    );
+    assert_eq!(result["hookSpecificOutput"]["permissionDecision"], "deny");
     assert!(
         result["hookSpecificOutput"]["ruleId"]
             .as_str()
@@ -698,38 +831,7 @@ fn run_dcg_batch_full(
     extra_args: &[&str],
     envs: &[(&str, &str)],
 ) -> std::process::Output {
-    let temp = tempfile::tempdir().expect("failed to create temp dir");
-    std::fs::create_dir_all(temp.path().join(".git")).expect("failed to create .git dir");
-    let home_dir = temp.path().join("home");
-    let xdg_config_dir = temp.path().join("xdg_config");
-    std::fs::create_dir_all(&home_dir).unwrap();
-    std::fs::create_dir_all(&xdg_config_dir).unwrap();
-
-    let mut args = vec!["hook", "--batch"];
-    args.extend(extra_args);
-
-    let mut cmd = Command::new(dcg_binary());
-    cmd.env_clear()
-        .env("HOME", &home_dir)
-        .env("USERPROFILE", &home_dir)
-        .env("XDG_CONFIG_HOME", &xdg_config_dir)
-        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
-        .env("DCG_PACKS", "core.git,core.filesystem")
-        .current_dir(temp.path())
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (k, v) in envs {
-        cmd.env(k, v);
-    }
-
-    let mut child = cmd.spawn().expect("failed to spawn dcg batch mode");
-    {
-        let stdin = child.stdin.as_mut().expect("failed to open stdin");
-        stdin.write_all(input.as_bytes()).unwrap();
-    }
-    child.wait_with_output().expect("failed to wait for dcg")
+    run_dcg_batch_bytes_full(input.as_bytes(), extra_args, envs)
 }
 
 // ============================================================================

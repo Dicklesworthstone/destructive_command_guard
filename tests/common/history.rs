@@ -45,7 +45,7 @@ fn retry_with_window(
                     "{context}: retrying a fresh history fixture after attempt {attempts}: {}",
                     incomplete.0
                 );
-                std::thread::sleep(Duration::from_millis(20).min(window - elapsed));
+                std::thread::sleep(Duration::from_millis(20).min(window.saturating_sub(elapsed)));
             }
         }
     }
@@ -62,16 +62,14 @@ pub fn check_history_after_exit(
     context: &str,
 ) -> Result<(), IncompleteHistoryFlush> {
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let connection = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap_or_else(|error| {
-        panic!(
-            "{context}: cannot read history at {}: {error}; stderr:\n{stderr}",
-            path.display()
-        )
-    });
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{context}: cannot read history at {}: {error}; stderr:\n{stderr}",
+                    path.display()
+                )
+            });
     let actual: i64 = connection
         .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
         .unwrap_or_else(|error| {
@@ -120,13 +118,15 @@ mod tests {
 
     #[test]
     fn exact_count_does_not_confuse_a_late_ack_with_data_loss() {
-        assert!(check_count(
-            "late acknowledgement",
-            1,
-            1,
-            "[dcg-history] status=shutdown_timeout timeout_ms=1000 elapsed_ms=1001"
-        )
-        .is_ok());
+        assert!(
+            check_count(
+                "late acknowledgement",
+                1,
+                1,
+                "[dcg-history] status=shutdown_timeout timeout_ms=1000 elapsed_ms=1001"
+            )
+            .is_ok()
+        );
     }
 
     #[test]

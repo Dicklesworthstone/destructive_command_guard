@@ -71,8 +71,12 @@ fn hook_denies(command: &str, home: &Path, config: &Path) -> Option<String> {
         .write_all(payload.as_bytes())
         .expect("write payload");
     let output = child.wait_with_output().expect("wait for dcg");
-    // `dcg hook` exits 1 on a deny and 0 on an allow; anything else is a
-    // protocol failure rather than a verdict.
+    // `dcg hook` is the explicit spelling of bare hook mode (#430), so the
+    // verdict rides in the agent protocol's `permissionDecision` on stdout and
+    // the process exits 0 either way. Anything other than 0/1 is a protocol
+    // failure rather than a verdict. Reading the batch mode's `decision` field
+    // here would make every command in this file look allowed, which is exactly
+    // what the MUST_DENY controls at the bottom exist to catch.
     let code = output.status.code();
     assert!(
         matches!(code, Some(0 | 1)),
@@ -80,7 +84,9 @@ fn hook_denies(command: &str, home: &Path, config: &Path) -> Option<String> {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    stdout.contains(r#""decision":"deny""#).then_some(stdout)
+    stdout
+        .contains(r#""permissionDecision":"deny""#)
+        .then_some(stdout)
 }
 
 /// Ordinary command lines an agent or a person types all day. Every one of
