@@ -38,6 +38,24 @@ macro_rules! kubectl_delete_argument {
     };
 }
 
+// One proof for BOTH the pack whitelist and the evaluator's whole-command
+// destructive fallback. Evaluating safe patterns per segment alone is not
+// enough: the fallback legitimately matches a rendering/deletion pipeline.
+// The optional producer is one literal rendering command, and the receiving
+// kubectl must have a positive preview in an option slot. The full-input
+// exclusion below additionally enforces \A/\z and uses only the linear engine.
+const PREVIEW_PATTERN: &str = concat!(
+    r"^[ \t]*(?:(?:(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+/)?kustomize[ \t]+build|(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+/)?kubectl[ \t]+kustomize)",
+    r"(?:[ \t]+[^\s;&|<>()\x22'\\$`*?\[\]{}~]+)*[ \t]*\|[ \t]*)?",
+    r"(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+/)?kubectl[ \t]+(?:",
+    kubectl_global_option!(),
+    r"[ \t]+)*delete(?:[ \t]+",
+    kubectl_delete_argument!(),
+    r")*[ \t]+--dry-run(?:=(?:client|server))?(?:[ \t]+(?:",
+    kubectl_delete_argument!(),
+    r"|--dry-run(?:=(?:client|server))?))*[ \t]*$"
+);
+
 /// Create the Kustomize pack.
 #[must_use]
 pub fn create_pack() -> Pack {
@@ -59,30 +77,16 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     // Plain build/render/diff commands do not need exemptions: they do not
     // match the delete rules. Searching for those words in arbitrary argv
     // data can instead shield a deletion (`--cache-dir diff`, for example).
-    //
-    // The optional producer below is one literal rendering command; the
-    // receiving kubectl command must itself have a positive dry-run option.
-    // Bound the entire pipeline so a preview cannot shield another sink.
     // --raw is intentionally not part of the preview grammar.
     vec![SafePattern {
         name: "kustomize-dry-run",
-        regex: LazyCompiledRegex::new(concat!(
-            r"^[ \t]*(?:(?:(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+/)?kustomize[ \t]+build|(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+/)?kubectl[ \t]+kustomize)",
-            r"(?:[ \t]+[^\s;&|<>()\x22'\\$`*?\[\]{}~]+)*[ \t]*\|[ \t]*)?",
-            r"(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+/)?kubectl[ \t]+(?:",
-            kubectl_global_option!(),
-            r"[ \t]+)*delete(?:[ \t]+",
-            kubectl_delete_argument!(),
-            r")*[ \t]+--dry-run(?:=(?:client|server))?(?:[ \t]+(?:",
-            kubectl_delete_argument!(),
-            r"|--dry-run(?:=(?:client|server))?))*[ \t]*$"
-        )),
+        regex: LazyCompiledRegex::new(PREVIEW_PATTERN),
     }]
 }
 
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
-    // No preview lookaheads here: they used to repeat the same data-slot
-    // mistake even when a safe pattern refused the apparent dry-run flag.
+    // Keep candidates permissive. Preview proofs run separately below, not
+    // inside negative lookaheads whose backtracking failure can lose a denial.
     vec![
         // kustomize build | kubectl delete
         destructive_pattern!(
@@ -136,6 +140,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - kubectl get -k <dir>: List resources that would be affected"
         ),
     ]
+    .into_iter()
+    .map(|mut pattern| {
+        pattern.regex = pattern.regex.excluding_full_match(PREVIEW_PATTERN);
+        pattern
+    })
+    .collect()
 }
 
 #[cfg(test)]
@@ -249,6 +259,14 @@ mod tests {
         ] {
             assert_safe_pattern_matches(&pack, command);
             assert_allows(&pack, command);
+            // The hook's whole-command fallback does not consult the pack
+            // whitelist again. Test the matching APIs that it actually uses.
+            for pattern in &pack.destructive_patterns {
+                assert_eq!(pattern.regex.full_match_exclusion(), Some(PREVIEW_PATTERN));
+                assert!(!pattern.regex.is_match(command), "fallback: {command}");
+                assert_eq!(pattern.regex.find(command), None);
+                assert_eq!(pattern.regex.find_from(command, 0), None);
+            }
         }
     }
 
@@ -269,10 +287,29 @@ mod tests {
             "kubectl delete -k ./prod --dry-run=client --raw /api/v1/pods",
             "kustomize build ./prod | kubectl delete --dry-run=client -f - | kubectl delete -f -",
             "kustomize build 'x | kubectl delete --dry-run=client' | kubectl delete -f -",
+            "kustomize build ./prod | kubectl delete -f - --cache-dir 'note --dry-run=client'",
         ] {
             assert_no_safe_match(&pack, command);
             assert_blocks(&pack, command, "kustomiz");
+            assert!(
+                pack.destructive_patterns
+                    .iter()
+                    .any(|pattern| pattern.regex.find_from(command, 0).is_some()),
+                "whole-command fallback must retain a denial: {command}"
+            );
         }
+    }
+
+    #[test]
+    fn quoted_preview_evidence_stays_data_after_normalization() {
+        let pack = create_pack();
+        let source =
+            "kustomize build ./prod | kubectl delete -f - --cache-dir \"note --dry-run=client\"";
+        let normalized = crate::normalize::normalize_command(source);
+        assert!(normalized.contains("\"note --dry-run=client\""));
+        assert_blocks(&pack, normalized.as_ref(), "kustomize");
+        let sanitized = crate::context::sanitize_for_pattern_matching(normalized.as_ref());
+        assert_blocks(&pack, sanitized.as_ref(), "kustomize");
     }
 
     #[test]
