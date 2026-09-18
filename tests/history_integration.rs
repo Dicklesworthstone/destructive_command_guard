@@ -533,15 +533,22 @@ fn acknowledged_busy_history_entry_is_dropped_not_replayed() {
     );
 
     let locker = rusqlite::Connection::open(&db_path).expect("open lock connection");
-    locker.execute_batch("BEGIN IMMEDIATE").expect("hold writer lock");
+    locker
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("hold writer lock");
     writer.log(CommandEntry {
         command: "dropped while busy".to_string(),
         ..Default::default()
     });
     let acknowledged = writer.flush_sync_with_timeout(Duration::from_secs(30));
     // Release the lock before asserting, including on a failed acknowledgement.
-    locker.execute_batch("ROLLBACK").expect("release writer lock");
-    assert!(acknowledged, "busy entry was not processed within the test watchdog");
+    locker
+        .execute_batch("ROLLBACK")
+        .expect("release writer lock");
+    assert!(
+        acknowledged,
+        "busy entry was not processed within the test watchdog"
+    );
 
     writer.log(CommandEntry {
         command: "persisted after unlock".to_string(),

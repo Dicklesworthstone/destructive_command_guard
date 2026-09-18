@@ -343,7 +343,10 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // -- Migrations read-only --
         supabase_safe_pattern!("supabase-migration-list", r"migration[ \t]+list(?:[ \t]|$)"),
         supabase_safe_pattern!("supabase-migration-new", r"migration[ \t]+new(?:[ \t]|$)"),
-        supabase_safe_pattern!("supabase-migration-fetch", r"migration[ \t]+fetch(?:[ \t]|$)"),
+        supabase_safe_pattern!(
+            "supabase-migration-fetch",
+            r"migration[ \t]+fetch(?:[ \t]|$)"
+        ),
         // Require positive preview evidence in an option slot, consuming
         // known value-taking options on both sides. A disabling repeat is
         // not admitted; a false-looking password value is still just data.
@@ -360,7 +363,10 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         // -- Functions read-only --
         supabase_safe_pattern!("supabase-functions-list", r"functions[ \t]+list(?:[ \t]|$)"),
-        supabase_safe_pattern!("supabase-functions-serve", r"functions[ \t]+serve(?:[ \t]|$)"),
+        supabase_safe_pattern!(
+            "supabase-functions-serve",
+            r"functions[ \t]+serve(?:[ \t]|$)"
+        ),
         supabase_safe_pattern!(
             "supabase-functions-download",
             r"functions[ \t]+download(?:[ \t]|$)"
@@ -378,7 +384,10 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         supabase_safe_pattern!("supabase-branches-get", r"branches[ \t]+get(?:[ \t]|$)"),
         // -- Domains read-only --
         supabase_safe_pattern!("supabase-domains-get", r"domains[ \t]+get(?:[ \t]|$)"),
-        supabase_safe_pattern!("supabase-domains-reverify", r"domains[ \t]+reverify(?:[ \t]|$)"),
+        supabase_safe_pattern!(
+            "supabase-domains-reverify",
+            r"domains[ \t]+reverify(?:[ \t]|$)"
+        ),
         supabase_safe_pattern!(
             "supabase-vanity-subdomains-get",
             r"vanity-subdomains[ \t]+get(?:[ \t]|$)"

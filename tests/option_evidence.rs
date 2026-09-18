@@ -8,8 +8,9 @@ use std::collections::HashSet;
 
 use destructive_command_guard::hook::{HookInput, extract_command_with_protocol};
 use destructive_command_guard::packs::{Pack, REGISTRY};
-use destructive_command_guard::{destructive_pattern, safe_pattern,
-    Config, EvaluationDecision, LayeredAllowlist, evaluate_command_with_pack_order,
+use destructive_command_guard::{
+    Config, EvaluationDecision, LayeredAllowlist, destructive_pattern,
+    evaluate_command_with_pack_order, safe_pattern,
 };
 
 fn assert_decision(pack_id: &str, source: &str, expected: EvaluationDecision) {
@@ -40,7 +41,11 @@ fn assert_decision(pack_id: &str, source: &str, expected: EvaluationDecision) {
             &command,
             &keywords,
             &ordered,
-            if indexed { keyword_index.as_ref() } else { None },
+            if indexed {
+                keyword_index.as_ref()
+            } else {
+                None
+            },
             &overrides,
             &allowlists,
             &heredoc,

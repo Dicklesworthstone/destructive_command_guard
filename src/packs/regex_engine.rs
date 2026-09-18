@@ -913,8 +913,7 @@ mod tests {
 
     #[test]
     fn exclusion_keeps_whole_input_scope_at_later_offsets() {
-        let lazy = LazyCompiledRegex::new("delete")
-            .excluding_full_match("delete item --dry-run");
+        let lazy = LazyCompiledRegex::new("delete").excluding_full_match("delete item --dry-run");
         let command = "delete real; delete item --dry-run";
         assert_eq!(lazy.find_from(command, 12), Some((13, 19)));
         assert_eq!(lazy.find_from("é delete", 1), None);
@@ -938,15 +937,14 @@ mod tests {
         assert!(lazy.is_match("delete live data"));
         let empty = LazyCompiledRegex::new("delete").excluding_full_match("");
         assert!(empty.is_match("delete"));
-        let multiline = LazyCompiledRegex::new("delete")
-            .excluding_full_match(r"(?m)^delete --dry-run$");
+        let multiline =
+            LazyCompiledRegex::new("delete").excluding_full_match(r"(?m)^delete --dry-run$");
         assert!(multiline.is_match("delete --dry-run\ndelete live"));
     }
 
     #[test]
     fn exclusion_is_lazy_and_linear_for_adversarial_input() {
-        let lazy = LazyCompiledRegex::new("delete")
-            .excluding_full_match(r"delete (a+)+ --dry-run");
+        let lazy = LazyCompiledRegex::new("delete").excluding_full_match(r"delete (a+)+ --dry-run");
         let proof = lazy.exclusion.as_ref().unwrap();
         assert!(proof.compiled.get().is_none());
         assert!(!lazy.is_match("unrelated"));

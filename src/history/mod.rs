@@ -593,11 +593,7 @@ fn history_receive_timeout(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn history_worker(
-    db: HistoryDb,
-    receiver: mpsc::Receiver<HistoryMessage>,
-    config: WorkerConfig,
-) {
+fn history_worker(db: HistoryDb, receiver: mpsc::Receiver<HistoryMessage>, config: WorkerConfig) {
     run_history_worker(db, config, |timeout| match timeout {
         Some(timeout) => receiver.recv_timeout(timeout),
         None => receiver
@@ -1164,11 +1160,9 @@ mod tests {
     }
 
     fn persisted_test_commands(path: &Path) -> Vec<String> {
-        let connection = rusqlite::Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .expect("open read-only observer");
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open read-only observer");
         let mut statement = connection
             .prepare("SELECT command FROM commands ORDER BY id")
             .expect("prepare persisted command query");

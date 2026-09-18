@@ -3705,7 +3705,7 @@ fn extract_heredoc_target_resolution(
 
     // The heredoc operator binds to the simple command on its OWN physical line,
     // so only that line can own this heredoc. Bounding here is a soundness fix:
-    // `tokenize_backwards` stops at `| ; & $ ( )` but NOT at newlines, so an
+    // `tokenize_backwards` stops at `| ; & ( )` but NOT at newlines, so an
     // unbounded scan resolves the target from an EARLIER line — e.g.
     // `cat f\nbash <<EOF\nrm -rf /\nEOF` would resolve the target as `cat` (a data
     // sink) and mask the executing `bash` body: a false negative. Limiting the
@@ -3815,6 +3815,18 @@ fn shell_assignment_name(token: &str) -> Option<&str> {
 /// Tokenize a command string backwards, respecting quotes.
 /// Returns tokens in reverse order (last token first).
 ///
+/// The walk stops at a real command boundary — `|`, `;`, `&`, `(`, `)` — so it
+/// never reads tokens belonging to another command. A bare `$` is **not** one:
+/// it introduces an expansion *inside* a word, and `$VAR`/`${VAR}` keep the word
+/// in the same simple command. Treating it as a boundary truncated the walk
+/// before the program word, so `cat > $S/out.md <<'EOF'` resolved no target at
+/// all, the quoted (therefore inert) body could not be masked, and a line-leading
+/// backtick in it tripped `heredoc.shell:launcher-unverified` — while the
+/// better-quoted `cat > "$S/out.md"` was allowed, because the quoted-string arm
+/// below consumes that token whole and the walk reached `cat` (#439).
+/// A command substitution is still bounded: `$(…)` ends in `)` and an unclosed
+/// one leaves its `(`, both of which stop the walk.
+///
 /// Note: This function does not handle escaped quotes inside double-quoted strings
 /// (e.g., `"foo\"bar"`). In such cases, tokenization may be incorrect. This is acceptable
 /// because the failure mode is safe - we won't find the target command and thus won't
@@ -3848,8 +3860,8 @@ fn tokenize_backwards(s: &str) -> Vec<String> {
             continue;
         }
 
-        // Check for command separator (|, ;, &, $, ()
-        if matches!(bytes[i - 1], b'|' | b';' | b'&' | b'$' | b'(' | b')') {
+        // Check for command separator (|, ;, &, (, ))
+        if matches!(bytes[i - 1], b'|' | b';' | b'&' | b'(' | b')') {
             // Stop parsing - we've reached a command boundary
             break;
         }
@@ -3857,7 +3869,7 @@ fn tokenize_backwards(s: &str) -> Vec<String> {
         // Regular word - scan backwards to whitespace or separator
         while i > 0 {
             let c = bytes[i - 1];
-            if c.is_ascii_whitespace() || matches!(c, b'|' | b';' | b'&' | b'$' | b'(' | b')') {
+            if c.is_ascii_whitespace() || matches!(c, b'|' | b';' | b'&' | b'(' | b')') {
                 break;
             }
             i -= 1;
@@ -4658,7 +4670,7 @@ pub(crate) fn range_is_inert_interpreter_stdin(command: &str, range: &Range<usiz
 /// after the terminator are still scanned, so a real destructive command chained
 /// after the heredoc still blocks. `--stdin-paths` is deliberately NOT matched.
 /// The scan is bounded to the heredoc's own physical line (see below) and
-/// `tokenize_backwards` additionally stops at shell separators (`| ; & $ ( )`),
+/// `tokenize_backwards` additionally stops at shell separators (`| ; & ( )`),
 /// so it never reads tokens across a command boundary; quoted args (e.g. a
 /// `-m "…-F -…"` message) are single tokens and cannot be mistaken for real flags.
 fn is_git_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
@@ -4667,7 +4679,7 @@ fn is_git_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
     }
     // A heredoc operator binds to the simple command on its OWN physical line, so
     // only that line can own this heredoc. Bounding the scan to the current line
-    // is essential for soundness: `tokenize_backwards` stops at `| ; & $ ( )` but
+    // is essential for soundness: `tokenize_backwards` stops at `| ; & ( )` but
     // NOT at newlines, so without this a `git … -F -` on an EARLIER line would
     // leak its stdin sentinel onto a later, genuinely-executing heredoc and mask
     // its body — e.g. `git commit -F - f\nbash <<EOF\nrm -rf /\nEOF` would wrongly
