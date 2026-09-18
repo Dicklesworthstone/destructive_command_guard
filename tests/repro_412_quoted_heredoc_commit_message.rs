@@ -234,3 +234,59 @@ fn masking_is_decided_by_the_delimiter_not_by_the_body_bytes() {
         "an unquoted delimiter expands and must stay visible"
     );
 }
+
+// ===========================================================================
+// #420: an interpreter payload quoted inside a data heredoc is data too
+//
+// The body was masked for pattern matching and simultaneously mined for inline
+// scripts, because inline-script extraction scanned the raw command. So a
+// commit message or a documentation file that *describes* a dangerous command
+// was denied — including, when this was found, the commit message describing
+// the fix for #399/#398.
+//
+// Inline-script extraction now reads the same data-heredoc-masked view the
+// pattern matcher does. The masker's existing conditions decide what counts as
+// data: a quoted delimiter, a non-shell data sink, and a target that cannot
+// have been rebound.
+// ===========================================================================
+
+#[test]
+fn a_documented_command_inside_a_data_heredoc_is_allowed() {
+    for command in [
+        // The reported shapes.
+        "git commit -F - <<'EOF'\nfix: document bash -c \"rm -rf ~/x\"\nEOF",
+        "git commit -F - <<'EOF'\nfix: document python -c \"import shutil; shutil.rmtree('/etc')\"\nEOF",
+        "cat > /tmp/notes/notes.md <<'EOF'\nbash -c \"rm -rf ~/x\"\nEOF",
+        // The same class through the other inline-script extractors.
+        "cat > /tmp/notes/notes.md <<'EOF'\nnode -e \"require('fs').rmSync('/etc', {recursive: true})\"\nEOF",
+        "cat > /tmp/notes/notes.md <<'EOF'\nssh host 'rm -rf ~/x'\nEOF",
+        "cat > /tmp/notes/notes.md <<'EOF'\nawk 'BEGIN{ system(\"rm -rf ~/x\") }'\nEOF",
+        "tee /tmp/notes/notes.md <<'EOF'\nperl -e 'unlink glob \"~/x/*\"'\nEOF",
+    ] {
+        assert_eq!(
+            decision(command),
+            "allow",
+            "a payload quoted inside a data heredoc is documentation: {command:?}"
+        );
+    }
+}
+
+#[test]
+fn a_live_payload_outside_a_data_heredoc_still_denies() {
+    for command in [
+        // A shell interpreter receiving the body executes it.
+        "bash <<'EOF'\nrm -rf ~/x\nEOF",
+        "sh <<'EOF'\nrm -rf ~/x\nEOF",
+        // An unquoted delimiter expands, so the body stays visible.
+        "cat > /tmp/notes/notes.md <<EOF\nbash -c \"rm -rf ~/x\"\nEOF",
+        // Executable text outside any heredoc body is untouched by this.
+        "bash -c \"rm -rf ~/x\"",
+        "cat > /tmp/notes/notes.md <<'EOF'\nharmless\nEOF\nbash -c \"rm -rf ~/x\"",
+    ] {
+        assert_eq!(
+            decision(command),
+            "deny",
+            "a live payload must still be denied: {command:?}"
+        );
+    }
+}

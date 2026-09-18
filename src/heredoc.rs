@@ -1277,6 +1277,37 @@ fn record_timeout_if_needed(
 #[must_use]
 #[instrument(skip(command, limits), fields(cmd_len = command.len(), timeout_ms = limits.timeout_ms))]
 pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionResult {
+    // Inline-script extraction scans a view whose *data* heredoc bodies are
+    // blanked, while heredoc extraction keeps the raw text (#420).
+    //
+    // Both were scanning the raw command, so a quoted body destined for a data
+    // sink was masked for pattern matching and simultaneously mined for inline
+    // scripts: `git commit -F - <<'EOF'` whose message *describes*
+    // `bash -c "rm -rf ~/x"` was denied, and so was a `cat > notes.md` heredoc
+    // documenting the same thing. The text is data by every test the masker
+    // applies — quoted delimiter, non-shell data sink, target not rebindable —
+    // and `evaluate_heredoc`'s own skip already says so; it just never reached
+    // the payload the extractor had already mined out of it.
+    //
+    // The mask is blank-fill and length preserving, so every `byte_range` an
+    // extractor computes against the view is the same range in the original.
+    let scan_view = mask_non_expanding_data_heredocs(command);
+    extract_content_with_scan_view(command, scan_view.as_ref(), limits)
+}
+
+/// [`extract_content`], with the view that inline-script extraction scans given
+/// explicitly.
+///
+/// `active_single_heredoc_fallback` calls this with `scan_view == command` to
+/// break a cycle: masking asks `active_heredocs` where the bodies are, that
+/// falls back to this extractor when the parse is ambiguous, and computing the
+/// mask again there would not terminate. Scanning the raw text in that one
+/// place is the conservative direction — it is what every caller did before.
+fn extract_content_with_scan_view(
+    command: &str,
+    scan_view: &str,
+    limits: &ExtractionLimits,
+) -> ExtractionResult {
     let start_time = Instant::now();
     let timeout = Duration::from_millis(limits.timeout_ms);
     let mut skip_reasons: Vec<SkipReason> = Vec::new();
@@ -1309,9 +1340,13 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         return ExtractionResult::Skipped(skip_reasons);
     }
 
-    // Extract inline scripts (-c/-e flags)
+    // Extract inline scripts (-c/-e flags). These and the six extractors after
+    // them read the scan view, so a payload quoted inside a data heredoc's body
+    // is not mined out of it as a live invocation (#420). The heredoc and
+    // here-string extractors below keep the raw command: their whole job is to
+    // find those bodies.
     extract_inline_scripts(
-        command,
+        scan_view,
         limits,
         start_time,
         timeout,
@@ -1331,7 +1366,7 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
 
     // Extract Windows inline wrappers (cmd /c|/k, iex/Invoke-Expression, -EncodedCommand)
     extract_windows_inline_scripts(
-        command,
+        scan_view,
         limits,
         start_time,
         timeout,
@@ -1351,7 +1386,7 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
 
     // Extract `mise exec -c/--command` inline shell payloads (#259)
     extract_mise_inline_scripts(
-        command,
+        scan_view,
         limits,
         start_time,
         timeout,
@@ -1371,7 +1406,7 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
 
     // Extract `bun exec <payload>` inline shell payloads (#397)
     extract_bun_exec_inline_scripts(
-        command,
+        scan_view,
         limits,
         start_time,
         timeout,
@@ -1391,7 +1426,7 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
 
     // Extract awk `system()` / command-pipe shell payloads (#399)
     extract_awk_inline_scripts(
-        command,
+        scan_view,
         limits,
         start_time,
         timeout,
@@ -1411,7 +1446,7 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
 
     // Extract `osascript -e 'do shell script "…"'` payloads (#398)
     extract_osascript_inline_scripts(
-        command,
+        scan_view,
         limits,
         start_time,
         timeout,
@@ -1431,7 +1466,7 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
 
     // Extract `ssh … destination <command…>` remote payloads (#326)
     extract_ssh_inline_scripts(
-        command,
+        scan_view,
         limits,
         start_time,
         timeout,
@@ -4032,14 +4067,19 @@ pub(crate) fn stdin_data_sink_may_be_overridden(
 /// deliberately left alone: the shell *does* evaluate `$(…)` inside them, so
 /// their bytes can carry a real override.
 fn quoted_heredoc_bodies_blanked(command: &str) -> Option<String> {
-    let extracted = match extract_content(command, &ExtractionLimits::default()) {
-        ExtractionResult::Extracted(extracted) | ExtractionResult::Partial { extracted, .. } => {
-            extracted
-        }
-        ExtractionResult::NoContent
-        | ExtractionResult::Skipped(_)
-        | ExtractionResult::Failed(_) => return None,
-    };
+    // Raw text, not the masked scan view. The masker calls
+    // `stdin_data_sink_may_be_overridden`, which reaches this function, so
+    // asking for the mask here would not terminate (#420). Using the raw text
+    // is also the honest input: the question here is which bodies exist, not
+    // which of them are data.
+    let extracted =
+        match extract_content_with_scan_view(command, command, &ExtractionLimits::default()) {
+            ExtractionResult::Extracted(extracted)
+            | ExtractionResult::Partial { extracted, .. } => extracted,
+            ExtractionResult::NoContent
+            | ExtractionResult::Skipped(_)
+            | ExtractionResult::Failed(_) => return None,
+        };
     let mut ranges: Vec<std::ops::Range<usize>> = extracted
         .into_iter()
         .filter(|content| {
@@ -5209,14 +5249,18 @@ fn active_single_heredoc_fallback(command: &str) -> Option<Vec<ActiveHeredoc>> {
         Some(_) => return None,
     }
 
-    let extracted = match extract_content(command, &ExtractionLimits::default()) {
-        ExtractionResult::Extracted(extracted) | ExtractionResult::Partial { extracted, .. } => {
-            extracted
-        }
-        ExtractionResult::NoContent
-        | ExtractionResult::Skipped(_)
-        | ExtractionResult::Failed(_) => return None,
-    };
+    // Raw text, not the masked scan view: this function is reached *from* the
+    // masker, so asking for the mask here would not terminate (#420). Scanning
+    // the raw text in this one place is the conservative direction, and it is
+    // what every caller did before.
+    let extracted =
+        match extract_content_with_scan_view(command, command, &ExtractionLimits::default()) {
+            ExtractionResult::Extracted(extracted)
+            | ExtractionResult::Partial { extracted, .. } => extracted,
+            ExtractionResult::NoContent
+            | ExtractionResult::Skipped(_)
+            | ExtractionResult::Failed(_) => return None,
+        };
     let mut candidates = extracted.into_iter().filter(|content| {
         content.byte_range.start == operator_start
             && content
