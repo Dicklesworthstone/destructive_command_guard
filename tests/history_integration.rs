@@ -22,6 +22,42 @@ use destructive_command_guard::history::{
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+/// Wait for normal writer shutdown, including closing its SQLite connection.
+///
+/// This is a persistence-test barrier, not a hook-latency assertion. Waiting
+/// only for a short flush acknowledgement conflates host scheduling with data
+/// loss, and opening a reader before shutdown can race WAL close handling.
+/// The generous watchdog keeps a genuinely stuck worker from hanging the suite.
+/// An acknowledgement is NOT proof of persistence: every caller must still
+/// assert the exact stored rows/content, since best-effort writes can be dropped.
+fn finish_history_writer(writer: HistoryWriter, context: &str) {
+    const WATCHDOG: Duration = Duration::from_secs(30);
+    let started = Instant::now();
+    let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
+    let _waiter = std::thread::Builder::new()
+        .name("history-test-shutdown".to_string())
+        .spawn(move || {
+            drop(writer);
+            let _ = completed_tx.send(());
+        })
+        .expect("spawn history shutdown waiter");
+
+    match completed_rx.recv_timeout(WATCHDOG) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+            "{context}: history flush/shutdown did not complete within {WATCHDOG:?} \
+             ({:?} elapsed); the worker may be stalled or the host overloaded; \
+             persistence has not yet been checked",
+            started.elapsed()
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+            "{context}: history shutdown waiter disconnected after {:?}; \
+             this is not a successful flush",
+            started.elapsed()
+        ),
+    }
+}
+
 fn sv_to_string(v: &SqliteValue) -> String {
     match v {
         SqliteValue::Text(s) => s.clone(),
@@ -354,7 +390,7 @@ fn test_command_hash_stored() {
 fn test_concurrent_writes() {
     init_test_logging();
 
-    let temp_dir = tempfile::TempDir::new().unwrap();
+    let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("concurrent_test.db");
 
     // Test that a single connection can handle many interleaved writes from
@@ -391,7 +427,7 @@ fn test_concurrent_writes() {
 fn concurrent_opens_and_inserts_keep_fts_exactly_synchronized() {
     init_test_logging();
 
-    let temp_dir = tempfile::TempDir::new().unwrap();
+    let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("concurrent_fts.db");
     HistoryDb::open(Some(db_path.clone())).expect("initialize history schema");
 
@@ -475,6 +511,54 @@ fn locked_history_database_never_delays_writer_drop_past_hook_budget() {
     );
 }
 
+/// A flush acknowledgement means processed, not persisted. Contention must
+/// remain best-effort, and a dropped entry must never be replayed by a later
+/// flush. Persistence tests therefore still need exact row/content assertions.
+#[test]
+fn acknowledged_busy_history_entry_is_dropped_not_replayed() {
+    init_test_logging();
+
+    let temp_dir = TempDir::new().expect("temp dir");
+    let db_path = temp_dir.path().join("acknowledged_busy_history.db");
+    let config = HistoryConfig {
+        enabled: true,
+        redaction_mode: HistoryRedactionMode::None,
+        batch_size: 1,
+        ..Default::default()
+    };
+    let writer = HistoryWriter::new(Some(db_path.clone()), &config);
+    assert!(
+        writer.flush_sync_with_timeout(Duration::from_secs(30)),
+        "history initialization did not acknowledge within the test watchdog"
+    );
+
+    let locker = rusqlite::Connection::open(&db_path).expect("open lock connection");
+    locker.execute_batch("BEGIN IMMEDIATE").expect("hold writer lock");
+    writer.log(CommandEntry {
+        command: "dropped while busy".to_string(),
+        ..Default::default()
+    });
+    let acknowledged = writer.flush_sync_with_timeout(Duration::from_secs(30));
+    // Release the lock before asserting, including on a failed acknowledgement.
+    locker.execute_batch("ROLLBACK").expect("release writer lock");
+    assert!(acknowledged, "busy entry was not processed within the test watchdog");
+
+    writer.log(CommandEntry {
+        command: "persisted after unlock".to_string(),
+        ..Default::default()
+    });
+    drop(locker);
+    finish_history_writer(writer, "busy-entry recovery");
+
+    let reader = HistoryDb::open(Some(db_path)).expect("open reader");
+    let rows = reader
+        .connection()
+        .query("SELECT command FROM commands ORDER BY id")
+        .expect("query persisted entries");
+    assert_eq!(rows.len(), 1, "only the post-contention entry may persist");
+    assert_eq!(sv_to_string(&rows[0].values()[0]), "persisted after unlock");
+}
+
 /// Test: VACUUM operation
 #[test]
 fn test_vacuum_operation() {
@@ -522,10 +606,7 @@ fn test_history_writer_logs_allow() {
         outcome: Outcome::Allow,
         ..Default::default()
     });
-    assert!(
-        writer.flush_sync_with_timeout(Duration::from_secs(2)),
-        "history writer did not acknowledge allow entry"
-    );
+    finish_history_writer(writer, "allow entry");
 
     let reader = HistoryDb::open(Some(db_path)).expect("open reader");
     assert_eq!(reader.count_commands().unwrap(), 1);
@@ -552,10 +633,8 @@ fn test_history_writer_respects_disabled() {
         outcome: Outcome::Allow,
         ..Default::default()
     });
-    assert!(
-        writer.flush_sync_with_timeout(Duration::from_secs(2)),
-        "disabled history writer should not require storage"
-    );
+    finish_history_writer(writer, "disabled history writer");
+    assert!(!db_path.exists(), "disabled writer must not create storage");
 
     let reader = HistoryDb::open(Some(db_path)).expect("open reader");
     assert_eq!(reader.count_commands().unwrap(), 0);
@@ -583,10 +662,7 @@ fn test_history_writer_full_redaction() {
         outcome: Outcome::Allow,
         ..Default::default()
     });
-    assert!(
-        writer.flush_sync_with_timeout(Duration::from_secs(2)),
-        "history writer did not acknowledge redacted entry"
-    );
+    finish_history_writer(writer, "redacted entry");
 
     let reader = HistoryDb::open(Some(db_path)).expect("open reader");
     let stored: String = reader
@@ -621,10 +697,7 @@ fn test_history_writer_logs_deny_with_match_info() {
         pattern_name: Some("reset-hard".to_string()),
         ..Default::default()
     });
-    assert!(
-        writer.flush_sync_with_timeout(Duration::from_secs(2)),
-        "history writer did not acknowledge deny entry"
-    );
+    finish_history_writer(writer, "deny entry");
 
     let reader = HistoryDb::open(Some(db_path)).expect("open reader");
     let row = reader
@@ -708,10 +781,7 @@ fn test_history_writer_async_performance() {
         "Logging too slow: {elapsed:?}"
     );
 
-    assert!(
-        writer.flush_sync_with_timeout(Duration::from_secs(5)),
-        "history writer did not acknowledge async batch"
-    );
+    finish_history_writer(writer, "async batch");
     let reader = HistoryDb::open(Some(db_path)).expect("open reader");
     assert_eq!(reader.count_commands().unwrap(), entry_count);
 }
@@ -739,11 +809,7 @@ fn fresh_history_survives_repeated_hook_style_reopens_with_stock_integrity() {
             outcome: Outcome::Allow,
             ..Default::default()
         });
-        assert!(
-            writer.flush_sync_with_timeout(Duration::from_secs(2)),
-            "history writer did not acknowledge reopen probe {index}"
-        );
-        drop(writer);
+        finish_history_writer(writer, &format!("reopen probe {index}"));
     }
 
     let stock = rusqlite::Connection::open(&db_path).expect("open with stock SQLite");
@@ -806,11 +872,7 @@ fn history_max_size_mb_is_a_hard_main_database_cap() {
             ..Default::default()
         });
     }
-    assert!(
-        writer.flush_sync_with_timeout(Duration::from_secs(5)),
-        "history writer did not acknowledge size-cap batch"
-    );
-    drop(writer);
+    finish_history_writer(writer, "size-cap batch");
 
     let main_size = std::fs::metadata(&db_path).expect("history metadata").len();
     assert!(
