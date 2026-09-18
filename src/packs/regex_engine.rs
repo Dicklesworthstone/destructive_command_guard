@@ -70,7 +70,7 @@ const fn canonical_static_pattern(pattern: &'static str) -> &'static str {
 /// let simple = CompiledRegex::new(r"rm\s+-rf").unwrap();
 /// assert!(!simple.uses_backtracking());
 ///
-/// // Auto-selects backtracking engine (has lookahead)
+/// // Lookahead patterns should use backtracking engine
 /// let lookahead = CompiledRegex::new(r"git\s+push(?=.*--force)").unwrap();
 /// assert!(lookahead.uses_backtracking());
 /// ```
@@ -317,6 +317,27 @@ pub fn needs_backtracking_engine(pattern: &str) -> bool {
 pub struct LazyCompiledRegex {
     pattern: PatternText,
     compiled: OnceLock<Result<CompiledRegex, String>>,
+    // Only rules needing a whole-command preview proof allocate this state.
+    // Ordinary pack patterns retain their allocation-free constructors.
+    exclusion: Option<Box<LinearFullMatchExclusion>>,
+}
+
+/// A positive, full-input proof that a destructive candidate is exempt.
+/// Never fall back to fancy-regex here: failure to prove safety must retain
+/// the candidate, not lose it to a negative lookahead's backtracking limit.
+#[derive(Debug)]
+struct LinearFullMatchExclusion {
+    pattern: &'static str,
+    compiled: OnceLock<Result<regex::Regex, regex::Error>>,
+}
+
+impl LinearFullMatchExclusion {
+    fn is_match(&self, haystack: &str) -> bool {
+        self.compiled
+            .get_or_init(|| regex::Regex::new(&format!(r"\A(?:{})\z", self.pattern)))
+            .as_ref()
+            .is_ok_and(|regex| regex.is_match(haystack))
+    }
 }
 
 #[derive(Debug)]
@@ -344,6 +365,7 @@ impl LazyCompiledRegex {
         Self {
             pattern: PatternText::Static(canonical_static_pattern(pattern)),
             compiled: OnceLock::new(),
+            exclusion: None,
         }
     }
 
@@ -359,7 +381,42 @@ impl LazyCompiledRegex {
         Self {
             pattern,
             compiled: OnceLock::new(),
+            exclusion: None,
         }
+    }
+
+    /// Attach a positive exemption proof to a destructive pattern (#435).
+    ///
+    /// The proof must match the ENTIRE input, even when [`Self::find_from`]
+    /// begins searching at a later offset. It is compiled only by the linear
+    /// engine. Invalid or unsupported proofs do not suppress any match.
+    ///
+    /// Use only on destructive patterns, not safe-pattern RegexSet entries.
+    /// Keep argument boundaries in the supplied input: this cannot recover
+    /// information already erased by a caller's normalization.
+    #[must_use]
+    pub(crate) fn excluding_full_match(mut self, proof: &'static str) -> Self {
+        self.exclusion = Some(Box::new(LinearFullMatchExclusion {
+            pattern: proof,
+            compiled: OnceLock::new(),
+        }));
+        self
+    }
+
+    /// The additional full-input exemption proof, if one was authored.
+    ///
+    /// [`Self::as_str`] describes the candidate regex only. Recompiling that
+    /// string alone does not reproduce the exemption semantics; matching
+    /// callers should use this object's `is_match`, `find`, or `find_from`.
+    #[must_use]
+    pub fn full_match_exclusion(&self) -> Option<&'static str> {
+        self.exclusion.as_ref().map(|proof| proof.pattern)
+    }
+
+    fn is_excluded(&self, haystack: &str) -> bool {
+        self.exclusion
+            .as_ref()
+            .is_some_and(|proof| proof.is_match(haystack))
     }
 
     /// Get or compile the regex.
@@ -372,43 +429,46 @@ impl LazyCompiledRegex {
             .ok()
     }
 
-    /// Check if the pattern matches the text.
+    /// Check if the pattern matches the text and is not fully exempted.
     ///
     /// On first call, this compiles the regex. Subsequent calls reuse the
-    /// compiled pattern.
+    /// compiled pattern. Exemption compilation is deferred until a candidate
+    /// matches, and a failed exemption proof never suppresses that candidate.
     ///
-    /// Returns `false` on regex execution or compile errors.
+    /// Returns `false` on candidate regex execution or compile errors.
     #[must_use]
     pub fn is_match(&self, haystack: &str) -> bool {
         self.get_compiled()
             .is_some_and(|compiled| compiled.is_match(haystack))
+            && !self.is_excluded(haystack)
     }
 
-    /// Find the span (start, end) of the first match.
+    /// Find the span (start, end) of the first non-exempted match.
     ///
-    /// Returns `None` if no match or on execution/compile error.
+    /// Returns `None` if no match or on candidate execution/compile error.
     #[must_use]
     pub fn find(&self, haystack: &str) -> Option<(usize, usize)> {
-        self.get_compiled()
-            .and_then(|compiled| compiled.find(haystack))
+        let span = self.get_compiled()?.find(haystack)?;
+        (!self.is_excluded(haystack)).then_some(span)
     }
 
-    /// Find the first match whose search begins at `start`.
+    /// Find the first non-exempted match whose search begins at `start`.
     ///
-    /// Returns `None` if no match exists or on execution/compile error.
+    /// Both anchors and the exemption proof retain whole-input scope.
+    /// Returns `None` if no match exists or on candidate execution/compile error.
     #[must_use]
     pub fn find_from(&self, haystack: &str, start: usize) -> Option<(usize, usize)> {
-        self.get_compiled()
-            .and_then(|compiled| compiled.find_from(haystack, start))
+        let span = self.get_compiled()?.find_from(haystack, start)?;
+        (!self.is_excluded(haystack)).then_some(span)
     }
 
-    /// Get the pattern string.
+    /// Get the candidate pattern string, without any full-input exclusion.
     #[must_use]
     pub fn as_str(&self) -> &str {
         self.pattern.as_str()
     }
 
-    /// Check if the regex has been compiled.
+    /// Check if the candidate regex has been compiled.
     ///
     /// Useful for testing to verify lazy compilation behavior.
     #[must_use]
@@ -822,6 +882,79 @@ mod tests {
 
         // All calls after first should still show as compiled
         assert!(lazy.is_compiled());
+    }
+
+    #[test]
+    fn full_input_exclusion_is_honored_by_every_matching_api() {
+        let lazy = LazyCompiledRegex::new("delete")
+            .excluding_full_match(r"delete item --dry-run(?:=client)?");
+        assert_eq!(
+            lazy.full_match_exclusion(),
+            Some(r"delete item --dry-run(?:=client)?")
+        );
+        for command in ["delete item --dry-run", "delete item --dry-run=client"] {
+            assert!(!lazy.is_match(command));
+            assert_eq!(lazy.find(command), None);
+            assert_eq!(lazy.find_from(command, 0), None);
+        }
+        for command in [
+            "delete item",
+            "delete item --description --dry-run",
+            "delete item --dry-run=client --dry-run=none",
+            "delete item --dry-run; delete other",
+            "delete item --dry-run\ndelete other",
+            "prefix delete item --dry-run",
+        ] {
+            assert!(lazy.is_match(command), "must not exempt: {command}");
+            assert!(lazy.find(command).is_some());
+            assert!(lazy.find_from(command, 0).is_some());
+        }
+    }
+
+    #[test]
+    fn exclusion_keeps_whole_input_scope_at_later_offsets() {
+        let lazy = LazyCompiledRegex::new("delete")
+            .excluding_full_match("delete item --dry-run");
+        let command = "delete real; delete item --dry-run";
+        assert_eq!(lazy.find_from(command, 12), Some((13, 19)));
+        assert_eq!(lazy.find_from("é delete", 1), None);
+        assert_eq!(lazy.find_from(command, usize::MAX), None);
+    }
+
+    #[test]
+    fn malformed_or_non_linear_exclusions_retain_denials() {
+        for proof in ["(", r"delete (?=item)item", r"(delete) \1"] {
+            let lazy = LazyCompiledRegex::new("delete").excluding_full_match(proof);
+            assert!(lazy.is_match("delete item"));
+            assert_eq!(lazy.find("delete item"), Some((0, 6)));
+            assert_eq!(lazy.find_from("delete item", 0), Some((0, 6)));
+        }
+    }
+
+    #[test]
+    fn exclusion_cannot_exempt_a_prefix_or_empty_substring() {
+        let lazy = LazyCompiledRegex::new("delete").excluding_full_match("delete|preview");
+        assert!(!lazy.is_match("delete"));
+        assert!(lazy.is_match("delete live data"));
+        let empty = LazyCompiledRegex::new("delete").excluding_full_match("");
+        assert!(empty.is_match("delete"));
+        let multiline = LazyCompiledRegex::new("delete")
+            .excluding_full_match(r"(?m)^delete --dry-run$");
+        assert!(multiline.is_match("delete --dry-run\ndelete live"));
+    }
+
+    #[test]
+    fn exclusion_is_lazy_and_linear_for_adversarial_input() {
+        let lazy = LazyCompiledRegex::new("delete")
+            .excluding_full_match(r"delete (a+)+ --dry-run");
+        let proof = lazy.exclusion.as_ref().unwrap();
+        assert!(proof.compiled.get().is_none());
+        assert!(!lazy.is_match("unrelated"));
+        assert!(proof.compiled.get().is_none());
+        let command = format!("delete {}! --dry-run", "a".repeat(20_000));
+        assert!(lazy.is_match(&command));
+        assert!(proof.compiled.get().unwrap().is_ok());
+        assert!(lazy.find(&command).is_some());
     }
 
     // =========================================================================
