@@ -13929,6 +13929,7 @@ fn opencode_appears_in_use() -> bool {
         .parent()
         .and_then(std::path::Path::parent)
         .is_some_and(std::path::Path::is_dir)
+        || which_executable("opencode").is_some()
 }
 
 /// Extract the first dotted-version major from OpenCode's CLI version text.
