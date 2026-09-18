@@ -25,6 +25,10 @@ pub fn create_pack() -> Pack {
 }
 
 fn create_safe_patterns() -> Vec<SafePattern> {
+    // Do not add a pipeline-wide `diff` exemption here (#435). A real
+    // `kubectl diff` does not match our delete rules and needs no exemption.
+    // Searching for `diff` anywhere after kubectl also matches argument data,
+    // e.g. `kubectl delete -f - --cache-dir diff`, and shields the deletion.
     vec![
         // kustomize build alone is safe (just renders)
         safe_pattern!(
@@ -35,11 +39,6 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!(
             "kubectl-kustomize",
             r"kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+kustomize\b(?!.*\|)"
-        ),
-        // kustomize with diff is safe
-        safe_pattern!(
-            "kustomize-diff",
-            r"kustomize\b.*?\bbuild\s+.*\|\s*kubectl\b.*?\s+diff\b"
         ),
         // kustomize with dry-run
         safe_pattern!(
@@ -60,8 +59,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "Piping kustomize build to kubectl delete removes ALL resources defined in the \
              kustomization directory. This can delete entire applications:\n\n\
              - Every resource in kustomization.yaml and its bases is deleted\n\
-             - Deployments, services, configmaps, secrets all removed\n\
              - Overlays may include resources you didn't expect\n\
+             - Deployments, services, configmaps, secrets all removed\n\
              - No confirmation or preview by default\n\n\
              Safer alternatives:\n\
              - kustomize build <dir>: Review manifests first\n\
@@ -127,6 +126,24 @@ mod tests {
     }
 
     #[test]
+    fn kustomize_diff_argument_does_not_exempt_delete() {
+        // Exercise this pack alone: kubernetes.kubectl must not be needed
+        // to compensate for a pipeline-wide safe match in this pack.
+        let pack = create_pack();
+        for command in [
+            "kustomize build ./prod | kubectl delete -f - --cache-dir diff",
+            "kustomize build ./prod | kubectl --cache-dir diff delete -f -",
+            "kustomize build ./prod | kubectl delete -f - --context diff",
+            "kustomize build ./prod | kubectl delete -f - --cache-dir 'diff'",
+            "kustomize build ./prod | kubectl delete -f - diff",
+            "kustomize build ./prod | kubectl delete -f -; echo diff",
+        ] {
+            assert_no_safe_match(&pack, command);
+            assert_blocks(&pack, command, "kustomize");
+        }
+    }
+
+    #[test]
     fn kustomize_blocks_kubectl_delete_k() {
         let pack = create_pack();
         assert_blocks(&pack, "kubectl delete -k ./overlays/prod", "delete -k");
@@ -158,7 +175,13 @@ mod tests {
     #[test]
     fn kustomize_safe_with_diff() {
         let pack = create_pack();
-        assert_allows(&pack, "kustomize build ./overlays/prod | kubectl diff -f -");
+        for command in [
+            "kustomize build ./overlays/prod | kubectl diff -f -",
+            "kustomize build ./overlays/prod | kubectl --context prod diff -f -",
+            "kubectl kustomize ./overlays/prod | kubectl diff -f -",
+        ] {
+            assert_allows(&pack, command);
+        }
     }
 
     #[test]
