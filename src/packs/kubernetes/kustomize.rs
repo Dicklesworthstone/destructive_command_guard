@@ -75,9 +75,9 @@ pub fn create_pack() -> Pack {
 
 fn create_safe_patterns() -> Vec<SafePattern> {
     // Plain build/render/diff commands do not need exemptions: they do not
-    // match the delete rules. Searching for those words in arbitrary argv
-    // data can instead shield a deletion (`--cache-dir diff`, for example).
-    // --raw is intentionally not part of the preview grammar.
+    // match the delete rules (#435). Searching for those words in arbitrary
+    // argv data can instead shield a deletion (`--cache-dir diff`, for
+    // example). --raw is intentionally not part of the preview grammar.
     vec![SafePattern {
         name: "kustomize-dry-run",
         regex: LazyCompiledRegex::new(PREVIEW_PATTERN),
@@ -97,8 +97,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "Piping kustomize build to kubectl delete removes ALL resources defined in the \
              kustomization directory. This can delete entire applications:\n\n\
              - Every resource in kustomization.yaml and its bases is deleted\n\
-             - Deployments, services, configmaps, secrets all removed\n\
              - Overlays may include resources you didn't expect\n\
+             - Deployments, services, configmaps, secrets all removed\n\
              - No confirmation or preview by default\n\n\
              Safer alternatives:\n\
              - kustomize build <dir>: Review manifests first\n\
