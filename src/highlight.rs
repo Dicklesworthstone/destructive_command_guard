@@ -365,6 +365,15 @@ fn strip_markdown_heading(line: &str) -> Option<&str> {
     }
 }
 
+/// Render inline markdown as plain text for the non-rich explanation output.
+///
+/// A marker is removed only where it actually delimits a span. Dropping every
+/// `` ` ``, `*`, `_` and `~` unconditionally rewrote the very text these
+/// explanations exist to deliver: `` `~/.aws/credentials` `` printed as
+/// `/.aws/credentials`, `` `<pack>_tests.rs` `` as `<pack>tests.rs`, and the
+/// `` `~` `` in the find-delete guidance disappeared completely, leaving an empty
+/// entry in its list of protected roots (#418). A code span is emitted verbatim,
+/// so a path or a regex inside one keeps every character.
 fn strip_markdown_inline(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut index = 0;
@@ -388,9 +397,19 @@ fn strip_markdown_inline(text: &str) -> String {
             }
         }
 
-        if matches!(ch, '`' | '*' | '_' | '~') {
-            index += ch.len_utf8();
-            continue;
+        if ch == '`' {
+            // Inside a code span every marker is content, not markup.
+            if let Some((content, next_index)) = code_span_at(text, index) {
+                output.push_str(content);
+                index = next_index;
+                continue;
+            }
+        } else if matches!(ch, '*' | '_' | '~') {
+            if let Some((content, next_index)) = emphasis_span_at(text, index, ch) {
+                output.push_str(&strip_markdown_inline(content));
+                index = next_index;
+                continue;
+            }
         }
 
         output.push(ch);
@@ -398,6 +417,78 @@ fn strip_markdown_inline(text: &str) -> String {
     }
 
     output
+}
+
+/// The contents of the backtick code span opening at `index`, plus the offset
+/// just past its closing run.
+///
+/// The closing run must be exactly as long as the opening one, so ``` ``a`b`` ```
+/// keeps its inner backtick. `None` means the run is never closed on this line,
+/// in which case the backticks are ordinary text and are kept.
+fn code_span_at(text: &str, index: usize) -> Option<(&str, usize)> {
+    let after_open = text.get(index..)?;
+    let fence_len = after_open.bytes().take_while(|byte| *byte == b'`').count();
+    let fence = after_open.get(..fence_len)?;
+    let content_start = index.checked_add(fence_len)?;
+    let rest = text.get(content_start..)?;
+
+    let mut search = 0;
+    while let Some(hit) = rest.get(search..)?.find(fence) {
+        let close = search + hit;
+        let run_len = rest[close..]
+            .bytes()
+            .take_while(|byte| *byte == b'`')
+            .count();
+        if run_len == fence_len {
+            return Some((&rest[..close], content_start + close + fence_len));
+        }
+        // `run_len >= fence_len >= 1`, so the scan always advances.
+        search = close + run_len;
+    }
+    None
+}
+
+/// The contents of the emphasis span opening at `index`, plus the offset just
+/// past its closing marker.
+///
+/// Only a marker with a partner on the same line is markup; an unpaired `*`, `_`
+/// or `~` is ordinary text. Two CommonMark rules matter here because the pack
+/// text relies on them: strikethrough needs a doubled `~~`, so the `~` in a home
+/// path stands alone, and `_` never emphasizes inside a word, so `os_system`
+/// survives.
+fn emphasis_span_at(text: &str, index: usize, marker: char) -> Option<(&str, usize)> {
+    let after = text.get(index..)?;
+    let run = after.chars().take_while(|ch| *ch == marker).count().min(2);
+    if marker == '~' && run < 2 {
+        return None;
+    }
+    if marker == '_'
+        && text[..index]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+    {
+        return None;
+    }
+
+    let delimiter = marker.to_string().repeat(run);
+    let content_start = index.checked_add(delimiter.len())?;
+    let rest = text.get(content_start..)?;
+    let close = rest.find(&delimiter)?;
+    if close == 0 {
+        // `**` with nothing between the markers is not emphasis.
+        return None;
+    }
+    let end = content_start + close + delimiter.len();
+    if marker == '_'
+        && text
+            .get(end..)
+            .and_then(|tail| tail.chars().next())
+            .is_some_and(char::is_alphanumeric)
+    {
+        return None;
+    }
+    Some((&rest[..close], end))
 }
 
 fn parse_markdown_link(
@@ -769,6 +860,60 @@ mod tests {
         let rendered = format_markdown_explanation("Review ![diagram](file://secret).", false, 80);
 
         assert_eq!(rendered, "Review diagram.");
+    }
+
+    /// #418: the plain fallback dropped every marker character, so it silently
+    /// rewrote the paths and identifiers the explanations exist to deliver.
+    #[test]
+    fn test_format_markdown_explanation_plain_keeps_code_span_contents_418() {
+        for (source, expected) in [
+            // The find-delete guidance listed `/`, `~` and `$HOME`; the `~`
+            // vanished entirely, leaving an empty entry.
+            ("Rooted at `/`, `~`, `$HOME`", "Rooted at /, ~, $HOME"),
+            ("Edit `~/.aws/credentials`", "Edit ~/.aws/credentials"),
+            ("See `<pack>_tests.rs`", "See <pack>_tests.rs"),
+            (
+                "Rule `heredoc.python:os_system.rm_rf`",
+                "Rule heredoc.python:os_system.rm_rf",
+            ),
+            ("Matches `rm -rf /*` anywhere", "Matches rm -rf /* anywhere"),
+            // A regex in a code span must survive character for character.
+            (
+                r"Pattern `\bfind\b[^|;&]*?\s-delete`",
+                r"Pattern \bfind\b[^|;&]*?\s-delete",
+            ),
+        ] {
+            assert_eq!(
+                format_markdown_explanation(source, false, 80),
+                expected,
+                "code span contents must be verbatim: {source}"
+            );
+        }
+    }
+
+    /// Emphasis is still rendered away, but only where it is really emphasis.
+    #[test]
+    fn test_format_markdown_explanation_plain_only_strips_paired_markers_418() {
+        for (source, expected) in [
+            ("ask **first**", "ask first"),
+            ("ask *first*", "ask first"),
+            ("ask _first_", "ask first"),
+            ("~~never~~ do this", "never do this"),
+            // Unpaired markers are ordinary text.
+            ("a lone ~ tilde", "a lone ~ tilde"),
+            ("write to ~/notes", "write to ~/notes"),
+            ("2 * 3 is six", "2 * 3 is six"),
+            ("an unclosed `backtick", "an unclosed `backtick"),
+            // `_` never emphasizes inside a word.
+            ("os_system and rm_rf_x", "os_system and rm_rf_x"),
+            ("field_one plus field_two", "field_one plus field_two"),
+        ] {
+            assert_eq!(
+                format_markdown_explanation(source, false, 80),
+                expected,
+                "marker handling for {source}"
+            );
+        }
     }
 
     // =========================================================================

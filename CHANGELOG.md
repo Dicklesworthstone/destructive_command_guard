@@ -179,6 +179,23 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   containing `$(…)` still denies because the shell expands it before the sink sees
   it, and `heredoc.python:os_system.rm_rf_catastrophic` and friends are untouched.
 
+- **The plain explanation renderer was corrupting the commands it tells you to
+  run (#418 follow-up).** `strip_markdown_inline` deleted every `` ` ``, `*`, `_`
+  and `~` byte it saw, regardless of whether the character was markup or content —
+  and it is the shipped renderer, since `rich-output` is not a default feature. So
+  the `rm -rf` denial offered `mv /path/to/directory /.Trash/` as its recoverable
+  alternative, a path at the filesystem root rather than the user's trash; the
+  shell-startup-file denial named the SSH trust store `/.ssh/knownhosts`, wrong
+  twice over; `~/.ssh/*.pub` printed as `/.ssh/.pub`; and the find-delete guidance
+  the issue asked about listed its protected roots as ``/`, `, `$HOME`` with an
+  empty entry where `~` had been. 362 distinct backtick-quoted tokens in the pack
+  text contain one of those characters.
+
+  A marker is now removed only where it delimits a span, a code span is emitted
+  verbatim, and the two CommonMark rules this text depends on hold: strikethrough
+  needs `~~`, so a lone `~` is a home directory, and `_` does not emphasize inside
+  a word, so `os_system` survives.
+
 - **`find … -delete` explains itself honestly (#418).** The rule text claimed
   the decision was made on the search root and that the scoped form was
   "bytewise-equivalent to `rm -rf`". Neither was true. It now says what it does:
