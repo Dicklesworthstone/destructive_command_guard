@@ -335,13 +335,121 @@ fn test_hook_without_batch_reads_single_json() {
         "dcg hook (no --batch) must not leak the internal delegation error"
     );
 
-    // It processes the single JSON object and denies -> exit 1.
-    assert_eq!(output.status.code(), Some(1));
+    // Plain `dcg hook` is the explicit spelling of bare hook mode: the
+    // protocol carries the block on stdout and therefore exits 0.
+    assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let results = parse_jsonl_output(&stdout);
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0]["decision"], "deny");
-    assert_eq!(results[0]["index"], 0);
+    let result: serde_json::Value =
+        serde_json::from_str(&stdout).expect("plain hook must emit one protocol response");
+    assert_eq!(
+        result["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+    assert!(
+        result["hookSpecificOutput"]["ruleId"]
+            .as_str()
+            .is_some_and(|rule| rule.contains("reset-hard"))
+    );
+}
+
+#[test]
+fn test_hook_without_batch_salvages_destructive_invalid_utf8_430() {
+    let temp = tempfile::tempdir().expect("failed to create temp dir");
+    let home_dir = temp.path().join("home");
+    let xdg_config_dir = temp.path().join("xdg_config");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    std::fs::create_dir_all(&xdg_config_dir).unwrap();
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("HOME", &home_dir)
+        .env("USERPROFILE", &home_dir)
+        .env("XDG_CONFIG_HOME", &xdg_config_dir)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_PACKS", "core.git,core.filesystem")
+        .current_dir(temp.path())
+        .arg("hook")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to spawn dcg hook");
+
+    let mut input =
+        br#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#.to_vec();
+    input.push(0xff);
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(&input)
+        .expect("write invalid UTF-8 hook payload");
+
+    let output = child.wait_with_output().expect("failed to wait for dcg");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "destructive salvage uses the hook protocol's exit-0 block response"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result: serde_json::Value =
+        serde_json::from_str(&stdout).expect("salvage scan must emit a blocking response");
+    assert_eq!(
+        result["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+    assert!(
+        result["hookSpecificOutput"]["ruleId"]
+            .as_str()
+            .is_some_and(|rule| rule.contains("reset-hard"))
+    );
+}
+
+#[test]
+fn test_hook_without_batch_salvages_destructive_oversized_input_430() {
+    let temp = tempfile::tempdir().expect("failed to create temp dir");
+    let home_dir = temp.path().join("home");
+    let xdg_config_dir = temp.path().join("xdg_config");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    std::fs::create_dir_all(&xdg_config_dir).unwrap();
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("HOME", &home_dir)
+        .env("USERPROFILE", &home_dir)
+        .env("XDG_CONFIG_HOME", &xdg_config_dir)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_PACKS", "core.git,core.filesystem")
+        .current_dir(temp.path())
+        .arg("hook")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to spawn dcg hook");
+
+    let mut input =
+        br#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#.to_vec();
+    input.extend(vec![b' '; 270_000]); // default max_hook_input_bytes is 256 KiB
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(&input)
+        .expect("write oversized hook payload");
+
+    let output = child.wait_with_output().expect("failed to wait for dcg");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result: serde_json::Value =
+        serde_json::from_str(&stdout).expect("oversized salvage must emit a blocking response");
+    assert_eq!(
+        result["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+    assert!(
+        result["hookSpecificOutput"]["ruleId"]
+            .as_str()
+            .is_some_and(|rule| rule.contains("reset-hard"))
+    );
 }
 
 // ============================================================================

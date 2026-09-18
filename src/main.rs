@@ -1610,7 +1610,7 @@ fn main() {
     // Parse CLI arguments (subcommands). If parsing fails (e.g., unknown flags),
     // print the clap error and exit instead of falling into hook mode and
     // blocking on stdin.
-    let cli = match Cli::try_parse() {
+    let mut cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
             let exit_code = e.exit_code();
@@ -1633,7 +1633,27 @@ fn main() {
         colored::control::set_override(false);
     }
 
-    // If there's a subcommand, handle it and exit.
+    // Plain `dcg hook` is the documented explicit spelling of bare hook
+    // mode. Route it into this exact path instead of the JSONL batch reader so
+    // both entry points share the bounded byte reader, invalid-UTF-8
+    // classification, oversized-prefix salvage scan, and fail-open/fail-closed
+    // policy (#430). Any batch-specific option keeps the dedicated JSONL
+    // implementation, preserving its output/exit-code contract.
+    let plain_hook_alias = matches!(
+        cli.command.as_ref(),
+        Some(cli::Command::Hook(cmd))
+            if !cmd.batch
+                && !cmd.parallel
+                && cmd.workers == 0
+                && !cmd.continue_on_error
+                && cmd.with_packs.is_none()
+    );
+    if plain_hook_alias {
+        cli.command = None;
+    }
+
+    // If there's another subcommand (or an explicitly configured batch hook),
+    // handle it and exit.
     if cli.command.is_some() {
         if let Err(e) = cli::run_command(cli) {
             emit_stderr!("Error: {e}");
