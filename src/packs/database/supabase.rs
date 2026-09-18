@@ -12,8 +12,55 @@
 //! - Auth: `sso remove`
 //! - Config: `config push`, `stop --no-backup`
 
+use crate::destructive_pattern;
+use crate::packs::regex_engine::LazyCompiledRegex;
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
-use crate::{destructive_pattern, safe_pattern};
+
+// Exemption-only grammars (#429/#435). Required option values are consumed
+// even when they look like flags; boolean options never consume a following
+// word. Unknown flags, shell expansions, quotes, and `--` withdraw the
+// exemption instead of guessing. Keep the destructive patterns permissive.
+macro_rules! supabase_global_option {
+    () => {
+        concat!(
+            r"(?:--(?:dns-resolver|network-id|output|profile|workdir|project-ref)",
+            r"(?:=[^\s;&|<>()\x22'\\$`*?\[\]{}~]+|[ \t]+[^\s;&|<>()\x22'\\$`*?\[\]{}~]+)",
+            r"|-o(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+|[ \t]+[^\s;&|<>()\x22'\\$`*?\[\]{}~]+)",
+            r"|--(?:create-ticket|debug|experimental|yes|help)(?:=(?:true|false))?|-h)"
+        )
+    };
+}
+
+macro_rules! supabase_safe_prefix {
+    () => {
+        concat!(
+            r"^[ \t]*(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+/)?supabase[ \t]+(?:",
+            supabase_global_option!(),
+            r"[ \t]+)*"
+        )
+    };
+}
+
+macro_rules! supabase_push_option {
+    () => {
+        concat!(
+            r"(?:",
+            supabase_global_option!(),
+            r"|--(?:db-url|password)(?:=[^\s;&|<>()\x22'\\$`*?\[\]{}~]+|[ \t]+[^\s;&|<>()\x22'\\$`*?\[\]{}~]+)",
+            r"|-p(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+|[ \t]+[^\s;&|<>()\x22'\\$`*?\[\]{}~]+)",
+            r"|--(?:linked|local|include-all|include-roles|include-seed)(?:=(?:true|false))?)"
+        )
+    };
+}
+
+macro_rules! supabase_safe_pattern {
+    ($name:literal, $suffix:expr) => {
+        SafePattern {
+            name: $name,
+            regex: LazyCompiledRegex::new(concat!(supabase_safe_prefix!(), $suffix)),
+        }
+    };
+}
 
 // ============================================================================
 // Suggestion constants (must be 'static for the pattern struct)
@@ -272,160 +319,95 @@ pub fn create_pack() -> Pack {
 
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
-        // -- Database read-only operations --
-        safe_pattern!(
-            "supabase-db-diff",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+diff"
-        ),
-        safe_pattern!(
-            "supabase-db-lint",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+lint"
-        ),
-        safe_pattern!(
-            "supabase-db-dump",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+dump"
-        ),
-        safe_pattern!(
-            "supabase-db-shell-safe",
-            r"(?i)supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+shell\s*$"
-        ),
-        safe_pattern!(
-            "supabase-inspect-db",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+inspect\s+db"
-        ),
+        // Read-only exemptions start at the real executable/subcommand.
+        // A password or other argument containing `supabase db diff` is
+        // not a second invocation and must not shield a push/reset.
+        supabase_safe_pattern!("supabase-db-diff", r"db[ \t]+diff(?:[ \t]|$)"),
+        supabase_safe_pattern!("supabase-db-lint", r"db[ \t]+lint(?:[ \t]|$)"),
+        supabase_safe_pattern!("supabase-db-dump", r"db[ \t]+dump(?:[ \t]|$)"),
+        SafePattern {
+            name: "supabase-db-shell-safe",
+            regex: LazyCompiledRegex::new(concat!(
+                r"(?i)",
+                supabase_safe_prefix!(),
+                r"db[ \t]+shell[ \t]*$"
+            )),
+        },
+        supabase_safe_pattern!("supabase-inspect-db", r"inspect[ \t]+db(?:[ \t]|$)"),
         // -- Status & info --
-        safe_pattern!(
-            "supabase-status",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+status"
-        ),
-        safe_pattern!(
-            "supabase-start",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+start"
-        ),
-        safe_pattern!(
-            "supabase-services",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+services"
-        ),
-        safe_pattern!(
-            "supabase-gen-types",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+gen\s+types"
-        ),
-        safe_pattern!(
-            "supabase-test-db",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+test\s+db"
-        ),
+        supabase_safe_pattern!("supabase-status", r"status(?:[ \t]|$)"),
+        supabase_safe_pattern!("supabase-start", r"start(?:[ \t]|$)"),
+        supabase_safe_pattern!("supabase-services", r"services(?:[ \t]|$)"),
+        supabase_safe_pattern!("supabase-gen-types", r"gen[ \t]+types(?:[ \t]|$)"),
+        supabase_safe_pattern!("supabase-test-db", r"test[ \t]+db(?:[ \t]|$)"),
         // -- Migrations read-only --
-        safe_pattern!(
-            "supabase-migration-list",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+migration\s+list"
-        ),
-        safe_pattern!(
-            "supabase-migration-new",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+migration\s+new"
-        ),
-        safe_pattern!(
-            "supabase-migration-fetch",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+migration\s+fetch"
-        ),
-        // supabase db push --dry-run (anywhere in args) is safe.
-        // Treat only bare `--dry-run` or explicit true as previews;
-        // false-valued flags must not mask the destructive push rule.
-        safe_pattern!(
+        supabase_safe_pattern!("supabase-migration-list", r"migration[ \t]+list(?:[ \t]|$)"),
+        supabase_safe_pattern!("supabase-migration-new", r"migration[ \t]+new(?:[ \t]|$)"),
+        supabase_safe_pattern!("supabase-migration-fetch", r"migration[ \t]+fetch(?:[ \t]|$)"),
+        // Require positive preview evidence in an option slot, consuming
+        // known value-taking options on both sides. A disabling repeat is
+        // not admitted; a false-looking password value is still just data.
+        // Keep this linear, so long argv cannot exhaust a backtracking budget.
+        supabase_safe_pattern!(
             "supabase-db-push-dry-run",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+push\b.*--dry-run(?:=true)?(?:\s|$)"
+            concat!(
+                r"db[ \t]+push(?:[ \t]+",
+                supabase_push_option!(),
+                r")*[ \t]+--dry-run(?:=true)?(?:[ \t]+(?:",
+                supabase_push_option!(),
+                r"|--dry-run(?:=true)?))*[ \t]*$"
+            )
         ),
         // -- Functions read-only --
-        safe_pattern!(
-            "supabase-functions-list",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+functions\s+list"
-        ),
-        safe_pattern!(
-            "supabase-functions-serve",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+functions\s+serve"
-        ),
-        safe_pattern!(
+        supabase_safe_pattern!("supabase-functions-list", r"functions[ \t]+list(?:[ \t]|$)"),
+        supabase_safe_pattern!("supabase-functions-serve", r"functions[ \t]+serve(?:[ \t]|$)"),
+        supabase_safe_pattern!(
             "supabase-functions-download",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+functions\s+download"
+            r"functions[ \t]+download(?:[ \t]|$)"
         ),
-        safe_pattern!(
-            "supabase-functions-new",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+functions\s+new"
-        ),
+        supabase_safe_pattern!("supabase-functions-new", r"functions[ \t]+new(?:[ \t]|$)"),
         // -- Secrets read-only --
-        safe_pattern!(
-            "supabase-secrets-list",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+secrets\s+list"
-        ),
+        supabase_safe_pattern!("supabase-secrets-list", r"secrets[ \t]+list(?:[ \t]|$)"),
         // -- Storage read-only --
-        safe_pattern!(
-            "supabase-storage-ls",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+ls"
-        ),
+        supabase_safe_pattern!("supabase-storage-ls", r"storage[ \t]+ls(?:[ \t]|$)"),
         // -- Projects/Orgs read-only --
-        safe_pattern!(
-            "supabase-projects-list",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+projects\s+list"
-        ),
-        safe_pattern!(
-            "supabase-orgs-list",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+orgs\s+list"
-        ),
+        supabase_safe_pattern!("supabase-projects-list", r"projects[ \t]+list(?:[ \t]|$)"),
+        supabase_safe_pattern!("supabase-orgs-list", r"orgs[ \t]+list(?:[ \t]|$)"),
         // -- Branches read-only --
-        safe_pattern!(
-            "supabase-branches-list",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+branches\s+list"
-        ),
-        safe_pattern!(
-            "supabase-branches-get",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+branches\s+get"
-        ),
+        supabase_safe_pattern!("supabase-branches-list", r"branches[ \t]+list(?:[ \t]|$)"),
+        supabase_safe_pattern!("supabase-branches-get", r"branches[ \t]+get(?:[ \t]|$)"),
         // -- Domains read-only --
-        safe_pattern!(
-            "supabase-domains-get",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+domains\s+get"
-        ),
-        safe_pattern!(
-            "supabase-domains-reverify",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+domains\s+reverify"
-        ),
-        safe_pattern!(
+        supabase_safe_pattern!("supabase-domains-get", r"domains[ \t]+get(?:[ \t]|$)"),
+        supabase_safe_pattern!("supabase-domains-reverify", r"domains[ \t]+reverify(?:[ \t]|$)"),
+        supabase_safe_pattern!(
             "supabase-vanity-subdomains-get",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+vanity-subdomains\s+get"
+            r"vanity-subdomains[ \t]+get(?:[ \t]|$)"
         ),
-        safe_pattern!(
+        supabase_safe_pattern!(
             "supabase-vanity-subdomains-check",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+vanity-subdomains\s+check-availability"
+            r"vanity-subdomains[ \t]+check-availability(?:[ \t]|$)"
         ),
         // -- SSO read-only --
-        safe_pattern!(
-            "supabase-sso-list",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+sso\s+list"
-        ),
-        safe_pattern!(
-            "supabase-sso-show",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+sso\s+show"
-        ),
-        safe_pattern!(
-            "supabase-sso-info",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+sso\s+info"
-        ),
+        supabase_safe_pattern!("supabase-sso-list", r"sso[ \t]+list(?:[ \t]|$)"),
+        supabase_safe_pattern!("supabase-sso-show", r"sso[ \t]+show(?:[ \t]|$)"),
+        supabase_safe_pattern!("supabase-sso-info", r"sso[ \t]+info(?:[ \t]|$)"),
         // -- Network/SSL read-only --
-        safe_pattern!(
+        supabase_safe_pattern!(
             "supabase-network-restrictions-get",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+network-restrictions\s+get"
+            r"network-restrictions[ \t]+get(?:[ \t]|$)"
         ),
-        safe_pattern!(
+        supabase_safe_pattern!(
             "supabase-network-bans-get",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+network-bans\s+get"
+            r"network-bans[ \t]+get(?:[ \t]|$)"
         ),
-        safe_pattern!(
+        supabase_safe_pattern!(
             "supabase-ssl-enforcement-get",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+ssl-enforcement\s+get"
+            r"ssl-enforcement[ \t]+get(?:[ \t]|$)"
         ),
         // -- Postgres config read-only --
-        safe_pattern!(
+        supabase_safe_pattern!(
             "supabase-postgres-config-get",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+postgres-config\s+get"
+            r"postgres-config[ \t]+get(?:[ \t]|$)"
         ),
     ]
 }
@@ -633,7 +615,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+orgs\s+delete",
             "supabase orgs delete permanently removes the organization and may affect all projects within it.",
             High,
-            "supabase orgs delete permanently removes a Supabase organization:\n\n\
+            "supabase orgs delete permanently removes an organization:\n\n\
              - All projects in the organization may be affected\n\
              - Billing and subscription are cancelled\n\
              - Team members lose access\n\n\
@@ -717,7 +699,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "supabase sso remove disconnects an SSO identity provider. All users authenticating via that provider will be locked out.",
             Critical,
             "supabase sso remove disconnects an SSO identity provider:\n\n\
-             - All users authenticating via that provider are immediately locked out\n\
+             - All users authenticating via these providers are immediately locked out\n\
              - Existing sessions may be invalidated\n\
              - Re-adding the provider requires full reconfiguration\n\n\
              List providers before removing:\n  \
@@ -787,22 +769,56 @@ mod tests {
     #[test]
     fn test_db_push_dry_run_safe() {
         let pack = create_pack();
-        // --dry-run immediately after push
-        assert_allows(&pack, "supabase db push --dry-run");
-        assert_allows(&pack, "supabase db push --dry-run=true");
-        // --dry-run after other flags
-        assert_allows(&pack, "supabase db push --linked --dry-run");
+        for command in [
+            "supabase db push --dry-run",
+            "supabase db push --dry-run=true",
+            "supabase db push --linked --dry-run",
+            "supabase --debug --workdir . db push --linked --dry-run",
+            "supabase db push --db-url postgres://localhost/db --dry-run",
+            "supabase db push -psecret --dry-run",
+            "supabase db push --dry-run --dry-run=true",
+            "supabase db push --dry-run --password --dry-run=false",
+        ] {
+            assert_safe_pattern_matches(&pack, command);
+            assert_allows(&pack, command);
+        }
+    }
+
+    #[test]
+    fn test_db_push_dry_run_evidence_is_not_argument_data() {
+        let pack = create_pack();
+        for command in [
+            "supabase db push --password --dry-run",
+            "supabase db push --password=--dry-run",
+            "supabase db push -p--dry-run",
+            "supabase db push --workdir --dry-run",
+            "supabase db push --db-url postgres://localhost/db?application_name=--dry-run",
+            "supabase db push --workdir 'note --dry-run'",
+            "supabase db push -- --dry-run",
+            "supabase db push --unknown-option --dry-run",
+            "supabase db push --dry-run --password *",
+            "supabase db push --dry-run --password ${ARGS}",
+            "supabase db push; echo --dry-run",
+            "supabase db push | grep -- --dry-run",
+            "supabase db push\necho --dry-run",
+            "supabase db push --password 'supabase db diff'",
+        ] {
+            assert_no_safe_match(&pack, command);
+            assert_blocks_with_pattern(&pack, command, "supabase-db-push");
+        }
     }
 
     #[test]
     fn test_db_push_false_dry_run_does_not_bypass() {
         let pack = create_pack();
-
         for command in [
             "supabase db push --dry-run=false",
             "supabase db push --linked --dry-run=false",
             "supabase db push --dry-run=0",
             "supabase db push --no-dry-run",
+            "supabase db push --dry-run --dry-run=false",
+            "supabase db push --dry-run=true --dry-run=0",
+            "supabase db push --dry-run=false --dry-run",
         ] {
             assert_blocks_with_pattern(&pack, command, "supabase-db-push");
             assert_no_safe_match(&pack, command);
