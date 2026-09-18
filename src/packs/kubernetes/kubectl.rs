@@ -6,8 +6,28 @@
 //! - cordon nodes
 //! - delete without dry-run
 
+use crate::destructive_pattern;
+use crate::packs::regex_engine::LazyCompiledRegex;
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
-use crate::{destructive_pattern, safe_pattern};
+
+// Exemption-only grammar (#435). Required global values must not be optional:
+// a boolean flag must not swallow `delete`, and a string value must not pose
+// as a read-only subcommand. Destructive matching deliberately stays broad.
+macro_rules! kubectl_safe_pattern {
+    ($name:literal, $verb:literal) => {
+        SafePattern {
+            name: $name,
+            regex: LazyCompiledRegex::new(concat!(
+                r"^[ \t]*(?:[^\s;&|<>()\x22'\\$`]+/)?kubectl(?:\.exe)?",
+                r"(?:[ \t]+(?:--(?:as|as-group|as-uid|cache-dir|certificate-authority|client-certificate|client-key|cluster|context|kubeconfig|kuberc|namespace|password|profile|profile-output|request-timeout|server|tls-server-name|token|user|username|v|vmodule)(?:=[^\s;&|<>()\x22'\\$`]+|[ \t]+[^\s;&|<>()\x22'\\$`]+)",
+                r"|-[nsv](?:[^\s;&|<>()\x22'\\$`]+|[ \t]+[^\s;&|<>()\x22'\\$`]+)",
+                r"|--(?:disable-compression|insecure-skip-tls-verify|match-server-version|warnings-as-errors)(?:=(?:true|false))?))*[ \t]+",
+                $verb,
+                r"(?=\s|$)"
+            )),
+        }
+    };
+}
 
 /// Suggestions for `kubectl delete namespace` pattern.
 const DELETE_NAMESPACE_SUGGESTIONS: &[PatternSuggestion] = &[
@@ -29,7 +49,7 @@ const DELETE_NAMESPACE_SUGGESTIONS: &[PatternSuggestion] = &[
 const DELETE_ALL_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "kubectl delete {resource} --all --dry-run=client",
-        "Preview what would be deleted without making changes",
+        "Preview deletion without making changes",
     ),
     PatternSuggestion::new(
         "kubectl rollout restart deployment/{name}",
@@ -131,131 +151,178 @@ pub fn create_pack() -> Pack {
 }
 
 fn create_safe_patterns() -> Vec<SafePattern> {
-    // Two safeguards on each safe subcommand:
-    //   1. `(?:\s+--?\S+(?:\s+\S+)?)*` only accepts flag-value pairs between
-    //      `kubectl` and the safe subcommand — so a destructive command
-    //      like `kubectl delete deployment get` (resource literally named
-    //      `get`) can't short-circuit via the trailing `get` token.
-    //   2. `(?=\s|$)` on the trailing side so a resource name that STARTS
-    //      with the subcommand keyword (e.g. `get-handler`, `logs-archive`)
-    //      also can't short-circuit.
     vec![
-        // get/describe/logs are safe (read-only)
-        safe_pattern!(
-            "kubectl-get",
-            r"kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+get(?=\s|$)"
-        ),
-        safe_pattern!(
-            "kubectl-describe",
-            r"kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+describe(?=\s|$)"
-        ),
-        safe_pattern!(
-            "kubectl-logs",
-            r"kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+logs(?=\s|$)"
-        ),
-        // diff is safe (shows what would change)
-        safe_pattern!(
-            "kubectl-diff",
-            r"kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+diff(?=\s|$)"
-        ),
-        // explain is safe (documentation)
-        safe_pattern!(
-            "kubectl-explain",
-            r"kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+explain(?=\s|$)"
-        ),
-        // top is safe (metrics)
-        safe_pattern!(
-            "kubectl-top",
-            r"kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+top(?=\s|$)"
-        ),
-        // config is safe
-        safe_pattern!(
-            "kubectl-config",
-            r"kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+config(?=\s|$)"
-        ),
-        // api-resources/api-versions are safe
-        safe_pattern!(
-            "kubectl-api",
-            r"kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+api-(?:resources|versions)(?=\s|$)"
-        ),
-        // version is safe
-        safe_pattern!(
-            "kubectl-version",
-            r"kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s|$)"
-        ),
+        kubectl_safe_pattern!("kubectl-get", "get"),
+        kubectl_safe_pattern!("kubectl-describe", "describe"),
+        kubectl_safe_pattern!("kubectl-logs", "logs"),
+        kubectl_safe_pattern!("kubectl-diff", "diff"),
+        kubectl_safe_pattern!("kubectl-explain", "explain"),
+        kubectl_safe_pattern!("kubectl-top", "top"),
+        kubectl_safe_pattern!("kubectl-config", "config"),
+        kubectl_safe_pattern!("kubectl-api", "api-(?:resources|versions)"),
+        kubectl_safe_pattern!("kubectl-version", "version"),
     ]
 }
 
-/// Return true only when kubectl's final effective `--dry-run` value is
-/// provably non-executing. Regex matching is insufficient here because pflag
-/// accepts repeated flags, separated values, quoting, and `--` termination.
+/// Prove the effective preview from whole shell words, never a substring of
+/// argument data (#435). Both Pack safe-matching paths call this function.
+/// Unknown syntax/option arity withdraws the exemption, not a denial rule.
 pub(crate) fn dry_run_is_effectively_safe(command: &str) -> bool {
-    let segments = crate::packs::split_command_segments(command);
-    if segments.len() > 1 {
-        let mut kubectl_segments = segments
-            .into_iter()
-            .filter(|segment| kubectl_executable_index(segment).is_some());
-        let Some(segment) = kubectl_segments.next() else {
+    let mut saw_preview = false;
+    for segment in crate::packs::split_command_segments(command) {
+        let stripped = crate::normalize::strip_wrapper_prefixes(segment);
+        if stripped.wrapper_limit_reached {
+            return false;
+        }
+        let source = stripped.normalized.as_ref();
+        let Ok(tokens) = shell_words::split(source) else {
             return false;
         };
-        return kubectl_segments.next().is_none() && dry_run_is_effectively_safe(segment);
-    }
-    if kubectl_command_contains_dynamic_shell_syntax(command) {
-        return false;
-    }
-    let Ok(tokens) = shell_words::split(command) else {
-        return false;
-    };
-    let Some(kubectl_index) = kubectl_executable_index_from_tokens(&tokens) else {
-        return false;
-    };
-
-    let mut effective = None;
-    let mut index = kubectl_index + 1;
-    while index < tokens.len() {
-        let token = &tokens[index];
-        if token == "--" {
-            break;
-        }
-        if let Some(value) = token.strip_prefix("--dry-run=") {
-            effective = Some(value.to_ascii_lowercase());
-            index += 1;
+        let Some(executable) = tokens.first() else {
             continue;
-        }
-        if token == "--dry-run" {
-            let separated = tokens.get(index + 1).map(String::as_str);
-            if separated.is_some_and(|value| {
-                matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "client" | "server" | "none" | "false" | "true"
-                )
-            }) {
-                effective = separated.map(str::to_ascii_lowercase);
-                index += 2;
-            } else {
-                effective = Some("bare".to_string());
-                index += 1;
+        };
+        if !is_kubectl_executable(executable) {
+            // Do not re-anchor at an argument named kubectl. Such a segment
+            // can still trip the permissive whole-command deny expressions.
+            if tokens.iter().any(|token| is_kubectl_executable(token)) {
+                return false;
             }
             continue;
         }
-        index += 1;
+        if kubectl_command_contains_dynamic_shell_syntax(source) {
+            return false;
+        }
+        match invocation_preview(&tokens[1..]) {
+            Some(preview) => saw_preview |= preview,
+            None => return false,
+        }
     }
-
-    effective.is_some_and(|value| matches!(value.as_str(), "bare" | "client" | "server" | "true"))
+    saw_preview
 }
 
-fn kubectl_executable_index(command: &str) -> Option<usize> {
-    let tokens = shell_words::split(command).ok()?;
-    kubectl_executable_index_from_tokens(&tokens)
-}
-
-fn kubectl_executable_index_from_tokens(tokens: &[String]) -> Option<usize> {
-    tokens.iter().position(|token| {
-        token
-            .rsplit(['/', '\\'])
-            .next()
-            .is_some_and(|name| name.eq_ignore_ascii_case("kubectl"))
+fn is_kubectl_executable(token: &str) -> bool {
+    token.rsplit(['/', '\\']).next().is_some_and(|name| {
+        name.eq_ignore_ascii_case("kubectl") || name.eq_ignore_ascii_case("kubectl.exe")
     })
+}
+
+/// Some(false) is a known read-only invocation; Some(true) is a proven
+/// preview; None means the invocation must face the destructive rules.
+fn invocation_preview(args: &[String]) -> Option<bool> {
+    let mut index = 0;
+    while args.get(index).is_some_and(|arg| arg.starts_with('-')) {
+        index = consume_known_option(args, index, false)?;
+    }
+    let subcommand = args.get(index)?.as_str();
+    if matches!(
+        subcommand,
+        "get" | "describe" | "logs" | "diff" | "explain" | "top" | "config"
+            | "api-resources" | "api-versions" | "version" | "kustomize"
+    ) {
+        return Some(false);
+    }
+    if !matches!(subcommand, "delete" | "apply" | "drain" | "cordon" | "taint" | "scale") {
+        return None;
+    }
+    index += 1;
+    let mut effective = None;
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--dry-run" {
+            // pflag's NoOptDefVal applies WITHOUT consuming the next word.
+            // `--dry-run false` is a preview plus a positional word, not false.
+            effective = Some(true);
+            index += 1;
+        } else if let Some(value) = arg.strip_prefix("--dry-run=") {
+            // String options are assigned in order; kubectl validates the
+            // final value. Do not lowercase client/server: they are case-sensitive.
+            effective = Some(matches!(
+                value,
+                "client" | "server" | "unchanged" | "true" | "True" | "TRUE" | "1" | "t" | "T"
+            ));
+            index += 1;
+        } else if arg.starts_with('-') && arg != "-" {
+            index = consume_known_option(args, index, true)?;
+        } else {
+            index += 1;
+        }
+    }
+    effective.filter(|preview| *preview)
+}
+
+/// Advance across one pflag option, consuming a required value even when it
+/// starts with `--`. The bool is option scope, not an inference about arity.
+/// Notably --raw is absent: a raw request must never inherit a preview proof.
+fn consume_known_option(args: &[String], index: usize, local: bool) -> Option<usize> {
+    let arg = args.get(index)?;
+    if let Some(long) = arg.strip_prefix("--") {
+        let (name, attached) = long.split_once('=').map_or((long, false), |(name, _)| (name, true));
+        if global_value_option(name) || local && local_value_option(name) {
+            return if attached {
+                Some(index + 1)
+            } else {
+                args.get(index + 1).map(|_| index + 2)
+            };
+        }
+        if matches!(
+            name,
+            "disable-compression" | "insecure-skip-tls-verify" | "match-server-version"
+                | "warnings-as-errors" | "help"
+        ) || local && matches!(
+            name,
+            "all" | "all-namespaces" | "force" | "ignore-not-found" | "now" | "wait"
+                | "interactive" | "recursive" | "cascade" | "validate" | "overwrite"
+                | "server-side" | "force-conflicts" | "prune" | "record" | "save-config"
+                | "dry-run" | "ignore-daemonsets" | "delete-emptydir-data" | "disable-eviction"
+        ) {
+            return Some(index + 1);
+        }
+        return None;
+    }
+    let flags = arg.strip_prefix('-')?.as_bytes();
+    if flags.is_empty() {
+        return None;
+    }
+    for (position, flag) in flags.iter().copied().enumerate() {
+        if matches!(flag, b'n' | b's' | b'v') || local && matches!(flag, b'f' | b'k' | b'l' | b'o') {
+            return if position + 1 < flags.len() {
+                Some(index + 1)
+            } else {
+                args.get(index + 1).map(|_| index + 2)
+            };
+        }
+        if flag != b'h' && !(local && matches!(flag, b'A' | b'R' | b'i')) {
+            return None;
+        }
+        // A bool shorthand with `=value` consumes the rest of this token.
+        if flags.get(position + 1) == Some(&b'=') {
+            return Some(index + 1);
+        }
+    }
+    Some(index + 1)
+}
+
+fn global_value_option(name: &str) -> bool {
+    matches!(
+        name,
+        "as" | "as-group" | "as-uid" | "cache-dir" | "certificate-authority"
+            | "client-certificate" | "client-key" | "cluster" | "context" | "kubeconfig"
+            | "kuberc" | "namespace" | "password" | "profile" | "profile-output"
+            | "request-timeout" | "server" | "tls-server-name" | "token" | "user"
+            | "username" | "v" | "vmodule"
+    )
+}
+
+fn local_value_option(name: &str) -> bool {
+    matches!(
+        name,
+        "filename" | "kustomize" | "selector" | "field-selector" | "grace-period"
+            | "timeout" | "output" | "field-manager" | "replicas" | "current-replicas"
+            | "resource-version" | "pod-selector" | "skip-wait-for-delete-timeout"
+            | "chunk-size" | "prune-allowlist" | "prune-whitelist" | "template"
+    )
 }
 
 fn kubectl_command_contains_dynamic_shell_syntax(command: &str) -> bool {
@@ -273,10 +340,8 @@ fn kubectl_command_contains_dynamic_shell_syntax(command: &str) -> bool {
         if in_single {
             continue;
         }
-        if byte == b'\\'
-            || byte == b'$'
-            || byte == b'`'
-            || (!in_double && matches!(byte, b'*' | b'?' | b'[' | b'{' | b'~' | b';' | b'|' | b'&'))
+        if matches!(byte, b'\\' | b'$' | b'`' | b'%' | b'!' | b'^')
+            || (!in_double && matches!(byte, b'*' | b'?' | b'[' | b'{' | b'~' | b';' | b'|' | b'&' | b'<' | b'>'))
         {
             return true;
         }
@@ -460,7 +525,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - StatefulSets: Ordered shutdown from highest ordinal\n\n\
              This is often intentional but can cause outages if done accidentally.\n\n\
              Check current replicas:\n  \
-             kubectl get deployment <name> -o jsonpath='{.spec.replicas}'\n\n\
+             kubectl get deployment <name> --replicas=0\n\n\
              To restore:\n  \
              kubectl scale deployment <name> --replicas=<N>"
         ),
@@ -537,113 +602,46 @@ mod tests {
 
     #[test]
     fn kubectl_patterns_match_with_global_flags() {
-        // Same class bug as every other CLI pack: kubectl global flags
-        // (`--context`, `--kubeconfig`, `--namespace`/`-n`, `--user`,
-        // `--cluster`, `--server`, `-v`) between `kubectl` and the
-        // subcommand break every `kubectl\s+<sub>` pattern. This is
-        // the single most common kubectl usage shape — any operator
-        // working against multiple clusters or explicit namespaces
-        // routinely uses `--context` / `-n`.
         let pack = create_pack();
-        // delete namespace with --context
-        assert_blocks(
-            &pack,
-            "kubectl --context prod delete namespace critical",
-            "namespace",
-        );
-        // delete --all with --kubeconfig
-        assert_blocks(
-            &pack,
-            "kubectl --kubeconfig /tmp/prod.yaml delete deployment --all",
-            "--all",
-        );
-        // delete across all namespaces with --context.  The broader
-        // `delete-all` rule (matching `--all`) fires before the more
-        // specific `delete-all-namespaces` — both reasons are accurate
-        // but `delete-all`'s reason lands first; the test just asserts
-        // *some* kind of "all" block fires.
-        assert_blocks(
-            &pack,
-            "kubectl --context prod delete pods --all-namespaces -l app=legacy",
-            "ALL resources",
-        );
-        // drain with explicit context
-        assert_blocks(
-            &pack,
-            "kubectl --context prod drain node-1 --ignore-daemonsets",
-            "drain",
-        );
-        // force+grace-period=0 with -n namespace
-        assert_blocks(
-            &pack,
-            "kubectl -n prod delete pod stuck-pod --force --grace-period=0",
-            "force",
-        );
-        // delete pvc with --context
-        assert_blocks(
-            &pack,
-            "kubectl --context prod delete pvc prod-db-data",
-            "pvc",
-        );
-        // apply --force with --context
-        assert_blocks(
-            &pack,
-            "kubectl --context prod apply -f manifest.yaml --force",
-            "force",
-        );
+        assert_blocks(&pack, "kubectl --context prod delete namespace critical", "namespace");
+        assert_blocks(&pack, "kubectl --kubeconfig /tmp/prod.yaml delete deployment --all", "--all");
+        assert_blocks(&pack, "kubectl --context prod delete pods --all-namespaces -l app=legacy", "ALL resources");
+        assert_blocks(&pack, "kubectl --context prod drain node-1 --ignore-daemonsets", "drain");
+        assert_blocks(&pack, "kubectl -n prod delete pod stuck-pod --force --grace-period=0", "force");
+        assert_blocks(&pack, "kubectl --context prod delete pvc prod-db-data", "pvc");
+        assert_blocks(&pack, "kubectl --context prod apply -f manifest.yaml --force", "force");
     }
 
     #[test]
     fn kubectl_safe_patterns_do_not_bypass_via_flag_value() {
-        // The flag-as-safe-word bypass class: widening the safe
-        // patterns' service-anchor must not let destructive commands
-        // with flag values like `--get-url`, `--describe-pod`,
-        // `--top-logs` sneak through. Only positional `get`/`describe`
-        // /`logs`/etc. should match safe rules.
         let pack = create_pack();
-        // Genuine read commands still allowed
         assert_allows(&pack, "kubectl get pods");
         assert_allows(&pack, "kubectl --context prod get pods");
         assert_allows(&pack, "kubectl describe pod foo");
         assert_allows(&pack, "kubectl logs deployment/foo");
-        // Safe positional after global flags
         assert_allows(&pack, "kubectl -n prod get pods");
-        // Genuine dry-run bypass stays allowed
-        assert_allows(
-            &pack,
-            "kubectl --context prod delete deployment foo --dry-run=client",
-        );
+        assert_allows(&pack, "kubectl --context prod delete deployment foo --dry-run=client");
+        for command in [
+            "kubectl --warnings-as-errors delete namespace get",
+            "kubectl delete namespace prod --cache-dir 'kubectl get'",
+            "kubectl delete namespace prod --cache-dir kubectl get",
+        ] {
+            assert_no_safe_match(&pack, command);
+            assert_blocks(&pack, command, "namespace");
+        }
     }
 
     #[test]
     fn safe_subcommand_inside_resource_name_does_not_short_circuit() {
-        // Resource names often contain read-only subcommand keywords as
-        // substrings. Without the `(?=\s|$)` anchor, `kubectl delete
-        // deployment get-handler` matches the `kubectl-get` safe rule via
-        // `get` in `get-handler`, short-circuiting the destructive
-        // `delete-workload` check.
         let pack = create_pack();
-        assert!(
-            pack.check("kubectl delete deployment get-handler")
-                .is_some(),
-            "delete deployment named `get-handler` must still block"
-        );
-        assert!(
-            pack.check("kubectl delete statefulset describe-worker")
-                .is_some(),
-            "delete statefulset named `describe-worker` must still block"
-        );
-        assert!(
-            pack.check("kubectl delete daemonset logs-archive")
-                .is_some(),
-            "delete daemonset named `logs-archive` must still block"
-        );
-        assert!(
-            pack.check("kubectl delete pvc top-disk").is_some(),
-            "delete pvc named `top-disk` must still block"
-        );
-
-        // Bare subcommands still short-circuit.
+        for command in [
+            "kubectl delete deployment get-handler",
+            "kubectl delete statefulset describe-worker",
+            "kubectl delete daemonset logs-archive",
+            "kubectl delete pvc top-disk",
+        ] {
+            assert!(pack.check(command).is_some(), "must block {command}");
+        }
         assert_allows(&pack, "kubectl get pods");
         assert_allows(&pack, "kubectl describe pod foo");
         assert_allows(&pack, "kubectl logs deployment/myapp");
@@ -655,152 +653,138 @@ mod tests {
         assert_blocks(&pack, "kubectl delete namespace production", "namespace");
         assert_blocks(&pack, "kubectl delete ns staging", "namespace");
         assert_blocks(&pack, "kubectl delete pods --all", "--all");
-        assert_blocks(
-            &pack,
-            "kubectl delete pods --all-namespaces",
-            "ALL resources",
-        );
+        assert_blocks(&pack, "kubectl delete pods --all-namespaces", "ALL resources");
         assert_blocks(&pack, "kubectl delete pods -A", "ALL namespaces");
         assert_blocks(&pack, "kubectl drain node-1", "drain");
         assert_blocks(&pack, "kubectl cordon node-1", "cordon");
-        assert_blocks(
-            &pack,
-            "kubectl taint nodes node-1 key=val:NoExecute",
-            "NoExecute",
-        );
+        assert_blocks(&pack, "kubectl taint nodes node-1 key=val:NoExecute", "NoExecute");
         assert_blocks(&pack, "kubectl delete deployment web-api", "workload");
         assert_blocks(&pack, "kubectl delete statefulset db-cluster", "workload");
         assert_blocks(&pack, "kubectl delete pvc data-volume", "pvc");
         assert_blocks(&pack, "kubectl delete pv my-volume", "pv");
-        assert_blocks(
-            &pack,
-            "kubectl scale deployment web --replicas=0",
-            "replicas=0",
-        );
-        assert_blocks(
-            &pack,
-            "kubectl delete pod foo --force --grace-period=0",
-            "force",
-        );
+        assert_blocks(&pack, "kubectl scale deployment web --replicas=0", "replicas=0");
+        assert_blocks(&pack, "kubectl delete pod foo --force --grace-period=0", "force");
         assert_blocks(&pack, "kubectl apply -f deploy.yaml --force", "force");
-        assert_blocks(&pack, "cat manifest.yaml | kubectl delete -f -", "stdin");
-        assert_blocks(&pack, "kubectl --context prod delete --filename=-", "stdin");
-        assert_blocks(&pack, "kubectl delete --filename '-'", "stdin");
-        assert_blocks(&pack, "kubectl delete -f \"-\"", "stdin");
-        assert_blocks(&pack, "kubectl delete -f-", "stdin");
-        assert_blocks(&pack, "kubectl delete -f=-", "stdin");
-        assert_blocks(&pack, "kubectl delete --filename=-,other.yaml", "stdin");
-        assert_blocks(&pack, "kubectl delete -f other.yaml,-", "stdin");
-        assert_blocks(&pack, "kubectl delete -f - --dry-run=none", "stdin");
-        assert_blocks(&pack, "kubectl delete -f - --dry-run false", "stdin");
-        assert_blocks(
-            &pack,
+        for command in [
+            "cat manifest.yaml | kubectl delete -f -",
+            "kubectl --context prod delete --filename=-",
+            "kubectl delete --filename '-'",
+            "kubectl delete -f \"-\"",
+            "kubectl delete -f-",
+            "kubectl delete -f=-",
+            "kubectl delete --filename=-,other.yaml",
+            "kubectl delete -f other.yaml,-",
+            "kubectl delete -f - --dry-run=none",
             "kubectl delete -f - --dry-run=client --dry-run=none",
-            "stdin",
-        );
-        assert_blocks(
-            &pack,
-            "kubectl delete -f - --dry-run=client --dry-run false",
-            "stdin",
-        );
-        assert_blocks(
-            &pack,
             "kubectl delete -f - --dry-run=client '--dry-run=none'",
-            "stdin",
-        );
-        assert_blocks(
-            &pack,
             r"kubectl delete -f - --dry-run=client \--dry-run=none",
-            "stdin",
-        );
-        assert_blocks(
-            &pack,
             "kubectl delete -f - --dry-run=$DRY_RUN_MODE",
-            "stdin",
-        );
+        ] {
+            assert_blocks(&pack, command, "stdin");
+        }
         assert_blocks(&pack, "kubectl delete -f ./manifests/", "directories");
     }
 
     #[test]
     fn kubectl_blocks_with_correct_severity() {
         let pack = create_pack();
-        assert_blocks_with_severity(
-            &pack,
-            "kubectl delete namespace production",
-            Severity::Critical,
-        );
+        assert_blocks_with_severity(&pack, "kubectl delete namespace production", Severity::Critical);
         assert_blocks_with_severity(&pack, "kubectl delete pods --all", Severity::High);
         assert_blocks_with_severity(&pack, "kubectl delete pods -A", Severity::Critical);
         assert_blocks_with_severity(&pack, "kubectl drain node-1", Severity::High);
         assert_blocks_with_severity(&pack, "kubectl cordon node-1", Severity::Medium);
-        assert_blocks_with_severity(
-            &pack,
-            "kubectl taint nodes n1 k=v:NoExecute",
-            Severity::High,
-        );
+        assert_blocks_with_severity(&pack, "kubectl taint nodes n1 k=v:NoExecute", Severity::High);
         assert_blocks_with_severity(&pack, "kubectl delete pvc data-vol", Severity::Critical);
         assert_blocks_with_severity(&pack, "kubectl delete pv my-vol", Severity::Critical);
-        assert_blocks_with_severity(
-            &pack,
-            "kubectl delete pod foo --force --grace-period=0",
-            Severity::Critical,
-        );
+        assert_blocks_with_severity(&pack, "kubectl delete pod foo --force --grace-period=0", Severity::Critical);
     }
 
     #[test]
     fn kubectl_all_safe_patterns_match() {
         let pack = create_pack();
-        assert_safe_pattern_matches(&pack, "kubectl get pods");
-        assert_safe_pattern_matches(&pack, "kubectl describe pod foo");
-        assert_safe_pattern_matches(&pack, "kubectl logs foo");
-        assert_safe_pattern_matches(&pack, "kubectl delete pod foo --dry-run=client");
-        assert_safe_pattern_matches(&pack, "kubectl diff -f deploy.yaml");
-        assert_safe_pattern_matches(&pack, "kubectl explain deployment");
-        assert_safe_pattern_matches(&pack, "kubectl top nodes");
-        assert_safe_pattern_matches(&pack, "kubectl config view");
-        assert_safe_pattern_matches(&pack, "kubectl api-resources");
-        assert_safe_pattern_matches(&pack, "kubectl api-versions");
-        assert_safe_pattern_matches(&pack, "kubectl version");
+        for command in [
+            "kubectl get pods", "kubectl describe pod foo", "kubectl logs foo",
+            "kubectl delete pod foo --dry-run=client", "kubectl diff -f deploy.yaml",
+            "kubectl explain deployment", "kubectl top nodes", "kubectl config view",
+            "kubectl api-resources", "kubectl api-versions", "kubectl version",
+        ] {
+            assert_safe_pattern_matches(&pack, command);
+        }
     }
 
     #[test]
     fn kubectl_dry_run_overrides_destructive() {
         let pack = create_pack();
-        assert_allows(
-            &pack,
+        for command in [
             "kubectl delete namespace production --dry-run=client",
-        );
-        assert_allows(&pack, "kubectl delete deployment web --dry-run=server");
-        assert_allows(&pack, "kubectl delete deployment web --dry-run");
-        assert_allows(&pack, "kubectl delete deployment web --dry-run -o yaml");
-        assert_allows(&pack, "kubectl delete deployment web --dry-run client");
-        assert_allows(&pack, "kubectl delete -f '-' --dry-run=\"client\"");
-        assert_allows(
-            &pack,
+            "kubectl delete deployment web --dry-run=server",
+            "kubectl delete deployment web --dry-run",
+            "kubectl delete deployment web --dry-run -o yaml",
+            "kubectl delete deployment web --dry-run client",
+            "kubectl delete -f '-' --dry-run=\"client\"",
             "generate-manifest | kubectl delete -f - --dry-run=client",
-        );
-        assert_allows(&pack, "kubectl delete -f - --dry-run=none --dry-run=client");
-        assert_allows(
-            &pack,
+            "kubectl delete -f - --dry-run=none --dry-run=client",
             "kubectl delete -f - --dry-run=client -- --dry-run=none",
-        );
+            // NoOptDefVal: a separated word does not disable a bare flag.
+            "kubectl delete -f - --dry-run false",
+            "kubectl delete -f - --dry-run=client --dry-run false",
+            "kubectl delete ns prod --dry-run=client --cache-dir --dry-run=none",
+            "kubectl delete ns prod --cache-dir 'note --dry-run=none' --dry-run=client",
+            "kubectl delete ns prod --dry-run=client --cache-dir 'note --cache-dir'",
+            "sudo kubectl delete ns prod --dry-run=client",
+            "kubectl kustomize ./prod | kubectl delete -f - --dry-run=client",
+            "kubectl delete ns one --dry-run=client; kubectl delete ns two --dry-run=server",
+        ] {
+            assert!(dry_run_is_effectively_safe(command), "preview proof failed: {command}");
+            assert_allows(&pack, command);
+        }
     }
 
     #[test]
     fn kubectl_dry_run_none_does_not_bypass_destructive_patterns() {
         let pack = create_pack();
-        assert_blocks_with_pattern(
-            &pack,
-            "kubectl delete deployment web --dry-run=none",
-            "delete-workload",
-        );
-        assert_blocks_with_pattern(
-            &pack,
-            "kubectl delete pvc data --dry-run=none",
-            "delete-pvc",
-        );
+        assert_blocks_with_pattern(&pack, "kubectl delete deployment web --dry-run=none", "delete-workload");
+        assert_blocks_with_pattern(&pack, "kubectl delete pvc data --dry-run=none", "delete-pvc");
         assert_blocks_with_pattern(&pack, "kubectl delete pv data --dry-run=none", "delete-pv");
         assert_no_safe_match(&pack, "kubectl delete deployment web --dry-run=none");
+    }
+
+    #[test]
+    fn kubectl_preview_cannot_come_from_data_or_hide_a_disabling_option() {
+        let pack = create_pack();
+        for command in [
+            "kubectl delete ns prod --cache-dir --dry-run=client",
+            "kubectl delete ns prod --cache-dir=--dry-run=client",
+            "kubectl delete ns prod --context --dry-run",
+            "kubectl delete ns prod -n--dry-run=client",
+            "kubectl delete ns prod --cache-dir 'note --dry-run=client'",
+            "kubectl delete ns prod --dry-run=client --cache-dir 'note --cache-dir' --dry-run=none",
+            "kubectl delete ns prod -- --dry-run=client",
+            "kubectl delete ns prod --dry-run=client --unknown-option value",
+            "kubectl delete ns prod --dry-run=client --raw /api/v1/namespaces/prod",
+            "kubectl delete ns prod --dry-run=client --cache-dir ${ARGS}",
+            "kubectl delete ns prod --dry-run=client --cache-dir %ARGS%",
+            "kubectl delete ns prod --dry-run=client --cache-dir *",
+            "kubectl delete ns prod; kubectl delete ns other --dry-run=client",
+            "kubectl delete ns prod --dry-run=client; kubectl delete ns other",
+        ] {
+            assert!(!dry_run_is_effectively_safe(command), "invalid proof: {command}");
+            assert_blocks(&pack, command, "namespace");
+        }
+        assert!(!dry_run_is_effectively_safe("echo kubectl delete ns prod --dry-run=client"));
+    }
+
+    #[test]
+    fn kubectl_preview_respects_short_option_arity() {
+        for command in [
+            "kubectl delete ns prod -n --dry-run=client",
+            "kubectl delete ns prod -Rf--dry-run=client",
+            "kubectl delete ns prod --filename --dry-run=client",
+        ] {
+            assert!(!dry_run_is_effectively_safe(command), "data was accepted as preview: {command}");
+        }
+        assert!(dry_run_is_effectively_safe("kubectl delete -Rfmanifest.yaml --dry-run=client"));
+        assert!(dry_run_is_effectively_safe("kubectl -v6 delete ns prod --dry-run=server"));
     }
 
     #[test]
