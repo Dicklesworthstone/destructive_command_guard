@@ -203,6 +203,50 @@ fn kustomize_previews_survive_the_whole_command_fallback() {
 }
 
 #[test]
+fn mongodb_read_exemptions_cannot_shadow_any_current_destructive_rule() {
+    // #435 audit: MongoDB's read exemptions carry an explicit destructive
+    // exclusion list. Exercise every destructive regex family through the
+    // shared evaluator with a later read operation present so adding a safe
+    // word can never turn the denial into an allow.
+    for command in [
+        "db.dropDatabase(); db.posts.find({})",
+        "db.users.drop(); db.posts.find({})",
+        "db.users.dropCollection(); db.posts.countDocuments({})",
+        "db.users.deleteMany({}); db.posts.aggregate([])",
+        "db.users.remove({}); db.posts.find({}).explain()",
+        "mongorestore --drop /backup; db.posts.find({})",
+    ] {
+        assert_decision("database.mongodb", command, EvaluationDecision::Deny);
+    }
+}
+
+#[test]
+fn redis_read_exemptions_cannot_shadow_any_current_destructive_rule() {
+    // #435 audit: cover every destructive Redis keyword family with a safe
+    // read token in the same command. The safe negative lookahead is a
+    // security invariant: if a new destructive family is added without also
+    // withdrawing the read exemption, one of these shapes should fail open.
+    for command in [
+        "redis-cli FLUSHALL && redis-cli GET foo",
+        "redis-cli FLUSHDB && redis-cli MGET foo bar",
+        "redis-cli DEBUG SEGFAULT && redis-cli INFO",
+        "redis-cli DEBUG SLEEP 30 && redis-cli DBSIZE",
+        "redis-cli SHUTDOWN NOSAVE && redis-cli GET foo",
+        "redis-cli CONFIG RESETSTAT && redis-cli INFO",
+        "redis-cli CONFIG SET dir /tmp && redis-cli CONFIG GET dir",
+        "redis-cli CONFIG SET maxmemory 100mb && redis-cli INFO memory",
+        "redis-cli CONFIG SET maxmemory-policy allkeys-lru && redis-cli CONFIG GET maxmemory-policy",
+        "redis-cli CONFIG SET save '' && redis-cli CONFIG GET save",
+        "redis-cli CONFIG SET appendonly no && redis-cli CONFIG GET appendonly",
+        "redis-cli CONFIG REWRITE && redis-cli INFO",
+        "redis-cli KEYS '*' | xargs redis-cli DEL && redis-cli GET sentinel",
+        "redis-cli --scan --pattern 'prefix:*' | xargs -r redis-cli UNLINK && redis-cli SCAN 0",
+    ] {
+        assert_decision("database.redis", command, EvaluationDecision::Deny);
+    }
+}
+
+#[test]
 fn multiword_quoted_evidence_remains_one_argument_in_matching_views() {
     for command in [
         "helm uninstall r --description \"note --dry-run\"",
