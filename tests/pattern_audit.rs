@@ -171,7 +171,6 @@ fn test_audit_backtracking_requirements() {
                 "fastly-profile",
                 "fastly-service-describe",
                 "fastly-service-list",
-                "fastly-service-search",
                 "fastly-vcl-describe",
                 "fastly-vcl-list",
                 "fastly-version",
@@ -591,6 +590,9 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "kubernetes.helm",
+            // Destructive uninstall/rollback no longer contain preview
+            // vetoes (#435). Only the read-only verb-boundary lookaheads
+            // need backtracking; the argument-aware preview proof is linear.
             HashSet::from([
                 "helm-diff",
                 "helm-get",
@@ -603,8 +605,6 @@ fn test_audit_backtracking_requirements() {
                 "helm-show",
                 "helm-status",
                 "helm-template",
-                "rollback",
-                "uninstall",
             ]),
         ),
         (
@@ -622,16 +622,9 @@ fn test_audit_backtracking_requirements() {
                 "kubectl-version",
             ]),
         ),
-        (
-            "kubernetes.kustomize",
-            HashSet::from([
-                "kubectl-delete-k",
-                "kubectl-kustomize",
-                "kubectl-kustomize-delete",
-                "kustomize-build",
-                "kustomize-delete",
-            ]),
-        ),
+        // #435 removes redundant render exemptions and destructive preview
+        // vetoes. The remaining positive proof and delete rules are linear.
+        ("kubernetes.kustomize", HashSet::new()),
         (
             "loadbalancer.traefik",
             HashSet::from([
@@ -736,7 +729,6 @@ fn test_audit_backtracking_requirements() {
                 "yarn-add",
                 "yarn-audit",
                 "yarn-list",
-                "yarn-publish",
                 "yum-remove",
             ]),
         ),
@@ -885,7 +877,6 @@ fn test_audit_backtracking_requirements() {
                 "modal-dict-delete",
                 "modal-queue-delete",
                 "modal-app-stop",
-                "modal-container-stop",
                 "modal-volume-rm-recursive",
                 "modal-dict-clear",
                 "modal-queue-clear",
