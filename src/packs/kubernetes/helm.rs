@@ -16,13 +16,14 @@ use crate::packs::{DestructivePattern, Pack, SafePattern};
 // A required pflag value consumes the following token even when it begins
 // with `--`. It must not be optional, or a description/context/value can
 // supply the apparent dry-run flag. Unknown options, quoting, shell syntax,
-// and a bare `--` conservatively withdraw the regex exemption.
+// and a bare `--` conservatively withdraw the regex exemption. Expansions
+// are excluded because one apparent value can expand into several flags.
 macro_rules! helm_global_option {
     () => {
         concat!(
             r"(?:--(?:burst-limit|kube-apiserver|kube-as-group|kube-as-user|kube-ca-file|kube-context|kube-tls-server-name|kube-token|kubeconfig|namespace|qps|registry-config|repository-cache|repository-config)",
-            r"(?:=[^\s;&|<>()\x22'\\$`]+|[ \t]+[^\s;&|<>()\x22'\\$`]+)",
-            r"|-n(?:[^\s;&|<>()\x22'\\$`]+|[ \t]+[^\s;&|<>()\x22'\\$`]+)",
+            r"(?:=[^\s;&|<>()\x22'\\$`*?\[\]{}~]+|[ \t]+[^\s;&|<>()\x22'\\$`*?\[\]{}~]+)",
+            r"|-n(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+|[ \t]+[^\s;&|<>()\x22'\\$`*?\[\]{}~]+)",
             r"|--(?:debug|kube-insecure-skip-tls-verify)(?:=(?:true|false))?)"
         )
     };
@@ -34,10 +35,10 @@ macro_rules! helm_argument {
             r"(?:",
             helm_global_option!(),
             r"|--(?:description|cascade|timeout|history-max|output|version|repo|username|password|ca-file|cert-file|key-file|keyring|post-renderer|post-renderer-args|values|set|set-file|set-json|set-literal|set-string|labels)",
-            r"(?:=[^\s;&|<>()\x22'\\$`]+|[ \t]+[^\s;&|<>()\x22'\\$`]+)",
-            r"|-[fo](?:[^\s;&|<>()\x22'\\$`]+|[ \t]+[^\s;&|<>()\x22'\\$`]+)",
+            r"(?:=[^\s;&|<>()\x22'\\$`*?\[\]{}~]+|[ \t]+[^\s;&|<>()\x22'\\$`*?\[\]{}~]+)",
+            r"|-[fo](?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+|[ \t]+[^\s;&|<>()\x22'\\$`*?\[\]{}~]+)",
             r"|--(?:no-hooks|ignore-not-found|keep-history|force|force-replace|force-conflicts|reset-values|reuse-values|reset-then-reuse-values|install|atomic|cleanup-on-fail|disable-openapi-validation|skip-schema-validation|skip-crds|create-namespace|verify|wait|wait-for-jobs|devel|dependency-update|enable-dns|hide-notes|hide-secret|insecure-skip-tls-verify|plain-http|render-subchart-notes|take-ownership)(?:=(?:true|false|watcher|hookOnly|legacy))?",
-            r"|-i|[^\s;&|<>()\x22'\\$`-][^\s;&|<>()\x22'\\$`]*|-)"
+            r"|-i|[^\s;&|<>()\x22'\\$`*?\[\]{}~-][^\s;&|<>()\x22'\\$`*?\[\]{}~]*|-)"
         )
     };
 }
@@ -47,7 +48,7 @@ macro_rules! helm_safe_pattern {
         SafePattern {
             name: $name,
             regex: LazyCompiledRegex::new(concat!(
-                r"^[ \t]*(?:[^\s;&|<>()\x22'\\$`]+/)?helm[ \t]+(?:",
+                r"^[ \t]*(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~]+/)?helm[ \t]+(?:",
                 helm_global_option!(),
                 r"[ \t]+)*",
                 $suffix
@@ -319,6 +320,10 @@ mod tests {
             "helm uninstall my-release | grep -- --dry-run",
             "helm uninstall my-release\necho --dry-run",
             "helm uninstall my-release -n \"$(echo --dry-run)\"",
+            "helm uninstall my-release --dry-run --description *",
+            "helm uninstall my-release --dry-run --description file?",
+            "helm uninstall my-release --dry-run --description {a,b}",
+            "helm uninstall my-release --dry-run --description ${ARGS}",
         ] {
             assert_no_safe_match(&pack, command);
             assert_blocks(&pack, command, "uninstall");
@@ -371,8 +376,11 @@ mod tests {
             .iter()
             .find(|pattern| pattern.name == "helm-dry-run")
             .expect("dry-run rule exists");
-        assert!(!crate::packs::regex_engine::needs_backtracking_engine(
-            dry_run.regex.as_str()
+        let compiled = crate::packs::regex_engine::CompiledRegex::new(dry_run.regex.as_str())
+            .expect("valid dry-run regex");
+        assert!(matches!(
+            compiled,
+            crate::packs::regex_engine::CompiledRegex::Linear(_)
         ));
     }
 
