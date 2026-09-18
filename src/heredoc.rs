@@ -8842,6 +8842,76 @@ fi"#;
         );
     }
 
+    /// #439: a `$VAR` on the heredoc's line must not hide its target command.
+    ///
+    /// `tokenize_backwards` treated a bare `$` as a command boundary, so the walk
+    /// stopped before the program word and no target was resolved at all. The
+    /// quoted (inert) body then could not be masked, and a line-leading backtick
+    /// in it tripped `heredoc.shell:launcher-unverified`. A `$` introduces an
+    /// expansion inside a word, not a new command.
+    #[test]
+    fn extract_heredoc_target_command_resolves_across_dollar_expansions_439() {
+        for (command, expected) in [
+            // The reported shape: the redirect target is variable-expanded.
+            ("S=/tmp && cat > $S/d.md <<'EOF'\nbody\nEOF", Some("cat")),
+            // Braced, and quoted — the quoted spelling already worked, which is
+            // what pinned the cause.
+            ("S=/tmp && cat > ${S}/d.md <<'EOF'\nbody\nEOF", Some("cat")),
+            (
+                "S=/tmp && cat > \"$S/d.md\" <<'EOF'\nbody\nEOF",
+                Some("cat"),
+            ),
+            // A dynamic operand rather than a dynamic redirect target.
+            ("S=/tmp && cat $S/in.md <<'EOF'\nbody\nEOF", Some("cat")),
+            (
+                "D=/r && git -C $D commit -F - <<'EOF'\nbody\nEOF",
+                Some("git"),
+            ),
+            // An executing interpreter must still resolve to itself, never to a
+            // data sink, so its body is never masked.
+            ("S=/tmp && bash $S/x <<'EOF'\nbody\nEOF", Some("bash")),
+            ("S=/bin && $S/bash <<'EOF'\nbody\nEOF", Some("bash")),
+            // A program that is itself an unresolved expansion stays unproven:
+            // the token is returned as-is and matches no data sink.
+            ("S=cat && $S <<'EOF'\nbody\nEOF", Some("$S")),
+            // A command substitution is still a boundary, so nothing is resolved.
+            ("cat $(date) <<'EOF'\nbody\nEOF", None),
+        ] {
+            let start = command.find("<<").expect("heredoc operator");
+            assert_eq!(
+                extract_heredoc_target_command(command, start).as_deref(),
+                expected,
+                "target resolution for {command:?}"
+            );
+        }
+    }
+
+    /// The boundary set `tokenize_backwards` actually stops at (#439).
+    #[test]
+    fn tokenize_backwards_stops_at_command_boundaries_but_not_dollar_439() {
+        // A bare `$` keeps the word in the same simple command.
+        assert_eq!(
+            tokenize_backwards("cat > $S/d.md"),
+            vec!["$S/d.md".to_string(), ">".to_string(), "cat".to_string()]
+        );
+        // Every real separator still ends the walk, so tokens from another
+        // command can never be read as this one's.
+        for (source, expected_last) in [
+            ("echo hi | cat", "cat"),
+            ("echo hi; cat", "cat"),
+            ("echo hi && cat", "cat"),
+            ("(echo hi) cat", "cat"),
+            ("x=$(echo hi) cat", "cat"),
+        ] {
+            let tokens = tokenize_backwards(source);
+            assert_eq!(
+                tokens,
+                vec![expected_last.to_string()],
+                "walk should stop at the separator in {source:?}"
+            );
+        }
+    }
+
     /// #136 REVERTED: interpreter-stdin heredoc bodies are no longer masked, so
     /// `is_interpreter_source_heredoc_command` returns false for EVERY command.
     /// Masking a body that actually executes is unsound for a zero-false-negative

@@ -152,6 +152,33 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   missed it. A newline now counts as an opener when the explicit `TRUNCATE
   TABLE` spelling follows, which is evidence no Tailwind class list carries.
 
+- **A `$VAR` on a heredoc's line no longer hides its target command (#439).**
+  `tokenize_backwards` treated a bare `$` as a command boundary, so the backward
+  walk over the heredoc's own line stopped before the program word and resolved no
+  target at all. With no proven data sink the quoted — therefore inert — body
+  stayed visible to the raw-shell rescan, where a line-leading backtick read as a
+  dynamically assembled launcher: `S=/tmp/s && cat > $S/d.md <<'EOF'` with a
+  `` `symbol` `` in the body denied as `heredoc.shell:launcher-unverified`. That is
+  the ordinary shape for an agent writing Markdown to a scratch directory held in a
+  variable. A `$` introduces an expansion *inside* a word; `$(…)` is still bounded
+  by its own parentheses.
+
+  What located it: the *better-quoted* `cat > "$S/d.md"` was already allowed,
+  because the tokenizer's quoted-string arm runs before the boundary check and
+  consumes that token whole. Quoting a path cannot change whether a body is
+  executable, and the report's own gating table — which blamed the redirect target
+  — turned out to be one case of a wider rule: any `$VAR` on that line did it,
+  including one that is only an operand.
+
+  The same truncation was silently suppressing three other stdin-data proofs that
+  resolve their program word through the same walk, so `git -C $D commit -F -`,
+  `gh issue comment $N -F -` and `spx session handoff $A` were all denied for
+  bodies that merely mentioned a destructive command. A differential sweep over 960
+  heredoc shapes found zero new denials, and every shape that moved had been
+  blocked by that one advisory rule: shells still deny every body, an unquoted body
+  containing `$(…)` still denies because the shell expands it before the sink sees
+  it, and `heredoc.python:os_system.rm_rf_catastrophic` and friends are untouched.
+
 - **`find … -delete` explains itself honestly (#418).** The rule text claimed
   the decision was made on the search root and that the scoped form was
   "bytewise-equivalent to `rm -rf`". Neither was true. It now says what it does:
