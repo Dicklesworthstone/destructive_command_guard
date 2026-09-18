@@ -20056,6 +20056,19 @@ fn evaluate_packs_with_allowlists_at_depth(
             return EvaluationResult::indeterminate_due_to_budget();
         }
 
+        // PostgreSQL block comments nest and MySQL's do not, so the shared
+        // comment-skipping group in the SQL patterns ends at the first `*/` and
+        // the statement behind a nested comment is invisible (#432). Blank the
+        // comments for this pack only — MySQL's `/*! … */` is executable SQL and
+        // must keep reaching its own rules. The mask is length preserving, so
+        // every span and segment range computed from the original text stays
+        // valid; see `postgresql::mask_comments`.
+        let sql_comment_masked = (pack_id == "database.postgresql")
+            .then(|| crate::packs::database::postgresql::mask_comments(command_for_packs));
+        let command_for_packs = sql_comment_masked
+            .as_ref()
+            .map_or(command_for_packs, std::convert::AsRef::as_ref);
+
         // For a single proven database-client invocation, only that client's
         // enabled pack may interpret its embedded payload. In a compound shell
         // command we retain every pack here because another segment may invoke
@@ -24595,6 +24608,25 @@ fn evaluate_pack_destructive_patterns(
         mask_nested_segment_ranges(unmasked_pattern_command, slice_offset, ignored_ranges)
     };
     let pattern_command = masked_pattern_command.as_ref();
+    // PostgreSQL block comments nest and MySQL's do not, so the shared
+    // comment-skipping group in the SQL patterns — which ends at the first
+    // `*/` — reads `/* /* */ */ TRUNCATE TABLE users;` as a comment followed by
+    // `*/ TRUNCATE …`, and the statement is invisible. Verified against
+    // PostgreSQL 18: that command truncates (#432).
+    //
+    // Arbitrary nesting is not regular, and the previous attempt to widen the
+    // expression instead caused a fail-open: an ambiguous body gave the
+    // backtracking engine exponentially many parses and `is_match` returned
+    // false on the backtrack limit (558f0c4). So comments are blanked by a
+    // scanner before matching. The mask is length preserving, which is what
+    // keeps this off the `transformed_without_source_map` path: every byte
+    // offset in the masked view is the same offset in the original, so spans
+    // still map back.
+    let sql_comment_masked = (pack_id == "database.postgresql")
+        .then(|| crate::packs::database::postgresql::mask_comments(pattern_command));
+    let pattern_command = sql_comment_masked
+        .as_ref()
+        .map_or(pattern_command, std::convert::AsRef::as_ref);
     let redirect_syntax_command = if pack_id == "core.filesystem"
         && shell_dialect != crate::normalize::ShellDialect::Unknown
         && normalized_offset == Some(0)
@@ -34921,6 +34953,70 @@ mod tests {
             assert!(
                 !result.is_denied(),
                 "a resolvable foreign argv0 must still stand the rule down: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// #432: PostgreSQL block comments nest and MySQL's do not, so the shared
+    /// comment-skipping group ended at the first `*/` and the statement behind
+    /// a nested comment was invisible. The reporter confirmed on PostgreSQL 18
+    /// that the first command truncates a seeded table.
+    #[test]
+    fn nested_sql_comments_do_not_hide_the_statement_issue_432() {
+        for command in [
+            "/* /* */ */ TRUNCATE TABLE users;",
+            "/* /* /* */ */ */ TRUNCATE TABLE users;",
+            "/*/* nested without spaces */*/ TRUNCATE TABLE users;",
+            "/* multi\n   line\n   /* nested */ */\nTRUNCATE TABLE users;",
+            // The control from the report, which always denied.
+            "/* x */ TRUNCATE TABLE users;",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["database.postgresql"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "a nested comment must not hide the statement: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Comment introducers inside string data are data: neither starts a
+        // comment, and blanking them would hide real SQL. Both of these deny
+        // because of the statement, not in spite of it.
+        for command in [
+            "SELECT '/* not a comment */'; TRUNCATE TABLE users;",
+            "SELECT '-- not a comment'; TRUNCATE TABLE users;",
+            "SELECT $$ /* body */ $$; TRUNCATE TABLE users;",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["database.postgresql"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "a quoted comment introducer must not hide the statement: {command:?}"
+            );
+        }
+
+        // And a genuinely commented-out statement stays commented out.
+        for command in [
+            "/* TRUNCATE TABLE users; */ SELECT 1;",
+            "-- TRUNCATE TABLE users;",
+            "/* /* TRUNCATE TABLE users; */ */ SELECT 1;",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["database.postgresql"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                !result.is_denied(),
+                "a commented-out statement must not deny: {command:?}: {:?}",
                 result.pattern_info
             );
         }

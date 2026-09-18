@@ -8,6 +8,174 @@
 
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
+use std::borrow::Cow;
+
+/// Blank out *nested* PostgreSQL block comments so a statement behind one is
+/// still visible to the pack's patterns (#432).
+///
+/// **PostgreSQL block comments nest; MySQL's do not.** The shared
+/// `truncate-table` expression skips a comment with
+/// `/\*(?:[^*]|\*+[^*/])*\*+/`, which ends at the first `*/` — right for MySQL,
+/// wrong here, so `/* /* */ */ TRUNCATE TABLE users;` had its statement hidden
+/// behind what dcg read as the comment's tail. Verified against PostgreSQL 18:
+/// that command truncates.
+///
+/// Arbitrary nesting is not a regular language, so this is a scanner rather
+/// than a wider regex. Four rules keep it from becoming a false-negative
+/// machine of its own, which the first draft was:
+///
+/// * **Only nested comments are blanked.** A comment that never reaches depth
+///   two is left alone, because the pattern's own skip group already handles
+///   it. Everything that used to match still matches byte for byte.
+/// * **Only closed comments are blanked.** An unterminated `/*` is left alone
+///   rather than swallowing the rest of the input. PostgreSQL rejects it as a
+///   syntax error, so nothing runs either way — but this text is a *shell*
+///   command line, where `/*` is also a glob, and blanking to the end of
+///   `rm -rf /*/*; dropdb mydb` would hide the `dropdb` from this pack.
+/// * **`--` is not treated as a comment at all.** In the shell text these
+///   patterns run against, `--` is the end-of-options separator:
+///   `ssh host -- dropdb mydb` is a real denial, and blanking from `--` to the
+///   end of the line withdrew it. A leading `-- …` SQL comment needs no help,
+///   because the expression already anchors on `\r?\n` before the statement.
+/// * **Strings are not comments.** `'…'` (with `''` escapes), `"…"` and
+///   `$tag$…$tag$` bodies are copied through untouched, so a literal
+///   containing `/*` neither starts a comment nor gets blanked.
+///
+/// The mask is **length preserving**: every blanked byte becomes a space and
+/// every newline is kept, so byte offsets in the masked view are byte offsets
+/// in the original, spans still map back, and the `\r?\n`-anchored
+/// alternatives still see their line structure.
+pub(crate) fn mask_comments(sql: &str) -> Cow<'_, str> {
+    if !sql.contains("/*") {
+        return Cow::Borrowed(sql);
+    }
+
+    let bytes = sql.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+
+        match byte {
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                let (end, max_depth, closed) = block_comment_extent(bytes, index);
+                if closed && max_depth >= 2 {
+                    for &inner in &bytes[index..end] {
+                        out.push(if inner == b'\n' || inner == b'\r' {
+                            inner
+                        } else {
+                            b' '
+                        });
+                    }
+                } else {
+                    out.extend_from_slice(&bytes[index..end]);
+                }
+                index = end;
+            }
+            b'\'' | b'"' => {
+                let quote = byte;
+                out.push(byte);
+                index += 1;
+                while index < bytes.len() {
+                    out.push(bytes[index]);
+                    if bytes[index] == quote {
+                        // A doubled quote is an escaped quote, not the end.
+                        if bytes.get(index + 1) == Some(&quote) {
+                            out.push(quote);
+                            index += 2;
+                            continue;
+                        }
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'$' => {
+                if let Some(tag_end) = dollar_quote_tag_end(bytes, index) {
+                    let tag = &bytes[index..=tag_end];
+                    out.extend_from_slice(tag);
+                    index = tag_end + 1;
+                    // Copy the body through to the closing tag, or to the end
+                    // of input when it is never closed.
+                    let closing = find_subslice(&bytes[index..], tag).map(|at| index + at);
+                    let stop = closing.map_or(bytes.len(), |at| at + tag.len());
+                    out.extend_from_slice(&bytes[index..stop]);
+                    index = stop;
+                } else {
+                    out.push(byte);
+                    index += 1;
+                }
+            }
+            _ => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    debug_assert_eq!(out.len(), bytes.len(), "masking must preserve byte offsets");
+    match String::from_utf8(out) {
+        Ok(masked) if masked != sql => Cow::Owned(masked),
+        // Masking only ever replaces ASCII bytes with ASCII spaces, so a
+        // decode failure is impossible; fail open rather than panic if that
+        // reasoning ever stops holding.
+        _ => Cow::Borrowed(sql),
+    }
+}
+
+/// Walk a block comment starting at `start` (which must be `/*`).
+///
+/// Returns the byte index just past the comment, the deepest nesting it
+/// reached, and whether it closed. A comment that does not close reports the
+/// end of input, so the caller can leave it untouched.
+fn block_comment_extent(bytes: &[u8], start: usize) -> (usize, usize, bool) {
+    let mut index = start + 2;
+    let mut depth = 1usize;
+    let mut max_depth = 1usize;
+    while index < bytes.len() {
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            depth += 1;
+            max_depth = max_depth.max(depth);
+            index += 2;
+            continue;
+        }
+        if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+            depth -= 1;
+            index += 2;
+            if depth == 0 {
+                return (index, max_depth, true);
+            }
+            continue;
+        }
+        index += 1;
+    }
+    (bytes.len(), max_depth, false)
+}
+
+/// The index of the final `$` of a dollar-quote tag starting at `start`, if the
+/// bytes there are one. Tags are `$$` or `$name$` with an identifier body.
+fn dollar_quote_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'$' => return Some(index),
+            b'_' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' => index += 1,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
 
 // ============================================================================
 // Suggestion constants (must be 'static for the pattern struct)
@@ -496,5 +664,118 @@ mod tests {
         // Real dropdb still blocks.
         assert_blocks(&pack, "dropdb mydb", "dropdb");
         assert_blocks(&pack, "/usr/bin/dropdb mydb", "dropdb");
+    }
+    /// #432: PostgreSQL block comments nest, so a comment-skipping expression
+    /// that ends at the first `*/` hides the statement behind it. Verified on a
+    /// live PostgreSQL 18 instance by the reporter: the first command below
+    /// truncates a seeded table.
+    ///
+    /// The masking is applied by the evaluator, which is where the decision is
+    /// made, so the verdicts are asserted there
+    /// (`evaluator::tests::nested_sql_comments_do_not_hide_the_statement_issue_432`).
+    /// What this test pins is that the statement survives masking at all — the
+    /// pack's own patterns match a *masked* view, and if the mask ate the
+    /// statement no rule could fire.
+    #[test]
+    fn nested_block_comments_leave_the_following_statement_visible() {
+        let pack = create_pack();
+        for command in [
+            "/* /* */ */ TRUNCATE TABLE users;",
+            "/* /* /* */ */ */ TRUNCATE TABLE users;",
+            "/* x */ TRUNCATE TABLE users;",
+            "/*/* nested without spaces */*/ TRUNCATE TABLE users;",
+            "-- a line comment\nTRUNCATE TABLE users;",
+            "/* multi\n   line\n   /* nested */ */\nTRUNCATE TABLE users;",
+        ] {
+            let masked = mask_comments(command);
+            assert!(
+                masked.contains("TRUNCATE TABLE users;"),
+                "masking must not eat the statement: {command:?} -> {masked:?}"
+            );
+            assert_blocks(&pack, masked.as_ref(), "TRUNCATE");
+        }
+    }
+
+    /// Everything the mask must leave exactly as it found it. The first draft
+    /// of this masker blanked `--` to end of line and swallowed unterminated
+    /// comments, and both withdrew real denials from shell text — `--` is the
+    /// end-of-options separator (`ssh host -- dropdb mydb`) and `/*` is a glob.
+    #[test]
+    fn comment_masking_only_touches_nested_closed_comments() {
+        for unchanged in [
+            "SELECT 1;",
+            // Not nested: the pattern's own skip group already handles it, so
+            // masking here could only change behaviour that already works.
+            "/* plain */ TRUNCATE TABLE users;",
+            // `--` is shell syntax here, not a SQL comment.
+            "ssh example-host -- dropdb mydb",
+            "-- drop it\nTRUNCATE TABLE users;",
+            // Unterminated: left alone rather than blanked to the end, because
+            // `/*` is also a shell glob.
+            "/* unterminated TRUNCATE TABLE users;",
+            "rm -rf /*/*; dropdb mydb",
+            // Strings and dollar-quoted bodies are data.
+            "SELECT '/* /* */ */ not a comment';",
+            "SELECT 'it''s /* /* */ */ fine';",
+            "SELECT $$ /* /* */ */ body $$; TRUNCATE TABLE users;",
+            "SELECT $tag$ /* /* */ */ body $tag$;",
+            "SELECT $1 FROM t;",
+        ] {
+            assert_eq!(
+                mask_comments(unchanged),
+                unchanged,
+                "must be left unchanged: {unchanged:?}"
+            );
+        }
+
+        // A nested, closed comment is blanked, and only it.
+        assert_eq!(
+            mask_comments("/* /* */ */ TRUNCATE TABLE users;"),
+            "            TRUNCATE TABLE users;"
+        );
+        let source = "SELECT 1; /*/* c */*/ TRUNCATE TABLE users;";
+        let masked = mask_comments(source);
+        assert_eq!(masked.len(), source.len());
+        assert!(masked.starts_with("SELECT 1; "), "{masked:?}");
+        assert!(masked.ends_with(" TRUNCATE TABLE users;"), "{masked:?}");
+        assert!(
+            !masked.contains('*'),
+            "the comment must be gone: {masked:?}"
+        );
+
+        // Length and line structure are preserved, so spans and the
+        // `\r?\n`-anchored alternatives keep working.
+        for source in [
+            "/* /* */ */ TRUNCATE TABLE users;",
+            "/* multi\n   /* nested */ */\nTRUNCATE TABLE users;",
+        ] {
+            let masked = mask_comments(source);
+            assert_eq!(
+                masked.len(),
+                source.len(),
+                "masking must preserve byte offsets: {source:?} -> {masked:?}"
+            );
+            assert_eq!(
+                masked.lines().count(),
+                source.lines().count(),
+                "newlines must survive: {source:?} -> {masked:?}"
+            );
+        }
+    }
+
+    /// An unterminated block comment is left alone: PostgreSQL rejects it as a
+    /// syntax error so nothing runs, and blanking it would hide later commands
+    /// in the same shell line from this pack.
+    #[test]
+    fn an_unterminated_comment_is_left_alone() {
+        let pack = create_pack();
+        assert_eq!(
+            mask_comments("/* TRUNCATE TABLE users;"),
+            "/* TRUNCATE TABLE users;"
+        );
+        assert_no_match(&pack, "/* TRUNCATE TABLE users;");
+        // And a later statement on the same line is still reachable.
+        let masked = mask_comments("rm -rf /*/*; dropdb mydb");
+        assert!(masked.contains("dropdb mydb"), "{masked:?}");
     }
 }
