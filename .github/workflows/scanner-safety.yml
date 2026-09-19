@@ -10,6 +10,7 @@ on:
       - .cargo/config.toml
       - .github/workflows/scanner-safety.yml
       - scripts/check_scanner_safety.py
+      - scripts/test_check_scanner_safety.py
       - scripts/scanner_brace_probe.c
       - src/ast_matcher.rs
       - src/heredoc.rs
@@ -40,6 +41,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Verify the scanner gate rejects detected defects
+        run: python3 -m unittest discover -s scripts -p test_check_scanner_safety.py -v
       - name: Test the vendored scanner across all Unicode scalars
         run: python3 scripts/check_scanner_safety.py prepare
       - name: Activate the repository-pinned Rust toolchain

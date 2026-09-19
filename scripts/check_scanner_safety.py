@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Reproduce #442 against the real C scanner and validate the narrow repair.
 
-prepare: fetch the checksum-pinned release, prove the ctype-domain violation,
-         and apply the reviewed patches in this checkout (never a Cargo cache).
+prepare: validate the checked-in scanner (bootstrap the pinned copy if absent).
 repeat:  run the complete --lib gate repeatedly; retain every failure and log.
 publish-tree: stage ONLY the candidate Git objects, never update any Git ref.
 
@@ -32,17 +31,23 @@ VERSION = "0.25.1"
 CHECKSUM = "9e5ec769279cc91b561d3df0d8a5deb26b0ad40d183127f409494d6d8fc53062"
 VENDOR = ROOT / "vendor" / "tree-sitter-bash"
 PATCHES = ROOT / "vendor" / "patches"
+SANITIZER_FLAGS = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+                   "-fno-omit-frame-pointer"]
+# Do not let inherited recovery/exitcode/suppression options turn a diagnostic
+# into a successful gate. These overrides apply only to the native child.
+SANITIZER_ENV = {"ASAN_OPTIONS": "halt_on_error=1:exitcode=1",
+                 "UBSAN_OPTIONS": "halt_on_error=1:exitcode=1:print_stacktrace=1"}
 
 
 def run(command: list[str], log_name: str, expected: int | None = 0,
-        timeout: int = 300) -> int:
+        timeout: int = 300, *, env: dict[str, str] | None = None) -> int:
     RESULTS.mkdir(parents=True, exist_ok=True)
     log = RESULTS / log_name
     print("+", " ".join(command), flush=True)
     with log.open("wb") as output:
         try:
             process = subprocess.Popen(command, cwd=ROOT, stdout=output,
-                                       stderr=subprocess.STDOUT,
+                                       stderr=subprocess.STDOUT, env=env,
                                        start_new_session=os.name == "posix")
             status = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -67,7 +72,10 @@ def native(source: Path, name: str, flags: list[str], expected: int | None = 0) 
     run([os.environ.get("CC", "cc"), "-std=c11", "-O1", "-g", *flags,
          "-I", str(source / "src"), str(ROOT / "scripts/scanner_brace_probe.c"),
          "-o", str(binary)], name + "-build.log")
-    return run([str(binary)], name + ".log", expected)
+    environment = None
+    if any(flag.startswith("-fsanitize=") for flag in flags):
+        environment = {**os.environ, **SANITIZER_ENV}
+    return run([str(binary)], name + ".log", expected, env=environment)
 
 
 def prepare() -> None:
@@ -113,11 +121,13 @@ def prepare() -> None:
                 arguments.append(f"--directory={directory}")
             run([*arguments, "--check", str(patch)], patch.stem + "-check.log")
             run([*arguments, str(patch)], patch.stem + "-apply.log")
+    # Always check the ctype precondition, including on the normal vendored
+    # path. A mapped libc table overread need not fault or trip ASAN/UBSAN.
+    native(VENDOR, "patched-domain", ["-DCHECK_CTYPE_DOMAIN"])
     native(VENDOR, "patched-native", [])
-    native(VENDOR, "patched-sanitized", ["-fsanitize=address,undefined",
-                                        "-fno-omit-frame-pointer"])
-    print((RESULTS / "patched-native.log").read_text(), flush=True)
-    print((RESULTS / "patched-sanitized.log").read_text(), flush=True)
+    native(VENDOR, "patched-sanitized", SANITIZER_FLAGS)
+    for name in ["patched-domain", "patched-native", "patched-sanitized"]:
+        print((RESULTS / f"{name}.log").read_text(), flush=True)
 
 
 def repeat(runs: int) -> None:
