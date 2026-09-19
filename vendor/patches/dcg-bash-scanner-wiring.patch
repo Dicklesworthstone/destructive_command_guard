@@ -1,0 +1,39 @@
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -105,6 +105,11 @@ tru = "0.2.2"
+ # stack and the regex renderer below already has a purpose-built highlighter.
+ rich_rust = { version = "0.2.2", features = ["markdown"], optional = true }
+ 
++[patch.crates-io]
++# #442: the upstream scanner passes Unicode code points to byte-only isdigit.
++# Keep the grammar unchanged; vendor only the two ASCII digit-loop fixes.
++tree-sitter-bash = { path = "vendor/tree-sitter-bash" }
++
+ [build-dependencies]
+ vergen-gix = { version = "10.0.0-beta.8", features = ["build", "cargo", "rustc"] }
+ # Windows PE metadata (#303): a VERSIONINFO resource (product/company/
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4879,8 +4879,6 @@ dependencies = [
+ [[package]]
+ name = "tree-sitter-bash"
+ version = "0.25.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "9e5ec769279cc91b561d3df0d8a5deb26b0ad40d183127f409494d6d8fc53062"
+ dependencies = [
+  "cc",
+  "tree-sitter-language",
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -96,5 +96,8 @@ pub mod trace;
+ pub mod update;
+ 
++#[cfg(test)]
++mod scanner_regression_tests;
++
+ // Re-export commonly used types
+ pub use allowlist::{
+     AllowEntry, AllowSelector, AllowlistError, AllowlistFile, AllowlistLayer, LayeredAllowlist,

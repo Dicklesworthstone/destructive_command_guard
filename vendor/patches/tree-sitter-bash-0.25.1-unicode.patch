@@ -1,0 +1,23 @@
+diff --git a/src/scanner.c b/src/scanner.c
+--- a/src/scanner.c
++++ b/src/scanner.c
+@@ -1155,7 +1155,9 @@ brace_start:
+         advance(lexer);
+         lexer->mark_end(lexer);
+ 
+-        while (isdigit(lexer->lookahead)) {
++        // TSLexer lookahead is a Unicode code point, not an unsigned char.
++        // Passing it to libc isdigit can read outside its classification table.
++        while (lexer->lookahead >= '0' && lexer->lookahead <= '9') {
+             advance(lexer);
+         }
+ 
+@@ -1169,7 +1171,7 @@ brace_start:
+         }
+         advance(lexer);
+ 
+-        while (isdigit(lexer->lookahead)) {
++        while (lexer->lookahead >= '0' && lexer->lookahead <= '9') {
+             advance(lexer);
+         }
+ 

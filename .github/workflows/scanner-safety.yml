@@ -1,0 +1,71 @@
+name: Bash scanner safety
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/scanner-safety.yml
+      - scripts/check_scanner_safety.py
+      - scripts/scanner_brace_probe.c
+      - src/scanner_regression_tests.rs
+      - vendor/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scanner-safety-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  scanner-safety:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # Bootstrap: upload candidate Git objects, NEVER move a ref. This grant
+    # can be removed once the checksum-pinned vendor repair is on main.
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 2
+      RCH_ENABLED: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Reproduce the exact native bug and test the patched scanner
+        run: python3 scripts/check_scanner_safety.py prepare
+      - name: Activate the repository-pinned Rust toolchain
+        run: rustup show
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Compile and run the actual ast-grep regressions
+        id: focused
+        run: cargo test --locked --lib scanner_regression_tests
+      - name: Stage candidate objects without updating any branch
+        if: steps.focused.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! git ls-files --error-unmatch vendor/tree-sitter-bash/src/scanner.c >/dev/null 2>&1; then
+            python3 scripts/check_scanner_safety.py publish-tree
+          fi
+      - name: Repeated complete lib gate, without retries or test skips
+        if: steps.focused.outcome == 'success'
+        run: python3 scripts/check_scanner_safety.py repeat --runs 12
+      - name: Check all targets
+        if: steps.focused.outcome == 'success'
+        run: cargo check --locked --all-targets
+      - name: Clippy all targets
+        if: steps.focused.outcome == 'success'
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Retain every native and lib-run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanner-safety-${{ github.sha }}
+          path: |
+            target/scanner-safety/*.log
+            target/scanner-safety/*.json
+          if-no-files-found: error
