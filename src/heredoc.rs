@@ -6343,15 +6343,39 @@ mod tests {
     mod ssh_remote_payload_extraction {
         use super::*;
 
+        /// Extraction limits with only the wall clock relaxed.
+        ///
+        /// These cases assert *which* payloads ssh's option grammar yields, never
+        /// how fast the host is, but `ExtractionLimits::default()` also carries
+        /// `timeout_ms: 50`. Measured on a 128-core host at load 91, the inline
+        /// `heredoc` tests failed 2 of 8 runs here. The size and slot caps keep
+        /// their shipped values, so nothing about the grammar under test moves.
+        fn ssh_limits() -> ExtractionLimits {
+            ExtractionLimits {
+                timeout_ms: 5_000,
+                ..ExtractionLimits::default()
+            }
+        }
+
         fn ssh_payloads(command: &str) -> Vec<String> {
-            let result = extract_content(command, &ExtractionLimits::default());
-            match result {
+            // Only a completed extraction is an answer. Collapsing everything else
+            // into an empty vector let the wall clock decide these tests twice
+            // over: the positive assertions flaked, and the negative ones passed
+            // for the wrong reason, because
+            // `unmodeled_options_bail_without_extraction` cannot tell "ssh refused
+            // the option" from "extraction ran out of time" when both yield no
+            // payloads. `NoContent`/`Skipped` stay empty since they are real
+            // outcomes for these inputs; an incomplete read is now loud instead.
+            match extract_content(command, &ssh_limits()) {
                 ExtractionResult::Extracted(contents) => contents
                     .into_iter()
                     .filter(|content| content.target_command.as_deref() == Some("ssh"))
                     .map(|content| content.content)
                     .collect(),
-                _ => Vec::new(),
+                ExtractionResult::NoContent | ExtractionResult::Skipped(_) => Vec::new(),
+                incomplete @ (ExtractionResult::Partial { .. } | ExtractionResult::Failed(_)) => {
+                    panic!("extraction did not complete for {command:?}: {incomplete:?}")
+                }
             }
         }
 
