@@ -389,6 +389,41 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Known open
 
+- **A credential file named relatively is writable, for every target the rule
+  protects (#407).** `echo x > $HOME/.ssh/id_rsa` denies as
+  `core.filesystem:credential-file-write`; `echo x > .ssh/id_rsa` with the working
+  directory at `$HOME` does not. Uniform across all ten protected targets —
+  `.ssh/id_rsa`, `.ssh/id_ed25519`, `.ssh/authorized_keys`, `.aws/credentials`,
+  `.netrc`, `.npmrc`, `.bashrc`, `.profile`, `.config/gh/hosts.yml`,
+  `.gnupg/trustdb.gpg`. The intended allowances are unaffected: appending
+  (`ssh-keyscan h >> .ssh/known_hosts`) and reading are allowed in both spellings,
+  as designed.
+
+  It is reachable from where an agent actually sits. From `$HOME/projects/app`, all
+  of `../../.ssh/id_rsa`, `./../../.ssh/id_rsa`, `../app/../../.ssh/id_rsa`,
+  `cd ~ && … .ssh/id_rsa`, `cd $HOME && …` and `pushd ~ && …` name the real key and
+  are allowed, while `$HOME/…` and `~/…` deny. A genuinely local
+  `echo x > .ssh/id_rsa` from a project directory stays allowed, correctly, since it
+  is a different file.
+
+  Scope, from auditing all fifteen root/home rules: **eleven already resolve a
+  relative operand** — `rm -rf projects`, `rm *`, `unlink .bashrc`,
+  `truncate -s 0 .bashrc`, `shred -u .ssh/id_rsa`, `dd of=.bashrc`,
+  `find . -delete`, `tar --remove-files docs` all deny — so the irreversible-delete
+  family is not affected. The gap is four rules, and they share a shape: rules
+  gating on a *path operand* resolve it, rules gating on a *redirect target* or a
+  *move/copy source* do not (`redirect-truncate-root-home`,
+  `credential-file-write`, `mv-sensitive-source-root-home`,
+  `cp-sensitive-then-delete`).
+
+  `rebase_recovery::resolve_effective_cwd` (#387) already answers which directory a
+  command runs in, applying leading static `cd`/`pushd` and failing closed when the
+  answer is not statically knowable, and it is already computed for every command
+  as the allowlist scope. What is missing is only that it feeds allowlist scoping
+  and not operand resolution, which would be a new step in matching rather than a
+  pattern change. The `cd ~ && …` spellings need no resolution at all — the command
+  states its own directory — so they are separable from the bare-relative form.
+
 - **A `core.git` safe pattern can still match starting at a later argv token**
   (#429), so `git clean -fdx -- . clean -n` is allowed and real git removes every
   untracked and ignored file under `.`. A grammar-accurate executable prefix
