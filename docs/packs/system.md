@@ -80,6 +80,8 @@ These patterns match safe commands that are always allowed:
 | `lvm-list` | `\b(?:lvs\|vgs\|pvs)\b` |
 | `lvm-display` | `\b(?:lvdisplay\|vgdisplay\|pvdisplay)\b` |
 | `lvm-scan` | `\b(?:lvscan\|vgscan\|pvscan)\b` |
+| `device-write-pseudo-tee` | `\b(?:tee\|sponge)\b(?:\s+-{1,2}\S+)*\s+['"]?/dev/(?:null\|zero\|full\|random\|urandom\|std(?:in\|out\|err)\|tty\|console\|ptmx\|fd/\|pts/\|shm/)\S*['"]?\s*(?:$\|[\|>])` |
+| `device-write-pseudo-copy` | `\b(?:cp\|mv\|install)\b[^\|;&]*\s['"]?/dev/(?:null\|zero\|full\|random\|urandom\|std(?:in\|out\|err)\|tty\|console\|ptmx\|fd/\|pts/\|shm/)\S*['"]?\s*$` |
 
 ### Destructive Patterns (Blocked)
 
@@ -87,6 +89,8 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `tee-device` | tee/sponge into a device will OVERWRITE that device, exactly as dd would. Extremely dangerous! | high |
+| `copy-to-device` | Copying or moving onto a device OVERWRITES that device, exactly as dd would. Extremely dangerous! | high |
 | `dd-device` | dd to a block device will OVERWRITE all data on that device. Extremely dangerous! | high |
 | `dd-wipe` | dd from /dev/zero or /dev/urandom to a device will WIPE all data! | high |
 | `fdisk-edit` | fdisk can modify partition tables and cause data loss. | high |
