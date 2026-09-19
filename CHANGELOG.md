@@ -192,6 +192,42 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   `PATH`. OpenCode is not covered by `scripts/e2e_harness_matrix.sh`, so this is
   currently the only execution-level coverage of that bridge.
 
+- **Swept the rest of the suite for tests that assert host speed, and found two
+  more — where a timeout also made the negative assertions pass for the wrong
+  reason.** After the third instance of this class (#433, #443, #446), auditing
+  one file at a time stopped being sensible. Every test touching
+  `ExtractionLimits::default()`, `HOOK_EVALUATION_BUDGET_MS`, `AST_TIMEOUT_MS` or
+  a fixed `Duration` deadline was classified, then the candidates were run
+  repeatedly under load rather than edited on suspicion.
+
+  Most turned out to be fine, and two categories deserve credit rather than
+  changes: the deliberate timing tests (`locked_history_database_never_delays_writer_drop_past_hook_budget`,
+  the deny-latency gate) and the places that already relax explicitly
+  (`repro_windows_exe` and `repro_252` set 5000ms, `codex_hook_protocol` uses
+  `DCG_AST_TIMEOUT_MS`, `common/history.rs` retries inside a 30s window).
+  `tests/repro_heredoc_indent.rs` looked like a match on paper — three content
+  assertions on the default 50ms budget — but survived 8/8 runs at load 91, so it
+  was left alone.
+
+  The real finding was `heredoc::tests::ssh_remote_payload_extraction`: **2 of 8
+  runs failed at load 91**, in `double_dash_ends_option_parsing` and
+  `multi_word_payload_keeps_raw_per_word_quoting`. Its helper collapsed every
+  non-`Extracted` result into an empty vector, so the wall clock decided these
+  tests twice over — the positive assertions flaked, and the negative ones passed
+  for the wrong reason, because `unmodeled_options_bail_without_extraction` could
+  not distinguish "ssh refused the unknown option" from "extraction ran out of
+  time" when both yield no payloads. The helper now relaxes only the clock and
+  panics on an incomplete read instead of reporting it as "nothing found".
+
+  A broader fix was tried and rejected: giving `ExtractionLimits::default()` a
+  `#[cfg(test)]` timeout, mirroring `AST_TIMEOUT_MS`, would have covered all ~50
+  inline call sites at once. But it breaks
+  `structural_scan_limits_relax_only_the_wall_clock_443`, which asserts
+  `structural.timeout_ms > default.timeout_ms`, and more importantly it makes the
+  shipped relationship unobservable from any test — relaxing a public API value is
+  not equivalent to relaxing a private constant. The narrow, test-local relaxation
+  keeps that invariant checkable.
+
 - **The #427 extraction-budget tests asserted host speed, not the budget they
   were written for.** `an_untruncated_extraction_is_still_reported_as_complete`
   and `a_truncated_extraction_reports_itself_as_partial` both ran through
