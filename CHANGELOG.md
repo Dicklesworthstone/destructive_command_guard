@@ -217,7 +217,17 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   for the wrong reason, because `unmodeled_options_bail_without_extraction` could
   not distinguish "ssh refused the unknown option" from "extraction ran out of
   time" when both yield no payloads. The helper now relaxes only the clock and
-  panics on an incomplete read instead of reporting it as "nothing found".
+  panics on an incomplete read instead of reporting it as "nothing found". After
+  the fix: **8 of 8 clean runs at load 102.9**, above the load that produced the
+  failures.
+
+  One note on how that was measured, since it bears on trusting the numbers. The
+  first sweep harness later reported 10 of 10 failures for a target that passed
+  273/273 when run directly — its exit-status accounting was unreliable, so the
+  post-fix figure above comes from a simpler harness that prints each run's exit
+  code and summary line. The original 2-of-8 result stands because that harness
+  also printed the two failing test names, which it could only have parsed out of
+  a real `failures:` block; a miscounted exit status cannot invent them.
 
   A broader fix was tried and rejected: giving `ExtractionLimits::default()` a
   `#[cfg(test)]` timeout, mirroring `AST_TIMEOUT_MS`, would have covered all ~50
