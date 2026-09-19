@@ -16385,7 +16385,14 @@ fn static_producer_source(command: &str) -> IndirectInputSource {
 }
 
 fn literal_heredoc_producer_source(command: &str) -> Option<IndirectInputSource> {
-    let extracted = match extract_content(command, &crate::heredoc::ExtractionLimits::default()) {
+    // Structural budget, not the 50 ms hot-path one: a timeout here is
+    // returned as `Unverified`, so whether this command counts as a literal
+    // heredoc producer would otherwise depend on how busy the machine is
+    // (#443). The size caps still bound the work.
+    let extracted = match extract_content(
+        command,
+        &crate::heredoc::ExtractionLimits::structural_scan(),
+    ) {
         ExtractionResult::Extracted(contents) => contents,
         ExtractionResult::Partial { .. }
         | ExtractionResult::Skipped(_)
@@ -23869,9 +23876,13 @@ fn shell_inline_payload_offset_is_quoted_data(command: &str, offset: usize) -> O
     if crate::heredoc::check_triggers(command) == crate::heredoc::TriggerResult::NoTrigger {
         return None;
     }
-    let crate::heredoc::ExtractionResult::Extracted(contents) =
-        crate::heredoc::extract_content(command, &crate::heredoc::ExtractionLimits::default())
-    else {
+    // Structural budget (#443): a timeout answers `None` here, which reads as
+    // "this offset is not quoted data" and keeps the deny — a classification
+    // that must follow the command, not the machine's load.
+    let crate::heredoc::ExtractionResult::Extracted(contents) = crate::heredoc::extract_content(
+        command,
+        &crate::heredoc::ExtractionLimits::structural_scan(),
+    ) else {
         return None;
     };
     for content in &contents {
@@ -24012,9 +24023,12 @@ fn inline_payload_offset_is_quoted_redirect_data(
     if crate::heredoc::check_triggers(command) == crate::heredoc::TriggerResult::NoTrigger {
         return false;
     }
-    let crate::heredoc::ExtractionResult::Extracted(contents) =
-        crate::heredoc::extract_content(command, &crate::heredoc::ExtractionLimits::default())
-    else {
+    // Structural budget (#443): a timeout answers `false`, which keeps the
+    // deny — the same load-dependent classification.
+    let crate::heredoc::ExtractionResult::Extracted(contents) = crate::heredoc::extract_content(
+        command,
+        &crate::heredoc::ExtractionLimits::structural_scan(),
+    ) else {
         return false;
     };
     for content in &contents {
@@ -24058,9 +24072,12 @@ fn range_intersects_conservatively_scanned_interpreter_input(
         return false;
     }
 
-    let crate::heredoc::ExtractionResult::Extracted(contents) =
-        crate::heredoc::extract_content(command, &crate::heredoc::ExtractionLimits::default())
-    else {
+    // Structural budget (#443): a timeout answers `false`, which decides that
+    // the range does not intersect conservatively scanned interpreter input.
+    let crate::heredoc::ExtractionResult::Extracted(contents) = crate::heredoc::extract_content(
+        command,
+        &crate::heredoc::ExtractionLimits::structural_scan(),
+    ) else {
         return false;
     };
 

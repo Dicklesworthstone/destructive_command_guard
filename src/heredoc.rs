@@ -543,9 +543,16 @@ impl Default for ExtractionLimits {
 }
 
 impl ExtractionLimits {
-    /// Limits for the two helpers that answer a *structural* question — which
+    /// Limits for the helpers that answer a *structural* question — which
     /// heredoc bodies exist, and where one body begins and ends — rather than
     /// doing hot-path extraction work.
+    ///
+    /// `pub(crate)` for the four evaluator classification helpers that ask the
+    /// same kind of question: is this a literal heredoc producer, is this
+    /// offset inside a quoted body, does this range intersect interpreter
+    /// input. Each turns a non-`Extracted` result straight into a
+    /// classification — `Unverified`, `None`, `false` — so the wall clock
+    /// decided the answer there too (#443).
     ///
     /// Same size caps as [`Self::default`], because those are what actually bound
     /// the work: the caller has already limited the input to 256 KiB, and a body
@@ -560,7 +567,7 @@ impl ExtractionLimits {
     /// The budget is kept rather than removed so a pathological input still
     /// terminates; it is sized so that only descheduling, never ordinary work,
     /// could reach it.
-    fn structural_scan() -> Self {
+    pub(crate) fn structural_scan() -> Self {
         Self {
             timeout_ms: 5_000,
             ..Self::default()
@@ -7065,6 +7072,50 @@ mod tests {
                 structural.timeout_ms > 0,
                 "the budget stays finite so a pathological input terminates"
             );
+        }
+
+        /// Every *classification* helper has to use the structural budget.
+        ///
+        /// The six sites of #443 turn a non-`Extracted` result straight into
+        /// an answer — `Unverified`, `None`, `false`, "no content" — so with
+        /// the 50 ms hot-path budget the verdict followed the machine's load
+        /// rather than the command. The two here were fixed first; the four in
+        /// the evaluator ask the same kind of question (is this a literal
+        /// heredoc producer, is this offset inside a quoted body, does this
+        /// range intersect interpreter input) and were audited afterwards.
+        ///
+        /// A source check rather than a timing one on purpose: reproducing the
+        /// expiry needs a loaded host, which is the nondeterminism being
+        /// removed. `src/perf.rs` guards its own invariants the same way.
+        #[test]
+        fn classification_helpers_use_the_structural_budget_443() {
+            for (file, source) in [
+                ("src/heredoc.rs", include_str!("heredoc.rs")),
+                ("src/evaluator.rs", include_str!("evaluator.rs")),
+            ] {
+                let production = source
+                    .split("\nmod tests {")
+                    .next()
+                    .expect("split always yields a first element");
+                // Doc comments may name the default profile in an example; a
+                // call site is what matters.
+                let offenders: Vec<_> = production
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| {
+                        let code = line.trim_start();
+                        !code.starts_with("//") && code.contains("ExtractionLimits::default()")
+                    })
+                    .map(|(index, line)| format!("{}: {}", index + 1, line.trim()))
+                    .collect();
+                assert!(
+                    offenders.is_empty(),
+                    "{file}: a classification helper outside tests still takes the 50 ms \
+                     hot-path budget, so its answer depends on how busy the machine is \
+                     (#443):\n  {}",
+                    offenders.join("\n  ")
+                );
+            }
         }
 
         #[test]
