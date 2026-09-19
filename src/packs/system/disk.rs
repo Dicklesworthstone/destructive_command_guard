@@ -1013,6 +1013,63 @@ mod tests {
         }
     }
 
+    /// The exemption bypass #448 reported survived in two more patterns.
+    ///
+    /// `cab2851` anchored `lsblk`/`blkid`/`df` at the command position, but
+    /// `fdisk-list` (`fdisk\s+-l`, unanchored) and `mount-list` (`\bmount\s*$`,
+    /// anchored only at the end) still matched argument data — and a safe match
+    /// short-circuits every destructive rule in the pack. `/` is a word
+    /// boundary, so a redirect target whose last component is `mount` satisfied
+    /// `mount-list`.
+    ///
+    /// These are the shapes that would actually execute. An earlier pass of mine
+    /// used `dd … of=/dev/sda mount`, which exempts but also fails on the stray
+    /// operand, so it proved nothing.
+    #[test]
+    fn inert_data_naming_a_read_only_tool_does_not_disarm_the_pack_issue_448() {
+        let pack = create_pack();
+        for command in [
+            // `mount-list`: the redirect target's last component is `mount`.
+            "dd if=/dev/zero of=/dev/sda 2>>/var/log/mount",
+            "wipefs -a /dev/sdb 2>/tmp/mount",
+            // `fdisk-list`: the two tokens inside a quoted filename.
+            r#"mkfs.ext4 /dev/sdb1 2>>"/tmp/fdisk -l.log""#,
+        ] {
+            assert!(
+                !pack.matches_safe(command),
+                "{command:?} names a read-only tool only in inert data and must \
+                 not be exempted"
+            );
+            assert!(
+                pack.check(command).is_some(),
+                "{command:?} is destructive and must still be blocked"
+            );
+        }
+    }
+
+    /// Dropping those two exemptions must not block the read-only commands they
+    /// existed for. Neither is needed: `fdisk-edit` requires `/dev/` directly
+    /// after `fdisk` and also carries `(?!.*-l)`, and no rule here matches a
+    /// bare `mount` — `mount-bind-root` needs `--bind` with a root target and
+    /// `umount-force` needs the literal `umount`.
+    #[test]
+    fn read_only_fdisk_and_mount_stay_allowed_without_their_exemptions_issue_448() {
+        let pack = create_pack();
+        for command in [
+            "fdisk -l",
+            "fdisk -l /dev/sda",
+            "sudo fdisk -l",
+            "fdisk /dev/sda -l",
+            "mount",
+            "mount /dev/sdb1 /mnt",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command:?} is read-only or ordinary and must not be blocked"
+            );
+        }
+    }
+
     #[test]
     fn mkswap_check_is_not_read_only_issue_448() {
         // mkswap(8): "-c, --check: Check the device (if it is a block device)
