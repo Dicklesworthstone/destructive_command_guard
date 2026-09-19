@@ -50,11 +50,9 @@ These patterns match safe commands that are always allowed:
 | `dd-file-out` | `dd\s+.*of=['"]?[^/\s'"]+\.` |
 | `dd-discard` | `dd\s+.*of=['"]?/dev/(?:null\|zero\|full)['"]?(?:\s\|$)` |
 | `lsblk` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?lsblk\b` |
-| `fdisk-list` | `fdisk\s+-l` |
 | `parted-print` | `parted\b(?:\s+--?\S+)*\s+(?:['"]?/dev/\S+['"]?\s+)?print(?:\s+(?:devices\|free\|list\|all\|\d+))?\s*$` |
 | `blkid` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?blkid\b` |
 | `df` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?df\b` |
-| `mount-list` | `\bmount\s*$` |
 | `btrfs-subvolume-list` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+subvolume\s+list(?=\s\|$)` |
 | `btrfs-subvolume-show` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+subvolume\s+show(?=\s\|$)` |
 | `btrfs-filesystem-show` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+filesystem\s+show(?=\s\|$)` |
