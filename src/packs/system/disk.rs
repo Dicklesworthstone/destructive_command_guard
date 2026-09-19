@@ -121,41 +121,31 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // `mkswap --check /dev/sdb1` was allowed while `mkswap -c /dev/sdb1`,
         // which does exactly the same thing, was denied (#448). mkswap has no
         // read-only mode to carve out.
-        // --- mdadm safe patterns ---
+        // --- mdadm has no safe patterns, deliberately ---
         //
-        // Each of these required its read-only flag to follow `mdadm`
-        // immediately, which made the exemption depend on argument order rather
-        // than on what the command does. `mdadm --stop /dev/md0 --detail` was
-        // denied, but `mdadm --detail --stop /dev/md0` was allowed, and
-        // `mdadm --scan --zero-superblock /dev/sdb` — which destroys RAID
-        // metadata — was allowed too (#448).
+        // There were five: --detail, --examine, --query, -Q and --scan, each
+        // written as `mdadm\s+--detail\b`. Requiring the read-only flag to
+        // follow `mdadm` immediately made the exemption depend on argument
+        // order rather than on what the command does, so
+        // `mdadm --stop /dev/md0 --detail` was denied while
+        // `mdadm --detail --stop /dev/md0` was allowed, and
+        // `mdadm --scan --zero-superblock /dev/sdb` — which destroys the RAID
+        // metadata identifying array members — was allowed too (#448).
         //
-        // A read-only flag now only exempts a command that does not also carry
-        // a destructive mode. The negative lookahead mirrors `dns-dig-safe`'s
-        // `\bdig\b(?!.*(?i:\b(?:axfr|ixfr)\b))`, and its alternatives are the
-        // modes the destructive patterns below match: --stop/-S, --remove,
-        // --fail/-f, --zero-superblock, --create/-C and --grow.
-        safe_pattern!(
-            "mdadm-detail",
-            r"mdadm\b(?!.*\s(?:--(?:stop|remove|fail|zero-superblock|create|grow)|-[SfC])\b).*\s--detail\b"
-        ),
-        safe_pattern!(
-            "mdadm-examine",
-            r"mdadm\b(?!.*\s(?:--(?:stop|remove|fail|zero-superblock|create|grow)|-[SfC])\b).*\s--examine\b"
-        ),
-        safe_pattern!(
-            "mdadm-query",
-            r"mdadm\b(?!.*\s(?:--(?:stop|remove|fail|zero-superblock|create|grow)|-[SfC])\b).*\s--query\b"
-        ),
-        // Short form of --query.
-        safe_pattern!(
-            "mdadm-query-short",
-            r"mdadm\b(?!.*\s(?:--(?:stop|remove|fail|zero-superblock|create|grow)|-[SfC])\b).*\s-Q\b"
-        ),
-        safe_pattern!(
-            "mdadm-scan",
-            r"mdadm\b(?!.*\s(?:--(?:stop|remove|fail|zero-superblock|create|grow)|-[SfC])\b).*\s--scan\b"
-        ),
+        // The obvious repair is a negative lookahead excluding the destructive
+        // modes, and that works, but it is a list that has to be kept in step
+        // with the destructive patterns below: add a seventh mdadm rule without
+        // extending the list and the exemption silently covers it again. That
+        // is the same shape of latent defect this issue exists to remove.
+        //
+        // Deleting them costs nothing instead. Every destructive mdadm rule
+        // below requires an explicit mode — --stop/-S, --remove, --fail/-f,
+        // --zero-superblock, --create/-C, --grow — and a read-only invocation
+        // carries none of them, so `mdadm --detail /dev/md0` and friends are
+        // allowed by matching no destructive pattern rather than by matching a
+        // safe one. The exemptions only ever bought an early exit, and they are
+        // asserted still allowed in
+        // `mdadm_genuinely_read_only_invocations_stay_allowed_issue_448`.
         // --- btrfs safe patterns ---
         // btrfs subvolume list (read-only)
         safe_pattern!(

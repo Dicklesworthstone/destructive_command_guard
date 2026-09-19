@@ -55,11 +55,6 @@ These patterns match safe commands that are always allowed:
 | `blkid` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?blkid\b` |
 | `df` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?df\b` |
 | `mount-list` | `\bmount\s*$` |
-| `mdadm-detail` | `mdadm\b(?!.*\s(?:--(?:stop\|remove\|fail\|zero-superblock\|create\|grow)\|-[SfC])\b).*\s--detail\b` |
-| `mdadm-examine` | `mdadm\b(?!.*\s(?:--(?:stop\|remove\|fail\|zero-superblock\|create\|grow)\|-[SfC])\b).*\s--examine\b` |
-| `mdadm-query` | `mdadm\b(?!.*\s(?:--(?:stop\|remove\|fail\|zero-superblock\|create\|grow)\|-[SfC])\b).*\s--query\b` |
-| `mdadm-query-short` | `mdadm\b(?!.*\s(?:--(?:stop\|remove\|fail\|zero-superblock\|create\|grow)\|-[SfC])\b).*\s-Q\b` |
-| `mdadm-scan` | `mdadm\b(?!.*\s(?:--(?:stop\|remove\|fail\|zero-superblock\|create\|grow)\|-[SfC])\b).*\s--scan\b` |
 | `btrfs-subvolume-list` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+subvolume\s+list(?=\s\|$)` |
 | `btrfs-subvolume-show` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+subvolume\s+show(?=\s\|$)` |
 | `btrfs-filesystem-show` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+filesystem\s+show(?=\s\|$)` |
