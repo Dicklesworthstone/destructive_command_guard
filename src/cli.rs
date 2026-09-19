@@ -11070,6 +11070,13 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 OpencodePluginProbe::Current => {
                     println!("{}", "OK".green());
                     println!("  Found: {}", plugin_path.display());
+                    // The plugin carries both contracts, so the version is
+                    // reported rather than gating anything (#419).
+                    if let Some(major) = detected_opencode_major_version() {
+                        println!(
+                            "  OpenCode v{major} detected; the plugin exports both the v1 and v2 shapes"
+                        );
+                    }
                 }
                 OpencodePluginProbe::OwnedStale => {
                     println!("{}", "OUTDATED OR MODIFIED".red());
@@ -14050,10 +14057,6 @@ fn detected_opencode_major_version() -> Option<u64> {
     }
     parse_opencode_major_version(&String::from_utf8_lossy(&output.stdout))
         .or_else(|| parse_opencode_major_version(&String::from_utf8_lossy(&output.stderr)))
-}
-
-fn unsupported_opencode_major_version() -> Option<u64> {
-    detected_opencode_major_version().filter(|major| *major >= 2)
 }
 
 /// Fidelity of an installed OpenCode plugin against the canonical source
@@ -22649,6 +22652,70 @@ if ($errors.Count -ne 0) {
         assert_eq!(parse_opencode_major_version("opencode 2.0.4"), Some(2));
         assert_eq!(parse_opencode_major_version("OpenCode v12.7.1\n"), Some(12));
         assert_eq!(parse_opencode_major_version("version unknown"), None);
+    }
+
+    /// #419: the generated plugin must load under BOTH OpenCode plugin
+    /// contracts.
+    ///
+    /// v1 reads the named `DcgGuard` export and calls
+    /// `tool.execute.before(input, output)`; v2 requires a default export
+    /// `{ id, setup(ctx) }` and registers through
+    /// `ctx.tool.hook("execute.before", cb)`. A v1-only file fails v2's loader
+    /// with `SchemaError: Missing key at ["default"]` and the bash tool then
+    /// runs unguarded, with nothing visible outside OpenCode's log.
+    ///
+    /// Both shapes live in one file rather than being selected by a detected
+    /// version, because detection answers `None` whenever `opencode` is not on
+    /// PATH at install time, and `dcg update` regenerates this file long after
+    /// `dcg install` ran — so a version-selected template can be written for
+    /// the wrong major.
+    #[test]
+    fn opencode_plugin_source_exports_both_v1_and_v2_shapes_419() {
+        let source = build_opencode_plugin_source(std::path::Path::new("/opt/bin/dcg"))
+            .expect("plugin generation");
+
+        // v1 contract.
+        assert!(
+            source.contains("export const DcgGuard"),
+            "v1 loads the named DcgGuard export"
+        );
+        assert!(
+            source.contains("\"tool.execute.before\""),
+            "v1 registers a tool.execute.before hook map"
+        );
+
+        // v2 contract.
+        assert!(
+            source.contains("export default"),
+            "v2 requires a default export, absent one it reports \
+             SchemaError: Missing key at [\"default\"]"
+        );
+        assert!(
+            source.contains("id: \"dcg-guard\""),
+            "v2's default export must carry an id"
+        );
+        assert!(
+            source.contains("async setup(ctx)"),
+            "v2's default export must carry a setup function"
+        );
+        assert!(
+            source.contains("ctx.tool.hook(\"execute.before\""),
+            "v2 registers hooks through ctx.tool.hook"
+        );
+
+        // v2 migrated Bun -> Node, so `Bun` is undefined there. Bun implements
+        // the `node:` modules, so one spawn path serves both runtimes.
+        assert!(
+            source.contains("node:child_process"),
+            "the spawn path must work on both the Bun and Node runtimes"
+        );
+        // The call, not the mention: the generated file's own comment explains
+        // why `Bun.spawn` is not used, so a bare substring test flags its own
+        // documentation.
+        assert!(
+            !source.contains("Bun.spawn("),
+            "Bun.spawn is undefined under OpenCode v2's Node runtime"
+        );
     }
 
     /// #318: the generated OpenCode plugin embeds the absolute dcg path as a
