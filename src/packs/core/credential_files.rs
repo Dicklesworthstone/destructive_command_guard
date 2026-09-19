@@ -109,6 +109,7 @@ pub(crate) fn may_name_protected_path(command: &str) -> bool {
             .any(|prefix| command.contains(prefix))
         || RELATIVE_ANCHORS
             .iter()
+            .chain(RELATIVE_FILE_ANCHORS)
             .any(|anchor| command.contains(anchor))
 }
 
@@ -972,27 +973,60 @@ const RELATIVE_ANCHORS: &[&str] = &[
     ".zshrc.d",
 ];
 
-/// Byte index where the first literal [`RELATIVE_ANCHORS`] component of `word`
-/// begins, when the word is a relative path that passes through one.
+/// Login-shell startup files, anchored only when one *is* the whole relative
+/// path (`.bashrc`, `./.zshrc`).
 ///
-/// The anchor must be followed by a separator: the protected material lives
-/// inside the directory, and a plain file named `.ssh` is not it.
+/// Every one of these is executed by the next shell, so writing one is code
+/// execution — the same reason `.bashrc.d/` and `.zshrc.d/` are directory
+/// anchors above, and leaving the files out while anchoring their drop-in
+/// directories would have been arbitrary.
+///
+/// Only as the entire path: `> .bashrc` is what gets written while standing in
+/// a home directory, whereas `templates/.bashrc` is far more likely a skeleton
+/// being assembled. The credential dotfiles (`.npmrc`, `.netrc`, `.pypirc`)
+/// are deliberately NOT here — writing a project-local one is a routine CI
+/// idiom, and the rooted spelling still denies.
+const RELATIVE_FILE_ANCHORS: &[&str] = &[
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".profile",
+    ".zshrc",
+    ".zshenv",
+    ".zprofile",
+    ".zlogin",
+];
+
+/// Byte index where `word`'s anchor begins, when it is a relative path that
+/// reaches protected material.
+///
+/// A [`RELATIVE_ANCHORS`] directory anchors wherever it appears, but must be
+/// followed by a separator: the protected material lives inside it, and a
+/// plain file named `.ssh` is not it. A [`RELATIVE_FILE_ANCHORS`] file anchors
+/// only as the whole path, ignoring a leading `./`.
 fn relative_anchor_start(word: &Word) -> Option<usize> {
     let text = &word.text;
+    let literal = |range: std::ops::Range<usize>| word.literal[range].iter().all(|flag| *flag);
     let mut start = 0usize;
+    let mut only_dot_so_far = true;
     for index in 0..text.len() {
         if text[index] != '/' {
             continue;
         }
         let component: String = text[start..index].iter().collect();
-        if RELATIVE_ANCHORS.contains(&component.as_str())
-            && word.literal[start..index].iter().all(|literal| *literal)
-        {
+        if RELATIVE_ANCHORS.contains(&component.as_str()) && literal(start..index) {
             return Some(start);
         }
+        // `./x` is `x`; anything else means the file anchor below is not the
+        // whole path any more.
+        only_dot_so_far &= component.is_empty() || component == ".";
         start = index + 1;
     }
-    None
+    let last: String = text[start..].iter().collect();
+    (only_dot_so_far
+        && RELATIVE_FILE_ANCHORS.contains(&last.as_str())
+        && literal(start..text.len()))
+    .then_some(start)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1005,6 +1039,10 @@ struct Spelling {
     partial: Option<String>,
     /// `..` climbed above the root.
     escaped: bool,
+    /// The spelling was relative and reached its root through a
+    /// [`RELATIVE_ANCHORS`] or [`RELATIVE_FILE_ANCHORS`] component, so it has
+    /// no `~/` to display.
+    anchored_relative: bool,
 }
 
 /// Char offset just past the first `count` non-empty `/`-separated parts.
@@ -1054,6 +1092,7 @@ fn resolve(word: &Word) -> Option<Spelling> {
     let text = &word.text;
     let first = *text.first()?;
     let first_literal = word.literal[0];
+    let mut anchored_relative = false;
     let (root, mut comps, rest_start): (Root, Vec<String>, usize) =
         if first == '~' && !first_literal {
             // `~`, `~/…`, `~user/…` — all home directories.
@@ -1103,7 +1142,9 @@ fn resolve(word: &Word) -> Option<Spelling> {
             // decision the absolute ones already make — including the `*.pub`
             // and `known_hosts`-append carve-outs. A word with no anchor is
             // not a path this classifier can judge.
-            (Root::Home, Vec::new(), relative_anchor_start(word)?)
+            let start = relative_anchor_start(word)?;
+            anchored_relative = true;
+            (Root::Home, Vec::new(), start)
         };
 
     let mut current = String::new();
@@ -1142,6 +1183,7 @@ fn resolve(word: &Word) -> Option<Spelling> {
         comps,
         partial,
         escaped,
+        anchored_relative,
     })
 }
 
@@ -1277,6 +1319,16 @@ fn judge_file_target(word: &Word, writer: Writer) -> Option<CredentialFileWrite>
             if append_ok && writer.mode == WriteMode::Append {
                 None
             } else {
+                // Name the file the way the command named it. An anchored
+                // relative spelling was rebased onto the home table to be
+                // judged, but it is not `~/…` unless the shell happens to be
+                // standing there, and a reason that claims a path the user
+                // never wrote reads like a misfire.
+                let display = if spelling.anchored_relative {
+                    display.trim_start_matches("~/").to_owned()
+                } else {
+                    display
+                };
                 Some(protected_hit(writer, &display, what, span))
             }
         }
@@ -2016,13 +2068,12 @@ mod tests {
             "echo x > ~/.config/gh/config.yml",
             "echo x > /etc/hosts",
             "echo x > /etc/sudoers.tmp",
+            // `/tmp/.zshrc` stays: an absolute path outside a home directory
+            // is a different file. The relative spellings that used to sit
+            // here — `.zshrc`, `./.ssh/authorized_keys`, `.ssh/authorized_keys`
+            // — pinned the limitation #407 reported rather than a decision,
+            // and they now deny; see `relative_anchors` below.
             "echo x > /tmp/.zshrc",
-            // `.zshrc` stays here: a bare dotfile is not an anchor, because a
-            // project-local one is ordinary. `./.ssh/authorized_keys` and
-            // `.ssh/authorized_keys` used to sit beside it and now deny — they
-            // pinned the limitation that #407 reported, not a decision, and
-            // they moved to `relative_anchors` below.
-            "echo x > .zshrc",
             "install -d -m 700 ~/.ssh",
             "mkdir -p ~/.ssh",
             "touch ~/.ssh/authorized_keys",
@@ -2272,7 +2323,9 @@ mod tests {
     /// does, and only the rooted one was being judged.
     mod relative_anchors {
         use super::{allowed, denied, hit};
-        use crate::packs::core::credential_files::{ENTRIES, RELATIVE_ANCHORS, Root};
+        use crate::packs::core::credential_files::{
+            ENTRIES, RELATIVE_ANCHORS, RELATIVE_FILE_ANCHORS, Root,
+        };
 
         /// Rooted/relative pairs that must reach the same verdict.
         const PAIRS: &[&str] = &[
@@ -2340,6 +2393,29 @@ mod tests {
         }
 
         #[test]
+        fn the_reason_names_the_path_the_way_the_command_did() {
+            let relative = denied("echo x > .ssh/authorized_keys").reason;
+            assert!(
+                relative.contains(".ssh/authorized_keys"),
+                "reason should name the file: {relative}"
+            );
+            assert!(
+                !relative.contains("~/.ssh/authorized_keys"),
+                "a relative spelling is not `~/…` unless the shell is standing there: {relative}"
+            );
+            assert!(
+                !denied("echo x > .zshrc").reason.contains("~/.zshrc"),
+                "the same applies to an anchored login-startup file"
+            );
+            // The rooted spelling still shows its root.
+            assert!(
+                denied("echo x > ~/.ssh/authorized_keys")
+                    .reason
+                    .contains("~/.ssh/authorized_keys")
+            );
+        }
+
+        #[test]
         fn the_rooted_carve_outs_survive_the_relative_spelling() {
             // Public keys are public, and appending a host key is what ssh does.
             allowed("cp ./src .ssh/id_rsa.pub");
@@ -2391,8 +2467,52 @@ mod tests {
         }
 
         #[test]
+        fn a_login_startup_file_anchors_as_the_whole_path() {
+            for name in [
+                ".bashrc",
+                ".bash_profile",
+                ".bash_login",
+                ".profile",
+                ".zshrc",
+                ".zshenv",
+                ".zprofile",
+                ".zlogin",
+            ] {
+                denied(&format!("echo x > {name}"));
+                denied(&format!("echo x > ./{name}"));
+                denied(&format!("cp ./src {name}"));
+                denied(&format!("sed -i 's/a/b/' {name}"));
+            }
+        }
+
+        #[test]
+        fn a_login_startup_file_under_a_directory_is_not_anchored() {
+            // A skeleton being assembled, not the shell's own startup file.
+            for command in [
+                "echo x > templates/.bashrc",
+                "cp ./src skel/.zshrc",
+                "echo x > ../.bashrc",
+                "echo x > .bashrc.bak",
+                "echo x > my.profile",
+            ] {
+                allowed(command);
+            }
+        }
+
+        #[test]
+        fn credential_dotfiles_stay_relative_writable() {
+            // Writing a project-local one of these is a routine CI idiom, and
+            // the rooted spelling still denies. Listed so the exclusion is a
+            // decision on the record rather than an oversight.
+            for name in [".npmrc", ".netrc", ".pypirc", ".git-credentials"] {
+                allowed(&format!("echo x > {name}"));
+                denied(&format!("echo x > ~/{name}"));
+            }
+        }
+
+        #[test]
         fn every_anchor_names_a_real_home_entry() {
-            for anchor in RELATIVE_ANCHORS {
+            for anchor in RELATIVE_ANCHORS.iter().chain(RELATIVE_FILE_ANCHORS) {
                 assert!(
                     ENTRIES.iter().any(|entry| {
                         entry.root == Root::Home && entry.comps.first() == Some(anchor)
