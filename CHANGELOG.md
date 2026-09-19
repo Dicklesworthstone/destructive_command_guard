@@ -105,12 +105,13 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   `docker system prune -a -f --filter label=ps` and
   `rm -rf /etc/nginx --exclude=ls` all still deny.
 
-  **Five more in the same pack carried the defect and were not in that set of
+  **Six more across two packs carried the defect and were not in that set of
   nine.** Verifying the fix — all fourteen reported shapes deny, all twelve
   read-only invocations still allowed — then sweeping every direct
-  `safe_pattern!` in every pack for the same shape turned up `fdisk-list`
-  (`fdisk\s+-l`, unanchored), `mount-list` (`\bmount\s*$`, anchored only at the
-  *end*), and the three LVM exemptions. `/` is a word boundary, so any
+  `safe_pattern!` in every pack for the same shape turned up five in
+  `system.disk` — `fdisk-list` (`fdisk\s+-l`, unanchored), `mount-list`
+  (`\bmount\s*$`, anchored only at the *end*), and the three LVM exemptions —
+  plus `service-status` in `system.services`. `/` is a word boundary, so any
   destructive command whose redirect target's last path component is `mount`
   satisfied `mount-list`; and `lvs`/`vgs`/`pvs` are three letters matched as a
   word anywhere, which makes them as easy to trip as the `df` case above.
@@ -145,6 +146,18 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   `lvs -a -o +devices`, `lvscan`, `vgscan`, `lvdisplay`, `vgdisplay /dev/sda`,
   `pvdisplay`, `fdisk -l`, `fdisk -l /dev/sda`, `fdisk /dev/sda -l`, `mount` and
   `mount /dev/sdb1 /mnt`.
+
+  `system.services`' `service-status` was the same end-anchored shape as
+  `mount-list`, and it executes for a reason worth noting: `systemctl` accepts
+  several unit names, so `systemctl stop nginx service foo status` stops nginx
+  while `service`, `foo` and `status` merely fail to resolve. That is what
+  separates it from shapes like `dd … of=/dev/sda mount`, where the tool rejects
+  the stray operand and nothing destructive happens. It is redundant too — the
+  only destructive rule there naming `service` requires a critical unit *and*
+  `stop` — so it is dropped rather than anchored, and `systemctl-status` beside it
+  needs no change, because its optional group consumes only `-`-prefixed tokens.
+  That pack is opt-in, so unlike the `system.disk` five it was not a
+  default-configuration bypass.
 
   The sweep that found them is worth recording as a method: of 781 direct
   `safe_pattern!` invocations, 52 are unanchored with a short literal, and the
