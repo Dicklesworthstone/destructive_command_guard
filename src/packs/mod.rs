@@ -2102,6 +2102,11 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "fdisk",
             "parted",
             "wipefs",
+            // Without `/dev/` the tee-device and copy-to-device rules are dead:
+            // `tee /dev/sda < /dev/zero` names no other keyword in this row, so
+            // the quick-reject drops the command before this pack is a
+            // candidate and the rule never runs (#444).
+            "/dev/",
             // Without `umount` the umount-force rule was dead: no other
             // keyword in this list appears in `umount -f /mnt/x` (#323).
             "umount",
@@ -6466,17 +6471,6 @@ mod tests {
             ("infrastructure.ansible", "playbook"), // `ansible-playbook` carries `ansible`
             ("system.disk", "mount"),               // `mount -o remount,ro /` has no rule
             ("system.permissions", "chgrp"),        // `chgrp -R … /etc` has no rule
-            // Every device-destroying shape that reaches a rule names its tool —
-            // `dd`, `mkfs`, `wipefs`, all in the row — and a bare redirect into a
-            // device is caught by always-on `core.filesystem` as
-            // `redirect-truncate-root-home` rather than by this pack. So no rule
-            // here needs `/dev/`. `tee /dev/sda < /dev/zero` is allowed by both
-            // packs — a raw device write with no rule at all — and is filed as
-            // #444. If a rule for that shape is added, `/dev/` has to move into
-            // this pack's row in the same change, or the new rule is unreachable
-            // for any command naming no other disk tool, which is exactly the
-            // `tee` case.
-            ("system.disk", "/dev/"),
             // ---- A deliberate omission rather than an oversight. The row carries
             // `sqlite3`, the binary modern systems ship; `sqlite` is SQLite 2's
             // CLI. Admitting it would make the pack a candidate for any command

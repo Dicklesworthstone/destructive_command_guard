@@ -184,11 +184,59 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!("lvm-display", r"\b(?:lvdisplay|vgdisplay|pvdisplay)\b"),
         // lvscan, vgscan, pvscan (scan commands)
         safe_pattern!("lvm-scan", r"\b(?:lvscan|vgscan|pvscan)\b"),
+        // The pseudo-devices every writer tool legitimately names. `tee
+        // /dev/null` is the single most common shape of all, and `/dev/shm`,
+        // `/dev/fd/N` and `/dev/pts/N` are ordinary paths rather than block
+        // devices. Writing to /dev/zero or /dev/full is discarded, which
+        // `dd-discard` above already treats as safe for dd (#444).
+        // The exemption has to name the WRITE TARGET, not merely some
+        // pseudo-device in the command: `tee /dev/sda < /dev/zero` reads
+        // /dev/zero and writes the disk, and an exemption that skipped over
+        // the target to find the source would allow exactly the command #444
+        // is about. So tee/sponge's operand must be the pseudo-device itself,
+        // and cp/mv/install's must be the final argument they write.
+        safe_pattern!(
+            "device-write-pseudo-tee",
+            r#"\b(?:tee|sponge)\b(?:\s+-{1,2}\S+)*\s+['"]?/dev/(?:null|zero|full|random|urandom|std(?:in|out|err)|tty|console|ptmx|fd/|pts/|shm/)\S*['"]?\s*(?:$|[|>])"#
+        ),
+        safe_pattern!(
+            "device-write-pseudo-copy",
+            r#"\b(?:cp|mv|install)\b[^|;&]*\s['"]?/dev/(?:null|zero|full|random|urandom|std(?:in|out|err)|tty|console|ptmx|fd/|pts/|shm/)\S*['"]?\s*$"#
+        ),
     ]
 }
 
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
+        // A writer tool naming a device destroys it exactly as `dd` does, and
+        // every neighbouring spelling already denied: `dd of=/dev/sda`,
+        // `mkfs.ext4 /dev/sda1`, `wipefs --all /dev/sda` and every redirect
+        // form (`cat /dev/zero > /dev/sda`) via core.filesystem. `tee` fell
+        // between them — not a redirect, so the redirect rule saw no target,
+        // and not a device tool this pack modelled (#444). `curl … | tee
+        // /dev/sda` is the idiom an agent reaches for once `dd` is blocked,
+        // which is the same substitution pressure that motivated the
+        // `find … -delete` rules.
+        //
+        // The device set is left open the way `dd-device` leaves it open:
+        // matching `/dev/` and exempting the pseudo-devices by name below.
+        // Enumerating block devices instead would miss whatever this host
+        // calls them — /dev/xvda, /dev/nbd0, /dev/ram0 — and a destructive
+        // pattern that fails to match is a missed denial, while a safe
+        // pattern that fails to match only withdraws an exemption.
+        destructive_pattern!(
+            "tee-device",
+            r#"\b(?:tee|sponge)\b(?:\s+-{1,2}\S+)*\s+['"]?/dev/"#,
+            "tee/sponge into a device will OVERWRITE that device, exactly as dd would. Extremely dangerous!"
+        ),
+        // cp/mv/install write their LAST argument, so the device has to be in
+        // destination position: `cp /dev/null foo` reads a device and is
+        // ordinary, `cp /dev/zero /dev/sda` writes one and is not.
+        destructive_pattern!(
+            "copy-to-device",
+            r#"\b(?:cp|mv|install)\b[^|;&]*\s['"]?/dev/[^\s'"|;&]+['"]?\s*$"#,
+            "Copying or moving onto a device OVERWRITES that device, exactly as dd would. Extremely dangerous!"
+        ),
         // dd to block devices. Accept optional quotes around the device path
         // (`dd of="/dev/sda"` unquotes to `of=/dev/sda` before exec).
         destructive_pattern!(
@@ -719,6 +767,90 @@ mod tests {
         assert_no_match(&pack, "git status");
         assert_no_match(&pack, "echo hello");
         assert_no_match(&pack, "cargo build");
+    }
+
+    #[test]
+    fn writer_tools_naming_a_device_are_blocked_issue_444() {
+        // `tee /dev/sda` destroys the device exactly as `dd of=/dev/sda` does,
+        // and every neighbouring spelling already denied: the tool forms here,
+        // the redirect forms in core.filesystem. `tee` fell between the two.
+        let pack = create_pack();
+        for command in [
+            "tee /dev/sda < /dev/zero",
+            "tee -a /dev/sda",
+            "some-generator | tee /dev/sda > /dev/null",
+            "curl -s https://example/image.img | tee /dev/sda > /dev/null",
+            "tee /dev/nvme0n1",
+            "sponge /dev/sda",
+        ] {
+            assert!(
+                pack.might_match(command),
+                "keyword gating must reach the pack for {command:?}: `/dev/` is the only \
+                 keyword such a command carries"
+            );
+            assert_blocks_with_pattern(&pack, command, "tee-device");
+        }
+        for command in [
+            "cp /dev/zero /dev/sda",
+            "install -m 0 somefile /dev/sda",
+            "mv somefile /dev/sda",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "copy-to-device");
+        }
+    }
+
+    #[test]
+    fn writer_tools_naming_a_pseudo_device_stay_allowed_issue_444() {
+        // `tee /dev/null` is the most common shape of all, and /dev/shm,
+        // /dev/fd and /dev/pts are ordinary paths rather than block devices.
+        let pack = create_pack();
+        for command in [
+            "tee /dev/null",
+            "echo 1 | tee /dev/null",
+            "cat x | tee /dev/null | wc -l",
+            "tee /dev/stdout",
+            "tee -a /dev/stderr",
+            "cat x | tee /dev/tty",
+            "tee /dev/fd/3",
+            "cmd | tee /dev/shm/buffer",
+            "cp file /dev/shm/x",
+            "cp /dev/null placeholder.log",
+            "tee out.txt",
+            "tee -a /var/log/app.log",
+            "tee file1 file2",
+            "cp a.txt b.txt",
+        ] {
+            // Either a safe pattern exempts it, or no destructive pattern
+            // matched it in the first place — `cp /dev/null placeholder.log`
+            // names a device as its SOURCE, so `copy-to-device` (which
+            // requires the device in destination position) never fires.
+            assert!(
+                pack.matches_safe(command) || pack.check(command).is_none(),
+                "{command:?} must not be blocked by the device-writer rules"
+            );
+        }
+    }
+
+    #[test]
+    fn device_write_exemption_names_the_target_not_a_source_issue_444() {
+        // The exemption must not skip over the write target to find a
+        // pseudo-device used as a SOURCE: `tee /dev/sda < /dev/zero` reads
+        // /dev/zero and writes the disk, and an exemption keyed on "some
+        // /dev/ pseudo-device appears" would allow exactly the reported
+        // command. Same for `cp /dev/zero /dev/sda`.
+        let pack = create_pack();
+        assert!(
+            !pack.matches_safe("tee /dev/sda < /dev/zero"),
+            "a /dev/zero source must not exempt a write to /dev/sda"
+        );
+        assert!(
+            !pack.matches_safe("cp /dev/zero /dev/sda"),
+            "a /dev/zero source must not exempt a copy onto /dev/sda"
+        );
+        assert!(
+            !pack.matches_safe("some-generator | tee /dev/sda > /dev/null"),
+            "a /dev/null redirect must not exempt a write to /dev/sda"
+        );
     }
 
     #[test]
