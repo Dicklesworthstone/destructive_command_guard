@@ -11309,7 +11309,22 @@ fn evaluate_executable_text_sinks(
     first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
     inherited_automated_stdin: bool,
 ) -> Option<EvaluationResult> {
-    let sinks = collect_executable_text_sinks(command, shell_dialect);
+    // Mask the bodies of heredocs whose target provably does not execute its
+    // stdin, exactly as the sibling launcher check does before its own scan.
+    //
+    // Without this the two disagreed about the same bytes. The pattern path
+    // already treats such a body as data — `cat > x.rb <<'OUTER' … rm -rf / …
+    // OUTER` is allowed, and so is a `$(rm -rf /)` in that position — but this
+    // scan read the raw command, found Ruby's `eval` inside the body, could not
+    // resolve its source, and failed closed as `heredoc.posix:eval-dynamic`. So
+    // authoring a Ruby script that uses Ruby's own `eval` was blocked, which is a
+    // pure write with nothing executed (#440).
+    //
+    // Only provably inert bodies vanish: the mask requires a quoted delimiter, so
+    // an unquoted body still reaches the scan because the shell expands it before
+    // the sink sees it, and a body fed to `bash`/`sh` is never masked at all.
+    let masked = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    let sinks = collect_executable_text_sinks(masked.as_ref(), shell_dialect);
     for sink in sinks {
         let (source, dialect, context) = match sink {
             ExecutableTextSink::Unverified { rule, reason } => {
