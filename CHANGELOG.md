@@ -118,6 +118,54 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Fixed
 
+- **The generated OpenCode plugin now loads on both plugin contracts, and a test
+  actually runs it (#419).** `34ecad1` / `7a23b48` emit one file carrying both
+  shapes: v1's named `DcgGuard` export returning a `"tool.execute.before"` hook
+  map called as `(input, output)`, and v2's default export `{ id, setup(ctx) }`
+  registering through `ctx.tool.hook("execute.before", cb)` with the command in
+  `event.input.command`. A single `node:child_process` spawn path serves both
+  runtimes, since v2 migrated Bun → Node while Bun implements the `node:`
+  modules — so the plugin needs no runtime detection, which matters because
+  `dcg update` regenerates it and the installed OpenCode may have changed major
+  version since `dcg install` ran.
+
+  Verified by executing the artifact, not by reading it: installed into a
+  throwaway `HOME`, imported as an ES module, and driven against the real dcg
+  binary under **node v26.0.0 and bun 1.4.2**. Both contracts deny `rm -rf /`
+  with dcg's reason, allow `git status`, ignore non-`bash` tools, tolerate
+  missing `args`/`input`/`event`, and fail **open** with a stderr notice when the
+  binary cannot be run — an unrunnable dcg is an infrastructure failure, and
+  treating it as a verdict would block every command in the session. `ask` fails
+  closed, deliberately, because OpenCode has no operator-review state.
+
+  The test that shipped with the fix asserts substrings of the generated source,
+  which cannot catch this issue's own failure mode. Measured against four broken
+  copies: it correctly fails when either export is removed, but **passes** both
+  when `dcgDenyReason` is neutered to always allow and when an unbalanced brace
+  makes the module unparseable. Those are the two that leave OpenCode unguarded
+  while saying nothing. `tests/repro_419_opencode_plugin_executes.rs` catches all
+  four, and `SKIP`s with a printed reason when neither `node` nor `bun` is on
+  `PATH`. OpenCode is not covered by `scripts/e2e_harness_matrix.sh`, so this is
+  currently the only execution-level coverage of that bridge.
+
+- **A busy host no longer fails the history suite and blames the writer for it
+  (#433).** Four tests asserted a fixed two-second flush deadline, so a loaded
+  machine turned "telemetry is best-effort and dropped an entry because the
+  database was busy" into "history writer did not acknowledge allow entry" — and
+  under a stash-and-rerun A/B that misattribution convicted an unrelated pattern
+  change. `20734cc` replaced the deadline with an outcome-based wait under a
+  generous watchdog (`finish_history_writer`), whose failure text now names the
+  host and reports actual elapsed time, and kept
+  `locked_history_database_never_delays_writer_drop_past_hook_budget` as the
+  separate timing assertion it always was.
+
+  Confirmed at the load that broke it: **11 consecutive clean runs, 42 tests
+  each, 0 failures, at 1-minute load averages from 34 to 106** on a 128-core
+  host. The report's four failures occurred at load 88; runs here at 79.9–106.3
+  took 4.8–6.4s, matching its 4.55s observation, so the slow condition was
+  reproduced rather than avoided. One run at load 47 took 11.1s, five times the
+  old deadline.
+
 - **The #442 scanner regressions never ran, and the CI step asserting them
   passed while testing nothing.** `src/scanner_regression_tests.rs` had no `mod`
   declaration on `main` — the declaration lived only in
