@@ -17,6 +17,43 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Security
 
+- **Every credential and login-startup file the guard protects was writable by
+  naming it relatively (#407).** `echo x > ~/.ssh/authorized_keys` denied;
+  `echo x > .ssh/authorized_keys` did not, and installs an SSH login for anyone
+  standing in a home directory. The same held for `.aws/credentials`,
+  `.kube/config`, `.docker/config.json`, `.gnupg/**`, `.bashrc`, `.zshrc`,
+  `.profile` and the rest — and for *every* writer the classifier understands,
+  not just redirects: `tee`, `cp`, `mv`, `install`, `ln`, `dd of=`, `sed -i`,
+  `perl -i`.
+
+  `resolve` only ever established a root from `~`, `$HOME`, `$VAR` or an
+  absolute `/home|/Users|/root|/etc` prefix, so a relative word returned `None`
+  and was never judged. It now also anchors on a path *component* that names a
+  credential directory (`.ssh/`, `.gnupg/`, `.aws/`, `.kube/`, `.docker/`,
+  `.bashrc.d/`, `.zshrc.d/`), or on a login-shell startup file that is the whole
+  relative path (`.bashrc`, `.zshrc`, `.profile`, …), and rebases onto the home
+  table from there — the argument
+  `redirect-truncate-git-internals-relative` already makes for `.git/`: the name
+  identifies the contents wherever the shell is standing. Because the rebase
+  hands off to the existing table, the relative spellings inherit every
+  decision the rooted ones already make, including the `*.pub` and
+  `known_hosts`-append carve-outs.
+
+  Two gates had to move with it. The cheap pre-gate reads the *raw* command, so
+  it also admits any command containing `\` — otherwise
+  `tee .ss\h/authorized_keys`, which opens the real file, never reached the
+  classifier. And the anchors are keywords in both the pack list and the
+  `PACK_ENTRIES` row (#441), because a bare redirect carries no other keyword
+  in that row; the non-redirect writers were already there under their own
+  names, which is why `tee`/`cp` needed no new entry.
+
+  Known limits, measured rather than assumed: an anchor the shell assembles
+  (`.ss${X}h/`) is not recognised, and `redirect-truncate-dynamic-path` does not
+  catch that shape either, because its quick-reject keywords want the `$`
+  directly after the `>`. `.netrc`, `.npmrc` and `.config/gh/hosts.yml` are
+  deliberately excluded; see **Known open**, which also records that this
+  denies a project-local `.ssh/id_rsa` that entry had called correctly allowed.
+
 - **`mount --bind /mnt /` was allowed, and `tee /dev/sda` before it: two rules
   that could never run because the quick-reject filter dropped the command first
   (#441, #444).** `system.disk` owns a rule for each — `mount-bind-root` and
@@ -659,32 +696,46 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   cause of #442's segfault and is not that cause, but it remains a genuine
   unsoundness rather than a tidy-up.
 
-- **A credential file named relatively is writable, for every target the rule
-  protects (#407).** `echo x > $HOME/.ssh/id_rsa` denies as
-  `core.filesystem:credential-file-write`; `echo x > .ssh/id_rsa` with the working
-  directory at `$HOME` does not. Uniform across all ten protected targets —
-  `.ssh/id_rsa`, `.ssh/id_ed25519`, `.ssh/authorized_keys`, `.aws/credentials`,
-  `.netrc`, `.npmrc`, `.bashrc`, `.profile`, `.config/gh/hosts.yml`,
-  `.gnupg/trustdb.gpg`. The intended allowances are unaffected: appending
-  (`ssh-keyscan h >> .ssh/known_hosts`) and reading are allowed in both spellings,
-  as designed.
+- **A credential file named relatively is writable — now only for the three
+  targets deliberately left out (#407).** Mostly closed; what follows records
+  what is left and one decision that deserves review.
 
-  It is reachable from where an agent actually sits. From `$HOME/projects/app`, all
-  of `../../.ssh/id_rsa`, `./../../.ssh/id_rsa`, `../app/../../.ssh/id_rsa`,
-  `cd ~ && … .ssh/id_rsa`, `cd $HOME && …` and `pushd ~ && …` name the real key and
-  are allowed, while `$HOME/…` and `~/…` deny. A genuinely local
-  `echo x > .ssh/id_rsa` from a project directory stays allowed, correctly, since it
-  is a different file.
+  Seven of the ten protected targets now deny in both spellings
+  (`.ssh/id_rsa`, `.ssh/id_ed25519`, `.ssh/authorized_keys`, `.aws/credentials`,
+  `.bashrc`, `.profile`, `.gnupg/trustdb.gpg`), as do every reachable spelling
+  this entry listed: `../../.ssh/id_rsa`, `./../../.ssh/id_rsa`,
+  `../app/../../.ssh/id_rsa`, `cd ~ && …`, `cd $HOME && …`, `pushd ~ && …`, and
+  `mv secrets ../../.ssh/id_rsa`. The intended allowances still hold in both
+  spellings: `ssh-keyscan h >> .ssh/known_hosts` appends, `*.pub` writes, and
+  reads are untouched.
+
+  **Still open, by choice:** `.netrc`, `.npmrc` and `.config/gh/hosts.yml`.
+  Writing a project-local `.npmrc` or `.netrc` is a routine CI idiom, and
+  anchoring `.config/` — whose only protected entry is `gh/hosts.yml` — would
+  widen the always-on keyword index for very little. The rooted spellings of
+  all three still deny.
+
+  **A decision to revisit:** the repair anchors on the *name*, the way
+  `redirect-truncate-git-internals-relative` does, so it needs no working
+  directory — and therefore it also denies a genuinely project-local
+  `echo x > .ssh/id_rsa`, which this entry previously called correctly allowed.
+  That is a real behaviour change, in the conservative direction: the file it
+  refuses is still a private key, and `dcg allow-once` covers the case. The
+  precise alternative is below and is not blocked by anything.
 
   Scope, from auditing all fifteen root/home rules: **eleven already resolve a
   relative operand** — `rm -rf projects`, `rm *`, `unlink .bashrc`,
   `truncate -s 0 .bashrc`, `shred -u .ssh/id_rsa`, `dd of=.bashrc`,
   `find . -delete`, `tar --remove-files docs` all deny — so the irreversible-delete
-  family is not affected. The gap is four rules, and they share a shape: rules
+  family is not affected. The gap was four rules, and they share a shape: rules
   gating on a *path operand* resolve it, rules gating on a *redirect target* or a
-  *move/copy source* do not (`redirect-truncate-root-home`,
-  `credential-file-write`, `mv-sensitive-source-root-home`,
-  `cp-sensitive-then-delete`).
+  *move/copy source* do not. `credential-file-write` is now handled by name
+  anchoring; the remaining three are `redirect-truncate-root-home` (any existing
+  file under `$HOME`, not just a protected one — `echo x > README.md` is still
+  allowed where the absolute spelling denies),
+  `mv-sensitive-source-root-home`, and `cp-sensitive-then-delete`
+  (`cp ../../.ssh/id_rsa /tmp/x` is still allowed, because the sensitive path is
+  the *source*).
 
   `rebase_recovery::resolve_effective_cwd` (#387) already answers which directory a
   command runs in, applying leading static `cd`/`pushd` and failing closed when the
