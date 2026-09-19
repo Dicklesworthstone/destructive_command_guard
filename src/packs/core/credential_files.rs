@@ -1065,10 +1065,10 @@ struct Spelling {
     partial: Option<String>,
     /// `..` climbed above the root.
     escaped: bool,
-    /// The spelling was relative and reached its root through a
-    /// [`RELATIVE_ANCHORS`] or [`RELATIVE_FILE_ANCHORS`] component, so it has
-    /// no `~/` to display.
-    anchored_relative: bool,
+    /// The components were taken from an anchor component rather than from a
+    /// root the spelling stated, so the table's `~/…` prefix would name a path
+    /// the command never did. Such a hit is displayed as written.
+    rebased_at_anchor: bool,
 }
 
 /// Char offset just past the first `count` non-empty `/`-separated parts.
@@ -1114,76 +1114,92 @@ fn parse_variable(word: &Word) -> Option<(String, usize)> {
 /// Resolve a decoded word to a protected root plus path components, or
 /// `None` when it cannot name a protected location (relative paths, other
 /// absolute trees, quoted `~`, unknown variables).
-fn resolve(word: &Word) -> Option<Spelling> {
+/// The root a spelling states outright, and where its components begin.
+///
+/// `None` means the word states no root this classifier models — a relative
+/// path, or one rooted somewhere it does not know (`$PWD`, `/opt`). Those are
+/// not rejected outright; [`resolve`] falls back to an anchor component.
+fn rooted_prefix(word: &Word) -> Option<(Root, Vec<String>, usize)> {
     let text = &word.text;
     let first = *text.first()?;
-    let first_literal = word.literal[0];
-    let mut anchored_relative = false;
-    let (root, mut comps, rest_start): (Root, Vec<String>, usize) =
-        if first == '~' && !first_literal {
-            // `~`, `~/…`, `~user/…` — all home directories.
-            let mut end = 1usize;
-            while text.get(end).is_some_and(|ch| *ch != '/') {
-                end += 1;
-            }
-            (Root::Home, Vec::new(), end)
-        } else if first == '$' && !first_literal {
-            let (name, end) = parse_variable(word)?;
-            let (_, root, alias) = VARIABLE_ROOTS
-                .iter()
-                .find(|(candidate, _, _)| *candidate == name)?;
-            if text.get(end).is_some_and(|ch| *ch != '/') {
-                return None;
-            }
-            (
-                *root,
-                alias
-                    .iter()
-                    .map(|component| (*component).to_string())
-                    .collect(),
-                end,
-            )
-        } else if first == '/' {
-            // The first components of an absolute path are read raw: the user
-            // component of `/home/*/.ssh` may be a glob and still name homes.
-            let raw: String = text.iter().collect();
-            let mut parts = raw.split('/').filter(|part| !part.is_empty());
-            let head = parts.next()?;
-            let second = parts.next();
-            // Case-folded: on a case-insensitive filesystem — APFS and NTFS by
-            // default — `/ETC/passwd` opens `/etc/passwd`, so a case-sensitive
-            // comparison here reads as a different path and lets the write
-            // through. Folding costs a false positive only on a case-sensitive
-            // filesystem that has a genuinely distinct `/ETC`.
-            let is = |value: &str, expected: &str| value.eq_ignore_ascii_case(expected);
-            let second_is = |expected: &str| second.is_some_and(|second| is(second, expected));
-            let (root, consumed) = if (is(head, "home") || is(head, "Users")) && second.is_some() {
-                (Root::Home, 2usize)
-            } else if is(head, "root") {
-                (Root::Home, 1)
-            } else if is(head, "var") && second_is("root") {
-                (Root::Home, 2)
-            } else if is(head, "etc") {
-                (Root::Etc, 1)
-            } else if is(head, "private") && second_is("etc") {
-                (Root::Etc, 2)
-            } else {
-                return None;
-            };
-            (root, Vec::new(), skip_parts(text, consumed))
-        } else {
+    if !word.literal[0] && first == '~' {
+        // `~`, `~/…`, `~user/…` — all home directories.
+        let mut end = 1usize;
+        while text.get(end).is_some_and(|ch| *ch != '/') {
+            end += 1;
+        }
+        return Some((Root::Home, Vec::new(), end));
+    }
+    if !word.literal[0] && first == '$' {
+        let (name, end) = parse_variable(word)?;
+        let (_, root, alias) = VARIABLE_ROOTS
+            .iter()
+            .find(|(candidate, _, _)| *candidate == name)?;
+        if text.get(end).is_some_and(|ch| *ch != '/') {
+            return None;
+        }
+        let alias = alias
+            .iter()
+            .map(|component| (*component).to_string())
+            .collect();
+        return Some((*root, alias, end));
+    }
+    if first != '/' {
+        return None;
+    }
+    // The first components of an absolute path are read raw: the user
+    // component of `/home/*/.ssh` may be a glob and still name homes.
+    let raw: String = text.iter().collect();
+    let mut parts = raw.split('/').filter(|part| !part.is_empty());
+    let head = parts.next()?;
+    let second = parts.next();
+    // Case-folded: on a case-insensitive filesystem — APFS and NTFS by
+    // default — `/ETC/passwd` opens `/etc/passwd`, so a case-sensitive
+    // comparison here reads as a different path and lets the write through.
+    // Folding costs a false positive only on a case-sensitive filesystem that
+    // has a genuinely distinct `/ETC`.
+    let is = |value: &str, expected: &str| value.eq_ignore_ascii_case(expected);
+    let second_is = |expected: &str| second.is_some_and(|second| is(second, expected));
+    let (root, consumed) = if (is(head, "home") || is(head, "Users")) && second.is_some() {
+        (Root::Home, 2usize)
+    } else if is(head, "root") {
+        (Root::Home, 1)
+    } else if is(head, "var") && second_is("root") {
+        (Root::Home, 2)
+    } else if is(head, "etc") {
+        (Root::Etc, 1)
+    } else if is(head, "private") && second_is("etc") {
+        (Root::Etc, 2)
+    } else {
+        return None;
+    };
+    Some((root, Vec::new(), skip_parts(text, consumed)))
+}
+
+fn resolve(word: &Word) -> Option<Spelling> {
+    let text = &word.text;
+    let mut rebased_at_anchor = false;
+    let (root, mut comps, rest_start): (Root, Vec<String>, usize) = match rooted_prefix(word) {
+        Some(prefix) => prefix,
+        None => {
             // A relative spelling names the same credential material as the
             // absolute one, and until #407 only the absolute one was judged:
-            // `tee ~/.ssh/authorized_keys` denied while `tee .ssh/authorized_keys`
-            // was allowed. Rebasing onto `Root::Home` at the anchor hands the
-            // rest to the same table, so relative spellings inherit every
-            // decision the absolute ones already make — including the `*.pub`
-            // and `known_hosts`-append carve-outs. A word with no anchor is
+            // `tee ~/.ssh/authorized_keys` denied while
+            // `tee .ssh/authorized_keys` was allowed. Rebasing onto
+            // `Root::Home` at the anchor hands the rest to the same table, so
+            // these spellings inherit every decision the rooted ones already
+            // make — including the `*.pub` and `known_hosts`-append carve-outs.
+            //
+            // This also catches a root the classifier does not model:
+            // `$PWD/.ssh/id_rsa`, `$FOO/.ssh/id_rsa` and `/opt/.ssh/id_rsa`
+            // reach here because `rooted_prefix` declined them, and the `.ssh`
+            // component decides them anyway. A word with no anchor at all is
             // not a path this classifier can judge.
             let start = relative_anchor_start(word)?;
-            anchored_relative = true;
+            rebased_at_anchor = true;
             (Root::Home, Vec::new(), start)
-        };
+        }
+    };
 
     let mut current = String::new();
     let mut partial = None;
@@ -1216,12 +1232,35 @@ fn resolve(word: &Word) -> Option<Spelling> {
             partial = Some(comps.pop().unwrap_or_default());
         }
     }
+
+    // An anchor applies wherever it sits, not only at the start of the path.
+    // `~/projects/app/.ssh/id_rsa` is an SSH private key as much as
+    // `~/.ssh/id_rsa` is, and without this it was allowed while the same file
+    // named relatively — `projects/app/.ssh/id_rsa` — denied, because only the
+    // relative branch consulted the anchors. Rebasing runs only when the
+    // spelling as a whole names nothing protected, so it can widen the match
+    // and never narrow one.
+    if !rebased_at_anchor && matches!(exact(root, &comps), Exact::Clear) {
+        let anchor = comps
+            .iter()
+            .position(|component| {
+                RELATIVE_ANCHORS
+                    .iter()
+                    .any(|anchor| component.eq_ignore_ascii_case(anchor))
+            })
+            .filter(|index| *index > 0);
+        if let Some(index) = anchor {
+            comps.drain(..index);
+            rebased_at_anchor = true;
+        }
+    }
+
     Some(Spelling {
         root,
         comps,
         partial,
         escaped,
-        anchored_relative,
+        rebased_at_anchor,
     })
 }
 
@@ -1357,13 +1396,13 @@ fn judge_file_target(word: &Word, writer: Writer) -> Option<CredentialFileWrite>
             if append_ok && writer.mode == WriteMode::Append {
                 None
             } else {
-                // Name the file the way the command named it. An anchored
-                // relative spelling was rebased onto the home table to be
-                // judged, but it is not `~/…` unless the shell happens to be
-                // standing there, and a reason that claims a path the user
-                // never wrote reads like a misfire.
-                let display = if spelling.anchored_relative {
-                    display.trim_start_matches("~/").to_owned()
+                // Name the file the way the command named it. A rebased
+                // spelling was put onto the home table to be judged, but
+                // `~/.ssh/id_rsa` is not where `projects/app/.ssh/id_rsa`
+                // points, and a reason that claims a path the user never wrote
+                // reads like a misfire.
+                let display = if spelling.rebased_at_anchor {
+                    word.as_string()
                 } else {
                     display
                 };
@@ -2593,6 +2632,65 @@ mod tests {
                 ] {
                     allowed(command);
                 }
+            }
+        }
+
+        /// An anchor decides the path wherever it sits, so the same file gets
+        /// the same verdict however the command reached it.
+        mod anchors_apply_under_any_root {
+            use super::super::{allowed, denied, hit};
+
+            #[test]
+            fn a_nested_path_is_anchored_under_every_root() {
+                // Before this, the relative spelling denied and the rooted ones
+                // did not — the anchors were consulted only on the relative
+                // branch, which made the fix stricter than the rule it mirrored.
+                for target in [
+                    "projects/app/.ssh/id_rsa",
+                    "~/projects/app/.ssh/id_rsa",
+                    "$HOME/projects/app/.ssh/id_rsa",
+                    "/Users/someone/projects/app/.ssh/id_rsa",
+                    "/home/someone/projects/app/.ssh/id_rsa",
+                    "~/dotfiles/.aws/credentials",
+                    "$HOME/dotfiles/.gnupg/secring.gpg",
+                ] {
+                    denied(&format!("tee {target}"));
+                }
+            }
+
+            #[test]
+            fn a_root_the_classifier_does_not_model_still_anchors() {
+                // `rooted_prefix` declines these, and the anchor decides them
+                // rather than the word being dropped unjudged.
+                for target in [
+                    "$PWD/.ssh/id_rsa",
+                    "${PWD}/.ssh/id_rsa",
+                    "$FOO/.ssh/id_rsa",
+                    "/opt/.ssh/id_rsa",
+                    "/var/lib/.ssh/id_rsa",
+                ] {
+                    denied(&format!("tee {target}"));
+                }
+            }
+
+            #[test]
+            fn rebasing_only_widens_and_keeps_the_carve_outs() {
+                // It runs only when the whole spelling named nothing, so a
+                // protected path cannot be rebased into a weaker verdict.
+                allowed("cp k ~/projects/app/.ssh/id_rsa.pub");
+                allowed("echo h >> ~/projects/app/.ssh/known_hosts");
+                allowed("tee ~/projects/app/notes.txt");
+            }
+
+            #[test]
+            fn a_rebased_reason_names_the_path_as_written() {
+                let reason = hit("tee ~/projects/app/.ssh/id_rsa")
+                    .expect("nested ssh key is protected")
+                    .reason;
+                assert!(
+                    reason.contains("~/projects/app/.ssh/id_rsa"),
+                    "a rebased hit should name the path the command used: {reason}"
+                );
             }
         }
 

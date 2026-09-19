@@ -135,6 +135,19 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   in that row; the non-redirect writers were already there under their own
   names, which is why `tee`/`cp` needed no new entry.
 
+  An anchor now decides the path **wherever it sits, under any root**. The
+  first cut consulted the anchors only on the relative branch, which made the
+  repair stricter than the rule it was mirroring: `tee projects/app/.ssh/id_rsa`
+  denied while `tee ~/projects/app/.ssh/id_rsa` — the same file — did not.
+  Components are rebased at the anchor when the spelling as a whole names
+  nothing protected, so it can only widen a match, never narrow one; the
+  `*.pub` and `known_hosts` carve-outs still apply at the rebased path. The
+  same fallback covers a root the classifier does not model, which previously
+  stopped the word being judged at all: `$PWD/.ssh/id_rsa`, `$FOO/.ssh/id_rsa`,
+  `/opt/.ssh/id_rsa` and `/var/lib/.ssh/id_rsa` were all allowed and now deny.
+  A rebased denial names the path as written rather than the `~/…` form the
+  table matched it against.
+
   Known limits, measured rather than assumed: an anchor the shell assembles
   (`.ss${X}h/`) is not recognised, and `redirect-truncate-dynamic-path` does not
   catch that shape either, because its quick-reject keywords want the `$`
