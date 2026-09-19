@@ -95,6 +95,12 @@ pub mod suggestions;
 pub mod trace;
 pub mod update;
 
+// #442 regressions against the real ast-grep bash parser. The declaration belongs
+// here and not in vendor/patches/dcg-bash-scanner-wiring.patch: an undeclared file
+// under src/ is not part of the crate at all, so while it lived only in that patch
+// the tests were never compiled, never linted and never run — and
+// `cargo test --lib scanner_regression_tests` exits 0 on a filter that matches
+// nothing, so the CI step asserting them passed while testing zero tests.
 #[cfg(test)]
 mod scanner_regression_tests;
 

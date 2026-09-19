@@ -12,7 +12,15 @@ fn corpus() -> Vec<String> {
         "echo {1..".to_owned(),
         "cat <<EOF\nhello\nEOF\n".to_owned(),
     ];
-    for cp in [0x100, 0x130, 0x660, 0xff10, 0x1f4a5, 0x10fffd, 0x10ffff] {
+    for cp in [
+        0x100,
+        0x130,
+        0x660,
+        0xff10,
+        0x1f4a5,
+        0x0010_fffd,
+        0x0010_ffff,
+    ] {
         let c = char::from_u32(cp).expect("valid Unicode scalar");
         for range in [
             format!("{{{c}..9}}"),

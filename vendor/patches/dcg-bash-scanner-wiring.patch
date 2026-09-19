@@ -25,15 +25,3 @@ diff --git a/Cargo.lock b/Cargo.lock
  dependencies = [
   "cc",
   "tree-sitter-language",
-diff --git a/src/lib.rs b/src/lib.rs
---- a/src/lib.rs
-+++ b/src/lib.rs
-@@ -96,5 +96,8 @@ pub mod trace;
- pub mod update;
- 
-+#[cfg(test)]
-+mod scanner_regression_tests;
-+
- // Re-export commonly used types
- pub use allowlist::{
-     AllowEntry, AllowSelector, AllowlistError, AllowlistFile, AllowlistLayer, LayeredAllowlist,

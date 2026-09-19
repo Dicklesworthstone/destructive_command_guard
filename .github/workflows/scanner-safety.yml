@@ -14,6 +14,10 @@ on:
       - src/ast_matcher.rs
       - src/heredoc.rs
       - src/scanner_regression_tests.rs
+      # src/lib.rs declares the module: undeclare it and the regressions stop
+      # running, which is exactly when this workflow needs to run.
+      - src/lib.rs
+      - tests/repro_442_source_modules_are_declared.rs
       - vendor/**
   workflow_dispatch:
 
@@ -44,7 +48,21 @@ jobs:
           rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
       - name: Compile and run the actual ast-grep regressions
         id: focused
-        run: cargo test --locked --lib scanner_regression_tests
+        run: |
+          set -euo pipefail
+          # `cargo test <filter>` exits 0 when the filter matches nothing, so the
+          # count is asserted rather than assumed. Until the module was declared
+          # in src/lib.rs this step passed while running zero tests, and every
+          # step below gated on its success inherited that vacuous pass.
+          count=$(cargo test --locked --lib scanner_regression_tests -- --list \
+            | sed -nE 's/^([0-9]+) tests?,.*/\1/p')
+          echo "scanner_regression_tests discovered: ${count:-0}"
+          if [ "${count:-0}" -lt 2 ]; then
+            echo "::error::expected at least 2 scanner_regression_tests; the module is not wired into src/lib.rs"
+            exit 1
+          fi
+          cargo test --locked --lib scanner_regression_tests
+          cargo test --locked --test repro_442_source_modules_are_declared
       - name: Repeated complete lib gate, without retries or test skips
         if: ${{ !cancelled() && steps.focused.outcome == 'success' }}
         run: python3 scripts/check_scanner_safety.py repeat --runs 12

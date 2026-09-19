@@ -171,11 +171,14 @@ def publish_tree() -> None:
                       ["ls-files", "--others", "--exclude-standard", "-z"]]:
         output = subprocess.check_output(["git", *arguments], cwd=ROOT)
         paths.update(path.decode() for path in output.split(b"\0") if path)
-    if not {"Cargo.toml", "Cargo.lock", "src/lib.rs"}.issubset(paths):
+    # src/lib.rs is deliberately absent: the scanner_regression_tests module is
+    # declared on main, not by the wiring patch, so the tests run with or without
+    # the vendored repair. The candidate is Cargo wiring plus the vendored source.
+    if not {"Cargo.toml", "Cargo.lock"}.issubset(paths):
         raise RuntimeError("candidate wiring is absent; refusing to stage an incomplete fix")
     entries = []
     for name in sorted(paths):
-        if name not in {"Cargo.toml", "Cargo.lock", "src/lib.rs"} and not name.startswith("vendor/tree-sitter-bash/"):
+        if name not in {"Cargo.toml", "Cargo.lock"} and not name.startswith("vendor/tree-sitter-bash/"):
             raise RuntimeError(f"unexpected candidate change: {name}")
         path = ROOT / name
         if path.is_symlink() or not path.is_file():

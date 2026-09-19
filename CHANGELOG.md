@@ -118,6 +118,61 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Fixed
 
+- **The #442 scanner regressions never ran, and the CI step asserting them
+  passed while testing nothing.** `src/scanner_regression_tests.rs` had no `mod`
+  declaration on `main` — the declaration lived only in
+  `vendor/patches/dcg-bash-scanner-wiring.patch`, which is applied when the
+  vendored repair is prepared. Rust does not auto-discover modules, so on `main`
+  the file was not compiled, not linted, and its tests never executed. That went
+  unnoticed because `cargo test --lib <filter>` exits 0 when the filter matches
+  nothing: `cargo test --locked --lib scanner_regression_tests` printed
+  `running 0 tests`, reported `ok`, and exited 0. Every later step in the
+  `scanner-safety` job is gated on `steps.focused.outcome == 'success'`, so all
+  of them inherited that vacuous pass.
+
+  Declaring the module immediately produced two `clippy::unreadable_literal`
+  errors under the repository's `-D warnings`: the file had never been linted, so
+  wiring it in was always going to break CI on the first attempt. That is exactly
+  what happened — `89da0e2` declared the module while landing the vendored
+  scanner and left the literals untouched, so `clippy --all-targets -- -D
+  warnings` failed on `main` until this commit separated them.
+
+  The declaration stays on `main` so the cases run with or without the vendored
+  repair, and `vendor/patches/dcg-bash-scanner-wiring.patch` no longer carries a
+  `src/lib.rs` hunk — re-applying it would have added a *second* declaration,
+  which `git apply` accepts and `rustc` then rejects as a duplicate module.
+  `publish-tree` correspondingly stops requiring `src/lib.rs` among a candidate's
+  changed paths, since the file is now committed rather than patched. The
+  workflow step asserts how many tests were discovered instead of trusting a
+  zero-test exit code, and `src/lib.rs` joins the job's path filter, because
+  undeclaring the module is precisely when the job needs to run.
+
+  Reviewing the repair itself found nothing to change and bounded its scope:
+  **bash is the only one of dcg's seven grammars affected.** Its scanner calls
+  the wide, domain-safe `iswspace`/`iswalpha`/`iswalnum`/`iswdigit` 52 times and
+  the narrow `isdigit` exactly twice — the two brace-range loops the patch fixes
+  — and no other vendored grammar's scanner calls a narrow ctype function at all.
+  The `iswdigit` the same file already uses elsewhere would have been equivalent
+  in behaviour — POSIX constrains the `digit` class to `0`–`9` in every locale,
+  and glibc agrees for U+0660, U+06F0, U+FF10 and U+1D7D8 under `C`, `C.UTF-8`
+  and `en_US.UTF-8` — so the choice between them is not about what they classify.
+  The explicit comparison is still the better repair because it removes the
+  domain question at the call site instead of relying on a wider domain to
+  contain it, and a reader can check a range comparison without knowing anything
+  about ctype domains. Probing dcg itself found no reachable fault: 42 hook invocations
+  across seven code points (U+0100 to U+10FFFF) and six command shapes all
+  decided correctly, and a trigger paired with a destructive command was still
+  denied as `core.filesystem:rm-rf-root-home`. The reason to land the repair is
+  therefore the shape of the failure rather than a reproduction — a hook that
+  dies writes nothing to stdout, and the protocol reads empty stdout as *allow*,
+  so a fault in the guard's own parser fails open.
+
+  `tests/repro_442_source_modules_are_declared.rs` guards the invariant for
+  every top-level `src/*.rs`. It lives under `tests/`, which Cargo discovers
+  automatically, so the guard cannot be orphaned the way the thing it guards
+  was, and its own detection is covered by negative controls rather than only by
+  passing.
+
 - **#412 is now fully closed.** The v0.14.4 notes below record it as partially
   fixed because the reported command was still denied. `stdin_data_sink_may_be_overridden`
   no longer lets the *bytes of a quoted heredoc body* decide whether a data sink
@@ -388,6 +443,23 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 - **Only a dollar the shell would actually expand is resolved (#396).**
 
 ### Known open
+
+- **The vendored bash scanner diverges from upstream until #442 is reported
+  there.** The repair is two lines in a crates.io release we now carry in-tree,
+  so every future `tree-sitter-bash` bump has to re-apply it until upstream takes
+  the fix. Upstream's own convention in the same file is already the wide,
+  domain-safe `iswdigit` (lines 612 and 631), so the report is small and the
+  divergence should be short-lived.
+
+- **The test suite's environment mutation is unsound, independently of #442.**
+  Three separate `ENV_LOCK` mutexes (`agent.rs`, `interactive.rs`, `hook.rs`)
+  each serialise only against themselves, and readers take no lock at all — 108
+  `env::var` sites against 21 `EnvVarGuard` uses, plus native readers such as
+  bundled SQLite consulting `TMPDIR`, which cannot take a Rust lock. The real
+  invariant is "writers in the same module exclude each other" while thousands of
+  other tests read `environ` concurrently. This was investigated as a candidate
+  cause of #442's segfault and is not that cause, but it remains a genuine
+  unsoundness rather than a tidy-up.
 
 - **A credential file named relatively is writable, for every target the rule
   protects (#407).** `echo x > $HOME/.ssh/id_rsa` denies as
