@@ -148,6 +148,28 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   `PATH`. OpenCode is not covered by `scripts/e2e_harness_matrix.sh`, so this is
   currently the only execution-level coverage of that bridge.
 
+- **The #427 extraction-budget tests asserted host speed, not the budget they
+  were written for.** `an_untruncated_extraction_is_still_reported_as_complete`
+  and `a_truncated_extraction_reports_itself_as_partial` both ran through
+  `ExtractionLimits::default()`, which carries `timeout_ms: 50` alongside the size
+  and slot caps. Both tests are about `max_heredocs` — whether a payload list
+  that fits reports `Extracted` and an over-long one reports `Partial` with the
+  slot budget filled — so the wall clock was incidental, and when it fired on a
+  loaded machine a complete extraction was downgraded to `Partial` and the test
+  failed with "a complete extraction must not be downgraded to partial", naming
+  the extractor rather than the host.
+
+  Load-matched A/B with one binary: **0/10 failures at load 34.6 and 2/10 at load
+  74.1** before; **0/14 at loads 102–115** after, so the fix was verified above
+  the load that broke it rather than at a quieter moment. The tests now relax
+  only the wall clock, keeping `max_heredocs` and the byte/line caps at their
+  shipped values so the boundary under test is unchanged — the same trade
+  `ExtractionLimits::structural_scan()` made for the structural helpers (#443).
+  The shared `payloads()` helper, which 45 call sites in that file use, got the
+  same treatment, and the surviving failure message now distinguishes a timeout
+  from a slot limit so a slow host cannot be mistaken for a wrong extractor
+  again.
+
 - **A busy host no longer fails the history suite and blames the writer for it
   (#433).** Four tests asserted a fixed two-second flush deadline, so a loaded
   machine turned "telemetry is best-effort and dropped an entry because the
