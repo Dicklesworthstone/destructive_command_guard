@@ -152,6 +152,34 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   missed it. A newline now counts as an opener when the explicit `TRUNCATE
   TABLE` spelling follows, which is evidence no Tailwind class list carries.
 
+- **The registry-covers-pack invariant is now enforced for every pack (#441).** All
+  29 packs that declare a keyword their `PACK_ENTRIES` row omits are audited, so a
+  *new* omission fails `registry_keywords_cover_every_audited_pack_declared_keyword`
+  rather than joining 125 existing ones unnoticed. Each pack's headline rules were
+  run with only that pack enabled, and every one still denies.
+
+  The exemptions record *why* each keyword is dead without being a bypass, and the
+  distinction matters: most are structural — a subcommand or service name of a CLI
+  whose own name the row carries, so no command can present the keyword without the
+  gate — and the `windows.*` upper-case spellings are reached through their
+  lower-case twins because the automaton is ASCII case-insensitive. A smaller group
+  is covered only because **no rule currently needs them** (`database.postgresql`'s
+  and `database.snowflake`'s bare SQL verbs, `system.disk`'s `mount` and `/dev/`,
+  `system.permissions`' `chgrp`, `infrastructure.ansible`'s `playbook`), which is a
+  weaker guarantee: adding a matching rule without also adding the keyword silently
+  reintroduces the defect, and the test cannot catch that. Those are called out as
+  such.
+
+  `database.sqlite`'s `sqlite` is left out deliberately rather than as an oversight.
+  The row carries `sqlite3`, the binary modern systems ship; admitting `sqlite`
+  would make the pack a candidate for any command merely containing that substring,
+  a path like `/var/lib/sqlite/` included, and the rule it reaches is
+  `(?i)\bDROP\s+TABLE\b` with no client requirement — so
+  `echo "DROP TABLE" >> /var/lib/sqlite/notes` would begin to deny.
+
+  Hot-path cost of the 19 keywords added across all of this: worst net p95 of
+  38.7 ms against the 1000 ms budget.
+
 - **Mongo shell methods and `kubectl delete -k` were unreachable, which is why two
   `option_evidence` audits were red (#441).** `database.mongodb`'s registry row
   carried client binaries and `dropDatabase`/`dropCollection`, so a mongosh snippet

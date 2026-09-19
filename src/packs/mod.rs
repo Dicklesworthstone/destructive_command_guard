@@ -6288,6 +6288,33 @@ mod tests {
             "package_managers",
             "database.mongodb",
             "kubernetes.kustomize",
+            "storage.s3",
+            "platform.railway",
+            "messaging.kafka",
+            "search.elasticsearch",
+            "search.opensearch",
+            "database.postgresql",
+            "database.mysql",
+            "database.redis",
+            "database.sqlite",
+            "database.databricks",
+            "database.snowflake",
+            "database.supabase",
+            "containers.docker",
+            "containers.compose",
+            "containers.podman",
+            "kubernetes.kubectl",
+            "kubernetes.helm",
+            "cloud.aws",
+            "cloud.gcp",
+            "cloud.azure",
+            "infrastructure.terraform",
+            "infrastructure.ansible",
+            "infrastructure.pulumi",
+            "system.disk",
+            "system.permissions",
+            "windows.filesystem",
+            "windows.system",
         ];
 
         /// Keywords an audited pack omits from its row without opening a bypass.
@@ -6309,6 +6336,156 @@ mod tests {
             // as `npm-publish` through the `npm` keyword, and every other
             // publisher names its own manager.
             ("package_managers", "publish"),
+            // ---- Covered structurally: a subcommand, service name or flag of a
+            // CLI whose own name the row carries, so no command can present the
+            // keyword without also presenting the gate. Each pack's headline
+            // rules were run with only that pack enabled and all still deny.
+            ("storage.s3", "rb"),
+            ("storage.s3", "delete-bucket"),
+            ("storage.s3", "delete-object"),
+            ("storage.s3", "delete-objects"),
+            ("storage.s3", "--delete"),
+            ("platform.railway", "Project-Access-Token"),
+            ("platform.railway", "PROJECT_ACCESS_TOKEN"),
+            ("messaging.kafka", "kafka-topics.sh"),
+            ("messaging.kafka", "kafka-consumer-groups.sh"),
+            ("messaging.kafka", "kafka-configs.sh"),
+            ("messaging.kafka", "kafka-acls.sh"),
+            ("messaging.kafka", "kafka-delete-records.sh"),
+            ("messaging.kafka", "kafka-console-consumer"),
+            ("messaging.kafka", "kafka-console-producer"),
+            ("messaging.kafka", "kafka-broker-api-versions"),
+            ("search.elasticsearch", "curl"),
+            ("search.elasticsearch", "http"),
+            ("search.opensearch", "aws"),
+            ("search.opensearch", "curl"),
+            ("search.opensearch", "http"),
+            ("database.mysql", "mysqladmin"),
+            ("database.mysql", "delete"),
+            ("database.mysql", "drop"),
+            ("database.mysql", "truncate"),
+            ("database.mysql", "GRANT"),
+            ("database.redis", "redis"),
+            ("database.databricks", "bundle"),
+            ("database.supabase", "vanity-subdomains delete"),
+            ("containers.docker", "prune"),
+            ("containers.docker", "rmi"),
+            ("containers.docker", "volume"),
+            ("containers.compose", "compose"),
+            ("containers.podman", "prune"),
+            ("kubernetes.kubectl", "delete"),
+            ("kubernetes.kubectl", "drain"),
+            ("kubernetes.kubectl", "cordon"),
+            ("kubernetes.kubectl", "taint"),
+            ("kubernetes.helm", "uninstall"),
+            ("kubernetes.helm", "delete"),
+            ("kubernetes.helm", "rollback"),
+            ("cloud.aws", "terminate"),
+            ("cloud.aws", "delete"),
+            ("cloud.aws", "s3"),
+            ("cloud.aws", "ec2"),
+            ("cloud.aws", "rds"),
+            ("cloud.aws", "ecr"),
+            ("cloud.aws", "logs"),
+            ("cloud.aws", "athena"),
+            ("cloud.aws", "glue"),
+            ("cloud.aws", "kms"),
+            ("cloud.aws", "secretsmanager"),
+            ("cloud.aws", "route53"),
+            ("cloud.aws", "cloudtrail"),
+            ("cloud.aws", "redshift"),
+            ("cloud.aws", "kinesis"),
+            ("cloud.aws", "efs"),
+            ("cloud.gcp", "delete"),
+            ("cloud.gcp", "instances"),
+            ("cloud.gcp", "artifacts"),
+            ("cloud.gcp", "images"),
+            ("cloud.gcp", "repositories"),
+            ("cloud.gcp", "secrets"),
+            ("cloud.gcp", "kms"),
+            ("cloud.gcp", "iam"),
+            ("cloud.gcp", "dns"),
+            ("cloud.gcp", "spanner"),
+            ("cloud.gcp", "bigtable"),
+            ("cloud.gcp", "dataproc"),
+            ("cloud.azure", "delete"),
+            ("cloud.azure", "vm"),
+            ("cloud.azure", "storage"),
+            ("cloud.azure", "acr"),
+            ("cloud.azure", "registry"),
+            ("cloud.azure", "keyvault"),
+            ("cloud.azure", "role"),
+            ("cloud.azure", "ad"),
+            ("cloud.azure", "dns"),
+            ("cloud.azure", "cosmosdb"),
+            ("cloud.azure", "monitor"),
+            ("cloud.azure", "purge"),
+            ("cloud.azure", "account"),
+            ("cloud.azure", "management-group"),
+            ("cloud.azure", "subscription"),
+            ("cloud.azure", "lock"),
+            ("cloud.azure", "cancel"),
+            ("cloud.azure", "clear"),
+            ("cloud.azure", "remove"),
+            ("infrastructure.terraform", "destroy"),
+            ("infrastructure.terraform", "taint"),
+            ("infrastructure.terraform", "state"),
+            ("infrastructure.pulumi", "destroy"),
+            ("infrastructure.pulumi", "state"),
+            // ---- Covered by the matcher, not by a sibling keyword: the
+            // automaton is ASCII case-insensitive (see the windows module docs),
+            // so these upper-case spellings are reached through their lower-case
+            // twins in the row.
+            ("windows.filesystem", "CLEAR-CONTENT"),
+            ("windows.filesystem", "CLEAR-RECYCLEBIN"),
+            ("windows.system", "SHADOWCOPY"),
+            ("windows.system", "REMOVE-PARTITION"),
+            ("windows.system", "INITIALIZE-DISK"),
+            ("windows.system", "RESET-PHYSICALDISK"),
+            // ---- Covered only because NO RULE currently needs them. This is a
+            // weaker guarantee than the groups above: adding a rule that matches
+            // one of these, without also adding the keyword here, silently
+            // reintroduces the #441 defect, and this test cannot catch that. Each
+            // was checked to be allowed both bare and with a row keyword present,
+            // which is what distinguishes "no rule" from "the gate hid the rule".
+            ("database.postgresql", "postgres"), // `postgres --single -D …`
+            ("database.postgresql", "delete"),
+            ("database.postgresql", "drop"),
+            ("database.postgresql", "truncate"),
+            ("database.snowflake", "drop"),
+            ("database.snowflake", "truncate"),
+            ("database.snowflake", "delete"),
+            ("database.snowflake", "update"),
+            ("database.snowflake", "alter"),
+            ("database.snowflake", "grant"),
+            ("database.snowflake", "revoke"),
+            ("database.snowflake", "remove"),
+            ("database.snowflake", "overwrite"),
+            ("database.snowflake", "EXECUTE"),
+            ("database.snowflake", "execute"),
+            ("infrastructure.ansible", "playbook"), // `ansible-playbook` carries `ansible`
+            ("system.disk", "mount"),               // `mount -o remount,ro /` has no rule
+            ("system.permissions", "chgrp"),        // `chgrp -R … /etc` has no rule
+            // Every device-destroying shape that reaches a rule names its tool —
+            // `dd`, `mkfs`, `wipefs`, all in the row — and a bare redirect into a
+            // device is caught by always-on `core.filesystem` as
+            // `redirect-truncate-root-home` rather than by this pack. So no rule
+            // here needs `/dev/`. `tee /dev/sda < /dev/zero` is allowed by both
+            // packs — a raw device write with no rule at all — and is filed as
+            // #444. If a rule for that shape is added, `/dev/` has to move into
+            // this pack's row in the same change, or the new rule is unreachable
+            // for any command naming no other disk tool, which is exactly the
+            // `tee` case.
+            ("system.disk", "/dev/"),
+            // ---- A deliberate omission rather than an oversight. The row carries
+            // `sqlite3`, the binary modern systems ship; `sqlite` is SQLite 2's
+            // CLI. Admitting it would make the pack a candidate for any command
+            // merely containing the substring — a path like `/var/lib/sqlite/`
+            // included — and the rule it reaches is `(?i)\bDROP\s+TABLE\b` with no
+            // client requirement, so `echo "DROP TABLE" >> /var/lib/sqlite/notes`
+            // would begin to deny. Widening a rule that broad for a legacy binary
+            // is a decision, not a reflex.
+            ("database.sqlite", "sqlite"),
         ];
 
         #[test]
