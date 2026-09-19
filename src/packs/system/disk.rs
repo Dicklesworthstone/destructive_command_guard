@@ -85,8 +85,20 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "lsblk",
             r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?lsblk\b"
         ),
-        // fdisk -l (list) is safe
-        safe_pattern!("fdisk-list", r"fdisk\s+-l"),
+        // There is deliberately no `fdisk -l` exemption.
+        //
+        // One used to sit here, unanchored, so `fdisk\s+-l` matched anywhere in
+        // a segment and short-circuited every destructive rule in the pack:
+        // `mkfs.ext4 /dev/sdb1 2>>"/tmp/fdisk -l.log"` was allowed (#448).
+        // Anchoring it at the command position, the way `lsblk`/`blkid`/`df`
+        // were, would have been the smaller change. It is dropped instead
+        // because `fdisk-edit` already excludes the read-only form twice over:
+        // it requires `/dev/` immediately after `fdisk`, so `fdisk -l /dev/sda`
+        // never reaches it, and it carries `(?!.*-l)`, so `fdisk /dev/sda -l`
+        // does not match either. The exemption only undid a deny the rule does
+        // not make. A redundant exemption is a short-circuit waiting to be
+        // re-widened, so it goes rather than gets narrowed — the same call
+        // `ae0cf8d` made for the mdadm read-only exemptions.
         // parted print is safe. Keep this tight because safe patterns run
         // before destructive patterns, and GNU Parted accepts multiple
         // commands after the device.
@@ -109,8 +121,18 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "df",
             r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?df\b"
         ),
-        // mount (without arguments, just list)
-        safe_pattern!("mount-list", r"\bmount\s*$"),
+        // There is deliberately no bare-`mount` exemption.
+        //
+        // One used to sit here as `\bmount\s*$`, anchored only at the END, and
+        // `/` is a word boundary — so any destructive command whose redirect
+        // target's last path component was `mount` satisfied it and skipped the
+        // whole pack: `dd if=/dev/zero of=/dev/sda 2>>/var/log/mount` and
+        // `wipefs -a /dev/sdb 2>/tmp/mount` were allowed (#448).
+        //
+        // Neither mount rule here can match a bare `mount` anyway:
+        // `mount-bind-root` requires `--bind` and a root target, and
+        // `umount-force` requires the literal `umount` with `-f`. So this was
+        // also a redundant exemption rather than a needed one.
         // There is deliberately no `mkswap --check` exemption.
         //
         // One used to sit here, commented "read-only inspection of swap area".
