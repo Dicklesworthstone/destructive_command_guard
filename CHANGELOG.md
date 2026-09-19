@@ -152,6 +152,31 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   missed it. A newline now counts as an opener when the explicit `TRUNCATE
   TABLE` spelling follows, which is evidence no Tailwind class list carries.
 
+- **A structural heredoc question no longer depends on how busy the machine is
+  (#443, partial).** Two helpers answer *where a heredoc body begins and ends* —
+  the #393 parse recovery, which exists because tree-sitter-bash rejects Ruby's
+  `<<~`, and the #412 quoted-body blanking. Both called extraction with the
+  hardcoded 50ms default budget. Under parallel load that expired, the helper
+  answered "no content", the recovery declined, and a data-sink heredoc body that
+  masks on an idle machine was re-scanned as live shell instead. The failing
+  direction is over-blocking, so it was fail-safe, but the question is a property
+  of the command.
+
+  Both now use size caps identical to the default with a far larger wall clock:
+  the caps are what bound the work — a 256 KiB input limit plus 1 MiB / 10k lines
+  / 10 heredocs — and the clock contributed only nondeterminism. It stays finite so
+  a pathological input still terminates. Measured on the previously load-flaky
+  `masks_indent_stripped_heredoc_body_with_space_indented_terminator`: 2/12
+  failures at loadavg 89 before, **0/25 at loadavg 129** after, and 0/16 rather
+  than ~2/14 across full `--lib` runs.
+
+  The wider half of #443 is untouched: six production helpers hardcode
+  `ExtractionLimits::default()` instead of the configured `HeredocSettings.limits`,
+  so `DCG_HEREDOC_TIMEOUT_MS` is inert for them. Only the two above were audited.
+  No end-to-end verdict was ever observed to flip — `cat > notes.md <<~ 'EOF'` with
+  `rm -rf /` in the body returned `allow` 40/40 idle and 40/40 at loadavg 66 — so
+  this is a determinism and config-correctness fix, not a reported misbehaviour.
+
 - **The AST budget is reachable from the environment (#438).** Of the three
   budgets a subprocess test can hit, it could raise two: `DCG_HOOK_TIMEOUT_MS` and
   `DCG_HEREDOC_TIMEOUT_MS`. AST matching sat on a hard 20ms release constant with

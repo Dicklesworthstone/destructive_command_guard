@@ -542,6 +542,32 @@ impl Default for ExtractionLimits {
     }
 }
 
+impl ExtractionLimits {
+    /// Limits for the two helpers that answer a *structural* question — which
+    /// heredoc bodies exist, and where one body begins and ends — rather than
+    /// doing hot-path extraction work.
+    ///
+    /// Same size caps as [`Self::default`], because those are what actually bound
+    /// the work: the caller has already limited the input to 256 KiB, and a body
+    /// is capped at 1 MiB / 10k lines / 10 heredocs. Only the wall clock differs,
+    /// and it is generous deliberately. At 50 ms it expired under parallel load,
+    /// the helper answered "no content", and the recovery declined — so a
+    /// data-sink heredoc body that masks on an idle machine was re-scanned as
+    /// live shell instead. The failing direction is over-blocking, so it was
+    /// fail-safe, but "does this command contain one heredoc" is a property of
+    /// the command and must not depend on how busy the machine is (#443).
+    ///
+    /// The budget is kept rather than removed so a pathological input still
+    /// terminates; it is sized so that only descheduling, never ordinary work,
+    /// could reach it.
+    fn structural_scan() -> Self {
+        Self {
+            timeout_ms: 5_000,
+            ..Self::default()
+        }
+    }
+}
+
 /// Detected language for embedded script content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScriptLanguage {
@@ -4084,14 +4110,18 @@ fn quoted_heredoc_bodies_blanked(command: &str) -> Option<String> {
     // asking for the mask here would not terminate (#420). Using the raw text
     // is also the honest input: the question here is which bodies exist, not
     // which of them are data.
-    let extracted =
-        match extract_content_with_scan_view(command, command, &ExtractionLimits::default()) {
-            ExtractionResult::Extracted(extracted)
-            | ExtractionResult::Partial { extracted, .. } => extracted,
-            ExtractionResult::NoContent
-            | ExtractionResult::Skipped(_)
-            | ExtractionResult::Failed(_) => return None,
-        };
+    let extracted = match extract_content_with_scan_view(
+        command,
+        command,
+        &ExtractionLimits::structural_scan(),
+    ) {
+        ExtractionResult::Extracted(extracted) | ExtractionResult::Partial { extracted, .. } => {
+            extracted
+        }
+        ExtractionResult::NoContent
+        | ExtractionResult::Skipped(_)
+        | ExtractionResult::Failed(_) => return None,
+    };
     let mut ranges: Vec<std::ops::Range<usize>> = extracted
         .into_iter()
         .filter(|content| {
@@ -5265,14 +5295,18 @@ fn active_single_heredoc_fallback(command: &str) -> Option<Vec<ActiveHeredoc>> {
     // masker, so asking for the mask here would not terminate (#420). Scanning
     // the raw text in this one place is the conservative direction, and it is
     // what every caller did before.
-    let extracted =
-        match extract_content_with_scan_view(command, command, &ExtractionLimits::default()) {
-            ExtractionResult::Extracted(extracted)
-            | ExtractionResult::Partial { extracted, .. } => extracted,
-            ExtractionResult::NoContent
-            | ExtractionResult::Skipped(_)
-            | ExtractionResult::Failed(_) => return None,
-        };
+    let extracted = match extract_content_with_scan_view(
+        command,
+        command,
+        &ExtractionLimits::structural_scan(),
+    ) {
+        ExtractionResult::Extracted(extracted) | ExtractionResult::Partial { extracted, .. } => {
+            extracted
+        }
+        ExtractionResult::NoContent
+        | ExtractionResult::Skipped(_)
+        | ExtractionResult::Failed(_) => return None,
+    };
     let mut candidates = extracted.into_iter().filter(|content| {
         content.byte_range.start == operator_start
             && content
@@ -6920,6 +6954,32 @@ mod tests {
             assert_eq!(limits.max_body_lines, 10_000);
             assert_eq!(limits.max_heredocs, 10);
             assert_eq!(limits.timeout_ms, 50);
+        }
+
+        /// #443: the structural helpers keep every size cap and only relax time.
+        ///
+        /// The size caps are what bound the work, so they must not drift from the
+        /// defaults. The wall clock is the one bound that made a property of the
+        /// *command* depend on how loaded the machine was, which is why it alone
+        /// is larger here — and it stays finite so a pathological input still
+        /// terminates.
+        #[test]
+        fn structural_scan_limits_relax_only_the_wall_clock_443() {
+            let structural = ExtractionLimits::structural_scan();
+            let default = ExtractionLimits::default();
+
+            assert_eq!(structural.max_body_bytes, default.max_body_bytes);
+            assert_eq!(structural.max_body_lines, default.max_body_lines);
+            assert_eq!(structural.max_heredocs, default.max_heredocs);
+
+            assert!(
+                structural.timeout_ms > default.timeout_ms,
+                "a structural question must not be decided by a budget the host can exhaust"
+            );
+            assert!(
+                structural.timeout_ms > 0,
+                "the budget stays finite so a pathological input terminates"
+            );
         }
 
         #[test]
