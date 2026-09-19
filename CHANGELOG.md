@@ -17,6 +17,50 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Security
 
+- **`mount --bind /mnt /` was allowed, and `tee /dev/sda` before it: two rules
+  that could never run because the quick-reject filter dropped the command first
+  (#441, #444).** `system.disk` owns a rule for each — `mount-bind-root` and
+  `tee-device` — and both matched their command all along. Neither could be
+  reached: a pack is only consulted when the command carries a keyword from that
+  pack's `PACK_ENTRIES` row, and the row named `umount` but not `mount`, and no
+  spelling of `/dev/` at all.
+
+  The shape is stark once measured. Against v0.14.4, `mount --bind /mnt /` was
+  allowed, while `mount --bind /mnt/btrfs /` was denied by `mount-bind-root` — the
+  same rule, the same shape, differing only in whether an unrelated row keyword
+  happened to appear inside a path. A bind mount over `/` shadows the running root
+  filesystem for every path resolved afterwards; `tee /dev/sda` overwrites a disk
+  exactly as `dd` would.
+
+  `mount` is registered in place of `umount`, not alongside it: keyword matching is
+  substring-based, so it reaches every `umount -f /mnt/x` the older entry was added
+  for (#323) and the bind spelling besides. Sweeping all 44 of the pack's
+  destructive regexes, `mount-bind-root` was the only one carrying no other row
+  keyword, so it is the only rule the wider gate can newly reach — confirmed by
+  `mount -t ext4 /dev/sdb1 /mnt`, `mount -o remount,ro /`,
+  `mount --bind /proc /mnt/proc`, `mountpoint -q /mnt` and
+  `docker run --mount type=bind,…`, which all still run.
+
+  `mount` had been recorded as a keyword no rule needed, on the evidence that
+  `mount -o remount,ro /` matches nothing. That is true, and it was the wrong
+  command to check. The probe has to come from the pack's rule list rather than
+  from what the keyword looks like it is for, and the exemption list now says so.
+
+  A second test covers the reason all of these shipped green:
+  `registry_gate_admits_every_command_its_rules_must_decide` builds the real
+  `EnabledKeywordIndex` and asserts the pack is a candidate *before* asserting the
+  rule fires, for `cat > .git/config` (#407), `umount -f /mnt/data` (#323),
+  `tee /dev/sda` (#444) and `mount --bind /mnt /` (#441). Pack-level tests call
+  `Pack::check` directly and never see the registry gate, so each of these four had
+  a passing test while the shipped binary allowed the command.
+
+  Sweeping every destructive rule in every pack for the same property — a regex
+  carrying no keyword from its own row — flagged 93 of 1116. 56 are `\b\B`
+  sentinels for rules decided by semantic classifiers, 12 were artifacts of
+  matching against regex source, and probing the rest against the real binary left
+  only the two above plus the `featureflags.flipt` and `featureflags.unleash` REST
+  rules, which need the vendor's name in the URL (#447, opt-in packs).
+
 - **`printf -v` could rebind a proven variable without the guard noticing, and
   `p=/tmp/safe; printf -v p /; rm -rf "$p"` reached `rm -rf /`.** Narrowing the
   variable-mutator list so a plain `printf` no longer blocks an ordinary write
@@ -344,9 +388,18 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 - **The registry-covers-pack invariant is now enforced for every pack (#441).** All
   29 packs that declare a keyword their `PACK_ENTRIES` row omits are audited, so a
-  *new* omission fails `registry_keywords_cover_every_audited_pack_declared_keyword`
+  *new* omission fails `registry_keywords_cover_every_pack_declared_keyword`
   rather than joining 125 existing ones unnoticed. Each pack's headline rules were
   run with only that pack enabled, and every one still denies.
+
+  The test reached that name the hard way. It first ran over an allowlist of
+  audited packs, which made the heading above true of 32 rows and not of the other
+  71 — a new omission in any of those 71 still passed. Re-measuring found the
+  backlog the allowlist existed to work through was already empty: 6 rows share one
+  `KEYWORDS` const with their pack and cannot drift, 68 already carry every keyword
+  their pack declares, and all remaining drift belonged to packs already audited.
+  The allowlist was removed; the only thing it could still do was exempt the next
+  pack to acquire an omission.
 
   The exemptions record *why* each keyword is dead without being a bypass, and the
   distinction matters: most are structural — a subcommand or service name of a CLI
@@ -354,11 +407,13 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   gate — and the `windows.*` upper-case spellings are reached through their
   lower-case twins because the automaton is ASCII case-insensitive. A smaller group
   is covered only because **no rule currently needs them** (`database.postgresql`'s
-  and `database.snowflake`'s bare SQL verbs, `system.disk`'s `mount` and `/dev/`,
-  `system.permissions`' `chgrp`, `infrastructure.ansible`'s `playbook`), which is a
-  weaker guarantee: adding a matching rule without also adding the keyword silently
-  reintroduces the defect, and the test cannot catch that. Those are called out as
-  such.
+  and `database.snowflake`'s bare SQL verbs, `system.permissions`' `chgrp`,
+  `infrastructure.ansible`'s `playbook`), which is a weaker guarantee: adding a
+  matching rule without also adding the keyword silently reintroduces the defect,
+  and the test cannot catch that. Those are called out as such.
+
+  `system.disk`'s `mount` and `/dev/` were in that group and should not have been.
+  Both had a rule: `/dev/` was corrected first, `mount` below.
 
   `database.sqlite`'s `sqlite` is left out deliberately rather than as an oversight.
   The row carries `sqlite3`, the binary modern systems ship; admitting `sqlite`
