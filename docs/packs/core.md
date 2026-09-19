@@ -108,6 +108,13 @@ Commands containing these keywords are checked against this pack:
 - `sed`
 - `perl`
 - `.git/`
+- `.ssh/`
+- `.gnupg/`
+- `.aws/`
+- `.kube/`
+- `.docker/`
+- `.bashrc.d/`
+- `.zshrc.d/`
 - `>/`
 - `> /`
 - `>~`

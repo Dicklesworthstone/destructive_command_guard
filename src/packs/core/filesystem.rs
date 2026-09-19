@@ -3344,11 +3344,59 @@ pub fn create_pack() -> Pack {
         // a dot or a directory name rather than `/`, `~`, `$` or a quote, so
         // `cat > .git/config` and `cat > sub/.git/config` reached no pattern at
         // all and the rule never ran (GitHub #407).
+        //
+        // The credential-directory anchors that follow it are there for the
+        // same reason and the same issue: `credential-file-write` now judges a
+        // relative path through one of them, but a bare redirect carries no
+        // other keyword, so `echo k > .ssh/authorized_keys` would be dropped
+        // before the classifier ran. The non-redirect writers (`tee`, `cp`, …)
+        // are already keywords under their own names and do not need these.
         keywords: &[
-            "rm", "find", "unlink", "truncate", "shred", "tar", "dd", "mv", "cp", "ln", "rsync",
-            "tee", "sponge", "install", "sed", "perl", ".git/", ">/", "> /", ">~", "> ~", ">$",
-            "> $", ">\"", "> \"", ">'", "> '", "&>", ">&", ">|", "1>", "2>", ">%", "> %", ">!",
-            "> !", ">^", "> ^",
+            "rm",
+            "find",
+            "unlink",
+            "truncate",
+            "shred",
+            "tar",
+            "dd",
+            "mv",
+            "cp",
+            "ln",
+            "rsync",
+            "tee",
+            "sponge",
+            "install",
+            "sed",
+            "perl",
+            ".git/",
+            ".ssh/",
+            ".gnupg/",
+            ".aws/",
+            ".kube/",
+            ".docker/",
+            ".bashrc.d/",
+            ".zshrc.d/",
+            ">/",
+            "> /",
+            ">~",
+            "> ~",
+            ">$",
+            "> $",
+            ">\"",
+            "> \"",
+            ">'",
+            "> '",
+            "&>",
+            ">&",
+            ">|",
+            "1>",
+            "2>",
+            ">%",
+            "> %",
+            ">!",
+            "> !",
+            ">^",
+            "> ^",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),

@@ -98,10 +98,18 @@ pub(crate) fn is_credential_writer(executable: &str) -> bool {
 /// `cargo install`, or a `sed | tee /tmp/out` pipeline never cold-initialise
 /// core.filesystem's regex set on this rule's account.
 pub(crate) fn may_name_protected_path(command: &str) -> bool {
-    command.contains(['~', '$'])
+    // `\` joins the cheap character check because this gate reads the raw
+    // command, before any quote or escape removal: `tee .ss\h/authorized_keys`
+    // opens `.ssh/authorized_keys` but contains no anchor to find here. The
+    // rooted spellings were already escape-tolerant by accident, since `~` and
+    // `$` survive into the raw text; the relative anchors have no such token.
+    command.contains(['~', '$', '\\'])
         || ["/etc", "/home/", "/Users/", "/root"]
             .iter()
             .any(|prefix| command.contains(prefix))
+        || RELATIVE_ANCHORS
+            .iter()
+            .any(|anchor| command.contains(anchor))
 }
 
 // ============================================================================
@@ -928,6 +936,65 @@ fn tokenize(segment: &str) -> Vec<Token> {
 // Path resolution
 // ============================================================================
 
+/// Path components that name a credential directory wherever the shell is
+/// standing, so a relative spelling through one can be judged without knowing
+/// the working directory (#407).
+///
+/// dcg does not know the cwd at pattern-match time, and refusing every
+/// relative write would refuse `> out.txt`. But `.ssh/id_rsa` is an SSH
+/// private key whether it is reached from `$HOME` or from a dotfiles
+/// checkout, exactly the argument `redirect-truncate-git-internals-relative`
+/// already makes for `.git/`. Each anchor here is a *directory* whose name
+/// identifies its contents; the bare dotfiles in `ENTRIES` (`.npmrc`,
+/// `.netrc`, `.bashrc`) are deliberately absent, because a project-local
+/// `.npmrc` written by CI is ordinary and common.
+///
+/// `.config` is also absent on purpose: its only entry is
+/// `.config/gh/hosts.yml`, and `.config/` is frequent enough in ordinary
+/// command text that anchoring it would widen the always-on hot path for
+/// little coverage.
+///
+/// Limit worth stating, measured rather than assumed: an anchor the shell
+/// assembles (`tee .ss${X}h/authorized_keys`) is not recognised, because the
+/// component is not literal and no root has been established yet to run the
+/// [`reachable`] partial check against. The rooted spelling of the same thing
+/// (`~/.ss${X}h/…`) still denies. A *redirect* to an assembled relative anchor
+/// is not caught by `redirect-truncate-dynamic-path` either: that rule's
+/// quick-reject keywords want the `$` directly after the `>`. An escaped
+/// anchor (`.ss\h/`) IS caught — see [`may_name_protected_path`].
+const RELATIVE_ANCHORS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".kube",
+    ".docker",
+    ".bashrc.d",
+    ".zshrc.d",
+];
+
+/// Byte index where the first literal [`RELATIVE_ANCHORS`] component of `word`
+/// begins, when the word is a relative path that passes through one.
+///
+/// The anchor must be followed by a separator: the protected material lives
+/// inside the directory, and a plain file named `.ssh` is not it.
+fn relative_anchor_start(word: &Word) -> Option<usize> {
+    let text = &word.text;
+    let mut start = 0usize;
+    for index in 0..text.len() {
+        if text[index] != '/' {
+            continue;
+        }
+        let component: String = text[start..index].iter().collect();
+        if RELATIVE_ANCHORS.contains(&component.as_str())
+            && word.literal[start..index].iter().all(|literal| *literal)
+        {
+            return Some(start);
+        }
+        start = index + 1;
+    }
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Spelling {
     root: Root,
@@ -1028,7 +1095,15 @@ fn resolve(word: &Word) -> Option<Spelling> {
             };
             (root, Vec::new(), skip_parts(text, consumed))
         } else {
-            return None;
+            // A relative spelling names the same credential material as the
+            // absolute one, and until #407 only the absolute one was judged:
+            // `tee ~/.ssh/authorized_keys` denied while `tee .ssh/authorized_keys`
+            // was allowed. Rebasing onto `Root::Home` at the anchor hands the
+            // rest to the same table, so relative spellings inherit every
+            // decision the absolute ones already make — including the `*.pub`
+            // and `known_hosts`-append carve-outs. A word with no anchor is
+            // not a path this classifier can judge.
+            (Root::Home, Vec::new(), relative_anchor_start(word)?)
         };
 
     let mut current = String::new();
@@ -1942,9 +2017,12 @@ mod tests {
             "echo x > /etc/hosts",
             "echo x > /etc/sudoers.tmp",
             "echo x > /tmp/.zshrc",
+            // `.zshrc` stays here: a bare dotfile is not an anchor, because a
+            // project-local one is ordinary. `./.ssh/authorized_keys` and
+            // `.ssh/authorized_keys` used to sit beside it and now deny — they
+            // pinned the limitation that #407 reported, not a decision, and
+            // they moved to `relative_anchors` below.
             "echo x > .zshrc",
-            "echo x > ./.ssh/authorized_keys",
-            "echo x > .ssh/authorized_keys",
             "install -d -m 700 ~/.ssh",
             "mkdir -p ~/.ssh",
             "touch ~/.ssh/authorized_keys",
@@ -2188,5 +2266,140 @@ mod tests {
             &question,
             &"_netrc".chars().collect::<Vec<_>>()
         ));
+    }
+
+    /// #407: a relative spelling names the same credential file the rooted one
+    /// does, and only the rooted one was being judged.
+    mod relative_anchors {
+        use super::{allowed, denied, hit};
+        use crate::packs::core::credential_files::{ENTRIES, RELATIVE_ANCHORS, Root};
+
+        /// Rooted/relative pairs that must reach the same verdict.
+        const PAIRS: &[&str] = &[
+            ".ssh/authorized_keys",
+            ".ssh/config",
+            ".ssh/id_rsa",
+            ".ssh/id_ed25519",
+            ".ssh/rc",
+            ".aws/credentials",
+            ".aws/config",
+            ".docker/config.json",
+            ".kube/config",
+            ".gnupg/trustdb.gpg",
+            ".gnupg/private-keys-v1.d/key.key",
+            ".bashrc.d/10-path.sh",
+            ".zshrc.d/aliases.zsh",
+        ];
+
+        #[test]
+        fn every_anchored_relative_path_is_denied_for_every_writer() {
+            for path in PAIRS {
+                for command in [
+                    format!("echo x > {path}"),
+                    format!("printf x >| {path}"),
+                    format!("echo x | tee {path}"),
+                    format!("cp ./src {path}"),
+                    format!("mv ./src {path}"),
+                    format!("install -m 600 ./src {path}"),
+                    format!("ln -sf /tmp/evil {path}"),
+                    format!("dd if=/tmp/x of={path}"),
+                    format!("sed -i 's/a/b/' {path}"),
+                    format!("perl -pi -e 's/a/b/' {path}"),
+                ] {
+                    denied(&command);
+                }
+            }
+        }
+
+        #[test]
+        fn the_relative_and_rooted_spellings_agree() {
+            for path in PAIRS {
+                for writer in ["echo x > ", "echo x | tee ", "cp ./src "] {
+                    let relative = hit(&format!("{writer}{path}")).is_some();
+                    let rooted = hit(&format!("{writer}~/{path}")).is_some();
+                    assert_eq!(
+                        relative, rooted,
+                        "`{writer}{path}` and `{writer}~/{path}` name the same file"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_path_through_an_anchor_is_anchored_wherever_it_starts() {
+            // These two moved out of `reads_permissions_and_neighbours_stay_allowed`,
+            // where they recorded the gap this module closes.
+            denied("echo x > ./.ssh/authorized_keys");
+            denied("echo x > .ssh/authorized_keys");
+            denied("cp ./src dotfiles/.ssh/config");
+            denied("cp ./src ../.ssh/authorized_keys");
+            denied("cp ./src ./.ssh/id_rsa");
+            // `..` after the anchor is resolved against it, so this still lands
+            // on a protected login file rather than escaping the check.
+            denied("cp ./src .ssh/../.bashrc");
+        }
+
+        #[test]
+        fn the_rooted_carve_outs_survive_the_relative_spelling() {
+            // Public keys are public, and appending a host key is what ssh does.
+            allowed("cp ./src .ssh/id_rsa.pub");
+            allowed("echo host >> .ssh/known_hosts");
+            assert!(
+                hit("echo host >> ~/.ssh/known_hosts").is_none(),
+                "the rooted append carve-out is the one being mirrored"
+            );
+        }
+
+        #[test]
+        fn an_escaped_anchor_is_still_an_anchor() {
+            // `.ss\h` is `.ssh` to the shell. The raw-text pre-gate cannot see
+            // that, which is why it also admits any command containing `\`.
+            denied("cp ./src .ss\\h/authorized_keys");
+            denied("cp ./src .s\\sh/authorized_keys");
+            denied("cp ./src '.ssh'/authorized_keys");
+        }
+
+        #[test]
+        fn an_assembled_relative_anchor_is_a_known_limit() {
+            // NOT a desired behaviour: pinned so that closing it is a
+            // deliberate change rather than an accident. The component is not
+            // literal and no root is established yet, so there is nothing to
+            // run the partial check against. The rooted spelling, which does
+            // have a root, still denies — that is the invariant that matters.
+            assert!(
+                hit("cp ./src .ss${E}h/authorized_keys").is_none(),
+                "if this now denies, delete this test and record the improvement"
+            );
+            denied("cp ./src ~/.ss${E}h/authorized_keys");
+        }
+
+        #[test]
+        fn unanchored_relative_paths_are_untouched() {
+            for command in [
+                "echo x > notes.txt",
+                "echo x > .npmrc",
+                "echo x > .netrc",
+                "cp ./src .sshd/config",
+                "cp ./src assh/config",
+                "cp ./src .sshfoo/key",
+                "cp ./src project/.aws-config",
+                // No separator: a plain file called `.ssh` is not the store.
+                "cp ./src .ssh",
+            ] {
+                allowed(command);
+            }
+        }
+
+        #[test]
+        fn every_anchor_names_a_real_home_entry() {
+            for anchor in RELATIVE_ANCHORS {
+                assert!(
+                    ENTRIES.iter().any(|entry| {
+                        entry.root == Root::Home && entry.comps.first() == Some(anchor)
+                    }),
+                    "anchor {anchor:?} matches no Root::Home entry, so it can never deny anything"
+                );
+            }
+        }
     }
 }

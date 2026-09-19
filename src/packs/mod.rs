@@ -1521,6 +1521,19 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             // command never runs (#407). The pack's own keyword list had it;
             // this row is the gate that actually decides, and it did not.
             ".git/",
+            // Credential-directory anchors, for the relative half of
+            // `credential-file-write` (#407). `.ssh/authorized_keys` names an
+            // SSH key store wherever the shell stands, and a bare redirect to
+            // it carries none of the keywords below. The non-redirect writers
+            // the classifier understands (`tee`, `cp`, `dd`, `sed`, …) are
+            // already in this row under their own names.
+            ".ssh/",
+            ".gnupg/",
+            ".aws/",
+            ".kube/",
+            ".docker/",
+            ".bashrc.d/",
+            ".zshrc.d/",
             ">/",
             "> /",
             ">~",
