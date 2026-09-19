@@ -17,6 +17,38 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Security
 
+- **`tee ~/.SSH/id_rsa` was allowed, on the filesystems most of our users are
+  on.** `credential-file-write` compared path components case-sensitively, so
+  an upper- or mixed-case spelling read as a different path and switched the
+  whole classifier off. APFS and NTFS — the macOS and Windows defaults — are
+  case-insensitive, so those spellings open the real files; verified on this
+  host by reading `.ssh/id_rsa` back through `.SSH/id_rsa`.
+
+  Redirects happened to survive, because `redirect-truncate-root-home` catches
+  `> ~/.ANYTHING` that already exists without caring what it is named. Every
+  other writer did not, and neither did a redirect to a target that does not
+  exist yet (the #337/#390 creation carve-out). Confirmed allowed before the
+  fix, all of which write the real file:
+
+  ```
+  tee ~/.SSH/id_rsa              cp evil ~/.SSH/id_rsa
+  sed -i 's/a/b/' ~/.SSH/config  echo x > ~/.NETRC
+  echo x > /ETC/passwd
+  ```
+
+  Component comparison, the `/home|/Users|/root|/etc|/private` root detection,
+  the `known_hosts` and `*.pub` neighbours, the `reachable` partial check and
+  the relative anchors all fold ASCII case now, and the raw-text pre-gate folds
+  with them — a gate has to be at least as permissive as the matcher behind it.
+  The carve-outs fold too rather than getting stricter: `>> ~/.ssh/KNOWN_HOSTS`
+  still appends and `~/.SSH/id_rsa.PUB` is still public.
+
+  The cost is a false positive only on a case-sensitive filesystem that has a
+  genuinely distinct `~/.SSH` or `/ETC`, which is the conservative direction
+  and matches what the pack keyword index already did — quick-rejection has
+  been ASCII case-insensitive all along, so the command reached the pack and
+  then fell out of the classifier.
+
 - **Any argument containing the word `lsblk`, `blkid`, `df`, `stat`, `getfacl`,
   `namei`, `journalctl`, `host` or `nslookup` switched off every rule in the
   pack that owns it (#448).** Nine safe patterns across four packs were written

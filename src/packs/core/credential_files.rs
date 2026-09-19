@@ -106,11 +106,25 @@ pub(crate) fn may_name_protected_path(command: &str) -> bool {
     command.contains(['~', '$', '\\'])
         || ["/etc", "/home/", "/Users/", "/root"]
             .iter()
-            .any(|prefix| command.contains(prefix))
-        || RELATIVE_ANCHORS
-            .iter()
+            .chain(RELATIVE_ANCHORS)
             .chain(RELATIVE_FILE_ANCHORS)
-            .any(|anchor| command.contains(anchor))
+            .any(|needle| contains_ascii_case_insensitive(command, needle))
+}
+
+/// Whether `haystack` contains `needle` (ASCII) ignoring case.
+///
+/// The gate has to be at least as permissive as the matcher behind it, and
+/// that matcher folds case because `/ETC/passwd` and `~/.SSH/id_rsa` open the
+/// real files on a case-insensitive filesystem. A sibling of this lives in
+/// `heredoc.rs` for the inline-script pre-gate, for the same reason.
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return needle.is_empty();
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 // ============================================================================
@@ -371,7 +385,7 @@ fn has_prefix(comps: &[String], prefix: &[&str]) -> bool {
         && comps
             .iter()
             .zip(prefix)
-            .all(|(component, expected)| component.as_str() == *expected)
+            .all(|(component, expected)| component.eq_ignore_ascii_case(expected))
 }
 
 /// The entries `comps` is a proper ancestor of, files before directories so
@@ -387,7 +401,7 @@ fn descendants(root: Root, comps: &[String]) -> impl Iterator<Item = &'static En
                 && comps
                     .iter()
                     .zip(entry.comps)
-                    .all(|(component, expected)| component.as_str() == *expected)
+                    .all(|(component, expected)| component.eq_ignore_ascii_case(expected))
         })
 }
 
@@ -443,14 +457,16 @@ fn ssh_entry(comps: &[String], default_what: &'static str) -> Exact {
     if public_key {
         return Exact::Clear;
     }
-    if comps.len() == 2 && matches!(name.as_str(), "known_hosts" | "known_hosts2") {
+    if comps.len() == 2
+        && (name.eq_ignore_ascii_case("known_hosts") || name.eq_ignore_ascii_case("known_hosts2"))
+    {
         return Exact::Protected {
             display,
             what: KNOWN_HOSTS_WHAT,
             append_ok: true,
         };
     }
-    let what = match name.as_str() {
+    let what = match name.to_ascii_lowercase().as_str() {
         "authorized_keys" | "authorized_keys2" => "grants SSH login as this user",
         "config" => "configures SSH hosts, identities, proxies, and commands",
         "rc" | "environment" => "runs at every SSH login",
@@ -470,7 +486,11 @@ fn reachable(root: Root, comps: &[String], partial: &str) -> Option<(String, &'s
         return Some((display, what));
     }
     descendants(root, comps)
-        .find(|entry| entry.comps[comps.len()].starts_with(partial))
+        .find(|entry| {
+            let candidate = entry.comps[comps.len()];
+            candidate.len() >= partial.len()
+                && candidate[..partial.len()].eq_ignore_ascii_case(partial)
+        })
         .map(|entry| (entry_display(entry, entry.comps.len()), entry.what))
 }
 
@@ -1014,7 +1034,11 @@ fn relative_anchor_start(word: &Word) -> Option<usize> {
             continue;
         }
         let component: String = text[start..index].iter().collect();
-        if RELATIVE_ANCHORS.contains(&component.as_str()) && literal(start..index) {
+        if RELATIVE_ANCHORS
+            .iter()
+            .any(|anchor| component.eq_ignore_ascii_case(anchor))
+            && literal(start..index)
+        {
             return Some(start);
         }
         // `./x` is `x`; anything else means the file anchor below is not the
@@ -1024,7 +1048,9 @@ fn relative_anchor_start(word: &Word) -> Option<usize> {
     }
     let last: String = text[start..].iter().collect();
     (only_dot_so_far
-        && RELATIVE_FILE_ANCHORS.contains(&last.as_str())
+        && RELATIVE_FILE_ANCHORS
+            .iter()
+            .any(|anchor| last.eq_ignore_ascii_case(anchor))
         && literal(start..text.len()))
     .then_some(start)
 }
@@ -1124,13 +1150,25 @@ fn resolve(word: &Word) -> Option<Spelling> {
             let mut parts = raw.split('/').filter(|part| !part.is_empty());
             let head = parts.next()?;
             let second = parts.next();
-            let (root, consumed) = match (head, second) {
-                ("home" | "Users", Some(_)) => (Root::Home, 2usize),
-                ("root", _) => (Root::Home, 1),
-                ("var", Some("root")) => (Root::Home, 2),
-                ("etc", _) => (Root::Etc, 1),
-                ("private", Some("etc")) => (Root::Etc, 2),
-                _ => return None,
+            // Case-folded: on a case-insensitive filesystem — APFS and NTFS by
+            // default — `/ETC/passwd` opens `/etc/passwd`, so a case-sensitive
+            // comparison here reads as a different path and lets the write
+            // through. Folding costs a false positive only on a case-sensitive
+            // filesystem that has a genuinely distinct `/ETC`.
+            let is = |value: &str, expected: &str| value.eq_ignore_ascii_case(expected);
+            let second_is = |expected: &str| second.is_some_and(|second| is(second, expected));
+            let (root, consumed) = if (is(head, "home") || is(head, "Users")) && second.is_some() {
+                (Root::Home, 2usize)
+            } else if is(head, "root") {
+                (Root::Home, 1)
+            } else if is(head, "var") && second_is("root") {
+                (Root::Home, 2)
+            } else if is(head, "etc") {
+                (Root::Etc, 1)
+            } else if is(head, "private") && second_is("etc") {
+                (Root::Etc, 2)
+            } else {
+                return None;
             };
             (root, Vec::new(), skip_parts(text, consumed))
         } else {
@@ -2507,6 +2545,54 @@ mod tests {
             for name in [".npmrc", ".netrc", ".pypirc", ".git-credentials"] {
                 allowed(&format!("echo x > {name}"));
                 denied(&format!("echo x > ~/{name}"));
+            }
+        }
+
+        /// On APFS and NTFS — the defaults on macOS and Windows — `~/.SSH/id_rsa`
+        /// opens `~/.ssh/id_rsa`. A case-sensitive comparison read that as a
+        /// different path and let every non-redirect writer through.
+        mod case_folding {
+            use super::super::{allowed, denied};
+
+            #[test]
+            fn an_upper_case_spelling_is_the_same_file() {
+                for command in [
+                    "tee ~/.SSH/id_rsa",
+                    "cp evil ~/.SSH/id_rsa",
+                    "sed -i 's/a/b/' ~/.SSH/config",
+                    "echo x > ~/.AWS/credentials",
+                    "echo x > ~/.Kube/config",
+                    "echo x > ~/.BASHRC",
+                    "echo x > ~/.NETRC",
+                    "echo x > /ETC/passwd",
+                    "echo x > /Etc/sudoers",
+                    // The relative anchors fold too.
+                    "tee .SSH/authorized_keys",
+                    "cp evil .Aws/credentials",
+                    "echo x > .BASHRC",
+                ] {
+                    denied(command);
+                }
+            }
+
+            #[test]
+            fn the_carve_outs_fold_with_it() {
+                // Same decision the lower-case spelling gets, not a stricter one.
+                allowed("echo h >> ~/.ssh/KNOWN_HOSTS");
+                allowed("cp k ~/.SSH/id_rsa.PUB");
+                allowed("cp k .SSH/id_rsa.pub");
+            }
+
+            #[test]
+            fn folding_does_not_swallow_neighbouring_names() {
+                for command in [
+                    "cp ./src .SSHD/config",
+                    "cp ./src ASSH/config",
+                    "echo x > ~/.ZSHRC.bak",
+                    "echo x > MY.PROFILE",
+                ] {
+                    allowed(command);
+                }
             }
         }
 
