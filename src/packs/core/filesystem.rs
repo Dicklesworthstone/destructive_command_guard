@@ -3376,6 +3376,16 @@ pub fn create_pack() -> Pack {
             ".docker/",
             ".bashrc.d/",
             ".zshrc.d/",
+            // The login-shell startup files, for the same reason: a bare
+            // `echo x > .bashrc` carries no other keyword in this row.
+            ".bashrc",
+            ".bash_profile",
+            ".bash_login",
+            ".profile",
+            ".zshrc",
+            ".zshenv",
+            ".zprofile",
+            ".zlogin",
             ">/",
             "> /",
             ">~",

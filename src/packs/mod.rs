@@ -1534,6 +1534,16 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             ".docker/",
             ".bashrc.d/",
             ".zshrc.d/",
+            // Login-shell startup files: writing one is code execution on the
+            // next shell, and a bare redirect to it carries no other keyword.
+            ".bashrc",
+            ".bash_profile",
+            ".bash_login",
+            ".profile",
+            ".zshrc",
+            ".zshenv",
+            ".zprofile",
+            ".zlogin",
             ">/",
             "> /",
             ">~",
