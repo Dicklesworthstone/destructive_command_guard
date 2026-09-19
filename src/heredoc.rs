@@ -5250,8 +5250,9 @@ fn active_heredocs(command: &str) -> Option<Vec<ActiveHeredoc>> {
 /// with `&&` or `|` was allowed.
 ///
 /// The recovery is deliberately narrow so malformed input can never erase
-/// later executable text: exactly one heredoc-like operator in the whole
-/// input, proven active by the quote-aware trigger scanner, not preceded by
+/// later executable text: one heredoc-like operator outside the body it
+/// describes (a second one *inside* that body is data, not shell input —
+/// #440), proven active by the quote-aware trigger scanner, not preceded by
 /// a `#` on its own line (the scanner does not model comments), a simple
 /// delimiter token (no `<<'E'OF`-style concatenation, whose quote removal the
 /// tier-2 extractor does not perform), and a terminator the extractor
@@ -5261,7 +5262,7 @@ fn active_heredocs(command: &str) -> Option<Vec<ActiveHeredoc>> {
 /// plus everything after the terminator, stay visible. Anything ambiguous
 /// answers `None`, which keeps the whole input unmasked.
 fn active_single_heredoc_fallback(command: &str) -> Option<Vec<ActiveHeredoc>> {
-    if command.match_indices("<<").count() != 1 || !contains_active_heredoc_operator(command) {
+    if !contains_active_heredoc_operator(command) {
         return None;
     }
     let operator_start = command.find("<<")?;
@@ -5320,6 +5321,24 @@ fn active_single_heredoc_fallback(command: &str) -> Option<Vec<ActiveHeredoc>> {
     }
     let body_range = candidate.content_range?;
     if body_range.start < delimiter_match.end() || body_range.end > command.len() {
+        return None;
+    }
+    // A second `<<` is tolerated in exactly one place: inside the very body
+    // this call is about to describe. That body is what the shell hands the
+    // command as data, so a heredoc operator written there is text — most
+    // often another language's, since Ruby's `<<~` is what made tree-sitter
+    // reject the parse in the first place. Requiring a single `<<` in the
+    // whole input meant `cat > x.rb <<'OUTER'` with `eval <<~'SCRIPT'` in its
+    // body produced no span at all, so the quoted body was rescanned as live
+    // shell and its Ruby `eval` denied as a POSIX one — while the same
+    // command without the nested operator was correctly allowed (#440).
+    // Anything outside the body still answers None: a `<<` before the
+    // operator is shell input on the operator's own line, and one after the
+    // terminator is shell input that masking must never erase.
+    if command
+        .match_indices("<<")
+        .any(|(index, _)| index != operator_start && !body_range.contains(&index))
+    {
         return None;
     }
     Some(vec![ActiveHeredoc {
@@ -6181,6 +6200,72 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use proptest::prelude::*;
+
+    /// Issue #440: a nested heredoc operator inside a quoted body is data.
+    ///
+    /// Writing a Ruby script with `cat > x.rb <<'OUTER'` whose body uses
+    /// Ruby's own `eval <<~'SCRIPT'` denied as a POSIX eval. Ruby's `<<~` is
+    /// what defeats tree-sitter-bash, and the single-heredoc recovery then
+    /// refused to describe the body because the input held a second `<<` —
+    /// one that sits *inside* that very body. With no span the quoted body
+    /// was rescanned as live shell.
+    #[test]
+    fn nested_heredoc_operator_inside_a_quoted_body_is_masked_issue_440() {
+        let command = "cat > /tmp/x.rb <<'OUTER'\neval <<~'SCRIPT'\n  puts 1\nSCRIPT\nOUTER";
+        let masked = mask_non_expanding_data_heredocs(command);
+        assert!(
+            !masked.contains("eval"),
+            "the quoted body must be masked out of the raw-shell rescan; got:\n{masked}"
+        );
+        // Masking is length-preserving, so spans computed against the raw
+        // command stay valid against the view.
+        assert_eq!(masked.len(), command.len());
+    }
+
+    /// The same shape with an UNQUOTED outer delimiter stays visible: the
+    /// shell expands that body before `cat` sees it, so it is not inert.
+    #[test]
+    fn nested_heredoc_operator_inside_an_unquoted_body_stays_visible_issue_440() {
+        let command = "cat > /tmp/x.rb <<OUTER\neval <<~'SCRIPT'\n  puts 1\nSCRIPT\nOUTER";
+        let masked = mask_non_expanding_data_heredocs(command);
+        assert!(
+            masked.contains("eval"),
+            "an unquoted body expands before the data sink runs and must not be masked"
+        );
+    }
+
+    /// Proves the recovery path itself, not just the AST path: `cat <<'EOF';
+    /// echo done` is the #393 shape tree-sitter-bash rejects outright, so the
+    /// span can only come from `active_single_heredoc_fallback`. With a nested
+    /// operator in the body the input holds three `<<`, which the old
+    /// single-operator guard refused, leaving the quoted body unmasked.
+    #[test]
+    fn fallback_recovers_a_body_holding_a_nested_operator_issue_440() {
+        let command = "cat <<'EOF'; echo done\neval <<~'X'\n  y\nX\nEOF";
+        let masked = mask_non_expanding_data_heredocs(command);
+        assert!(
+            !masked.contains("eval"),
+            "the recovery must describe a quoted body even when it holds another \
+             heredoc operator; got:\n{masked}"
+        );
+        assert!(
+            masked.contains("echo done"),
+            "the operator line's own commands stay visible"
+        );
+    }
+
+    /// The recovery must still refuse when the extra operator is real shell
+    /// input rather than body data — after the terminator, where masking it
+    /// would erase a command the shell actually runs.
+    #[test]
+    fn heredoc_operator_after_the_terminator_still_blocks_recovery_issue_440() {
+        let command = "cat > /tmp/x.rb <<'OUTER'\neval <<~'SCRIPT'\n  puts 1\nSCRIPT\nOUTER\ncat <<'NEXT'\nx\nNEXT";
+        let masked = mask_non_expanding_data_heredocs(command);
+        assert!(
+            masked.contains("cat <<'NEXT'"),
+            "text after the terminator is shell input and must never be erased"
+        );
+    }
 
     /// Issue #412: data bytes inside a quoted heredoc body must not decide
     /// whether the body gets masked.
