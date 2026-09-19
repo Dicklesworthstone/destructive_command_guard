@@ -27,8 +27,20 @@ pub fn create_pack() -> Pack {
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
         safe_pattern!("dns-dig-safe", r"\bdig\b(?!.*(?i:\b(?:axfr|ixfr)\b))"),
-        safe_pattern!("dns-host-safe", r"\bhost\b"),
-        safe_pattern!("dns-nslookup-safe", r"\bnslookup\b"),
+        // `host` and `nslookup` are read-only lookups, but only when they are
+        // what runs. As bare words they matched anywhere in the segment, and a
+        // safe match short-circuits the pack: `dig axfr example.com @host` was
+        // allowed while `dig axfr example.com` warned on
+        // `dns-dig-zone-transfer`. `host` is an ordinary enough word that this
+        // is as easy to hit by accident as deliberately (#448).
+        safe_pattern!(
+            "dns-host-safe",
+            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?host\b"
+        ),
+        safe_pattern!(
+            "dns-nslookup-safe",
+            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?nslookup\b"
+        ),
     ]
 }
 
@@ -93,6 +105,46 @@ mod tests {
     use super::*;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    #[test]
+    fn lookup_tool_names_in_argument_data_do_not_disarm_the_pack_issue_448() {
+        // `host` is an ordinary word, and as a bare safe pattern it matched
+        // anywhere in the segment. Measured against v0.14.4:
+        // `dig axfr example.com @host` was allowed while `dig axfr example.com`
+        // matched `dns-dig-zone-transfer`.
+        let pack = create_pack();
+        for command in [
+            "dig axfr example.com @host",
+            "dig axfr example.com @nslookup",
+        ] {
+            assert!(
+                !pack.matches_safe(command),
+                "{command:?} must not match a safe pattern: the lookup tool \
+                 name is argument data, not the command being run"
+            );
+            assert!(
+                pack.check(command).is_some(),
+                "{command:?} must still match the zone-transfer rule"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_lookups_stay_allowed_issue_448() {
+        let pack = create_pack();
+        for command in [
+            "host example.com",
+            "sudo host -t MX example.com",
+            "/usr/bin/host example.com 8.8.8.8",
+            "nslookup example.com",
+            "LC_ALL=C nslookup example.com",
+        ] {
+            assert!(
+                pack.matches_safe(command) || pack.check(command).is_none(),
+                "{command:?} is a read-only lookup and must not be blocked"
+            );
+        }
+    }
 
     #[test]
     fn test_pack_creation() {

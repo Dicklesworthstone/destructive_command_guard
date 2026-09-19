@@ -65,8 +65,26 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "dd-discard",
             r#"dd\s+.*of=['"]?/dev/(?:null|zero|full)['"]?(?:\s|$)"#
         ),
-        // lsblk is safe (read-only)
-        safe_pattern!("lsblk", r"\blsblk\b"),
+        // lsblk is safe (read-only), but only when lsblk is what runs.
+        //
+        // As a bare `\blsblk\b` this matched the word anywhere in the segment,
+        // and a safe match short-circuits the whole pack — so any argument
+        // carrying the word disarmed all 44 destructive rules:
+        // `wipefs -a /dev/sdb -o /tmp/lsblk.bak` and `mkfs.ext4 -L lsblk
+        // /dev/sdb1` were both allowed, while the same commands with any other
+        // label were denied. Separator-crossing spellings were already handled
+        // (`wipefs -a /dev/sdb && lsblk` denies, because segments are judged
+        // separately); what was missing is that evidence has to be the command,
+        // not its data. Same defect class as #429.
+        //
+        // Narrowing a safe pattern can only cost a false DENY where some
+        // destructive pattern also matches, and none of them match a read-only
+        // lsblk invocation — so an unusual spelling this misses (an env prefix
+        // it does not anticipate, say) still falls through to allow.
+        safe_pattern!(
+            "lsblk",
+            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?lsblk\b"
+        ),
         // fdisk -l (list) is safe
         safe_pattern!("fdisk-list", r"fdisk\s+-l"),
         // parted print is safe. Keep this tight because safe patterns run
@@ -76,25 +94,68 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "parted-print",
             r#"parted\b(?:\s+--?\S+)*\s+(?:['"]?/dev/\S+['"]?\s+)?print(?:\s+(?:devices|free|list|all|\d+))?\s*$"#
         ),
-        // blkid is safe (read-only)
-        safe_pattern!("blkid", r"\bblkid\b"),
-        // df is safe
-        safe_pattern!("df", r"\bdf\b"),
+        // blkid is safe (read-only) — anchored for the reason given on `lsblk`.
+        // `mdadm --stop /dev/md0 --config /etc/blkid.conf` and
+        // `tee /dev/sda < /tmp/blkid.img` were allowed on the bare spelling.
+        safe_pattern!(
+            "blkid",
+            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?blkid\b"
+        ),
+        // df is safe (read-only) — anchored for the same reason, and it was the
+        // easiest of the three to trip by accident: two letters matched as a
+        // word anywhere, so `mkfs.ext4 -L df /dev/sdb1` was allowed.
+        // `btrfs filesystem df` keeps its own pattern below.
+        safe_pattern!(
+            "df",
+            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?df\b"
+        ),
         // mount (without arguments, just list)
         safe_pattern!("mount-list", r"\bmount\s*$"),
-        // mkswap --check (read-only inspection of swap area)
-        safe_pattern!("mkswap-check", r"mkswap\s+(?:.*\s+)?--check\b"),
+        // There is deliberately no `mkswap --check` exemption.
+        //
+        // One used to sit here, commented "read-only inspection of swap area".
+        // mkswap(8) says otherwise: "-c, --check: Check the device (if it is a
+        // block device) for bad blocks *before creating the swap area*." The
+        // check is a preliminary to the format, not an alternative to it, so
+        // the exemption allowed a command that destroys the partition —
+        // `mkswap --check /dev/sdb1` was allowed while `mkswap -c /dev/sdb1`,
+        // which does exactly the same thing, was denied (#448). mkswap has no
+        // read-only mode to carve out.
         // --- mdadm safe patterns ---
-        // mdadm --detail (read-only inspection)
-        safe_pattern!("mdadm-detail", r"mdadm\s+--detail\b"),
-        // mdadm --examine (read-only superblock inspection)
-        safe_pattern!("mdadm-examine", r"mdadm\s+--examine\b"),
-        // mdadm --query (read-only query)
-        safe_pattern!("mdadm-query", r"mdadm\s+--query\b"),
-        // mdadm -Q (short form of --query)
-        safe_pattern!("mdadm-query-short", r"mdadm\s+-Q\b"),
-        // mdadm --scan (scan for arrays, read-only)
-        safe_pattern!("mdadm-scan", r"mdadm\s+--scan\b"),
+        //
+        // Each of these required its read-only flag to follow `mdadm`
+        // immediately, which made the exemption depend on argument order rather
+        // than on what the command does. `mdadm --stop /dev/md0 --detail` was
+        // denied, but `mdadm --detail --stop /dev/md0` was allowed, and
+        // `mdadm --scan --zero-superblock /dev/sdb` — which destroys RAID
+        // metadata — was allowed too (#448).
+        //
+        // A read-only flag now only exempts a command that does not also carry
+        // a destructive mode. The negative lookahead mirrors `dns-dig-safe`'s
+        // `\bdig\b(?!.*(?i:\b(?:axfr|ixfr)\b))`, and its alternatives are the
+        // modes the destructive patterns below match: --stop/-S, --remove,
+        // --fail/-f, --zero-superblock, --create/-C and --grow.
+        safe_pattern!(
+            "mdadm-detail",
+            r"mdadm\b(?!.*\s(?:--(?:stop|remove|fail|zero-superblock|create|grow)|-[SfC])\b).*\s--detail\b"
+        ),
+        safe_pattern!(
+            "mdadm-examine",
+            r"mdadm\b(?!.*\s(?:--(?:stop|remove|fail|zero-superblock|create|grow)|-[SfC])\b).*\s--examine\b"
+        ),
+        safe_pattern!(
+            "mdadm-query",
+            r"mdadm\b(?!.*\s(?:--(?:stop|remove|fail|zero-superblock|create|grow)|-[SfC])\b).*\s--query\b"
+        ),
+        // Short form of --query.
+        safe_pattern!(
+            "mdadm-query-short",
+            r"mdadm\b(?!.*\s(?:--(?:stop|remove|fail|zero-superblock|create|grow)|-[SfC])\b).*\s-Q\b"
+        ),
+        safe_pattern!(
+            "mdadm-scan",
+            r"mdadm\b(?!.*\s(?:--(?:stop|remove|fail|zero-superblock|create|grow)|-[SfC])\b).*\s--scan\b"
+        ),
         // --- btrfs safe patterns ---
         // btrfs subvolume list (read-only)
         safe_pattern!(
@@ -854,6 +915,146 @@ mod tests {
     }
 
     #[test]
+    fn read_only_tool_names_in_argument_data_do_not_disarm_the_pack_issue_448() {
+        // A safe match short-circuits every destructive pattern in the pack, so
+        // a safe pattern matching a bare word anywhere in the segment hands any
+        // argument the power to switch the pack off. Each pair below differs
+        // only by a token that `lsblk`, `blkid` or `df` used to match as a bare
+        // word; against the released 0.14.4 the second member of every pair was
+        // allowed while the first was denied.
+        let pack = create_pack();
+        for (command, rule) in [
+            (
+                "dd if=/dev/zero of=/dev/sda 2>>/var/log/blkid.log",
+                "dd-device",
+            ),
+            ("mkfs.ext4 -L lsblk /dev/sdb1", "mkfs"),
+            ("mkfs.ext4 -L df /dev/sdb1", "mkfs"),
+            ("wipefs -a /dev/sdb -o /tmp/lsblk.bak", "wipefs"),
+            ("wipefs -a /dev/sdb -o /tmp/df.bak", "wipefs"),
+            (
+                "mdadm --stop /dev/md0 --config /etc/blkid.conf",
+                "mdadm-stop",
+            ),
+            ("dmsetup remove mydev --table /tmp/lsblk", "dmsetup-remove"),
+            ("lvremove -f vg/lv --config /tmp/blkid", "lvremove"),
+            ("tee /dev/sda < /tmp/blkid.img", "tee-device"),
+            ("diskutil eraseDisk APFS lsblk /dev/disk9", "diskutil-erase"),
+        ] {
+            assert!(
+                !pack.matches_safe(command),
+                "{command:?} must not match a safe pattern: the read-only tool \
+                 name is argument data, not the command being run"
+            );
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+    }
+
+    #[test]
+    fn mdadm_read_only_flags_do_not_exempt_a_destructive_mode_issue_448() {
+        // The exemption used to depend on argument order: a read-only flag
+        // immediately after `mdadm` matched, whatever else the command asked
+        // for. Measured against v0.14.4, every variant below was allowed while
+        // the same modes in the other order were denied.
+        let pack = create_pack();
+        for (command, rule) in [
+            ("mdadm --detail --stop /dev/md0", "mdadm-stop"),
+            ("mdadm --examine --stop /dev/md0", "mdadm-stop"),
+            ("mdadm -Q --stop /dev/md0", "mdadm-stop"),
+            (
+                "mdadm --scan --zero-superblock /dev/sdb",
+                "mdadm-zero-superblock",
+            ),
+            ("mdadm --query --fail /dev/md0 /dev/sdb", "mdadm-fail"),
+            ("mdadm --detail --remove /dev/md0 /dev/sdb", "mdadm-remove"),
+            ("mdadm --scan --create /dev/md0 --level=0", "mdadm-create"),
+            (
+                "mdadm --detail --grow /dev/md0 --raid-devices=3",
+                "mdadm-grow",
+            ),
+        ] {
+            assert!(
+                !pack.matches_safe(command),
+                "{command:?} carries a destructive mdadm mode and must not be \
+                 exempted by a read-only flag"
+            );
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+    }
+
+    #[test]
+    fn mdadm_genuinely_read_only_invocations_stay_allowed_issue_448() {
+        let pack = create_pack();
+        for command in [
+            "mdadm --detail /dev/md0",
+            "mdadm --detail --scan",
+            "mdadm --examine /dev/sdb1",
+            "mdadm --query /dev/md0",
+            "mdadm -Q /dev/md0",
+            "mdadm --scan",
+            "sudo mdadm --detail --scan",
+        ] {
+            assert!(
+                pack.matches_safe(command) || pack.check(command).is_none(),
+                "{command:?} is read-only and must not be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn mkswap_check_is_not_read_only_issue_448() {
+        // mkswap(8): "-c, --check: Check the device (if it is a block device)
+        // for bad blocks before creating the swap area." The check precedes the
+        // format rather than replacing it, so every spelling formats the
+        // partition. The long form used to be exempt while the short form,
+        // which does the same thing, was denied.
+        let pack = create_pack();
+        for command in [
+            "mkswap --check /dev/sdb1",
+            "mkswap /dev/sdb1 --check",
+            "mkswap -c /dev/sdb1",
+            "mkswap /dev/sdb1 -c",
+            "sudo mkswap --check /dev/nvme0n1p3",
+        ] {
+            assert!(
+                !pack.matches_safe(command),
+                "{command:?} creates a swap area and must not match a safe pattern"
+            );
+            assert_blocks_with_pattern(&pack, command, "mkswap");
+        }
+    }
+
+    #[test]
+    fn read_only_disk_inspection_stays_allowed_issue_448() {
+        // The other direction: anchoring must not cost the genuine read-only
+        // invocations these patterns exist for, including the sudo, absolute
+        // path and env-prefix spellings.
+        let pack = create_pack();
+        for command in [
+            "lsblk",
+            "lsblk -f",
+            "lsblk --json /dev/sda",
+            "sudo lsblk",
+            "sudo -n lsblk -o NAME,SIZE",
+            "/usr/bin/lsblk",
+            "LC_ALL=C lsblk",
+            "blkid",
+            "blkid /dev/sda1",
+            "sudo blkid -o value -s UUID /dev/sda1",
+            "df",
+            "df -h",
+            "df -h /var",
+            "sudo df -i",
+            "btrfs filesystem df /mnt",
+        ] {
+            assert!(
+                pack.matches_safe(command) || pack.check(command).is_none(),
+                "{command:?} is read-only and must not be blocked"
+            );
+        }
+    }
+
+    #[test]
     fn bind_mount_over_root_is_blocked_issue_441() {
         // `mount --bind <src> /` shadows the running root filesystem for every
         // process that resolves a path afterwards. The rule has always matched
@@ -935,17 +1136,17 @@ mod tests {
     }
 
     #[test]
-    fn mkswap_check_and_unrelated_text_allowed() {
+    fn unrelated_mkswap_text_is_not_a_match() {
         let pack = create_pack();
-        // --check is read-only inspection.
-        assert!(
-            pack.matches_safe("mkswap --check /dev/sdb"),
-            "mkswap --check must be safe"
-        );
-        assert!(
-            pack.matches_safe("mkswap -L swap1 --check /dev/sdb1"),
-            "mkswap with other flags + --check must be safe"
-        );
+        // This test used to assert that `mkswap --check /dev/sdb` and
+        // `mkswap -L swap1 --check /dev/sdb1` were safe, on the premise that
+        // "--check is read-only inspection". mkswap(8) disagrees: "-c,
+        // --check: Check the device (if it is a block device) for bad blocks
+        // *before creating the swap area*" — the check is a preliminary to the
+        // format. The second case gave it away, since `-L swap1` writes a label
+        // into the header that mkswap is being asked to create. Both spellings
+        // are now blocked, asserted in `mkswap_check_is_not_read_only_issue_448`.
+        //
         // Unrelated text mentioning mkswap (e.g. docs / paths). The pack regex
         // requires `mkswap\s+` so a hyphenated/embedded mention does not match.
         assert_no_match(&pack, "cat mkswap-readme.md");

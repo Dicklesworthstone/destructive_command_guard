@@ -782,9 +782,12 @@ scenario_system_disk_default() {
     assert_blocked 'mkswap /dev/sdb'               'system.disk:mkswap'      'high'
     assert_blocked 'mkswap /dev/sda1'              'system.disk:mkswap'      'high'
     assert_blocked 'sudo mkswap /dev/sdb'          'system.disk:mkswap'      'high'
-    # mkswap --check is read-only inspection.
-    assert_allowed 'mkswap --check /dev/sdb'
-    assert_allowed 'mkswap -L tag --check /dev/sdb1'
+    # mkswap --check is NOT read-only: mkswap(8) checks for bad blocks "before
+    # creating the swap area", so the format still happens. These were asserted
+    # allowed until #448, while `mkswap -c`, the same command, was blocked.
+    assert_blocked 'mkswap --check /dev/sdb'       'system.disk:mkswap'      'high'
+    assert_blocked 'mkswap -L tag --check /dev/sdb1' 'system.disk:mkswap'    'high'
+    assert_blocked 'mkswap -c /dev/sdb'            'system.disk:mkswap'      'high'
     # Unrelated text mentioning the binary name must not false-positive.
     assert_allowed 'cat mkswap-readme.md'
     assert_allowed 'echo mkswap is dangerous'

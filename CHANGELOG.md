@@ -17,6 +17,62 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Security
 
+- **Any argument containing the word `lsblk`, `blkid`, `df`, `stat`, `getfacl`,
+  `namei`, `journalctl`, `host` or `nslookup` switched off every rule in the
+  pack that owns it (#448).** Nine safe patterns across four packs were written
+  as a bare word. A safe match short-circuits its pack's destructive patterns,
+  so the evidence for "this is read-only" could be supplied by the destructive
+  command's own arguments. `system.disk` is one of the five packs a default
+  install enables, so three of the nine were a default-configuration bypass.
+
+  Each pair below differs only in argument data, measured against v0.14.4:
+
+  | command | decision |
+  |---|---|
+  | `dd if=/dev/zero of=/dev/sda 2>>/var/log/dd.log` | DENY `dd-device` |
+  | `dd if=/dev/zero of=/dev/sda 2>>/var/log/blkid.log` | **allowed** |
+  | `mkfs.ext4 -L data /dev/sdb1` | DENY `mkfs` |
+  | `mkfs.ext4 -L df /dev/sdb1` | **allowed** |
+  | `wipefs -a /dev/sdb -o /tmp/wipe.bak` | DENY `wipefs` |
+  | `wipefs -a /dev/sdb -o /tmp/df.bak` | **allowed** |
+  | `mdadm --stop /dev/md0 --config /etc/blkid.conf` | **allowed** |
+  | `tee /dev/sda < /tmp/blkid.img` | **allowed** |
+  | `chmod -R 777 /etc --reference=/tmp/stat` | **allowed** |
+  | `systemctl stop sshd --output=journalctl` | **allowed** |
+  | `dig axfr example.com @host` | **allowed** |
+
+  `tee /dev/sda` defeats the rule added for #444 in the same release. `df` is
+  two letters matched as a word anywhere, so this was as easy to trip by
+  accident as deliberately.
+
+  The obvious probe passes, which is why earlier audits of this shape did not
+  reach these: separator-crossing spellings were already denied, because
+  segments are judged separately — `wipefs -a /dev/sdb && lsblk`, `; lsblk`,
+  `lsblk && wipefs …` and `# lsblk` all block. The hole is one segment wide, so
+  the evidence has to sit inside the destructive command's arguments. That is
+  the #429 shape rather than a second command, and the #435 audit covered it in
+  `kubernetes.helm`, `database.supabase`, `kubernetes.kustomize` and
+  `database.mongodb`.
+
+  Each pattern now requires its tool to be what the segment runs, still
+  accepting the env-prefix, `sudo` and absolute-path spellings:
+
+  ```
+  ^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?lsblk\b
+  ```
+
+  Narrowing a safe pattern can only cost a false deny where a destructive
+  pattern matches the same command, and none match a read-only invocation of
+  these tools — `lsblk`, `blkid` and `df` are not even in `system.disk`'s
+  keyword list, so a bare `lsblk` never reaches that pack. A spelling the anchor
+  misses therefore falls through to allow rather than to a block. The allowed
+  direction is asserted per pack alongside the blocked one.
+
+  The other four default-enabled packs resist this already, checked with matched
+  pairs: `git clean -fdx -e status`, `git reset --hard -- log`,
+  `docker system prune -a -f --filter label=ps` and
+  `rm -rf /etc/nginx --exclude=ls` all still deny.
+
 - **Every credential and login-startup file the guard protects was writable by
   naming it relatively (#407).** `echo x > ~/.ssh/authorized_keys` denied;
   `echo x > .ssh/authorized_keys` did not, and installs an SSH login for anyone

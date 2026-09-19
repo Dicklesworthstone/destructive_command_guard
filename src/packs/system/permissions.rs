@@ -59,14 +59,34 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "chmod-non-recursive",
             r"chmod\s+(?!-[rR])(?:\d{3,4}|[ugoa][+-][rwxXst]+)\s+[^/]"
         ),
-        // stat is safe (read-only)
-        safe_pattern!("stat", r"\bstat\b"),
-        // ls -l is safe
-        safe_pattern!("ls-perms", r"ls\s+.*-[a-zA-Z]*l"),
-        // getfacl is safe (read-only)
-        safe_pattern!("getfacl", r"\bgetfacl\b"),
-        // namei is safe
-        safe_pattern!("namei", r"\bnamei\b"),
+        // stat is safe (read-only), but only when stat is what runs. As a bare
+        // word it matched anywhere in the segment, and a safe match
+        // short-circuits the pack, so `chmod -R 777 /etc --reference=/tmp/stat`
+        // was allowed while `chmod -R 777 /etc` was denied (#448).
+        safe_pattern!(
+            "stat",
+            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?stat\b"
+        ),
+        // ls -l is safe, but only when ls is what runs. Unanchored, the `ls
+        // <anything> -l` shape could be found inside another command's
+        // arguments, and a safe match short-circuits the pack: `chmod -R 777
+        // /etc ls -l` was allowed while `chmod -R 777 /etc` was denied. The
+        // two-segment spelling `ls -l; chmod -R 777 /etc` was already denied,
+        // because segments are judged separately (#448).
+        safe_pattern!(
+            "ls-perms",
+            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?ls\b.*-[a-zA-Z]*l"
+        ),
+        // getfacl and namei are read-only — anchored for the reason given on
+        // `stat`; `chown -R nobody /etc --reference=/tmp/getfacl` was allowed.
+        safe_pattern!(
+            "getfacl",
+            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?getfacl\b"
+        ),
+        safe_pattern!(
+            "namei",
+            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?namei\b"
+        ),
     ]
 }
 
@@ -197,6 +217,71 @@ mod tests {
     use super::*;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    #[test]
+    fn read_only_tool_names_in_argument_data_do_not_disarm_the_pack_issue_448() {
+        // A safe match short-circuits every destructive pattern in the pack, so
+        // `stat`, `getfacl` and `namei` matched as bare words handed any
+        // argument the power to switch the pack off. Measured against v0.14.4:
+        // each of these was allowed, while the same command without the word
+        // was denied.
+        let pack = create_pack();
+        for command in [
+            "chmod -R 777 /etc --reference=/tmp/stat",
+            "chmod -R 777 /etc --reference=/tmp/namei",
+            "chown -R nobody /etc --reference=/tmp/getfacl",
+        ] {
+            assert!(
+                !pack.matches_safe(command),
+                "{command:?} must not match a safe pattern: the read-only tool \
+                 name is argument data, not the command being run"
+            );
+            assert!(
+                pack.check(command).is_some(),
+                "{command:?} must still be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn ls_long_form_in_argument_data_does_not_disarm_the_pack_issue_448() {
+        // `ls\s+.*-l` unanchored could be found inside another command's
+        // arguments. `chmod -R 777 /etc ls -l` was allowed against v0.14.4.
+        let pack = create_pack();
+        for command in ["chmod -R 777 /etc ls -l", "chown -R nobody /etc ls -al"] {
+            assert!(
+                !pack.matches_safe(command),
+                "{command:?} must not be exempted by an `ls -l` found in its arguments"
+            );
+            assert!(
+                pack.check(command).is_some(),
+                "{command:?} must still be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_permission_inspection_stays_allowed_issue_448() {
+        let pack = create_pack();
+        for command in [
+            "ls -l /etc",
+            "ls -la",
+            "sudo ls -l /root",
+            "/bin/ls -l",
+            "stat /etc/passwd",
+            "sudo stat -c %a /etc/shadow",
+            "/usr/bin/stat /tmp",
+            "LC_ALL=C stat /etc/passwd",
+            "getfacl /etc",
+            "sudo getfacl -R /srv",
+            "namei -l /etc/passwd",
+        ] {
+            assert!(
+                pack.matches_safe(command) || pack.check(command).is_none(),
+                "{command:?} is read-only and must not be blocked"
+            );
+        }
+    }
 
     #[test]
     fn test_pack_creation() {

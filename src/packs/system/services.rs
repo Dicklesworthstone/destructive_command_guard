@@ -73,8 +73,15 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "systemctl-cat",
             r"systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+cat(?=\s|$)"
         ),
-        // journalctl is safe (logs)
-        safe_pattern!("journalctl", r"\bjournalctl\b"),
+        // journalctl is safe (logs), but only when journalctl is what runs. As
+        // a bare word it matched anywhere in the segment, and a safe match
+        // short-circuits the pack, so `systemctl stop sshd --output=journalctl`
+        // and `shutdown -h now -- journalctl` were both allowed while the same
+        // commands without the word were denied (#448).
+        safe_pattern!(
+            "journalctl",
+            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?journalctl\b"
+        ),
     ]
 }
 
@@ -204,6 +211,45 @@ mod tests {
     use super::*;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    #[test]
+    fn journalctl_in_argument_data_does_not_disarm_the_pack_issue_448() {
+        // `\bjournalctl\b` matched the word anywhere in the segment, and a safe
+        // match short-circuits the pack. Measured against v0.14.4: both of
+        // these were allowed, while the same commands without the word denied.
+        let pack = create_pack();
+        for command in [
+            "systemctl stop sshd --output=journalctl",
+            "shutdown -h now -- journalctl",
+        ] {
+            assert!(
+                !pack.matches_safe(command),
+                "{command:?} must not match a safe pattern: `journalctl` is \
+                 argument data, not the command being run"
+            );
+            assert!(
+                pack.check(command).is_some(),
+                "{command:?} must still be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn reading_the_journal_stays_allowed_issue_448() {
+        let pack = create_pack();
+        for command in [
+            "journalctl",
+            "journalctl -u sshd -n 50",
+            "sudo journalctl --since today",
+            "/usr/bin/journalctl -f",
+            "LC_ALL=C journalctl -xe",
+        ] {
+            assert!(
+                pack.matches_safe(command) || pack.check(command).is_none(),
+                "{command:?} is read-only and must not be blocked"
+            );
+        }
+    }
 
     #[test]
     fn shutdown_is_reachable_via_keywords() {
