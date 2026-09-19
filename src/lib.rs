@@ -95,6 +95,9 @@ pub mod suggestions;
 pub mod trace;
 pub mod update;
 
+#[cfg(test)]
+mod scanner_regression_tests;
+
 // Re-export commonly used types
 pub use allowlist::{
     AllowEntry, AllowSelector, AllowlistError, AllowlistFile, AllowlistLayer, LayeredAllowlist,
