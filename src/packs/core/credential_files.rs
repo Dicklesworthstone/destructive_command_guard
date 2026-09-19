@@ -2396,6 +2396,107 @@ mod tests {
         ));
     }
 
+    /// Spellings of the same file must reach the same verdict — driven off
+    /// `ENTRIES` rather than a hand-kept list, so a new protected path is
+    /// covered the day it is added.
+    ///
+    /// Both bugs recorded in the modules below were one spelling of one path
+    /// disagreeing with another (`~/.SSH/id_rsa` vs `~/.ssh/id_rsa`;
+    /// `~/projects/app/.ssh/id_rsa` vs `projects/app/.ssh/id_rsa`), and both
+    /// were found by hand. These assert the property instead.
+    mod spelling_parity {
+        use super::hit;
+        use crate::packs::core::credential_files::{
+            ENTRIES, Entry, RELATIVE_ANCHORS, RELATIVE_FILE_ANCHORS, Root,
+        };
+
+        /// A concrete protected file for `entry`; a directory needs one in it.
+        fn probe_path(entry: &Entry) -> String {
+            let mut comps: Vec<&str> = entry.comps.to_vec();
+            if entry.dir {
+                comps.push("probe");
+            }
+            comps.join("/")
+        }
+
+        fn denies(command: &str) -> bool {
+            hit(command).is_some()
+        }
+
+        /// These loops are the whole test, so an empty or filtered-away table
+        /// would make all three pass while asserting nothing — the failure mode
+        /// `tests/repro_442_source_modules_are_declared.rs` exists to catch.
+        #[test]
+        fn the_table_these_loops_walk_is_not_empty() {
+            let home = ENTRIES.iter().filter(|e| e.root == Root::Home).count();
+            let etc = ENTRIES.iter().filter(|e| e.root == Root::Etc).count();
+            assert!(home >= 15, "only {home} home entries to check");
+            assert!(etc >= 5, "only {etc} /etc entries to check");
+        }
+
+        #[test]
+        fn every_rooted_spelling_of_a_home_entry_agrees() {
+            for entry in ENTRIES.iter().filter(|entry| entry.root == Root::Home) {
+                let path = probe_path(entry);
+                assert!(
+                    denies(&format!("tee ~/{path}")),
+                    "~/{path} should be protected"
+                );
+                for spelling in [
+                    format!("$HOME/{path}"),
+                    format!("/Users/someone/{path}"),
+                    format!("/home/someone/{path}"),
+                    format!("~someone/{path}"),
+                    format!("/root/{path}"),
+                ] {
+                    assert!(
+                        denies(&format!("tee {spelling}")),
+                        "`{spelling}` disagrees with `~/{path}`"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn an_upper_case_spelling_of_every_entry_agrees() {
+            for entry in ENTRIES {
+                let path = probe_path(entry);
+                let prefix = if entry.root == Root::Home {
+                    "~/"
+                } else {
+                    "/etc/"
+                };
+                let lower = denies(&format!("tee {prefix}{path}"));
+                let upper = denies(&format!("tee {prefix}{}", path.to_ascii_uppercase()));
+                assert_eq!(
+                    lower, upper,
+                    "case spellings of `{prefix}{path}` disagree — on APFS and NTFS they are \
+                     the same file"
+                );
+            }
+        }
+
+        #[test]
+        fn a_relative_spelling_denies_exactly_when_the_anchor_lists_say_so() {
+            // The deliberate exclusions (`.netrc`, `.npmrc`, `.pypirc`,
+            // `.git-credentials`, `_netrc`, `.config/gh/hosts.yml`) are a
+            // decision, so the test states it rather than listing paths twice.
+            for entry in ENTRIES.iter().filter(|entry| entry.root == Root::Home) {
+                let path = probe_path(entry);
+                let first = entry.comps[0];
+                let anchored = RELATIVE_ANCHORS.contains(&first)
+                    || (entry.comps.len() == 1
+                        && !entry.dir
+                        && RELATIVE_FILE_ANCHORS.contains(&first));
+                assert_eq!(
+                    denies(&format!("tee {path}")),
+                    anchored,
+                    "relative `{path}`: the anchor lists say anchored={anchored}"
+                );
+            }
+        }
+    }
+
     /// #407: a relative spelling names the same credential file the rooted one
     /// does, and only the rooted one was being judged.
     mod relative_anchors {
