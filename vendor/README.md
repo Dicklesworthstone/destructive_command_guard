@@ -47,3 +47,21 @@ must publish the reviewed tree explicitly. Remove its write permission after
 the candidate has been published; routine regression checks need read access
 only. No successful Rust or full-suite validation is implied by the presence
 of these scripts: consult the logs for the exact tested revision and results.
+
+## Recorded native result
+
+GitHub Actions run `35453962762`, commit
+`2d83133bd4388692c7a85b570efdbee4f6ee2bfb`, reproduced the actual upstream
+scanner's ctype-domain violation (exit 86) and an uninstrumented SIGSEGV
+(exit -11). The two-loop patch then passed 4,448,259 actual-scanner cases
+both normally and under AddressSanitizer plus UndefinedBehaviorSanitizer.
+No concurrency, parser cache or environment mutation was needed to reproduce
+this native defect. The scanner and headers came from the checksum-verified
+crates.io release, not a reimplementation of the crashing function.
+
+That run stopped at rustfmt's requested wrapping of the new assertion; it
+did not compile Rust or run the complete lib suite. The native result proves
+this input-triggered defect, not that every intermittent suite failure has
+the same cause. The bootstrap now exposes candidate objects immediately
+after native validation so the full Rust validation and source review can
+proceed independently. Candidate availability is still not a Rust pass.

@@ -36,21 +36,26 @@ jobs:
           persist-credentials: false
       - name: Reproduce the exact native bug and test the patched scanner
         run: python3 scripts/check_scanner_safety.py prepare
-      - name: Activate the repository-pinned Rust toolchain
-        run: rustup show
-      - name: Check formatting
-        run: cargo fmt --check
-      - name: Compile and run the actual ast-grep regressions
-        id: focused
-        run: cargo test --locked --lib scanner_regression_tests
       - name: Stage candidate objects without updating any branch
-        if: steps.focused.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if ! git ls-files --error-unmatch vendor/tree-sitter-bash/src/scanner.c >/dev/null 2>&1; then
             python3 scripts/check_scanner_safety.py publish-tree
           fi
+      - name: Expose the native-validated candidate for explicit review
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanner-candidate-${{ github.sha }}
+          path: target/scanner-safety/candidate-tree.json
+          if-no-files-found: ignore
+      - name: Activate the repository-pinned Rust toolchain
+        run: |
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+      - name: Compile and run the actual ast-grep regressions
+        id: focused
+        run: cargo test --locked --lib scanner_regression_tests
       - name: Repeated complete lib gate, without retries or test skips
         if: steps.focused.outcome == 'success'
         run: python3 scripts/check_scanner_safety.py repeat --runs 12
@@ -60,6 +65,9 @@ jobs:
       - name: Clippy all targets
         if: steps.focused.outcome == 'success'
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Check formatting
+        if: always()
+        run: cargo fmt --check
       - name: Retain every native and lib-run log
         if: always()
         uses: actions/upload-artifact@v4

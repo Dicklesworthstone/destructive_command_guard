@@ -33,7 +33,11 @@ fn parse_corpus(inputs: &[String]) {
     for input in inputs {
         let ast = AstGrep::new(input, SupportLang::Bash);
         let root = ast.root();
-        assert_eq!(root.text(), input.as_str(), "source bytes changed: {input:?}");
+        assert_eq!(
+            root.text(),
+            input.as_str(),
+            "source bytes changed: {input:?}"
+        );
         if input.ends_with("; rm -rf /") {
             assert!(
                 root.find("rm -rf /").is_some(),
