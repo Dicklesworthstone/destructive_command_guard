@@ -11309,22 +11309,23 @@ fn evaluate_executable_text_sinks(
     first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
     inherited_automated_stdin: bool,
 ) -> Option<EvaluationResult> {
-    // Mask the bodies of heredocs whose target provably does not execute its
-    // stdin, exactly as the sibling launcher check does before its own scan.
+    // This scans the RAW command deliberately, not the masked view the pattern
+    // path and the launcher check use. Masking here looks obviously right and is
+    // not: `mask_non_expanding_data_heredocs` decides a target from what precedes
+    // the operator on its own line, so `cat <<'EOF' | bash` masks a body that the
+    // pipe then hands to a shell to execute. The raw scan is what catches that
+    // shape, and nothing else does — masking here turned
+    // `cat <<'EOF'\nrm -rf ./src\nEOF | bash` into an allow (#440, tried and
+    // reverted; `repro_329_heredoc_prose_data_sink::executing_heredoc_sinks_still_block`
+    // and `repro_393_heredoc_boundary_data_sink::executing_receivers_and_expanding_bodies_stay_denied`
+    // both pin it).
     //
-    // Without this the two disagreed about the same bytes. The pattern path
-    // already treats such a body as data — `cat > x.rb <<'OUTER' … rm -rf / …
-    // OUTER` is allowed, and so is a `$(rm -rf /)` in that position — but this
-    // scan read the raw command, found Ruby's `eval` inside the body, could not
-    // resolve its source, and failed closed as `heredoc.posix:eval-dynamic`. So
-    // authoring a Ruby script that uses Ruby's own `eval` was blocked, which is a
-    // pure write with nothing executed (#440).
-    //
-    // Only provably inert bodies vanish: the mask requires a quoted delimiter, so
-    // an unquoted body still reaches the scan because the shell expands it before
-    // the sink sees it, and a body fed to `bash`/`sh` is never masked at all.
-    let masked = crate::heredoc::mask_non_expanding_data_heredocs(command);
-    let sinks = collect_executable_text_sinks(masked.as_ref(), shell_dialect);
+    // The cost of scanning raw is the #440 false positive: an `eval` whose source
+    // this scan cannot resolve denies even from inside a body nothing executes,
+    // so writing a Ruby script that uses Ruby's own `eval` is blocked. Fixing that
+    // needs either heredoc provenance on the extracted content, or a mask that
+    // knows where a data sink's output goes — not a mask swap here.
+    let sinks = collect_executable_text_sinks(command, shell_dialect);
     for sink in sinks {
         let (source, dialect, context) = match sink {
             ExecutableTextSink::Unverified { rule, reason } => {

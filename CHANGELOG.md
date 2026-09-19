@@ -152,34 +152,6 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   missed it. A newline now counts as an opener when the explicit `TRUNCATE
   TABLE` spelling follows, which is evidence no Tailwind class list carries.
 
-- **Writing a script that uses its own language's `eval` is no longer denied
-  (#440).** `cat > script.rb <<'OUTER' … eval <<~'SCRIPT' … SCRIPT … OUTER` denied as
-  `heredoc.posix:eval-dynamic`. No POSIX `eval` runs: the delimiter is quoted,
-  `cat >` does not execute its stdin, and the `eval` is Ruby's. It is the standard
-  way to drive a `pry`/IRB console non-interactively, so the natural spelling was the
-  blocked one.
-
-  Two sibling checks disagreed about the same bytes. The pattern path and the
-  launcher check both scan the *masked* view, in which a proven data-sink body is
-  blank — which is why `rm -rf /` and `$(rm -rf /)` in that position were always
-  allowed. The executable-text-sink scan read the raw command instead, found an
-  `eval` whose source it could not resolve, and failed closed. It now masks the same
-  view.
-
-  Both the reporter's diagnosis and my own first one were wrong, which is worth
-  recording because each sent the fix to the wrong place. The report inferred that
-  the nested heredoc made the scanner lose the outer body's boundary; I inferred
-  that Ruby's `<<~` breaks the bash parse so masking is skipped fail-closed. The
-  parse succeeds, the body *is* masked, and `<<~` is incidental — `eval "$(cat foo)"`
-  and `eval $CMD` in the same position denied just as hard. I had tried widening the
-  #393 parse recovery on that theory and reverted it, since it fixed nothing.
-
-  Only provably inert bodies vanish: masking requires a quoted delimiter, so an
-  unquoted body still reaches the scan because the shell expands it before the sink
-  sees it, and a body fed to `bash`/`sh` is never masked at all. Verified in both
-  directions — `bash <<'OUTER' … eval "$(cat foo)"`, `cat > x.rb <<OUTER` (unquoted)
-  with `$(rm -rf /)`, and a real top-level `eval "$(cat x.rb)"` all still deny.
-
 - **The registry-covers-pack invariant is now enforced for every pack (#441).** All
   29 packs that declare a keyword their `PACK_ENTRIES` row omits are audited, so a
   *new* omission fails `registry_keywords_cover_every_audited_pack_declared_keyword`
@@ -377,6 +349,31 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 - **Only a dollar the shell would actually expand is resolved (#396).**
 
 ### Known open
+
+- **Writing a script that uses its own language's `eval` is still denied (#440).**
+  `cat > script.rb <<'OUTER' … eval <<~'SCRIPT' … SCRIPT … OUTER` denies as
+  `heredoc.posix:eval-dynamic` although nothing executes: the delimiter is quoted,
+  `cat >` does not execute its stdin, and the `eval` is Ruby's.
+
+  Two sibling checks read different views of the same bytes. The pattern path and
+  the launcher check scan the *masked* view, where a proven data-sink body is blank
+  — which is why `rm -rf /` and `$(rm -rf /)` in that same position are allowed.
+  The executable-text-sink scan reads the raw command, finds an `eval` whose source
+  it cannot resolve, and fails closed. `<<~` is incidental: `eval "$(cat foo)"` and
+  `eval $CMD` deny identically, and both the report's diagnosis (the nested heredoc
+  loses the body boundary) and a first attempt of mine (the `<<~` breaks the bash
+  parse, so masking is skipped) were wrong — the parse succeeds and the body *is*
+  masked.
+
+  Masking that scan looks like the fix and is not.
+  `mask_non_expanding_data_heredocs` reads a target from what precedes the operator
+  on its own line, so it blanks the body of `cat <<'EOF' | bash`, where the pipe
+  hands that body to a shell. The raw scan is the only thing that catches that
+  shape, so the swap trades the false positive for a false negative; it was tried
+  and reverted. A real fix needs heredoc provenance on the extracted content, or a
+  mask that knows where a data sink's output goes.
+  `tests/repro_440_eval_sink_in_data_heredoc.rs` characterises all of it, with the
+  false positive `#[ignore]`d and the pipe-to-a-shell shape asserted next to it.
 
 - **A `core.git` safe pattern can still match starting at a later argv token**
   (#429), so `git clean -fdx -- . clean -n` is allowed and real git removes every
