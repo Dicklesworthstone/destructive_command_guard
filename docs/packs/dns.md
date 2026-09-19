@@ -147,8 +147,8 @@ These patterns match safe commands that are always allowed:
 | Pattern Name | Pattern |
 |--------------|----------|
 | `dns-dig-safe` | `\bdig\b(?!.*(?i:\b(?:axfr\|ixfr)\b))` |
-| `dns-host-safe` | `\bhost\b` |
-| `dns-nslookup-safe` | `\bnslookup\b` |
+| `dns-host-safe` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?host\b` |
+| `dns-nslookup-safe` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?nslookup\b` |
 
 ### Destructive Patterns (Blocked)
 

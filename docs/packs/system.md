@@ -49,18 +49,17 @@ These patterns match safe commands that are always allowed:
 |--------------|----------|
 | `dd-file-out` | `dd\s+.*of=['"]?[^/\s'"]+\.` |
 | `dd-discard` | `dd\s+.*of=['"]?/dev/(?:null\|zero\|full)['"]?(?:\s\|$)` |
-| `lsblk` | `\blsblk\b` |
+| `lsblk` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?lsblk\b` |
 | `fdisk-list` | `fdisk\s+-l` |
 | `parted-print` | `parted\b(?:\s+--?\S+)*\s+(?:['"]?/dev/\S+['"]?\s+)?print(?:\s+(?:devices\|free\|list\|all\|\d+))?\s*$` |
-| `blkid` | `\bblkid\b` |
-| `df` | `\bdf\b` |
+| `blkid` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?blkid\b` |
+| `df` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?df\b` |
 | `mount-list` | `\bmount\s*$` |
-| `mkswap-check` | `mkswap\s+(?:.*\s+)?--check\b` |
-| `mdadm-detail` | `mdadm\s+--detail\b` |
-| `mdadm-examine` | `mdadm\s+--examine\b` |
-| `mdadm-query` | `mdadm\s+--query\b` |
-| `mdadm-query-short` | `mdadm\s+-Q\b` |
-| `mdadm-scan` | `mdadm\s+--scan\b` |
+| `mdadm-detail` | `mdadm\b(?!.*\s(?:--(?:stop\|remove\|fail\|zero-superblock\|create\|grow)\|-[SfC])\b).*\s--detail\b` |
+| `mdadm-examine` | `mdadm\b(?!.*\s(?:--(?:stop\|remove\|fail\|zero-superblock\|create\|grow)\|-[SfC])\b).*\s--examine\b` |
+| `mdadm-query` | `mdadm\b(?!.*\s(?:--(?:stop\|remove\|fail\|zero-superblock\|create\|grow)\|-[SfC])\b).*\s--query\b` |
+| `mdadm-query-short` | `mdadm\b(?!.*\s(?:--(?:stop\|remove\|fail\|zero-superblock\|create\|grow)\|-[SfC])\b).*\s-Q\b` |
+| `mdadm-scan` | `mdadm\b(?!.*\s(?:--(?:stop\|remove\|fail\|zero-superblock\|create\|grow)\|-[SfC])\b).*\s--scan\b` |
 | `btrfs-subvolume-list` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+subvolume\s+list(?=\s\|$)` |
 | `btrfs-subvolume-show` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+subvolume\s+show(?=\s\|$)` |
 | `btrfs-filesystem-show` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+filesystem\s+show(?=\s\|$)` |
@@ -177,10 +176,10 @@ These patterns match safe commands that are always allowed:
 | Pattern Name | Pattern |
 |--------------|----------|
 | `chmod-non-recursive` | `chmod\s+(?!-[rR])(?:\d{3,4}\|[ugoa][+-][rwxXst]+)\s+[^/]` |
-| `stat` | `\bstat\b` |
-| `ls-perms` | `ls\s+.*-[a-zA-Z]*l` |
-| `getfacl` | `\bgetfacl\b` |
-| `namei` | `\bnamei\b` |
+| `stat` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?stat\b` |
+| `ls-perms` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?ls\b.*-[a-zA-Z]*l` |
+| `getfacl` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?getfacl\b` |
+| `namei` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?namei\b` |
 
 ### Destructive Patterns (Blocked)
 
@@ -247,7 +246,7 @@ These patterns match safe commands that are always allowed:
 | `systemctl-is` | `systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+is-(?:active\|enabled\|failed)(?=\s\|$)` |
 | `systemctl-reload` | `systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+daemon-reload(?=\s\|$)` |
 | `systemctl-cat` | `systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+cat(?=\s\|$)` |
-| `journalctl` | `\bjournalctl\b` |
+| `journalctl` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?journalctl\b` |
 
 ### Destructive Patterns (Blocked)
 
