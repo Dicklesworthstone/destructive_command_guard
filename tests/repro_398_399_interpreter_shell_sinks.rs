@@ -157,9 +157,31 @@ fn the_sink_text_as_ordinary_data_stays_allowed() {
 
 use destructive_command_guard::heredoc::{ExtractionLimits, ExtractionResult, extract_content};
 
+/// Extraction limits with only the wall clock relaxed.
+///
+/// Every assertion in this file is about *what* gets extracted and whether the
+/// result reports itself as complete — questions decided by the size and slot
+/// caps, never by how fast the host is. `ExtractionLimits::default()` also
+/// carries `timeout_ms: 50`, so on a loaded machine the extractor can stop early
+/// and downgrade a complete reading to `Partial`, failing these tests for a
+/// reason they are not testing. Measured with one binary:
+/// `an_untruncated_extraction_is_still_reported_as_complete` was 0/10 failures at
+/// load 34 and 2/10 at load 74.
+///
+/// Relaxing only the clock keeps `max_heredocs` and the byte/line caps at their
+/// shipped values, so the slot-budget boundary these #427 tests exist to pin
+/// down is unchanged. Mirrors `ExtractionLimits::structural_scan()` (#443),
+/// which made the same trade for the structural helpers.
+fn limits() -> ExtractionLimits {
+    ExtractionLimits {
+        timeout_ms: 5_000,
+        ..ExtractionLimits::default()
+    }
+}
+
 /// The shell payloads extracted from `command`, in order.
 fn payloads(command: &str) -> Vec<String> {
-    match extract_content(command, &ExtractionLimits::default()) {
+    match extract_content(command, &limits()) {
         ExtractionResult::Extracted(items)
         | ExtractionResult::Partial {
             extracted: items, ..
@@ -783,11 +805,11 @@ fn padding_one_extractor_does_not_starve_the_next() {
 #[test]
 fn a_truncated_extraction_reports_itself_as_partial() {
     let command = awk_with_pads(10, "rm -rf /Users/x/Documents");
-    match extract_content(&command, &ExtractionLimits::default()) {
+    match extract_content(&command, &limits()) {
         ExtractionResult::Partial { extracted, skipped } => {
             assert_eq!(
                 extracted.len(),
-                ExtractionLimits::default().max_heredocs,
+                limits().max_heredocs,
                 "the budget should be filled, not exceeded"
             );
             assert!(
@@ -815,11 +837,20 @@ fn an_untruncated_extraction_is_still_reported_as_complete() {
     // The distinction has to stay meaningful: a command whose payloads all fit
     // must report `Extracted`, or every caller pays for the fallback.
     let command = awk_with_pads(3, "rm -rf /Users/x/Documents");
+    let result = extract_content(&command, &limits());
     assert!(
-        matches!(
-            extract_content(&command, &ExtractionLimits::default()),
-            ExtractionResult::Extracted(_)
-        ),
-        "a complete extraction must not be downgraded to partial"
+        matches!(result, ExtractionResult::Extracted(_)),
+        "a complete extraction must not be downgraded to partial; got {}",
+        match &result {
+            ExtractionResult::Extracted(items) => format!("Extracted({} items)", items.len()),
+            ExtractionResult::Partial { extracted, skipped } => format!(
+                "Partial({} extracted, skipped {skipped:?}) — if this names a timeout rather \
+                 than a slot limit, the host was too slow, not the extractor wrong",
+                extracted.len()
+            ),
+            ExtractionResult::NoContent => "NoContent".to_string(),
+            ExtractionResult::Skipped(reasons) => format!("Skipped({reasons:?})"),
+            ExtractionResult::Failed(message) => format!("Failed({message})"),
+        }
     );
 }
