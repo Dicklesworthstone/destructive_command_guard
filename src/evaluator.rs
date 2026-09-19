@@ -11274,7 +11274,25 @@ fn restore_powershell_here_string_substitution_text<'a>(
 fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<ExecutableTextSink> {
     let mut sinks = Vec::new();
     if matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
-        collect_posix_eval_sinks(command, &mut sinks);
+        // The eval collector alone reads the masked view; every other collector
+        // keeps the raw command.
+        //
+        // The distinction is which question the collector asks. The pipeline and
+        // process-substitution collectors ask "does this body BECOME a shell's
+        // source" — `cat <<'EOF' | bash` executes the body, so they must see it,
+        // and masking them turned that into an allow (#440, first attempt). The
+        // eval collector asks "is there an eval here whose source I cannot
+        // resolve", and an eval sitting INSIDE a body that nothing executes is
+        // not one: `cat > script.rb <<'OUTER' … eval <<~'SCRIPT' … OUTER` writes a
+        // Ruby file, and Ruby's `eval` is not POSIX `eval`. Masking blanks exactly
+        // those bodies — quoted delimiter, target proven not to execute stdin —
+        // so the eval disappears with the text it was never part of.
+        //
+        // An eval that is real stays visible either way: outside any heredoc it is
+        // untouched, and inside a body a pipeline hands to a shell the pipeline
+        // collector recursively evaluates that body, where the eval is seen again.
+        let eval_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+        collect_posix_eval_sinks(eval_view.as_ref(), &mut sinks);
         collect_posix_pipeline_executable_sinks(command, &mut sinks);
         collect_posix_process_substitution_sinks(command, &mut sinks);
     }
