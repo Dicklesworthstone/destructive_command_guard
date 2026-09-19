@@ -152,6 +152,53 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   missed it. A newline now counts as an opener when the explicit `TRUNCATE
   TABLE` spelling follows, which is evidence no Tailwind class list carries.
 
+- **`system.services` and `package_managers` were almost entirely non-functional
+  (#441).** Auditing outward from the `.git/` case below found the same dead-keyword
+  shape in two more packs, and there it took out their headline rules. With the
+  pack enabled, `shutdown -h now`, `shutdown -r +1`, `reboot`, `reboot -f`,
+  `init 0`, `apt purge --autoremove`, `apt-get purge`, `yum remove -y`,
+  `dnf remove -y`, `brew uninstall --force`, `poetry publish`, `mvn deploy`,
+  `./mvnw deploy`, `gradle publish` and `./gradlew publish` were every one of them
+  allowed — fifteen commands whose rules existed and could never run, because the
+  registry row for `system.services` carried only `systemctl` and `service` (and
+  not `shutdown`, `reboot`, `init`) while `package_managers` named eight managers
+  but not `apt`, `yum`, `dnf`, `brew`, `poetry`, `mvn` or `gradle`. Anyone who
+  enabled these opt-in packs was unprotected for exactly the commands they enabled
+  them for.
+
+  Each was confirmed twice: before the fix, prefixing a benign command that
+  carries a keyword the row did have flipped the verdict to deny, proving the rule
+  existed and only the gate hid it; after the fix, each denies on its own. That
+  double check matters — for `initctl stop ssh` the same prefix trick reported a
+  gate bug that was not one, because `systemctl-stop-critical` requires the literal
+  `systemctl` and matched across the `;` into the probe's own prefix. `initctl` has
+  no rule at all, which is a coverage gap rather than a gate problem, and is
+  recorded as such.
+
+- **A truncating redirect into `.git` named relatively reached no rule at all
+  (#407, second half).** `cat > .git/config` was allowed while
+  `cat > /repo/.git/config` denied. The rule and its regex were both already
+  correct — the regex matches `> .git/` — but the rule could never run. There are
+  two live keyword lists per pack, gating in sequence: `PACK_ENTRIES` builds the
+  `EnabledKeywordIndex` that decides whether a pack is a candidate at all, and only
+  then does `Pack::might_match` consult the pack's own `keywords`. The `.git/`
+  keyword had been added to the pack's list and not to its registry row, so the
+  quick-reject dropped the command before the pack was ever considered. Every other
+  redirect keyword in that row requires the target to begin with `/`, `~`, `$` or a
+  quote, which is exactly what a relative target does not do — so adding any
+  unrelated pack keyword to the same command (`tee`, `rm`, `sed`) made it deny,
+  and pack-level unit tests could not see the gap because they call the pack
+  directly and never pass through the registry gate.
+
+  A new invariant test enforces that an audited pack's declared keywords all appear
+  in its registry row, since a keyword only in the pack's list is dead. Running it
+  across the whole registry turns up the same drift in a dozen other packs; those
+  omissions look harmless (a CLI subcommand cannot appear without the CLI's own
+  name, which those rows do carry) but have not been checked against the binary, so
+  they are tracked in #441 rather than assumed. `core.filesystem` is audited: its
+  six cmd redirect spellings are confirmed already denied without their keywords,
+  and the exemption list has its own staleness test.
+
 - **A `$VAR` on a heredoc's line no longer hides its target command (#439).**
   `tokenize_backwards` treated a bare `$` as a command boundary, so the backward
   walk over the heredoc's own line stopped before the program word and resolved no

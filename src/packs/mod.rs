@@ -1513,6 +1513,14 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "/sed",
             "perl",
             "/perl",
+            // `redirect-truncate-git-internals-relative` needs this: a relative
+            // target carries none of the redirect keywords below, which all
+            // require the path to begin with `/`, `~`, `$` or a quote. Without
+            // it the quick-reject drops `cat > .git/config` before the pack is
+            // even a candidate, and the rule that exists for exactly that
+            // command never runs (#407). The pack's own keyword list had it;
+            // this row is the gate that actually decides, and it did not.
+            ".git/",
             ">/",
             "> /",
             ">~",
@@ -2103,14 +2111,39 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "system.services",
-        &["systemctl", "service"],
+        // `init`, `shutdown` and `reboot` ARE the command word for the rules that
+        // gate them, so without them here the quick-reject drops the command
+        // before the pack is a candidate and `shutdown -h now`, `shutdown -r +1`,
+        // `reboot`, `reboot -f` and `init 0` are allowed with their rules sitting
+        // unreachable (#441). `systemctl`/`service` cannot stand in: none of those
+        // spellings contains either word.
+        //
+        // `upstart` is here only so the row covers the pack's own list. It matches
+        // no real command — upstart's CLI is `initctl` — and no rule covers
+        // `initctl` at all, so that is a coverage gap rather than a gate problem.
+        &[
+            "systemctl",
+            "service",
+            "init",
+            "upstart",
+            "shutdown",
+            "reboot",
+        ],
         system::services::create_pack,
     ),
     PackEntry::new("strict_git", &["git"], strict_git::create_pack),
     PackEntry::new(
         "package_managers",
+        // Each manager's own name has to be here: the row is what decides whether
+        // the pack runs at all, so omitting `apt`, `yum`, `dnf`, `brew`, `poetry`,
+        // `mvn`/`mvnw` and `gradle`/`gradlew` left `apt purge --autoremove`,
+        // `yum remove -y`, `brew uninstall --force`, `poetry publish`,
+        // `mvn deploy` and `gradle publish` allowed with their rules unreachable
+        // (#441). `publish` is deliberately absent: every command that needs it
+        // also names its manager.
         &[
-            "npm", "yarn", "pnpm", "pip", "cargo", "gem", "composer", "go",
+            "npm", "yarn", "pnpm", "pip", "cargo", "gem", "composer", "go", "apt", "yum", "dnf",
+            "brew", "poetry", "mvn", "mvnw", "gradle", "gradlew",
         ],
         package_managers::create_pack,
     ),
@@ -6200,6 +6233,169 @@ mod tests {
                     !entry.keywords.is_empty(),
                     "pack {} has no keywords — it can never be activated",
                     entry.id
+                );
+            }
+        }
+
+        /// Every keyword a pack declares must also be in its `PACK_ENTRIES` row.
+        ///
+        /// There are two live keyword lists per pack and they gate in sequence:
+        /// `PACK_ENTRIES` builds the `EnabledKeywordIndex` that decides whether a
+        /// pack is a candidate at all, and only then does `Pack::might_match` test
+        /// the pack's own `keywords`. So a keyword added to the pack but not to the
+        /// registry row is dead — the pack is rejected before its own list is ever
+        /// consulted, and any rule that relies on that keyword silently never runs.
+        ///
+        /// That is not hypothetical: #407 added `.git/` to `core::filesystem`'s
+        /// keywords so `cat > .git/config` would reach
+        /// `redirect-truncate-git-internals-relative`. The registry row did not get
+        /// it, so the rule stayed unreachable and the redirect kept being allowed,
+        /// while pack-level unit tests — which call `Pack::might_match` directly and
+        /// never see the registry gate — passed.
+        ///
+        /// The registry row may be a strict superset (it also carries `/rm`-style
+        /// path-qualified variants that the pack list does not); only the missing
+        /// direction is a defect.
+        /// Packs whose keyword drift has been audited end to end, so the invariant
+        /// below is enforced for them.
+        ///
+        /// Most packs still have keywords their `PACK_ENTRIES` row omits. Nearly
+        /// all look harmless — a CLI subcommand like `s3 rb` or `docker prune`
+        /// cannot appear without the CLI's own name, which the row does carry — but
+        /// "looks harmless" is not the standard, and every registry keyword widens
+        /// the matcher that runs on every command, so they are not being added
+        /// wholesale either. Each pack joins this list once its omissions have been
+        /// checked against the real binary. Tracked in #441.
+        const KEYWORD_COVERAGE_AUDITED_PACKS: &[&str] =
+            &["core.filesystem", "system.services", "package_managers"];
+
+        /// Keywords an audited pack omits from its row without opening a bypass.
+        ///
+        /// Every entry was run against the release binary: the commands that need
+        /// it are already denied without it. They are listed rather than added
+        /// because an entry that buys no coverage is not worth a wider hot path.
+        const KEYWORDS_DEAD_BUT_COVERED: &[(&str, &str)] = &[
+            // Cmd redirect spellings. Each of `echo x >%T%`, `>!T!` and `>^/etc/passwd`
+            // is already denied as `redirect-truncate-dynamic-path` with the keyword
+            // absent, checked individually in the cmd dialect.
+            ("core.filesystem", ">%"),
+            ("core.filesystem", "> %"),
+            ("core.filesystem", ">!"),
+            ("core.filesystem", "> !"),
+            ("core.filesystem", ">^"),
+            ("core.filesystem", "> ^"),
+            // `npm publish` — the only command needing this — is already denied
+            // as `npm-publish` through the `npm` keyword, and every other
+            // publisher names its own manager.
+            ("package_managers", "publish"),
+        ];
+
+        #[test]
+        fn registry_keywords_cover_every_audited_pack_declared_keyword() {
+            let mut dead: Vec<String> = Vec::new();
+            for entry in PACK_ENTRIES
+                .iter()
+                .filter(|entry| KEYWORD_COVERAGE_AUDITED_PACKS.contains(&entry.id))
+            {
+                let Some(pack) = REGISTRY.get(entry.id) else {
+                    continue;
+                };
+                for keyword in pack.keywords {
+                    if entry.keywords.contains(keyword) {
+                        continue;
+                    }
+                    if KEYWORDS_DEAD_BUT_COVERED.contains(&(entry.id, keyword)) {
+                        continue;
+                    }
+                    dead.push(format!("{}: {keyword:?}", entry.id));
+                }
+            }
+            assert!(
+                dead.is_empty(),
+                "these pack keywords are absent from PACK_ENTRIES, so the quick-reject \
+                 filter drops the command before the pack's own keyword list is \
+                 consulted and every rule relying on them is unreachable. Add each to \
+                 the pack's PACK_ENTRIES row, or — only after checking against the real \
+                 binary that the commands needing it are already denied — to \
+                 KEYWORDS_DEAD_BUT_COVERED:\n  {}",
+                dead.join("\n  ")
+            );
+        }
+
+        /// Report the same drift across *every* pack, for auditing the next one.
+        ///
+        /// Ignored by default because most packs are still unaudited (#441); this
+        /// is the authoritative way to list what is left, since it reads the two
+        /// lists the binary actually uses rather than parsing the sources:
+        ///
+        /// ```text
+        /// cargo test --lib report_registry_keyword_drift -- --ignored --nocapture
+        /// ```
+        #[test]
+        #[ignore = "reporting tool, not an assertion: see #441"]
+        fn report_registry_keyword_drift_for_every_pack() {
+            let mut packs = 0usize;
+            let mut keywords = 0usize;
+            for entry in &PACK_ENTRIES {
+                let Some(pack) = REGISTRY.get(entry.id) else {
+                    continue;
+                };
+                let missing: Vec<&str> = pack
+                    .keywords
+                    .iter()
+                    .filter(|keyword| !entry.keywords.contains(*keyword))
+                    .copied()
+                    .collect();
+                if missing.is_empty() {
+                    continue;
+                }
+                packs += 1;
+                keywords += missing.len();
+                let audited = if KEYWORD_COVERAGE_AUDITED_PACKS.contains(&entry.id) {
+                    " (audited)"
+                } else {
+                    ""
+                };
+                println!("{}{audited}: {missing:?}", entry.id);
+            }
+            println!("\n{packs} packs with drift, {keywords} keywords absent from their rows");
+        }
+
+        /// Neither list may outlive what it describes.
+        ///
+        /// An exemption for a keyword that has since been added to its row, or that
+        /// its pack no longer declares, is stale — and a stale exemption is how a
+        /// real omission gets waved through later.
+        #[test]
+        fn keyword_coverage_exemptions_have_no_stale_entries() {
+            for pack_id in KEYWORD_COVERAGE_AUDITED_PACKS {
+                assert!(
+                    PACK_ENTRIES.iter().any(|entry| entry.id == *pack_id),
+                    "unknown pack id in audited list: {pack_id}"
+                );
+            }
+            for (pack_id, keyword) in KEYWORDS_DEAD_BUT_COVERED {
+                assert!(
+                    KEYWORD_COVERAGE_AUDITED_PACKS.contains(pack_id),
+                    "{pack_id} has a keyword exemption but is not audited, so nothing \
+                     enforces the invariant it is exempt from"
+                );
+                let entry = PACK_ENTRIES
+                    .iter()
+                    .find(|entry| entry.id == *pack_id)
+                    .unwrap_or_else(|| panic!("unknown pack id in exemption list: {pack_id}"));
+                assert!(
+                    !entry.keywords.contains(keyword),
+                    "{pack_id}: {keyword:?} is in PACK_ENTRIES now — drop it from \
+                     KEYWORDS_DEAD_BUT_COVERED"
+                );
+                let pack = REGISTRY
+                    .get(pack_id)
+                    .unwrap_or_else(|| panic!("pack {pack_id} should be retrievable"));
+                assert!(
+                    pack.keywords.contains(keyword),
+                    "{pack_id}: {keyword:?} is no longer declared by the pack — drop it \
+                     from KEYWORDS_DEAD_BUT_COVERED"
                 );
             }
         }

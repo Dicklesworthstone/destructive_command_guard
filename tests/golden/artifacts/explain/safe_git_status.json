@@ -13,6 +13,7 @@
         "quick_rejected": false,
         "keywords_checked": [
           "&>",
+          ".git/",
           "/cp",
           "/dd",
           "/find",
