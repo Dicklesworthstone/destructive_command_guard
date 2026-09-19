@@ -221,6 +221,32 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   was, and its own detection is covered by negative controls rather than only by
   passing.
 
+- **The whole #442 gate could go green while linking the unpatched scanner.**
+  The repair is selected by the root `[patch.crates-io]`, and a Cargo patch is
+  silent when it stops applying: let the dependency graph ask for a
+  `tree-sitter-bash` the vendored copy does not satisfy — an `ast-grep-language`
+  bump is the likely way, since it requires `^0.25.0` today — and Cargo prints
+  `patch ... was not used in the crate graph` as a *warning*, links the registry
+  crate, and the build succeeds. Nothing in the tree noticed.
+  `scripts/check_scanner_safety.py` compiles
+  `vendor/tree-sitter-bash/src/scanner.c` with `cc`, so it validates the file on
+  disk rather than the one Cargo linked, and `src/scanner_regression_tests.rs`
+  asserts properties — source bytes preserved, the destructive command still
+  matched — that hold on an unpatched build too, because the out-of-domain read
+  usually returns a value the loop discards and faults only when process memory
+  layout puts libc's classification table beside an unmapped page. A green suite
+  was therefore not evidence that the patched scanner was in the binary.
+
+  `tests/repro_442_vendored_scanner_is_linked.rs` asserts the wiring instead of
+  a symptom: `Cargo.lock` must resolve `tree-sitter-bash` to the path package (a
+  registry fallback is visible as a `source` field) and record no
+  `[[patch.unused]]`, the locked and vendored versions must agree, and the
+  vendored scanner must call no narrow ctype function on a value that can be a
+  code point while keeping both ASCII digit loops. It lives under `tests/` for
+  the same reason as the module guard, and its detectors are proved against the
+  actual unpatched upstream scanner and against a lockfile with the patch
+  dropped, not only against inputs that pass.
+
 - **#412 is now fully closed.** The v0.14.4 notes below record it as partially
   fixed because the reported command was still denied. `stdin_data_sink_may_be_overridden`
   no longer lets the *bytes of a quoted heredoc body* decide whether a data sink

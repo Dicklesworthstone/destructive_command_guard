@@ -44,6 +44,16 @@ harness parallelism, 12 times with 128 test threads, and three times serially.
 Logs and raw exit statuses are retained under `target/scanner-safety/`.
 Any failed run makes the command fail; there is no retry-until-green behavior.
 
+Both of those validate behaviour, and behaviour cannot tell a patched build
+from an unpatched one: the out-of-domain read usually returns a value the loop
+discards. `cargo test --locked --test repro_442_vendored_scanner_is_linked`
+therefore asserts the wiring — that `Cargo.lock` resolves `tree-sitter-bash` to
+this path package rather than a registry source, that no patch is recorded
+unused, that the locked and vendored versions agree, and that the scanner here
+still calls no narrow ctype function on a code point. Cargo reports a patch
+that stopped applying only as a warning, so without that assertion a dependency
+bump would restore the upstream defect with every gate green.
+
 The Bash scanner safety workflow has read-only repository permissions.
 Dependency, native-source and parser-boundary changes rerun the gate.
 
