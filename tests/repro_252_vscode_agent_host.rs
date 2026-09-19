@@ -410,7 +410,10 @@ fn run_hook_with_env(payload: &str, extra_env: &[(&str, &str)]) -> std::process:
         .env("TMP", &tmp)
         .env("NO_COLOR", "1")
         .env("DCG_HOOK_TIMEOUT_MS", "5000")
-        .env("DCG_HEREDOC_TIMEOUT_MS", "5000");
+        .env("DCG_HEREDOC_TIMEOUT_MS", "5000")
+        // The AST budget is the third one, and until #438 no environment could
+        // reach it, so a loaded host could still cost this suite a rule id.
+        .env("DCG_AST_TIMEOUT_MS", "5000");
     for (key, value) in extra_env {
         command.env(key, value);
     }

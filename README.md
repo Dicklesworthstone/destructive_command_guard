@@ -722,6 +722,13 @@ Environment variables override config files (highest priority):
 - `DCG_HEREDOC_TIMEOUT=50`: heredoc extraction timeout (milliseconds)
 - `DCG_HEREDOC_TIMEOUT_MS=50`: heredoc extraction timeout (milliseconds)
 - `DCG_HEREDOC_LANGUAGES=python,bash`: filter heredoc languages
+- `DCG_AST_TIMEOUT_MS=<milliseconds>`: AST-matching budget for embedded code
+  (default 20). It can only **raise** the compiled-in budget, never lower it: a
+  smaller window pushes the matcher into its bounded fallback, which denies but
+  without naming a rule, so shrinking it from the environment would degrade
+  analysis rather than tighten it. Lower bounds belong to
+  `DCG_HOOK_TIMEOUT_MS` and `DCG_HEREDOC_TIMEOUT_MS`, which are measured
+  against real work
 - `DCG_POLICY_DEFAULT_MODE=deny|ask|warn|log`: global default decision mode (`ask` requires native operator review and fails closed on unsupported clients)
 - `DCG_HOOK_TIMEOUT_MS=<milliseconds>`: explicit hook evaluation timeout
   (ordinary default: 1000; automatic

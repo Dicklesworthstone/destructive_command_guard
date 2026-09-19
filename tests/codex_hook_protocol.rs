@@ -249,6 +249,10 @@ pub fn run_hook_raw(json_bytes: &[u8], extra_env: &[(&str, &str)]) -> HookOutcom
         .env("NO_COLOR", "1")
         .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .env("DCG_HEREDOC_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        // The third budget. Raising the other two left the AST matcher on its
+        // 20ms release constant, which no environment could reach, so a
+        // descheduled worker still lost the rule id (#438).
+        .env("DCG_AST_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -316,6 +320,10 @@ pub fn run_hook_raw_with_config(
         .env("NO_COLOR", "1")
         .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .env("DCG_HEREDOC_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        // The third budget. Raising the other two left the AST matcher on its
+        // 20ms release constant, which no environment could reach, so a
+        // descheduled worker still lost the rule id (#438).
+        .env("DCG_AST_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

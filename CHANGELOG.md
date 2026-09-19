@@ -152,6 +152,22 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   missed it. A newline now counts as an opener when the explicit `TRUNCATE
   TABLE` spelling follows, which is evidence no Tailwind class list carries.
 
+- **The AST budget is reachable from the environment (#438).** Of the three
+  budgets a subprocess test can hit, it could raise two: `DCG_HOOK_TIMEOUT_MS` and
+  `DCG_HEREDOC_TIMEOUT_MS`. AST matching sat on a hard 20ms release constant with
+  no knob, so a protocol suite could not insulate itself from it — on a loaded host
+  a worker is descheduled, the embedded-code analysis reports itself incomplete,
+  and the bounded fallback answers correctly but *without a rule id*, failing any
+  assertion about which rule fired while the product behaves exactly as designed. A
+  semantic test should not double as a deadline test. `DCG_AST_TIMEOUT_MS` now
+  raises it, and the three protocol suites set all three budgets.
+
+  The knob can only raise, never lower, and that asymmetry is the point: a smaller
+  window pushes the matcher into its bounded fallback more often, so an operator
+  shrinking it from the environment would degrade analysis while believing they had
+  tightened it — the same `DCG_*`-in-`settings.json` footgun as #245. Lower bounds
+  stay with the hook and heredoc budgets, which are measured against real work.
+
 - **`system.services` and `package_managers` were almost entirely non-functional
   (#441).** Auditing outward from the `.git/` case below found the same dead-keyword
   shape in two more packs, and there it took out their headline rules. With the

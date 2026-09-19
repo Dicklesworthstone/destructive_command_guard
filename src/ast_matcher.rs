@@ -54,6 +54,47 @@ const AST_TIMEOUT_MS: u64 = 20;
 #[cfg(test)]
 const AST_TIMEOUT_MS: u64 = 5_000;
 
+/// Upper bound on `DCG_AST_TIMEOUT_MS`.
+///
+/// Comfortably above the hook deadline, past which raising this budget buys
+/// nothing, while still refusing a value that would park a worker indefinitely.
+const AST_TIMEOUT_CEILING_MS: u64 = 60_000;
+
+/// The AST-matching budget, resolved once per process.
+///
+/// `DCG_AST_TIMEOUT_MS` may only **raise** the compiled-in budget, never lower
+/// it. The `cfg(test)` value above covers in-crate tests, but the protocol
+/// suites spawn the real release binary, so they got the strict 20ms and had no
+/// way to reach past it: under parallel load a worker is descheduled, the
+/// embedded-code analysis reports itself incomplete, and the bounded fallback
+/// answers correctly but **without a rule id** — so an assertion about *which*
+/// rule fired fails while the product behaves properly (#438). A semantic test
+/// should not double as a deadline test.
+///
+/// Only-raise is the safe direction and is deliberate: a budget an operator
+/// could shrink from the environment would push the matcher into its bounded
+/// fallback more often, which is precisely the `DCG_*`-in-`settings.json`
+/// footgun that #245 was about. Lowering remains possible through the
+/// enclosing hook and heredoc budgets, which are measured, not assumed.
+fn ast_timeout() -> Duration {
+    static RESOLVED_MS: LazyLock<u64> = LazyLock::new(|| {
+        resolve_ast_timeout_ms(std::env::var("DCG_AST_TIMEOUT_MS").ok().as_deref())
+    });
+    Duration::from_millis(*RESOLVED_MS)
+}
+
+/// The budget an environment request resolves to, given the compiled-in floor.
+///
+/// Split out from [`ast_timeout`] because that caches its answer for the process,
+/// which is right for a hot path and useless for testing the clamp.
+fn resolve_ast_timeout_ms(requested: Option<&str>) -> u64 {
+    requested
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(AST_TIMEOUT_MS, |ms| {
+            ms.clamp(AST_TIMEOUT_MS, AST_TIMEOUT_CEILING_MS)
+        })
+}
+
 /// Maximum body size the AST matcher will parse directly.
 ///
 /// Heredoc extraction already defaults to a 1 MiB body cap; keeping the direct
@@ -221,7 +262,7 @@ impl AstMatcher {
         precompile_perl_patterns();
         Self {
             patterns: precompile_patterns(default_patterns()),
-            timeout: Duration::from_millis(AST_TIMEOUT_MS),
+            timeout: ast_timeout(),
         }
     }
 
@@ -232,7 +273,7 @@ impl AstMatcher {
         precompile_perl_patterns();
         Self {
             patterns: precompile_patterns(patterns),
-            timeout: Duration::from_millis(AST_TIMEOUT_MS),
+            timeout: ast_timeout(),
         }
     }
 
@@ -2799,6 +2840,48 @@ fn precompile_patterns(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// #438: `DCG_AST_TIMEOUT_MS` may raise the budget and never lower it.
+    #[test]
+    fn ast_timeout_env_override_only_raises() {
+        // Absent, empty, and unparseable all keep the compiled-in budget rather
+        // than failing or silently disabling the matcher.
+        for requested in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("abc"),
+            Some("-5"),
+            Some("1e3"),
+        ] {
+            assert_eq!(
+                resolve_ast_timeout_ms(requested),
+                AST_TIMEOUT_MS,
+                "unusable value {requested:?} must keep the compiled-in budget"
+            );
+        }
+
+        // A smaller budget is refused: it would push the matcher into its
+        // bounded fallback, which denies without naming a rule.
+        assert_eq!(resolve_ast_timeout_ms(Some("1")), AST_TIMEOUT_MS);
+        assert_eq!(resolve_ast_timeout_ms(Some("0")), AST_TIMEOUT_MS);
+
+        // A larger one is honoured, whitespace and all, up to the ceiling.
+        let raised = AST_TIMEOUT_MS + 1_000;
+        assert_eq!(resolve_ast_timeout_ms(Some(&raised.to_string())), raised);
+        assert_eq!(
+            resolve_ast_timeout_ms(Some(&format!("  {raised}  "))),
+            raised
+        );
+        assert_eq!(
+            resolve_ast_timeout_ms(Some("999999999")),
+            AST_TIMEOUT_CEILING_MS,
+            "a value past the ceiling is capped, not accepted"
+        );
+
+        // And the resolved process budget is never below the floor.
+        assert!(ast_timeout() >= Duration::from_millis(AST_TIMEOUT_MS));
+    }
 
     #[test]
     fn severity_labels() {
