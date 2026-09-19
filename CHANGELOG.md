@@ -451,7 +451,8 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   domain-safe `iswdigit` (lines 612 and 631), so the report is small and the
   divergence should be short-lived.
 
-- **The test suite's environment mutation is unsound, independently of #442.**
+- **The test suite's environment mutation is unsound, independently of #442
+  (#445).**
   Three separate `ENV_LOCK` mutexes (`agent.rs`, `interactive.rs`, `hook.rs`)
   each serialise only against themselves, and readers take no lock at all — 108
   `env::var` sites against 21 `EnvVarGuard` uses, plus native readers such as
