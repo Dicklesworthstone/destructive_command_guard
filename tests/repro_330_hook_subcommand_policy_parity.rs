@@ -52,6 +52,11 @@ impl Lab {
     }
 
     /// Run the `dcg hook` JSONL subcommand on one Claude-style payload.
+    ///
+    /// `--batch` is what names the JSONL contract this file pins. Plain
+    /// `dcg hook` became the explicit spelling of bare hook mode in #430, which
+    /// answers in the agent protocol and stays silent on an allow, so the
+    /// `{"decision":…}` line these assertions read would not exist.
     fn hook(&self, shell_command: &str) -> HookResult {
         let payload = serde_json::json!({
             "tool_name": "Bash",
@@ -59,7 +64,7 @@ impl Lab {
             "cwd": self.dir.path(),
         });
         let mut child = self
-            .command(&["hook"])
+            .command(&["hook", "--batch"])
             .stdin(Stdio::piped())
             .spawn()
             .expect("spawn dcg hook");
@@ -382,7 +387,9 @@ fn hook_batch_envelope(lab: &Lab, commands: &[&str]) -> HookResult {
         "toolCalls": tool_calls,
     });
     let mut child = lab
-        .command(&["hook"])
+        // `--batch` for the same reason as `Lab::hook`: this reads JSONL result
+        // lines, which plain `dcg hook` no longer emits (#430).
+        .command(&["hook", "--batch"])
         .stdin(Stdio::piped())
         .spawn()
         .expect("spawn dcg hook");

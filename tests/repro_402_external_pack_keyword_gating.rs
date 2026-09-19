@@ -149,7 +149,11 @@ impl Fixture {
             .write_all(payload.as_bytes())
             .expect("write payload");
         let output = child.wait_with_output().expect("wait for dcg");
-        String::from_utf8_lossy(&output.stdout).contains(r#""decision":"deny""#)
+        // Plain `dcg hook` is the explicit spelling of bare hook mode (#430), so
+        // the verdict rides in the agent protocol's `permissionDecision`. Reading
+        // batch mode's `decision` here made every command look allowed, which is
+        // the same trap `false_positive_corpus` fell into.
+        String::from_utf8_lossy(&output.stdout).contains(r#""permissionDecision":"deny""#)
     }
 }
 

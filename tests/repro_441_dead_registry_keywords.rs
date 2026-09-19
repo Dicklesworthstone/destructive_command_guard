@@ -141,6 +141,66 @@ fn the_added_keywords_do_not_deny_ordinary_commands() {
 }
 
 #[test]
+fn mongo_shell_methods_and_kubectl_kustomize_are_reachable() {
+    // Neither shape names a client binary or the word "kustomize", which is all
+    // their registry rows used to carry. Both were the root cause of the two
+    // `option_evidence` assertions that were red on main.
+    for (command, pack) in [
+        ("db.users.drop(); db.posts.find({})", "database.mongodb"),
+        ("db.users.remove({}); db.posts.find({})", "database.mongodb"),
+        (
+            "db.users.deleteMany({}); db.posts.aggregate([])",
+            "database.mongodb",
+        ),
+        (
+            "kubectl delete -k ./prod --cache-dir=--dry-run=client",
+            "kubernetes.kustomize",
+        ),
+        ("kubectl delete --force -k./prod", "kubernetes.kustomize"),
+        // `drop()` takes an optional options document and still drops the
+        // collection, so an argument does not make it a read.
+        ("db.users.drop({writeConcern: {w: 1}})", "database.mongodb"),
+    ] {
+        assert_eq!(
+            decision(command, pack),
+            "deny",
+            "should be denied with {pack} enabled: {command}"
+        );
+    }
+}
+
+#[test]
+fn the_mongo_and_kustomize_keywords_do_not_over_block() {
+    // `.drop(` and `kubectl` are broad substrings, so the guard here is that the
+    // rules they reach stayed narrow: `remove`/`deleteMany` need a literal
+    // `({})`, and the kustomize rule needs a `-k`/`--kustomize` delete. Ordinary
+    // code that merely contains the substrings must stay allowed — `df.drop(…)`
+    // in particular, since a pandas drop is not a Mongo collection drop.
+    for (command, pack) in [
+        ("python3 -c \"df.drop(columns=['a'])\"", "database.mongodb"),
+        ("df.drop(columns=['a'])", "database.mongodb"),
+        ("python3 -c \"items.remove(x)\"", "database.mongodb"),
+        ("items.remove(x)", "database.mongodb"),
+        // A filtered delete is not the unfiltered `({})` the rule gates.
+        ("db.users.deleteMany({status: 'stale'})", "database.mongodb"),
+        // kubectl without a kustomize delete.
+        ("kubectl get pods", "kubernetes.kustomize"),
+        ("kubectl apply -k ./prod", "kubernetes.kustomize"),
+        (
+            "kubectl delete -f manifest.yaml --dry-run=client",
+            "kubernetes.kustomize",
+        ),
+        ("kustomize build ./prod", "kubernetes.kustomize"),
+    ] {
+        assert_eq!(
+            decision(command, pack),
+            "allow",
+            "should be allowed with {pack} enabled: {command}"
+        );
+    }
+}
+
+#[test]
 fn a_disabled_pack_still_does_not_fire() {
     // The keywords live on the pack's row, so enabling nothing must not make
     // these deny — the row is consulted only for packs that are enabled.

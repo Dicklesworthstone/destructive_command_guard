@@ -152,6 +152,34 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   missed it. A newline now counts as an opener when the explicit `TRUNCATE
   TABLE` spelling follows, which is evidence no Tailwind class list carries.
 
+- **Mongo shell methods and `kubectl delete -k` were unreachable, which is why two
+  `option_evidence` audits were red (#441).** `database.mongodb`'s registry row
+  carried client binaries and `dropDatabase`/`dropCollection`, so a mongosh snippet
+  that names no client — `db.users.drop()`, `db.users.remove({})`,
+  `db.users.deleteMany({})` — was quick-rejected before the pack was a candidate.
+  `kubernetes.kustomize`'s row carried only `kustomize`, so `kubectl delete -k
+  ./prod` and `kubectl delete --force -k./prod` never reached the
+  `kubectl-delete-k` rule written for them.
+
+  Those two gaps were the whole cause of the `#435` audit assertions
+  `mongodb_read_exemptions_cannot_shadow_any_current_destructive_rule` and
+  `kustomize_pipeline_argument_data_cannot_exempt_a_delete` failing — the rules and
+  their exemption logic were already correct. The rules stay narrow, so admitting
+  the keywords widens which commands the pack is *asked* about and not what it
+  denies: `df.drop(columns=['a'])` and `items.remove(x)` are still allowed, as is
+  `kubectl apply -k`, while `db.users.drop({writeConcern: …})` denies because
+  Mongo's `drop()` takes an options document and still drops the collection.
+
+- **Three test suites were reading batch mode's `decision` field while invoking
+  plain `dcg hook`**, which #430 made the agent-protocol path. It reports
+  `permissionDecision` and stays silent on an allow, so every command looked
+  allowed. `false_positive_corpus` caught it through its own `MUST_DENY` controls;
+  `repro_330_hook_subcommand_policy_parity` (9 tests) and
+  `repro_402_external_pack_keyword_gating` were simply red, and `cargo test`'s
+  fail-fast had been stopping at an earlier failure before reaching them. The
+  policy-parity suite now names the JSONL contract it pins with `--batch`; the
+  other two read the protocol field.
+
 - **A structural heredoc question no longer depends on how busy the machine is
   (#443, partial).** Two helpers answer *where a heredoc body begins and ends* —
   the #393 parse recovery, which exists because tree-sitter-bash rejects Ruby's

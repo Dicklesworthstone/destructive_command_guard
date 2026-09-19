@@ -1897,6 +1897,14 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "database.mongodb",
+        // The shell-method spellings have to be here, not just in the pack's own
+        // list: a mongosh snippet pasted into a `-eval` or a script names no
+        // client binary, so `db.users.drop()`, `db.users.remove({})` and
+        // `db.users.deleteMany({})` carried none of the keywords below and were
+        // quick-rejected before the pack was ever a candidate (#441). The rules
+        // they reach are tight — `.drop(` requires empty parens and
+        // `remove`/`deleteMany` require a literal `({})` — so admitting these
+        // widens which commands the pack is asked about, not what it denies.
         &[
             "mongo",
             "mongosh",
@@ -1904,6 +1912,10 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "mongorestore",
             "dropDatabase",
             "dropCollection",
+            "deleteMany",
+            ".drop(",
+            ".remove(",
+            ".deleteMany(",
         ],
         database::mongodb::create_pack,
     ),
@@ -2020,7 +2032,11 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     PackEntry::new("kubernetes.helm", &["helm"], kubernetes::helm::create_pack),
     PackEntry::new(
         "kubernetes.kustomize",
-        &["kustomize"],
+        // `kubectl-delete-k` matches `kubectl … delete … -k`, which need not
+        // contain the word "kustomize" at all: `kubectl delete -k ./prod` and
+        // `kubectl delete --force -k./prod` were quick-rejected before this pack
+        // was a candidate, so the rule written for them could not fire (#441).
+        &["kustomize", "kubectl"],
         kubernetes::kustomize::create_pack,
     ),
     PackEntry::new("cloud.aws", &["aws"], cloud::aws::create_pack),
@@ -6266,8 +6282,13 @@ mod tests {
         /// the matcher that runs on every command, so they are not being added
         /// wholesale either. Each pack joins this list once its omissions have been
         /// checked against the real binary. Tracked in #441.
-        const KEYWORD_COVERAGE_AUDITED_PACKS: &[&str] =
-            &["core.filesystem", "system.services", "package_managers"];
+        const KEYWORD_COVERAGE_AUDITED_PACKS: &[&str] = &[
+            "core.filesystem",
+            "system.services",
+            "package_managers",
+            "database.mongodb",
+            "kubernetes.kustomize",
+        ];
 
         /// Keywords an audited pack omits from its row without opening a bypass.
         ///
