@@ -19,6 +19,7 @@ on:
       # running, which is exactly when this workflow needs to run.
       - src/lib.rs
       - tests/repro_442_source_modules_are_declared.rs
+      - tests/repro_442_vendored_scanner_is_linked.rs
       - vendor/**
   workflow_dispatch:
 
@@ -66,6 +67,9 @@ jobs:
           fi
           cargo test --locked --lib scanner_regression_tests
           cargo test --locked --test repro_442_source_modules_are_declared
+          # Those regressions pass on an unpatched build too, so assert
+          # separately that the patched scanner is the one Cargo linked.
+          cargo test --locked --test repro_442_vendored_scanner_is_linked
       - name: Repeated complete lib gate, without retries or test skips
         if: ${{ !cancelled() && steps.focused.outcome == 'success' }}
         run: python3 scripts/check_scanner_safety.py repeat --runs 12
