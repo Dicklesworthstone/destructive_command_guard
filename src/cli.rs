@@ -11065,20 +11065,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     if opencode_appears_in_use() {
         print!("Checking OpenCode plugin registration... ");
         let plugin_path = opencode_user_plugin_path();
-        if let Some(major) = unsupported_opencode_major_version() {
-            println!("{}", "UNSUPPORTED RUNTIME".red());
-            issues += 1;
-            println!(
-                "  OpenCode v{major} is detected, but this dcg build only has the legacy v1 plugin bridge"
-            );
-            println!(
-                "  The v1 module shape/runtime is incompatible with OpenCode v2+, so a present dcg-guard.js"
-            );
-            println!("  must NOT be interpreted as protection.");
-            println!(
-                "  → Treat OpenCode v{major} shell commands as UNGUARDED until native v2 veto semantics are verified (#419)"
-            );
-        } else {
+        {
             match probe_opencode_plugin(&plugin_path) {
                 OpencodePluginProbe::Current => {
                     println!("{}", "OK".green());
@@ -12472,21 +12459,7 @@ fn collect_doctor_report(
     if opencode_appears_in_use() {
         let plugin_path = opencode_user_plugin_path();
         let mut opencode_fixed = false;
-        let (status, message, remediation) = if let Some(major) =
-            unsupported_opencode_major_version()
-        {
-            issues += 1;
-            (
-                DoctorCheckStatus::Error,
-                format!(
-                    "OpenCode v{major} is detected, but dcg's legacy v1 plugin bridge is incompatible \
-                     with v2+; a present plugin must not be interpreted as protection"
-                ),
-                Some(format!(
-                    "Treat OpenCode v{major} shell commands as UNGUARDED until native v2 veto semantics are verified (#419)"
-                )),
-            )
-        } else {
+        let (status, message, remediation) = {
             match probe_opencode_plugin(&plugin_path) {
                 OpencodePluginProbe::Current => (
                     DoctorCheckStatus::Ok,
@@ -13952,51 +13925,85 @@ fn build_opencode_plugin_source(executable: &std::path::Path) -> std::io::Result
 // Routes every OpenCode bash tool call through dcg (Destructive Command
 // Guard) before execution. Remove with `uninstall.sh` or by deleting this
 // file. Docs: https://github.com/Dicklesworthstone/destructive_command_guard
+//
+// One file serves both plugin contracts (#419). OpenCode v1 loads the named
+// `DcgGuard` export and calls `tool.execute.before(input, output)`; v2 loads
+// the default export and requires `{{ id, setup(ctx) }}`, registering through
+// `ctx.tool.hook("execute.before", cb)` with a single `event` argument. An ES
+// module may carry both, and each loader reads only the shape it knows, so
+// the plugin does not depend on detecting the runtime — which matters because
+// `dcg update` regenerates this file and the installed OpenCode may have
+// changed major version since `dcg install` ran.
+//
+// `node:child_process` rather than `Bun.spawn`: v2 migrated Bun -> Node, so
+// `Bun` is undefined there, while Bun implements the `node:` modules — so the
+// one spawn path works under both runtimes.
+import {{ spawnSync }} from "node:child_process";
+
 const DCG_BIN = {path_literal};
 
+// Returns a deny reason, or null to allow. Infrastructure failures (dcg
+// missing, unrunnable, timed out) fail OPEN with a stderr notice, matching
+// the hook-envelope failure policy; the *evaluation* itself stays fail-closed
+// inside dcg.
+function dcgDenyReason(command) {{
+  if (typeof command !== "string" || command.length === 0) return null;
+  let result;
+  try {{
+    result = spawnSync(process.env.DCG_BIN || DCG_BIN, {{
+      input: JSON.stringify({{ tool_name: "Bash", tool_input: {{ command }} }}),
+      encoding: "utf8",
+      env: {{ ...process.env, OPENCODE: "1" }},
+      timeout: 10000,
+    }});
+  }} catch (err) {{
+    console.error(`[dcg] OpenCode guard could not run dcg: ${{err}}`);
+    return null;
+  }}
+  if (!result || result.error) {{
+    console.error(`[dcg] OpenCode guard could not run dcg: ${{result && result.error}}`);
+    return null;
+  }}
+
+  const text = (result.stdout || "").trim();
+  if (!text) return null; // empty stdout = allow
+
+  let decision;
+  try {{
+    decision = JSON.parse(text);
+  }} catch {{
+    return null; // non-JSON stdout: treat as allow (matches other harnesses)
+  }}
+  const hso = decision.hookSpecificOutput;
+  const verdict = hso && hso.permissionDecision;
+  // OpenCode has no operator-review state, so `ask` fails closed.
+  if (verdict === "deny" || verdict === "ask") {{
+    return (hso && hso.permissionDecisionReason) || "Blocked by dcg";
+  }}
+  return null;
+}}
+
+// OpenCode v1: named export, hook map, command in `output.args`.
 export const DcgGuard = async () => {{
   return {{
     "tool.execute.before": async (input, output) => {{
       if (!input || input.tool !== "bash") return;
-      const command = output?.args?.command;
-      if (typeof command !== "string" || command.length === 0) return;
-
-      let stdoutText;
-      try {{
-        const proc = Bun.spawn([process.env.DCG_BIN || DCG_BIN], {{
-          stdin: new TextEncoder().encode(
-            JSON.stringify({{ tool_name: "Bash", tool_input: {{ command }} }})
-          ),
-          stdout: "pipe",
-          stderr: "ignore",
-          env: {{ ...process.env, OPENCODE: "1" }},
-        }});
-        stdoutText = await new Response(proc.stdout).text();
-        await proc.exited;
-      }} catch (err) {{
-        // dcg missing or unrunnable is an infrastructure failure, not a
-        // safety verdict: fail open, but say so.
-        console.error(`[dcg] OpenCode guard could not run dcg: ${{err}}`);
-        return;
-      }}
-
-      const text = (stdoutText || "").trim();
-      if (!text) return; // empty stdout = allow
-
-      let decision;
-      try {{
-        decision = JSON.parse(text);
-      }} catch {{
-        return; // non-JSON stdout: treat as allow (matches other harnesses)
-      }}
-      const hso = decision.hookSpecificOutput;
-      const verdict = hso && hso.permissionDecision;
-      if (verdict === "deny" || verdict === "ask") {{
-        // OpenCode has no operator-review state, so `ask` fails closed.
-        throw new Error(hso.permissionDecisionReason || "Blocked by dcg");
-      }}
+      const reason = dcgDenyReason(output?.args?.command);
+      if (reason) throw new Error(reason);
     }},
   }};
+}};
+
+// OpenCode v2: default export with `id` + `setup`, command in `event.input`.
+export default {{
+  id: "dcg-guard",
+  async setup(ctx) {{
+    await ctx.tool.hook("execute.before", async (event) => {{
+      if (!event || event.tool !== "bash") return;
+      const reason = dcgDenyReason(event.input && event.input.command);
+      if (reason) throw new Error(reason);
+    }});
+  }},
 }};
 "#
     ))
@@ -15645,16 +15652,6 @@ fn build_provenance_doctor_parts(config: &Config) -> (DoctorCheckStatus, String,
 /// Install the native OpenCode plugin (#318).
 fn install_opencode_plugin(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
-
-    if let Some(major) = unsupported_opencode_major_version() {
-        return Err(format!(
-            "OpenCode v{major} is installed, but dcg's current OpenCode bridge targets v1. \
-             Refusing to install or refresh a plugin that v2+ cannot load reliably or whose \
-             veto semantics have not been verified. OpenCode v2 shell commands must be \
-             treated as UNGUARDED by dcg until native v2 support lands (#419)."
-        )
-        .into());
-    }
 
     let plugin_path = if project {
         project_opencode_plugin_path()?
