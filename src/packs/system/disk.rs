@@ -250,13 +250,23 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "diskutil-readonly",
             r"(?i)diskutil\s+(?:list|info|information|activity|listFilesystems|apfs\s+list(?:Snapshots|Users)?)\b[^;&|\r\n]*$"
         ),
-        // --- LVM safe patterns (read-only) ---
-        // lvs, vgs, pvs (list commands)
-        safe_pattern!("lvm-list", r"\b(?:lvs|vgs|pvs)\b"),
-        // lvdisplay, vgdisplay, pvdisplay (display commands)
-        safe_pattern!("lvm-display", r"\b(?:lvdisplay|vgdisplay|pvdisplay)\b"),
-        // lvscan, vgscan, pvscan (scan commands)
-        safe_pattern!("lvm-scan", r"\b(?:lvscan|vgscan|pvscan)\b"),
+        // There are deliberately no LVM read-only exemptions.
+        //
+        // Three used to sit here — `\b(?:lvs|vgs|pvs)\b`,
+        // `\b(?:lvdisplay|vgdisplay|pvdisplay)\b` and
+        // `\b(?:lvscan|vgscan|pvscan)\b` — all unanchored, so argument data
+        // supplied the evidence and short-circuited the whole pack (#448).
+        // `lvs`/`vgs`/`pvs` are three letters matched as a word anywhere, which
+        // makes them as easy to trip as the `df` case that entry calls out:
+        //
+        //   mkfs.ext4 -L lvs /dev/sdb1                        was allowed
+        //   dd if=/dev/zero of=/dev/sda 2>>/var/log/vgs.log   was allowed
+        //   wipefs -a /dev/sdb 2>/tmp/pvs                     was allowed
+        //
+        // Dropped rather than anchored because none was load-bearing: every
+        // destructive LVM rule here is word-anchored on a *remove* or *reduce*
+        // tool (`\bpvremove\b`, `\bvgremove\b`, `\blvremove\b`, `\bvgreduce\b`,
+        // `\blvreduce\b`), so nothing in this pack ever denied a query tool.
         // The pseudo-devices every writer tool legitimately names. `tee
         // /dev/null` is the single most common shape of all, and `/dev/shm`,
         // `/dev/fd/N` and `/dev/pts/N` are ordinary paths rather than block
@@ -1034,6 +1044,16 @@ mod tests {
             "wipefs -a /dev/sdb 2>/tmp/mount",
             // `fdisk-list`: the two tokens inside a quoted filename.
             r#"mkfs.ext4 /dev/sdb1 2>>"/tmp/fdisk -l.log""#,
+            // `lvm-list`: three letters, as a filesystem label or a log path.
+            "mkfs.ext4 -L lvs /dev/sdb1",
+            "mkfs.ext4 -L vgs /dev/sdb1",
+            "mkfs.ext4 -L pvs /dev/sdb1",
+            "dd if=/dev/zero of=/dev/sda 2>>/var/log/vgs.log",
+            "wipefs -a /dev/sdb 2>/tmp/pvs",
+            // `lvm-scan` and `lvm-display`: the same shape, longer words.
+            "mkfs.ext4 -L lvscan /dev/sdb1",
+            "dd if=/dev/zero of=/dev/sda 2>>/var/log/pvscan",
+            "mkfs.ext4 -L vgdisplay /dev/sdb1",
         ] {
             assert!(
                 !pack.matches_safe(command),
@@ -1062,6 +1082,17 @@ mod tests {
             "fdisk /dev/sda -l",
             "mount",
             "mount /dev/sdb1 /mnt",
+            // The LVM query tools: every destructive LVM rule here is anchored
+            // on a remove/reduce tool, so none of these was ever denied.
+            "lvs",
+            "vgs -o vg_name",
+            "pvs /dev/sda",
+            "lvs -a -o +devices",
+            "lvscan",
+            "vgscan",
+            "lvdisplay",
+            "vgdisplay /dev/sda",
+            "pvdisplay",
         ] {
             assert!(
                 pack.check(command).is_none(),

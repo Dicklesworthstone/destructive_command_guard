@@ -105,6 +105,60 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   `docker system prune -a -f --filter label=ps` and
   `rm -rf /etc/nginx --exclude=ls` all still deny.
 
+  **Five more in the same pack carried the defect and were not in that set of
+  nine.** Verifying the fix — all fourteen reported shapes deny, all twelve
+  read-only invocations still allowed — then sweeping every direct
+  `safe_pattern!` in every pack for the same shape turned up `fdisk-list`
+  (`fdisk\s+-l`, unanchored), `mount-list` (`\bmount\s*$`, anchored only at the
+  *end*), and the three LVM exemptions. `/` is a word boundary, so any
+  destructive command whose redirect target's last path component is `mount`
+  satisfied `mount-list`; and `lvs`/`vgs`/`pvs` are three letters matched as a
+  word anywhere, which makes them as easy to trip as the `df` case above.
+  Measured with no pack config, so `system.disk` is default-enabled:
+
+  ```
+  dd if=/dev/zero of=/dev/sda 2>>/var/log/mount        was ALLOW
+  wipefs -a /dev/sdb 2>/tmp/mount                      was ALLOW
+  mkfs.ext4 /dev/sdb1 2>>"/tmp/fdisk -l.log"           was ALLOW
+  mkfs.ext4 -L lvs /dev/sdb1                           was ALLOW
+  mkfs.ext4 -L vgs /dev/sdb1                           was ALLOW
+  mkfs.ext4 -L pvs /dev/sdb1                           was ALLOW
+  dd if=/dev/zero of=/dev/sda 2>>/var/log/vgs.log      was ALLOW
+  wipefs -a /dev/sdb 2>/tmp/pvs                        was ALLOW
+  mkfs.ext4 -L lvscan /dev/sdb1                        was ALLOW
+  dd if=/dev/zero of=/dev/sda 2>>/var/log/pvscan       was ALLOW
+  ```
+
+  All five are **dropped rather than anchored**, because none was load-bearing —
+  the call `ae0cf8d` made for the mdadm exemptions. `fdisk-edit` already excludes
+  the read-only form twice over: it requires `/dev/` directly after `fdisk`, so
+  `fdisk -l /dev/sda` never reaches it, and it carries `(?!.*-l)`, so
+  `fdisk /dev/sda -l` does not match either. No rule here matches a bare `mount`:
+  `mount-bind-root` needs `--bind` with a root target and `umount-force` needs the
+  literal `umount`. And every destructive LVM rule is word-anchored on a *remove*
+  or *reduce* tool — `\bpvremove\b`, `\bvgremove\b`, `\blvremove\b`,
+  `\bvgreduce\b`, `\blvreduce\b` — so no query tool was ever denied; `lvm-display`
+  is dropped alongside its two siblings for the same reason rather than left as
+  the one unanchored survivor. All of the pack's existing tests pass unchanged,
+  including `ordinary_mounts_stay_allowed_issue_441`, and the allowed direction is
+  asserted for every dropped exemption: `lvs`, `vgs -o vg_name`, `pvs /dev/sda`,
+  `lvs -a -o +devices`, `lvscan`, `vgscan`, `lvdisplay`, `vgdisplay /dev/sda`,
+  `pvdisplay`, `fdisk -l`, `fdisk -l /dev/sda`, `fdisk /dev/sda -l`, `mount` and
+  `mount /dev/sdb1 /mnt`.
+
+  The sweep that found them is worth recording as a method: of 781 direct
+  `safe_pattern!` invocations, 52 are unanchored with a short literal, and the
+  three wrapper macros (`helm_safe_pattern!`, `kubectl_safe_pattern!`,
+  `supabase_safe_pattern!`) anchor their own prefix so their bare verbs are not
+  candidates. An earlier pass of this sweep reported 91 because it matched
+  `safe_pattern!` as a substring of those wrappers.
+
+  Bounded the same way the entry above bounds itself. Comments are not a way in
+  (`dd … # verify with fdisk -l afterwards` denies), segment splitting still
+  protects the destructive half (`dd … ; mount`, `mkfs … && mount` deny), and an
+  earlier pass of mine was discarded because half its shapes — `dd … of=/dev/sda
+  mount` — exempt but also fail on the stray operand, so they proved nothing.
+
 - **Every credential and login-startup file the guard protects was writable by
   naming it relatively (#407).** `echo x > ~/.ssh/authorized_keys` denied;
   `echo x > .ssh/authorized_keys` did not, and installs an SSH login for anyone

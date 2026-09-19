@@ -69,9 +69,6 @@ These patterns match safe commands that are always allowed:
 | `nbd-client-list` | `nbd-client\s+-l\b` |
 | `nbd-client-check` | `nbd-client\s+.*-check\b` |
 | `diskutil-readonly` | `(?i)diskutil\s+(?:list\|info\|information\|activity\|listFilesystems\|apfs\s+list(?:Snapshots\|Users)?)\b[^;&\|\r\n]*$` |
-| `lvm-list` | `\b(?:lvs\|vgs\|pvs)\b` |
-| `lvm-display` | `\b(?:lvdisplay\|vgdisplay\|pvdisplay)\b` |
-| `lvm-scan` | `\b(?:lvscan\|vgscan\|pvscan)\b` |
 | `device-write-pseudo-tee` | `\b(?:tee\|sponge)\b(?:\s+-{1,2}\S+)*\s+['"]?/dev/(?:null\|zero\|full\|random\|urandom\|std(?:in\|out\|err)\|tty\|console\|ptmx\|fd/\|pts/\|shm/)\S*['"]?\s*(?:$\|[\|>])` |
 | `device-write-pseudo-copy` | `\b(?:cp\|mv\|install)\b[^\|;&]*\s['"]?/dev/(?:null\|zero\|full\|random\|urandom\|std(?:in\|out\|err)\|tty\|console\|ptmx\|fd/\|pts/\|shm/)\S*['"]?\s*$` |
 
@@ -233,7 +230,6 @@ These patterns match safe commands that are always allowed:
 | Pattern Name | Pattern |
 |--------------|----------|
 | `systemctl-status` | `systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+status(?=\s\|$)` |
-| `service-status` | `service\s+\S+\s+status(?=\s\|$)` |
 | `systemctl-list` | `systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+list-(?:units\|unit-files\|sockets\|timers)(?=\s\|$)` |
 | `systemctl-show` | `systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s\|$)` |
 | `systemctl-is` | `systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+is-(?:active\|enabled\|failed)(?=\s\|$)` |

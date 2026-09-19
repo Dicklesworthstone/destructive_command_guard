@@ -47,7 +47,25 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "systemctl-status",
             r"systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+status(?=\s|$)"
         ),
-        safe_pattern!("service-status", r"service\s+\S+\s+status(?=\s|$)"),
+        // There is deliberately no `service <unit> status` exemption.
+        //
+        // One used to sit here as `service\s+\S+\s+status(?=\s|$)`, anchored only
+        // at the end, so three trailing tokens satisfied it and short-circuited
+        // every destructive rule in the pack (#448). `systemctl stop` accepts
+        // several unit names, so the real unit still stops while the junk ones
+        // merely error — unlike the shapes where the tool rejects a stray
+        // operand outright, these execute:
+        //
+        //   systemctl stop nginx service foo status      was allowed
+        //   systemctl disable nginx service foo status   was allowed
+        //   systemctl mask sshd service foo status       was allowed
+        //
+        // Dropped rather than anchored because it was redundant: the only
+        // destructive rule here naming `service` is
+        // `service\s+(?:ssh|sshd|network|networking|docker)\s+stop`, which a
+        // `status` invocation cannot match. `systemctl-status` above needs no
+        // change — its optional group only consumes `-`-prefixed tokens, so
+        // `systemctl stop nginx status` does not satisfy it.
         // list commands are safe
         safe_pattern!(
             "systemctl-list",
@@ -230,6 +248,52 @@ mod tests {
             assert!(
                 pack.check(command).is_some(),
                 "{command:?} must still be blocked"
+            );
+        }
+    }
+
+    /// The same class as the test above, in an exemption anchored only at the end.
+    ///
+    /// `service-status` was `service\s+\S+\s+status(?=\s|$)`, so three trailing
+    /// tokens satisfied it. These execute: `systemctl` accepts several unit
+    /// names, so the real unit stops while `service`, `foo` and `status` merely
+    /// fail to resolve.
+    #[test]
+    fn a_trailing_service_status_does_not_disarm_the_pack_issue_448() {
+        let pack = create_pack();
+        for command in [
+            "systemctl stop nginx service foo status",
+            "systemctl disable nginx service foo status",
+            "systemctl mask sshd service foo status",
+        ] {
+            assert!(
+                !pack.matches_safe(command),
+                "{command:?} must not match a safe pattern: `service foo status` \
+                 is trailing argument data, not the command being run"
+            );
+            assert!(
+                pack.check(command).is_some(),
+                "{command:?} must still be blocked"
+            );
+        }
+    }
+
+    /// Dropping `service-status` must not block the read-only invocations it
+    /// existed for. It was redundant: the only destructive rule here naming
+    /// `service` requires a critical unit *and* `stop`.
+    #[test]
+    fn reading_service_state_stays_allowed_without_its_exemption_issue_448() {
+        let pack = create_pack();
+        for command in [
+            "service nginx status",
+            "service sshd status",
+            "sudo service docker status",
+            "systemctl status nginx",
+            "systemctl is-active nginx",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command:?} is read-only and must not be blocked"
             );
         }
     }
