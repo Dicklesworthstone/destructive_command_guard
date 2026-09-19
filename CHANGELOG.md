@@ -152,6 +152,34 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   missed it. A newline now counts as an opener when the explicit `TRUNCATE
   TABLE` spelling follows, which is evidence no Tailwind class list carries.
 
+- **Writing a script that uses its own language's `eval` is no longer denied
+  (#440).** `cat > script.rb <<'OUTER' … eval <<~'SCRIPT' … SCRIPT … OUTER` denied as
+  `heredoc.posix:eval-dynamic`. No POSIX `eval` runs: the delimiter is quoted,
+  `cat >` does not execute its stdin, and the `eval` is Ruby's. It is the standard
+  way to drive a `pry`/IRB console non-interactively, so the natural spelling was the
+  blocked one.
+
+  Two sibling checks disagreed about the same bytes. The pattern path and the
+  launcher check both scan the *masked* view, in which a proven data-sink body is
+  blank — which is why `rm -rf /` and `$(rm -rf /)` in that position were always
+  allowed. The executable-text-sink scan read the raw command instead, found an
+  `eval` whose source it could not resolve, and failed closed. It now masks the same
+  view.
+
+  Both the reporter's diagnosis and my own first one were wrong, which is worth
+  recording because each sent the fix to the wrong place. The report inferred that
+  the nested heredoc made the scanner lose the outer body's boundary; I inferred
+  that Ruby's `<<~` breaks the bash parse so masking is skipped fail-closed. The
+  parse succeeds, the body *is* masked, and `<<~` is incidental — `eval "$(cat foo)"`
+  and `eval $CMD` in the same position denied just as hard. I had tried widening the
+  #393 parse recovery on that theory and reverted it, since it fixed nothing.
+
+  Only provably inert bodies vanish: masking requires a quoted delimiter, so an
+  unquoted body still reaches the scan because the shell expands it before the sink
+  sees it, and a body fed to `bash`/`sh` is never masked at all. Verified in both
+  directions — `bash <<'OUTER' … eval "$(cat foo)"`, `cat > x.rb <<OUTER` (unquoted)
+  with `$(rm -rf /)`, and a real top-level `eval "$(cat x.rb)"` all still deny.
+
 - **The registry-covers-pack invariant is now enforced for every pack (#441).** All
   29 packs that declare a keyword their `PACK_ENTRIES` row omits are audited, so a
   *new* omission fails `registry_keywords_cover_every_audited_pack_declared_keyword`
