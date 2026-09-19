@@ -2120,9 +2120,19 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             // the quick-reject drops the command before this pack is a
             // candidate and the rule never runs (#444).
             "/dev/",
-            // Without `umount` the umount-force rule was dead: no other
-            // keyword in this list appears in `umount -f /mnt/x` (#323).
-            "umount",
+            // `mount` is registered rather than `umount` because keyword
+            // matching is substring-based: it still reaches every `umount -f
+            // /mnt/x` this row carried `umount` for (#323), and it additionally
+            // reaches `mount --bind /mnt /`.
+            //
+            // With only `umount` here, `mount-bind-root` was dead. No other
+            // keyword in this list appears in `mount --bind /mnt /`, so the
+            // quick-reject dropped the command before this pack was a
+            // candidate. Measured against the release binary: that command was
+            // allowed, while the same command carrying an unrelated row keyword
+            // (`mount --bind /mnt/btrfs /`) was denied by `mount-bind-root` —
+            // the rule, not the gate, is what should decide (#441).
+            "mount",
             "mdadm",
             "btrfs",
             "dmsetup",
@@ -6271,71 +6281,7 @@ mod tests {
             }
         }
 
-        /// Every keyword a pack declares must also be in its `PACK_ENTRIES` row.
-        ///
-        /// There are two live keyword lists per pack and they gate in sequence:
-        /// `PACK_ENTRIES` builds the `EnabledKeywordIndex` that decides whether a
-        /// pack is a candidate at all, and only then does `Pack::might_match` test
-        /// the pack's own `keywords`. So a keyword added to the pack but not to the
-        /// registry row is dead — the pack is rejected before its own list is ever
-        /// consulted, and any rule that relies on that keyword silently never runs.
-        ///
-        /// That is not hypothetical: #407 added `.git/` to `core::filesystem`'s
-        /// keywords so `cat > .git/config` would reach
-        /// `redirect-truncate-git-internals-relative`. The registry row did not get
-        /// it, so the rule stayed unreachable and the redirect kept being allowed,
-        /// while pack-level unit tests — which call `Pack::might_match` directly and
-        /// never see the registry gate — passed.
-        ///
-        /// The registry row may be a strict superset (it also carries `/rm`-style
-        /// path-qualified variants that the pack list does not); only the missing
-        /// direction is a defect.
-        /// Packs whose keyword drift has been audited end to end, so the invariant
-        /// below is enforced for them.
-        ///
-        /// Most packs still have keywords their `PACK_ENTRIES` row omits. Nearly
-        /// all look harmless — a CLI subcommand like `s3 rb` or `docker prune`
-        /// cannot appear without the CLI's own name, which the row does carry — but
-        /// "looks harmless" is not the standard, and every registry keyword widens
-        /// the matcher that runs on every command, so they are not being added
-        /// wholesale either. Each pack joins this list once its omissions have been
-        /// checked against the real binary. Tracked in #441.
-        const KEYWORD_COVERAGE_AUDITED_PACKS: &[&str] = &[
-            "core.filesystem",
-            "system.services",
-            "package_managers",
-            "database.mongodb",
-            "kubernetes.kustomize",
-            "storage.s3",
-            "platform.railway",
-            "messaging.kafka",
-            "search.elasticsearch",
-            "search.opensearch",
-            "database.postgresql",
-            "database.mysql",
-            "database.redis",
-            "database.sqlite",
-            "database.databricks",
-            "database.snowflake",
-            "database.supabase",
-            "containers.docker",
-            "containers.compose",
-            "containers.podman",
-            "kubernetes.kubectl",
-            "kubernetes.helm",
-            "cloud.aws",
-            "cloud.gcp",
-            "cloud.azure",
-            "infrastructure.terraform",
-            "infrastructure.ansible",
-            "infrastructure.pulumi",
-            "system.disk",
-            "system.permissions",
-            "windows.filesystem",
-            "windows.system",
-        ];
-
-        /// Keywords an audited pack omits from its row without opening a bypass.
+        /// Keywords a pack omits from its row without opening a bypass.
         ///
         /// Every entry was run against the release binary: the commands that need
         /// it are already denied without it. They are listed rather than added
@@ -6466,6 +6412,13 @@ mod tests {
             // reintroduces the #441 defect, and this test cannot catch that. Each
             // was checked to be allowed both bare and with a row keyword present,
             // which is what distinguishes "no rule" from "the gate hid the rule".
+            //
+            // Derive that probe from the pack's rule list, not from what the
+            // keyword suggests. `("system.disk", "mount")` used to sit here on the
+            // strength of `mount -o remount,ro /`, which really does match no
+            // rule — while `mount-bind-root` had matched `mount --bind /mnt /`
+            // the whole time. The pair was allowed-bare and allowed-prefixed, so
+            // the method reported "no rule" correctly about the wrong command.
             ("database.postgresql", "postgres"), // `postgres --single -D …`
             ("database.postgresql", "delete"),
             ("database.postgresql", "drop"),
@@ -6482,7 +6435,6 @@ mod tests {
             ("database.snowflake", "EXECUTE"),
             ("database.snowflake", "execute"),
             ("infrastructure.ansible", "playbook"), // `ansible-playbook` carries `ansible`
-            ("system.disk", "mount"),               // `mount -o remount,ro /` has no rule
             ("system.permissions", "chgrp"),        // `chgrp -R … /etc` has no rule
             // ---- A deliberate omission rather than an oversight. The row carries
             // `sqlite3`, the binary modern systems ship; `sqlite` is SQLite 2's
@@ -6495,13 +6447,109 @@ mod tests {
             ("database.sqlite", "sqlite"),
         ];
 
+        /// Commands whose rule was, or could be, hidden by the registry gate.
+        ///
+        /// Each entry is `(pack, command, rule)` for a command that carries
+        /// exactly one keyword belonging to its pack's row — the keyword whose
+        /// absence made the rule unreachable. They are the four escapes this
+        /// defect class has produced, kept as a corpus because each was found
+        /// only after shipping.
+        const GATE_MUST_REACH_RULE: &[(&str, &str, &str)] = &[
+            // #407: `.git/` was declared by the pack but missing from the row.
+            (
+                "core.filesystem",
+                "cat > .git/config",
+                "redirect-truncate-git-internals-relative",
+            ),
+            // #323: no other keyword in system.disk's row appears here.
+            ("system.disk", "umount -f /mnt/data", "umount-force"),
+            // #444: `tee /dev/sda` names `/dev/` and nothing else.
+            ("system.disk", "tee /dev/sda", "tee-device"),
+            // #441: `mount --bind /mnt /` names `mount` and nothing else. The
+            // row carried only `umount`, which this command does not contain.
+            ("system.disk", "mount --bind /mnt /", "mount-bind-root"),
+        ];
+
+        /// A rule is only real if the production gate lets its pack see the command.
+        ///
+        /// `Pack::check` and `Pack::might_match` consult the pack's own keyword
+        /// list, so a pack-level test passes whether or not the registry row
+        /// carries the keyword. Production does not work that way: the
+        /// `EnabledKeywordIndex` built from `PACK_ENTRIES` decides candidacy
+        /// first, and a pack that is not a candidate never runs. Every escape in
+        /// `GATE_MUST_REACH_RULE` had a correct rule and a green pack-level test.
+        ///
+        /// So assert both halves against the same command: the gate admits the
+        /// pack, *and* the rule then fires with the expected id.
         #[test]
-        fn registry_keywords_cover_every_audited_pack_declared_keyword() {
+        fn registry_gate_admits_every_command_its_rules_must_decide() {
+            for (pack_id, command, rule) in GATE_MUST_REACH_RULE {
+                let mut enabled = HashSet::new();
+                enabled.insert((*pack_id).to_string());
+                let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+                let index = REGISTRY
+                    .build_enabled_keyword_index(&ordered)
+                    .expect("keyword index should build for a single pack");
+                let pack_idx = ordered
+                    .iter()
+                    .position(|id| id == pack_id)
+                    .expect("enabled pack should appear in the ordered list");
+
+                assert_eq!(
+                    (index.candidate_pack_mask(command) >> pack_idx) & 1,
+                    1,
+                    "{pack_id} is not a candidate for {command:?}, so rule {rule} can \
+                     never run no matter what it matches. Add the keyword this command \
+                     carries to the pack's PACK_ENTRIES row"
+                );
+
+                let pack = REGISTRY
+                    .get(pack_id)
+                    .unwrap_or_else(|| panic!("pack {pack_id} should be retrievable"));
+                let matched = pack
+                    .check(command)
+                    .unwrap_or_else(|| panic!("{pack_id} must block {command:?}"));
+                assert_eq!(
+                    matched.name,
+                    Some(*rule),
+                    "{command:?} was blocked by the wrong rule"
+                );
+            }
+        }
+
+        /// Every keyword a pack declares must also be in its `PACK_ENTRIES` row.
+        ///
+        /// There are two live keyword lists per pack and they gate in sequence:
+        /// `PACK_ENTRIES` builds the `EnabledKeywordIndex` that decides whether a
+        /// pack is a candidate at all, and only then does `Pack::might_match` test
+        /// the pack's own `keywords`. So a keyword added to the pack but not to the
+        /// registry row is dead — the pack is rejected before its own list is ever
+        /// consulted, and any rule that relies on that keyword silently never runs.
+        ///
+        /// That is not hypothetical: #407 added `.git/` to `core::filesystem`'s
+        /// keywords so `cat > .git/config` would reach
+        /// `redirect-truncate-git-internals-relative`. The registry row did not get
+        /// it, so the rule stayed unreachable and the redirect kept being allowed,
+        /// while pack-level unit tests — which call `Pack::might_match` directly and
+        /// never see the registry gate — passed.
+        ///
+        /// The registry row may be a strict superset (it also carries `/rm`-style
+        /// path-qualified variants that the pack list does not); only the missing
+        /// direction is a defect.
+        ///
+        /// This runs over **every** registered pack. It was once limited to an
+        /// allowlist of packs whose drift had been audited, on the assumption that
+        /// most rows omitted keywords. Re-measuring settled it: of the 103 rows, 6
+        /// share one `KEYWORDS` const with their pack and so cannot drift at all,
+        /// 68 already carry every keyword their pack declares, and every remaining
+        /// omission belongs to a pack that was already audited and recorded in
+        /// `KEYWORDS_DEAD_BUT_COVERED`. Nothing was left to phase in, so the
+        /// allowlist was removed — all it could still do is exempt the next pack to
+        /// acquire an omission, which is the defect it was meant to find (#441).
+        #[test]
+        fn registry_keywords_cover_every_pack_declared_keyword() {
             let mut dead: Vec<String> = Vec::new();
-            for entry in PACK_ENTRIES
-                .iter()
-                .filter(|entry| KEYWORD_COVERAGE_AUDITED_PACKS.contains(&entry.id))
-            {
+            for entry in &PACK_ENTRIES {
                 let Some(pack) = REGISTRY.get(entry.id) else {
                     continue;
                 };
@@ -6527,17 +6575,18 @@ mod tests {
             );
         }
 
-        /// Report the same drift across *every* pack, for auditing the next one.
+        /// Report every row's drift, exemption or not.
         ///
-        /// Ignored by default because most packs are still unaudited (#441); this
-        /// is the authoritative way to list what is left, since it reads the two
-        /// lists the binary actually uses rather than parsing the sources:
+        /// The assertion above says only that each omission is *accounted for*.
+        /// This prints what is actually omitted, which is what an audit needs to
+        /// re-check when a pack gains a rule. It reads the two lists the binary
+        /// uses rather than parsing the sources:
         ///
         /// ```text
         /// cargo test --lib report_registry_keyword_drift -- --ignored --nocapture
         /// ```
         #[test]
-        #[ignore = "reporting tool, not an assertion: see #441"]
+        #[ignore = "reporting tool, not an assertion"]
         fn report_registry_keyword_drift_for_every_pack() {
             let mut packs = 0usize;
             let mut keywords = 0usize;
@@ -6556,12 +6605,17 @@ mod tests {
                 }
                 packs += 1;
                 keywords += missing.len();
-                let audited = if KEYWORD_COVERAGE_AUDITED_PACKS.contains(&entry.id) {
-                    " (audited)"
+                let unexplained: Vec<&str> = missing
+                    .iter()
+                    .filter(|keyword| !KEYWORDS_DEAD_BUT_COVERED.contains(&(entry.id, *keyword)))
+                    .copied()
+                    .collect();
+                let flag = if unexplained.is_empty() {
+                    String::new()
                 } else {
-                    ""
+                    format!(" UNEXEMPTED {unexplained:?}")
                 };
-                println!("{}{audited}: {missing:?}", entry.id);
+                println!("{}: {missing:?}{flag}", entry.id);
             }
             println!("\n{packs} packs with drift, {keywords} keywords absent from their rows");
         }
@@ -6573,18 +6627,7 @@ mod tests {
         /// real omission gets waved through later.
         #[test]
         fn keyword_coverage_exemptions_have_no_stale_entries() {
-            for pack_id in KEYWORD_COVERAGE_AUDITED_PACKS {
-                assert!(
-                    PACK_ENTRIES.iter().any(|entry| entry.id == *pack_id),
-                    "unknown pack id in audited list: {pack_id}"
-                );
-            }
             for (pack_id, keyword) in KEYWORDS_DEAD_BUT_COVERED {
-                assert!(
-                    KEYWORD_COVERAGE_AUDITED_PACKS.contains(pack_id),
-                    "{pack_id} has a keyword exemption but is not audited, so nothing \
-                     enforces the invariant it is exempt from"
-                );
                 let entry = PACK_ENTRIES
                     .iter()
                     .find(|entry| entry.id == *pack_id)

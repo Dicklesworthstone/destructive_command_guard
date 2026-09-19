@@ -854,6 +854,68 @@ mod tests {
     }
 
     #[test]
+    fn bind_mount_over_root_is_blocked_issue_441() {
+        // `mount --bind <src> /` shadows the running root filesystem for every
+        // process that resolves a path afterwards. The rule has always matched
+        // it; until #441 the registry row carried only `umount`, so the
+        // quick-reject dropped the command — it names no other keyword in that
+        // row — and the pack never ran. Measured against the release binary
+        // before the fix: `mount --bind /mnt /` was allowed, while
+        // `mount --bind /mnt/btrfs /` (identical but for an unrelated row
+        // keyword in the path) was denied by this same rule.
+        let pack = create_pack();
+        for command in [
+            "mount --bind /mnt /",
+            "mount --bind /tmp /",
+            "sudo mount --bind /mnt/overlay /",
+        ] {
+            assert!(
+                pack.might_match(command),
+                "keyword gating must reach the pack for {command:?}"
+            );
+            assert_blocks_with_pattern(&pack, command, "mount-bind-root");
+        }
+    }
+
+    #[test]
+    fn ordinary_mounts_stay_allowed_issue_441() {
+        // Registering `mount` widens the gate, so the pack now sees every
+        // command containing that substring — including `umount`, which is why
+        // the row no longer needs a separate entry for it. Widening the gate
+        // must not widen any rule: only a bind whose target is root denies.
+        let pack = create_pack();
+        for command in [
+            "mount --bind /proc /mnt/proc",
+            "mount --bind /dev /mnt/dev",
+            "mount -t ext4 /dev/sdb1 /mnt",
+            "mount -o remount,ro /",
+            "mount",
+            "mountpoint -q /mnt",
+            "docker run --mount type=bind,src=/data,dst=/data alpine",
+        ] {
+            assert!(
+                pack.matches_safe(command) || pack.check(command).is_none(),
+                "{command:?} must not be blocked by the mount rules"
+            );
+        }
+    }
+
+    #[test]
+    fn umount_force_still_reachable_after_mount_keyword_swap_issue_441() {
+        // `umount` contains `mount`, and keyword matching is substring-based,
+        // so replacing the row's `umount` entry with `mount` kept #323's rule
+        // reachable. This asserts the rule, not just the keyword arithmetic.
+        let pack = create_pack();
+        for command in ["umount -f /mnt/data", "sudo umount -lf /mnt/nfs"] {
+            assert!(
+                pack.might_match(command),
+                "keyword gating must still reach the pack for {command:?}"
+            );
+            assert_blocks_with_pattern(&pack, command, "umount-force");
+        }
+    }
+
+    #[test]
     fn mkswap_blocks_destructive_variants() {
         let pack = create_pack();
         let cases = [
