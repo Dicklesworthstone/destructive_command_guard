@@ -846,6 +846,31 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Known open
 
+- **PowerShell `Remove-Item` is guarded by its alias and not by its own name
+  (#451).** Under `tool_name: "powershell"`, `rm -Recurse ./tree` denies and
+  `Remove-Item -Recurse ./tree` does not, nor does
+  `Remove-Item -Recurse -Force /etc`. `rm` is in `core.filesystem`'s keyword row
+  for POSIX reasons, so the alias selects the pack and the PowerShell parser
+  then reads `-Recurse`; the canonical cmdlet is in no row.
+  `powershell-remove-item-recursive` itself is fine — the existing unit test
+  asserts the parser denies exactly these — so this is reachability, the #441
+  shape. Adding `remove-item` to both keyword lists was tried and reverted: it
+  changes no verdict, because selecting the pack is not sufficient and the
+  PowerShell branch of `rm_semantic_scan_required` only asks for the scan when
+  the command contains one of `` ` @ & $ ( ``. That is also why
+  `Remove-Item -Recurse -Force $HOME` denies while the same command without a
+  variable does not — the obfuscated spelling is caught and the plain one is
+  not. `windows.filesystem:remove-item-recurse` covers all of them, but
+  `windows.*` is default-enabled from `requested_pack_ids(cfg!(windows))`, so it
+  turns on for a Windows *build* rather than for a PowerShell *payload*: a Linux
+  or macOS dcg gating a PowerShell tool has neither layer. Native Windows builds
+  are covered.
+
+  Noted with it: `dcg test --help` promises "the conservative union of the
+  POSIX, PowerShell and Cmd views, which can deny where the hook allows", and
+  `rm -Recurse ./tree` goes the other way — the hook denies, `dcg test` allows.
+  The same help points at `dcg test` for validating an override (#402).
+
 - **The vendored bash scanner diverges from upstream until #442 is reported
   there.** The repair is two lines in a crates.io release we now carry in-tree,
   so every future `tree-sitter-bash` bump has to re-apply it until upstream takes
