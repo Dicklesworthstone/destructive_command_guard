@@ -298,7 +298,7 @@ scenario_find_delete_temp_safe() {
     assert_allowed 'find /tmp/foo -delete'
     assert_allowed 'find /tmp -name *.log -delete'
     assert_allowed 'find /var/tmp -delete'
-    assert_allowed 'find $TMPDIR -delete'
+    # `find $TMPDIR -delete` is in scenario_dynamic_temp_paths_are_reviewed.
 }
 
 scenario_find_no_false_positive() {
@@ -364,8 +364,7 @@ scenario_unlink_temp_safe() {
     assert_allowed 'unlink /tmp/scratch'
     assert_allowed 'unlink /tmp/foo/bar'
     assert_allowed 'unlink /var/tmp/cache'
-    assert_allowed 'unlink $TMPDIR/file'
-    assert_allowed 'unlink ${TMPDIR}/file'
+    # `unlink $TMPDIR/…` is in scenario_dynamic_temp_paths_are_reviewed.
     assert_allowed 'unlink --help'
     assert_allowed 'unlink --version'
 }
@@ -426,8 +425,7 @@ scenario_truncate_temp_safe() {
     assert_allowed 'truncate -s 1G /tmp/sparse-file.bin'
     assert_allowed 'truncate -s 0 /var/tmp/cache.bin'
     assert_allowed 'truncate -s 100M /var/tmp/test.img'
-    assert_allowed 'truncate -s 0 $TMPDIR/cache.bin'
-    assert_allowed 'truncate --size=0 ${TMPDIR}/scratch'
+    # `truncate … $TMPDIR/…` is in scenario_dynamic_temp_paths_are_reviewed.
     assert_allowed 'truncate -s -100 /tmp/log.txt'
     # Pure-growth allowed everywhere (non-destructive).
     assert_allowed 'truncate -s +1024 ./output.bin'
@@ -488,8 +486,7 @@ scenario_shred_temp_safe() {
     assert_allowed 'shred -u /tmp/scratch.bin'
     assert_allowed 'shred -fzu /tmp/foo/cache'
     assert_allowed 'shred -u /var/tmp/cache.bin'
-    assert_allowed 'shred -u $TMPDIR/file'
-    assert_allowed 'shred -u ${TMPDIR}/file'
+    # `shred -u $TMPDIR/…` is in scenario_dynamic_temp_paths_are_reviewed.
     assert_allowed 'shred -n 1 -u /tmp/scratch'
     assert_allowed 'shred /tmp/foo/output'
     assert_allowed 'shred --help'
@@ -554,8 +551,8 @@ scenario_tar_remove_files_temp_safe() {
     assert_allowed 'tar --remove-files -cf out.tar /tmp/scratch'
     assert_allowed 'tar -cf out.tar --remove-files /tmp/foo'
     assert_allowed 'tar --remove-files -czf out.tar.gz /var/tmp/cache'
-    assert_allowed 'tar --remove-files -cf out.tar $TMPDIR/scratch'
-    assert_allowed 'tar --remove-files -cf out.tar ${TMPDIR}/scratch'
+    # `tar --remove-files … $TMPDIR/…` is in
+    # scenario_dynamic_temp_paths_are_reviewed.
 }
 
 scenario_tar_no_false_positive() {
@@ -584,37 +581,44 @@ scenario_tar_remove_files_bypass_var() {
 # dd of= (git_safety_guard-nqhi.5)
 # ---------------------------------------------------------------------------
 scenario_dd_root_home() {
+    # Split by TARGET, exactly as in scenario_redirect_root_home: `dd of=` is
+    # one of the writers `credential-file-write` classifies, so it answers for
+    # the credential and login files and `dd-overwrite-root-home` answers for
+    # every other root/home path. Both deny; the credential rule names the
+    # file (#450).
+    #
     # Canonical zero/urandom into sensitive files.
-    assert_blocked 'dd if=/dev/zero of=/etc/passwd'                  'core.filesystem:dd-overwrite-root-home' 'critical'
-    assert_blocked 'dd if=/dev/urandom of=/etc/shadow'               'core.filesystem:dd-overwrite-root-home' 'critical'
-    assert_blocked 'dd if=/dev/zero of=/etc/sudoers'                 'core.filesystem:dd-overwrite-root-home' 'critical'
+    assert_blocked 'dd if=/dev/zero of=/etc/passwd'                  'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'dd if=/dev/urandom of=/etc/shadow'               'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'dd if=/dev/zero of=/etc/sudoers'                 'core.filesystem:credential-file-write' 'critical'
     # With bs/count operands.
-    assert_blocked 'dd if=/dev/zero of=/etc/passwd bs=1M count=10'   'core.filesystem:dd-overwrite-root-home' 'critical'
+    assert_blocked 'dd if=/dev/zero of=/etc/passwd bs=1M count=10'   'core.filesystem:credential-file-write' 'critical'
     # Operand order swapped (of= first).
-    assert_blocked 'dd of=/etc/passwd if=/dev/zero'                  'core.filesystem:dd-overwrite-root-home' 'critical'
-    assert_blocked 'dd of=/etc/passwd if=/dev/zero bs=1M'            'core.filesystem:dd-overwrite-root-home' 'critical'
+    assert_blocked 'dd of=/etc/passwd if=/dev/zero'                  'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'dd of=/etc/passwd if=/dev/zero bs=1M'            'core.filesystem:credential-file-write' 'critical'
     # No if= (dd reads from stdin — still destroys content).
-    assert_blocked 'dd of=/etc/passwd'                               'core.filesystem:dd-overwrite-root-home' 'critical'
+    assert_blocked 'dd of=/etc/passwd'                               'core.filesystem:credential-file-write' 'critical'
     # Quoted paths.
-    assert_blocked 'dd if=/dev/zero of="/etc/passwd"'                'core.filesystem:dd-overwrite-root-home' 'critical'
-    assert_blocked "dd if=/dev/zero of='/etc/shadow'"                'core.filesystem:dd-overwrite-root-home' 'critical'
+    assert_blocked 'dd if=/dev/zero of="/etc/passwd"'                'core.filesystem:credential-file-write' 'critical'
+    assert_blocked "dd if=/dev/zero of='/etc/shadow'"                'core.filesystem:credential-file-write' 'critical'
     # Home variants.
-    assert_blocked 'dd if=/dev/zero of=~/.ssh/id_ed25519'            'core.filesystem:dd-overwrite-root-home' 'critical'
-    assert_blocked 'dd if=/dev/zero of=$HOME/.aws/credentials'       'core.filesystem:dd-overwrite-root-home' 'critical'
-    assert_blocked 'dd if=/dev/zero of=${HOME}/.gnupg/secring.gpg'   'core.filesystem:dd-overwrite-root-home' 'critical'
-    # Other system roots.
+    assert_blocked 'dd if=/dev/zero of=~/.ssh/id_ed25519'            'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'dd if=/dev/zero of=$HOME/.aws/credentials'       'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'dd if=/dev/zero of=${HOME}/.gnupg/secring.gpg'   'core.filesystem:credential-file-write' 'critical'
+    # Other system roots — not credential files, so the dd rule answers. These
+    # are the controls that keep the split above honest.
     assert_blocked 'dd if=/dev/zero of=/usr/bin/sudo'                'core.filesystem:dd-overwrite-root-home' 'critical'
     assert_blocked 'dd if=/dev/zero of=/boot/vmlinuz'                'core.filesystem:dd-overwrite-root-home' 'critical'
     # Compound forms.
-    assert_blocked 'echo done; dd if=/dev/zero of=/etc/passwd'       'core.filesystem:dd-overwrite-root-home' 'critical'
-    assert_blocked 'true && dd if=/dev/zero of=/etc/passwd'          'core.filesystem:dd-overwrite-root-home' 'critical'
-    assert_blocked '(dd if=/dev/zero of=/etc/passwd)'                'core.filesystem:dd-overwrite-root-home' 'critical'
-    # Wrappers.
-    assert_blocked 'sudo dd if=/dev/zero of=/etc/passwd'             'core.filesystem:dd-overwrite-root-home' 'critical'
-    assert_blocked 'env FOO=bar dd if=/dev/zero of=/etc/passwd'      'core.filesystem:dd-overwrite-root-home' 'critical'
+    assert_blocked 'echo done; dd if=/dev/zero of=/etc/passwd'       'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'true && dd if=/dev/zero of=/etc/passwd'          'core.filesystem:credential-file-write' 'critical'
+    assert_blocked '(dd if=/dev/zero of=/etc/passwd)'                'core.filesystem:credential-file-write' 'critical'
+    # Wrappers — the classifier sees through `sudo` and an env prefix.
+    assert_blocked 'sudo dd if=/dev/zero of=/etc/passwd'             'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'env FOO=bar dd if=/dev/zero of=/etc/passwd'      'core.filesystem:credential-file-write' 'critical'
     # Path-prefixed (PATH_NORMALIZER).
-    assert_blocked '/usr/bin/dd if=/dev/zero of=/etc/passwd'         'core.filesystem:dd-overwrite-root-home' 'critical'
-    assert_blocked '/bin/dd if=/dev/urandom of=/etc/shadow'          'core.filesystem:dd-overwrite-root-home' 'critical'
+    assert_blocked '/usr/bin/dd if=/dev/zero of=/etc/passwd'         'core.filesystem:credential-file-write' 'critical'
+    assert_blocked '/bin/dd if=/dev/urandom of=/etc/shadow'          'core.filesystem:credential-file-write' 'critical'
 }
 
 scenario_dd_general() {
@@ -629,8 +633,8 @@ scenario_dd_temp_safe() {
     assert_allowed 'dd if=/dev/zero of=/tmp/scratch.bin bs=1M count=10'
     assert_allowed 'dd if=/dev/urandom of=/tmp/random.bin bs=4096 count=1'
     assert_allowed 'dd if=/dev/zero of=/var/tmp/cache.bin'
-    assert_allowed 'dd if=/dev/zero of=$TMPDIR/cache.bin'
-    assert_allowed 'dd if=/dev/zero of=${TMPDIR}/scratch'
+    # `$TMPDIR` moved to scenario_dd_temp_dynamic_reviewed; the two literal
+    # temp destinations above are the controls for it.
     assert_allowed 'dd of=/tmp/out.bin'
     assert_allowed 'dd of=/tmp/out.bin if=/dev/zero'
     # Backup TO tmp from sensitive source — NOT destruction (of= is to tmp).
@@ -664,8 +668,8 @@ scenario_dd_no_false_positive() {
 }
 
 scenario_dd_bypass_var() {
-    assert_blocked_under_falsy_bypass  'dd if=/dev/zero of=/etc/passwd'    'core.filesystem:dd-overwrite-root-home'
-    assert_blocked_under_falsy_bypass  'dd if=/dev/urandom of=/etc/shadow' 'core.filesystem:dd-overwrite-root-home'
+    assert_blocked_under_falsy_bypass  'dd if=/dev/zero of=/etc/passwd'    'core.filesystem:credential-file-write'
+    assert_blocked_under_falsy_bypass  'dd if=/dev/urandom of=/etc/shadow' 'core.filesystem:credential-file-write'
     assert_allowed_under_truthy_bypass 'dd if=/dev/zero of=/etc/passwd'
 }
 
@@ -722,8 +726,10 @@ scenario_mv_no_false_positive() {
     assert_allowed 'mv /tmp/foo /tmp/sub/bar'
     assert_allowed 'mv -v /tmp/foo /tmp/bar'
     assert_allowed 'mv /var/tmp/foo /var/tmp/bar'
-    assert_allowed 'mv $TMPDIR/foo $TMPDIR/bar'
-    assert_allowed 'mv ${TMPDIR}/foo ${TMPDIR}/bar'
+    # `mv $TMPDIR/foo $TMPDIR/bar` is in
+    # scenario_dynamic_temp_paths_are_reviewed. The literal-path control
+    # (`mv /tmp/foo /tmp/bar`) stays here, and is what shows the denial is
+    # about the expansion rather than the destination.
     # --help / --version.
     assert_allowed 'mv --help'
     assert_allowed 'mv --version'
@@ -843,61 +849,87 @@ scenario_system_disk_default() {
 # tier ships; a `-general` rule would block legitimate
 # `make > build.log` workflows.
 scenario_redirect_root_home() {
+    # Two rules cover this scenario and the split is by TARGET, not by
+    # redirect spelling. `core.filesystem:credential-file-write` answers
+    # whenever the target is one of the credential, key or login-shell files
+    # it knows (`/etc/passwd`, `/etc/shadow`, `/etc/sudoers`, `~/.ssh/**`,
+    # `~/.aws/credentials`, `~/.gnupg/**`); `redirect-truncate-root-home`
+    # answers for every other root/home path. The credential rule is the more
+    # specific of the two and names the file in its reason, so it is the one
+    # that should answer — see #450. The rules compose rather than shadow:
+    # where the classifier declines (a `.pub` is public), the generic rule
+    # still denies, which is what `scenario_redirect_pub_key` below pins.
+    #
     # Bare redirect.
-    assert_blocked '> /etc/passwd'                'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked '>/etc/passwd'                 'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked '> /etc/passwd'                'core.filesystem:credential-file-write' 'critical'
+    assert_blocked '>/etc/passwd'                 'core.filesystem:credential-file-write' 'critical'
     # Null builtin + redirect (common idiom).
-    assert_blocked ': > /etc/passwd'              'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked ': >/etc/shadow'               'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked ': > /etc/passwd'              'core.filesystem:credential-file-write' 'critical'
+    assert_blocked ': >/etc/shadow'               'core.filesystem:credential-file-write' 'critical'
     # Any command stdout > sensitive.
-    assert_blocked 'echo > /etc/passwd'           'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked 'echo "x" > /etc/passwd'       'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked 'cat /dev/null > /etc/passwd'  'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked 'printf foo > /etc/sudoers'    'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo > /etc/passwd'           'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'echo "x" > /etc/passwd'       'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'cat /dev/null > /etc/passwd'  'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'printf foo > /etc/sudoers'    'core.filesystem:credential-file-write' 'critical'
     # Force-overwrite (>|).
-    assert_blocked '>| /etc/passwd'               'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked 'echo x >| /etc/passwd'        'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked '>| /etc/passwd'               'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'echo x >| /etc/passwd'        'core.filesystem:credential-file-write' 'critical'
     # stdout+stderr (&>).
-    assert_blocked '&> /etc/passwd'               'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked '&> /etc/passwd'               'core.filesystem:credential-file-write' 'critical'
+    # /etc/log is not a credential file, so the generic rule answers — this
+    # is the control that keeps the split above honest.
     assert_blocked 'make &> /etc/log'             'core.filesystem:redirect-truncate-root-home' 'critical'
     # Numbered FDs.
-    assert_blocked 'echo x 1> /etc/passwd'        'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked 'echo x 2> /etc/passwd'        'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked 'echo x 1>| /etc/passwd'       'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked 'echo x 2>| /etc/passwd'       'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo x 1> /etc/passwd'        'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'echo x 2> /etc/passwd'        'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'echo x 1>| /etc/passwd'       'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'echo x 2>| /etc/passwd'       'core.filesystem:credential-file-write' 'critical'
     # Home variants.
-    assert_blocked 'echo x > ~/.ssh/id_ed25519'   'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked 'echo x > $HOME/.aws/credentials'      'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked 'echo x > ${HOME}/.gnupg/secring.gpg'  'core.filesystem:redirect-truncate-root-home' 'critical'
-    # Other system roots.
+    assert_blocked 'echo x > ~/.ssh/id_ed25519'   'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'echo x > $HOME/.aws/credentials'      'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'echo x > ${HOME}/.gnupg/secring.gpg'  'core.filesystem:credential-file-write' 'critical'
+    # Other system roots — not credential files, so the generic rule answers.
     assert_blocked 'echo x > /usr/bin/sudo'       'core.filesystem:redirect-truncate-root-home' 'critical'
     assert_blocked 'echo x > /boot/vmlinuz'       'core.filesystem:redirect-truncate-root-home' 'critical'
     # Quoted sensitive paths.
-    assert_blocked 'echo x > "/etc/passwd"'       'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked "echo x > '/etc/shadow'"       'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo x > "/etc/passwd"'       'core.filesystem:credential-file-write' 'critical'
+    assert_blocked "echo x > '/etc/shadow'"       'core.filesystem:credential-file-write' 'critical'
     # Compound forms.
-    assert_blocked 'echo done; > /etc/passwd'     'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked 'true && > /etc/passwd'        'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked '(> /etc/passwd)'              'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo done; > /etc/passwd'     'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'true && > /etc/passwd'        'core.filesystem:credential-file-write' 'critical'
+    assert_blocked '(> /etc/passwd)'              'core.filesystem:credential-file-write' 'critical'
     # Leading whitespace (common in script formatting and heredoc
     # bodies) must not break the rule — the regex doesn't anchor to
     # start, so internal `>` matches regardless.
-    assert_blocked '  > /etc/passwd'              'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked '	> /etc/passwd'              'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked '  > /etc/passwd'              'core.filesystem:credential-file-write' 'critical'
+    assert_blocked '	> /etc/passwd'              'core.filesystem:credential-file-write' 'critical'
 }
 
 scenario_redirect_append_safe() {
-    # `>>` is append (non-destructive); negative lookbehind in the
-    # destructive regex must exclude it. Even on sensitive paths.
+    # `>>` is append (non-destructive); the negative lookbehind in the
+    # truncation regex must exclude it, even on sensitive paths.
     assert_allowed 'echo line >> /etc/syslog'
-    assert_allowed 'echo line >> ~/.bashrc'
     assert_allowed 'make >> build.log'
-    assert_allowed 'echo line >> /etc/passwd'
-    assert_allowed 'echo line >> /etc/shadow'
     assert_allowed 'command >> /usr/local/log'
     assert_allowed 'echo x &>> /etc/log'
-    assert_allowed 'echo x 1>> /etc/passwd'
-    assert_allowed 'echo x 2>> /etc/passwd'
+}
+
+scenario_redirect_append_credential_still_blocked() {
+    # Appending does not truncate, which is why the rule above ignores `>>`.
+    # It is NOT why the FILE is safe: a line appended to /etc/passwd adds an
+    # account, and a line appended to ~/.bashrc is code execution at the next
+    # shell. `credential-file-write` blocks appends to the files it knows for
+    # exactly that reason, so these belong here rather than beside the
+    # genuinely safe appends above (#450).
+    assert_blocked 'echo line >> ~/.bashrc'      'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'echo line >> /etc/passwd'    'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'echo line >> /etc/shadow'    'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'echo x 1>> /etc/passwd'      'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'echo x 2>> /etc/passwd'      'core.filesystem:credential-file-write' 'critical'
+    # The one documented append exception, which must survive: this is what
+    # ssh itself does, and `known_hosts` is the single `append_ok` entry.
+    assert_allowed 'ssh-keyscan host >> ~/.ssh/known_hosts'
+    assert_allowed 'echo x >> ~/.ssh/known_hosts'
 }
 
 scenario_redirect_temp_safe() {
@@ -909,8 +941,9 @@ scenario_redirect_temp_safe() {
     assert_allowed 'echo x > foo.log'
     assert_allowed 'ls > files.txt'
     assert_allowed 'command > /tmp/scratch'
-    assert_allowed 'command > $TMPDIR/scratch'
-    assert_allowed 'command > ${TMPDIR}/scratch'
+    # `$TMPDIR` moved to scenario_redirect_temp_dynamic_reviewed below: dcg
+    # judges the literal text, and an unresolvable root is reviewed rather
+    # than assumed to be temp.
     assert_allowed 'echo x >| build.log'
     assert_allowed 'echo x &> build.log'
     assert_allowed 'echo x 2> err.log'
@@ -938,26 +971,65 @@ scenario_redirect_temp_safe() {
     assert_allowed 'echo test > /dev/full'
 }
 
+scenario_dynamic_temp_paths_are_reviewed() {
+    # A variable-rooted path is NOT treated as temp, for any of these tools.
+    #
+    # dcg judges the literal `$TMPDIR` text, not its value — verified: the
+    # verdict is identical with the ambient macOS `TMPDIR=/var/folders/…` and
+    # with `TMPDIR=/tmp`, so these reproduce on any host. The shipped deny
+    # text states the posture outright: "Variable-rooted paths such as
+    # $TMPDIR: Reviewed because the environment may point anywhere."
+    #
+    # These used to sit in the `*_temp_safe` scenarios asserting the opposite,
+    # which had been failing since well before #450 was filed. Each tool's
+    # literal-path control (`/tmp/scratch`, `mv /tmp/foo /tmp/bar`, …) stays
+    # in its original scenario and is what proves these denials are about the
+    # expansion rather than the destination.
+    assert_blocked 'find $TMPDIR -delete'                             'core.filesystem:find-delete-general' 'high'
+    assert_blocked 'unlink $TMPDIR/file'                              'core.filesystem:unlink-general' 'high'
+    assert_blocked 'unlink ${TMPDIR}/file'                            'core.filesystem:unlink-general' 'high'
+    assert_blocked 'truncate -s 0 $TMPDIR/cache.bin'                  'core.filesystem:truncate-zero-general' 'high'
+    assert_blocked 'truncate --size=0 ${TMPDIR}/scratch'              'core.filesystem:truncate-zero-general' 'high'
+    assert_blocked 'shred -u $TMPDIR/file'                            'core.filesystem:shred-general' 'high'
+    assert_blocked 'shred -u ${TMPDIR}/file'                          'core.filesystem:shred-general' 'high'
+    assert_blocked 'tar --remove-files -cf out.tar $TMPDIR/scratch'   'core.filesystem:tar-remove-files-general' 'high'
+    assert_blocked 'tar --remove-files -cf out.tar ${TMPDIR}/scratch' 'core.filesystem:tar-remove-files-general' 'high'
+    assert_blocked 'dd if=/dev/zero of=$TMPDIR/cache.bin'             'core.filesystem:dd-overwrite-general' 'high'
+    assert_blocked 'dd if=/dev/zero of=${TMPDIR}/scratch'             'core.filesystem:dd-overwrite-general' 'high'
+    assert_blocked 'mv $TMPDIR/foo $TMPDIR/bar'                       'core.filesystem:mv-dynamic-path' 'high'
+    assert_blocked 'mv ${TMPDIR}/foo ${TMPDIR}/bar'                   'core.filesystem:mv-dynamic-path' 'high'
+    assert_blocked 'command > $TMPDIR/scratch'                        'core.filesystem:redirect-truncate-dynamic-path' 'high'
+    assert_blocked 'command > ${TMPDIR}/scratch'                      'core.filesystem:redirect-truncate-dynamic-path' 'high'
+    # The literal controls, repeated here so this scenario fails if the
+    # denials above ever stop being about the expansion.
+    assert_allowed 'command > /tmp/scratch'
+    assert_allowed 'mv /tmp/foo /tmp/bar'
+    assert_allowed 'find /tmp -delete'
+}
+
 scenario_redirect_bypass_attempts() {
     # Bypass-attempt regression guards. These previously slipped past
     # the destructive regex due to (a) the dcg tokenizer not splitting
     # glued operator+target words, and (b) the optional-quote prefix
     # not accepting Bash ANSI-C (`$'...'`) or locale (`$"..."`) forms.
     #
-    # Glued operator+target (no space between `>` and path).
-    assert_blocked 'echo data>/etc/passwd'              'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked 'printf data>/etc/passwd'            'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked 'echo data>~/.ssh/id_rsa'            'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked 'echo data>$HOME/.aws/credentials'   'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked 'echo "data">/etc/passwd'            'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked "echo data>'/etc/passwd'"            'core.filesystem:redirect-truncate-root-home' 'critical'
+    # Glued operator+target (no space between `>` and path). All of these
+    # name credential files, so `credential-file-write` answers — the point
+    # of the scenario is that the spelling is still SEEN, not which of the
+    # two rules names it (#450).
+    assert_blocked 'echo data>/etc/passwd'              'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'printf data>/etc/passwd'            'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'echo data>~/.ssh/id_rsa'            'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'echo data>$HOME/.aws/credentials'   'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'echo "data">/etc/passwd'            'core.filesystem:credential-file-write' 'critical'
+    assert_blocked "echo data>'/etc/passwd'"            'core.filesystem:credential-file-write' 'critical'
     # Numbered FD glued (`2>/path`).
-    assert_blocked 'echo x 1>/etc/passwd'               'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked 'echo x 2>/etc/passwd'               'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo x 1>/etc/passwd'               'core.filesystem:credential-file-write' 'critical'
+    assert_blocked 'echo x 2>/etc/passwd'               'core.filesystem:credential-file-write' 'critical'
     # Bash ANSI-C and locale quoting.
-    assert_blocked "> \$'/etc/passwd'"                  'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked '> $"/etc/passwd"'                   'core.filesystem:redirect-truncate-root-home' 'critical'
-    assert_blocked "echo > \$'/etc/passwd'"             'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked "> \$'/etc/passwd'"                  'core.filesystem:credential-file-write' 'critical'
+    assert_blocked '> $"/etc/passwd"'                   'core.filesystem:credential-file-write' 'critical'
+    assert_blocked "echo > \$'/etc/passwd'"             'core.filesystem:credential-file-write' 'critical'
     # Device-target redirects (the carve-out is null/zero/full only;
     # `> /dev/sda` etc. must still block).
     assert_blocked '> /dev/sda'                         'core.filesystem:redirect-truncate-root-home' 'critical'
@@ -975,8 +1047,8 @@ scenario_mv_bypass_attempts() {
 }
 
 scenario_redirect_bypass_var() {
-    assert_blocked_under_falsy_bypass  '> /etc/passwd'              'core.filesystem:redirect-truncate-root-home'
-    assert_blocked_under_falsy_bypass  'echo x > ~/.ssh/id_ed25519' 'core.filesystem:redirect-truncate-root-home'
+    assert_blocked_under_falsy_bypass  '> /etc/passwd'              'core.filesystem:credential-file-write'
+    assert_blocked_under_falsy_bypass  'echo x > ~/.ssh/id_ed25519' 'core.filesystem:credential-file-write'
     assert_allowed_under_truthy_bypass '> /etc/passwd'
 }
 
@@ -1021,6 +1093,7 @@ run_all() {
         scenario_tar_remove_files_bypass_var \
         scenario_redirect_root_home \
         scenario_redirect_append_safe \
+        scenario_redirect_append_credential_still_blocked \
         scenario_redirect_temp_safe \
         scenario_redirect_bypass_attempts \
         scenario_redirect_bypass_var \
@@ -1030,6 +1103,7 @@ run_all() {
         scenario_mv_sensitive_bypass_var \
         scenario_sensitive_propagation_then_delete \
         scenario_sensitive_propagation_no_false_positive \
+        scenario_dynamic_temp_paths_are_reviewed \
         scenario_system_disk_default; do
         if declare -F "$scenario" >/dev/null 2>&1; then
             run_scenario "$scenario"
