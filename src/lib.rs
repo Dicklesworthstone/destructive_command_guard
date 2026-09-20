@@ -260,3 +260,39 @@ pub use update::{
 
 // Re-export session occurrence tracking types for graduated response system
 pub use session::{OccurrenceSnapshot, hash_command as session_hash_command};
+
+/// One lock for every test in this crate that mutates the process environment.
+///
+/// There were three, one per module — `hook`, `agent` and `interactive` — and
+/// each serialised only against itself, so a writer in one module ran
+/// concurrently with a writer in another. In Rust 2024 `set_var` is `unsafe`
+/// precisely because glibc's `setenv` can realloc and free the `environ` array
+/// while another thread walks it, which faults inside libc with no Rust panic
+/// and no backtrace.
+///
+/// **This does not make the suite sound, and the guards that take it must not
+/// claim otherwise.** It closes writer-against-writer only. Readers take no
+/// lock — there are far more `env::var` call sites than `EnvVarGuard` uses, and
+/// native code such as bundled SQLite consulting `TMPDIR` cannot take a Rust
+/// lock at all. Closing that needs the tests to stop mutating the environment,
+/// or to run in a process of their own; see #445.
+///
+/// It lives at the end of this file because it is a test module, and
+/// `clippy::items_after_test_module` wants the crate's items above it.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serialise against every other env-mutating test in the crate.
+    ///
+    /// A poisoned lock is taken anyway: the data is `()`, so there is no
+    /// invariant for a panicking test to have broken, and cascading every
+    /// later env test into a second failure hides the first one.
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}

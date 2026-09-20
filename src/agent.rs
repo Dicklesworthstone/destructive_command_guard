@@ -1357,11 +1357,7 @@ mod tests {
 #[cfg(test)]
 mod env_tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Mutex to serialize tests that manipulate environment variables.
-    /// This prevents race conditions when tests run in parallel.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_env;
 
     /// All known agent environment variable keys.
     const AGENT_ENV_VARS: &[&str] = &[
@@ -1399,14 +1395,12 @@ mod env_tests {
     where
         F: FnOnce() -> R,
     {
-        // Acquire lock to prevent race conditions with parallel tests
-        let _lock = ENV_LOCK.lock().unwrap();
+        // The crate-wide lock, so a writer in `hook` or `interactive` cannot
+        // run concurrently with this one (#445).
+        let _lock = test_env::lock();
 
         // Clear cache before test
         clear_cache();
-
-        // SAFETY: We hold ENV_LOCK during all tests that modify environment
-        // variables, preventing concurrent modifications.
 
         // Save and clear all agent env vars (to avoid ambient env interference)
         let saved: Vec<_> = AGENT_ENV_VARS
@@ -1742,8 +1736,8 @@ mod env_tests {
 
     #[test]
     fn test_detect_unknown_no_env() {
-        // Acquire lock to prevent race conditions with parallel tests
-        let _lock = ENV_LOCK.lock().unwrap();
+        // The crate-wide lock (#445).
+        let _lock = test_env::lock();
 
         let saved: Vec<_> = AGENT_ENV_VARS
             .iter()
@@ -1752,8 +1746,8 @@ mod env_tests {
 
         // Ensure no agent env vars are set
         clear_cache();
-        // SAFETY: We hold ENV_LOCK during this test, preventing concurrent
-        // modifications to environment variables.
+        // SAFETY: this test holds `test_env::lock()`, which excludes every
+        // other env WRITER in the crate. Readers are not excluded; see #445.
         unsafe {
             for &k in AGENT_ENV_VARS {
                 std::env::remove_var(k);

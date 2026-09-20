@@ -3470,9 +3470,7 @@ fn chrono_lite_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_env;
 
     #[derive(Default)]
     struct FlushProbe {
@@ -3498,18 +3496,26 @@ mod tests {
     }
 
     impl EnvVarGuard {
+        // SAFETY, for every `set_var`/`remove_var` below: the caller holds
+        // `test_env::lock()`, which is now the single lock for env-mutating
+        // tests in this crate, so no other test WRITES the environment
+        // concurrently.
+        //
+        // That is the whole of the justification, and it is not sufficient on
+        // its own: readers take no lock, and native readers cannot. The
+        // previous wording here claimed "no concurrent access to environment
+        // variables", which was never true — it was three per-module locks,
+        // each serialising only against itself. Tracked in #445; closing it
+        // means not mutating the environment from a threaded test process.
+
         fn set(key: &'static str, value: &str) -> Self {
             let previous = std::env::var(key).ok();
-            // SAFETY: We hold ENV_LOCK during all tests that use this guard,
-            // ensuring no concurrent access to environment variables.
             unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
 
         fn remove(key: &'static str) -> Self {
             let previous = std::env::var(key).ok();
-            // SAFETY: We hold ENV_LOCK during all tests that use this guard,
-            // ensuring no concurrent access to environment variables.
             unsafe { std::env::remove_var(key) };
             Self { key, previous }
         }
@@ -3518,12 +3524,11 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(value) = self.previous.take() {
-                // SAFETY: We hold ENV_LOCK during all tests that use this guard,
-                // ensuring no concurrent access to environment variables.
+                // SAFETY: as on the constructors above — the caller holds
+                // `test_env::lock()`, which excludes other env WRITERS only.
                 unsafe { std::env::set_var(self.key, value) };
             } else {
-                // SAFETY: We hold ENV_LOCK during all tests that use this guard,
-                // ensuring no concurrent access to environment variables.
+                // SAFETY: as above.
                 unsafe { std::env::remove_var(self.key) };
             }
         }
@@ -3987,7 +3992,7 @@ mod tests {
         // Ambient `PA_PROJECT_DIR` (the Posit Assistant marker checked ahead
         // of the Windows-shell rule) would legitimately steer these payloads
         // to ClaudeCompatible, so pin it removed for a deterministic result.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let _no_posit_env = EnvVarGuard::remove("PA_PROJECT_DIR");
         for tool in [
             "powershell",
@@ -4056,7 +4061,7 @@ mod tests {
 
     #[test]
     fn test_posit_assistant_bash_payload_is_claude_compatible_without_env() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let _no_env = EnvVarGuard::remove("PA_PROJECT_DIR");
 
         let input: HookInput = serde_json::from_str(POSIT_ASSISTANT_BASH_PAYLOAD).unwrap();
@@ -4089,7 +4094,7 @@ mod tests {
         // Windows-shell → Codex rule. `PA_PROJECT_DIR` — which the hook
         // contract sets in the hook subprocess — must steer the payload back
         // to the Claude-compatible response Posit Assistant actually reads.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let json = r#"{
             "session_id":"pa-session-42",
             "cwd":"C:\\Users\\user\\analysis",
@@ -4120,7 +4125,7 @@ mod tests {
         // Assistant workspace, so a payload carrying another agent's own wire
         // markers must keep that agent's protocol. Every branch below runs
         // ahead of the Posit Assistant env check.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let _env = EnvVarGuard::set("PA_PROJECT_DIR", "/home/user/analysis");
 
         // Gemini: BeforeTool event + run_shell_command tool.
@@ -4183,7 +4188,7 @@ mod tests {
         // Claude shape (Gemini's parser reads `decision`/`reason`, not
         // `hookSpecificOutput`, so the deny was dropped). The gate now also
         // requires a Posit-Assistant shell tool name.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let _env = EnvVarGuard::set("PA_PROJECT_DIR", "/home/user/analysis");
         let _no_claude_env = EnvVarGuard::remove("CLAUDE_CODE");
         let _no_claude_session_env = EnvVarGuard::remove("CLAUDE_SESSION_ID");
@@ -4205,7 +4210,7 @@ mod tests {
         // shell tool is another agent's must keep that agent's protocol. The
         // Posit branch only exists to reroute `bash`/Windows-shell names away
         // from the #125 bare-Windows-shell → Codex rule.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let _env = EnvVarGuard::set("PA_PROJECT_DIR", "/home/user/analysis");
         let _no_claude_env = EnvVarGuard::remove("CLAUDE_CODE");
         let _no_claude_session_env = EnvVarGuard::remove("CLAUDE_SESSION_ID");
@@ -5671,7 +5676,7 @@ mod tests {
         // Regression: the toolCalls branch fired on ANY non-empty array, so a
         // single non-shell entry rerouted another agent's payload into Claude
         // wire shape — a deny document those parsers drop (fail-open).
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let _no_posit_env = EnvVarGuard::remove("PA_PROJECT_DIR");
         let _no_claude_env = EnvVarGuard::remove("CLAUDE_CODE");
         let _no_claude_session_env = EnvVarGuard::remove("CLAUDE_SESSION_ID");
@@ -5834,9 +5839,10 @@ mod tests {
 
     #[test]
     fn test_env_var_guard_restores_value() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let key = "DCG_TEST_ENV_GUARD";
-        // SAFETY: We hold ENV_LOCK to prevent concurrent env modifications
+        // SAFETY: the test holds `test_env::lock()`, which excludes other env
+        // WRITERS in this crate. Readers are not excluded; see #445.
         unsafe { std::env::remove_var(key) };
 
         {
@@ -5968,7 +5974,7 @@ mod tests {
         // workspace, `CLAUDE_CODE`/`CLAUDE_SESSION_ID` from a Claude Code
         // session) would otherwise make this assertion flaky, so pin them
         // removed under the env lock like the sibling Posit tests do.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = test_env::lock();
         let _no_posit_env = EnvVarGuard::remove("PA_PROJECT_DIR");
         let _no_claude_env = EnvVarGuard::remove("CLAUDE_CODE");
         let _no_claude_session_env = EnvVarGuard::remove("CLAUDE_SESSION_ID");

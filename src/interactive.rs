@@ -958,17 +958,15 @@ pub fn print_not_available_message(reason: &NotAvailableReason) {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::sync::{Mutex, OnceLock};
     use std::time::Instant;
 
     const CI_ENV_VARS: [&str; 5] = ["CI", "GITHUB_ACTIONS", "GITLAB_CI", "JENKINS", "TRAVIS"];
 
+    /// The crate-wide env lock, so this module's writers are serialised
+    /// against `hook`'s and `agent`'s rather than only against each other
+    /// (#445).
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock poisoned")
+        crate::test_env::lock()
     }
 
     fn with_clean_ci_env<F>(f: F)
