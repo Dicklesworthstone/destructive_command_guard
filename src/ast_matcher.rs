@@ -1023,6 +1023,21 @@ static JS_FIRST_STRING_ARG: LazyLock<Regex> = LazyLock::new(|| {
         .expect("js first string arg regex compiles")
 });
 
+/// The path argument of an `fs` deletion call, anchored on the method name.
+///
+/// [`JS_FIRST_STRING_ARG`] takes the first string in the matched text, which
+/// is the target only when the call is the whole match. For a chained
+/// receiver — `require('fs').rmSync('/home/user', …)` — the first string is
+/// the *module name*, so the path read as `"fs"`, `is_catastrophic_path` said
+/// no, and the severity refinement left the hit warn-only. The rule matched
+/// and the command was still allowed (#453).
+static JS_FS_DELETE_PATH_ARG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?m)\.(?:rmSync|rmdirSync|unlinkSync|rm|rmdir|unlink)\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+    )
+    .expect("js fs delete path arg regex compiles")
+});
+
 static RUBY_SYSTEM_EXEC_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     // Matches:
     // - system("...") / system '...'
@@ -1188,8 +1203,11 @@ fn refine_javascript_match(meta: &CompiledPattern, matched_text: &str) -> Option
     if rule_id.starts_with("heredoc.javascript.fs_")
         || rule_id.starts_with("heredoc.javascript.fspromises_")
     {
-        let path = JS_FIRST_STRING_ARG
+        // Prefer the argument of the deletion call itself; fall back to the
+        // first string only when the method-anchored form finds nothing.
+        let path = JS_FS_DELETE_PATH_ARG
             .captures(matched_text)
+            .or_else(|| JS_FIRST_STRING_ARG.captures(matched_text))
             .and_then(|caps| string_literal_from_caps(&caps));
 
         let recursive_relevant = JS_RECURSIVE_TRUE.is_match(matched_text);
@@ -1296,8 +1314,11 @@ fn refine_typescript_match(meta: &CompiledPattern, matched_text: &str) -> Option
         || rule_id.starts_with("heredoc.typescript.fspromises_")
         || rule_id == "heredoc.typescript.deno_remove"
     {
-        let path = JS_FIRST_STRING_ARG
+        // Prefer the argument of the deletion call itself; fall back to the
+        // first string only when the method-anchored form finds nothing.
+        let path = JS_FS_DELETE_PATH_ARG
             .captures(matched_text)
+            .or_else(|| JS_FIRST_STRING_ARG.captures(matched_text))
             .and_then(|caps| string_literal_from_caps(&caps));
 
         let recursive_relevant = JS_RECURSIVE_TRUE.is_match(matched_text);
@@ -1484,6 +1505,29 @@ static PERL_FILE_PATH_RMTREE_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
         r#"(?m)\b(?:File::Path::)?(?P<fn>rmtree|remove_tree)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
     )
     .expect("perl File::Path rmtree/remove_tree regex compiles")
+});
+
+/// `File::Path` exports `rmtree` and `remove_tree` by default, so the
+/// unqualified call is the *documented* usage and the fully-qualified
+/// `File::Path::rmtree` the rule above requires is the rarer spelling. Both
+/// `use File::Path; rmtree('/home/user')` and
+/// `use File::Path qw(remove_tree); remove_tree('/home/user')` were allowed
+/// (#453).
+///
+/// Requiring `use File::Path` elsewhere in the same script is what keeps this
+/// from firing on an unrelated sub that happens to be named `rmtree` — the
+/// import is checked separately by [`PERL_USES_FILE_PATH`] rather than being
+/// folded into one expression, so the two can be read independently.
+static PERL_BARE_RMTREE_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?m)(?:^|[;{}]|\bdo\b)\s*(?P<fn>rmtree|remove_tree)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+    )
+    .expect("perl bare rmtree/remove_tree regex compiles")
+});
+
+/// Whether the script imports `File::Path` at all.
+static PERL_USES_FILE_PATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)\buse\s+File::Path\b").expect("perl use File::Path regex compiles")
 });
 
 static PERL_UNLINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
@@ -1735,7 +1779,19 @@ fn scan_perl_file_path(
     timeout: Duration,
     budget_ms: u64,
 ) -> Result<(), MatchError> {
-    for caps in PERL_FILE_PATH_RMTREE_LITERAL.captures_iter(haystack) {
+    // The unqualified spellings only count when the script imports the module
+    // that exports them, which is what stops an unrelated local sub called
+    // `rmtree` from matching (#453).
+    let bare_matches = if PERL_USES_FILE_PATH.is_match(haystack) {
+        PERL_BARE_RMTREE_LITERAL.captures_iter(haystack)
+    } else {
+        PERL_BARE_RMTREE_LITERAL.captures_iter("")
+    };
+
+    for caps in PERL_FILE_PATH_RMTREE_LITERAL
+        .captures_iter(haystack)
+        .chain(bare_matches)
+    {
         perl_check_timeout(start_time, timeout, budget_ms)?;
         let Some(m) = caps.get(0) else {
             continue;
@@ -2406,8 +2462,15 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
     patterns.insert(
         ScriptLanguage::JavaScript,
         vec![
+            // The receiver is a metavariable, not the literal `fs`, so the
+            // chained form `require('fs').rmSync(...)` matches as well as a
+            // bound `const fs = require('fs')` (#453). That spelling is the
+            // shorter one to type and the one a `-e` one-liner actually uses.
+            // Over-matching on the receiver is bounded by the severity
+            // refinement below, which still requires `recursive: true` or a
+            // catastrophic literal path before this denies.
             CompiledPattern::new(
-                "fs.rmSync($$$)".to_string(),
+                "$FS.rmSync($$$)".to_string(),
                 "heredoc.javascript.fs_rmsync".to_string(),
                 "fs.rmSync() deletes files/directories".to_string(),
                 Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
@@ -2471,7 +2534,27 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
                 Severity::Low,
                 None,
             ),
-            // Promise-based fs variants
+            // Promise-based fs variants. `$FS.promises.rm(...)` is the member
+            // spelling — `fs.promises.rm(...)` and
+            // `require('fs').promises.rm(...)` — which is the API Node's own
+            // docs recommend for removing a tree, and which was absent
+            // entirely under any spelling (#453). `fsPromises.rm(...)` stays
+            // for the `const fsPromises = require('fs/promises')` binding,
+            // where there is no `.promises` member to match.
+            CompiledPattern::new(
+                "$FS.promises.rm($$$)".to_string(),
+                "heredoc.javascript.fspromises_rm".to_string(),
+                "fs.promises.rm() deletes files/directories".to_string(),
+                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
+                Some("Verify target path carefully before running".to_string()),
+            ),
+            CompiledPattern::new(
+                "$FS.promises.rmdir($$$)".to_string(),
+                "heredoc.javascript.fspromises_rmdir".to_string(),
+                "fs.promises.rmdir() deletes directories".to_string(),
+                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
+                Some("Verify target path carefully before running".to_string()),
+            ),
             CompiledPattern::new(
                 "fsPromises.rm($$$)".to_string(),
                 "heredoc.javascript.fspromises_rm".to_string(),
@@ -2493,8 +2576,10 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
     patterns.insert(
         ScriptLanguage::TypeScript,
         vec![
+            // Receiver metavariable, as on the JavaScript side above, so the
+            // chained `require('fs').rmSync(...)` spelling matches too (#453).
             CompiledPattern::new(
-                "fs.rmSync($$$)".to_string(),
+                "$FS.rmSync($$$)".to_string(),
                 "heredoc.typescript.fs_rmsync".to_string(),
                 "fs.rmSync() deletes files/directories".to_string(),
                 Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
@@ -2562,6 +2647,22 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
                 "fs.unlink() deletes files".to_string(),
                 Severity::Low,
                 None,
+            ),
+            // The `.promises` member spelling, which was absent entirely:
+            // `fs.promises.rm(...)` and `require('fs').promises.rm(...)`.
+            CompiledPattern::new(
+                "$FS.promises.rm($$$)".to_string(),
+                "heredoc.typescript.fspromises_rm".to_string(),
+                "fs.promises.rm() deletes files/directories".to_string(),
+                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
+                Some("Verify target path carefully before running".to_string()),
+            ),
+            CompiledPattern::new(
+                "$FS.promises.rmdir($$$)".to_string(),
+                "heredoc.typescript.fspromises_rmdir".to_string(),
+                "fs.promises.rmdir() deletes directories".to_string(),
+                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
+                Some("Verify target path carefully before running".to_string()),
             ),
             CompiledPattern::new(
                 "fsPromises.rm($$$)".to_string(),
@@ -3089,6 +3190,48 @@ mod tests {
         use super::*;
 
         #[test]
+        fn chained_and_promise_spellings_block_like_their_siblings() {
+            // #453. The root cause was not the patterns: a chained receiver
+            // made `JS_FIRST_STRING_ARG` read the *module name* as the target
+            // path, so `require('fs')` scored as non-catastrophic and the hit
+            // stayed warn-only. Each of these deletes a home directory.
+            let ast_matcher = AstMatcher::new();
+            for code in [
+                "require('fs').rmSync('/home/user', { recursive: true, force: true })",
+                "require('node:fs').rmSync('/home/user', { recursive: true })",
+                "require('fs').promises.rm('/home/user', { recursive: true })",
+                "const fs = require('fs'); fs.promises.rm('/home/user', { recursive: true })",
+            ] {
+                let matches = ast_matcher
+                    .find_matches(code, ScriptLanguage::JavaScript)
+                    .unwrap();
+                assert!(
+                    matches.iter().any(|m| m.severity.blocks_by_default()),
+                    "must block: {code}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_chained_receiver_does_not_make_a_safe_target_look_dangerous() {
+            // The mirror of the bug: reading the module name as the path could
+            // just as easily have gone the other way.
+            let ast_matcher = AstMatcher::new();
+            for code in [
+                "require('fs').rmSync('./dist', { recursive: true })",
+                "require('fs').readFileSync('/home/user/notes.txt')",
+            ] {
+                let matches = ast_matcher
+                    .find_matches(code, ScriptLanguage::JavaScript)
+                    .unwrap();
+                assert!(
+                    !matches.iter().any(|m| m.severity.blocks_by_default()),
+                    "must not block: {code}"
+                );
+            }
+        }
+
+        #[test]
         fn fs_rmsync_catastrophic_blocks() {
             let ast_matcher = AstMatcher::new();
             let code = "const fs = require('fs');\nfs.rmSync('/etc', { recursive: true });";
@@ -3505,6 +3648,47 @@ mod tests {
             assert!(!matches.is_empty());
             assert!(matches[0].rule_id.contains("rm_rf"));
             assert!(matches[0].severity.blocks_by_default());
+        }
+
+        #[test]
+        fn perl_unqualified_rmtree_matches_when_the_module_is_imported() {
+            // #453. `File::Path` exports both by default, so the unqualified
+            // call is the documented usage and the fully-qualified spelling
+            // the rule required is the rarer one.
+            let ast_matcher = AstMatcher::new().with_timeout(std::time::Duration::from_millis(100));
+            for code in [
+                "use File::Path; rmtree('/home/user');",
+                "use File::Path qw(remove_tree); remove_tree('/home/user');",
+                "use File::Path;\nremove_tree('/home/user');\n",
+            ] {
+                let matches = ast_matcher
+                    .find_matches(code, ScriptLanguage::Perl)
+                    .expect("perl ast_matcher should run within 100ms");
+                assert!(
+                    matches.iter().any(|m| m.severity.blocks_by_default()),
+                    "must block: {code}"
+                );
+            }
+        }
+
+        #[test]
+        fn perl_unqualified_rmtree_needs_the_import_to_count() {
+            // The import requirement is what keeps an unrelated local sub of
+            // the same name from matching.
+            let ast_matcher = AstMatcher::new().with_timeout(std::time::Duration::from_millis(100));
+            for code in [
+                "sub rmtree { print 'hi' } rmtree('/home/user');",
+                "print 'rmtree is dangerous';",
+                "use File::Path; rmtree('./build');",
+            ] {
+                let matches = ast_matcher
+                    .find_matches(code, ScriptLanguage::Perl)
+                    .expect("perl ast_matcher should run within 100ms");
+                assert!(
+                    !matches.iter().any(|m| m.severity.blocks_by_default()),
+                    "must not block: {code}"
+                );
+            }
         }
 
         #[test]
