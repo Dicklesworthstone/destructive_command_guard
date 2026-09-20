@@ -1298,14 +1298,29 @@ fn powershell_variable_assignment(command: &str) -> bool {
 pub(crate) fn rm_semantic_scan_required(command: &str, dialect: ShellDialect) -> bool {
     match dialect {
         ShellDialect::PowerShell => {
-            if !command.contains(['`', '@', '&', '$', '(']) {
-                return false;
-            }
             if command.contains('&') {
                 // The call operator can execute a variable, subexpression, or
                 // concatenation whose bytes contain no literal pack keyword.
                 return true;
             }
+            // There used to be a `!command.contains(['`', '@', '&', '$', '('])`
+            // short-circuit here, on the theory that a command with no
+            // obfuscation character would already have been selected by the
+            // bytewise pack keywords. That holds for `rm`, which is a keyword.
+            // It does not hold for the cmdlet spellings — `Remove-Item`, `ri`,
+            // `del`, `rd`, `erase` are not core.filesystem keywords — so the
+            // plain, unobfuscated `Remove-Item -Recurse ./tree` fell between the
+            // two mechanisms: too plain for this scan's prefilter, and invisible
+            // to the keyword index. `Remove-Item -Recurse -Force $HOME` blocked
+            // only because the `$` happened to satisfy the prefilter, so the
+            // spelling with a variable in it was caught while the plain literal
+            // was not (#451).
+            //
+            // The segment check below is the authoritative test and already
+            // decodes the command word against `powershell_remove_item_alias`,
+            // so it answers this correctly on its own. Only PowerShell and
+            // Unknown dialects reach this arm, so the tokenizing cost does not
+            // land on the POSIX hot path.
             crate::packs::split_command_segments_in_dialect(command, dialect)
                 .into_iter()
                 .any(powershell_segment_requires_rm_semantic_scan)
@@ -7675,6 +7690,57 @@ mod tests {
             assert!(
                 !filesystem_semantic_scan_required(command, dialect),
                 "inert data or ordinary POSIX syntax must not require a dialect fallback scan: {command}"
+            );
+        }
+    }
+
+    /// #451: the PLAIN cmdlet spellings must force candidate selection too.
+    ///
+    /// These carry no obfuscation character, which is exactly why they were
+    /// missed: the removed prefilter assumed the bytewise keyword index would
+    /// have caught anything unobfuscated, but `Remove-Item`/`ri`/`del`/`rd` are
+    /// not core.filesystem keywords. The consequence was inverted coverage —
+    /// `Remove-Item -Recurse -Force $HOME` blocked because of the `$`, while the
+    /// plain literal target did not.
+    #[test]
+    fn plain_powershell_removal_cmdlets_force_candidate_selection_issue_451() {
+        for command in [
+            "Remove-Item -Recurse ./tree",
+            "Remove-Item -Recurse -Force /etc",
+            "Remove-Item -Path /etc -Recurse -Force",
+            "ri -Recurse -Force /etc",
+            "del -Recurse ./tree",
+            "rd -Recurse ./tree",
+            "erase -Recurse ./tree",
+            "Get-Process; Remove-Item -Recurse ./tree",
+        ] {
+            assert!(
+                filesystem_semantic_scan_required(command, ShellDialect::PowerShell),
+                "a plain PowerShell removal cmdlet must force core.filesystem \
+                 candidate selection even with no obfuscation character: {command}"
+            );
+        }
+    }
+
+    /// Negative control for the test above: dropping the prefilter must not make
+    /// the signal fire for every PowerShell command, or core.filesystem would be
+    /// force-selected on every payload and the quick-reject would stop meaning
+    /// anything.
+    #[test]
+    fn ordinary_powershell_commands_still_skip_the_semantic_scan_issue_451() {
+        for command in [
+            "Get-ChildItem -Path C:\\Users",
+            "Write-Output 'hello'",
+            "Set-Location C:\\src",
+            "Copy-Item a.txt b.txt",
+            "New-Item -ItemType Directory ./build",
+            "Get-Content log.txt | Select-String error",
+            // Mentions a cmdlet name as DATA, not as the command word.
+            "Write-Output 'Remove-Item -Recurse ./tree'",
+        ] {
+            assert!(
+                !filesystem_semantic_scan_required(command, ShellDialect::PowerShell),
+                "an ordinary PowerShell command must not force a semantic scan: {command}"
             );
         }
     }

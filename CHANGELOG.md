@@ -17,6 +17,40 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Security
 
+- **`Remove-Item -Recurse /` was allowed under a PowerShell payload; the same
+  command with `$HOME` was blocked** (#451). No rule was missing:
+  `core.filesystem`'s `powershell-remove-item-recursive` already knows every
+  alias and already works on non-Windows builds. It was never reached.
+
+  `rm_semantic_scan_required`'s PowerShell arm returned false unless the command
+  contained a backtick, `@`, `&`, `$` or `(`, on the premise that anything
+  unobfuscated would already be selected by the bytewise pack keywords. True for
+  `rm`, which is a keyword; false for `Remove-Item`, `ri`, `del`, `rd` and
+  `erase`, which are not. So the plain spelling fell between the two mechanisms,
+  and the `$HOME` form blocked only because `$` satisfied the prefilter — the
+  spelling with a variable in it was caught while the plain literal target was
+  not.
+
+  `powershell_segment_requires_rm_semantic_scan` one level down already decodes
+  the command word against the alias list, so the prefilter was a pure
+  optimisation with a wrong correctness assumption. Removed, keeping the `&`
+  call-operator fast path. `windows.filesystem` already had the right shape:
+  `windows_filesystem_semantic_scan_required` pairs its escape-character test
+  with a case-insensitive protected-word check; `core.filesystem` had only the
+  escape-character half.
+
+  Ten of ten reported rows now deny, six of which were allowed. Fourteen
+  legitimate commands still allow, including the `-WhatIf` escape, all three
+  temp-path carve-outs, and a payload that names the cmdlet as data. Only the
+  PowerShell and Unknown dialects reach this arm, so the POSIX hot path is
+  untouched.
+
+  Unchanged and still open: `windows.filesystem`/`windows.system` remain gated on
+  `cfg!(windows)`, so on a non-Windows build with a PowerShell or cmd payload
+  `Clear-Content`, `Clear-RecycleBin`, `[System.IO.Directory]::Delete`,
+  `del /s`, `rd /s` and `format C:` are still allowed. That is the structural
+  half of #451 and needs a pack-selection decision.
+
 - **Perl's documented way of calling `File::Path` was unguarded** (#453).
   `PERL_FILE_PATH_RMTREE_LITERAL` required the fully qualified
   `File::Path::rmtree`, but the module's own documentation imports the
