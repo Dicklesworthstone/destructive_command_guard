@@ -5,8 +5,27 @@
 //! - nsupdate -l local updates
 //! - dig AXFR/IXFR zone transfers
 
+use crate::packs::regex_engine::LazyCompiledRegex;
 use crate::packs::{DestructivePattern, Pack, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
+
+/// Anchor a read-only exemption to the command the segment actually runs.
+///
+/// Same shape as `system::disk`'s macro. The sudo group admits only `-n`:
+/// `sudo -u host dig axfr example.com` supplies `host` as `-u`'s value, and a
+/// prefix skipping `-\S+` would read that as evidence the segment is a lookup
+/// rather than a zone transfer (#448).
+macro_rules! dns_safe_pattern {
+    ($name:literal, $body:expr) => {
+        SafePattern {
+            name: $name,
+            regex: LazyCompiledRegex::new(concat!(
+                r"^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~=]+/)?",
+                $body
+            )),
+        }
+    };
+}
 
 /// Create the generic DNS tools pack.
 #[must_use]
@@ -33,14 +52,8 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // allowed while `dig axfr example.com` warned on
         // `dns-dig-zone-transfer`. `host` is an ordinary enough word that this
         // is as easy to hit by accident as deliberately (#448).
-        safe_pattern!(
-            "dns-host-safe",
-            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?host\b"
-        ),
-        safe_pattern!(
-            "dns-nslookup-safe",
-            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?nslookup\b"
-        ),
+        dns_safe_pattern!("dns-host-safe", r"host\b"),
+        dns_safe_pattern!("dns-nslookup-safe", r"nslookup\b"),
     ]
 }
 

@@ -6,8 +6,30 @@
 //! - chown -R on system directories
 //! - setfacl with dangerous patterns
 
+use crate::packs::regex_engine::LazyCompiledRegex;
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
+
+/// Anchor a read-only exemption to the command the segment actually runs.
+///
+/// Mirrors `system::disk`'s macro of the same shape. The sudo group admits only
+/// `-n`, never arbitrary options: `sudo -u stat chmod -R 777 /etc` passes `stat`
+/// as `-u`'s *value*, so a prefix that skipped `-\S+` would find the tool name
+/// it was looking for and exempt the chmod behind it. The evaluator's sudo table
+/// knows `-u` consumes a value and normalises that command to `chmod …` today,
+/// which is why nothing was reachable through it — but an exemption that can
+/// disarm a whole pack should not depend on another layer to stay sound (#448).
+macro_rules! perms_safe_pattern {
+    ($name:literal, $body:expr) => {
+        SafePattern {
+            name: $name,
+            regex: LazyCompiledRegex::new(concat!(
+                r"^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~=]+/)?",
+                $body
+            )),
+        }
+    };
+}
 
 // ============================================================================
 // Suggestion constants (must be 'static for the pattern struct)
@@ -63,30 +85,18 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // word it matched anywhere in the segment, and a safe match
         // short-circuits the pack, so `chmod -R 777 /etc --reference=/tmp/stat`
         // was allowed while `chmod -R 777 /etc` was denied (#448).
-        safe_pattern!(
-            "stat",
-            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?stat\b"
-        ),
+        perms_safe_pattern!("stat", r"stat\b"),
         // ls -l is safe, but only when ls is what runs. Unanchored, the `ls
         // <anything> -l` shape could be found inside another command's
         // arguments, and a safe match short-circuits the pack: `chmod -R 777
         // /etc ls -l` was allowed while `chmod -R 777 /etc` was denied. The
         // two-segment spelling `ls -l; chmod -R 777 /etc` was already denied,
         // because segments are judged separately (#448).
-        safe_pattern!(
-            "ls-perms",
-            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?ls\b.*-[a-zA-Z]*l"
-        ),
+        perms_safe_pattern!("ls-perms", r"ls\b.*-[a-zA-Z]*l"),
         // getfacl and namei are read-only — anchored for the reason given on
         // `stat`; `chown -R nobody /etc --reference=/tmp/getfacl` was allowed.
-        safe_pattern!(
-            "getfacl",
-            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?getfacl\b"
-        ),
-        safe_pattern!(
-            "namei",
-            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?namei\b"
-        ),
+        perms_safe_pattern!("getfacl", r"getfacl\b"),
+        perms_safe_pattern!("namei", r"namei\b"),
     ]
 }
 
@@ -261,9 +271,31 @@ mod tests {
     }
 
     #[test]
+    fn a_read_only_tool_named_as_a_sudo_option_value_is_not_evidence_issue_448() {
+        // `sudo -u stat` passes `stat` as the option's VALUE, so an exemption
+        // whose prefix skips arbitrary `-\S+` options finds the tool name it is
+        // looking for and disarms the pack behind it. The evaluator's sudo
+        // table knows `-u` consumes a value and normalises these to the real
+        // command, so nothing was reachable through it — but the exemption must
+        // not rely on a separate layer to stay sound.
+        let pack = create_pack();
+        for command in [
+            "sudo -u stat chmod -R 777 /etc",
+            "sudo -u getfacl chown -R nobody /etc",
+            "sudo -u namei chmod -R 777 /etc",
+        ] {
+            assert!(
+                !pack.matches_safe(command),
+                "{command:?} runs the destructive tool; the read-only name is an option value"
+            );
+        }
+    }
+
+    #[test]
     fn read_only_permission_inspection_stays_allowed_issue_448() {
         let pack = create_pack();
         for command in [
+            "sudo -n stat /etc/passwd",
             "ls -l /etc",
             "ls -la",
             "sudo ls -l /root",

@@ -5,8 +5,27 @@
 //! - service stop on critical services
 //! - init system modifications
 
+use crate::packs::regex_engine::LazyCompiledRegex;
 use crate::packs::{DestructivePattern, Pack, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
+
+/// Anchor a read-only exemption to the command the segment actually runs.
+///
+/// Same shape as `system::disk`'s macro, and the sudo group admits only `-n` for
+/// the same reason: `sudo -u journalctl systemctl stop sshd` supplies the tool
+/// name as `-u`'s value, and a prefix skipping `-\S+` would treat that as
+/// evidence the segment is a journal read (#448).
+macro_rules! services_safe_pattern {
+    ($name:literal, $body:expr) => {
+        SafePattern {
+            name: $name,
+            regex: LazyCompiledRegex::new(concat!(
+                r"^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~=]+/)?",
+                $body
+            )),
+        }
+    };
+}
 
 /// Create the Services pack.
 #[must_use]
@@ -96,10 +115,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // short-circuits the pack, so `systemctl stop sshd --output=journalctl`
         // and `shutdown -h now -- journalctl` were both allowed while the same
         // commands without the word were denied (#448).
-        safe_pattern!(
-            "journalctl",
-            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?journalctl\b"
-        ),
+        services_safe_pattern!("journalctl", r"journalctl\b"),
     ]
 }
 
