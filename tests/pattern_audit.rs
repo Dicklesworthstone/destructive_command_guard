@@ -1106,22 +1106,26 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "system.disk",
+            // #448 moved this set in both directions at once.
+            //
+            // The eight `btrfs-*` and five `dmsetup-*` read-only patterns were
+            // here and are gone: anchoring them to command position replaced
+            // the unbounded prefix that forced the backtracking engine, so
+            // they now run on the linear one. That is a straight win, and
+            // leaving them listed would have kept a stale claim in a file
+            // whose whole job is to be exact.
+            //
+            // The three that arrived need it for reasons the linear engine
+            // cannot express: `dd-discard` uses lookaround for the `/dev/`
+            // carve-out, and `tee-device`/`copy-to-device` additionally
+            // capture the opening quote and match it with a `\1`
+            // backreference.
             HashSet::from([
-                "btrfs-device-stats",
-                "btrfs-filesystem-df",
-                "btrfs-filesystem-show",
-                "btrfs-filesystem-usage",
-                "btrfs-property-get",
-                "btrfs-scrub-status",
-                "btrfs-subvolume-list",
-                "btrfs-subvolume-show",
-                "dmsetup-deps",
-                "dmsetup-info",
-                "dmsetup-ls",
-                "dmsetup-status",
-                "dmsetup-table",
+                "copy-to-device",
+                "dd-discard",
                 "fdisk-edit",
                 "parted-modify",
+                "tee-device",
             ]),
         ),
         ("system.permissions", HashSet::from(["chmod-non-recursive"])),
