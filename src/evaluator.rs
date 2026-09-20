@@ -25794,12 +25794,21 @@ fn evaluate_heredoc(
     None
 }
 
-#[allow(dead_code)]
 fn check_fallback_patterns(command: &str) -> Option<EvaluationResult> {
     // Critical destructive patterns checked whenever high-fidelity embedded
     // code analysis is incomplete (timeout, parse failure, or bounded input
     // limit). These patterns must be robust to whitespace variations.
-    // These patterns must be robust to whitespace variations where applicable.
+    //
+    // This is the ONLY backstop that covers both incomplete-analysis paths: it
+    // runs on the raw command when extraction is incomplete (the `Skipped` /
+    // `Partial` / `Failed` arms above) and on the extracted body when the AST
+    // pass errors or times out. `scan_filesystem_sink_fallback` is the other
+    // fallback, but it only ever sees an extracted body, so extraction failing
+    // leaves this set alone. A language missing here is therefore unguarded
+    // whenever analysis is incomplete — which is exactly what happened to Ruby:
+    // no entry here, and `FileUtils.rm_rf('/home/user')` in a body past
+    // `max_body_lines` was allowed while the same shape in Python was denied
+    // (#452).
     static FALLBACK_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
         RegexSet::new([
             r"shutil\.rmtree",
@@ -25811,6 +25820,14 @@ fn check_fallback_patterns(command: &str) -> Option<EvaluationResult> {
             r"child_process\.execSync",
             r"child_process\.spawnSync",
             r"os\.RemoveAll",
+            // Ruby. Deliberately a prefix match with NO trailing `\b`: every
+            // `FileUtils` method whose name starts with `rm` or `remove` is a
+            // deletion (rm, rm_f, rm_r, rm_rf, rmdir, remove, remove_dir,
+            // remove_entry, remove_entry_secure, remove_file) and none of the
+            // non-deleting ones do. Spelling this as `FileUtils\.rm\b` would
+            // reintroduce #454, where the `\b` could not hold between `m` and
+            // `_` and so `rm_r` was unmatchable while `rm_rf` matched.
+            r"FileUtils\.(?:rm|remove)",
             r"\brm\s+(?:-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\b", // rm -rf, rm -fr, rm -r -f
             r"\bgit\s+reset\s+--hard\b",
         ])
@@ -38215,6 +38232,97 @@ mod tests {
                 result.is_allowed(),
                 "exceeded line limit should fail-open with default settings"
             );
+        }
+
+        /// #452: `check_fallback_patterns` is the only backstop that covers an
+        /// incomplete *extraction*.
+        ///
+        /// The other fallback, `scan_filesystem_sink_fallback`, is called with an
+        /// extracted body, so when extraction is what failed it never runs. Any
+        /// language missing from the `FALLBACK_PATTERNS` set is therefore
+        /// unguarded on this path, and Ruby was: `FileUtils.rm_rf` in a body past
+        /// `max_body_lines` was allowed while the identical Python shape denied.
+        ///
+        /// `max_body_lines: 1` forces the skip with no load, timing or
+        /// repetition, so this pins the behaviour deterministically.
+        #[test]
+        fn incomplete_extraction_backstops_every_covered_language_issue_452() {
+            let limits = crate::heredoc::ExtractionLimits {
+                max_body_bytes: 1024 * 1024,
+                max_body_lines: 1,
+                max_heredocs: 10,
+                timeout_ms: 50,
+            };
+            let settings = heredoc_config_with_limits(limits);
+
+            for (label, cmd) in [
+                (
+                    "ruby FileUtils.rm_rf",
+                    "ruby <<'RB'\nrequire 'fileutils'\nFileUtils.rm_rf('/home/user')\nRB",
+                ),
+                (
+                    "ruby FileUtils.rm_r",
+                    "ruby <<'RB'\nrequire 'fileutils'\nFileUtils.rm_r('/home/user')\nRB",
+                ),
+                (
+                    "ruby FileUtils.remove_entry",
+                    "ruby <<'RB'\nrequire 'fileutils'\nFileUtils.remove_entry('/home/user')\nRB",
+                ),
+                (
+                    "python shutil.rmtree",
+                    "python3 <<'PY'\nimport shutil\nshutil.rmtree('/home/user')\nPY",
+                ),
+                (
+                    "shell rm -rf",
+                    "bash <<'SH'\necho starting\nrm -rf /home/user\nSH",
+                ),
+            ] {
+                let result = eval_with_heredoc(cmd, &settings);
+                assert!(
+                    result.is_denied(),
+                    "{label}: extraction was skipped past max_body_lines, so the bounded \
+                     fallback is the only thing left and must deny; got {result:?}"
+                );
+            }
+        }
+
+        /// Negative control for the test above. The bounded fallback must stay a
+        /// pattern check, not a blanket denial of anything it could not parse —
+        /// the sibling tests in this module assert exactly that posture for
+        /// benign bodies, and widening the pattern set must not quietly convert
+        /// them into denials.
+        #[test]
+        fn incomplete_extraction_still_allows_benign_bodies_issue_452() {
+            let limits = crate::heredoc::ExtractionLimits {
+                max_body_bytes: 1024 * 1024,
+                max_body_lines: 1,
+                max_heredocs: 10,
+                timeout_ms: 50,
+            };
+            let settings = heredoc_config_with_limits(limits);
+
+            for (label, cmd) in [
+                (
+                    "ruby FileUtils.mkdir_p",
+                    "ruby <<'RB'\nrequire 'fileutils'\nFileUtils.mkdir_p('/opt/app')\nRB",
+                ),
+                (
+                    "ruby FileUtils.cp_r",
+                    "ruby <<'RB'\nrequire 'fileutils'\nFileUtils.cp_r('a', 'b')\nRB",
+                ),
+                (
+                    "python open/write",
+                    "python3 <<'PY'\nwith open('out.txt', 'w') as fh:\n    fh.write('hi')\nPY",
+                ),
+                ("shell echo", "bash <<'SH'\necho one\necho two\nSH"),
+            ] {
+                let result = eval_with_heredoc(cmd, &settings);
+                assert!(
+                    result.is_allowed(),
+                    "{label}: an incomplete extraction of a benign body must still \
+                     fail-open; got {result:?}"
+                );
+            }
         }
 
         #[test]
