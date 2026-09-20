@@ -325,6 +325,40 @@ const REDIRECT_TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
         "Safe temp-directory redirect (allowed without confirmation)",
     ),
 ];
+
+/// Suggestions for the `.git`-internals write rules.
+///
+/// Deliberately not [`REDIRECT_TRUNCATE_SUGGESTIONS`]. That list offers
+/// `echo data >> {path}` as the gentler spelling, which is sound advice for an
+/// ordinary file and wrong for a git internal: appending a `[url] insteadOf`
+/// section or a `[core] pager` command to `.git/config` runs on the next git
+/// invocation without destroying a byte, so the truncate/append axis the
+/// redirect rules are drawn on does not separate safe from unsafe here (#457).
+/// `cp` from a staged file stays on the list on purpose — it is the one
+/// spelling that puts a human-reviewable artifact between the agent and the
+/// repository, and the rules below leave it allowed.
+const GIT_INTERNALS_WRITE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "git config <key> <value>",
+        "Change repository configuration through git, which writes atomically and validates the key",
+    ),
+    PatternSuggestion::new(
+        "git update-ref <ref> <sha>",
+        "Move a ref through git rather than by writing .git/refs or .git/HEAD",
+    ),
+    PatternSuggestion::new(
+        "producer | dcg create-new {path}",
+        "After resolving a literal destination, create it only if no file, directory, or symlink already exists",
+    ),
+    PatternSuggestion::new(
+        "cat .git/config",
+        "Reading anything under .git is never blocked",
+    ),
+    PatternSuggestion::new(
+        "echo data > /tmp/{subdir}/config && cp /tmp/{subdir}/config .git/config",
+        "Stage the proposed file outside the repository and copy it in after review",
+    ),
+];
 use crate::normalize::{
     NormalizeTokenKind, ShellDialect, ShellTokenDecoder, ShellTokenRole,
     tokenize_for_normalization, tokenize_for_shell_dialect,
@@ -599,6 +633,8 @@ pub(crate) fn is_pre_rm_propagation_rule(name: Option<&str>) -> bool {
                 | "redirect-truncate-root-home"
                 | "redirect-truncate-dynamic-path"
                 | "redirect-truncate-git-internals-relative"
+                | "redirect-append-git-internals-relative"
+                | "tee-git-internals"
         )
     )
 }
@@ -4713,7 +4749,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //
         // `.gitignore`, `.gitattributes` and `.github/` are untouched: the
         // component must be exactly `.git` followed by a separator. Append
-        // (`>>`) does not truncate and is not matched.
+        // (`>>`) does not truncate, so it is matched by the sibling rule
+        // below rather than by this one.
         destructive_pattern!(
             "redirect-truncate-git-internals-relative",
             r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?:\./)?(?:[^\s;&|'"]*/)?\.git/"#,
@@ -4736,7 +4773,78 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - To inspect rather than replace, read it: `cat .git/config`.\n\
              - If a file genuinely must be rewritten, write it beside the repository and \
                copy it in after review: `… > /tmp/<subdir>/config && cp /tmp/<subdir>/config .git/config`.",
-            REDIRECT_TRUNCATE_SUGGESTIONS
+            GIT_INTERNALS_WRITE_SUGGESTIONS
+        ),
+        // An appending redirect into a `.git` directory, named relatively or
+        // otherwise.
+        //
+        // The truncating sibling above leaves `>>` out on purpose, and every
+        // other redirect rule in this pack is drawn on the same axis: `>`
+        // destroys the previous contents, `>>` does not. Inside `.git` that is
+        // the wrong axis. Git reads these files whole, so adding to one is how
+        // it is subverted rather than a milder way of replacing it (#457):
+        //
+        //     echo '[url "…"]'      >> .git/config     rewrites where fetches go
+        //     echo 'pager = sh -c …' >> .git/config    runs on the next git command
+        //     echo 'curl … | sh'     >> .git/hooks/pre-commit
+        //
+        // None of those truncate anything, and the third executes on the next
+        // commit exactly as an overwritten hook would. `.gitignore` and
+        // `.github/` stay untouched for the same reason as above: the
+        // component must be exactly `.git` followed by a separator.
+        destructive_pattern!(
+            "redirect-append-git-internals-relative",
+            r#"(?<![<>])(?:&>>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>>)\s*(?:['"\\]|\$['"])?(?:\./)?(?:[^\s;&|'"]*/)?\.git/"#,
+            "shell appending redirect into a .git directory adds repository configuration or hook code that git runs on its next invocation.",
+            Critical,
+            "`>> .git/<path>` leaves the existing contents in place and adds to them, \
+             which is what makes it useful against a repository rather than what makes \
+             it safe:\n\
+             - A `[url \"…\"] insteadOf` or `[credential] helper` section appended to \
+               `.git/config` redirects the next fetch or hands over a token; the \
+               sections already there keep working, so nothing looks broken.\n\
+             - `[core] pager`, `[core] editor` and `[alias]` entries name commands git \
+               runs, so appending one is code execution on the next git invocation.\n\
+             - A line appended to `.git/hooks/**` runs on the next commit, merge or \
+               checkout just as a rewritten hook would.\n\n\
+             Truncating the same file is already denied. Appending to it reaches the \
+             same end state by a route that preserves the evidence.\n\n\
+             Safer alternatives:\n\
+             - Add configuration through git, which validates the key and writes \
+               atomically: `git config <key> <value>`, `git remote add <name> <url>`.\n\
+             - Install a hook from a reviewed file rather than by appending lines.\n\
+             - To inspect rather than extend, read it: `cat .git/config`.",
+            GIT_INTERNALS_WRITE_SUGGESTIONS
+        ),
+        // `tee` and `sponge` write every file operand they are given, so a
+        // `.git/` operand is a write to a git internal no matter where in the
+        // argument list it sits. This is the same reading `system.disk`
+        // applies to `tee /dev/sda` (#444), and `credential-file-write`
+        // already treats `tee` as a writer of `~/.ssh/**`; only the `.git`
+        // target was missing (#457).
+        //
+        // The operand walk is what makes the position irrelevant:
+        // `tee /tmp/log .git/config` writes both. Reading a git internal INTO
+        // a tee is untouched, because `cat .git/config | tee /tmp/x` puts the
+        // `.git` path before `tee`, and this pattern only looks forward.
+        destructive_pattern!(
+            "tee-git-internals",
+            r#"\b(?:tee|sponge)\b(?:\s+(?:[^\s"'\\;&|<>]|\\[^\r\n]|'[^']*'|"[^"]*")+)*\s+['"]?(?:\./)?(?:[^\s'";&|<>]*/)?\.git/"#,
+            "tee/sponge into a .git path writes repository internals, and -a makes it an append rather than a replacement.",
+            Critical,
+            "`tee` writes every file it is named with, and `tee -a` appends to them. \
+             Either way the destination here is a git internal:\n\
+             - `.git/config` carries remotes, hook configuration and credential helpers.\n\
+             - `.git/HEAD` and `.git/refs/**` decide which commits are reachable.\n\
+             - `.git/hooks/**` is executed by git, so a write there runs on the next \
+               commit, merge or checkout.\n\n\
+             Redirecting to the same path is already denied in both its truncating and \
+             its appending spelling; piping through `tee` is the same write.\n\n\
+             Safer alternatives:\n\
+             - Change configuration through git: `git config <key> <value>`.\n\
+             - Send the tee output to a scratch path instead: `tee /tmp/<subdir>/config`.\n\
+             - Reading a git internal is never blocked: `cat .git/config`.",
+            GIT_INTERNALS_WRITE_SUGGESTIONS
         ),
         // The shell expands redirect targets at runtime. A variable, command
         // substitution, or backslash-obfuscated suffix can therefore resolve
@@ -6135,6 +6243,8 @@ mod tests {
             "redirect-truncate-root-home",
             "redirect-truncate-dynamic-path",
             "redirect-truncate-git-internals-relative",
+            "redirect-append-git-internals-relative",
+            "tee-git-internals",
         ] {
             let rule = pack
                 .destructive_patterns
@@ -6156,6 +6266,12 @@ mod tests {
         // `>>` is append (non-destructive); the destructive regex's
         // negative lookbehind `(?<![<>])` excludes it. Even on
         // sensitive paths, append must NOT block.
+        //
+        // `.git/` is the one exception, and it is not a hole in this rule but
+        // a different judgement about a different target: git reads its
+        // internals whole, so adding to one runs on the next git command
+        // without destroying anything (#457). See
+        // `append_into_git_internals_is_denied_issue_457`.
         let pack = create_pack();
         for cmd in [
             "echo line >> /etc/syslog",
@@ -6170,6 +6286,73 @@ mod tests {
             "echo x 17>> /etc/passwd",
             "echo x {audit}>> /etc/passwd",
             "Write-Output x *>> /etc/passwd",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn append_into_git_internals_is_denied_issue_457() {
+        // The truncating spelling of each of these was already denied; the
+        // appending one reaches the same end state and was allowed. Appending
+        // is the more useful primitive against a repository, not the milder
+        // one: a section added to `.git/config` runs on the next fetch and
+        // leaves everything already there working.
+        let pack = create_pack();
+        for cmd in [
+            "cat >> .git/config",
+            "echo x >>.git/config",
+            "echo x >> ./.git/config",
+            "echo x >> sub/.git/config",
+            "echo x >> /home/u/proj/.git/hooks/pre-commit",
+            "echo x >> \"$HOME/proj/.git/config\"",
+            "echo x 1>> .git/config",
+            "echo x &>> .git/config",
+            "echo x {audit}>> .git/config",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+            assert_blocks_with_pattern(&pack, cmd, "redirect-append-git-internals-relative");
+        }
+    }
+
+    #[test]
+    fn tee_into_git_internals_is_denied_issue_457() {
+        // `tee` writes every operand it is given, which is the same reading
+        // `system.disk:tee-device` applies and the same one
+        // `credential-file-write` applies to `~/.ssh/**`. Only the `.git`
+        // target was missing.
+        let pack = create_pack();
+        for cmd in [
+            "tee .git/config",
+            "tee -a .git/config",
+            "echo x | tee .git/hooks/pre-commit",
+            "echo x | tee /tmp/log .git/config",
+            "sponge .git/config",
+            "tee \"$HOME/proj/.git/config\"",
+            "tee sub/.git/config",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+            assert_blocks_with_pattern(&pack, cmd, "tee-git-internals");
+        }
+    }
+
+    #[test]
+    fn ordinary_git_adjacent_writes_stay_allowed_issue_457() {
+        // The component must be exactly `.git` followed by a separator, and
+        // reading a git internal into a writer is not writing one. `cp` and
+        // `install` stay allowed on purpose: staging a file and copying it in
+        // is the reviewed path the `.git` denial text itself recommends.
+        let pack = create_pack();
+        for cmd in [
+            "echo x >> .gitignore",
+            "echo x >> .gitattributes",
+            "echo x >> .github/workflows/ci.yml",
+            "echo x >> notes/git.md",
+            "cat .git/config | tee /tmp/backup",
+            "git ls-files | tee .gitignore",
+            "tee /tmp/scratch/config",
+            "cp /tmp/x .git/config",
+            "install -m 644 /tmp/x .git/config",
         ] {
             assert_no_match(&pack, cmd);
         }

@@ -324,6 +324,9 @@ fn test_audit_backtracking_requirements() {
                 "mv-to-trash-quoted",
                 "mv-var-tmp",
                 "mv-within-home",
+                // Shares the `(?<![<>])` lookbehind its siblings use, so the
+                // second `>` of `>>` cannot start a second match of its own.
+                "redirect-append-git-internals-relative",
                 "redirect-truncate-dynamic-path",
                 // Shares the `(?<![<>])` lookbehind its siblings use, so a
                 // read redirect (`<`) or an append (`>>`) is not read as a

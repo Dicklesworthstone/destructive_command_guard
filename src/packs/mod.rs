@@ -6482,6 +6482,21 @@ mod tests {
                 "cat > .git/config",
                 "redirect-truncate-git-internals-relative",
             ),
+            // #457: the appending spelling of the same write. It carries `.git/`
+            // and nothing else — `>>` is not a row keyword.
+            (
+                "core.filesystem",
+                "cat >> .git/config",
+                "redirect-append-git-internals-relative",
+            ),
+            // #457: `tee` is on the row for `credential-file-write`, so this
+            // one is admitted twice over; assert it anyway, because the rule
+            // would be just as dead if that row entry were ever pruned.
+            (
+                "core.filesystem",
+                "tee .git/hooks/pre-commit",
+                "tee-git-internals",
+            ),
             // #323: no other keyword in system.disk's row appears here.
             ("system.disk", "umount -f /mnt/data", "umount-force"),
             // #444: `tee /dev/sda` names `/dev/` and nothing else.

@@ -955,21 +955,53 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
             ),
         ],
     );
+    // The `.git` rules cannot take the generic redirect advice, because its
+    // second entry is "use append instead". For an ordinary file that is the
+    // safer spelling; for a git internal it is the more useful one, since a
+    // section appended to `.git/config` runs on the next git command and
+    // leaves everything already there working (#457). These rules get their
+    // own list, built around the routes git provides.
+    let git_internals_write_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "Read the current content first; reads under `.git` are never blocked",
+        )
+        .with_command("cat .git/config"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Change repository configuration through git, which validates the key and writes atomically",
+        )
+        .with_command("git config <key> <value>"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Move a ref through git rather than by writing `.git/refs` or `.git/HEAD`",
+        )
+        .with_command("git update-ref <ref> <sha>"),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Stage the proposed file outside the repository and copy it in after review",
+        )
+        .with_command("echo data > /tmp/scratch/config && cp /tmp/scratch/config .git/config"),
+    ];
     m.insert(
         "core.filesystem:redirect-truncate-root-home",
         redirect_truncate_suggestions.clone(),
     );
     m.insert(
         "core.filesystem:redirect-truncate-dynamic-path",
-        redirect_truncate_suggestions.clone(),
+        redirect_truncate_suggestions,
     );
     m.insert(
         "core.filesystem:redirect-truncate-git-internals-relative",
-        // The generic redirect advice applies — resolve the target, use a temp
-        // path, prefer append — and the rule's own explanation adds the git
-        // routes (`git config`, `git update-ref`) that write these files
-        // safely.
-        redirect_truncate_suggestions,
+        git_internals_write_suggestions.clone(),
+    );
+    m.insert(
+        "core.filesystem:redirect-append-git-internals-relative",
+        git_internals_write_suggestions.clone(),
+    );
+    m.insert(
+        "core.filesystem:tee-git-internals",
+        git_internals_write_suggestions,
     );
     m.insert(
         "core.filesystem:fork-bomb",
