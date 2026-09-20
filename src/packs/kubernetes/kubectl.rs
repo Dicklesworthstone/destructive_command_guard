@@ -141,7 +141,13 @@ pub fn create_pack() -> Pack {
         name: "kubectl",
         description: "Protects against destructive kubectl operations like delete namespace, \
                       drain, and mass deletion",
-        keywords: &["kubectl", "delete", "drain", "cordon", "taint"],
+        // `/api/v1/` and `/apis/` are what the `api-delete-*` rules key on. A
+        // raw API call contains no "kubectl", so without them those rules
+        // cannot fire — the #441/#447 gate-reachability shape. Mirrored in the
+        // `PACK_ENTRIES` row, which is the gate that actually decides.
+        keywords: &[
+            "kubectl", "delete", "drain", "cordon", "taint", "/api/v1/", "/apis/",
+        ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
@@ -582,6 +588,83 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Preview:\n  \
              kubectl delete pv <name> --dry-run=client"
         ),
+        // ---- the same operations spelled as raw API calls (#449) ----
+        //
+        // This pack modelled the `kubectl` CLI and not the Kubernetes API, so
+        // the same deletion was denied as a CLI call and allowed as a `curl`
+        // call to the API server. An agent that hits a blocked `kubectl delete`
+        // has a working alternative in the shape it reaches for next.
+        //
+        // These MIRROR the CLI rules above rather than going beyond them, which
+        // is the point: a resource the CLI side does not gate — `secrets`,
+        // `configmaps`, a pod deleted by name — is not gated here either, so
+        // the two spellings agree in both directions. Making REST stricter than
+        // the CLI would be the same asymmetry in the other direction.
+        //
+        // The paths are versioned and machine-generated, which is what makes
+        // them safe to anchor on:
+        //   core group:  /api/v1/namespaces/{ns}/{resource}[/{name}]
+        //   named group: /apis/{group}/{version}/namespaces/{ns}/{resource}[/{name}]
+        //   cluster:     /api/v1/{resource}/{name}
+        //
+        // Limit, stated rather than discovered later: these match `curl`, as
+        // every other REST rule in this codebase does. `wget --method=DELETE`
+        // and httpie's `http DELETE` are not covered, and widening the HTTP
+        // client set is a decision for all the REST packs at once, not this one.
+        destructive_pattern!(
+            "api-delete-namespace",
+            r#"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*/api/v1/namespaces/[^/\s'"]+(?:["'\s]|$)).*"#,
+            "DELETE to /api/v1/namespaces/<name> removes the namespace and ALL resources in it.",
+            Critical,
+            "This is `kubectl delete namespace` spelled as an API call, and it destroys \
+             everything inside the namespace:\n\n\
+             - All deployments, pods, services\n\
+             - All configmaps and secrets\n\
+             - All persistent volume claims (data may be lost)\n\n\
+             It is irreversible, and the API server applies it without the CLI's \
+             confirmation or dry-run affordances.\n\n\
+             Preview what would be deleted:\n  \
+             kubectl get all -n <namespace>",
+            DELETE_NAMESPACE_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "api-delete-collection",
+            r#"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*/namespaces/[^/\s'"]+/[a-z][a-z0-9.-]*(?:["'\s]|$)).*"#,
+            "DELETE to a collection path removes every resource of that type in the namespace.",
+            High,
+            "A DELETE to a path that ends at the resource type, with no /<name> after it, \
+             is the API's deleteCollection — the equivalent of `kubectl delete <type> --all`:\n\n\
+             - .../pods       kills every pod in the namespace\n\
+             - .../services   removes all services (networking breaks)\n\
+             - .../persistentvolumeclaims  may delete all persistent data\n\n\
+             Name the single resource instead, or use a label selector:\n  \
+             kubectl delete <resource> -l app=myapp",
+            DELETE_ALL_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "api-delete-workload",
+            r#"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*/(?:deployments|statefulsets|daemonsets|replicasets)/[^/\s'"]+).*"#,
+            "DELETE to a workload path removes the controller and the pods it manages.",
+            High,
+            "This is `kubectl delete deployment/statefulset/daemonset/replicaset` as an \
+             API call. The controller is removed and its pods terminate; anything not \
+             stored outside the pod is gone.\n\n\
+             Check what it manages first:\n  \
+             kubectl get all -n <namespace> -l app=<name>"
+        ),
+        destructive_pattern!(
+            "api-delete-persistent-storage",
+            r#"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*/(?:persistentvolumeclaims|persistentvolumes)/[^/\s'"]+).*"#,
+            "DELETE to a PVC or PV path can permanently destroy the underlying storage.",
+            Critical,
+            "This is `kubectl delete pvc` / `kubectl delete pv` as an API call:\n\n\
+             - Cloud disks (EBS, GCE PD, Azure Disk) may be deleted\n\
+             - Data is not recoverable once the volume is released\n\
+             - Even with a Retain policy, deleting the PV may trigger cleanup\n\n\
+             Check what is bound to it first:\n  \
+             kubectl get pvc -A",
+            DELETE_PVC_SUGGESTIONS
+        ),
         // scale to 0
         destructive_pattern!(
             "scale-to-zero",
@@ -669,6 +752,93 @@ mod tests {
     use super::*;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    /// #449: the same operation spelled as a raw API call.
+    ///
+    /// The property these pin is *agreement between the two spellings*, in
+    /// both directions — so the ALLOW cases matter as much as the DENY ones.
+    mod raw_api {
+        use super::*;
+
+        #[test]
+        fn the_four_operations_the_cli_denies_are_denied_as_api_calls() {
+            let pack = create_pack();
+            for (command, pattern) in [
+                (
+                    "curl -X DELETE https://k8s.internal/api/v1/namespaces/production",
+                    "api-delete-namespace",
+                ),
+                (
+                    "curl -X DELETE https://k8s.internal/api/v1/namespaces/production/pods",
+                    "api-delete-collection",
+                ),
+                (
+                    "curl -X DELETE https://k8s.internal/apis/apps/v1/namespaces/production/deployments/web",
+                    "api-delete-workload",
+                ),
+                (
+                    "curl -X DELETE https://k8s.internal/api/v1/namespaces/production/persistentvolumeclaims/data",
+                    "api-delete-persistent-storage",
+                ),
+                // Siblings of the same rules, by the same paths.
+                (
+                    "curl -X DELETE https://k8s.internal/api/v1/persistentvolumes/pv-0001",
+                    "api-delete-persistent-storage",
+                ),
+                (
+                    "curl -X DELETE https://k8s.internal/apis/apps/v1/namespaces/production/statefulsets/db",
+                    "api-delete-workload",
+                ),
+                // Spelling variants of the method.
+                (
+                    "curl -XDELETE https://k8s.internal/api/v1/namespaces/production",
+                    "api-delete-namespace",
+                ),
+                (
+                    "curl --request=DELETE https://k8s.internal/api/v1/namespaces/production",
+                    "api-delete-namespace",
+                ),
+            ] {
+                assert_blocks_with_pattern(&pack, command, pattern);
+            }
+        }
+
+        #[test]
+        fn what_the_cli_allows_stays_allowed_as_an_api_call() {
+            // These mirror the CLI side deliberately: this pack does not gate
+            // `kubectl delete secret` or `kubectl delete pod <name>`, so it
+            // must not gate their API spellings either. Making REST stricter
+            // than the CLI is the same asymmetry as the gap, pointing the
+            // other way.
+            let pack = create_pack();
+            for command in [
+                "curl -X DELETE https://k8s.internal/api/v1/namespaces/production/secrets/api-token",
+                "curl -X DELETE https://k8s.internal/api/v1/namespaces/production/pods/web-0",
+                "curl -X DELETE https://k8s.internal/api/v1/namespaces/production/configmaps/settings",
+            ] {
+                assert_allows(&pack, command);
+            }
+        }
+
+        #[test]
+        fn only_delete_is_destructive_and_only_on_kubernetes_paths() {
+            let pack = create_pack();
+            for command in [
+                // Reads and writes are not deletions.
+                "curl -X GET https://k8s.internal/api/v1/namespaces/production",
+                "curl https://k8s.internal/api/v1/namespaces/production/pods",
+                "curl -X POST https://k8s.internal/api/v1/namespaces/production/pods",
+                "curl -X PATCH https://k8s.internal/apis/apps/v1/namespaces/production/deployments/web",
+                // `/api/v1/` is a keyword now, so this is the false positive to
+                // watch: an unrelated service that happens to version its API
+                // the same way must not be caught by a Kubernetes rule.
+                "curl -X DELETE https://example.com/api/v1/widgets/42",
+                "curl -X DELETE https://billing.internal/api/v1/invoices/2026-09",
+            ] {
+                assert_allows(&pack, command);
+            }
+        }
+    }
 
     #[test]
     fn kubectl_patterns_match_with_global_flags() {

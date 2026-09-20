@@ -2058,7 +2058,9 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "kubernetes.kubectl",
-        &["kubectl"],
+        // `/api/v1/` and `/apis/` reach the `api-delete-*` rules: the same
+        // deletion spelled as a raw API call carries no "kubectl" (#449).
+        &["kubectl", "/api/v1/", "/apis/"],
         kubernetes::kubectl::create_pack,
     ),
     PackEntry::new("kubernetes.helm", &["helm"], kubernetes::helm::create_pack),
@@ -6682,6 +6684,10 @@ mod tests {
             ("featureflags.flipt", "/api/v1/"),
             ("featureflags.unleash", "/api/admin/"),
             ("monitoring.prometheus", "/api/dashboards"),
+            // Kubernetes is self-hosted by definition, and a raw API call
+            // carries no "kubectl" at all (#449).
+            ("kubernetes.kubectl", "/api/v1/"),
+            ("kubernetes.kubectl", "/apis/"),
         ];
 
         /// A rule keyed on a URL path needs that path in the gate.

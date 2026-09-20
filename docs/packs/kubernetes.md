@@ -25,6 +25,8 @@ Commands containing these keywords are checked against this pack:
 - `drain`
 - `cordon`
 - `taint`
+- `/api/v1/`
+- `/apis/`
 
 ### Safe Patterns (Allowed)
 
@@ -57,6 +59,10 @@ These patterns match potentially destructive commands:
 | `delete-workload` | kubectl delete deployment/statefulset/daemonset removes the workload. Use --dry-run first. | high |
 | `delete-pvc` | kubectl delete pvc may permanently delete data if ReclaimPolicy is Delete. | critical |
 | `delete-pv` | kubectl delete pv may permanently delete the underlying storage. | critical |
+| `api-delete-namespace` | DELETE to /api/v1/namespaces/<name> removes the namespace and ALL resources in it. | critical |
+| `api-delete-collection` | DELETE to a collection path removes every resource of that type in the namespace. | high |
+| `api-delete-workload` | DELETE to a workload path removes the controller and the pods it manages. | high |
+| `api-delete-persistent-storage` | DELETE to a PVC or PV path can permanently destroy the underlying storage. | critical |
 | `scale-to-zero` | kubectl scale --replicas=0 stops all pods for the workload. | high |
 | `delete-force` | kubectl delete --force --grace-period=0 immediately removes resources without graceful shutdown. | critical |
 | `apply-force` | kubectl apply --force deletes and recreates resources, causing downtime. | high |
