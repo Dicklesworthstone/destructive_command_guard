@@ -2105,6 +2105,20 @@ fn detect_shell_payload(payload: &str) -> Option<ShellPayloadHit> {
             continue;
         };
 
+        // Compare on the basename. `next_shell_command` unwraps `sudo`/`command`/
+        // `env` frontends but returns the command word verbatim, so a path
+        // spelling never equalled the literals below: the argv reconstruction
+        // above turned `['/bin/rm','-rf','/home/user']` back into
+        // `/bin/rm -rf /home/user` and this match then missed it, while the bare
+        // `['rm',…]` spelling was caught (#459). Same stripping the shell path
+        // already applies to a command word, same idiom as `normalize.rs`, so
+        // `/usr/bin/rm`, `./rm` and `rm.exe` line up with plain `rm` here too.
+        let cmd = cmd
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(cmd)
+            .trim_end_matches(".exe");
+
         match cmd {
             "git" => {
                 if let Some(hit) = detect_git_destructive(tokens) {
@@ -4483,6 +4497,75 @@ mod tests {
                 "unexpected rule id: {}",
                 matches[0].rule_id
             );
+        }
+
+        /// #459: the argv reconstruction must recognise a path-spelled binary.
+        ///
+        /// `detect_shell_payload` compared the command word against the bare
+        /// literal `"rm"`, so joining `['/bin/rm','-rf','/home/user']` back into
+        /// `/bin/rm -rf /home/user` produced a command word that never matched —
+        /// the bare `['rm',…]` spelling blocked while every path spelling was
+        /// allowed, even though the shell path strips exactly these prefixes.
+        #[test]
+        fn subprocess_list_arg_blocks_for_every_binary_spelling_issue_459() {
+            let ast_matcher = AstMatcher::new();
+
+            for func in ["run", "call", "Popen"] {
+                for binary in [
+                    "rm",
+                    "/bin/rm",
+                    "/usr/bin/rm",
+                    "./rm",
+                    "../bin/rm",
+                    "rm.exe",
+                ] {
+                    let code = format!(
+                        "import subprocess\nsubprocess.{func}(['{binary}','-rf','/home/user'])"
+                    );
+                    let matches = ast_matcher
+                        .find_matches(&code, ScriptLanguage::Python)
+                        .unwrap();
+                    assert!(
+                        matches.iter().any(|m| m.severity.blocks_by_default()),
+                        "subprocess.{func}(['{binary}','-rf','/home/user']) must block; got {:?}",
+                        matches
+                            .iter()
+                            .map(|m| (&m.rule_id, m.severity))
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+
+        /// Negative control for the test above: stripping the path must not make
+        /// the payload scan match an unrelated command whose basename merely ends
+        /// in the same letters, and a non-destructive argv list must stay inert.
+        #[test]
+        fn subprocess_list_arg_basename_stripping_is_not_overbroad_issue_459() {
+            let ast_matcher = AstMatcher::new();
+
+            for code in [
+                // Not `rm`: basename is `rm-helper` / `norm`, which must not match.
+                "import subprocess\nsubprocess.run(['/opt/bin/rm-helper','-rf','/home/user'])",
+                "import subprocess\nsubprocess.run(['/opt/bin/norm','-rf','/home/user'])",
+                // Real `rm` basename but an ordinary, non-recursive invocation.
+                "import subprocess\nsubprocess.run(['/bin/rm','./build/stamp'])",
+                // Ordinary tooling with a path spelling.
+                "import subprocess\nsubprocess.run(['/usr/bin/git','status'])",
+                "import subprocess\nsubprocess.run(['/usr/bin/make','build'])",
+            ] {
+                let matches = ast_matcher
+                    .find_matches(code, ScriptLanguage::Python)
+                    .unwrap();
+                assert!(
+                    !matches.iter().any(|m| m.severity.blocks_by_default()),
+                    "must not block: {code:?}; got {:?}",
+                    matches
+                        .iter()
+                        .map(|m| (&m.rule_id, m.severity))
+                        .collect::<Vec<_>>()
+                );
+            }
         }
 
         #[test]

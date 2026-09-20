@@ -17,6 +17,30 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Security
 
+- **`subprocess.run(['/bin/rm','-rf','/home/user'])` was allowed** while the bare
+  `['rm',…]` spelling and the plain shell `/bin/rm -rf /home/user` were both
+  denied (#459). Every path spelling bypassed the argv reconstruction that the
+  bare one did not: `/bin/rm`, `/usr/bin/rm`, `./rm`, `../bin/rm` and `rm.exe`,
+  across `subprocess.run`, `call` and `Popen`.
+
+  The reconstruction itself was working — `detect_destructive_in_args` joins the
+  argv literals back into one command line (#136), so the text reaching
+  `detect_shell_payload` was correct. The miss was one step later:
+  `next_shell_command` unwraps `sudo`/`command`/`env` frontends but returns the
+  command word verbatim, and the match compares it against the bare literals
+  `"git"` and `"rm"`, which a path spelling can never equal. Now compared on the
+  basename, with the same stripping the shell path already applies and the same
+  idiom as `normalize.rs`.
+
+  Why it stayed hidden: the nested shape `['sh','-c','/bin/rm -rf /home/user']`
+  denies regardless, because bodies are no longer masked from the raw-shell
+  rescan and the pack rules do strip paths. Only argv split lacks contiguous
+  `rm -rf` text for that layer to catch, so only it depended on this comparison.
+
+  This is the Python half of #459. The JavaScript half is receiver anchoring
+  (`cp.spawnSync` vs `child_process.spawnSync`) and the Ruby half is a
+  first-string-only payload extraction; both are untouched.
+
 - **Perl and PHP deletions were unguarded whenever embedded-code analysis was
   incomplete** (#452), completing the fallback coverage started for Ruby. Five
   sinks were covered when analysis succeeded and allowed when it did not:
