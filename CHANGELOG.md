@@ -367,8 +367,48 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Fixed
 
-- **The generated OpenCode plugin now loads on both plugin contracts, and a test
-  actually runs it (#419).** `34ecad1` / `7a23b48` emit one file carrying both
+- **`e2e_destructive_equivalents.sh` was red with 99 failures, so a real
+  regression landing in it would not have stood out (#450).** Now 540 passed,
+  0 failed, 44 scenarios, none skipped.
+
+  The issue reported 16 failures and attributed them to `eafd36a` / #407. Both
+  turned out to be wrong, and the second one matters because it pointed at a
+  security fix as the culprit. Dated from git rather than assumed:
+  `credential-file-write` and its `/etc` table arrived in **`00ffdb6`,
+  2026-09-09** — the commit that created `credential_files.rs` — while the
+  `redirect-truncate-root-home` assertions here were last touched in
+  **`213d387`, 2026-04-29**. The assertions predate the rule that now answers
+  by over four months; #407 extended credential coverage to *relative*
+  spellings and every failing case was an absolute path.
+
+  Three shapes, none of them an under-block:
+
+  - **79 rule-id mismatches** where `credential-file-write` answers instead of
+    the older generic rule (`redirect-truncate-root-home`,
+    `dd-overwrite-root-home`). It should: it is more specific and its reason
+    names the file. The rules compose rather than shadow — where the
+    classifier declines, the generic rule still denies, which is why
+    `echo x > /usr/bin/sudo`, `make &> /etc/log` and `dd … of=/boot/vmlinuz`
+    keep the old id and are now the controls that hold that split honest.
+  - **`echo line >> /etc/passwd` and `>> ~/.bashrc` are blocked**, and
+    `scenario_redirect_append_safe` asserted they were allowed. Appending does
+    not truncate, which is why the *redirect* rule ignores `>>`; it is not why
+    the *file* is safe, since an appended line to `/etc/passwd` adds an account
+    and one to `~/.bashrc` is code execution at the next shell. They moved to
+    their own scenario, with the single documented exception —
+    `ssh-keyscan h >> ~/.ssh/known_hosts` — pinned beside them.
+  - **`$TMPDIR` is reviewed, not treated as temp**, for `find`, `unlink`,
+    `truncate`, `shred`, `tar`, `dd`, `mv` and redirects. Verified to be
+    independent of the environment: identical verdict with the ambient macOS
+    `/var/folders/…` and with `TMPDIR=/tmp`, because dcg judges the literal
+    text. The shipped deny text already says so — "Variable-rooted paths such
+    as `$TMPDIR`: Reviewed because the environment may point anywhere" — so
+    the `*_temp_safe` scenarios were contradicting documented behaviour. They
+    are collected in one scenario that states the rule for each tool, with the
+    literal-path controls repeated in it.
+
+  Assertion count went **up**, 535 to 540, which is the check that matters for
+  a change that turns a red suite green: nothing was deleted to get there. `34ecad1` / `7a23b48` emit one file carrying both
   shapes: v1's named `DcgGuard` export returning a `"tool.execute.before"` hook
   map called as `(input, output)`, and v2's default export `{ id, setup(ctx) }`
   registering through `ctx.tool.hook("execute.before", cb)` with the command in
