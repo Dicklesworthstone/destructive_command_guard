@@ -17,6 +17,28 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Security
 
+- **Perl and PHP deletions were unguarded whenever embedded-code analysis was
+  incomplete** (#452), completing the fallback coverage started for Ruby. Five
+  sinks were covered when analysis succeeded and allowed when it did not:
+  `rmtree`, `remove_tree`, `File::Path::rmtree`, PHP `unlink` and PHP `rmdir`.
+  Measured deterministically with a heredoc body one line past
+  `max_body_lines`, with the already-covered Ruby and Python rows denying in
+  both columns to show the lever was sound.
+
+  Every pre-existing `FALLBACK_PATTERNS` entry anchors on a module receiver
+  (`os.`, `shutil.`, `fs.`, `FileUtils.`). Perl and PHP have none — `File::Path`
+  is imported and called bare, and PHP's are builtins — so the call syntax does
+  that work: `\b(?:rmtree|remove_tree)\s*[('"$@]` accepts `rmtree('/x')`,
+  `rmtree '/x'` and `rmtree $dir` while a prose mention does not match, and
+  `\b(?:unlink|rmdir)\s*\(` uses the paren to separate the function call from
+  the shell command of the same name.
+
+  That paren also keeps the entry disjoint from `core.filesystem:unlink-general`
+  (`\bunlink\s+\S`), which requires whitespace and so never matched the no-space
+  paren form. That disjointness is why the gap existed, and it means shell
+  `unlink <file>` keeps being judged solely by its own rule, `/tmp` carve-out
+  included.
+
 - **`Remove-Item -Recurse /` was allowed under a PowerShell payload; the same
   command with `$HOME` was blocked** (#451). No rule was missing:
   `core.filesystem`'s `powershell-remove-item-recursive` already knows every

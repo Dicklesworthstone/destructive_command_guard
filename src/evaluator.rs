@@ -25828,6 +25828,19 @@ fn check_fallback_patterns(command: &str) -> Option<EvaluationResult> {
             // reintroduce #454, where the `\b` could not hold between `m` and
             // `_` and so `rm_r` was unmatchable while `rm_rf` matched.
             r"FileUtils\.(?:rm|remove)",
+            // Perl `File::Path`. Every entry above anchors on a module receiver
+            // (`os.`, `shutil.`, `fs.`, `FileUtils.`); these have none, because
+            // the documented usage imports the function and calls it bare
+            // (#453). The call syntax is the disambiguator instead: a paren, a
+            // quote, or a sigil. That accepts `rmtree('/x')`, `rmtree '/x'` and
+            // `rmtree $dir` while keeping a prose mention out.
+            r#"\b(?:rmtree|remove_tree)\s*[('"$@]"#,
+            // PHP and Perl builtins. `unlink` and `rmdir` are also ordinary
+            // shell command names, so the opening paren is what separates the
+            // function call from `rmdir /tmp/empty` — which is harmless and must
+            // stay allowed. PHP always parenthesises its calls, so requiring it
+            // costs no coverage there.
+            r"\b(?:unlink|rmdir)\s*\(",
             r"\brm\s+(?:-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\b", // rm -rf, rm -fr, rm -r -f
             r"\bgit\s+reset\s+--hard\b",
         ])
@@ -38276,6 +38289,33 @@ mod tests {
                     "shell rm -rf",
                     "bash <<'SH'\necho starting\nrm -rf /home/user\nSH",
                 ),
+                // Perl and PHP have no module receiver to anchor on, so these
+                // exercise the call-syntax disambiguator instead.
+                (
+                    "perl rmtree, imported",
+                    "perl <<'PL'\nuse File::Path qw(rmtree);\nrmtree('/home/user');\nPL",
+                ),
+                (
+                    "perl rmtree, no parens",
+                    "perl <<'PL'\nuse File::Path qw(rmtree);\nrmtree '/home/user';\nPL",
+                ),
+                (
+                    "perl rmtree, variable target",
+                    "perl <<'PL'\nuse File::Path qw(rmtree);\nrmtree $dir;\nPL",
+                ),
+                (
+                    "perl remove_tree",
+                    "perl <<'PL'\nuse File::Path qw(remove_tree);\nremove_tree('/home/user');\nPL",
+                ),
+                (
+                    "perl File::Path::rmtree",
+                    "perl <<'PL'\nuse File::Path;\nFile::Path::rmtree('/home/user');\nPL",
+                ),
+                (
+                    "php unlink",
+                    "php <<'PHP'\n<?php\nunlink('/home/user/.ssh/id_rsa');\nPHP",
+                ),
+                ("php rmdir", "php <<'PHP'\n<?php\nrmdir('/home/user');\nPHP"),
             ] {
                 let result = eval_with_heredoc(cmd, &settings);
                 assert!(
@@ -38315,6 +38355,31 @@ mod tests {
                     "python3 <<'PY'\nwith open('out.txt', 'w') as fh:\n    fh.write('hi')\nPY",
                 ),
                 ("shell echo", "bash <<'SH'\necho one\necho two\nSH"),
+                // `unlink` and `rmdir` are shell command names as well as PHP
+                // and Perl function names. The fallback entries for them require
+                // an opening paren precisely so these stay allowed: `rmdir` only
+                // removes an empty directory and fails otherwise, and neither is
+                // a recursive delete.
+                (
+                    "shell rmdir on an empty dir",
+                    "bash <<'SH'\nmkdir -p build/tmp\nrmdir build/tmp\nSH",
+                ),
+                // Shell `unlink <file>` is denied on its own merits by the
+                // pre-existing `core.filesystem:unlink-general` rule, so it is
+                // not a control for this change. Its documented temp carve-out
+                // is: the paren requirement means the fallback entry never
+                // reaches the shell spelling, leaving that rule's own judgement
+                // — carve-out included — intact.
+                (
+                    "shell unlink under /tmp (documented carve-out)",
+                    "bash <<'SH'\ntouch /tmp/dcgscratch/stamp\nunlink /tmp/dcgscratch/stamp\nSH",
+                ),
+                // A prose mention of the Perl helpers, which is why those entries
+                // require a paren, quote or sigil rather than matching bare.
+                (
+                    "perl comment mentioning rmtree",
+                    "perl <<'PL'\n# use rmtree or remove_tree to clean up\nprint \"ok\\n\";\nPL",
+                ),
             ] {
                 let result = eval_with_heredoc(cmd, &settings);
                 assert!(
