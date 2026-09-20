@@ -611,6 +611,14 @@ fn test_audit_backtracking_requirements() {
         (
             "kubernetes.kubectl",
             HashSet::from([
+                // The `api-delete-*` rules (#449) use lookahead to require the
+                // DELETE method and the resource path independently of the
+                // order `curl` happens to put them in, so they need the
+                // backtracking engine.
+                "api-delete-collection",
+                "api-delete-namespace",
+                "api-delete-persistent-storage",
+                "api-delete-workload",
                 "delete-from-stdin",
                 "kubectl-api",
                 "kubectl-config",
