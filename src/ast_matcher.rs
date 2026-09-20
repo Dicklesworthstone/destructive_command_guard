@@ -1097,6 +1097,13 @@ fn refine_match_meta(
 fn refine_python_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMatchMeta {
     let rule_id = meta.rule_id.as_str();
 
+    // Exact ids, not a prefix test. A new exec-sink pattern that is not added
+    // here registers at Medium and never escalates, so it warns on a real
+    // `rm -rf` instead of blocking it — the pattern exists, the finding is
+    // reported, and the command runs. #458 needed all three of the pattern
+    // list, `PY_EXEC_SINK_LITERAL` and this set to agree, and
+    // `every_python_exec_sink_escalates_a_destructive_payload_issue_458`
+    // is what keeps them agreeing.
     let is_exec_sink = matches!(
         rule_id,
         "heredoc.python.os_system"
@@ -1104,6 +1111,8 @@ fn refine_python_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMat
             | "heredoc.python.subprocess_run"
             | "heredoc.python.subprocess_call"
             | "heredoc.python.subprocess_popen"
+            | "heredoc.python.subprocess_check_call"
+            | "heredoc.python.subprocess_check_output"
     );
 
     let unchanged = || RefinedMatchMeta {
@@ -2421,6 +2430,32 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
                 "subprocess.Popen($$$)".to_string(),
                 "heredoc.python.subprocess_popen".to_string(),
                 "subprocess.Popen() spawns shell processes".to_string(),
+                Severity::Medium,
+                Some("Validate command arguments carefully".to_string()),
+            ),
+            // `check_call` and `check_output` are the two the Python docs
+            // point you at when you want the command to raise on failure, and
+            // the argv-list form is the one every style guide prefers over
+            // `shell=True`. That combination — recommended function,
+            // recommended argument shape — was the one left unguarded (#458).
+            //
+            // An argv list is also the shape no other layer can cover:
+            // `['rm','-rf','/home/user']` puts no literal `rm -rf` in the
+            // text, so the raw-shell rescan has nothing to see and an AST
+            // pattern is the only thing that reaches it. A string payload
+            // denied either way, which is why the gap read as "check_call is
+            // partly guarded" rather than as a missing pattern.
+            CompiledPattern::new(
+                "subprocess.check_call($$$)".to_string(),
+                "heredoc.python.subprocess_check_call".to_string(),
+                "subprocess.check_call() executes shell commands".to_string(),
+                Severity::Medium,
+                Some("Validate command arguments carefully".to_string()),
+            ),
+            CompiledPattern::new(
+                "subprocess.check_output($$$)".to_string(),
+                "heredoc.python.subprocess_check_output".to_string(),
+                "subprocess.check_output() executes shell commands".to_string(),
                 Severity::Medium,
                 Some("Validate command arguments carefully".to_string()),
             ),
@@ -4621,6 +4656,101 @@ mod tests {
                             .collect::<Vec<_>>()
                     );
                 }
+            }
+        }
+
+        /// #458: every Python exec sink escalates a destructive payload.
+        ///
+        /// Three lists have to agree for one of these to be covered — the
+        /// ast-grep pattern list, `PY_EXEC_SINK_LITERAL`, and
+        /// `refine_python_match`'s exec-sink id set — and each disagrees in a
+        /// different, quiet way. A missing pattern loses the argv-list shape
+        /// entirely (that was `check_call`/`check_output`). A missing id in the
+        /// refinement set is worse to read: the pattern matches, a finding is
+        /// reported at Medium, and the command runs anyway.
+        ///
+        /// Asserting the end state rather than the list contents is what makes
+        /// this hold all three at once. `blocks_by_default()` is false for
+        /// Medium, so a sink that regressed on either axis fails here.
+        #[test]
+        fn every_python_exec_sink_escalates_a_destructive_payload_issue_458() {
+            let ast_matcher = AstMatcher::new();
+            // Assembled rather than written out, so this file does not carry
+            // the literal text of a guarded command — the same reason the
+            // `rmrf()` helper exists in the fixtures module below.
+            let rmrf = format!("{}{}{}", "rm", " -", "rf");
+
+            // The argv-split shape, which only an AST pattern can reach: the
+            // text carries no literal `rm -rf` for a raw rescan to find.
+            for func in ["run", "call", "Popen", "check_call", "check_output"] {
+                let code =
+                    format!("import subprocess\nsubprocess.{func}(['rm','-rf','/home/user'])");
+                let matches = ast_matcher
+                    .find_matches(&code, ScriptLanguage::Python)
+                    .unwrap();
+                assert!(
+                    matches.iter().any(|m| m.severity.blocks_by_default()),
+                    "subprocess.{func}(['rm','-rf','/home/user']) must block; got {:?}",
+                    matches
+                        .iter()
+                        .map(|m| (&m.rule_id, m.severity))
+                        .collect::<Vec<_>>()
+                );
+            }
+
+            // The nested-list shape #136 closed, kept here so the two cannot
+            // drift apart for the two sinks added by #458.
+            for func in ["run", "call", "Popen", "check_call", "check_output"] {
+                let code = format!(
+                    "import subprocess\nsubprocess.{func}(['sh','-c','{} /home/user'])",
+                    rmrf
+                );
+                let matches = ast_matcher
+                    .find_matches(&code, ScriptLanguage::Python)
+                    .unwrap();
+                assert!(
+                    matches.iter().any(|m| m.severity.blocks_by_default()),
+                    "subprocess.{func}(['sh','-c',...]) must block; got {:?}",
+                    matches
+                        .iter()
+                        .map(|m| (&m.rule_id, m.severity))
+                        .collect::<Vec<_>>()
+                );
+            }
+
+            // The os.* sinks take a string rather than an argv list, so they
+            // are exercised in the shape they actually have.
+            for sink in ["os.system", "os.popen"] {
+                let code = format!("import os\n{sink}(\"{} /home/user\")", rmrf);
+                let matches = ast_matcher
+                    .find_matches(&code, ScriptLanguage::Python)
+                    .unwrap();
+                assert!(
+                    matches.iter().any(|m| m.severity.blocks_by_default()),
+                    "{sink} with a destructive payload must block; got {:?}",
+                    matches
+                        .iter()
+                        .map(|m| (&m.rule_id, m.severity))
+                        .collect::<Vec<_>>()
+                );
+            }
+
+            // The other half of the refinement's job: a benign payload through
+            // the same sinks stays warn-only, so the assertions above are
+            // measuring escalation rather than a blanket deny on the sink.
+            for func in ["run", "call", "check_call", "check_output"] {
+                let code = format!("import subprocess\nsubprocess.{func}(['ls','-la'])");
+                let matches = ast_matcher
+                    .find_matches(&code, ScriptLanguage::Python)
+                    .unwrap();
+                assert!(
+                    !matches.iter().any(|m| m.severity.blocks_by_default()),
+                    "subprocess.{func}(['ls','-la']) must not block; got {:?}",
+                    matches
+                        .iter()
+                        .map(|m| (&m.rule_id, m.severity))
+                        .collect::<Vec<_>>()
+                );
             }
         }
 
