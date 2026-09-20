@@ -1463,9 +1463,25 @@ static PERL_QX_SLASH_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)\bqx\s*/(?P<cmd>(?:\\.|[^/\n])*)/").expect("perl qx// regex compiles")
 });
 
+/// The `File::Path::` qualifier is optional because the documented way to use
+/// this module imports the function and calls it bare (#453):
+///
+/// ```perl
+/// use File::Path qw(rmtree);
+/// rmtree('/home/user');
+/// ```
+///
+/// Requiring the qualifier caught only the rarer spelling: `File::Path::rmtree`
+/// blocked while the idiomatic `rmtree` was allowed, at every target including
+/// catastrophic ones. `unlink` and `rmdir` below are already matched bare, so
+/// the qualifier was also the odd convention out within this file.
+///
+/// A bare `rmtree`/`remove_tree` is still specific enough to key on: these names
+/// are not Perl builtins, the scan only ever runs on an extracted Perl body with
+/// comments masked, and the match additionally requires a quoted string argument.
 static PERL_FILE_PATH_RMTREE_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?m)\bFile::Path::(?P<fn>rmtree|remove_tree)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+        r#"(?m)\b(?:File::Path::)?(?P<fn>rmtree|remove_tree)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
     )
     .expect("perl File::Path rmtree/remove_tree regex compiles")
 });
@@ -3394,6 +3410,75 @@ mod tests {
             assert!(!matches.is_empty());
             assert!(matches[0].rule_id.contains("rm_rf"));
             assert!(!matches[0].severity.blocks_by_default());
+        }
+
+        /// #453: `File::Path` is normally imported and called bare, so requiring
+        /// the `File::Path::` qualifier guarded only the rarer spelling.
+        #[test]
+        fn perl_file_path_blocks_imported_and_qualified_spellings_issue_453() {
+            let ast_matcher = AstMatcher::new();
+
+            for code in [
+                "use File::Path;\nFile::Path::rmtree('/home/user');\n",
+                "use File::Path qw(rmtree);\nrmtree('/home/user');\n",
+                "use File::Path qw(rmtree);\nrmtree '/home/user';\n",
+                "use File::Path;\nFile::Path::remove_tree('/home/user');\n",
+                "use File::Path qw(remove_tree);\nremove_tree('/home/user');\n",
+            ] {
+                let matches = ast_matcher
+                    .find_matches(code, ScriptLanguage::Perl)
+                    .expect("perl ast_matcher should run");
+                assert!(
+                    matches
+                        .iter()
+                        .any(|m| m.rule_id.starts_with("heredoc.perl.file_path.")
+                            && m.severity.blocks_by_default()),
+                    "catastrophic File::Path delete must block regardless of spelling; \
+                     code was {code:?}, got {:?}",
+                    matches.iter().map(|m| &m.rule_id).collect::<Vec<_>>()
+                );
+            }
+        }
+
+        /// Negative control for the test above: dropping the required qualifier
+        /// must not turn the bare names into a blanket match.
+        #[test]
+        fn perl_file_path_unqualified_still_respects_target_and_context_issue_453() {
+            let ast_matcher = AstMatcher::new();
+
+            // Non-catastrophic target warns rather than blocks, as the qualified
+            // spelling already did.
+            let relative = ast_matcher
+                .find_matches(
+                    "use File::Path qw(rmtree);\nrmtree('./build');\n",
+                    ScriptLanguage::Perl,
+                )
+                .expect("perl ast_matcher should run");
+            assert!(
+                !relative.iter().any(|m| m.severity.blocks_by_default()),
+                "rmtree('./build') is non-catastrophic and must warn only; got {:?}",
+                relative.iter().map(|m| &m.rule_id).collect::<Vec<_>>()
+            );
+
+            // A comment mentioning the call is masked before the scan.
+            let comment = ast_matcher
+                .find_matches("# never call rmtree('/home/user')\n", ScriptLanguage::Perl)
+                .expect("perl ast_matcher should run");
+            assert!(
+                !comment.iter().any(|m| m.severity.blocks_by_default()),
+                "a commented-out rmtree must not block; got {:?}",
+                comment.iter().map(|m| &m.rule_id).collect::<Vec<_>>()
+            );
+
+            // No string argument means no literal target to judge.
+            let dynamic = ast_matcher
+                .find_matches("rmtree($dir);\n", ScriptLanguage::Perl)
+                .expect("perl ast_matcher should run");
+            assert!(
+                !dynamic.iter().any(|m| m.severity.blocks_by_default()),
+                "rmtree($dir) has no literal target and must not block here; got {:?}",
+                dynamic.iter().map(|m| &m.rule_id).collect::<Vec<_>>()
+            );
         }
 
         #[test]

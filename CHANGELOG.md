@@ -17,6 +17,31 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Security
 
+- **Perl's documented way of calling `File::Path` was unguarded** (#453).
+  `PERL_FILE_PATH_RMTREE_LITERAL` required the fully qualified
+  `File::Path::rmtree`, but the module's own documentation imports the
+  functions — `use File::Path qw(rmtree); rmtree('/home/user')` — and calls
+  them bare. So the guard covered the rarer spelling and missed the idiomatic
+  one, at every target including catastrophic ones. The qualified form denied
+  throughout, which is how we know the coverage existed and only the
+  qualification was wrong.
+
+  It was also the odd convention out in its own file: `PERL_UNLINK_LITERAL` and
+  `PERL_RMDIR_LITERAL`, defined immediately below, match `unlink` and `rmdir`
+  with no qualification at all.
+
+  The prefix is now optional. A bare `rmtree`/`remove_tree` stays specific
+  enough to key on: neither is a Perl builtin, the scan only runs on an
+  extracted Perl body with comments masked, and a quoted string argument is
+  still required. Non-catastrophic targets still warn rather than block, a
+  commented-out mention does not match, and `rmtree($dir)` with no literal
+  target does not block.
+
+  Still advisory-only and unchanged here: `scan_perl_unlink_rmdir` assigns
+  `Severity::Low` unconditionally and never checks the target, so Perl
+  `rmdir('/')` and `unlink('/etc/shadow')` do not block. That is a posture
+  question rather than a pattern bug — see #455.
+
 - **`FileUtils.rm_r('/')` was allowed while `FileUtils.rm_rf('/')` was
   blocked** (#454). Ruby's own docs define `rm_rf` as `rm_r` with
   `force: true`; the only difference is that `rm_rf` swallows errors, so `rm_r`
