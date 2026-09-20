@@ -73,6 +73,20 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   `del /s`, `rd /s` and `format C:` are still allowed. That is the structural
   half of #451 and needs a pack-selection decision.
 
+  **Allowlist note.** Making the guard reachable also moved which rule answers
+  some commands that already denied. `core.*` is tier 1 and `windows.*` is tier
+  11, so wherever `core.filesystem` can now match it claims attribution, and
+  `pwsh -c "Remove-Item -Recurse -Force <path>"` reports
+  `core.filesystem:powershell-remove-item-recursive` where it previously
+  reported `windows.filesystem:remove-item-recurse-force`. Nothing became
+  allowed — both rules deny — but allowlists key on `pack_id:pattern_name`, so
+  an existing `windows.filesystem:remove-item-recurse-force` exception no longer
+  covers the `pwsh -c` spelling and needs the `core.filesystem` id added
+  alongside it. The bare `Remove-Item -Recurse -Force <path>` spelling is
+  unaffected and still answers `windows.filesystem`; the launcher wrapper, not
+  the path, is what moves attribution. Both routes are now pinned in
+  `tests/repro_313_powershell_read_only_false_positives.rs`.
+
 - **Perl's documented way of calling `File::Path` was unguarded** (#453).
   `PERL_FILE_PATH_RMTREE_LITERAL` required the fully qualified
   `File::Path::rmtree`, but the module's own documentation imports the
