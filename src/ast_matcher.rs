@@ -711,17 +711,39 @@ static RUBY_QUOTED_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     .expect("ruby quoted exec sink regex compiles")
 });
 
+/// Where a statement can begin: line start, or just after a separator that
+/// ends the previous one.
+///
+/// These two literals used to anchor at `^[ \t]*`, which fits a heredoc body
+/// — where the call is the first thing on its line — and fits a `-e`/`-c`
+/// one-liner not at all, because there the call follows `; `. They are the
+/// backstop when AST matching times out, so for those two payload families a
+/// timeout was an unconditional allow rather than a fallback (#452).
+///
+/// Line position was never the property worth requiring; *statement* position
+/// is. It keeps what the anchor was actually protecting — prose and comments
+/// that mention a call in passing ("never run `FileUtils.rm_rf('/')`") are
+/// preceded by a word, not by a separator, so they still do not match — while
+/// covering the one-liner. Both patterns additionally require a quoted string
+/// argument, which already excludes a bare mention of the function name.
+///
+/// The residual false positive is a comment whose text puts the call right
+/// after a separator, e.g. `# cleanup; FileUtils.rm_rf('/tmp/x')`. That is
+/// narrower than the unanchored `\b` alternative, which would fire on every
+/// passing mention.
+const STATEMENT_START: &str = r"(?:^|[;&|{(]|=>|\bdo\b|\bthen\b)[ \t]*";
+
 static RUBY_FILEUTILS_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?m)^[ \t]*FileUtils\.(?P<fn>rm_rf|remove_dir|rm|remove)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
-    )
+    Regex::new(&format!(
+        r#"(?m){STATEMENT_START}FileUtils\.(?P<fn>rm_rf|remove_dir|rm|remove)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#
+    ))
     .expect("ruby FileUtils literal regex compiles")
 });
 
 static JS_FS_RMSYNC_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?m)^[ \t]*(?:await[ \t]+)?fs\.rmSync\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
-    )
+    Regex::new(&format!(
+        r#"(?m){STATEMENT_START}(?:await[ \t]+)?fs\.rmSync\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#
+    ))
     .expect("JavaScript fs.rmSync literal regex compiles")
 });
 
@@ -4334,6 +4356,60 @@ def cleanup():
             assert!(
                 scan_filesystem_sink_fallback(code, ScriptLanguage::Ruby).is_none(),
                 "inert string containing FileUtils call must not fire fallback"
+            );
+        }
+
+        /// #452: these two literals are the backstop when AST matching times
+        /// out, and a line-start anchor could not reach a `-e`/`-c` one-liner
+        /// — so for those payloads a timeout was an allow, not a fallback.
+        #[test]
+        fn filesystem_fallback_reaches_one_liner_statement_positions() {
+            for code in [
+                // The reported payload: the call follows `; `, never a line start.
+                "require 'fileutils'; FileUtils.rm_rf('/home/user')",
+                "require \"fileutils\"; FileUtils.rm_rf(\"/\")",
+                "x = 1 && FileUtils.rm_rf('/')",
+                "loop do FileUtils.rm_rf('/') end",
+            ] {
+                assert!(
+                    scan_filesystem_sink_fallback(code, ScriptLanguage::Ruby).is_some(),
+                    "one-liner must reach the Ruby fallback: {code}"
+                );
+            }
+            for code in [
+                "const fs = require('fs'); fs.rmSync('/', { recursive: true })",
+                "const wipe = () => fs.rmSync('/etc', { recursive: true })",
+                "if (x) { fs.rmSync('/', { recursive: true }) }",
+            ] {
+                assert!(
+                    scan_filesystem_sink_fallback(code, ScriptLanguage::JavaScript).is_some(),
+                    "one-liner must reach the JavaScript fallback: {code}"
+                );
+            }
+        }
+
+        /// The property the old `^[ \t]*` anchor was actually protecting: a
+        /// call *mentioned* in passing follows a word, not a separator, so
+        /// statement anchoring still refuses it.
+        #[test]
+        fn filesystem_fallback_still_ignores_a_call_mentioned_in_prose() {
+            for code in [
+                "# never run FileUtils.rm_rf('/') on a live host",
+                "raise 'do not call FileUtils.rm_rf(\"/\") here'",
+                "# the FileUtils.rm_rf('/') below is illustrative",
+            ] {
+                assert!(
+                    scan_filesystem_sink_fallback(code, ScriptLanguage::Ruby).is_none(),
+                    "a mention preceded by a word must not fire the fallback: {code}"
+                );
+            }
+            assert!(
+                scan_filesystem_sink_fallback(
+                    "// never call fs.rmSync('/') here",
+                    ScriptLanguage::JavaScript
+                )
+                .is_none(),
+                "a mention preceded by a word must not fire the JavaScript fallback"
             );
         }
 
