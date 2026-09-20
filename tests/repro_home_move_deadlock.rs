@@ -329,8 +329,7 @@ fn relative_redirect_into_git_internals_is_denied_issue_407() {
     }
 }
 
-/// The neighbours of `.git` are ordinary files and must stay writable, and an
-/// append does not truncate.
+/// The neighbours of `.git` are ordinary files and must stay writable.
 #[test]
 fn relative_redirect_git_rule_does_not_overreach_issue_407() {
     for command in [
@@ -341,10 +340,15 @@ fn relative_redirect_git_rule_does_not_overreach_issue_407() {
         "cat > out.txt",
         "cat > git/config",
         "cat > mygit/config",
-        // Append leaves the previous contents in place.
-        "cat >> .git/config",
         // Reading is not writing.
         "cat < .git/config",
+        // The same neighbours under the appending spelling #457 added. The
+        // component has to be exactly `.git` followed by a separator, so none
+        // of these reach the new rule either.
+        "cat >> .gitignore",
+        "cat >> .gitattributes",
+        "cat >> .github/workflows/ci.yml",
+        "cat >> notes/git.md",
     ] {
         assert_allowed(command);
     }

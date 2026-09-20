@@ -116,15 +116,24 @@ fn the_absolute_spelling_still_denies_the_same_way() {
 }
 
 #[test]
-fn appending_to_git_internals_is_still_allowed() {
-    // The rule is about truncation. `>>` preserves the existing content, and
-    // reading is never gated, so neither may become collateral.
-    for command in [
-        "cat >> .git/config",
-        "echo x >> .git/config",
-        "cat .git/config",
-        "git config --list",
-    ] {
+fn appending_to_git_internals_now_denies_and_reading_stays_allowed() {
+    // This pinned `>>` as collateral #407's truncation rule must not take.
+    // #457 changed the judgement rather than the rule: git reads its internals
+    // whole, so a section appended to `.git/config` runs on the next git
+    // command without destroying a byte, which makes append the more useful
+    // primitive against a repository rather than the milder one. The sibling
+    // rule `redirect-append-git-internals-relative` is what denies it now.
+    //
+    // Reading is still never gated, and that half has not moved.
+    for command in ["cat >> .git/config", "echo x >> .git/config"] {
+        let (decision, rule) = outcome(command);
+        assert_eq!(decision, "deny", "should be denied: {command} ({rule})");
+        assert!(
+            rule.contains("redirect-append-git-internals-relative"),
+            "{command} should name the append rule, got {rule:?}"
+        );
+    }
+    for command in ["cat .git/config", "git config --list"] {
         let (decision, rule) = outcome(command);
         assert_eq!(decision, "allow", "should be allowed: {command} ({rule})");
     }
