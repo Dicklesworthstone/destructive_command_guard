@@ -12,8 +12,85 @@
 //! - LVM destructive commands (pvremove, vgremove, lvremove, etc.)
 //! - macOS diskutil erase/partition/APFS-delete operations
 
+use crate::destructive_pattern;
+use crate::packs::regex_engine::LazyCompiledRegex;
 use crate::packs::{DestructivePattern, Pack, SafePattern};
-use crate::{destructive_pattern, safe_pattern};
+
+// Exemptions must identify the executable, never a word in argument data (#448).
+// This is an exemption-only grammar: unknown wrappers/quoting withdraw the
+// exemption, not a destructive match. The evaluator also normalizes wrappers.
+// Do not use `\S*/` here: it accepts redirect targets and assignments as paths.
+// Do not consume arbitrary sudo options: `sudo -u lsblk dd ...` runs dd, not lsblk.
+macro_rules! disk_safe_pattern {
+    ($name:literal, $body:expr) => {
+        SafePattern {
+            name: $name,
+            regex: LazyCompiledRegex::new(concat!(
+                r"^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~=]+/)?",
+                $body
+            )),
+        }
+    };
+}
+
+// Complete literal arguments only. In particular, no output operand may be
+// hidden inside an input filename, and no second, unsafe of= may follow the
+// discard target. Expansion/shell syntax is left to the evaluator, not trusted
+// by a pack-wide regex exemption.
+macro_rules! dd_literal_word {
+    () => {
+        r#"(?:[^\s;&|<>()"'\\$`*?\[\]{}~]+|'[^'\r\n]*'|"[^"\\$`\r\n]*")"#
+    };
+}
+
+macro_rules! dd_non_output_operand {
+    () => {
+        concat!(
+            r"(?:(?:if|ibs|obs|bs|cbs|skip|iseek|seek|oseek|count|conv|iflag|oflag|status)=",
+            dd_literal_word!(),
+            r"|[0-9]*[<>]&(?:[0-9]+|-)|[0-9]*<[ \t]*",
+            dd_literal_word!(),
+            r"|(?:[0-9]*(?:>>?|>\|)|&>>?)[ \t]*(?:",
+            r#"/dev/(?:null|zero|full)|'/dev/(?:null|zero|full)'|"/dev/(?:null|zero|full)"|(?!['"]?/dev/)"#,
+            dd_literal_word!(),
+            r"))"
+        )
+    };
+}
+
+macro_rules! dd_discard_operand {
+    () => {
+        r#"(?:of=(?:/dev/(?:null|zero|full)|'/dev/(?:null|zero|full)'|"/dev/(?:null|zero|full)")|'of=/dev/(?:null|zero|full)'|"of=/dev/(?:null|zero|full)")"#
+    };
+}
+
+// Boolean options must not eat the destructive subcommand as a fictitious
+// value. Required values must be present, including with the --option=value form.
+macro_rules! btrfs_readonly_pattern {
+    ($name:literal, $verb:literal) => {
+        disk_safe_pattern!(
+            $name,
+            concat!(
+                r"btrfs[ \t]+(?:(?:--(?:verbose|quiet)|-[vq]+|--format(?:=|[ \t]+)(?:text|json)|--log(?:=|[ \t]+)(?:default|info|verbose|debug|quiet))[ \t]+)*",
+                $verb,
+                r"(?:[ \t]+[^;&|\r\n<>()`$]*)?[ \t]*$"
+            )
+        )
+    };
+}
+
+macro_rules! dmsetup_readonly_pattern {
+    ($name:literal, $verb:literal) => {
+        disk_safe_pattern!(
+            $name,
+            concat!(
+                r"dmsetup[ \t]+(?:(?:-v+|-c|--(?:verbose|noudevsync|verifyudev|readonly|columns|noheadings))[ \t]+)*",
+                $verb,
+                r"(?:[ \t]+[^;&|\r\n<>()`$]*)?[ \t]*$"
+            )
+        )
+    };
+}
 
 /// Create the Disk pack.
 #[must_use]
@@ -57,259 +134,68 @@ pub fn create_pack() -> Pack {
 
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
-        // dd to regular files is generally safe
-        safe_pattern!("dd-file-out", r#"dd\s+.*of=['"]?[^/\s'"]+\."#),
-        // dd to /dev/null|zero|full is safe (discard output). Accept optional
-        // quotes so `dd of="/dev/null"` still short-circuits as safe.
-        safe_pattern!(
+        // There is no dd-file-out exemption: it matched of= inside source
+        // filenames and let an ordinary filename hide an actual device output.
+        // Regular file outputs do not match dd-device in the first place.
+        disk_safe_pattern!(
             "dd-discard",
-            r#"dd\s+.*of=['"]?/dev/(?:null|zero|full)['"]?(?:\s|$)"#
+            concat!(
+                r"dd[ \t]+(?:",
+                dd_non_output_operand!(),
+                r"[ \t]+)*",
+                dd_discard_operand!(),
+                r"(?:[ \t]+(?:",
+                dd_non_output_operand!(),
+                r"|",
+                dd_discard_operand!(),
+                r"))*[ \t]*$"
+            )
         ),
-        // lsblk is safe (read-only), but only when lsblk is what runs.
-        //
-        // As a bare `\blsblk\b` this matched the word anywhere in the segment,
-        // and a safe match short-circuits the whole pack — so any argument
-        // carrying the word disarmed all 44 destructive rules:
-        // `wipefs -a /dev/sdb -o /tmp/lsblk.bak` and `mkfs.ext4 -L lsblk
-        // /dev/sdb1` were both allowed, while the same commands with any other
-        // label were denied. Separator-crossing spellings were already handled
-        // (`wipefs -a /dev/sdb && lsblk` denies, because segments are judged
-        // separately); what was missing is that evidence has to be the command,
-        // not its data. Same defect class as #429.
-        //
-        // Narrowing a safe pattern can only cost a false DENY where some
-        // destructive pattern also matches, and none of them match a read-only
-        // lsblk invocation — so an unusual spelling this misses (an env prefix
-        // it does not anticipate, say) still falls through to allow.
-        safe_pattern!(
-            "lsblk",
-            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?lsblk\b"
-        ),
-        // There is deliberately no `fdisk -l` exemption.
-        //
-        // One used to sit here, unanchored, so `fdisk\s+-l` matched anywhere in
-        // a segment and short-circuited every destructive rule in the pack:
-        // `mkfs.ext4 /dev/sdb1 2>>"/tmp/fdisk -l.log"` was allowed (#448).
-        // Anchoring it at the command position, the way `lsblk`/`blkid`/`df`
-        // were, would have been the smaller change. It is dropped instead
-        // because `fdisk-edit` already excludes the read-only form twice over:
-        // it requires `/dev/` immediately after `fdisk`, so `fdisk -l /dev/sda`
-        // never reaches it, and it carries `(?!.*-l)`, so `fdisk /dev/sda -l`
-        // does not match either. The exemption only undid a deny the rule does
-        // not make. A redundant exemption is a short-circuit waiting to be
-        // re-widened, so it goes rather than gets narrowed — the same call
-        // `ae0cf8d` made for the mdadm read-only exemptions.
-        // parted print is safe. Keep this tight because safe patterns run
-        // before destructive patterns, and GNU Parted accepts multiple
-        // commands after the device.
-        safe_pattern!(
+        disk_safe_pattern!("lsblk", r"lsblk(?:[ \t]+[^;&|\r\n<>()`$]*)?[ \t]*$"),
+        disk_safe_pattern!("blkid", r"blkid(?:[ \t]+[^;&|\r\n<>()`$]*)?[ \t]*$"),
+        disk_safe_pattern!("df", r"df(?:[ \t]+[^;&|\r\n<>()`$]*)?[ \t]*$"),
+        // Parted accepts multiple commands; only a complete print-only form
+        // can exempt it. The executable must also be in command position.
+        disk_safe_pattern!(
             "parted-print",
-            r#"parted\b(?:\s+--?\S+)*\s+(?:['"]?/dev/\S+['"]?\s+)?print(?:\s+(?:devices|free|list|all|\d+))?\s*$"#
+            r#"parted[ \t]+(?:(?:-s|--script|-m|--machine|-j|--json)[ \t]+)*(?:['"]?/dev/[^\s'";&|<>()`$]+['"]?[ \t]+)?print(?:[ \t]+(?:devices|free|list|all|\d+))?[ \t]*$"#
         ),
-        // blkid is safe (read-only) — anchored for the reason given on `lsblk`.
-        // `mdadm --stop /dev/md0 --config /etc/blkid.conf` and
-        // `tee /dev/sda < /tmp/blkid.img` were allowed on the bare spelling.
-        safe_pattern!(
-            "blkid",
-            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?blkid\b"
-        ),
-        // df is safe (read-only) — anchored for the same reason, and it was the
-        // easiest of the three to trip by accident: two letters matched as a
-        // word anywhere, so `mkfs.ext4 -L df /dev/sdb1` was allowed.
-        // `btrfs filesystem df` keeps its own pattern below.
-        safe_pattern!(
-            "df",
-            r"^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?df\b"
-        ),
-        // There is deliberately no bare-`mount` exemption.
-        //
-        // One used to sit here as `\bmount\s*$`, anchored only at the END, and
-        // `/` is a word boundary — so any destructive command whose redirect
-        // target's last path component was `mount` satisfied it and skipped the
-        // whole pack: `dd if=/dev/zero of=/dev/sda 2>>/var/log/mount` and
-        // `wipefs -a /dev/sdb 2>/tmp/mount` were allowed (#448).
-        //
-        // Neither mount rule here can match a bare `mount` anyway:
-        // `mount-bind-root` requires `--bind` and a root target, and
-        // `umount-force` requires the literal `umount` with `-f`. So this was
-        // also a redundant exemption rather than a needed one.
-        // There is deliberately no `mkswap --check` exemption.
-        //
-        // One used to sit here, commented "read-only inspection of swap area".
-        // mkswap(8) says otherwise: "-c, --check: Check the device (if it is a
-        // block device) for bad blocks *before creating the swap area*." The
-        // check is a preliminary to the format, not an alternative to it, so
-        // the exemption allowed a command that destroys the partition —
-        // `mkswap --check /dev/sdb1` was allowed while `mkswap -c /dev/sdb1`,
-        // which does exactly the same thing, was denied (#448). mkswap has no
-        // read-only mode to carve out.
-        // --- mdadm has no safe patterns, deliberately ---
-        //
-        // There were five: --detail, --examine, --query, -Q and --scan, each
-        // written as `mdadm\s+--detail\b`. Requiring the read-only flag to
-        // follow `mdadm` immediately made the exemption depend on argument
-        // order rather than on what the command does, so
-        // `mdadm --stop /dev/md0 --detail` was denied while
-        // `mdadm --detail --stop /dev/md0` was allowed, and
-        // `mdadm --scan --zero-superblock /dev/sdb` — which destroys the RAID
-        // metadata identifying array members — was allowed too (#448).
-        //
-        // The obvious repair is a negative lookahead excluding the destructive
-        // modes, and that works, but it is a list that has to be kept in step
-        // with the destructive patterns below: add a seventh mdadm rule without
-        // extending the list and the exemption silently covers it again. That
-        // is the same shape of latent defect this issue exists to remove.
-        //
-        // Deleting them costs nothing instead. Every destructive mdadm rule
-        // below requires an explicit mode — --stop/-S, --remove, --fail/-f,
-        // --zero-superblock, --create/-C, --grow — and a read-only invocation
-        // carries none of them, so `mdadm --detail /dev/md0` and friends are
-        // allowed by matching no destructive pattern rather than by matching a
-        // safe one. The exemptions only ever bought an early exit, and they are
-        // asserted still allowed in
-        // `mdadm_genuinely_read_only_invocations_stay_allowed_issue_448`.
-        // --- btrfs safe patterns ---
-        // btrfs subvolume list (read-only)
-        safe_pattern!(
-            "btrfs-subvolume-list",
-            r"btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+subvolume\s+list(?=\s|$)"
-        ),
-        // btrfs subvolume show (read-only)
-        safe_pattern!(
-            "btrfs-subvolume-show",
-            r"btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+subvolume\s+show(?=\s|$)"
-        ),
-        // btrfs filesystem show (read-only)
-        safe_pattern!(
-            "btrfs-filesystem-show",
-            r"btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+filesystem\s+show(?=\s|$)"
-        ),
-        // btrfs filesystem df (read-only)
-        safe_pattern!(
-            "btrfs-filesystem-df",
-            r"btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+filesystem\s+df(?=\s|$)"
-        ),
-        // btrfs filesystem usage (read-only)
-        safe_pattern!(
-            "btrfs-filesystem-usage",
-            r"btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+filesystem\s+usage(?=\s|$)"
-        ),
-        // btrfs device stats (read-only)
-        safe_pattern!(
-            "btrfs-device-stats",
-            r"btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+device\s+stats(?=\s|$)"
-        ),
-        // btrfs property get/list (read-only)
-        safe_pattern!(
-            "btrfs-property-get",
-            r"btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+property\s+(?:get|list)(?=\s|$)"
-        ),
-        // btrfs scrub status (read-only)
-        safe_pattern!(
-            "btrfs-scrub-status",
-            r"btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+scrub\s+status(?=\s|$)"
-        ),
-        // --- dmsetup safe patterns ---
-        // dmsetup ls (list devices)
-        safe_pattern!(
-            "dmsetup-ls",
-            r"dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+ls(?=\s|$)"
-        ),
-        // dmsetup status (show status)
-        safe_pattern!(
-            "dmsetup-status",
-            r"dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+status(?=\s|$)"
-        ),
-        // dmsetup info (show info)
-        safe_pattern!(
-            "dmsetup-info",
-            r"dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+info(?=\s|$)"
-        ),
-        // dmsetup table (show mapping table)
-        safe_pattern!(
-            "dmsetup-table",
-            r"dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+table(?=\s|$)"
-        ),
-        // dmsetup deps (show dependencies)
-        safe_pattern!(
-            "dmsetup-deps",
-            r"dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+deps(?=\s|$)"
-        ),
-        // --- nbd-client safe patterns ---
-        // nbd-client -l (list exports)
-        safe_pattern!("nbd-client-list", r"nbd-client\s+-l\b"),
-        // nbd-client -check (check connection)
-        safe_pattern!("nbd-client-check", r"nbd-client\s+.*-check\b"),
-        // --- macOS diskutil safe patterns (read-only) ---
-        // Verbs are matched case-insensitively because diskutil itself accepts
-        // any casing. End-bounded with [^;&|\r\n]* so a read-only verb cannot
-        // mask a chained destructive command in a later segment — every shell
-        // separator, newline included, ends the whitelisted span (conservative:
-        // failing to match here just falls through to the destructive check).
-        safe_pattern!(
+        btrfs_readonly_pattern!("btrfs-subvolume-list", r"subvolume[ \t]+list"),
+        btrfs_readonly_pattern!("btrfs-subvolume-show", r"subvolume[ \t]+show"),
+        btrfs_readonly_pattern!("btrfs-filesystem-show", r"filesystem[ \t]+show"),
+        btrfs_readonly_pattern!("btrfs-filesystem-df", r"filesystem[ \t]+df"),
+        btrfs_readonly_pattern!("btrfs-filesystem-usage", r"filesystem[ \t]+usage"),
+        btrfs_readonly_pattern!("btrfs-device-stats", r"device[ \t]+stats"),
+        btrfs_readonly_pattern!("btrfs-property-get", r"property[ \t]+(?:get|list)"),
+        btrfs_readonly_pattern!("btrfs-scrub-status", r"scrub[ \t]+status"),
+        dmsetup_readonly_pattern!("dmsetup-ls", "ls"),
+        dmsetup_readonly_pattern!("dmsetup-status", "status"),
+        dmsetup_readonly_pattern!("dmsetup-info", "info"),
+        dmsetup_readonly_pattern!("dmsetup-table", "table"),
+        dmsetup_readonly_pattern!("dmsetup-deps", "deps"),
+        disk_safe_pattern!(
             "diskutil-readonly",
-            r"(?i)diskutil\s+(?:list|info|information|activity|listFilesystems|apfs\s+list(?:Snapshots|Users)?)\b[^;&|\r\n]*$"
+            r"(?i:diskutil[ \t]+(?:list|info|information|activity|listFilesystems|apfs[ \t]+list(?:Snapshots|Users)?)(?:[ \t]+[^;&|\r\n<>()`$]*)?[ \t]*$)"
         ),
-        // There are deliberately no LVM read-only exemptions.
-        //
-        // Three used to sit here — `\b(?:lvs|vgs|pvs)\b`,
-        // `\b(?:lvdisplay|vgdisplay|pvdisplay)\b` and
-        // `\b(?:lvscan|vgscan|pvscan)\b` — all unanchored, so argument data
-        // supplied the evidence and short-circuited the whole pack (#448).
-        // `lvs`/`vgs`/`pvs` are three letters matched as a word anywhere, which
-        // makes them as easy to trip as the `df` case that entry calls out:
-        //
-        //   mkfs.ext4 -L lvs /dev/sdb1                        was allowed
-        //   dd if=/dev/zero of=/dev/sda 2>>/var/log/vgs.log   was allowed
-        //   wipefs -a /dev/sdb 2>/tmp/pvs                     was allowed
-        //
-        // Dropped rather than anchored because none was load-bearing: every
-        // destructive LVM rule here is word-anchored on a *remove* or *reduce*
-        // tool (`\bpvremove\b`, `\bvgremove\b`, `\blvremove\b`, `\bvgreduce\b`,
-        // `\blvreduce\b`), so nothing in this pack ever denied a query tool.
-        // The pseudo-devices every writer tool legitimately names. `tee
-        // /dev/null` is the single most common shape of all, and `/dev/shm`,
-        // `/dev/fd/N` and `/dev/pts/N` are ordinary paths rather than block
-        // devices. Writing to /dev/zero or /dev/full is discarded, which
-        // `dd-discard` above already treats as safe for dd (#444).
-        // The exemption has to name the WRITE TARGET, not merely some
-        // pseudo-device in the command: `tee /dev/sda < /dev/zero` reads
-        // /dev/zero and writes the disk, and an exemption that skipped over
-        // the target to find the source would allow exactly the command #444
-        // is about. So tee/sponge's operand must be the pseudo-device itself,
-        // and cp/mv/install's must be the final argument they write.
-        safe_pattern!(
-            "device-write-pseudo-tee",
-            r#"\b(?:tee|sponge)\b(?:\s+-{1,2}\S+)*\s+['"]?/dev/(?:null|zero|full|random|urandom|std(?:in|out|err)|tty|console|ptmx|fd/|pts/|shm/)\S*['"]?\s*(?:$|[|>])"#
-        ),
-        safe_pattern!(
-            "device-write-pseudo-copy",
-            r#"\b(?:cp|mv|install)\b[^|;&]*\s['"]?/dev/(?:null|zero|full|random|urandom|std(?:in|out|err)|tty|console|ptmx|fd/|pts/|shm/)\S*['"]?\s*$"#
-        ),
+        // fdisk-list, mount-list, mdadm and LVM read-only exemptions were
+        // redundant and removed for #448. The same is true of nbd-client -l
+        // and -check: neither matches a destructive mode unless -d is present.
+        // mkswap --check is NOT read-only: it checks before formatting.
+        // Pseudo-device writer exclusions belong to the target rules below,
+        // not here: a safe target must never exempt another destructive write.
     ]
 }
 
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
-        // A writer tool naming a device destroys it exactly as `dd` does, and
-        // every neighbouring spelling already denied: `dd of=/dev/sda`,
-        // `mkfs.ext4 /dev/sda1`, `wipefs --all /dev/sda` and every redirect
-        // form (`cat /dev/zero > /dev/sda`) via core.filesystem. `tee` fell
-        // between them — not a redirect, so the redirect rule saw no target,
-        // and not a device tool this pack modelled (#444). `curl … | tee
-        // /dev/sda` is the idiom an agent reaches for once `dd` is blocked,
-        // which is the same substitution pressure that motivated the
-        // `find … -delete` rules.
-        //
-        // The device set is left open the way `dd-device` leaves it open:
-        // matching `/dev/` and exempting the pseudo-devices by name below.
-        // Enumerating block devices instead would miss whatever this host
-        // calls them — /dev/xvda, /dev/nbd0, /dev/ram0 — and a destructive
-        // pattern that fails to match is a missed denial, while a safe
-        // pattern that fails to match only withdraws an exemption.
+        // A harmless destination is a property of that target, not permission
+        // to skip the entire pack. Check every tee operand, including after a
+        // regular file or /dev/null, but do not mistake an input redirect for
+        // an output. Quote capture keeps "/dev/null extra" from being exempted.
+        // Pseudo-device names are exact; /dev/shm paths cannot escape via `..`.
         destructive_pattern!(
             "tee-device",
-            r#"\b(?:tee|sponge)\b(?:\s+-{1,2}\S+)*\s+['"]?/dev/"#,
+            r#"\b(?:tee|sponge)\b(?:\s+(?:[^\s"'\\;&|<>]|\\[^\r\n]|'[^']*'|"[^"]*")+)*\s+(['"]?)/dev/(?!(?:(?:null|zero|full|random|urandom|std(?:in|out|err)|tty|console|ptmx)|(?:fd|pts)/\d+)\1(?:\s|$|[|<>])|shm/(?!(?:[^\s'"]*/)?\.\.(?:/|\1(?:\s|$)))[^\s'"]*\1(?:\s|$|[|<>]))"#,
             "tee/sponge into a device will OVERWRITE that device, exactly as dd would. Extremely dangerous!"
         ),
         // cp/mv/install write their LAST argument, so the device has to be in
@@ -317,7 +203,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // ordinary, `cp /dev/zero /dev/sda` writes one and is not.
         destructive_pattern!(
             "copy-to-device",
-            r#"\b(?:cp|mv|install)\b[^|;&]*\s['"]?/dev/[^\s'"|;&]+['"]?\s*$"#,
+            r#"\b(?:cp|mv|install)\b[^|;&]*\s(['"]?)/dev/(?!(?:(?:null|zero|full|random|urandom|std(?:in|out|err)|tty|console|ptmx)|(?:fd|pts)/\d+)\1(?:\s|$|[|<>])|shm/(?!(?:[^\s'"]*/)?\.\.(?:/|\1(?:\s|$)))[^\s'"]*\1(?:\s|$|[|<>]))[^\s'"|;&]+\1\s*$"#,
             "Copying or moving onto a device OVERWRITES that device, exactly as dd would. Extremely dangerous!"
         ),
         // dd to block devices. Accept optional quotes around the device path
@@ -1266,5 +1152,177 @@ mod tests {
             pack.might_match("mkswap /dev/sdb"),
             "mkswap must be in pack keywords or it will be filtered out before regex eval"
         );
+    }
+
+    #[test]
+    fn all_readonly_families_reject_redirect_data_issue_448() {
+        let pack = create_pack();
+        for command in [
+            "dd if=/dev/zero of=/dev/sda",
+            "wipefs -a /dev/sdb",
+            "mkfs.ext4 /dev/sdb1",
+        ] {
+            for text in [
+                "lsblk",
+                "blkid",
+                "df",
+                "fdisk -l",
+                "mount",
+                "btrfs subvolume list report",
+                "btrfs subvolume show report",
+                "btrfs filesystem show report",
+                "btrfs filesystem df report",
+                "btrfs filesystem usage report",
+                "btrfs device stats report",
+                "btrfs property get report",
+                "btrfs scrub status report",
+                "dmsetup ls report",
+                "dmsetup info report",
+                "dmsetup status report",
+                "dmsetup table report",
+                "dmsetup deps report",
+                "nbd-client -l report",
+                "nbd-client -check report",
+                "diskutil list report",
+                "dd of=backup.img",
+                "dd of=/dev/null",
+                "tee /dev/null",
+                "cp image /dev/null",
+            ] {
+                for quote in ['\'', '"'] {
+                    let candidate = format!("{command} 2>>{quote}/tmp/{text}{quote}");
+                    assert!(!pack.matches_safe(&candidate), "exempted: {candidate}");
+                    // At the raw-pack layer multiple destructive expressions
+                    // can see the filename. Require a denial, never a waiver.
+                    assert!(pack.check(&candidate).is_some(), "allowed: {candidate}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn readonly_exemptions_require_the_actual_executable_issue_448() {
+        let pack = create_pack();
+        for prefix in [
+            "2>/tmp/lsblk ",
+            "2>/tmp/blkid ",
+            "2>/tmp/df ",
+            "REPORT=/tmp/lsblk ",
+            "REPORT=/tmp/df ",
+            "sudo -u lsblk ",
+            "sudo -u df ",
+        ] {
+            let command = format!("{prefix}dd if=/dev/zero of=/dev/sda");
+            assert!(!pack.matches_safe(&command), "exempted: {command}");
+            assert_blocks_with_pattern(&pack, &command, "dd-device");
+        }
+        for command in [
+            "lsblk-helper dd of=/dev/sda",
+            "df-helper dd of=/dev/sda",
+            "blkid-helper dd of=/dev/sda",
+            "lsblk; dd of=/dev/sda",
+            "btrfs subvolume list /mnt; dd of=/dev/sda",
+        ] {
+            assert!(!pack.matches_safe(command), "exempted: {command}");
+        }
+    }
+
+    #[test]
+    fn readonly_global_flags_do_not_consume_mutations_issue_448() {
+        let pack = create_pack();
+        for command in [
+            "dmsetup -v remove info",
+            "dmsetup --noudevsync remove table",
+            "dmsetup --verifyudev remove status",
+        ] {
+            assert!(!pack.matches_safe(command), "exempted: {command}");
+            assert_blocks_with_pattern(&pack, command, "dmsetup-remove");
+        }
+        for command in [
+            "dmsetup -v info remove",
+            "dmsetup --noudevsync table remove",
+            "dmsetup --verifyudev status remove",
+            "btrfs --format json subvolume list /mnt",
+            "btrfs --format=json filesystem show",
+            "btrfs --verbose --log info filesystem usage /mnt",
+            "btrfs -q device stats /mnt",
+            "nbd-client -l server.example.com",
+            "nbd-client -check /dev/nbd0",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
+    #[test]
+    fn dd_discard_requires_real_output_operands_issue_448() {
+        let pack = create_pack();
+        // Repeated of= has no portable ordering guarantee. No safe output may
+        // cancel a device output in either order; filenames are not operands.
+        for command in [
+            "dd of=/dev/null of=/dev/sda",
+            "dd of=/dev/sda of=/dev/null",
+            "dd of=backup.img of=/dev/sda",
+            "dd of=/dev/sda of=backup.img",
+            "dd if=of=backup.img of=/dev/sda",
+            "dd if='of=backup.img' of=/dev/sda",
+            "dd if=source.img of='/dev/null' of='/dev/sda'",
+            "dd of=/dev/null 2>/dev/sda",
+        ] {
+            assert!(!pack.matches_safe(command), "exempted: {command}");
+            assert_blocks_with_pattern(&pack, command, "dd-device");
+        }
+        for command in [
+            "dd if=/dev/sda of=/dev/null count=1",
+            "dd of='/dev/null' if='/tmp/input with spaces'",
+            "dd of=\"/dev/null\" if=/dev/sda",
+            "dd 'of=/dev/null' if=/dev/sda",
+            "dd if='data of=/dev/sda' of=/dev/null",
+            "dd if=of=backup.img of=/dev/null",
+            "dd of=/dev/null of=/dev/zero",
+            "dd of=/dev/null < /dev/sda",
+            "dd if=/dev/sda of=/dev/null 2>/tmp/benchmark.log",
+            "dd if=/dev/sda of=/dev/null 2>&1",
+            "dd if=/dev/sda of=/dev/null > /dev/null",
+            "sudo -n /bin/dd if=/dev/sda of=/dev/null",
+        ] {
+            assert_safe_pattern_matches(&pack, command);
+            assert_allows(&pack, command);
+        }
+    }
+
+    #[test]
+    fn pseudo_devices_do_not_hide_other_writer_targets_issue_444() {
+        let pack = create_pack();
+        for command in [
+            "tee /dev/null /dev/sda",
+            "tee out.log /dev/sda",
+            "tee --append /dev/null /dev/sda",
+            "tee 'log with spaces' /dev/sda",
+            "tee /dev/null-disk",
+            "tee /dev/fd/3-disk",
+            "tee /dev/shm/../sda",
+            "tee /dev/shm/x/../../sda",
+            "tee \"/dev/null /../sda\"",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "tee-device");
+        }
+        for command in [
+            "cp file /dev/null-disk",
+            "cp file /dev/shm/../sda",
+            "mv file /dev/shm/x/../../sda",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "copy-to-device");
+        }
+        for command in [
+            "tee /dev/null /dev/zero",
+            "tee /dev/null out.log",
+            "tee out.log < /dev/sda",
+            "tee 'log /dev/sda'",
+            "tee \"/dev/null\"",
+            "cp file '/dev/null'",
+            "cp file /dev/shm/buffer",
+        ] {
+            assert_allows(&pack, command);
+        }
     }
 }
