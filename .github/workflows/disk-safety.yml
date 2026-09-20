@@ -1,0 +1,88 @@
+name: Disk safety
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/disk-safety.yml
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .cargo/**
+      - src/**
+      - vendor/**
+      - tests/disk_tests.rs
+      - scripts/e2e_destructive_equivalents.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: disk-safety-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  disk-safety:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 2
+      RCH_ENABLED: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Activate the repository-pinned Rust toolchain
+        run: |
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: disk-safety-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
+      - name: Disk pack unit tests and default-config real-binary regressions
+        run: |
+          set -euo pipefail
+          mkdir -p target/disk-safety
+          git rev-parse HEAD | tee target/disk-safety/revision.txt
+          cargo test --locked --lib packs::system::disk::tests -- --nocapture 2>&1 | tee target/disk-safety/unit.log
+          cargo test --locked --test disk_tests -- --nocapture 2>&1 | tee target/disk-safety/hook.log
+          cargo build --locked --bin dcg 2>&1 | tee target/disk-safety/build.log
+      - name: Default-config shell E2E scenario
+        run: |
+          set -euo pipefail
+          root=$(mktemp -d)
+          mkdir -p "$root/home" "$root/config" "$root/data" "$root/work"
+          binary="$PWD/target/debug/dcg"
+          script="$PWD/scripts/e2e_destructive_equivalents.sh"
+          log="$PWD/target/disk-safety/shell-e2e.log"
+          cd "$root/work"
+          env -i PATH="$PATH" HOME="$root/home" XDG_CONFIG_HOME="$root/config" \
+            XDG_DATA_HOME="$root/data" DCG_SELF_HEAL_HOOK=0 DCG_HOOK_TIMEOUT_MS=5000 \
+            DCG_ALLOWLIST_SYSTEM_PATH="$root/no-system-allowlist.toml" \
+            DCG_BIN="$binary" DCG_E2E_FILTER=system_disk_default DCG_E2E_LOG="$log" \
+            bash "$script"
+      - name: Compile and lint all targets
+        run: |
+          set -euo pipefail
+          cargo check --locked --all-targets 2>&1 | tee target/disk-safety/check.log
+          cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee target/disk-safety/clippy.log
+          cargo fmt --check 2>&1 | tee target/disk-safety/fmt.log
+      - name: Retain revision-bound evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: disk-safety-${{ github.sha }}
+          path: |
+            target/disk-safety/
+            target/debug/dcg
+            src/packs/system/disk.rs
+            src/packs/regex_engine.rs
+            tests/disk_tests.rs
+          retention-days: 7
+          if-no-files-found: error
