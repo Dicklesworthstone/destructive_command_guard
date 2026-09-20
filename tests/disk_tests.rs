@@ -5,37 +5,66 @@ fn dcg_binary() -> std::path::PathBuf {
 }
 
 fn run_hook(command: &str) -> String {
+    run_hook_with_packs(command, Some("system.disk"))
+}
+
+fn run_hook_with_packs(command: &str, packs: Option<&str>) -> String {
     let input = serde_json::json!({
         "tool_name": "Bash",
         "tool_input": {
             "command": command,
         }
     });
+    let sandbox = tempfile::tempdir().expect("failed to create hook sandbox");
+    let root = sandbox.path();
+    let mut hook = Command::new(dcg_binary());
 
-    let mut child = Command::new(dcg_binary())
-        .env("DCG_PACKS", "system.disk")
-        // Hook-mode self-heal writes the invoked binary's own path into the
-        // caller's real agent settings, so without this a test run registers
-        // `target/release/dcg` as a global Claude Code PreToolUse hook on the
-        // developer's machine.
+    // Change only the child's environment. Ambient bypasses, pack overrides,
+    // or explicit config paths must not turn these regressions into false passes.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().to_ascii_uppercase().starts_with("DCG_") {
+            hook.env_remove(key);
+        }
+    }
+    hook.current_dir(root)
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("APPDATA", root.join("appdata"))
+        .env("LOCALAPPDATA", root.join("localappdata"))
+        .env("TMPDIR", root)
+        .env("TEMP", root)
+        .env("TMP", root)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", root.join("system-allowlist.toml"))
+        // Hook-mode self-heal must not register a test binary in the caller's
+        // real agent settings (including native Windows known-folder paths).
         .env("DCG_SELF_HEAL_HOOK", "0")
-        // Classification is the subject of these E2Es. Keep scheduler stalls
-        // on a saturated test host from exercising the separately unit-tested
-        // 200 ms fail-closed deadline policy instead.
+        // These are classification tests, not tests of the shipped deadline.
         .env("DCG_HOOK_TIMEOUT_MS", "5000")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("failed to spawn dcg");
-
+        .stderr(std::process::Stdio::piped());
+    if let Some(packs) = packs {
+        hook.env("DCG_PACKS", packs);
+    }
+    // With None there is no DCG_PACKS or DCG_CONFIG and no user/project config:
+    // the issue #448 regressions exercise the default-enabled system.disk pack.
+    let mut child = hook.spawn().expect("failed to spawn dcg");
     {
-        let stdin = child.stdin.as_mut().expect("failed to open stdin");
+        let stdin = child.stdin.take().expect("failed to open stdin");
         serde_json::to_writer(stdin, &input).expect("failed to write json");
     }
 
     let output = child.wait_with_output().expect("failed to wait for dcg");
-    String::from_utf8_lossy(&output.stdout).to_string()
+    assert!(
+        output.status.success(),
+        "hook failed for {command:?}: status={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("hook stdout must be UTF-8")
 }
 
 #[test]
@@ -284,4 +313,140 @@ fn pvmove_blocked() {
     let cmd = "pvmove /dev/sda1 /dev/sdb1";
     let output = run_hook(cmd);
     assert!(output.contains("deny"), "Bypass: '{cmd}' was allowed!");
+}
+
+// --- #448: real-binary coverage with default pack selection ---
+
+fn assert_default_blocked(command: &str, expected_rule: &str) {
+    let output = run_hook_with_packs(command, None);
+    let result: serde_json::Value = serde_json::from_str(&output).unwrap_or_else(|error| {
+        panic!("invalid denial for {command:?}: {error}; stdout={output:?}")
+    });
+    let hook = &result["hookSpecificOutput"];
+    assert_eq!(hook["permissionDecision"], "deny", "{command:?}: {output}");
+    assert_eq!(hook["ruleId"], expected_rule, "{command:?}: {output}");
+}
+
+#[test]
+fn default_disk_redirect_targets_do_not_disarm_the_pack_issue_448() {
+    // These are shell redirects, not stray dd operands. The strings are only
+    // sent to dcg's hook; this test never executes a disk-writing command.
+    for (command, rule) in [
+        ("dd if=/dev/zero of=/dev/sda", "system.disk:dd-device"),
+        ("wipefs -a /dev/sdb", "system.disk:wipefs"),
+        ("mkfs.ext4 /dev/sdb1", "system.disk:mkfs"),
+    ] {
+        assert_default_blocked(command, rule);
+        for redirect in [
+            "2>>/tmp/dcg.log", // matched control: only the filename changes
+            "2>>/var/log/mount",
+            "2>/tmp/mount",
+            r#"2>>"/tmp/fdisk -l.log""#,
+            "2>>'/tmp/fdisk -l.log'",
+        ] {
+            assert_default_blocked(&format!("{command} {redirect}"), rule);
+        }
+    }
+}
+
+#[test]
+fn default_disk_original_bypasses_stay_blocked_issue_448() {
+    for (command, rule) in [
+        (
+            "dd if=/dev/zero of=/dev/sda 2>>/var/log/blkid.log",
+            "system.disk:dd-device",
+        ),
+        ("mkfs.ext4 -L lsblk /dev/sdb1", "system.disk:mkfs"),
+        ("mkfs.ext4 -L df /dev/sdb1", "system.disk:mkfs"),
+        ("wipefs -a /dev/sdb -o /tmp/df.bak", "system.disk:wipefs"),
+        (
+            "mdadm --stop /dev/md0 --config /etc/blkid.conf",
+            "system.disk:mdadm-stop",
+        ),
+        (
+            "dmsetup remove mydev --table /tmp/lsblk",
+            "system.disk:dmsetup-remove",
+        ),
+        ("lvremove -f vg/lv --config /tmp/blkid", "system.disk:lvremove"),
+        ("tee /dev/sda < /tmp/blkid.img", "system.disk:tee-device"),
+        ("mdadm --detail --stop /dev/md0", "system.disk:mdadm-stop"),
+        (
+            "mdadm --scan --zero-superblock /dev/sdb",
+            "system.disk:mdadm-zero-superblock",
+        ),
+        ("mkswap --check /dev/sdb1", "system.disk:mkswap"),
+        ("mkswap -c /dev/sdb1", "system.disk:mkswap"),
+        ("mkfs.ext4 -L lvs /dev/sdb1", "system.disk:mkfs"),
+        ("mkfs.ext4 -L vgs /dev/sdb1", "system.disk:mkfs"),
+        ("mkfs.ext4 -L pvs /dev/sdb1", "system.disk:mkfs"),
+        ("mkfs.ext4 -L lvscan /dev/sdb1", "system.disk:mkfs"),
+        (
+            "dd if=/dev/zero of=/dev/sda 2>>/var/log/pvscan",
+            "system.disk:dd-device",
+        ),
+    ] {
+        assert_default_blocked(command, rule);
+    }
+}
+
+#[test]
+fn default_disk_read_only_and_ordinary_commands_stay_allowed_issue_448() {
+    for command in [
+        "fdisk -l",
+        "fdisk -l /dev/sda",
+        "fdisk /dev/sda -l",
+        "sudo fdisk -l",
+        "/sbin/fdisk -l /dev/sda",
+        "LC_ALL=C fdisk -l /dev/sda",
+        "mount",
+        "sudo mount",
+        "/bin/mount",
+        "LC_ALL=C mount",
+        "mount -l",
+        "mount -t ext4",
+        "mount /dev/sdb1 /mnt",
+        "lsblk -f -o NAME,SIZE",
+        "sudo lsblk",
+        "blkid -o value -s UUID /dev/sda1",
+        "df -h /",
+        "mdadm --detail /dev/md0",
+        "mdadm --examine /dev/sdb1",
+        "mdadm --detail --scan",
+        "lvs -a -o +devices",
+        "vgs -o vg_name",
+        "pvs /dev/sda",
+        "lvdisplay",
+        "vgdisplay",
+        "pvdisplay",
+        "lvscan",
+        "vgscan",
+        "pvscan",
+        "parted /dev/sda print free",
+        "dd if=/dev/sda of=/dev/null count=1",
+    ] {
+        let output = run_hook_with_packs(command, None);
+        assert!(output.trim().is_empty(), "{command:?}: {output}");
+    }
+}
+
+#[test]
+fn default_disk_read_only_neighbors_do_not_hide_destruction_issue_448() {
+    for (command, rule) in [
+        (
+            "fdisk -l && dd if=/dev/zero of=/dev/sda 2>>/var/log/mount",
+            "system.disk:dd-device",
+        ),
+        (
+            "dd if=/dev/zero of=/dev/sda 2>>/var/log/mount; fdisk -l",
+            "system.disk:dd-device",
+        ),
+        ("mount; wipefs -a /dev/sdb 2>/tmp/mount", "system.disk:wipefs"),
+        ("wipefs -a /dev/sdb 2>/tmp/mount && mount", "system.disk:wipefs"),
+        (
+            r#"lsblk && mkfs.ext4 /dev/sdb1 2>>"/tmp/fdisk -l.log""#,
+            "system.disk:mkfs",
+        ),
+    ] {
+        assert_default_blocked(command, rule);
+    }
 }
