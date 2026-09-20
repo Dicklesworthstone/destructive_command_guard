@@ -22,7 +22,11 @@ fn run_hook_with_packs(command: &str, packs: Option<&str>) -> String {
     // Change only the child's environment. Ambient bypasses, pack overrides,
     // or explicit config paths must not turn these regressions into false passes.
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().to_ascii_uppercase().starts_with("DCG_") {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("DCG_")
+        {
             hook.env_remove(key);
         }
     }
@@ -37,7 +41,10 @@ fn run_hook_with_packs(command: &str, packs: Option<&str>) -> String {
         .env("TMPDIR", root)
         .env("TEMP", root)
         .env("TMP", root)
-        .env("DCG_ALLOWLIST_SYSTEM_PATH", root.join("system-allowlist.toml"))
+        .env(
+            "DCG_ALLOWLIST_SYSTEM_PATH",
+            root.join("system-allowlist.toml"),
+        )
         // Hook-mode self-heal must not register a test binary in the caller's
         // real agent settings (including native Windows known-folder paths).
         .env("DCG_SELF_HEAL_HOOK", "0")
@@ -367,7 +374,10 @@ fn default_disk_original_bypasses_stay_blocked_issue_448() {
             "dmsetup remove mydev --table /tmp/lsblk",
             "system.disk:dmsetup-remove",
         ),
-        ("lvremove -f vg/lv --config /tmp/blkid", "system.disk:lvremove"),
+        (
+            "lvremove -f vg/lv --config /tmp/blkid",
+            "system.disk:lvremove",
+        ),
         ("tee /dev/sda < /tmp/blkid.img", "system.disk:tee-device"),
         ("mdadm --detail --stop /dev/md0", "system.disk:mdadm-stop"),
         (
@@ -440,8 +450,14 @@ fn default_disk_read_only_neighbors_do_not_hide_destruction_issue_448() {
             "dd if=/dev/zero of=/dev/sda 2>>/var/log/mount; fdisk -l",
             "system.disk:dd-device",
         ),
-        ("mount; wipefs -a /dev/sdb 2>/tmp/mount", "system.disk:wipefs"),
-        ("wipefs -a /dev/sdb 2>/tmp/mount && mount", "system.disk:wipefs"),
+        (
+            "mount; wipefs -a /dev/sdb 2>/tmp/mount",
+            "system.disk:wipefs",
+        ),
+        (
+            "wipefs -a /dev/sdb 2>/tmp/mount && mount",
+            "system.disk:wipefs",
+        ),
         (
             r#"lsblk && mkfs.ext4 /dev/sdb1 2>>"/tmp/fdisk -l.log""#,
             "system.disk:mkfs",
