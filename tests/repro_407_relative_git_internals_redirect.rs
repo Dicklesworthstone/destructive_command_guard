@@ -157,3 +157,28 @@ fn an_ordinary_relative_redirect_is_not_collateral() {
         assert_eq!(decision, "allow", "should be allowed: {command} ({rule})");
     }
 }
+
+#[test]
+fn a_commit_message_discussing_the_rule_is_not_the_rule_firing() {
+    // These pins belong at THIS level and nowhere else. `pack.check` sees the
+    // raw text and the append rule matches a `>> .git/config` inside a commit
+    // message; what makes the command allowed is the evaluator's string-data
+    // sanitization, which runs before a pack regex is offered the slice. A
+    // pack-level `assert_no_match` for these fails, correctly.
+    //
+    // The same shape system.disk already relies on: `git commit -m "fix tee
+    // /dev/sda handling"` does not reach `tee-device` while bare
+    // `tee /dev/sda` does.
+    for command in [
+        "git commit -m \"document >> .git/config denial\"",
+        "git commit -m \"guard writes into .git/hooks\"",
+        "git commit -m \"note that cat > .git/config is denied\"",
+    ] {
+        let (decision, rule) = outcome(command);
+        assert_eq!(decision, "allow", "should be allowed: {command} ({rule})");
+    }
+
+    // The control, so this test cannot pass by the rules being dead.
+    let (decision, rule) = outcome("cat >> .git/config");
+    assert_eq!(decision, "deny", "the bare append must still deny ({rule})");
+}

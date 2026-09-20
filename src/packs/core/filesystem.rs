@@ -634,7 +634,6 @@ pub(crate) fn is_pre_rm_propagation_rule(name: Option<&str>) -> bool {
                 | "redirect-truncate-dynamic-path"
                 | "redirect-truncate-git-internals-relative"
                 | "redirect-append-git-internals-relative"
-                | "tee-git-internals"
         )
     )
 }
@@ -4816,36 +4815,28 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - To inspect rather than extend, read it: `cat .git/config`.",
             GIT_INTERNALS_WRITE_SUGGESTIONS
         ),
-        // `tee` and `sponge` write every file operand they are given, so a
-        // `.git/` operand is a write to a git internal no matter where in the
-        // argument list it sits. This is the same reading `system.disk`
-        // applies to `tee /dev/sda` (#444), and `credential-file-write`
-        // already treats `tee` as a writer of `~/.ssh/**`; only the `.git`
-        // target was missing (#457).
+        // There is deliberately no `tee`/`sponge` rule here, and the reason is
+        // a property of this pack rather than of the writer (#457, #460).
         //
-        // The operand walk is what makes the position irrelevant:
-        // `tee /tmp/log .git/config` writes both. Reading a git internal INTO
-        // a tee is untouched, because `cat .git/config | tee /tmp/x` puts the
-        // `.git` path before `tee`, and this pattern only looks forward.
-        destructive_pattern!(
-            "tee-git-internals",
-            r#"\b(?:tee|sponge)\b(?:\s+(?:[^\s"'\\;&|<>]|\\[^\r\n]|'[^']*'|"[^"]*")+)*\s+['"]?(?:\./)?(?:[^\s'";&|<>]*/)?\.git/"#,
-            "tee/sponge into a .git path writes repository internals, and -a makes it an append rather than a replacement.",
-            Critical,
-            "`tee` writes every file it is named with, and `tee -a` appends to them. \
-             Either way the destination here is a git internal:\n\
-             - `.git/config` carries remotes, hook configuration and credential helpers.\n\
-             - `.git/HEAD` and `.git/refs/**` decide which commits are reachable.\n\
-             - `.git/hooks/**` is executed by git, so a write there runs on the next \
-               commit, merge or checkout.\n\n\
-             Redirecting to the same path is already denied in both its truncating and \
-             its appending spelling; piping through `tee` is the same write.\n\n\
-             Safer alternatives:\n\
-             - Change configuration through git: `git config <key> <value>`.\n\
-             - Send the tee output to a scratch path instead: `tee /tmp/<subdir>/config`.\n\
-             - Reading a git internal is never blocked: `cat .git/config`.",
-            GIT_INTERNALS_WRITE_SUGGESTIONS
-        ),
+        // A `core.filesystem` destructive regex whose match lies wholly inside
+        // argv does not reach the evaluator. Measured three ways against a
+        // built binary: the rule spelled with the command word, the same rule
+        // executable-scoped with `executables = ["tee", "sponge"]`, and the
+        // rule reduced to the bare literal `\.git/` all allow
+        // `tee .git/config`, while `cat > .git/config` denies throughout and
+        // `truncate -s 0 .git/config` — a regex whose match BEGINS at the
+        // command word — denies too. `tee .ssh/id_rsa` denies as well, through
+        // `credential-file-write`, which is a classifier and does not go
+        // through the regex pass at all.
+        //
+        // So the supported way to guard a non-redirect writer of a literal
+        // path in this pack is the credential classifier, not a pattern. That
+        // is a larger change than #457 (it needs a per-entry rule name so a
+        // `.git` denial does not report as `credential-file-write`, and it
+        // decides the `cp`/`install` posture at the same time), so the writer
+        // gap stays open rather than being closed by a rule that passes its
+        // pack-level test and never fires in production.
+        //
         // The shell expands redirect targets at runtime. A variable, command
         // substitution, or backslash-obfuscated suffix can therefore resolve
         // outside an apparent temp path before O_TRUNC opens the file.
@@ -6244,7 +6235,6 @@ mod tests {
             "redirect-truncate-dynamic-path",
             "redirect-truncate-git-internals-relative",
             "redirect-append-git-internals-relative",
-            "tee-git-internals",
         ] {
             let rule = pack
                 .destructive_patterns
@@ -6316,24 +6306,50 @@ mod tests {
     }
 
     #[test]
-    fn tee_into_git_internals_is_denied_issue_457() {
-        // `tee` writes every operand it is given, which is the same reading
-        // `system.disk:tee-device` applies and the same one
-        // `credential-file-write` applies to `~/.ssh/**`. Only the `.git`
-        // target was missing.
+    fn a_pack_regex_cannot_reach_a_tee_operand_issue_460() {
+        // Why there is no `tee-git-internals` rule. A pack-level `check` DOES
+        // match a rule spelled for `tee <path>` — this test proves the regex
+        // is fine — and the same rule then never fires in the evaluator, which
+        // is the exact shape #407/#441/#444 were about, one layer deeper: the
+        // keyword admits the pack, the pack agrees, and production still
+        // allows the command.
+        //
+        // Keeping the rule with this test passing would have shipped a green
+        // assertion of coverage that does not exist, so the rule is out and
+        // #460 carries the evaluator gap. This test stays as the guard: if the
+        // regex ever stops matching here, the reasoning above is stale.
         let pack = create_pack();
+        let candidate = DestructivePattern {
+            regex: crate::packs::regex_engine::LazyCompiledRegex::new(
+                r#"\b(?:tee|sponge)\b(?:\s+(?:[^\s"'\\;&|<>]|\\[^\r\n]|'[^']*'|"[^"]*")+)*\s+['"]?(?:\./)?(?:[^\s'";&|<>]*/)?\.git/"#,
+            ),
+            reason: "candidate rule retained only as this test's fixture",
+            name: Some("tee-git-internals-candidate"),
+            severity: Severity::Critical,
+            explanation: None,
+            suggestions: &[],
+            executables: None,
+        };
         for cmd in [
             "tee .git/config",
             "tee -a .git/config",
             "echo x | tee .git/hooks/pre-commit",
-            "echo x | tee /tmp/log .git/config",
             "sponge .git/config",
-            "tee \"$HOME/proj/.git/config\"",
             "tee sub/.git/config",
         ] {
-            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
-            assert_blocks_with_pattern(&pack, cmd, "tee-git-internals");
+            assert!(
+                candidate.matches_command(cmd),
+                "the candidate regex must still match {cmd}; if it does not, the \
+                 #460 reasoning needs re-measuring rather than trusting"
+            );
         }
+        assert!(
+            !pack
+                .destructive_patterns
+                .iter()
+                .any(|pattern| pattern.name == Some("tee-git-internals")),
+            "the rule must stay out of the pack until the evaluator can reach it (#460)"
+        );
     }
 
     #[test]
@@ -6350,6 +6366,11 @@ mod tests {
             "echo x >> notes/git.md",
             "cat .git/config | tee /tmp/backup",
             "git ls-files | tee .gitignore",
+            // A commit message that discusses these rules is covered by the
+            // EVALUATOR's string-data sanitization, not by the pack, so its
+            // pin lives in `tests/repro_407_relative_git_internals_redirect`
+            // where the hook actually runs. Asserting it here fails, correctly:
+            // `pack.check` sees the raw text and the append rule matches it.
             "tee /tmp/scratch/config",
             "cp /tmp/x .git/config",
             "install -m 644 /tmp/x .git/config",

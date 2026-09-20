@@ -223,7 +223,6 @@ These patterns match potentially destructive commands:
 | `redirect-truncate-root-home` | shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to an existing sensitive system or home path destroys the previous file contents. A currently absent literal target under the home directory with an existing parent is allowed (creation, not truncation — the same thing `>>` would do); existing files, dynamic paths, symlinks, missing parents, system paths, and .git internals stay blocked. | critical |
 | `redirect-truncate-git-internals-relative` | shell truncating redirect into a .git directory rewrites repository internals; a relative spelling names the same file an absolute one does. | critical |
 | `redirect-append-git-internals-relative` | shell appending redirect into a .git directory adds repository configuration or hook code that git runs on its next invocation. | critical |
-| `tee-git-internals` | tee/sponge into a .git path writes repository internals, and -a makes it an append rather than a replacement. | critical |
 | `redirect-truncate-dynamic-path` | shell redirect to a dynamic or escaped path may truncate a sensitive file and requires human approval. | high |
 | `fork-bomb` | This is a fork bomb: it recursively spawns processes until the system is unusable. | critical |
 

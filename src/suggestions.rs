@@ -997,10 +997,6 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
     );
     m.insert(
         "core.filesystem:redirect-append-git-internals-relative",
-        git_internals_write_suggestions.clone(),
-    );
-    m.insert(
-        "core.filesystem:tee-git-internals",
         git_internals_write_suggestions,
     );
     m.insert(
