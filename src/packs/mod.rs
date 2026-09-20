@@ -6667,6 +6667,55 @@ mod tests {
             }
         }
 
+        /// Packs whose rules key on a URL path, and the path they key on.
+        ///
+        /// A vendor name is not a usable gate for a self-hosted product: the
+        /// server is reached at whatever hostname the operator chose, so a row
+        /// carrying only the vendor name lets its own API rules fire by
+        /// coincidence and not otherwise (#447). `monitoring.prometheus` set
+        /// the precedent by carrying `/api/dashboards` beside `grafana-cli`.
+        ///
+        /// SaaS-only products are deliberately absent: `launchdarkly` and
+        /// `split` anchor on `app.launchdarkly.com` and `api.split.io`, which
+        /// contain the vendor name, so their rows already reach them.
+        const API_PATH_TRIGGERS: &[(&str, &str)] = &[
+            ("featureflags.flipt", "/api/v1/"),
+            ("featureflags.unleash", "/api/admin/"),
+            ("monitoring.prometheus", "/api/dashboards"),
+        ];
+
+        /// A rule keyed on a URL path needs that path in the gate.
+        ///
+        /// `registry_keywords_cover_every_pack_declared_keyword` above compares
+        /// the two keyword lists against each other, so it passes when a
+        /// trigger is missing from *both* — which is exactly how #447 hid. This
+        /// checks the lists against what the rules actually match on instead.
+        ///
+        /// It is a table and not a derivation because a regex's literal anchors
+        /// are not machine-readable here; adding a pack with a URL-keyed rule
+        /// means adding a row.
+        #[test]
+        fn a_rule_keyed_on_a_url_path_has_that_path_in_its_gate() {
+            for (pack_id, path) in API_PATH_TRIGGERS {
+                let entry = PACK_ENTRIES
+                    .iter()
+                    .find(|entry| entry.id == *pack_id)
+                    .unwrap_or_else(|| panic!("unknown pack id: {pack_id}"));
+                assert!(
+                    entry.keywords.contains(path),
+                    "{pack_id}: PACK_ENTRIES must carry {path:?} — it is the gate that \
+                     decides, and the rule keyed on that path cannot fire without it"
+                );
+                let pack = REGISTRY
+                    .get(pack_id)
+                    .unwrap_or_else(|| panic!("pack {pack_id} should be retrievable"));
+                assert!(
+                    pack.keywords.contains(path),
+                    "{pack_id}: the pack must declare {path:?} too, so the two lists agree"
+                );
+            }
+        }
+
         #[test]
         fn all_registered_packs_instantiate_successfully() {
             for entry in &PACK_ENTRIES {
