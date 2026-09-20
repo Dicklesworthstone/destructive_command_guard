@@ -175,9 +175,15 @@ built-in rule IDs. Use these IDs for allowlisting and tests.
 | `heredoc.ruby.dir_delete` | `Dir.delete($$$)` | deletes directories |
 | `heredoc.ruby.dir_rmdir` | `Dir.rmdir($$$)` | deletes directories |
 | `heredoc.ruby.fileutils_rm` | `FileUtils.rm($$$)` | deletes files |
+| `heredoc.ruby.fileutils_rm_f` | `FileUtils.rm_f($$$)` | force-deletes files |
 | `heredoc.ruby.fileutils_remove` | `FileUtils.remove($$$)` | deletes files |
+| `heredoc.ruby.fileutils_remove_file` | `FileUtils.remove_file($$$)` | deletes a file |
+| `heredoc.ruby.fileutils_rmdir` | `FileUtils.rmdir($$$)` | deletes empty directories |
 | `heredoc.ruby.fileutils_remove_dir` | `FileUtils.remove_dir($$$)` | deletes directories |
 | `heredoc.ruby.fileutils_rm_rf` | `FileUtils.rm_rf($$$)` | recursively deletes directories |
+| `heredoc.ruby.fileutils_rm_r` | `FileUtils.rm_r($$$)` | recursively deletes directories |
+| `heredoc.ruby.fileutils_remove_entry` | `FileUtils.remove_entry($$$)` | recursively deletes a path and its children |
+| `heredoc.ruby.fileutils_remove_entry_secure` | `FileUtils.remove_entry_secure($$$)` | recursively deletes a path and its children |
 | `heredoc.ruby.system` | `system($$$)` | executes shell commands |
 | `heredoc.ruby.exec` | `exec($$$)` | replaces process with shell command |
 | `heredoc.ruby.kernel_system` | `Kernel.system($$$)` | executes shell commands |

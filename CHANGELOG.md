@@ -17,6 +17,35 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Security
 
+- **`FileUtils.rm_r('/')` was allowed while `FileUtils.rm_rf('/')` was
+  blocked** (#454). Ruby's own docs define `rm_rf` as `rm_r` with
+  `force: true`; the only difference is that `rm_rf` swallows errors, so `rm_r`
+  is the spelling a script that checks for failure reaches for. Both the AST
+  rules and the literal pre-AST fallback were driven by the same four method
+  names (`rm_rf`, `remove_dir`, `rm`, `remove`), so there was no second layer
+  to catch the gap, and `check_fallback_patterns` has no Ruby entries at all.
+
+  The trailing `\b` in `RUBY_FILEUTILS_LITERAL` is why `rm_r` was unmatchable
+  rather than merely unmatched: `rm` matches the prefix, and `\b` then has to
+  hold between `m` and `_`, which is not a boundary. No ordering of the
+  alternation could have fixed it.
+
+  The inversion ran the wrong way round. `FileUtils.rm('/home/user')` was
+  **denied** even though `rm` is not recursive and raises `Errno::EISDIR` on a
+  directory, while `FileUtils.rm_r('/home/user')` was **allowed** and wipes the
+  tree. Verified allowed before the fix and denied after, at `/`, `/etc`,
+  `/usr`, `/var`, `~` and `/home/user/.ssh`, in both a heredoc body and a
+  `ruby -e` one-liner.
+
+  Now covered: `rm_r`, `remove_entry`, `remove_entry_secure` (recursive),
+  `rm_f`, `remove_file` (the force/alias siblings of the already-covered
+  `rm`/`remove`), and `rmdir` — the last because `Dir.rmdir`, which
+  `FileUtils.rmdir` delegates to, already blocked on a catastrophic target, so
+  covering one spelling and not the other was an inconsistency rather than a
+  carve-out. Non-deleting `FileUtils` calls (`mkdir_p`, `cp_r`, `mv`,
+  `chmod_R`, `touch`, `ln_s`) and non-catastrophic targets are asserted
+  unchanged in both directions.
+
 - **`tee ~/.SSH/id_rsa` was allowed, on the filesystems most of our users are
   on.** `credential-file-write` compared path components case-sensitively, so
   an upper- or mixed-case spelling read as a different path and switched the

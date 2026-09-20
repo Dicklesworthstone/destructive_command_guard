@@ -733,9 +733,34 @@ static RUBY_QUOTED_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
 /// passing mention.
 const STATEMENT_START: &str = r"(?:^|[;&|{(]|=>|\bdo\b|\bthen\b)[ \t]*";
 
+/// Two constraints on the `fn` alternation, both load-bearing (#454):
+///
+/// 1. **Every recursive deletion method must be listed explicitly.** The
+///    trailing `\b` means a shorter name can never stand in for a longer one:
+///    against `FileUtils.rm_r(`, the `rm` alternative matches but `\b` then has
+///    to hold between `m` and `_`, and `_` is a word character. So `rm_r` was
+///    unmatchable by construction while `rm_rf` blocked — dcg denied
+///    `FileUtils.rm('/')`, which raises `Errno::EISDIR` on a directory, and
+///    allowed `FileUtils.rm_r('/')`, which wipes it. Per Ruby's docs `rm_rf` is
+///    just `rm_r` with `force: true`; the only difference is that `rm_rf`
+///    swallows errors, so `rm_r` is what a script that checks for failure uses.
+/// 2. **Longest-first ordering within each shared prefix.** `regex` prefers the
+///    earliest alternative that yields an overall match, and `fn` is
+///    interpolated straight into the rule id (`heredoc.ruby.fileutils_{fn}`).
+///    A short-first list would therefore be a silent allowlist-breaking rule-id
+///    change rather than a visible failure. The alternation is ordered by
+///    descending length within each family so the requirement is checkable by
+///    eye.
+///
+/// `rmdir` is included even though it removes only empty directories, because
+/// `Dir.rmdir` — the call `FileUtils.rmdir` delegates to — already blocks on a
+/// catastrophic target (`heredoc.ruby.dir_rmdir`). That is the same judgement
+/// already applied to `FileUtils.rm('/')`, which raises rather than deleting:
+/// a catastrophic literal target is treated as the signal, not the syscall's
+/// likely outcome.
 static RUBY_FILEUTILS_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"(?m){STATEMENT_START}FileUtils\.(?P<fn>rm_rf|remove_dir|rm|remove)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#
+        r#"(?m){STATEMENT_START}FileUtils\.(?P<fn>rm_rf|rmdir|rm_r|rm_f|rm|remove_entry_secure|remove_entry|remove_file|remove_dir|remove)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#
     ))
     .expect("ruby FileUtils literal regex compiles")
 });
@@ -2553,6 +2578,34 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
                 Severity::Medium, // refined to block only on catastrophic literal target
                 Some("Verify target path carefully before running".to_string()),
             ),
+            // `rm_r` is the same recursive delete as `rm_rf` (which Ruby defines
+            // as `rm_r` with `force: true`); it only differs by propagating
+            // errors instead of swallowing them. It must be listed separately
+            // here for the same reason it needs its own alternative in
+            // `RUBY_FILEUTILS_LITERAL`: these are exact method names, so a
+            // covered `rm_rf` grants `rm_r` nothing (#454).
+            CompiledPattern::new(
+                "FileUtils.rm_r($$$)".to_string(),
+                "heredoc.ruby.fileutils_rm_r".to_string(),
+                "FileUtils.rm_r() recursively deletes directories".to_string(),
+                Severity::Medium, // refined to block only on catastrophic literal target
+                Some("Verify target path carefully before running".to_string()),
+            ),
+            CompiledPattern::new(
+                "FileUtils.remove_entry($$$)".to_string(),
+                "heredoc.ruby.fileutils_remove_entry".to_string(),
+                "FileUtils.remove_entry() recursively deletes a path and its children".to_string(),
+                Severity::Medium, // refined to block only on catastrophic literal target
+                Some("Verify target path carefully before running".to_string()),
+            ),
+            CompiledPattern::new(
+                "FileUtils.remove_entry_secure($$$)".to_string(),
+                "heredoc.ruby.fileutils_remove_entry_secure".to_string(),
+                "FileUtils.remove_entry_secure() recursively deletes a path and its children"
+                    .to_string(),
+                Severity::Medium, // refined to block only on catastrophic literal target
+                Some("Verify target path carefully before running".to_string()),
+            ),
             CompiledPattern::new(
                 "FileUtils.remove_dir($$$)".to_string(),
                 "heredoc.ruby.fileutils_remove_dir".to_string(),
@@ -2567,10 +2620,39 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
                 Severity::Medium, // refined to block only on catastrophic literal target
                 None,
             ),
+            // The force variants of the two calls above. Listing `rm`/`remove`
+            // without them left the identical inversion this file already hit
+            // with `rm_r`, one step smaller: the plain call blocked and its
+            // `force: true` sibling did not (#454).
+            CompiledPattern::new(
+                "FileUtils.rm_f($$$)".to_string(),
+                "heredoc.ruby.fileutils_rm_f".to_string(),
+                "FileUtils.rm_f() force-deletes files".to_string(),
+                Severity::Medium, // refined to block only on catastrophic literal target
+                None,
+            ),
             CompiledPattern::new(
                 "FileUtils.remove($$$)".to_string(),
                 "heredoc.ruby.fileutils_remove".to_string(),
                 "FileUtils.remove() deletes files".to_string(),
+                Severity::Medium, // refined to block only on catastrophic literal target
+                None,
+            ),
+            CompiledPattern::new(
+                "FileUtils.remove_file($$$)".to_string(),
+                "heredoc.ruby.fileutils_remove_file".to_string(),
+                "FileUtils.remove_file() deletes a file".to_string(),
+                Severity::Medium, // refined to block only on catastrophic literal target
+                None,
+            ),
+            // Empty directories only, and it delegates to `Dir.rmdir`, which
+            // already blocks on a catastrophic target via
+            // `heredoc.ruby.dir_rmdir`. Covering only one of the two spellings
+            // was the inconsistency (#454).
+            CompiledPattern::new(
+                "FileUtils.rmdir($$$)".to_string(),
+                "heredoc.ruby.fileutils_rmdir".to_string(),
+                "FileUtils.rmdir() deletes empty directories".to_string(),
                 Severity::Medium, // refined to block only on catastrophic literal target
                 None,
             ),
@@ -3515,6 +3597,156 @@ mod tests {
                     .any(|m| m.rule_id == "heredoc.ruby.fileutils_rm_rf"
                         && !m.severity.blocks_by_default()),
                 "non-catastrophic FileUtils.rm_rf should warn only"
+            );
+        }
+
+        /// #454: every recursive `FileUtils` deletion blocks on a catastrophic
+        /// target, not just `rm_rf`.
+        ///
+        /// `rm_r` is the case that was allowed while `FileUtils.rm('/')` — which
+        /// raises `Errno::EISDIR` rather than deleting anything — was blocked.
+        #[test]
+        fn every_recursive_fileutils_delete_blocks_on_catastrophic_target_issue_454() {
+            let ast_matcher = AstMatcher::new();
+
+            for method in [
+                "rm_rf",
+                "rm_r",
+                "remove_entry",
+                "remove_entry_secure",
+                "remove_dir",
+            ] {
+                let code = format!("require 'fileutils'\nFileUtils.{method}('/')");
+                let matches = ast_matcher
+                    .find_matches(&code, ScriptLanguage::Ruby)
+                    .unwrap();
+                let expected = format!("heredoc.ruby.fileutils_{method}.catastrophic");
+                assert!(
+                    matches
+                        .iter()
+                        .any(|m| m.rule_id == expected && m.severity.blocks_by_default()),
+                    "FileUtils.{method}('/') must block as {expected}; got {:?}",
+                    matches.iter().map(|m| &m.rule_id).collect::<Vec<_>>()
+                );
+            }
+        }
+
+        /// The non-recursive deletions block on a catastrophic target too, and no
+        /// spelling of one is weaker than its siblings (#454).
+        ///
+        /// `rm` blocking while `rm_f` did not was the `rm_r` inversion in
+        /// miniature. `rmdir` is here because `Dir.rmdir` — what it delegates to
+        /// — already blocks; covering one spelling and not the other was the
+        /// inconsistency, not a deliberate carve-out.
+        #[test]
+        fn fileutils_non_recursive_deletes_are_uniformly_covered_issue_454() {
+            let ast_matcher = AstMatcher::new();
+
+            for method in ["rm", "rm_f", "remove", "remove_file", "rmdir"] {
+                let code = format!("require 'fileutils'\nFileUtils.{method}('/etc')");
+                let matches = ast_matcher
+                    .find_matches(&code, ScriptLanguage::Ruby)
+                    .unwrap();
+                let expected = format!("heredoc.ruby.fileutils_{method}.catastrophic");
+                assert!(
+                    matches
+                        .iter()
+                        .any(|m| m.rule_id == expected && m.severity.blocks_by_default()),
+                    "FileUtils.{method}('/etc') must block as {expected}; got {:?}",
+                    matches.iter().map(|m| &m.rule_id).collect::<Vec<_>>()
+                );
+            }
+        }
+
+        /// Negative control for the tests above: widening the method list must
+        /// not have made it match everything.
+        ///
+        /// Two independent directions. Non-deleting `FileUtils` calls must stay
+        /// unblocked even on a catastrophic path. And a non-catastrophic target
+        /// must still warn rather than block, which is what keeps the additions
+        /// from turning ordinary build-directory cleanup into a denial.
+        #[test]
+        fn fileutils_additions_do_not_block_indiscriminately_issue_454() {
+            let ast_matcher = AstMatcher::new();
+
+            // Non-deleting FileUtils calls are what an over-broad alternation
+            // would swallow, so they are the real negative control.
+            for method in [
+                "mkdir_p", "mkdir", "cp_r", "cp", "mv", "chmod_R", "touch", "ln_s",
+            ] {
+                let code = format!("require 'fileutils'\nFileUtils.{method}('/')");
+                let matches = ast_matcher
+                    .find_matches(&code, ScriptLanguage::Ruby)
+                    .unwrap();
+                assert!(
+                    !matches
+                        .iter()
+                        .any(|m| m.rule_id.starts_with("heredoc.ruby.fileutils_")
+                            && m.severity.blocks_by_default()),
+                    "FileUtils.{method} does not delete and must not block as a \
+                     fileutils deletion; got {:?}",
+                    matches.iter().map(|m| &m.rule_id).collect::<Vec<_>>()
+                );
+                assert!(
+                    scan_filesystem_sink_fallback(&code, ScriptLanguage::Ruby).is_none(),
+                    "FileUtils.{method} must not match the literal fallback either"
+                );
+            }
+
+            for method in ["rm_r", "remove_entry", "rm_f", "remove_file", "rmdir"] {
+                let code = format!("require 'fileutils'\nFileUtils.{method}('./build')");
+                let matches = ast_matcher
+                    .find_matches(&code, ScriptLanguage::Ruby)
+                    .unwrap();
+                assert!(
+                    !matches.iter().any(|m| m.severity.blocks_by_default()),
+                    "FileUtils.{method}('./build') is non-catastrophic and must warn only; got {:?}",
+                    matches.iter().map(|m| &m.rule_id).collect::<Vec<_>>()
+                );
+            }
+        }
+
+        /// The literal pre-AST scan is the backstop when the AST budget is gone,
+        /// so it has to know the same method names the AST rules do (#454).
+        /// It also has to report the right one: `fn` is interpolated into the
+        /// rule id, and allowlists key on rule ids, so a mis-captured name is a
+        /// silent breakage rather than a visible failure.
+        #[test]
+        fn literal_fallback_covers_and_correctly_names_each_fileutils_method_issue_454() {
+            for method in [
+                "rm_rf",
+                "rmdir",
+                "rm_r",
+                "rm_f",
+                "rm",
+                "remove_entry_secure",
+                "remove_entry",
+                "remove_file",
+                "remove_dir",
+                "remove",
+            ] {
+                let code = format!("FileUtils.{method}('/')");
+                let hit = scan_filesystem_sink_fallback(&code, ScriptLanguage::Ruby)
+                    .unwrap_or_else(|| panic!("literal fallback must match FileUtils.{method}"));
+                assert_eq!(
+                    hit.rule_id,
+                    format!("heredoc.ruby.fileutils_{method}.catastrophic"),
+                    "literal fallback captured the wrong method name for FileUtils.{method}"
+                );
+                assert!(
+                    hit.severity.blocks_by_default(),
+                    "catastrophic FileUtils.{method} must block via the literal fallback"
+                );
+            }
+
+            // The list above is ordered longest-first within each family, which
+            // the rule-id assertions enforce: were `rm` to precede `rm_rf`, the
+            // captured name — and so the rule id an allowlist keys on — would
+            // silently change rather than fail to match.
+            assert!(
+                scan_filesystem_sink_fallback("FileUtils.mkdir_p('/')", ScriptLanguage::Ruby)
+                    .is_none(),
+                "the literal fallback must not match a non-deleting FileUtils call"
             );
         }
 
