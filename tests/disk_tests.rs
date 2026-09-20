@@ -22,7 +22,11 @@ fn run_hook_with_packs(command: &str, packs: Option<&str>) -> String {
     // Change only the child's environment. Ambient bypasses, pack overrides,
     // or explicit config paths must not turn these regressions into false passes.
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().to_ascii_uppercase().starts_with("DCG_") {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("DCG_")
+        {
             hook.env_remove(key);
         }
     }
@@ -37,7 +41,10 @@ fn run_hook_with_packs(command: &str, packs: Option<&str>) -> String {
         .env("TMPDIR", root)
         .env("TEMP", root)
         .env("TMP", root)
-        .env("DCG_ALLOWLIST_SYSTEM_PATH", root.join("system-allowlist.toml"))
+        .env(
+            "DCG_ALLOWLIST_SYSTEM_PATH",
+            root.join("system-allowlist.toml"),
+        )
         // Hook-mode self-heal must not register a test binary in the caller's
         // real agent settings (including native Windows known-folder paths).
         .env("DCG_SELF_HEAL_HOOK", "0")
@@ -367,7 +374,10 @@ fn default_disk_original_bypasses_stay_blocked_issue_448() {
             "dmsetup remove mydev --table /tmp/lsblk",
             "system.disk:dmsetup-remove",
         ),
-        ("lvremove -f vg/lv --config /tmp/blkid", "system.disk:lvremove"),
+        (
+            "lvremove -f vg/lv --config /tmp/blkid",
+            "system.disk:lvremove",
+        ),
         ("tee /dev/sda < /tmp/blkid.img", "system.disk:tee-device"),
         ("mdadm --detail --stop /dev/md0", "system.disk:mdadm-stop"),
         (
@@ -440,13 +450,115 @@ fn default_disk_read_only_neighbors_do_not_hide_destruction_issue_448() {
             "dd if=/dev/zero of=/dev/sda 2>>/var/log/mount; fdisk -l",
             "system.disk:dd-device",
         ),
-        ("mount; wipefs -a /dev/sdb 2>/tmp/mount", "system.disk:wipefs"),
-        ("wipefs -a /dev/sdb 2>/tmp/mount && mount", "system.disk:wipefs"),
+        (
+            "mount; wipefs -a /dev/sdb 2>/tmp/mount",
+            "system.disk:wipefs",
+        ),
+        (
+            "wipefs -a /dev/sdb 2>/tmp/mount && mount",
+            "system.disk:wipefs",
+        ),
         (
             r#"lsblk && mkfs.ext4 /dev/sdb1 2>>"/tmp/fdisk -l.log""#,
             "system.disk:mkfs",
         ),
     ] {
         assert_default_blocked(command, rule);
+    }
+}
+
+#[test]
+fn default_disk_other_query_names_in_redirects_do_not_exempt_writes_issue_448() {
+    for (command, rule) in [
+        ("dd if=/dev/zero of=/dev/sda", "system.disk:dd-device"),
+        ("wipefs -a /dev/sdb", "system.disk:wipefs"),
+        ("mkfs.ext4 /dev/sdb1", "system.disk:mkfs"),
+    ] {
+        for text in [
+            "btrfs subvolume list report",
+            "btrfs filesystem df report",
+            "btrfs device stats report",
+            "btrfs property get report",
+            "dmsetup info report",
+            "dmsetup table report",
+            "nbd-client -l report",
+            "nbd-client -check report",
+            "diskutil list report",
+        ] {
+            for quote in ['\'', '"'] {
+                let candidate = format!("{command} 2>>{quote}/tmp/{text}{quote}");
+                assert_default_blocked(&candidate, rule);
+            }
+        }
+    }
+}
+
+#[test]
+fn default_disk_modes_and_outputs_cannot_be_disguised_as_readonly_issue_448() {
+    for command in [
+        "dmsetup -v remove info",
+        "dmsetup --noudevsync remove table",
+        "dmsetup --verifyudev remove status",
+    ] {
+        assert_default_blocked(command, "system.disk:dmsetup-remove");
+    }
+    for command in [
+        "dd of=/dev/null of=/dev/sda",
+        "dd of=/dev/sda of=/dev/null",
+        "REPORT=/tmp/lsblk dd if=/dev/zero of=/dev/sda",
+        "REPORT=/tmp/df dd if=/dev/zero of=/dev/sda",
+        "2>/tmp/lsblk dd if=/dev/zero of=/dev/sda",
+        "2>/tmp/df dd if=/dev/zero of=/dev/sda",
+        "sudo -u lsblk dd if=/dev/zero of=/dev/sda",
+    ] {
+        assert_default_blocked(command, "system.disk:dd-device");
+    }
+}
+
+#[test]
+fn default_disk_all_writer_targets_are_checked_issue_444() {
+    for command in [
+        "tee /dev/null /dev/sda",
+        "tee out.log /dev/sda",
+        "tee 'log with spaces' /dev/sda",
+        "tee /dev/null-disk",
+        "tee /dev/fd/3-disk",
+        "tee /dev/shm/../sda",
+        "tee /dev/shm/x/../../sda",
+    ] {
+        assert_default_blocked(command, "system.disk:tee-device");
+    }
+    for command in ["cp file /dev/null-disk", "cp file /dev/shm/../sda"] {
+        assert_default_blocked(command, "system.disk:copy-to-device");
+    }
+}
+
+#[test]
+fn default_disk_hardened_query_and_writer_controls_stay_allowed() {
+    for command in [
+        "dmsetup -v info remove",
+        "dmsetup --noudevsync table remove",
+        "dmsetup --verifyudev status remove",
+        "btrfs --format json subvolume list /mnt",
+        "btrfs --format=json filesystem show",
+        "btrfs --verbose --log info filesystem usage /mnt",
+        "btrfs -q device stats /mnt",
+        "nbd-client -l server.example.com",
+        "nbd-client -check /dev/nbd0",
+        "dd 'of=/dev/null' if=/dev/sda",
+        "dd of=/dev/null of=/dev/zero",
+        "dd of=/dev/null < /dev/sda",
+        "dd if=/dev/sda of=/dev/null 2>/tmp/benchmark.log",
+        "dd if=/dev/sda of=/dev/null 2>&1",
+        "dd if=/dev/sda of=/dev/null > /dev/null",
+        "tee /dev/null /dev/zero",
+        "tee /dev/null out.log",
+        "tee out.log < /dev/sda",
+        "tee 'log /dev/sda'",
+        "cp file '/dev/null'",
+        "cp file /dev/shm/buffer",
+    ] {
+        let output = run_hook_with_packs(command, None);
+        assert!(output.trim().is_empty(), "{command:?}: {output}");
     }
 }
