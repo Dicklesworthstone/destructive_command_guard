@@ -1711,7 +1711,13 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "featureflags.flipt",
-        &["flipt"],
+        // `/api/v1/` is what `flipt-api-delete` actually keys on, and Flipt is
+        // self-hosted, so the server is usually NOT at a hostname containing
+        // "flipt" (#447). With only the vendor name here the API rule could
+        // fire solely by coincidence of hostname. Same shape as
+        // `monitoring.prometheus`, which carries `/api/dashboards` beside
+        // `grafana-cli` for exactly this reason.
+        &["flipt", "/api/v1/"],
         featureflags::flipt::create_pack,
     ),
     PackEntry::new(
@@ -1726,7 +1732,10 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "featureflags.unleash",
-        &["unleash"],
+        // `/api/admin/` is what the three `unleash-api-delete-*` rules and the
+        // `unleash-api-get` exemption key on; Unleash is self-hosted, so the
+        // vendor name is not reliably in the command (#447).
+        &["unleash", "/api/admin/"],
         featureflags::unleash::create_pack,
     ),
     PackEntry::new(

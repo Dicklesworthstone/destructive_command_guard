@@ -14,7 +14,10 @@ pub fn create_pack() -> Pack {
         id: "featureflags.flipt".to_string(),
         name: "Flipt",
         description: "Protects against destructive Flipt CLI and API operations.",
-        keywords: &["flipt"],
+        // `/api/v1/` reaches `flipt-api-delete` on a self-hosted server whose
+        // hostname does not contain "flipt" (#447). The `PACK_ENTRIES` row is
+        // the gate that actually decides, so it carries this too.
+        keywords: &["flipt", "/api/v1/"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,

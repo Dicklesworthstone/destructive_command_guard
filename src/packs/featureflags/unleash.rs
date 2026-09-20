@@ -14,7 +14,10 @@ pub fn create_pack() -> Pack {
         id: "featureflags.unleash".to_string(),
         name: "Unleash",
         description: "Protects against destructive Unleash CLI and API operations.",
-        keywords: &["unleash"],
+        // `/api/admin/` reaches the `unleash-api-*` rules on a self-hosted
+        // server whose hostname does not contain "unleash" (#447). Mirrored in
+        // the `PACK_ENTRIES` row, which is the gate that actually decides.
+        keywords: &["unleash", "/api/admin/"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
