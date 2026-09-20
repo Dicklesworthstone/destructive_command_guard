@@ -1507,29 +1507,6 @@ static PERL_FILE_PATH_RMTREE_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     .expect("perl File::Path rmtree/remove_tree regex compiles")
 });
 
-/// `File::Path` exports `rmtree` and `remove_tree` by default, so the
-/// unqualified call is the *documented* usage and the fully-qualified
-/// `File::Path::rmtree` the rule above requires is the rarer spelling. Both
-/// `use File::Path; rmtree('/home/user')` and
-/// `use File::Path qw(remove_tree); remove_tree('/home/user')` were allowed
-/// (#453).
-///
-/// Requiring `use File::Path` elsewhere in the same script is what keeps this
-/// from firing on an unrelated sub that happens to be named `rmtree` — the
-/// import is checked separately by [`PERL_USES_FILE_PATH`] rather than being
-/// folded into one expression, so the two can be read independently.
-static PERL_BARE_RMTREE_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?m)(?:^|[;{}]|\bdo\b)\s*(?P<fn>rmtree|remove_tree)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
-    )
-    .expect("perl bare rmtree/remove_tree regex compiles")
-});
-
-/// Whether the script imports `File::Path` at all.
-static PERL_USES_FILE_PATH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)\buse\s+File::Path\b").expect("perl use File::Path regex compiles")
-});
-
 static PERL_UNLINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?m)\bunlink\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
         .expect("perl unlink regex compiles")
@@ -1779,19 +1756,7 @@ fn scan_perl_file_path(
     timeout: Duration,
     budget_ms: u64,
 ) -> Result<(), MatchError> {
-    // The unqualified spellings only count when the script imports the module
-    // that exports them, which is what stops an unrelated local sub called
-    // `rmtree` from matching (#453).
-    let bare_matches = if PERL_USES_FILE_PATH.is_match(haystack) {
-        PERL_BARE_RMTREE_LITERAL.captures_iter(haystack)
-    } else {
-        PERL_BARE_RMTREE_LITERAL.captures_iter("")
-    };
-
-    for caps in PERL_FILE_PATH_RMTREE_LITERAL
-        .captures_iter(haystack)
-        .chain(bare_matches)
-    {
+    for caps in PERL_FILE_PATH_RMTREE_LITERAL.captures_iter(haystack) {
         perl_check_timeout(start_time, timeout, budget_ms)?;
         let Some(m) = caps.get(0) else {
             continue;
@@ -2374,8 +2339,12 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
     patterns.insert(
         ScriptLanguage::Python,
         vec![
+            // Receiver metavariable, so a module alias matches too:
+            // `import shutil as sh; sh.rmtree(...)` was allowed while the
+            // canonical spelling denied. Same shape as the node chained
+            // receiver in #453.
             CompiledPattern::new(
-                "shutil.rmtree($$$)".to_string(),
+                "$M.rmtree($$$)".to_string(),
                 "heredoc.python.shutil_rmtree".to_string(),
                 "shutil.rmtree() recursively deletes directories".to_string(),
                 Severity::Critical,
@@ -2709,6 +2678,15 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
                 Severity::Medium, // refined to block only on catastrophic literal target
                 Some("Verify target path carefully before running".to_string()),
             ),
+            // `::` is Ruby's other call syntax for the same method, and it was
+            // allowed while the `.` spelling denied.
+            CompiledPattern::new(
+                "FileUtils::rm_rf($$$)".to_string(),
+                "heredoc.ruby.fileutils_rm_rf".to_string(),
+                "FileUtils::rm_rf() recursively deletes directories".to_string(),
+                Severity::Medium, // refined to block only on catastrophic literal target
+                Some("Verify target path carefully before running".to_string()),
+            ),
             // `rm_r` is the same recursive delete as `rm_rf` (which Ruby defines
             // as `rm_r` with `force: true`); it only differs by propagating
             // errors instead of swallowing them. It must be listed separately
@@ -2972,6 +2950,24 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
                 Severity::High,
                 None,
             ),
+            // The fully-qualified spelling. A leading `\` resolves to the
+            // global namespace and is the idiomatic way to call a builtin
+            // from inside a namespace, so it is ordinary PHP rather than
+            // obfuscation — and it was allowed while the bare call denied.
+            CompiledPattern::new(
+                "\\unlink($$$)".to_string(),
+                "heredoc.php.unlink".to_string(),
+                "unlink() deletes files".to_string(),
+                Severity::High,
+                None,
+            ),
+            CompiledPattern::new(
+                "\\rmdir($$$)".to_string(),
+                "heredoc.php.rmdir".to_string(),
+                "rmdir() deletes directories".to_string(),
+                Severity::High,
+                None,
+            ),
             CompiledPattern::new(
                 "rmdir($$$)".to_string(),
                 "heredoc.php.rmdir".to_string(),
@@ -3222,6 +3218,77 @@ mod tests {
                 assert!(
                     matches.iter().any(|m| m.severity.blocks_by_default()),
                     "must block: {code}"
+                );
+            }
+        }
+
+        #[test]
+        fn alias_and_alternate_call_spellings_block_like_the_canonical_one() {
+            // The #453 sweep carried into python/ruby/php: the same call,
+            // spelled the way the language also allows, was being allowed.
+            let ast_matcher = AstMatcher::new().with_timeout(std::time::Duration::from_millis(100));
+            for (code, language) in [
+                // Module alias — `import shutil as sh`.
+                (
+                    "import shutil as sh\nsh.rmtree('/home/user')",
+                    ScriptLanguage::Python,
+                ),
+                (
+                    "import shutil\nshutil.rmtree('/home/user')",
+                    ScriptLanguage::Python,
+                ),
+                // `::` is Ruby's other call syntax for the same method.
+                (
+                    "require 'fileutils'\nFileUtils::rm_rf('/home/user')",
+                    ScriptLanguage::Ruby,
+                ),
+                // A leading `\` resolves to PHP's global namespace, which is
+                // the idiomatic way to call a builtin from inside one.
+                ("<?php \\unlink('/home/user/id_rsa');", ScriptLanguage::Php),
+                ("<?php \\rmdir('/home/user/.ssh');", ScriptLanguage::Php),
+            ] {
+                let matches = ast_matcher
+                    .find_matches(code, language)
+                    .expect("ast_matcher should run within 100ms");
+                assert!(
+                    matches.iter().any(|m| m.severity.blocks_by_default()),
+                    "must block: {code:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn the_python_receiver_metavariable_widens_an_already_unconditional_rule() {
+            // Stated plainly rather than discovered later: Python's
+            // `shutil.rmtree` is `Severity::Critical` with no
+            // catastrophic-path refinement, unlike the JavaScript and Ruby
+            // rules. It already blocked `shutil.rmtree('./build')`, and
+            // accepting any receiver means `mylib.rmtree('./cache')` blocks
+            // too. That is a real widening, kept because `rmtree` is a
+            // recursive-delete name whatever the module, and because the
+            // alternative was missing `import shutil as sh`.
+            let ast_matcher = AstMatcher::new().with_timeout(std::time::Duration::from_millis(100));
+            for code in [
+                "import shutil\nshutil.rmtree('./build')",
+                "import mylib\nmylib.rmtree('./cache')",
+            ] {
+                let matches = ast_matcher
+                    .find_matches(code, ScriptLanguage::Python)
+                    .expect("ast_matcher should run within 100ms");
+                assert!(
+                    matches.iter().any(|m| m.severity.blocks_by_default()),
+                    "python rmtree blocks at any target: {code:?}"
+                );
+            }
+            // Only a mention with no call stays clear.
+            {
+                let code = "print('rmtree is dangerous')";
+                let matches = ast_matcher
+                    .find_matches(code, ScriptLanguage::Python)
+                    .expect("ast_matcher should run within 100ms");
+                assert!(
+                    !matches.iter().any(|m| m.severity.blocks_by_default()),
+                    "must not block: {code:?}"
                 );
             }
         }
@@ -3686,12 +3753,32 @@ mod tests {
         }
 
         #[test]
-        fn perl_unqualified_rmtree_needs_the_import_to_count() {
-            // The import requirement is what keeps an unrelated local sub of
-            // the same name from matching.
+        fn perl_unqualified_rmtree_does_not_require_the_import() {
+            // Deliberate: the qualifier is optional and there is no
+            // import gate, matching `PERL_UNLINK_LITERAL` and
+            // `PERL_RMDIR_LITERAL` beside it, which have never required one.
+            //
+            // The cost is that a local `sub rmtree` deleting a catastrophic
+            // path also matches. That is the direction this guard errs in, and
+            // it also means a `-MFile::Path` one-liner — where the import is on
+            // the command line and never appears in the extracted script — is
+            // still covered. An import gate would have been tidier and would
+            // have missed that.
             let ast_matcher = AstMatcher::new().with_timeout(std::time::Duration::from_millis(100));
+            let matches = ast_matcher
+                .find_matches(
+                    "sub rmtree { print 'hi' } rmtree('/home/user');",
+                    ScriptLanguage::Perl,
+                )
+                .expect("perl ast_matcher should run within 100ms");
+            assert!(
+                matches.iter().any(|m| m.severity.blocks_by_default()),
+                "a bare rmtree on a catastrophic path blocks whether or not the import is visible"
+            );
+
+            // What still must not fire: a mention with no call, and a call on
+            // a target that is not catastrophic.
             for code in [
-                "sub rmtree { print 'hi' } rmtree('/home/user');",
                 "print 'rmtree is dangerous';",
                 "use File::Path; rmtree('./build');",
             ] {

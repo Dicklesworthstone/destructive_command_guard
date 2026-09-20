@@ -107,10 +107,42 @@ fn item4_shell_assignment_before_pwsh_is_not_an_expansion_in_the_payload() {
 
 #[test]
 fn item4_planted_negative_destructive_pwsh_payload_still_denies() {
+    // Attribution moved here in `c917a36` (#451), which removed
+    // `rm_semantic_scan_required`'s PowerShell prefilter. This command carries
+    // none of the ``` ` @ & $ ( ``` characters that prefilter demanded, so
+    // core.filesystem was previously not even a candidate and windows.filesystem
+    // answered by default. core.* is tier 1 and windows.* is tier 11, so once
+    // core.filesystem could match it claimed the command — the documented order
+    // working as designed, not a tier regression.
+    //
+    // Pinned to the pack that actually answers, and paired below with the bare
+    // spelling that still routes to windows.filesystem, so this file fails if
+    // EITHER route moves again. The verdict assertion is unchanged.
     assert_blocked(
         r#"SP="/tmp/x"; pwsh -NoProfile -c "Remove-Item -Recurse -Force C:\src""#,
-        "windows.filesystem",
+        "core.filesystem",
     );
+}
+
+/// The launcher wrapper, not the path, decides which pack answers.
+///
+/// Same cmdlet and same target either way: wrapped in `pwsh -c` the inline
+/// script reaches core.filesystem's `powershell-remove-item-recursive`, and
+/// bare it is windows.filesystem's `remove-item-recurse-force`. Allowlists key
+/// on `pack_id:pattern_name`, so an operator excepting one spelling does not
+/// thereby except the other. That asymmetry is worth a pin of its own.
+#[test]
+fn item4_bare_and_wrapped_spellings_deny_under_different_rule_ids() {
+    for target in [r"C:\src", "./build"] {
+        assert_blocked(
+            &format!("Remove-Item -Recurse -Force {target}"),
+            "windows.filesystem",
+        );
+        assert_blocked(
+            &format!(r#"pwsh -NoProfile -c "Remove-Item -Recurse -Force {target}""#),
+            "core.filesystem",
+        );
+    }
 }
 
 #[test]
