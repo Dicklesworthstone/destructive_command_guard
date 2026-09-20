@@ -235,11 +235,25 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "dmsetup-deps",
             r"dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+deps(?=\s|$)"
         ),
-        // --- nbd-client safe patterns ---
-        // nbd-client -l (list exports)
-        safe_pattern!("nbd-client-list", r"nbd-client\s+-l\b"),
-        // nbd-client -check (check connection)
-        safe_pattern!("nbd-client-check", r"nbd-client\s+.*-check\b"),
+        // There are deliberately no nbd-client read-only exemptions.
+        //
+        // Two used to sit here, `nbd-client\s+-l\b` and
+        // `nbd-client\s+.*-check\b`, both unanchored (#448). The second was the
+        // loosest exemption in the pack: `nbd-client`, then *anything*, then
+        // `-check`, so the two halves could sit in different arguments and no
+        // quoting was needed to reach it. These executed and were allowed:
+        //
+        //   mkfs.ext4 -L nbd-client /dev/sdb1 -check
+        //   dd if=/dev/zero of=/dev/sda 2>>/tmp/nbd-client -check
+        //   wipefs -a /dev/sdb -o /tmp/nbd-client -check
+        //   mkfs.ext4 /dev/sdb1 2>>"/tmp/nbd-client -l.log"
+        //
+        // Unlike the other exemptions dropped for #448 these have destructive
+        // siblings, so redundancy was checked rather than assumed:
+        // `nbd-client-disconnect` needs a `-d` token and `nbd-client-connect`
+        // needs `<host> <port> /dev/nbd*`, and neither `-l` nor `-check` can
+        // satisfy either. So nothing here ever denied a read-only invocation,
+        // and the exemptions only widened the pack's blind spot.
         // --- macOS diskutil safe patterns (read-only) ---
         // Verbs are matched case-insensitively because diskutil itself accepts
         // any casing. End-bounded with [^;&|\r\n]* so a read-only verb cannot
@@ -1054,6 +1068,12 @@ mod tests {
             "mkfs.ext4 -L lvscan /dev/sdb1",
             "dd if=/dev/zero of=/dev/sda 2>>/var/log/pvscan",
             "mkfs.ext4 -L vgdisplay /dev/sdb1",
+            // `nbd-client-check` was the loosest of all: the two halves could sit
+            // in different arguments, so no quoting was needed.
+            "mkfs.ext4 -L nbd-client /dev/sdb1 -check",
+            "dd if=/dev/zero of=/dev/sda 2>>/tmp/nbd-client -check",
+            "wipefs -a /dev/sdb -o /tmp/nbd-client -check",
+            r#"mkfs.ext4 /dev/sdb1 2>>"/tmp/nbd-client -l.log""#,
         ] {
             assert!(
                 !pack.matches_safe(command),
@@ -1093,6 +1113,12 @@ mod tests {
             "lvdisplay",
             "vgdisplay /dev/sda",
             "pvdisplay",
+            // nbd-client queries: `nbd-client-disconnect` needs a `-d` token and
+            // `nbd-client-connect` needs `<host> <port> /dev/nbd*`, so neither of
+            // these was ever denied and their exemptions were redundant.
+            "nbd-client -l",
+            "nbd-client -l 10.0.0.5",
+            "nbd-client -c /dev/nbd0 -check",
         ] {
             assert!(
                 pack.check(command).is_none(),

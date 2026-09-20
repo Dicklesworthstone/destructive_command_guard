@@ -66,8 +66,6 @@ These patterns match safe commands that are always allowed:
 | `dmsetup-info` | `dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+info(?=\s\|$)` |
 | `dmsetup-table` | `dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+table(?=\s\|$)` |
 | `dmsetup-deps` | `dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+deps(?=\s\|$)` |
-| `nbd-client-list` | `nbd-client\s+-l\b` |
-| `nbd-client-check` | `nbd-client\s+.*-check\b` |
 | `diskutil-readonly` | `(?i)diskutil\s+(?:list\|info\|information\|activity\|listFilesystems\|apfs\s+list(?:Snapshots\|Users)?)\b[^;&\|\r\n]*$` |
 | `device-write-pseudo-tee` | `\b(?:tee\|sponge)\b(?:\s+-{1,2}\S+)*\s+['"]?/dev/(?:null\|zero\|full\|random\|urandom\|std(?:in\|out\|err)\|tty\|console\|ptmx\|fd/\|pts/\|shm/)\S*['"]?\s*(?:$\|[\|>])` |
 | `device-write-pseudo-copy` | `\b(?:cp\|mv\|install)\b[^\|;&]*\s['"]?/dev/(?:null\|zero\|full\|random\|urandom\|std(?:in\|out\|err)\|tty\|console\|ptmx\|fd/\|pts/\|shm/)\S*['"]?\s*$` |
