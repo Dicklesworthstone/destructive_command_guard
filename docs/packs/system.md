@@ -47,28 +47,25 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `dd-file-out` | `dd\s+.*of=['"]?[^/\s'"]+\.` |
-| `dd-discard` | `dd\s+.*of=['"]?/dev/(?:null\|zero\|full)['"]?(?:\s\|$)` |
-| `lsblk` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?lsblk\b` |
-| `parted-print` | `parted\b(?:\s+--?\S+)*\s+(?:['"]?/dev/\S+['"]?\s+)?print(?:\s+(?:devices\|free\|list\|all\|\d+))?\s*$` |
-| `blkid` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?blkid\b` |
-| `df` | `^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?df\b` |
-| `btrfs-subvolume-list` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+subvolume\s+list(?=\s\|$)` |
-| `btrfs-subvolume-show` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+subvolume\s+show(?=\s\|$)` |
-| `btrfs-filesystem-show` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+filesystem\s+show(?=\s\|$)` |
-| `btrfs-filesystem-df` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+filesystem\s+df(?=\s\|$)` |
-| `btrfs-filesystem-usage` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+filesystem\s+usage(?=\s\|$)` |
-| `btrfs-device-stats` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+device\s+stats(?=\s\|$)` |
-| `btrfs-property-get` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+property\s+(?:get\|list)(?=\s\|$)` |
-| `btrfs-scrub-status` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+scrub\s+status(?=\s\|$)` |
-| `dmsetup-ls` | `dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+ls(?=\s\|$)` |
-| `dmsetup-status` | `dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+status(?=\s\|$)` |
-| `dmsetup-info` | `dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+info(?=\s\|$)` |
-| `dmsetup-table` | `dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+table(?=\s\|$)` |
-| `dmsetup-deps` | `dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+deps(?=\s\|$)` |
-| `diskutil-readonly` | `(?i)diskutil\s+(?:list\|info\|information\|activity\|listFilesystems\|apfs\s+list(?:Snapshots\|Users)?)\b[^;&\|\r\n]*$` |
-| `device-write-pseudo-tee` | `\b(?:tee\|sponge)\b(?:\s+-{1,2}\S+)*\s+['"]?/dev/(?:null\|zero\|full\|random\|urandom\|std(?:in\|out\|err)\|tty\|console\|ptmx\|fd/\|pts/\|shm/)\S*['"]?\s*(?:$\|[\|>])` |
-| `device-write-pseudo-copy` | `\b(?:cp\|mv\|install)\b[^\|;&]*\s['"]?/dev/(?:null\|zero\|full\|random\|urandom\|std(?:in\|out\|err)\|tty\|console\|ptmx\|fd/\|pts/\|shm/)\S*['"]?\s*$` |
+| `dd-discard` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?dd[ \t]+(?:(?:(?:if\|ibs\|obs\|bs\|cbs\|skip\|iseek\|seek\|oseek\|count\|conv\|iflag\|oflag\|status)=(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")\|[0-9]*[<>]&(?:[0-9]+\|-)\|[0-9]*<[ \t]*(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")\|(?:[0-9]*(?:>>?\|>\\|)\|&>>?)[ \t]*(?:/dev/(?:null\|zero\|full)\|'/dev/(?:null\|zero\|full)'\|"/dev/(?:null\|zero\|full)"\|(?!['"]?/dev/)(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")))[ \t]+)*(?:of=(?:/dev/(?:null\|zero\|full)\|'/dev/(?:null\|zero\|full)'\|"/dev/(?:null\|zero\|full)")\|'of=/dev/(?:null\|zero\|full)'\|"of=/dev/(?:null\|zero\|full)")(?:[ \t]+(?:(?:(?:if\|ibs\|obs\|bs\|cbs\|skip\|iseek\|seek\|oseek\|count\|conv\|iflag\|oflag\|status)=(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")\|[0-9]*[<>]&(?:[0-9]+\|-)\|[0-9]*<[ \t]*(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")\|(?:[0-9]*(?:>>?\|>\\|)\|&>>?)[ \t]*(?:/dev/(?:null\|zero\|full)\|'/dev/(?:null\|zero\|full)'\|"/dev/(?:null\|zero\|full)"\|(?!['"]?/dev/)(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")))\|(?:of=(?:/dev/(?:null\|zero\|full)\|'/dev/(?:null\|zero\|full)'\|"/dev/(?:null\|zero\|full)")\|'of=/dev/(?:null\|zero\|full)'\|"of=/dev/(?:null\|zero\|full)")))*[ \t]*$` |
+| `lsblk` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?lsblk(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `blkid` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?blkid(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `df` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?df(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `parted-print` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?parted[ \t]+(?:(?:-s\|--script\|-m\|--machine\|-j\|--json)[ \t]+)*(?:['"]?/dev/[^\s'";&\|<>()`$]+['"]?[ \t]+)?print(?:[ \t]+(?:devices\|free\|list\|all\|\d+))?[ \t]*$` |
+| `btrfs-subvolume-list` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?btrfs[ \t]+(?:(?:--(?:verbose\|quiet)\|-[vq]+\|--format(?:=\|[ \t]+)(?:text\|json)\|--log(?:=\|[ \t]+)(?:default\|info\|verbose\|debug\|quiet))[ \t]+)*subvolume[ \t]+list(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `btrfs-subvolume-show` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?btrfs[ \t]+(?:(?:--(?:verbose\|quiet)\|-[vq]+\|--format(?:=\|[ \t]+)(?:text\|json)\|--log(?:=\|[ \t]+)(?:default\|info\|verbose\|debug\|quiet))[ \t]+)*subvolume[ \t]+show(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `btrfs-filesystem-show` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?btrfs[ \t]+(?:(?:--(?:verbose\|quiet)\|-[vq]+\|--format(?:=\|[ \t]+)(?:text\|json)\|--log(?:=\|[ \t]+)(?:default\|info\|verbose\|debug\|quiet))[ \t]+)*filesystem[ \t]+show(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `btrfs-filesystem-df` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?btrfs[ \t]+(?:(?:--(?:verbose\|quiet)\|-[vq]+\|--format(?:=\|[ \t]+)(?:text\|json)\|--log(?:=\|[ \t]+)(?:default\|info\|verbose\|debug\|quiet))[ \t]+)*filesystem[ \t]+df(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `btrfs-filesystem-usage` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?btrfs[ \t]+(?:(?:--(?:verbose\|quiet)\|-[vq]+\|--format(?:=\|[ \t]+)(?:text\|json)\|--log(?:=\|[ \t]+)(?:default\|info\|verbose\|debug\|quiet))[ \t]+)*filesystem[ \t]+usage(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `btrfs-device-stats` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?btrfs[ \t]+(?:(?:--(?:verbose\|quiet)\|-[vq]+\|--format(?:=\|[ \t]+)(?:text\|json)\|--log(?:=\|[ \t]+)(?:default\|info\|verbose\|debug\|quiet))[ \t]+)*device[ \t]+stats(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `btrfs-property-get` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?btrfs[ \t]+(?:(?:--(?:verbose\|quiet)\|-[vq]+\|--format(?:=\|[ \t]+)(?:text\|json)\|--log(?:=\|[ \t]+)(?:default\|info\|verbose\|debug\|quiet))[ \t]+)*property[ \t]+(?:get\|list)(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `btrfs-scrub-status` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?btrfs[ \t]+(?:(?:--(?:verbose\|quiet)\|-[vq]+\|--format(?:=\|[ \t]+)(?:text\|json)\|--log(?:=\|[ \t]+)(?:default\|info\|verbose\|debug\|quiet))[ \t]+)*scrub[ \t]+status(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `dmsetup-ls` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?dmsetup[ \t]+(?:(?:-v+\|-c\|--(?:verbose\|noudevsync\|verifyudev\|readonly\|columns\|noheadings))[ \t]+)*ls(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `dmsetup-status` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?dmsetup[ \t]+(?:(?:-v+\|-c\|--(?:verbose\|noudevsync\|verifyudev\|readonly\|columns\|noheadings))[ \t]+)*status(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `dmsetup-info` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?dmsetup[ \t]+(?:(?:-v+\|-c\|--(?:verbose\|noudevsync\|verifyudev\|readonly\|columns\|noheadings))[ \t]+)*info(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `dmsetup-table` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?dmsetup[ \t]+(?:(?:-v+\|-c\|--(?:verbose\|noudevsync\|verifyudev\|readonly\|columns\|noheadings))[ \t]+)*table(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `dmsetup-deps` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?dmsetup[ \t]+(?:(?:-v+\|-c\|--(?:verbose\|noudevsync\|verifyudev\|readonly\|columns\|noheadings))[ \t]+)*deps(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `diskutil-readonly` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?(?i:diskutil[ \t]+(?:list\|info\|information\|activity\|listFilesystems\|apfs[ \t]+list(?:Snapshots\|Users)?)(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$)` |
 
 ### Destructive Patterns (Blocked)
 

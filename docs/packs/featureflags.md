@@ -22,6 +22,7 @@ Protects against destructive Flipt CLI and API operations.
 Commands containing these keywords are checked against this pack:
 
 - `flipt`
+- `/api/v1/`
 
 ### Safe Patterns (Allowed)
 
@@ -247,6 +248,7 @@ Protects against destructive Unleash CLI and API operations.
 Commands containing these keywords are checked against this pack:
 
 - `unleash`
+- `/api/admin/`
 
 ### Safe Patterns (Allowed)
 
