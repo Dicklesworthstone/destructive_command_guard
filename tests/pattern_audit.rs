@@ -1123,11 +1123,19 @@ fn test_audit_backtracking_requirements() {
             // carve-out, and `tee-device`/`copy-to-device` additionally
             // capture the opening quote and match it with a `\1`
             // backreference.
+            //
+            // The two GPT rules (#456) join them for the same reason as
+            // `fdisk-edit`: `gdisk-edit` excludes `-l` with a lookahead, and
+            // `sgdisk-modify` is built out of three of them — the dry-run
+            // withdrawal, the device requirement, and the "this option is not
+            // one of the read-only ones" test.
             HashSet::from([
                 "copy-to-device",
                 "dd-discard",
                 "fdisk-edit",
+                "gdisk-edit",
                 "parted-modify",
+                "sgdisk-modify",
                 "tee-device",
             ]),
         ),

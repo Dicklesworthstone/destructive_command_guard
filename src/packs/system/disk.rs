@@ -234,6 +234,69 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             r#"parted\b[^\n;&|]*?['"]?/dev/\S+['"]?(?:\s+--)?\s+(?:(?!\s*(?:align-check|help|h|print|p|quit|q|select|unit|u)\b)|[^\n;&|]*\b(?:print|p)\b\s+(?:(?:devices|free|list|all|\d+)\s+\S+|(?!devices\b|free\b|list\b|all\b|\d+\b)\S+)|[^\n;&|]*\b(?:disk_set|disk_toggle|mklabel|mktable|mkpart|name|rescue|resizepart|rm|set|toggle|type)\b)"#,
             "parted can modify partition tables and cause data loss."
         ),
+        // The GPT-native tools. `fdisk-edit` reaches `sfdisk` by substring and
+        // `parted-modify` covers GNU parted, but nothing covered gdisk's
+        // family — which is the family an agent reaches for on a UEFI system.
+        // `sgdisk --zap-all /dev/sda` erases the GPT *and* the protective MBR,
+        // strictly more than the `parted mklabel` the rule above denies (#456).
+        //
+        // The read-only carve-out lives INSIDE this pattern rather than in a
+        // SafePattern, because a pack-wide exemption short-circuits every
+        // destructive rule in the pack — the shape that made #448 possible.
+        //
+        // The option test is written as "carries an option that is not one of
+        // the read-only ones" rather than "carries one of the mutating ones".
+        // sgdisk's mutating surface is open-ended (-Z -o -d -n -t -c -A -g -G
+        // -r -C -m -M -N -j -s -S -u -U -e …) while its read-only surface is a
+        // closed handful, so enumerating the mutating side would make every
+        // option this list has not heard of a false negative. A bare `sgdisk
+        // /dev/sda` carries no option at all and does nothing, so it stays
+        // allowed.
+        //
+        // `-P`/`--pretend` is sgdisk's dry run and is a dry run whatever it is
+        // paired with, so it withdraws the denial the way `parted print` and
+        // `Remove-Item -WhatIf` do elsewhere. That lookahead refuses to cross a
+        // quote, so a `-P` sitting inside a partition name cannot buy an
+        // exemption for the mutating options around it; the cost is that a
+        // genuine dry run which also quotes an argument still denies, which is
+        // the direction this pack errs in on purpose.
+        destructive_pattern!(
+            "sgdisk-modify",
+            r#"sgdisk\b(?![^\n;&|'"]*[ \t]--?(?:P\b|pretend\b))(?=[^\n;&|]*['"]?/dev/)[^\n;&|]*[ \t]-(?!-?(?:p|print|i|info|b|backup|L|list-types|v|verify|V|version|h|help)\b)"#,
+            "sgdisk rewrites the GPT; --zap-all/-Z also erases the protective MBR, losing every partition.",
+            High,
+            "sgdisk applies its options and exits — there is no confirmation step and no \
+             undo. `--zap-all`/`-Z` destroys the GPT and the protective MBR together; \
+             `--clear`/`-o`, `--delete`/`-d`, `--new`/`-n` and `--typecode`/`-t` each \
+             rewrite the partition table in place. On a UEFI disk that is the same blast \
+             radius as `parted mklabel`, which is already denied.\n\n\
+             What stays allowed:\n\
+             - Inspecting the table: `sgdisk --print /dev/sda`, `sgdisk -i 1 /dev/sda`.\n\
+             - Saving it: `sgdisk --backup=/tmp/table.bin /dev/sda`.\n\
+             - Rehearsing a change: add `-P`/`--pretend` to see what would happen.\n\n\
+             Before changing anything, back the table up and look at the device:\n  \
+             sgdisk --backup=/tmp/table.bin /dev/sda\n  \
+             lsblk /dev/sda",
+            executables = ["sgdisk"]
+        ),
+        // gdisk and cgdisk are interactive and carry no mutating flag to match
+        // on, so they get `fdisk-edit`'s treatment: the bare invocation against
+        // a device is what is denied, and `-l` (list) is excluded the same way.
+        // `\b` keeps this off `sgdisk`, which has its own rule above.
+        destructive_pattern!(
+            "gdisk-edit",
+            r#"\bc?gdisk\s+['"]?/dev/(?!.*-l)"#,
+            "gdisk/cgdisk open the GPT for interactive editing; a write from that session destroys the partition table.",
+            High,
+            "gdisk and cgdisk are editors: they load the partition table and apply what \
+             the session writes back. An agent that cannot see the prompts cannot know \
+             what it is about to commit.\n\n\
+             Read the table instead, which is never blocked:\n  \
+             gdisk -l /dev/sda\n  \
+             sgdisk --print /dev/sda\n  \
+             lsblk /dev/sda",
+            executables = ["gdisk", "cgdisk"]
+        ),
         // mkfs (format filesystem)
         destructive_pattern!(
             "mkfs",
@@ -712,6 +775,87 @@ mod tests {
                 .check(cmd)
                 .unwrap_or_else(|| panic!("parted mutation must block: {cmd}"));
             assert_eq!(matched.name, Some("parted-modify"), "wrong rule for {cmd}");
+        }
+    }
+
+    #[test]
+    fn gpt_tools_are_covered_like_their_mbr_era_siblings_issue_456() {
+        // The control is the row above these in the issue: `parted mklabel`
+        // and `fdisk /dev/sda` already deny, so the pack treats this exact
+        // class of operation as worth blocking. These are the same operation
+        // spelled with the GPT-native tools.
+        let pack = create_pack();
+        for cmd in [
+            "sgdisk --zap-all /dev/sda",
+            "sgdisk -Z /dev/sda",
+            "sgdisk --clear /dev/sda",
+            "sgdisk -o /dev/sda",
+            "sgdisk --delete=1 /dev/sda",
+            "sgdisk -d 1 /dev/sda",
+            "sgdisk --new=1:0:0 /dev/sda",
+            "sgdisk -n 1:0:0 /dev/sda",
+            "sgdisk -t 1:8300 /dev/sda",
+            "sgdisk --typecode=1:8300 /dev/sda",
+            "sgdisk -g /dev/sda",
+            "sgdisk --randomize-guids /dev/sda",
+            // Options this rule has never heard of still deny: the test is
+            // "not read-only", not "in a list of known mutations".
+            "sgdisk --some-future-option /dev/sda",
+            // A read-only option does not launder the mutating one beside it.
+            "sgdisk --print --zap-all /dev/sda",
+            "sgdisk -p -Z /dev/sda",
+            // Device first, option after.
+            "sgdisk /dev/sda --zap-all",
+        ] {
+            let matched = pack
+                .check(cmd)
+                .unwrap_or_else(|| panic!("sgdisk mutation must block: {cmd}"));
+            assert_eq!(matched.name, Some("sgdisk-modify"), "wrong rule for {cmd}");
+        }
+        for cmd in ["gdisk /dev/sda", "cgdisk /dev/sda", "gdisk \"/dev/nvme0n1\""] {
+            let matched = pack
+                .check(cmd)
+                .unwrap_or_else(|| panic!("interactive GPT editor must block: {cmd}"));
+            assert_eq!(matched.name, Some("gdisk-edit"), "wrong rule for {cmd}");
+        }
+    }
+
+    #[test]
+    fn gpt_tool_read_only_forms_stay_allowed_issue_456() {
+        // These allowed before the rules existed because nothing matched. They
+        // have to keep allowing for the right reason now, and none of them may
+        // reach a SafePattern: a pack-wide exemption would disarm every other
+        // rule in this pack for the same command (#448).
+        let pack = create_pack();
+        for cmd in [
+            "sgdisk --print /dev/sda",
+            "sgdisk -p /dev/sda",
+            "sgdisk --info=1 /dev/sda",
+            "sgdisk -i 1 /dev/sda",
+            "sgdisk --backup=/tmp/table.bin /dev/sda",
+            "sgdisk -b /tmp/table.bin /dev/sda",
+            "sgdisk --verify /dev/sda",
+            "sgdisk --version",
+            "sgdisk --list-types",
+            // Bare invocation carries no option and does nothing.
+            "sgdisk /dev/sda",
+            // `-P` is the dry run, and stays a dry run beside a mutation.
+            "sgdisk -P --zap-all /dev/sda",
+            "sgdisk --pretend -Z /dev/sda",
+            "sgdisk --zap-all -P /dev/sda",
+            // gdisk's list mode, both orders.
+            "gdisk -l /dev/sda",
+            "gdisk /dev/sda -l",
+            // Not these tools at all.
+            "ls /dev/sda",
+            "echo sgdisk --zap-all /dev/sda",
+        ] {
+            assert_no_match(&pack, cmd);
+            assert!(
+                !pack.matches_safe(cmd),
+                "read-only GPT form must be allowed by not matching, not by a \
+                 pack-wide exemption: {cmd}"
+            );
         }
     }
 
