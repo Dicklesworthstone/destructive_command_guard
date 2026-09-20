@@ -918,6 +918,13 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   domain-safe `iswdigit` (lines 612 and 631), so the report is small and the
   divergence should be short-lived.
 
+  The report itself is written and checked in at
+  [`vendor/upstream-report.md`](vendor/upstream-report.md) — filing it is a
+  copy-paste. Confirmed 2026-09-19 that it is not a duplicate: upstream's
+  latest release is still `v0.25.1` (2025-12-02) and its issue tracker has
+  nothing matching `isdigit` or `lookahead`. Delete that file once the issue
+  exists and put its URL here instead.
+
 - **The test suite's environment mutation is unsound, independently of #442
   (#445).**
   Three separate `ENV_LOCK` mutexes (`agent.rs`, `interactive.rs`, `hook.rs`)
