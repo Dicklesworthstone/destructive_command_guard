@@ -812,7 +812,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("sgdisk mutation must block: {cmd}"));
             assert_eq!(matched.name, Some("sgdisk-modify"), "wrong rule for {cmd}");
         }
-        for cmd in ["gdisk /dev/sda", "cgdisk /dev/sda", "gdisk \"/dev/nvme0n1\""] {
+        for cmd in [
+            "gdisk /dev/sda",
+            "cgdisk /dev/sda",
+            "gdisk \"/dev/nvme0n1\"",
+        ] {
             let matched = pack
                 .check(cmd)
                 .unwrap_or_else(|| panic!("interactive GPT editor must block: {cmd}"));

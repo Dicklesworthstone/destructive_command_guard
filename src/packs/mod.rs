@@ -6506,11 +6506,7 @@ mod tests {
             // every invocation these rules can match already names a device.
             // Asserting it here is what makes that a measured decision rather
             // than an assumption about someone else's keyword budget.
-            (
-                "system.disk",
-                "sgdisk --zap-all /dev/sda",
-                "sgdisk-modify",
-            ),
+            ("system.disk", "sgdisk --zap-all /dev/sda", "sgdisk-modify"),
             ("system.disk", "gdisk /dev/sda", "gdisk-edit"),
             // #441: `mount --bind /mnt /` names `mount` and nothing else. The
             // row carried only `umount`, which this command does not contain.

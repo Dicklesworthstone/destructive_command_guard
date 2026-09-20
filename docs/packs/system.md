@@ -79,6 +79,8 @@ These patterns match potentially destructive commands:
 | `dd-wipe` | dd from /dev/zero or /dev/urandom to a device will WIPE all data! | high |
 | `fdisk-edit` | fdisk can modify partition tables and cause data loss. | high |
 | `parted-modify` | parted can modify partition tables and cause data loss. | high |
+| `sgdisk-modify` | sgdisk rewrites the GPT; --zap-all/-Z also erases the protective MBR, losing every partition. | high |
+| `gdisk-edit` | gdisk/cgdisk open the GPT for interactive editing; a write from that session destroys the partition table. | high |
 | `mkfs` | mkfs formats a partition/device and ERASES all existing data. | high |
 | `mkswap` | mkswap formats a partition as a swap area, ERASING any existing data. | high |
 | `wipefs` | wipefs removes filesystem signatures. Use with extreme caution. | high |
