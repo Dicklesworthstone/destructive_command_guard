@@ -25299,6 +25299,11 @@ fn evaluate_heredoc(
                 if let Some(blocked) = check_fallback_patterns(command) {
                     return Some(blocked);
                 }
+                if let Some(blocked) =
+                    check_credential_write_fallback(command, context, first_allowlist_hit)
+                {
+                    return Some(blocked);
+                }
 
                 let strict_timeout = is_timeout && !context.heredoc_settings.fallback_on_timeout;
                 let strict_other = !is_timeout && !context.heredoc_settings.fallback_on_parse_error;
@@ -25361,6 +25366,11 @@ fn evaluate_heredoc(
             }
             ExtractionResult::Failed(err) => {
                 if let Some(blocked) = check_fallback_patterns(command) {
+                    return Some(blocked);
+                }
+                if let Some(blocked) =
+                    check_credential_write_fallback(command, context, first_allowlist_hit)
+                {
                     return Some(blocked);
                 }
 
@@ -25839,8 +25849,97 @@ fn evaluate_heredoc(
         if let Some(blocked) = check_fallback_patterns(command) {
             return Some(blocked);
         }
+        if let Some(blocked) =
+            check_credential_write_fallback(command, context, first_allowlist_hit)
+        {
+            return Some(blocked);
+        }
     }
 
+    None
+}
+
+/// Credential-write backstop for incomplete heredoc extraction (#461).
+///
+/// `check_fallback_patterns` below is the only backstop on the incomplete-
+/// extraction paths, and it is a set of sink NAMES. That is right for
+/// deletions — `shutil.rmtree` is dangerous whatever it is handed — and wrong
+/// for writes, where `open(p, 'w')` is ordinary for almost every `p`. A write
+/// is dangerous only for a protected path, so it cannot be reduced to a name,
+/// and `credential-file-write` had no entry there. That is the gap #452 found
+/// for Ruby, one rule over: with extraction forced to time out, a heredoc
+/// writing `~/.ssh/authorized_keys` was allowed while a heredoc deleting
+/// `$HOME` was still denied.
+///
+/// The remedy is #443's. Re-extract on the structural budget, which keeps
+/// every size cap and relaxes only the wall clock, then run the same
+/// synchronous classifier the primary path uses. The verdict then follows the
+/// command rather than how busy the host was. If even the structural budget is
+/// exhausted this returns `None`, the same outcome as before — #443 sized that
+/// budget so only descheduling, never ordinary work, reaches it.
+///
+/// Allowlisting is honoured exactly as on the primary path, so an explicitly
+/// reviewed `core.filesystem:credential-file-write` exception lifts this
+/// denial too rather than the two paths disagreeing about the same write.
+fn check_credential_write_fallback(
+    command: &str,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    let items = match extract_content(
+        command,
+        &crate::heredoc::ExtractionLimits::structural_scan(),
+    ) {
+        ExtractionResult::Extracted(items)
+        | ExtractionResult::Partial {
+            extracted: items, ..
+        } => items,
+        _ => return None,
+    };
+    const PACK_ID: &str = "core.filesystem";
+    for item in items {
+        let Ok(hits) =
+            crate::packs::core::credential_files::scan_extracted(&item.content, item.language)
+        else {
+            continue;
+        };
+        let Some(hit) = hits.into_iter().next() else {
+            continue;
+        };
+        let severity = crate::packs::Severity::Critical;
+        if let Some(allow_hit) =
+            context
+                .allowlists
+                .match_rule_at_path(PACK_ID, hit.rule, context.project_path)
+        {
+            if first_allowlist_hit.is_none() {
+                *first_allowlist_hit = Some((
+                    PatternMatch {
+                        pack_id: Some(PACK_ID.to_string()),
+                        pattern_name: Some(hit.rule.to_string()),
+                        severity: Some(severity),
+                        reason: hit.reason.clone(),
+                        source: MatchSource::HeredocAst,
+                        matched_span: None,
+                        matched_text_preview: None,
+                        explanation: None,
+                        suggestions: &[],
+                    },
+                    allow_hit.layer,
+                    allow_hit.entry.reason.clone(),
+                ));
+            }
+            continue;
+        }
+        return Some(EvaluationResult::denied_by_pack_pattern(
+            PACK_ID,
+            hit.rule,
+            &hit.reason,
+            None,
+            severity,
+            &[],
+        ));
+    }
     None
 }
 
@@ -38286,6 +38385,67 @@ mod tests {
                     .is_some_and(|reason| reason.contains("bounded fallback")),
                 "timeout denial should identify the bounded fallback path: {result:?}"
             );
+        }
+
+        /// #461: the credential-write rule needs the incomplete-extraction
+        /// backstop too, not just the deletion sinks.
+        ///
+        /// `check_fallback_patterns` is a set of sink NAMES, which cannot express
+        /// a write — `open(p, 'w')` is dangerous only for a protected `p`. So on
+        /// this path a heredoc writing `authorized_keys` was allowed while one
+        /// deleting a home directory was denied; with extraction at 0 ms every
+        /// row below was ALLOWED before `check_credential_write_fallback`. That
+        /// is also why the #461 end-to-end suite flaked under concurrency: a
+        /// busy host pushed extraction past its 50 ms budget and the write
+        /// slipped through.
+        #[test]
+        fn extraction_timeout_keeps_the_credential_write_backstop_461() {
+            let limits = crate::heredoc::ExtractionLimits {
+                max_body_bytes: 1024 * 1024,
+                max_body_lines: 10_000,
+                max_heredocs: 10,
+                timeout_ms: 0,
+            };
+            let settings = heredoc_config_with_limits(limits);
+            for cmd in [
+                "python3 <<'PY'\nopen('/home/example/.ssh/authorized_keys', 'a').write('k')\nPY",
+                "node <<'JS'\nrequire('fs').writeFileSync('/home/example/.bashrc', 'x')\nJS",
+                "ruby <<'RB'\nFile.write('/home/example/.bashrc', 'x')\nRB",
+                // The append exemption is for known_hosts only; truncating it is not.
+                "python3 <<'PY'\nopen('/home/example/.ssh/known_hosts', 'w')\nPY",
+            ] {
+                let result = eval_with_heredoc(cmd, &settings);
+                assert!(
+                    result.is_denied(),
+                    "an extraction timeout must not turn a protected write into an allow: \
+                     {cmd:?} -> {result:?}"
+                );
+                assert_eq!(
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref()),
+                    Some("credential-file-write"),
+                    "the fallback must deny under the SAME rule as the primary path, so one \
+                     allowlist entry governs both: {cmd:?}"
+                );
+            }
+            // The fallback classifies paths rather than matching sink names, so
+            // everything the primary path allows stays allowed.
+            for cmd in [
+                "python3 <<'PY'\nopen('build/out.txt', 'w').write('x')\nPY",
+                "python3 <<'PY'\nprint(open('/home/example/.ssh/id_rsa').read())\nPY",
+                "python3 <<'PY'\nopen('/home/example/.ssh/known_hosts', 'a').write('h')\nPY",
+                "python3 <<'PY'\nprint(\"open('/home/example/.bashrc', 'w')\")\nPY",
+                "cat <<'EOF'\nopen('/home/example/.bashrc', 'w')\nEOF",
+            ] {
+                let result = eval_with_heredoc(cmd, &settings);
+                assert!(
+                    result.is_allowed(),
+                    "the credential backstop must not over-block under a timeout: \
+                     {cmd:?} -> {result:?}"
+                );
+            }
         }
 
         #[test]

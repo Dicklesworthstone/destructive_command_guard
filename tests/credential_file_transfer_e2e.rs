@@ -84,7 +84,11 @@ fn assert_decision(command: &str, home: &Path, rule: Option<&str>) {
             String::from_utf8_lossy(&output.stderr)
         )
     });
-    assert_eq!(output.status.code(), Some(i32::from(rule.is_some())), "{command}: {stdout}");
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(rule.is_some())),
+        "{command}: {stdout}"
+    );
     assert_eq!(
         json["decision"],
         if rule.is_some() { "deny" } else { "allow" },
@@ -117,13 +121,36 @@ fn transfer_destinations_reach_both_entry_points() {
         ("/home/u/.ssh/known_hosts", "credential-file-write"),
     ] {
         for (exe, source) in [
-            ("python3", format!("import os; os.replace('staged', '{target}')")),
-            ("python3", format!("from os import rename as install; install(dst='{target}', src='staged')")),
-            ("python3", format!("from shutil import copyfile as save; save('staged', '{target}')")),
-            ("python3", format!("from pathlib import Path; Path('staged').replace(target='{target}')")),
-            ("node", format!("require('fs').renameSync('staged', '{target}')")),
-            ("node", format!("const {{copyFileSync: save}} = require('node:fs'); save('staged', '{target}')")),
-            ("node", format!("require('fs/promises').copyFile('staged', '{target}')")),
+            (
+                "python3",
+                format!("import os; os.replace('staged', '{target}')"),
+            ),
+            (
+                "python3",
+                format!("from os import rename as install; install(dst='{target}', src='staged')"),
+            ),
+            (
+                "python3",
+                format!("from shutil import copyfile as save; save('staged', '{target}')"),
+            ),
+            (
+                "python3",
+                format!("from pathlib import Path; Path('staged').replace(target='{target}')"),
+            ),
+            (
+                "node",
+                format!("require('fs').renameSync('staged', '{target}')"),
+            ),
+            (
+                "node",
+                format!(
+                    "const {{copyFileSync: save}} = require('node:fs'); save('staged', '{target}')"
+                ),
+            ),
+            (
+                "node",
+                format!("require('fs/promises').copyFile('staged', '{target}')"),
+            ),
             ("ruby", format!("File.rename('staged', '{target}')")),
             ("ruby", format!("IO.copy_stream('staged', '{target}')")),
         ] {
@@ -136,8 +163,14 @@ fn transfer_destinations_reach_both_entry_points() {
 fn copying_out_is_a_read_but_renaming_out_mutates_the_source() {
     let home = home();
     for (exe, source) in [
-        ("python3", "import shutil; shutil.copyfile('.bashrc', 'backup.txt')"),
-        ("node", "require('fs').copyFileSync('.git/config', 'backup.txt')"),
+        (
+            "python3",
+            "import shutil; shutil.copyfile('.bashrc', 'backup.txt')",
+        ),
+        (
+            "node",
+            "require('fs').copyFileSync('.git/config', 'backup.txt')",
+        ),
         ("ruby", "IO.copy_stream('.ssh/id_rsa', 'backup.txt')"),
     ] {
         assert_program(exe, source, home.path(), None);
@@ -146,7 +179,10 @@ fn copying_out_is_a_read_but_renaming_out_mutates_the_source() {
         ("python3", "import os; os.replace('.bashrc', 'backup.txt')"),
         ("node", "require('fs').renameSync('.bashrc', 'backup.txt')"),
         ("ruby", "File.rename('.bashrc', 'backup.txt')"),
-        ("python3", "import shutil; shutil.copyfile(source, '.bashrc')"),
+        (
+            "python3",
+            "import shutil; shutil.copyfile(source, '.bashrc')",
+        ),
         ("node", "require('fs').renameSync('.bashrc', destination)"),
     ] {
         assert_program(exe, source, home.path(), Some("credential-file-write"));
@@ -167,8 +203,14 @@ fn one_rename_requires_permission_for_both_rule_families() {
         .expect("rule allowlist");
         for (source, destination) in [(".bashrc", ".git/config"), (".git/config", ".bashrc")] {
             for (exe, program) in [
-                ("python3", format!("import os; os.replace('{source}', '{destination}')")),
-                ("node", format!("require('fs').renameSync('{source}', '{destination}')")),
+                (
+                    "python3",
+                    format!("import os; os.replace('{source}', '{destination}')"),
+                ),
+                (
+                    "node",
+                    format!("require('fs').renameSync('{source}', '{destination}')"),
+                ),
                 ("ruby", format!("File.rename('{source}', '{destination}')")),
             ] {
                 assert_program(exe, &program, home.path(), Some(denied));
@@ -182,12 +224,24 @@ fn inert_text_unrelated_receivers_and_real_append_remain_allowed() {
     let home = home();
     for (exe, source) in [
         ("python3", "print(\"os.replace('staged', '.bashrc')\")"),
-        ("python3", "import shutil; shutil = store; shutil.copyfile('staged', '.bashrc')"),
-        ("node", "const fs = require('unrelated'); fs.renameSync('staged', '.bashrc')"),
+        (
+            "python3",
+            "import shutil; shutil = store; shutil.copyfile('staged', '.bashrc')",
+        ),
+        (
+            "node",
+            "const fs = require('unrelated'); fs.renameSync('staged', '.bashrc')",
+        ),
         ("ruby", "puts \"File.rename('staged', '.bashrc')\""),
         ("ruby", "Store.rename('staged', '.bashrc')"),
-        ("python3", "open('/home/u/.ssh/known_hosts', 'a').write('host')"),
-        ("node", "require('fs').appendFileSync('/home/u/.ssh/known_hosts', 'host')"),
+        (
+            "python3",
+            "open('/home/u/.ssh/known_hosts', 'a').write('host')",
+        ),
+        (
+            "node",
+            "require('fs').appendFileSync('/home/u/.ssh/known_hosts', 'host')",
+        ),
     ] {
         assert_program(exe, source, home.path(), None);
     }

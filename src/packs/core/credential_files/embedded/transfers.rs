@@ -159,39 +159,101 @@ mod tests {
     #[test]
     fn direct_destinations_and_aliases_reach_shared_policy() {
         for (language, source) in [
-            (ScriptLanguage::Python, "import os; os.replace('staged', '.bashrc')"),
-            (ScriptLanguage::Python, "from os import rename as install; install(dst='.bashrc', src='staged')"),
-            (ScriptLanguage::Python, "import shutil as disk; disk.copyfile('staged', '.bashrc')"),
-            (ScriptLanguage::Python, "from shutil import copyfile as save; save(src='staged', dst='.bashrc')"),
-            (ScriptLanguage::Python, "from pathlib import Path; Path('staged').replace(target='.bashrc')"),
-            (ScriptLanguage::Python, "from pathlib import Path as P; install = P('staged').rename; install('.bashrc')"),
-            (ScriptLanguage::Python, "import os; os.replace('staged', os.path.expanduser('~/.bashrc'))"),
-            (ScriptLanguage::JavaScript, "require('fs').renameSync('staged', '.bashrc')"),
-            (ScriptLanguage::JavaScript, "const {copyFileSync: save} = require('node:fs'); save('staged', '.bashrc')"),
-            (ScriptLanguage::JavaScript, "import {rename as install} from 'node:fs/promises'; install('staged', '.bashrc')"),
-            (ScriptLanguage::JavaScript, "require('fs').promises.copyFile('staged', '.bashrc')"),
-            (ScriptLanguage::TypeScript, "import * as fs from 'node:fs'; const p: string = '.bashrc'; fs.copyFileSync('staged', p)"),
+            (
+                ScriptLanguage::Python,
+                "import os; os.replace('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "from os import rename as install; install(dst='.bashrc', src='staged')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import shutil as disk; disk.copyfile('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "from shutil import copyfile as save; save(src='staged', dst='.bashrc')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "from pathlib import Path; Path('staged').replace(target='.bashrc')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "from pathlib import Path as P; install = P('staged').rename; install('.bashrc')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os; os.replace('staged', os.path.expanduser('~/.bashrc'))",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('fs').renameSync('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const {copyFileSync: save} = require('node:fs'); save('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "import {rename as install} from 'node:fs/promises'; install('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('fs').promises.copyFile('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::TypeScript,
+                "import * as fs from 'node:fs'; const p: string = '.bashrc'; fs.copyFileSync('staged', p)",
+            ),
             (ScriptLanguage::Ruby, "File.rename('staged', '.bashrc')"),
             (ScriptLanguage::Ruby, "IO.copy_stream('staged', '.bashrc')"),
-            (ScriptLanguage::Ruby, "File.copy_stream('staged', '.bashrc')"),
-            (ScriptLanguage::Ruby, "F = File; F.rename('staged', File.expand_path('~/.bashrc'))"),
+            (
+                ScriptLanguage::Ruby,
+                "File.copy_stream('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::Ruby,
+                "F = File; F.rename('staged', File.expand_path('~/.bashrc'))",
+            ),
         ] {
-            assert_eq!(rules(source, language), ["credential-file-write"], "{source}");
+            assert_eq!(
+                rules(source, language),
+                ["credential-file-write"],
+                "{source}"
+            );
         }
     }
 
     #[test]
     fn unknown_operand_cannot_hide_the_known_mutation() {
         for (language, source) in [
-            (ScriptLanguage::Python, "import shutil; shutil.copyfile(source, '.bashrc')"),
-            (ScriptLanguage::Python, "import os; os.replace('.bashrc', destination)"),
-            (ScriptLanguage::JavaScript, "require('fs').copyFileSync(source, '.bashrc')"),
-            (ScriptLanguage::JavaScript, "require('fs').renameSync('.bashrc', destination)"),
+            (
+                ScriptLanguage::Python,
+                "import shutil; shutil.copyfile(source, '.bashrc')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os; os.replace('.bashrc', destination)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('fs').copyFileSync(source, '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('fs').renameSync('.bashrc', destination)",
+            ),
             (ScriptLanguage::Ruby, "File.rename(source, '.bashrc')"),
             (ScriptLanguage::Ruby, "IO.copy_stream(source, '.bashrc')"),
             (ScriptLanguage::Ruby, "File.rename('.bashrc', destination)"),
         ] {
-            assert_eq!(rules(source, language), ["credential-file-write"], "{source}");
+            assert_eq!(
+                rules(source, language),
+                ["credential-file-write"],
+                "{source}"
+            );
         }
     }
 
@@ -199,14 +261,30 @@ mod tests {
     fn rename_preserves_both_rule_families_in_a_single_call() {
         for (source, destination) in [(".bashrc", ".git/config"), (".git/config", ".bashrc")] {
             for (language, program) in [
-                (ScriptLanguage::Python, format!("import os; os.replace('{source}', '{destination}')")),
-                (ScriptLanguage::Python, format!("from pathlib import Path; Path('{source}').rename('{destination}')")),
-                (ScriptLanguage::JavaScript, format!("require('fs').renameSync('{source}', '{destination}')")),
-                (ScriptLanguage::Ruby, format!("File.rename('{source}', '{destination}')")),
+                (
+                    ScriptLanguage::Python,
+                    format!("import os; os.replace('{source}', '{destination}')"),
+                ),
+                (
+                    ScriptLanguage::Python,
+                    format!("from pathlib import Path; Path('{source}').rename('{destination}')"),
+                ),
+                (
+                    ScriptLanguage::JavaScript,
+                    format!("require('fs').renameSync('{source}', '{destination}')"),
+                ),
+                (
+                    ScriptLanguage::Ruby,
+                    format!("File.rename('{source}', '{destination}')"),
+                ),
             ] {
                 let mut actual = rules(&program, language);
                 actual.sort_unstable();
-                assert_eq!(actual, ["credential-file-write", "git-internals-write"], "{program}");
+                assert_eq!(
+                    actual,
+                    ["credential-file-write", "git-internals-write"],
+                    "{program}"
+                );
             }
         }
     }
@@ -214,37 +292,95 @@ mod tests {
     #[test]
     fn copies_read_the_source_but_never_inherit_append_exemptions() {
         for (language, source) in [
-            (ScriptLanguage::Python, "import shutil; shutil.copyfile('.bashrc', 'backup.txt')"),
-            (ScriptLanguage::Python, "import shutil; shutil.copyfile('.git/config', 'backup.txt')"),
-            (ScriptLanguage::JavaScript, "require('fs').copyFileSync('.ssh/id_rsa', 'backup.txt')"),
-            (ScriptLanguage::Ruby, "IO.copy_stream('.ssh/id_rsa', 'backup.txt')"),
+            (
+                ScriptLanguage::Python,
+                "import shutil; shutil.copyfile('.bashrc', 'backup.txt')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import shutil; shutil.copyfile('.git/config', 'backup.txt')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('fs').copyFileSync('.ssh/id_rsa', 'backup.txt')",
+            ),
+            (
+                ScriptLanguage::Ruby,
+                "IO.copy_stream('.ssh/id_rsa', 'backup.txt')",
+            ),
         ] {
             assert!(rules(source, language).is_empty(), "{source}");
         }
         for (language, source) in [
-            (ScriptLanguage::Python, "import shutil; shutil.copyfile('staged', '.ssh/known_hosts')"),
-            (ScriptLanguage::JavaScript, "const fs = require('fs'); fs.copyFileSync('staged', '.ssh/known_hosts', fs.constants.COPYFILE_EXCL)"),
-            (ScriptLanguage::Ruby, "File.rename('staged', '.ssh/known_hosts')"),
-            (ScriptLanguage::Ruby, "IO.copy_stream('staged', '.ssh/known_hosts', 0)"),
+            (
+                ScriptLanguage::Python,
+                "import shutil; shutil.copyfile('staged', '.ssh/known_hosts')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const fs = require('fs'); fs.copyFileSync('staged', '.ssh/known_hosts', fs.constants.COPYFILE_EXCL)",
+            ),
+            (
+                ScriptLanguage::Ruby,
+                "File.rename('staged', '.ssh/known_hosts')",
+            ),
+            (
+                ScriptLanguage::Ruby,
+                "IO.copy_stream('staged', '.ssh/known_hosts', 0)",
+            ),
         ] {
-            assert_eq!(rules(source, language), ["credential-file-write"], "{source}");
+            assert_eq!(
+                rules(source, language),
+                ["credential-file-write"],
+                "{source}"
+            );
         }
     }
 
     #[test]
     fn inert_text_shadowing_and_unrelated_receivers_stay_clear() {
         for (language, source) in [
-            (ScriptLanguage::Python, "print(\"os.replace('staged', '.bashrc')\")"),
-            (ScriptLanguage::Python, "# os.replace('staged', '.bashrc')\nprint('ok')"),
-            (ScriptLanguage::Python, "import shutil; shutil = store; shutil.copyfile('staged', '.bashrc')"),
-            (ScriptLanguage::Python, "import os; deferral = os.replace; deferral = print; deferral('staged', '.bashrc')"),
-            (ScriptLanguage::Python, "def example(os):\n    os.replace('staged', '.bashrc')"),
-            (ScriptLanguage::JavaScript, "const fs = require('unrelated'); fs.renameSync('staged', '.bashrc')"),
-            (ScriptLanguage::JavaScript, "function example(require) { require('fs').renameSync('staged', '.bashrc') }"),
-            (ScriptLanguage::JavaScript, "console.log(\"require('fs').copyFileSync('staged', '.bashrc')\")"),
+            (
+                ScriptLanguage::Python,
+                "print(\"os.replace('staged', '.bashrc')\")",
+            ),
+            (
+                ScriptLanguage::Python,
+                "# os.replace('staged', '.bashrc')\nprint('ok')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import shutil; shutil = store; shutil.copyfile('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os; deferral = os.replace; deferral = print; deferral('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "def example(os):\n    os.replace('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const fs = require('unrelated'); fs.renameSync('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "function example(require) { require('fs').renameSync('staged', '.bashrc') }",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "console.log(\"require('fs').copyFileSync('staged', '.bashrc')\")",
+            ),
             (ScriptLanguage::Ruby, "Store.rename('staged', '.bashrc')"),
-            (ScriptLanguage::Ruby, "IO = Store; IO.copy_stream('staged', '.bashrc')"),
-            (ScriptLanguage::Ruby, "puts \"File.rename('staged', '.bashrc')\""),
+            (
+                ScriptLanguage::Ruby,
+                "IO = Store; IO.copy_stream('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::Ruby,
+                "puts \"File.rename('staged', '.bashrc')\"",
+            ),
         ] {
             assert!(rules(source, language).is_empty(), "{source}");
         }
@@ -254,17 +390,44 @@ mod tests {
     fn transfer_names_survive_both_candidate_gates() {
         for (interpreter, flag, source) in [
             ("python3", "-c", "import os; os.rename('staged', '.bashrc')"),
-            ("python3", "-c", "import os; os.replace('staged', '.bashrc')"),
-            ("python3", "-c", "import shutil; shutil.copyfile('staged', '.bashrc')"),
-            ("node", "-e", "require('fs').copyFileSync('staged', '.bashrc')"),
-            ("node", "-e", "require('fs').copyFile('staged', '.bashrc', () => {})"),
-            ("node", "-e", "require('fs').renameSync('staged', '.bashrc')"),
-            ("node", "-e", "require('fs').rename('staged', '.bashrc', () => {})"),
+            (
+                "python3",
+                "-c",
+                "import os; os.replace('staged', '.bashrc')",
+            ),
+            (
+                "python3",
+                "-c",
+                "import shutil; shutil.copyfile('staged', '.bashrc')",
+            ),
+            (
+                "node",
+                "-e",
+                "require('fs').copyFileSync('staged', '.bashrc')",
+            ),
+            (
+                "node",
+                "-e",
+                "require('fs').copyFile('staged', '.bashrc', () => {})",
+            ),
+            (
+                "node",
+                "-e",
+                "require('fs').renameSync('staged', '.bashrc')",
+            ),
+            (
+                "node",
+                "-e",
+                "require('fs').rename('staged', '.bashrc', () => {})",
+            ),
             ("ruby", "-e", "File.rename('staged', '.bashrc')"),
             ("ruby", "-e", "IO.copy_stream('staged', '.bashrc')"),
         ] {
             let command = format!("{interpreter} {flag} \"{source}\"");
-            assert!(classify(&command, ShellDialect::Posix).is_some(), "{command}");
+            assert!(
+                classify(&command, ShellDialect::Posix).is_some(),
+                "{command}"
+            );
         }
     }
 }

@@ -7111,12 +7111,58 @@ mod tests {
         /// A source check rather than a timing one on purpose: reproducing the
         /// expiry needs a loaded host, which is the nondeterminism being
         /// removed. `src/perf.rs` guards its own invariants the same way.
+        ///
+        /// It walks every file under `src/`, not a named list. It used to read
+        /// just `heredoc.rs` and `evaluator.rs`, and #461's
+        /// `credential_files/embedded.rs` — a new file — repeated this exact
+        /// anti-pattern in a classifier the guard could not see: extraction on
+        /// the 50 ms budget, anything but a completed result mapped to "no
+        /// protected write". A named list only protects the files someone
+        /// remembered, so a new file is now covered by default and escapes only
+        /// through `HOT_PATH_BUDGET_OWNERS` below.
         #[test]
         fn classification_helpers_use_the_structural_budget_443() {
-            for (file, source) in [
-                ("src/heredoc.rs", include_str!("heredoc.rs")),
-                ("src/evaluator.rs", include_str!("evaluator.rs")),
-            ] {
+            /// Files whose job is to materialize the configurable HOT-PATH
+            /// extraction budget, which #443 deliberately leaves at 50 ms: that
+            /// knob governs extraction work, and a timeout there is handled by
+            /// the evaluator's bounded fallback rather than read as an answer.
+            /// Add a file here only if it builds that budget — never to let a
+            /// classifier keep the default.
+            const HOT_PATH_BUDGET_OWNERS: &[&str] = &["src/config.rs"];
+
+            fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+                for entry in std::fs::read_dir(dir).expect("read a source directory") {
+                    let path = entry.expect("read a source directory entry").path();
+                    if path.is_dir() {
+                        rust_sources(&path, out);
+                    } else if path.extension().is_some_and(|ext| ext == "rs") {
+                        out.push(path);
+                    }
+                }
+            }
+
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            let mut files = Vec::new();
+            rust_sources(&root.join("src"), &mut files);
+            files.sort();
+            // Vacuity guard: an empty or near-empty walk would pass trivially.
+            assert!(
+                files.iter().any(|path| path.ends_with("heredoc.rs"))
+                    && files.iter().any(|path| path.ends_with("evaluator.rs"))
+                    && files.iter().any(|path| path.ends_with("embedded.rs")),
+                "the source walk must reach the files this guard exists for: {files:?}"
+            );
+
+            for path in files {
+                let file = path
+                    .strip_prefix(root)
+                    .expect("walked path is under the manifest dir")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if HOT_PATH_BUDGET_OWNERS.contains(&file.as_str()) {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("read a source file");
                 let production = source
                     .split("\nmod tests {")
                     .next()

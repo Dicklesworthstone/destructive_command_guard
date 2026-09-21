@@ -6,7 +6,9 @@
 //! executed and no destination is read or opened.
 
 use super::{CredentialFileWrite, shell};
-use crate::heredoc::{ExtractionLimits, ExtractionResult, HeredocType, ScriptLanguage, extract_content};
+use crate::heredoc::{
+    ExtractionLimits, ExtractionResult, HeredocType, ScriptLanguage, extract_content,
+};
 use crate::normalize::{ShellDialect, strip_wrapper_prefixes};
 use ast_grep_core::{AstGrep, Node, tree_sitter::StrDoc};
 use ast_grep_language::SupportLang;
@@ -74,8 +76,7 @@ pub(crate) fn source_scan_required(code: &str, language: ScriptLanguage) -> bool
 /// family's files. Keep this a superset, not a raw destination-path check.
 fn source_has_sink_name(code: &str) -> bool {
     [
-        "open", "write", "Write", "append", "truncate", "File", "Path", "copy", "rename",
-        "replace",
+        "open", "write", "Write", "append", "truncate", "File", "Path", "copy", "rename", "replace",
     ]
     .iter()
     .any(|word| code.contains(word))
@@ -163,7 +164,11 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
     // when their actual shell receiver is a supported stdin interpreter, and
     // verify that receiver against executable command nodes in the shell AST.
     if segment.contains("<<") {
-        let items = match extract_content(segment, &ExtractionLimits::default()) {
+        // Structural budget, not the 50 ms hot-path default (#443). This is a
+        // classification — anything but a completed extraction becomes `None`
+        // below, i.e. "no protected write" — so on the default budget the
+        // answer followed how busy the host was rather than the command.
+        let items = match extract_content(segment, &ExtractionLimits::structural_scan()) {
             ExtractionResult::Extracted(items)
             | ExtractionResult::Partial {
                 extracted: items, ..
@@ -173,9 +178,7 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
         for item in items {
             // Here-strings were inspected on their owning command above. A
             // regex extraction cannot prove which descriptor consumes them.
-            if item.heredoc_type.is_none()
-                || item.heredoc_type == Some(HeredocType::HereString)
-            {
+            if item.heredoc_type.is_none() || item.heredoc_type == Some(HeredocType::HereString) {
                 continue;
             }
             let Some(target) = item.target_command.as_deref() else {
@@ -243,9 +246,9 @@ fn here_string_source(command: &Syntax<'_>) -> Option<(String, Range<usize>)> {
             }
             match redirect.kind().as_ref() {
                 "herestring_redirect" | "heredoc_redirect" => true,
-                "file_redirect" => redirect.children().any(|child| {
-                    matches!(child.text().as_ref(), "<" | "<&" | "<&-" | "<>")
-                }),
+                "file_redirect" => redirect
+                    .children()
+                    .any(|child| matches!(child.text().as_ref(), "<" | "<&" | "<&-" | "<>")),
                 _ => false,
             }
         })
@@ -1072,7 +1075,10 @@ mod here_string_tests {
         ] {
             for prefix in ["", "env ", "sudo ", "FOO=1 "] {
                 for flag in ["", " -"] {
-                    for word in [format!("\"{code}\""), format!("'{}'", code.replace('\'', "'\\''"))] {
+                    for word in [
+                        format!("\"{code}\""),
+                        format!("'{}'", code.replace('\'', "'\\''")),
+                    ] {
                         for redirect in ["<<< ", "<<<", "0<<< "] {
                             let command = format!("{prefix}{exe}{flag} {redirect}{word}");
                             let hit = classify(&command, ShellDialect::Posix).expect(&command);
@@ -1097,10 +1103,16 @@ mod here_string_tests {
             "cat <<'DATA'\npython3 <<< \"open('/etc/shadow', 'w')\"\nDATA",
             "echo 'python3 <<< \"open(/etc/shadow, w)\"'",
         ] {
-            assert!(classify(command, ShellDialect::Posix).is_none(), "{command}");
+            assert!(
+                classify(command, ShellDialect::Posix).is_none(),
+                "{command}"
+            );
         }
         let command = "python3 </dev/null <<< \"open('/etc/shadow', 'w')\"";
-        assert!(classify(command, ShellDialect::Posix).is_some(), "{command}");
+        assert!(
+            classify(command, ShellDialect::Posix).is_some(),
+            "{command}"
+        );
     }
 
     #[test]
@@ -1115,10 +1127,16 @@ mod here_string_tests {
         ] {
             let word = format!("'{}'", code.replace('\'', "'\\''"));
             let command = format!("python3 <<< {word}");
-            assert!(classify(&command, ShellDialect::Posix).is_none(), "{command}");
+            assert!(
+                classify(&command, ShellDialect::Posix).is_none(),
+                "{command}"
+            );
         }
         let command = "python3 <<< \"import os; os.truncate('/home/u/.ssh/known_hosts', 0)\"";
-        assert!(classify(command, ShellDialect::Posix).is_some(), "{command}");
+        assert!(
+            classify(command, ShellDialect::Posix).is_some(),
+            "{command}"
+        );
     }
 
     #[test]
@@ -1132,7 +1150,9 @@ mod here_string_tests {
         let enabled = HashSet::from(["core.filesystem".to_string()]);
         let ordered = REGISTRY.expand_enabled_ordered(&enabled);
         let keywords = REGISTRY.collect_enabled_keywords(&enabled);
-        let index = REGISTRY.build_enabled_keyword_index(&ordered).expect("keyword index");
+        let index = REGISTRY
+            .build_enabled_keyword_index(&ordered)
+            .expect("keyword index");
         let overrides = CompiledOverrides::default();
         let allowlists = LayeredAllowlist::default();
         let mut heredoc = Config::default().heredoc_settings();
