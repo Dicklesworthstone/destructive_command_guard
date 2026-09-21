@@ -90,10 +90,12 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
         // in `is_js_api` that spells it with a capital and carries none of the
         // other needles, so it was rejected here before the parser ever ran and
         // every `createWriteStream` write of a credential file was allowed.
+        // `truncate` joins because `os.truncate(p, 0)` and `fs.truncateSync(p, 0)`
+        // contain none of the other words.
         // `every_sink_name_trips_the_pre_gate` is what keeps the two lists
         // agreeing; a new camelCase sink will fail that test rather than fail
         // silently.
-        || !["open", "write", "Write", "append", "File", "Path"]
+        || !["open", "write", "Write", "append", "File", "Path", "truncate"]
             .iter()
             .any(|word| segment.contains(word))
     {
@@ -278,6 +280,20 @@ enum Value {
     Fs,
     File,
     Api(String),
+    /// Python's `os` module, and the two members of it that matter here.
+    Os,
+    OsPath,
+    /// `os.truncate(path, length)` — a truncating write with no mode argument.
+    OsTruncate,
+    /// `os.path.expanduser` / Ruby's `File.expand_path`.
+    ExpandUser,
+    /// A path literal the source provably home-expands at run time.
+    ///
+    /// Kept distinct from `Text` because a bare string literal is NOT expanded:
+    /// `open('~/.ssh/id_rsa','w')` creates a directory named `~`. Only when an
+    /// expander wraps the literal does its leading `~` name the home directory,
+    /// and `protected` has to know which of the two it is looking at.
+    HomePath(String),
 }
 
 type Bindings = HashMap<String, Value>;
@@ -357,8 +373,8 @@ fn visit(
         return None;
     }
     bind(&node, language, env);
-    if let Some((api, path, access)) = write_call(&node, language, env) {
-        if let Some(rule) = protected(&path, access) {
+    if let Some((api, path, access, expands)) = write_call(&node, language, env) {
+        if let Some(rule) = protected(&path, access, expands) {
             return Some((api, path, access, rule));
         }
     }
@@ -374,11 +390,36 @@ fn visit(
 /// Quote every byte so embedded string contents cannot become shell syntax,
 /// expansions, glob patterns, or extra targets. This deliberately does not
 /// expand literal '~' or '$HOME' in an ordinary language string literal.
-fn protected(path: &str, access: Access) -> Option<&'static str> {
+///
+/// The one exception is `expands_home`, set only when `path_value` saw the
+/// literal wrapped in `os.path.expanduser` or `File.expand_path` — code that
+/// really does resolve `~` against the home directory at run time. Then the
+/// leading `~`/`~user` alone is left unquoted, so the shell resolver reads it
+/// as the home anchor exactly as it reads `tee -a ~/.ssh/authorized_keys`.
+/// Everything after the first `/` stays quoted, so the carve-out cannot
+/// introduce any other expansion.
+fn protected(path: &str, access: Access, expands_home: bool) -> Option<&'static str> {
+
     if access == Access::Read {
         return None;
     }
-    let quoted = format!("'{}'", path.replace('\'', "'\\''"));
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+    // A tilde prefix is `~` or `~user`: word characters only. Anything else
+    // after the `~` would be spliced into the shell word unquoted, so it is
+    // judged fully quoted instead — never widening what the adapter parses.
+    let anchor = expands_home
+        .then(|| path.split_once('/').unwrap_or((path, "")))
+        .filter(|(anchor, _)| {
+            anchor.starts_with('~')
+                && anchor[1..]
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        });
+    let quoted = match anchor {
+        Some((anchor, "")) => anchor.to_string(),
+        Some((anchor, rest)) => format!("{anchor}/{}", quote(rest)),
+        None => quote(path),
+    };
     let append = if access == Access::Append { "-a " } else { "" };
     // The synthesized writer is `tee`, never a redirect, so a `.git` target
     // reaches the rule here exactly as `tee .git/config` would (#457) — and
@@ -408,10 +449,23 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
                 (None, "io") => Some(Value::Io),
                 (None, "builtins") => Some(Value::Builtins),
                 (None, "pathlib") => Some(Value::Pathlib),
+                (None, "os") => Some(Value::Os),
                 (Some("io" | "builtins"), "open") => Some(Value::Open),
                 (Some("pathlib"), "Path") => Some(Value::PathConstructor),
+                (Some("os"), "truncate") => Some(Value::OsTruncate),
+                (Some("os"), "path") => Some(Value::OsPath),
+                (Some("os.path"), "expanduser") => Some(Value::ExpandUser),
                 _ => None,
             };
+            // `import os.path` binds the name `os`, not `os.path`, so the
+            // alias computed above is wrong for it. Without this the common
+            // `import os.path; os.path.expanduser(...)` would leave `os`
+            // unbound and the expansion unseen.
+            if module.is_none() && source.starts_with("os.") && name.field("alias").is_none() {
+                env.remove("os");
+                env.insert("os".into(), Value::Os);
+                continue;
+            }
             env.remove(&alias);
             if let Some(value) = value {
                 env.insert(alias, value);
@@ -489,7 +543,13 @@ fn is_fs_module(module: &str) -> bool {
 fn is_js_api(name: &str) -> bool {
     matches!(
         name,
-        "writeFile" | "writeFileSync" | "appendFile" | "appendFileSync" | "createWriteStream"
+        "writeFile"
+            | "writeFileSync"
+            | "appendFile"
+            | "appendFileSync"
+            | "createWriteStream"
+            | "truncate"
+            | "truncateSync"
     )
 }
 
@@ -522,6 +582,22 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                 (Value::Path(path), "open") => Some(Value::PathOpen(path)),
                 (Value::Fs, "promises") => Some(Value::Fs),
                 (Value::Fs, name) if is_js_api(name) => Some(Value::Api(name.into())),
+                (Value::Os, "truncate") => Some(Value::OsTruncate),
+                (Value::Os, "path") => Some(Value::OsPath),
+                (Value::OsPath, "expanduser") => Some(Value::ExpandUser),
+                _ => None,
+            }
+        }
+        // Ruby spells a call as receiver/method rather than a `function`
+        // field, so `File.expand_path('~/x')` never reaches the arm below.
+        "call" if language == Language::Ruby => {
+            if value(&node.field("receiver")?, language, env, depth + 1)? != Value::File
+                || node.field("method")?.text() != "expand_path"
+            {
+                return None;
+            }
+            match value(arguments(node).first()?, language, env, depth + 1)? {
+                Value::Text(path) => Some(Value::HomePath(path)),
                 _ => None,
             }
         }
@@ -539,6 +615,10 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                 }
                 Value::PathConstructor => match value(args.first()?, language, env, depth + 1)? {
                     Value::Text(path) | Value::Path(path) => Some(Value::Path(path)),
+                    _ => None,
+                },
+                Value::ExpandUser => match value(args.first()?, language, env, depth + 1)? {
+                    Value::Text(path) => Some(Value::HomePath(path)),
                     _ => None,
                 },
                 _ => None,
@@ -563,6 +643,18 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
 fn text_value(node: &Syntax<'_>, language: Language, env: &Bindings) -> Option<String> {
     match value(node, language, env, 0)? {
         Value::Text(text) | Value::Path(text) => Some(text),
+        _ => None,
+    }
+}
+
+/// A write destination, and whether the source home-expands its leading `~`.
+///
+/// Used only where a *path* is expected. `text_value` stays as it was for the
+/// mode and module strings, which must never be treated as expanded paths.
+fn path_value(node: &Syntax<'_>, language: Language, env: &Bindings) -> Option<(String, bool)> {
+    match value(node, language, env, 0)? {
+        Value::Text(text) | Value::Path(text) => Some((text, false)),
+        Value::HomePath(text) => Some((text, true)),
         _ => None,
     }
 }
@@ -595,7 +687,7 @@ fn write_call(
     node: &Syntax<'_>,
     language: Language,
     env: &Bindings,
-) -> Option<(String, String, Access)> {
+) -> Option<(String, String, Access, bool)> {
     if !matches!(node.kind().as_ref(), "call" | "call_expression") {
         return None;
     }
@@ -605,10 +697,15 @@ fn write_call(
             return None;
         }
         let method = node.field("method")?.text().into_owned();
-        if !matches!(method.as_str(), "write" | "binwrite" | "open" | "new") {
+        // `truncate` is one of the ten spellings #461 measured, and the only
+        // one of Ruby's three that was not already here.
+        if !matches!(
+            method.as_str(),
+            "write" | "binwrite" | "open" | "new" | "truncate"
+        ) {
             return None;
         }
-        let path = text_value(args.first()?, language, env)?;
+        let (path, expands) = path_value(args.first()?, language, env)?;
         let opener = matches!(method.as_str(), "open" | "new");
         let mut mode = if opener {
             args.get(1)
@@ -635,17 +732,17 @@ fn write_call(
             None if opener => Access::Read,
             None => Access::Write,
         };
-        return Some((format!("File.{method}"), path, access));
+        return Some((format!("File.{method}"), path, access, expands));
     }
     let function = node.field("function")?;
     match value(&function, language, env, 0)? {
         Value::Open | Value::PathOpen(_) if language == Language::Python => {
             let resolved = value(&function, language, env, 0)?;
-            let (path, index) = if let Value::PathOpen(path) = resolved {
-                (path, 0)
+            let ((path, expands), index) = if let Value::PathOpen(path) = resolved {
+                ((path, false), 0)
             } else {
                 (
-                    text_value(&python_argument(&args, 0, "file")?, language, env)?,
+                    path_value(&python_argument(&args, 0, "file")?, language, env)?,
                     1,
                 )
             };
@@ -653,13 +750,24 @@ fn write_call(
                 Some(mode) => mode_access(&text_value(&mode, language, env)?)?,
                 None => Access::Read,
             };
-            Some((function.text().into_owned(), path, access))
+            Some((function.text().into_owned(), path, access, expands))
         }
         Value::PathWrite(path) if language == Language::Python => {
-            Some((function.text().into_owned(), path, Access::Write))
+            Some((function.text().into_owned(), path, Access::Write, false))
+        }
+        // `os.truncate(path, length)`: truncating, with no mode to consult.
+        Value::OsTruncate if language == Language::Python => {
+            let (path, expands) = path_value(&python_argument(&args, 0, "path")?, language, env)?;
+            Some((function.text().into_owned(), path, Access::Write, expands))
         }
         Value::Api(api) if language == Language::Node => {
-            let path = text_value(args.first()?, language, env)?;
+            let (path, expands) = path_value(args.first()?, language, env)?;
+            // The second argument of `truncate`/`truncateSync` is a length, not
+            // an options object, so it has no flag to consult — and whatever it
+            // says, the call cuts the file down.
+            if matches!(api.as_str(), "truncate" | "truncateSync") {
+                return Some((format!("fs.{api}"), path, Access::Write, expands));
+            }
             let append = matches!(api.as_str(), "appendFile" | "appendFileSync");
             let default = if append {
                 Access::Append
@@ -669,7 +777,7 @@ fn write_call(
             let stream = api == "createWriteStream";
             let options = args.get(if stream { 1 } else { 2 });
             let access = js_access(options, if stream { "flags" } else { "flag" }, default, env);
-            Some((format!("fs.{api}"), path, access))
+            Some((format!("fs.{api}"), path, access, expands))
         }
         _ => None,
     }

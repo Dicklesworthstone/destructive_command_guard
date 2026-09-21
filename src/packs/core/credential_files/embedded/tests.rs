@@ -226,17 +226,141 @@ fn shell_context_and_candidate_gate_reach_the_matcher() {
 fn policy_bridge_cannot_turn_a_literal_into_shell_syntax() {
     // `protected` returns the rule the write denies under rather than a bool
     // (#457), so these read `.is_none()` / `.is_some()`.
-    assert!(protected("/tmp/x'; tee /home/test/.bashrc; echo '", Access::Write).is_none());
-    assert!(protected("$HOME/.bashrc", Access::Write).is_none());
-    assert!(protected("~/.bashrc", Access::Write).is_none());
-    assert!(protected("/home/test/.ssh/authorized_keys", Access::Append).is_some());
-    assert!(protected("/home/test/.ssh/known_hosts", Access::Append).is_none());
-    assert!(protected("/home/test/.ssh/known_hosts", Access::Write).is_some());
+    assert!(protected("/tmp/x'; tee /home/test/.bashrc; echo '", Access::Write, false).is_none());
+    assert!(protected("$HOME/.bashrc", Access::Write, false).is_none());
+    assert!(protected("~/.bashrc", Access::Write, false).is_none());
+    assert!(protected("/home/test/.ssh/authorized_keys", Access::Append, false).is_some());
+    assert!(protected("/home/test/.ssh/known_hosts", Access::Append, false).is_none());
+    assert!(protected("/home/test/.ssh/known_hosts", Access::Write, false).is_some());
     for dialect in [ShellDialect::PowerShell, ShellDialect::Cmd] {
         assert!(classify(r#"python -c "open('/home/test/.bashrc','w')""#, dialect).is_none());
     }
 }
 
+/// The three truncating sinks #461 measured that the first cut did not know.
+///
+/// Each of these was one of the issue's ten truncation spellings and was still
+/// allowed after it landed: `os.truncate` had no `os` binding at all and never
+/// passed the pre-gate, Ruby's method list stopped at `open`/`new`, and Node's
+/// API list had no truncate. They pass no mode, so they are always a Write.
+#[test]
+fn truncating_sinks_are_writes() {
+    let target = "/home/test/.ssh/id_rsa";
+    for (language, code) in [
+        (
+            Language::Python,
+            format!("import os; os.truncate('{target}', 0)"),
+        ),
+        (
+            Language::Python,
+            format!("from os import truncate; truncate('{target}', 0)"),
+        ),
+        (Language::Ruby, format!("File.truncate('{target}', 0)")),
+        (
+            Language::Node,
+            format!("require('fs').truncateSync('{target}', 0)"),
+        ),
+        (
+            Language::Node,
+            format!("require('fs').promises.truncate('{target}')"),
+        ),
+        (
+            Language::Node,
+            format!("const fs = require('fs'); fs.truncate('{target}', 0, () => {{}})"),
+        ),
+    ] {
+        assert!(denied(&code, language), "{language:?}: {code}");
+    }
+    // Truncating an ordinary file is the everyday use and must stay allowed.
+    for (language, code) in [
+        (
+            Language::Python,
+            "import os; os.truncate('build/log.txt', 0)",
+        ),
+        (Language::Ruby, "File.truncate('log/app.log', 0)"),
+        (
+            Language::Node,
+            "require('fs').truncateSync('dist/out.js', 0)",
+        ),
+    ] {
+        assert!(!denied(code, language), "{language:?}: {code}");
+    }
+}
+
+/// Home expansion counts only when the source performs it.
+///
+/// The bridge above pins that a bare `'~/.bashrc'` is NOT the home file — Python
+/// and Ruby leave the tilde alone. This pins the other half: when
+/// `os.path.expanduser` or `File.expand_path` wraps the literal, the same `~`
+/// does name the home directory. Without it, the idiomatic spelling of an
+/// `authorized_keys` append was allowed.
+#[test]
+fn home_expansion_is_honoured_only_when_the_source_performs_it() {
+    assert!(protected("~/.bashrc", Access::Write, true).is_some());
+    assert!(protected("~/.ssh/authorized_keys", Access::Append, true).is_some());
+    assert!(protected("~/.ssh/known_hosts", Access::Append, true).is_none());
+    assert!(protected("~/notes.txt", Access::Write, true).is_none());
+
+    for (language, code) in [
+        (
+            Language::Python,
+            "import os; open(os.path.expanduser('~/.ssh/authorized_keys'), 'a')",
+        ),
+        (
+            Language::Python,
+            "import os.path; open(os.path.expanduser('~/.ssh/id_rsa'), 'w')",
+        ),
+        (
+            Language::Python,
+            "from os.path import expanduser; open(expanduser('~/.ssh/id_rsa'), 'w')",
+        ),
+        (
+            Language::Python,
+            "from os import path; open(path.expanduser('~/.bashrc'), 'a')",
+        ),
+        (
+            Language::Ruby,
+            "File.open(File.expand_path('~/.ssh/authorized_keys'), 'a')",
+        ),
+    ] {
+        assert!(denied(code, language), "{language:?}: {code}");
+    }
+    for (language, code) in [
+        // Unwrapped: a directory named `~`, exactly as the bridge test says.
+        (Language::Python, "open('~/notes.txt', 'w')"),
+        // Wrapped, but an ordinary file.
+        (
+            Language::Python,
+            "import os; open(os.path.expanduser('~/notes.txt'), 'w')",
+        ),
+        // Wrapped and protected, but a read.
+        (
+            Language::Python,
+            "import os; print(open(os.path.expanduser('~/.ssh/id_rsa')).read())",
+        ),
+        // The append exemption survives expansion.
+        (
+            Language::Python,
+            "import os; open(os.path.expanduser('~/.ssh/known_hosts'), 'a')",
+        ),
+    ] {
+        assert!(!denied(code, language), "{language:?}: {code}");
+    }
+}
+
+/// Only a real tilde prefix is left unquoted; anything else stays quoted.
+///
+/// `~user` is legitimate. `~$(id)` is not a tilde prefix at all, and splicing it
+/// unquoted would hand the policy adapter a command substitution to parse. It is
+/// judged fully quoted instead — still denied here, through the `.ssh/` anchor,
+/// but without the adapter ever seeing shell syntax the source did not contain.
+#[test]
+fn only_a_word_tilde_prefix_is_left_unquoted() {
+    assert!(protected("~root/.ssh/authorized_keys", Access::Write, true).is_some());
+    assert!(protected("~$(id)/.ssh/id_rsa", Access::Write, true).is_some());
+    assert!(protected("~$(id)/notes.txt", Access::Write, true).is_none());
+    assert!(protected("~`id`/notes.txt", Access::Write, true).is_none());
+}
 /// Every sink name this module can reach must survive the cheap pre-gate in
 /// `classify`.
 ///
