@@ -64,9 +64,11 @@ pub(crate) fn source_scan_required(code: &str, language: ScriptLanguage) -> bool
             | ScriptLanguage::Ruby
             | ScriptLanguage::JavaScript
             | ScriptLanguage::TypeScript
-    ) && ["open", "write", "Write", "append", "truncate", "File", "Path"]
-        .iter()
-        .any(|word| code.contains(word))
+    ) && [
+        "open", "write", "Write", "append", "truncate", "File", "Path",
+    ]
+    .iter()
+    .any(|word| code.contains(word))
 }
 
 /// Inspect already-extracted executable source, never shell tokens. Return
@@ -407,7 +409,14 @@ fn visit(
             }
         }
         for child in node.children() {
-            visit(child, language, &mut local, depth + 1, remaining_nodes, hits)?;
+            visit(
+                child,
+                language,
+                &mut local,
+                depth + 1,
+                remaining_nodes,
+                hits,
+            )?;
         }
         return Ok(());
     }
@@ -562,7 +571,10 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
 }
 
 fn is_fs_module(module: &str) -> bool {
-    matches!(module, "fs" | "node:fs" | "fs/promises" | "node:fs/promises")
+    matches!(
+        module,
+        "fs" | "node:fs" | "fs/promises" | "node:fs/promises"
+    )
 }
 
 fn is_js_api(name: &str) -> bool {

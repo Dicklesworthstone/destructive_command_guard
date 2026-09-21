@@ -94,8 +94,7 @@ fn assert_denied_by(command: &str, home: &Path, rule: &str) {
     let json: serde_json::Value = serde_json::from_str(&output)
         .unwrap_or_else(|error| panic!("{command}: {error}; output={output}"));
     assert_eq!(
-        json["hookSpecificOutput"]["permissionDecision"],
-        "deny",
+        json["hookSpecificOutput"]["permissionDecision"], "deny",
         "{command}: {output}"
     );
     assert!(output.contains(rule), "wrong rule for {command}: {output}");
