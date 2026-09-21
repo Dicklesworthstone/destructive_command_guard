@@ -69,8 +69,10 @@ impl DefaultPolicyMatcher {
     }
 }
 
-/// Retain the existing deletion backstop, adding protected writes on the
-/// SAME extracted-source path before the expensive full-pattern scan. This
+/// Deletion backstop plus protected-write detection on extracted source.
+///
+/// Retains the existing deletion backstop and adds protected writes on the
+/// SAME extracted-source path, before the expensive full-pattern scan. This
 /// is independent of core.filesystem's shell-keyword candidate gate.
 #[must_use]
 pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Option<PatternMatch> {
