@@ -6787,6 +6787,138 @@ mod tests {
             println!("\n{packs} packs with drift, {keywords} keywords absent from their rows");
         }
 
+        /// Report every rule whose regex names no keyword on its own row.
+        ///
+        /// The exemption list above is a set of human claims made against the
+        /// binary at one point in time, and #323 is what happens when one rots:
+        /// `system.disk` carried `mount` on the strength of a probe
+        /// (`mount -o remount,ro /`) that really does match no rule, while
+        /// `umount-force` and `mount-bind-root` both needed keywords the row did
+        /// not have. The list's own comment says to derive the probe from the
+        /// pack's RULE list rather than from what the keyword suggests — which is
+        /// exactly what this does, mechanically, for every rule in the registry.
+        ///
+        /// The question asked per rule: can a command match this regex while
+        /// carrying no row keyword as a whole token? Approximated by looking for
+        /// any row keyword appearing as a literal in the regex source. A rule
+        /// with none is not necessarily dead — it may be reached through a path
+        /// literal like `/dev/`, a classifier, or a keyword spelled differently
+        /// in the source — but it is the shape every escape in this class has
+        /// had, and it is the list an audit should work through.
+        ///
+        /// ```text
+        /// cargo test --lib report_rules_whose_regex_names_no_row_keyword -- --ignored --nocapture
+        /// ```
+        ///
+        /// Known-clean classes still appear: semantic `*-unverified` rules and
+        /// classifiers like `credential-file-write` carry no command word by
+        /// design, and SQL-keyed packs are gated by their client's name instead.
+        /// It is a worklist, not a defect list. Retire it if rule reachability
+        /// ever becomes a standing assertion rather than an audit.
+        fn regex_names_keyword(source: &str, keyword: &str) -> bool {
+            let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+            if keyword.is_empty() {
+                return false;
+            }
+            // Neutralize escape sequences first. `\bpvremove\b` otherwise
+            // reads as the letter `b` abutting the keyword, which makes the
+            // boundary test reject the single most common way a rule anchors
+            // on its command word — the first draft of this report flagged
+            // 278 of 1124 rules almost entirely for that reason.
+            let mut flattened = Vec::with_capacity(source.len());
+            let mut bytes = source.bytes();
+            while let Some(byte) = bytes.next() {
+                if byte == b'\\' {
+                    flattened.push(b' ');
+                    if bytes.next().is_some() {
+                        flattened.push(b' ');
+                    }
+                } else {
+                    flattened.push(byte);
+                }
+            }
+            let (hay, needle) = (flattened.as_slice(), keyword.as_bytes());
+            hay.windows(needle.len())
+                .enumerate()
+                .filter(|(_, window)| window.eq_ignore_ascii_case(needle))
+                .any(|(at, _)| {
+                    let before_is_word = at > 0 && is_word(hay[at - 1]) && is_word(needle[0]);
+                    let after = at + needle.len();
+                    let after_is_word = after < hay.len()
+                        && is_word(hay[after])
+                        && is_word(needle[needle.len() - 1]);
+                    !before_is_word && !after_is_word
+                })
+        }
+
+        /// The helper above is the whole report, so it gets its own pins.
+        ///
+        /// Its first draft had no escape handling and flagged 278 of 1124 rules,
+        /// nearly all of them because `\bfoo\b` reads as the letter `b` abutting
+        /// the keyword. A reporting tool that cries wolf is worse than none.
+        #[test]
+        fn regex_names_keyword_matches_tokens_not_substrings() {
+            // The defect this whole class is about.
+            assert!(!regex_names_keyword(r"umount\s+.*-[a-z]*f", "mount"));
+            assert!(regex_names_keyword(r"umount\s+.*-[a-z]*f", "umount"));
+            // `\b` must not count as the letter `b`.
+            assert!(regex_names_keyword(r"\bpvremove\b", "pvremove"));
+            assert!(regex_names_keyword(r"\bshutdown\b", "shutdown"));
+            // A keyword that is genuinely absent stays absent.
+            assert!(!regex_names_keyword(r"\bpvremove\b", "vgremove"));
+            // Path-shaped keywords have non-word edges of their own.
+            assert!(regex_names_keyword(r"tee\s+/dev/sd[a-z]", "/dev/"));
+            // Case-insensitive, matching the automaton.
+            assert!(regex_names_keyword(r"(?i)Remove-Item", "remove-item"));
+            assert!(!regex_names_keyword("", "mount"));
+        }
+
+        #[test]
+        #[ignore = "reporting tool, not an assertion"]
+        fn report_rules_whose_regex_names_no_row_keyword() {
+            let mut flagged = 0usize;
+            let mut total = 0usize;
+            for entry in &PACK_ENTRIES {
+                let Some(pack) = REGISTRY.get(entry.id) else {
+                    continue;
+                };
+                let mut bare: Vec<&str> = Vec::new();
+                for pattern in &pack.destructive_patterns {
+                    total += 1;
+                    let source = pattern.regex.as_str();
+                    if entry
+                        .keywords
+                        .iter()
+                        .any(|keyword| regex_names_keyword(source, keyword))
+                    {
+                        continue;
+                    }
+                    // A rule scoped to declared executables is gated by those,
+                    // not by its regex text.
+                    if pattern.executables.is_some_and(|executables| {
+                        executables.iter().any(|executable| {
+                            entry
+                                .keywords
+                                .iter()
+                                .any(|keyword| regex_names_keyword(executable, keyword))
+                        })
+                    }) {
+                        continue;
+                    }
+                    bare.push(pattern.name.unwrap_or("<unnamed>"));
+                }
+                if bare.is_empty() {
+                    continue;
+                }
+                flagged += bare.len();
+                println!("{}: {bare:?}", entry.id);
+            }
+            println!(
+                "\n{flagged} of {total} rules name no keyword from their own row; \
+                 each needs a command probe before it can be called reachable"
+            );
+        }
+
         /// Neither list may outlive what it describes.
         ///
         /// An exemption for a keyword that has since been added to its row, or that
