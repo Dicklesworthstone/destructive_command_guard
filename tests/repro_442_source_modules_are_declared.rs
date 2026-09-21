@@ -45,6 +45,46 @@ fn declared_modules(source: &str) -> BTreeSet<&str> {
         .collect()
 }
 
+/// Top-level `.rs` files a module pulls in through `#[path = "x.rs"]`.
+///
+/// `#[path]` is the other way a file joins the crate: `ast_matcher.rs` declares
+/// `#[path = "ast_pattern_engine.rs"] mod engine;`, so that file is compiled,
+/// linted and tested as `ast_matcher::engine` even though no root names it. Only
+/// a bare file name counts — a path into a subdirectory names a nested file,
+/// which this guard does not inspect.
+fn path_included_modules(source: &str) -> BTreeSet<String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let code = line.split("//").next()?.trim();
+            let value = code
+                .strip_prefix("#[path")?
+                .trim_start()
+                .strip_prefix('=')?
+                .trim_start()
+                .strip_prefix('"')?;
+            let target = &value[..value.find('"')?];
+            if target.contains(['/', '\\']) {
+                return None;
+            }
+            target.strip_suffix(".rs").map(str::to_owned)
+        })
+        .collect()
+}
+
+/// Files pulled in by `#[path]` from modules that are themselves declared.
+///
+/// Reading only DECLARED parents is what keeps this from weakening the guard.
+/// An orphaned file is never compiled, so a `#[path]` written inside one pulls
+/// nothing in — and if it were counted, one orphan could vouch for another.
+fn path_includes_of_declared(src: &Path, declared: &BTreeSet<&str>) -> BTreeSet<String> {
+    declared
+        .iter()
+        .filter_map(|parent| std::fs::read_to_string(src.join(format!("{parent}.rs"))).ok())
+        .flat_map(|text| path_included_modules(&text))
+        .collect()
+}
+
 /// Stems of `*.rs` files directly under `dir`, excluding the crate roots, that
 /// none of the roots declare. Sorted, so failure output is stable.
 fn orphaned_modules(dir: &Path, declared: &BTreeSet<&str>) -> Vec<String> {
@@ -86,6 +126,8 @@ fn every_top_level_source_file_is_declared_in_a_crate_root() {
     declared.extend(declared_modules(&main));
 
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let included = path_includes_of_declared(&src, &declared);
+    declared.extend(included.iter().map(String::as_str));
     let orphaned = orphaned_modules(&src, &declared);
 
     assert!(
@@ -129,7 +171,58 @@ fn the_wiring_patch_does_not_redeclare_the_module() {
 /// orphans" forever, which is the failure mode this whole file exists to catch,
 /// so the detection is exercised against inputs with known answers.
 mod detection_is_not_vacuous {
-    use super::{declared_modules, orphaned_modules};
+    use super::{
+        declared_modules, orphaned_modules, path_included_modules, path_includes_of_declared,
+    };
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn reads_a_path_attribute_and_nothing_else() {
+        let found = path_included_modules(
+            "#[path = \"engine.rs\"]\nmod engine;\n\
+             // #[path = \"ghost.rs\"]\n\
+             #[path = \"nested/deep.rs\"]\nmod deep;\n\
+             #[path=\"tight.rs\"] mod tight;\n",
+        );
+        assert!(found.contains("engine"));
+        assert!(found.contains("tight"), "spacing around `=` is optional");
+        assert!(
+            !found.contains("ghost"),
+            "a commented-out attribute pulls nothing in"
+        );
+        assert!(
+            !found.contains("deep") && !found.contains("nested/deep"),
+            "a subdirectory path names a nested file, not a top-level one"
+        );
+    }
+
+    #[test]
+    fn a_path_include_counts_only_through_a_declared_module() {
+        let directory = tempfile::tempdir().expect("create a temporary source directory");
+        let source = directory.path();
+        std::fs::write(
+            source.join("parent.rs"),
+            "#[path = \"engine.rs\"]\nmod engine;\n",
+        )
+        .expect("write a declared parent");
+        std::fs::write(
+            source.join("orphan.rs"),
+            "#[path = \"smuggled.rs\"]\nmod smuggled;\n",
+        )
+        .expect("write an orphaned parent");
+
+        let declared = BTreeSet::from(["parent"]);
+        let included = path_includes_of_declared(source, &declared);
+
+        assert!(
+            included.contains("engine"),
+            "a declared module's #[path] include is part of the crate"
+        );
+        assert!(
+            !included.contains("smuggled"),
+            "an orphan is never compiled, so its #[path] cannot vouch for anything"
+        );
+    }
 
     #[test]
     fn accepts_every_visibility_and_attribute_form() {
