@@ -33,6 +33,46 @@ use std::ops::Range;
 /// reason naming the writer and the file.
 pub(crate) const CREDENTIAL_FILE_WRITE_NAME: &str = "credential-file-write";
 
+/// Rule name for a write into a `.git` directory (#457).
+///
+/// Separate from [`CREDENTIAL_FILE_WRITE_NAME`] on purpose, and the reason is
+/// allowlists rather than wording. Allowlists key on the rule name, so a
+/// project that legitimately rewrites `.git/config` would otherwise have to
+/// allow `credential-file-write` — and that one entry would also permit a
+/// write to `~/.ssh/authorized_keys`. Repository state and private keys are
+/// not the same grant and must not share a name.
+pub(crate) const GIT_INTERNALS_WRITE_NAME: &str = "git-internals-write";
+
+/// The single path component that anchors [`GIT_INTERNALS_WRITE_NAME`].
+const GIT_ANCHOR: &str = ".git";
+
+/// What [`may_name_protected_path`] looks for instead of the bare [`GIT_ANCHOR`].
+const GIT_ANCHOR_NEEDLE: &str = ".git/";
+
+/// Safer alternatives for a `.git` write, attached to the pack pattern.
+///
+/// Deliberately not [`CREDENTIAL_FILE_WRITE_SUGGESTIONS`]: `chmod 600` and
+/// appending to `known_hosts` are meaningless here, and the useful advice is
+/// the porcelain command that does the same job with git's own validation.
+pub(crate) const GIT_INTERNALS_WRITE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "git config <key> <value>",
+        "Let git edit its own config; it validates the key and picks the right scope",
+    ),
+    PatternSuggestion::new(
+        "git remote set-url origin <url>",
+        "Change a remote through porcelain rather than by rewriting .git/config",
+    ),
+    PatternSuggestion::new(
+        "cat .git/config",
+        "Read the current content first; reads are never blocked",
+    ),
+    PatternSuggestion::new(
+        "git config --list --show-origin",
+        "Show the user which file and key you intend to change, and let them apply it",
+    ),
+];
+
 /// Safer alternatives attached to the pack pattern (its reason and
 /// explanation live on the `destructive_pattern!` entry in `filesystem.rs`).
 pub(crate) const CREDENTIAL_FILE_WRITE_SUGGESTIONS: &[PatternSuggestion] = &[
@@ -62,6 +102,28 @@ pub(crate) struct CredentialFileWrite {
     pub(crate) span: Range<usize>,
     /// Reason naming the writer, the file, and why it matters.
     pub(crate) reason: String,
+    /// Which rule denies this write — [`CREDENTIAL_FILE_WRITE_NAME`] for
+    /// everything that is a secret or a login file, and
+    /// [`GIT_INTERNALS_WRITE_NAME`] for `.git/`. Carried on the hit rather
+    /// than assumed by the caller so allowlists stay separable (#457).
+    pub(crate) rule: &'static str,
+}
+
+/// Which rule a resolved path denies under.
+///
+/// The `.git` anchor is the one entry in [`ENTRIES`] that is not a credential,
+/// key or login-shell file, so it is the one case that answers differently.
+/// Keyed on the leading component because every spelling that reaches here has
+/// already been rebased onto its anchor.
+fn rule_for(comps: &[String]) -> &'static str {
+    if comps
+        .first()
+        .is_some_and(|component| component.eq_ignore_ascii_case(GIT_ANCHOR))
+    {
+        GIT_INTERNALS_WRITE_NAME
+    } else {
+        CREDENTIAL_FILE_WRITE_NAME
+    }
 }
 
 /// Classify one command segment (may contain several simple commands).
@@ -106,9 +168,24 @@ pub(crate) fn may_name_protected_path(command: &str) -> bool {
     command.contains(['~', '$', '\\'])
         || ["/etc", "/home/", "/Users/", "/root"]
             .iter()
-            .chain(RELATIVE_ANCHORS)
+            .chain(RELATIVE_ANCHORS.iter().filter(|anchor| **anchor != GIT_ANCHOR))
             .chain(RELATIVE_FILE_ANCHORS)
             .any(|needle| contains_ascii_case_insensitive(command, needle))
+        // `.git` is the one anchor whose bare name is too common to scan for.
+        // This gate is a substring test on the raw command, so listing it
+        // beside the others would wake the classifier for `.gitignore`,
+        // `.github/`, `.gitattributes` and `.gitmodules` — four of the most
+        // frequent tokens in a developer's shell — on every command, which is
+        // the same always-on cost `.config` was left out for.
+        //
+        // Requiring the separator costs exactly one spelling: a quote sitting
+        // between the anchor and the slash, `tee ".git"/config`. That is
+        // measured, not assumed — the equivalent `tee ".ssh"/id_rsa` IS caught
+        // today, which is why the other anchors keep their permissive needle
+        // and only this one is tightened. The redirect spellings of the same
+        // write are covered by the `redirect-*-git-internals-relative` rules
+        // regardless.
+        || contains_ascii_case_insensitive(command, GIT_ANCHOR_NEEDLE)
 }
 
 /// Whether `haystack` contains `needle` (ASCII) ignoring case.
@@ -157,6 +234,19 @@ struct Entry {
 }
 
 const ENTRIES: &[Entry] = &[
+    // Not a credential, and the only entry that denies under
+    // `git-internals-write`. It sits on the home table because that is where
+    // `relative_anchor_start` rebases an anchored spelling to be judged; the
+    // reason text names the path the user actually wrote, so a rebased
+    // `repo/.git/config` never claims to be `~/.git/config` (#457).
+    Entry {
+        root: Root::Home,
+        comps: &[GIT_ANCHOR],
+        dir: true,
+        what: "is the repository's own state — config (which carries remotes, \
+               `insteadOf` rewrites and credential helpers), hooks that run on \
+               ordinary git commands, refs, and the object store",
+    },
     Entry {
         root: Root::Home,
         comps: &[".ssh"],
@@ -991,6 +1081,13 @@ const RELATIVE_ANCHORS: &[&str] = &[
     ".docker",
     ".bashrc.d",
     ".zshrc.d",
+    // `.git` is here for the same reason the comment above cites it as the
+    // precedent: `.git/config` is repository state whether it is reached from
+    // a checkout root or from three directories down. It denies under
+    // `git-internals-write`, not `credential-file-write`, and unlike its
+    // neighbours it is gated on `.git/` rather than `.git` in
+    // `may_name_protected_path` — see the note there (#457).
+    GIT_ANCHOR,
 ];
 
 /// Login-shell startup files, anchored only when one *is* the whole relative
@@ -1332,16 +1429,34 @@ impl Writer {
 
 const REMEDY: &str = "Reads and chmod/chown are unaffected; show the user the exact change and let them apply it, or grant this one command with `dcg allow-once`.";
 
+/// Build the hit for a resolved protected path, unless an existing rule owns
+/// this spelling already.
+///
+/// Returns `None` for a *redirect* into `.git/`. Those spellings are decided by
+/// `redirect-truncate-git-internals-relative` and
+/// `redirect-append-git-internals-relative`, which predate this entry, carry
+/// their own git-specific guidance, and are what existing allowlists name. The
+/// classifier is evaluated ahead of every redirect rule, so without this it
+/// would silently take those two rules' hits over and rename them — a
+/// user-visible id change and a broken allowlist, for no added coverage. What
+/// `.git/` gains here is the writers a redirect rule cannot see: `tee`,
+/// `sponge`, `cp`, `mv`, `install`, `sed -i`, `perl -i`, dd of=`, and the
+/// embedded-code sinks.
 fn protected_hit(
     writer: Writer,
     display: &str,
     what: &str,
+    rule: &'static str,
     span: Range<usize>,
-) -> CredentialFileWrite {
-    CredentialFileWrite {
+) -> Option<CredentialFileWrite> {
+    if rule == GIT_INTERNALS_WRITE_NAME && writer.kind.is_none() {
+        return None;
+    }
+    Some(CredentialFileWrite {
         span,
         reason: format!("{} {display}, which {what}. {REMEDY}", writer.verb()),
-    }
+        rule,
+    })
 }
 
 fn unprovable_hit(
@@ -1358,6 +1473,11 @@ fn unprovable_hit(
             writer.verb(),
             word.as_string()
         ),
+        // An unresolvable spelling is reported under the general rule even when
+        // the example happens to be a `.git` path: the match says the
+        // destination COULD be protected, and allowing it must not be narrower
+        // than what it actually permits.
+        rule: CREDENTIAL_FILE_WRITE_NAME,
     }
 }
 
@@ -1373,6 +1493,9 @@ fn escaped_hit(writer: Writer, word: &Word, root: Root, span: Range<usize>) -> C
                 Root::Etc => "/etc",
             }
         ),
+        // Same reasoning as `unprovable_hit`: a `..` climb means the
+        // destination was never resolved, so the general rule is the honest one.
+        rule: CREDENTIAL_FILE_WRITE_NAME,
     }
 }
 
@@ -1406,7 +1529,7 @@ fn judge_file_target(word: &Word, writer: Writer) -> Option<CredentialFileWrite>
                 } else {
                     display
                 };
-                Some(protected_hit(writer, &display, what, span))
+                protected_hit(writer, &display, what, rule_for(&spelling.comps), span)
             }
         }
         Exact::Parent | Exact::Clear => None,
@@ -1484,7 +1607,13 @@ fn judge_placement(
             .map(|(example, what)| unprovable_hit(writer, directory_word, &example, what, span));
     }
     match exact(directory.root, &directory.comps) {
-        Exact::Protected { display, what, .. } => Some(protected_hit(writer, &display, what, span)),
+        Exact::Protected { display, what, .. } => protected_hit(
+            writer,
+            &display,
+            what,
+            rule_for(&directory.comps),
+            span,
+        ),
         Exact::Clear => None,
         Exact::Parent => {
             let pattern = source_basename_pattern(source);
@@ -1503,7 +1632,13 @@ fn judge_placement(
                 comps.push(basename);
                 return match exact(directory.root, &comps) {
                     Exact::Protected { display, what, .. } => {
-                        Some(protected_hit(writer, &display, what, source.range.clone()))
+                        protected_hit(
+                            writer,
+                            &display,
+                            what,
+                            rule_for(&comps),
+                            source.range.clone(),
+                        )
                     }
                     // Copying a whole `.aws`/`.config` tree into place installs
                     // whatever credential files it carries.
@@ -1517,6 +1652,7 @@ fn judge_placement(
                                 entry_display(entry, entry.comps.len()),
                                 entry.what
                             ),
+                            rule: rule_for(&comps),
                         }
                     }),
                     Exact::Clear => None,
@@ -1537,6 +1673,7 @@ fn judge_placement(
                         entry_display(entry, depth + 1),
                         entry.what
                     ),
+                    rule: rule_for(&directory.comps),
                 })
         }
     }
@@ -1806,7 +1943,13 @@ fn classify_copy(kind: WriterKind, args: &[&Word]) -> Option<CredentialFileWrite
     }
     match exact(destination.root, &destination.comps) {
         Exact::Protected { display, what, .. } => {
-            Some(protected_hit(writer, &display, what, dest.range.clone()))
+            protected_hit(
+                writer,
+                &display,
+                what,
+                rule_for(&destination.comps),
+                dest.range.clone(),
+            )
         }
         Exact::Parent => sources
             .iter()
