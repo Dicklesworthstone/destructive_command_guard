@@ -31,14 +31,14 @@ jobs:
       CARGO_BUILD_JOBS: 2
       RCH_ENABLED: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Activate the repository-pinned Rust toolchain
         run: |
           toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -75,7 +75,7 @@ jobs:
           cargo fmt --check 2>&1 | tee target/disk-safety/fmt.log
       - name: Retain revision-bound evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: disk-safety-${{ github.sha }}
           path: |
