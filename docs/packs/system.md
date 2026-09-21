@@ -28,6 +28,9 @@ Commands containing these keywords are checked against this pack:
 - `parted`
 - `mount`
 - `wipefs`
+- `sgdisk`
+- `gdisk`
+- `cgdisk`
 - `/dev/`
 - `mdadm`
 - `btrfs`
