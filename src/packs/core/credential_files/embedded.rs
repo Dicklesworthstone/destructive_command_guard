@@ -6,7 +6,7 @@
 //! executed and no destination is read or opened.
 
 use super::{CredentialFileWrite, shell};
-use crate::heredoc::{ExtractionLimits, ExtractionResult, ScriptLanguage, extract_content};
+use crate::heredoc::{ExtractionLimits, ExtractionResult, HeredocType, ScriptLanguage, extract_content};
 use crate::normalize::{ShellDialect, strip_wrapper_prefixes};
 use ast_grep_core::{AstGrep, Node, tree_sitter::StrDoc};
 use ast_grep_language::SupportLang;
@@ -132,9 +132,7 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
     let ast = AstGrep::new(segment, SupportLang::Bash);
     let root = ast.root();
     for command in root.dfs().filter(|node| node.kind() == "command") {
-        let text = command.text();
-        let normalized = strip_wrapper_prefixes(text.as_ref());
-        let Ok(words) = shell_words::split(normalized.normalized.as_ref()) else {
+        let Some(words) = command_words(&command) else {
             continue;
         };
         let Some(language) = words.first().and_then(|name| interpreter(name)) else {
@@ -143,6 +141,13 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
         if let Some(code) = inline_code(&words, language) {
             if let Some(hit) = inspect(&code, language, command.range()) {
                 return Some(hit);
+            }
+        }
+        if reads_stdin(&words, language) {
+            if let Some((code, span)) = here_string_source(&command) {
+                if let Some(hit) = inspect(&code, language, span) {
+                    return Some(hit);
+                }
             }
         }
     }
@@ -159,7 +164,11 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
             _ => return None,
         };
         for item in items {
-            if item.heredoc_type.is_none() {
+            // Here-strings were inspected on their owning command above. A
+            // regex extraction cannot prove which descriptor consumes them.
+            if item.heredoc_type.is_none()
+                || item.heredoc_type == Some(HeredocType::HereString)
+            {
                 continue;
             }
             let Some(target) = item.target_command.as_deref() else {
@@ -176,13 +185,9 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
                 continue;
             }
             let receiver = root.dfs().any(|node| {
-                if node.kind() != "command" || node.range().start > item.byte_range.end {
-                    return false;
-                }
-                let text = node.text();
-                let normalized = strip_wrapper_prefixes(text.as_ref());
-                shell_words::split(normalized.normalized.as_ref())
-                    .is_ok_and(|actual| actual == words)
+                node.kind() == "command"
+                    && node.range().start <= item.byte_range.end
+                    && command_words(&node).is_some_and(|actual| actual == words)
             });
             if receiver {
                 let span = item.content_range.unwrap_or(item.byte_range);
@@ -193,6 +198,81 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
         }
     }
     None
+}
+
+/// Redirections are syntax, not argv. In the Bash grammar a here-string is
+/// a child of `command`, so splitting `command.text()` includes `<<<` and its
+/// source as spurious interpreter arguments. Preserve shell quoting while
+/// selecting only the command-name and argument fields (#461).
+fn command_words(command: &Syntax<'_>) -> Option<Vec<String>> {
+    let mut text = command.field("name")?.text().into_owned();
+    for argument in command.field_children("argument") {
+        text.push(' ');
+        text.push_str(argument.text().as_ref());
+    }
+    let normalized = strip_wrapper_prefixes(&text);
+    shell_words::split(normalized.normalized.as_ref()).ok()
+}
+
+/// Only the last redirection of stdin supplies interpreter source. Trailing
+/// file redirects may live on the enclosing redirected_statement; do not
+/// accidentally inspect a here-string that a later `< /dev/null` replaces.
+fn here_string_source(command: &Syntax<'_>) -> Option<(String, Range<usize>)> {
+    let mut redirects: Vec<_> = command.field_children("redirect").collect();
+    if let Some(parent) = command.parent() {
+        if parent.kind() == "redirected_statement"
+            && parent
+                .field("body")
+                .is_some_and(|body| body.range() == command.range())
+        {
+            redirects.extend(parent.field_children("redirect"));
+        }
+    }
+    let redirect = redirects
+        .into_iter()
+        .filter(|redirect| {
+            if let Some(descriptor) = redirect.field("descriptor") {
+                return descriptor.text().parse::<u32>() == Ok(0);
+            }
+            match redirect.kind().as_ref() {
+                "herestring_redirect" | "heredoc_redirect" => true,
+                "file_redirect" => redirect.children().any(|child| {
+                    matches!(child.text().as_ref(), "<" | "<&" | "<&-" | "<>")
+                }),
+                _ => false,
+            }
+        })
+        .max_by_key(|redirect| redirect.range().start)?;
+    if redirect.kind() != "herestring_redirect" {
+        return None;
+    }
+    let source = redirect.children().find(|child| {
+        child.is_named() && !matches!(child.kind().as_ref(), "file_descriptor" | "comment")
+    })?;
+    // Decode a static shell word, not an expanded value. Dynamic substitutions
+    // retain the evaluator's existing recursive/fallback handling; never run
+    // them or invent a literal destination. ANSI-C strings need their own
+    // decoder and must not be misdecoded by shell_words as ordinary quotes.
+    if source.dfs().any(|node| {
+        matches!(
+            node.kind().as_ref(),
+            "simple_expansion"
+                | "expansion"
+                | "command_substitution"
+                | "process_substitution"
+                | "arithmetic_expansion"
+                | "ansi_c_string"
+                | "translated_string"
+                | "ERROR"
+        )
+    }) {
+        return None;
+    }
+    let words = shell_words::split(source.text().as_ref()).ok()?;
+    let [code] = words.as_slice() else {
+        return None;
+    };
+    Some((code.clone(), source.range()))
 }
 
 /// Follow interpreter option boundaries, not a substring `-c` or `-e` in a
@@ -947,3 +1027,113 @@ fn literal(node: &Syntax<'_>, language: Language) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod here_string_tests {
+    use super::*;
+
+    #[test]
+    fn here_strings_bind_to_the_actual_interpreter_argv() {
+        for (exe, code) in [
+            ("python3", "open('/etc/shadow', 'a').write('x')"),
+            ("ruby", "File.write('/etc/shadow', 'x')"),
+            ("node", "require('fs').writeFileSync('/etc/shadow', 'x')"),
+        ] {
+            for prefix in ["", "env ", "sudo ", "FOO=1 "] {
+                for flag in ["", " -"] {
+                    for word in [format!("\"{code}\""), format!("'{}'", code.replace('\'', "'\\''"))] {
+                        for redirect in ["<<< ", "<<<", "0<<< "] {
+                            let command = format!("{prefix}{exe}{flag} {redirect}{word}");
+                            let hit = classify(&command, ShellDialect::Posix).expect(&command);
+                            assert_eq!(hit.rule, shell::CREDENTIAL_FILE_WRITE_NAME, "{command}");
+                            assert!(command.get(hit.span).is_some(), "{command}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn here_strings_do_not_borrow_receivers_or_non_stdin_descriptors() {
+        for command in [
+            "python3 -V; cat <<< \"open('/etc/shadow', 'w')\"",
+            "python3 example.py <<< \"open('/etc/shadow', 'w')\"",
+            "python3 -c \"print('ok')\" <<< \"open('/etc/shadow', 'w')\"",
+            "python3 3<<< \"open('/etc/shadow', 'w')\"",
+            "python3 <<< \"open('/etc/shadow', 'w')\" </dev/null",
+            "python3 <<< \"open('/etc/shadow', 'w')\" <<< \"print('ok')\"",
+            "cat <<'DATA'\npython3 <<< \"open('/etc/shadow', 'w')\"\nDATA",
+            "echo 'python3 <<< \"open(/etc/shadow, w)\"'",
+        ] {
+            assert!(classify(command, ShellDialect::Posix).is_none(), "{command}");
+        }
+        let command = "python3 </dev/null <<< \"open('/etc/shadow', 'w')\"";
+        assert!(classify(command, ShellDialect::Posix).is_some(), "{command}");
+    }
+
+    #[test]
+    fn here_strings_preserve_read_data_and_append_only_exceptions() {
+        for code in [
+            "open('/etc/shadow', 'r').read()",
+            "open('/home/u/.ssh/known_hosts', 'a').write('host')",
+            "open('/home/u/.ssh/id_rsa.pub', 'w')",
+            "open('~/.bashrc', 'w')",
+            "print(\"open('/etc/shadow', 'w')\")",
+            "# open('/etc/shadow', 'w')\nprint('ok')",
+        ] {
+            let word = format!("'{}'", code.replace('\'', "'\\''"));
+            let command = format!("python3 <<< {word}");
+            assert!(classify(&command, ShellDialect::Posix).is_none(), "{command}");
+        }
+        let command = "python3 <<< \"import os; os.truncate('/home/u/.ssh/known_hosts', 0)\"";
+        assert!(classify(command, ShellDialect::Posix).is_some(), "{command}");
+    }
+
+    #[test]
+    fn here_strings_reach_public_evaluation_with_both_keyword_paths() {
+        use crate::allowlist::LayeredAllowlist;
+        use crate::config::{CompiledOverrides, Config};
+        use crate::evaluator::evaluate_command_with_pack_order_at_path_in_dialect;
+        use crate::packs::REGISTRY;
+        use std::collections::HashSet;
+
+        let enabled = HashSet::from(["core.filesystem".to_string()]);
+        let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+        let keywords = REGISTRY.collect_enabled_keywords(&enabled);
+        let index = REGISTRY.build_enabled_keyword_index(&ordered).expect("keyword index");
+        let overrides = CompiledOverrides::default();
+        let allowlists = LayeredAllowlist::default();
+        let mut heredoc = Config::default().heredoc_settings();
+        for command in [
+            "python3 <<< \"open('/etc/shadow', 'w')\"",
+            "env ruby - <<< \"File.write('/home/u/.bashrc', 'x')\"",
+            "node <<< \"require('fs').appendFileSync('/root/.ssh/authorized_keys', 'x')\"",
+        ] {
+            for indexed in [false, true] {
+                for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                    for enabled in [false, true] {
+                        heredoc.enabled = enabled;
+                        let result = evaluate_command_with_pack_order_at_path_in_dialect(
+                            command,
+                            &keywords,
+                            &ordered,
+                            indexed.then_some(&index),
+                            &overrides,
+                            &allowlists,
+                            &heredoc,
+                            None,
+                            dialect,
+                        );
+                        assert!(result.is_denied(), "{command}: {result:?}");
+                        let info = result.pattern_info.expect("policy finding");
+                        assert_eq!(info.pack_id.as_deref(), Some("core.filesystem"));
+                        assert_eq!(info.pattern_name.as_deref(), Some("credential-file-write"));
+                        let span = info.matched_span.expect("original-source span");
+                        assert!(command.get(span.start..span.end).is_some());
+                    }
+                }
+            }
+        }
+    }
+}
