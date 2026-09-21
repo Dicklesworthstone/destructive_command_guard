@@ -1383,11 +1383,30 @@ fn posix_segment_requires_rm_semantic_scan(segment: &str) -> bool {
     if !segment.contains(['$', '`', '\'', '"', '\\', '*', '?', '[', '{']) {
         return false;
     }
-    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    // Read the executable THROUGH wrapper prefixes. The first token of
+    // `sudo python3 -c ...` is `sudo`, which is neither a credential writer nor
+    // an interpreter, so without this the pack is never made a candidate and
+    // `credential-file-write` never runs — while the identical command with no
+    // prefix denies.
+    //
+    // Measured before the fix: all twelve combinations of
+    // {sudo, env, /usr/bin/env, FOO=1} x {python3 -c, ruby -e, node -e}
+    // writing a login-shell startup file were ALLOWED, including
+    // `sudo python3 -c "open('~/.ssh/authorized_keys','w')"`, while every shell
+    // writer spelling of the same write denied (#464).
+    //
+    // The classifier was already correct for these inputs — called directly it
+    // returns a hit for every wrapped spelling — so this is a gating defect,
+    // not a policy one. Widening a candidate gate cannot manufacture a false
+    // positive: it only lets the classifier see a command it would otherwise
+    // never judge, and the classifier is what decides.
+    let unwrapped = crate::normalize::strip_wrapper_prefixes(segment);
+    let effective = unwrapped.normalized.as_ref();
+    let tokens = tokenize_for_shell_dialect(effective, ShellDialect::Posix);
     let Some(raw) = tokens
         .iter()
         .find(|token| token.kind != NormalizeTokenKind::Separator)
-        .and_then(|token| token.text(segment))
+        .and_then(|token| token.text(effective))
     else {
         return false;
     };

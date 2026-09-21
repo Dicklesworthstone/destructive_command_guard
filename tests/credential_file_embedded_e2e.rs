@@ -17,6 +17,12 @@ fn home() -> tempfile::TempDir {
 
 fn dcg(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dcg"));
+    // An ambient bypass must not certify an analysis path that never ran.
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("DCG_") {
+            command.env_remove(name);
+        }
+    }
     command
         .current_dir(home)
         .env("HOME", home)
@@ -205,6 +211,11 @@ fn credential_reads_and_append_only_known_hosts_remain_allowed() {
         "python3 <<'EOF'\nprint(open('/etc/shadow').read())\nEOF",
         "ruby <<'EOF'\nputs File.read('/etc/shadow')\nEOF",
         "node <<'EOF'\nconsole.log(require('fs').readFileSync('/etc/shadow','utf8'))\nEOF",
+        "cat <<'EOF'\nimport os; os.truncate('/home/me/.bashrc', 0)\nEOF",
+        "python3 <<'EOF'\nprint(\"open('/home/me/.bashrc', 'w')\")\nEOF",
+        "ruby <<'EOF'\n# File.truncate('/home/me/.bashrc', 0)\nputs 'ok'\nEOF",
+        "node <<'EOF'\nconsole.log(\"require('fs').truncateSync('/home/me/.bashrc', 0)\")\nEOF",
+        r#"python3 -c "import os; os.truncate('/home/me/.ssh/id_rsa.pub', 0)""#,
     ] {
         assert_allowed(command, home.path());
     }
@@ -236,5 +247,117 @@ fn existing_allowlist_id_lifts_only_the_credential_rule() {
         r#"node -e "require('fs').writeFileSync('/home/me/repo/.git/config','x')""#,
     ] {
         assert_denied_by(command, home.path(), "git-internals-write");
+    }
+}
+
+#[test]
+fn original_ten_spellings_cross_both_entry_points_with_unchanged_fixtures() {
+    let home = home();
+    fs::create_dir_all(home.path().join(".ssh")).expect("fixture directory");
+    for target in [".ssh/id_rsa", ".ssh/authorized_keys", ".bashrc"] {
+        // Existing relative anchors are real files beneath the isolated HOME.
+        // Candidate commands are inspected, never run against these fixtures.
+        let fixture = home.path().join(target);
+        fs::write(&fixture, "UNCHANGED").expect("fixture contents");
+        for (interpreter, flag, source) in [
+            ("python3", "-c", format!("open('{target}', 'w')")),
+            ("python3", "-c", format!("open('{target}', 'wb')")),
+            (
+                "python3",
+                "-c",
+                format!("with open('{target}', 'w') as f:\n    f.write('')"),
+            ),
+            (
+                "python3",
+                "-c",
+                format!("from pathlib import Path; Path('{target}').write_text('')"),
+            ),
+            (
+                "python3",
+                "-c",
+                format!("import os; os.truncate('{target}', 0)"),
+            ),
+            ("ruby", "-e", format!("File.write('{target}', '')")),
+            ("ruby", "-e", format!("File.open('{target}', 'w')")),
+            ("ruby", "-e", format!("File.truncate('{target}', 0)")),
+            (
+                "node",
+                "-e",
+                format!("require('fs').writeFileSync('{target}', '')"),
+            ),
+            (
+                "node",
+                "-e",
+                format!("require('fs').truncateSync('{target}', 0)"),
+            ),
+        ] {
+            assert_denied(&format!("{interpreter} {flag} \"{source}\""), home.path());
+            assert_denied(
+                &format!("{interpreter} <<'SRC'\n{source}\nSRC"),
+                home.path(),
+            );
+        }
+        assert_eq!(fs::read_to_string(fixture).unwrap(), "UNCHANGED");
+    }
+    for command in [
+        "python3 <<'SRC'\nopen('.ssh/authorized_keys', 'a').write('KEY')\nSRC",
+        "python3 <<'SRC'\nopen('.bashrc', 'a').write('LINE')\nSRC",
+        "ruby <<'SRC'\nFile.open('.ssh/authorized_keys', 'a')\nSRC",
+        "node <<'SRC'\nrequire('fs').appendFileSync('.bashrc', 'LINE')\nSRC",
+        r#"python3 -c "import os; os.truncate('/home/me/.ssh/known_hosts', 0)""#,
+        r#"ruby -e "File.truncate('/home/me/.ssh/known_hosts', 0)""#,
+        r#"node -e "require('fs/promises').truncate('/home/me/.ssh/known_hosts', 0)""#,
+        r#"python3 -c "open('/ho' + 'me/u/.ba' + 'shrc', 'w')""#,
+    ] {
+        assert_denied(command, home.path());
+    }
+}
+
+#[test]
+fn one_allowlisted_rule_cannot_hide_another_inside_the_same_script() {
+    for (allowed, blocked) in [
+        ("credential-file-write", "git-internals-write"),
+        ("git-internals-write", "credential-file-write"),
+    ] {
+        let home = home();
+        fs::write(
+            home.path().join("xdg/dcg/allowlist.toml"),
+            format!(
+                "[[allow]]\nrule = \"core.filesystem:{allowed}\"\nreason = \"reviewed one rule only\"\n"
+            ),
+        )
+        .expect("independent rule allowlist");
+        for (first, second) in [(".bashrc", ".git/config"), (".git/config", ".bashrc")] {
+            for (interpreter, flag, source) in [
+                (
+                    "python3",
+                    "-c",
+                    format!("open('{first}', 'w'); open('{second}', 'w')"),
+                ),
+                (
+                    "ruby",
+                    "-e",
+                    format!("File.write('{first}', 'x'); File.write('{second}', 'x')"),
+                ),
+                (
+                    "node",
+                    "-e",
+                    format!(
+                        "const fs = require('fs'); fs.writeFileSync('{first}', 'x'); fs.writeFileSync('{second}', 'x')"
+                    ),
+                ),
+            ] {
+                assert_denied_by(
+                    &format!("{interpreter} {flag} \"{source}\""),
+                    home.path(),
+                    blocked,
+                );
+                assert_denied_by(
+                    &format!("{interpreter} <<'SRC'\n{source}\nSRC"),
+                    home.path(),
+                    blocked,
+                );
+            }
+        }
     }
 }
