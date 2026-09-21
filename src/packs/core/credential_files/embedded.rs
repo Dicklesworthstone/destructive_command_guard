@@ -13,6 +13,8 @@ use ast_grep_language::SupportLang;
 use std::collections::HashMap;
 use std::ops::Range;
 
+mod transfers;
+
 type Syntax<'a> = Node<'a, StrDoc<SupportLang>>;
 
 // Bound direct library calls as well as the hook. An exhausted source walk
@@ -64,8 +66,16 @@ pub(crate) fn source_scan_required(code: &str, language: ScriptLanguage) -> bool
             | ScriptLanguage::Ruby
             | ScriptLanguage::JavaScript
             | ScriptLanguage::TypeScript
-    ) && [
-        "open", "write", "Write", "append", "truncate", "File", "Path",
+    ) && source_has_sink_name(code)
+}
+
+/// Shared by the shell and extracted-source gates. In particular, a rename
+/// contains neither `open` nor `write`, but can replace either protected rule
+/// family's files. Keep this a superset, not a raw destination-path check.
+fn source_has_sink_name(code: &str) -> bool {
+    [
+        "open", "write", "Write", "append", "truncate", "File", "Path", "copy", "rename",
+        "replace",
     ]
     .iter()
     .any(|word| code.contains(word))
@@ -122,10 +132,7 @@ fn mode_access(mode: &str) -> Option<Access> {
 pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<CredentialFileWrite> {
     if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
         || segment.len() > MAX_BYTES
-        // `createWriteStream` needs the capital-W spelling too.
-        || !["open", "write", "Write", "append", "truncate", "File", "Path"]
-            .iter()
-            .any(|word| segment.contains(word))
+        || !source_has_sink_name(segment)
     {
         return None;
     }
@@ -382,6 +389,8 @@ enum Value {
     Os,
     OsPath,
     OsTruncate,
+    Shutil,
+    Transfer(transfers::Operation),
     ExpandUser,
     /// Only a proven runtime expander grants a leading tilde home semantics.
     HomePath(String),
@@ -390,6 +399,7 @@ enum Value {
     Path(String),
     PathWrite(String),
     PathOpen(String),
+    PathTransfer(String),
     Require,
     Fs,
     File,
@@ -428,6 +438,7 @@ fn scan_source(
         }
         Language::Ruby => {
             bindings.insert("File".into(), Value::File);
+            bindings.insert("IO".into(), Value::Io);
         }
         Language::Node => {
             bindings.insert("require".into(), Value::Require);
@@ -513,6 +524,10 @@ fn visit(
                 });
             }
         }
+    } else {
+        // Transfers may mutate two paths under distinct rule identities.
+        // Do not flatten them to write_call's single-destination result.
+        transfers::scan(&node, language, env, hits);
     }
     for child in node.children() {
         visit(child, language, env, depth + 1, remaining_nodes, hits)?;
@@ -570,9 +585,16 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
                 (None, "builtins") => Some(Value::Builtins),
                 (None, "pathlib") => Some(Value::Pathlib),
                 (None, "os") => Some(Value::Os),
+                (None, "shutil") => Some(Value::Shutil),
                 (Some("io" | "builtins"), "open") => Some(Value::Open),
                 (Some("pathlib"), "Path") => Some(Value::PathConstructor),
                 (Some("os"), "truncate") => Some(Value::OsTruncate),
+                (Some("os"), "rename" | "replace") => {
+                    Some(Value::Transfer(transfers::Operation::Rename))
+                }
+                (Some("shutil"), "copyfile") => {
+                    Some(Value::Transfer(transfers::Operation::CopyFile))
+                }
                 (Some("os"), "path") => Some(Value::OsPath),
                 (Some("os.path"), "expanduser") => Some(Value::ExpandUser),
                 _ => None,
@@ -667,7 +689,7 @@ fn is_js_api(name: &str) -> bool {
             | "createWriteStream"
             | "truncate"
             | "truncateSync"
-    )
+    ) || transfers::js_operation(name).is_some()
 }
 
 fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) -> Option<Value> {
@@ -695,11 +717,18 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
             match (object, member.as_str()) {
                 (Value::Io | Value::Builtins, "open") => Some(Value::Open),
                 (Value::Os, "truncate") => Some(Value::OsTruncate),
+                (Value::Os, "rename" | "replace") => {
+                    Some(Value::Transfer(transfers::Operation::Rename))
+                }
+                (Value::Shutil, "copyfile") => {
+                    Some(Value::Transfer(transfers::Operation::CopyFile))
+                }
                 (Value::Os, "path") => Some(Value::OsPath),
                 (Value::OsPath, "expanduser") => Some(Value::ExpandUser),
                 (Value::Pathlib, "Path") => Some(Value::PathConstructor),
                 (Value::Path(path), "write_text" | "write_bytes") => Some(Value::PathWrite(path)),
                 (Value::Path(path), "open") => Some(Value::PathOpen(path)),
+                (Value::Path(path), "rename" | "replace") => Some(Value::PathTransfer(path)),
                 (Value::Fs, "promises") => Some(Value::Fs),
                 (Value::Fs, name) if is_js_api(name) => Some(Value::Api(name.into())),
                 _ => None,
@@ -872,7 +901,9 @@ fn write_call(
             let (path, expands) = path_value(&python_argument(&args, 0, "path")?, language, env)?;
             Some((function.text().into_owned(), path, Access::Write, expands))
         }
-        Value::Api(api) if language == Language::Node => {
+        Value::Api(api)
+            if language == Language::Node && transfers::js_operation(&api).is_none() =>
+        {
             let (path, expands) = path_value(args.first()?, language, env)?;
             if matches!(api.as_str(), "truncate" | "truncateSync") {
                 return Some((format!("fs.{api}"), path, Access::Write, expands));
