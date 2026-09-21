@@ -77,6 +77,7 @@ pub(crate) fn source_scan_required(code: &str, language: ScriptLanguage) -> bool
 fn source_has_sink_name(code: &str) -> bool {
     [
         "open", "write", "Write", "append", "truncate", "File", "Path", "copy", "rename", "replace",
+        "move",
     ]
     .iter()
     .any(|word| code.contains(word))
@@ -544,16 +545,11 @@ fn visit(
     Ok(())
 }
 
-/// A canonical, SINGLE-QUOTED sink is a policy adapter, never executed.
-/// Quote every byte so embedded string contents cannot become shell syntax,
-/// expansions, glob patterns, or extra targets. This deliberately does not
-/// expand literal '~' or '$HOME' in an ordinary language string literal.
-/// Only `os.path.expanduser` and `File.expand_path` may leave a leading
-/// `~`/`~user` unquoted. All other characters retain literal semantics.
-fn protected(path: &str, access: Access, expands_home: bool) -> Option<&'static str> {
-    if access == Access::Read {
-        return None;
-    }
+/// Encode a decoded path for the shared shell policy, never for execution.
+/// Every character is literal except a leading tilde whose runtime expansion
+/// was already proven. Transfers and direct writes must use the same adapter:
+/// neither source basenames nor destinations may acquire shell glob semantics.
+fn quote_policy_path(path: &str, expands_home: bool) -> String {
     let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
     let anchor = expands_home
         .then(|| path.split_once('/').unwrap_or((path, "")))
@@ -563,11 +559,19 @@ fn protected(path: &str, access: Access, expands_home: bool) -> Option<&'static 
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
         });
-    let quoted = match anchor {
+    match anchor {
         Some((anchor, "")) => anchor.to_string(),
         Some((anchor, rest)) => format!("{anchor}/{}", quote(rest)),
         None => quote(path),
-    };
+    }
+}
+
+/// Judge a single opened path, preserving literal versus expanded-home input.
+fn protected(path: &str, access: Access, expands_home: bool) -> Option<&'static str> {
+    if access == Access::Read {
+        return None;
+    }
+    let quoted = quote_policy_path(path, expands_home);
     let append = if access == Access::Append { "-a " } else { "" };
     // Use the exact shared path table and rule identity, including .git.
     shell::classify_credential_file_write(&format!("tee {append}-- {quoted}"), ShellDialect::Posix)
@@ -601,9 +605,7 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
                 (Some("os"), "rename" | "replace") => {
                     Some(Value::Transfer(transfers::Operation::Rename))
                 }
-                (Some("shutil"), "copyfile") => {
-                    Some(Value::Transfer(transfers::Operation::CopyFile))
-                }
+                (Some("shutil"), name) => transfers::shutil_operation(name).map(Value::Transfer),
                 (Some("os"), "path") => Some(Value::OsPath),
                 (Some("os.path"), "expanduser") => Some(Value::ExpandUser),
                 _ => None,
@@ -729,9 +731,7 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                 (Value::Os, "rename" | "replace") => {
                     Some(Value::Transfer(transfers::Operation::Rename))
                 }
-                (Value::Shutil, "copyfile") => {
-                    Some(Value::Transfer(transfers::Operation::CopyFile))
-                }
+                (Value::Shutil, name) => transfers::shutil_operation(name).map(Value::Transfer),
                 (Value::Os, "path") => Some(Value::OsPath),
                 (Value::OsPath, "expanduser") => Some(Value::ExpandUser),
                 (Value::Pathlib, "Path") => Some(Value::PathConstructor),

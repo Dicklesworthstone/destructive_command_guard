@@ -1,23 +1,38 @@
-//! Exact-destination file transfers share the protected-write policy (#461).
+//! File transfers share the protected-write policy (#461).
 //!
-//! A copy reads its source and writes its destination. A rename also removes
-//! the source name. Inspect those effects independently: a dynamic source
-//! must not hide a known protected destination, and one allowlisted rule
-//! must not hide the other rule on the opposite end of a single rename.
+//! A copy reads its source and writes its destination. A rename or move also
+//! removes the source name. Inspect those effects independently: a dynamic
+//! source must not hide a known protected destination, and one allowlisted
+//! rule must not hide the other rule on the opposite end of one operation.
 //!
-//! Only APIs whose destination is an exact path are handled here. Directory
-//! placement APIs (`shutil.copy`, `shutil.move`, `FileUtils.cp`) need their own
-//! basename/container semantics; they must not be mislabeled as copyfile.
+//! Keep exact-path APIs separate from directory-placement and whole-tree APIs.
+//! Python copy/copy2/move can place the source basename inside a destination
+//! directory; copytree writes the destination tree itself, not dst/basename(src).
+//! The existing shell classifier supplies the path table and placement policy.
+//! No candidate is executed and no directory is traversed to determine its type.
 
 use super::{
-    Access, Bindings, CredentialFileWrite, Language, Syntax, Value, arguments, path_value,
-    protected, python_argument, value,
+    Access, Bindings, CredentialFileWrite, Language, ShellDialect, Syntax, Value, arguments,
+    path_value, protected, python_argument, quote_policy_path, shell, value,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Operation {
     CopyFile,
     Rename,
+    Copy,
+    Move,
+    CopyTree,
+}
+
+pub(super) fn shutil_operation(name: &str) -> Option<Operation> {
+    match name {
+        "copyfile" => Some(Operation::CopyFile),
+        "copy" | "copy2" => Some(Operation::Copy),
+        "move" => Some(Operation::Move),
+        "copytree" => Some(Operation::CopyTree),
+        _ => None,
+    }
 }
 
 pub(super) fn js_operation(name: &str) -> Option<Operation> {
@@ -99,24 +114,51 @@ pub(super) fn scan(
     let Some(transfer) = classify(node, language, env) else {
         return;
     };
-    // Always inspect the destination, even when the source cannot be resolved.
-    // Exclusive/no-clobber flags still permit creation of a protected file and
-    // are not an append-only known_hosts exemption.
-    record(
-        node,
-        &transfer.api,
-        "creates or replaces",
-        transfer.destination,
-        hits,
-    );
-    if transfer.operation == Operation::Rename {
-        record(
+    // Destination semantics are part of the API, not a guess based on whether
+    // this machine happens to have the target directory. Exclusive/no-clobber
+    // flags still permit creation; they are not append-only exemptions.
+    match transfer.operation {
+        Operation::CopyFile | Operation::Rename => record(
+            node,
+            &transfer.api,
+            "creates or replaces",
+            transfer.destination.as_ref(),
+            hits,
+        ),
+        Operation::Copy | Operation::Move => record_placement(
+            node,
+            &transfer.api,
+            transfer.source.as_ref(),
+            transfer.destination.as_ref(),
+            hits,
+        ),
+        Operation::CopyTree => record_tree(
+            node,
+            &transfer.api,
+            "writes a tree at",
+            transfer.destination.as_ref(),
+            hits,
+        ),
+    }
+    match transfer.operation {
+        Operation::Rename => record(
             node,
             &transfer.api,
             "removes the source name of",
-            transfer.source,
+            transfer.source.as_ref(),
             hits,
-        );
+        ),
+        // shutil.move also moves directories, including a .aws/.config tree
+        // whose root is not itself a protected file. Copy operations never
+        // inspect this source-side mutation: they only read their sources.
+        Operation::Move => record_tree(
+            node,
+            &transfer.api,
+            "removes the source path or tree at",
+            transfer.source.as_ref(),
+            hits,
+        ),
+        Operation::CopyFile | Operation::Copy | Operation::CopyTree => {}
     }
 }
 
@@ -124,15 +166,26 @@ fn record(
     node: &Syntax<'_>,
     api: &str,
     effect: &str,
-    path: Option<ResolvedPath>,
+    path: Option<&ResolvedPath>,
     hits: &mut Vec<CredentialFileWrite>,
 ) {
     let Some((path, expands_home)) = path else {
         return;
     };
-    let Some(rule) = protected(&path, Access::Write, expands_home) else {
+    let Some(rule) = protected(path, Access::Write, *expands_home) else {
         return;
     };
+    record_rule(node, api, effect, path, rule, hits);
+}
+
+fn record_rule(
+    node: &Syntax<'_>,
+    api: &str,
+    effect: &str,
+    path: &str,
+    rule: &'static str,
+    hits: &mut Vec<CredentialFileWrite>,
+) {
     if !hits.iter().any(|hit| hit.rule == rule) {
         hits.push(CredentialFileWrite {
             span: node.range(),
@@ -141,6 +194,74 @@ fn record(
                 "{api} {effect} protected target {path:?}. File transfers are not append-only updates. Stage the proposed change for review or use dcg allow-once."
             ),
         });
+    }
+}
+
+/// A directory-capable destination can be either an exact file or a container.
+/// Check both possibilities, preserving the known source basename for the
+/// latter. Copying notes.txt into /home/u is not a write to /home/u/.bashrc.
+fn record_placement(
+    node: &Syntax<'_>,
+    api: &str,
+    source: Option<&ResolvedPath>,
+    destination: Option<&ResolvedPath>,
+    hits: &mut Vec<CredentialFileWrite>,
+) {
+    record(node, api, "creates or replaces", destination, hits);
+    let Some((destination, expands_home)) = destination else {
+        return;
+    };
+    let source = source.map_or_else(
+        // In the shared placement policy, '.' represents unknown contents.
+        // Do not invent a harmless basename for an unresolved source operand.
+        || "'.'".to_string(),
+        |(path, expands)| quote_policy_path(path, *expands),
+    );
+    record_directory_policy(
+        node,
+        api,
+        "places a source into",
+        destination,
+        *expands_home,
+        &source,
+        hits,
+    );
+}
+
+/// Whole-tree writes and source-directory removal affect protected descendants,
+/// not only the directory entry. Reuse the shell policy's unknown-contents
+/// judgment; do not infer an inventory, follow symlinks, or apply ignore filters.
+fn record_tree(
+    node: &Syntax<'_>,
+    api: &str,
+    effect: &str,
+    path: Option<&ResolvedPath>,
+    hits: &mut Vec<CredentialFileWrite>,
+) {
+    record(node, api, effect, path, hits);
+    if let Some((path, expands_home)) = path {
+        record_directory_policy(node, api, effect, path, *expands_home, "'.'", hits);
+    }
+}
+
+fn record_directory_policy(
+    node: &Syntax<'_>,
+    api: &str,
+    effect: &str,
+    path: &str,
+    expands_home: bool,
+    source_word: &str,
+    hits: &mut Vec<CredentialFileWrite>,
+) {
+    if path.is_empty() {
+        return;
+    }
+    // This arm explicitly judges the directory interpretation. Its trailing
+    // separator also keeps a bare .git directory inside the shell pre-gate.
+    let directory = quote_policy_path(&format!("{path}/"), expands_home);
+    let adapter = format!("cp -t {directory} -- {source_word}");
+    if let Some(hit) = shell::classify_credential_file_write(&adapter, ShellDialect::Posix) {
+        record_rule(node, api, effect, path, hit.rule, hits);
     }
 }
 
@@ -428,6 +549,89 @@ mod tests {
                 classify(&command, ShellDialect::Posix).is_some(),
                 "{command}"
             );
+        }
+    }
+
+    #[test]
+    fn shutil_directory_placement_preserves_basename_and_aliases() {
+        for source in [
+            "import shutil; shutil.copy('staged', '/etc/shadow')",
+            "import shutil; shutil.copy2('fixtures/.bashrc', '/home/u')",
+            "import shutil as disk; disk.copy('fixtures/credentials', '/home/u/.aws')",
+            "from shutil import copy2 as publish; publish(dst='/etc', src='fixtures/passwd')",
+            "import shutil; publish = shutil.copy2; publish('staged', '.bashrc')",
+            "import shutil, os; shutil.copy2('fixtures/.bashrc', os.path.expanduser('~'))",
+            "import shutil; shutil.copy(source, '/home/u/.ssh')",
+            "import shutil; shutil.copy2(source, '/home/u')",
+            "import shutil; shutil.copy2('staged', '/home/u/.ssh/known_hosts')",
+        ] {
+            assert_eq!(rules(source, ScriptLanguage::Python), ["credential-file-write"], "{source}");
+        }
+        for source in [
+            "import shutil; shutil.copy2('staged', '.git')",
+            "from shutil import copy as publish; publish('staged', 'repo/.git/hooks')",
+        ] {
+            assert_eq!(rules(source, ScriptLanguage::Python), ["git-internals-write"], "{source}");
+        }
+    }
+
+    #[test]
+    fn shutil_copytree_targets_the_destination_tree_not_the_source_basename() {
+        for source in [
+            "import shutil; shutil.copytree('backup', '/home/u', dirs_exist_ok=True)",
+            "from shutil import copytree as restore; restore(src='backup', dst='/etc')",
+            "import shutil; shutil.copytree(source, '/home/u/.config')",
+            "import shutil; shutil.copytree('backup', '/home/u/.ssh', dirs_exist_ok=False)",
+        ] {
+            assert_eq!(rules(source, ScriptLanguage::Python), ["credential-file-write"], "{source}");
+        }
+        let source = "import shutil; shutil.copytree('backup', '.git', dirs_exist_ok=True)";
+        assert_eq!(rules(source, ScriptLanguage::Python), ["git-internals-write"]);
+    }
+
+    #[test]
+    fn shutil_moves_check_source_trees_and_keep_independent_rule_families() {
+        for source in [
+            "import shutil; shutil.move('/home/u/.aws', 'backup')",
+            "from shutil import move as archive; archive(src='/home/u/.config', dst=destination)",
+            "import shutil; shutil.move('.bashrc', destination)",
+            "import shutil; shutil.move(source, '.bashrc')",
+        ] {
+            assert_eq!(rules(source, ScriptLanguage::Python), ["credential-file-write"], "{source}");
+        }
+        for source in [
+            "import shutil; shutil.move('.bashrc', '.git')",
+            "import shutil; shutil.move('.git', '.bashrc')",
+        ] {
+            let mut actual = rules(source, ScriptLanguage::Python);
+            actual.sort_unstable();
+            assert_eq!(actual, ["credential-file-write", "git-internals-write"], "{source}");
+        }
+        let source = "from shutil import move as archive; archive('.bashrc', 'backup')";
+        let command = format!("python3 -c \"{source}\"");
+        assert!(classify(&command, ShellDialect::Posix).is_some(), "move pre-gate: {command}");
+    }
+
+    #[test]
+    fn shutil_reads_safe_placements_and_literal_metacharacters_stay_clear() {
+        for source in [
+            "import shutil; shutil.copy2('.bashrc', '/tmp/backup.txt')",
+            "import shutil; shutil.copytree('/home/u/.ssh', '/tmp/backup')",
+            "import shutil; shutil.copytree('/home/u/.config', '/tmp/backup')",
+            "import shutil; shutil.copy('notes.txt', '/home/u')",
+            "import shutil; shutil.copy2('fixtures/readme.txt', '/home/u/.aws')",
+            "import shutil; shutil.move('notes.txt', '/home/u')",
+            "import shutil; shutil.copy2('fixtures/pass*', '/etc')",
+            "import shutil; shutil.copy2('fixtures/pass{wd,x}', '/etc')",
+            "import shutil; shutil.copy2('fixtures/.bashrc', '~')",
+            "import shutil; shutil.copytree('backup', '~')",
+            "print(\"shutil.copy2('staged', '.bashrc')\")",
+            "import shutil; shutil = store; shutil.move('staged', '.bashrc')",
+            "from shutil import copy2 as publish; publish = print; publish('staged', '.bashrc')",
+            "from unrelated import copy2; copy2('staged', '.bashrc')",
+            "def example(shutil):\n    shutil.copytree('backup', '/etc')",
+        ] {
+            assert!(rules(source, ScriptLanguage::Python).is_empty(), "{source}");
         }
     }
 }
