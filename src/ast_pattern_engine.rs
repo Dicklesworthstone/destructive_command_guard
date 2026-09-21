@@ -527,13 +527,22 @@ pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Op
         language,
         ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
     ) {
-        for caps in JS_FS_RMSYNC_LITERAL.captures_iter(code) {
+        for caps in JS_FS_SINK_LITERAL.captures_iter(code) {
             let Some(m) = caps.get(0) else { continue };
             if !is_javascript_executable_offset(code, m.start()) {
                 continue;
             }
             let Some(path) = string_literal_from_caps(&caps) else {
                 continue;
+            };
+            // The captured sink names the rule, so the id matches the AST rule
+            // for the same API rather than reporting everything as `fs_rmsync`.
+            let sink = caps.name("sink").map_or("rmSync", |s| s.as_str());
+            let rule_suffix = match sink {
+                "rmdirSync" => "fs_rmdirsync",
+                "unlinkSync" => "fs_unlinksync",
+                "rm" => "fs_rm",
+                _ => "fs_rmsync",
             };
             let catastrophic = is_catastrophic_path(path);
             // #455: the fallback must reach the same verdict as the AST pass.
@@ -559,12 +568,13 @@ pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Op
             };
             let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
             return Some(PatternMatch {
-                rule_id: format!("heredoc.{lang_id}.fs_rmsync.{suffix}"),
+                rule_id: format!("heredoc.{lang_id}.{rule_suffix}.{suffix}"),
                 reason: if catastrophic {
-                    "fs.rmSync() deletes files/directories (catastrophic target path)".to_string()
+                    format!("fs.{sink}() deletes files/directories (catastrophic target path)")
                 } else {
-                    "fs.rmSync() recursively deletes files/directories outside a temp directory"
-                        .to_string()
+                    format!(
+                        "fs.{sink}() recursively deletes files/directories outside a temp directory"
+                    )
                 },
                 matched_text_preview: truncate_preview(
                     code.get(m.start()..m.end()).unwrap_or(""),
@@ -821,11 +831,30 @@ static RUBY_FILEUTILS_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     .expect("ruby FileUtils literal regex compiles")
 });
 
-static JS_FS_RMSYNC_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+/// Name-anchored filesystem-delete sinks, the way [`JS_EXEC_SINK_LITERAL`] is
+/// name-anchored for exec sinks.
+///
+/// The receiver is optional and may be a chain, so all three binding styles are
+/// covered by one pattern: `fs.rmSync(p)`, an alias like `f.rmSync(p)`, the
+/// `fs.promises.rm(p)` member spelling, and — the reason this changed — a
+/// destructured import with NO receiver at all.
+///
+/// A metavariable in receiver position (`$FS.rmSync($$$)`) closed the aliased
+/// spellings in the AST pass, but it structurally cannot match a call that has
+/// no receiver, so `const { rmSync } = require('fs'); rmSync('/home/user',
+/// {recursive: true})` and `import { rm } from 'node:fs/promises'` stayed
+/// allowed at a catastrophic target (#459). Those are current idiomatic Node —
+/// the `node:` prefix is the recommended form and destructuring is the default
+/// style — so the guarded spellings were the older ones.
+///
+/// Over-matching is bounded exactly as before: the caller still requires a
+/// catastrophic literal target, or `recursive: true` on a non-temp literal,
+/// before this blocks. A user-defined `rm('./build')` therefore does not.
+static JS_FS_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"(?m){STATEMENT_START}(?:await[ \t]+)?fs\.rmSync\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#
+        r#"(?m){STATEMENT_START}(?:await[ \t]+)?(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*(?P<sink>rmdirSync|unlinkSync|rmSync|rm)\b\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#
     ))
-    .expect("JavaScript fs.rmSync literal regex compiles")
+    .expect("JavaScript filesystem sink literal regex compiles")
 });
 
 static JS_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
