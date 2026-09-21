@@ -1607,13 +1607,9 @@ fn judge_placement(
             .map(|(example, what)| unprovable_hit(writer, directory_word, &example, what, span));
     }
     match exact(directory.root, &directory.comps) {
-        Exact::Protected { display, what, .. } => protected_hit(
-            writer,
-            &display,
-            what,
-            rule_for(&directory.comps),
-            span,
-        ),
+        Exact::Protected { display, what, .. } => {
+            protected_hit(writer, &display, what, rule_for(&directory.comps), span)
+        }
         Exact::Clear => None,
         Exact::Parent => {
             let pattern = source_basename_pattern(source);
@@ -1942,15 +1938,13 @@ fn classify_copy(kind: WriterKind, args: &[&Word]) -> Option<CredentialFileWrite
         return judge_file_target(dest, writer);
     }
     match exact(destination.root, &destination.comps) {
-        Exact::Protected { display, what, .. } => {
-            protected_hit(
-                writer,
-                &display,
-                what,
-                rule_for(&destination.comps),
-                dest.range.clone(),
-            )
-        }
+        Exact::Protected { display, what, .. } => protected_hit(
+            writer,
+            &display,
+            what,
+            rule_for(&destination.comps),
+            dest.range.clone(),
+        ),
         Exact::Parent => sources
             .iter()
             .find_map(|source| judge_placement(&destination, dest, source, writer)),
@@ -2087,6 +2081,111 @@ mod tests {
 
     fn hit(command: &str) -> Option<CredentialFileWrite> {
         classify_credential_file_write(command, ShellDialect::Posix)
+    }
+
+    /// The two rule names this module reports must exist as pack entries.
+    ///
+    /// `destructive_pattern!` takes a string literal, so the id in
+    /// `filesystem.rs` and the const here are two spellings of one name with
+    /// nothing tying them together. #460 was exactly this shape one layer up —
+    /// a rule that looked right at its definition and decided nothing in
+    /// production — so the link is asserted rather than assumed.
+    #[test]
+    fn both_rule_names_are_registered_pack_rules() {
+        let pack = crate::packs::core::filesystem::create_pack();
+        let names: Vec<&str> = pack.guidance_rule_names().collect();
+        for rule in [CREDENTIAL_FILE_WRITE_NAME, GIT_INTERNALS_WRITE_NAME] {
+            assert!(
+                names.contains(&rule),
+                "{rule} is reported by the classifier but is not a rule in core.filesystem, \
+                 so it has no guidance, no docs entry and no allowlist target; got {names:?}"
+            );
+        }
+        assert_ne!(
+            CREDENTIAL_FILE_WRITE_NAME, GIT_INTERNALS_WRITE_NAME,
+            "the whole point of the second name is that allowing one does not allow the other"
+        );
+    }
+
+    /// #457: `.git/` reaches the writers a redirect rule cannot see.
+    #[test]
+    fn git_internals_are_reached_by_every_non_redirect_writer() {
+        for command in [
+            "tee .git/config",
+            "tee -a .git/config",
+            "echo x | sponge .git/config",
+            "cp /tmp/x .git/config",
+            "mv /tmp/x .git/config",
+            "install /tmp/x .git/config",
+            "sed -i s/a/b/ .git/config",
+            "tee repo/.git/hooks/pre-commit",
+            "tee ./.git/config",
+        ] {
+            let found = hit(command).unwrap_or_else(|| panic!("must deny: {command}"));
+            assert_eq!(
+                found.rule, GIT_INTERNALS_WRITE_NAME,
+                "{command} must deny under its own rule, not the credential one"
+            );
+        }
+    }
+
+    /// A redirect into `.git/` stays with the rules that already own it.
+    ///
+    /// The classifier runs ahead of every redirect rule, so if it answered
+    /// here it would rename their hits and break allowlists that name them.
+    #[test]
+    fn git_internals_redirects_are_left_to_the_redirect_rules() {
+        for command in [
+            "cat > .git/config",
+            "cat >> .git/config",
+            "cat >| .git/config",
+        ] {
+            assert!(
+                hit(command).is_none(),
+                "{command} must be left to redirect-*-git-internals-relative"
+            );
+        }
+        // …and the same exclusion must not leak to real credentials, whose
+        // redirect spellings the classifier has always owned.
+        assert_eq!(
+            hit("cat > .ssh/id_rsa")
+                .expect("ssh redirect still denies")
+                .rule,
+            CREDENTIAL_FILE_WRITE_NAME
+        );
+    }
+
+    /// The neighbours that are not inside `.git/` and must stay ordinary.
+    #[test]
+    fn git_adjacent_files_are_not_git_internals() {
+        for command in [
+            "tee .gitignore",
+            "tee .gitattributes",
+            "tee .gitmodules",
+            "tee .github/workflows/ci.yml",
+            "tee src/git/config",
+            "tee .git",
+        ] {
+            assert!(hit(command).is_none(), "must stay allowed: {command}");
+        }
+    }
+
+    /// The gate needle is `.git/`, so the common neighbours never reach the
+    /// classifier at all — the hot-path half of the same decision.
+    #[test]
+    fn the_gate_ignores_git_adjacent_tokens() {
+        for command in [
+            "cat .gitignore",
+            "rg TODO .github/workflows",
+            "git status",
+            "tee .gitmodules",
+        ] {
+            assert!(
+                !may_name_protected_path(command),
+                "{command} must not wake the classifier"
+            );
+        }
+        assert!(may_name_protected_path("tee .git/config"));
     }
 
     fn denied(command: &str) -> CredentialFileWrite {

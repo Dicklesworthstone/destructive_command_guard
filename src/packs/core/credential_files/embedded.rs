@@ -1,24 +1,29 @@
 //! Structural recognition of Python, Ruby, and Node file-write APIs (#461).
 //!
-//! Parse shell syntax first: an interpreter invocation printed by echo, stored
-//! in an argument, or mentioned in a comment is not an executable script.
-//! Parse the resulting script in its own language, tracking simple imports and
-//! bindings so unrelated objects with methods named `writeFile` are not sinks.
-//! No script is executed and no destination is read or opened.
+//! Shell callers first establish that the source belongs to an interpreter.
+//! The evaluator also calls `scan_extracted` directly on executable source:
+//! its shell-segment view has already masked interpreter bodies. No script is
+//! executed and no destination is read or opened.
 
 use super::{CredentialFileWrite, shell};
-use crate::heredoc::{ExtractionLimits, ExtractionResult, extract_content};
+use crate::heredoc::{
+    ExtractionLimits, ExtractionResult, HeredocType, ScriptLanguage, extract_content,
+};
 use crate::normalize::{ShellDialect, strip_wrapper_prefixes};
 use ast_grep_core::{AstGrep, Node, tree_sitter::StrDoc};
 use ast_grep_language::SupportLang;
 use std::collections::HashMap;
 use std::ops::Range;
 
+mod transfers;
+
 type Syntax<'a> = Node<'a, StrDoc<SupportLang>>;
 
-// The hook already bounds command size. Keep direct library calls bounded too.
+// Bound direct library calls as well as the hook. An exhausted source walk
+// must report incomplete analysis, not a successful empty match set.
 const MAX_BYTES: usize = 256 * 1024;
 const MAX_DEPTH: usize = 128;
+const MAX_NODES: usize = 40_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Language {
@@ -53,6 +58,50 @@ pub(super) fn is_interpreter(executable: &str) -> bool {
     interpreter(executable).is_some()
 }
 
+/// A lexical superset of the API names that can establish a write binding.
+/// Do not gate on a raw protected-path substring: constant concatenation and
+/// language escapes can assemble that substring only after decoding.
+pub(crate) fn source_scan_required(code: &str, language: ScriptLanguage) -> bool {
+    matches!(
+        language,
+        ScriptLanguage::Python
+            | ScriptLanguage::Ruby
+            | ScriptLanguage::JavaScript
+            | ScriptLanguage::TypeScript
+    ) && source_has_sink_name(code)
+}
+
+/// Shared by the shell and extracted-source gates. In particular, a rename
+/// contains neither `open` nor `write`, but can replace either protected rule
+/// family's files. Keep this a superset, not a raw destination-path check.
+fn source_has_sink_name(code: &str) -> bool {
+    [
+        "open", "write", "Write", "append", "truncate", "File", "Path", "copy", "rename", "replace",
+    ]
+    .iter()
+    .any(|word| code.contains(word))
+}
+
+/// Inspect already-extracted executable source, never shell tokens. Return
+/// the first hit for EACH rule so allowing credentials cannot hide a later
+/// `.git` write (or conversely). Spans are bytes in `code`.
+pub(crate) fn scan_extracted(
+    code: &str,
+    language: ScriptLanguage,
+) -> Result<Vec<CredentialFileWrite>, &'static str> {
+    if !source_scan_required(code, language) {
+        return Ok(Vec::new());
+    }
+    let (language, grammar) = match language {
+        ScriptLanguage::Python => (Language::Python, SupportLang::Python),
+        ScriptLanguage::Ruby => (Language::Ruby, SupportLang::Ruby),
+        ScriptLanguage::JavaScript => (Language::Node, SupportLang::JavaScript),
+        ScriptLanguage::TypeScript => (Language::Node, SupportLang::TypeScript),
+        _ => return Ok(Vec::new()),
+    };
+    scan_source(code, language, grammar)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Access {
     Read,
@@ -84,18 +133,14 @@ fn mode_access(mode: &str) -> Option<Access> {
 pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<CredentialFileWrite> {
     if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
         || segment.len() > MAX_BYTES
-        || !["open", "write", "append", "File", "Path"]
-            .iter()
-            .any(|word| segment.contains(word))
+        || !source_has_sink_name(segment)
     {
         return None;
     }
     let ast = AstGrep::new(segment, SupportLang::Bash);
     let root = ast.root();
     for command in root.dfs().filter(|node| node.kind() == "command") {
-        let text = command.text();
-        let normalized = strip_wrapper_prefixes(text.as_ref());
-        let Ok(words) = shell_words::split(normalized.normalized.as_ref()) else {
+        let Some(words) = command_words(&command) else {
             continue;
         };
         let Some(language) = words.first().and_then(|name| interpreter(name)) else {
@@ -106,13 +151,24 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
                 return Some(hit);
             }
         }
+        if reads_stdin(&words, language) {
+            if let Some((code, span)) = here_string_source(&command) {
+                if let Some(hit) = inspect(&code, language, span) {
+                    return Some(hit);
+                }
+            }
+        }
     }
 
     // Extraction alone may infer a language from data. Accept heredocs only
     // when their actual shell receiver is a supported stdin interpreter, and
     // verify that receiver against executable command nodes in the shell AST.
     if segment.contains("<<") {
-        let items = match extract_content(segment, &ExtractionLimits::default()) {
+        // Structural budget, not the 50 ms hot-path default (#443). This is a
+        // classification — anything but a completed extraction becomes `None`
+        // below, i.e. "no protected write" — so on the default budget the
+        // answer followed how busy the host was rather than the command.
+        let items = match extract_content(segment, &ExtractionLimits::structural_scan()) {
             ExtractionResult::Extracted(items)
             | ExtractionResult::Partial {
                 extracted: items, ..
@@ -120,7 +176,9 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
             _ => return None,
         };
         for item in items {
-            if item.heredoc_type.is_none() {
+            // Here-strings were inspected on their owning command above. A
+            // regex extraction cannot prove which descriptor consumes them.
+            if item.heredoc_type.is_none() || item.heredoc_type == Some(HeredocType::HereString) {
                 continue;
             }
             let Some(target) = item.target_command.as_deref() else {
@@ -137,13 +195,9 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
                 continue;
             }
             let receiver = root.dfs().any(|node| {
-                if node.kind() != "command" || node.range().start > item.byte_range.end {
-                    return false;
-                }
-                let text = node.text();
-                let normalized = strip_wrapper_prefixes(text.as_ref());
-                shell_words::split(normalized.normalized.as_ref())
-                    .is_ok_and(|actual| actual == words)
+                node.kind() == "command"
+                    && node.range().start <= item.byte_range.end
+                    && command_words(&node).is_some_and(|actual| actual == words)
             });
             if receiver {
                 let span = item.content_range.unwrap_or(item.byte_range);
@@ -154,6 +208,87 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
         }
     }
     None
+}
+
+/// Redirections are syntax, not argv. In the Bash grammar a here-string is
+/// a child of `command`, so splitting `command.text()` includes `<<<` and its
+/// source as spurious interpreter arguments. Preserve shell quoting while
+/// selecting only the command-name and argument fields (#461).
+fn command_words(command: &Syntax<'_>) -> Option<Vec<String>> {
+    let mut text = command.field("name")?.text().into_owned();
+    for argument in command.field_children("argument") {
+        text.push(' ');
+        text.push_str(argument.text().as_ref());
+    }
+    let normalized = strip_wrapper_prefixes(&text);
+    shell_words::split(normalized.normalized.as_ref()).ok()
+}
+
+/// Only the last redirection of stdin supplies interpreter source. Trailing
+/// file redirects may live on the enclosing redirected_statement; do not
+/// accidentally inspect a here-string that a later `< /dev/null` replaces.
+fn here_string_source(command: &Syntax<'_>) -> Option<(String, Range<usize>)> {
+    // Bound to a local so the chained iterator can borrow it; the redirects on
+    // the enclosing `redirected_statement` are appended after the command's own
+    // so `max_by_key` breaks ties the same way the collected form did.
+    let enclosing = command.parent().filter(|parent| {
+        parent.kind() == "redirected_statement"
+            && parent
+                .field("body")
+                .is_some_and(|body| body.range() == command.range())
+    });
+    let redirect = command
+        .field_children("redirect")
+        .chain(
+            enclosing
+                .as_ref()
+                .map(|parent| parent.field_children("redirect"))
+                .into_iter()
+                .flatten(),
+        )
+        .filter(|redirect| {
+            if let Some(descriptor) = redirect.field("descriptor") {
+                return descriptor.text().parse::<u32>() == Ok(0);
+            }
+            match redirect.kind().as_ref() {
+                "herestring_redirect" | "heredoc_redirect" => true,
+                "file_redirect" => redirect
+                    .children()
+                    .any(|child| matches!(child.text().as_ref(), "<" | "<&" | "<&-" | "<>")),
+                _ => false,
+            }
+        })
+        .max_by_key(|redirect| redirect.range().start)?;
+    if redirect.kind() != "herestring_redirect" {
+        return None;
+    }
+    let source = redirect.children().find(|child| {
+        child.is_named() && !matches!(child.kind().as_ref(), "file_descriptor" | "comment")
+    })?;
+    // Decode a static shell word, not an expanded value. Dynamic substitutions
+    // retain the evaluator's existing recursive/fallback handling; never run
+    // them or invent a literal destination. ANSI-C strings need their own
+    // decoder and must not be misdecoded by shell_words as ordinary quotes.
+    if source.dfs().any(|node| {
+        matches!(
+            node.kind().as_ref(),
+            "simple_expansion"
+                | "expansion"
+                | "command_substitution"
+                | "process_substitution"
+                | "arithmetic_expansion"
+                | "ansi_c_string"
+                | "translated_string"
+                | "ERROR"
+        )
+    }) {
+        return None;
+    }
+    let words = shell_words::split(source.text().as_ref()).ok()?;
+    let [code] = words.as_slice() else {
+        return None;
+    };
+    Some((code.clone(), source.range()))
 }
 
 /// Follow interpreter option boundaries, not a substring `-c` or `-e` in a
@@ -260,11 +395,20 @@ enum Value {
     Open,
     Io,
     Builtins,
+    Os,
+    OsPath,
+    OsTruncate,
+    Shutil,
+    Transfer(transfers::Operation),
+    ExpandUser,
+    /// Only a proven runtime expander grants a leading tilde home semantics.
+    HomePath(String),
     Pathlib,
     PathConstructor,
     Path(String),
     PathWrite(String),
     PathOpen(String),
+    PathTransfer(String),
     Require,
     Fs,
     File,
@@ -274,14 +418,27 @@ enum Value {
 type Bindings = HashMap<String, Value>;
 
 fn inspect(code: &str, language: Language, span: Range<usize>) -> Option<CredentialFileWrite> {
-    if code.len() > MAX_BYTES {
-        return None;
-    }
     let grammar = match language {
         Language::Python => SupportLang::Python,
         Language::Ruby => SupportLang::Ruby,
         Language::Node => SupportLang::JavaScript,
     };
+    let mut hit = scan_source(code, language, grammar)
+        .ok()?
+        .into_iter()
+        .next()?;
+    hit.span = span;
+    Some(hit)
+}
+
+fn scan_source(
+    code: &str,
+    language: Language,
+    grammar: SupportLang,
+) -> Result<Vec<CredentialFileWrite>, &'static str> {
+    if code.len() > MAX_BYTES {
+        return Err("protected-write source exceeds the byte limit");
+    }
     let ast = AstGrep::new(code, grammar);
     let mut bindings = Bindings::new();
     match language {
@@ -290,32 +447,43 @@ fn inspect(code: &str, language: Language, span: Range<usize>) -> Option<Credent
         }
         Language::Ruby => {
             bindings.insert("File".into(), Value::File);
+            bindings.insert("IO".into(), Value::Io);
         }
         Language::Node => {
             bindings.insert("require".into(), Value::Require);
         }
     }
-    let (api, path, _, rule) = visit(ast.root(), language, &mut bindings, 0)?;
-    Some(CredentialFileWrite {
-        span,
-        rule,
-        reason: format!(
-            "{api} writes protected credential, login-startup, or trust target {path:?}. Reads remain allowed; only append-only known_hosts updates are exempt. Show the user the proposed change or use dcg allow-once."
-        ),
-    })
+    let mut hits = Vec::new();
+    let mut remaining_nodes = MAX_NODES;
+    visit(
+        ast.root(),
+        language,
+        &mut bindings,
+        0,
+        &mut remaining_nodes,
+        &mut hits,
+    )?;
+    Ok(hits)
 }
 
-/// Return the first protected write, not just the first write in a script.
+/// Collect one hit per rule, not just the first write in a script. A rule
+/// allowlist is not permission to stop scanning other rule families.
 fn visit(
     node: Syntax<'_>,
     language: Language,
     env: &mut Bindings,
     depth: usize,
-) -> Option<(String, String, Access, &'static str)> {
-    if depth > MAX_DEPTH {
-        return None;
+    remaining_nodes: &mut usize,
+    hits: &mut Vec<CredentialFileWrite>,
+) -> Result<(), &'static str> {
+    if depth > MAX_DEPTH || *remaining_nodes == 0 {
+        return Err("protected-write source exceeds the AST traversal limit");
     }
+    *remaining_nodes -= 1;
     let kind = node.kind();
+    if kind == "ERROR" {
+        return Err("protected-write source contains a syntax error");
+    }
     if matches!(
         kind.as_ref(),
         "function_definition"
@@ -341,41 +509,67 @@ fn visit(
             }
         }
         for child in node.children() {
-            if let Some(hit) = visit(child, language, &mut local, depth + 1) {
-                return Some(hit);
-            }
+            visit(
+                child,
+                language,
+                &mut local,
+                depth + 1,
+                remaining_nodes,
+                hits,
+            )?;
         }
-        return None;
+        return Ok(());
     }
     bind(&node, language, env);
-    if let Some((api, path, access)) = write_call(&node, language, env) {
-        if let Some(rule) = protected(&path, access) {
-            return Some((api, path, access, rule));
+    if let Some((api, path, access, expands)) = write_call(&node, language, env) {
+        if let Some(rule) = protected(&path, access, expands) {
+            if !hits.iter().any(|hit| hit.rule == rule) {
+                hits.push(CredentialFileWrite {
+                    span: node.range(),
+                    rule,
+                    reason: format!(
+                        "{api} writes protected credential, login-startup, or trust target {path:?}. Reads remain allowed; only append-only known_hosts updates are exempt. Show the user the proposed change or use dcg allow-once."
+                    ),
+                });
+            }
         }
+    } else {
+        // Transfers may mutate two paths under distinct rule identities.
+        // Do not flatten them to write_call's single-destination result.
+        transfers::scan(&node, language, env, hits);
     }
     for child in node.children() {
-        if let Some(hit) = visit(child, language, env, depth + 1) {
-            return Some(hit);
-        }
+        visit(child, language, env, depth + 1, remaining_nodes, hits)?;
     }
-    None
+    Ok(())
 }
 
 /// A canonical, SINGLE-QUOTED sink is a policy adapter, never executed.
 /// Quote every byte so embedded string contents cannot become shell syntax,
 /// expansions, glob patterns, or extra targets. This deliberately does not
 /// expand literal '~' or '$HOME' in an ordinary language string literal.
-fn protected(path: &str, access: Access) -> Option<&'static str> {
+/// Only `os.path.expanduser` and `File.expand_path` may leave a leading
+/// `~`/`~user` unquoted. All other characters retain literal semantics.
+fn protected(path: &str, access: Access, expands_home: bool) -> Option<&'static str> {
     if access == Access::Read {
         return None;
     }
-    let quoted = format!("'{}'", path.replace('\'', "'\\''"));
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+    let anchor = expands_home
+        .then(|| path.split_once('/').unwrap_or((path, "")))
+        .filter(|(anchor, _)| {
+            anchor.starts_with('~')
+                && anchor[1..]
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        });
+    let quoted = match anchor {
+        Some((anchor, "")) => anchor.to_string(),
+        Some((anchor, rest)) => format!("{anchor}/{}", quote(rest)),
+        None => quote(path),
+    };
     let append = if access == Access::Append { "-a " } else { "" };
-    // The synthesized writer is `tee`, never a redirect, so a `.git` target
-    // reaches the rule here exactly as `tee .git/config` would (#457) — and
-    // the rule it answers with is carried back rather than flattened to a
-    // bool, so an embedded write is allowlistable by the same name as its
-    // shell equivalent.
+    // Use the exact shared path table and rule identity, including .git.
     shell::classify_credential_file_write(&format!("tee {append}-- {quoted}"), ShellDialect::Posix)
         .map(|hit| hit.rule)
 }
@@ -399,10 +593,27 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
                 (None, "io") => Some(Value::Io),
                 (None, "builtins") => Some(Value::Builtins),
                 (None, "pathlib") => Some(Value::Pathlib),
+                (None, "os") => Some(Value::Os),
+                (None, "shutil") => Some(Value::Shutil),
                 (Some("io" | "builtins"), "open") => Some(Value::Open),
                 (Some("pathlib"), "Path") => Some(Value::PathConstructor),
+                (Some("os"), "truncate") => Some(Value::OsTruncate),
+                (Some("os"), "rename" | "replace") => {
+                    Some(Value::Transfer(transfers::Operation::Rename))
+                }
+                (Some("shutil"), "copyfile") => {
+                    Some(Value::Transfer(transfers::Operation::CopyFile))
+                }
+                (Some("os"), "path") => Some(Value::OsPath),
+                (Some("os.path"), "expanduser") => Some(Value::ExpandUser),
                 _ => None,
             };
+            // `import os.path` binds `os`, not `os.path`.
+            if module.is_none() && source.starts_with("os.") && name.field("alias").is_none() {
+                env.remove("os");
+                env.insert("os".into(), Value::Os);
+                continue;
+            }
             env.remove(&alias);
             if let Some(value) = value {
                 env.insert(alias, value);
@@ -480,8 +691,14 @@ fn is_fs_module(module: &str) -> bool {
 fn is_js_api(name: &str) -> bool {
     matches!(
         name,
-        "writeFile" | "writeFileSync" | "appendFile" | "appendFileSync" | "createWriteStream"
-    )
+        "writeFile"
+            | "writeFileSync"
+            | "appendFile"
+            | "appendFileSync"
+            | "createWriteStream"
+            | "truncate"
+            | "truncateSync"
+    ) || transfers::js_operation(name).is_some()
 }
 
 fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) -> Option<Value> {
@@ -508,11 +725,32 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                 .into_owned();
             match (object, member.as_str()) {
                 (Value::Io | Value::Builtins, "open") => Some(Value::Open),
+                (Value::Os, "truncate") => Some(Value::OsTruncate),
+                (Value::Os, "rename" | "replace") => {
+                    Some(Value::Transfer(transfers::Operation::Rename))
+                }
+                (Value::Shutil, "copyfile") => {
+                    Some(Value::Transfer(transfers::Operation::CopyFile))
+                }
+                (Value::Os, "path") => Some(Value::OsPath),
+                (Value::OsPath, "expanduser") => Some(Value::ExpandUser),
                 (Value::Pathlib, "Path") => Some(Value::PathConstructor),
                 (Value::Path(path), "write_text" | "write_bytes") => Some(Value::PathWrite(path)),
                 (Value::Path(path), "open") => Some(Value::PathOpen(path)),
+                (Value::Path(path), "rename" | "replace") => Some(Value::PathTransfer(path)),
                 (Value::Fs, "promises") => Some(Value::Fs),
                 (Value::Fs, name) if is_js_api(name) => Some(Value::Api(name.into())),
+                _ => None,
+            }
+        }
+        "call" if language == Language::Ruby => {
+            if value(&node.field("receiver")?, language, env, depth + 1)? != Value::File
+                || node.field("method")?.text() != "expand_path"
+            {
+                return None;
+            }
+            match value(arguments(node).first()?, language, env, depth + 1)? {
+                Value::Text(path) => Some(Value::HomePath(path)),
                 _ => None,
             }
         }
@@ -530,6 +768,10 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                 }
                 Value::PathConstructor => match value(args.first()?, language, env, depth + 1)? {
                     Value::Text(path) | Value::Path(path) => Some(Value::Path(path)),
+                    _ => None,
+                },
+                Value::ExpandUser => match value(args.first()?, language, env, depth + 1)? {
+                    Value::Text(path) => Some(Value::HomePath(path)),
                     _ => None,
                 },
                 _ => None,
@@ -554,6 +796,15 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
 fn text_value(node: &Syntax<'_>, language: Language, env: &Bindings) -> Option<String> {
     match value(node, language, env, 0)? {
         Value::Text(text) | Value::Path(text) => Some(text),
+        _ => None,
+    }
+}
+
+/// Keep path expansion separate from mode/module strings.
+fn path_value(node: &Syntax<'_>, language: Language, env: &Bindings) -> Option<(String, bool)> {
+    match value(node, language, env, 0)? {
+        Value::Text(text) | Value::Path(text) => Some((text, false)),
+        Value::HomePath(text) => Some((text, true)),
         _ => None,
     }
 }
@@ -586,7 +837,7 @@ fn write_call(
     node: &Syntax<'_>,
     language: Language,
     env: &Bindings,
-) -> Option<(String, String, Access)> {
+) -> Option<(String, String, Access, bool)> {
     if !matches!(node.kind().as_ref(), "call" | "call_expression") {
         return None;
     }
@@ -596,10 +847,16 @@ fn write_call(
             return None;
         }
         let method = node.field("method")?.text().into_owned();
-        if !matches!(method.as_str(), "write" | "binwrite" | "open" | "new") {
+        if !matches!(
+            method.as_str(),
+            "write" | "binwrite" | "open" | "new" | "truncate"
+        ) {
             return None;
         }
-        let path = text_value(args.first()?, language, env)?;
+        let (path, expands) = path_value(args.first()?, language, env)?;
+        if method == "truncate" {
+            return Some(("File.truncate".into(), path, Access::Write, expands));
+        }
         let opener = matches!(method.as_str(), "open" | "new");
         let mut mode = if opener {
             args.get(1)
@@ -626,17 +883,17 @@ fn write_call(
             None if opener => Access::Read,
             None => Access::Write,
         };
-        return Some((format!("File.{method}"), path, access));
+        return Some((format!("File.{method}"), path, access, expands));
     }
     let function = node.field("function")?;
     match value(&function, language, env, 0)? {
         Value::Open | Value::PathOpen(_) if language == Language::Python => {
             let resolved = value(&function, language, env, 0)?;
-            let (path, index) = if let Value::PathOpen(path) = resolved {
-                (path, 0)
+            let ((path, expands), index) = if let Value::PathOpen(path) = resolved {
+                ((path, false), 0)
             } else {
                 (
-                    text_value(&python_argument(&args, 0, "file")?, language, env)?,
+                    path_value(&python_argument(&args, 0, "file")?, language, env)?,
                     1,
                 )
             };
@@ -644,13 +901,22 @@ fn write_call(
                 Some(mode) => mode_access(&text_value(&mode, language, env)?)?,
                 None => Access::Read,
             };
-            Some((function.text().into_owned(), path, access))
+            Some((function.text().into_owned(), path, access, expands))
         }
         Value::PathWrite(path) if language == Language::Python => {
-            Some((function.text().into_owned(), path, Access::Write))
+            Some((function.text().into_owned(), path, Access::Write, false))
         }
-        Value::Api(api) if language == Language::Node => {
-            let path = text_value(args.first()?, language, env)?;
+        Value::OsTruncate if language == Language::Python => {
+            let (path, expands) = path_value(&python_argument(&args, 0, "path")?, language, env)?;
+            Some((function.text().into_owned(), path, Access::Write, expands))
+        }
+        Value::Api(api)
+            if language == Language::Node && transfers::js_operation(&api).is_none() =>
+        {
+            let (path, expands) = path_value(args.first()?, language, env)?;
+            if matches!(api.as_str(), "truncate" | "truncateSync") {
+                return Some((format!("fs.{api}"), path, Access::Write, expands));
+            }
             let append = matches!(api.as_str(), "appendFile" | "appendFileSync");
             let default = if append {
                 Access::Append
@@ -660,7 +926,7 @@ fn write_call(
             let stream = api == "createWriteStream";
             let options = args.get(if stream { 1 } else { 2 });
             let access = js_access(options, if stream { "flags" } else { "flag" }, default, env);
-            Some((format!("fs.{api}"), path, access))
+            Some((format!("fs.{api}"), path, access, expands))
         }
         _ => None,
     }
@@ -796,8 +1062,135 @@ fn literal(node: &Syntax<'_>, language: Language) -> Option<String> {
             _ => return None,
         }
     }
-    (!result.contains('\0')).then_some(result)
+    Some(result)
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod here_string_tests {
+    use super::*;
+
+    #[test]
+    fn here_strings_bind_to_the_actual_interpreter_argv() {
+        for (exe, code) in [
+            ("python3", "open('/etc/shadow', 'a').write('x')"),
+            ("ruby", "File.write('/etc/shadow', 'x')"),
+            ("node", "require('fs').writeFileSync('/etc/shadow', 'x')"),
+        ] {
+            for prefix in ["", "env ", "sudo ", "FOO=1 "] {
+                for flag in ["", " -"] {
+                    for word in [
+                        format!("\"{code}\""),
+                        format!("'{}'", code.replace('\'', "'\\''")),
+                    ] {
+                        for redirect in ["<<< ", "<<<", "0<<< "] {
+                            let command = format!("{prefix}{exe}{flag} {redirect}{word}");
+                            let hit = classify(&command, ShellDialect::Posix).expect(&command);
+                            assert_eq!(hit.rule, shell::CREDENTIAL_FILE_WRITE_NAME, "{command}");
+                            assert!(command.get(hit.span).is_some(), "{command}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn here_strings_do_not_borrow_receivers_or_non_stdin_descriptors() {
+        for command in [
+            "python3 -V; cat <<< \"open('/etc/shadow', 'w')\"",
+            "python3 example.py <<< \"open('/etc/shadow', 'w')\"",
+            "python3 -c \"print('ok')\" <<< \"open('/etc/shadow', 'w')\"",
+            "python3 3<<< \"open('/etc/shadow', 'w')\"",
+            "python3 <<< \"open('/etc/shadow', 'w')\" </dev/null",
+            "python3 <<< \"open('/etc/shadow', 'w')\" <<< \"print('ok')\"",
+            "cat <<'DATA'\npython3 <<< \"open('/etc/shadow', 'w')\"\nDATA",
+            "echo 'python3 <<< \"open(/etc/shadow, w)\"'",
+        ] {
+            assert!(
+                classify(command, ShellDialect::Posix).is_none(),
+                "{command}"
+            );
+        }
+        let command = "python3 </dev/null <<< \"open('/etc/shadow', 'w')\"";
+        assert!(
+            classify(command, ShellDialect::Posix).is_some(),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn here_strings_preserve_read_data_and_append_only_exceptions() {
+        for code in [
+            "open('/etc/shadow', 'r').read()",
+            "open('/home/u/.ssh/known_hosts', 'a').write('host')",
+            "open('/home/u/.ssh/id_rsa.pub', 'w')",
+            "open('~/.bashrc', 'w')",
+            "print(\"open('/etc/shadow', 'w')\")",
+            "# open('/etc/shadow', 'w')\nprint('ok')",
+        ] {
+            let word = format!("'{}'", code.replace('\'', "'\\''"));
+            let command = format!("python3 <<< {word}");
+            assert!(
+                classify(&command, ShellDialect::Posix).is_none(),
+                "{command}"
+            );
+        }
+        let command = "python3 <<< \"import os; os.truncate('/home/u/.ssh/known_hosts', 0)\"";
+        assert!(
+            classify(command, ShellDialect::Posix).is_some(),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn here_strings_reach_public_evaluation_with_both_keyword_paths() {
+        use crate::allowlist::LayeredAllowlist;
+        use crate::config::{CompiledOverrides, Config};
+        use crate::evaluator::evaluate_command_with_pack_order_at_path_in_dialect;
+        use crate::packs::REGISTRY;
+        use std::collections::HashSet;
+
+        let enabled = HashSet::from(["core.filesystem".to_string()]);
+        let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+        let keywords = REGISTRY.collect_enabled_keywords(&enabled);
+        let index = REGISTRY
+            .build_enabled_keyword_index(&ordered)
+            .expect("keyword index");
+        let overrides = CompiledOverrides::default();
+        let allowlists = LayeredAllowlist::default();
+        let mut heredoc = Config::default().heredoc_settings();
+        for command in [
+            "python3 <<< \"open('/etc/shadow', 'w')\"",
+            "env ruby - <<< \"File.write('/home/u/.bashrc', 'x')\"",
+            "node <<< \"require('fs').appendFileSync('/root/.ssh/authorized_keys', 'x')\"",
+        ] {
+            for indexed in [false, true] {
+                for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                    for enabled in [false, true] {
+                        heredoc.enabled = enabled;
+                        let result = evaluate_command_with_pack_order_at_path_in_dialect(
+                            command,
+                            &keywords,
+                            &ordered,
+                            indexed.then_some(&index),
+                            &overrides,
+                            &allowlists,
+                            &heredoc,
+                            None,
+                            dialect,
+                        );
+                        assert!(result.is_denied(), "{command}: {result:?}");
+                        let info = result.pattern_info.expect("policy finding");
+                        assert_eq!(info.pack_id.as_deref(), Some("core.filesystem"));
+                        assert_eq!(info.pattern_name.as_deref(), Some("credential-file-write"));
+                        let span = info.matched_span.expect("original-source span");
+                        assert!(command.get(span.start..span.end).is_some());
+                    }
+                }
+            }
+        }
+    }
+}

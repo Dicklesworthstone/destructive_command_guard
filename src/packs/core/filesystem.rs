@@ -1383,6 +1383,43 @@ fn posix_segment_requires_rm_semantic_scan(segment: &str) -> bool {
     if !segment.contains(['$', '`', '\'', '"', '\\', '*', '?', '[', '{']) {
         return false;
     }
+    // Ask about the segment as written AND about the segment with wrapper
+    // prefixes removed, and admit the pack if EITHER view names a writer.
+    //
+    // Both views are needed, and taking only one is a real defect in each
+    // direction:
+    //
+    // - As-written only: the first token of `sudo python3 -c "…"` is `sudo`,
+    //   which is neither a credential writer nor an interpreter, so the pack
+    //   was never made a candidate and `credential-file-write` never ran, while
+    //   the identical command without the prefix denied. Measured: all twelve
+    //   combinations of {sudo, env, /usr/bin/env, FOO=1} x three interpreters
+    //   writing a login-shell startup file were allowed (#464).
+    //
+    // - Unwrapped only: `strip_wrapper_prefixes` also unwraps an *interpreter*
+    //   down to the code it runs, so the first token of `python3 -c "open(…)"`
+    //   becomes the payload rather than `python3`, and the gate answers false
+    //   for a command it used to admit. That is a false NEGATIVE, and it is why
+    //   this ORs rather than replaces.
+    //
+    // OR-ing is strictly more permissive than the original, so it can only add
+    // candidates. It cannot manufacture a false positive: nothing here decides
+    // anything, it only lets the classifier see a command it would otherwise
+    // never judge, and the classifier is what decides.
+    // The unwrap is deliberately on the right of the `||`: this runs on every
+    // command, and a segment whose first word is already a writer never pays
+    // for the rewrite.
+    segment_names_semantic_writer(segment)
+        || segment_names_semantic_writer(
+            crate::normalize::strip_wrapper_prefixes(segment)
+                .normalized
+                .as_ref(),
+        )
+}
+
+/// Whether the first word of `segment`, as spelled, is a writer the semantic
+/// rules in this pack own.
+fn segment_names_semantic_writer(segment: &str) -> bool {
     let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
     let Some(raw) = tokens
         .iter()

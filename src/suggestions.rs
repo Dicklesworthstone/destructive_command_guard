@@ -955,6 +955,30 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
             ),
         ],
     );
+    m.insert(
+        "core.filesystem:git-internals-write",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Read the current content first; reads under `.git/` are never blocked",
+            )
+            .with_command("git config --list --show-origin"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Let git edit its own config; it validates the key and picks the right scope",
+            )
+            .with_command("git config remote.origin.url <url>"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Change a remote through porcelain rather than by rewriting `.git/config`",
+            )
+            .with_command("git remote set-url origin <url>"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "For a change the user has approved, grant this one command with `dcg allow-once`, or allowlist `core.filesystem:git-internals-write` in the project config with a reason — note this is deliberately separate from `credential-file-write`, so allowing one does not allow the other",
+            ),
+        ],
+    );
     // The `.git` rules cannot take the generic redirect advice, because its
     // second entry is "use append instead". For an ordinary file that is the
     // safer spelling; for a git internal it is the more useful one, since a

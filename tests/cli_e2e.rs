@@ -6100,7 +6100,6 @@ custom_paths = ["{}"]
     }
 
     #[test]
-    #[ignore = "External pack loading not yet integrated into evaluation path"]
     fn custom_pack_blocks_matching_command() {
         let pack_content = r#"
 schema_version: 1
@@ -6130,7 +6129,6 @@ destructive_patterns:
     }
 
     #[test]
-    #[ignore = "External pack loading not yet integrated into evaluation path"]
     fn custom_pack_allows_non_matching_command() {
         let pack_content = r#"
 schema_version: 1
@@ -6148,18 +6146,18 @@ destructive_patterns:
         let (_temp, output) = setup_custom_pack_env(pack_content, "deploy --env staging");
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        // Parse hook output
-        let json: serde_json::Value =
-            serde_json::from_str(stdout.trim()).expect("should produce valid JSON");
-
-        assert_eq!(
-            json["hookSpecificOutput"]["permissionDecision"], "allow",
-            "custom pack should allow non-matching command\nstdout:\n{stdout}"
+        // An allowed command produces NO hook output at all — silence is the
+        // allow signal in the Claude Code hook protocol, and dcg only emits
+        // JSON to deny. This test used to parse stdout as JSON and was left
+        // `#[ignore]`d as "external pack loading not integrated", which was a
+        // misreading: loading works, and the deny half of this pair proves it.
+        assert!(
+            stdout.trim().is_empty(),
+            "an external pack must not block a non-matching command\nstdout:\n{stdout}"
         );
     }
 
     #[test]
-    #[ignore = "External pack loading not yet integrated into evaluation path"]
     fn custom_pack_safe_pattern_takes_precedence() {
         let pack_content = r#"
 schema_version: 1
@@ -6179,16 +6177,26 @@ safe_patterns:
     description: Staging deployments are allowed
 "#;
 
-        // Staging should be allowed (safe pattern takes precedence)
+        // Staging is allowed by the safe pattern even though the destructive
+        // one also matches, so the hook stays silent (see the sibling test for
+        // why silence is the allow signal).
         let (_temp, output) = setup_custom_pack_env(pack_content, "deploy --env staging");
         let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.trim().is_empty(),
+            "an external safe pattern must outrank its own destructive pattern\nstdout:\n{stdout}"
+        );
 
-        let json: serde_json::Value =
-            serde_json::from_str(stdout.trim()).expect("should produce valid JSON");
-
+        // The countermetric: the destructive pattern in the SAME pack must
+        // still bite when the safe one does not match. Without this the test
+        // above passes for an external pack that does nothing at all.
+        let (_temp, output) = setup_custom_pack_env(pack_content, "deploy --env prod");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|error| panic!("expected a deny payload: {error}; stdout:\n{stdout}"));
         assert_eq!(
-            json["hookSpecificOutput"]["permissionDecision"], "allow",
-            "safe pattern should allow staging deploy\nstdout:\n{stdout}"
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "the pack's destructive pattern must still block prod\nstdout:\n{stdout}"
         );
     }
 }

@@ -242,6 +242,24 @@ cargo test safe_pattern_tests
 cargo test destructive_pattern_tests
 ```
 
+**Prefer `cargo nextest run` when touching anything that mutates the
+environment.** CI runs `cargo nextest run --profile ci`, and nextest gives each
+test its own process — verified by observation, not assumption: sampling a
+`--lib` run showed up to 128 concurrent per-test `--exact` invocations. That
+process isolation is what makes the `unsafe { env::set_var }` sites in test code
+sound, because it removes the concurrent reader.
+
+Under plain `cargo test` every test shares one process and runs on threads, and
+the crate has ~109 `env::var` call sites against ~22 `EnvVarGuard` uses, none of
+the readers taking the lock — plus native code (bundled SQLite reading `TMPDIR`)
+that cannot take a Rust lock even in principle. So `cargo test` is the
+configuration the single crate-wide `ENV_LOCK` cannot actually make safe (#445).
+No failure has been observed from this; the race is available, not active.
+
+`cargo test` stays documented above because filter and `--ignored` syntax differ
+between the two runners (nextest wants `--run-ignored`), and several workflows in
+this file depend on the `cargo test` spelling.
+
 ### The Three Release-Blocking E2E Suites (read before touching perf or protocols)
 
 `cargo test` cannot catch the failure modes that have actually broken users.
