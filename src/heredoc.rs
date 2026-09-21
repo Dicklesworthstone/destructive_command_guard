@@ -7110,7 +7110,10 @@ mod tests {
         ///
         /// The part of a source file compiled outside `cfg(test)`: everything
         /// before the first `#[cfg(test)]` that gates an INLINE module
-        /// (`mod x {`), with any attributes between.
+        /// (`mod x {`), with any attributes between. That relies on no
+        /// production item following an inline test module, which holds for
+        /// every file under `src/` (what follows one is further test modules
+        /// or top-level `#[test]` fns, as in `normalize.rs`).
         ///
         /// Two kinds of `#[cfg(test)]` are deliberately NOT split points, and
         /// getting either wrong makes the guard silently weaker, not stricter:
@@ -7156,7 +7159,9 @@ mod tests {
         /// Such a file is test code from its first line, so `production_part`
         /// cannot see that — it has no gate of its own. Resolved with the
         /// standard rules: a module declared in `lib.rs`/`main.rs`/`mod.rs`
-        /// lives beside it, one declared in `foo.rs` lives under `foo/`.
+        /// lives beside it, one declared in `foo.rs` lives under `foo/`, and a
+        /// `#[path = "x.rs"]` (the layout `packs/test_template.rs` recommends
+        /// for pack tests) is relative to the declaring file's directory.
         fn test_only_files(
             files: &[std::path::PathBuf],
         ) -> std::collections::BTreeSet<std::path::PathBuf> {
@@ -7177,10 +7182,16 @@ mod tests {
                     if line != "#[cfg(test)]" {
                         continue;
                     }
-                    let Some(item) = lines
-                        .clone()
-                        .find(|next| !next.is_empty() && !next.starts_with("#["))
-                    else {
+                    let mut path_attribute = None;
+                    let Some(item) = lines.clone().find(|next| {
+                        if let Some(path) = next
+                            .strip_prefix("#[path = \"")
+                            .and_then(|rest| rest.strip_suffix("\"]"))
+                        {
+                            path_attribute = Some(path);
+                        }
+                        !next.is_empty() && !next.starts_with("#[")
+                    }) else {
                         continue;
                     };
                     let item = item
@@ -7193,6 +7204,10 @@ mod tests {
                     else {
                         continue;
                     };
+                    if let Some(path) = path_attribute {
+                        test_only.insert(dir.join(path));
+                        continue;
+                    }
                     test_only.insert(child_dir.join(format!("{name}.rs")));
                     test_only.insert(child_dir.join(name).join("mod.rs"));
                 }
@@ -7244,12 +7259,25 @@ mod tests {
             )
             .unwrap();
             std::fs::write(src.join("pack.rs"), "#[cfg(test)]\nmod tests;\n").unwrap();
-            let files = vec![src.join("lib.rs"), src.join("pack.rs")];
+            std::fs::write(
+                src.join("my_pack.rs"),
+                "#[cfg(test)]\n#[path = \"my_pack_tests.rs\"]\nmod tests;\n",
+            )
+            .unwrap();
+            let files = vec![src.join("lib.rs"), src.join("pack.rs"), src.join("my_pack.rs")];
             let test_only = test_only_files(&files);
             assert!(test_only.contains(&src.join("beside.rs")), "{test_only:?}");
             assert!(
                 test_only.contains(&src.join("pack").join("tests.rs")),
                 "a module of `pack.rs` lives under `pack/`: {test_only:?}"
+            );
+            assert!(
+                test_only.contains(&src.join("my_pack_tests.rs")),
+                "`#[path]` is relative to the declaring file's directory: {test_only:?}"
+            );
+            assert!(
+                !test_only.contains(&src.join("my_pack").join("tests.rs")),
+                "`#[path]` replaces the default location: {test_only:?}"
             );
             assert!(
                 !test_only.contains(&src.join("shipped.rs")),
