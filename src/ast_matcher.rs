@@ -475,14 +475,25 @@ pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Op
             let Some(path) = string_literal_from_caps(&caps) else {
                 continue;
             };
+            let fn_name = caps.name("fn").map_or("rm_rf", |s| s.as_str());
             let catastrophic = is_catastrophic_path(path);
-            let severity = if catastrophic {
+            // #455: the fallback has to reach the same verdict the AST pass
+            // would, or an AST timeout quietly relaxes the policy.
+            let non_temp_recursive = !catastrophic
+                && is_recursive_delete_rule(&format!("heredoc.ruby.fileutils_{fn_name}"))
+                && !is_temp_scratch_path(path);
+            let severity = if catastrophic || non_temp_recursive {
                 Severity::Critical
             } else {
                 Severity::Medium
             };
-            let suffix = if catastrophic { ".catastrophic" } else { "" };
-            let fn_name = caps.name("fn").map_or("rm_rf", |s| s.as_str());
+            let suffix = if catastrophic {
+                ".catastrophic"
+            } else if non_temp_recursive {
+                ".non_temp"
+            } else {
+                ""
+            };
             let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
 
             return Some(PatternMatch {
@@ -490,6 +501,10 @@ pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Op
                 reason: if catastrophic {
                     format!(
                         "FileUtils.{fn_name}() deletes files/directories (catastrophic target path)"
+                    )
+                } else if non_temp_recursive {
+                    format!(
+                        "FileUtils.{fn_name}() recursively deletes files/directories outside a temp directory"
                     )
                 } else {
                     format!("FileUtils.{fn_name}() deletes files/directories")
@@ -520,7 +535,15 @@ pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Op
             let Some(path) = string_literal_from_caps(&caps) else {
                 continue;
             };
-            if !is_catastrophic_path(path) {
+            let catastrophic = is_catastrophic_path(path);
+            // #455: the fallback must reach the same verdict as the AST pass.
+            // A `recursive: true` delete of a literal outside /tmp blocks; a
+            // single-file `fs.rmSync('./a.txt')` is still not this rule's
+            // business, so the recursive option has to be present.
+            let non_temp_recursive = !catastrophic
+                && JS_RECURSIVE_TRUE.is_match(code.get(m.start()..).unwrap_or(""))
+                && !is_temp_scratch_path(path);
+            if !catastrophic && !non_temp_recursive {
                 continue;
             }
 
@@ -529,11 +552,20 @@ pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Op
             } else {
                 "javascript"
             };
+            let suffix = if catastrophic {
+                "catastrophic"
+            } else {
+                "non_temp"
+            };
             let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
             return Some(PatternMatch {
-                rule_id: format!("heredoc.{lang_id}.fs_rmsync.catastrophic"),
-                reason: "fs.rmSync() deletes files/directories (catastrophic target path)"
-                    .to_string(),
+                rule_id: format!("heredoc.{lang_id}.fs_rmsync.{suffix}"),
+                reason: if catastrophic {
+                    "fs.rmSync() deletes files/directories (catastrophic target path)".to_string()
+                } else {
+                    "fs.rmSync() recursively deletes files/directories outside a temp directory"
+                        .to_string()
+                },
                 matched_text_preview: truncate_preview(
                     code.get(m.start()..m.end()).unwrap_or(""),
                     60,
@@ -811,6 +843,25 @@ static JS_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
         r#"(?m)\b(?P<sink>execFileSync|execFile|execSync|exec|spawnSync|spawn|fork)\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
     )
     .expect("js exec sink literal regex compiles")
+});
+
+/// The first string literal handed to a Python call, used to read the target
+/// of `shutil.rmtree('…')` (#455).
+static PY_FIRST_STRING_ARG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
+        .expect("python first string arg regex compiles")
+});
+
+/// A `tempfile` call whose result is a directory `tempfile` itself created.
+///
+/// `shutil.rmtree(tempfile.mkdtemp())` is the documented way to clean up after
+/// `mkdtemp`, and blocking it is a false positive on the single most common
+/// correct use of `rmtree` — the target is a fresh scratch directory by
+/// construction, so it is exactly what `is_temp_scratch_path` means, reached
+/// through a call rather than a literal (#455).
+static PY_TEMPFILE_PRODUCED_DIR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:tempfile\s*\.\s*)?(?:mkdtemp|TemporaryDirectory)\s*\(")
+        .expect("python tempfile-produced dir regex compiles")
 });
 
 static PY_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
@@ -1171,6 +1222,29 @@ fn refine_python_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMat
         return unchanged();
     }
 
+    // #455: `shutil.rmtree` is the one recursive delete that blocked a target
+    // under /tmp, which `rm -rf /tmp/build` has always allowed. It is also the
+    // rule that blocked `shutil.rmtree(tempfile.mkdtemp())` — the documented
+    // way to clean up after `mkdtemp`, and a false positive on the most common
+    // correct use of the function. Both are the temp carve-out the other
+    // languages get; nothing else about the rule changes, so a literal outside
+    // /tmp and a target this cannot read both stay Critical.
+    if is_recursive_delete_rule(rule_id) {
+        let path = PY_FIRST_STRING_ARG
+            .captures(matched_text)
+            .and_then(|caps| string_literal_from_caps(&caps));
+        let targets_scratch = path.is_some_and(is_temp_scratch_path)
+            || (path.is_none() && PY_TEMPFILE_PRODUCED_DIR.is_match(matched_text));
+        if targets_scratch {
+            return RefinedMatchMeta {
+                rule_id: format!("{rule_id}.temp"),
+                reason: format!("{} (target is a temp directory)", meta.reason),
+                severity: Severity::Medium,
+                suggestion: meta.suggestion.clone(),
+            };
+        }
+    }
+
     unchanged()
 }
 
@@ -1268,6 +1342,15 @@ fn refine_javascript_match(meta: &CompiledPattern, matched_text: &str) -> Option
                 severity: Severity::Critical,
                 suggestion: meta.suggestion.clone(),
             });
+        }
+
+        // #455: only when the call actually recurses. `fs.rmSync('./a.txt')`
+        // with no `recursive: true` deletes one file and is left alone; the
+        // `{recursive: true}` form destroys a tree the way `rm -rf` does.
+        if recursive_relevant && is_recursive_delete_rule(rule_id) {
+            if let Some(refined) = recursive_delete_refinement(meta, path) {
+                return Some(refined);
+            }
         }
 
         return Some(RefinedMatchMeta {
@@ -1381,6 +1464,13 @@ fn refine_typescript_match(meta: &CompiledPattern, matched_text: &str) -> Option
             });
         }
 
+        // #455, same rule as the JavaScript arm above.
+        if recursive_relevant && is_recursive_delete_rule(rule_id) {
+            if let Some(refined) = recursive_delete_refinement(meta, path) {
+                return Some(refined);
+            }
+        }
+
         return Some(RefinedMatchMeta {
             rule_id: meta.rule_id.clone(),
             reason: meta.reason.clone(),
@@ -1459,6 +1549,15 @@ fn refine_ruby_match(meta: &CompiledPattern, matched_text: &str) -> Option<Refin
                 severity: Severity::Critical,
                 suggestion: meta.suggestion.clone(),
             });
+        }
+
+        // #455: a recursive delete of a literal path outside /tmp is the same
+        // operation `rm -rf ./build` is, and that blocks. Non-recursive
+        // FileUtils calls and dynamic targets fall through to warn-only.
+        if is_recursive_delete_rule(rule_id) {
+            if let Some(refined) = recursive_delete_refinement(meta, path) {
+                return Some(refined);
+            }
         }
 
         return Some(RefinedMatchMeta {
@@ -1799,14 +1898,31 @@ fn scan_perl_file_path(
         };
         let fn_name = caps.name("fn").map_or("rmtree", |m| m.as_str());
 
-        let severity = if is_catastrophic_path(path) {
+        // #455: `rmtree`/`remove_tree` are Perl's recursive delete, so they get
+        // the same single policy as `rm -rf`, `shutil.rmtree`, `FileUtils.rm_rf`
+        // and `fs.rmSync({recursive})` — a literal target outside /tmp blocks.
+        // The issue left Perl out of its table only because #453 was open on
+        // coverage; the policy question is the same one.
+        let catastrophic = is_catastrophic_path(path);
+        let non_temp = !catastrophic && !is_temp_scratch_path(path);
+        let severity = if catastrophic || non_temp {
             Severity::Critical
         } else {
             Severity::Medium
         };
 
-        let rule_id = format!("heredoc.perl.file_path.{fn_name}");
-        let reason = format!("File::Path::{fn_name}() recursively deletes directories");
+        let rule_id = if non_temp {
+            format!("heredoc.perl.file_path.{fn_name}.non_temp")
+        } else {
+            format!("heredoc.perl.file_path.{fn_name}")
+        };
+        let reason = if non_temp {
+            format!(
+                "File::Path::{fn_name}() recursively deletes directories outside a temp directory"
+            )
+        } else {
+            format!("File::Path::{fn_name}() recursively deletes directories")
+        };
 
         push_regex_match(
             out,
@@ -1838,14 +1954,32 @@ fn scan_perl_unlink_rmdir(
         let Some(m) = caps.get(0) else {
             continue;
         };
-        // Only match string-literal unlink; severity is warn-only by default.
+        // Only match string-literal unlink; warn-only by default.
+        //
+        // #455's smaller half: a catastrophic literal target blocks, the way
+        // Ruby's `File.delete('/etc/passwd')` already does. Neither call
+        // recurses, so this is the catastrophic-target rule and not the
+        // recursive-delete one — `unlink('./a.txt')` stays warn-only.
+        let catastrophic = string_literal_from_caps(&caps).is_some_and(is_catastrophic_path);
         push_regex_match(
             out,
             code,
             newline_positions,
-            "heredoc.perl.unlink",
-            "unlink() deletes files",
-            Severity::Low,
+            if catastrophic {
+                "heredoc.perl.unlink.catastrophic"
+            } else {
+                "heredoc.perl.unlink"
+            },
+            if catastrophic {
+                "unlink() deletes files (catastrophic target path)"
+            } else {
+                "unlink() deletes files"
+            },
+            if catastrophic {
+                Severity::Critical
+            } else {
+                Severity::Low
+            },
             None,
             m.start(),
             m.end(),
@@ -1857,13 +1991,28 @@ fn scan_perl_unlink_rmdir(
         let Some(m) = caps.get(0) else {
             continue;
         };
+        // Same as `unlink` above: `Dir.rmdir('/')` and `os.rmdir('/')` both
+        // block, and Perl's spelling did not (#455).
+        let catastrophic = string_literal_from_caps(&caps).is_some_and(is_catastrophic_path);
         push_regex_match(
             out,
             code,
             newline_positions,
-            "heredoc.perl.rmdir",
-            "rmdir() deletes directories",
-            Severity::Low,
+            if catastrophic {
+                "heredoc.perl.rmdir.catastrophic"
+            } else {
+                "heredoc.perl.rmdir"
+            },
+            if catastrophic {
+                "rmdir() deletes directories (catastrophic target path)"
+            } else {
+                "rmdir() deletes directories"
+            },
+            if catastrophic {
+                Severity::Critical
+            } else {
+                Severity::Low
+            },
             None,
             m.start(),
             m.end(),
@@ -2332,6 +2481,79 @@ fn is_catastrophic_path(path: &str) -> bool {
     sys_dirs.iter().any(|&dir| has_path_prefix(path, dir))
 }
 
+/// A scratch directory a recursive delete may target without review.
+///
+/// One definition, shared by every language, and deliberately the same one the
+/// shell side already uses: `core.filesystem`'s `rm-rf-tmp` / `rm-rf-var-tmp`
+/// safe patterns exempt `(?:/private)?/tmp/…` and `(?:/private)?/var/tmp/…`
+/// and refuse any `..` component. `rm -rf /tmp/build` is allowed, so
+/// `shutil.rmtree('/tmp/build')` and `FileUtils.rm_rf('/tmp/build')` have to be
+/// allowed too, or the policy depends on which language the agent picked
+/// (#455).
+///
+/// Traversal disqualifies a path here for the same reason it does there:
+/// `/tmp/../etc` names `/etc`, not a scratch directory.
+fn is_temp_scratch_path(path: &str) -> bool {
+    let candidate = path.strip_prefix("/private").unwrap_or(path);
+    (has_path_prefix(candidate, "/tmp") || has_path_prefix(candidate, "/var/tmp"))
+        && !contains_path_traversal(candidate)
+}
+
+/// Recursive-delete rule ids, by language, under #455's single policy.
+///
+/// Membership is what makes a literal non-temp target block, so it is an exact
+/// list rather than a prefix test. It holds only the calls that actually
+/// recurse: `FileUtils.rm_f` / `rm` / `remove_file` delete one file and
+/// `rmdir` needs the directory to be empty already, so none of them can
+/// destroy a tree and none of them are here. That empty-directory family is
+/// the smaller split the issue offers to bundle, and it is left alone.
+fn is_recursive_delete_rule(rule_id: &str) -> bool {
+    matches!(
+        rule_id,
+        "heredoc.python.shutil_rmtree"
+            | "heredoc.ruby.fileutils_rm_rf"
+            | "heredoc.ruby.fileutils_rm_r"
+            | "heredoc.ruby.fileutils_remove_entry"
+            | "heredoc.ruby.fileutils_remove_entry_secure"
+            | "heredoc.ruby.fileutils_remove_dir"
+            | "heredoc.javascript.fs_rmsync"
+            | "heredoc.javascript.fs_rmdirsync"
+            | "heredoc.javascript.fs_rm"
+            | "heredoc.javascript.fs_rmdir"
+            | "heredoc.javascript.fspromises_rm"
+            | "heredoc.javascript.fspromises_rmdir"
+            | "heredoc.typescript.fs_rmsync"
+            | "heredoc.typescript.fs_rmdirsync"
+            | "heredoc.typescript.fs_rm"
+            | "heredoc.typescript.fs_rmdir"
+            | "heredoc.typescript.fspromises_rm"
+            | "heredoc.typescript.fspromises_rmdir"
+    )
+}
+
+/// The refinement a recursive delete with a *literal* target gets.
+///
+/// `None` when nothing is proven — the target is not a literal, or it is a
+/// scratch path — and the caller keeps whatever severity it had. A literal
+/// outside `/tmp` is the case #455 is about: `FileUtils.rm_rf('./build')` and
+/// `fs.rmSync('./dist', {recursive: true})` destroy a working tree exactly the
+/// way `rm -rf ./build` does, and that already blocks.
+fn recursive_delete_refinement(
+    meta: &CompiledPattern,
+    path: Option<&str>,
+) -> Option<RefinedMatchMeta> {
+    let path = path?;
+    if is_temp_scratch_path(path) {
+        return None;
+    }
+    Some(RefinedMatchMeta {
+        rule_id: format!("{}.non_temp", meta.rule_id),
+        reason: format!("{} outside a temp directory", meta.reason),
+        severity: Severity::Critical,
+        suggestion: Some("Delete under /tmp, or narrow the target and run it manually".to_string()),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_regex_match(
     out: &mut Vec<PatternMatch>,
@@ -2518,15 +2740,20 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
                 Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
                 Some("Verify target path carefully before running".to_string()),
             ),
+            // Same metavariable receiver as `rmSync` above, and for the same
+            // reason: `require('fs').rmdirSync('/')` was allowed while the
+            // bound `fs.rmdirSync('/')` denied, so the shorter spelling a
+            // `-e` one-liner actually uses was the one that got through
+            // (#453's fix reached only `rmSync`; found while measuring #455).
             CompiledPattern::new(
-                "fs.rmdirSync($$$)".to_string(),
+                "$FS.rmdirSync($$$)".to_string(),
                 "heredoc.javascript.fs_rmdirsync".to_string(),
                 "fs.rmdirSync() deletes directories".to_string(),
                 Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
                 Some("Verify target path carefully before running".to_string()),
             ),
             CompiledPattern::new(
-                "fs.unlinkSync($$$)".to_string(),
+                "$FS.unlinkSync($$$)".to_string(),
                 "heredoc.javascript.fs_unlinksync".to_string(),
                 "fs.unlinkSync() deletes files".to_string(),
                 Severity::Low,
@@ -2627,15 +2854,20 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
                 Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
                 Some("Verify target path carefully before running".to_string()),
             ),
+            // Same metavariable receiver as `rmSync` above, and for the same
+            // reason: `require('fs').rmdirSync('/')` was allowed while the
+            // bound `fs.rmdirSync('/')` denied, so the shorter spelling a
+            // `-e` one-liner actually uses was the one that got through
+            // (#453's fix reached only `rmSync`; found while measuring #455).
             CompiledPattern::new(
-                "fs.rmdirSync($$$)".to_string(),
+                "$FS.rmdirSync($$$)".to_string(),
                 "heredoc.typescript.fs_rmdirsync".to_string(),
                 "fs.rmdirSync() deletes directories".to_string(),
                 Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
                 Some("Verify target path carefully before running".to_string()),
             ),
             CompiledPattern::new(
-                "fs.unlinkSync($$$)".to_string(),
+                "$FS.unlinkSync($$$)".to_string(),
                 "heredoc.typescript.fs_unlinksync".to_string(),
                 "fs.unlinkSync() deletes files".to_string(),
                 Severity::Low,
@@ -3229,8 +3461,12 @@ mod tests {
 
     #[test]
     fn python_positive_match() {
+        // The target moved out of /tmp for #455: `shutil.rmtree('/tmp/test')`
+        // is the one case this rule is now expected NOT to block, because
+        // `rm -rf /tmp/test` has always been allowed. The structural match is
+        // what this test is about, so it uses a target the policy still blocks.
         let ast_matcher = AstMatcher::new();
-        let code = "import shutil\nshutil.rmtree('/tmp/test')";
+        let code = "import shutil\nshutil.rmtree('/srv/data')";
 
         let matches = ast_matcher.find_matches(code, ScriptLanguage::Python);
         match matches {
@@ -3240,6 +3476,50 @@ mod tests {
                 assert!(m[0].severity.blocks_by_default());
             }
             Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    /// #455: the temp carve-out `rm -rf` has always had, given to `rmtree`.
+    ///
+    /// The false positive this closes is not hypothetical. `shutil.rmtree`
+    /// paired with `tempfile.mkdtemp()` is what the standard library's own
+    /// documentation recommends for cleaning up a scratch directory, and it
+    /// was blocked.
+    #[test]
+    fn shutil_rmtree_gets_the_same_temp_carve_out_as_rm_rf_issue_455() {
+        let ast_matcher = AstMatcher::new();
+
+        for code in [
+            "import shutil\nshutil.rmtree('/tmp/test')",
+            "import shutil\nshutil.rmtree('/var/tmp/build')",
+            "import shutil, tempfile\nshutil.rmtree(tempfile.mkdtemp())",
+            "import shutil\nfrom tempfile import mkdtemp\nshutil.rmtree(mkdtemp())",
+        ] {
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
+            assert!(
+                !matches.iter().any(|m| m.severity.blocks_by_default()),
+                "a temp target must not block: {code:?}"
+            );
+        }
+
+        // The carve-out is the temp directory, not the word. Traversal out of
+        // it, a relative `./tmp`, and a target this cannot read all still
+        // block — the last one because an unreadable target is not a proven
+        // safe one.
+        for code in [
+            "import shutil\nshutil.rmtree('/tmp/../etc')",
+            "import shutil\nshutil.rmtree('./tmp')",
+            "import shutil\nshutil.rmtree(target)",
+        ] {
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
+            assert!(
+                matches.iter().any(|m| m.severity.blocks_by_default()),
+                "must still block: {code:?}"
+            );
         }
     }
 
@@ -3356,9 +3636,13 @@ mod tests {
         fn a_chained_receiver_does_not_make_a_safe_target_look_dangerous() {
             // The mirror of the bug: reading the module name as the path could
             // just as easily have gone the other way.
+            //
+            // The recursive-delete row moved to `/tmp` for #455 — `./dist` now
+            // blocks on its own merits, which would make this test pass for
+            // the wrong reason. `/tmp/dist` keeps it measuring what it says.
             let ast_matcher = AstMatcher::new();
             for code in [
-                "require('fs').rmSync('./dist', { recursive: true })",
+                "require('fs').rmSync('/tmp/dist', { recursive: true })",
                 "require('fs').readFileSync('/home/user/notes.txt')",
             ] {
                 let matches = ast_matcher
@@ -3392,25 +3676,53 @@ mod tests {
             assert!(hit.severity.blocks_by_default());
         }
 
+        /// #455: one policy for a recursive delete, whatever language spells it.
+        ///
+        /// This used to assert the opposite — that `fs.rmSync('./dist', {
+        /// recursive: true })` only warns. That was deliberate and documented,
+        /// and it was also the whole problem: `rm -rf ./dist` blocks, so an
+        /// agent refused the shell spelling got the same effect from a Node
+        /// one-liner. Nothing about that is adversarial; it is what a model
+        /// does when a step is refused.
+        ///
+        /// The friction this costs is real and belongs in a test rather than
+        /// in someone's build script, so `./dist` and `./node_modules` are
+        /// named here on purpose.
         #[test]
-        fn fs_rmsync_non_catastrophic_warns_only() {
+        fn recursive_rmsync_outside_tmp_blocks_like_rm_rf_issue_455() {
             let ast_matcher = AstMatcher::new();
-            let code = "const fs = require('fs');\nfs.rmSync('./dist', { recursive: true });";
 
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::JavaScript)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id == "heredoc.javascript.fs_rmsync"),
-                "non-catastrophic recursive rmSync should be detected"
-            );
-            let hit = matches
-                .into_iter()
-                .find(|m| m.rule_id == "heredoc.javascript.fs_rmsync")
-                .unwrap();
-            assert!(!hit.severity.blocks_by_default());
+            for target in ["./dist", "./node_modules", "build", "/data/cache"] {
+                let code = format!(
+                    "const fs = require('fs');\nfs.rmSync('{target}', {{ recursive: true }});"
+                );
+                let matches = ast_matcher
+                    .find_matches(&code, ScriptLanguage::JavaScript)
+                    .unwrap();
+                assert!(
+                    matches
+                        .iter()
+                        .any(|m| m.rule_id == "heredoc.javascript.fs_rmsync.non_temp"
+                            && m.severity.blocks_by_default()),
+                    "recursive delete outside /tmp must block: {code}"
+                );
+            }
+
+            // Still warn-only: a scratch directory, and a delete that does not
+            // recurse. `fs.rmSync('./a.txt')` removes one file and is not this
+            // rule's business.
+            for code in [
+                "const fs = require('fs');\nfs.rmSync('/tmp/dist', { recursive: true });",
+                "const fs = require('fs');\nfs.rmSync('./a.txt');",
+            ] {
+                let matches = ast_matcher
+                    .find_matches(code, ScriptLanguage::JavaScript)
+                    .unwrap();
+                assert!(
+                    !matches.iter().any(|m| m.severity.blocks_by_default()),
+                    "must not block: {code}"
+                );
+            }
         }
 
         #[test]
@@ -3623,7 +3935,9 @@ mod tests {
     #[test]
     fn happy_path_still_matches_with_bounded_worker() {
         let ast_matcher = AstMatcher::new().with_timeout(Duration::from_millis(250));
-        let code = "import shutil\nshutil.rmtree('/tmp/test')";
+        // A non-temp target, so the rule id is the unrefined one this asserts
+        // on; `/tmp/test` now refines to `.temp` (#455).
+        let code = "import shutil\nshutil.rmtree('/srv/data')";
 
         let matches = ast_matcher
             .find_matches(code, ScriptLanguage::Python)
@@ -3729,8 +4043,25 @@ mod tests {
         fn perl_file_path_unqualified_still_respects_target_and_context_issue_453() {
             let ast_matcher = AstMatcher::new();
 
-            // Non-catastrophic target warns rather than blocks, as the qualified
-            // spelling already did.
+            // A scratch target warns rather than blocks, as the qualified
+            // spelling already did. This row was `./build` until #455 gave
+            // Perl the same recursive-delete policy as the other four
+            // languages; the unqualified spelling has to follow the qualified
+            // one wherever that policy lands, which is what this asserts.
+            let scratch = ast_matcher
+                .find_matches(
+                    "use File::Path qw(rmtree);\nrmtree('/tmp/build');\n",
+                    ScriptLanguage::Perl,
+                )
+                .expect("perl ast_matcher should run");
+            assert!(
+                !scratch.iter().any(|m| m.severity.blocks_by_default()),
+                "rmtree('/tmp/build') targets a scratch directory and must warn only; got {:?}",
+                scratch.iter().map(|m| &m.rule_id).collect::<Vec<_>>()
+            );
+
+            // …and the non-temp spelling blocks, so the row above is measuring
+            // the carve-out rather than a rule that never fires.
             let relative = ast_matcher
                 .find_matches(
                     "use File::Path qw(rmtree);\nrmtree('./build');\n",
@@ -3738,8 +4069,11 @@ mod tests {
                 )
                 .expect("perl ast_matcher should run");
             assert!(
-                !relative.iter().any(|m| m.severity.blocks_by_default()),
-                "rmtree('./build') is non-catastrophic and must warn only; got {:?}",
+                relative
+                    .iter()
+                    .any(|m| m.rule_id == "heredoc.perl.file_path.rmtree.non_temp"
+                        && m.severity.blocks_by_default()),
+                "rmtree('./build') is a recursive delete outside /tmp and must block; got {:?}",
                 relative.iter().map(|m| &m.rule_id).collect::<Vec<_>>()
             );
 
@@ -3836,10 +4170,13 @@ mod tests {
             );
 
             // What still must not fire: a mention with no call, and a call on
-            // a target that is not catastrophic.
+            // a scratch target. `rmtree('./build')` used to be the second case
+            // here; #455 gave Perl the same single recursive-delete policy as
+            // the other four languages, so a non-temp target blocks and only
+            // the temp carve-out is left.
             for code in [
                 "print 'rmtree is dangerous';",
-                "use File::Path; rmtree('./build');",
+                "use File::Path; rmtree('/tmp/build');",
             ] {
                 let matches = ast_matcher
                     .find_matches(code, ScriptLanguage::Perl)
@@ -4012,21 +4349,49 @@ mod tests {
             );
         }
 
+        /// #455, the Ruby half. See the JavaScript twin for the reasoning.
+        ///
+        /// `./tmp` is the case worth keeping: it is a *relative* directory that
+        /// merely happens to be spelled like the system scratch directory, so
+        /// it blocks. `rm -rf ./tmp` blocks for the same reason — the safe
+        /// pattern is anchored on `/tmp/`, not on the four letters.
         #[test]
-        fn fileutils_rm_rf_non_catastrophic_warns_only() {
+        fn recursive_fileutils_delete_outside_tmp_blocks_like_rm_rf_issue_455() {
             let ast_matcher = AstMatcher::new();
-            let code = "require 'fileutils'\nFileUtils.rm_rf('./tmp')";
 
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Ruby)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id == "heredoc.ruby.fileutils_rm_rf"
-                        && !m.severity.blocks_by_default()),
-                "non-catastrophic FileUtils.rm_rf should warn only"
-            );
+            for (method, target) in [
+                ("rm_rf", "./build"),
+                ("rm_rf", "./tmp"),
+                ("rm_r", "./node_modules"),
+                ("remove_entry", "/data/cache"),
+            ] {
+                let code = format!("require 'fileutils'\nFileUtils.{method}('{target}')");
+                let matches = ast_matcher
+                    .find_matches(&code, ScriptLanguage::Ruby)
+                    .unwrap();
+                assert!(
+                    matches.iter().any(|m| m.rule_id
+                        == format!("heredoc.ruby.fileutils_{method}.non_temp")
+                        && m.severity.blocks_by_default()),
+                    "recursive delete outside /tmp must block: {code}"
+                );
+            }
+
+            // The scratch directory itself, and the non-recursive family that
+            // cannot destroy a tree, both stay warn-only.
+            for code in [
+                "require 'fileutils'\nFileUtils.rm_rf('/tmp/build')",
+                "require 'fileutils'\nFileUtils.rm_f('./build/app.o')",
+                "require 'fileutils'\nFileUtils.rmdir('./build')",
+            ] {
+                let matches = ast_matcher
+                    .find_matches(code, ScriptLanguage::Ruby)
+                    .unwrap();
+                assert!(
+                    !matches.iter().any(|m| m.severity.blocks_by_default()),
+                    "must not block: {code}"
+                );
+            }
         }
 
         /// #454: every recursive `FileUtils` deletion blocks on a catastrophic
@@ -4122,14 +4487,20 @@ mod tests {
                 );
             }
 
-            for method in ["rm_r", "remove_entry", "rm_f", "remove_file", "rmdir"] {
+            // #455 split this row. `rm_r` and `remove_entry` recurse, so a
+            // non-temp target now blocks them the way `rm -rf ./build` is
+            // blocked; `rm_f` and `remove_file` delete one file and `rmdir`
+            // needs an already-empty directory, so none of the three can
+            // destroy a tree and all three stay warn-only. That is the line,
+            // and it is drawn on what the call can do rather than on its name.
+            for method in ["rm_f", "remove_file", "rmdir"] {
                 let code = format!("require 'fileutils'\nFileUtils.{method}('./build')");
                 let matches = ast_matcher
                     .find_matches(&code, ScriptLanguage::Ruby)
                     .unwrap();
                 assert!(
                     !matches.iter().any(|m| m.severity.blocks_by_default()),
-                    "FileUtils.{method}('./build') is non-catastrophic and must warn only; got {:?}",
+                    "FileUtils.{method}('./build') cannot delete a tree and must warn only; got {:?}",
                     matches.iter().map(|m| &m.rule_id).collect::<Vec<_>>()
                 );
             }
@@ -4365,8 +4736,46 @@ mod tests {
             );
         }
 
+        /// Every `fs` deleter takes a metavariable receiver, not just `rmSync`.
+        ///
+        /// #453 gave `rmSync` a `$FS` receiver so `require('fs').rmSync('/')`
+        /// would match the way the bound `fs.rmSync('/')` does. `rmdirSync` and
+        /// `unlinkSync` kept a literal `fs.` receiver, so the chained spelling
+        /// — the shorter one, and the one a `node -e` one-liner actually writes
+        /// — was allowed on a catastrophic target. Found while measuring #455.
         #[test]
-        fn fs_rmsync_non_catastrophic_warns_only() {
+        fn a_chained_require_receiver_reaches_every_fs_deleter() {
+            let ast_matcher = AstMatcher::new();
+            for (code, expected) in [
+                (
+                    "require('fs').rmdirSync('/')",
+                    "heredoc.typescript.fs_rmdirsync.catastrophic",
+                ),
+                (
+                    "require('fs').unlinkSync('/etc/passwd')",
+                    "heredoc.typescript.fs_unlinksync.catastrophic",
+                ),
+                (
+                    "require('fs').rmSync('/')",
+                    "heredoc.typescript.fs_rmsync.catastrophic",
+                ),
+            ] {
+                let matches = ast_matcher
+                    .find_matches(code, ScriptLanguage::TypeScript)
+                    .unwrap();
+                assert!(
+                    matches
+                        .iter()
+                        .any(|m| m.rule_id == expected && m.severity.blocks_by_default()),
+                    "chained receiver must reach {expected}: {code}; got {:?}",
+                    matches.iter().map(|m| &m.rule_id).collect::<Vec<_>>()
+                );
+            }
+        }
+
+        /// #455, the TypeScript half. See the JavaScript twin for the reasoning.
+        #[test]
+        fn recursive_rmsync_outside_tmp_blocks_like_rm_rf_issue_455() {
             let ast_matcher = AstMatcher::new();
             let code = "import * as fs from 'fs';\nfs.rmSync('./dist', { recursive: true });";
 
@@ -4376,9 +4785,18 @@ mod tests {
             assert!(
                 matches
                     .iter()
-                    .any(|m| m.rule_id == "heredoc.typescript.fs_rmsync"
-                        && !m.severity.blocks_by_default()),
-                "non-catastrophic recursive rmSync should warn only"
+                    .any(|m| m.rule_id == "heredoc.typescript.fs_rmsync.non_temp"
+                        && m.severity.blocks_by_default()),
+                "recursive delete outside /tmp must block"
+            );
+
+            let safe = "import * as fs from 'fs';\nfs.rmSync('/tmp/dist', { recursive: true });";
+            let matches = ast_matcher
+                .find_matches(safe, ScriptLanguage::TypeScript)
+                .unwrap();
+            assert!(
+                !matches.iter().any(|m| m.severity.blocks_by_default()),
+                "a scratch target must not block"
             );
         }
 
@@ -5157,13 +5575,30 @@ def cleanup():
             );
         }
 
+        /// The fallback must reach the same verdict the AST pass would (#455).
+        ///
+        /// It runs when the AST pass is unavailable or out of time. If it kept
+        /// the old policy, an AST timeout would quietly relax the new one, and
+        /// the way to get a recursive delete past the guard would be to make
+        /// the parse slow.
         #[test]
-        fn filesystem_fallback_ignores_non_catastrophic_javascript_target() {
-            let code = "fs.rmSync('./dist', { recursive: true });";
-            assert!(
-                scan_filesystem_sink_fallback(code, ScriptLanguage::JavaScript).is_none(),
-                "non-catastrophic targets remain warn-only in the primary AST matcher"
-            );
+        fn filesystem_fallback_agrees_with_the_ast_pass_on_recursive_deletes() {
+            let blocked = "fs.rmSync('./dist', { recursive: true });";
+            let hit = scan_filesystem_sink_fallback(blocked, ScriptLanguage::JavaScript)
+                .expect("recursive delete outside /tmp must be caught by the fallback too");
+            assert_eq!(hit.rule_id, "heredoc.javascript.fs_rmsync.non_temp");
+            assert!(hit.severity.blocks_by_default());
+
+            for code in [
+                // A scratch target, and a delete that does not recurse.
+                "fs.rmSync('/tmp/dist', { recursive: true });",
+                "fs.rmSync('./a.txt');",
+            ] {
+                assert!(
+                    scan_filesystem_sink_fallback(code, ScriptLanguage::JavaScript).is_none(),
+                    "fallback must stay quiet: {code}"
+                );
+            }
         }
 
         #[test]

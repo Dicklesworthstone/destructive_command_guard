@@ -694,7 +694,11 @@ fn heredoc_embedded_destructive_blocks_for_claude_and_codex() {
         "heredoc_embedded_destructive_blocks_for_claude_and_codex",
         |log| {
             let command =
-                "python3 <<'PY'\nimport shutil\nshutil.rmtree('/tmp/dcg-real-service')\nPY";
+                // Non-temp target: #455 gave the recursive-delete rule the
+                // temp carve-out `rm -rf` has always had, so a /tmp payload
+                // no longer blocks and this test is about the heredoc path
+                // reaching the service at all.
+                "python3 <<'PY'\nimport shutil\nshutil.rmtree('/home/example/project')\nPY";
 
             let claude_env = RealServiceEnv::new("heredoc-claude");
             let claude = run_hook(log, &claude_env, Protocol::Claude, command, &[]);

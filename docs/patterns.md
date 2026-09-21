@@ -42,6 +42,11 @@ Heredoc patterns are authored using ast-grep pattern syntax (as implemented by
 
 - `$$$` matches any subtree.
 - `$X` captures a single AST node.
+- A metavariable in receiver position (`$FS.rmSync($$$)`) matches any
+  receiver, so the chained `require('fs').rmSync(...)` spelling is covered
+  alongside a bound `const fs = require('fs')`. Over-matching is bounded by
+  the severity refinement, which still requires `recursive: true` or a
+  catastrophic or non-temp literal target before the rule denies.
 - Patterns are language-specific and only evaluated on code parsed for that
   language.
 
@@ -123,10 +128,10 @@ built-in rule IDs. Use these IDs for allowlisting and tests.
 | --- | --- | --- |
 | `heredoc.javascript.fs_rm` | `fs.rm($$$)` | deletes files/directories |
 | `heredoc.javascript.fs_rmdir` | `fs.rmdir($$$)` | deletes directories |
-| `heredoc.javascript.fs_rmsync` | `fs.rmSync($$$)` | deletes files/directories |
-| `heredoc.javascript.fs_rmdirsync` | `fs.rmdirSync($$$)` | deletes directories |
+| `heredoc.javascript.fs_rmsync` | `$FS.rmSync($$$)` | deletes files/directories |
+| `heredoc.javascript.fs_rmdirsync` | `$FS.rmdirSync($$$)` | deletes directories |
 | `heredoc.javascript.fs_unlink` | `fs.unlink($$$)` | deletes files |
-| `heredoc.javascript.fs_unlinksync` | `fs.unlinkSync($$$)` | deletes files |
+| `heredoc.javascript.fs_unlinksync` | `$FS.unlinkSync($$$)` | deletes files |
 | `heredoc.javascript.fspromises_rm` | `fsPromises.rm($$$)` | deletes files/directories |
 | `heredoc.javascript.fspromises_rmdir` | `fsPromises.rmdir($$$)` | deletes directories |
 | `heredoc.javascript.execsync` | `child_process.execSync($$$)` | executes shell commands |
@@ -139,10 +144,10 @@ built-in rule IDs. Use these IDs for allowlisting and tests.
 | --- | --- | --- |
 | `heredoc.typescript.fs_rm` | `fs.rm($$$)` | deletes files/directories |
 | `heredoc.typescript.fs_rmdir` | `fs.rmdir($$$)` | deletes directories |
-| `heredoc.typescript.fs_rmsync` | `fs.rmSync($$$)` | deletes files/directories |
-| `heredoc.typescript.fs_rmdirsync` | `fs.rmdirSync($$$)` | deletes directories |
+| `heredoc.typescript.fs_rmsync` | `$FS.rmSync($$$)` | deletes files/directories |
+| `heredoc.typescript.fs_rmdirsync` | `$FS.rmdirSync($$$)` | deletes directories |
 | `heredoc.typescript.fs_unlink` | `fs.unlink($$$)` | deletes files |
-| `heredoc.typescript.fs_unlinksync` | `fs.unlinkSync($$$)` | deletes files |
+| `heredoc.typescript.fs_unlinksync` | `$FS.unlinkSync($$$)` | deletes files |
 | `heredoc.typescript.fspromises_rm` | `fsPromises.rm($$$)` | deletes files/directories |
 | `heredoc.typescript.fspromises_rmdir` | `fsPromises.rmdir($$$)` | deletes directories |
 | `heredoc.typescript.execsync` | `child_process.execSync($$$)` | executes shell commands |
@@ -163,6 +168,8 @@ built-in rule IDs. Use these IDs for allowlisting and tests.
 | `heredoc.python.subprocess_run` | `subprocess.run($$$)` | executes shell commands |
 | `heredoc.python.subprocess_call` | `subprocess.call($$$)` | executes shell commands |
 | `heredoc.python.subprocess_popen` | `subprocess.Popen($$$)` | spawns shell processes |
+| `heredoc.python.subprocess_check_call` | `subprocess.check_call($$$)` | executes shell commands |
+| `heredoc.python.subprocess_check_output` | `subprocess.check_output($$$)` | executes shell commands |
 | `heredoc.python.os_system` | `os.system($$$)` | executes shell commands |
 | `heredoc.python.os_popen` | `os.popen($$$)` | executes shell commands |
 
@@ -226,8 +233,46 @@ Some patterns refine their rule IDs based on detected arguments:
 - For Ruby `system`/`exec`/`Open3`/backticks and Perl shell calls, literal
   payloads produce rule IDs with suffixes such as `.rm_rf` and
   `.rm_rf_catastrophic`.
+- For a **recursive delete** with a literal target outside a temp directory,
+  `.non_temp` is appended and the severity becomes Critical (example:
+  `heredoc.ruby.fileutils_rm_rf.non_temp`). Python's `shutil.rmtree` is the one
+  exception to the suffix: it is Critical already, so a target that *is* a temp
+  directory appends `.temp` and drops it to warn-only instead.
+- For Perl `unlink`/`rmdir`, a catastrophic literal target appends
+  `.catastrophic` and raises the severity to Critical.
 
 All derived rule IDs are valid allowlist targets.
+
+## One policy for a recursive delete
+
+`rm -rf`, `shutil.rmtree`, `FileUtils.rm_rf`/`rm_r`/`remove_entry`/
+`remove_entry_secure`/`remove_dir`, `fs.rmSync`/`rmdirSync`/`rm`/`rmdir`
+(and the `fsPromises` and TypeScript spellings) with `recursive: true`, and
+Perl's `File::Path::rmtree`/`remove_tree` all answer the same question the same
+way: a literal target outside a temp directory is denied, and a temp target is
+warn-only.
+
+"Temp" has one definition shared by every language, taken from the shell's own
+`rm-rf-tmp` / `rm-rf-var-tmp` safe patterns: `/tmp` or `/var/tmp`, optionally
+`/private`-prefixed, with any `..` component disqualifying the path. Python
+additionally treats `tempfile.mkdtemp()` / `TemporaryDirectory()` as a scratch
+directory, since those produce one by construction.
+
+The reason it is one policy is that the thing choosing the spelling is usually
+an agent. An agent refused `rm -rf ./build` must not get the same effect from a
+Ruby or Node one-liner; that is not adversarial behaviour, it is what a model
+does when a step is refused (GH #455).
+
+Deliberately **not** in this set: calls that cannot destroy a tree.
+`FileUtils.rm_f`/`rm`/`remove_file` and Perl `unlink` delete one file,
+`FileUtils.rmdir` and Perl `rmdir` need an already-empty directory, and
+`fs.rmSync` without `recursive: true` removes one file. Those keep the
+catastrophic-target rule only.
+
+A **dynamic** target is still judged per language: `shutil.rmtree(d)` denies,
+while the Ruby and JavaScript equivalents warn. Raising those would block
+`fs.rmSync(buildDir, { recursive: true })` in most Node build scripts, which is
+a wider change than #455 decided.
 
 ## Limitations and False Positive Notes
 

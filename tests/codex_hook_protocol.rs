@@ -3071,7 +3071,10 @@ fn run_claude_heredoc(command: &str) -> HookOutcome {
 
 #[test]
 fn heredoc_python_shutil_rmtree_codex_deny() {
-    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/tmp/data')""#;
+    // Non-temp target: #455 gave the recursive-delete rule the same temp
+    // carve-out `rm -rf /tmp/data` has always had, and these tests are about
+    // the hook protocol shape rather than which paths the rule covers.
+    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/home/example/project')""#;
     let o = run_codex_hook(cmd);
     assert!(
         o.is_codex_block_shape(),
@@ -3089,7 +3092,10 @@ fn heredoc_python_shutil_rmtree_codex_deny() {
 
 #[test]
 fn heredoc_python_shutil_rmtree_claude_deny() {
-    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/tmp/data')""#;
+    // Non-temp target: #455 gave the recursive-delete rule the same temp
+    // carve-out `rm -rf /tmp/data` has always had, and these tests are about
+    // the hook protocol shape rather than which paths the rule covers.
+    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/home/example/project')""#;
     let o = run_claude_hook(cmd);
     assert!(
         o.is_claude_block_shape(),
@@ -3154,7 +3160,10 @@ fn heredoc_javascript_fs_rmsync_claude_deny() {
 
 #[test]
 fn heredoc_python_cross_protocol_parity() {
-    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/tmp/data')""#;
+    // Non-temp target: #455 gave the recursive-delete rule the same temp
+    // carve-out `rm -rf /tmp/data` has always had, and these tests are about
+    // the hook protocol shape rather than which paths the rule covers.
+    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/home/example/project')""#;
     let codex = run_codex_hook(cmd);
     let claude = run_claude_hook(cmd);
 

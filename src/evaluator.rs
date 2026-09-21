@@ -30686,12 +30686,32 @@ mod tests {
         let compiled = default_compiled_overrides();
         let allowlists = default_allowlists();
 
-        // Non-catastrophic recursive deletes are currently warn-only; evaluator should not block.
-        let cmd =
-            "node <<EOF\nconst fs = require('fs');\nfs.rmSync('./dist', { recursive: true });\nEOF";
+        // A recursive delete under /tmp is warn-only; the evaluator should not
+        // block it. The target used to be `./dist`, which #455 now blocks —
+        // one policy for a recursive delete whatever language spells it — so
+        // this asserts the warn-only path with a target that still has one.
+        let cmd = "node <<EOF\nconst fs = require('fs');\nfs.rmSync('/tmp/dist', { recursive: true });\nEOF";
         let result = evaluate_command(cmd, &config, &["kubectl"], &compiled, &allowlists);
         assert!(result.is_allowed());
         assert!(result.pattern_info.is_none());
+    }
+
+    /// #455: and the same heredoc with a non-temp target does block, through
+    /// the evaluator rather than through `AstMatcher` directly.
+    #[test]
+    fn heredoc_recursive_delete_outside_tmp_blocks_issue_455() {
+        let mut config = default_config();
+        config.heredoc.timeout_ms = Some(5_000);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+
+        let cmd =
+            "node <<EOF\nconst fs = require('fs');\nfs.rmSync('./dist', { recursive: true });\nEOF";
+        let result = evaluate_command(cmd, &config, &["kubectl"], &compiled, &allowlists);
+        assert!(
+            !result.is_allowed(),
+            "a recursive delete of ./dist must block in a heredoc too"
+        );
     }
 
     #[test]

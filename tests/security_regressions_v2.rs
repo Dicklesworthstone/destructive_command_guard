@@ -36,7 +36,13 @@ fn check_blocked(cmd: &str) {
 
 #[test]
 fn test_heredoc_spaced_delimiter_bypass() {
-    let cmd = "python3 << \"EOF SPACE\"\nimport shutil\nshutil.rmtree('/tmp/test')\nEOF SPACE";
+    // The target is `/home/example/project`, not `/tmp/test`: this test is
+    // about the heredoc delimiter, so its payload has to be one the payload
+    // rules deny for their own reasons. #455 gave `shutil.rmtree` the same
+    // temp carve-out `rm -rf /tmp/test` has always had, which would otherwise
+    // make this pass or fail on the wrong thing.
+    let cmd =
+        "python3 << \"EOF SPACE\"\nimport shutil\nshutil.rmtree('/home/example/project')\nEOF SPACE";
     check_blocked(cmd);
 }
 
@@ -73,6 +79,7 @@ fn test_complex_quoting_bypass() {
 #[test]
 fn test_heredoc_empty_delimiter() {
     // Regression for the fix allowing empty quoted delimiters
-    let cmd = "python3 << \"\"\nimport shutil\nshutil.rmtree('/tmp/test')\n\n";
+    // Non-temp target for the same reason as the spaced-delimiter test above.
+    let cmd = "python3 << \"\"\nimport shutil\nshutil.rmtree('/home/example/project')\n\n";
     check_blocked(cmd);
 }
