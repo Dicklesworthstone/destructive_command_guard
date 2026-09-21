@@ -102,8 +102,9 @@ tru = "0.2.2"
 rich_rust = { version = "0.2.2", features = ["markdown"], optional = true }
 
 [patch.crates-io]
-# #442: the upstream scanner passes Unicode code points to byte-only isdigit.
-# Keep the grammar unchanged; vendor only the two ASCII digit-loop fixes.
+# #442/#461: retain the Unicode scanner safety fixes and repair explicit
+# stdin descriptors and mixed file/here-string redirection sequences.
+# Generated parser artifacts are checked in alongside the patched grammar.
 tree-sitter-bash = { path = "vendor/tree-sitter-bash" }
 
 [build-dependencies]

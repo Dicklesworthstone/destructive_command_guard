@@ -259,25 +259,20 @@
                   "type": "FIELD",
                   "name": "redirect",
                   "content": {
-                    "type": "CHOICE",
-                    "members": [
-                      {
-                        "type": "REPEAT1",
-                        "content": {
-                          "type": "CHOICE",
-                          "members": [
-                            {
-                              "type": "SYMBOL",
-                              "name": "file_redirect"
-                            },
-                            {
-                              "type": "SYMBOL",
-                              "name": "heredoc_redirect"
-                            }
-                          ]
+                    "type": "REPEAT1",
+                    "content": {
+                      "type": "CHOICE",
+                      "members": [
+                        {
+                          "type": "SYMBOL",
+                          "name": "_redirect"
+                        },
+                        {
+                          "type": "SYMBOL",
+                          "name": "heredoc_redirect"
                         }
-                      }
-                    ]
+                      ]
+                    }
                   }
                 }
               ]
@@ -6980,12 +6975,29 @@
     }
   ],
   "conflicts": [
-    ["_expression", "command_name"],
-    ["command", "variable_assignments"],
-    ["redirected_statement", "command"],
-    ["redirected_statement", "command_substitution"],
-    ["function_definition", "command_name"],
-    ["pipeline"]
+    [
+      "_expression",
+      "command_name"
+    ],
+    [
+      "command",
+      "variable_assignments"
+    ],
+    [
+      "redirected_statement",
+      "command"
+    ],
+    [
+      "redirected_statement",
+      "command_substitution"
+    ],
+    [
+      "function_definition",
+      "command_name"
+    ],
+    [
+      "pipeline"
+    ]
   ],
   "precedences": [],
   "externals": [
@@ -7119,6 +7131,10 @@
     "_statement_not_subshell",
     "_redirect"
   ],
-  "supertypes": ["_statement", "_expression", "_primary_expression"],
+  "supertypes": [
+    "_statement",
+    "_expression",
+    "_primary_expression"
+  ],
   "reserved": {}
 }

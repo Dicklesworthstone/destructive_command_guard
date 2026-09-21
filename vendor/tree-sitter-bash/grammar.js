@@ -179,7 +179,9 @@ module.exports = grammar({
           choice(
             seq(
               field("body", $._statement),
-              field("redirect", choice(repeat1(choice($.file_redirect, $.heredoc_redirect)))),
+              // Preserve the same receiver after a file redirect (#461).
+              // A later here-string is not a separate redirected statement.
+              field("redirect", repeat1(choice($._redirect, $.heredoc_redirect))),
             ),
             seq(field("body", choice($.if_statement, $.while_statement)), $.herestring_redirect),
             field("redirect", repeat1($._redirect)),

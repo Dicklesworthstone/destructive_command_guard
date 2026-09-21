@@ -1073,6 +1073,98 @@ mod here_string_tests {
     use super::*;
 
     #[test]
+    fn here_string_parser_preserves_descriptors_and_receiver_argv() {
+        for descriptor in ["0", "00", "3"] {
+            let command = format!("python3 {descriptor}<<< 'pass'");
+            let ast = AstGrep::new(&command, SupportLang::Bash);
+            let root = ast.root();
+            assert!(!root.dfs().any(|node| node.kind() == "ERROR"), "{command}");
+            let receiver = root.dfs().find(|node| node.kind() == "command").unwrap();
+            assert_eq!(
+                command_words(&receiver),
+                Some(vec!["python3".to_string()]),
+                "{command}"
+            );
+            let redirect = root
+                .dfs()
+                .find(|node| node.kind() == "herestring_redirect")
+                .unwrap();
+            assert_eq!(
+                redirect
+                    .field("descriptor")
+                    .map(|node| node.text().into_owned()),
+                Some(descriptor.to_string()),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn here_string_parser_preserves_mixed_redirection_order() {
+        for command in [
+            "python3 0<<< 'pass'",
+            "python3 00<<< 'pass'",
+            "python3 </dev/null <<< 'pass'",
+            "python3 0</dev/null 0<<< 'pass'",
+            "python3 <<< 'old' </dev/null 0<<< 'pass'",
+            "python3 2>/dev/null 0<<< 'pass'",
+        ] {
+            let ast = AstGrep::new(command, SupportLang::Bash);
+            let root = ast.root();
+            assert!(!root.dfs().any(|node| node.kind() == "ERROR"), "{command}");
+            let mut commands = root.dfs().filter(|node| node.kind() == "command");
+            let receiver = commands.next().expect(command);
+            assert!(commands.next().is_none(), "{command}");
+            assert_eq!(
+                command_words(&receiver),
+                Some(vec!["python3".to_string()]),
+                "{command}"
+            );
+            let (code, span) = here_string_source(&receiver).expect(command);
+            assert_eq!(code, "pass", "{command}");
+            assert_eq!(&command[span], "'pass'", "{command}");
+        }
+    }
+
+    #[test]
+    fn explicit_stdin_does_not_consume_real_arguments_or_other_descriptors() {
+        for command in [
+            "python3 0 <<< \"open('/etc/shadow', 'w')\"",
+            "python3 '0'<<< \"open('/etc/shadow', 'w')\"",
+            "python3 \\0<<< \"open('/etc/shadow', 'w')\"",
+            "python3 3<<< \"open('/etc/shadow', 'w')\"",
+            "python3 0<<< \"open('/etc/shadow', 'w')\" 0</dev/null",
+            "python3 0<<< \"open('/etc/shadow', 'w')\" <&-",
+            "python3 example.py </dev/null 0<<< \"open('/etc/shadow', 'w')\"",
+        ] {
+            assert!(
+                classify(command, ShellDialect::Posix).is_none(),
+                "{command}"
+            );
+        }
+        // The scanner's special-parameter path must still accept $0.
+        let ast = AstGrep::new("echo \"$0\" \"${0}\" \"$@\"", SupportLang::Bash);
+        assert!(!ast.root().dfs().any(|node| node.kind() == "ERROR"));
+    }
+
+    #[test]
+    fn explicit_stdin_obeys_last_redirection_without_borrowing_stdout() {
+        for command in [
+            "python3 </dev/null 0<<< \"open('/etc/shadow', 'w')\"",
+            "python3 0</dev/null <<< \"open('/etc/shadow', 'w')\"",
+            "python3 <<< 'pass' </dev/null 0<<< \"open('/etc/shadow', 'w')\"",
+            "python3 0<<< \"open('/etc/shadow', 'w')\" 2>/dev/null",
+            "python3 3<<< 'pass' 0<<< \"open('/etc/shadow', 'w')\"",
+            "0<<< \"open('/etc/shadow', 'w')\" python3",
+        ] {
+            assert!(
+                classify(command, ShellDialect::Posix).is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn here_strings_bind_to_the_actual_interpreter_argv() {
         for (exe, code) in [
             ("python3", "open('/etc/shadow', 'a').write('x')"),
@@ -1085,7 +1177,7 @@ mod here_string_tests {
                         format!("\"{code}\""),
                         format!("'{}'", code.replace('\'', "'\\''")),
                     ] {
-                        for redirect in ["<<< ", "<<<", "0<<< "] {
+                        for redirect in ["<<< ", "<<<", "0<<< ", "0<<<", "00<<< "] {
                             let command = format!("{prefix}{exe}{flag} {redirect}{word}");
                             let hit = classify(&command, ShellDialect::Posix).expect(&command);
                             assert_eq!(hit.rule, shell::CREDENTIAL_FILE_WRITE_NAME, "{command}");
@@ -1164,8 +1256,12 @@ mod here_string_tests {
         let mut heredoc = Config::default().heredoc_settings();
         for command in [
             "python3 <<< \"open('/etc/shadow', 'w')\"",
+            "python3 0<<< \"open('/etc/shadow', 'w')\"",
+            "python3 </dev/null <<< \"open('/etc/shadow', 'w')\"",
             "env ruby - <<< \"File.write('/home/u/.bashrc', 'x')\"",
+            "env ruby - 0</dev/null 0<<< \"File.write('/home/u/.bashrc', 'x')\"",
             "node <<< \"require('fs').appendFileSync('/root/.ssh/authorized_keys', 'x')\"",
+            "node 0<<< \"require('fs').appendFileSync('/root/.ssh/authorized_keys', 'x')\" 2>/dev/null",
         ] {
             for indexed in [false, true] {
                 for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {

@@ -569,9 +569,12 @@ static bool scan(Scanner *scanner, TSLexer *lexer, const bool *valid_symbols) {
         }
 
         // no '*', '@', '?', '-', '$', '0', '_'
+        // A leading zero is also a valid redirection descriptor (#461).
+        // Leave it for the numeric scanner when that token is admissible;
+        // consuming it here turns 0<<< into an argv word plus a redirect.
         if (!valid_symbols[EXPANSION_WORD] &&
             (lexer->lookahead == '*' || lexer->lookahead == '@' || lexer->lookahead == '?' || lexer->lookahead == '-' ||
-             lexer->lookahead == '0' || lexer->lookahead == '_')) {
+             (lexer->lookahead == '0' && !valid_symbols[FILE_DESCRIPTOR]) || lexer->lookahead == '_')) {
             lexer->mark_end(lexer);
             advance(lexer);
             if (lexer->lookahead == '=' || lexer->lookahead == '[' || lexer->lookahead == ':' ||
