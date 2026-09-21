@@ -455,32 +455,9 @@ fn a_wrapper_prefix_does_not_change_the_verdict() {
     }
 }
 
-/// The heredoc spellings of the same writes, which share the gate above.
-#[test]
-fn a_heredoc_receiver_is_judged_like_its_inline_twin() {
-    const TARGET: &str = "/home/test/.bashrc";
-    for command in [
-        format!("python3 <<'EOF'\nopen('{TARGET}', 'w')\nEOF"),
-        format!("python3 <<EOF\nopen('{TARGET}', 'w')\nEOF"),
-        format!("python3 - <<'EOF'\nopen('{TARGET}', 'w')\nEOF"),
-        format!("ruby <<'EOF'\nFile.write('{TARGET}', 'x')\nEOF"),
-        format!("node <<'EOF'\nrequire('fs').writeFileSync('{TARGET}','x')\nEOF"),
-    ] {
-        assert!(
-            classify(&command, ShellDialect::Posix).is_some(),
-            "heredoc receiver not judged: {command}"
-        );
-    }
-
-    // The guard this path exists for: content that merely looks like code,
-    // fed to something that is not an interpreter, is still data.
-    for command in [
-        format!("cat <<'EOF'\nopen('{TARGET}', 'w')\nEOF"),
-        format!("echo <<'EOF'\nFile.write('{TARGET}', 'x')\nEOF"),
-    ] {
-        assert!(
-            classify(&command, ShellDialect::Posix).is_none(),
-            "a non-interpreter receiver must stay data: {command}"
-        );
-    }
-}
+// Heredoc spellings are deliberately NOT asserted here. The evaluator extracts
+// a heredoc body and judges it as its own segment, so `classify` on the raw
+// `python3 <<'EOF' …` text answers None by design and an assertion at this
+// layer would either fail for the wrong reason or pass vacuously. The heredoc
+// contract lives end-to-end in `tests/credential_file_embedded_e2e.rs`, which
+// drives the real hook.
