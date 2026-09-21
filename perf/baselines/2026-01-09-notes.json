@@ -21,7 +21,7 @@
       "id": "bypass",
       "description": "DCG_BYPASS=1",
       "command": "ls -la",
-      "env": {"DCG_BYPASS": "1"},
+      "env": { "DCG_BYPASS": "1" },
       "metrics": {
         "p50_ms": 1.55,
         "p95_ms": null,

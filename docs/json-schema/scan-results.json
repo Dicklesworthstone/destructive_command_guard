@@ -14,7 +14,15 @@
     "summary": {
       "type": "object",
       "description": "Aggregated statistics for the scan",
-      "required": ["files_scanned", "files_skipped", "commands_extracted", "findings_total", "decisions", "severities", "max_findings_reached"],
+      "required": [
+        "files_scanned",
+        "files_skipped",
+        "commands_extracted",
+        "findings_total",
+        "decisions",
+        "severities",
+        "max_findings_reached"
+      ],
       "properties": {
         "files_scanned": {
           "type": "integer",
@@ -39,7 +47,14 @@
               },
               "reason": {
                 "type": "string",
-                "enum": ["path_not_found", "metadata_error", "not_a_regular_file", "too_large", "no_extractor", "read_error"],
+                "enum": [
+                  "path_not_found",
+                  "metadata_error",
+                  "not_a_regular_file",
+                  "too_large",
+                  "no_extractor",
+                  "read_error"
+                ],
                 "description": "Why the file was skipped"
               }
             }

@@ -4,7 +4,16 @@
   "title": "DCG Statistics Output",
   "description": "JSON output format for 'dcg stats' command, which displays aggregated statistics from dcg log files over a configurable time period.",
   "type": "object",
-  "required": ["period_start", "period_end", "total_entries", "total_blocks", "total_allows", "total_bypasses", "total_warns", "by_pack"],
+  "required": [
+    "period_start",
+    "period_end",
+    "total_entries",
+    "total_blocks",
+    "total_allows",
+    "total_bypasses",
+    "total_warns",
+    "by_pack"
+  ],
   "properties": {
     "period_start": {
       "type": "integer",

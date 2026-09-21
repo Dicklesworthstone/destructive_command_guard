@@ -11,10 +11,7 @@
   "reason": "Force push can destroy remote history. Use --force-with-lease if necessary.",
   "explanation": "git push --force overwrites remote history with your local history. This can permanently destroy commits that others have already pulled, causing data loss for your entire team. Collaborators may lose work, and recovering requires manual intervention from everyone affected.\n\nWhat can go wrong:\n- Commits others pushed are deleted from remote\n- Team members get diverged histories\n- CI/CD pipelines may reference deleted commits\n\nSafer alternative:\n- git push --force-with-lease: Only forces if remote matches your last fetch\n\nCheck remote state first:\n  git fetch && git log origin/<branch>..HEAD",
   "source": "pack",
-  "matched_span": [
-    0,
-    16
-  ],
+  "matched_span": [0, 16],
   "severity": "critical",
   "agent": {
     "detected": "unknown",

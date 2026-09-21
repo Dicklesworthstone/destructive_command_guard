@@ -6,10 +6,7 @@
   "pattern_name": "reset-hard",
   "reason": "git reset --hard destroys uncommitted changes. Use 'git stash' first.",
   "source": "pack",
-  "matched_span": [
-    0,
-    16
-  ],
+  "matched_span": [0, 16],
   "agent": {
     "detected": "unknown",
     "trust_level": "medium",
