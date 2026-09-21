@@ -93,6 +93,7 @@
           "tar",
           "tee",
           "truncate",
+          "umount",
           "unlink",
           "vgreduce",
           "vgremove",

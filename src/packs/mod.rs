@@ -298,6 +298,30 @@ impl std::fmt::Debug for SafePattern {
 }
 
 /// A destructive pattern that, when matched, blocks the command.
+///
+/// # A correct regex is not a live rule
+///
+/// Three independent layers stand between this pattern and a production denial,
+/// and a rule can clear the first two and still never fire. Every escape in
+/// `GATE_MUST_REACH_RULE` looked like a working rule with a green pack-level
+/// test, because `Pack::check` is not what production calls.
+///
+/// 1. **`pack_aware_quick_reject`** — word-boundary aware, and it runs first.
+///    A command carrying none of the pack's `PACK_ENTRIES` keywords *as whole
+///    tokens* is allowed before any pack is consulted. Note that this matcher
+///    and `candidate_pack_mask` (layer 2) disagree: the mask is substring-based,
+///    so a row can look sufficient there and still be dead here. `mount` on the
+///    row does not reach the token `umount` (#323/#441).
+/// 2. **`candidate_pack_mask`** — decides pack candidacy from the same row.
+/// 3. **The evaluator's pattern pass** — applies phase filters that
+///    `Pack::check` does not, and treats a non-rm command's ordinary argv as
+///    data. A rule whose match lies wholly inside argv does not fire here, and
+///    belongs in a semantic classifier instead (#460, `tee-git-internals`).
+///
+/// So a new rule needs a row keyword this command carries as a token, and an
+/// end-to-end assertion. Add it to `GATE_MUST_REACH_RULE`, which proves all
+/// three layers against the same command; a pack-level test alone will pass
+/// whether or not the rule can ever run.
 pub struct DestructivePattern {
     /// Lazily-compiled regex pattern.
     pub regex: LazyCompiledRegex,
@@ -2141,19 +2165,33 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             // the quick-reject drops the command before this pack is a
             // candidate and the rule never runs (#444).
             "/dev/",
-            // `mount` is registered rather than `umount` because keyword
-            // matching is substring-based: it still reaches every `umount -f
-            // /mnt/x` this row carried `umount` for (#323), and it additionally
-            // reaches `mount --bind /mnt /`.
+            // BOTH spellings are required. This row briefly carried only
+            // `mount`, on the theory that keyword matching is substring-based
+            // and `mount` therefore also reaches `umount`. It is not, and it
+            // does not.
             //
-            // With only `umount` here, `mount-bind-root` was dead. No other
-            // keyword in this list appears in `mount --bind /mnt /`, so the
-            // quick-reject dropped the command before this pack was a
-            // candidate. Measured against the release binary: that command was
-            // allowed, while the same command carrying an unrelated row keyword
-            // (`mount --bind /mnt/btrfs /`) was denied by `mount-bind-root` —
-            // the rule, not the gate, is what should decide (#441).
+            // There are two keyword matchers with different semantics, and they
+            // run in that order: `pack_aware_quick_reject` is word-boundary
+            // aware and deliberately ignores substring hits (it is what keeps
+            // `cat .gitignore` from waking `core.git`), while
+            // `candidate_pack_mask` is substring-based. The quick-reject runs
+            // FIRST, so `mount` never matches the token `umount` in production
+            // no matter what the mask would have said.
+            //
+            // Measured against the built binary with `mount` alone on the row:
+            // `umount -f /mnt/data` and `umount -f /` were ALLOWED, while
+            // `umount -f /mount/data` — the same rule, rescued only by the
+            // literal `mount` inside the PATH operand — was denied by
+            // `umount-force`. So #441's fix silently un-shipped #323's rule.
+            //
+            // With only `umount` here, `mount-bind-root` was dead for the
+            // mirror-image reason: no other keyword in this list appears in
+            // `mount --bind /mnt /` (#441). Neither keyword substitutes for the
+            // other; both are load-bearing, and
+            // `registry_gate_admits_every_command_its_rules_must_decide` now
+            // asserts each one end-to-end through the evaluator.
             "mount",
+            "umount",
             "mdadm",
             "btrfs",
             "dmsetup",
@@ -6514,8 +6552,20 @@ mod tests {
         /// first, and a pack that is not a candidate never runs. Every escape in
         /// `GATE_MUST_REACH_RULE` had a correct rule and a green pack-level test.
         ///
-        /// So assert both halves against the same command: the gate admits the
-        /// pack, *and* the rule then fires with the expected id.
+        /// So assert all three layers against the same command: the gate admits
+        /// the pack, the pack agrees the command is destructive, *and* the
+        /// evaluator actually returns that rule.
+        ///
+        /// The third layer is not redundant (#460). `Pack::check` is not what
+        /// production calls — the evaluator runs the pattern pass itself, with
+        /// phase filters `Pack::check` does not apply, and a rule can pass the
+        /// first two layers and still never fire. That is the #407/#441/#444
+        /// shape one level deeper: the keyword admits the pack, the pack agrees,
+        /// and the command is allowed anyway. `tee-git-internals` was withdrawn
+        /// in `0dfabb6` for exactly this, after its pack-level test had been
+        /// green the whole time. A rule that cannot fire in production now fails
+        /// its own reachability test instead of advertising coverage it does not
+        /// have.
         #[test]
         fn registry_gate_admits_every_command_its_rules_must_decide() {
             for (pack_id, command, rule) in GATE_MUST_REACH_RULE {
@@ -6548,6 +6598,88 @@ mod tests {
                     matched.name,
                     Some(*rule),
                     "{command:?} was blocked by the wrong rule"
+                );
+
+                // Layer three: the production evaluator, with only this pack
+                // enabled so nothing else can rescue the command. Built from the
+                // same `ordered`/`index` the gate check above used.
+                let keywords = REGISTRY.collect_enabled_keywords(&enabled);
+                let config = crate::Config::default();
+                let result = crate::evaluator::evaluate_command_with_pack_order(
+                    command,
+                    &keywords,
+                    &ordered,
+                    Some(&index),
+                    &config.overrides.compile(),
+                    &crate::LayeredAllowlist::default(),
+                    &config.heredoc_settings(),
+                );
+                let fired = result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref());
+                assert_eq!(
+                    fired,
+                    Some(*rule),
+                    "{pack_id} and its keyword row both accept {command:?} and \
+                     `Pack::check` returns {rule}, but the evaluator answered \
+                     {fired:?}. The rule is unreachable in production, so a \
+                     pack-level test asserting it is asserting coverage that does \
+                     not exist (#460). A destructive pattern must anchor on the \
+                     command word or on shell syntax; one that can only match \
+                     inside argv needs a semantic classifier instead."
+                );
+            }
+        }
+
+        /// The countermetric for widening a keyword row: what must STAY allowed.
+        ///
+        /// Adding `umount` to `system.disk` makes the pack a candidate for every
+        /// command naming it, where before the quick-reject dropped them all.
+        /// From that point only `umount-force`'s own regex separates the force
+        /// spelling from the ordinary one, so the ordinary one needs an
+        /// end-to-end pin rather than a pack-level `check` — the whole lesson of
+        /// #460 is that those two answer different questions.
+        #[test]
+        fn widening_the_disk_row_does_not_deny_ordinary_mount_commands() {
+            let mut enabled = HashSet::new();
+            enabled.insert("system.disk".to_string());
+            let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+            let index = REGISTRY
+                .build_enabled_keyword_index(&ordered)
+                .expect("keyword index should build for a single pack");
+            let keywords = REGISTRY.collect_enabled_keywords(&enabled);
+            let config = crate::Config::default();
+
+            for command in [
+                "umount /mnt/data",
+                "umount -l /mnt/data",
+                "mount",
+                "mount -l",
+                "mount /dev/sdb1 /mnt",
+                // The cmdlet named as data, not run. `umount-force`'s regex is
+                // unanchored, so this is the shape that would expose a widening.
+                "echo umount -f /mnt/data",
+                r#"git commit -m "fix umount -f handling""#,
+            ] {
+                let result = crate::evaluator::evaluate_command_with_pack_order(
+                    command,
+                    &keywords,
+                    &ordered,
+                    Some(&index),
+                    &config.overrides.compile(),
+                    &crate::LayeredAllowlist::default(),
+                    &config.heredoc_settings(),
+                );
+                assert_eq!(
+                    result.decision,
+                    crate::evaluator::EvaluationDecision::Allow,
+                    "{command:?} is ordinary and must stay allowed after the row \
+                     gained `umount`; it was answered by {:?}",
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref())
                 );
             }
         }
