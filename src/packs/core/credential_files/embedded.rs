@@ -1,13 +1,12 @@
 //! Structural recognition of Python, Ruby, and Node file-write APIs (#461).
 //!
-//! Parse shell syntax first: an interpreter invocation printed by echo, stored
-//! in an argument, or mentioned in a comment is not an executable script.
-//! Parse the resulting script in its own language, tracking simple imports and
-//! bindings so unrelated objects with methods named `writeFile` are not sinks.
-//! No script is executed and no destination is read or opened.
+//! Shell callers first establish that the source belongs to an interpreter.
+//! The evaluator also calls `scan_extracted` directly on executable source:
+//! its shell-segment view has already masked interpreter bodies. No script is
+//! executed and no destination is read or opened.
 
 use super::{CredentialFileWrite, shell};
-use crate::heredoc::{ExtractionLimits, ExtractionResult, extract_content};
+use crate::heredoc::{ExtractionLimits, ExtractionResult, ScriptLanguage, extract_content};
 use crate::normalize::{ShellDialect, strip_wrapper_prefixes};
 use ast_grep_core::{AstGrep, Node, tree_sitter::StrDoc};
 use ast_grep_language::SupportLang;
@@ -16,9 +15,11 @@ use std::ops::Range;
 
 type Syntax<'a> = Node<'a, StrDoc<SupportLang>>;
 
-// The hook already bounds command size. Keep direct library calls bounded too.
+// Bound direct library calls as well as the hook. An exhausted source walk
+// must report incomplete analysis, not a successful empty match set.
 const MAX_BYTES: usize = 256 * 1024;
 const MAX_DEPTH: usize = 128;
+const MAX_NODES: usize = 40_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Language {
@@ -53,6 +54,41 @@ pub(super) fn is_interpreter(executable: &str) -> bool {
     interpreter(executable).is_some()
 }
 
+/// A lexical superset of the API names that can establish a write binding.
+/// Do not gate on a raw protected-path substring: constant concatenation and
+/// language escapes can assemble that substring only after decoding.
+pub(crate) fn source_scan_required(code: &str, language: ScriptLanguage) -> bool {
+    matches!(
+        language,
+        ScriptLanguage::Python
+            | ScriptLanguage::Ruby
+            | ScriptLanguage::JavaScript
+            | ScriptLanguage::TypeScript
+    ) && ["open", "write", "Write", "append", "truncate", "File", "Path"]
+        .iter()
+        .any(|word| code.contains(word))
+}
+
+/// Inspect already-extracted executable source, never shell tokens. Return
+/// the first hit for EACH rule so allowing credentials cannot hide a later
+/// `.git` write (or conversely). Spans are bytes in `code`.
+pub(crate) fn scan_extracted(
+    code: &str,
+    language: ScriptLanguage,
+) -> Result<Vec<CredentialFileWrite>, &'static str> {
+    if !source_scan_required(code, language) {
+        return Ok(Vec::new());
+    }
+    let (language, grammar) = match language {
+        ScriptLanguage::Python => (Language::Python, SupportLang::Python),
+        ScriptLanguage::Ruby => (Language::Ruby, SupportLang::Ruby),
+        ScriptLanguage::JavaScript => (Language::Node, SupportLang::JavaScript),
+        ScriptLanguage::TypeScript => (Language::Node, SupportLang::TypeScript),
+        _ => return Ok(Vec::new()),
+    };
+    scan_source(code, language, grammar)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Access {
     Read,
@@ -84,18 +120,8 @@ fn mode_access(mode: &str) -> Option<Access> {
 pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<CredentialFileWrite> {
     if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
         || segment.len() > MAX_BYTES
-        // Cheap pre-gate: every sink name this module can reach must contain
-        // one of these. The match is case-SENSITIVE, which is why `Write` is
-        // listed separately from `write` — `createWriteStream` is the one API
-        // in `is_js_api` that spells it with a capital and carries none of the
-        // other needles, so it was rejected here before the parser ever ran and
-        // every `createWriteStream` write of a credential file was allowed.
-        // `truncate` joins because `os.truncate(p, 0)` and `fs.truncateSync(p, 0)`
-        // contain none of the other words.
-        // `every_sink_name_trips_the_pre_gate` is what keeps the two lists
-        // agreeing; a new camelCase sink will fail that test rather than fail
-        // silently.
-        || !["open", "write", "Write", "append", "File", "Path", "truncate"]
+        // `createWriteStream` needs the capital-W spelling too.
+        || !["open", "write", "Write", "append", "truncate", "File", "Path"]
             .iter()
             .any(|word| segment.contains(word))
     {
@@ -271,6 +297,12 @@ enum Value {
     Open,
     Io,
     Builtins,
+    Os,
+    OsPath,
+    OsTruncate,
+    ExpandUser,
+    /// Only a proven runtime expander grants a leading tilde home semantics.
+    HomePath(String),
     Pathlib,
     PathConstructor,
     Path(String),
@@ -280,33 +312,32 @@ enum Value {
     Fs,
     File,
     Api(String),
-    /// Python's `os` module, and the two members of it that matter here.
-    Os,
-    OsPath,
-    /// `os.truncate(path, length)` — a truncating write with no mode argument.
-    OsTruncate,
-    /// `os.path.expanduser` / Ruby's `File.expand_path`.
-    ExpandUser,
-    /// A path literal the source provably home-expands at run time.
-    ///
-    /// Kept distinct from `Text` because a bare string literal is NOT expanded:
-    /// `open('~/.ssh/id_rsa','w')` creates a directory named `~`. Only when an
-    /// expander wraps the literal does its leading `~` name the home directory,
-    /// and `protected` has to know which of the two it is looking at.
-    HomePath(String),
 }
 
 type Bindings = HashMap<String, Value>;
 
 fn inspect(code: &str, language: Language, span: Range<usize>) -> Option<CredentialFileWrite> {
-    if code.len() > MAX_BYTES {
-        return None;
-    }
     let grammar = match language {
         Language::Python => SupportLang::Python,
         Language::Ruby => SupportLang::Ruby,
         Language::Node => SupportLang::JavaScript,
     };
+    let mut hit = scan_source(code, language, grammar)
+        .ok()?
+        .into_iter()
+        .next()?;
+    hit.span = span;
+    Some(hit)
+}
+
+fn scan_source(
+    code: &str,
+    language: Language,
+    grammar: SupportLang,
+) -> Result<Vec<CredentialFileWrite>, &'static str> {
+    if code.len() > MAX_BYTES {
+        return Err("protected-write source exceeds the byte limit");
+    }
     let ast = AstGrep::new(code, grammar);
     let mut bindings = Bindings::new();
     match language {
@@ -320,27 +351,37 @@ fn inspect(code: &str, language: Language, span: Range<usize>) -> Option<Credent
             bindings.insert("require".into(), Value::Require);
         }
     }
-    let (api, path, _, rule) = visit(ast.root(), language, &mut bindings, 0)?;
-    Some(CredentialFileWrite {
-        span,
-        rule,
-        reason: format!(
-            "{api} writes protected credential, login-startup, or trust target {path:?}. Reads remain allowed; only append-only known_hosts updates are exempt. Show the user the proposed change or use dcg allow-once."
-        ),
-    })
+    let mut hits = Vec::new();
+    let mut remaining_nodes = MAX_NODES;
+    visit(
+        ast.root(),
+        language,
+        &mut bindings,
+        0,
+        &mut remaining_nodes,
+        &mut hits,
+    )?;
+    Ok(hits)
 }
 
-/// Return the first protected write, not just the first write in a script.
+/// Collect one hit per rule, not just the first write in a script. A rule
+/// allowlist is not permission to stop scanning other rule families.
 fn visit(
     node: Syntax<'_>,
     language: Language,
     env: &mut Bindings,
     depth: usize,
-) -> Option<(String, String, Access, &'static str)> {
-    if depth > MAX_DEPTH {
-        return None;
+    remaining_nodes: &mut usize,
+    hits: &mut Vec<CredentialFileWrite>,
+) -> Result<(), &'static str> {
+    if depth > MAX_DEPTH || *remaining_nodes == 0 {
+        return Err("protected-write source exceeds the AST traversal limit");
     }
+    *remaining_nodes -= 1;
     let kind = node.kind();
+    if kind == "ERROR" {
+        return Err("protected-write source contains a syntax error");
+    }
     if matches!(
         kind.as_ref(),
         "function_definition"
@@ -366,47 +407,41 @@ fn visit(
             }
         }
         for child in node.children() {
-            if let Some(hit) = visit(child, language, &mut local, depth + 1) {
-                return Some(hit);
-            }
+            visit(child, language, &mut local, depth + 1, remaining_nodes, hits)?;
         }
-        return None;
+        return Ok(());
     }
     bind(&node, language, env);
     if let Some((api, path, access, expands)) = write_call(&node, language, env) {
         if let Some(rule) = protected(&path, access, expands) {
-            return Some((api, path, access, rule));
+            if !hits.iter().any(|hit| hit.rule == rule) {
+                hits.push(CredentialFileWrite {
+                    span: node.range(),
+                    rule,
+                    reason: format!(
+                        "{api} writes protected credential, login-startup, or trust target {path:?}. Reads remain allowed; only append-only known_hosts updates are exempt. Show the user the proposed change or use dcg allow-once."
+                    ),
+                });
+            }
         }
     }
     for child in node.children() {
-        if let Some(hit) = visit(child, language, env, depth + 1) {
-            return Some(hit);
-        }
+        visit(child, language, env, depth + 1, remaining_nodes, hits)?;
     }
-    None
+    Ok(())
 }
 
 /// A canonical, SINGLE-QUOTED sink is a policy adapter, never executed.
 /// Quote every byte so embedded string contents cannot become shell syntax,
 /// expansions, glob patterns, or extra targets. This deliberately does not
 /// expand literal '~' or '$HOME' in an ordinary language string literal.
-///
-/// The one exception is `expands_home`, set only when `path_value` saw the
-/// literal wrapped in `os.path.expanduser` or `File.expand_path` — code that
-/// really does resolve `~` against the home directory at run time. Then the
-/// leading `~`/`~user` alone is left unquoted, so the shell resolver reads it
-/// as the home anchor exactly as it reads `tee -a ~/.ssh/authorized_keys`.
-/// Everything after the first `/` stays quoted, so the carve-out cannot
-/// introduce any other expansion.
+/// Only `os.path.expanduser` and `File.expand_path` may leave a leading
+/// `~`/`~user` unquoted. All other characters retain literal semantics.
 fn protected(path: &str, access: Access, expands_home: bool) -> Option<&'static str> {
-
     if access == Access::Read {
         return None;
     }
     let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
-    // A tilde prefix is `~` or `~user`: word characters only. Anything else
-    // after the `~` would be spliced into the shell word unquoted, so it is
-    // judged fully quoted instead — never widening what the adapter parses.
     let anchor = expands_home
         .then(|| path.split_once('/').unwrap_or((path, "")))
         .filter(|(anchor, _)| {
@@ -421,11 +456,7 @@ fn protected(path: &str, access: Access, expands_home: bool) -> Option<&'static 
         None => quote(path),
     };
     let append = if access == Access::Append { "-a " } else { "" };
-    // The synthesized writer is `tee`, never a redirect, so a `.git` target
-    // reaches the rule here exactly as `tee .git/config` would (#457) — and
-    // the rule it answers with is carried back rather than flattened to a
-    // bool, so an embedded write is allowlistable by the same name as its
-    // shell equivalent.
+    // Use the exact shared path table and rule identity, including .git.
     shell::classify_credential_file_write(&format!("tee {append}-- {quoted}"), ShellDialect::Posix)
         .map(|hit| hit.rule)
 }
@@ -457,10 +488,7 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
                 (Some("os.path"), "expanduser") => Some(Value::ExpandUser),
                 _ => None,
             };
-            // `import os.path` binds the name `os`, not `os.path`, so the
-            // alias computed above is wrong for it. Without this the common
-            // `import os.path; os.path.expanduser(...)` would leave `os`
-            // unbound and the expansion unseen.
+            // `import os.path` binds `os`, not `os.path`.
             if module.is_none() && source.starts_with("os.") && name.field("alias").is_none() {
                 env.remove("os");
                 env.insert("os".into(), Value::Os);
@@ -534,10 +562,7 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
 }
 
 fn is_fs_module(module: &str) -> bool {
-    matches!(
-        module,
-        "fs" | "node:fs" | "fs/promises" | "node:fs/promises"
-    )
+    matches!(module, "fs" | "node:fs" | "fs/promises" | "node:fs/promises")
 }
 
 fn is_js_api(name: &str) -> bool {
@@ -577,19 +602,17 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                 .into_owned();
             match (object, member.as_str()) {
                 (Value::Io | Value::Builtins, "open") => Some(Value::Open),
+                (Value::Os, "truncate") => Some(Value::OsTruncate),
+                (Value::Os, "path") => Some(Value::OsPath),
+                (Value::OsPath, "expanduser") => Some(Value::ExpandUser),
                 (Value::Pathlib, "Path") => Some(Value::PathConstructor),
                 (Value::Path(path), "write_text" | "write_bytes") => Some(Value::PathWrite(path)),
                 (Value::Path(path), "open") => Some(Value::PathOpen(path)),
                 (Value::Fs, "promises") => Some(Value::Fs),
                 (Value::Fs, name) if is_js_api(name) => Some(Value::Api(name.into())),
-                (Value::Os, "truncate") => Some(Value::OsTruncate),
-                (Value::Os, "path") => Some(Value::OsPath),
-                (Value::OsPath, "expanduser") => Some(Value::ExpandUser),
                 _ => None,
             }
         }
-        // Ruby spells a call as receiver/method rather than a `function`
-        // field, so `File.expand_path('~/x')` never reaches the arm below.
         "call" if language == Language::Ruby => {
             if value(&node.field("receiver")?, language, env, depth + 1)? != Value::File
                 || node.field("method")?.text() != "expand_path"
@@ -647,10 +670,7 @@ fn text_value(node: &Syntax<'_>, language: Language, env: &Bindings) -> Option<S
     }
 }
 
-/// A write destination, and whether the source home-expands its leading `~`.
-///
-/// Used only where a *path* is expected. `text_value` stays as it was for the
-/// mode and module strings, which must never be treated as expanded paths.
+/// Keep path expansion separate from mode/module strings.
 fn path_value(node: &Syntax<'_>, language: Language, env: &Bindings) -> Option<(String, bool)> {
     match value(node, language, env, 0)? {
         Value::Text(text) | Value::Path(text) => Some((text, false)),
@@ -697,8 +717,6 @@ fn write_call(
             return None;
         }
         let method = node.field("method")?.text().into_owned();
-        // `truncate` is one of the ten spellings #461 measured, and the only
-        // one of Ruby's three that was not already here.
         if !matches!(
             method.as_str(),
             "write" | "binwrite" | "open" | "new" | "truncate"
@@ -706,6 +724,9 @@ fn write_call(
             return None;
         }
         let (path, expands) = path_value(args.first()?, language, env)?;
+        if method == "truncate" {
+            return Some(("File.truncate".into(), path, Access::Write, expands));
+        }
         let opener = matches!(method.as_str(), "open" | "new");
         let mut mode = if opener {
             args.get(1)
@@ -755,16 +776,12 @@ fn write_call(
         Value::PathWrite(path) if language == Language::Python => {
             Some((function.text().into_owned(), path, Access::Write, false))
         }
-        // `os.truncate(path, length)`: truncating, with no mode to consult.
         Value::OsTruncate if language == Language::Python => {
             let (path, expands) = path_value(&python_argument(&args, 0, "path")?, language, env)?;
             Some((function.text().into_owned(), path, Access::Write, expands))
         }
         Value::Api(api) if language == Language::Node => {
             let (path, expands) = path_value(args.first()?, language, env)?;
-            // The second argument of `truncate`/`truncateSync` is a length, not
-            // an options object, so it has no flag to consult — and whatever it
-            // says, the call cuts the file down.
             if matches!(api.as_str(), "truncate" | "truncateSync") {
                 return Some((format!("fs.{api}"), path, Access::Write, expands));
             }
@@ -913,7 +930,7 @@ fn literal(node: &Syntax<'_>, language: Language) -> Option<String> {
             _ => return None,
         }
     }
-    (!result.contains('\0')).then_some(result)
+    Some(result)
 }
 
 #[cfg(test)]
