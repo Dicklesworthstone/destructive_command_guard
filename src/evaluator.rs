@@ -25707,20 +25707,37 @@ fn evaluate_heredoc(
             });
         }
 
-        // Conservative exec-sink backstop (#136).
+        // Conservative exec-sink backstop (#136, wired up for #459).
         //
-        // Interpreter-source heredoc bodies (python -/node -/ruby/…) are masked
-        // out of the evaluator's later raw-shell rescan because this AST path is
-        // authoritative. ast-grep patterns only match specific call shapes, so an
-        // aliased / inline-imported sink (e.g. `const cp = require("child_process");
-        // cp.execSync("rm -rf /etc")`) can slip past them. Re-scan the raw body
-        // for name-anchored exec sinks called with a destructive string literal so
-        // masking never converts a real executing deletion into a false negative.
-        // Inert literals with no sink call (`print("rm -rf x")`) do not match.
-        if content
-            .target_command
-            .as_ref()
-            .is_some_and(|cmd| crate::heredoc::is_interpreter_source_heredoc_command(cmd))
+        // ast-grep patterns match specific call *shapes*, so an aliased or
+        // inline-imported sink (`const cp = require("child_process");
+        // cp.execSync("rm -rf /etc")`) slips past them. This re-scans the body for
+        // name-anchored exec sinks whose argument region carries a destructive
+        // payload. Inert literals with no sink call (`print("rm -rf x")`) do not
+        // match, so the #136 reporter's false positive stays fixed.
+        //
+        // This block reached production dead. Its gate was
+        // `is_interpreter_source_heredoc_command`, written when interpreter bodies
+        // were masked out of the raw-shell rescan and this was the compensating
+        // control. #136 reverted that masking as unsound, and the predicate now
+        // returns false for EVERY language — `interpreter_source_heredoc_command_classification_136`
+        // asserts exactly that. So the gate was self-consistent and the backstop
+        // never ran.
+        //
+        // Removing the masking did not remove the hole the backstop covers. The
+        // raw rescan needs contiguous destructive text, and an argv-split spawn
+        // has none: in `cp.spawnSync("rm", ["-rf", "/home/user"])` the literals
+        // are separately harmless. `detect_destructive_in_args` is what joins them
+        // back into a command line, and its docstring names this exact shape —
+        // Python already benefits from it, JavaScript and Ruby did not, purely
+        // because nothing called this (#459).
+        //
+        // Position is the gate now. Every blocking AST match has already returned
+        // above, so this runs only when the authoritative path found nothing,
+        // which keeps rule attribution with the specific pattern where one exists.
+        // Language scoping lives inside the function: Bash is never masked and
+        // Perl/Php/Go use their own primary paths, so it returns `None` for them
+        // without a caller-side check.
         {
             if let Some(m) =
                 crate::ast_matcher::scan_executing_sink_fallback(&content.content, content.language)

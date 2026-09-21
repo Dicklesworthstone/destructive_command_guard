@@ -405,14 +405,32 @@ pub fn scan_executing_sink_fallback(code: &str, language: ScriptLanguage) -> Opt
             continue;
         };
 
-        // Escalate destructive exec-sink payloads to a blocking severity.
-        let severity = match hit.severity {
-            Severity::Critical => Severity::Critical,
-            _ => Severity::High,
-        };
-        if !severity.blocks_by_default() {
+        // Carry the payload's own severity rather than escalating it.
+        //
+        // This used to read `_ => Severity::High`, which blocked every hit
+        // regardless of target. That was right while it compensated for #136's
+        // interpreter-body masking: a masked body was invisible to every other
+        // layer, so the backstop had to be the maximally conservative one. The
+        // masking was reverted, the body keeps flowing through the raw-shell
+        // rescan, and this scanner ran nowhere at all until #459 wired it up.
+        //
+        // Its unique contribution now is the argv join — a shape with no
+        // contiguous destructive text for any other layer to see. That is a
+        // question of *visibility*, not of severity, so the payload should be
+        // judged by the same yardstick everywhere: `rm -rf /home/user` is
+        // Critical and blocks, `rm -rf ./build` is Medium and does not.
+        //
+        // Escalating here would have decided two open questions as a side effect
+        // of wiring in a scanner. Measured with the escalation still in place:
+        // `spawnSync("rm", ["-rf", "./build"])`, `node_modules`, `dist` and
+        // `/tmp/scratch` all began to deny in JavaScript and Ruby. The first
+        // three are #455 — whether a relative recursive delete should block at
+        // all is a live design question with three policies in play — and the
+        // last defeats the `/tmp` carve-out every other layer honours.
+        if !hit.severity.blocks_by_default() {
             continue;
         }
+        let severity = hit.severity;
 
         let sink = caps.name("sink").map_or("exec", |s| s.as_str());
         let lang_id = match language {
@@ -671,12 +689,18 @@ fn ruby_exec_sink_match(
     sink: &str,
     hit: &ShellPayloadHit,
 ) -> PatternMatch {
-    // Escalate destructive exec-sink payloads to a blocking severity so even a
-    // non-catastrophic target still BLOCKS (the sink unambiguously executes).
-    let severity = match hit.severity {
-        Severity::Critical => Severity::Critical,
-        _ => Severity::High,
-    };
+    // Carry the payload's own severity, matching the generic sink pass above.
+    //
+    // This also read `_ => Severity::High`, on the stated grounds that the sink
+    // unambiguously executes. True, and it is the reason this pass exists — but
+    // every other layer judging an executing `rm -rf` already applies the
+    // catastrophic/relative distinction, so escalating here made Ruby the only
+    // language where `system("rm", "-rf", "./build")` blocked. Measured: with the
+    // escalation in place JavaScript allowed that shape and Ruby denied it, for
+    // no reason either language could articulate. Whether a relative recursive
+    // delete should block anywhere is #455, and it should be decided there and
+    // for all languages at once, not settled here by an inconsistency.
+    let severity = hit.severity;
     let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
     PatternMatch {
         rule_id: format!("heredoc.ruby.exec_sink.{}", hit.rule_suffix),
