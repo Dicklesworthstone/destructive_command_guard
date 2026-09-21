@@ -39,7 +39,7 @@ jobs:
       CARGO_BUILD_JOBS: 2
       RCH_ENABLED: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Verify the scanner gate rejects detected defects
@@ -84,7 +84,7 @@ jobs:
         run: cargo fmt --check
       - name: Retain every native and lib-run log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: scanner-safety-${{ github.sha }}
           path: |
