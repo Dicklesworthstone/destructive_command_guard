@@ -7108,6 +7108,155 @@ mod tests {
         /// heredoc producer, is this offset inside a quoted body, does this
         /// range intersect interpreter input) and were audited afterwards.
         ///
+        /// The part of a source file compiled outside `cfg(test)`: everything
+        /// before the first `#[cfg(test)]` that gates an INLINE module
+        /// (`mod x {`), with any attributes between.
+        ///
+        /// Two kinds of `#[cfg(test)]` are deliberately NOT split points, and
+        /// getting either wrong makes the guard silently weaker, not stricter:
+        ///
+        /// - On a non-module item. Production code follows several of those —
+        ///   `ast_matcher.rs`'s `FLOOR_MS`, test-only helpers in `evaluator.rs`,
+        ///   a `thread_local!` in `allowlist.rs`.
+        /// - On an EXTERNAL module (`mod x;`). Its test code lives in the other
+        ///   file (see `test_only_files`); this file carries on as production.
+        ///   `packs/mod.rs` declares one at line 50 of ~7,000, so treating it as
+        ///   a split point would have dropped the whole pack registry from the
+        ///   scan while every assertion here still passed.
+        ///
+        /// It generalizes the old `"\nmod tests {"` split, which missed inline
+        /// test modules with other names (`windows_exe_tests`, `test_env`).
+        fn production_part(source: &str) -> &str {
+            let mut offset = 0;
+            let mut lines = source.split_inclusive('\n');
+            while let Some(line) = lines.next() {
+                if line.trim() == "#[cfg(test)]" {
+                    let gated = lines
+                        .clone()
+                        .map(str::trim)
+                        .find(|next| !next.is_empty() && !next.starts_with("#["));
+                    let is_inline_module = gated.is_some_and(|item| {
+                        let item = item
+                            .strip_prefix("pub(crate) ")
+                            .or_else(|| item.strip_prefix("pub "))
+                            .unwrap_or(item);
+                        item.starts_with("mod ") && !item.ends_with(';')
+                    });
+                    if is_inline_module {
+                        return &source[..offset];
+                    }
+                }
+                offset += line.len();
+            }
+            source
+        }
+
+        /// Files that exist only as `#[cfg(test)] mod name;` of some parent.
+        ///
+        /// Such a file is test code from its first line, so `production_part`
+        /// cannot see that — it has no gate of its own. Resolved with the
+        /// standard rules: a module declared in `lib.rs`/`main.rs`/`mod.rs`
+        /// lives beside it, one declared in `foo.rs` lives under `foo/`.
+        fn test_only_files(
+            files: &[std::path::PathBuf],
+        ) -> std::collections::BTreeSet<std::path::PathBuf> {
+            let mut test_only = std::collections::BTreeSet::new();
+            for file in files {
+                let Ok(source) = std::fs::read_to_string(file) else {
+                    continue;
+                };
+                let Some(dir) = file.parent() else { continue };
+                let stem = file.file_stem().and_then(|stem| stem.to_str());
+                let child_dir = if matches!(stem, Some("lib" | "main" | "mod")) {
+                    dir.to_path_buf()
+                } else {
+                    dir.join(stem.unwrap_or_default())
+                };
+                let mut lines = source.lines().map(str::trim);
+                while let Some(line) = lines.next() {
+                    if line != "#[cfg(test)]" {
+                        continue;
+                    }
+                    let Some(item) = lines
+                        .clone()
+                        .find(|next| !next.is_empty() && !next.starts_with("#["))
+                    else {
+                        continue;
+                    };
+                    let item = item
+                        .strip_prefix("pub(crate) ")
+                        .or_else(|| item.strip_prefix("pub "))
+                        .unwrap_or(item);
+                    let Some(name) = item
+                        .strip_prefix("mod ")
+                        .and_then(|rest| rest.strip_suffix(';'))
+                    else {
+                        continue;
+                    };
+                    test_only.insert(child_dir.join(format!("{name}.rs")));
+                    test_only.insert(child_dir.join(name).join("mod.rs"));
+                }
+            }
+            test_only
+        }
+
+        #[test]
+        fn production_part_splits_only_at_a_gated_module() {
+            let source = "fn a() {}\n#[cfg(test)]\nconst FLOOR: u64 = 1;\nfn b() {}\n\
+                          #[cfg(test)]\n#[allow(dead_code)]\nmod windows_exe_tests {\n}\n";
+            let production = production_part(source);
+            assert!(
+                production.contains("fn b()"),
+                "a gated const is not a module; code after it is still production"
+            );
+            assert!(
+                !production.contains("windows_exe_tests"),
+                "a gated module ends production whatever it is named"
+            );
+            assert_eq!(
+                production_part("fn only() {}\n"),
+                "fn only() {}\n",
+                "a file with no gated module is all production"
+            );
+            assert!(
+                production_part("fn a() {}\n#[cfg(test)]\npub(crate) mod test_env {\n}\n")
+                    .ends_with("fn a() {}\n"),
+                "visibility on the gated module does not hide it"
+            );
+            // The regression this guards: an EXTERNAL gated module must not end
+            // production. `packs/mod.rs` has one at line 50 of ~7,000.
+            let registry = "#[cfg(test)]\nmod test_template;\nstatic REGISTRY: u8 = 0;\n";
+            assert_eq!(
+                production_part(registry),
+                registry,
+                "`mod x;` puts its tests in another file; code after it is production"
+            );
+        }
+
+        #[test]
+        fn test_only_files_resolve_external_gated_modules() {
+            let root = tempfile::tempdir().expect("tempdir");
+            let src = root.path();
+            std::fs::create_dir_all(src.join("pack")).unwrap();
+            std::fs::write(
+                src.join("lib.rs"),
+                "#[cfg(test)]\nmod beside;\nmod shipped;\n",
+            )
+            .unwrap();
+            std::fs::write(src.join("pack.rs"), "#[cfg(test)]\nmod tests;\n").unwrap();
+            let files = vec![src.join("lib.rs"), src.join("pack.rs")];
+            let test_only = test_only_files(&files);
+            assert!(test_only.contains(&src.join("beside.rs")), "{test_only:?}");
+            assert!(
+                test_only.contains(&src.join("pack").join("tests.rs")),
+                "a module of `pack.rs` lives under `pack/`: {test_only:?}"
+            );
+            assert!(
+                !test_only.contains(&src.join("shipped.rs")),
+                "an ungated module is production"
+            );
+        }
+
         /// A source check rather than a timing one on purpose: reproducing the
         /// expiry needs a loaded host, which is the nondeterminism being
         /// removed. `src/perf.rs` guards its own invariants the same way.
@@ -7153,20 +7302,23 @@ mod tests {
                 "the source walk must reach the files this guard exists for: {files:?}"
             );
 
+            let test_only = test_only_files(&files);
+            assert!(
+                test_only.contains(&root.join("src/scanner_regression_tests.rs")),
+                "external test-module resolution must find the known case: {test_only:?}"
+            );
+
             for path in files {
                 let file = path
                     .strip_prefix(root)
                     .expect("walked path is under the manifest dir")
                     .to_string_lossy()
                     .replace('\\', "/");
-                if HOT_PATH_BUDGET_OWNERS.contains(&file.as_str()) {
+                if HOT_PATH_BUDGET_OWNERS.contains(&file.as_str()) || test_only.contains(&path) {
                     continue;
                 }
                 let source = std::fs::read_to_string(&path).expect("read a source file");
-                let production = source
-                    .split("\nmod tests {")
-                    .next()
-                    .expect("split always yields a first element");
+                let production = production_part(&source);
                 // Doc comments may name the default profile in an example; a
                 // call site is what matters.
                 let offenders: Vec<_> = production
