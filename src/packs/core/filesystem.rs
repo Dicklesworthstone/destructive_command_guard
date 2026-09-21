@@ -3881,6 +3881,33 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     ]
 }
 
+/// The destructive patterns for `core.filesystem`.
+///
+/// # A pattern here cannot match an argv operand
+///
+/// This pack and `core.git` are the two the evaluator treats as argv-inert.
+/// `command_pattern_match_is_inert_quoted_data` rejects any match from them
+/// whose first alphanumeric byte lands in a span `offset_is_quoted_data`
+/// classifies as `SpanKind::Data` **or** `SpanKind::Argument` — that is, any
+/// operand, quoted or not. Only the two rules named by
+/// `is_core_filesystem_redirect_rule` are exempt.
+///
+/// This is deliberate and load-bearing: it is what keeps
+/// `git commit -m "rm -rf /"` from being read as the command it quotes. Do not
+/// weaken it to rescue a single rule.
+///
+/// The consequence for authors is concrete. A rule whose match begins at the
+/// command word (`rm …`, a redirect operator) works. A rule that keys on a
+/// *path in argv* — `tee .git/config`, `cp x .git/config` — will match the
+/// regex, pass `Pack::check`, pass `Pack::might_match`, pass the registry gate,
+/// pass every pack-level test, and then be discarded by the evaluator, so it
+/// decides nothing for a user. `tee-git-internals` shipped that way (#460).
+///
+/// A path-keyed writer therefore belongs in the `credential_files.rs`
+/// classifier, which inspects resolved operands, not in a pattern here. And a
+/// new rule of that shape is only proven by an assertion through
+/// `evaluate_command` — see
+/// `the_evaluator_actually_decides_every_command_its_rules_must_reach`.
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     // Severity levels:
     // - Critical: Most dangerous, irreversible, high-confidence detections

@@ -2173,23 +2173,31 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             // There are two keyword matchers with different semantics, and they
             // run in that order: `pack_aware_quick_reject` is word-boundary
             // aware and deliberately ignores substring hits (it is what keeps
-            // `cat .gitignore` from waking `core.git`), while
-            // `candidate_pack_mask` is substring-based. The quick-reject runs
-            // FIRST, so `mount` never matches the token `umount` in production
-            // no matter what the mask would have said.
+            // `cat .gitignore` from waking `core.git` — see
+            // `pack_aware_quick_reject_ignores_substring_matches` and its
+            // `echo dcgx` case), while `candidate_pack_mask` is substring-based
+            // (overlapping Aho-Corasick). The quick-reject runs FIRST, so an
+            // alphanumeric `u` in front of `mount` is not a boundary and
+            // `mount` never matches the token `umount` in production, no matter
+            // what the mask would have said.
             //
             // Measured against the built binary with `mount` alone on the row:
             // `umount -f /mnt/data` and `umount -f /` were ALLOWED, while
             // `umount -f /mount/data` — the same rule, rescued only by the
             // literal `mount` inside the PATH operand — was denied by
-            // `umount-force`. So #441's fix silently un-shipped #323's rule.
+            // `umount-force`. `umount -f /dev/sda1` was denied for the same
+            // kind of reason, by the unrelated `/dev/` row keyword. So #441's
+            // fix silently un-shipped #323's rule for every unmount that names
+            // neither, while its pack-level test stayed green because
+            // `Pack::check` never sees this gate (#460).
             //
             // With only `umount` here, `mount-bind-root` was dead for the
             // mirror-image reason: no other keyword in this list appears in
-            // `mount --bind /mnt /` (#441). Neither keyword substitutes for the
-            // other; both are load-bearing, and
-            // `registry_gate_admits_every_command_its_rules_must_decide` now
-            // asserts each one end-to-end through the evaluator.
+            // `mount --bind /mnt /`, and that command was allowed while
+            // `mount --bind /mnt/btrfs /` — rescued only by an unrelated row
+            // keyword — was denied (#441). Neither keyword substitutes for the
+            // other; both are load-bearing, and the gate tests now assert each
+            // one end-to-end through the evaluator.
             "mount",
             "umount",
             "mdadm",
@@ -6510,9 +6518,9 @@ mod tests {
         ///
         /// Each entry is `(pack, command, rule)` for a command that carries
         /// exactly one keyword belonging to its pack's row — the keyword whose
-        /// absence made the rule unreachable. They are the four escapes this
-        /// defect class has produced, kept as a corpus because each was found
-        /// only after shipping.
+        /// absence made the rule unreachable. They are the escapes this defect
+        /// class has produced, kept as a corpus because each was found only
+        /// after shipping, and twice a fix for one row broke another.
         const GATE_MUST_REACH_RULE: &[(&str, &str, &str)] = &[
             // #407: `.git/` was declared by the pack but missing from the row.
             (
@@ -6527,7 +6535,10 @@ mod tests {
                 "cat >> .git/config",
                 "redirect-append-git-internals-relative",
             ),
-            // #323: no other keyword in system.disk's row appears here.
+            // #323: no other keyword in system.disk's row appears here. #441
+            // dropped `umount` from the row believing `mount` covered it by
+            // substring; it does not, because the quick-reject needs a word
+            // boundary, and this rule was dead in production until #460.
             ("system.disk", "umount -f /mnt/data", "umount-force"),
             // #444: `tee /dev/sda` names `/dev/` and nothing else.
             ("system.disk", "tee /dev/sda", "tee-device"),
@@ -6588,6 +6599,24 @@ mod tests {
                      carries to the pack's PACK_ENTRIES row"
                 );
 
+                // `candidate_pack_mask` is not the only gate, and on its own it
+                // is the more permissive of the two: it is an overlapping
+                // Aho-Corasick scan, so a row keyword buried inside a longer
+                // word still sets the bit. `pack_aware_quick_reject` requires a
+                // word boundary, runs first, and is what actually drops the
+                // command. Asserting only the mask is how `umount-force` went
+                // dead while this test stayed green: `mount` set system.disk's
+                // bit from inside `umount`, and the quick-reject then threw the
+                // command away (#460).
+                let keywords = REGISTRY.collect_enabled_keywords(&enabled);
+                assert!(
+                    !pack_aware_quick_reject(command, &keywords),
+                    "the word-boundary quick-reject drops {command:?} before {pack_id} \
+                     runs, so rule {rule} can never decide it. A row keyword that only \
+                     appears inside a longer word does not count: add the spelling this \
+                     command actually uses"
+                );
+
                 let pack = REGISTRY
                     .get(pack_id)
                     .unwrap_or_else(|| panic!("pack {pack_id} should be retrievable"));
@@ -6602,8 +6631,7 @@ mod tests {
 
                 // Layer three: the production evaluator, with only this pack
                 // enabled so nothing else can rescue the command. Built from the
-                // same `ordered`/`index` the gate check above used.
-                let keywords = REGISTRY.collect_enabled_keywords(&enabled);
+                // same `ordered`/`index`/`keywords` the gate checks above used.
                 let config = crate::Config::default();
                 let result = crate::evaluator::evaluate_command_with_pack_order(
                     command,
@@ -6680,6 +6708,74 @@ mod tests {
                         .pattern_info
                         .as_ref()
                         .and_then(|info| info.pattern_name.as_deref())
+                );
+            }
+        }
+
+        /// The same commands, under the config a user actually runs.
+        ///
+        /// The layer-three assertion above enables only the pack under test, so
+        /// that nothing else can rescue the command and the attribution is
+        /// unambiguous. That is the right way to prove the *rule* works, and it
+        /// is deliberately not the question here.
+        ///
+        /// Nobody runs dcg with one pack. In production five packs are enabled
+        /// together, and every one of them contributes safe patterns and
+        /// allowlist entries that can suppress a match another pack made. A rule
+        /// can therefore pass all three layers in isolation and still be
+        /// overridden the moment it shares a process with its neighbours — a
+        /// failure mode a single-pack harness cannot see, because the neighbour
+        /// is not loaded.
+        ///
+        /// So this runs `evaluate_command`, the entry point `main` uses, against
+        /// `Config::default()`: whatever it says is what a user gets. It also
+        /// pins the pack id, not just the rule name, so a row cannot start
+        /// passing because a different pack happens to deny the same command.
+        #[test]
+        fn the_evaluator_actually_decides_every_command_its_rules_must_reach() {
+            use crate::allowlist::LayeredAllowlist;
+            use crate::config::Config;
+            use crate::evaluator::{EvaluationDecision, evaluate_command};
+
+            let config = Config::default();
+            let enabled_packs = config.enabled_pack_ids();
+            let keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+            let keyword_refs: Vec<&str> = keywords.iter().map(|s| &**s).collect();
+            let overrides = config.overrides.compile();
+            let allowlists = LayeredAllowlist::default();
+
+            // `enabled_pack_ids` keeps category markers such as `core` rather
+            // than expanding them, so ask the registry what that actually means.
+            let expanded = REGISTRY.expand_enabled_ordered(&enabled_packs);
+
+            for (pack_id, command, rule) in GATE_MUST_REACH_RULE {
+                assert!(
+                    expanded.iter().any(|id| id == pack_id),
+                    "{pack_id} is not enabled by default, so this row cannot be \
+                     asserted through the evaluator; move it or enable the pack"
+                );
+
+                let result =
+                    evaluate_command(command, &config, &keyword_refs, &overrides, &allowlists);
+
+                assert!(
+                    matches!(result.decision, EvaluationDecision::Deny),
+                    "the evaluator ALLOWS {command:?} under the DEFAULT config, so rule \
+                     {pack_id}:{rule} does not decide it for a user — even if the \
+                     single-pack assertion above passes (#460). The usual cause is a \
+                     neighbouring default-on pack's safe pattern or allowlist entry \
+                     suppressing the match; find it with `dcg explain` before changing \
+                     this rule."
+                );
+
+                let info = result
+                    .pattern_info
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{command:?} denied with no pattern attributed"));
+                assert_eq!(
+                    (info.pack_id.as_deref(), info.pattern_name.as_deref()),
+                    (Some(*pack_id), Some(*rule)),
+                    "{command:?} is decided by a different rule than the row claims"
                 );
             }
         }

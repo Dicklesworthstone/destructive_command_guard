@@ -5247,6 +5247,15 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     ]
 }
 
+/// The destructive patterns for `core.git`.
+///
+/// Like `core.filesystem`, this pack is argv-inert: the evaluator discards any
+/// match here whose first alphanumeric byte lands in an operand span, quoted or
+/// not, which is what keeps `git commit -m "rm -rf /"` from being read as the
+/// command it quotes. Rules must therefore key on the command word or an
+/// option, never on a path sitting in argv. The full statement of the
+/// constraint, and where a path-keyed rule belongs instead, is on
+/// `core::filesystem::create_destructive_patterns` (#460).
 #[allow(clippy::too_many_lines)]
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     // Severity levels:
