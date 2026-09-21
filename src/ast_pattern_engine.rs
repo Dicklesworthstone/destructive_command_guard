@@ -5640,6 +5640,86 @@ def cleanup():
             }
         }
 
+        /// #459: the fallback is name-anchored, so a call with NO receiver is
+        /// caught.
+        ///
+        /// `$FS.rmSync($$$)` closed every aliased receiver in the AST pass, but a
+        /// metavariable in receiver position cannot match a destructured import
+        /// that calls the sink bare — and `const { rmSync } = require('fs')` and
+        /// `import { rm } from 'node:fs/promises'` are how current Node is
+        /// written, so the guarded spellings were the older ones.
+        #[test]
+        fn filesystem_fallback_catches_every_receiver_shape_issue_459() {
+            for (code, expected) in [
+                // No receiver at all: a destructured import.
+                (
+                    "rmSync('/home/user', { recursive: true });",
+                    "heredoc.javascript.fs_rmsync.catastrophic",
+                ),
+                (
+                    "rmdirSync('/home/user', { recursive: true });",
+                    "heredoc.javascript.fs_rmdirsync.catastrophic",
+                ),
+                (
+                    "unlinkSync('/home/user/.ssh/id_rsa');",
+                    "heredoc.javascript.fs_unlinksync.catastrophic",
+                ),
+                (
+                    "rm('/home/user', { recursive: true });",
+                    "heredoc.javascript.fs_rm.catastrophic",
+                ),
+                // A receiver, under any name.
+                (
+                    "fs.rmSync('/home/user', { recursive: true });",
+                    "heredoc.javascript.fs_rmsync.catastrophic",
+                ),
+                (
+                    "nodefs.rmSync('/home/user', { recursive: true });",
+                    "heredoc.javascript.fs_rmsync.catastrophic",
+                ),
+                // A receiver chain: the `fs.promises` member spelling.
+                (
+                    "fs.promises.rm('/home/user', { recursive: true });",
+                    "heredoc.javascript.fs_rm.catastrophic",
+                ),
+                // `await` in front, which the pattern allows for.
+                (
+                    "await rm('/home/user', { recursive: true });",
+                    "heredoc.javascript.fs_rm.catastrophic",
+                ),
+            ] {
+                let hit = scan_filesystem_sink_fallback(code, ScriptLanguage::JavaScript)
+                    .unwrap_or_else(|| panic!("fallback must catch {code}"));
+                assert_eq!(hit.rule_id, expected, "wrong rule id for {code}");
+                assert!(hit.severity.blocks_by_default(), "must block: {code}");
+            }
+        }
+
+        /// Negative control for the test above: name-anchoring must not turn any
+        /// bare call with a path argument into a block.
+        #[test]
+        fn filesystem_fallback_name_anchor_is_not_overbroad_issue_459() {
+            for code in [
+                // Not deletions, even at a catastrophic target.
+                "mkdirSync('/home/user/newdir');",
+                "readFileSync('/home/user/.bashrc');",
+                "writeFileSync('/home/user/notes.txt', 'x');",
+                "copyFileSync('/home/user/a', '/home/user/b');",
+                // Real deletion names, but the target and options do not qualify:
+                // a scratch path, and a non-recursive delete of a relative file.
+                "rm('/tmp/scratch/x', { recursive: true });",
+                "rmSync('./build/stamp');",
+                "rm('./build');",
+                // A longer identifier that merely ends in a sink name.
+                "confirmSync('/home/user');",
+            ] {
+                assert!(
+                    scan_filesystem_sink_fallback(code, ScriptLanguage::JavaScript).is_none(),
+                    "fallback must stay quiet: {code}"
+                );
+            }
+        }
+
         #[test]
         fn filesystem_fallback_ignores_ruby_fileutils_in_comment() {
             let code = "# FileUtils.rm_rf(\"/\")";
