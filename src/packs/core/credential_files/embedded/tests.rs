@@ -224,16 +224,52 @@ fn shell_context_and_candidate_gate_reach_the_matcher() {
 
 #[test]
 fn policy_bridge_cannot_turn_a_literal_into_shell_syntax() {
-    assert!(!protected(
-        "/tmp/x'; tee /home/test/.bashrc; echo '",
-        Access::Write
-    ));
-    assert!(!protected("$HOME/.bashrc", Access::Write));
-    assert!(!protected("~/.bashrc", Access::Write));
-    assert!(protected("/home/test/.ssh/authorized_keys", Access::Append));
-    assert!(!protected("/home/test/.ssh/known_hosts", Access::Append));
-    assert!(protected("/home/test/.ssh/known_hosts", Access::Write));
+    // `protected` returns the rule the write denies under rather than a bool
+    // (#457), so these read `.is_none()` / `.is_some()`.
+    assert!(protected("/tmp/x'; tee /home/test/.bashrc; echo '", Access::Write).is_none());
+    assert!(protected("$HOME/.bashrc", Access::Write).is_none());
+    assert!(protected("~/.bashrc", Access::Write).is_none());
+    assert!(protected("/home/test/.ssh/authorized_keys", Access::Append).is_some());
+    assert!(protected("/home/test/.ssh/known_hosts", Access::Append).is_none());
+    assert!(protected("/home/test/.ssh/known_hosts", Access::Write).is_some());
     for dialect in [ShellDialect::PowerShell, ShellDialect::Cmd] {
         assert!(classify(r#"python -c "open('/home/test/.bashrc','w')""#, dialect).is_none());
+    }
+}
+
+/// Every sink name this module can reach must survive the cheap pre-gate in
+/// `classify`.
+///
+/// The gate is a case-sensitive substring test over a handful of needles, and
+/// the sink lists are written separately from it, so the two can disagree
+/// without anything failing to compile. They did: `createWriteStream` is the
+/// only name in `is_js_api` that spells "write" with a capital and carries
+/// none of the other needles, so it never reached the parser and
+/// `require('fs').createWriteStream('~/.ssh/id_rsa')` was allowed
+/// while every other API on the same list denied.
+///
+/// Asserted end to end rather than against the needle list, so it keeps
+/// holding if the gate is rewritten.
+#[test]
+fn every_sink_name_trips_the_pre_gate() {
+    let target = "/home/test/.ssh/id_rsa";
+    let commands = [
+        format!(r#"node -e "require('fs').writeFile('{target}','x')""#),
+        format!(r#"node -e "require('fs').writeFileSync('{target}','x')""#),
+        format!(r#"node -e "require('fs').appendFile('{target}','x')""#),
+        format!(r#"node -e "require('fs').appendFileSync('{target}','x')""#),
+        format!(r#"node -e "require('fs').createWriteStream('{target}')""#),
+        format!(r#"python3 -c "open('{target}','w')""#),
+        format!(r#"python3 -c "import io; io.open('{target}','w')""#),
+        format!(r#"python3 -c "from pathlib import Path; Path('{target}').write_text('x')""#),
+        format!(r#"ruby -e "File.write('{target}','x')""#),
+        format!(r#"ruby -e "File.binwrite('{target}','x')""#),
+        format!(r#"ruby -e "File.open('{target}','w')""#),
+    ];
+    for command in commands {
+        assert!(
+            classify(&command, ShellDialect::Posix).is_some(),
+            "sink did not reach the classifier: {command}"
+        );
     }
 }

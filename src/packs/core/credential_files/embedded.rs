@@ -84,7 +84,16 @@ fn mode_access(mode: &str) -> Option<Access> {
 pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<CredentialFileWrite> {
     if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
         || segment.len() > MAX_BYTES
-        || !["open", "write", "append", "File", "Path"]
+        // Cheap pre-gate: every sink name this module can reach must contain
+        // one of these. The match is case-SENSITIVE, which is why `Write` is
+        // listed separately from `write` — `createWriteStream` is the one API
+        // in `is_js_api` that spells it with a capital and carries none of the
+        // other needles, so it was rejected here before the parser ever ran and
+        // every `createWriteStream` write of a credential file was allowed.
+        // `every_sink_name_trips_the_pre_gate` is what keeps the two lists
+        // agreeing; a new camelCase sink will fail that test rather than fail
+        // silently.
+        || !["open", "write", "Write", "append", "File", "Path"]
             .iter()
             .any(|word| segment.contains(word))
     {
