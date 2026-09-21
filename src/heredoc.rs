@@ -7264,7 +7264,11 @@ mod tests {
                 "#[cfg(test)]\n#[path = \"my_pack_tests.rs\"]\nmod tests;\n",
             )
             .unwrap();
-            let files = vec![src.join("lib.rs"), src.join("pack.rs"), src.join("my_pack.rs")];
+            let files = vec![
+                src.join("lib.rs"),
+                src.join("pack.rs"),
+                src.join("my_pack.rs"),
+            ];
             let test_only = test_only_files(&files);
             assert!(test_only.contains(&src.join("beside.rs")), "{test_only:?}");
             assert!(

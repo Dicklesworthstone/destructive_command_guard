@@ -1,4 +1,5 @@
-//! Regression pins for issue #459: argv-split spawns in JavaScript and Ruby.
+//! Regression pins for issue #459: argv-split spawns in JavaScript and Ruby
+//! (and Perl, whose `system`/`exec` argv form had the same gap).
 //!
 //! When an embedded script spawns a process with the command and its flags in
 //! *separate* arguments, no single string literal contains the command, so the
@@ -6,7 +7,7 @@
 //! which match call shapes, not argv contents — see only inert fragments.
 //!
 //! The capability to handle this already existed: `detect_destructive_in_args`
-//! joins a call's string literals back into a command line, and its docstring
+//! reads a call's string literals back as the command's argv, and its docstring
 //! names `spawnSync("rm", ["-rf", "/etc/x"])` as the shape it is for. Python
 //! reached it; JavaScript and Ruby did not, because the only production caller
 //! of `scan_executing_sink_fallback` was gated on
@@ -57,7 +58,7 @@ fn assert_blocked(command: &str) {
     let (result, full) = dcg_test(command);
     assert!(
         result.starts_with("Result: BLOCKED") || result.starts_with("Result: REVIEW REQUIRED"),
-        "argv-split recursive delete outside a temp directory must deny: {command}\n{full}"
+        "argv-split destructive command must deny: {command}\n{full}"
     );
 }
 
@@ -76,6 +77,10 @@ fn node(body: &str) -> String {
 
 fn ruby(body: &str) -> String {
     format!("ruby -e \"{body}\"")
+}
+
+fn perl(body: &str) -> String {
+    format!("perl -e \"{body}\"")
 }
 
 #[test]
@@ -124,7 +129,7 @@ fn contiguous_payload_spawns_still_deny() {
 /// The argv-list form is what Node's and Ruby's own docs steer authors toward
 /// over the string form, so this is the common spelling in real code rather
 /// than a corner. If the join were a keyword scan over list elements instead of
-/// a command-line reconstruction, these would deny.
+/// a reading of the argv, these would deny.
 #[test]
 fn ordinary_argv_split_spawns_stay_allowed() {
     for body in [
@@ -186,4 +191,51 @@ fn argv_split_recursive_deletes_follow_the_single_policy_issue_455() {
     }
     // Traversal out of the temp tree is not scratch: `/tmp/../etc` is `/etc`.
     assert_blocked(&node("cp.spawnSync('rm',['-rf','/tmp/../etc'])"));
+}
+
+/// Every operand of an argv-split `rm -rf` counts, and option arguments are
+/// not operands.
+///
+/// Only the first operand used to count, so a temp decoy in front laundered
+/// the rest: `spawnSync('rm', ['-rf', '/tmp/x', '/'])` was ALLOWED in
+/// JavaScript, Ruby and Perl while `rm -rf /tmp/x /` denied in the shell. And
+/// Perl read only the first literal of `system`/`exec`, so its whole argv form
+/// was unguarded — `system('rm','-rf','/')` included.
+#[test]
+fn every_operand_counts_and_options_do_not() {
+    for body in [
+        "cp.spawnSync('rm',['-rf','/tmp/x','/'])",
+        "cp.spawnSync('rm',['-rf','/tmp/x','./build'])",
+        // An argv element is one word; the `;` does not end the command.
+        "cp.spawnSync('rm',['-rf','/tmp/x;','/'])",
+    ] {
+        assert_blocked(&node(body));
+    }
+    for body in [
+        "system('rm','-rf','/tmp/x','/')",
+        "system('rm','-rf','/tmp/x','./build')",
+    ] {
+        assert_blocked(&ruby(body));
+    }
+    for body in [
+        "system('rm','-rf','/')",
+        "system('rm','-rf','/tmp/x','/')",
+        "exec('rm','-rf','./build')",
+        "system 'rm', '-rf', '/';",
+        "system('git','reset','--hard')",
+        // `File::Path` takes several paths as well, or the legacy interface's
+        // array reference, which was not matched at all.
+        "use File::Path; rmtree('/tmp/x', '/')",
+        "use File::Path; rmtree(['/'])",
+    ] {
+        assert_blocked(&perl(body));
+    }
+
+    // Each of these deletes only temp directories. An option's string
+    // (`inherit`, `/dev/null`) is not a target.
+    assert_allowed(&node(
+        "cp.spawnSync('rm',['-rf','/tmp/x'],{stdio:'inherit'})",
+    ));
+    assert_allowed(&ruby("system('rm','-rf','/tmp/x',out: '/dev/null')"));
+    assert_allowed(&perl("system('rm','-rf','/tmp/x','/var/tmp/y')"));
 }

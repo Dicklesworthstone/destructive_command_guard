@@ -1312,8 +1312,8 @@ fn refine_javascript_match(meta: &CompiledPattern, matched_text: &str) -> Option
                 .filter_map(|caps| string_literal_from_caps(&caps))
                 .collect();
 
-            if let Some(reconstructed) = reconstruct_spawn_command(cmd, &args) {
-                return detect_shell_payload(&reconstructed).map(|hit| RefinedMatchMeta {
+            if let Some(argv) = spawn_argv(cmd, &args) {
+                return detect_argv_payload(&argv).map(|hit| RefinedMatchMeta {
                     rule_id: format!("{rule_id}.{}", hit.rule_suffix),
                     reason: hit.reason.to_string(),
                     severity: hit.severity,
@@ -1432,8 +1432,8 @@ fn refine_typescript_match(meta: &CompiledPattern, matched_text: &str) -> Option
                 .filter_map(|caps| string_literal_from_caps(&caps))
                 .collect();
 
-            if let Some(reconstructed) = reconstruct_spawn_command(cmd, &args) {
-                return detect_shell_payload(&reconstructed).map(|hit| RefinedMatchMeta {
+            if let Some(argv) = spawn_argv(cmd, &args) {
+                return detect_argv_payload(&argv).map(|hit| RefinedMatchMeta {
                     rule_id: format!("{rule_id}.{}", hit.rule_suffix),
                     reason: hit.reason.to_string(),
                     severity: hit.severity,
@@ -1602,20 +1602,14 @@ fn refine_ruby_match(meta: &CompiledPattern, matched_text: &str) -> Option<Refin
     })
 }
 
-fn reconstruct_spawn_command(cmd: &str, args: &[&str]) -> Option<String> {
+/// `spawnSync(cmd, args)` as the argv the child receives, for
+/// `detect_argv_payload`. `None` for an empty command.
+fn spawn_argv<'a>(cmd: &'a str, args: &[&'a str]) -> Option<Vec<&'a str>> {
     let cmd = cmd.trim();
     if cmd.is_empty() {
         return None;
     }
-
-    let mut out = String::new();
-    out.push_str(cmd);
-    for arg in args {
-        out.push(' ');
-        out.push_str(arg);
-    }
-
-    Some(out)
+    Some(std::iter::once(cmd).chain(args.iter().copied()).collect())
 }
 
 // ============================================================================
@@ -1657,12 +1651,12 @@ static PERL_QX_SLASH_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
 ///
 /// A bare `rmtree`/`remove_tree` is still specific enough to key on: these names
 /// are not Perl builtins, the scan only ever runs on an extracted Perl body with
-/// comments masked, and the match additionally requires a quoted string argument.
+/// comments masked, and the call must open with a quoted string or with the
+/// legacy interface's array reference (`rmtree(['/a', '/b'])`), whose paths the
+/// scan then requires to include a literal.
 static PERL_FILE_PATH_RMTREE_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?m)\b(?:File::Path::)?(?P<fn>rmtree|remove_tree)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
-    )
-    .expect("perl File::Path rmtree/remove_tree regex compiles")
+    Regex::new(r#"(?m)\b(?:File::Path::)?(?P<fn>rmtree|remove_tree)\b(?:\s*\(\s*|\s+)["'\[]"#)
+        .expect("perl File::Path rmtree/remove_tree regex compiles")
 });
 
 static PERL_UNLINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
@@ -1816,18 +1810,25 @@ fn scan_perl_system_exec(
             _ => continue,
         };
 
-        let Some(payload) = string_literal_from_caps(&caps) else {
+        // The whole argument list, not just the first literal. `system('rm',
+        // '-rf', '/')` is Perl's argv form, whose first literal `rm` flags
+        // nothing on its own, so reading only that literal left every
+        // argv-form `system`/`exec` unguarded — a `/` target included — while
+        // the one-string form blocked. JavaScript, Python and Ruby already
+        // read the list this way.
+        let region = exec_sink_arg_region(haystack, m.start());
+        let Some(hit) = detect_destructive_in_args(region) else {
             continue;
         };
 
-        push_perl_shell_payload_match(
+        push_perl_shell_hit(
             out,
             code,
             newline_positions,
             call,
-            payload,
+            &hit,
             m.start(),
-            m.end(),
+            m.start() + region.len(),
         );
     }
 
@@ -1919,9 +1920,21 @@ fn scan_perl_file_path(
         let Some(m) = caps.get(0) else {
             continue;
         };
-        let Some(path) = string_literal_from_caps(&caps) else {
+        // Every path the call deletes, not just the first. Both interfaces take
+        // several — `rmtree('/a', '/b')` and the legacy `rmtree(['/a', '/b'],
+        // $verbose, $safe)` — and weighing only the first let a temp decoy
+        // launder the rest: `rmtree('/tmp/x', '/')` was allowed, and so was
+        // `rmtree(['/'])`, since the array form matched nothing at all. The
+        // region stops at an options hash (`{ keep_root => 1 }`), whose
+        // strings are not paths.
+        let region = exec_argv_region(exec_sink_arg_region(haystack, m.start()));
+        let paths: Vec<&str> = ANY_STRING_LITERAL
+            .captures_iter(region)
+            .filter_map(|caps| string_literal_from_caps(&caps))
+            .collect();
+        if paths.is_empty() {
             continue;
-        };
+        }
         let fn_name = caps.name("fn").map_or("rmtree", |m| m.as_str());
 
         // #455: `rmtree`/`remove_tree` are Perl's recursive delete, so they get
@@ -1929,8 +1942,8 @@ fn scan_perl_file_path(
         // and `fs.rmSync({recursive})` — a literal target outside /tmp blocks.
         // The issue left Perl out of its table only because #453 was open on
         // coverage; the policy question is the same one.
-        let catastrophic = is_catastrophic_path(path);
-        let non_temp = !catastrophic && !is_temp_scratch_path(path);
+        let catastrophic = paths.iter().any(|path| is_catastrophic_path(path));
+        let non_temp = !catastrophic && !paths.iter().all(|path| is_temp_scratch_path(path));
         let severity = if catastrophic || non_temp {
             Severity::Critical
         } else {
@@ -2148,7 +2161,21 @@ static ANY_STRING_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
 /// the region is bounded to the end of the current line so we still scan the
 /// visible arguments. This lets [`detect_destructive_in_args`] see every literal
 /// in `subprocess.run(["sh", "-c", "rm -rf /etc"])`, not just the first.
+///
+/// A call written without parentheses (Perl and Ruby: `system 'rm', '-rf',
+/// $x;`) runs to the end of its line instead, because the first bracket on
+/// that line is not the call's own. Matching it used to end the region inside
+/// an argument — `lc('/tmp/x')` in `system 'rm', '-rf', lc('/tmp/x'),
+/// './build'` — and drop every operand after it. [`exec_argv_region`] then
+/// finds where such a list really ends (`;`, `or die …`, `if …`).
 fn exec_sink_arg_region(code: &str, match_start: usize) -> &str {
+    let after_name = code[match_start..]
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.' | ':')))
+        .map_or(code.len(), |offset| match_start + offset);
+    if !code[after_name..].trim_start().starts_with('(') {
+        return code[match_start..].split('\n').next().unwrap_or_default();
+    }
+
     let bytes = code.as_bytes();
     let mut depth: i32 = 0;
     let mut seen_open = false;
@@ -2197,39 +2224,175 @@ fn exec_sink_arg_region(code: &str, match_start: usize) -> &str {
     &code[match_start..]
 }
 
-/// Scan **every** string literal in an exec-sink call's text for a destructive
-/// shell payload and return the first hit.
+/// Scan **every** string literal in an exec-sink call's argv for a destructive
+/// shell payload and return the most severe hit.
 ///
 /// This descends into list/tuple literal elements (e.g. the `"rm -rf /etc"`
 /// inside `subprocess.run(["sh", "-c", "rm -rf /etc"])`), closing the list-arg
 /// exec-sink false negative where only the first literal was inspected (#136).
 /// Callers MUST only invoke this once the surrounding call is confirmed to be a
 /// real exec sink, so inert literals (`print("rm -rf x")`) never reach here.
+///
+/// Most severe, not first: a harmless first finding used to end the search,
+/// so `spawnSync('rm', ['-rf', 'rm -rf /tmp/y', '/'])` reported the `Medium`
+/// payload in its third literal and never weighed the argv that deletes `/`.
 fn detect_destructive_in_args(call_text: &str) -> Option<ShellPayloadHit> {
-    let literals: Vec<String> = ANY_STRING_LITERAL
-        .captures_iter(call_text)
-        .filter_map(|caps| string_literal_from_caps(&caps).map(str::to_string))
+    let literals: Vec<&str> = ANY_STRING_LITERAL
+        .captures_iter(exec_argv_region(call_text))
+        .filter_map(|caps| string_literal_from_caps(&caps))
         .collect();
 
     // 1) Each literal on its own (catches `subprocess.run(["sh","-c","rm -rf /etc"])`
     //    where the destructive command lives in a single literal).
-    if let Some(hit) = literals.iter().find_map(|lit| detect_shell_payload(lit)) {
-        return Some(hit);
+    let mut found = None;
+    for literal in &literals {
+        found = more_severe(found, detect_shell_payload(literal));
     }
 
-    // 2) Argv-style reconstruction: a destructive command split across separate
-    //    literals (`spawnSync("rm", ["-rf", "/etc/x"])`, `exec.Command("rm","-rf","/x")`)
-    //    has no single literal that flags, so join every literal as one command
-    //    line and re-scan (#136). Safe because this runs ONLY after the call is
+    // 2) Argv: a destructive command split across separate literals
+    //    (`spawnSync("rm", ["-rf", "/etc/x"])`, `exec.Command("rm","-rf","/x")`)
+    //    has no single literal that flags, so read the literals as the argv
+    //    they are (#136). Safe because this runs ONLY after the call is
     //    confirmed to be a real exec sink, so inert literals never reach here.
     if literals.len() > 1 {
-        let joined = literals.join(" ");
-        if let Some(hit) = detect_shell_payload(&joined) {
-            return Some(hit);
-        }
+        found = more_severe(found, detect_argv_payload(&literals));
     }
 
-    None
+    found
+}
+
+/// The part of an exec-sink call that holds the command it runs: its argument
+/// list, up to where options begin.
+///
+/// Options carry strings that are not operands. `spawnSync('rm', ['-rf',
+/// '/tmp/x'], { stdio: 'inherit' })` deletes only `/tmp/x`, and with every
+/// operand weighed, reading `inherit` as one would block it — just as Ruby's
+/// `out: '/dev/null'` would read as a catastrophic target. So the region ends
+/// at:
+///
+/// - a `{…}` argument (a JavaScript options object, a Ruby options hash);
+/// - a keyword argument (`cwd='/'`, `out: File::NULL`, `:out => …`), or any
+///   argument followed by `=>`, which also ends a JavaScript callback;
+/// - the end of a list argument — in JavaScript and Python the list IS the
+///   argv (`spawnSync(cmd, args, options)`, `subprocess.run(args, **kw)`);
+/// - without parentheses (Perl, Ruby), a `;`, `||`/`&&`, or a low-precedence
+///   operator or statement modifier (`or die "…"`, `if $x`).
+///
+/// A dynamic positional argument does not end it: `system('rm', '-rf', $dir,
+/// '/')` still deletes `/`.
+fn exec_argv_region(call_text: &str) -> &str {
+    let bytes = call_text.as_bytes();
+    let mut i = call_text
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.' | ':')))
+        .unwrap_or(call_text.len());
+    while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    let parenthesized = bytes.get(i) == Some(&b'(');
+    if parenthesized {
+        i += 1;
+    }
+    let begin = i;
+    let mut depth = 0_usize;
+    let mut quote: Option<u8> = None;
+    let mut arg_start = begin;
+    let mut at_arg_start = true;
+    let mut list_arg = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if at_arg_start && !b.is_ascii_whitespace() {
+            at_arg_start = false;
+            arg_start = i;
+            if b == b'{' || is_keyword_argument(&call_text[i..]) {
+                return &call_text[begin..i];
+            }
+            list_arg = b == b'[';
+        }
+        if depth == 0
+            && !parenthesized
+            && !at_arg_start
+            && b.is_ascii_whitespace()
+            && starts_low_precedence_operator(&call_text[i..])
+        {
+            return &call_text[begin..i];
+        }
+        match b {
+            b'"' | b'\'' => quote = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                // Below the argument list: the call's own closing paren.
+                let Some(inner) = depth.checked_sub(1) else {
+                    return &call_text[begin..i];
+                };
+                depth = inner;
+                if depth == 0 && list_arg && b == b']' {
+                    return &call_text[begin..=i];
+                }
+            }
+            b',' if depth == 0 => at_arg_start = true,
+            b'=' if depth == 0 && bytes.get(i + 1) == Some(&b'>') => {
+                return &call_text[begin..arg_start];
+            }
+            b';' if depth == 0 && !parenthesized => return &call_text[begin..i],
+            b'|' | b'&' if depth == 0 && !parenthesized && bytes.get(i + 1) == Some(&b) => {
+                return &call_text[begin..i];
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    &call_text[begin..]
+}
+
+/// A keyword argument: `cwd='/'` (Python), `out: File::NULL` or `:out => …`
+/// (Ruby). Python's `args=[…]` is the argv itself, so it is not one.
+fn is_keyword_argument(arg: &str) -> bool {
+    if let Some(symbol) = arg.strip_prefix(':') {
+        return symbol.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_');
+    }
+    if arg.starts_with(|c: char| c.is_ascii_digit()) {
+        return false;
+    }
+    let name_len = arg
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(arg.len());
+    let (name, rest) = arg.split_at(name_len);
+    if name.is_empty() || name == "args" {
+        return false;
+    }
+    if let Some(after_colon) = rest.strip_prefix(':') {
+        return !after_colon.starts_with(':');
+    }
+    let rest = rest.trim_start();
+    rest.starts_with('=') && !rest.starts_with("==") && !rest.starts_with("=>")
+}
+
+/// ` or die "…"`, ` if $x`, ` unless …`: where Perl and Ruby end an argument
+/// list written without parentheses.
+fn starts_low_precedence_operator(rest: &str) -> bool {
+    let word = rest.trim_start();
+    [
+        "or", "and", "xor", "if", "unless", "while", "until", "for", "foreach", "rescue",
+    ]
+    .iter()
+    .any(|keyword| {
+        word.strip_prefix(keyword).is_some_and(|after| {
+            !after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        })
+    })
 }
 
 fn push_perl_shell_payload_match(
@@ -2244,7 +2407,18 @@ fn push_perl_shell_payload_match(
     let Some(hit) = detect_shell_payload(payload) else {
         return;
     };
+    push_perl_shell_hit(out, code, newline_positions, call, &hit, start, end);
+}
 
+fn push_perl_shell_hit(
+    out: &mut Vec<PatternMatch>,
+    code: &str,
+    newline_positions: &[usize],
+    call: PerlShellCall,
+    hit: &ShellPayloadHit,
+    start: usize,
+    end: usize,
+) {
     let rule_id = format!("heredoc.perl.{}.{}", call.id_prefix(), hit.rule_suffix);
     push_regex_match(
         out,
@@ -2277,37 +2451,105 @@ fn detect_shell_payload(payload: &str) -> Option<ShellPayloadHit> {
         let Some(cmd) = next_shell_command(&mut tokens) else {
             continue;
         };
-
-        // Compare on the basename. `next_shell_command` unwraps `sudo`/`command`/
-        // `env` frontends but returns the command word verbatim, so a path
-        // spelling never equalled the literals below: the argv reconstruction
-        // above turned `['/bin/rm','-rf','/home/user']` back into
-        // `/bin/rm -rf /home/user` and this match then missed it, while the bare
-        // `['rm',…]` spelling was caught (#459). Same stripping the shell path
-        // already applies to a command word, same idiom as `normalize.rs`, so
-        // `/usr/bin/rm`, `./rm` and `rm.exe` line up with plain `rm` here too.
-        let cmd = cmd
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(cmd)
-            .trim_end_matches(".exe");
-
-        match cmd {
-            "git" => {
-                if let Some(hit) = detect_git_destructive(tokens) {
-                    return Some(hit);
-                }
-            }
-            "rm" => {
-                if let Some(hit) = detect_rm_rf_destructive(tokens) {
-                    return Some(hit);
-                }
-            }
-            _ => {}
+        if let Some(hit) = detect_destructive_command(cmd, tokens, PayloadSyntax::Shell) {
+            return Some(hit);
         }
     }
 
     None
+}
+
+/// How the words of a payload reach the program.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PayloadSyntax {
+    /// A shell parses them first, so an unquoted `>` or `2>/dev/null` is a
+    /// redirection and names no operand.
+    Shell,
+    /// An argv vector the program receives as-is: every word is an operand or
+    /// an option, whatever characters it holds.
+    Argv,
+}
+
+/// A command handed over as an argv vector — `spawnSync('rm', ['-rf', x])`,
+/// `system('rm', '-rf', x)`, `subprocess.run(['rm', '-rf', x])` — rather than
+/// as one shell string.
+///
+/// No shell parses it, so each element is exactly one word. Joining the
+/// elements and scanning the result as shell text, as this used to, let one
+/// element hide every operand after it: `'/tmp/x;'` ended the "command" at the
+/// `;`, and `'>'` would read as a redirection. `spawnSync('rm', ['-rf',
+/// '/tmp/x;', '/'])` deletes `/`.
+///
+/// The shell reading is still consulted when the argv one does not block,
+/// because `{ shell: true }` does hand the joined words to a shell, where
+/// `['x;', 'git', 'reset', '--hard']` is two commands.
+fn detect_argv_payload(argv: &[&str]) -> Option<ShellPayloadHit> {
+    let mut words = argv.iter().copied().peekable();
+    let as_argv = next_shell_command(&mut words)
+        .and_then(|cmd| detect_destructive_command(cmd, words, PayloadSyntax::Argv));
+    if as_argv
+        .as_ref()
+        .is_some_and(|hit| hit.severity.blocks_by_default())
+    {
+        return as_argv;
+    }
+    more_severe(as_argv, detect_shell_payload(&argv.join(" ")))
+}
+
+fn detect_destructive_command<'a, I>(
+    cmd: &str,
+    tokens: I,
+    syntax: PayloadSyntax,
+) -> Option<ShellPayloadHit>
+where
+    I: Iterator<Item = &'a str>,
+{
+    // Compare on the basename. `next_shell_command` unwraps `sudo`/`command`/
+    // `env` frontends but returns the command word verbatim, so a path
+    // spelling never equalled the literals below: `['/bin/rm','-rf',
+    // '/home/user']` reached here as `/bin/rm` and this match missed it, while
+    // the bare `['rm',…]` spelling was caught (#459). Same stripping the shell
+    // path already applies to a command word, same idiom as `normalize.rs`, so
+    // `/usr/bin/rm`, `./rm` and `rm.exe` line up with plain `rm` here too.
+    let cmd = cmd
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(cmd)
+        .trim_end_matches(".exe");
+
+    match cmd {
+        "git" => detect_git_destructive(tokens),
+        "rm" => detect_rm_rf_destructive(tokens, syntax),
+        _ => None,
+    }
+}
+
+/// The more severe of two findings, preferring `a` on a tie.
+fn more_severe(a: Option<ShellPayloadHit>, b: Option<ShellPayloadHit>) -> Option<ShellPayloadHit> {
+    const fn rank(severity: Severity) -> u8 {
+        match severity {
+            Severity::Critical => 3,
+            Severity::High => 2,
+            Severity::Medium => 1,
+            Severity::Low => 0,
+        }
+    }
+    match (a, b) {
+        (Some(a), Some(b)) if rank(b.severity) > rank(a.severity) => Some(b),
+        (Some(a), _) => Some(a),
+        (None, b) => b,
+    }
+}
+
+/// `Some(file_is_next_word)` when `token` is an unquoted shell redirection —
+/// `>`, `2>>` (the file is the next word) or `2>/dev/null`, `<in` (attached) —
+/// and `None` when it is an ordinary word. A quoted `'>'` is a file name.
+fn shell_redirection(token: &str) -> Option<bool> {
+    let operator = token.trim_start_matches(|c: char| c.is_ascii_digit());
+    if !operator.starts_with(['<', '>']) {
+        return None;
+    }
+    Some(operator.trim_start_matches(['<', '>']).is_empty())
 }
 
 fn detect_git_destructive<'a, I>(mut tokens: I) -> Option<ShellPayloadHit>
@@ -2360,16 +2602,33 @@ where
     None
 }
 
-fn detect_rm_rf_destructive<'a, I>(tokens: I) -> Option<ShellPayloadHit>
+fn detect_rm_rf_destructive<'a, I>(tokens: I, syntax: PayloadSyntax) -> Option<ShellPayloadHit>
 where
     I: Iterator<Item = &'a str>,
 {
     let mut has_r = false;
     let mut has_f = false;
-    let mut target: Option<&str> = None;
     let mut options_ended = false;
+    let mut skip_redirection_file = false;
+    // Every operand is deleted, so every operand is weighed. This used to read
+    // only the first and stop, so a temp decoy in front laundered whatever
+    // followed it: `spawnSync('rm', ['-rf', '/tmp/x', '/'])` was ALLOWED in
+    // JavaScript, Ruby and Perl while `rm -rf /tmp/x /` blocked in the shell.
+    let mut operands = 0_usize;
+    let mut catastrophic = false;
+    let mut temp_scratch = true;
 
     for token in tokens {
+        if skip_redirection_file {
+            skip_redirection_file = false;
+            continue;
+        }
+        if syntax == PayloadSyntax::Shell {
+            if let Some(file_is_next_word) = shell_redirection(token) {
+                skip_redirection_file = file_is_next_word;
+                continue;
+            }
+        }
         if !options_ended && token == "--" {
             options_ended = true;
             continue;
@@ -2389,32 +2648,37 @@ where
             has_f |= flags.contains('f');
             continue;
         }
+        // Past the first operand an option still counts: GNU `rm` permutes
+        // its arguments, so `rm ./build -rf` is a recursive delete.
 
-        target = Some(token);
-        break;
+        let target = clean_path_token(token);
+        if target.is_empty() {
+            continue;
+        }
+        operands += 1;
+        catastrophic |= is_catastrophic_path(target);
+        temp_scratch &= is_temp_scratch_path(target);
     }
 
-    if !has_r || !has_f {
+    if !has_r || !has_f || operands == 0 {
         return None;
     }
 
-    let target = clean_path_token(target?);
-    let catastrophic = is_catastrophic_path(target);
     // #455's single policy, expressed where every exec-sink consumer reads it:
     // a recursive delete of a literal target outside a temp directory blocks
     // in every language, and `/tmp` / `/var/tmp` are carved out exactly as
-    // `rm -rf /tmp/x` is in the shell.
+    // `rm -rf /tmp/x` is in the shell — only when EVERY operand is one.
     //
     // This used to return `Medium` for every non-catastrophic target. The
     // JavaScript, TypeScript and Ruby refiners, both exec-sink backstops and the
-    // Perl payload path all carry this severity through unchanged, so an
-    // argv-split `spawnSync('rm', ['-rf', './build'])` or `system('rm', '-rf',
-    // './build')` was ALLOWED — the one spelling with no contiguous `rm -rf`
-    // text for the shell rescan to catch — while `rm -rf ./build` and
-    // `shutil.rmtree('./build')` denied. `High` for a non-temp target closes
-    // that without relaxing anything: the Python refiner already escalated
-    // every hit to `High`, so its verdicts do not move.
-    let temp_scratch = !catastrophic && is_temp_scratch_path(target);
+    // Perl `system`/`exec` path all carry this severity through unchanged, so
+    // an argv-split `spawnSync('rm', ['-rf', './build'])` was ALLOWED — the one
+    // spelling with no contiguous `rm -rf` text for the shell rescan to catch —
+    // while `rm -rf ./build` and `shutil.rmtree('./build')` denied. `High` for
+    // a non-temp target closes that without relaxing anything: the Python
+    // refiner already escalated every hit to `High`, so its verdicts do not
+    // move.
+    let temp_scratch = !catastrophic && temp_scratch;
 
     Some(ShellPayloadHit {
         rule_suffix: if catastrophic {
@@ -4094,6 +4358,163 @@ mod tests {
                 !severity_for("/tmp/build").blocks_by_default(),
                 "the temp carve-out is the same one `rm -rf /tmp/x` has in the shell"
             );
+        }
+
+        /// Every operand of an exec-sink `rm -rf` is weighed. Only the first
+        /// used to count, so a temp decoy in front laundered the rest.
+        #[test]
+        fn exec_sink_rm_rf_weighs_every_operand() {
+            let severity = |call: &str| detect_destructive_in_args(call).map(|hit| hit.severity);
+            for (call, expected) in [
+                (
+                    "spawnSync('rm', ['-rf', '/tmp/x', '/'])",
+                    Severity::Critical,
+                ),
+                ("system('rm', '-rf', '/tmp/x', './build')", Severity::High),
+                (
+                    "system('rm', '-rf', '/tmp/x', '/var/tmp/y')",
+                    Severity::Medium,
+                ),
+                // An argv element is one word: no shell parses it, so `;` and
+                // `>` hide nothing after them.
+                (
+                    "spawnSync('rm', ['-rf', '/tmp/x;', '/'])",
+                    Severity::Critical,
+                ),
+                (
+                    "spawnSync('rm', ['-rf', '/tmp/x', '>', '/'])",
+                    Severity::Critical,
+                ),
+                // In a shell string a QUOTED `>` is a file name too.
+                ("execSync(\"rm -rf /tmp/x '>' /\")", Severity::Critical),
+                // GNU `rm` permutes: an option after an operand still applies.
+                ("spawnSync('rm', ['./build', '-rf'])", Severity::High),
+                // A dynamic operand does not end the argv.
+                ("system('rm', '-rf', $dir, '/')", Severity::Critical),
+                // A harmless payload in one literal does not end the search.
+                (
+                    "spawnSync('rm', ['-rf', 'rm -rf /tmp/y', '/'])",
+                    Severity::Critical,
+                ),
+                // Python's argv passed by keyword is still the argv.
+                (
+                    "subprocess.run(args=['rm', '-rf', '/'], check=True)",
+                    Severity::Critical,
+                ),
+            ] {
+                assert_eq!(severity(call), Some(expected), "{call}");
+            }
+        }
+
+        /// What an exec sink is told besides its argv — options, callbacks,
+        /// redirections, a paren-less statement's tail — names no operand.
+        /// Each of these deletes only `/tmp/x`.
+        #[test]
+        fn exec_sink_options_are_not_rm_operands() {
+            for call in [
+                "spawnSync('rm', ['-rf', '/tmp/x'], { stdio: 'inherit' })",
+                "execFile('rm', ['-rf', '/tmp/x'], (err) => console.log('rm -rf / failed'))",
+                "system('rm', '-rf', '/tmp/x', out: '/dev/null')",
+                "system('rm', '-rf', '/tmp/x', :out => '/dev/null')",
+                "system('rm', '-rf', '/tmp/x', 'out' => '/dev/null')",
+                "subprocess.run(['rm', '-rf', '/tmp/x'], cwd='/')",
+                "system 'rm', '-rf', '/tmp/x' or die \"rm -rf / failed\";",
+                "system 'rm', '-rf', '/tmp/x' if -d '/etc';",
+                "system 'rm', '-rf', '/tmp/x'; unlink '/etc';",
+                "execSync('rm -rf /tmp/x 2>/dev/null')",
+                "execSync('rm -rf /tmp/x > /dev/null')",
+            ] {
+                assert_eq!(
+                    detect_destructive_in_args(call).map(|hit| hit.severity),
+                    Some(Severity::Medium),
+                    "{call}"
+                );
+            }
+        }
+
+        /// Perl's argv form of `system`/`exec` is read in full. Only its first
+        /// literal used to be, and `rm` alone flags nothing.
+        #[test]
+        fn perl_argv_form_system_exec_is_read_in_full() {
+            let ast_matcher = AstMatcher::new();
+            // (blocks, is critical)
+            let verdict = |code: &str| {
+                let matches = ast_matcher
+                    .find_matches(code, ScriptLanguage::Perl)
+                    .expect("perl ast_matcher should run");
+                (
+                    matches.iter().any(|m| m.severity.blocks_by_default()),
+                    matches.iter().any(|m| m.severity == Severity::Critical),
+                )
+            };
+            assert_eq!(verdict("system('rm', '-rf', '/');\n"), (true, true));
+            assert_eq!(verdict("system 'rm', '-rf', '/';\n"), (true, true));
+            assert_eq!(verdict("exec('rm', '-rf', './build');\n"), (true, false));
+            assert_eq!(
+                verdict("system('git', 'reset', '--hard');\n"),
+                (true, false)
+            );
+            assert_eq!(
+                verdict("system('rm', '-rf', '/tmp/x') == 0 or die 'rm -rf / failed';\n"),
+                (false, false),
+                "the `die` message is outside the call"
+            );
+            assert_eq!(verdict("system('ls', '-la');\n"), (false, false));
+            // Without parentheses, a bracket inside an argument is not the
+            // call's own: `./build` after `lc(…)` is still an operand.
+            assert_eq!(
+                verdict("system 'rm', '-rf', lc('/tmp/x'), './build';\n"),
+                (true, false)
+            );
+            assert_eq!(
+                verdict("system 'rm', '-rf', '/tmp/x' if -d lc('/');\n"),
+                (false, false),
+                "the statement modifier is not part of the argv"
+            );
+        }
+
+        /// `rmtree`/`remove_tree` weigh every path they are given, in both
+        /// interfaces. Only the first used to count, and the legacy array
+        /// reference was not matched at all — `rmtree(['/'])` was allowed.
+        #[test]
+        fn perl_file_path_weighs_every_path() {
+            let ast_matcher = AstMatcher::new();
+            // (rule id, severity) of the File::Path match, if any.
+            let file_path_hit = |code: &str| {
+                ast_matcher
+                    .find_matches(code, ScriptLanguage::Perl)
+                    .expect("perl ast_matcher should run")
+                    .into_iter()
+                    .find(|m| m.rule_id.starts_with("heredoc.perl.file_path."))
+                    .map(|m| (m.rule_id, m.severity))
+            };
+            let blocks = |code: &str| {
+                file_path_hit(code).is_some_and(|(_, severity)| severity.blocks_by_default())
+            };
+            for code in [
+                "rmtree('/tmp/x', '/');\n",
+                "remove_tree('/tmp/x', './build');\n",
+                "File::Path::rmtree('/tmp/x', '/home/user');\n",
+                "rmtree(['/']);\n",
+                "rmtree(['/tmp/x', './build'], 1, 1);\n",
+                "rmtree '/tmp/x', '/';\n",
+            ] {
+                assert!(blocks(code), "{code}: {:?}", file_path_hit(code));
+            }
+            assert_eq!(
+                file_path_hit("rmtree('/tmp/x', './build');\n").map(|(rule, _)| rule),
+                Some("heredoc.perl.file_path.rmtree.non_temp".to_string())
+            );
+            // Temp-only targets, however many, stay warn-only; an options
+            // hash's strings are not paths; a dynamic list is not judged here.
+            for code in [
+                "rmtree('/tmp/x', '/var/tmp/y');\n",
+                "rmtree(['/tmp/x'], 0, 1);\n",
+                "remove_tree('/tmp/x', { error => \\my $err, result => '/' });\n",
+            ] {
+                assert!(!blocks(code), "{code}: {:?}", file_path_hit(code));
+            }
+            assert_eq!(file_path_hit("rmtree([$dir]);\n"), None);
         }
 
         /// #453: `File::Path` is normally imported and called bare, so requiring

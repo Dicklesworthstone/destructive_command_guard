@@ -48,10 +48,10 @@ fn declared_modules(source: &str) -> BTreeSet<&str> {
 /// Top-level `.rs` files a module pulls in through `#[path = "x.rs"]`.
 ///
 /// `#[path]` is the other way a file joins the crate: `ast_matcher.rs` declares
-/// `#[path = "ast_pattern_engine.rs"] mod engine;`, so that file is compiled,
-/// linted and tested as `ast_matcher::engine` even though no root names it. Only
-/// a bare file name counts — a path into a subdirectory names a nested file,
-/// which this guard does not inspect.
+/// `#[path = "ast_pattern_engine.rs"] mod pattern_engine;`, so that file is
+/// compiled, linted and tested as `ast_matcher::pattern_engine` even though no
+/// root names it. Only a bare file name counts — a path into a subdirectory
+/// names a nested file, which this guard does not inspect.
 fn path_included_modules(source: &str) -> BTreeSet<String> {
     source
         .lines()

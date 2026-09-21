@@ -25718,8 +25718,8 @@ fn evaluate_heredoc(
         // Removing the masking did not remove the hole the backstop covers. The
         // raw rescan needs contiguous destructive text, and an argv-split spawn
         // has none: in `cp.spawnSync("rm", ["-rf", "/home/user"])` the literals
-        // are separately harmless. `detect_destructive_in_args` is what joins them
-        // back into a command line, and its docstring names this exact shape —
+        // are separately harmless. `detect_destructive_in_args` is what reads them
+        // back as the command's argv, and its docstring names this exact shape —
         // Python already benefits from it, JavaScript and Ruby did not, purely
         // because nothing called this (#459).
         //
