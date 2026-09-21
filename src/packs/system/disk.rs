@@ -111,6 +111,13 @@ pub fn create_pack() -> Pack {
             "parted",
             "mount",
             "wipefs",
+            // The GPT editors need all three spellings here as well as in
+            // `PACK_ENTRIES`; a keyword present in only one of the two lists is
+            // inert (#441). Boundary-aware matching means `gdisk` does not cover
+            // `sgdisk`, and `cgdisk` covers neither (#456).
+            "sgdisk",
+            "gdisk",
+            "cgdisk",
             "/dev/",
             "mdadm",
             "btrfs",

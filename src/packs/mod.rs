@@ -2200,6 +2200,20 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             // one end-to-end through the evaluator.
             "mount",
             "umount",
+            // All three GPT-editor spellings are required, for the same reason
+            // `mount` and `umount` both are: the quick-reject is word-boundary
+            // aware, so `gdisk` does not match the token `sgdisk` (no boundary
+            // between `s` and `g`) and `cgdisk` derives from neither.
+            //
+            // Without these, `sgdisk-modify` and `gdisk-edit` were reachable
+            // only when some OTHER keyword on this row happened to appear, and
+            // the one carrying them was `/dev/`. Quoting the device hid it:
+            // `gdisk /dev/sda` denied while `gdisk '/dev/sda'` was
+            // quick-rejected with no keywords and allowed, along with
+            // `sgdisk -Z '/dev/sda'` and `sudo gdisk '/dev/sda'` (#456).
+            "sgdisk",
+            "gdisk",
+            "cgdisk",
             "mdadm",
             "btrfs",
             "dmsetup",
