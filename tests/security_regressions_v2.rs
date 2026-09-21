@@ -41,8 +41,7 @@ fn test_heredoc_spaced_delimiter_bypass() {
     // rules deny for their own reasons. #455 gave `shutil.rmtree` the same
     // temp carve-out `rm -rf /tmp/test` has always had, which would otherwise
     // make this pass or fail on the wrong thing.
-    let cmd =
-        "python3 << \"EOF SPACE\"\nimport shutil\nshutil.rmtree('/home/example/project')\nEOF SPACE";
+    let cmd = "python3 << \"EOF SPACE\"\nimport shutil\nshutil.rmtree('/home/example/project')\nEOF SPACE";
     check_blocked(cmd);
 }
 
