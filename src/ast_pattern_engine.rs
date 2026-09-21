@@ -2781,23 +2781,31 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
                 Severity::Medium,
                 Some("Validate command and arguments carefully".to_string()),
             ),
-            // Async versions (still dangerous)
+            // Async versions (still dangerous). Metavariable receivers for the
+            // same reason the `*Sync` siblings above have them: a literal `fs.`
+            // matched only one binding spelling, so an aliased promises object
+            // was unguarded. `const fsp = require('fs').promises; fsp.rm(p,
+            // {recursive:true})` and `const fsp = require('fs/promises')` were
+            // both allowed at a catastrophic target while `fs.rm` and the
+            // chained `require('fs').promises.rm` denied (#459). Over-matching
+            // stays bounded by the same severity refinement: `recursive: true`
+            // or a catastrophic/non-temp literal target is still required.
             CompiledPattern::new(
-                "fs.rm($$$)".to_string(),
+                "$FS.rm($$$)".to_string(),
                 "heredoc.javascript.fs_rm".to_string(),
                 "fs.rm() deletes files/directories".to_string(),
                 Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
                 Some("Verify target path carefully before running".to_string()),
             ),
             CompiledPattern::new(
-                "fs.rmdir($$$)".to_string(),
+                "$FS.rmdir($$$)".to_string(),
                 "heredoc.javascript.fs_rmdir".to_string(),
                 "fs.rmdir() deletes directories".to_string(),
                 Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
                 Some("Verify target path carefully before running".to_string()),
             ),
             CompiledPattern::new(
-                "fs.unlink($$$)".to_string(),
+                "$FS.unlink($$$)".to_string(),
                 "heredoc.javascript.fs_unlink".to_string(),
                 "fs.unlink() deletes files".to_string(),
                 Severity::Low,
@@ -2901,22 +2909,24 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
                 Severity::Medium,
                 Some("Validate command and arguments carefully".to_string()),
             ),
+            // Metavariable receivers, matching the JavaScript block: a literal
+            // `fs.` left an aliased promises object unguarded (#459).
             CompiledPattern::new(
-                "fs.rm($$$)".to_string(),
+                "$FS.rm($$$)".to_string(),
                 "heredoc.typescript.fs_rm".to_string(),
                 "fs.rm() deletes files/directories".to_string(),
                 Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
                 Some("Verify target path carefully before running".to_string()),
             ),
             CompiledPattern::new(
-                "fs.rmdir($$$)".to_string(),
+                "$FS.rmdir($$$)".to_string(),
                 "heredoc.typescript.fs_rmdir".to_string(),
                 "fs.rmdir() deletes directories".to_string(),
                 Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
                 Some("Verify target path carefully before running".to_string()),
             ),
             CompiledPattern::new(
-                "fs.unlink($$$)".to_string(),
+                "$FS.unlink($$$)".to_string(),
                 "heredoc.typescript.fs_unlink".to_string(),
                 "fs.unlink() deletes files".to_string(),
                 Severity::Low,
