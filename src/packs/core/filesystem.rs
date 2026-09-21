@@ -4648,6 +4648,48 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                `core.filesystem:credential-file-write` in that project's dcg config with a reason.",
             super::credential_files::CREDENTIAL_FILE_WRITE_SUGGESTIONS
         ),
+        // ----- `.git/` writes (Critical, semantic) -----
+        //
+        // Same classifier, same unsatisfiable-regex arrangement, separate id.
+        // A project that must rewrite `.git/config` allowlists this without
+        // also granting itself `~/.ssh/authorized_keys`, which is the whole
+        // reason it is not folded into `credential-file-write` (#457).
+        //
+        // Redirects are NOT decided here: `> .git/x` and `>> .git/x` keep
+        // `redirect-truncate-git-internals-relative` and
+        // `redirect-append-git-internals-relative`, so no existing allowlist
+        // entry changes meaning. This id covers the writers those two rules
+        // cannot see.
+        destructive_pattern!(
+            "git-internals-write",
+            r"(?!)",
+            "writing inside a `.git` directory with `tee`, `sponge`, `cp`/`mv`/`install`, `sed -i`, `perl -i`, `dd of=`, or an embedded-code sink rewrites repository state: `.git/config` carries remotes, `insteadOf` rewrites and credential helpers, `.git/hooks/*` run on ordinary git commands, and refs and objects are the history itself. Reads are unaffected, and `.gitignore`, `.gitattributes`, `.gitmodules` and `.github/` are not this rule.",
+            Critical,
+            "`.git` is not a secret, it is the repository. Three of its contents \
+             change what later commands do rather than what they see: `config` \
+             names the remotes a push reaches and can install a credential \
+             helper or an `insteadOf` rewrite that silently redirects a fetch; \
+             `hooks/*` execute on commit, push and checkout, so writing one is \
+             arbitrary code execution at the next ordinary git command; refs \
+             and objects are the history, and rewriting them by hand loses work \
+             in a way `git reflog` cannot always recover.\n\n\
+             The write is judged by the path the shell will open, so a \
+             checkout-relative `.git/config`, a nested `repo/.git/config`, and \
+             a quoted or escaped spelling are all recognised.\n\n\
+             What stays allowed:\n\
+             - Reading anything under `.git/` (`cat`, `grep`, `git config --list`).\n\
+             - Every git porcelain command; this rule never sees them.\n\
+             - `.gitignore`, `.gitattributes`, `.gitmodules`, `.github/` — none \
+               of these are inside `.git/`.\n\n\
+             Safer alternatives:\n\
+             - `git config <key> <value>` edits config with git's own validation.\n\
+             - `git remote set-url` changes a remote without touching the file.\n\
+             - Show the user the exact change and let them apply it, or use \
+               `dcg allow-once` for a one-off.\n\
+             - For a project that genuinely manages `.git` files, allowlist \
+               `core.filesystem:git-internals-write` with a reason.",
+            super::credential_files::GIT_INTERNALS_WRITE_SUGGESTIONS
+        ),
         // ----- `> <sensitive>` (Critical: shell redirect truncate) -----
         //
         // Bash output redirection truncates the target file to zero

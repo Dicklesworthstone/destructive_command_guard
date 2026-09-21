@@ -23405,7 +23405,10 @@ fn evaluate_core_filesystem_pack(
                 .as_ref(),
             shell_dialect,
         ) {
-            let rule = crate::packs::core::credential_files::CREDENTIAL_FILE_WRITE_NAME;
+            // The hit names its own rule: `.git/` writes deny under
+            // `git-internals-write` so allowing one does not also allow a
+            // write to `~/.ssh/authorized_keys` (#457).
+            let rule = hit.rule;
             let severity = crate::packs::Severity::Critical;
             let (explanation, suggestions) = pack.rule_guidance(rule);
             let span = MatchSpan {

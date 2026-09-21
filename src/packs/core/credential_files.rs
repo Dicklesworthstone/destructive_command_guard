@@ -9,7 +9,7 @@ mod shell;
 
 pub(crate) use shell::{
     CREDENTIAL_FILE_WRITE_NAME, CREDENTIAL_FILE_WRITE_SUGGESTIONS, CredentialFileWrite,
-    may_name_protected_path,
+    GIT_INTERNALS_WRITE_NAME, GIT_INTERNALS_WRITE_SUGGESTIONS, may_name_protected_path,
 };
 
 use crate::normalize::ShellDialect;
