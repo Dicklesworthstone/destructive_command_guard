@@ -5,14 +5,7 @@
       "camelcase": "Bash",
       "scope": "source.bash",
       "path": ".",
-      "file-types": [
-        "sh",
-        "bash",
-        ".bashrc",
-        ".bash_profile",
-        "ebuild",
-        "eclass"
-      ],
+      "file-types": ["sh", "bash", ".bashrc", ".bash_profile", "ebuild", "eclass"],
       "injection-regex": "^(shell|bash|sh)$",
       "first-line-regex": "^#!.*\\b(sh|bash|dash)\\b.*$"
     }

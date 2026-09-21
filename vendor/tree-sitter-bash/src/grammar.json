@@ -6980,29 +6980,12 @@
     }
   ],
   "conflicts": [
-    [
-      "_expression",
-      "command_name"
-    ],
-    [
-      "command",
-      "variable_assignments"
-    ],
-    [
-      "redirected_statement",
-      "command"
-    ],
-    [
-      "redirected_statement",
-      "command_substitution"
-    ],
-    [
-      "function_definition",
-      "command_name"
-    ],
-    [
-      "pipeline"
-    ]
+    ["_expression", "command_name"],
+    ["command", "variable_assignments"],
+    ["redirected_statement", "command"],
+    ["redirected_statement", "command_substitution"],
+    ["function_definition", "command_name"],
+    ["pipeline"]
   ],
   "precedences": [],
   "externals": [
@@ -7136,10 +7119,6 @@
     "_statement_not_subshell",
     "_redirect"
   ],
-  "supertypes": [
-    "_statement",
-    "_expression",
-    "_primary_expression"
-  ],
+  "supertypes": ["_statement", "_expression", "_primary_expression"],
   "reserved": {}
 }
