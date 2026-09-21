@@ -228,18 +228,24 @@ fn command_words(command: &Syntax<'_>) -> Option<Vec<String>> {
 /// file redirects may live on the enclosing redirected_statement; do not
 /// accidentally inspect a here-string that a later `< /dev/null` replaces.
 fn here_string_source(command: &Syntax<'_>) -> Option<(String, Range<usize>)> {
-    let mut redirects: Vec<_> = command.field_children("redirect").collect();
-    if let Some(parent) = command.parent() {
-        if parent.kind() == "redirected_statement"
+    // Bound to a local so the chained iterator can borrow it; the redirects on
+    // the enclosing `redirected_statement` are appended after the command's own
+    // so `max_by_key` breaks ties the same way the collected form did.
+    let enclosing = command.parent().filter(|parent| {
+        parent.kind() == "redirected_statement"
             && parent
                 .field("body")
                 .is_some_and(|body| body.range() == command.range())
-        {
-            redirects.extend(parent.field_children("redirect"));
-        }
-    }
-    let redirect = redirects
-        .into_iter()
+    });
+    let redirect = command
+        .field_children("redirect")
+        .chain(
+            enclosing
+                .as_ref()
+                .map(|parent| parent.field_children("redirect"))
+                .into_iter()
+                .flatten(),
+        )
         .filter(|redirect| {
             if let Some(descriptor) = redirect.field("descriptor") {
                 return descriptor.text().parse::<u32>() == Ok(0);

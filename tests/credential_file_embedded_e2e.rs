@@ -133,6 +133,41 @@ fn embedded_writes_reach_the_core_rule_through_the_hook() {
     }
 }
 
+/// A wrapper prefix must not change the hook's answer (#464).
+///
+/// This has to run end-to-end. The classifier was never wrong about these —
+/// called directly it returns a hit for every row below — but the *candidate
+/// gate* took the segment's first token as the executable, so `sudo python3 …`
+/// presented `sudo`, which is neither a credential writer nor an interpreter,
+/// and the pack was never made a candidate. Twelve of twelve wrapped embedded
+/// spellings were allowed while every shell spelling of the same write denied.
+///
+/// So a unit test at the classifier would have stayed green throughout the bug,
+/// and did. The shell row is carried alongside on purpose: it passed before the
+/// fix too, and it is what makes this a *parity* assertion rather than a list —
+/// the two halves must answer the same way about the same write.
+///
+/// `sudo` and `env` are the words an agent actually adds when a step is
+/// refused, which is why the prefix list is the retry vocabulary rather than a
+/// theoretical one. `FOO=1` is an assignment prefix rather than a wrapper
+/// command and reaches the same code path.
+#[test]
+fn a_wrapper_prefix_does_not_change_the_hook_verdict() {
+    let home = home();
+    let sinks = [
+        r#"python3 -c "open('/home/me/.bashrc', 'w')""#,
+        r#"ruby -e "File.write('/home/me/.bashrc', 'x')""#,
+        r#"node -e "require('fs').writeFileSync('/home/me/.bashrc','x')""#,
+        // The shell half, which always worked; it keeps this honest.
+        "tee /home/me/.bashrc",
+    ];
+    for sink in sinks {
+        for prefix in ["", "sudo ", "env ", "/usr/bin/env ", "FOO=1 "] {
+            assert_denied(&format!("{prefix}{sink}"), home.path());
+        }
+    }
+}
+
 #[test]
 fn reported_targets_have_shell_inline_and_heredoc_policy_parity() {
     let home = home();

@@ -1383,30 +1383,48 @@ fn posix_segment_requires_rm_semantic_scan(segment: &str) -> bool {
     if !segment.contains(['$', '`', '\'', '"', '\\', '*', '?', '[', '{']) {
         return false;
     }
-    // Read the executable THROUGH wrapper prefixes. The first token of
-    // `sudo python3 -c ...` is `sudo`, which is neither a credential writer nor
-    // an interpreter, so without this the pack is never made a candidate and
-    // `credential-file-write` never runs — while the identical command with no
-    // prefix denies.
+    // Ask about the segment as written AND about the segment with wrapper
+    // prefixes removed, and admit the pack if EITHER view names a writer.
     //
-    // Measured before the fix: all twelve combinations of
-    // {sudo, env, /usr/bin/env, FOO=1} x {python3 -c, ruby -e, node -e}
-    // writing a login-shell startup file were ALLOWED, including
-    // `sudo python3 -c "open('~/.ssh/authorized_keys','w')"`, while every shell
-    // writer spelling of the same write denied (#464).
+    // Both views are needed, and taking only one is a real defect in each
+    // direction:
     //
-    // The classifier was already correct for these inputs — called directly it
-    // returns a hit for every wrapped spelling — so this is a gating defect,
-    // not a policy one. Widening a candidate gate cannot manufacture a false
-    // positive: it only lets the classifier see a command it would otherwise
+    // - As-written only: the first token of `sudo python3 -c "…"` is `sudo`,
+    //   which is neither a credential writer nor an interpreter, so the pack
+    //   was never made a candidate and `credential-file-write` never ran, while
+    //   the identical command without the prefix denied. Measured: all twelve
+    //   combinations of {sudo, env, /usr/bin/env, FOO=1} x three interpreters
+    //   writing a login-shell startup file were allowed (#464).
+    //
+    // - Unwrapped only: `strip_wrapper_prefixes` also unwraps an *interpreter*
+    //   down to the code it runs, so the first token of `python3 -c "open(…)"`
+    //   becomes the payload rather than `python3`, and the gate answers false
+    //   for a command it used to admit. That is a false NEGATIVE, and it is why
+    //   this ORs rather than replaces.
+    //
+    // OR-ing is strictly more permissive than the original, so it can only add
+    // candidates. It cannot manufacture a false positive: nothing here decides
+    // anything, it only lets the classifier see a command it would otherwise
     // never judge, and the classifier is what decides.
-    let unwrapped = crate::normalize::strip_wrapper_prefixes(segment);
-    let effective = unwrapped.normalized.as_ref();
-    let tokens = tokenize_for_shell_dialect(effective, ShellDialect::Posix);
+    // The unwrap is deliberately on the right of the `||`: this runs on every
+    // command, and a segment whose first word is already a writer never pays
+    // for the rewrite.
+    segment_names_semantic_writer(segment)
+        || segment_names_semantic_writer(
+            crate::normalize::strip_wrapper_prefixes(segment)
+                .normalized
+                .as_ref(),
+        )
+}
+
+/// Whether the first word of `segment`, as spelled, is a writer the semantic
+/// rules in this pack own.
+fn segment_names_semantic_writer(segment: &str) -> bool {
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
     let Some(raw) = tokens
         .iter()
         .find(|token| token.kind != NormalizeTokenKind::Separator)
-        .and_then(|token| token.text(effective))
+        .and_then(|token| token.text(segment))
     else {
         return false;
     };
