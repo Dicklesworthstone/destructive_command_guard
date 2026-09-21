@@ -74,19 +74,18 @@ impl DefaultPolicyMatcher {
 /// Retains the existing deletion backstop and adds protected writes on the SAME
 /// extracted-source path, before the expensive full-pattern scan. This is
 /// independent of core.filesystem's shell-keyword candidate gate.
+/// Returns all established rule families: the caller must apply a rule grant
+/// to each finding, not treat the first granted rule as a grant for the script.
 #[must_use]
-pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Option<PatternMatch> {
+pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Vec<PatternMatch> {
     let existing = engine::scan_filesystem_sink_fallback(code, language);
-    if existing
-        .as_ref()
-        .is_some_and(|hit| hit.severity.blocks_by_default())
-    {
-        return existing;
+    let mut matches = protected_matches(code, language).unwrap_or_default();
+    // Keep the established deletion precedence, but do not discard another
+    // policy finding before the evaluator has applied per-rule allowlists.
+    if let Some(existing) = existing {
+        matches.insert(0, existing);
     }
-    protected_matches(code, language)
-        .ok()
-        .and_then(|hits| hits.into_iter().next())
-        .or(existing)
+    matches
 }
 
 fn protected_scan_budget() -> Duration {
@@ -200,7 +199,9 @@ mod tests {
                 "const p: string = '/home/u/.bashrc'; require('fs').writeFileSync(p, 'x')",
             ),
         ] {
-            let early = scan_filesystem_sink_fallback(source, language).expect(source);
+            let early = scan_filesystem_sink_fallback(source, language);
+            assert_eq!(early.len(), 1, "{source}: {early:?}");
+            let early = &early[0];
             assert_eq!(early.rule_id, "core.filesystem.credential-file-write");
             assert_eq!(early.severity, Severity::Critical);
             assert!(source.get(early.start..early.end).is_some());
@@ -238,6 +239,48 @@ mod tests {
             );
             assert!(core[0].start < core[1].start);
         }
+    }
+
+    #[test]
+    fn early_backstop_preserves_both_rules_at_one_transfer_span() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "import os; os.replace('.git/config', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::Ruby,
+                "File.rename('.git/config', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('fs').renameSync('.git/config', '.bashrc')",
+            ),
+        ] {
+            for hits in [
+                scan_filesystem_sink_fallback(source, language),
+                DEFAULT_MATCHER.find_matches(source, language).unwrap(),
+            ] {
+                let core: Vec<_> = hits
+                    .iter()
+                    .filter(|hit| hit.rule_id.starts_with("core.filesystem."))
+                    .collect();
+                assert_eq!(core.len(), 2, "{source}: {hits:?}");
+                assert_ne!(core[0].rule_id, core[1].rule_id, "{source}");
+                assert_eq!((core[0].start, core[0].end), (core[1].start, core[1].end));
+            }
+        }
+    }
+
+    #[test]
+    fn early_backstop_retains_writes_beside_an_allowlistable_deletion() {
+        let source = "FileUtils.rm_rf('/home/u/work'); File.write('/etc/shadow', 'x')";
+        let hits = scan_filesystem_sink_fallback(source, ScriptLanguage::Ruby);
+        assert!(hits[0].rule_id.starts_with("heredoc.ruby.fileutils_rm_rf"));
+        assert!(
+            hits.iter()
+                .any(|hit| hit.rule_id == "core.filesystem.credential-file-write")
+        );
     }
 
     #[test]

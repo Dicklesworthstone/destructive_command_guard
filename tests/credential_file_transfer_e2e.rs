@@ -259,10 +259,18 @@ fn shutil_copy_placement_checks_the_effective_destination() {
         for (source, destination, rule) in [
             ("staged", "/etc/shadow", Some("credential-file-write")),
             ("fixtures/.bashrc", "/home/u", Some("credential-file-write")),
-            ("fixtures/credentials", "/home/u/.aws", Some("credential-file-write")),
+            (
+                "fixtures/credentials",
+                "/home/u/.aws",
+                Some("credential-file-write"),
+            ),
             ("fixtures/passwd", "/etc", Some("credential-file-write")),
             ("staged", ".git", Some("git-internals-write")),
-            ("staged", "/home/u/.ssh/known_hosts", Some("credential-file-write")),
+            (
+                "staged",
+                "/home/u/.ssh/known_hosts",
+                Some("credential-file-write"),
+            ),
             ("notes.txt", "/home/u", None),
             ("readme.txt", "/home/u/.aws", None),
             ("fixtures/pass*", "/etc", None),
@@ -278,7 +286,12 @@ fn shutil_copy_placement_checks_the_effective_destination() {
         "import shutil; shutil.copy2(source, '/home/u')",
         "import shutil, os; shutil.copy2('fixtures/.bashrc', os.path.expanduser('~'))",
     ] {
-        assert_program("python3", source, home.path(), Some("credential-file-write"));
+        assert_program(
+            "python3",
+            source,
+            home.path(),
+            Some("credential-file-write"),
+        );
     }
 }
 
@@ -292,7 +305,12 @@ fn shutil_recursive_restore_and_move_preserve_source_effects() {
         "import shutil; shutil.move('/home/u/.aws', 'backup')",
         "from shutil import move as archive; archive(src='/home/u/.config', dst=destination)",
     ] {
-        assert_program("python3", source, home.path(), Some("credential-file-write"));
+        assert_program(
+            "python3",
+            source,
+            home.path(),
+            Some("credential-file-write"),
+        );
     }
     for source in [
         "import shutil; shutil.copytree('backup', '.git', dirs_exist_ok=True)",
@@ -339,9 +357,18 @@ fn shutil_move_cannot_cross_independently_allowlisted_rules() {
 fn shutil_directory_transfers_reach_stdin_without_scanning_inert_data() {
     let home = home();
     for (source, rule) in [
-        ("import shutil; shutil.copy2('fixtures/.bashrc', '/home/u')", Some("credential-file-write")),
-        ("import shutil; shutil.copytree('backup', '/home/u')", Some("credential-file-write")),
-        ("from shutil import move as archive; archive('.git', 'backup')", Some("git-internals-write")),
+        (
+            "import shutil; shutil.copy2('fixtures/.bashrc', '/home/u')",
+            Some("credential-file-write"),
+        ),
+        (
+            "import shutil; shutil.copytree('backup', '/home/u')",
+            Some("credential-file-write"),
+        ),
+        (
+            "from shutil import move as archive; archive('.git', 'backup')",
+            Some("git-internals-write"),
+        ),
         ("import shutil; shutil.copy('notes.txt', '/home/u')", None),
         ("print(\"shutil.copytree('backup', '/etc')\")", None),
     ] {
@@ -354,4 +381,128 @@ fn shutil_directory_transfers_reach_stdin_without_scanning_inert_data() {
         home.path(),
         None,
     );
+}
+
+#[test]
+fn cross_rule_grants_survive_every_delivery_and_extraction_mode() {
+    use std::fmt::Write as _;
+
+    for settings in [
+        "[heredoc]\nenabled = true\ntimeout_ms = 5000\n",
+        "[heredoc]\nenabled = true\ntimeout_ms = 0\n",
+        "[heredoc]\nenabled = false\n",
+    ] {
+        for (allowed, denied) in [
+            ("credential-file-write", Some("git-internals-write")),
+            ("git-internals-write", Some("credential-file-write")),
+            ("both", None),
+        ] {
+            let home = home();
+            fs::write(home.path().join("config.toml"), settings).unwrap();
+            let rules = if allowed == "both" {
+                vec!["credential-file-write", "git-internals-write"]
+            } else {
+                vec![allowed]
+            };
+            let mut grants = String::new();
+            for rule in &rules {
+                writeln!(
+                    grants,
+                    "[[allow]]\nrule = \"core.filesystem:{rule}\"\nreason = \"reviewed endpoint\""
+                )
+                .expect("write rule grant");
+            }
+            fs::write(home.path().join("xdg/dcg/allowlist.toml"), grants).unwrap();
+            for rule in rules {
+                let target = if rule == "credential-file-write" {
+                    ".bashrc"
+                } else {
+                    ".git/config"
+                };
+                // Prove that the grant was loaded; a broken allowlist must not
+                // satisfy the cross-rule DENY assertion by accident.
+                assert_program(
+                    "python3",
+                    &format!("open('{target}', 'w')"),
+                    home.path(),
+                    None,
+                );
+            }
+            for (source, destination) in [(".bashrc", ".git/config"), (".git/config", ".bashrc")] {
+                for (exe, program) in [
+                    (
+                        "python3",
+                        format!("import os; os.replace('{source}', '{destination}')"),
+                    ),
+                    ("ruby", format!("File.rename('{source}', '{destination}')")),
+                    (
+                        "node",
+                        format!("require('fs').renameSync('{source}', '{destination}')"),
+                    ),
+                ] {
+                    assert_program(exe, &program, home.path(), denied);
+                    let quoted = format!("'{}'", program.replace('\'', "'\\''"));
+                    assert_decision(&format!("env {exe} - 0<<< {quoted}"), home.path(), denied);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_granted_first_segment_does_not_hide_a_later_interpreter_rule() {
+    let home = home();
+    fs::write(
+        home.path().join("config.toml"),
+        "[heredoc]\nenabled = false\n",
+    )
+    .unwrap();
+    fs::write(
+        home.path().join("xdg/dcg/allowlist.toml"),
+        "[[allow]]\nrule = \"core.filesystem:credential-file-write\"\nreason = \"one rule only\"\n",
+    )
+    .unwrap();
+    assert_decision("echo x >> .bashrc", home.path(), None);
+    for command in [
+        "echo x >> .bashrc; python3 0<<< \"open('.git/config', 'w')\"",
+        "python3 0<<< \"open('.bashrc', 'w')\"; python3 0<<< \"open('.git/config', 'w')\"",
+        "python3 -c \"open('.bashrc', 'w'); open('.git/config', 'w')\"",
+    ] {
+        assert_decision(command, home.path(), Some("git-internals-write"));
+    }
+}
+
+#[test]
+fn explicit_language_filters_preserve_other_interpreters_and_shell_writes() {
+    for settings in [
+        "[heredoc]\nenabled = true\ntimeout_ms = 5000\nlanguages = ['ruby']\n",
+        "[heredoc]\nenabled = true\ntimeout_ms = 0\nlanguages = ['ruby']\n",
+        "[heredoc]\nenabled = false\nlanguages = ['ruby']\n",
+    ] {
+        let home = home();
+        fs::write(home.path().join("config.toml"), settings).unwrap();
+        assert_program("python3", "open('.bashrc', 'w')", home.path(), None);
+        assert_decision(
+            "env python3 - 0<<< \"open('.bashrc', 'w')\"",
+            home.path(),
+            None,
+        );
+        assert_program(
+            "ruby",
+            "File.write('.git/config', 'x')",
+            home.path(),
+            Some("git-internals-write"),
+        );
+        assert_decision(
+            "python3 0<<< \"open('.bashrc', 'w')\"; ruby 0<<< \"File.write('.git/config', 'x')\"",
+            home.path(),
+            Some("git-internals-write"),
+        );
+        // An interpreter-language exclusion never grants shell file writes.
+        assert_decision(
+            "echo x >> .bashrc",
+            home.path(),
+            Some("credential-file-write"),
+        );
+    }
 }

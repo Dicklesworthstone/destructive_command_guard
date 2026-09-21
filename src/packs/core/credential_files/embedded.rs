@@ -76,8 +76,8 @@ pub(crate) fn source_scan_required(code: &str, language: ScriptLanguage) -> bool
 /// family's files. Keep this a superset, not a raw destination-path check.
 fn source_has_sink_name(code: &str) -> bool {
     [
-        "open", "write", "Write", "append", "truncate", "File", "Path", "copy", "rename", "replace",
-        "move",
+        "open", "write", "Write", "append", "truncate", "File", "Path", "copy", "rename",
+        "replace", "move",
     ]
     .iter()
     .any(|word| code.contains(word))
@@ -131,13 +131,39 @@ fn mode_access(mode: &str) -> Option<Access> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<CredentialFileWrite> {
+    scan_command(segment, dialect, |_, _| false)
+        .into_iter()
+        .next()
+}
+
+/// Keep one finding for every affected rule until the evaluator applies its
+/// allowlists. A rename can affect two rules at the very same source span.
+/// Apply explicit source exemptions per decoded program, never to the entire
+/// shell command: another interpreter or shell writer may still be protected.
+pub(super) fn scan_command(
+    segment: &str,
+    dialect: ShellDialect,
+    mut source_is_exempt: impl FnMut(&str, ScriptLanguage) -> bool,
+) -> Vec<CredentialFileWrite> {
+    let mut hits = Vec::new();
     if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
         || segment.len() > MAX_BYTES
         || !source_has_sink_name(segment)
     {
-        return None;
+        return hits;
     }
+    let mut inspect_source = |code: &str, language: Language, span: Range<usize>| {
+        let script_language = match language {
+            Language::Python => ScriptLanguage::Python,
+            Language::Ruby => ScriptLanguage::Ruby,
+            Language::Node => ScriptLanguage::JavaScript,
+        };
+        if !source_is_exempt(code, script_language) {
+            inspect(code, language, span, &mut hits);
+        }
+    };
     let ast = AstGrep::new(segment, SupportLang::Bash);
     let root = ast.root();
     for command in root.dfs().filter(|node| node.kind() == "command") {
@@ -148,15 +174,11 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
             continue;
         };
         if let Some(code) = inline_code(&words, language) {
-            if let Some(hit) = inspect(&code, language, command.range()) {
-                return Some(hit);
-            }
+            inspect_source(&code, language, command.range());
         }
         if reads_stdin(&words, language) {
             if let Some((code, span)) = here_string_source(&command) {
-                if let Some(hit) = inspect(&code, language, span) {
-                    return Some(hit);
-                }
+                inspect_source(&code, language, span);
             }
         }
     }
@@ -166,15 +188,15 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
     // verify that receiver against executable command nodes in the shell AST.
     if segment.contains("<<") {
         // Structural budget, not the 50 ms hot-path default (#443). This is a
-        // classification — anything but a completed extraction becomes `None`
-        // below, i.e. "no protected write" — so on the default budget the
-        // answer followed how busy the host was rather than the command.
+        // classification, so the answer must not depend on host load. An
+        // incomplete extraction must not discard findings already established
+        // by another inline script or here-string in this command.
         let items = match extract_content(segment, &ExtractionLimits::structural_scan()) {
             ExtractionResult::Extracted(items)
             | ExtractionResult::Partial {
                 extracted: items, ..
             } => items,
-            _ => return None,
+            _ => return hits,
         };
         for item in items {
             // Here-strings were inspected on their owning command above. A
@@ -202,13 +224,11 @@ pub(super) fn classify(segment: &str, dialect: ShellDialect) -> Option<Credentia
             });
             if receiver {
                 let span = item.content_range.unwrap_or(item.byte_range);
-                if let Some(hit) = inspect(&item.content, language, span) {
-                    return Some(hit);
-                }
+                inspect_source(&item.content, language, span);
             }
         }
     }
-    None
+    hits
 }
 
 /// Redirections are syntax, not argv. In the Bash grammar a here-string is
@@ -418,18 +438,25 @@ enum Value {
 
 type Bindings = HashMap<String, Value>;
 
-fn inspect(code: &str, language: Language, span: Range<usize>) -> Option<CredentialFileWrite> {
+fn inspect(
+    code: &str,
+    language: Language,
+    span: Range<usize>,
+    hits: &mut Vec<CredentialFileWrite>,
+) {
     let grammar = match language {
         Language::Python => SupportLang::Python,
         Language::Ruby => SupportLang::Ruby,
         Language::Node => SupportLang::JavaScript,
     };
-    let mut hit = scan_source(code, language, grammar)
-        .ok()?
-        .into_iter()
-        .next()?;
-    hit.span = span;
-    Some(hit)
+    if let Ok(found) = scan_source(code, language, grammar) {
+        for mut hit in found {
+            if !hits.iter().any(|existing| existing.rule == hit.rule) {
+                hit.span = span.clone();
+                hits.push(hit);
+            }
+        }
+    }
 }
 
 fn scan_source(
@@ -1091,6 +1118,47 @@ mod here_string_tests {
     use super::*;
 
     #[test]
+    fn source_exemptions_do_not_hide_a_different_program() {
+        let command =
+            "python3 0<<< \"open('.bashrc', 'w')\"; ruby 0<<< \"File.write('.git/config', 'x')\"";
+        let hits = scan_command(command, ShellDialect::Posix, |_, language| {
+            language == ScriptLanguage::Python
+        });
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].rule, shell::GIT_INTERNALS_WRITE_NAME);
+        assert!(command[hits[0].span.clone()].contains("File.write"));
+
+        let command =
+            "python3 <<< \"open('.bashrc', 'w')\"; python3 <<< \"open('.git/config', 'w')\"";
+        let hits = scan_command(command, ShellDialect::Posix, |code, _| {
+            code.contains(".bashrc")
+        });
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].rule, shell::GIT_INTERNALS_WRITE_NAME);
+    }
+
+    #[test]
+    fn command_scan_retains_independent_rules_with_coincident_spans() {
+        for command in [
+            "python3 -c \"import os; os.replace('.git/config', '.bashrc')\"",
+            "python3 -c \"import os; os.replace('.bashrc', '.git/config')\"",
+            "ruby 0<<< \"File.rename('.git/config', '.bashrc')\"",
+            "node <<'JS'\nrequire('fs').renameSync('.git/config', '.bashrc')\nJS",
+        ] {
+            let hits = scan_command(command, ShellDialect::Posix, |_, _| false);
+            assert_eq!(hits.len(), 2, "{command}: {hits:?}");
+            assert_ne!(hits[0].rule, hits[1].rule, "{command}");
+            assert_eq!(hits[0].span, hits[1].span, "{command}");
+            assert!(command.get(hits[0].span.clone()).is_some());
+        }
+        let command =
+            "python3 <<< \"open('.bashrc', 'w')\"; python3 <<< \"open('.git/config', 'w')\"";
+        let hits = scan_command(command, ShellDialect::Posix, |_, _| false);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits[0].span.end < hits[1].span.start, "{hits:?}");
+    }
+
+    #[test]
     fn here_string_parser_preserves_descriptors_and_receiver_argv() {
         for descriptor in ["0", "00", "3"] {
             let command = format!("python3 {descriptor}<<< 'pass'");
@@ -1345,7 +1413,10 @@ mod assignment_order_tests {
                 ScriptLanguage::TypeScript,
                 "let fs: any = require('fs'); fs = fs.writeFileSync('.bashrc', 'x')",
             ),
-            (ScriptLanguage::Ruby, "File = File.write('/etc/shadow', 'x')"),
+            (
+                ScriptLanguage::Ruby,
+                "File = File.write('/etc/shadow', 'x')",
+            ),
             (
                 ScriptLanguage::Ruby,
                 "writer = File; writer = writer.write('/etc/shadow', 'x')",
@@ -1379,7 +1450,9 @@ mod assignment_order_tests {
             ),
         ] {
             assert!(
-                scan_extracted(source, language).expect("complete analysis").is_empty(),
+                scan_extracted(source, language)
+                    .expect("complete analysis")
+                    .is_empty(),
                 "{source}"
             );
         }
@@ -1387,7 +1460,9 @@ mod assignment_order_tests {
         // of an unknown call is invalidated, not every right-hand-side value.
         let source = "import shutil; save = shutil; save.copy2('staged', '.bashrc')";
         assert_eq!(
-            scan_extracted(source, ScriptLanguage::Python).unwrap().len(),
+            scan_extracted(source, ScriptLanguage::Python)
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -1403,7 +1478,10 @@ mod assignment_order_tests {
                 ScriptLanguage::JavaScript,
                 "let fs = require('fs'); fs = fs.renameSync('.bashrc', '.git/config')",
             ),
-            (ScriptLanguage::Ruby, "File = File.rename('.bashrc', '.git/config')"),
+            (
+                ScriptLanguage::Ruby,
+                "File = File.rename('.bashrc', '.git/config')",
+            ),
         ] {
             let mut rules: Vec<_> = scan_extracted(source, language)
                 .expect("complete source analysis")
@@ -1413,7 +1491,10 @@ mod assignment_order_tests {
             rules.sort_unstable();
             assert_eq!(
                 rules,
-                [shell::CREDENTIAL_FILE_WRITE_NAME, shell::GIT_INTERNALS_WRITE_NAME],
+                [
+                    shell::CREDENTIAL_FILE_WRITE_NAME,
+                    shell::GIT_INTERNALS_WRITE_NAME
+                ],
                 "{source}"
             );
         }

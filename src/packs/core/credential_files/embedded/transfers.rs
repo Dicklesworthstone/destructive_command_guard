@@ -565,13 +565,21 @@ mod tests {
             "import shutil; shutil.copy2(source, '/home/u')",
             "import shutil; shutil.copy2('staged', '/home/u/.ssh/known_hosts')",
         ] {
-            assert_eq!(rules(source, ScriptLanguage::Python), ["credential-file-write"], "{source}");
+            assert_eq!(
+                rules(source, ScriptLanguage::Python),
+                ["credential-file-write"],
+                "{source}"
+            );
         }
         for source in [
             "import shutil; shutil.copy2('staged', '.git')",
             "from shutil import copy as publish; publish('staged', 'repo/.git/hooks')",
         ] {
-            assert_eq!(rules(source, ScriptLanguage::Python), ["git-internals-write"], "{source}");
+            assert_eq!(
+                rules(source, ScriptLanguage::Python),
+                ["git-internals-write"],
+                "{source}"
+            );
         }
     }
 
@@ -583,10 +591,17 @@ mod tests {
             "import shutil; shutil.copytree(source, '/home/u/.config')",
             "import shutil; shutil.copytree('backup', '/home/u/.ssh', dirs_exist_ok=False)",
         ] {
-            assert_eq!(rules(source, ScriptLanguage::Python), ["credential-file-write"], "{source}");
+            assert_eq!(
+                rules(source, ScriptLanguage::Python),
+                ["credential-file-write"],
+                "{source}"
+            );
         }
         let source = "import shutil; shutil.copytree('backup', '.git', dirs_exist_ok=True)";
-        assert_eq!(rules(source, ScriptLanguage::Python), ["git-internals-write"]);
+        assert_eq!(
+            rules(source, ScriptLanguage::Python),
+            ["git-internals-write"]
+        );
     }
 
     #[test]
@@ -597,7 +612,11 @@ mod tests {
             "import shutil; shutil.move('.bashrc', destination)",
             "import shutil; shutil.move(source, '.bashrc')",
         ] {
-            assert_eq!(rules(source, ScriptLanguage::Python), ["credential-file-write"], "{source}");
+            assert_eq!(
+                rules(source, ScriptLanguage::Python),
+                ["credential-file-write"],
+                "{source}"
+            );
         }
         for source in [
             "import shutil; shutil.move('.bashrc', '.git')",
@@ -605,11 +624,18 @@ mod tests {
         ] {
             let mut actual = rules(source, ScriptLanguage::Python);
             actual.sort_unstable();
-            assert_eq!(actual, ["credential-file-write", "git-internals-write"], "{source}");
+            assert_eq!(
+                actual,
+                ["credential-file-write", "git-internals-write"],
+                "{source}"
+            );
         }
         let source = "from shutil import move as archive; archive('.bashrc', 'backup')";
         let command = format!("python3 -c \"{source}\"");
-        assert!(classify(&command, ShellDialect::Posix).is_some(), "move pre-gate: {command}");
+        assert!(
+            classify(&command, ShellDialect::Posix).is_some(),
+            "move pre-gate: {command}"
+        );
     }
 
     #[test]

@@ -4075,7 +4075,10 @@ mod tests {
             let ast_matcher = AstMatcher::new();
             let severity_for = |target: &str| {
                 let matches = ast_matcher
-                    .find_matches(&format!("system('rm -rf {target}');\n"), ScriptLanguage::Perl)
+                    .find_matches(
+                        &format!("system('rm -rf {target}');\n"),
+                        ScriptLanguage::Perl,
+                    )
                     .expect("perl ast_matcher should run");
                 let hit = matches
                     .into_iter()

@@ -20361,6 +20361,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                 &mut first_allowlist_hit,
                 deadline,
                 inherited_automated_stdin,
+                nested_context.map(|context| context.heredoc_settings),
             ) {
                 return result;
             }
@@ -23331,6 +23332,7 @@ fn evaluate_core_filesystem_pack(
     first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
     deadline: Option<&Deadline>,
     inherited_automated_stdin: bool,
+    heredoc_settings: Option<&crate::config::HeredocSettings>,
 ) -> Option<EvaluationResult> {
     // These rules intentionally span shell separators (the propagation
     // chains and the fork bomb). Evaluate them once against the complete
@@ -23404,13 +23406,14 @@ fn evaluate_core_filesystem_pack(
         // outranks `redirect-truncate-root-home` and the #390 absent-file
         // carve-out (which only stands that one rule down). Nested
         // substitution ranges are evaluated as their own segments.
-        let mut credential_span_base = segment_start;
-        let mut credential_hit =
-            crate::packs::core::credential_files::classify_credential_file_write(
-                mask_nested_segment_ranges(dialect_segment, segment_start, &nested_segment_ranges)
-                    .as_ref(),
-                shell_dialect,
-            );
+        // Embedded code is scanned once below with its source exemptions.
+        // The segment pass must not rediscover an excluded program without
+        // that context; shell redirects remain independently protected.
+        let credential_hit = crate::packs::core::credential_files::classify_credential_file_write(
+            mask_nested_segment_ranges(dialect_segment, segment_start, &nested_segment_ranges)
+                .as_ref(),
+            shell_dialect,
+        );
         // Embedded interpreter code is delivered out-of-band, so no single
         // segment holds both the interpreter and its code: a heredoc body is
         // split off by the newlines that separate commands, a pipeline puts the
@@ -23419,22 +23422,30 @@ fn evaluate_core_filesystem_pack(
         // for any of those — only for inline `-c`/`-e`, where the code is inside
         // the segment. Measured before this: `python3 -c "open('/etc/shadow',
         // 'a').write(k)"` denied while the same code in a heredoc, a pipe, or a
-        // here-string was allowed (#461). Scan the whole command once, and only
-        // when no segment produced a hit, so segment attribution still wins.
-        if credential_hit.is_none() && !embedded_credential_scanned {
+        // here-string was allowed (#461). Inspect original source once, even
+        // when a segment found a write: allowing that rule must not hide a
+        // second rule on the same rename or in another interpreter command.
+        let embedded_hits = if embedded_credential_scanned {
+            Vec::new()
+        } else {
             embedded_credential_scanned = true;
-            credential_hit =
-                crate::packs::core::credential_files::classify_embedded_credential_file_write(
-                    command_for_packs,
-                    shell_dialect,
-                );
-            if credential_hit.is_some() {
-                // The span is already in whole-command coordinates, the same
-                // space `segment_start` offsets into, so the base is zero.
-                credential_span_base = 0;
-            }
-        }
-        if let Some(hit) = credential_hit {
+            crate::packs::core::credential_files::classify_embedded_credential_file_writes(
+                original_command,
+                shell_dialect,
+                |code, language| {
+                    heredoc_settings.is_some_and(|settings| {
+                        executable_source_is_exempt(code, language, settings, project_path)
+                    })
+                },
+            )
+        };
+        // Segment attribution keeps precedence. Embedded spans already refer
+        // to the original command, not its normalized or sanitized view.
+        for (hit, credential_span_base, span_offset) in credential_hit
+            .into_iter()
+            .map(|hit| (hit, segment_start, normalized_offset))
+            .chain(embedded_hits.into_iter().map(|hit| (hit, 0, Some(0))))
+        {
             // The hit names its own rule: `.git/` writes deny under
             // `git-internals-write` so allowing one does not also allow a
             // write to `~/.ssh/authorized_keys` (#457).
@@ -23445,7 +23456,7 @@ fn evaluate_core_filesystem_pack(
                 start: hit.span.start + credential_span_base,
                 end: hit.span.end + credential_span_base,
             };
-            let mapped_span = map_span_with_offset(span, normalized_offset, original_len);
+            let mapped_span = map_span_with_offset(span, span_offset, original_len);
             let preview = mapped_span
                 .as_ref()
                 .map(|span| extract_match_preview(original_command, span));
@@ -25398,7 +25409,7 @@ fn evaluate_heredoc(
         // Cheap, high-signal fallback before the expensive AST pass. If the
         // hook is already close to its evaluation deadline, this keeps obvious
         // catastrophic language-library deletes on the direct denial path.
-        if let Some(m) =
+        for m in
             crate::ast_matcher::scan_filesystem_sink_fallback(&content.content, content.language)
         {
             if m.severity.blocks_by_default() {
@@ -25796,34 +25807,25 @@ fn evaluate_heredoc(
     None
 }
 
-/// Whether the heredoc analysis skips an extracted body entirely.
-///
-/// One predicate for every caller, so the primary loop and the
-/// incomplete-extraction backstop cannot disagree about which bodies are code.
-/// They used to: the backstop re-extracted and scanned every body, so with
-/// extraction forced to time out it denied what the primary path allows — a
-/// `cat > s.py <<EOF` body whose `#!/usr/bin/env python3` shebang made
-/// extraction infer Python, a Python heredoc under `languages = ["bash"]`, and
-/// any body the user had content-allowlisted.
-fn heredoc_content_is_exempt(
-    command: &str,
-    content: &crate::heredoc::ExtractedContent,
-    context: HeredocEvaluationContext<'_>,
+/// Explicit language/content exemptions apply to every executable-source
+/// entry point. Re-scanning the original command must not bypass a decision
+/// already made by the primary extractor or its incomplete-extraction backstop.
+fn executable_source_is_exempt(
+    code: &str,
+    language: crate::heredoc::ScriptLanguage,
+    settings: &crate::config::HeredocSettings,
+    project_path: Option<&Path>,
 ) -> bool {
-    if let Some(allowed) = &context.heredoc_settings.allowed_languages {
-        if !allowed.contains(&content.language) {
+    if let Some(allowed) = &settings.allowed_languages {
+        if !allowed.contains(&language) {
             return true;
         }
     }
 
     // Check content-level allowlist before AST matching.
     // This allows users to whitelist specific patterns or content hashes.
-    if let Some(ref content_allowlist) = context.heredoc_settings.content_allowlist {
-        if let Some(hit) = content_allowlist.is_content_allowlisted(
-            &content.content,
-            content.language,
-            context.project_path,
-        ) {
+    if let Some(ref content_allowlist) = settings.content_allowlist {
+        if let Some(hit) = content_allowlist.is_content_allowlisted(code, language, project_path) {
             tracing::debug!(
                 hit_kind = hit.kind.label(),
                 matched = hit.matched,
@@ -25833,6 +25835,24 @@ fn heredoc_content_is_exempt(
             // Content is allowlisted - skip AST matching for this heredoc
             return true;
         }
+    }
+    false
+}
+
+/// Receiver checks are in addition to the shared explicit source exemptions.
+/// Disabling optional heredoc analysis is not itself a core-policy exemption.
+fn heredoc_content_is_exempt(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    context: HeredocEvaluationContext<'_>,
+) -> bool {
+    if executable_source_is_exempt(
+        &content.content,
+        content.language,
+        context.heredoc_settings,
+        context.project_path,
+    ) {
+        return true;
     }
 
     // Skip ALL heredoc content analysis if the target command is non-executing.
@@ -38606,6 +38626,59 @@ mod tests {
                 eval_with_heredoc(python, &bash_only).is_allowed(),
                 "`languages = [\"bash\"]` must hold on the timeout path too"
             );
+        }
+
+        #[test]
+        fn extraction_backstop_applies_each_rule_grant_independently_461() {
+            let settings = heredoc_config(true, true);
+            let compiled = default_compiled_overrides();
+            for (allowed, denied) in [
+                ("credential-file-write", "git-internals-write"),
+                ("git-internals-write", "credential-file-write"),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("allowlist.toml");
+                fs::write(&path, format!(
+                    "[[allow]]\nrule = \"core.filesystem:{allowed}\"\nreason = \"one endpoint only\"\n"
+                )).unwrap();
+                let allowlists = LayeredAllowlist::load_from_paths(Some(path), None, None);
+                assert!(
+                    allowlists
+                        .match_rule_at_path("core.filesystem", allowed, None)
+                        .is_some()
+                );
+                let context = HeredocEvaluationContext {
+                    allowlists: &allowlists,
+                    heredoc_settings: &settings,
+                    project_path: None,
+                    deadline: None,
+                    enabled_keywords: &[],
+                    ordered_packs: &[],
+                    keyword_index: None,
+                    compiled_overrides: &compiled,
+                    allow_once_audit: None,
+                    shell_dialect: ShellDialect::Posix,
+                    nested_command_depth: 0,
+                    inherited_automated_stdin: false,
+                };
+                for command in [
+                    "python3 <<'PY'\nimport os; os.replace('.git/config', '.bashrc')\nPY",
+                    "python3 <<'PY'\nimport os; os.replace('.bashrc', '.git/config')\nPY",
+                    "ruby <<'RB'\nFile.rename('.git/config', '.bashrc')\nRB",
+                    "node <<'JS'\nrequire('fs').renameSync('.bashrc', '.git/config')\nJS",
+                ] {
+                    // Call the backstop directly: the core-pack scan must not
+                    // rescue a broken fallback and make this assertion pass.
+                    let mut grant = None;
+                    let result = check_credential_write_fallback(command, context, &mut grant)
+                        .expect("the other endpoint remains protected");
+                    assert!(result.is_denied(), "{command}: {result:?}");
+                    assert_eq!(
+                        result.pattern_info.unwrap().pattern_name.as_deref(),
+                        Some(denied)
+                    );
+                }
+            }
         }
 
         #[test]

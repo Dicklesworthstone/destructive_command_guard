@@ -1,7 +1,9 @@
 use super::*;
 
 fn denied(code: &str, language: Language) -> bool {
-    inspect(code, language, 0..code.len()).is_some()
+    let mut hits = Vec::new();
+    inspect(code, language, 0..code.len(), &mut hits);
+    !hits.is_empty()
 }
 
 #[test]
