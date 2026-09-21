@@ -416,3 +416,71 @@ fn every_sink_name_trips_the_pre_gate() {
         );
     }
 }
+
+/// A wrapper prefix must not change the answer (#464).
+///
+/// The classifier was always right about these — called directly it returns a
+/// hit for every one — but the *candidate gate* read the first token as the
+/// executable, so `sudo python3 …` presented `sudo`, which is neither a
+/// credential writer nor an interpreter, and the pack was never made a
+/// candidate. Twelve of twelve wrapped embedded spellings were allowed while
+/// every shell spelling of the same write denied.
+///
+/// This asserts at the classifier, where the policy lives; the end-to-end
+/// half, through the real hook and the gate that was actually broken, is
+/// `tests/credential_file_embedded_e2e.rs`. Both are needed: this one alone
+/// passed throughout the bug.
+#[test]
+fn a_wrapper_prefix_does_not_change_the_verdict() {
+    const TARGET: &str = "/home/test/.bashrc";
+    let sinks = [
+        format!(r#"python3 -c "open('{TARGET}', 'w')""#),
+        format!(r#"ruby -e "File.write('{TARGET}', 'x')""#),
+        format!(r#"node -e "require('fs').writeFileSync('{TARGET}','x')""#),
+    ];
+    // `FOO=1` is an assignment prefix rather than a wrapper command, and it
+    // reaches the same code path; a bare `sudo`/`env` is what an agent adds on
+    // a retry, which is why this list is the retry vocabulary and not a
+    // theoretical one.
+    let prefixes = ["", "sudo ", "env ", "/usr/bin/env ", "FOO=1 "];
+
+    for sink in &sinks {
+        for prefix in prefixes {
+            let command = format!("{prefix}{sink}");
+            assert!(
+                classify(&command, ShellDialect::Posix).is_some(),
+                "a prefix changed the verdict: {command}"
+            );
+        }
+    }
+}
+
+/// The heredoc spellings of the same writes, which share the gate above.
+#[test]
+fn a_heredoc_receiver_is_judged_like_its_inline_twin() {
+    const TARGET: &str = "/home/test/.bashrc";
+    for command in [
+        format!("python3 <<'EOF'\nopen('{TARGET}', 'w')\nEOF"),
+        format!("python3 <<EOF\nopen('{TARGET}', 'w')\nEOF"),
+        format!("python3 - <<'EOF'\nopen('{TARGET}', 'w')\nEOF"),
+        format!("ruby <<'EOF'\nFile.write('{TARGET}', 'x')\nEOF"),
+        format!("node <<'EOF'\nrequire('fs').writeFileSync('{TARGET}','x')\nEOF"),
+    ] {
+        assert!(
+            classify(&command, ShellDialect::Posix).is_some(),
+            "heredoc receiver not judged: {command}"
+        );
+    }
+
+    // The guard this path exists for: content that merely looks like code,
+    // fed to something that is not an interpreter, is still data.
+    for command in [
+        format!("cat <<'EOF'\nopen('{TARGET}', 'w')\nEOF"),
+        format!("echo <<'EOF'\nFile.write('{TARGET}', 'x')\nEOF"),
+    ] {
+        assert!(
+            classify(&command, ShellDialect::Posix).is_none(),
+            "a non-interpreter receiver must stay data: {command}"
+        );
+    }
+}
