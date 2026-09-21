@@ -521,7 +521,17 @@ fn visit(
         }
         return Ok(());
     }
-    bind(&node, language, env);
+    // The right-hand side runs before assignment installs its result. Removing
+    // `open` or `fs` first hides the very write in `open = open(path, 'w')` or
+    // `fs = fs.writeFileSync(path, data)`. Keep the previous bindings throughout
+    // the expression, then invalidate/rebind the assignment target normally.
+    let bind_after_children = matches!(
+        kind.as_ref(),
+        "assignment" | "assignment_expression" | "variable_declarator"
+    );
+    if !bind_after_children {
+        bind(&node, language, env);
+    }
     if let Some((api, path, access, expands)) = write_call(&node, language, env) {
         if let Some(rule) = protected(&path, access, expands) {
             if !hits.iter().any(|hit| hit.rule == rule) {
@@ -541,6 +551,9 @@ fn visit(
     }
     for child in node.children() {
         visit(child, language, env, depth + 1, remaining_nodes, hits)?;
+    }
+    if bind_after_children {
+        bind(&node, language, env);
     }
     Ok(())
 }
@@ -1287,6 +1300,117 @@ mod here_string_tests {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod assignment_order_tests {
+    use super::*;
+
+    #[test]
+    fn assigning_a_write_result_cannot_erase_the_invoked_api() {
+        for (language, source) in [
+            (ScriptLanguage::Python, "open = open('/etc/shadow', 'w')"),
+            (
+                ScriptLanguage::Python,
+                "from io import open as save; save = save('/etc/shadow', 'w')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "from pathlib import Path; p = Path('.bashrc'); p = p.write_text('x')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import shutil; shutil = shutil.copy2('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "let fs = require('fs'); fs = fs.writeFileSync('.bashrc', 'x')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "let save = require('fs').writeFileSync; save = save('.bashrc', 'x')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "let fs = require('fs'); ({fs} = fs.writeFileSync('.bashrc', 'x'))",
+            ),
+            (
+                ScriptLanguage::TypeScript,
+                "let fs: any = require('fs'); fs = fs.writeFileSync('.bashrc', 'x')",
+            ),
+            (ScriptLanguage::Ruby, "File = File.write('/etc/shadow', 'x')"),
+            (
+                ScriptLanguage::Ruby,
+                "writer = File; writer = writer.write('/etc/shadow', 'x')",
+            ),
+        ] {
+            let hits = scan_extracted(source, language).expect("complete source analysis");
+            assert_eq!(hits.len(), 1, "{source}: {hits:?}");
+            assert_eq!(hits[0].rule, shell::CREDENTIAL_FILE_WRITE_NAME, "{source}");
+            assert!(source.get(hits[0].span.clone()).is_some(), "{source}");
+        }
+    }
+
+    #[test]
+    fn assignment_results_still_invalidate_bindings_after_evaluation() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "open = open('/etc/shadow', 'r'); open('/etc/shadow', 'w')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import shutil; shutil = shutil.copy2('.bashrc', '/tmp/backup'); shutil.copy2('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "let fs = require('fs'); fs = fs.readFileSync('.bashrc'); fs.writeFileSync('.bashrc', 'x')",
+            ),
+            (
+                ScriptLanguage::Ruby,
+                "File = File.read('/etc/shadow'); File.write('/etc/shadow', 'x')",
+            ),
+        ] {
+            assert!(
+                scan_extracted(source, language).expect("complete analysis").is_empty(),
+                "{source}"
+            );
+        }
+        // A known alias remains usable after the assignment; only the result
+        // of an unknown call is invalidated, not every right-hand-side value.
+        let source = "import shutil; save = shutil; save.copy2('staged', '.bashrc')";
+        assert_eq!(
+            scan_extracted(source, ScriptLanguage::Python).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn assigned_transfers_keep_both_rule_families() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "import shutil; shutil = shutil.move('.bashrc', '.git')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "let fs = require('fs'); fs = fs.renameSync('.bashrc', '.git/config')",
+            ),
+            (ScriptLanguage::Ruby, "File = File.rename('.bashrc', '.git/config')"),
+        ] {
+            let mut rules: Vec<_> = scan_extracted(source, language)
+                .expect("complete source analysis")
+                .into_iter()
+                .map(|hit| hit.rule)
+                .collect();
+            rules.sort_unstable();
+            assert_eq!(
+                rules,
+                [shell::CREDENTIAL_FILE_WRITE_NAME, shell::GIT_INTERNALS_WRITE_NAME],
+                "{source}"
+            );
         }
     }
 }
