@@ -7,6 +7,7 @@
 mod embedded;
 mod shell;
 
+pub(crate) use embedded::{scan_extracted, source_scan_required};
 // The two rule NAMES are deliberately not re-exported: every hit carries the
 // rule it denies under, so the evaluator reads `hit.rule` instead of choosing
 // one. That is what keeps `.git/` writes allowlistable separately from
