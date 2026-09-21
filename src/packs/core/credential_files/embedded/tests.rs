@@ -226,7 +226,14 @@ fn shell_context_and_candidate_gate_reach_the_matcher() {
 fn policy_bridge_cannot_turn_a_literal_into_shell_syntax() {
     // `protected` returns the rule the write denies under rather than a bool
     // (#457), so these read `.is_none()` / `.is_some()`.
-    assert!(protected("/tmp/x'; tee /home/test/.bashrc; echo '", Access::Write, false).is_none());
+    assert!(
+        protected(
+            "/tmp/x'; tee /home/test/.bashrc; echo '",
+            Access::Write,
+            false
+        )
+        .is_none()
+    );
     assert!(protected("$HOME/.bashrc", Access::Write, false).is_none());
     assert!(protected("~/.bashrc", Access::Write, false).is_none());
     assert!(protected("/home/test/.ssh/authorized_keys", Access::Append, false).is_some());
@@ -389,6 +396,18 @@ fn every_sink_name_trips_the_pre_gate() {
         format!(r#"ruby -e "File.write('{target}','x')""#),
         format!(r#"ruby -e "File.binwrite('{target}','x')""#),
         format!(r#"ruby -e "File.open('{target}','w')""#),
+        format!(r#"ruby -e "File.new('{target}','w')""#),
+        // The truncating sinks, which nothing else exercises through this gate:
+        // `truncating_sinks_are_writes` calls `inspect`, which skips it.
+        // `os.truncate`, `fs.truncate` and `fs.truncateSync` carry none of the
+        // other needles and pass only because `truncate` is listed, so without
+        // them deleting that needle would pass every test and silently re-open
+        // spellings #461 measured. `File.truncate` already passes on `File`
+        // and is here so the list stays a complete inventory of sinks.
+        format!(r#"python3 -c "import os; os.truncate('{target}', 0)""#),
+        format!(r#"ruby -e "File.truncate('{target}', 0)""#),
+        format!(r#"node -e "require('fs').truncate('{target}', 0, () => {{}})""#),
+        format!(r#"node -e "require('fs').truncateSync('{target}', 0)""#),
     ];
     for command in commands {
         assert!(
