@@ -126,7 +126,13 @@ fn every_top_level_source_file_is_declared_in_a_crate_root() {
     declared.extend(declared_modules(&main));
 
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let included = path_includes_of_declared(&src, &declared);
+    // `#[path]` can sit in a declared module (`ast_matcher.rs` pulls in
+    // `ast_pattern_engine.rs`) or in a root itself; a root's own attribute is
+    // relative to `src/` too, and reading only the children would report the
+    // file it names as an orphan.
+    let mut included = path_includes_of_declared(&src, &declared);
+    included.extend(path_included_modules(&lib));
+    included.extend(path_included_modules(&main));
     declared.extend(included.iter().map(String::as_str));
     let orphaned = orphaned_modules(&src, &declared);
 
