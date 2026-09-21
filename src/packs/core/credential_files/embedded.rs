@@ -621,9 +621,14 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
                 (Some("shutil"), name) => transfers::shutil_operation(name).map(Value::Transfer),
                 (Some("os"), "path") => Some(Value::OsPath),
                 (Some("os.path"), "expanduser") => Some(Value::ExpandUser),
+                // `import os.path as p` binds `p` to the `os.path` module.
+                // Without this the aliased form fell through to `None`, left
+                // `p` unbound, and `open(p.expanduser('~/.ssh/x'), 'a')` was
+                // not recognised while every other spelling was.
+                (None, "os.path") => Some(Value::OsPath),
                 _ => None,
             };
-            // `import os.path` binds `os`, not `os.path`.
+            // `import os.path` (no alias) binds `os`, not `os.path`.
             if module.is_none() && source.starts_with("os.") && name.field("alias").is_none() {
                 env.remove("os");
                 env.insert("os".into(), Value::Os);

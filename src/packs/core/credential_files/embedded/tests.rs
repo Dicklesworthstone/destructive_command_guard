@@ -325,6 +325,12 @@ fn home_expansion_is_honoured_only_when_the_source_performs_it() {
             Language::Python,
             "from os import path; open(path.expanduser('~/.bashrc'), 'a')",
         ),
+        // Aliased `import os.path as p` binds `p` to the module; it was the one
+        // import spelling left unbound.
+        (
+            Language::Python,
+            "import os.path as p; open(p.expanduser('~/.ssh/authorized_keys'), 'a')",
+        ),
         (
             Language::Ruby,
             "File.open(File.expand_path('~/.ssh/authorized_keys'), 'a')",
