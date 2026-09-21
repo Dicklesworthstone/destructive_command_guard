@@ -298,7 +298,9 @@ fn inspect(code: &str, language: Language, span: Range<usize>) -> Option<Credent
     let (api, path, _) = visit(ast.root(), language, &mut bindings, 0)?;
     Some(CredentialFileWrite {
         span,
-        reason: format!("{api} writes protected credential, login-startup, or trust target {path:?}. Reads remain allowed; only append-only known_hosts updates are exempt. Show the user the proposed change or use dcg allow-once."),
+        reason: format!(
+            "{api} writes protected credential, login-startup, or trust target {path:?}. Reads remain allowed; only append-only known_hosts updates are exempt. Show the user the proposed change or use dcg allow-once."
+        ),
     })
 }
 
@@ -330,7 +332,10 @@ fn visit(
         }
         let mut local = env.clone();
         if let Some(parameters) = node.field("parameters").or_else(|| node.field("parameter")) {
-            for parameter in parameters.dfs().filter(|child| child.kind() == "identifier") {
+            for parameter in parameters
+                .dfs()
+                .filter(|child| child.kind() == "identifier")
+            {
                 local.remove(parameter.text().as_ref());
             }
         }
@@ -365,11 +370,8 @@ fn protected(path: &str, access: Access) -> bool {
     }
     let quoted = format!("'{}'", path.replace('\'', "'\\''"));
     let append = if access == Access::Append { "-a " } else { "" };
-    shell::classify_credential_file_write(
-        &format!("tee {append}-- {quoted}"),
-        ShellDialect::Posix,
-    )
-    .is_some()
+    shell::classify_credential_file_write(&format!("tee {append}-- {quoted}"), ShellDialect::Posix)
+        .is_some()
 }
 
 fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
@@ -463,7 +465,10 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
 }
 
 fn is_fs_module(module: &str) -> bool {
-    matches!(module, "fs" | "node:fs" | "fs/promises" | "node:fs/promises")
+    matches!(
+        module,
+        "fs" | "node:fs" | "fs/promises" | "node:fs/promises"
+    )
 }
 
 fn is_js_api(name: &str) -> bool {
@@ -511,7 +516,8 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
             let args = arguments(node);
             match function {
                 Value::Require => {
-                    let Value::Text(module) = value(args.first()?, language, env, depth + 1)? else {
+                    let Value::Text(module) = value(args.first()?, language, env, depth + 1)?
+                    else {
                         return None;
                     };
                     is_fs_module(&module).then_some(Value::Fs)
@@ -600,7 +606,10 @@ fn write_call(
             for pair in arg.dfs().filter(|n| n.kind() == "pair") {
                 let key = pair.field("key")?.text().into_owned();
                 if key.trim_matches([':', '\'', '"']) == "mode" {
-                    mode = Some(pair.field("value").and_then(|n| text_value(&n, language, env)));
+                    mode = Some(
+                        pair.field("value")
+                            .and_then(|n| text_value(&n, language, env)),
+                    );
                 }
             }
         }
@@ -637,7 +646,11 @@ fn write_call(
         Value::Api(api) if language == Language::Node => {
             let path = text_value(args.first()?, language, env)?;
             let append = matches!(api.as_str(), "appendFile" | "appendFileSync");
-            let default = if append { Access::Append } else { Access::Write };
+            let default = if append {
+                Access::Append
+            } else {
+                Access::Write
+            };
             let stream = api == "createWriteStream";
             let options = args.get(if stream { 1 } else { 2 });
             let access = js_access(options, if stream { "flags" } else { "flag" }, default, env);
@@ -706,9 +719,10 @@ fn literal(node: &Syntax<'_>, language: Language) -> Option<String> {
             .collect::<Option<Vec<_>>>()
             .map(|parts| parts.concat());
     }
-    if node.dfs().any(|n| {
-        matches!(n.kind().as_ref(), "interpolation" | "template_substitution")
-    }) {
+    if node
+        .dfs()
+        .any(|n| matches!(n.kind().as_ref(), "interpolation" | "template_substitution"))
+    {
         return None;
     }
     let raw = node.text();

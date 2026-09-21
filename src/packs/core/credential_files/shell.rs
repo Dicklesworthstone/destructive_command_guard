@@ -2406,7 +2406,7 @@ mod tests {
     /// were found by hand. These assert the property instead.
     mod spelling_parity {
         use super::hit;
-        use crate::packs::core::credential_files::{
+        use crate::packs::core::credential_files::shell::{
             ENTRIES, Entry, RELATIVE_ANCHORS, RELATIVE_FILE_ANCHORS, Root,
         };
 
@@ -2501,7 +2501,7 @@ mod tests {
     /// does, and only the rooted one was being judged.
     mod relative_anchors {
         use super::{allowed, denied, hit};
-        use crate::packs::core::credential_files::{
+        use crate::packs::core::credential_files::shell::{
             ENTRIES, RELATIVE_ANCHORS, RELATIVE_FILE_ANCHORS, Root,
         };
 

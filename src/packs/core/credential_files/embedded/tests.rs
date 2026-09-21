@@ -22,7 +22,10 @@ fn every_language_uses_the_existing_target_policy() {
     ] {
         for (language, code) in [
             (Language::Python, format!("open('{path}', 'w').write('x')")),
-            (Language::Python, format!("import io; io.open('{path}', 'a')")),
+            (
+                Language::Python,
+                format!("import io; io.open('{path}', 'a')"),
+            ),
             (
                 Language::Python,
                 format!("from pathlib import Path; Path('{path}').write_text('x')"),
@@ -198,7 +201,10 @@ fn shell_context_and_candidate_gate_reach_the_matcher() {
         r#"node example.js -e "require('fs').writeFileSync('/home/test/.bashrc','x')""#,
         "cat <<'EOF'\nopen('/home/test/.bashrc', 'w')\nEOF",
     ] {
-        assert!(classify(command, ShellDialect::Posix).is_none(), "{command}");
+        assert!(
+            classify(command, ShellDialect::Posix).is_none(),
+            "{command}"
+        );
     }
     for (receiver, code) in [
         ("python3", "open('/home/test/.bashrc', 'w')"),
@@ -209,7 +215,10 @@ fn shell_context_and_candidate_gate_reach_the_matcher() {
         ),
     ] {
         let command = format!("{receiver} <<'EOF'\n{code}\nEOF");
-        assert!(classify(&command, ShellDialect::Posix).is_some(), "{command}");
+        assert!(
+            classify(&command, ShellDialect::Posix).is_some(),
+            "{command}"
+        );
     }
 }
 
@@ -221,10 +230,7 @@ fn policy_bridge_cannot_turn_a_literal_into_shell_syntax() {
     ));
     assert!(!protected("$HOME/.bashrc", Access::Write));
     assert!(!protected("~/.bashrc", Access::Write));
-    assert!(protected(
-        "/home/test/.ssh/authorized_keys",
-        Access::Append
-    ));
+    assert!(protected("/home/test/.ssh/authorized_keys", Access::Append));
     assert!(!protected("/home/test/.ssh/known_hosts", Access::Append));
     assert!(protected("/home/test/.ssh/known_hosts", Access::Write));
     for dialect in [ShellDialect::PowerShell, ShellDialect::Cmd] {
