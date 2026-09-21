@@ -57,7 +57,7 @@ fn assert_blocked(command: &str) {
     let (result, full) = dcg_test(command);
     assert!(
         result.starts_with("Result: BLOCKED") || result.starts_with("Result: REVIEW REQUIRED"),
-        "argv-split spawn of a catastrophic target must deny: {command}\n{full}"
+        "argv-split recursive delete outside a temp directory must deny: {command}\n{full}"
     );
 }
 
@@ -148,26 +148,42 @@ fn ordinary_argv_split_spawns_stay_allowed() {
     }
 }
 
-/// Wiring the backstop must not decide #455, and must not defeat the temp
-/// carve-out.
+/// Argv-split spawns follow #455's single policy for a recursive delete.
 ///
-/// The backstop used to escalate every hit to `High`, which blocks regardless
-/// of target. Left in place it would have made these deny — relative recursive
-/// deletes in JS and Ruby, and a `/tmp` target that every other layer allows —
-/// as a side effect of wiring in a scanner. Whether a relative recursive delete
-/// should block is #455's open question, to be answered for all languages at
-/// once rather than settled here.
+/// #455 was resolved as "a recursive delete of a literal target outside a temp
+/// directory denies whatever language spells it", with `/tmp` and `/var/tmp`
+/// carved out in all of them. When this backstop was first wired, #455 was
+/// still open, so this test pinned the relative rows as ALLOWED to avoid
+/// settling it as a side effect. Once it was settled the other way, that left
+/// argv-split the one spelling that disagreed:
+///
+/// ```text
+/// rm -rf ./build                             deny
+/// shutil.rmtree('./build')                   deny
+/// fs.rmSync('./build', {recursive: true})    deny
+/// spawnSync('rm', ['-rf', './build'])        ALLOW   <- this backstop
+/// ```
+///
+/// Both halves are pinned: every relative target denies, and the temp
+/// carve-out still allows, so neither direction can drift unnoticed.
 #[test]
-fn relative_and_temp_targets_are_not_decided_by_the_backstop_issue_455() {
+fn argv_split_recursive_deletes_follow_the_single_policy_issue_455() {
     for body in [
         "cp.spawnSync('rm',['-rf','./build'])",
         "cp.spawnSync('rm',['-rf','node_modules'])",
         "cp.spawnSync('rm',['-rf','dist'])",
-        "cp.spawnSync('rm',['-rf','/tmp/scratch'])",
     ] {
-        assert_allowed(&node(body));
+        assert_blocked(&node(body));
     }
     // Ruby reaches the same payload through its own `%x`/backtick-aware pass,
-    // which escalated separately. Both passes must agree.
-    assert_allowed(&ruby("system('rm','-rf','./build')"));
+    // which carries severity separately. Both passes must agree.
+    assert_blocked(&ruby("system('rm','-rf','./build')"));
+
+    // The carve-out is the same one `rm -rf /tmp/x` has in the shell.
+    for target in ["/tmp/scratch", "/var/tmp/scratch", "/private/tmp/scratch"] {
+        assert_allowed(&node(&format!("cp.spawnSync('rm',['-rf','{target}'])")));
+        assert_allowed(&ruby(&format!("system('rm','-rf','{target}')")));
+    }
+    // Traversal out of the temp tree is not scratch: `/tmp/../etc` is `/etc`.
+    assert_blocked(&node("cp.spawnSync('rm',['-rf','/tmp/../etc'])"));
 }
