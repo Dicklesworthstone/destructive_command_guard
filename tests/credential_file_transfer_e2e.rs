@@ -251,3 +251,107 @@ fn inert_text_unrelated_receivers_and_real_append_remain_allowed() {
         None,
     );
 }
+
+#[test]
+fn shutil_copy_placement_checks_the_effective_destination() {
+    let home = home();
+    for operation in ["copy", "copy2"] {
+        for (source, destination, rule) in [
+            ("staged", "/etc/shadow", Some("credential-file-write")),
+            ("fixtures/.bashrc", "/home/u", Some("credential-file-write")),
+            ("fixtures/credentials", "/home/u/.aws", Some("credential-file-write")),
+            ("fixtures/passwd", "/etc", Some("credential-file-write")),
+            ("staged", ".git", Some("git-internals-write")),
+            ("staged", "/home/u/.ssh/known_hosts", Some("credential-file-write")),
+            ("notes.txt", "/home/u", None),
+            ("readme.txt", "/home/u/.aws", None),
+            ("fixtures/pass*", "/etc", None),
+            (".bashrc", "/tmp/backup.txt", None),
+        ] {
+            let program = format!("import shutil; shutil.{operation}('{source}', '{destination}')");
+            assert_program("python3", &program, home.path(), rule);
+        }
+    }
+    for source in [
+        "from shutil import copy2 as publish; publish(dst='/etc', src='fixtures/passwd')",
+        "import shutil; shutil.copy(source, '/home/u/.ssh')",
+        "import shutil; shutil.copy2(source, '/home/u')",
+        "import shutil, os; shutil.copy2('fixtures/.bashrc', os.path.expanduser('~'))",
+    ] {
+        assert_program("python3", source, home.path(), Some("credential-file-write"));
+    }
+}
+
+#[test]
+fn shutil_recursive_restore_and_move_preserve_source_effects() {
+    let home = home();
+    for source in [
+        "import shutil; shutil.copytree('backup', '/home/u', dirs_exist_ok=True)",
+        "from shutil import copytree as restore; restore(src='backup', dst='/etc')",
+        "import shutil; shutil.copytree(source, '/home/u/.config')",
+        "import shutil; shutil.move('/home/u/.aws', 'backup')",
+        "from shutil import move as archive; archive(src='/home/u/.config', dst=destination)",
+    ] {
+        assert_program("python3", source, home.path(), Some("credential-file-write"));
+    }
+    for source in [
+        "import shutil; shutil.copytree('backup', '.git', dirs_exist_ok=True)",
+        "import shutil; shutil.move('.git', 'backup')",
+    ] {
+        assert_program("python3", source, home.path(), Some("git-internals-write"));
+    }
+    for source in [
+        "import shutil; shutil.copytree('/home/u/.ssh', '/tmp/backup')",
+        "import shutil; shutil.copytree('/home/u/.config', '/tmp/backup')",
+        "import shutil; shutil.copytree('backup', '~')",
+        "import shutil; shutil.move('notes.txt', '/home/u')",
+        "import shutil; shutil = store; shutil.move('staged', '.bashrc')",
+        "print(\"shutil.copytree('backup', '/etc')\")",
+    ] {
+        assert_program("python3", source, home.path(), None);
+    }
+}
+
+#[test]
+fn shutil_move_cannot_cross_independently_allowlisted_rules() {
+    for (allowed, denied, target) in [
+        ("credential-file-write", "git-internals-write", ".bashrc"),
+        ("git-internals-write", "credential-file-write", ".git"),
+    ] {
+        let home = home();
+        fs::write(
+            home.path().join("xdg/dcg/allowlist.toml"),
+            format!("[[allow]]\nrule = \"core.filesystem:{allowed}\"\nreason = \"reviewed one endpoint\"\n"),
+        )
+        .expect("rule allowlist");
+        // This positive control proves the configured grant actually applies;
+        // a malformed or unloaded allowlist must not make the deny test pass.
+        let control = format!("import shutil; shutil.copy2('staged', '{target}')");
+        assert_program("python3", &control, home.path(), None);
+        for (source, destination) in [(".bashrc", ".git"), (".git", ".bashrc")] {
+            let program = format!("import shutil; shutil.move('{source}', '{destination}')");
+            assert_program("python3", &program, home.path(), Some(denied));
+        }
+    }
+}
+
+#[test]
+fn shutil_directory_transfers_reach_stdin_without_scanning_inert_data() {
+    let home = home();
+    for (source, rule) in [
+        ("import shutil; shutil.copy2('fixtures/.bashrc', '/home/u')", Some("credential-file-write")),
+        ("import shutil; shutil.copytree('backup', '/home/u')", Some("credential-file-write")),
+        ("from shutil import move as archive; archive('.git', 'backup')", Some("git-internals-write")),
+        ("import shutil; shutil.copy('notes.txt', '/home/u')", None),
+        ("print(\"shutil.copytree('backup', '/etc')\")", None),
+    ] {
+        let quoted = format!("'{}'", source.replace('\'', "'\\''"));
+        let command = format!("env python3 - 0<<< {quoted}");
+        assert_decision(&command, home.path(), rule);
+    }
+    assert_decision(
+        "cat <<'DATA'\nimport shutil; shutil.copytree('backup', '/etc')\nDATA",
+        home.path(),
+        None,
+    );
+}
