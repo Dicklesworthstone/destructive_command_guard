@@ -23356,6 +23356,10 @@ fn evaluate_core_filesystem_pack(
         }
     }
 
+    // Set once the whole-command embedded-credential scan below has run, so a
+    // multi-segment command pays for it at most once.
+    let mut embedded_credential_scanned = false;
+
     for &(segment_start, segment_end) in segment_ranges {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
             return Some(EvaluationResult::indeterminate_due_to_budget());
@@ -23400,11 +23404,37 @@ fn evaluate_core_filesystem_pack(
         // outranks `redirect-truncate-root-home` and the #390 absent-file
         // carve-out (which only stands that one rule down). Nested
         // substitution ranges are evaluated as their own segments.
-        if let Some(hit) = crate::packs::core::credential_files::classify_credential_file_write(
-            mask_nested_segment_ranges(dialect_segment, segment_start, &nested_segment_ranges)
-                .as_ref(),
-            shell_dialect,
-        ) {
+        let mut credential_span_base = segment_start;
+        let mut credential_hit =
+            crate::packs::core::credential_files::classify_credential_file_write(
+                mask_nested_segment_ranges(dialect_segment, segment_start, &nested_segment_ranges)
+                    .as_ref(),
+                shell_dialect,
+            );
+        // Embedded interpreter code is delivered out-of-band, so no single
+        // segment holds both the interpreter and its code: a heredoc body is
+        // split off by the newlines that separate commands, a pipeline puts the
+        // interpreter in its own segment, and a here-string carries no heredoc
+        // type. The embedded classifier needs both together, so it never fired
+        // for any of those — only for inline `-c`/`-e`, where the code is inside
+        // the segment. Measured before this: `python3 -c "open('/etc/shadow',
+        // 'a').write(k)"` denied while the same code in a heredoc, a pipe, or a
+        // here-string was allowed (#461). Scan the whole command once, and only
+        // when no segment produced a hit, so segment attribution still wins.
+        if credential_hit.is_none() && !embedded_credential_scanned {
+            embedded_credential_scanned = true;
+            credential_hit =
+                crate::packs::core::credential_files::classify_embedded_credential_file_write(
+                    command_for_packs,
+                    shell_dialect,
+                );
+            if credential_hit.is_some() {
+                // The span is already in whole-command coordinates, the same
+                // space `segment_start` offsets into, so the base is zero.
+                credential_span_base = 0;
+            }
+        }
+        if let Some(hit) = credential_hit {
             // The hit names its own rule: `.git/` writes deny under
             // `git-internals-write` so allowing one does not also allow a
             // write to `~/.ssh/authorized_keys` (#457).
@@ -23412,8 +23442,8 @@ fn evaluate_core_filesystem_pack(
             let severity = crate::packs::Severity::Critical;
             let (explanation, suggestions) = pack.rule_guidance(rule);
             let span = MatchSpan {
-                start: hit.span.start + segment_start,
-                end: hit.span.end + segment_start,
+                start: hit.span.start + credential_span_base,
+                end: hit.span.end + credential_span_base,
             };
             let mapped_span = map_span_with_offset(span, normalized_offset, original_len);
             let preview = mapped_span
