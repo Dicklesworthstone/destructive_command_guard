@@ -69,7 +69,7 @@ impl DefaultPolicyMatcher {
     }
 }
 
-/// The deletion backstop, plus protected writes on the same source.
+/// Deletion backstop plus protected-write detection on extracted source.
 ///
 /// Retains the existing deletion backstop and adds protected writes on the SAME
 /// extracted-source path, before the expensive full-pattern scan. This is
