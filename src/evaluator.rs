@@ -25391,71 +25391,8 @@ fn evaluate_heredoc(
             return Some(EvaluationResult::indeterminate_due_to_budget());
         }
 
-        if let Some(allowed) = &context.heredoc_settings.allowed_languages {
-            if !allowed.contains(&content.language) {
-                continue;
-            }
-        }
-
-        // Check content-level allowlist before AST matching.
-        // This allows users to whitelist specific patterns or content hashes.
-        if let Some(ref content_allowlist) = context.heredoc_settings.content_allowlist {
-            if let Some(hit) = content_allowlist.is_content_allowlisted(
-                &content.content,
-                content.language,
-                context.project_path,
-            ) {
-                tracing::debug!(
-                    hit_kind = hit.kind.label(),
-                    matched = hit.matched,
-                    reason = hit.reason,
-                    "heredoc content allowlisted"
-                );
-                // Content is allowlisted - skip AST matching for this heredoc
-                continue;
-            }
-        }
-
-        // Skip ALL heredoc content analysis if the target command is non-executing.
-        // Commands like `cat`, `tee`, `grep`, etc. just output the heredoc content
-        // as data - they don't execute it as code. This prevents false positives
-        // where documentation text containing dangerous command examples is blocked.
-        let target_not_overridden = |cmd: &str| {
-            !crate::heredoc::stdin_data_sink_may_be_overridden(
-                command,
-                content.byte_range.start,
-                cmd,
-            )
-        };
-        // `cat`/`awk`/`sed`/… do not execute what arrives on their STDIN, which
-        // is what a heredoc or here-string body is. An *inline* payload is not
-        // stdin at all: awk's `system("…")` argument is a command awk hands to
-        // /bin/sh, and skipping it because awk happens to be a data sink for
-        // its stdin conflated the two channels and let the payload through
-        // (#399). Gate on the body actually being stdin-bound, exactly as the
-        // structured-sink branch below already does.
-        let non_executing_target = content.heredoc_type.is_some()
-            && content.target_command.as_deref().is_some_and(|cmd| {
-                crate::heredoc::is_non_executing_heredoc_command(cmd) && target_not_overridden(cmd)
-            });
-        // Structured stdin data sinks (`git commit -F - <<'EOF'`, `spx session
-        // handoff <<EOF`) likewise consume the body as DATA — a commit message
-        // is read by git, never executed (#277). Mirror the masking path's
-        // gate: only heredoc/here-string bodies are stdin-bound (inline `-c`
-        // scripts are not), and any PATH/alias override of the target keeps
-        // the body scannable (fail-closed).
-        let structured_stdin_sink = content.heredoc_type.is_some()
-            && crate::heredoc::is_structured_stdin_data_sink(command, content.byte_range.start)
-            && content
-                .target_command
-                .as_deref()
-                .is_none_or(target_not_overridden);
-        if non_executing_target || structured_stdin_sink {
-            tracing::trace!(
-                target_command = ?content.target_command,
-                "Skipping heredoc content analysis for non-executing target"
-            );
-            continue; // Skip to next extracted content - this heredoc is just data
+        if heredoc_content_is_exempt(command, &content, context) {
+            continue;
         }
 
         // Cheap, high-signal fallback before the expensive AST pass. If the
@@ -25859,33 +25796,130 @@ fn evaluate_heredoc(
     None
 }
 
-/// Credential-write backstop for incomplete heredoc extraction (#461).
+/// Whether the heredoc analysis skips an extracted body entirely.
 ///
-/// `check_fallback_patterns` below is the only backstop on the incomplete-
-/// extraction paths, and it is a set of sink NAMES. That is right for
-/// deletions — `shutil.rmtree` is dangerous whatever it is handed — and wrong
-/// for writes, where `open(p, 'w')` is ordinary for almost every `p`. A write
-/// is dangerous only for a protected path, so it cannot be reduced to a name,
-/// and `credential-file-write` had no entry there. That is the gap #452 found
-/// for Ruby, one rule over: with extraction forced to time out, a heredoc
-/// writing `~/.ssh/authorized_keys` was allowed while a heredoc deleting
-/// `$HOME` was still denied.
+/// One predicate for every caller, so the primary loop and the
+/// incomplete-extraction backstop cannot disagree about which bodies are code.
+/// They used to: the backstop re-extracted and scanned every body, so with
+/// extraction forced to time out it denied what the primary path allows — a
+/// `cat > s.py <<EOF` body whose `#!/usr/bin/env python3` shebang made
+/// extraction infer Python, a Python heredoc under `languages = ["bash"]`, and
+/// any body the user had content-allowlisted.
+fn heredoc_content_is_exempt(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    context: HeredocEvaluationContext<'_>,
+) -> bool {
+    if let Some(allowed) = &context.heredoc_settings.allowed_languages {
+        if !allowed.contains(&content.language) {
+            return true;
+        }
+    }
+
+    // Check content-level allowlist before AST matching.
+    // This allows users to whitelist specific patterns or content hashes.
+    if let Some(ref content_allowlist) = context.heredoc_settings.content_allowlist {
+        if let Some(hit) = content_allowlist.is_content_allowlisted(
+            &content.content,
+            content.language,
+            context.project_path,
+        ) {
+            tracing::debug!(
+                hit_kind = hit.kind.label(),
+                matched = hit.matched,
+                reason = hit.reason,
+                "heredoc content allowlisted"
+            );
+            // Content is allowlisted - skip AST matching for this heredoc
+            return true;
+        }
+    }
+
+    // Skip ALL heredoc content analysis if the target command is non-executing.
+    // Commands like `cat`, `tee`, `grep`, etc. just output the heredoc content
+    // as data - they don't execute it as code. This prevents false positives
+    // where documentation text containing dangerous command examples is blocked.
+    let target_not_overridden = |cmd: &str| {
+        !crate::heredoc::stdin_data_sink_may_be_overridden(command, content.byte_range.start, cmd)
+    };
+    // `cat`/`awk`/`sed`/… do not execute what arrives on their STDIN, which
+    // is what a heredoc or here-string body is. An *inline* payload is not
+    // stdin at all: awk's `system("…")` argument is a command awk hands to
+    // /bin/sh, and skipping it because awk happens to be a data sink for
+    // its stdin conflated the two channels and let the payload through
+    // (#399). Gate on the body actually being stdin-bound, exactly as the
+    // structured-sink branch below already does.
+    let non_executing_target = content.heredoc_type.is_some()
+        && content.target_command.as_deref().is_some_and(|cmd| {
+            crate::heredoc::is_non_executing_heredoc_command(cmd) && target_not_overridden(cmd)
+        });
+    // Structured stdin data sinks (`git commit -F - <<'EOF'`, `spx session
+    // handoff <<EOF`) likewise consume the body as DATA — a commit message
+    // is read by git, never executed (#277). Mirror the masking path's
+    // gate: only heredoc/here-string bodies are stdin-bound (inline `-c`
+    // scripts are not), and any PATH/alias override of the target keeps
+    // the body scannable (fail-closed).
+    let structured_stdin_sink = content.heredoc_type.is_some()
+        && crate::heredoc::is_structured_stdin_data_sink(command, content.byte_range.start)
+        && content
+            .target_command
+            .as_deref()
+            .is_none_or(target_not_overridden);
+    if non_executing_target || structured_stdin_sink {
+        tracing::trace!(
+            target_command = ?content.target_command,
+            "Skipping heredoc content analysis for non-executing target"
+        );
+        return true; // this heredoc is just data
+    }
+    false
+}
+
+/// Protected-write backstop for incomplete heredoc extraction (#461).
+///
+/// `check_fallback_patterns` below is the only other backstop on the
+/// incomplete-extraction paths, and it is a set of sink NAMES. That is right
+/// for deletions — `shutil.rmtree` is dangerous whatever it is handed — and
+/// wrong for writes, where `open(p, 'w')` is ordinary for almost every `p`. A
+/// write is dangerous only for a protected path, so it cannot be reduced to a
+/// name, and the protected-write rules had no entry there. That is the gap
+/// #452 found for Ruby, one rule over: with extraction forced to time out, a
+/// heredoc writing `~/.ssh/authorized_keys` was allowed while a heredoc
+/// deleting `$HOME` was still denied.
 ///
 /// The remedy is #443's. Re-extract on the structural budget, which keeps
 /// every size cap and relaxes only the wall clock, then run the same
-/// synchronous classifier the primary path uses. The verdict then follows the
-/// command rather than how busy the host was. If even the structural budget is
-/// exhausted this returns `None`, the same outcome as before — #443 sized that
-/// budget so only descheduling, never ordinary work, reaches it.
+/// synchronous classifier the primary path uses, over the same bodies
+/// (`heredoc_content_is_exempt`). The verdict then follows the command rather
+/// than how busy the host was.
 ///
-/// Allowlisting is honoured exactly as on the primary path, so an explicitly
-/// reviewed `core.filesystem:credential-file-write` exception lifts this
-/// denial too rather than the two paths disagreeing about the same write.
+/// Every hit is weighed, not just the first. `scan_extracted` returns one hit
+/// per rule precisely so that allowing `credential-file-write` cannot hide a
+/// `git-internals-write` in the same body; stopping at the first hit threw
+/// that away and let the allowlisted one shadow the other. Allowlisting is
+/// otherwise honoured exactly as on the primary path, so one reviewed
+/// exception governs both paths.
+///
+/// What this does NOT cover: a body past the SIZE caps (`max_body_lines`,
+/// `max_body_bytes`). The structural budget relaxes only time, so such a body
+/// is skipped here as it is on the primary path, where exceeding a size limit
+/// deliberately fails open (`exceeded_line_limit_allows_in_failopen_mode`).
+/// Deletions keep a safety net there because `check_fallback_patterns` reads
+/// the raw command; protected writes have none, since a path-dependent rule
+/// cannot be a name regex. Likewise if even the structural time budget is
+/// exhausted this returns `None` — #443 sized it so only descheduling, never
+/// ordinary work, reaches it.
 fn check_credential_write_fallback(
     command: &str,
     context: HeredocEvaluationContext<'_>,
     first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
 ) -> Option<EvaluationResult> {
+    // Same budget discipline as the primary loop: an exhausted hook deadline
+    // is reported as indeterminate (surfaced per `unverified_decision`), never
+    // as a silent allow, and no further work is started past it.
+    if deadline_exceeded(context.deadline) {
+        return Some(EvaluationResult::indeterminate_due_to_budget());
+    }
     let items = match extract_content(
         command,
         &crate::heredoc::ExtractionLimits::structural_scan(),
@@ -25897,48 +25931,85 @@ fn check_credential_write_fallback(
         _ => return None,
     };
     const PACK_ID: &str = "core.filesystem";
+    let severity = crate::packs::Severity::Critical;
     for item in items {
+        if deadline_exceeded(context.deadline) {
+            return Some(EvaluationResult::indeterminate_due_to_budget());
+        }
+        if heredoc_content_is_exempt(command, &item, context) {
+            continue;
+        }
         let Ok(hits) =
             crate::packs::core::credential_files::scan_extracted(&item.content, item.language)
         else {
             continue;
         };
-        let Some(hit) = hits.into_iter().next() else {
-            continue;
-        };
-        let severity = crate::packs::Severity::Critical;
-        if let Some(allow_hit) =
-            context
-                .allowlists
-                .match_rule_at_path(PACK_ID, hit.rule, context.project_path)
-        {
-            if first_allowlist_hit.is_none() {
-                *first_allowlist_hit = Some((
-                    PatternMatch {
-                        pack_id: Some(PACK_ID.to_string()),
-                        pattern_name: Some(hit.rule.to_string()),
-                        severity: Some(severity),
-                        reason: hit.reason.clone(),
-                        source: MatchSource::HeredocAst,
-                        matched_span: None,
-                        matched_text_preview: None,
-                        explanation: None,
-                        suggestions: &[],
-                    },
-                    allow_hit.layer,
-                    allow_hit.entry.reason.clone(),
-                ));
+        for hit in hits {
+            // Build the same intermediate match the primary path builds in
+            // `ast_matcher::protected_matches`, so the denial carries the same
+            // reason shape (language, rule, line, 80-char preview) whichever
+            // path produced it.
+            let ast_match = crate::ast_matcher::PatternMatch {
+                rule_id: format!("{PACK_ID}.{}", hit.rule),
+                reason: hit.reason,
+                matched_text_preview: item
+                    .content
+                    .get(hit.span.clone())
+                    .unwrap_or("")
+                    .chars()
+                    .take(80)
+                    .collect(),
+                start: hit.span.start,
+                end: hit.span.end,
+                line_number: item
+                    .content
+                    .get(..hit.span.start)
+                    .unwrap_or("")
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count()
+                    + 1,
+                severity: crate::ast_matcher::Severity::Critical,
+                suggestion: None,
+            };
+            let pattern_match = PatternMatch {
+                pack_id: Some(PACK_ID.to_string()),
+                pattern_name: Some(hit.rule.to_string()),
+                severity: Some(severity),
+                reason: format_heredoc_denial_reason(&item, &ast_match, PACK_ID, hit.rule),
+                source: MatchSource::HeredocAst,
+                matched_span: map_heredoc_span(command, &item, ast_match.start, ast_match.end),
+                matched_text_preview: Some(ast_match.matched_text_preview),
+                explanation: None,
+                suggestions: &[],
+            };
+            if let Some(allow_hit) =
+                context
+                    .allowlists
+                    .match_rule_at_path(PACK_ID, hit.rule, context.project_path)
+            {
+                if first_allowlist_hit.is_none() {
+                    *first_allowlist_hit = Some((
+                        pattern_match,
+                        allow_hit.layer,
+                        allow_hit.entry.reason.clone(),
+                    ));
+                }
+                continue;
             }
-            continue;
+            return Some(EvaluationResult {
+                decision: EvaluationDecision::Deny,
+                pattern_info: Some(pattern_match),
+                allowlist_override: None,
+                effective_mode: Some(crate::packs::DecisionMode::Deny),
+                skipped_due_to_budget: false,
+                quick_rejected: false,
+                branch_context: None,
+                session_occurrence: None,
+                graduated_response: None,
+                bypass_method: None,
+            });
         }
-        return Some(EvaluationResult::denied_by_pack_pattern(
-            PACK_ID,
-            hit.rule,
-            &hit.reason,
-            None,
-            severity,
-            &[],
-        ));
     }
     None
 }
@@ -38316,13 +38387,20 @@ mod tests {
             command: &str,
             settings: &crate::config::HeredocSettings,
         ) -> EvaluationResult {
+            eval_with_heredoc_and_allowlists(command, settings, &default_allowlists())
+        }
+
+        fn eval_with_heredoc_and_allowlists(
+            command: &str,
+            settings: &crate::config::HeredocSettings,
+            allowlists: &LayeredAllowlist,
+        ) -> EvaluationResult {
             let config = default_config();
             let enabled_packs = config.enabled_pack_ids();
             let ordered_packs = crate::packs::REGISTRY.expand_enabled_ordered(&enabled_packs);
             let enabled_keywords = crate::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
             let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
             let compiled = default_compiled_overrides();
-            let allowlists = default_allowlists();
 
             evaluate_command_with_pack_order(
                 command,
@@ -38330,7 +38408,7 @@ mod tests {
                 ordered_packs.as_slice(),
                 keyword_index.as_ref(),
                 &compiled,
-                &allowlists,
+                allowlists,
                 settings,
             )
         }
@@ -38446,6 +38524,88 @@ mod tests {
                      {cmd:?} -> {result:?}"
                 );
             }
+        }
+
+        /// The primary path, with a budget no machine load can exhaust, so a
+        /// test comparing it to the timeout path compares policy, not luck.
+        fn completed_extraction() -> crate::config::HeredocSettings {
+            heredoc_config_with_limits(crate::heredoc::ExtractionLimits::structural_scan())
+        }
+
+        fn forced_extraction_timeout() -> crate::config::HeredocSettings {
+            heredoc_config_with_limits(crate::heredoc::ExtractionLimits {
+                max_body_bytes: 1024 * 1024,
+                max_body_lines: 10_000,
+                max_heredocs: 10,
+                timeout_ms: 0,
+            })
+        }
+
+        /// Allowing one protected-write rule must not hide the other in the
+        /// same body on the timeout path.
+        ///
+        /// `scan_extracted` returns one hit per rule precisely so that allowing
+        /// `credential-file-write` cannot shadow a `git-internals-write`. The
+        /// first version of the backstop weighed only the first hit, so with
+        /// the credential rule allowlisted this body was ALLOWED on the timeout
+        /// path while the primary path denied it under `git-internals-write`.
+        #[test]
+        fn credential_allowlist_does_not_hide_a_git_write_in_the_same_body_461() {
+            let allowlists =
+                project_allowlists_for_rule("core.filesystem:credential-file-write", "reviewed");
+            let cmd =
+                "python3 <<'PY'\nopen('/home/example/.bashrc', 'w')\nopen('.git/config', 'w')\nPY";
+            for (label, settings) in [
+                ("primary", completed_extraction()),
+                ("timeout", forced_extraction_timeout()),
+            ] {
+                let result = eval_with_heredoc_and_allowlists(cmd, &settings, &allowlists);
+                assert!(result.is_denied(), "{label}: {result:?}");
+                assert_eq!(
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref()),
+                    Some("git-internals-write"),
+                    "{label}: the allowlisted credential hit must not shadow the git hit"
+                );
+            }
+        }
+
+        /// The backstop analyses exactly the bodies the primary loop does.
+        ///
+        /// It first re-extracted and scanned EVERY body, so with extraction
+        /// timed out it denied what the primary path deliberately allows. The
+        /// shebang row is the one that bit: `#!/usr/bin/env python3` makes
+        /// extraction infer Python for a body `cat` only writes to disk.
+        #[test]
+        fn timeout_backstop_skips_the_bodies_the_primary_path_skips_461() {
+            let data_sinks = [
+                "cat > s.py <<'EOF'\n#!/usr/bin/env python3\nopen('/home/example/.bashrc', 'w')\nEOF",
+                "tee s.py <<'EOF'\n#!/usr/bin/env python3\nopen('/home/example/.bashrc', 'w')\nEOF",
+                "git commit -F - <<'EOF'\nfix: open('/home/example/.bashrc', 'w') handling\nEOF",
+            ];
+            for cmd in data_sinks {
+                for (label, settings) in [
+                    ("primary", completed_extraction()),
+                    ("timeout", forced_extraction_timeout()),
+                ] {
+                    let result = eval_with_heredoc(cmd, &settings);
+                    assert!(
+                        result.is_allowed(),
+                        "{label}: a data sink's body is not code: {cmd:?} -> {result:?}"
+                    );
+                }
+            }
+
+            // A language the config excludes is excluded on both paths.
+            let mut bash_only = forced_extraction_timeout();
+            bash_only.allowed_languages = Some(vec![crate::heredoc::ScriptLanguage::Bash]);
+            let python = "python3 <<'PY'\nopen('/home/example/.bashrc', 'w')\nPY";
+            assert!(
+                eval_with_heredoc(python, &bash_only).is_allowed(),
+                "`languages = [\"bash\"]` must hold on the timeout path too"
+            );
         }
 
         #[test]

@@ -416,17 +416,16 @@ pub fn scan_executing_sink_fallback(code: &str, language: ScriptLanguage) -> Opt
         //
         // Its unique contribution now is the argv join — a shape with no
         // contiguous destructive text for any other layer to see. That is a
-        // question of *visibility*, not of severity, so the payload should be
-        // judged by the same yardstick everywhere: `rm -rf /home/user` is
-        // Critical and blocks, `rm -rf ./build` is Medium and does not.
+        // question of *visibility*, not of severity, so the payload is judged
+        // by the one yardstick every consumer shares: the severity
+        // `detect_rm_rf_destructive` assigns, which encodes #455's resolved
+        // policy. A literal target outside a temp directory is `High` and
+        // blocks (`./build`, `node_modules`); `/tmp` and `/var/tmp` are
+        // `Medium` and do not, exactly as `rm -rf /tmp/x` is in the shell.
         //
-        // Escalating here would have decided two open questions as a side effect
-        // of wiring in a scanner. Measured with the escalation still in place:
-        // `spawnSync("rm", ["-rf", "./build"])`, `node_modules`, `dist` and
-        // `/tmp/scratch` all began to deny in JavaScript and Ruby. The first
-        // three are #455 — whether a relative recursive delete should block at
-        // all is a live design question with three policies in play — and the
-        // last defeats the `/tmp` carve-out every other layer honours.
+        // Escalating HERE instead would still be wrong: a blanket `High` would
+        // defeat that temp carve-out for this one path. Keeping the policy in
+        // `detect_rm_rf_destructive` means it is decided once, not per consumer.
         if !hit.severity.blocks_by_default() {
             continue;
         }
@@ -734,14 +733,12 @@ fn ruby_exec_sink_match(
     // Carry the payload's own severity, matching the generic sink pass above.
     //
     // This also read `_ => Severity::High`, on the stated grounds that the sink
-    // unambiguously executes. True, and it is the reason this pass exists — but
-    // every other layer judging an executing `rm -rf` already applies the
-    // catastrophic/relative distinction, so escalating here made Ruby the only
-    // language where `system("rm", "-rf", "./build")` blocked. Measured: with the
-    // escalation in place JavaScript allowed that shape and Ruby denied it, for
-    // no reason either language could articulate. Whether a relative recursive
-    // delete should block anywhere is #455, and it should be decided there and
-    // for all languages at once, not settled here by an inconsistency.
+    // unambiguously executes. It does — but a blanket escalation here overrode
+    // the policy every other layer applies, and it made Ruby disagree with
+    // JavaScript about the same argv-split shape. #455 has since settled that
+    // policy once, in `detect_rm_rf_destructive`: a non-temp literal target is
+    // `High` and blocks, a `/tmp` or `/var/tmp` target is `Medium` and does
+    // not. Carrying that severity is how this pass follows it.
     let severity = hit.severity;
     let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
     PatternMatch {
@@ -2403,6 +2400,21 @@ where
 
     let target = clean_path_token(target?);
     let catastrophic = is_catastrophic_path(target);
+    // #455's single policy, expressed where every exec-sink consumer reads it:
+    // a recursive delete of a literal target outside a temp directory blocks
+    // in every language, and `/tmp` / `/var/tmp` are carved out exactly as
+    // `rm -rf /tmp/x` is in the shell.
+    //
+    // This used to return `Medium` for every non-catastrophic target. The
+    // JavaScript, TypeScript and Ruby refiners, both exec-sink backstops and the
+    // Perl payload path all carry this severity through unchanged, so an
+    // argv-split `spawnSync('rm', ['-rf', './build'])` or `system('rm', '-rf',
+    // './build')` was ALLOWED — the one spelling with no contiguous `rm -rf`
+    // text for the shell rescan to catch — while `rm -rf ./build` and
+    // `shutil.rmtree('./build')` denied. `High` for a non-temp target closes
+    // that without relaxing anything: the Python refiner already escalated
+    // every hit to `High`, so its verdicts do not move.
+    let temp_scratch = !catastrophic && is_temp_scratch_path(target);
 
     Some(ShellPayloadHit {
         rule_suffix: if catastrophic {
@@ -2417,8 +2429,10 @@ where
         },
         severity: if catastrophic {
             Severity::Critical
-        } else {
+        } else if temp_scratch {
             Severity::Medium
+        } else {
+            Severity::High
         },
         suggestion: Some("Verify the target path and use safer alternatives when possible"),
     })
@@ -3781,23 +3795,39 @@ mod tests {
             );
         }
 
+        /// #455's single policy reaches an exec-sink `rm -rf` payload too.
+        ///
+        /// This test used to be `execsync_rm_rf_non_catastrophic_warns_only`,
+        /// written long before #455. When #455 made a non-temp recursive delete
+        /// deny in every language it deleted the matching warns-only tests for
+        /// the calls it covered (`fs_rmsync_…`, `fileutils_rm_rf_…`); this one
+        /// was never revisited. `rm -rf` is the canonical recursive delete, so
+        /// it follows the same rule: a non-temp target blocks and the temp
+        /// carve-out does not. Both halves are pinned.
         #[test]
-        fn execsync_rm_rf_non_catastrophic_warns_only() {
+        fn execsync_rm_rf_follows_the_single_policy_issue_455() {
             let ast_matcher = AstMatcher::new();
-            let code = "const child_process = require('child_process');\nchild_process.execSync('rm -rf ./build');";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::JavaScript)
-                .unwrap();
+            let severity_for = |target: &str| {
+                let code = format!(
+                    "const child_process = require('child_process');\n\
+                     child_process.execSync('rm -rf {target}');"
+                );
+                ast_matcher
+                    .find_matches(&code, ScriptLanguage::JavaScript)
+                    .unwrap()
+                    .into_iter()
+                    .find(|m| m.rule_id.ends_with(".rm_rf"))
+                    .unwrap_or_else(|| panic!("execSync('rm -rf {target}') should be detected"))
+                    .severity
+            };
             assert!(
-                matches.iter().any(|m| m.rule_id.ends_with(".rm_rf")),
-                "execSync('rm -rf ./build') should be detected"
+                severity_for("./build").blocks_by_default(),
+                "a recursive delete outside a temp directory blocks (#455)"
             );
-            let hit = matches
-                .into_iter()
-                .find(|m| m.rule_id.ends_with(".rm_rf"))
-                .unwrap();
-            assert!(!hit.severity.blocks_by_default());
+            assert!(
+                !severity_for("/tmp/build").blocks_by_default(),
+                "the temp carve-out is the same one `rm -rf /tmp/x` has in the shell"
+            );
         }
 
         #[test]
@@ -4035,17 +4065,32 @@ mod tests {
             assert!(matches[0].severity.blocks_by_default());
         }
 
+        /// Perl's `system('rm -rf …')` follows #455's single policy too.
+        ///
+        /// Formerly `perl_system_rm_rf_non_catastrophic_warns_only`, a pre-#455
+        /// pin that #455 never revisited; see
+        /// `execsync_rm_rf_follows_the_single_policy_issue_455` for why.
         #[test]
-        fn perl_system_rm_rf_non_catastrophic_warns_only() {
+        fn perl_system_rm_rf_follows_the_single_policy_issue_455() {
             let ast_matcher = AstMatcher::new();
-            let code = "system('rm -rf ./build');\n";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Perl)
-                .expect("perl ast_matcher should run");
-            assert!(!matches.is_empty());
-            assert!(matches[0].rule_id.contains("rm_rf"));
-            assert!(!matches[0].severity.blocks_by_default());
+            let severity_for = |target: &str| {
+                let matches = ast_matcher
+                    .find_matches(&format!("system('rm -rf {target}');\n"), ScriptLanguage::Perl)
+                    .expect("perl ast_matcher should run");
+                let hit = matches
+                    .into_iter()
+                    .find(|m| m.rule_id.contains("rm_rf"))
+                    .unwrap_or_else(|| panic!("system('rm -rf {target}') should be detected"));
+                hit.severity
+            };
+            assert!(
+                severity_for("./build").blocks_by_default(),
+                "a recursive delete outside a temp directory blocks (#455)"
+            );
+            assert!(
+                !severity_for("/tmp/build").blocks_by_default(),
+                "the temp carve-out is the same one `rm -rf /tmp/x` has in the shell"
+            );
         }
 
         /// #453: `File::Path` is normally imported and called bare, so requiring
