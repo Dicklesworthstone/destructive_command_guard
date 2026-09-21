@@ -295,9 +295,10 @@ fn inspect(code: &str, language: Language, span: Range<usize>) -> Option<Credent
             bindings.insert("require".into(), Value::Require);
         }
     }
-    let (api, path, _) = visit(ast.root(), language, &mut bindings, 0)?;
+    let (api, path, _, rule) = visit(ast.root(), language, &mut bindings, 0)?;
     Some(CredentialFileWrite {
         span,
+        rule,
         reason: format!(
             "{api} writes protected credential, login-startup, or trust target {path:?}. Reads remain allowed; only append-only known_hosts updates are exempt. Show the user the proposed change or use dcg allow-once."
         ),
@@ -310,7 +311,7 @@ fn visit(
     language: Language,
     env: &mut Bindings,
     depth: usize,
-) -> Option<(String, String, Access)> {
+) -> Option<(String, String, Access, &'static str)> {
     if depth > MAX_DEPTH {
         return None;
     }
@@ -348,8 +349,8 @@ fn visit(
     }
     bind(&node, language, env);
     if let Some((api, path, access)) = write_call(&node, language, env) {
-        if protected(&path, access) {
-            return Some((api, path, access));
+        if let Some(rule) = protected(&path, access) {
+            return Some((api, path, access, rule));
         }
     }
     for child in node.children() {
@@ -364,14 +365,19 @@ fn visit(
 /// Quote every byte so embedded string contents cannot become shell syntax,
 /// expansions, glob patterns, or extra targets. This deliberately does not
 /// expand literal '~' or '$HOME' in an ordinary language string literal.
-fn protected(path: &str, access: Access) -> bool {
+fn protected(path: &str, access: Access) -> Option<&'static str> {
     if access == Access::Read {
-        return false;
+        return None;
     }
     let quoted = format!("'{}'", path.replace('\'', "'\\''"));
     let append = if access == Access::Append { "-a " } else { "" };
+    // The synthesized writer is `tee`, never a redirect, so a `.git` target
+    // reaches the rule here exactly as `tee .git/config` would (#457) — and
+    // the rule it answers with is carried back rather than flattened to a
+    // bool, so an embedded write is allowlistable by the same name as its
+    // shell equivalent.
     shell::classify_credential_file_write(&format!("tee {append}-- {quoted}"), ShellDialect::Posix)
-        .is_some()
+        .map(|hit| hit.rule)
 }
 
 fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
