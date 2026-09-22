@@ -37,7 +37,6 @@ Commands containing these keywords are checked against this pack:
 - `drop`
 - `truncate`
 - `UPDATE`
-- `update`
 
 ### Safe Patterns (Allowed)
 
@@ -108,7 +107,6 @@ Commands containing these keywords are checked against this pack:
 - `truncate`
 - `GRANT`
 - `UPDATE`
-- `update`
 
 ### Safe Patterns (Allowed)
 
