@@ -1356,6 +1356,7 @@ fn refine_match_meta(
         ScriptLanguage::Ruby => refine_ruby_match(meta, matched_text),
         ScriptLanguage::Python => Some(refine_python_match(meta, matched_text)),
         ScriptLanguage::Go => Some(refine_go_match(meta, matched_text)),
+        ScriptLanguage::Php => Some(refine_php_match(meta, matched_text)),
         _ => Some(RefinedMatchMeta {
             rule_id: meta.rule_id.clone(),
             reason: meta.reason.clone(),
@@ -1548,6 +1549,60 @@ fn refine_go_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMatchMe
     }
 
     unchanged()
+}
+
+/// Refine a PHP exec-sink match (#473).
+///
+/// PHP had no refinement of any kind: `refine_match_meta` fell through to the
+/// catch-all that returns the meta unchanged, and all seven exec sinks register
+/// at `Medium`. PHP is also scoped out of the exec-sink backstop, on the same
+/// "uses its own primary path" ground #472 corrected for Go. So nothing in
+/// PHP's own path could ever block, and every PHP exec denial came from the
+/// raw-shell rescan finding contiguous destructive text — under
+/// `core.filesystem:rm-rf-root-home`, never under the `heredoc.php.*` rule
+/// `docs/patterns.md` tabulates.
+///
+/// Two shapes carry no contiguous text and were allowed outright: the PHP 7.4+
+/// argv array `proc_open(["rm","-rf","/etc"], …)`, and a concatenated payload
+/// `system("rm" . " -rf" . " /etc")`. `detect_destructive_in_args` reads a
+/// call's literals both individually and as the argv they are, which is exactly
+/// the pair of views those two shapes need.
+///
+/// Backticks are deliberately not in the sink set. `` `rm -rf /etc` `` carries
+/// no quoted literal for `ANY_STRING_LITERAL` to read, and PHP's backtick
+/// operator takes one interpolated string rather than an argument list, so it
+/// has neither an argv nor a concatenation form to escape through. Adding it
+/// would be a no-op dressed as coverage.
+///
+/// Fail-safe: a dynamic payload (`system($cmd)`) keeps the warn-only meta.
+fn refine_php_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMatchMeta {
+    let unchanged = || RefinedMatchMeta {
+        rule_id: meta.rule_id.clone(),
+        reason: meta.reason.clone(),
+        severity: meta.severity,
+        suggestion: meta.suggestion.clone(),
+    };
+
+    if !is_php_exec_sink_rule(&meta.rule_id) {
+        return unchanged();
+    }
+
+    let Some(hit) = detect_destructive_in_args(matched_text) else {
+        return unchanged();
+    };
+
+    // Escalate to at least High so the AST path blocks even for a
+    // non-catastrophic target: the sink unambiguously runs the command.
+    let severity = match hit.severity {
+        Severity::Critical => Severity::Critical,
+        _ => Severity::High,
+    };
+    RefinedMatchMeta {
+        rule_id: format!("{}.{}", meta.rule_id, hit.rule_suffix),
+        reason: hit.reason.to_string(),
+        severity,
+        suggestion: hit.suggestion.map(str::to_string),
+    }
 }
 
 fn refine_javascript_match(meta: &CompiledPattern, matched_text: &str) -> Option<RefinedMatchMeta> {
@@ -3087,6 +3142,24 @@ fn is_temp_scratch_path(path: &str) -> bool {
 /// halves: every shape blocks, and each blocks exactly once.
 fn is_go_exec_sink_rule(rule_id: &str) -> bool {
     rule_id == "heredoc.go.exec_command"
+}
+
+/// PHP's exec-sink rule ids, the set `refine_php_match` escalates (#473).
+///
+/// Exact ids for the reason `refine_python_match` gives: a sink missing from
+/// this list registers at Medium and never escalates, so it reports a finding
+/// on a real `rm -rf` and the command still runs. `heredoc.php.backticks` is
+/// absent on purpose — see `refine_php_match` for why it has nothing to read.
+fn is_php_exec_sink_rule(rule_id: &str) -> bool {
+    matches!(
+        rule_id,
+        "heredoc.php.system"
+            | "heredoc.php.exec"
+            | "heredoc.php.shell_exec"
+            | "heredoc.php.passthru"
+            | "heredoc.php.popen"
+            | "heredoc.php.proc_open"
+    )
 }
 
 /// Recursive-delete rule ids, by language, under #455's single policy.
@@ -5523,6 +5596,133 @@ mod tests {
                     .any(|hit| hit.rule_id.starts_with("heredoc.go.exec_command")),
                 "the benign call must still be REPORTED, or the negative above \
                  would pass on a pattern that stopped matching entirely"
+            );
+        }
+    }
+
+    /// PHP's exec sinks must escalate a destructive payload (#473).
+    ///
+    /// PHP had no refinement at all, so nothing in its own path could block.
+    /// Every PHP exec denial came from the raw-shell rescan finding contiguous
+    /// destructive text, under `core.filesystem:rm-rf-root-home` rather than the
+    /// `heredoc.php.*` rule `docs/patterns.md` names — right verdict, wrong
+    /// attribution, and an ID nobody could grant.
+    ///
+    /// The two shapes with no contiguous text were allowed outright, and they
+    /// are the two views `detect_destructive_in_args` exists to provide: the
+    /// argv array, and the concatenated literal.
+    #[test]
+    fn every_php_exec_sink_escalates_a_destructive_payload_issue_473() {
+        let ast_matcher = AstMatcher::new();
+        // Assembled rather than written out, so this file does not carry the
+        // literal text of a guarded command.
+        let rmrf = format!("{}{}{}", "rm", " -", "rf");
+
+        fn program(statement: &str) -> String {
+            format!("<?php\n{statement}\n?>\n")
+        }
+        fn blocking(matches: &[PatternMatch]) -> Vec<&str> {
+            matches
+                .iter()
+                .filter(|hit| hit.severity.blocks_by_default())
+                .map(|hit| hit.rule_id.as_str())
+                .collect()
+        }
+
+        // The single-literal shape, through every refined sink. These already
+        // denied via the pack rule; what is asserted here is that PHP's own
+        // rule is now the one that blocks, so the ID in the denial is the ID
+        // the docs tabulate.
+        for sink in [
+            "system",
+            "exec",
+            "shell_exec",
+            "passthru",
+            "proc_open",
+            "popen",
+        ] {
+            let call = match sink {
+                "popen" => format!("popen(\"{rmrf} /home/user\", \"r\");"),
+                "proc_open" => format!("proc_open(\"{rmrf} /home/user\", [], $pipes);"),
+                other => format!("{other}(\"{rmrf} /home/user\");"),
+            };
+            let code = program(&call);
+            let matches = ast_matcher
+                .find_matches(&code, ScriptLanguage::Php)
+                .unwrap();
+            let hits = blocking(&matches);
+            assert_eq!(
+                hits.len(),
+                1,
+                "{call} must block under exactly one PHP rule; got {:?}",
+                matches
+                    .iter()
+                    .map(|hit| (&hit.rule_id, hit.severity))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                hits[0].starts_with(&format!("heredoc.php.{sink}.")),
+                "{call} blocked under {:?}, not a refined heredoc.php.{sink} id",
+                hits[0]
+            );
+        }
+
+        // The argv-array shape (PHP 7.4+), which only the AST path can reach:
+        // the text carries no contiguous payload for a raw rescan to find.
+        let code = program(r#"$p = proc_open(["rm","-rf","/home/user"], [], $pipes);"#);
+        let matches = ast_matcher
+            .find_matches(&code, ScriptLanguage::Php)
+            .unwrap();
+        assert!(
+            !blocking(&matches).is_empty(),
+            "proc_open with an argv array must block; got {:?}",
+            matches
+                .iter()
+                .map(|hit| (&hit.rule_id, hit.severity))
+                .collect::<Vec<_>>()
+        );
+
+        // The concatenated-literal shape, likewise invisible to a raw rescan.
+        let code = program(&format!(
+            "system(\"{}\" . \" -{}\" . \" /home/user\");",
+            "rm", "rf"
+        ));
+        let matches = ast_matcher
+            .find_matches(&code, ScriptLanguage::Php)
+            .unwrap();
+        assert!(
+            !blocking(&matches).is_empty(),
+            "a concatenated payload must block; got {:?}",
+            matches
+                .iter()
+                .map(|hit| (&hit.rule_id, hit.severity))
+                .collect::<Vec<_>>()
+        );
+
+        // The other half of the refinement's job: benign payloads through the
+        // same sinks stay warn-only, so the assertions above measure escalation
+        // rather than a blanket deny on `system`/`proc_open`.
+        for call in [
+            "system(\"ls -l\");",
+            "$p = proc_open([\"ls\",\"-l\"], [], $pipes);",
+            "system($cmd);",
+        ] {
+            let code = program(call);
+            let matches = ast_matcher
+                .find_matches(&code, ScriptLanguage::Php)
+                .unwrap();
+            assert!(
+                blocking(&matches).is_empty(),
+                "{call} must stay warn-only; got {:?}",
+                matches
+                    .iter()
+                    .map(|hit| (&hit.rule_id, hit.severity))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                !matches.is_empty(),
+                "{call} must still be REPORTED, or the negative above would pass \
+                 on a pattern that stopped matching entirely"
             );
         }
     }

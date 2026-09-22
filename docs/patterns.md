@@ -264,6 +264,15 @@ Some patterns refine their rule IDs based on detected arguments:
 - For Ruby `system`/`exec`/`Open3`/backticks and Perl shell calls, literal
   payloads produce rule IDs with suffixes such as `.rm_rf` and
   `.rm_rf_catastrophic`.
+- For PHP `system`/`exec`/`shell_exec`/`passthru`/`popen`/`proc_open`, a
+  destructive literal payload produces the same suffixes (example:
+  `heredoc.php.proc_open.rm_rf_catastrophic`), read both as individual literals
+  and as the argv they form — so the PHP 7.4+ array spelling
+  `proc_open(["rm","-rf","/home/user"], …)` and the concatenated spelling
+  `system("rm" . " -rf" . " /home/user")` refine like a plain single literal.
+  `` `backticks` `` are not refined: the operator takes one interpolated string,
+  so it has no argv or concatenation form, and it carries no quoted literal to
+  read.
 - For Go `exec.Command`, a destructive literal payload produces the same
   suffixes (example: `heredoc.go.exec_command.rm_rf_catastrophic`), read from
   the call's arguments as the argv they are — so the split spelling
@@ -296,6 +305,7 @@ command it denies:
 | `heredoc.python.shutil_rmtree` | `…shutil_rmtree` | works |
 | `heredoc.go.os_removeall` | `…os_removeall` | works |
 | `heredoc.go.exec_command` | `…exec_command.rm_rf_catastrophic` | accepted, never matches |
+| `heredoc.php.system` | `…system.rm_rf_catastrophic` | accepted, never matches |
 | `core.filesystem:rm-rf-root-home` | `core.filesystem:rm-rf-root-home` | works |
 
 The pattern is that a base ID is grantable exactly when the rule is sometimes
