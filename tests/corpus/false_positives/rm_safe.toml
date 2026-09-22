@@ -84,12 +84,10 @@ description = "interactive once after force restores prompting"
 command = "rm -r --force --interactive=once ./build"
 expected = "allow"
 
-# NOTE: rm -rf with extra flags may not match safe patterns
-# The --verbose flag between -rf and path causes pattern mismatch
-# [[case]]
-# description = "rm -rf with verbose in /tmp is safe"
-# command = "rm -rf --verbose /tmp/build"
-# expected = "allow"
+[[case]]
+description = "rm -rf with verbose in /tmp is safe"
+command = "rm -rf --verbose /tmp/build"
+expected = "allow"
 
 # ============================================================================
 # Non-recursive rm is always safe

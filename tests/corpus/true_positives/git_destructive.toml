@@ -33,13 +33,35 @@ command = "git clean -fdx"
 expected = "deny"
 rule_id = "core.git:clean-force"
 
-# NOTE: git checkout -f is not currently blocked.
-# Tracked in: tests/corpus/README.md (future enhancement)
-# [[case]]
-# description = "git checkout with force overwrites"
-# command = "git checkout -f main"
-# expected = "deny"
-# rule_id = "core.git:checkout-force"
+[[case]]
+description = "git checkout with force overwrites"
+command = "git checkout -f main"
+expected = "deny"
+rule_id = "core.git:checkout-force"
+
+[[case]]
+description = "git switch --discard-changes throws away local modifications"
+command = "git switch --discard-changes main"
+expected = "deny"
+rule_id = "core.git:switch-discard"
+
+[[case]]
+description = "git rm -f deletes files with uncommitted modifications"
+command = "git rm -f src/main.rs"
+expected = "deny"
+rule_id = "core.git:rm-force"
+
+[[case]]
+description = "git update-ref -d deletes a branch ref"
+command = "git update-ref -d refs/heads/main"
+expected = "deny"
+rule_id = "core.git:update-ref-delete"
+
+[[case]]
+description = "a '+' refspec is a per-ref force push"
+command = "git push origin +main"
+expected = "deny"
+rule_id = "core.git:push-force-refspec"
 
 [[case]]
 description = "git stash drop discards stash"

@@ -34,11 +34,10 @@ description = "python3 -W <filter> -c with os.remove (non-bareword value)"
 command = "python3 -W error::DeprecationWarning -c \"import os; os.remove('/etc/passwd')\""
 expected = "deny"
 
-# NOTE: python subprocess calls depend on heredoc scanner detecting nested commands
-# [[case]]
-# description = "python -c with subprocess git reset"
-# command = "python -c \"import subprocess; subprocess.run(['git', 'reset', '--hard'])\""
-# expected = "deny"
+[[case]]
+description = "python -c with subprocess git reset"
+command = "python -c \"import subprocess; subprocess.run(['git', 'reset', '--hard'])\""
+expected = "deny"
 
 # ============================================================================
 # Bash inline execution (-c flag) - DESTRUCTIVE ONLY
@@ -70,11 +69,10 @@ rule_id = "core.git:clean-force"
 # Node.js inline execution (-e flag) - DESTRUCTIVE ONLY
 # ============================================================================
 
-# NOTE: These patterns depend on heredoc scanner + language-specific patterns
-# [[case]]
-# description = "node -e with fs.rmSync (destructive)"
-# command = "node -e \"require('fs').rmSync('/home/user', {recursive: true})\""
-# expected = "deny"
+[[case]]
+description = "node -e with fs.rmSync (destructive)"
+command = "node -e \"require('fs').rmSync('/home/user', {recursive: true})\""
+expected = "deny"
 
 [[case]]
 description = "node -e with child_process rm (destructive)"
@@ -104,11 +102,10 @@ description = "perl -e with system rm (destructive)"
 command = "perl -e \"system('rm -rf /home/user')\""
 expected = "deny"
 
-# NOTE: unlink() for single file may not be blocked - depends on pattern coverage
-# [[case]]
-# description = "perl -e with unlink (file deletion)"
-# command = "perl -e \"unlink '/etc/passwd'\""
-# expected = "deny"
+[[case]]
+description = "perl -e with unlink (file deletion)"
+command = "perl -e \"unlink '/etc/passwd'\""
+expected = "deny"
 
 # ============================================================================
 # Heredocs (bash style) - DESTRUCTIVE ONLY
@@ -150,11 +147,10 @@ rule_id = "core.git:reset-hard"
 # Piped execution - DESTRUCTIVE ONLY
 # ============================================================================
 
-# NOTE: Piped execution detection depends on context classification
-# [[case]]
-# description = "echo piped to bash with rm (destructive)"
-# command = "echo 'rm -rf /' | bash"
-# expected = "deny"
+[[case]]
+description = "echo piped to bash with rm (destructive)"
+command = "echo 'rm -rf /' | bash"
+expected = "deny"
 
 # [[case]]
 # description = "echo piped to sh with git reset (destructive)"

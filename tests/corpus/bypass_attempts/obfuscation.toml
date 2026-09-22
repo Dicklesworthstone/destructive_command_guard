@@ -54,13 +54,10 @@ description = "sudo rm -rf"
 command = "sudo rm -rf /"
 expected = "deny"
 
-# NOTE: git clean -d -f (flags separated) is not currently detected.
-# The pattern expects -fd or -df combined. This is a gap.
-# Tracked in: tests/corpus/README.md (future enhancement)
-# [[case]]
-# description = "git clean variations"
-# command = "git clean -d -f"
-# expected = "deny"
+[[case]]
+description = "git clean variations (flags separated)"
+command = "git clean -d -f"
+expected = "deny"
 
 [[case]]
 description = "backslash escaped git"

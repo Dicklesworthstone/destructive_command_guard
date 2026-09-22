@@ -253,17 +253,16 @@ They are commented out in the corpus files with `# NOTE:` markers.
 
 ### Flag Separation
 
-These patterns use separated flags which current patterns don't handle:
-
-- `rm -r -f /path` - Flags separated by space (only `-rf` combined works)
-- `git clean -d -f` - Flags separated (only `-fd` combined works)
+None currently known: separated flags (`rm -r -f /path`, `git clean -d -f`)
+are covered.
 
 ### Missing Patterns
 
-These dangerous operations don't have patterns yet:
-
-- `git checkout -f` / `git checkout --force` - Overwrites local changes
-- `git checkout HEAD -- .` - Can overwrite working tree
+None currently tracked here. `git checkout -f`/`--force`, `git switch
+--discard-changes`, `git rm -f`, `git update-ref -d`, `+refspec` pushes and
+`find … -exec rm {}` were added in 2026-09; `git checkout HEAD -- .` is
+`core.git:checkout-ref-discard`. Remote-branch deletion, `push --mirror` and
+`worktree remove --force` are deliberately in the opt-in `strict_git` pack.
 
 ### Partial Coverage
 
