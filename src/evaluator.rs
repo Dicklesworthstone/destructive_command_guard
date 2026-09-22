@@ -25315,6 +25315,11 @@ fn evaluate_heredoc(
                 {
                     return Some(blocked);
                 }
+                if let Some(blocked) =
+                    check_exec_sink_fallback(command, context, first_allowlist_hit)
+                {
+                    return Some(blocked);
+                }
 
                 let strict_timeout = is_timeout && !context.heredoc_settings.fallback_on_timeout;
                 let strict_other = !is_timeout && !context.heredoc_settings.fallback_on_parse_error;
@@ -25381,6 +25386,11 @@ fn evaluate_heredoc(
                 }
                 if let Some(blocked) =
                     check_credential_write_fallback(command, context, first_allowlist_hit)
+                {
+                    return Some(blocked);
+                }
+                if let Some(blocked) =
+                    check_exec_sink_fallback(command, context, first_allowlist_hit)
                 {
                     return Some(blocked);
                 }
@@ -25627,7 +25637,12 @@ fn evaluate_heredoc(
                     return Some(EvaluationResult::denied_by_legacy(&reason));
                 }
 
-                continue;
+                // No AST verdict, but the exec-sink backstop below is regex
+                // work that needs no parse, so fall through to it. A `continue`
+                // here skipped it, and a timed-out parse of
+                // `spawnSync('rm', ['-rf', '/'])` — an argv shape no other
+                // layer sees — was ALLOWED on a loaded host.
+                Vec::new()
             }
         };
 
@@ -25726,70 +25741,14 @@ fn evaluate_heredoc(
         // Position is the gate now. Every blocking AST match has already returned
         // above, so this runs only when the authoritative path found nothing,
         // which keeps rule attribution with the specific pattern where one exists.
-        // Language scoping lives inside the function: Bash is never masked and
-        // Perl/Php/Go use their own primary paths, so it returns `None` for them
-        // without a caller-side check.
+        // Language scoping lives inside the scanner: Bash is never masked and
+        // Php/Go use their own primary paths, so it finds nothing for them
+        // without a caller-side check. Perl's scans are re-run there because a
+        // timed-out `find_matches` takes them down with it.
+        if let Some(blocked) =
+            exec_sink_backstop_verdict(command, &content, context, first_allowlist_hit)
         {
-            if let Some(m) =
-                crate::ast_matcher::scan_executing_sink_fallback(&content.content, content.language)
-            {
-                if m.severity.blocks_by_default() {
-                    let (pack_id, pattern_name) = split_ast_rule_id(&m.rule_id);
-
-                    if let Some(hit) = context.allowlists.match_rule_at_path(
-                        &pack_id,
-                        &pattern_name,
-                        context.project_path,
-                    ) {
-                        if first_allowlist_hit.is_none() {
-                            let reason =
-                                format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
-                            let mapped_span = map_heredoc_span(command, &content, m.start, m.end);
-                            *first_allowlist_hit = Some((
-                                PatternMatch {
-                                    pack_id: Some(pack_id),
-                                    pattern_name: Some(pattern_name),
-                                    severity: Some(ast_severity_to_pack_severity(m.severity)),
-                                    reason,
-                                    source: MatchSource::HeredocAst,
-                                    matched_span: mapped_span,
-                                    matched_text_preview: Some(m.matched_text_preview),
-                                    explanation: None,
-                                    suggestions: &[],
-                                },
-                                hit.layer,
-                                hit.entry.reason.clone(),
-                            ));
-                        }
-                    } else {
-                        let reason =
-                            format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
-                        let mapped_span = map_heredoc_span(command, &content, m.start, m.end);
-                        return Some(EvaluationResult {
-                            decision: EvaluationDecision::Deny,
-                            pattern_info: Some(PatternMatch {
-                                pack_id: Some(pack_id),
-                                pattern_name: Some(pattern_name),
-                                severity: Some(ast_severity_to_pack_severity(m.severity)),
-                                reason,
-                                source: MatchSource::HeredocAst,
-                                matched_span: mapped_span,
-                                matched_text_preview: Some(m.matched_text_preview),
-                                explanation: None,
-                                suggestions: &[],
-                            }),
-                            allowlist_override: None,
-                            effective_mode: Some(crate::packs::DecisionMode::Deny),
-                            skipped_due_to_budget: false,
-                            quick_rejected: false,
-                            branch_context: None,
-                            session_occurrence: None,
-                            graduated_response: None,
-                            bypass_method: None,
-                        });
-                    }
-                }
-            }
+            return Some(blocked);
         }
     }
 
@@ -25802,8 +25761,111 @@ fn evaluate_heredoc(
         {
             return Some(blocked);
         }
+        if let Some(blocked) = check_exec_sink_fallback(command, context, first_allowlist_hit) {
+            return Some(blocked);
+        }
     }
 
+    None
+}
+
+/// The exec-sink backstop's verdict on one extracted body.
+///
+/// Every blocking match is weighed: an allowlisted one is recorded and
+/// skipped, and the first other one denies. This used to take one match and
+/// stop, so allowlisting `heredoc.javascript.exec_sink.rm_rf` for a `./build`
+/// delete also let a `/` delete later in the same body through.
+fn exec_sink_backstop_verdict(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    for m in crate::ast_matcher::scan_executing_sink_matches(&content.content, content.language) {
+        let (pack_id, pattern_name) = split_ast_rule_id(&m.rule_id);
+        let allow_hit =
+            context
+                .allowlists
+                .match_rule_at_path(&pack_id, &pattern_name, context.project_path);
+        let pattern_match = PatternMatch {
+            reason: format_heredoc_denial_reason(content, &m, &pack_id, &pattern_name),
+            pack_id: Some(pack_id),
+            pattern_name: Some(pattern_name),
+            severity: Some(ast_severity_to_pack_severity(m.severity)),
+            source: MatchSource::HeredocAst,
+            matched_span: map_heredoc_span(command, content, m.start, m.end),
+            matched_text_preview: Some(m.matched_text_preview),
+            explanation: None,
+            suggestions: &[],
+        };
+        if let Some(hit) = allow_hit {
+            if first_allowlist_hit.is_none() {
+                *first_allowlist_hit = Some((pattern_match, hit.layer, hit.entry.reason.clone()));
+            }
+            continue;
+        }
+        return Some(EvaluationResult {
+            decision: EvaluationDecision::Deny,
+            pattern_info: Some(pattern_match),
+            allowlist_override: None,
+            effective_mode: Some(crate::packs::DecisionMode::Deny),
+            skipped_due_to_budget: false,
+            quick_rejected: false,
+            branch_context: None,
+            session_occurrence: None,
+            graduated_response: None,
+            bypass_method: None,
+        });
+    }
+    None
+}
+
+/// Exec-sink backstop for an incomplete extraction.
+///
+/// `check_fallback_patterns` recognises deletions by sink NAME (`shutil.rmtree`,
+/// `fs.rmSync`), and the raw-shell rescan needs contiguous `rm -rf` text, so
+/// neither sees an argv-form spawn: `subprocess.run(['rm', '-rf', '/'])`,
+/// `spawnSync('rm', ['-rf', '/'])`, `system('rm', '-rf', '/')`. Only the
+/// per-body exec-sink backstop denies those, and an extraction that ran past
+/// its hot-path budget never reaches it — so on a loaded host, or with
+/// `[heredoc] timeout_ms = 0`, every one of them was ALLOWED while the same
+/// command denied a moment later.
+///
+/// Same remedy as `check_credential_write_fallback`: re-extract on the
+/// structural budget (#443), skip what the primary loop exempts, and run the
+/// same scanner under the same rule ids, so one allowlist entry governs both
+/// paths.
+fn check_exec_sink_fallback(
+    command: &str,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    if deadline_exceeded(context.deadline) {
+        return Some(EvaluationResult::indeterminate_due_to_budget());
+    }
+    let items = match extract_content(
+        command,
+        &crate::heredoc::ExtractionLimits::structural_scan(),
+    ) {
+        ExtractionResult::Extracted(items)
+        | ExtractionResult::Partial {
+            extracted: items, ..
+        } => items,
+        _ => return None,
+    };
+    for item in items {
+        if deadline_exceeded(context.deadline) {
+            return Some(EvaluationResult::indeterminate_due_to_budget());
+        }
+        if heredoc_content_is_exempt(command, &item, context) {
+            continue;
+        }
+        if let Some(blocked) =
+            exec_sink_backstop_verdict(command, &item, context, first_allowlist_hit)
+        {
+            return Some(blocked);
+        }
+    }
     None
 }
 
@@ -38626,6 +38688,82 @@ mod tests {
                 eval_with_heredoc(python, &bash_only).is_allowed(),
                 "`languages = [\"bash\"]` must hold on the timeout path too"
             );
+        }
+
+        /// Argv-form exec-sink deletes keep their backstop when extraction or
+        /// AST matching runs out of time.
+        ///
+        /// Neither `check_fallback_patterns` (sink names) nor the raw-shell
+        /// rescan (contiguous `rm -rf` text) can see an argv spawn, so with
+        /// extraction at 0 ms every destructive row below was ALLOWED. A loaded
+        /// host did the same at random: a differential fuzzer run twice on one
+        /// seed allowed different rows each time.
+        #[test]
+        fn extraction_timeout_keeps_the_exec_sink_backstop() {
+            let destructive = [
+                "python3 <<'PY'\nimport subprocess\nsubprocess.run(['rm', '-rf', '/'])\nPY",
+                "node <<'JS'\nrequire('child_process').spawnSync('rm', ['-rf', './build'])\nJS",
+                "ruby <<'RB'\nsystem('rm', '-rf', '/')\nRB",
+                "perl <<'PL'\nsystem('rm', '-rf', '/');\nPL",
+                "perl <<'PL'\nuse File::Path;\nrmtree(['/tmp/x', '/']);\nPL",
+            ];
+            let temp_only = [
+                "node <<'JS'\nrequire('child_process').spawnSync('rm', ['-rf', '/tmp/x'])\nJS",
+                "ruby <<'RB'\nsystem('rm', '-rf', '/tmp/x')\nRB",
+                "perl <<'PL'\nsystem('rm', '-rf', '/tmp/x');\nPL",
+            ];
+            for (label, settings) in [
+                ("primary", completed_extraction()),
+                ("timeout", forced_extraction_timeout()),
+            ] {
+                for cmd in destructive {
+                    let result = eval_with_heredoc(cmd, &settings);
+                    assert!(result.is_denied(), "{label}: {cmd:?} -> {result:?}");
+                }
+                for cmd in temp_only {
+                    let result = eval_with_heredoc(cmd, &settings);
+                    assert!(result.is_allowed(), "{label}: {cmd:?} -> {result:?}");
+                }
+            }
+        }
+
+        /// Every exec-sink match in a body is weighed, on both paths.
+        ///
+        /// Ruby's pass returned its first hit whatever its severity, so a
+        /// harmless temp delete ahead of `system('rm', '-rf', '/')` ALLOWED the
+        /// pair; and the backstop took one match, so allowlisting the `./build`
+        /// rule let the `/` delete after it through.
+        #[test]
+        fn exec_sink_backstop_weighs_every_match() {
+            let decoyed = [
+                "ruby <<'RB'\nsystem('rm', '-rf', '/tmp/x')\nsystem('rm', '-rf', '/')\nRB",
+                "ruby <<'RB'\n%x(rm -rf /tmp/x)\nsystem('rm', '-rf', '/')\nRB",
+            ];
+            let allowlists =
+                project_allowlists_for_rule("heredoc.javascript:exec_sink.rm_rf", "reviewed");
+            let allowlisted_first = "node <<'JS'\nconst cp = require('child_process');\n\
+                                     cp.spawnSync('rm', ['-rf', './build']);\n\
+                                     cp.spawnSync('rm', ['-rf', '/']);\nJS";
+            for (label, settings) in [
+                ("primary", completed_extraction()),
+                ("timeout", forced_extraction_timeout()),
+            ] {
+                for cmd in decoyed {
+                    let result = eval_with_heredoc(cmd, &settings);
+                    assert!(result.is_denied(), "{label}: {cmd:?} -> {result:?}");
+                }
+                let result =
+                    eval_with_heredoc_and_allowlists(allowlisted_first, &settings, &allowlists);
+                assert!(result.is_denied(), "{label}: {result:?}");
+                assert_eq!(
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref()),
+                    Some("exec_sink.rm_rf_catastrophic"),
+                    "{label}: the allowlisted `./build` hit must not shadow the `/` hit"
+                );
+            }
         }
 
         #[test]
