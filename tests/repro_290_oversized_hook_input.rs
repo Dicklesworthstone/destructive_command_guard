@@ -27,10 +27,25 @@ fn dcg_binary() -> PathBuf {
 /// Run dcg in hook mode with raw stdin bytes and an isolated HOME/config
 /// (default config: fail-open, default size limits).
 fn run_hook_raw(input: &str, home: &Path) -> (String, String, i32) {
+    run_hook_raw_with_budget(input, home, None)
+}
+
+/// As [`run_hook_raw`], with an explicit hook budget in milliseconds.
+///
+/// A budget of 1ms is guaranteed to be exhausted before the multi-megabyte
+/// window scan finishes, which is what lets the #475 regression test assert the
+/// exhaustion answer deterministically instead of waiting for a loaded host to
+/// produce it. `None` keeps the shipped default.
+fn run_hook_raw_with_budget(
+    input: &str,
+    home: &Path,
+    budget_ms: Option<u64>,
+) -> (String, String, i32) {
     let config_path = home.join("dcg-test-config.toml");
     fs::write(&config_path, "").expect("failed to write empty config");
 
-    let mut child = Command::new(dcg_binary())
+    let mut command = Command::new(dcg_binary());
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -41,9 +56,16 @@ fn run_hook_raw(input: &str, home: &Path) -> (String, String, i32) {
             "DCG_PENDING_EXCEPTIONS_PATH",
             home.join("pending_exceptions.jsonl"),
         )
-        .env_remove("DCG_FAIL_CLOSED")
-        .spawn()
-        .expect("failed to spawn dcg process");
+        .env_remove("DCG_FAIL_CLOSED");
+    match budget_ms {
+        Some(ms) => {
+            command.env("DCG_HOOK_TIMEOUT_MS", ms.to_string());
+        }
+        None => {
+            command.env_remove("DCG_HOOK_TIMEOUT_MS");
+        }
+    }
+    let mut child = command.spawn().expect("failed to spawn dcg process");
 
     {
         let stdin = child.stdin.as_mut().expect("failed to get stdin");
@@ -229,6 +251,78 @@ fn issue_290_padding_before_tool_input_is_denied() {
 #[test]
 fn issue_290_padding_inside_command_before_destructive_part_is_denied() {
     assert_denied("pad inside command", &pad_inside_command_envelope());
+}
+
+/// An exhausted budget must not turn an oversized payload into a silent allow
+/// (#475).
+///
+/// The window scan used to `break` into the fail-open branch, so "the deadline
+/// ran out" and "nothing destructive is here" produced the same answer: allow.
+/// That is what made the test above flaky rather than wrong — it was green only
+/// while the host was fast enough to finish the multi-megabyte scan inside the
+/// budget, and on a loaded machine dcg printed
+/// `allowing command (fail-open)` for the very payload that test exists to
+/// deny.
+///
+/// The budget is forced here rather than inferred from ambient load, so this
+/// asserts the property on an idle machine too. Measured before the fix:
+/// ALLOW with empty stdout, 12/12.
+///
+/// The control is the point. The same command *without* the padding answers the
+/// same exhausted budget with ask-or-deny and never allow, so the oversized
+/// path was the outlier, not the deadline.
+#[test]
+fn issue_475_exhausted_budget_on_an_oversized_payload_is_indeterminate_not_allow() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let input = pad_inside_command_envelope();
+    assert!(input.len() > 256 * 1024, "envelope must exceed the limit");
+
+    let (stdout, stderr, exit_code) = run_hook_raw_with_budget(&input, temp.path(), Some(1));
+
+    assert_eq!(exit_code, 0, "hook mode exits 0\nstderr: {stderr}");
+    assert!(
+        !stdout.trim().is_empty(),
+        "an exhausted budget left windows unscanned, so this must publish a \
+         decision rather than exit silently (a silent exit IS the allow); \
+         stderr: {stderr:?}"
+    );
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("expected a decision JSON ({e}); stdout: {stdout:?}"));
+    let decision = json["hookSpecificOutput"]["permissionDecision"]
+        .as_str()
+        .unwrap_or_default();
+    assert_ne!(
+        decision, "allow",
+        "exhaustion is indeterminate, never a silent allow; got {stdout:?}"
+    );
+    assert_eq!(
+        decision, "ask",
+        "the normal-size path answers an exhausted budget with ask; the \
+         oversized path must answer the same way. Got {stdout:?}"
+    );
+
+    // Control: identical command, no padding, identical budget. This one is
+    // allowed to be either ask or deny depending on how far it gets, but it
+    // must never allow -- that is the invariant the padded case was breaking.
+    let control_home = tempfile::tempdir().expect("tempdir");
+    let control = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": "git reset --hard" }
+    })
+    .to_string();
+    let (control_stdout, control_stderr, control_exit) =
+        run_hook_raw_with_budget(&control, control_home.path(), Some(1));
+    assert_eq!(control_exit, 0, "control exits 0\nstderr: {control_stderr}");
+    let control_json: serde_json::Value = serde_json::from_str(control_stdout.trim())
+        .unwrap_or_else(|e| panic!("control expected decision JSON ({e}); got {control_stdout:?}"));
+    let control_decision = control_json["hookSpecificOutput"]["permissionDecision"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        matches!(control_decision, "ask" | "deny"),
+        "the unpadded control must answer ask or deny under the same budget, \
+         never allow; got {control_stdout:?}"
+    );
 }
 
 /// An oversized NON-shell envelope must keep fail-open behavior: dcg never

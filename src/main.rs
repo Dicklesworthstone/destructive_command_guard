@@ -613,11 +613,46 @@ fn try_deny_unparseable_payload(
     // thread + database) unless a denial is actually published.
     // Deny if ANY extracted occurrence (or scan window) resolves decisively;
     // a benign decoy ahead of the real command must not be able to end the
-    // scan. Bail out as soon as the deadline is gone — an exhausted budget
-    // means fail-open, exactly as before.
+    // scan.
+    //
+    // An exhausted deadline leaves windows unscanned, so "nothing found" is not
+    // something this run established — and this loop used to `break` into the
+    // fail-open branch, which ALLOWS. That contradicted the invariant stated
+    // twice in AGENTS.md ("exhaustion is indeterminate, never a silent allow"),
+    // and the normal-size path already honours it: measured at
+    // `DCG_HOOK_TIMEOUT_MS=1`, `git reset --hard` answered ask-or-deny 12/12
+    // while the same command padded past the size limit answered ALLOW 12/12
+    // (#475). Publishing the same Indeterminate the normal path publishes is
+    // what closes that, and it is also why
+    // `issue_290_padding_inside_command_before_destructive_part_is_denied`
+    // flaked: it was green only while the host was fast enough to finish.
+    //
+    // Completing the scan with no hit still returns None. That is a real
+    // "nothing found", not an unknown, so a benign oversized payload keeps
+    // failing open exactly as `issue_290_padded_benign_command_still_fails_open`
+    // requires.
     for command in &commands {
         if deadline.is_exceeded() {
-            break;
+            let mut history_writer = if config.history.enabled {
+                let mut writer =
+                    HistoryWriter::new(Some(history_db_path(&config.history)), &config.history);
+                writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
+                Some(writer)
+            } else {
+                None
+            };
+            let exit_code = publish_decisive_response(
+                &eval_context,
+                ResolvedCommandOutcome::DeadlineExhausted {
+                    command: command.clone(),
+                    stage: "oversized_payload_window_scan",
+                },
+                &mut history_writer,
+            );
+            // Dropped before the caller can `process::exit`, for the same
+            // reason the deny arm below drops its writer here.
+            drop(history_writer);
+            return Some(exit_code);
         }
         // Windows made of pure padding carry no enabled keyword; skipping
         // them keeps the multi-window scan a substring search per megabyte
