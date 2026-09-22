@@ -539,6 +539,61 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
             .with_command("git lfs install"),
         ],
     );
+    m.insert(
+        "core.git:checkout-discard-cwd",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Review exactly what would be discarded with `git diff`",
+            )
+            .with_command("git diff"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Save the changes first, then restore later with `git stash pop`",
+            )
+            .with_command("git stash"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Limit the overwrite to reviewed files: `git checkout <ref> -- <file>`",
+            ),
+        ],
+    );
+    m.insert(
+        "core.git:filter-branch",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Back up the current refs before rewriting: `git branch backup-before-rewrite`",
+            )
+            .with_command("git branch backup-before-rewrite"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Prefer git-filter-repo (faster and safer) and review the result",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Force-push a rewritten branch only with --force-with-lease after review",
+            ),
+        ],
+    );
+    m.insert(
+        "core.git:reflog-expire-now",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Recover what you need first: `git reflog`, then `git branch <name> <sha>`",
+            )
+            .with_command("git reflog"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Let the reflog expire on its default 90-day schedule instead of --expire=now",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Only expire the reflog once you have confirmed nothing else needs recovery",
+            ),
+        ],
+    );
 }
 
 /// Recursive rm rules whose target is a root, home, or sensitive system path.

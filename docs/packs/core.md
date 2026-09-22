@@ -45,6 +45,9 @@ These patterns match potentially destructive commands:
 | `branch-dynamic-token` | A dynamic shell expansion in this git branch command can expand into a deletion or forced ref update. Quote the branch name or add `--` to make it a literal creation. | high |
 | `checkout-discard` | git checkout -- discards uncommitted changes permanently. Use 'git stash' first. | high |
 | `checkout-ref-discard` | git checkout <ref> -- <path> overwrites working tree. Use 'git stash' first. | high |
+| `checkout-discard-cwd` | git checkout . discards all uncommitted changes in the path. Use 'git stash' first. | high |
+| `filter-branch` | git filter-branch rewrites repository history and can permanently drop commits. Back up the refs first. | high |
+| `reflog-expire-now` | git reflog expire --expire=now destroys the reflog, removing the ability to recover lost commits. | high |
 | `show-redirect-overwrite-source` | git show <ref>:<path> redirected onto the same <path> overwrites the working tree file, exactly like the denied 'git checkout <ref> -- <path>'. | high |
 | `restore-worktree` | git restore discards uncommitted changes. Use 'git stash' or 'git diff' first. | high |
 | `restore-worktree-explicit` | git restore --worktree/-W discards uncommitted changes permanently. | high |

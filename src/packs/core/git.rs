@@ -5384,6 +5384,60 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 ]
             }
         ),
+        // `git checkout .` / `git checkout <ref> .` (no `--`) discards every
+        // uncommitted change under the pathspec, exactly like the blocked
+        // `git checkout -- .` and `git restore .`. The `--`-only rules above
+        // deliberately leave the general `git checkout <pathspec>` alone
+        // because a bare word is ambiguous with a branch name — but `.` (and
+        // `./…`) is NEVER a valid ref, so it is an unambiguous working-tree
+        // discard that was slipping through.
+        destructive_pattern!(
+            "checkout-discard-cwd",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+(?!-b\b)(?!--orphan\b)(?:[^\s;&|<>()]+\s+)*\.(?:/[^\s;&|<>()]*)?(?:\s|$|[;&|<>)])",
+            "git checkout . discards all uncommitted changes in the path. Use 'git stash' first.",
+            High,
+            "git checkout . (or git checkout <ref> .) overwrites the working tree from the \
+             index or a commit, discarding every uncommitted change under the current \
+             directory. The changes were never committed, so they cannot be recovered.\n\n\
+             Safer alternatives:\n\
+             - git stash: save the changes first, restore later with 'git stash pop'\n\
+             - git diff: review exactly what would be discarded\n\
+             - git checkout <ref> -- <specific-file>: limit the overwrite to reviewed files"
+        ),
+        // `git filter-branch` rewrites every commit in the history it touches
+        // and can silently drop commits; `git-filter-repo` (its recommended
+        // replacement) is already treated as unverifiable. Rewritten history
+        // must be reviewed before it is force-pushed over a shared branch.
+        destructive_pattern!(
+            "filter-branch",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)filter-branch\b",
+            "git filter-branch rewrites repository history and can permanently drop commits. Back up the refs first.",
+            High,
+            "git filter-branch rewrites every commit in the selected range, changing their \
+             hashes and, with the wrong filter, silently dropping commits or files. The \
+             original commits survive only in the reflog until it expires or is pruned.\n\n\
+             Safer alternatives:\n\
+             - Back up first: git branch backup-before-rewrite\n\
+             - Prefer git-filter-repo (faster, safer) and review the result\n\
+             - Force-push a rewritten branch only with --force-with-lease"
+        ),
+        // `git reflog expire --expire=now` (and `--expire-unreachable=now`)
+        // destroys the reflog entries that are the last recovery path for
+        // reset/rebase/branch-deletion mistakes; paired with `gc --prune=now`
+        // the lost commits become truly unrecoverable.
+        destructive_pattern!(
+            "reflog-expire-now",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reflog\s+expire\b[^|;&\r\n]*--expire(?:-unreachable)?=(?:now|all|0)\b",
+            "git reflog expire --expire=now destroys the reflog, removing the ability to recover lost commits.",
+            High,
+            "The reflog records where HEAD and each branch pointed, and is what lets you \
+             recover from a bad reset, rebase, or branch deletion. Expiring it with \
+             --expire=now deletes those entries immediately; after a subsequent \
+             gc --prune=now the orphaned commits cannot be recovered at all.\n\n\
+             Safer alternatives:\n\
+             - Let the reflog expire on its default schedule (90 days)\n\
+             - Recover what you need first: git reflog, then git branch <name> <sha>"
+        ),
         // `git show <ref>:<path>` is safe on its own (stdout only), and the
         // checkout-ref-discard remediation above recommends it. But redirected
         // back onto the SAME path it reaches the identical end state that rule
@@ -8014,6 +8068,54 @@ git x",
             assert!(
                 !command_executes_git_in_dialect(command, ShellDialect::Posix),
                 "{command:?} must not be treated as a git built-in"
+            );
+        }
+    }
+
+    /// Working-tree/history/recovery destroyers that were previously fail-open:
+    /// `git checkout .` (the no-`--` twin of the blocked `git restore .`),
+    /// `git filter-branch`, and `git reflog expire --expire=now`.
+    #[test]
+    fn checkout_cwd_filter_branch_and_reflog_expire_block() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("git checkout .", "checkout-discard-cwd"),
+            ("git checkout ./src", "checkout-discard-cwd"),
+            ("git checkout HEAD .", "checkout-discard-cwd"),
+            ("git checkout origin/main .", "checkout-discard-cwd"),
+            ("git filter-branch -f HEAD", "filter-branch"),
+            ("git-filter-branch --force", "filter-branch"),
+            ("git reflog expire --expire=now --all", "reflog-expire-now"),
+            (
+                "git reflog expire --expire-unreachable=now main",
+                "reflog-expire-now",
+            ),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+
+        // Branch switches, dotted branch names, quoted mentions, and the
+        // default-schedule reflog expiry must stay allowed — `.` is the only
+        // unambiguous pathspec, so ambiguous bare words are left alone.
+        // (A `.`/`filter-branch`/`checkout .` mention inside a quoted argument,
+        // e.g. `git commit -m 'git checkout .'`, is allowed in production
+        // because the evaluator masks quoted strings before matching — a
+        // property of the evaluator, not `Pack::check`, so it is not asserted
+        // at this raw-regex layer.)
+        for command in [
+            "git checkout main",
+            "git checkout -b feature",
+            "git checkout --orphan gh-pages",
+            "git checkout feature.branch",
+            "git checkout release/1.2",
+            "git log --grep=filter-branch",
+            "git reflog expire --all",
+            "git reflog",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|matched| matched.name)
             );
         }
     }
