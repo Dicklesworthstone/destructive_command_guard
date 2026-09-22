@@ -2171,6 +2171,15 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "dd",
             "diskutil",
             "mkfs",
+            "mke2fs",
+            "mkdosfs",
+            "mkntfs",
+            "mkexfatfs",
+            "newfs",
+            "newfs_apfs",
+            "newfs_hfs",
+            "newfs_msdos",
+            "newfs_exfat",
             "mkswap",
             "fdisk",
             "parted",
@@ -6594,6 +6603,10 @@ mod tests {
             // #441: `mount --bind /mnt /` names `mount` and nothing else. The
             // row carried only `umount`, which this command does not contain.
             ("system.disk", "mount --bind /mnt /", "mount-bind-root"),
+            // Direct formatters with no `/dev/` in the command: the new row
+            // keywords are the only thing that selects the pack.
+            ("system.disk", "mke2fs disk.img", "mkfs"),
+            ("system.disk", "newfs_apfs disk2s1", "mkfs"),
         ];
 
         /// A rule is only real if the production gate lets its pack see the command.

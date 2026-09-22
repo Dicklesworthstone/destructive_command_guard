@@ -107,6 +107,18 @@ pub fn create_pack() -> Pack {
             "diskutil",
             "fdisk",
             "mkfs",
+            // Direct formatters (see the `mkfs` rule). `newfs_*` are spelled
+            // out: `_` is a word character, so `newfs` never matches inside
+            // `newfs_apfs` under the boundary-aware quick-reject.
+            "mke2fs",
+            "mkdosfs",
+            "mkntfs",
+            "mkexfatfs",
+            "newfs",
+            "newfs_apfs",
+            "newfs_hfs",
+            "newfs_msdos",
+            "newfs_exfat",
             "mkswap",
             "parted",
             "mount",
@@ -319,10 +331,13 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              lsblk /dev/sda",
             executables = ["gdisk", "cgdisk"]
         ),
-        // mkfs (format filesystem)
+        // mkfs (format filesystem), and the formatters `mkfs.*` fronts but an
+        // agent can run directly: `mke2fs` (ext2/3/4), `mkdosfs`, `mkntfs`,
+        // `mkexfatfs`, and macOS `newfs_*`. `mke2fs /dev/sdb1` reached this
+        // pack through `/dev/` and matched no rule, so it was allowed.
         destructive_pattern!(
             "mkfs",
-            r"mkfs(?:\.[a-z0-9]+)?\s+",
+            r"(?:mkfs(?:\.[a-z0-9]+)?|mke2fs|mkdosfs|mkntfs|mkexfatfs|newfs(?:_[a-z0-9]+)?)\s+",
             "mkfs formats a partition/device and ERASES all existing data."
         ),
         // mkswap (format as swap area). Same blast radius as mkfs: overwrites
@@ -1642,6 +1657,31 @@ mod tests {
             "zpool scrub tank",
             "btrfs scrub start /mnt",
             "wipe notes.txt",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
+    /// The formatters `mkfs.*` fronts, run directly, format just the same.
+    #[test]
+    fn direct_filesystem_formatters_are_mkfs() {
+        let pack = create_pack();
+        for command in [
+            "mke2fs /dev/sdb1",
+            "mke2fs -t ext4 /dev/sdb1",
+            "mkdosfs -F 32 /dev/sdc1",
+            "mkntfs -f /dev/sdc2",
+            "mkexfatfs /dev/sdd1",
+            "newfs_apfs /dev/disk2s1",
+            "newfs_hfs -v Data /dev/disk3s2",
+            "newfs_msdos -F 32 /dev/disk4s1",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "mkfs");
+        }
+        for command in [
+            "dumpe2fs /dev/sdb1",
+            "e2fsck -n /dev/sdb1",
+            "tune2fs -l /dev/sdb1",
         ] {
             assert_allows(&pack, command);
         }
