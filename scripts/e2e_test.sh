@@ -1192,9 +1192,13 @@ test_command "sudo git reset --hard" "block" "sudo git reset --hard"
 test_command 'git "reset" --hard' "block" 'git "reset" --hard (quoted subcommand)'
 test_command '"git" reset --hard' "block" '"git" reset --hard (quoted binary)'
 test_command 'sudo "/bin/git" reset --hard' "block" 'sudo "/bin/git" reset --hard (quoted binary with path and wrapper)'
+# Target is /home/user, not a temp path: this test is about the `<< "EOF SPACE"`
+# delimiter being parsed, and #455 made a recursive delete of a temp literal
+# warn-only in every language, so a /tmp target would assert the opposite of the
+# shipped policy rather than exercise the delimiter.
 test_command "python3 << \"EOF SPACE\"
 import shutil
-shutil.rmtree('/tmp/test')
+shutil.rmtree('/home/user')
 EOF SPACE" "block" "heredoc with spaced delimiter"
 
 log_section "Non-Core Pack Regression Tests (git_safety_guard-99e.1.2)"
@@ -1427,7 +1431,7 @@ log_section "Heredoc / Inline Script Tests (git_safety_guard-e2eh)"
 test_command $'node <<EOF\nconst fs = require(\'fs\');\nfs.rmSync(\'/etc\', { recursive: true });\nEOF\n' "block" "node heredoc fs.rmSync('/etc', {recursive:true})"
 
 # Must BLOCK: cross-language heredoc cases (at least 3 languages)
-test_command $'python3 <<EOF\nimport shutil\nshutil.rmtree(\"/tmp/test\")\nEOF\n' "block" "python heredoc shutil.rmtree('/tmp/test')"
+test_command $'python3 <<EOF\nimport shutil\nshutil.rmtree(\"/\")\nEOF\n' "block" "python heredoc shutil.rmtree('/')"
 test_command $'ruby <<EOF\nrequire \"fileutils\"\nFileUtils.rm_rf(\"/\")\nEOF\n' "block" "ruby heredoc FileUtils.rm_rf('/')"
 test_command $'perl <<EOF\nsystem(\"rm -rf /\");\nEOF\n' "block" "perl heredoc system(\"rm -rf /\")"
 test_command $'bash <<EOF\nrm -rf /etc\nEOF\n' "block" "bash heredoc rm -rf /etc"
