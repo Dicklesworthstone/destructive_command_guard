@@ -24,6 +24,15 @@ Commands containing these keywords are checked against this pack:
 - `diskutil`
 - `fdisk`
 - `mkfs`
+- `mke2fs`
+- `mkdosfs`
+- `mkntfs`
+- `mkexfatfs`
+- `newfs`
+- `newfs_apfs`
+- `newfs_hfs`
+- `newfs_msdos`
+- `newfs_exfat`
 - `mkswap`
 - `parted`
 - `mount`
