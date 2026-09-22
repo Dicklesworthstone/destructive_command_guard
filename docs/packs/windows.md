@@ -151,7 +151,7 @@ These patterns match safe commands that are always allowed:
 |--------------|----------|
 | `vssadmin-list` | `(?i)^\s*vssadmin(?:\.exe)?\s+list\b[^\|&;\r\n]*$` |
 | `diskpart-list` | `(?i)^\s*diskpart(?:\.exe)?\s+(?:/s\s+\S+\s+)?list\b[^\|&;\r\n]*$` |
-| `storage-whatif` | `(?i)^\s*(?:format-volume\|clear-disk\|remove-partition\|initialize-disk\|reset-physicaldisk)\b[^\|&;\r\n]*\s-whatif\b[^\|&;\r\n]*$` |
+| `storage-whatif` | `(?i)^\s*(?:format-volume\|clear-disk\|remove-partition\|initialize-disk\|reset-physicaldisk)\b[^\|&;\r\n'"`$@(){}]*\s-whatif(?:\s[^\|&;\r\n'"`$@(){}]*)?$` |
 
 ### Destructive Patterns (Blocked)
 

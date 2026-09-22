@@ -104,6 +104,19 @@ pub fn create_pack() -> Pack {
     }
 }
 
+/// A storage cmdlet previewed with a bare `-WhatIf` switch; see
+/// `create_safe_patterns`. Shared with the core.filesystem baseline so the two
+/// packs cannot disagree about what a preview is.
+pub(crate) const STORAGE_WHATIF_SAFE: &str = r#"(?i)^\s*(?:format-volume|clear-disk|remove-partition|initialize-disk|reset-physicaldisk)\b[^|&;\r\n'"`$@(){}]*\s-whatif(?:\s[^|&;\r\n'"`$@(){}]*)?$"#;
+
+/// The `storage-whatif` safe pattern (see [`STORAGE_WHATIF_SAFE`]).
+pub(crate) fn storage_whatif_safe_pattern() -> SafePattern {
+    SafePattern {
+        regex: crate::packs::regex_engine::LazyCompiledRegex::new(STORAGE_WHATIF_SAFE),
+        name: "storage-whatif",
+    }
+}
+
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
         // Read-only inspection of shadow copies / disks.
@@ -118,10 +131,14 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // `-WhatIf` previews, but only on PowerShell storage cmdlets that
         // honor it. A stray `-WhatIf` must not whitelist cmd.exe tools such as
         // vssadmin, cipher, or bcdedit.
-        safe_pattern!(
-            "storage-whatif",
-            r"(?i)^\s*(?:format-volume|clear-disk|remove-partition|initialize-disk|reset-physicaldisk)\b[^|&;\r\n]*\s-whatif\b[^|&;\r\n]*$"
-        ),
+        //
+        // Only the bare switch counts. `-WhatIf:$false` (or `:0`) turns the
+        // preview OFF and the cmdlet really runs; `\b` used to accept it, so
+        // `Remove-Partition ... -WhatIf:$false` was allowed. The whole command
+        // may also not contain quotes, backticks, `$`, `@`, parentheses or
+        // braces: ` -WhatIf` inside a quoted label or a `$( )` subexpression
+        // is not a switch on the cmdlet. Anything doubtful stays denied.
+        storage_whatif_safe_pattern(),
     ]
 }
 
@@ -388,5 +405,33 @@ mod tests {
         for command in allowed {
             assert_allows(&pack, command);
         }
+    }
+
+    /// `-WhatIf:$false` disables the preview, so the cmdlet really runs; the
+    /// carve-out used to accept it through `\b`. A ` -WhatIf` that is not a
+    /// switch on the cmdlet (inside a quoted argument or a subexpression) and
+    /// a longer parameter name must not count either.
+    #[test]
+    fn whatif_carve_out_accepts_only_the_bare_switch() {
+        let pack = create_pack();
+        for command in [
+            "Format-Volume -DriveLetter D -WhatIf:$false",
+            "Format-Volume -DriveLetter D -WhatIf:$False -Confirm:$false",
+            "Clear-Disk -Number 1 -RemoveData -WhatIf:$false",
+            "Remove-Partition -DiskNumber 1 -PartitionNumber 2 -WhatIf:0",
+            "Initialize-Disk -Number 2 -WhatIf:$false",
+            "Reset-PhysicalDisk -FriendlyName Disk1 -WhatIf:$false",
+            "Format-Volume -DriveLetter D -NewFileSystemLabel ' -WhatIf'",
+            "Format-Volume -DriveLetter D -NewFileSystemLabel \" -WhatIf\"",
+            "Remove-Partition -DiskNumber $(Get-Disk -WhatIf) -PartitionNumber 2",
+            "Remove-Partition -DiskNumber 1 -PartitionNumber 2 -WhatIfx",
+            "Remove-Partition -DiskNumber 1 -PartitionNumber 2 `\n-WhatIf",
+        ] {
+            assert!(pack.check(command).is_some(), "must stay denied: {command}");
+        }
+        assert_allows(
+            &pack,
+            "Remove-Partition -DiskNumber 1 -PartitionNumber 2 -WhatIf -Confirm",
+        );
     }
 }

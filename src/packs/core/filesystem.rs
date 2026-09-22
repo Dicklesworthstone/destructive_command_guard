@@ -3924,6 +3924,10 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     // destructive rules, and a second `--` would have to satisfy the
     // temp-operand group (it cannot), so `rm -rf -- -- /tmp/x` keeps denying.
     vec![
+        // The baseline Format-Volume / Clear-Disk rules (#451) mirror
+        // windows.system's regexes, so they take its preview carve-out too:
+        // a bare `-WhatIf` is a preview, `-WhatIf:$false` is not.
+        crate::packs::windows::system::storage_whatif_safe_pattern(),
         // rm -rf in /tmp (combined flags)
         safe_pattern!(
             "rm-rf-tmp",
@@ -9034,12 +9038,22 @@ mod classifier_guidance_tests {
             "Get-Volume",
             "Get-Disk",
             "git format-patch -1",
+            // A bare -WhatIf is a preview (windows.system's carve-out).
+            "Format-Volume -DriveLetter D -WhatIf",
+            "Clear-Disk -Number 1 -RemoveData -WhatIf",
         ] {
             assert!(
                 pack.check(command).is_none(),
                 "{command} must stay allowed, matched {:?}",
                 pack.check(command).and_then(|matched| matched.name)
             );
+        }
+        // `-WhatIf:$false` turns the preview off: the volume is formatted.
+        for command in [
+            "Format-Volume -DriveLetter D -WhatIf:$false",
+            "Clear-Disk -Number 1 -RemoveData -WhatIf:$false",
+        ] {
+            assert!(pack.check(command).is_some(), "{command} must be denied");
         }
     }
 
