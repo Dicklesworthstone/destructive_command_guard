@@ -1217,3 +1217,156 @@ fn node_and_ruby_composed_paths_keep_rule_grants_independent() {
         }
     }
 }
+
+#[test]
+fn compound_open_flags_reach_hook_cli_and_stdin() {
+    for (exe, source) in [
+        (
+            "python3",
+            "import os; f = os.O_RDONLY; f |= os.O_WRONLY; os.open('.bashrc', f)",
+        ),
+        (
+            "python3",
+            "import os; f = os.O_WRONLY | os.O_APPEND; f |= os.O_TRUNC; os.open('.ssh/known_hosts', f)",
+        ),
+        (
+            "node",
+            "const fs = require('fs'); let f = fs.constants.O_RDONLY; f |= fs.constants.O_WRONLY; fs.openSync('.bashrc', f)",
+        ),
+        (
+            "node",
+            "const fs = require('fs'); let f = fs.constants.O_WRONLY | fs.constants.O_APPEND; f |= fs.constants.O_TRUNC; fs.openSync('.ssh/known_hosts', f)",
+        ),
+        (
+            "ruby",
+            "f = File::RDONLY; f |= File::WRONLY; IO.sysopen('.bashrc', f)",
+        ),
+        (
+            "ruby",
+            "f = File::WRONLY | File::APPEND; f |= File::TRUNC; IO.sysopen('.ssh/known_hosts', f)",
+        ),
+    ] {
+        assert_link_cases(exe, &[(source, Some("credential-file-write"))]);
+    }
+}
+
+#[test]
+fn compound_path_construction_and_safe_controls_reach_real_entry_points() {
+    for (exe, source, rule) in [
+        (
+            "python3",
+            "p = '/home/u/'; p += '.bashrc'; open(p, 'w')",
+            Some("credential-file-write"),
+        ),
+        (
+            "python3",
+            "from pathlib import Path; p = Path.home(); p /= '.ssh'; p /= 'authorized_keys'; p.write_text('x')",
+            Some("credential-file-write"),
+        ),
+        (
+            "node",
+            "let p = require('os').homedir(); p += '/.bashrc'; require('fs').writeFileSync(p, 'x')",
+            Some("credential-file-write"),
+        ),
+        (
+            "ruby",
+            "p = Dir.home; p += '/.bashrc'; File.write(p, 'x')",
+            Some("credential-file-write"),
+        ),
+        (
+            "python3",
+            "import os; f = os.O_WRONLY; f |= os.O_APPEND; os.open('.ssh/known_hosts', f)",
+            None,
+        ),
+        (
+            "node",
+            "const fs = require('fs'); let f = fs.constants.O_WRONLY; f |= fs.constants.O_APPEND; fs.openSync('.ssh/known_hosts', f)",
+            None,
+        ),
+        (
+            "ruby",
+            "f = File::WRONLY; f |= File::APPEND; IO.sysopen('.ssh/known_hosts', f)",
+            None,
+        ),
+        (
+            "python3",
+            "p = '.bashrc'; p += '.backup'; open(p, 'w')",
+            None,
+        ),
+        (
+            "node",
+            "let p = '.bashrc'; p += '.backup'; require('fs').writeFileSync(p, 'x')",
+            None,
+        ),
+        (
+            "ruby",
+            "p = '.bashrc'; p += '.backup'; File.write(p, 'x')",
+            None,
+        ),
+        (
+            "python3",
+            "print(\"p = '/home/u/'; p += '.bashrc'; open(p, 'w')\")",
+            None,
+        ),
+    ] {
+        assert_link_cases(exe, &[(source, rule)]);
+    }
+}
+
+#[test]
+fn compound_writes_keep_rule_grants_independent() {
+    for (allowed, denied, target) in [
+        ("credential-file-write", "git-internals-write", ".bashrc"),
+        (
+            "git-internals-write",
+            "credential-file-write",
+            ".git/config",
+        ),
+    ] {
+        let home = home();
+        fs::write(
+            home.path().join("config.toml"),
+            "[heredoc]\nenabled = false\n",
+        )
+        .unwrap();
+        fs::write(
+            home.path().join("xdg/dcg/allowlist.toml"),
+            format!(
+                "[[allow]]\nrule = \"core.filesystem:{allowed}\"\nreason = \"one rule only\"\n"
+            ),
+        )
+        .unwrap();
+        assert_program(
+            "python3",
+            &format!("open('{target}', 'w')"),
+            home.path(),
+            None,
+        );
+        for (first, second) in [(".bashrc", ".git/config"), (".git/config", ".bashrc")] {
+            for (exe, source) in [
+                (
+                    "python3",
+                    format!(
+                        "import os; f = os.O_RDONLY; f |= os.O_WRONLY; os.open('{first}', f); os.open('{second}', f)"
+                    ),
+                ),
+                (
+                    "node",
+                    format!(
+                        "const fs = require('fs'); let f = fs.constants.O_RDONLY; f |= fs.constants.O_WRONLY; fs.openSync('{first}', f); fs.openSync('{second}', f)"
+                    ),
+                ),
+                (
+                    "ruby",
+                    format!(
+                        "f = File::RDONLY; f |= File::WRONLY; IO.sysopen('{first}', f); IO.sysopen('{second}', f)"
+                    ),
+                ),
+            ] {
+                assert_program(exe, &source, home.path(), Some(denied));
+                let quoted = format!("'{}'", source.replace('\'', "'\\''"));
+                assert_decision(&format!("{exe} 0<<< {quoted}"), home.path(), Some(denied));
+            }
+        }
+    }
+}

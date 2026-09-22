@@ -1199,3 +1199,215 @@ fn a_wrapper_prefix_does_not_change_the_verdict() {
 // layer would either fail for the wrong reason or pass vacuously. The heredoc
 // contract lives end-to-end in `tests/credential_file_embedded_e2e.rs`, which
 // drives the real hook.
+
+#[test]
+fn compound_flags_cannot_reuse_read_or_append_proofs() {
+    for (language, source) in [
+        (
+            ScriptLanguage::Python,
+            "import os; f = os.O_RDONLY; f |= os.O_WRONLY; os.open('.bashrc', f)",
+        ),
+        (
+            ScriptLanguage::Python,
+            "import os; f = os.O_WRONLY | os.O_APPEND; f |= os.O_TRUNC; os.open('.ssh/known_hosts', f)",
+        ),
+        (
+            ScriptLanguage::Python,
+            "import os; f = unknown; f |= os.O_WRONLY; os.open('.bashrc', f)",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "const fs = require('fs'); let f = fs.constants.O_RDONLY; f |= fs.constants.O_CREAT; fs.openSync('.bashrc', f)",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "const fs = require('fs'); let f = fs.constants.O_WRONLY | fs.constants.O_APPEND; f |= fs.constants.O_TRUNC; fs.openSync('.ssh/known_hosts', f)",
+        ),
+        (
+            ScriptLanguage::TypeScript,
+            "import {openSync, constants as C} from 'node:fs'; let f: number = C.O_RDONLY; f |= C.O_WRONLY; openSync('.bashrc', f)",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "f = File::RDONLY; f |= File::WRONLY; IO.sysopen('.bashrc', f)",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "f = File::WRONLY | File::APPEND; f |= File::TRUNC; File.open('.ssh/known_hosts', f)",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "f = unknown; f |= File::WRONLY; IO.sysopen('.bashrc', f)",
+        ),
+    ] {
+        let hits = scan_extracted(source, language).expect(source);
+        assert_eq!(hits.len(), 1, "{language:?}: {source}: {hits:?}");
+        assert_eq!(hits[0].rule, shell::CREDENTIAL_FILE_WRITE_NAME, "{source}");
+        assert!(source.get(hits[0].span.clone()).is_some(), "{source}");
+    }
+}
+
+#[test]
+fn compound_paths_and_modes_preserve_existing_path_semantics() {
+    for (language, source) in [
+        (
+            ScriptLanguage::Python,
+            "p = '/home/u/'; p += '.bashrc'; open(p, 'w')",
+        ),
+        (
+            ScriptLanguage::Python,
+            "mode = 'r'; mode += '+'; open('.bashrc', mode)",
+        ),
+        (
+            ScriptLanguage::Python,
+            "from pathlib import Path; p = Path.home(); p /= '.ssh'; p /= 'authorized_keys'; p.write_text('x')",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "let p = require('os').homedir(); p += '/.bashrc'; require('fs').writeFileSync(p, 'x')",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "let mode = 'r'; mode += '+'; require('fs').openSync('.bashrc', mode)",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "p = Dir.home; p += '/.bashrc'; File.write(p, 'x')",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "mode = 'r'; mode += '+'; File.open('.bashrc', mode)",
+        ),
+    ] {
+        let hits = scan_extracted(source, language).expect(source);
+        assert_eq!(hits.len(), 1, "{source}: {hits:?}");
+        assert_eq!(hits[0].rule, shell::CREDENTIAL_FILE_WRITE_NAME, "{source}");
+    }
+    for (language, source) in [
+        (
+            ScriptLanguage::Python,
+            "p = '.bashrc'; p += '.backup'; open(p, 'w')",
+        ),
+        (
+            ScriptLanguage::Python,
+            "from pathlib import Path; p = Path.home(); p /= '/tmp/proposal'; p.write_text('x')",
+        ),
+        (
+            ScriptLanguage::Python,
+            "from pathlib import Path; p = Path('~'); p /= '.bashrc'; p.write_text('x')",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "let p = '.bashrc'; p += '.backup'; require('fs').writeFileSync(p, 'x')",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "p = '.bashrc'; p += '.backup'; File.write(p, 'x')",
+        ),
+    ] {
+        assert!(
+            scan_extracted(source, language).expect(source).is_empty(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn compound_updates_keep_real_append_and_read_controls() {
+    for (language, source) in [
+        (
+            ScriptLanguage::Python,
+            "import os; f = os.O_WRONLY; f |= os.O_APPEND; os.open('.ssh/known_hosts', f)",
+        ),
+        (
+            ScriptLanguage::Python,
+            "import os; f = os.O_RDONLY; f |= os.O_CLOEXEC; os.open('.bashrc', f)",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "const fs = require('fs'); let f = fs.constants.O_WRONLY; f |= fs.constants.O_APPEND; fs.openSync('.ssh/known_hosts', f)",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "const fs = require('fs'); let f = fs.constants.O_RDONLY; f |= fs.constants.O_NOFOLLOW; fs.openSync('.bashrc', f)",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "f = File::WRONLY; f |= File::APPEND; IO.sysopen('.ssh/known_hosts', f)",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "f = File::RDONLY; f |= File::NONBLOCK; File.open('.bashrc', f)",
+        ),
+        (
+            ScriptLanguage::Python,
+            "p = '.bashrc'; p *= 0; open(p, 'w')",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "let fs = require('fs'); fs += ''; fs.writeFileSync('.bashrc', 'x')",
+        ),
+    ] {
+        assert!(
+            scan_extracted(source, language).expect(source).is_empty(),
+            "{source}"
+        );
+    }
+    // A bit-clearing/unknown operation is not evidence of append-only access
+    // for an explicit writer. Do not interpret native numeric masks here.
+    for (language, source) in [
+        (
+            ScriptLanguage::JavaScript,
+            "const fs = require('fs'); let f = fs.constants.O_WRONLY | fs.constants.O_APPEND; f ^= mask; fs.appendFileSync('.ssh/known_hosts', 'x', {flag: f})",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "f = File::WRONLY | File::APPEND; f &= mask; File.write('.ssh/known_hosts', 'x', mode: f)",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "const fs = require('fs'); let f = fs.constants.O_WRONLY | fs.constants.O_APPEND; f |= unknown; fs.openSync('.ssh/known_hosts', f)",
+        ),
+    ] {
+        let hits = scan_extracted(source, language).expect(source);
+        assert_eq!(hits.len(), 1, "{source}: {hits:?}");
+    }
+}
+
+#[test]
+fn compound_rhs_effects_are_checked_before_target_invalidation() {
+    for (language, source) in [
+        (ScriptLanguage::Python, "open += open('.bashrc', 'w')"),
+        (
+            ScriptLanguage::JavaScript,
+            "let fs = require('fs'); fs += fs.writeFileSync('.bashrc', 'x')",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "writer = File; writer += writer.write('.bashrc', 'x')",
+        ),
+    ] {
+        let hits = scan_extracted(source, language).expect(source);
+        assert_eq!(hits.len(), 1, "{source}: {hits:?}");
+    }
+    for (language, source) in [
+        (
+            ScriptLanguage::Python,
+            "import os; os.O_RDONLY |= unknown; os.open('.bashrc', os.O_WRONLY)",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "const fs = require('fs'); fs.constants.O_RDONLY |= unknown; fs.openSync('.bashrc', fs.constants.O_WRONLY)",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "File::RDONLY |= unknown; File.open('.bashrc', File::WRONLY)",
+        ),
+    ] {
+        // An altered module is no longer a proven standard-library receiver.
+        assert!(
+            scan_extracted(source, language).expect(source).is_empty(),
+            "{source}"
+        );
+    }
+}

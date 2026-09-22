@@ -666,6 +666,28 @@ fn visit(
         }
         return Ok(());
     }
+    if matches!(
+        kind.as_ref(),
+        "augmented_assignment"
+            | "augmented_assignment_expression"
+            | "operator_assignment"
+            | "update_expression"
+    ) {
+        // Compound assignment reads the old target before evaluating the RHS.
+        // Capture that value now; install the result only after visiting the
+        // children, so an effectful RHS cannot hide its own filesystem call.
+        let target = node.field("left").or_else(|| node.field("argument"));
+        let updated = target
+            .as_ref()
+            .and_then(|target| compound_value(&node, target, language, env));
+        for child in node.children() {
+            visit(child, language, env, depth + 1, remaining_nodes, hits)?;
+        }
+        if let Some(target) = target {
+            bind_compound_target(target, updated, env);
+        }
+        return Ok(());
+    }
     // The right-hand side runs before assignment installs its result. Removing
     // `open` or `fs` first hides the very write in `open = open(path, 'w')` or
     // `fs = fs.writeFileSync(path, data)`. Keep the previous bindings throughout
@@ -701,6 +723,57 @@ fn visit(
         bind(&node, language, env);
     }
     Ok(())
+}
+
+/// Evaluate only operations with a sound model in our abstract value domain.
+/// OR preserves known mutation bits even with an unknown operand; AND/XOR and
+/// arithmetic on native flag numbers do not. Never keep the old append proof
+/// after an unsupported update. Text concatenation and Python Path division
+/// reuse their existing size limits and symbolic-home boundary rules.
+fn compound_value(
+    node: &Syntax<'_>,
+    target: &Syntax<'_>,
+    language: Language,
+    env: &Bindings,
+) -> Option<Value> {
+    let left = value(target, language, env, 0);
+    let right = node
+        .field("right")
+        .and_then(|right| value(&right, language, env, 0));
+    match node.field("operator")?.text().as_ref() {
+        "|=" => combine_open_flags(left, right),
+        "+=" => concatenate_text(left?, right?),
+        "/=" if language == Language::Python => {
+            let (left, right) = (left?, right?);
+            if !matches!(left, Value::Path(_)) && !matches!(right, Value::Path(_)) {
+                return None;
+            }
+            python_join_path(resolved_path(left), resolved_path(right)?).map(Value::Path)
+        }
+        _ => None,
+    }
+}
+
+fn bind_compound_target(target: Syntax<'_>, updated: Option<Value>, env: &mut Bindings) {
+    if matches!(target.kind().as_ref(), "identifier" | "constant") {
+        let name = target.text().into_owned();
+        env.remove(&name);
+        if let Some(updated) = updated {
+            env.insert(name, updated);
+        }
+        return;
+    }
+    // A member update invalidates the receiver's provenance, just like a
+    // plain assignment. Never create a binding for the text `fs.constants`.
+    let mut object = target;
+    while let Some(parent) = object
+        .field("object")
+        .or_else(|| object.field("value"))
+        .or_else(|| object.field("scope"))
+    {
+        object = parent;
+    }
+    env.remove(object.text().as_ref());
 }
 
 /// Encode a decoded path for the shared shell policy, never for execution.
