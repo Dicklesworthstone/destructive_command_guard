@@ -107,6 +107,8 @@ Commands containing these keywords are checked against this pack:
 - `drop`
 - `truncate`
 - `GRANT`
+- `UPDATE`
+- `update`
 
 ### Safe Patterns (Allowed)
 
@@ -131,6 +133,8 @@ These patterns match potentially destructive commands:
 | `drop-table` | DROP TABLE permanently deletes the table. Verify and back up first. | high |
 | `truncate-table` | TRUNCATE permanently deletes all rows. Cannot be rolled back in MySQL. | high |
 | `delete-without-where` | DELETE without WHERE clause deletes ALL rows. Add a WHERE clause. | high |
+| `update-without-where` | UPDATE without WHERE clause overwrites the column in ALL rows. Add a WHERE clause. | high |
+| `drop-column` | ALTER TABLE ... DROP COLUMN permanently deletes that column's data in every row. | high |
 | `mysqladmin-drop` | mysqladmin drop permanently deletes the database. Verify carefully. | critical |
 | `mysqldump-add-drop-database` | mysqldump --add-drop-database drops the database before restore. | high |
 | `mysqldump-add-drop-table` | mysqldump --add-drop-table drops tables before creating them on restore. | medium |
@@ -177,6 +181,7 @@ Commands containing these keywords are checked against this pack:
 - `.drop(`
 - `.remove(`
 - `.deleteMany(`
+- `.updateMany(`
 - `mongorestore`
 - `mongodump`
 
@@ -202,6 +207,7 @@ These patterns match potentially destructive commands:
 | `drop-database` | dropDatabase permanently deletes the entire database. | critical |
 | `drop-collection` | drop/dropCollection permanently deletes the collection. | high |
 | `delete-all` | remove({}) or deleteMany({}) deletes ALL documents. Add filter criteria. | high |
+| `update-all` | updateMany({}, ...) overwrites fields in ALL documents. Add filter criteria. | high |
 | `mongorestore-drop` | mongorestore --drop deletes existing data before restoring. | high |
 | `collection-drop` | collection.drop() permanently deletes the collection. | high |
 
@@ -313,6 +319,7 @@ Commands containing these keywords are checked against this pack:
 - `DROP`
 - `TRUNCATE`
 - `DELETE`
+- `UPDATE`
 
 ### Safe Patterns (Allowed)
 
@@ -334,6 +341,8 @@ These patterns match potentially destructive commands:
 | `stdin-unverified` | sqlite3 receives indirect input that dcg cannot statically verify. | high |
 | `drop-table` | DROP TABLE permanently deletes the table (even with IF EXISTS). Verify it is intended. | critical |
 | `delete-without-where` | DELETE without WHERE deletes ALL rows. Add a WHERE clause. | critical |
+| `update-without-where` | UPDATE without WHERE overwrites the column in ALL rows. Add a WHERE clause. | high |
+| `drop-column` | ALTER TABLE ... DROP COLUMN permanently deletes that column's data in every row. | high |
 | `vacuum-into` | VACUUM INTO overwrites the target file if it exists. | medium |
 | `sqlite3-stdin` | Running SQL from file could contain destructive commands. Review the file first. | high |
 

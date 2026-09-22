@@ -191,6 +191,8 @@ pub fn create_pack() -> Pack {
             "drop",
             "truncate",
             "GRANT",
+            "UPDATE",
+            "update",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -315,6 +317,34 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              SELECT COUNT(*) FROM tablename;  -- all rows!\n  \
              SELECT * FROM tablename LIMIT 10;",
             DELETE_WITHOUT_WHERE_SUGGESTIONS
+        ),
+        // UPDATE without WHERE rewrites every row (same blast radius as the
+        // unscoped DELETE above).
+        destructive_pattern!(
+            "update-without-where",
+            // Keep byte-identical to `crate::packs::database::UPDATE_WITHOUT_WHERE_PATTERN`.
+            r#"(?i)\bUPDATE\s+(?:(?:LOW_PRIORITY|IGNORE|ONLY|OR\s+(?:ROLLBACK|ABORT|REPLACE|FAIL|IGNORE))\s+)*(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\])(?:\s*\.\s*(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\]))?\s+(?:(?:AS\s+)?(?!SET\b)[A-Za-z_]\w*\s+)?SET\b(?:(?!\bWHERE\b)[^;])*(?:;|$)"#,
+            "UPDATE without WHERE clause overwrites the column in ALL rows. Add a WHERE clause.",
+            High,
+            "UPDATE without WHERE changes every row in the table. With autocommit on (the \
+             MySQL default) the previous values are gone the moment it runs.\n\n\
+             Scope it:\n  \
+             UPDATE tablename SET col = value WHERE condition;\n\n\
+             Preview what would change:\n  \
+             SELECT COUNT(*) FROM tablename WHERE condition;"
+        ),
+        // ALTER TABLE … DROP COLUMN (and DROP PARTITION) deletes data in every
+        // row; index/key/constraint drops are metadata only.
+        destructive_pattern!(
+            "drop-column",
+            // Keep byte-identical to `crate::packs::database::DROP_COLUMN_PATTERN`.
+            r#"(?i)\bALTER\s+TABLE\b[^;]*?\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?(?!(?:CONSTRAINT|DEFAULT|NOT\s+NULL|IDENTITY|EXPRESSION|INDEX|KEY|PRIMARY\s+KEY|FOREIGN\s+KEY|CHECK)\b)[A-Za-z_"`\[]"#,
+            "ALTER TABLE ... DROP COLUMN permanently deletes that column's data in every row.",
+            High,
+            "Dropping a column (or a partition) removes its data from every row it covers; \
+             ALTER TABLE is not transactional in MySQL, so there is no rollback.\n\n\
+             Back up the column first:\n  \
+             CREATE TABLE tablename_col_backup AS SELECT id, col FROM tablename;"
         ),
         // mysqladmin drop
         destructive_pattern!(

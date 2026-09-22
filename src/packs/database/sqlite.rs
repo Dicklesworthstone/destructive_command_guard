@@ -16,7 +16,7 @@ pub fn create_pack() -> Pack {
         name: "SQLite",
         description: "Protects against destructive SQLite operations like DROP TABLE, \
                       DELETE without WHERE, and accidental data loss",
-        keywords: &["sqlite", "sqlite3", "DROP", "TRUNCATE", "DELETE"],
+        keywords: &["sqlite", "sqlite3", "DROP", "TRUNCATE", "DELETE", "UPDATE"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
@@ -90,6 +90,32 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - DELETE FROM table WHERE condition: Add explicit conditions\n\
              - .backup before DELETE: Create backup first\n\
              - Use transactions: BEGIN; DELETE ...; verify; COMMIT or ROLLBACK"
+        ),
+        // UPDATE without WHERE rewrites every row.
+        destructive_pattern!(
+            "update-without-where",
+            // Keep byte-identical to `crate::packs::database::UPDATE_WITHOUT_WHERE_PATTERN`.
+            r#"(?i)\bUPDATE\s+(?:(?:LOW_PRIORITY|IGNORE|ONLY|OR\s+(?:ROLLBACK|ABORT|REPLACE|FAIL|IGNORE))\s+)*(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\])(?:\s*\.\s*(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\]))?\s+(?:(?:AS\s+)?(?!SET\b)[A-Za-z_]\w*\s+)?SET\b(?:(?!\bWHERE\b)[^;])*(?:;|$)"#,
+            "UPDATE without WHERE overwrites the column in ALL rows. Add a WHERE clause.",
+            High,
+            "UPDATE without a WHERE clause changes every row in the table; outside a \
+             transaction the previous values are gone.\n\n\
+             Safer alternatives:\n\
+             - UPDATE table SET col = value WHERE condition\n\
+             - .backup first, or BEGIN; UPDATE ...; verify; COMMIT or ROLLBACK"
+        ),
+        // ALTER TABLE … DROP COLUMN (SQLite 3.35+) deletes the column's data.
+        destructive_pattern!(
+            "drop-column",
+            // Keep byte-identical to `crate::packs::database::DROP_COLUMN_PATTERN`.
+            r#"(?i)\bALTER\s+TABLE\b[^;]*?\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?(?!(?:CONSTRAINT|DEFAULT|NOT\s+NULL|IDENTITY|EXPRESSION|INDEX|KEY|PRIMARY\s+KEY|FOREIGN\s+KEY|CHECK)\b)[A-Za-z_"`\[]"#,
+            "ALTER TABLE ... DROP COLUMN permanently deletes that column's data in every row.",
+            High,
+            "SQLite rewrites the table without the column; its values are gone unless you \
+             have a backup.\n\n\
+             Safer alternatives:\n\
+             - .backup first\n\
+             - CREATE TABLE t_col_backup AS SELECT rowid, col FROM t"
         ),
         // VACUUM INTO with existing file could overwrite
         destructive_pattern!(

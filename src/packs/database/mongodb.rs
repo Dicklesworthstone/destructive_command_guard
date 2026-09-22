@@ -27,6 +27,7 @@ pub fn create_pack() -> Pack {
             ".drop(",
             ".remove(",
             ".deleteMany(",
+            ".updateMany(",
             "mongorestore",
             "mongodump",
         ],
@@ -128,6 +129,20 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Preview what would be deleted:\n  \
              db.collection.countDocuments({})  // All documents!\n  \
              db.collection.find({}).limit(10)  // Sample docs"
+        ),
+        // updateMany({}, …) with an empty filter rewrites every document — the
+        // update counterpart of `delete-all`, which denied while this allowed.
+        destructive_pattern!(
+            "update-all",
+            r"\.updateMany\s*\(\s*\{\s*\}\s*,",
+            "updateMany({}, ...) overwrites fields in ALL documents. Add filter criteria.",
+            High,
+            "An empty filter {} matches every document, so the update rewrites the whole \
+             collection and the previous values are gone.\n\n\
+             Add filter criteria:\n  \
+             db.collection.updateMany({ status: 'pending' }, { $set: { ... } })\n\n\
+             Preview what would change:\n  \
+             db.collection.countDocuments({})  // All documents!"
         ),
         // mongorestore --drop
         destructive_pattern!(

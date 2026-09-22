@@ -430,7 +430,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // radius as the DELETE rule above, which denied while this allowed.
         destructive_pattern!(
             "update-without-where",
-            r#"(?i)\bUPDATE\s+(?:ONLY\s+)?(?:[a-zA-Z_][a-zA-Z0-9_]*|"[^"]+")(?:\.(?:[a-zA-Z_][a-zA-Z0-9_]*|"[^"]+"))?\s+(?:AS\s+\w+\s+)?SET\b(?:(?!\bWHERE\b)[^;])*(?:;|$)"#,
+            // Keep byte-identical to `crate::packs::database::UPDATE_WITHOUT_WHERE_PATTERN`.
+            r#"(?i)\bUPDATE\s+(?:(?:LOW_PRIORITY|IGNORE|ONLY|OR\s+(?:ROLLBACK|ABORT|REPLACE|FAIL|IGNORE))\s+)*(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\])(?:\s*\.\s*(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\]))?\s+(?:(?:AS\s+)?(?!SET\b)[A-Za-z_]\w*\s+)?SET\b(?:(?!\bWHERE\b)[^;])*(?:;|$)"#,
             "UPDATE without WHERE clause overwrites the column in ALL rows. Add a WHERE clause.",
             High,
             "UPDATE without WHERE changes every row in the table, replacing whatever values \
@@ -447,7 +448,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `DROP CONSTRAINT` change metadata only and stay allowed.
         destructive_pattern!(
             "drop-column",
-            r"(?i)\bALTER\s+TABLE\b[^;]*?\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?(?!(?:CONSTRAINT|DEFAULT|NOT\s+NULL|IDENTITY|EXPRESSION)\b)[A-Za-z_\x22]",
+            // Keep byte-identical to `crate::packs::database::DROP_COLUMN_PATTERN`.
+            r#"(?i)\bALTER\s+TABLE\b[^;]*?\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?(?!(?:CONSTRAINT|DEFAULT|NOT\s+NULL|IDENTITY|EXPRESSION|INDEX|KEY|PRIMARY\s+KEY|FOREIGN\s+KEY|CHECK)\b)[A-Za-z_"`\[]"#,
             "ALTER TABLE ... DROP COLUMN permanently deletes that column's data in every row.",
             High,
             "Dropping a column removes its values from every row. PostgreSQL does not keep \

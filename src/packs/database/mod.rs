@@ -108,6 +108,22 @@
 #[cfg(test)]
 pub(crate) const TRUNCATE_TABLE_PATTERN: &str = r#"(?i)(?:(?:^|[;"'`])(?:\s|/\*(?:[^*]|\*+[^*/])*\*+/)*|\r?\n(?:\s|/\*(?:[^*]|\*+[^*/])*\*+/)*(?=TRUNCATE\s+TABLE\b)|/\*!\d*\s*)(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|\*/|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#;
 
+/// `UPDATE <table> SET …` with no `WHERE` before the statement ends rewrites
+/// every row — the unscoped blast radius every SQL pack already denies for
+/// `DELETE`. Shared by the PostgreSQL, MySQL and SQLite packs (each spells it
+/// out; `sql_mutation_patterns_are_shared` keeps the copies identical).
+/// Covers MySQL `LOW_PRIORITY`/`IGNORE`, SQLite `OR <conflict>`, quoted,
+/// backticked and bracketed identifiers, and a table alias.
+#[cfg(test)]
+pub(crate) const UPDATE_WITHOUT_WHERE_PATTERN: &str = r#"(?i)\bUPDATE\s+(?:(?:LOW_PRIORITY|IGNORE|ONLY|OR\s+(?:ROLLBACK|ABORT|REPLACE|FAIL|IGNORE))\s+)*(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\])(?:\s*\.\s*(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\]))?\s+(?:(?:AS\s+)?(?!SET\b)[A-Za-z_]\w*\s+)?SET\b(?:(?!\bWHERE\b)[^;])*(?:;|$)"#;
+
+/// `ALTER TABLE … DROP [COLUMN] <col>` deletes that column's data in every
+/// row. Metadata-only drops stay allowed: `DROP CONSTRAINT|DEFAULT|NOT NULL|
+/// IDENTITY|EXPRESSION` and MySQL's `DROP INDEX|KEY|PRIMARY KEY|FOREIGN KEY|
+/// CHECK`. `DROP PARTITION` is NOT exempt: it deletes that partition's rows.
+#[cfg(test)]
+pub(crate) const DROP_COLUMN_PATTERN: &str = r#"(?i)\bALTER\s+TABLE\b[^;]*?\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?(?!(?:CONSTRAINT|DEFAULT|NOT\s+NULL|IDENTITY|EXPRESSION|INDEX|KEY|PRIMARY\s+KEY|FOREIGN\s+KEY|CHECK)\b)[A-Za-z_"`\[]"#;
+
 pub mod bigquery;
 pub mod databricks;
 pub mod mongodb;
@@ -120,7 +136,74 @@ pub mod supabase;
 
 #[cfg(test)]
 mod tests {
-    use super::TRUNCATE_TABLE_PATTERN;
+    use super::{DROP_COLUMN_PATTERN, TRUNCATE_TABLE_PATTERN, UPDATE_WITHOUT_WHERE_PATTERN};
+
+    /// Same reasoning as `truncate_table_pattern_is_shared`: one copy per
+    /// dialect drifts, so the three SQL packs must spell these identically.
+    #[test]
+    fn sql_mutation_patterns_are_shared() {
+        for pack in [
+            super::postgresql::create_pack(),
+            super::mysql::create_pack(),
+            super::sqlite::create_pack(),
+        ] {
+            for (name, shared) in [
+                ("update-without-where", UPDATE_WITHOUT_WHERE_PATTERN),
+                ("drop-column", DROP_COLUMN_PATTERN),
+            ] {
+                let pattern = pack
+                    .destructive_patterns
+                    .iter()
+                    .find(|pattern| pattern.name == Some(name))
+                    .unwrap_or_else(|| panic!("{} defines {name}", pack.id));
+                assert_eq!(pattern.regex.as_str(), shared, "{} {name}", pack.id);
+            }
+        }
+    }
+
+    /// What the shared expressions decide, per dialect spelling.
+    #[test]
+    fn sql_mutation_patterns_decide_per_dialect() {
+        let matches = |pattern: &str, sql: &str| {
+            fancy_regex::Regex::new(pattern)
+                .expect("compiles")
+                .is_match(sql)
+                .expect("matches")
+        };
+        for sql in [
+            "UPDATE users SET admin = 1",
+            "UPDATE LOW_PRIORITY IGNORE `users` SET admin = 1;",
+            "UPDATE OR REPLACE users SET x = 1",
+            "UPDATE [dbo].[users] SET x = 1",
+            "update app.users u set x = 1",
+        ] {
+            assert!(matches(UPDATE_WITHOUT_WHERE_PATTERN, sql), "{sql}");
+        }
+        for sql in [
+            "UPDATE users SET admin = 1 WHERE id = 7",
+            "UPDATE users SET a = 1 WHERE id IN (SELECT id FROM t)",
+            "apt update",
+            "SELECT * FROM users WHERE updated = 1",
+        ] {
+            assert!(!matches(UPDATE_WITHOUT_WHERE_PATTERN, sql), "{sql}");
+        }
+        for sql in [
+            "ALTER TABLE users DROP COLUMN email",
+            "ALTER TABLE `users` DROP `email`",
+            "ALTER TABLE logs DROP PARTITION p2023",
+        ] {
+            assert!(matches(DROP_COLUMN_PATTERN, sql), "{sql}");
+        }
+        for sql in [
+            "ALTER TABLE users DROP INDEX idx_email",
+            "ALTER TABLE users DROP PRIMARY KEY",
+            "ALTER TABLE users DROP FOREIGN KEY fk_org",
+            "ALTER TABLE users ALTER COLUMN email DROP DEFAULT",
+            "ALTER TABLE users DROP CONSTRAINT users_email_key",
+        ] {
+            assert!(!matches(DROP_COLUMN_PATTERN, sql), "{sql}");
+        }
+    }
 
     fn truncate_pattern_of(pack: &crate::packs::Pack) -> &str {
         pack.destructive_patterns

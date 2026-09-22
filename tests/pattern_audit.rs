@@ -417,7 +417,14 @@ fn test_audit_backtracking_requirements() {
         // expression is anchored on a literal keyword, so the cost is bounded.
         (
             "database.mysql",
-            HashSet::from(["mysqldump-no-drop", "truncate-table"]),
+            // drop-column / update-without-where: the shared SQL expressions
+            // (database::DROP_COLUMN_PATTERN, UPDATE_WITHOUT_WHERE_PATTERN).
+            HashSet::from([
+                "drop-column",
+                "mysqldump-no-drop",
+                "truncate-table",
+                "update-without-where",
+            ]),
         ),
         (
             "database.postgresql",
@@ -443,7 +450,10 @@ fn test_audit_backtracking_requirements() {
                 "redis-scan",
             ]),
         ),
-        ("database.sqlite", HashSet::new()),
+        (
+            "database.sqlite",
+            HashSet::from(["drop-column", "update-without-where"]),
+        ),
         ("dns.generic", HashSet::from(["dns-dig-safe"])),
         (
             "dns.cloudflare",
