@@ -1455,6 +1455,7 @@ enum WriterKind {
     Dd,
     Sed,
     Perl,
+    Rsync,
     // PowerShell cmdlets and Cmd built-ins (#477). Never produced by
     // [`writer_kind`], which names POSIX executables: `windows_shells` binds
     // their parameters itself and reuses the judges below.
@@ -1484,6 +1485,7 @@ fn writer_kind(executable: &str) -> Option<WriterKind> {
         "dd" => Some(WriterKind::Dd),
         "sed" => Some(WriterKind::Sed),
         "perl" => Some(WriterKind::Perl),
+        "rsync" => Some(WriterKind::Rsync),
         _ => None,
     }
 }
@@ -1511,6 +1513,7 @@ impl Writer {
             (Some(WriterKind::Mv), _) => "`mv` replaces",
             (Some(WriterKind::Install), _) => "`install` writes",
             (Some(WriterKind::Ln), _) => "`ln` replaces",
+            (Some(WriterKind::Rsync), _) => "`rsync` writes",
             (Some(WriterKind::Dd), WriteMode::Replace) => "`dd` overwrites",
             (Some(WriterKind::Dd), WriteMode::Append) => "`dd oflag=append` appends to",
             (Some(WriterKind::Sed), _) => "`sed -i` rewrites",
@@ -1920,6 +1923,7 @@ fn classify_simple_command(tokens: &[Token]) -> Option<CredentialFileWrite> {
         WriterKind::Dd => classify_dd(args),
         WriterKind::Sed => classify_sed(args),
         WriterKind::Perl => classify_perl(args),
+        WriterKind::Rsync => classify_rsync(args),
         // `writer_kind` names POSIX executables only; these are bound by
         // `windows_shells`, which calls the judges directly.
         WriterKind::AddContent
@@ -2049,6 +2053,24 @@ fn classify_copy(kind: WriterKind, args: &[&Word]) -> Option<CredentialFileWrite
     if no_target_dir {
         return judge_file_target(dest, writer);
     }
+    judge_transfer_destination(writer, dest, sources)
+}
+
+/// Judge a transfer whose destination is its last operand.
+///
+/// Shared by `cp`/`mv`/`install`/`ln` and by `rsync`, which reach it with the
+/// same two facts and nothing else: where the bytes land, and what is being
+/// placed there. Only the option grammar differs, and that stays with each
+/// caller because rsync's is not cp's.
+///
+/// The `Exact::Parent` arm is what catches a directory destination -- syncing
+/// into `~/.ssh/` names no protected file in the command text, and the
+/// protected file is the one the sources put there.
+fn judge_transfer_destination(
+    writer: Writer,
+    dest: &Word,
+    sources: &[&Word],
+) -> Option<CredentialFileWrite> {
     let destination = resolve(dest)?;
     if destination.escaped || destination.partial.is_some() {
         return judge_file_target(dest, writer);
@@ -2065,6 +2087,143 @@ fn classify_copy(kind: WriterKind, args: &[&Word]) -> Option<CredentialFileWrite
             .iter()
             .find_map(|source| judge_placement(&destination, dest, source, writer)),
         Exact::Clear => None,
+    }
+}
+
+/// Options whose VALUE is the next word, so that word is not an operand.
+///
+/// Getting this list wrong in the missing direction is not merely incomplete,
+/// it manufactures a false positive: `rsync --exclude id_rsa /tmp/x ~/.ssh/`
+/// would read `id_rsa` as a source, and a source placed into the protected
+/// destination is exactly what `judge_placement` reports. The `--option=value`
+/// spelling needs no entry here because it carries its value.
+const RSYNC_VALUE_LONGS: &[&str] = &[
+    "rsh",
+    "exclude",
+    "include",
+    "filter",
+    "exclude-from",
+    "include-from",
+    "files-from",
+    "log-file",
+    "log-file-format",
+    "out-format",
+    "password-file",
+    "temp-dir",
+    "partial-dir",
+    "compare-dest",
+    "copy-dest",
+    "link-dest",
+    "backup-dir",
+    "suffix",
+    "chmod",
+    "chown",
+    "usermap",
+    "groupmap",
+    "bwlimit",
+    "timeout",
+    "contimeout",
+    "port",
+    "sockopts",
+    "modify-window",
+    "block-size",
+    "max-size",
+    "min-size",
+    "max-delete",
+    "skip-compress",
+    "protocol",
+    "iconv",
+    "checksum-seed",
+    "remote-option",
+    "info",
+    "debug",
+    "address",
+    "compress-level",
+    "write-batch",
+    "read-batch",
+    "only-write-batch",
+    "copy-as",
+];
+
+/// Short options whose value is the next word.
+const RSYNC_VALUE_SHORTS: &[char] = &['e', 'f', 'M', 'T', 'B'];
+
+/// `rsync SRC… DEST` (#478).
+///
+/// Every sibling that replaces a file at a named path already denies this --
+/// `cp`, `mv`, `install`, `ln`, `tee` and `dd` all refuse a write to
+/// `~/.ssh/authorized_keys` -- and `rsync` did not, although it is in the pack's keyword set and
+/// has its own `rsync-sensitive-then-delete` rule. One line replaced an
+/// authorized-keys file.
+///
+/// rsync gets its own option grammar rather than `classify_copy`'s: `-e`,
+/// `--exclude` and friends take a following word that cp has no equivalent for,
+/// and mis-reading one as an operand is the false positive documented on
+/// `RSYNC_VALUE_LONGS`.
+///
+/// A remote destination (`host:path`, `rsync://…`) is declined. The protected
+/// table is rooted at THIS machine's home and `/etc`, so a remote spelling
+/// names a path this classifier cannot resolve; saying so is honester than
+/// judging it against the wrong root.
+fn classify_rsync(args: &[&Word]) -> Option<CredentialFileWrite> {
+    let mut operands: Vec<&Word> = Vec::new();
+    let mut ended = false;
+    let mut index = 0usize;
+    while let Some(word) = args.get(index) {
+        index += 1;
+        let text = word.as_string();
+        if ended || text == "-" || !text.starts_with('-') {
+            operands.push(word);
+            continue;
+        }
+        if text == "--" {
+            ended = true;
+            continue;
+        }
+        if let Some(long) = text.strip_prefix("--") {
+            if !long.contains('=') && RSYNC_VALUE_LONGS.contains(&long) {
+                index += 1;
+            }
+            continue;
+        }
+        // A short cluster consumes the next word only when its LAST character
+        // is the value-taking one (`-ave ssh`), because anything earlier takes
+        // the remainder of the cluster as its value.
+        if text
+            .chars()
+            .next_back()
+            .is_some_and(|last| RSYNC_VALUE_SHORTS.contains(&last))
+        {
+            index += 1;
+        }
+    }
+    if operands.len() < 2 {
+        return None;
+    }
+    let (dest, sources) = operands.split_last()?;
+    if names_remote_host(&dest.as_string()) {
+        return None;
+    }
+    let writer = Writer {
+        kind: Some(WriterKind::Rsync),
+        mode: WriteMode::Replace,
+    };
+    judge_transfer_destination(writer, dest, sources)
+}
+
+/// Whether an rsync operand names a remote host rather than a local path.
+///
+/// `host:path` and `user@host:path` are remote; a colon that appears after the
+/// first `/` is an ordinary (if unusual) filename character rather than a host
+/// separator.
+fn names_remote_host(operand: &str) -> bool {
+    if operand.starts_with("rsync://") {
+        return true;
+    }
+    match (operand.find(':'), operand.find('/')) {
+        (Some(colon), Some(slash)) => colon < slash,
+        (Some(_), None) => true,
+        _ => false,
     }
 }
 
@@ -2197,6 +2356,92 @@ mod tests {
 
     fn hit(command: &str) -> Option<CredentialFileWrite> {
         classify_credential_file_write(command, ShellDialect::Posix)
+    }
+
+    /// `rsync` writes a protected destination like every sibling (#478).
+    ///
+    /// It was the one replacement tool with no guard: 8/8 writes to credential
+    /// paths were allowed while `cp`, `mv`, `install`, `tee`, `ln` and the
+    /// byte-copier all denied the same operation. rsync was already in the
+    /// pack's keyword set and already had a `rsync-sensitive-then-delete` rule,
+    /// so it was modelled as something that moves sensitive data and not as
+    /// something that writes a protected destination.
+    #[test]
+    fn rsync_guards_a_protected_destination_issue_478() {
+        for command in [
+            "rsync /tmp/evil /home/user/.ssh/authorized_keys",
+            "rsync -a /tmp/evil /home/user/.ssh/authorized_keys",
+            "rsync /tmp/evil /home/user/.ssh/id_rsa",
+            "rsync /tmp/evil /home/user/.bashrc",
+            "rsync /tmp/evil /etc/shadow",
+            // A directory destination: the command text names no protected
+            // file, the source placed into it is the protected file.
+            "rsync -av /tmp/keys/authorized_keys /home/user/.ssh/",
+            // Option forms that must not hide the destination.
+            "rsync -e ssh /tmp/evil /home/user/.ssh/authorized_keys",
+            "rsync -ave ssh /tmp/evil /home/user/.ssh/authorized_keys",
+            "rsync --exclude '*.log' /tmp/evil /home/user/.ssh/authorized_keys",
+            "rsync --exclude='*.log' /tmp/evil /home/user/.ssh/authorized_keys",
+            "rsync -a -- /tmp/evil /home/user/.ssh/authorized_keys",
+        ] {
+            assert!(
+                hit(command).is_some(),
+                "rsync must guard its destination like every other writer: {command}"
+            );
+        }
+    }
+
+    /// The other half: rsync's own option grammar, and the shapes that are not
+    /// a protected write at all.
+    ///
+    /// The trailing-option rows are the reason rsync does not reuse
+    /// `classify_copy`'s grammar. cp has no option that takes a following word,
+    /// so reading one as an operand there is impossible; in rsync it would make
+    /// the option's VALUE the last operand, and the last operand is the
+    /// destination. Each row below would be a false positive on a command that
+    /// writes only into /tmp.
+    #[test]
+    fn rsync_option_values_are_not_the_destination_issue_478() {
+        for command in [
+            "rsync /tmp/a /tmp/b --exclude /home/user/.ssh/id_rsa",
+            "rsync /tmp/a /tmp/b --link-dest /home/user/.ssh/id_rsa",
+            "rsync /tmp/a /tmp/b --files-from /home/user/.ssh/id_rsa",
+            "rsync /tmp/a /tmp/b -e /home/user/.ssh/id_rsa",
+            // Ordinary syncs.
+            "rsync -a /tmp/src/ /tmp/dst/",
+            "rsync -a ./build/ /tmp/out/",
+            "rsync -a /home/user/project/ /tmp/backup/",
+            // Public key material is not credential material.
+            "rsync /tmp/evil /home/user/.ssh/id_rsa.pub",
+            // Reading FROM a protected path is not a protected write; the
+            // `rsync-sensitive-then-delete` rule owns that concern.
+            "rsync /home/user/.ssh/id_rsa /tmp/backup/",
+            // A remote destination names a path on another machine, which this
+            // table cannot resolve, so it is declined rather than judged
+            // against the wrong root.
+            "rsync /tmp/evil remote:/home/user/.ssh/authorized_keys",
+            "rsync /tmp/evil user@host:/home/user/.ssh/authorized_keys",
+            "rsync /tmp/evil rsync://host/module/x",
+        ] {
+            assert!(
+                hit(command).is_none(),
+                "rsync must not report a protected write here: {command}"
+            );
+        }
+    }
+
+    /// `known_hosts` keeps its append carve-out under rsync too.
+    ///
+    /// rsync always replaces rather than appends, so the carve-out that lets a
+    /// `tee -a` add a host key does not apply to it -- and that is the point of
+    /// asserting it: the mode is a property of the writer, not of the path.
+    #[test]
+    fn rsync_replaces_rather_than_appends_issue_478() {
+        assert!(
+            hit("rsync /tmp/evil /home/user/.ssh/known_hosts").is_some(),
+            "rsync rewrites known_hosts wholesale, which is not the append the \
+             carve-out permits"
+        );
     }
 
     /// The two rule names this module reports must exist as pack entries.
