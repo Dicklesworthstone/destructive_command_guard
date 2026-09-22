@@ -16,6 +16,7 @@ use ast_grep_language::SupportLang;
 use std::collections::HashMap;
 use std::ops::Range;
 
+mod go;
 mod perl;
 mod php;
 mod transfers;
@@ -81,6 +82,7 @@ pub(crate) fn source_scan_required(code: &str, language: ScriptLanguage) -> bool
             | ScriptLanguage::TypeScript
             | ScriptLanguage::Php
             | ScriptLanguage::Perl
+            | ScriptLanguage::Go
     ) && source_has_sink_name(code)
 }
 
@@ -95,6 +97,7 @@ fn source_has_sink_name(code: &str) -> bool {
     .iter()
     .any(|word| code.contains(word))
         || php::has_sink_name(code)
+        || go::has_sink_name(code)
 }
 
 /// Inspect already-extracted executable source, never shell tokens. Return
@@ -114,6 +117,7 @@ pub(crate) fn scan_extracted(
         ScriptLanguage::TypeScript => (Language::Node, SupportLang::TypeScript),
         ScriptLanguage::Php => return php::scan(code),
         ScriptLanguage::Perl => return perl::scan(code),
+        ScriptLanguage::Go => return go::scan(code),
         _ => return Ok(Vec::new()),
     };
     scan_source(code, language, grammar)
