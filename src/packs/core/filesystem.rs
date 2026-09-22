@@ -1506,6 +1506,11 @@ pub(crate) fn filesystem_semantic_scan_required(command: &str, dialect: ShellDia
         || (dialect == ShellDialect::Cmd
             && command.contains('>')
             && command.contains(['%', '!', '^']))
+        // PowerShell/Cmd writers of a protected file (#477). `Add-Content`
+        // and `Copy-Item` are in no keyword row, so without this the
+        // credential classifier could not run on the idiomatic spellings.
+        || (dialect != ShellDialect::Posix
+            && super::credential_files::names_windows_shell_writer(command))
         // Fork-bomb reachability (issue #302): the `fork-bomb` rule matches a
         // shell function-definition shape (`name() { … }`). The paren pair is
         // pure syntax that keyword-based quick-reject cannot see, and POSIX
@@ -4293,6 +4298,30 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Use `rm -ri` for manual cleanup of derived temp trees.",
             SENSITIVE_PROPAGATION_DELETE_SUGGESTIONS
         ),
+        // `rsync --delete` into a system directory or a home root MIRRORS the
+        // source over the destination, DELETING every destination file the
+        // source does not have. `rsync --delete /empty/ /etc/` wipes /etc as
+        // surely as `rm -rf /etc`, yet it carried no rule. Keyed on the
+        // DESTINATION only: `--delete` into an ordinary backup dir, or into a
+        // subdirectory of a home (`~/backup/`, `/home/u/proj/`), is a routine
+        // operation and stays allowed, as does any `--dry-run`. A sensitive
+        // path as the SOURCE (`rsync --delete /etc/ /backup/`) is unaffected.
+        destructive_pattern!(
+            "rsync-delete-sensitive-dest",
+            r#"\brsync\b(?![^|;&\r\n]*(?:--dry-run\b|\s-[A-Za-z]*n[A-Za-z]*(?:\s|$)))(?=[^|;&\r\n]*\s--del(?:ete(?:-(?:after|before|during|delay|excluded))?)?\b)[^|;&\r\n]*[\s=](?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|sys|proc|dev|opt)(?:/[^\s;&|<>()'"]*)?|/(?:home|Users)(?:/[^/\s;&|<>()'"]+)?/?|/|~/?|\$\{?HOME\}?/?)\s*(?:$|[;&|<>)])"#,
+            "rsync --delete into a system directory or home root mirror-deletes its contents. EXTREMELY DANGEROUS.",
+            Critical,
+            "rsync --delete makes the destination match the source, so it DELETES every \
+             file in the destination that is not present in the source. Aimed at /, /etc, \
+             /usr, a home root, or another system path, an empty or wrong source empties \
+             that directory — the same catastrophe as `rm -rf` on it, with no undo.\n\n\
+             Safer alternatives:\n\
+             - Preview first: add `--dry-run` (or `-n`) and read the deletion list.\n\
+             - Drop `--delete` to copy without removing extra destination files.\n\
+             - Mirror into a dedicated, non-system directory you own.\n\
+             - Back the destination up before a real mirror into it.",
+            SENSITIVE_PROPAGATION_DELETE_SUGGESTIONS
+        ),
         // rm -rf on root or home paths (CRITICAL - catastrophic, never allow)
         // Target set covers:
         //   - literal `/` or `~` (optionally quoted/backslash-escaped)
@@ -4940,7 +4969,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "credential-file-write",
             r"(?!)",
-            "writing a credential, private-key, login-shell startup, or system authentication file (`~/.ssh/*`, `~/.aws/credentials`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.docker/config.json`, `~/.kube/config`, `~/.gnupg/*`, `~/.config/gh/hosts.yml`, the shell rc files and `~/.bashrc.d`/`~/.zshrc.d`, `/etc/sudoers*`, `/etc/passwd`, `/etc/shadow`, `/etc/group`, `/etc/ssh/*`) with `>`, `>>`, `tee`, `cp`/`mv`/`install`/`ln`, `dd of=`, or `sed -i` installs persistent access or replaces the trust this machine runs on, whether or not the file exists yet. Reads and `chmod`/`chown` are unaffected; appending to `~/.ssh/known_hosts` stays allowed.",
+            "writing a credential, private-key, login-shell startup, or system authentication file (`~/.ssh/*`, `~/.aws/credentials`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.docker/config.json`, `~/.kube/config`, `~/.gnupg/*`, `~/.config/gh/hosts.yml`, the shell rc files and `~/.bashrc.d`/`~/.zshrc.d`, `/etc/sudoers*`, `/etc/passwd`, `/etc/shadow`, `/etc/group`, `/etc/ssh/*`) with `>`, `>>`, `tee`, `cp`/`mv`/`install`/`ln`, `dd of=`, or `sed -i` — or, from PowerShell or Cmd, `Add-Content`, `Set-Content`, `Clear-Content`, `Out-File`, `Tee-Object`, `New-Item`, `Copy-Item`, `Move-Item`, `copy`, or `move` — installs persistent access or replaces the trust this machine runs on, whether or not the file exists yet. Reads and `chmod`/`chown` are unaffected; appending to `~/.ssh/known_hosts` stays allowed.",
             Critical,
             "These files decide who can log in, which keys and tokens act as this user, and what \
              code every new shell runs. Writing one of them — even creating it where it did not \
@@ -4950,7 +4979,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              The write is judged by the path the shell will open, so quoted, escaped, `$HOME`, \
              `~user`, `/home/<user>`, and `$ZDOTDIR`-style spellings are all recognised, and a \
              brace, glob, or alternation that could still expand into one of these paths is \
-             treated as if it did.\n\n\
+             treated as if it did. A PowerShell or Cmd payload is read with that shell's own \
+             quoting and variables (`$env:USERPROFILE`, `%USERPROFILE%`, `C:\\Users\\<user>`), \
+             whichever host dcg runs on.\n\n\
              What stays allowed:\n\
              - Reading them (`cat`, `grep`, `diff`, `ssh -F`, `source`).\n\
              - `chmod 600` / `chown` on them.\n\
@@ -8875,6 +8906,57 @@ mod classifier_guidance_tests {
             "Get-Volume",
             "Get-Disk",
             "git format-patch -1",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|matched| matched.name)
+            );
+        }
+    }
+
+    /// `rsync --delete` into a system directory or home root mirror-deletes it,
+    /// the same catastrophe as `rm -rf` on that path, and was previously
+    /// fail-open. Keyed on the DESTINATION, so backups and `--dry-run` stay
+    /// allowed and a sensitive SOURCE is unaffected.
+    #[test]
+    fn rsync_delete_into_sensitive_destination_blocks() {
+        let pack = create_pack();
+        for command in [
+            "rsync -a --delete /src/ /etc/",
+            "rsync -a --delete src/ /",
+            "rsync -avz --delete /tmp/x/ /usr/",
+            "rsync -a --delete /empty/ /var/",
+            "rsync -a --delete /e/ /boot/",
+            "rsync -a --delete-after /s/ /etc/",
+            "rsync -a --delete-excluded /s/ /etc/",
+            "rsync -a --del /s/ /etc/",
+            "rsync -a --delete /s/ ~/",
+            "rsync -a --delete /s/ $HOME/",
+            "rsync -a --delete /s/ /home/",
+            "rsync -a --delete /s/ /home/user/",
+            "rsync -a --delete /s/ /root/",
+            "rsync --delete /s/ /etc/",
+        ] {
+            assert_eq!(
+                pack.check(command).and_then(|matched| matched.name),
+                Some("rsync-delete-sensitive-dest"),
+                "{command}"
+            );
+        }
+
+        // Backups, home subdirectories, dry runs, a sensitive SOURCE, and
+        // plain (no --delete) rsync all stay allowed.
+        for command in [
+            "rsync -a --delete src/ dest/",
+            "rsync -a --delete /tmp/a/ /tmp/b/",
+            "rsync -a --delete /project/ /home/user/backup/",
+            "rsync -a --delete /project/ ~/backup/",
+            "rsync -a --dry-run --delete /src/ /etc/",
+            "rsync -avn --delete /src/ /etc/",
+            "rsync -a --delete /etc/ /backup/",
+            "rsync -a /src/ /etc/",
+            "rsync -avz /src/ backup:/dst/",
         ] {
             assert!(
                 pack.check(command).is_none(),
