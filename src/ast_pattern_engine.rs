@@ -37,6 +37,7 @@ use ast_grep_core::{AstGrep, Pattern};
 use ast_grep_language::SupportLang;
 use memchr::memchr_iter;
 use regex::Regex;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, mpsc};
@@ -590,15 +591,15 @@ pub fn exec_sink_reconstructed_commands(
         if detect_destructive_in_args(region).is_some() {
             continue;
         }
-        let literals: Vec<&str> = ANY_STRING_LITERAL
-            .captures_iter(exec_argv_region(region))
-            .filter_map(|caps| string_literal_from_caps(&caps))
-            .collect();
-        if literals.len() < 2 {
+        // Operands, for the same reason `detect_destructive_in_args` uses them:
+        // reconstructing `dd` from `"d"+"d"` as two argv words would not be the
+        // command the call actually runs (#474).
+        let operands = concatenated_operands(exec_argv_region(region));
+        if operands.len() < 2 {
             continue;
         }
         out.push(ReconstructedCommand {
-            command: literals.join(" "),
+            command: operands.join(" "),
             start: m.start(),
             end: m.end(),
         });
@@ -2560,10 +2561,11 @@ fn exec_sink_arg_region(code: &str, match_start: usize) -> &str {
 /// so `spawnSync('rm', ['-rf', 'rm -rf /tmp/y', '/'])` reported the `Medium`
 /// payload in its third literal and never weighed the argv that deletes `/`.
 fn detect_destructive_in_args(call_text: &str) -> Option<ShellPayloadHit> {
-    let literals: Vec<&str> = ANY_STRING_LITERAL
-        .captures_iter(exec_argv_region(call_text))
-        .filter_map(|caps| string_literal_from_caps(&caps))
-        .collect();
+    // Operands, not literals. A token split across a concatenation operator is
+    // one operand the call really builds, and reading its halves separately hid
+    // it from both views below in every language at once (#474).
+    let operands = concatenated_operands(exec_argv_region(call_text));
+    let literals: Vec<&str> = operands.iter().map(Cow::as_ref).collect();
 
     // 1) Each literal on its own (catches `subprocess.run(["sh","-c","rm -rf /etc"])`
     //    where the destructive command lives in a single literal).
@@ -2582,6 +2584,74 @@ fn detect_destructive_in_args(call_text: &str) -> Option<ShellPayloadHit> {
     }
 
     found
+}
+
+/// The string operands of a call's argument region, with concatenated literals
+/// folded into the single operand they build (#474).
+///
+/// `detect_destructive_in_args` read each *literal*, never each *operand*, so
+/// splitting a token across a `+` hid it from both of its views: no single
+/// literal is destructive, and the argv view saw `r`, `m`, `-rf` instead of
+/// `rm`, `-rf`. Measured before this, `subprocess.run(["r"+"m","-rf",T])` was
+/// allowed in Python, Ruby, JavaScript, Go and PHP alike.
+///
+/// The fold is driven by the operator, never by adjacency. Comma-separated
+/// literals stay separate operands, or the argv view would start manufacturing
+/// commands the source never builds — `["echo", "rm", "-rf"]` must remain three
+/// operands. So the gap between two literals folds only when it is whitespace
+/// plus exactly one `+` or `.`, which is also what keeps a dynamic operand
+/// (`"rm -rf " + dir`) fail-open: the identifier in the gap stops the fold.
+///
+/// `.` is PHP's concatenation operator and `+` is the other four languages'.
+/// Accepting both everywhere is safe because neither is valid *between two
+/// string literals* in a language that does not use it that way, and a method
+/// call like `"a".freeze` leaves letters in the gap, which blocks the fold.
+///
+/// Borrowed until something is actually joined, so the common no-concatenation
+/// case allocates nothing beyond the operand vector.
+fn concatenated_operands(region: &str) -> Vec<Cow<'_, str>> {
+    let mut operands: Vec<Cow<'_, str>> = Vec::new();
+    let mut previous_end: Option<usize> = None;
+
+    for caps in ANY_STRING_LITERAL.captures_iter(region) {
+        let Some(whole) = caps.get(0) else { continue };
+        let Some(literal) = string_literal_from_caps(&caps) else {
+            continue;
+        };
+
+        let folds = previous_end.is_some_and(|end| {
+            region
+                .get(end..whole.start())
+                .is_some_and(is_concatenation_gap)
+        });
+        if folds {
+            if let Some(last) = operands.last_mut() {
+                last.to_mut().push_str(literal);
+            }
+        } else {
+            operands.push(Cow::Borrowed(literal));
+        }
+        previous_end = Some(whole.end());
+    }
+
+    operands
+}
+
+/// Whether the text between two string literals is exactly one concatenation.
+///
+/// Exactly one operator, because `"a" + + "b"` is not concatenation in any of
+/// these languages, and because requiring a count rather than "contains an
+/// operator" is what makes a stray token in the gap block the fold.
+fn is_concatenation_gap(gap: &str) -> bool {
+    let mut operators = 0_usize;
+    for ch in gap.chars() {
+        match ch {
+            '+' | '.' => operators += 1,
+            c if c.is_whitespace() => {}
+            _ => return false,
+        }
+    }
+    operators == 1
 }
 
 /// The part of an exec-sink call that holds the command it runs: its argument
@@ -5724,6 +5794,167 @@ mod tests {
                 "{call} must still be REPORTED, or the negative above would pass \
                  on a pattern that stopped matching entirely"
             );
+        }
+    }
+
+    /// A concatenated token is one operand, in every language (#474).
+    ///
+    /// `detect_destructive_in_args` read each literal and never each operand,
+    /// so a token split across a `+` was invisible to both of its views: no
+    /// single literal is destructive, and the argv view saw `r`, `m`, `-rf`
+    /// rather than `rm`, `-rf`. Measured before the fix, every language allowed
+    /// it -- this was never a Go or PHP artifact.
+    ///
+    /// The negatives carry equal weight here. Folding by adjacency instead of
+    /// by operator would make the argv view manufacture commands the source
+    /// never builds, so a comma-separated list holding `rm` as an inert element
+    /// must keep allowing.
+    #[test]
+    fn a_concatenated_token_is_one_operand_issue_474() {
+        // Assembled so this file does not carry the literal text of a guarded
+        // command, and so the halves are genuinely separate literals.
+        let split = "\"r\" + \"m\"";
+        let php_split = "\"r\" . \"m\"";
+
+        // Each language is exercised at the layer that actually consults
+        // `detect_destructive_in_args`, because they do not share one. Python,
+        // Go and PHP reach it from their `find_matches` refiners; JavaScript and
+        // Ruby reach it from the exec-sink scanner the evaluator runs, and their
+        // refiners never see an argv at all (Ruby's reads only the first string
+        // literal and drops the match when it is inert). Asserting all five
+        // through `find_matches` would have measured that difference instead of
+        // the fold.
+        enum Layer {
+            Refiner,
+            SinkScanner,
+        }
+        for (language, layer, code) in [
+            (
+                ScriptLanguage::Python,
+                Layer::Refiner,
+                format!("import subprocess\nsubprocess.run([{split}, \"-rf\", \"/home/user\"])"),
+            ),
+            (
+                ScriptLanguage::Go,
+                Layer::Refiner,
+                format!(
+                    "package main\n\nimport \"os/exec\"\n\nfunc main() {{\n\t_ = exec.Command({split}, \"-rf\", \"/home/user\").Run()\n}}\n"
+                ),
+            ),
+            (
+                ScriptLanguage::Php,
+                Layer::Refiner,
+                format!(
+                    "<?php\n$p = proc_open([{php_split},\"-rf\",\"/home/user\"], [], $pipes);\n?>\n"
+                ),
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                Layer::SinkScanner,
+                format!(
+                    "const cp = require('child_process');\ncp.spawnSync({split}, [\"-rf\", \"/home/user\"]);"
+                ),
+            ),
+            (
+                ScriptLanguage::Ruby,
+                Layer::SinkScanner,
+                format!("system({split}, \"-rf\", \"/home/user\")"),
+            ),
+        ] {
+            let matches = match layer {
+                Layer::Refiner => DEFAULT_MATCHER
+                    .find_matches(&code, language)
+                    .unwrap_or_else(|error| panic!("{language:?} fixture should scan: {error:?}")),
+                Layer::SinkScanner => scan_executing_sink_matches(&code, language),
+            };
+            assert!(
+                matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                "{language:?}: a token split across a concatenation operator must \
+                 still block; got {:?}",
+                matches
+                    .iter()
+                    .map(|hit| (&hit.rule_id, hit.severity))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // Countermetric: the fold is driven by the operator, never by
+        // adjacency. A comma-separated list holding `rm` as an inert element
+        // stays three operands and must keep allowing, or the argv view has
+        // begun inventing commands.
+        // Measured at the same layer each language's positive row used, so a
+        // pass here cannot come from the match being dropped somewhere else.
+        for (language, layer, code) in [
+            (
+                ScriptLanguage::Python,
+                Layer::Refiner,
+                "import subprocess\nsubprocess.run([\"echo\", \"rm\", \"-rf\"])".to_string(),
+            ),
+            (
+                ScriptLanguage::Ruby,
+                Layer::SinkScanner,
+                "system(\"echo\", \"rm\", \"-rf\")".to_string(),
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                Layer::SinkScanner,
+                "const cp = require('child_process');\ncp.spawnSync(\"echo\", [\"rm\", \"-rf\"]);"
+                    .to_string(),
+            ),
+        ] {
+            let matches = match layer {
+                Layer::Refiner => DEFAULT_MATCHER
+                    .find_matches(&code, language)
+                    .unwrap_or_else(|error| panic!("{language:?} fixture should scan: {error:?}")),
+                Layer::SinkScanner => scan_executing_sink_matches(&code, language),
+            };
+            assert!(
+                !matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                "{language:?}: `echo rm -rf` prints two words and deletes nothing; \
+                 folding by adjacency would have turned it into a delete. Got {:?}",
+                matches
+                    .iter()
+                    .map(|hit| (&hit.rule_id, hit.severity))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // A dynamic operand keeps the gap non-foldable, so it stays fail-open
+        // rather than being joined into something the source never builds.
+        let matches = DEFAULT_MATCHER
+            .find_matches(
+                "import subprocess\nsubprocess.run([\"rm\", \"-rf\", \"/tmp/\" + name])",
+                ScriptLanguage::Python,
+            )
+            .expect("dynamic fixture should scan");
+        assert!(
+            matches.iter().any(|hit| hit.severity.blocks_by_default()),
+            "the `rm`/`-rf` operands are still literal, so this blocks on them; \
+             the point is only that `/tmp/` was not silently joined to an \
+             identifier. Got {:?}",
+            matches
+                .iter()
+                .map(|hit| (&hit.rule_id, hit.severity))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The gap rule that drives the fold, in isolation (#474).
+    #[test]
+    fn only_a_single_operator_gap_folds_issue_474() {
+        for gap in [" + ", "+", " . ", ".", "\n  + ", " +\n"] {
+            assert!(is_concatenation_gap(gap), "{gap:?} should fold");
+        }
+        for gap in [
+            ", ",        // an argv separator, not a concatenation
+            " + x + ",   // a dynamic operand between the halves
+            ".freeze, ", // a method call, not PHP concatenation
+            " + + ",     // two operators is not concatenation in any of these
+            "",          // literals cannot abut without an operator
+            " ",         // whitespace alone is adjacency, not concatenation
+            ") ,(",
+        ] {
+            assert!(!is_concatenation_gap(gap), "{gap:?} must not fold");
         }
     }
 
