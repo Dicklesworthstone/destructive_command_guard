@@ -666,6 +666,65 @@ impl EvaluationResult {
         }
     }
 
+    /// Create a denial for the bounded fallback over an incomplete analysis.
+    ///
+    /// Same reason [`Self::denied_by_embedded_sink`] exists (#261): a denial
+    /// built with [`Self::denied_by_legacy`] carries no `ruleId`, no `packId`
+    /// and no `severity`, so it reaches the wire with three of the fields
+    /// AGENTS.md lists under "Key fields for agent parsing" absent. The
+    /// practical cost is not cosmetic — `ruleId` is what an allowlist entry
+    /// keys on, so such a denial can only ever be waived one command at a time
+    /// with `dcg allow-once`, and never granted.
+    ///
+    /// The bounded fallback is reachable in ordinary operation, not only under
+    /// a deliberately small budget: it is what answers whenever extraction
+    /// reports itself incomplete, which is exactly what a loaded host produces.
+    /// `ast_pattern_engine.rs` already said this out loud — "its bounded
+    /// fallback, which denies without naming a rule".
+    ///
+    /// `High`, not `Critical`: the pattern that matched is a destructive one,
+    /// but it matched a *sanitized approximation* of a body the analyser could
+    /// not finish reading, so the finding is real and its target is not
+    /// established. That is the same severity the sibling bounds rule in this
+    /// pack carries for the same reason.
+    #[must_use]
+    pub fn denied_by_incomplete_analysis(reason: &str) -> Self {
+        let (pack_id, pattern_name) = split_ast_rule_id(INCOMPLETE_ANALYSIS_RULE);
+        let explanation = format!(
+            "Embedded-code analysis did not finish, so dcg fell back to scanning the \
+             command text for destructive patterns and found one. The finding is real; \
+             its exact location and target are not established, because the body it \
+             would have been read from was never fully parsed. Re-running may succeed \
+             if the analyser ran out of budget on a loaded machine. If you have reviewed \
+             the command, allow it exactly with `dcg allowlist add-command '<command>' \
+             -r \"reviewed\" --user`, or allow this rule with \
+             `dcg allowlist add '{pack_id}:{pattern_name}' -r \"reviewed\" --user` — \
+             note that granting the rule waives the whole backstop, not one command."
+        );
+        Self {
+            decision: EvaluationDecision::Deny,
+            pattern_info: Some(PatternMatch {
+                pack_id: Some(pack_id),
+                pattern_name: Some(pattern_name),
+                severity: Some(crate::packs::Severity::High),
+                reason: reason.to_string(),
+                source: MatchSource::LegacyPattern,
+                matched_span: None,
+                matched_text_preview: None,
+                explanation: Some(explanation),
+                suggestions: &[],
+            }),
+            allowlist_override: None,
+            effective_mode: Some(crate::packs::DecisionMode::Deny),
+            skipped_due_to_budget: false,
+            quick_rejected: false,
+            branch_context: None,
+            session_occurrence: None,
+            graduated_response: None,
+            bypass_method: None,
+        }
+    }
+
     /// Create an embedded-sink denial mapped back to the outer command.
     ///
     /// Executable-stdin analysis evaluates producer bytes separately, but the
@@ -6575,6 +6634,9 @@ const PIPELINE_RECORDS_BOUNDS_RULE: &str = "heredoc.posix.pipeline-records-bound
 const PIPELINE_FILE_SOURCE_RULE: &str = "heredoc.posix.pipeline-file-source";
 const PROCESS_SUBSTITUTION_RULE: &str = "heredoc.posix.process-substitution";
 const SINK_ANALYSIS_BOUNDS_RULE: &str = "heredoc.shell.analysis-bounds";
+/// The bounded fallback's own identity, so its denial is allowlistable (#476).
+/// Same pack as its sibling above: both say "analysis could not complete".
+const INCOMPLETE_ANALYSIS_RULE: &str = "heredoc.shell.incomplete-analysis";
 const POWERSHELL_IEX_RULE: &str = "heredoc.powershell.invoke-expression-dynamic";
 const POWERSHELL_SCRIPTBLOCK_RULE: &str = "heredoc.powershell.scriptblock-dynamic";
 /// A PowerShell/cmd launcher assembled through escaping, control prefixes, or
@@ -25307,7 +25369,9 @@ fn evaluate_heredoc(
                 // for every incomplete extraction class so scheduler stalls,
                 // malformed syntax, and size limits cannot turn an obvious
                 // catastrophic sink into a quick-rejected allow.
-                if let Some(blocked) = check_fallback_patterns(command) {
+                if let Some(blocked) =
+                    check_fallback_patterns(command, context, first_allowlist_hit)
+                {
                     return Some(blocked);
                 }
                 if let Some(blocked) =
@@ -25381,7 +25445,9 @@ fn evaluate_heredoc(
                 (extracted, fallback_needed)
             }
             ExtractionResult::Failed(err) => {
-                if let Some(blocked) = check_fallback_patterns(command) {
+                if let Some(blocked) =
+                    check_fallback_patterns(command, context, first_allowlist_hit)
+                {
                     return Some(blocked);
                 }
                 if let Some(blocked) =
@@ -25622,7 +25688,9 @@ fn evaluate_heredoc(
         let matches = match DEFAULT_MATCHER.find_matches(&content.content, content.language) {
             Ok(matches) => matches,
             Err(err) => {
-                if let Some(blocked) = check_fallback_patterns(&content.content) {
+                if let Some(blocked) =
+                    check_fallback_patterns(&content.content, context, first_allowlist_hit)
+                {
                     return Some(blocked);
                 }
 
@@ -25767,7 +25835,7 @@ fn evaluate_heredoc(
     }
 
     if fallback_needed {
-        if let Some(blocked) = check_fallback_patterns(command) {
+        if let Some(blocked) = check_fallback_patterns(command, context, first_allowlist_hit) {
             return Some(blocked);
         }
         if let Some(blocked) =
@@ -26184,7 +26252,7 @@ fn check_credential_write_fallback(
     None
 }
 
-fn check_fallback_patterns(command: &str) -> Option<EvaluationResult> {
+fn fallback_pattern_hit(command: &str) -> bool {
     // Critical destructive patterns checked whenever high-fidelity embedded
     // code analysis is incomplete (timeout, parse failure, or bounded input
     // limit). These patterns must be robust to whitespace variations.
@@ -26293,13 +26361,47 @@ fn check_fallback_patterns(command: &str) -> Option<EvaluationResult> {
     let sanitized = sanitize_for_pattern_matching(masked.as_ref());
     let check_target = sanitized.as_ref();
 
-    if FALLBACK_PATTERNS.is_match(check_target) {
-        return Some(EvaluationResult::denied_by_legacy(
-            "Incomplete embedded-code analysis found a destructive pattern (bounded fallback)",
-        ));
-    }
+    FALLBACK_PATTERNS.is_match(check_target)
+}
 
-    None
+/// The bounded fallback's verdict, with its rule's allowlist grant honoured.
+///
+/// Reporting a rule id (#476) is only half of making a denial addressable: the
+/// other half is that granting the id has to do something. Every other
+/// synthesized denial in this file already consults the allowlist before it
+/// denies -- `launcher_unverified_denial` and `check_credential_write_fallback`
+/// both do -- and this one did not, because it had no identity to look up. A
+/// reported id that cannot be granted is the trap #470 describes, so the two
+/// changes only make sense together.
+///
+/// Granting this rule waives the whole backstop rather than one command, which
+/// is why the explanation says so and offers `allowlist add-command` first.
+fn check_fallback_patterns(
+    command: &str,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    if !fallback_pattern_hit(command) {
+        return None;
+    }
+    let denial = EvaluationResult::denied_by_incomplete_analysis(
+        "Incomplete embedded-code analysis found a destructive pattern (bounded fallback)",
+    );
+    let (pack_id, pattern_name) = split_ast_rule_id(INCOMPLETE_ANALYSIS_RULE);
+    if let Some(allow_hit) =
+        context
+            .allowlists
+            .match_rule_at_path(&pack_id, &pattern_name, context.project_path)
+    {
+        if first_allowlist_hit.is_none() {
+            if let Some(info) = denial.pattern_info {
+                *first_allowlist_hit =
+                    Some((info, allow_hit.layer, allow_hit.entry.reason.clone()));
+            }
+        }
+        return None;
+    }
+    Some(denial)
 }
 
 fn split_ast_rule_id(rule_id: &str) -> (String, String) {
@@ -39173,7 +39275,7 @@ mod tests {
                 "a metavariable receiver must become an identifier"
             );
             assert!(
-                check_fallback_patterns("os.Truncate(\"/home/user\")").is_none(),
+                !fallback_pattern_hit("os.Truncate(\"/home/user\")"),
                 "the backstop must not match an arbitrary sink, or the assertion \
                  below is vacuous"
             );
@@ -39192,7 +39294,7 @@ mod tests {
                         continue;
                     }
                     let call = instantiate(&meta.pattern_str, meta.selector.as_deref());
-                    if check_fallback_patterns(&call).is_none() {
+                    if !fallback_pattern_hit(&call) {
                         gaps.push(format!("{language:?} {} => {call}", meta.rule_id));
                     }
                 }
@@ -39280,7 +39382,7 @@ mod tests {
                 ),
             ] {
                 assert!(
-                    check_fallback_patterns(cmd).is_some(),
+                    fallback_pattern_hit(cmd),
                     "{label}: the bounded fallback must match a one-liner, or an AST \
                      timeout allows this command outright (#452): {cmd}"
                 );
@@ -39300,7 +39402,7 @@ mod tests {
                 ),
             ] {
                 assert!(
-                    check_fallback_patterns(cmd).is_none(),
+                    !fallback_pattern_hit(cmd),
                     "{label}: an unqualified rm( must not reach this target-blind \
                      backstop (#468): {cmd}"
                 );
@@ -39330,7 +39432,7 @@ mod tests {
                 ),
             ] {
                 assert!(
-                    check_fallback_patterns(cmd).is_none(),
+                    !fallback_pattern_hit(cmd),
                     "{label}: the bounded fallback must not fire on a mention (#420): {cmd}"
                 );
             }
