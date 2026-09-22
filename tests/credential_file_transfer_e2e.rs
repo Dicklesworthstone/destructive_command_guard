@@ -1370,3 +1370,109 @@ fn compound_writes_keep_rule_grants_independent() {
         }
     }
 }
+
+#[test]
+fn compound_parenthesized_targets_reach_hook_cli_and_stdin() {
+    assert_link_cases(
+        "node",
+        &[
+            (
+                "const fs = require('fs'); let f = fs.constants.O_RDONLY; (f) |= fs.constants.O_WRONLY; fs.openSync('.bashrc', f)",
+                Some("credential-file-write"),
+            ),
+            (
+                "const fs = require('fs'); let f = fs.constants.O_WRONLY | fs.constants.O_APPEND; (/* target */ f) |= (/* flags */ fs.constants.O_TRUNC); fs.openSync('.ssh/known_hosts', f)",
+                Some("credential-file-write"),
+            ),
+            (
+                "let p = '/home/u/'; (p) += '.bashrc'; require('fs').writeFileSync(p, 'x')",
+                Some("credential-file-write"),
+            ),
+            (
+                "let p = '.bashrc'; (p) += '.backup'; require('fs').writeFileSync(p, 'x')",
+                None,
+            ),
+            (
+                "const fs = require('fs'); let f = fs.constants.O_WRONLY; (f) |= fs.constants.O_APPEND; fs.openSync('.ssh/known_hosts', f)",
+                None,
+            ),
+        ],
+    );
+}
+
+#[test]
+fn compound_expression_arguments_reach_hook_cli_and_stdin() {
+    for (exe, source, rule) in [
+        (
+            "node",
+            "let p = require('os').homedir(); require('fs').writeFileSync(p += '/.bashrc', 'x')",
+            Some("credential-file-write"),
+        ),
+        (
+            "node",
+            "const fs = require('fs'); let f = fs.constants.O_WRONLY | fs.constants.O_APPEND; fs.openSync('.ssh/known_hosts', f |= fs.constants.O_TRUNC)",
+            Some("credential-file-write"),
+        ),
+        (
+            "ruby",
+            "p = Dir.home; File.write(p += '/.bashrc', 'x')",
+            Some("credential-file-write"),
+        ),
+        (
+            "ruby",
+            "f = File::WRONLY | File::APPEND; IO.sysopen('.ssh/known_hosts', (f |= File::TRUNC))",
+            Some("credential-file-write"),
+        ),
+        (
+            "node",
+            "let p = '.bashrc'; require('fs').writeFileSync(p += '.backup', 'x')",
+            None,
+        ),
+        (
+            "ruby",
+            "p = '.bashrc'; File.write(p += '.backup', 'x')",
+            None,
+        ),
+        (
+            "node",
+            "const fs = require('fs'); let f = fs.constants.O_WRONLY; fs.openSync('.ssh/known_hosts', f |= fs.constants.O_APPEND)",
+            None,
+        ),
+        (
+            "ruby",
+            "f = File::WRONLY; IO.sysopen('.ssh/known_hosts', (f |= File::APPEND))",
+            None,
+        ),
+    ] {
+        assert_link_cases(exe, &[(source, rule)]);
+    }
+}
+
+#[test]
+fn parenthesized_plain_assignments_reach_real_entry_points() {
+    assert_link_cases(
+        "node",
+        &[
+            (
+                "const fs = require('fs'); let f = fs.constants.O_RDONLY; (f) = fs.constants.O_WRONLY; fs.openSync('.bashrc', f)",
+                Some("credential-file-write"),
+            ),
+            (
+                "let mode = 'a'; (mode) = 'w'; require('fs').openSync('.ssh/known_hosts', mode)",
+                Some("credential-file-write"),
+            ),
+            (
+                "let p = '/tmp/proposal'; (p) = '.bashrc'; require('fs').writeFileSync(p, 'x')",
+                Some("credential-file-write"),
+            ),
+            (
+                "let p = '.bashrc'; (p) = '/tmp/proposal'; require('fs').writeFileSync(p, 'x')",
+                None,
+            ),
+            (
+                "let mode = 'w'; (mode) = 'a'; require('fs').openSync('.ssh/known_hosts', mode)",
+                None,
+            ),
+        ],
+    );
+}

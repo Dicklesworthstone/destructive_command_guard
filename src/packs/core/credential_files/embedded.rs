@@ -679,7 +679,7 @@ fn visit(
         let target = node.field("left").or_else(|| node.field("argument"));
         let updated = target
             .as_ref()
-            .and_then(|target| compound_value(&node, target, language, env));
+            .and_then(|target| compound_value(&node, target, language, env, 0));
         for child in node.children() {
             visit(child, language, env, depth + 1, remaining_nodes, hits)?;
         }
@@ -735,11 +735,12 @@ fn compound_value(
     target: &Syntax<'_>,
     language: Language,
     env: &Bindings,
+    depth: usize,
 ) -> Option<Value> {
-    let left = value(target, language, env, 0);
+    let left = value(target, language, env, depth + 1);
     let right = node
         .field("right")
-        .and_then(|right| value(&right, language, env, 0));
+        .and_then(|right| value(&right, language, env, depth + 1));
     match node.field("operator")?.text().as_ref() {
         "|=" => combine_open_flags(left, right),
         "+=" => concatenate_text(left?, right?),
@@ -755,6 +756,7 @@ fn compound_value(
 }
 
 fn bind_compound_target(target: Syntax<'_>, updated: Option<Value>, env: &mut Bindings) {
+    let target = unparenthesized_target(target);
     if matches!(target.kind().as_ref(), "identifier" | "constant") {
         let name = target.text().into_owned();
         env.remove(&name);
@@ -771,9 +773,31 @@ fn bind_compound_target(target: Syntax<'_>, updated: Option<Value>, env: &mut Bi
         .or_else(|| object.field("value"))
         .or_else(|| object.field("scope"))
     {
-        object = parent;
+        object = unparenthesized_target(parent);
     }
     env.remove(object.text().as_ref());
+}
+
+/// JavaScript permits `(flags) |= bit` and `(receiver).member += value`.
+/// Parentheses and comments must not change which binding gets updated or
+/// invalidated. Do not unwrap multi-expression nodes as a simple target.
+fn unparenthesized_target(mut target: Syntax<'_>) -> Syntax<'_> {
+    while target.kind() == "parenthesized_expression" {
+        let inner = {
+            let mut children = target
+                .children()
+                .filter(|child| child.is_named() && child.kind() != "comment");
+            let Some(inner) = children.next() else {
+                break;
+            };
+            if children.next().is_some() {
+                break;
+            }
+            inner
+        };
+        target = inner;
+    }
+    target
 }
 
 /// Encode a decoded path for the shared shell policy, never for execution.
@@ -907,7 +931,10 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
         kind.as_ref(),
         "assignment" | "assignment_expression" | "variable_declarator"
     ) {
-        let left = node.field("left").or_else(|| node.field("name"));
+        let left = node
+            .field("left")
+            .or_else(|| node.field("name"))
+            .map(unparenthesized_target);
         let right = node.field("right").or_else(|| node.field("value"));
         if let (Some(left), Some(right)) = (left, right) {
             let value = value(&right, language, env, 0);
@@ -931,12 +958,13 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
                         env.insert(name, member);
                     }
                 }
-            } else if let Some(mut object) = left.field("object").or_else(|| left.field("value")) {
+            } else if let Some(object) = left.field("object").or_else(|| left.field("value")) {
                 // Attribute/subscript assignment can replace a module member
                 // or mutate an imported environment mapping. Do not retain a
                 // proven runtime API after its root binding was modified.
+                let mut object = unparenthesized_target(object);
                 while let Some(parent) = object.field("object").or_else(|| object.field("value")) {
-                    object = parent;
+                    object = unparenthesized_target(parent);
                 }
                 env.remove(object.text().as_ref());
             }
@@ -1008,8 +1036,17 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
     }
     match node.kind().as_ref() {
         "identifier" | "constant" => env.get(node.text().as_ref()).cloned(),
+        "augmented_assignment_expression" | "operator_assignment" => {
+            // JS and Ruby assignment expressions return their new value. A
+            // write may consume that value directly, before the visitor has
+            // reached the assignment child. Evaluate it without mutating the
+            // bindings here; visit installs it at the expression boundary.
+            compound_value(node, &node.field("left")?, language, env, depth)
+        }
         "parenthesized_expression" => value(
-            &node.children().find(Node::is_named)?,
+            &node
+                .children()
+                .find(|child| child.is_named() && child.kind() != "comment")?,
             language,
             env,
             depth + 1,

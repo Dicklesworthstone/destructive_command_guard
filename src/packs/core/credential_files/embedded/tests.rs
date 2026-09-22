@@ -1411,3 +1411,111 @@ fn compound_rhs_effects_are_checked_before_target_invalidation() {
         );
     }
 }
+
+#[test]
+fn compound_parenthesized_targets_preserve_binding_identity() {
+    for language in [ScriptLanguage::JavaScript, ScriptLanguage::TypeScript] {
+        for source in [
+            "const fs = require('fs'); let f = fs.constants.O_RDONLY; (f) |= fs.constants.O_WRONLY; fs.openSync('.bashrc', f)",
+            "const fs = require('fs'); let f = fs.constants.O_WRONLY | fs.constants.O_APPEND; (((f))) |= fs.constants.O_TRUNC; fs.openSync('.ssh/known_hosts', f)",
+            "const fs = require('fs'); let f = fs.constants.O_RDONLY; (/* target */ f) |= (/* flags */ fs.constants.O_WRONLY); fs.openSync('.bashrc', f)",
+            "let p = '/home/u/'; (/* target */ p) += '.bashrc'; require('fs').writeFileSync(p, 'x')",
+        ] {
+            let hits = scan_extracted(source, language).expect(source);
+            assert_eq!(hits.len(), 1, "{language:?}: {source}: {hits:?}");
+            assert_eq!(hits[0].rule, shell::CREDENTIAL_FILE_WRITE_NAME);
+        }
+        for source in [
+            "let p = '.bashrc'; (p) += '.backup'; require('fs').writeFileSync(p, 'x')",
+            "const fs = require('fs'); let f = fs.constants.O_WRONLY; (f) |= fs.constants.O_APPEND; fs.openSync('.ssh/known_hosts', f)",
+            "const fs = require('fs'); (fs.constants).O_RDONLY |= unknown; fs.openSync('.bashrc', fs.constants.O_WRONLY)",
+        ] {
+            assert!(
+                scan_extracted(source, language).expect(source).is_empty(),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn compound_expression_values_reach_the_enclosing_write_sink() {
+    for (language, source) in [
+        (
+            ScriptLanguage::JavaScript,
+            "let p = require('os').homedir(); require('fs').writeFileSync(p += '/.bashrc', 'x')",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "const fs = require('fs'); let f = fs.constants.O_WRONLY | fs.constants.O_APPEND; fs.openSync('.ssh/known_hosts', f |= fs.constants.O_TRUNC)",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "const fs = require('fs'); let f = fs.constants.O_RDONLY; fs.openSync('.bashrc', (f |= fs.constants.O_WRONLY))",
+        ),
+        (
+            ScriptLanguage::TypeScript,
+            "let p: string = '/home/u/'; require('fs').writeFileSync(p += '.bashrc', 'x')",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "p = Dir.home; File.write(p += '/.bashrc', 'x')",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "f = File::WRONLY | File::APPEND; IO.sysopen('.ssh/known_hosts', (f |= File::TRUNC))",
+        ),
+    ] {
+        let hits = scan_extracted(source, language).expect(source);
+        assert_eq!(hits.len(), 1, "{language:?}: {source}: {hits:?}");
+        assert_eq!(hits[0].rule, shell::CREDENTIAL_FILE_WRITE_NAME);
+    }
+    for (language, source) in [
+        (
+            ScriptLanguage::JavaScript,
+            "let p = '.bashrc'; require('fs').writeFileSync(p += '.backup', 'x')",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "const fs = require('fs'); let f = fs.constants.O_WRONLY; fs.openSync('.ssh/known_hosts', f |= fs.constants.O_APPEND)",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "p = '.bashrc'; File.write(p += '.backup', 'x')",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "f = File::WRONLY; IO.sysopen('.ssh/known_hosts', (f |= File::APPEND))",
+        ),
+    ] {
+        assert!(
+            scan_extracted(source, language).expect(source).is_empty(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn parenthesized_plain_assignment_replaces_old_mode_and_path_proofs() {
+    for language in [ScriptLanguage::JavaScript, ScriptLanguage::TypeScript] {
+        for source in [
+            "const fs = require('fs'); let f = fs.constants.O_RDONLY; (f) = fs.constants.O_WRONLY; fs.openSync('.bashrc', f)",
+            "let mode = 'a'; (mode) = 'w'; require('fs').openSync('.ssh/known_hosts', mode)",
+            "let p = '/tmp/proposal'; (p) = '.bashrc'; require('fs').writeFileSync(p, 'x')",
+        ] {
+            let hits = scan_extracted(source, language).expect(source);
+            assert_eq!(hits.len(), 1, "{source}: {hits:?}");
+            assert_eq!(hits[0].rule, shell::CREDENTIAL_FILE_WRITE_NAME);
+        }
+        for source in [
+            "let p = '.bashrc'; (p) = '/tmp/proposal'; require('fs').writeFileSync(p, 'x')",
+            "let mode = 'w'; (mode) = 'a'; require('fs').openSync('.ssh/known_hosts', mode)",
+            "const fs = require('fs'); (fs.constants).O_RDONLY = unknown; fs.openSync('.bashrc', fs.constants.O_WRONLY)",
+        ] {
+            assert!(
+                scan_extracted(source, language).expect(source).is_empty(),
+                "{source}"
+            );
+        }
+    }
+}
