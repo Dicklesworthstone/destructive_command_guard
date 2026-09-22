@@ -443,8 +443,16 @@ enum Value {
     PathOpen(ResolvedPath),
     PathTransfer(ResolvedPath),
     Require,
+    NodeOs,
+    NodePath,
+    Process,
+    NodeEnvironment,
+    HomeDirectory,
+    NodeJoin,
+    NodeResolve,
     Fs,
     File,
+    RubyDir,
     Api(String),
 }
 
@@ -494,9 +502,11 @@ fn scan_source(
         Language::Ruby => {
             bindings.insert("File".into(), Value::File);
             bindings.insert("IO".into(), Value::Io);
+            bindings.insert("Dir".into(), Value::RubyDir);
         }
         Language::Node => {
             bindings.insert("require".into(), Value::Require);
+            bindings.insert("process".into(), Value::Process);
         }
     }
     let mut hits = Vec::new();
@@ -690,8 +700,10 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
         }
     }
     if language == Language::Node && kind == "import_statement" {
-        let module = node.field("source").and_then(|n| literal(&n, language));
-        let filesystem = module.as_deref().is_some_and(is_fs_module);
+        let module = node
+            .field("source")
+            .and_then(|n| literal(&n, language))
+            .and_then(|name| js_module(&name));
         for child in node.dfs() {
             if child.kind() == "import_specifier" {
                 let Some(name) = child.field("name") else {
@@ -703,8 +715,11 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
                     .text()
                     .into_owned();
                 env.remove(&alias);
-                if filesystem && is_js_api(name.text().as_ref()) {
-                    env.insert(alias, Value::Api(name.text().into_owned()));
+                if let Some(member) = module
+                    .as_ref()
+                    .and_then(|module| js_member(module, name.text().as_ref()))
+                {
+                    env.insert(alias, member);
                 }
             } else if child.kind() == "identifier"
                 && child.parent().is_some_and(|p| {
@@ -713,8 +728,8 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
             {
                 let alias = child.text().into_owned();
                 env.remove(&alias);
-                if filesystem {
-                    env.insert(alias, Value::Fs);
+                if let Some(module) = &module {
+                    env.insert(alias, module.clone());
                 }
             }
         }
@@ -739,8 +754,12 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
                     let destination = property.field("value").unwrap_or_else(|| property.clone());
                     let name = destination.text().into_owned();
                     env.remove(&name);
-                    if value == Some(Value::Fs) && is_js_api(source.text().as_ref()) {
-                        env.insert(name, Value::Api(source.text().into_owned()));
+                    let member =
+                        literal(&source, language).unwrap_or_else(|| source.text().into_owned());
+                    if let Some(member) =
+                        value.as_ref().and_then(|object| js_member(object, &member))
+                    {
+                        env.insert(name, member);
                     }
                 }
             } else if let Some(mut object) = left.field("object").or_else(|| left.field("value")) {
@@ -756,11 +775,32 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
     }
 }
 
-fn is_fs_module(module: &str) -> bool {
-    matches!(
-        module,
-        "fs" | "node:fs" | "fs/promises" | "node:fs/promises"
-    )
+/// Recognize only Node's built-in modules. A same-named method on an
+/// unrelated import must not acquire filesystem or home-directory authority.
+fn js_module(module: &str) -> Option<Value> {
+    match module.strip_prefix("node:").unwrap_or(module) {
+        "fs" | "fs/promises" => Some(Value::Fs),
+        "os" => Some(Value::NodeOs),
+        "path" | "path/posix" => Some(Value::NodePath),
+        "process" => Some(Value::Process),
+        _ => None,
+    }
+}
+
+/// Share member resolution between qualified access, ESM named imports and
+/// CommonJS destructuring so all three retain the same binding provenance.
+fn js_member(object: &Value, name: &str) -> Option<Value> {
+    match (object, name) {
+        (Value::Fs, "promises") => Some(Value::Fs),
+        (Value::Fs, name) if is_js_api(name) => Some(Value::Api(name.into())),
+        (Value::NodeOs, "homedir") => Some(Value::HomeDirectory),
+        (Value::NodePath, "posix") => Some(Value::NodePath),
+        (Value::NodePath, "join") => Some(Value::NodeJoin),
+        (Value::NodePath, "resolve") => Some(Value::NodeResolve),
+        (Value::Process, "env") => Some(Value::NodeEnvironment),
+        (Value::NodeEnvironment, "HOME") => Some(Value::HomePath("~".into())),
+        _ => None,
+    }
 }
 
 fn is_js_api(name: &str) -> bool {
@@ -819,8 +859,7 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                 (Value::Path(path), "write_text" | "write_bytes") => Some(Value::PathWrite(path)),
                 (Value::Path(path), "open") => Some(Value::PathOpen(path)),
                 (Value::Path(path), "rename" | "replace") => Some(Value::PathTransfer(path)),
-                (Value::Fs, "promises") => Some(Value::Fs),
-                (Value::Fs, name) if is_js_api(name) => Some(Value::Api(name.into())),
+                (object, name) if language == Language::Node => js_member(&object, name),
                 _ => None,
             }
         }
@@ -834,14 +873,36 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                 None
             }
         }
-        "call" if language == Language::Ruby => {
-            if value(&node.field("receiver")?, language, env, depth + 1)? != Value::File
-                || node.field("method")?.text() != "expand_path"
-            {
+        "subscript_expression" if language == Language::Node => {
+            let object = value(&node.field("object")?, language, env, depth + 1)?;
+            let Value::Text(member) = value(&node.field("index")?, language, env, depth + 1)?
+            else {
                 return None;
-            }
-            match value(arguments(node).first()?, language, env, depth + 1)? {
-                Value::Text(path) => Some(Value::HomePath(path)),
+            };
+            js_member(&object, &member)
+        }
+        "call" if language == Language::Ruby => {
+            let receiver = value(&node.field("receiver")?, language, env, depth + 1)?;
+            let method = node.field("method")?;
+            let args = arguments(node);
+            match (receiver, method.text().as_ref()) {
+                (Value::RubyDir, "home") if args.is_empty() => Some(Value::HomePath("~".into())),
+                (Value::File, "join") => {
+                    let mut path = (String::new(), false);
+                    for arg in args {
+                        path = concatenate_path(
+                            path,
+                            resolved_path(value(&arg, language, env, depth + 1)?)?,
+                        )?;
+                    }
+                    Some(path_as_text(path))
+                }
+                (Value::File, "expand_path") => {
+                    match value(args.first()?, language, env, depth + 1)? {
+                        Value::Text(path) | Value::HomePath(path) => Some(Value::HomePath(path)),
+                        _ => None,
+                    }
+                }
                 _ => None,
             }
         }
@@ -855,7 +916,12 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                     else {
                         return None;
                     };
-                    is_fs_module(&module).then_some(Value::Fs)
+                    js_module(&module)
+                }
+                Value::HomeDirectory if args.is_empty() => Some(Value::HomePath("~".into())),
+                Value::NodeJoin => node_path_arguments(&args, env, depth, false).map(path_as_text),
+                Value::NodeResolve => {
+                    node_path_arguments(&args, env, depth, true).map(path_as_text)
                 }
                 Value::PathHome if args.is_empty() => Some(Value::Path(("~".into(), true))),
                 Value::PathConstructor => {
@@ -888,7 +954,7 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                 _ => None,
             }
         }
-        "binary_operator" | "binary_expression" => {
+        "binary_operator" | "binary_expression" | "binary" => {
             let left = value(&node.field("left")?, language, env, depth + 1)?;
             let right = value(&node.field("right")?, language, env, depth + 1)?;
             match node.field("operator")?.text().as_ref() {
@@ -970,6 +1036,96 @@ fn python_join_paths(
     path
 }
 
+/// Node's join and resolve are not interchangeable: join('/tmp', '/etc')
+/// retains /tmp, whereas resolve discards it. Relative results stay relative
+/// for the shared path policy; never substitute the guard's working directory.
+fn node_path_arguments(
+    args: &[Syntax<'_>],
+    env: &Bindings,
+    depth: usize,
+    resolve: bool,
+) -> Option<ResolvedPath> {
+    let mut path = Some((String::new(), false));
+    for arg in args {
+        let next = match value(arg, Language::Node, env, depth + 1) {
+            Some(Value::Text(text)) => Some((text, false)),
+            Some(Value::HomePath(text)) => Some((text, true)),
+            _ => None,
+        };
+        path = next.and_then(|next| {
+            if resolve {
+                python_join_path(path, next)
+            } else {
+                concatenate_path(path?, next)
+            }
+        });
+    }
+    normalize_node_path(path.filter(|(path, _)| !path.is_empty())?, !resolve)
+}
+
+/// Node normalizes dot components lexically before a filesystem call. Passing
+/// `/tmp/../etc/shadow` through as if it were a raw OS path loses that fact.
+/// The symbolic home is opaque: a parent above it needs the runtime home value,
+/// so never invent an absolute parent from the guard's own home directory.
+fn normalize_node_path((path, home): ResolvedPath, keep_trailing: bool) -> Option<ResolvedPath> {
+    let absolute = path.starts_with('/');
+    let symbolic_home = home && path.starts_with('~');
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if symbolic_home && parts.len() == 1 {
+                    return None;
+                }
+                if parts.last().is_some_and(|last| *last != "..") {
+                    parts.pop();
+                } else if !absolute {
+                    parts.push(part);
+                }
+            }
+            _ => parts.push(part),
+        }
+    }
+    let mut normalized = parts.join("/");
+    if absolute {
+        normalized.insert(0, '/');
+    } else if normalized.is_empty() {
+        normalized.push('.');
+    }
+    if keep_trailing && path.ends_with('/') && !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    Some((normalized, home))
+}
+
+/// Node path.join and Ruby File.join concatenate even an absolute later
+/// component, unlike Python path joining and Node path.resolve.
+fn concatenate_path(
+    (mut base, home): ResolvedPath,
+    (next, next_home): ResolvedPath,
+) -> Option<ResolvedPath> {
+    if base.is_empty() {
+        return Some((next, next_home));
+    }
+    if next.is_empty() {
+        return Some((base, home));
+    }
+    // The absolute value of another runtime home is unknown. Concatenating
+    // it after an existing path cannot be modelled as a literal tilde.
+    if next_home {
+        return None;
+    }
+    if base.len().checked_add(next.len())?.checked_add(1)? > MAX_STATIC_PATH_BYTES {
+        return None;
+    }
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+    base.push_str(next.trim_start_matches('/'));
+    Some((base, home))
+}
+
 /// Concatenation is not path joining. A home on the right is not absolute
 /// after a nonempty literal prefix, and Path objects do not support `+`.
 fn concatenate_text(left: Value, right: Value) -> Option<Value> {
@@ -983,6 +1139,16 @@ fn concatenate_text(left: Value, right: Value) -> Option<Value> {
         Value::HomePath(path) if text.is_empty() => return Some(Value::HomePath(path)),
         _ => return None,
     };
+    // `homedir() + 'other'` does not select ~other. Keep the symbolic home
+    // token intact unless a separator establishes the runtime path boundary.
+    if home
+        && text.starts_with('~')
+        && !text.contains('/')
+        && !suffix.is_empty()
+        && !suffix.starts_with('/')
+    {
+        return None;
+    }
     if text.len().checked_add(suffix.len())? > MAX_STATIC_PATH_BYTES {
         return None;
     }

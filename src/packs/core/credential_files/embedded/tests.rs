@@ -7,6 +7,157 @@ fn denied(code: &str, language: Language) -> bool {
 }
 
 #[test]
+fn node_composed_paths_preserve_builtin_module_provenance() {
+    for code in [
+        "const os = require('os'); require('fs').writeFileSync(os.homedir() + '/.bashrc', 'x')",
+        "const {homedir: home} = require('node:os'); const {join: J} = require('node:path'); require('fs').writeFileSync(J(home(), '.ssh', 'id_rsa'), 'x')",
+        "import {homedir as H} from 'node:os'; import {join as J} from 'node:path'; import {writeFileSync as save} from 'node:fs'; save(J(H(), '.aws', 'credentials'), 'x')",
+        "import * as os from 'os'; import path from 'path'; require('fs').writeFileSync(path.join(os.homedir(), '.bashrc'), 'x')",
+        "require('fs').writeFileSync(require('path/posix').join('/etc', 'shadow'), 'x')",
+        "require('fs').writeFileSync(require('node:path').posix.resolve('/tmp', '/etc', 'shadow'), 'x')",
+        "require('fs').writeFileSync(require('path').join('/tmp', '..', 'etc', 'shadow'), 'x')",
+        "require('fs').writeFileSync(require('path').join(require('os').homedir(), '.ssh', '..', '.bashrc'), 'x')",
+        "require('fs').writeFileSync(process.env.HOME + '/.bashrc', 'x')",
+        "require('fs').writeFileSync(process.env['HOME'] + '/.bashrc', 'x')",
+        "const {env: E} = require('node:process'); require('fs').writeFileSync(E.HOME + '/.bashrc', 'x')",
+        "const {HOME: home} = process.env; require('fs').writeFileSync(home + '/.bashrc', 'x')",
+        "import {env} from 'node:process'; require('fs').writeFileSync(env.HOME + '/.bashrc', 'x')",
+        "const home = require('os')['homedir']; require('fs')['writeFileSync'](home() + '/.bashrc', 'x')",
+    ] {
+        for language in [ScriptLanguage::JavaScript, ScriptLanguage::TypeScript] {
+            let hits = scan_extracted(code, language).expect(code);
+            assert_eq!(hits.len(), 1, "{language:?}: {code}: {hits:?}");
+            assert_eq!(hits[0].rule, shell::CREDENTIAL_FILE_WRITE_NAME, "{code}");
+            assert!(code.get(hits[0].span.clone()).is_some(), "{code}");
+        }
+    }
+}
+
+#[test]
+fn node_composed_paths_preserve_join_resolve_and_safe_controls() {
+    for code in [
+        "require('fs').writeFileSync(require('path').join('/tmp', '/etc', 'shadow'), 'x')",
+        "require('fs').writeFileSync(require('path').resolve(require('os').homedir(), '/tmp/dcg-preview'), 'x')",
+        "require('fs').writeFileSync(require('path').join(require('os').homedir(), 'notes.txt'), 'x')",
+        "require('fs').writeFileSync(require('path').join('~', '.bashrc'), 'x')",
+        "require('fs').readFileSync(require('path').join(require('os').homedir(), '.ssh', 'id_rsa'))",
+        "require('fs').appendFileSync(require('path').join(require('os').homedir(), '.ssh', 'known_hosts'), 'host')",
+        "const os = require('unrelated'); require('fs').writeFileSync(os.homedir() + '/.bashrc', 'x')",
+        "const {join} = require('unrelated'); require('fs').writeFileSync(join('/etc', 'shadow'), 'x')",
+        "let os = require('os'); os = store; require('fs').writeFileSync(os.homedir() + '/.bashrc', 'x')",
+        "const process = store; require('fs').writeFileSync(process.env.HOME + '/.bashrc', 'x')",
+        "const {env: E} = process; E.HOME = unknown; require('fs').writeFileSync(E.HOME + '/.bashrc', 'x')",
+        "require('fs').writeFileSync(require('path').join(unknown, '.bashrc'), 'x')",
+        "require('fs').writeFileSync(require('path').win32.join('C:\\\\scratch', '.bashrc'), 'x')",
+        "console.log(\"require('fs').writeFileSync(require('path').join('/etc', 'shadow'), 'x')\")",
+    ] {
+        assert!(!denied(code, Language::Node), "{code}");
+    }
+    let code = "require('fs').appendFileSync(require('path').join(require('os').homedir(), '.ssh', 'known_hosts'), 'host', {flag: 'w'})";
+    assert!(denied(code, Language::Node), "{code}");
+    assert_eq!(
+        concatenate_path(("/tmp".into(), false), ("/etc/shadow".into(), false)),
+        Some(("/tmp/etc/shadow".into(), false)),
+    );
+    assert!(concatenate_path(("/tmp".into(), false), ("~/.bashrc".into(), true)).is_none());
+    assert!(
+        concatenate_path(
+            ("x".repeat(MAX_STATIC_PATH_BYTES), false),
+            ("y".into(), false)
+        )
+        .is_none()
+    );
+    assert!(
+        concatenate_text(
+            Value::HomePath("~".into()),
+            Value::Text("other/.bashrc".into())
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn node_path_normalization_preserves_runtime_home_boundaries() {
+    for (path, home, trailing, expected) in [
+        ("/tmp/../etc/shadow", false, true, Some("/etc/shadow")),
+        ("//tmp/../../etc//shadow", false, true, Some("/etc/shadow")),
+        ("~/.ssh/../.bashrc", true, true, Some("~/.bashrc")),
+        ("~/../etc/shadow", true, true, None),
+        ("~/../etc/shadow", false, true, Some("etc/shadow")),
+        ("../../etc/shadow", false, true, Some("../../etc/shadow")),
+        ("/etc/./", false, true, Some("/etc/")),
+        ("/etc/./", false, false, Some("/etc")),
+    ] {
+        assert_eq!(
+            normalize_node_path((path.into(), home), trailing),
+            expected.map(|path| (path.into(), home)),
+            "{path}",
+        );
+    }
+}
+
+#[test]
+fn ruby_composed_paths_preserve_home_and_literal_controls() {
+    for code in [
+        "File.write(File.join(Dir.home, '.bashrc'), 'x')",
+        "File.write(File.join(Dir.home(), '.ssh', 'id_rsa'), 'x')",
+        "File.open(Dir.home + '/.bashrc', 'w')",
+        "File.write(File.join('/etc', 'shadow'), 'x')",
+        "File.write(File.expand_path(File.join('~', '.bashrc')), 'x')",
+        "File.write(File.join(File.expand_path('~'), '.bashrc'), 'x')",
+        "home = Dir.home; File.write(File.join(home, '.bashrc'), 'x')",
+    ] {
+        assert!(denied(code, Language::Ruby), "{code}");
+    }
+    for code in [
+        "File.write(File.join('~', '.bashrc'), 'x')",
+        "File.write(File.join(Dir.home, 'notes.txt'), 'x')",
+        "File.write(File.join('/tmp', '/etc', 'shadow'), 'x')",
+        "File.read(File.join(Dir.home, '.ssh', 'id_rsa'))",
+        "File.open(File.join(Dir.home, '.ssh', 'known_hosts'), 'a')",
+        "Dir = Store; File.write(File.join(Dir.home, '.bashrc'), 'x')",
+        "File.write(File.join(unknown, '.bashrc'), 'x')",
+        "puts \"File.write(File.join(Dir.home, '.bashrc'), 'x')\"",
+    ] {
+        assert!(!denied(code, Language::Ruby), "{code}");
+    }
+}
+
+#[test]
+fn node_and_ruby_composed_paths_preserve_both_transfer_rules() {
+    for (language, code) in [
+        (
+            ScriptLanguage::JavaScript,
+            "require('fs').renameSync(require('path').join(require('os').homedir(), '.bashrc'), '.git/config')",
+        ),
+        (
+            ScriptLanguage::TypeScript,
+            "import {join} from 'node:path'; import {homedir} from 'node:os'; require('fs').renameSync('.git/config', join(homedir(), '.bashrc'))",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "File.rename(File.join(Dir.home, '.bashrc'), '.git/config')",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "File.rename('.git/config', File.join(Dir.home, '.bashrc'))",
+        ),
+    ] {
+        let hits = scan_extracted(code, language).expect(code);
+        assert_eq!(hits.len(), 2, "{code}: {hits:?}");
+        assert!(
+            hits.iter()
+                .any(|hit| hit.rule == shell::CREDENTIAL_FILE_WRITE_NAME)
+        );
+        assert!(
+            hits.iter()
+                .any(|hit| hit.rule == shell::GIT_INTERNALS_WRITE_NAME)
+        );
+        assert_eq!(hits[0].span, hits[1].span, "{code}");
+    }
+}
+
+#[test]
 fn python_composed_paths_reach_the_shared_policy() {
     for code in [
         "from pathlib import Path; (Path.home() / '.ssh' / 'id_rsa').write_text('x')",

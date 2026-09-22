@@ -599,3 +599,136 @@ fn python_composed_paths_cannot_hide_a_rename_endpoint_behind_a_grant() {
         }
     }
 }
+
+#[test]
+fn node_and_ruby_composed_paths_reach_hook_cli_and_stdin() {
+    for settings in [
+        "[heredoc]\nenabled = true\ntimeout_ms = 5000\n",
+        "[heredoc]\nenabled = false\n",
+    ] {
+        let home = home();
+        fs::write(home.path().join("config.toml"), settings).unwrap();
+        for (exe, source, rule) in [
+            (
+                "node",
+                "require('fs').writeFileSync(require('path').join(require('os').homedir(), '.ssh', 'id_rsa'), 'x')",
+                Some("credential-file-write"),
+            ),
+            (
+                "node",
+                "const {join: J} = require('node:path'); require('fs').writeFileSync(J(process.env.HOME, '.aws', 'credentials'), 'x')",
+                Some("credential-file-write"),
+            ),
+            (
+                "node",
+                "require('fs').writeFileSync(require('path').resolve('/tmp', '/etc', 'shadow'), 'x')",
+                Some("credential-file-write"),
+            ),
+            (
+                "node",
+                "require('fs').writeFileSync(require('path').join('/tmp', '..', 'etc', 'shadow'), 'x')",
+                Some("credential-file-write"),
+            ),
+            (
+                "node",
+                "require('fs').writeFileSync(require('path').join('/tmp', '/etc', 'shadow'), 'x')",
+                None,
+            ),
+            (
+                "node",
+                "require('fs').appendFileSync(require('path').join(require('os').homedir(), '.ssh', 'known_hosts'), 'host')",
+                None,
+            ),
+            (
+                "node",
+                "require('fs').writeFileSync(require('path').join('~', '.bashrc'), 'x')",
+                None,
+            ),
+            (
+                "ruby",
+                "File.write(File.join(Dir.home, '.bashrc'), 'x')",
+                Some("credential-file-write"),
+            ),
+            (
+                "ruby",
+                "File.write(File.join('/etc', 'shadow'), 'x')",
+                Some("credential-file-write"),
+            ),
+            ("ruby", "File.write(File.join('~', '.bashrc'), 'x')", None),
+            (
+                "ruby",
+                "File.open(File.join(Dir.home, '.ssh', 'known_hosts'), 'a')",
+                None,
+            ),
+            (
+                "ruby",
+                "File.write(File.join('/tmp', '/etc', 'shadow'), 'x')",
+                None,
+            ),
+        ] {
+            assert_program(exe, source, home.path(), rule);
+            let quoted = format!("'{}'", source.replace('\'', "'\\''"));
+            assert_decision(&format!("env {exe} - 0<<< {quoted}"), home.path(), rule);
+        }
+    }
+}
+
+#[test]
+fn node_and_ruby_composed_paths_keep_rule_grants_independent() {
+    for (allowed, denied, target) in [
+        ("credential-file-write", "git-internals-write", ".bashrc"),
+        (
+            "git-internals-write",
+            "credential-file-write",
+            ".git/config",
+        ),
+    ] {
+        let home = home();
+        fs::write(
+            home.path().join("config.toml"),
+            "[heredoc]\nenabled = false\n",
+        )
+        .unwrap();
+        fs::write(
+            home.path().join("xdg/dcg/allowlist.toml"),
+            format!(
+                "[[allow]]\nrule = \"core.filesystem:{allowed}\"\nreason = \"one endpoint only\"\n"
+            ),
+        )
+        .unwrap();
+        assert_program(
+            "node",
+            &format!("require('fs').writeFileSync('{target}', 'x')"),
+            home.path(),
+            None,
+        );
+        assert_program(
+            "ruby",
+            &format!("File.write('{target}', 'x')"),
+            home.path(),
+            None,
+        );
+        for (exe, source) in [
+            (
+                "node",
+                "require('fs').renameSync(require('path').join(require('os').homedir(), '.bashrc'), '.git/config')",
+            ),
+            (
+                "node",
+                "require('fs').renameSync('.git/config', require('path').join(process.env.HOME, '.bashrc'))",
+            ),
+            (
+                "ruby",
+                "File.rename(File.join(Dir.home, '.bashrc'), '.git/config')",
+            ),
+            (
+                "ruby",
+                "File.rename('.git/config', File.join(Dir.home, '.bashrc'))",
+            ),
+        ] {
+            assert_program(exe, source, home.path(), Some(denied));
+            let quoted = format!("'{}'", source.replace('\'', "'\\''"));
+            assert_decision(&format!("{exe} 0<<< {quoted}"), home.path(), Some(denied));
+        }
+    }
+}
