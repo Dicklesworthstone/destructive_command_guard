@@ -23423,6 +23423,8 @@ fn evaluate_core_filesystem_pack(
     // Set once the whole-command embedded-credential scan below has run, so a
     // multi-segment command pays for it at most once.
     let mut embedded_credential_scanned = false;
+    // Likewise for the whole-command PowerShell credential read below.
+    let mut powershell_credential_scanned = false;
 
     for &(segment_start, segment_end) in segment_ranges {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
@@ -23471,11 +23473,33 @@ fn evaluate_core_filesystem_pack(
         // Embedded code is scanned once below with its source exemptions.
         // The segment pass must not rediscover an excluded program without
         // that context; shell redirects remain independently protected.
-        let credential_hit = crate::packs::core::credential_files::classify_credential_file_write(
-            mask_nested_segment_ranges(dialect_segment, segment_start, &nested_segment_ranges)
-                .as_ref(),
-            shell_dialect,
-        );
+        //
+        // PowerShell is read once, over the whole original command. Its
+        // segments are cut at `(` and `)`, but there a parenthesised argument
+        // is an expression whose value binds to the parameter —
+        // `Add-Content ('~/.bashrc') x` writes `~/.bashrc` — so no single
+        // segment holds both the writer and its path (#477). The PowerShell
+        // lexer splits commands and reads such groups itself, and its spans
+        // already refer to the original command.
+        let credential_hit = if shell_dialect == ShellDialect::PowerShell {
+            if powershell_credential_scanned {
+                None
+            } else {
+                powershell_credential_scanned = true;
+                crate::packs::core::credential_files::classify_credential_file_write(
+                    original_command,
+                    shell_dialect,
+                )
+                .map(|hit| (hit, 0, Some(0)))
+            }
+        } else {
+            crate::packs::core::credential_files::classify_credential_file_write(
+                mask_nested_segment_ranges(dialect_segment, segment_start, &nested_segment_ranges)
+                    .as_ref(),
+                shell_dialect,
+            )
+            .map(|hit| (hit, segment_start, normalized_offset))
+        };
         // Embedded interpreter code is delivered out-of-band, so no single
         // segment holds both the interpreter and its code: a heredoc body is
         // split off by the newlines that separate commands, a pipeline puts the
@@ -23505,7 +23529,6 @@ fn evaluate_core_filesystem_pack(
         // to the original command, not its normalized or sanitized view.
         for (hit, credential_span_base, span_offset) in credential_hit
             .into_iter()
-            .map(|hit| (hit, segment_start, normalized_offset))
             .chain(embedded_hits.into_iter().map(|hit| (hit, 0, Some(0))))
         {
             // The hit names its own rule: `.git/` writes deny under
@@ -32862,12 +32885,17 @@ mod tests {
                 "a real {dialect:?} redirect must remain visible: {command:?}: {:?}",
                 result.pattern_info
             );
+            // Every target here is a credential or authentication file, so
+            // since #477 these deny under `credential-file-write` — the rule
+            // the POSIX spelling of the same write already reported. What
+            // this test protects is that the redirect is SEEN, and a rule
+            // that outranks `redirect-truncate-root-home` still proves that.
             assert_eq!(
                 result
                     .pattern_info
                     .as_ref()
                     .and_then(|info| info.pattern_name.as_deref()),
-                Some("redirect-truncate-root-home"),
+                Some("credential-file-write"),
                 "wrong rule for {dialect:?} redirect {command:?}: {:?}",
                 result.pattern_info
             );
@@ -32897,6 +32925,79 @@ mod tests {
             assert!(
                 result.is_allowed(),
                 "escaped or inert {dialect:?} redirect text must remain data: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// #477 through the production gate, not just the classifier: an
+    /// appending write and the cmdlet writers carry no keyword in
+    /// core.filesystem's row, so a classifier-level test would pass while the
+    /// pack was never selected — the #460 shape.
+    #[test]
+    fn credential_file_writes_deny_in_every_dialect_through_the_gate() {
+        for (dialect, command) in [
+            (ShellDialect::Posix, "echo x >> ~/.ssh/authorized_keys"),
+            (ShellDialect::PowerShell, "echo x >> ~/.ssh/authorized_keys"),
+            (ShellDialect::PowerShell, "echo x >> ~/.bashrc"),
+            (ShellDialect::PowerShell, "echo x >> /etc/shadow"),
+            (
+                ShellDialect::PowerShell,
+                "Add-Content -Path ~/.ssh/authorized_keys -Value x",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "'x' | Out-File -Append ~/.ssh/authorized_keys",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Set-Content -Path /etc/shadow -Value x",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Copy-Item C:\\temp\\k $env:USERPROFILE\\.ssh\\authorized_keys",
+            ),
+            // The evaluator splits `(…)` into its own segment; the value it
+            // binds must still reach the writer (passed the classifier-level
+            // test while this layer allowed it).
+            (ShellDialect::PowerShell, "Add-Content ('~/.bashrc') x"),
+            (
+                ShellDialect::Cmd,
+                "echo x >> %USERPROFILE%\\.ssh\\authorized_keys",
+            ),
+            (
+                ShellDialect::Cmd,
+                "copy /y k %USERPROFILE%\\.ssh\\authorized_keys",
+            ),
+            (
+                ShellDialect::Unknown,
+                "Add-Content -Path ~/.ssh/authorized_keys -Value x",
+            ),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some("credential-file-write"),
+                "{dialect:?} {command:?} must deny as a credential write: {:?}",
+                result.pattern_info
+            );
+        }
+        for (dialect, command) in [
+            (ShellDialect::PowerShell, "echo x >> /tmp/out.txt"),
+            (
+                ShellDialect::PowerShell,
+                "Add-Content -Path ./notes.txt -Value x",
+            ),
+            (ShellDialect::PowerShell, "Add-Content ~/.ssh/known_hosts x"),
+            (ShellDialect::Cmd, "echo x >> %TEMP%\\out.txt"),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+            assert!(
+                result.is_allowed(),
+                "{dialect:?} {command:?} must stay allowed: {:?}",
                 result.pattern_info
             );
         }

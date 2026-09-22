@@ -2956,7 +2956,9 @@ rules: a target containing a variable, command substitution, backtick, glob, or
 `core.filesystem:credential-file-write` (writes to `~/.ssh/*`,
 `~/.aws/credentials`, `~/.netrc`, `~/.npmrc`, the shell rc files,
 `/etc/sudoers*`, `/etc/passwd`, and the rest of its list, by `>`/`>>`, `tee`,
-`cp`/`mv`/`install`/`ln`, `dd`, or `sed -i`) has no target-glob setting: the
+`cp`/`mv`/`install`/`ln`, `dd`, or `sed -i` — and, from a PowerShell or Cmd
+payload on any host, `Add-Content`/`Set-Content`/`Out-File`/`Tee-Object`/
+`New-Item`/`Copy-Item`/`Move-Item` or `copy`/`move`) has no target-glob setting: the
 files are the point, so there is no "scratch" subset to carve out. Reads,
 `chmod`/`chown`, and appending to `~/.ssh/known_hosts` are already allowed;
 for a project that legitimately manages one of these files, allowlist the rule

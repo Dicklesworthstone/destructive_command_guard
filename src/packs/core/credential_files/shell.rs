@@ -20,12 +20,15 @@
 //! into a protected path (`~/.zshr{c..c}`, `~/.ssh/id_*`, `~/{.zshrc,x}`) and
 //! ignored when it cannot (`~/notes-{a,b}.txt`).
 //!
-//! Only the POSIX dialect (and the unknown dialect, evaluated as POSIX) is
-//! classified here; PowerShell and Cmd spellings are out of scope.
+//! PowerShell and Cmd payloads are read by [`windows_shells`], which decodes
+//! their words into the same [`Word`] model so every path decision below is
+//! shared rather than re-implemented per dialect (#477).
 
 use crate::normalize::{ShellDialect, is_env_assignment};
 use crate::packs::PatternSuggestion;
 use std::ops::Range;
+
+mod windows_shells;
 
 /// Rule name under `core.filesystem`. The pattern entry in
 /// `filesystem::create_destructive_patterns` carries the static reason shown
@@ -129,21 +132,47 @@ fn rule_for(comps: &[String]) -> &'static str {
 /// Classify one command segment (may contain several simple commands).
 ///
 /// Returns the first write of a protected file, or `None` when the segment
-/// contains no such write. PowerShell and Cmd dialects are never classified.
+/// contains no such write.
+///
+/// The payload's dialect decides how it is read, never the host's: `pwsh`
+/// runs on Linux and macOS, and a `powershell` tool name resolves to
+/// PowerShell wherever dcg runs (#451). Until #477 this returned `None` for
+/// PowerShell and Cmd outright, so `echo x >> ~/.ssh/authorized_keys` — the
+/// persistence write this rule exists for — was allowed from a PowerShell
+/// tool while the same bytes denied from Bash. Declining was protecting the
+/// POSIX parser below, not expressing a policy, and declining is the
+/// fail-open direction. The unknown dialect reads the segment every way it
+/// could be meant, because the caller could not prove which shell runs it.
 pub(crate) fn classify_credential_file_write(
     segment: &str,
     dialect: ShellDialect,
 ) -> Option<CredentialFileWrite> {
-    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
-        return None;
-    }
     if !may_name_protected_path(segment) {
         return None;
     }
-    let tokens = tokenize(segment);
-    tokens
-        .split(|token| matches!(token, Token::Separator))
-        .find_map(classify_simple_command)
+    let posix = || {
+        tokenize(segment)
+            .split(|token| matches!(token, Token::Separator))
+            .find_map(classify_simple_command)
+    };
+    match dialect {
+        ShellDialect::Posix => posix(),
+        ShellDialect::PowerShell | ShellDialect::Cmd => windows_shells::classify(segment, dialect),
+        ShellDialect::Unknown => posix()
+            .or_else(|| windows_shells::classify(segment, ShellDialect::PowerShell))
+            .or_else(|| windows_shells::classify(segment, ShellDialect::Cmd)),
+    }
+}
+
+/// Whether `command` names a PowerShell or Cmd writer this classifier reads.
+///
+/// The pack's keyword gates know POSIX writers only, so without this an
+/// `Add-Content ~/.ssh/authorized_keys` never selected core.filesystem at all
+/// and the classifier behind it could not run. Gated on
+/// [`may_name_protected_path`] first for the same reason the POSIX writer
+/// words are: `copy` and `move` are ordinary words.
+pub(crate) fn names_windows_shell_writer(command: &str) -> bool {
+    may_name_protected_path(command) && windows_shells::names_writer(command)
 }
 
 /// Whether a decoded command word names one of the writers this classifier
@@ -1426,6 +1455,19 @@ enum WriterKind {
     Dd,
     Sed,
     Perl,
+    // PowerShell cmdlets and Cmd built-ins (#477). Never produced by
+    // [`writer_kind`], which names POSIX executables: `windows_shells` binds
+    // their parameters itself and reuses the judges below.
+    AddContent,
+    SetContent,
+    ClearContent,
+    OutFile,
+    TeeObject,
+    NewItem,
+    CopyItem,
+    MoveItem,
+    CmdCopy,
+    CmdMove,
 }
 
 fn writer_kind(executable: &str) -> Option<WriterKind> {
@@ -1473,6 +1515,18 @@ impl Writer {
             (Some(WriterKind::Dd), WriteMode::Append) => "`dd oflag=append` appends to",
             (Some(WriterKind::Sed), _) => "`sed -i` rewrites",
             (Some(WriterKind::Perl), _) => "`perl -i` rewrites",
+            (Some(WriterKind::AddContent), _) => "`Add-Content` appends to",
+            (Some(WriterKind::SetContent), _) => "`Set-Content` rewrites",
+            (Some(WriterKind::ClearContent), _) => "`Clear-Content` empties",
+            (Some(WriterKind::OutFile), WriteMode::Replace) => "`Out-File` rewrites",
+            (Some(WriterKind::OutFile), WriteMode::Append) => "`Out-File -Append` appends to",
+            (Some(WriterKind::TeeObject), WriteMode::Replace) => "`Tee-Object` rewrites",
+            (Some(WriterKind::TeeObject), WriteMode::Append) => "`Tee-Object -Append` appends to",
+            (Some(WriterKind::NewItem), _) => "`New-Item` creates or replaces",
+            (Some(WriterKind::CopyItem), _) => "`Copy-Item` writes",
+            (Some(WriterKind::MoveItem), _) => "`Move-Item` replaces",
+            (Some(WriterKind::CmdCopy), _) => "`copy` writes",
+            (Some(WriterKind::CmdMove), _) => "`move` replaces",
         }
     }
 }
@@ -1866,6 +1920,18 @@ fn classify_simple_command(tokens: &[Token]) -> Option<CredentialFileWrite> {
         WriterKind::Dd => classify_dd(args),
         WriterKind::Sed => classify_sed(args),
         WriterKind::Perl => classify_perl(args),
+        // `writer_kind` names POSIX executables only; these are bound by
+        // `windows_shells`, which calls the judges directly.
+        WriterKind::AddContent
+        | WriterKind::SetContent
+        | WriterKind::ClearContent
+        | WriterKind::OutFile
+        | WriterKind::TeeObject
+        | WriterKind::NewItem
+        | WriterKind::CopyItem
+        | WriterKind::MoveItem
+        | WriterKind::CmdCopy
+        | WriterKind::CmdMove => None,
     }
 }
 
@@ -2614,16 +2680,27 @@ mod tests {
         assert_eq!(&"cp .zshrc ~/"[hit.span.clone()], ".zshrc");
     }
 
+    /// #477: this test used to assert the opposite for PowerShell, which is
+    /// what let an appending write to a login file through from a PowerShell
+    /// tool. The dialect now decides how the words are read, not whether they
+    /// are judged. Cmd is the control: it never expands `~`, so there the
+    /// same text names a directory literally called `~`.
     #[test]
-    fn other_dialects_are_never_classified() {
-        for dialect in [ShellDialect::PowerShell, ShellDialect::Cmd] {
+    fn every_dialect_is_classified_by_its_own_expansion_rules() {
+        for dialect in [
+            ShellDialect::Posix,
+            ShellDialect::PowerShell,
+            ShellDialect::Unknown,
+        ] {
             assert!(
-                classify_credential_file_write("echo x >> ~/.zshrc", dialect).is_none(),
+                classify_credential_file_write("echo x >> ~/.zshrc", dialect).is_some(),
                 "{dialect:?}"
             );
         }
+        assert!(classify_credential_file_write("echo x >> ~/.zshrc", ShellDialect::Cmd).is_none());
         assert!(
-            classify_credential_file_write("echo x >> ~/.zshrc", ShellDialect::Unknown).is_some()
+            classify_credential_file_write("echo x >> %USERPROFILE%/.zshrc", ShellDialect::Cmd)
+                .is_some()
         );
     }
 

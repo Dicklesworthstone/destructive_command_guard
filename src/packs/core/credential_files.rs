@@ -16,6 +16,7 @@ pub(crate) use embedded::{scan_extracted, source_scan_required};
 pub(crate) use shell::{
     CREDENTIAL_FILE_WRITE_SUGGESTIONS, CredentialFileWrite, GIT_INTERNALS_WRITE_SUGGESTIONS,
     classify_credential_file_write, may_name_protected_path, names_protected_file,
+    names_windows_shell_writer,
 };
 
 use crate::normalize::ShellDialect;

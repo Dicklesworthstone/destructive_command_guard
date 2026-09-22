@@ -1171,6 +1171,23 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         "core.filesystem:wmic-shadowcopy-delete",
         shadow_copy_suggestions,
     );
+    m.insert(
+        "core.filesystem:rsync-delete-sensitive-dest",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Preview the deletions first with `--dry-run` (or `-n`) and read the list",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Drop `--delete` to copy without removing extra files in the destination",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Mirror into a dedicated non-system directory you own, and back it up first",
+            ),
+        ],
+    );
 }
 
 /// Register suggestions for heredoc pattern rules.
