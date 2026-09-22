@@ -17,6 +17,51 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Security
 
+- **Every Go pattern was incapable of matching anything, including
+  `os.RemoveAll` at Critical** (#465). A Go heredoc that recursively deleted a
+  home directory was allowed, while the Python and Ruby spellings of the same
+  operation denied.
+
+  Go's grammar has no top-level expression statement, so `os.RemoveAll($$$)` is
+  not a parseable Go fragment: it compiles to an ERROR-rooted tree
+  (`[[os, ., RemoveAll], (, Multiple, )]`) that can never equal a real
+  `call_expression`. All six Go patterns were built this way. The same pattern
+  shape works in Python precisely because Python permits a bare expression
+  statement, and that asymmetry is the whole bug — it reproduces in the pinned
+  `ast-grep 0.45.3` CLI on its own, independently of dcg. Go's patterns are now
+  stated inside the smallest enclosing construct that parses
+  (`func f() { os.RemoveAll($$$) }`) with `call_expression` as the selector,
+  which binds to the outermost call so the chained `.Run()`/`.Output()`/
+  `.CombinedOutput()` shapes keep their spans instead of collapsing into the
+  bare `exec.Command` pattern.
+
+  Why it stayed hidden: three things that look like they should have caught it
+  do not. `Pattern::try_new` returns `Ok`, so the fail-open skip for invalid
+  patterns never fired. `default_patterns_all_precompile` asserted that every
+  pattern compiles and passed throughout — compiling is not matching. And
+  `Pattern::has_error()` returns `false` for these patterns, because ast-grep's
+  `are_kinds_matching` treats an ERROR *goal* kind as a wildcard and cannot tell
+  a broken pattern from a deliberately permissive one. No structural predicate
+  available to us can see this, so the new guards are behavioural:
+  `every_language_corpus_matches_its_fixture_issue_465` requires each language's
+  corpus to match its own fixture and fails a language that registers patterns
+  without one, and `go_corpus_matches_every_registered_rule_issue_465` pins all
+  six Go rule ids with their severities and exact spans.
+
+  Turning six patterns from never-matching to always-matching exposed the benign
+  half of `os.RemoveAll`, so `heredoc.go.os_removeall` also joins #455's single
+  recursive-delete policy. Each shape was measured against its Python twin
+  first, and only one disagreed: a literal target under `/tmp` or `/var/tmp`
+  denied in Go while Python and plain `rm -rf /tmp/build` allowed it. That is now
+  carved out as `heredoc.go.os_removeall.temp` at Medium, in both Go string
+  spellings (`"/tmp/build"` and the raw `` `/tmp/build` ``). The shapes that keep
+  blocking already agreed with Python and are unchanged: the two-statement
+  `dir, _ := os.MkdirTemp(…)` / `defer os.RemoveAll(dir)` idiom (the producer is
+  not in the matched call, and proving `dir` still holds that value needs taint
+  analysis this scanner does not do — Python denies its own two-statement
+  spelling for the same reason), the temp *root* `os.RemoveAll(os.TempDir())`,
+  and any `..` escaping `/tmp`.
+
 - **`subprocess.run(['/bin/rm','-rf','/home/user'])` was allowed** while the bare
   `['rm',…]` spelling and the plain shell `/bin/rm -rf /home/user` were both
   denied (#459). Every path spelling bypassed the argv reconstruction that the

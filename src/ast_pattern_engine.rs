@@ -203,6 +203,25 @@ impl std::fmt::Display for MatchError {
 pub struct CompiledPattern {
     /// The pattern string (for debugging/logging).
     pub pattern_str: String,
+    /// Node kind that carves the real pattern out of `pattern_str`.
+    ///
+    /// `None` means `pattern_str` is itself a parseable fragment of the target
+    /// language, which is the common case: Python, JavaScript, Ruby and PHP all
+    /// accept a bare expression at the top level of a file, so
+    /// `shutil.rmtree($$$)` parses straight to a call node.
+    ///
+    /// Go does not. Its grammar has no top-level expression statement, so
+    /// `os.RemoveAll($$$)` parses to an ERROR node wrapping a `qualified_type`
+    /// and some loose tokens — a tree that cannot equal a real
+    /// `call_expression`, so the pattern matches nothing, anywhere, ever.
+    /// `Pattern::try_new` still returns `Ok` for it and
+    /// [`Pattern::has_error`](ast_grep_core::Pattern::has_error) still returns
+    /// `false`, so neither the compile step nor a compile-only test can see the
+    /// problem (#465).
+    ///
+    /// Such a language states its pattern inside the smallest enclosing
+    /// construct that parses (`func f() { … }`) and names the node to extract.
+    pub selector: Option<String>,
     /// Stable rule ID.
     pub rule_id: String,
     /// Human-readable reason.
@@ -214,7 +233,7 @@ pub struct CompiledPattern {
 }
 
 impl CompiledPattern {
-    /// Create a new compiled pattern.
+    /// Create a new compiled pattern from a self-contained pattern fragment.
     #[must_use]
     pub const fn new(
         pattern_str: String,
@@ -225,6 +244,31 @@ impl CompiledPattern {
     ) -> Self {
         Self {
             pattern_str,
+            selector: None,
+            rule_id,
+            reason,
+            severity,
+            suggestion,
+        }
+    }
+
+    /// Create a pattern stated inside enclosing context, matching `selector`.
+    ///
+    /// For languages whose grammar rejects a bare expression — see
+    /// [`CompiledPattern::selector`] — the pattern is written as valid code and
+    /// the node kind to match is named separately.
+    #[must_use]
+    pub const fn contextual(
+        context: String,
+        selector: String,
+        rule_id: String,
+        reason: String,
+        severity: Severity,
+        suggestion: Option<String>,
+    ) -> Self {
+        Self {
+            pattern_str: context,
+            selector: Some(selector),
             rule_id,
             reason,
             severity,
@@ -927,6 +971,19 @@ static PY_TEMPFILE_PRODUCED_DIR: LazyLock<Regex> = LazyLock::new(|| {
         .expect("python tempfile-produced dir regex compiles")
 });
 
+/// The first string literal handed to a Go call, used to read the target of
+/// `os.RemoveAll("…")` for #455's temp carve-out (#465).
+///
+/// Go spells a string two ways and both are idiomatic for paths: interpreted
+/// (`"…"`) and raw (`` `…` ``). A raw literal is the natural choice on Windows
+/// paths, so reading only the interpreted form would carve out
+/// `os.RemoveAll("/tmp/build")` while still blocking
+/// ``os.RemoveAll(`/tmp/build`)`` — the same target, one spelling apart.
+static GO_FIRST_STRING_ARG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\(\s*(?:"(?P<dq>[^"\n]*)"|`(?P<raw>[^`]*)`)"#)
+        .expect("go first string arg regex compiles")
+});
+
 static PY_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     // Aliased/qualified Python shell sinks invoked as a call. Only the sink NAME
     // + opening paren is anchored here; the destructive-payload search runs over
@@ -1208,6 +1265,7 @@ fn refine_match_meta(
         ScriptLanguage::TypeScript => refine_typescript_match(meta, matched_text),
         ScriptLanguage::Ruby => refine_ruby_match(meta, matched_text),
         ScriptLanguage::Python => Some(refine_python_match(meta, matched_text)),
+        ScriptLanguage::Go => Some(refine_go_match(meta, matched_text)),
         _ => Some(RefinedMatchMeta {
             rule_id: meta.rule_id.clone(),
             reason: meta.reason.clone(),
@@ -1306,6 +1364,67 @@ fn refine_python_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMat
                 suggestion: meta.suggestion.clone(),
             };
         }
+    }
+
+    unchanged()
+}
+
+/// Give Go's recursive delete the same temp carve-out every other language has.
+///
+/// Repairing the Go patterns (#465) turned six rules that matched nothing into
+/// rules that match unconditionally, which newly exposed the benign half of
+/// `os.RemoveAll`. Measuring each shape against its Python twin — Python being
+/// the established #455 policy, not a guess — found exactly one disagreement:
+///
+/// | shape                                   | Python | Go before |
+/// |-----------------------------------------|--------|-----------|
+/// | literal `/tmp/build`                    | allow  | **deny**  |
+/// | producer nested in the call              | allow  | n/a       |
+/// | producer on a previous line              | deny   | deny      |
+/// | temp *root* (`gettempdir`/`os.TempDir`)  | deny   | deny      |
+/// | `/tmp/../home/u` traversal               | deny   | deny      |
+///
+/// So only the literal target needs the carve-out. The rest already agree and
+/// are left alone:
+///
+/// - The two-statement idiom (`dir, _ := os.MkdirTemp(…)` then
+///   `defer os.RemoveAll(dir)`) keeps blocking. `matched_text` is the call node
+///   alone, so the producer on the previous line is not visible here, and
+///   proving `dir` still holds that value needs taint analysis this scanner
+///   deliberately does not do. Python blocks its own two-statement spelling for
+///   the same reason, so Go blocking it is the established posture rather than a
+///   Go-specific wart. It is also the fail-safe direction.
+/// - `os.RemoveAll(os.TempDir())` keeps blocking: that is the temp *root*, not a
+///   directory this program created, and Python denies `tempfile.gettempdir()`
+///   for the same reason. Go cannot nest its producer the way Python can —
+///   `os.MkdirTemp` returns `(string, error)` — so the nested shape #455 carved
+///   out has no valid Go spelling to carve.
+///
+/// Fail-safe: an unreadable (dynamic) target keeps the original Critical meta.
+fn refine_go_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMatchMeta {
+    let unchanged = || RefinedMatchMeta {
+        rule_id: meta.rule_id.clone(),
+        reason: meta.reason.clone(),
+        severity: meta.severity,
+        suggestion: meta.suggestion.clone(),
+    };
+
+    if !is_recursive_delete_rule(&meta.rule_id) {
+        return unchanged();
+    }
+
+    let path = GO_FIRST_STRING_ARG.captures(matched_text).and_then(|caps| {
+        caps.name("dq")
+            .or_else(|| caps.name("raw"))
+            .map(|found| found.as_str())
+    });
+    if path.is_some_and(is_temp_scratch_path) {
+        return RefinedMatchMeta {
+            rule_id: format!("{}.temp", meta.rule_id),
+            reason: format!("{} (target is a temp directory)", meta.reason),
+            severity: Severity::Medium,
+            suggestion: meta.suggestion.clone(),
+        };
     }
 
     unchanged()
@@ -2855,6 +2974,10 @@ fn is_recursive_delete_rule(rule_id: &str) -> bool {
     matches!(
         rule_id,
         "heredoc.python.shutil_rmtree"
+            // Go joined this list late only because none of its patterns could
+            // match until #465 repaired them; `os.RemoveAll` is the same
+            // recursive delete under the same policy.
+            | "heredoc.go.os_removeall"
             | "heredoc.ruby.fileutils_rm_rf"
             | "heredoc.ruby.fileutils_rm_r"
             | "heredoc.ruby.fileutils_remove_entry"
@@ -3530,51 +3653,65 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
         ],
     );
 
-    // Go patterns
+    // Go patterns.
+    //
+    // Every Go pattern is contextual. Go's grammar has no top-level expression
+    // statement, so a bare `os.RemoveAll($$$)` parses to an ERROR node and can
+    // never match — see [`CompiledPattern::selector`] for why nothing caught
+    // that for six patterns (#465). `func f() { … }` is the smallest enclosing
+    // construct that parses, and `call_expression` binds to the OUTERMOST call
+    // in it, so the chained `.Run()`/`.Output()` shapes keep their full span
+    // rather than degrading to the bare `exec.Command` pattern.
     patterns.insert(
         ScriptLanguage::Go,
         vec![
             // Recursive deletion - always dangerous
-            CompiledPattern::new(
-                "os.RemoveAll($$$)".to_string(),
+            CompiledPattern::contextual(
+                "func f() { os.RemoveAll($$$) }".to_string(),
+                "call_expression".to_string(),
                 "heredoc.go.os_removeall".to_string(),
                 "os.RemoveAll() recursively deletes directories".to_string(),
                 Severity::Critical,
                 Some("Verify the target path carefully before running".to_string()),
             ),
             // File deletion
-            CompiledPattern::new(
-                "os.Remove($$$)".to_string(),
+            CompiledPattern::contextual(
+                "func f() { os.Remove($$$) }".to_string(),
+                "call_expression".to_string(),
                 "heredoc.go.os_remove".to_string(),
                 "os.Remove() deletes files".to_string(),
                 Severity::High,
                 None,
             ),
             // Shell command execution - medium severity, refined at match time
-            CompiledPattern::new(
-                "exec.Command($$$)".to_string(),
+            CompiledPattern::contextual(
+                "func f() { exec.Command($$$) }".to_string(),
+                "call_expression".to_string(),
                 "heredoc.go.exec_command".to_string(),
                 "exec.Command() executes shell commands".to_string(),
                 Severity::Medium,
                 Some("Validate command arguments carefully".to_string()),
             ),
             // Combined patterns for common usage
-            CompiledPattern::new(
-                "exec.Command($$$).Run()".to_string(),
+            CompiledPattern::contextual(
+                "func f() { exec.Command($$$).Run() }".to_string(),
+                "call_expression".to_string(),
                 "heredoc.go.exec_command_run".to_string(),
                 "exec.Command().Run() executes shell commands".to_string(),
                 Severity::Medium,
                 Some("Validate command arguments carefully".to_string()),
             ),
-            CompiledPattern::new(
-                "exec.Command($$$).Output()".to_string(),
+            CompiledPattern::contextual(
+                "func f() { exec.Command($$$).Output() }".to_string(),
+                "call_expression".to_string(),
                 "heredoc.go.exec_command_output".to_string(),
                 "exec.Command().Output() executes shell commands".to_string(),
                 Severity::Medium,
                 Some("Validate command arguments carefully".to_string()),
             ),
-            CompiledPattern::new(
-                "exec.Command($$$).CombinedOutput()".to_string(),
+            CompiledPattern::contextual(
+                "func f() { exec.Command($$$).CombinedOutput() }".to_string(),
+                "call_expression".to_string(),
                 "heredoc.go.exec_command_combined_output".to_string(),
                 "exec.Command().CombinedOutput() executes shell commands".to_string(),
                 Severity::Medium,
@@ -3691,7 +3828,11 @@ fn precompile_patterns(
 
         let mut compiled = Vec::with_capacity(patterns.len());
         for meta in patterns {
-            let Ok(pattern) = Pattern::try_new(&meta.pattern_str, ast_lang) else {
+            let built = match meta.selector.as_deref() {
+                Some(selector) => Pattern::contextual(&meta.pattern_str, selector, ast_lang),
+                None => Pattern::try_new(&meta.pattern_str, ast_lang),
+            };
+            let Ok(pattern) = built else {
                 // Fail-open: skip invalid patterns silently (default patterns should be validated by tests).
                 continue;
             };
@@ -4848,6 +4989,224 @@ mod tests {
                 "all default patterns should compile for {lang:?}"
             );
         }
+    }
+
+    /// Compiling is not matching: every language's corpus must actually fire.
+    ///
+    /// `default_patterns_all_precompile` above passed for the entire life of
+    /// the Go corpus while all six Go patterns were incapable of matching
+    /// anything (#465). A bare `os.RemoveAll($$$)` is not a parseable Go
+    /// fragment — Go has no top-level expression statement — so it compiled to
+    /// an ERROR-rooted tree. `Pattern::try_new` returned `Ok`, the count check
+    /// was satisfied, and `os.RemoveAll` at `Severity::Critical` silently
+    /// matched nothing in any Go heredoc.
+    ///
+    /// Two structural predicates were tried first and both failed to see it:
+    /// `Pattern::has_error()` reports `false` for those patterns, and
+    /// ast-grep's own `are_kinds_matching` treats an ERROR *goal* kind as a
+    /// wildcard, so kind inspection cannot distinguish a broken pattern from a
+    /// deliberately permissive one. Only behaviour can, hence a fixture.
+    ///
+    /// This is a floor, not a per-pattern guarantee: it asserts each language
+    /// is non-vacuous. `go_corpus_matches_every_registered_rule_issue_465`
+    /// carries the per-rule table for Go, the language this bug class hit.
+    #[test]
+    fn every_language_corpus_matches_its_fixture_issue_465() {
+        // One fixture per language, each exercising at least one registered
+        // pattern. A language whose corpus matches nothing here is dead code
+        // pretending to be coverage.
+        let fixtures: &[(ScriptLanguage, &str)] = &[
+            (ScriptLanguage::Bash, "git reset --hard HEAD~1\n"),
+            (
+                ScriptLanguage::Go,
+                "package main\n\nimport \"os\"\n\nfunc main() {\n\tos.RemoveAll(\"/home/user\")\n}\n",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('fs').rmSync('/home/user', { recursive: true })\n",
+            ),
+            (
+                ScriptLanguage::TypeScript,
+                "require('fs').rmSync('/home/user', { recursive: true })\n",
+            ),
+            (ScriptLanguage::Php, "<?php\nunlink('/home/user/id_rsa');\n"),
+            (
+                ScriptLanguage::Python,
+                "import shutil\nshutil.rmtree('/home/user')\n",
+            ),
+            (
+                ScriptLanguage::Ruby,
+                "require 'fileutils'\nFileUtils.rm_rf('/home/user')\n",
+            ),
+        ];
+
+        let registered: Vec<ScriptLanguage> = DEFAULT_MATCHER.patterns.keys().copied().collect();
+        for language in &registered {
+            assert!(
+                fixtures.iter().any(|(lang, _)| lang == language),
+                "{language:?} has registered patterns but no fixture; a new language \
+                 must prove its corpus matches something"
+            );
+        }
+
+        for (language, source) in fixtures {
+            let hits = DEFAULT_MATCHER
+                .find_matches(source, *language)
+                .unwrap_or_else(|error| panic!("{language:?} fixture failed to scan: {error:?}"));
+            assert!(
+                !hits.is_empty(),
+                "{language:?} registered {} patterns but matched nothing in its own \
+                 fixture — the corpus cannot block anything",
+                DEFAULT_MATCHER
+                    .patterns
+                    .get(language)
+                    .map_or(0, std::vec::Vec::len)
+            );
+        }
+    }
+
+    /// Every registered Go rule id must fire on a real Go program (#465).
+    ///
+    /// Go is the language that carried six unmatchable patterns, so it gets the
+    /// per-rule table rather than the per-language floor above. The chained
+    /// assertions also pin the selector binding: `call_expression` must resolve
+    /// to the OUTERMOST call, or `.Run()`/`.Output()`/`.CombinedOutput()`
+    /// silently collapse into the bare `exec.Command` pattern.
+    #[test]
+    fn go_corpus_matches_every_registered_rule_issue_465() {
+        let source = concat!(
+            "package main\n\n",
+            "import (\n\t\"os\"\n\t\"os/exec\"\n)\n\n",
+            "func main() {\n",
+            "\tos.RemoveAll(\"/home/user\")\n",
+            "\tos.Remove(\"/home/user/.ssh/id_rsa\")\n",
+            "\t_ = exec.Command(\"ls\", \"-l\")\n",
+            "\t_ = exec.Command(\"rm\", \"-r\", \"-f\", \"/home/user\").Run()\n",
+            "\t_, _ = exec.Command(\"rm\", \"-r\", \"-f\", \"/home/user\").Output()\n",
+            "\t_, _ = exec.Command(\"rm\", \"-r\", \"-f\", \"/home/user\").CombinedOutput()\n",
+            "}\n",
+        );
+
+        let hits = DEFAULT_MATCHER
+            .find_matches(source, ScriptLanguage::Go)
+            .expect("go fixture should scan");
+
+        for expected in [
+            "heredoc.go.os_removeall",
+            "heredoc.go.os_remove",
+            "heredoc.go.exec_command",
+            "heredoc.go.exec_command_run",
+            "heredoc.go.exec_command_output",
+            "heredoc.go.exec_command_combined_output",
+        ] {
+            assert!(
+                hits.iter().any(|hit| hit.rule_id == expected),
+                "{expected} matched nothing; got {:?}",
+                hits.iter().map(|hit| &hit.rule_id).collect::<Vec<_>>()
+            );
+        }
+
+        // The recursive delete must block, not merely be reported.
+        let removeall = hits
+            .iter()
+            .find(|hit| hit.rule_id == "heredoc.go.os_removeall")
+            .expect("os.RemoveAll should match");
+        assert_eq!(removeall.severity, Severity::Critical);
+        assert!(removeall.severity.blocks_by_default());
+        assert_eq!(
+            source.get(removeall.start..removeall.end),
+            Some("os.RemoveAll(\"/home/user\")"),
+            "the reported span must be the call, not its enclosing function"
+        );
+
+        // The chained form keeps its own span; if `call_expression` bound to the
+        // inner call instead, `.Run()` would fall outside the match.
+        let run = hits
+            .iter()
+            .find(|hit| hit.rule_id == "heredoc.go.exec_command_run")
+            .expect("exec.Command().Run() should match");
+        assert!(
+            source
+                .get(run.start..run.end)
+                .is_some_and(|text| text.ends_with(".Run()")),
+            "chained match span should cover .Run(): {:?}",
+            source.get(run.start..run.end)
+        );
+    }
+
+    /// Go's recursive delete follows #455's temp policy, and only that far.
+    ///
+    /// Each row was measured against its Python twin through the real hook
+    /// before being written down, so this is the established cross-language
+    /// policy rather than a Go-specific invention. See `refine_go_match` for the
+    /// comparison table and why the two-statement and temp-root shapes keep
+    /// blocking.
+    #[test]
+    fn go_recursive_delete_gets_the_shared_temp_carve_out_issue_465() {
+        fn scan(statement: &str) -> Vec<PatternMatch> {
+            let source =
+                format!("package main\n\nimport \"os\"\n\nfunc main() {{\n\t{statement}\n}}\n");
+            DEFAULT_MATCHER
+                .find_matches(&source, ScriptLanguage::Go)
+                .unwrap_or_else(|error| panic!("{statement} should scan: {error:?}"))
+        }
+
+        fn removeall(statement: &str) -> PatternMatch {
+            scan(statement)
+                .into_iter()
+                .find(|hit| hit.rule_id.starts_with("heredoc.go.os_removeall"))
+                .unwrap_or_else(|| panic!("{statement} should match os.RemoveAll"))
+        }
+
+        // Carved out: a literal target under a temp root, in either Go string
+        // spelling. `rm -rf /tmp/build` has always been allowed.
+        for statement in [
+            r#"os.RemoveAll("/tmp/build")"#,
+            "os.RemoveAll(`/tmp/build`)",
+            r#"os.RemoveAll("/var/tmp/build")"#,
+            r#"os.RemoveAll("/private/tmp/build")"#,
+        ] {
+            let hit = removeall(statement);
+            assert_eq!(
+                hit.rule_id, "heredoc.go.os_removeall.temp",
+                "{statement} should carry the temp rule id"
+            );
+            assert_eq!(hit.severity, Severity::Medium, "{statement}");
+            assert!(
+                !hit.severity.blocks_by_default(),
+                "{statement} must not block"
+            );
+        }
+
+        // Still Critical. Each for a distinct reason, all of them matching what
+        // Python already does for the same shape.
+        for (statement, why) in [
+            (r#"os.RemoveAll("/home/user")"#, "a real target"),
+            (r#"os.RemoveAll("/")"#, "root"),
+            (
+                r#"os.RemoveAll("/tmp/../home/user")"#,
+                "traversal escapes /tmp",
+            ),
+            (
+                "os.RemoveAll(os.TempDir())",
+                "the temp root itself, not a created directory",
+            ),
+            ("os.RemoveAll(dir)", "a dynamic target cannot be read"),
+        ] {
+            let hit = removeall(statement);
+            assert_eq!(hit.rule_id, "heredoc.go.os_removeall", "{statement}: {why}");
+            assert_eq!(hit.severity, Severity::Critical, "{statement}: {why}");
+            assert!(hit.severity.blocks_by_default(), "{statement}: {why}");
+        }
+
+        // `os.Remove` deletes one file, so it is not in the recursive family and
+        // gets no carve-out — exactly as Python's `os.remove('/tmp/x')` blocks.
+        let single = scan(r#"os.Remove("/tmp/scratch.txt")"#)
+            .into_iter()
+            .find(|hit| hit.rule_id.starts_with("heredoc.go.os_remove"))
+            .expect("os.Remove should match");
+        assert_eq!(single.rule_id, "heredoc.go.os_remove");
+        assert_eq!(single.severity, Severity::High);
     }
 
     #[test]
