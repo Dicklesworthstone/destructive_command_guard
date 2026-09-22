@@ -13,6 +13,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// `path` spelled for the POSIX command lines these tests build. On Windows
+/// that is the git-bash form `C:/…`: the canonical `\\?\C:\…` would be read as
+/// backslash escapes, so `cd` targets never resolved and every allow case
+/// failed while every deny case passed for the wrong reason.
+fn sh(path: &Path) -> String {
+    let shown = path.display().to_string();
+    if cfg!(windows) {
+        shown.trim_start_matches(r"\\?\").replace('\\', "/")
+    } else {
+        shown
+    }
+}
+
 fn dcg_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
@@ -153,7 +166,7 @@ fn embedded_cd_into_rebasing_repo_allows_from_a_sibling_cwd() {
     // Failure mode A from the report: cwd is the sibling; the command cd's
     // into the rebasing repo itself.
     let lab = Lab::new("embedded-cd");
-    let command = format!("cd {} && {RESTORE}", lab.rebasing().display());
+    let command = format!("cd {} && {RESTORE}", sh(&lab.rebasing()));
     let out = lab.hook(&lab.clean(), Some(&lab.clean()), &command);
     assert_allowed_by_recovery(&out, "cwd=clean, cd rebasing && restore");
 
@@ -163,7 +176,7 @@ fn embedded_cd_into_rebasing_repo_allows_from_a_sibling_cwd() {
         "git checkout HEAD -- f.txt",
         "git restore f.txt",
     ] {
-        let command = format!("cd {} && {guarded}", lab.rebasing().display());
+        let command = format!("cd {} && {guarded}", sh(&lab.rebasing()));
         let out = lab.hook(&lab.clean(), Some(&lab.clean()), &command);
         assert_allowed_by_recovery(&out, &format!("cd rebasing && {guarded}"));
     }
@@ -218,7 +231,7 @@ fn cd_out_of_the_rebasing_repo_denies() {
     // Planted negative: the hook cwd IS rebasing, but the command leaves it
     // before the guarded call. Probing the hook cwd would wrongly allow.
     let lab = Lab::new("cd-out");
-    let command = format!("cd {} && {RESTORE}", lab.clean().display());
+    let command = format!("cd {} && {RESTORE}", sh(&lab.clean()));
     let out = lab.hook(&lab.rebasing(), Some(&lab.rebasing()), &command);
     assert_denied(
         &out,
@@ -243,13 +256,13 @@ fn unattributable_directory_changes_deny() {
     let cases = [
         "cd \"$REPO\" && git restore --worktree --ours -- f.txt".to_string(),
         "cd $(cat where) && git restore -- f.txt".to_string(),
-        format!("(cd {}) && git restore -- f.txt", rebasing.display()),
-        format!("(cd {} && git restore -- f.txt)", rebasing.display()),
-        format!("cd - && cd {} && git restore -- f.txt", rebasing.display()),
+        format!("(cd {}) && git restore -- f.txt", sh(&rebasing)),
+        format!("(cd {} && git restore -- f.txt)", sh(&rebasing)),
+        format!("cd - && cd {} && git restore -- f.txt", sh(&rebasing)),
         "cd ~nobody && git restore -- f.txt".to_string(),
         "cd missing-dir && git restore -- f.txt".to_string(),
         // The cd comes AFTER the guarded call: it runs in the hook cwd.
-        format!("git restore -- f.txt && cd {}", rebasing.display()),
+        format!("git restore -- f.txt && cd {}", sh(&rebasing)),
     ];
     for command in &cases {
         let out = lab.hook(&lab.clean(), Some(&lab.clean()), command);
@@ -263,7 +276,7 @@ fn embedded_cd_does_not_unlock_non_recovery_rules() {
     // outside the narrow recovery set stay blocked inside a rebasing repo.
     let lab = Lab::new("scope");
     for guarded in ["git reset --hard", "git clean -fd", "git push --force"] {
-        let command = format!("cd {} && {guarded}", lab.rebasing().display());
+        let command = format!("cd {} && {guarded}", sh(&lab.rebasing()));
         let (stdout, stderr) = lab.hook(&lab.clean(), Some(&lab.clean()), &command);
         assert!(
             stdout.contains("deny"),
@@ -286,7 +299,7 @@ fn permit_minted_in_the_target_repo_is_consumed_through_an_embedded_cd() {
     let permit = target.join(".dcg").join("rebase-recovery-permit");
 
     // No rebase in progress, no permit: blocked.
-    let command = format!("cd {} && git checkout -- .", target.display());
+    let command = format!("cd {} && git checkout -- .", sh(&target));
     let out = lab.hook(&lab.root, Some(&lab.root), &command);
     assert_denied(&out, "checkout-discard", "pre-permit");
 
@@ -317,7 +330,7 @@ fn permit_in_the_hook_cwd_is_not_consumed_by_a_command_that_cds_elsewhere() {
     let permit = here.join(".dcg").join("rebase-recovery-permit");
     assert!(permit.exists());
 
-    let command = format!("cd {} && git checkout -- .", elsewhere.display());
+    let command = format!("cd {} && git checkout -- .", sh(&elsewhere));
     let out = lab.hook(&here, Some(&here), &command);
     assert_denied(
         &out,
@@ -364,7 +377,7 @@ fn recovery_does_not_unlock_a_second_destructive_operation_on_the_line() {
 
     // The same shapes reached through an embedded cd.
     for (guarded, rule) in &cases[..4] {
-        let command = format!("cd {} && {guarded}", rebasing.display());
+        let command = format!("cd {} && {guarded}", sh(&rebasing));
         let out = lab.hook(&lab.clean(), Some(&lab.clean()), &command);
         assert_denied(&out, rule, &command);
     }
@@ -393,20 +406,20 @@ fn recovery_denies_a_second_guarded_call_in_another_repository() {
     let cases = [
         format!(
             "cd {} && git restore -- f.txt && cd {} && git restore -- g.txt",
-            rebasing.display(),
-            clean.display()
+            sh(&rebasing),
+            sh(&clean)
         ),
         format!(
             "git restore -- f.txt && git -C {} restore -- g.txt",
-            clean.display()
+            sh(&clean)
         ),
         format!(
             "git restore -- f.txt && (cd {} && git restore -- g.txt)",
-            clean.display()
+            sh(&clean)
         ),
         format!(
             "git restore -- f.txt; pushd {} && git checkout -- .",
-            clean.display()
+            sh(&clean)
         ),
         "git restore -- f.txt && bash -c 'cd ../clean && git restore -- g.txt'".to_string(),
         "bash -c 'cd ../clean && git restore -- g.txt' && git restore -- f.txt".to_string(),
@@ -494,7 +507,7 @@ fn embedded_cd_with_an_unrelated_trailing_command_keeps_the_deny() {
     let lab = Lab::new("trailing");
     let command = format!(
         "cd {} && git checkout -- . && npm install",
-        lab.rebasing().display()
+        sh(&lab.rebasing())
     );
     let (stdout, stderr) = lab.hook(&lab.clean(), Some(&lab.clean()), &command);
     assert!(stdout.contains("deny"), "{stdout}\n{stderr}");

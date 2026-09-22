@@ -70,7 +70,10 @@ impl TestEnv {
         );
         if let Some(paths) = paths {
             use std::fmt::Write as _;
-            let rendered: Vec<String> = paths.iter().map(|p| format!("\"{p}\"")).collect();
+            // TOML literal strings: a Windows path in a basic string reads
+            // `\U` as a unicode escape and `\?` as an error, so the whole
+            // allowlist failed to parse there and no grant ever existed.
+            let rendered: Vec<String> = paths.iter().map(|p| format!("'{p}'")).collect();
             writeln!(entry, "paths = [{}]", rendered.join(", ")).expect("format allowlist entry");
         }
         fs::write(self.xdg_config.join("dcg").join("allowlist.toml"), entry)

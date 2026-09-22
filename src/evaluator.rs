@@ -34200,10 +34200,14 @@ mod tests {
 
         // Inside a worktree (unchanged from #337).
         allowed("echo hi > ~/repo/docs/new.md");
-        allowed(&format!(
-            "echo hi > {}/docs/new-absolute.md",
-            repo.display()
-        ));
+        // A native Windows path in a POSIX redirect is backslash escapes, so
+        // the carve-out correctly declines it there (fail closed).
+        if cfg!(unix) {
+            allowed(&format!(
+                "echo hi > {}/docs/new-absolute.md",
+                repo.display()
+            ));
+        }
         // Outside any worktree (#390): same absent-literal shape, same answer.
         allowed("echo hi > ~/.claude/absent.txt");
         allowed("echo hi > ~/.config/absent.txt");

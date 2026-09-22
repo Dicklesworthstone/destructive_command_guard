@@ -3266,7 +3266,13 @@ mod config_tests {
         let check = doctor_history_check(&temp, &home_dir, &xdg_config_dir, &bin_dir, &[]);
         assert_eq!(check["status"], "ok", "{check}");
         let message = check["message"].as_str().expect("message");
-        let expected = home_dir.join(".local").join("state").join("dcg");
+        // Windows: %LOCALAPPDATA%\dcg, derived from the redirected profile
+        // because this environment is cleared.
+        let expected = if cfg!(windows) {
+            home_dir.join("AppData").join("Local").join("dcg")
+        } else {
+            home_dir.join(".local").join("state").join("dcg")
+        };
         assert!(
             message.contains(&expected.display().to_string()),
             "default must live under the state directory: {message}"
@@ -3310,16 +3316,19 @@ mod config_tests {
             &[("XDG_STATE_HOME", xdg_state.as_os_str())],
         );
         let message = check["message"].as_str().expect("message").to_string();
-        assert!(
-            message.contains(
-                &xdg_state
-                    .join("dcg")
-                    .join("history.db")
-                    .display()
-                    .to_string()
-            ),
-            "XDG_STATE_HOME must relocate the default: {message}"
-        );
+        // XDG_STATE_HOME is a Unix convention; Windows keeps %LOCALAPPDATA%.
+        if cfg!(unix) {
+            assert!(
+                message.contains(
+                    &xdg_state
+                        .join("dcg")
+                        .join("history.db")
+                        .display()
+                        .to_string()
+                ),
+                "XDG_STATE_HOME must relocate the default: {message}"
+            );
+        }
 
         // Config override.
         std::fs::write(

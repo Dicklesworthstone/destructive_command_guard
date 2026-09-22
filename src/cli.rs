@@ -112,7 +112,9 @@ impl OutputFormat {
 /// destructive commands by AI coding agents. It blocks dangerous git commands,
 /// filesystem operations, database queries, and more.
 #[derive(Parser, Debug)]
-#[command(name = "dcg")]
+// `bin_name` pins usage lines to `dcg`; otherwise clap takes argv[0] and
+// Windows help reads `Usage: dcg.exe ...`, unlike every documented example.
+#[command(name = "dcg", bin_name = "dcg")]
 #[command(version, about, long_about = None)]
 #[command(after_help = "Run 'dcg doctor' to verify your installation.")]
 pub struct Cli {
@@ -14563,9 +14565,12 @@ fn enable_codex_hook_state_at(
         .and_then(|state| state.get_mut(state_key))
         .and_then(toml_edit::Item::as_table_like_mut)
         .ok_or_else(|| {
+            // Render the key as TOML would: a Windows key holds backslashes,
+            // which a hand-quoted basic string turns into escapes.
             format!(
-                "no [hooks.state.\"{state_key}\"] entry exists in {}; approve the hook in \
+                "no [hooks.state.{}] entry exists in {}; approve the hook in \
                  Codex first (doctor will not forge a trust entry)",
+                toml_edit::Key::new(state_key),
                 config_path.display()
             )
         })?;
@@ -22324,9 +22329,12 @@ if ($errors.Count -ne 0) {
         std::fs::write(&hooks_path, CODEX_HOOKS_DCG_FIRST).expect("write");
         let config_path = dir.path().join("config.toml");
         let key = format!("{}:pre_tool_use:0:0", hooks_path.display());
+        // TOML-quoted as Codex writes it: a Windows path in a hand-written
+        // basic string turns `\U...` into an escape and the key never matches.
+        let key_toml = toml_edit::Key::new(key.as_str());
         std::fs::write(
             &config_path,
-            format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"sha256:abc\"\n"),
+            format!("[hooks.state.{key_toml}]\ntrusted_hash = \"sha256:abc\"\n"),
         )
         .expect("write");
         assert_eq!(
@@ -22370,9 +22378,12 @@ if ($errors.Count -ne 0) {
         std::fs::write(&hooks_path, CODEX_HOOKS_DCG_FIRST).expect("write");
         let config_path = dir.path().join("config.toml");
         let key = format!("{}:pre_tool_use:0:0", hooks_path.display());
+        // TOML-quoted as Codex writes it: a Windows path in a hand-written
+        // basic string turns `\U...` into an escape and the key never matches.
+        let key_toml = toml_edit::Key::new(key.as_str());
         std::fs::write(
             &config_path,
-            format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"sha256:abc\"\nenabled = false\n"),
+            format!("[hooks.state.{key_toml}]\ntrusted_hash = \"sha256:abc\"\nenabled = false\n"),
         )
         .expect("write");
         assert_eq!(
@@ -22601,9 +22612,12 @@ if ($errors.Count -ne 0) {
         std::fs::write(&hooks_path, CODEX_HOOKS_DCG_FIRST).expect("write");
         let config_path = dir.path().join("config.toml");
         let key = format!("{}:pre_tool_use:0:0", hooks_path.display());
+        // TOML-quoted as Codex writes it: a Windows path in a hand-written
+        // basic string turns `\U...` into an escape and the key never matches.
+        let key_toml = toml_edit::Key::new(key.as_str());
         std::fs::write(
             &config_path,
-            format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"sha256:abc\"\n"),
+            format!("[hooks.state.{key_toml}]\ntrusted_hash = \"sha256:abc\"\n"),
         )
         .expect("write");
         // Trusted and enabled, yet the program is gone: that outranks the

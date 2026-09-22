@@ -456,7 +456,9 @@ fn test_allowlist_add_defaults_to_user_and_untrusted_project_write_is_refused() 
     let refusal = format!("{}{}", stdout_text(&refused), stderr_text(&refused));
     assert!(refusal.contains("Project allowlists are inactive"));
     assert!(refusal.contains("--path"));
-    assert!(refusal.contains("/**"));
+    // The suggested descendant glob uses the host separator (`C:\repo\**` on
+    // Windows); allowlist matching normalizes `\` to `/`, so both work.
+    assert!(refusal.contains(&format!("{}**", std::path::MAIN_SEPARATOR)));
     assert!(!repo.path().join(".dcg/allowlist.toml").exists());
 }
 
