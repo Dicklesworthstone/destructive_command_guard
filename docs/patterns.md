@@ -273,7 +273,33 @@ Some patterns refine their rule IDs based on detected arguments:
 - For Perl `unlink`/`rmdir`, a catastrophic literal target appends
   `.catastrophic` and raises the severity to Critical.
 
-All derived rule IDs are valid allowlist targets.
+### Allowlisting a derived rule ID
+
+Allowlist matching is on the **exact** rule ID a denial reports. Derived IDs are
+valid targets, but granting the base ID does **not** cover its derived forms — and
+for rules that only ever block *with* a suffix, the base ID in the tables above is
+therefore not a usable grant. Measured, granting each base ID and re-running the
+command it denies:
+
+| rule | ID the denial reports | base-ID grant |
+| --- | --- | --- |
+| `heredoc.javascript.fs_rmsync` | `…fs_rmsync.catastrophic` | accepted, never matches |
+| `heredoc.ruby.fileutils_rm_rf` | `…fileutils_rm_rf.catastrophic` | accepted, never matches |
+| `heredoc.python.shutil_rmtree` | `…shutil_rmtree` | works |
+| `heredoc.go.os_removeall` | `…os_removeall` | works |
+| `core.filesystem:rm-rf-root-home` | `core.filesystem:rm-rf-root-home` | works |
+
+The pattern is that a base ID is grantable exactly when the rule is sometimes
+reported without a suffix. The `fs.*` family, the Ruby `FileUtils`/`File`/`Dir`
+family and the shell-payload exec sinks are refined to a suffix in every case that
+blocks, so they never report bare. `dcg allowlist add` accepts a well-formed base ID
+for those without complaining, and it then has nothing to match.
+
+**So copy the ID from the denial, not from the table above.** Every denial carries
+it in `hookSpecificOutput.ruleId` and again in the `Rule:` line of the reason text;
+`dcg explain "<command>"` prints the same string as `Rule ID:`. The tables here name
+the *rule*, which is what you want when reading; the denial names the *decision*,
+which is what you want when granting.
 
 ## One policy for a recursive delete
 
