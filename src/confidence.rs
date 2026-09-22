@@ -214,7 +214,9 @@ pub fn compute_match_confidence(ctx: &ConfidenceContext<'_>) -> ConfidenceScore 
     }
 
     // Signal 4: Check if match is at command position vs argument position
-    if is_command_position(ctx.command, ctx.match_start) {
+    if is_command_position(ctx.command, ctx.match_start)
+        || invoked_at_command_position(ctx.command, ctx.match_start)
+    {
         score.add_signal(ConfidenceSignal::CommandPosition);
     } else {
         score.add_signal(ConfidenceSignal::ArgumentPosition);
@@ -297,6 +299,71 @@ fn is_command_position(command: &str, match_start: usize) -> bool {
         || trimmed.ends_with("$(")
 }
 
+/// Whether the word that owns a match starting at `match_start` is itself the
+/// invoked command.
+///
+/// Rule spans rarely start at the command word: every `rm` rule's span starts
+/// at its flags (`rm -rf ./build` reports `-rf`), and `git` rules start at the
+/// subcommand. Judged at the span start alone, an executed `rm -rf ./build`
+/// scored 0.6 — the same as `grep rm -rf` — so a `[confidence]
+/// warn_threshold` of 0.7, inside the documented 0.3–0.7 range, downgraded
+/// it to a warning and let it run.
+///
+/// So walk back from the span over the words before it in the same segment:
+/// option words (`-f`, `--force`) belong to whatever command they follow, and
+/// the first non-option word is the one invoked. Wrappers that run the word
+/// after them (`sudo rm`, `env X=1 rm`, `xargs rm`) are skipped too. Wrappers
+/// that take a value (`timeout 5 rm`, `sudo -u bob rm`) are not modelled and
+/// keep the old penalty. Only ever *raises* a score — it can keep a match at
+/// Deny, never let one through.
+fn invoked_at_command_position(command: &str, match_start: usize) -> bool {
+    const WRAPPERS: &[&str] = &[
+        "sudo", "doas", "env", "nice", "nohup", "time", "command", "exec", "builtin", "xargs",
+    ];
+    let (Some(prefix), Some(rest)) = (command.get(..match_start), command.get(match_start..))
+    else {
+        return false;
+    };
+    // The segment that holds the match, through the end of the word the span
+    // starts in: a span may start AT the command word (`man rm -rf` can
+    // report `rm -rf`), and then that word is the candidate owner, not the
+    // one before it.
+    let segment_start = prefix
+        .rfind(['|', ';', '&', '(', '`', '\n'])
+        .map_or(0, |at| at + 1);
+    // Spans can begin on the separating space (`man rm -rf` reports
+    // ` rm -rf`), so the word is the first one after any leading blanks.
+    let leading = rest.len() - rest.trim_start().len();
+    let word_end = leading
+        + rest[leading..]
+            .find(char::is_whitespace)
+            .unwrap_or(rest.len() - leading);
+    let Some(through_match_word) = command.get(segment_start..match_start + word_end) else {
+        return false;
+    };
+    let words: Vec<&str> = through_match_word.split_whitespace().collect();
+    // The nearest non-option word is the match's command (or an operand of
+    // some other command); it counts only if it is the first real word.
+    let Some(owner) = words.iter().rposition(|word| !word.starts_with('-')) else {
+        return false;
+    };
+    let invoked = words[..=owner].iter().position(|word| {
+        !word.starts_with('-') && !WRAPPERS.contains(word) && !is_env_assignment_word(word)
+    });
+    invoked == Some(owner)
+}
+
+/// `NAME=value` as a leading environment assignment.
+fn is_env_assignment_word(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            && !name.starts_with(|ch: char| ch.is_ascii_digit())
+    })
+}
+
 /// Compute confidence for a match, returning both the score and whether to downgrade.
 ///
 /// This is a convenience function that combines confidence computation with
@@ -311,6 +378,54 @@ pub fn should_downgrade_to_warn(ctx: &ConfidenceContext<'_>) -> (ConfidenceScore
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn score_at(command: &str, needle: &str) -> f32 {
+        let start = command.find(needle).expect("needle in command");
+        compute_match_confidence(&ConfidenceContext {
+            command,
+            sanitized_command: None,
+            match_start: start,
+            match_end: start + needle.len(),
+        })
+        .value
+    }
+
+    /// Production spans start at the flags, not the command word: the `rm`
+    /// rules report `-rf` for `rm -rf ./build`. Scored at the span start
+    /// alone that was 0.6, so a documented 0.7 threshold downgraded an
+    /// executed `rm -rf ./build` to a warning.
+    #[test]
+    fn a_flag_span_of_the_invoked_command_is_not_argument_position() {
+        for (command, span) in [
+            ("rm -rf ./build", "-rf"),
+            ("rm -f -r ./build", "-r ./build"),
+            ("sudo rm -rf ./build", "-rf"),
+            ("env LC_ALL=C rm -rf ./build", "-rf"),
+            ("cd /x && rm -rf ./build", "-rf"),
+            ("find . -name x | xargs rm -rf", "-rf"),
+            ("rm -rf ./build", "rm -rf"),
+        ] {
+            let value = score_at(command, span);
+            assert!(value >= 0.9, "{command:?} at {span:?} scored {value}");
+        }
+    }
+
+    /// The same text as an operand of a different command keeps its penalty.
+    #[test]
+    fn the_same_flags_under_another_command_stay_argument_position() {
+        for (command, span) in [
+            ("grep rm -rf notes.txt", "-rf"),
+            ("man rm -rf", "-rf"),
+            // A span that starts AT the rule's command word still belongs to
+            // `man`, not to the word before it.
+            ("man rm -rf", "rm -rf"),
+            // …including the production span, which starts on the space.
+            ("man rm -rf", " rm -rf"),
+        ] {
+            let value = score_at(command, span);
+            assert!(value < 0.7, "{command:?} at {span:?} scored {value}");
+        }
+    }
 
     #[test]
     fn test_high_confidence_executed_command() {

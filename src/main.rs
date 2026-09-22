@@ -1104,6 +1104,7 @@ fn resolve_hook_command(
 
     // Use the shared evaluator for hook mode parity with `dcg test`.
     let eval_start = Instant::now();
+    let allow_once_audit = ctx.config.allow_once_audit();
     let mut result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
         command,
         ctx.enabled_keywords,
@@ -1112,7 +1113,7 @@ fn resolve_hook_command(
         ctx.compiled_overrides,
         ctx.allowlists,
         ctx.heredoc_settings,
-        None,                 // allow_once_audit
+        allow_once_audit.as_ref(),
         scope_cwd.as_deref(), // project_path: scopes path-aware allowlist entries (#186, #387)
         Some(ctx.deadline),
         shell_dialect,
@@ -1400,7 +1401,7 @@ fn publish_decisive_response(
                     &ctx.config.logging.redaction,
                     false,
                     Some(format!("{:?}", info.source)),
-                    None,
+                    ctx.config.allow_once_audit().as_ref(),
                     budget,
                 ) {
                     Ok(Some((record, maintenance))) => {

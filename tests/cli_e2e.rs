@@ -1238,6 +1238,43 @@ mod allow_once_flow_tests {
         assert_is_allowed(&result3);
     }
 
+    /// With `general.log_file` set, the allow-once lifecycle is audited: the
+    /// code issued at the block, the redemption that lifts it, and the grant
+    /// when the command then runs. Every production caller used to pass no
+    /// audit config, so only `clear`/`revoke` were ever written — the
+    /// redemption, the step that actually lifts a block, went unrecorded.
+    #[test]
+    fn allow_once_lifecycle_is_written_to_the_audit_log() {
+        let env = FlowTestEnv::new();
+        let log_path = env.temp.path().join("dcg-audit.log");
+        let config = format!("[general]\nlog_file = {:?}\n", log_path.to_string_lossy());
+        // The user config under both spellings the platforms resolve.
+        for dir in [
+            env.xdg_config_dir.join("dcg"),
+            env.home_dir.join(".config").join("dcg"),
+        ] {
+            std::fs::create_dir_all(&dir).expect("config dir");
+            std::fs::write(dir.join("config.toml"), &config).expect("write config");
+        }
+        let command = "git reset --hard";
+
+        let denied = env.run_hook(command);
+        let code = extract_code_from_denial(&assert_is_denial(&denied))
+            .expect("blocked command should emit allow-once code");
+        let allow_output = env.run_cli(&["allow-once", &code, "--yes"]);
+        assert!(
+            allow_output.status.success(),
+            "allow-once should succeed: {}",
+            String::from_utf8_lossy(&allow_output.stderr)
+        );
+        assert_is_allowed(&env.run_hook(command));
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        for event in ["code_issued", "code_resolved", "allow_granted"] {
+            assert!(log.contains(event), "audit log is missing {event}:\n{log}");
+        }
+    }
+
     /// #262: without `--yes` and without a terminal, the confirmation can
     /// never be answered. dcg must refuse *before* printing a confirmation
     /// block that reads like a granted allowance, must say so on stderr, and

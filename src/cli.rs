@@ -18051,6 +18051,17 @@ fn handle_allow_once_command(
     let allow_once_store = AllowOnceStore::new(allow_once_path.clone());
     let _maintenance = allow_once_store.add_entry(&entry, now)?;
 
+    // Redeeming a code is the step that lifts a block — including a `--force`
+    // over an explicit config block — so it is the one most worth auditing.
+    if let Some(audit) = config.allow_once_audit() {
+        let _ = crate::pending_exceptions::log_code_resolved(
+            audit.log_file,
+            &entry,
+            audit.redaction,
+            audit.format,
+        );
+    }
+
     // Remove the pending exception so it doesn't show up in lists anymore.
     // This is best-effort (if it fails, the allowed command still works).
     if let Err(e) = pending_store.remove_by_full_hash(&selected.full_hash, now) {

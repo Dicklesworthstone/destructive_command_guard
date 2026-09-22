@@ -4712,7 +4712,11 @@ fail_on = "nope"
             line: 1,
             col: None,
             extractor_id: "shell.script".to_string(),
-            command: "rm -rf ./some/path".to_string(),
+            // `man` only reads a manual page: the rule matches text in the
+            // operands of a different command, which is what confidence
+            // scoring is for. A direct `rm -rf ./some/path` scores a full 1.0
+            // and correctly stays a deny even at this threshold.
+            command: "man rm -rf ./some/path".to_string(),
             metadata: None,
         };
 

@@ -764,7 +764,7 @@
           "default": false
         },
         "warn_threshold": {
-          "description": "Confidence threshold below which Deny is downgraded to Warn.\n\nValues range from 0.0 (always warn) to 1.0 (never warn).\nRecommended range: 0.3 - 0.7\n\nDefault: 0.5",
+          "description": "Confidence threshold below which Deny is downgraded to Warn.\n\nA match downgrades when its score is *below* this value, so 0.0 never\ndowngrades and 1.0 downgrades every match short of full confidence.\nA direct invocation (`rm -rf ./build`) scores 1.0 and never downgrades.\nRecommended range: 0.3 - 0.7\n\nDefault: 0.5",
           "type": "number",
           "format": "float",
           "default": 0.5

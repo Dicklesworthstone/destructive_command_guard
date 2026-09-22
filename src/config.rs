@@ -1203,7 +1203,9 @@ pub struct ConfidenceConfig {
 
     /// Confidence threshold below which Deny is downgraded to Warn.
     ///
-    /// Values range from 0.0 (always warn) to 1.0 (never warn).
+    /// A match downgrades when its score is *below* this value, so 0.0 never
+    /// downgrades and 1.0 downgrades every match short of full confidence.
+    /// A direct invocation (`rm -rf ./build`) scores 1.0 and never downgrades.
     /// Recommended range: 0.3 - 0.7
     ///
     /// Default: 0.5
@@ -4912,6 +4914,32 @@ impl Config {
             return value;
         }
         self.general.fail_closed
+    }
+
+    /// Where allow-once lifecycle events are audited, if anywhere.
+    ///
+    /// The whole event model — code issued, code redeemed, command allowed,
+    /// single-use entry consumed — existed, but every production caller
+    /// passed `None`, so with `general.log_file` set the only allow-once lines
+    /// ever written were `clear` and `revoke`. The step that actually lifts a
+    /// block went unrecorded. Events go to the same `general.log_file` those
+    /// two already use, in `[logging] format`, redacted per
+    /// `[logging] redaction`.
+    #[must_use]
+    pub fn allow_once_audit(&self) -> Option<crate::pending_exceptions::AllowOnceAuditConfig<'_>> {
+        let log_file = self.general.log_file.as_deref()?;
+        Some(crate::pending_exceptions::AllowOnceAuditConfig {
+            log_file,
+            format: match self.logging.format {
+                crate::logging::LogFormat::Json => {
+                    crate::pending_exceptions::AllowOnceLogFormat::Json
+                }
+                crate::logging::LogFormat::Text => {
+                    crate::pending_exceptions::AllowOnceLogFormat::Text
+                }
+            },
+            redaction: &self.logging.redaction,
+        })
     }
 
     /// Whether an unverified command (deadline exhausted, or over the command
