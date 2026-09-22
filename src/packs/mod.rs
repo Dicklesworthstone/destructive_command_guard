@@ -6546,6 +6546,14 @@ mod tests {
             ("database.postgresql", "delete"),
             ("database.postgresql", "drop"),
             ("database.postgresql", "truncate"),
+            // The lowercase twin of the `UPDATE` the row carries, dead for the
+            // same reason as its three neighbours above: quick-rejection is
+            // ASCII case-insensitive, so one spelling admits both. Checked
+            // against the real binary with only this pack enabled --
+            // `psql -c "UPDATE <table> SET <col> = <value>"` denies as
+            // `database.postgresql:update-without-where`, and the same command
+            // carrying a WHERE clause allows.
+            ("database.postgresql", "update"),
             ("database.snowflake", "drop"),
             ("database.snowflake", "truncate"),
             ("database.snowflake", "delete"),
