@@ -146,9 +146,17 @@
       "$ref": "#/$defs/GitAwarenessConfig",
       "default": {
         "enabled": false,
-        "protected_branches": ["main", "production", "release/*"],
+        "protected_branches": [
+          "main",
+          "production",
+          "release/*"
+        ],
         "protected_strictness": "all",
-        "relaxed_branches": ["feature/*", "experiment/*", "sandbox/*"],
+        "relaxed_branches": [
+          "feature/*",
+          "experiment/*",
+          "sandbox/*"
+        ],
         "relaxed_strictness": "critical",
         "default_strictness": "high",
         "detached_head_strictness": "all",
@@ -218,7 +226,10 @@
         },
         "log_file": {
           "description": "Path to log file for blocked commands (optional).",
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "default": null
         },
         "verbose": {
@@ -228,28 +239,40 @@
         },
         "hook_timeout_ms": {
           "description": "Hook evaluation budget override in milliseconds.\nWhen set, overrides the default hook evaluation budget. Values below\n10 milliseconds are clamped to the minimum safe evaluation window.",
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint64",
           "minimum": 0,
           "default": null
         },
         "max_hook_input_bytes": {
           "description": "Maximum bytes to read from stdin in hook mode.\nOversized hook envelopes are allowed with an audit warning by default;\n`fail_closed` blocks them because their size is attacker-controlled.\nDefault: 262144 (256 KiB).",
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint",
           "minimum": 0,
           "default": null
         },
         "max_command_bytes": {
           "description": "Maximum bytes for command string after extraction from JSON.\nCommands exceeding this limit produce an explicit indeterminate result;\nreview-capable protocols ask and other protocols block.\nDefault: 65536 (64 KiB).",
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint",
           "minimum": 0,
           "default": null
         },
         "max_findings_per_command": {
           "description": "Maximum findings to report per command.\nLimits output size and processing time for pathological inputs.\nDefault: 100.",
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint",
           "minimum": 0,
           "default": null
@@ -302,17 +325,26 @@
       "properties": {
         "highlight_enabled": {
           "description": "Enable span highlighting in denial output.\nWhen enabled, shows caret-style markers under the matched portion.\nDefault: true",
-          "type": ["boolean", "null"],
+          "type": [
+            "boolean",
+            "null"
+          ],
           "default": null
         },
         "explanations_enabled": {
           "description": "Enable explanations in denial output.\nWhen enabled, shows detailed explanations for why patterns are dangerous.\nDefault: true",
-          "type": ["boolean", "null"],
+          "type": [
+            "boolean",
+            "null"
+          ],
           "default": null
         },
         "high_contrast": {
           "description": "Enable high-contrast output.\nUses ASCII borders and a black/white palette for accessibility.\nDefault: false",
-          "type": ["boolean", "null"],
+          "type": [
+            "boolean",
+            "null"
+          ],
           "default": null
         }
       }
@@ -323,17 +355,26 @@
       "properties": {
         "palette": {
           "description": "Palette name: \"default\" | \"colorblind\" | \"high-contrast\".",
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "default": null
         },
         "use_unicode": {
           "description": "Whether Unicode box drawing is allowed.",
-          "type": ["boolean", "null"],
+          "type": [
+            "boolean",
+            "null"
+          ],
           "default": null
         },
         "use_color": {
           "description": "Whether colors are allowed (overrides `NO_COLOR` when set to false).",
-          "type": ["boolean", "null"],
+          "type": [
+            "boolean",
+            "null"
+          ],
           "default": null
         }
       }
@@ -385,7 +426,10 @@
         },
         "observe_until": {
           "description": "Optional observe-mode window end timestamp.\n\nWhen set and the current time is **before** this timestamp:\n- `default_mode` applies, but defaults to `\"warn\"` when unset.\n\nWhen set and the current time is **at/after** this timestamp:\n- `default_mode` is ignored and dcg reverts to severity-based defaults.\n\nAccepted formats:\n- RFC 3339: `2026-02-01T00:00:00Z`\n- ISO 8601 without timezone (treated as UTC): `2026-02-01T00:00:00`\n- Date only (treated as end of day UTC): `2026-02-01`",
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "packs": {
           "description": "Per-pack mode overrides.\nKey is `pack_id` (e.g., \"core.git\", \"database.postgresql\").\nValue is the mode to use for all patterns in that pack.",
@@ -466,10 +510,15 @@
             },
             "when": {
               "description": "Optional condition (e.g., \"CI=true\").",
-              "type": ["string", "null"]
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
-          "required": ["pattern"]
+          "required": [
+            "pattern"
+          ]
         }
       ]
     },
@@ -486,7 +535,10 @@
           "type": "string"
         }
       },
-      "required": ["pattern", "reason"]
+      "required": [
+        "pattern",
+        "reason"
+      ]
     },
     "AllowlistConfig": {
       "description": "Settings for layered allowlist files (`.dcg/allowlist.toml`,\n`~/.config/dcg/allowlist.toml`, and `/etc/dcg/allowlist.toml`).",
@@ -505,40 +557,58 @@
       "properties": {
         "enabled": {
           "description": "Enable heredoc/inline-script scanning.",
-          "type": ["boolean", "null"],
+          "type": [
+            "boolean",
+            "null"
+          ],
           "default": null
         },
         "timeout_ms": {
           "description": "Timeout budget for Tier 2 extraction (milliseconds).",
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint64",
           "minimum": 0,
           "default": null
         },
         "max_body_bytes": {
           "description": "Maximum bytes extracted from heredoc bodies.",
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint",
           "minimum": 0,
           "default": null
         },
         "max_body_lines": {
           "description": "Maximum number of lines extracted from heredoc bodies.",
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint",
           "minimum": 0,
           "default": null
         },
         "max_heredocs": {
           "description": "Maximum number of heredocs to process per command.",
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint",
           "minimum": 0,
           "default": null
         },
         "languages": {
           "description": "Optional allowlist of languages to scan.\n\nValues are case-insensitive and may include aliases:\n- bash: bash, sh, shell\n- python: python, py\n- ruby: ruby, rb\n- perl: perl, pl\n- javascript: javascript, js, node\n- typescript: typescript, ts\n- php: php\n- go: go, golang\n- unknown: unknown\n\nSpecial value \"all\" scans all languages (the default if omitted).",
-          "type": ["array", "null"],
+          "type": [
+            "array",
+            "null"
+          ],
           "items": {
             "type": "string"
           },
@@ -546,12 +616,18 @@
         },
         "fallback_on_parse_error": {
           "description": "Use bounded fallback scanning when AST parsing fails for embedded code.\nWhen false, block on the incomplete analysis instead.",
-          "type": ["boolean", "null"],
+          "type": [
+            "boolean",
+            "null"
+          ],
           "default": null
         },
         "fallback_on_timeout": {
           "description": "Use bounded fallback scanning when extraction/parsing exceeds its timeout.\nWhen false, block on the incomplete analysis instead.",
-          "type": ["boolean", "null"],
+          "type": [
+            "boolean",
+            "null"
+          ],
           "default": null
         },
         "allowlist": {
@@ -612,7 +688,10 @@
       "properties": {
         "language": {
           "description": "Optional language filter (e.g., \"python\", \"bash\"). If None, matches any language.",
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "pattern": {
           "description": "Substring pattern to match in heredoc content.",
@@ -623,7 +702,10 @@
           "type": "string"
         }
       },
-      "required": ["pattern", "reason"]
+      "required": [
+        "pattern",
+        "reason"
+      ]
     },
     "ContentHashEntry": {
       "description": "A content-hash based heredoc allowlist entry.",
@@ -638,7 +720,10 @@
           "type": "string"
         }
       },
-      "required": ["hash", "reason"]
+      "required": [
+        "hash",
+        "reason"
+      ]
     },
     "ProjectHeredocAllowlist": {
       "description": "Project-specific heredoc allowlist overrides.",
@@ -665,7 +750,9 @@
           "default": []
         }
       },
-      "required": ["path"]
+      "required": [
+        "path"
+      ]
     },
     "ConfidenceConfig": {
       "description": "Confidence scoring configuration for ambiguous pattern matches.\n\nWhen enabled, confidence scoring analyzes the context of pattern matches\nto determine if they're likely true positives or false positives. Matches\nin data contexts (quoted strings, commit messages, search patterns) have\nlower confidence and may be downgraded from Deny to Warn.\n\n# Example Configuration (TOML)\n\n```toml\n[confidence]\nenabled = true\nwarn_threshold = 0.5\nprotect_critical = true\n```",
@@ -700,7 +787,10 @@
         },
         "file": {
           "description": "Path to log file. Supports ~ expansion.",
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "default": null
         },
         "format": {
@@ -731,7 +821,10 @@
     "LogFormat": {
       "description": "Log output format.",
       "type": "string",
-      "enum": ["text", "json"]
+      "enum": [
+        "text",
+        "json"
+      ]
     },
     "RedactionConfig": {
       "description": "Redaction configuration.",
@@ -756,7 +849,11 @@
     "RedactionMode": {
       "description": "Redaction mode.",
       "type": "string",
-      "enum": ["none", "arguments", "full"]
+      "enum": [
+        "none",
+        "arguments",
+        "full"
+      ]
     },
     "LogEventFilter": {
       "description": "Filter for which events to log.",
@@ -807,7 +904,10 @@
         },
         "database_path": {
           "description": "Optional database file path override.",
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "default": null
         },
         "auto_prune": {
@@ -898,7 +998,10 @@
         },
         "require_env": {
           "description": "Require this env var to be set to enable interactive mode.",
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -946,7 +1049,11 @@
           "items": {
             "type": "string"
           },
-          "default": ["main", "production", "release/*"]
+          "default": [
+            "main",
+            "production",
+            "release/*"
+          ]
         },
         "protected_strictness": {
           "description": "Strictness level for protected branches.\nDefault: `All` (block everything including Low severity)",
@@ -959,7 +1066,11 @@
           "items": {
             "type": "string"
           },
-          "default": ["feature/*", "experiment/*", "sandbox/*"]
+          "default": [
+            "feature/*",
+            "experiment/*",
+            "sandbox/*"
+          ]
         },
         "relaxed_strictness": {
           "description": "Strictness level for relaxed branches.\nDefault: `Critical` (only block Critical severity)",
@@ -1158,7 +1269,14 @@
     "GraduationMode": {
       "description": "Graduation mode controlling how responses escalate with repeated occurrences.",
       "type": "string",
-      "enum": ["paranoid", "strict", "standard", "lenient", "warning_only", "disabled"]
+      "enum": [
+        "paranoid",
+        "strict",
+        "standard",
+        "lenient",
+        "warning_only",
+        "disabled"
+      ]
     },
     "SeverityOverrides": {
       "description": "Per-severity graduation mode override.",
