@@ -23447,6 +23447,15 @@ fn evaluate_core_filesystem_pack(
             } else {
                 segment
             };
+        // The whole text `dialect_segment` was sliced from, for parsers that
+        // must look at a neighbouring pipeline stage.
+        let dialect_segment_source =
+            if shell_dialect != ShellDialect::Unknown && normalized_offset == Some(0) {
+                original_command
+            } else {
+                command_for_packs
+            };
+        let dialect_segment_start = segment_start;
         let sanitized_segment = sanitize_for_pattern_matching(segment);
         let powershell_literal_sources = restore_powershell_here_string_substitution_text(
             sanitized_segment.as_ref(),
@@ -23681,6 +23690,32 @@ fn evaluate_core_filesystem_pack(
             rm_automated_stdin,
             shell_dialect,
         );
+        // `Get-ChildItem -Recurse | Remove-Item`: every item of the tree
+        // reaches this Remove-Item, so judge it as the recursive delete it is.
+        // The same classifier decides (-WhatIf, rule id, severity); only a
+        // deny is taken, so this can never make the segment more permitted.
+        if shell_dialect == ShellDialect::PowerShell
+            && rm_automated_stdin
+            && matches!(
+                rm_decision,
+                crate::packs::core::filesystem::RmParseDecision::NoMatch
+            )
+            && crate::packs::core::filesystem::powershell_recursive_listing_feeds(
+                dialect_segment_source,
+                dialect_segment_start,
+            )
+        {
+            let as_recursive = format!("{} -Recurse", dialect_segment.trim_end());
+            if let deny @ crate::packs::core::filesystem::RmParseDecision::Deny(_) =
+                crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
+                    &as_recursive,
+                    rm_automated_stdin,
+                    shell_dialect,
+                )
+            {
+                rm_decision = deny;
+            }
+        }
         // A `$VAR` operand proven to resolve to the literal path the temp
         // exemption already allows is not a dynamic path (#396). The proof runs
         // the same classifier over the resolved text, so only a command that
@@ -32929,6 +32964,54 @@ mod tests {
             assert!(
                 result.is_allowed(),
                 "escaped or inert {dialect:?} redirect text must remain data: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// `Get-ChildItem -Recurse | Remove-Item` is the idiomatic PowerShell tree
+    /// delete; the recursion is on the producer, so it was allowed.
+    #[test]
+    fn powershell_recursive_listing_piped_to_remove_item_denies() {
+        for command in [
+            r"Get-ChildItem -Recurse C:\src | Remove-Item -Force",
+            "gci -r ./src | Remove-Item",
+            "ls -Recurse ./src | rm",
+            "dir -Depth 3 ./src | del -Force",
+            r"Get-ChildItem C:\src -Recurse -Filter *.log | Remove-Item",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::PowerShell,
+            );
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some("powershell-remove-item-recursive"),
+                "{command}: {:?}",
+                result.pattern_info
+            );
+        }
+        // A non-recursive listing is a one-directory delete (POSIX `rm *` is
+        // allowed too), -WhatIf is a preview, and a non-deleting consumer or a
+        // non-listing producer changes nothing.
+        for command in [
+            "Get-ChildItem ./logs | Remove-Item",
+            "Get-ChildItem -Recurse ./src | Remove-Item -WhatIf",
+            "Get-ChildItem -Recurse ./src | Select-Object Name",
+            "Get-Content list.txt | Remove-Item",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::PowerShell,
+            );
+            assert!(
+                result.is_allowed(),
+                "{command} must stay allowed: {:?}",
                 result.pattern_info
             );
         }

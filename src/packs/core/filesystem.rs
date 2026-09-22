@@ -1954,6 +1954,53 @@ fn parse_powershell_remove_item_segment(command: &str, automated_stdin: bool) ->
     })
 }
 
+/// Whether the pipeline stage feeding the segment at `segment_start` is a
+/// recursive PowerShell listing — `Get-ChildItem -Recurse` (or `gci`, `ls`,
+/// `dir`, `-Depth N`).
+///
+/// `Get-ChildItem -Recurse C:\src | Remove-Item -Force` is the idiomatic
+/// PowerShell tree delete, and it was allowed in every dialect: the recursion
+/// is on the producer, so the `-Recurse` the Remove-Item classifier looks for
+/// never appears on the consumer (#451 comment). Every item of the tree
+/// reaches `Remove-Item`, the same deletion `find … -delete` performs.
+pub(crate) fn powershell_recursive_listing_feeds(command: &str, segment_start: usize) -> bool {
+    let Some(prefix) = command.get(..segment_start) else {
+        return false;
+    };
+    let prefix = prefix.trim_end();
+    let Some(producer_end) = prefix.strip_suffix('|').filter(|rest| !rest.ends_with('|')) else {
+        return false;
+    };
+    let producer_start = producer_end
+        .rfind([';', '|', '&', '\n', '{', '('])
+        .map_or(0, |at| at + 1);
+    let producer = producer_end[producer_start..].trim();
+    let tokens = tokenize_for_shell_dialect(producer, ShellDialect::PowerShell);
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+    let mut words = tokens
+        .iter()
+        .filter(|token| token.kind != NormalizeTokenKind::Separator)
+        .filter_map(|token| token.text(producer));
+    let Some(executable) = words
+        .next()
+        .and_then(|word| decoder.decode(word, ShellTokenRole::Syntax))
+    else {
+        return false;
+    };
+    let lister = ["get-childitem", "gci", "ls", "dir"]
+        .iter()
+        .any(|alias| executable.eq_ignore_ascii_case(alias));
+    lister
+        && words.any(|word| {
+            decoder
+                .decode(word, ShellTokenRole::Syntax)
+                .is_some_and(|word| {
+                    powershell_switch_value(word.as_ref(), "recurse", 1, true) == Some(true)
+                        || powershell_switch_value(word.as_ref(), "depth", 2, false).is_some()
+                })
+        })
+}
+
 fn powershell_remove_item_alias(executable: &str) -> bool {
     ["remove-item", "rm", "ri", "del", "erase", "rd", "rmdir"]
         .iter()
