@@ -421,7 +421,16 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "database.postgresql",
-            HashSet::from(["pg-dump-no-clean", "truncate-table"]),
+            HashSet::from([
+                // `DROP` not followed by a metadata-only target (DEFAULT,
+                // NOT NULL, CONSTRAINT, …): a negative lookahead.
+                "drop-column",
+                "pg-dump-no-clean",
+                "truncate-table",
+                // `SET` with no `WHERE` before the statement ends: a tempered
+                // negative lookahead.
+                "update-without-where",
+            ]),
         ),
         (
             "database.redis",
@@ -634,6 +643,9 @@ fn test_audit_backtracking_requirements() {
                 "api-delete-namespace",
                 "api-delete-persistent-storage",
                 "api-delete-workload",
+                // `--prune` without a `--dry-run` anywhere in the command: a
+                // negative lookahead.
+                "apply-prune",
                 "delete-from-stdin",
                 "kubectl-api",
                 "kubectl-config",
