@@ -6611,30 +6611,6 @@ mod tests {
             // Direct formatters with no `/dev/` in the command: the new row
             // keywords are the only thing that selects the pack.
             ("system.disk", "mke2fs disk.img", "mkfs"),
-            // Unscoped UPDATE reaches each SQL pack on `UPDATE` alone, and the
-            // mongosh method spelling on `.updateMany(` alone.
-            (
-                "database.postgresql",
-                "UPDATE users SET admin = true",
-                "update-without-where",
-            ),
-            (
-                "database.mysql",
-                "UPDATE users SET admin = 1",
-                "update-without-where",
-            ),
-            (
-                "database.sqlite",
-                "UPDATE users SET admin = 1",
-                "update-without-where",
-            ),
-            (
-                "database.mongodb",
-                // No `$` operator: in a bare shell line `$set` is a shell
-                // variable and `stdin-unverified` (correctly) answers first.
-                "db.users.updateMany({}, [])",
-                "update-all",
-            ),
             ("system.disk", "newfs_apfs disk2s1", "mkfs"),
         ];
 

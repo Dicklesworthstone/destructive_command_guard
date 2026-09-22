@@ -29827,12 +29827,71 @@ mod tests {
         }
     }
 
+    /// Unscoped UPDATE reaches each SQL pack on the `UPDATE` keyword alone
+    /// (any case), and mongosh's unfiltered update on `.updateMany(` alone —
+    /// through the keyword index and evaluator, not just `Pack::check`.
+    #[test]
+    fn unscoped_database_updates_reach_their_rule_through_the_evaluator() {
+        for (pack_id, command, rule) in [
+            (
+                "database.postgresql",
+                "UPDATE users SET admin = true",
+                "update-without-where",
+            ),
+            (
+                "database.postgresql",
+                "update users set admin = true",
+                "update-without-where",
+            ),
+            (
+                "database.mysql",
+                "UPDATE users SET admin = 1",
+                "update-without-where",
+            ),
+            (
+                "database.mysql",
+                "update users set admin = 1",
+                "update-without-where",
+            ),
+            (
+                "database.sqlite",
+                "UPDATE users SET admin = 1",
+                "update-without-where",
+            ),
+            (
+                "database.postgresql",
+                "ALTER TABLE users DROP COLUMN email",
+                "drop-column",
+            ),
+            // No `$` operator: in a bare shell line `$set` is a shell variable
+            // and `stdin-unverified` (correctly) answers first.
+            (
+                "database.mongodb",
+                "db.users.updateMany({}, [])",
+                "update-all",
+            ),
+        ] {
+            let result = evaluate_with_pack_ids(command, &[pack_id]);
+            let info = result.pattern_info.as_ref();
+            assert_eq!(
+                (
+                    info.and_then(|info| info.pack_id.as_deref()),
+                    info.and_then(|info| info.pattern_name.as_deref())
+                ),
+                (Some(pack_id), Some(rule)),
+                "{command}"
+            );
+        }
+    }
+
     #[test]
     fn database_argument_quote_provenance_is_preserved() {
         for (command, pack_id) in [
             ("psql app -c 'SELECT $1;'", "database.postgresql"),
+            // A filtered update: the quoted `$set` must stay data. (The
+            // unfiltered `updateMany({}, …)` is `update-all` since 8a250fb.)
             (
-                "mongosh --eval 'db.users.updateMany({}, {$set: {active: true}})'",
+                "mongosh --eval 'db.users.updateMany({id: 1}, {$set: {active: true}})'",
                 "database.mongodb",
             ),
             ("psql app -c SELECT\\é", "database.postgresql"),

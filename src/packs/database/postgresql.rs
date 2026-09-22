@@ -301,7 +301,7 @@ pub fn create_pack() -> Pack {
                       TRUNCATE, and dropdb",
         keywords: &[
             "psql", "dropdb", "DROP", "TRUNCATE", "pg_dump", "postgres", "DELETE", "delete",
-            "drop", "truncate", "UPDATE", "update",
+            "drop", "truncate", "UPDATE",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),

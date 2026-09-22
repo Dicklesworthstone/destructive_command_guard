@@ -192,7 +192,6 @@ pub fn create_pack() -> Pack {
             "truncate",
             "GRANT",
             "UPDATE",
-            "update",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
