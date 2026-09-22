@@ -275,22 +275,23 @@ CLAUDE_ALLOW=$(jq -nc --arg c "$ALLOW_CMD" '{tool_name:"Bash",tool_input:{comman
 assert_case claude-code deny "$CLAUDE_DENY" deny \
   '.hookSpecificOutput.permissionDecision' deny
 assert_case claude-code allow "$CLAUDE_ALLOW" allow '.' ''
-# The PowerShell shell tool is platform-sensitive by design: windows.filesystem
-# is default-ON on Windows and opt-in elsewhere. Assert the behavior for the
-# host we are actually running on rather than assuming Unix.
-case "$(uname -s 2>/dev/null || echo unknown)" in
-  MINGW*|MSYS*|CYGWIN*|Windows_NT) WIN_PACK_EXPECT=deny ;;
-  *) WIN_PACK_EXPECT=allow ;;
-esac
-if [[ "$WIN_PACK_EXPECT" == deny ]]; then
-  assert_case claude-code powershell-tool-windows-default-packs \
-    "$(jq -nc --arg c 'Remove-Item -Recurse -Force C:\\src' '{tool_name:"PowerShell",tool_input:{command:$c}}')" \
-    deny '.hookSpecificOutput.permissionDecision' deny
-else
-  assert_case claude-code powershell-tool-optin-on-unix \
-    "$(jq -nc --arg c 'Remove-Item -Recurse -Force C:\\src' '{tool_name:"PowerShell",tool_input:{command:$c}}')" \
-    allow '.' ''
-fi
+# A PowerShell payload is judged as PowerShell on every host. This used to be
+# host-conditional, on the theory that the coverage lived in windows.filesystem
+# (default-ON on Windows, opt-in elsewhere) and so a Unix host must allow. #451
+# moved it: `Remove-Item -Recurse` is now decided by core.filesystem's PowerShell
+# semantic classifier, which is always on and keys on the payload's dialect rather
+# than the host's configuration — which was the whole complaint in #451, since an
+# agent on Unix can still drive a Windows shell. So the verdict no longer depends
+# on `uname`, and asserting per-host would re-encode the bug.
+#
+# Only the decision is asserted. dcg classifies an explicit `PowerShell` tool name
+# as a Codex-style payload (see `detect_protocol`: Claude Code's shell tool is
+# always `Bash`/`launch-process`), and the Codex protocol deliberately omits
+# ruleId/severity/remediation for its stricter parser, so those fields are absent
+# here by design.
+assert_case claude-code powershell-tool-denies-on-any-host \
+  "$(jq -nc --arg c 'Remove-Item -Recurse -Force C:\\src' '{tool_name:"PowerShell",tool_input:{command:$c}}')" \
+  deny '.hookSpecificOutput.permissionDecision' deny
 # The agent-facing metadata contract other tools key on:
 for field in ruleId packId severity; do
   got="$(printf '%s' "$CLAUDE_DENY" | run_dcg 2>/dev/null | jq -r ".hookSpecificOutput.$field // empty")"
