@@ -26117,8 +26117,22 @@ fn check_fallback_patterns(command: &str) -> Option<EvaluationResult> {
             r"os\.remove",
             r"os\.rmdir",
             r"os\.unlink",
-            r"fs\.rmSync",
-            r"fs\.rmdirSync",
+            // Node deletions anchor on the CALL, not on an `fs.` receiver.
+            // `fs\.rmSync` only ever matched the bound spelling
+            // (`const fs = require('fs'); fs.rmSync(…)`), and missed the
+            // chained one — `require('fs').rmSync(…)`, where the text between
+            // `fs` and `.rmSync` is `')`. That chained form is the shorter one
+            // to type and the one a `node -e` one-liner actually writes, which
+            // is the same reason the AST patterns took a metavariable receiver
+            // in #453; the backstop never got the equivalent, so the payload
+            // family #452 is about was still unreachable here.
+            //
+            // The opening paren is the disambiguator, exactly as it is for the
+            // receiver-less `unlink`/`rmdir` and `rmtree`/`remove_tree` entries
+            // below. A bare mention (`# cleanup uses rmSync`) carries no paren,
+            // and a quoted one is masked by `sanitize_for_pattern_matching`
+            // before this set runs.
+            r"\b(?:rmSync|rmdirSync)\s*\(",
             r"child_process\.execSync",
             r"child_process\.spawnSync",
             r"os\.RemoveAll",
@@ -38923,6 +38937,95 @@ mod tests {
                     result.is_denied(),
                     "{label}: extraction was skipped past max_body_lines, so the bounded \
                      fallback is the only thing left and must deny; got {result:?}"
+                );
+            }
+        }
+
+        /// #452's actual complaint: the backstop must reach a ONE-LINER.
+        ///
+        /// The two patterns it named were anchored `(?m)^[ \t]*`, which fits a
+        /// heredoc body — where the call is the first thing on its line — and
+        /// can never fit `ruby -e "require 'fileutils'; FileUtils.rm_rf(…)"`,
+        /// where the call follows `; `. For exactly those two payload families
+        /// an AST timeout was therefore an unconditional allow, which made the
+        /// deny probabilistic and defeatable by retrying.
+        ///
+        /// The sibling test above forces an incomplete *extraction*, which a
+        /// one-liner has none of: its code arrives on argv, so the only thing
+        /// that can send it here is an AST error or timeout, and that is a
+        /// function of host load rather than of the command. So this asserts the
+        /// property directly on the pure function instead — *if* the fallback
+        /// runs on this string it denies — which is the half that regressed and
+        /// the half a timing-dependent test cannot pin.
+        #[test]
+        fn the_bounded_fallback_reaches_inline_one_liners_issue_452() {
+            for (label, cmd) in [
+                (
+                    "ruby -e FileUtils.rm_rf",
+                    r#"ruby -e "require 'fileutils'; FileUtils.rm_rf('/home/user')""#,
+                ),
+                (
+                    "ruby -e FileUtils.rm_r",
+                    r#"ruby -e "require 'fileutils'; FileUtils.rm_r('/home/user')""#,
+                ),
+                (
+                    "ruby -e FileUtils.remove_entry",
+                    r#"ruby -e "require 'fileutils'; FileUtils.remove_entry('/home/user')""#,
+                ),
+                (
+                    "node -e fs.rmSync",
+                    r#"node -e "require('fs').rmSync('/home/user', {recursive: true})""#,
+                ),
+                (
+                    "node -e fs.rmdirSync",
+                    r#"node -e "require('fs').rmdirSync('/home/user', {recursive: true})""#,
+                ),
+                (
+                    "python3 -c shutil.rmtree",
+                    r#"python3 -c "import shutil; shutil.rmtree('/home/user')""#,
+                ),
+                (
+                    "perl -e rmtree",
+                    r#"perl -e "use File::Path qw(rmtree); rmtree('/home/user')""#,
+                ),
+                (
+                    "php -r unlink",
+                    r#"php -r "unlink('/home/user/.ssh/id_rsa');""#,
+                ),
+            ] {
+                assert!(
+                    check_fallback_patterns(cmd).is_some(),
+                    "{label}: the bounded fallback must match a one-liner, or an AST \
+                     timeout allows this command outright (#452): {cmd}"
+                );
+            }
+
+            // The other half of the trade. Unanchoring is only acceptable while
+            // a mention stays a mention, which is the #420 class this project
+            // hits on its own commit messages — so the negatives are pinned
+            // beside the positives rather than in a separate test.
+            for (label, cmd) in [
+                (
+                    "prose in a data-sink heredoc",
+                    "cat <<'EOF'\nnever run FileUtils.rm_rf('/')\nEOF",
+                ),
+                (
+                    "commit message naming the rule",
+                    r#"git commit -m "guard FileUtils.rm_rf and fs.rmSync writes""#,
+                ),
+                ("echoed advice", r#"echo "do not call fs.rmSync('/')""#),
+                (
+                    "non-deleting FileUtils",
+                    r#"ruby -e "require 'fileutils'; FileUtils.mkdir_p('/opt/app')""#,
+                ),
+                (
+                    "rmdir as a shell command, not a call",
+                    "rmdir /tmp/empty-dir",
+                ),
+            ] {
+                assert!(
+                    check_fallback_patterns(cmd).is_none(),
+                    "{label}: the bounded fallback must not fire on a mention (#420): {cmd}"
                 );
             }
         }

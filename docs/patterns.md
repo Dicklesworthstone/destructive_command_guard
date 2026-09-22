@@ -126,14 +126,12 @@ built-in rule IDs. Use these IDs for allowlisting and tests.
 
 | Rule ID | Pattern | Reason |
 | --- | --- | --- |
-| `heredoc.javascript.fs_rm` | `fs.rm($$$)` | deletes files/directories |
-| `heredoc.javascript.fs_rmdir` | `fs.rmdir($$$)` | deletes directories |
+| `heredoc.javascript.fs_rm` | `$FS.rm($$$)` | deletes files/directories |
+| `heredoc.javascript.fs_rmdir` | `$FS.rmdir($$$)` | deletes directories |
 | `heredoc.javascript.fs_rmsync` | `$FS.rmSync($$$)` | deletes files/directories |
 | `heredoc.javascript.fs_rmdirsync` | `$FS.rmdirSync($$$)` | deletes directories |
-| `heredoc.javascript.fs_unlink` | `fs.unlink($$$)` | deletes files |
+| `heredoc.javascript.fs_unlink` | `$FS.unlink($$$)` | deletes files |
 | `heredoc.javascript.fs_unlinksync` | `$FS.unlinkSync($$$)` | deletes files |
-| `heredoc.javascript.fspromises_rm` | `fsPromises.rm($$$)` | deletes files/directories |
-| `heredoc.javascript.fspromises_rmdir` | `fsPromises.rmdir($$$)` | deletes directories |
 | `heredoc.javascript.execsync` | `child_process.execSync($$$)` | executes shell commands |
 | `heredoc.javascript.require_execsync` | `require('child_process').execSync($$$)` | executes shell commands |
 | `heredoc.javascript.spawnsync` | `child_process.spawnSync($$$)` | executes shell commands |
@@ -142,14 +140,12 @@ built-in rule IDs. Use these IDs for allowlisting and tests.
 
 | Rule ID | Pattern | Reason |
 | --- | --- | --- |
-| `heredoc.typescript.fs_rm` | `fs.rm($$$)` | deletes files/directories |
-| `heredoc.typescript.fs_rmdir` | `fs.rmdir($$$)` | deletes directories |
+| `heredoc.typescript.fs_rm` | `$FS.rm($$$)` | deletes files/directories |
+| `heredoc.typescript.fs_rmdir` | `$FS.rmdir($$$)` | deletes directories |
 | `heredoc.typescript.fs_rmsync` | `$FS.rmSync($$$)` | deletes files/directories |
 | `heredoc.typescript.fs_rmdirsync` | `$FS.rmdirSync($$$)` | deletes directories |
-| `heredoc.typescript.fs_unlink` | `fs.unlink($$$)` | deletes files |
+| `heredoc.typescript.fs_unlink` | `$FS.unlink($$$)` | deletes files |
 | `heredoc.typescript.fs_unlinksync` | `$FS.unlinkSync($$$)` | deletes files |
-| `heredoc.typescript.fspromises_rm` | `fsPromises.rm($$$)` | deletes files/directories |
-| `heredoc.typescript.fspromises_rmdir` | `fsPromises.rmdir($$$)` | deletes directories |
 | `heredoc.typescript.execsync` | `child_process.execSync($$$)` | executes shell commands |
 | `heredoc.typescript.require_execsync` | `require('child_process').execSync($$$)` | executes shell commands |
 | `heredoc.typescript.spawnsync` | `child_process.spawnSync($$$)` | executes shell commands |
@@ -224,9 +220,11 @@ Supported `<suffix>` values (from shell-payload detection):
 
 Some patterns refine their rule IDs based on detected arguments:
 
-- For JavaScript/TypeScript `fs.*` and `fsPromises.*` patterns, a literal
+- For JavaScript/TypeScript `fs.*` patterns, a literal
   catastrophic path appends `.catastrophic` to the rule ID
-  (example: `heredoc.javascript.fs_rmsync.catastrophic`).
+  (example: `heredoc.javascript.fs_rmsync.catastrophic`). The receiver is a
+  metavariable, so one rule covers every spelling — `fs.rm`, `fs.promises.rm`,
+  `fsPromises.rm` and `require('fs').promises.rm` all report `fs_rm`.
 - For TypeScript `deno_remove`, a catastrophic path appends `.catastrophic`.
 - For Ruby `FileUtils`/`File`/`Dir` patterns, catastrophic paths append
   `.catastrophic`.
@@ -235,9 +233,10 @@ Some patterns refine their rule IDs based on detected arguments:
   `.rm_rf_catastrophic`.
 - For a **recursive delete** with a literal target outside a temp directory,
   `.non_temp` is appended and the severity becomes Critical (example:
-  `heredoc.ruby.fileutils_rm_rf.non_temp`). Python's `shutil.rmtree` is the one
-  exception to the suffix: it is Critical already, so a target that *is* a temp
-  directory appends `.temp` and drops it to warn-only instead.
+  `heredoc.ruby.fileutils_rm_rf.non_temp`). Python's `shutil.rmtree` and Go's
+  `os.RemoveAll` are the exceptions to the suffix: they are Critical already, so
+  a target that *is* a temp directory appends `.temp` and drops it to warn-only
+  instead (example: `heredoc.go.os_removeall.temp`).
 - For Perl `unlink`/`rmdir`, a catastrophic literal target appends
   `.catastrophic` and raises the severity to Critical.
 
@@ -245,18 +244,27 @@ All derived rule IDs are valid allowlist targets.
 
 ## One policy for a recursive delete
 
-`rm -rf`, `shutil.rmtree`, `FileUtils.rm_rf`/`rm_r`/`remove_entry`/
-`remove_entry_secure`/`remove_dir`, `fs.rmSync`/`rmdirSync`/`rm`/`rmdir`
-(and the `fsPromises` and TypeScript spellings) with `recursive: true`, and
+`rm -rf`, `shutil.rmtree`, `os.RemoveAll` (Go), `FileUtils.rm_rf`/`rm_r`/
+`remove_entry`/`remove_entry_secure`/`remove_dir`,
+`fs.rmSync`/`rmdirSync`/`rm`/`rmdir`
+(under any receiver spelling, including the promise APIs, in both JavaScript and
+TypeScript) with `recursive: true`, and
 Perl's `File::Path::rmtree`/`remove_tree` all answer the same question the same
 way: a literal target outside a temp directory is denied, and a temp target is
 warn-only.
 
 "Temp" has one definition shared by every language, taken from the shell's own
 `rm-rf-tmp` / `rm-rf-var-tmp` safe patterns: `/tmp` or `/var/tmp`, optionally
-`/private`-prefixed, with any `..` component disqualifying the path. Python
-additionally treats `tempfile.mkdtemp()` / `TemporaryDirectory()` as a scratch
-directory, since those produce one by construction.
+`/private`-prefixed, with any `..` component disqualifying the path. Both of
+Go's string spellings count, interpreted (`"/tmp/build"`) and raw
+(`` `/tmp/build` ``). Python additionally treats `tempfile.mkdtemp()` /
+`TemporaryDirectory()` as a scratch directory, since those produce one by
+construction; Go has no equivalent because `os.MkdirTemp` returns
+`(string, error)` and so cannot be nested inside the delete call. The Go idiom
+that splits it across two statements (`dir, _ := os.MkdirTemp(…)` then
+`defer os.RemoveAll(dir)`) is denied, exactly as Python's two-statement
+`d = tempfile.mkdtemp(); shutil.rmtree(d)` is — proving `dir` still holds that
+value needs taint analysis this scanner does not do.
 
 The reason it is one policy is that the thing choosing the spelling is usually
 an agent. An agent refused `rm -rf ./build` must not get the same effect from a
@@ -269,7 +277,8 @@ Deliberately **not** in this set: calls that cannot destroy a tree.
 `fs.rmSync` without `recursive: true` removes one file. Those keep the
 catastrophic-target rule only.
 
-A **dynamic** target is still judged per language: `shutil.rmtree(d)` denies,
+A **dynamic** target is still judged per language: `shutil.rmtree(d)` and Go's
+`os.RemoveAll(dir)` deny,
 while the Ruby and JavaScript equivalents warn. Raising those would block
 `fs.rmSync(buildDir, { recursive: true })` in most Node build scripts, which is
 a wider change than #455 decided.

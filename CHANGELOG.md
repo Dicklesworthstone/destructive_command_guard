@@ -15,7 +15,84 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
+### Fixed
+
+- **Allowlisting the rule id dcg reports did not always allow the command**
+  (#467). `dcg explain` on a `fsPromises.rm('/home/user', { recursive: true })`
+  heredoc reported `heredoc.javascript:fs_rm.catastrophic`; allowlisting exactly
+  that left the command denied under `heredoc.javascript:fspromises_rm`, an id
+  that had never appeared in any output, so there was nothing to tell the user
+  what to allowlist next. The `fs.rm` spelling allowlisted correctly, which is
+  what showed the allowlist mechanism was fine and the duplicate rule was not.
+
+  Two patterns matched the same call, and `find_matches_ast` collects a hit for
+  every pattern, so granting the reported rule simply promoted the shadowed one
+  to winner. The duplication was leftover scaffolding: #453 added
+  `$FS.promises.rm($$$)` for the member spelling and kept `fsPromises.rm($$$)`
+  for the `require('fs/promises')` binding, "where there is no `.promises` member
+  to match", and generalising the receiver to a metavariable in #459 made both
+  redundant — a metavariable matches the whole receiver node whatever its shape.
+  Measured against one file holding all four spellings, `$FS.rm($$$)` matches
+  `fs.rm`, `fs.promises.rm`, `fsPromises.rm` and `require('fs').promises.rm`,
+  while each removed pattern matched a strict subset, so no coverage was lost.
+
+  All four promise-specific patterns are gone (eight `CompiledPattern` entries,
+  since each rule id was registered twice), along with the now-dead
+  `fspromises_` arms in `refine_javascript_match`, `refine_typescript_match` and
+  `is_recursive_delete_rule`. Severity, the `.catastrophic` suffix and #455's
+  temp policy are unchanged, because `fs_rm` and `fspromises_rm` were already in
+  the same refinement sets. `one_deletion_call_yields_one_deletion_rule_issue_467`
+  asserts one deletion rule per call across all four receivers × `rm`/`rmdir` ×
+  both languages. `docs/patterns.md` was stale in the same area and is corrected:
+  the `fs_rm`/`fs_rmdir`/`fs_unlink` rows still showed the pre-#459 `fs.rm($$$)`
+  spelling.
+
 ### Security
+
+- **Every Go pattern was incapable of matching anything, including
+  `os.RemoveAll` at Critical** (#465). A Go heredoc that recursively deleted a
+  home directory was allowed, while the Python and Ruby spellings of the same
+  operation denied.
+
+  Go's grammar has no top-level expression statement, so `os.RemoveAll($$$)` is
+  not a parseable Go fragment: it compiles to an ERROR-rooted tree
+  (`[[os, ., RemoveAll], (, Multiple, )]`) that can never equal a real
+  `call_expression`. All six Go patterns were built this way. The same pattern
+  shape works in Python precisely because Python permits a bare expression
+  statement, and that asymmetry is the whole bug — it reproduces in the pinned
+  `ast-grep 0.45.3` CLI on its own, independently of dcg. Go's patterns are now
+  stated inside the smallest enclosing construct that parses
+  (`func f() { os.RemoveAll($$$) }`) with `call_expression` as the selector,
+  which binds to the outermost call so the chained `.Run()`/`.Output()`/
+  `.CombinedOutput()` shapes keep their spans instead of collapsing into the
+  bare `exec.Command` pattern.
+
+  Why it stayed hidden: three things that look like they should have caught it
+  do not. `Pattern::try_new` returns `Ok`, so the fail-open skip for invalid
+  patterns never fired. `default_patterns_all_precompile` asserted that every
+  pattern compiles and passed throughout — compiling is not matching. And
+  `Pattern::has_error()` returns `false` for these patterns, because ast-grep's
+  `are_kinds_matching` treats an ERROR *goal* kind as a wildcard and cannot tell
+  a broken pattern from a deliberately permissive one. No structural predicate
+  available to us can see this, so the new guards are behavioural:
+  `every_language_corpus_matches_its_fixture_issue_465` requires each language's
+  corpus to match its own fixture and fails a language that registers patterns
+  without one, and `go_corpus_matches_every_registered_rule_issue_465` pins all
+  six Go rule ids with their severities and exact spans.
+
+  Turning six patterns from never-matching to always-matching exposed the benign
+  half of `os.RemoveAll`, so `heredoc.go.os_removeall` also joins #455's single
+  recursive-delete policy. Each shape was measured against its Python twin
+  first, and only one disagreed: a literal target under `/tmp` or `/var/tmp`
+  denied in Go while Python and plain `rm -rf /tmp/build` allowed it. That is now
+  carved out as `heredoc.go.os_removeall.temp` at Medium, in both Go string
+  spellings (`"/tmp/build"` and the raw `` `/tmp/build` ``). The shapes that keep
+  blocking already agreed with Python and are unchanged: the two-statement
+  `dir, _ := os.MkdirTemp(…)` / `defer os.RemoveAll(dir)` idiom (the producer is
+  not in the matched call, and proving `dir` still holds that value needs taint
+  analysis this scanner does not do — Python denies its own two-statement
+  spelling for the same reason), the temp *root* `os.RemoveAll(os.TempDir())`,
+  and any `..` escaping `/tmp`.
 
 - **`subprocess.run(['/bin/rm','-rf','/home/user'])` was allowed** while the bare
   `['rm',…]` spelling and the plain shell `/bin/rm -rf /home/user` were both
