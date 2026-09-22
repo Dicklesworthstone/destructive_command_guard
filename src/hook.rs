@@ -1763,6 +1763,36 @@ fn segment_is_windows_alias_invocation(segment: &str) -> bool {
         .any(|token| is_powershell_parameter_token(token) || is_cmd_switch_token(token))
 }
 
+/// Return whether a segment runs Windows `format` against a drive letter
+/// (`format D: /q`, `/c/Windows/System32/format.com E:`).
+///
+/// On a Windows host the Bash tool is git-bash, where `format.com` is on PATH,
+/// but under the Posix dialect the `windows.filesystem` pack is skipped, so
+/// `format D: /q` was allowed on exactly the platform its rule exists for.
+/// Nothing on a POSIX system is spelled `format <letter>:`, so widening to the
+/// fail-closed `Unknown` union costs nothing there.
+fn segment_is_format_drive_invocation(segment: &str) -> bool {
+    let mut tokens = segment.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    if !["format", "format.com", "format.exe"]
+        .iter()
+        .any(|name| base.eq_ignore_ascii_case(name))
+    {
+        return false;
+    }
+    tokens.any(|token| {
+        let token = token.trim_matches(['"', '\'']);
+        let bytes = token.as_bytes();
+        bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2..].iter().all(|&b| b == b'\\' || b == b'/')
+    })
+}
+
 /// Return whether any statement/pipeline segment of `command` is unmistakably
 /// Windows shell: a PowerShell cmdlet-shaped leading token (`Remove-Item …`,
 /// `… ; Clear-Content …`) or a destructive alias carrying a Windows-shell-only
@@ -1776,6 +1806,7 @@ fn command_has_powershell_shape(command: &str) -> bool {
                 .next()
                 .is_some_and(is_powershell_cmdlet_token)
                 || segment_is_windows_alias_invocation(segment)
+                || segment_is_format_drive_invocation(segment)
         })
 }
 
@@ -3829,6 +3860,13 @@ mod tests {
             "erase /q /s C:\\tmp",
             "cd build; rm -Recurse -Force .\\dist",
             "Del.exe /S /Q C:\\src",
+            // Windows `format` against a drive letter: git-bash runs format.com,
+            // so the Bash label must not skip the windows.filesystem pack.
+            "format D: /q",
+            "format /q /y E:",
+            "FORMAT.COM d:\\",
+            "/c/Windows/System32/format.com E: /fs:NTFS",
+            "echo ok && format \"D:\" /q",
         ] {
             assert_eq!(
                 refine_shell_dialect(command, ShellDialect::Posix),
@@ -3853,6 +3891,12 @@ mod tests {
             // and PowerShell never spells options with `--`.
             "rm -- -Recurse",
             "rm -- -Force ./weird-file",
+            // `format` without a drive operand, or as part of another word.
+            "format",
+            "format --help",
+            "clang-format -i src/main.c",
+            "git format-patch -1",
+            "cargo fmt; echo format done",
         ] {
             assert_eq!(
                 refine_shell_dialect(command, ShellDialect::Posix),

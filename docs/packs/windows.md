@@ -106,7 +106,7 @@ risk_acknowledged = true
 
 **Pack ID:** `windows.system`
 
-Protects against catastrophic Windows disk/system operations: `vssadmin delete shadows` / `wmic shadowcopy delete` (Volume Shadow Copy destruction), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `Initialize-Disk`, `Reset-PhysicalDisk`, `cipher /w`, and `bcdedit /delete`.
+Protects against catastrophic Windows disk/system operations: `vssadmin delete shadows` / `wmic shadowcopy delete` (Volume Shadow Copy destruction), `wbadmin delete` (backup recovery points), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `Initialize-Disk`, `Reset-PhysicalDisk`, `cipher /w`, and `bcdedit /delete`.
 
 ### Keywords
 
@@ -140,6 +140,8 @@ Commands containing these keywords are checked against this pack:
 - `CIPHER`
 - `bcdedit`
 - `BCDEDIT`
+- `wbadmin`
+- `WBADMIN`
 
 ### Safe Patterns (Allowed)
 
@@ -158,6 +160,7 @@ These patterns match potentially destructive commands:
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
 | `vssadmin-delete-shadows` | vssadmin delete shadows destroys Volume Shadow Copies (System Restore + backups). | critical |
+| `wbadmin-delete` | wbadmin delete destroys Windows backup recovery points or the backup catalog. | critical |
 | `wmic-shadowcopy-delete` | wmic shadowcopy delete destroys Volume Shadow Copies. | critical |
 | `diskpart` | diskpart with clean/delete/format/script reconfigures or wipes disks and partitions. | high |
 | `format-volume` | Format-Volume erases a volume's filesystem and data. | critical |

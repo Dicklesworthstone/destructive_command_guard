@@ -60,7 +60,7 @@ pub fn create_pack() -> Pack {
         name: "Windows Disk & System",
         description: "Protects against catastrophic Windows disk/system operations: \
                       `vssadmin delete shadows` / `wmic shadowcopy delete` (Volume Shadow Copy \
-                      destruction), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, \
+                      destruction), `wbadmin delete` (backup recovery points), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, \
                       `Initialize-Disk`, `Reset-PhysicalDisk`, `cipher /w`, and `bcdedit /delete`.",
         // Conventional keyword casings retained for readable metadata; the
         // quick-reject itself is ASCII case-insensitive. See packs::windows.
@@ -93,6 +93,8 @@ pub fn create_pack() -> Pack {
             "CIPHER",
             "bcdedit",
             "BCDEDIT",
+            "wbadmin",
+            "WBADMIN",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -138,6 +140,24 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Safer alternatives:\n\
              - vssadmin list shadows: review what exists before deleting anything\n\
              - Take a fresh backup (wbadmin / your backup tool) instead of deleting recovery points",
+            SHADOW_SUGGESTIONS
+        ),
+        // `wbadmin delete catalog|backup|systemstatebackup` removes Windows
+        // Server Backup / system-image recovery points: the same inhibit-recovery
+        // step as shadow deletion, and just as irreversible.
+        destructive_pattern!(
+            "wbadmin-delete",
+            r"(?i)\bwbadmin(?:\.exe)?\s+delete\s+(?:catalog|backup|systemstatebackup)\b",
+            "wbadmin delete destroys Windows backup recovery points or the backup catalog.",
+            Critical,
+            "`wbadmin delete backup` / `delete systemstatebackup` removes Windows Server Backup and \
+             system-image recovery points (with `-keepVersions:0`, all of them), and `wbadmin delete \
+             catalog` erases the catalog that makes the remaining backups restorable. Like \
+             `vssadmin delete shadows`, it is a standard ransomware step and an irreversible loss \
+             of recovery.\n\n\
+             Safer alternatives:\n\
+             - wbadmin get versions: list the recovery points first\n\
+             - Take a fresh backup before pruning old versions",
             SHADOW_SUGGESTIONS
         ),
         destructive_pattern!(
@@ -294,6 +314,15 @@ mod tests {
             ),
             ("VSSADMIN DELETE SHADOWS /ALL", "vssadmin-delete-shadows"),
             ("wmic shadowcopy delete", "wmic-shadowcopy-delete"),
+            ("wbadmin delete catalog -quiet", "wbadmin-delete"),
+            (
+                "wbadmin delete systemstatebackup -keepVersions:0",
+                "wbadmin-delete",
+            ),
+            (
+                "WBADMIN.EXE DELETE BACKUP -keepVersions:0 -quiet",
+                "wbadmin-delete",
+            ),
         ];
         for (command, expected) in checks {
             assert_blocks_with_pattern(&pack, command, expected);
@@ -351,6 +380,8 @@ mod tests {
             "Initialize-Disk -Number 2 -WhatIf",
             "Reset-PhysicalDisk -FriendlyName Disk1 -WhatIf",
             "bcdedit /enum",
+            "wbadmin get versions",
+            "wbadmin start backup -backupTarget:E: -include:C: -quiet",
             // bare diskpart with no destructive verb on the line is not flagged here
             "diskpart",
         ];

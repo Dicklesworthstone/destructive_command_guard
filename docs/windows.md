@@ -95,7 +95,8 @@ to the always-on `core.filesystem` / `core.git` and default-on `system.disk`):
   cmdlets/aliases that honor it, plus deletes scoped to temp dirs.
 - **`windows.system`** (default-on, opt-out as above): `vssadmin delete shadows`
   and `wmic shadowcopy delete` (Volume Shadow Copy destruction — a ransomware
-  hallmark), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`,
+  hallmark), `wbadmin delete catalog|backup|systemstatebackup` (backup
+  recovery points), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`,
   `Initialize-Disk` / `Reset-PhysicalDisk`, `cipher /w`, `bcdedit /delete`.
 
 Opt-in (registered but off until enabled, on every platform):

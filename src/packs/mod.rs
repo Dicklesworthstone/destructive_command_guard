@@ -2364,6 +2364,8 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "CIPHER",
             "bcdedit",
             "BCDEDIT",
+            "wbadmin",
+            "WBADMIN",
         ],
         windows::system::create_pack,
     ),
