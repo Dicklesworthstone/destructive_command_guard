@@ -44,9 +44,10 @@ loaded in full rather than through the enforcement-only project filter.
 
 On Unix, automatic discovery additionally requires `.dcg.toml` to be a direct
 regular file and binds the pathname to the same descriptor used for the
-bounded read. Native Windows currently ignores automatic project config until
-dcg has equivalent reparse-point-safe open and file-identity checks. A reviewed
-file remains available there through explicit `DCG_CONFIG` selection.
+bounded read. Native Windows applies the equivalent policy: the file is opened
+with `FILE_FLAG_OPEN_REPARSE_POINT` so a symlinked or junctioned `.dcg.toml` is
+refused rather than followed, must be a regular file, and the path must still
+name the opened handle's file when validation finishes.
 
 Implicit system config is likewise accepted only on Unix, from a direct
 root-owned path whose file and ancestor directories are not group/world

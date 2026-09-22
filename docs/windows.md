@@ -69,7 +69,7 @@ dcg resolves its own config/state via the `dirs` crate (never hardcoded Unix pat
 | User allowlist | `%APPDATA%\dcg\allowlist.toml` |
 | **System config / allowlist** | The implicit `%ProgramData%\dcg\` layer is ignored on native Windows until dcg can validate ACLs, reparse points, and opened-file identity. An explicitly selected `DCG_CONFIG` or `DCG_ALLOWLIST_SYSTEM_PATH` remains user-trusted. |
 | History DB / pending exceptions | under `%APPDATA%` / `%LOCALAPPDATA%` |
-| Project config | Automatic `.dcg.toml` discovery is ignored on native Windows until equivalent path validation exists; use `DCG_CONFIG=.dcg.toml` after review for explicit full authority. |
+| Project config | Automatic `.dcg.toml` discovery works as on Unix: enforcement-only (it can add protection, never remove it), and a symlinked or junctioned `.dcg.toml` is refused. Use `DCG_CONFIG=.dcg.toml` after review for explicit full authority. |
 | Project allowlist | `.dcg\allowlist.toml` is inactive unless `DCG_CONFIG` explicitly selects the reviewed repo-root `.dcg.toml`. |
 
 `~`-prefixed paths in config expand from `%USERPROFILE%` (Windows has no `HOME`),

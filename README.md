@@ -816,12 +816,10 @@ language filters, agent profiles, nested project overrides, and per-rule
 [target-path exemptions](#per-rule-target-path-exemptions) — are ignored during
 automatic discovery.
 
-Automatic project discovery currently runs only where dcg can bind a direct
-regular file to the descriptor it actually reads (Unix, including macOS).
-Native Windows ignores an automatically discovered `.dcg.toml` until equivalent
-reparse-point and file-identity validation is available; this avoids turning a
-workspace path race into a privileged file read. A reviewed Windows project
-file can still be selected explicitly with `DCG_CONFIG=.dcg.toml`.
+Automatic project discovery reads only a direct regular file bound to the
+handle it actually reads: `O_NOFOLLOW` plus descriptor identity on Unix
+(including macOS), and a reparse-point-refusing open plus handle/path identity
+on native Windows. A symlinked `.dcg.toml` is refused on every platform.
 
 To deliberately trust the complete repository config for one invocation, select
 it explicitly: `DCG_CONFIG=.dcg.toml dcg ...`. An explicit file has the same

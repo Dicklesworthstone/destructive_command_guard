@@ -62,7 +62,7 @@ pub(crate) enum ConfigSource {
 /// file type can be rejected.
 pub(crate) fn read_config_file_bounded(path: &Path, source: ConfigSource) -> Option<String> {
     #[cfg(not(unix))]
-    if matches!(source, ConfigSource::AutoProject | ConfigSource::System) {
+    if non_unix_source_is_unsupported(source) {
         warn_and_ignore_non_unix_restricted_config(path, source);
         return None;
     }
@@ -142,6 +142,11 @@ fn open_config_file_for_source(path: &Path, source: ConfigSource) -> io::Result<
         }
     }
 
+    #[cfg(windows)]
+    if source == ConfigSource::AutoProject {
+        return open_restricted_windows_project_config(path);
+    }
+
     #[cfg(not(unix))]
     if source != ConfigSource::Untrusted {
         return Err(io::Error::new(
@@ -151,6 +156,67 @@ fn open_config_file_for_source(path: &Path, source: ConfigSource) -> io::Result<
     }
 
     fs::File::open(path)
+}
+
+/// Restricted sources a non-Unix build cannot validate and therefore ignores.
+///
+/// Windows validates the automatic project config (see
+/// [`open_restricted_windows_project_config`]); the system layer stays
+/// ignored there because trusting `%ProgramData%\dcg` needs an ACL check std
+/// cannot express, and standard users may create folders under `ProgramData`.
+#[cfg(not(unix))]
+const fn non_unix_source_is_unsupported(source: ConfigSource) -> bool {
+    match source {
+        ConfigSource::System => true,
+        ConfigSource::AutoProject => !cfg!(windows),
+        ConfigSource::Untrusted => false,
+    }
+}
+
+/// Open an automatic project config on Windows with the Unix policy's
+/// guarantees: never follow a symlink or junction at the leaf, accept only a
+/// regular file, and read from the handle whose identity was checked.
+///
+/// `FILE_FLAG_OPEN_REPARSE_POINT` opens a reparse point as itself rather than
+/// its target (the `O_NOFOLLOW` analogue), so a symlinked `.dcg.toml` shows the
+/// reparse attribute on the opened handle and is rejected. The path is then
+/// re-inspected and must still name a non-reparse regular file with the same
+/// size and timestamps as the handle, which binds the reported path to the
+/// bytes read. Project config is enforcement-only (#218), so this validation
+/// guards what dcg reports and reads, not what the file may authorize.
+#[cfg(windows)]
+fn open_restricted_windows_project_config(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let denied = |message: &str| io::Error::new(io::ErrorKind::PermissionDenied, message);
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let opened = file.metadata()?;
+    if opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(denied(
+            "symlinks and reparse points are not permitted for this config source",
+        ));
+    }
+    if !opened.is_file() {
+        return Err(denied("config source is not a regular file"));
+    }
+
+    let at_path = fs::symlink_metadata(path)?;
+    if at_path.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !at_path.is_file()
+        || at_path.file_size() != opened.file_size()
+        || at_path.creation_time() != opened.creation_time()
+        || at_path.last_write_time() != opened.last_write_time()
+    {
+        return Err(denied("config path changed while it was being validated"));
+    }
+
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -350,7 +416,7 @@ fn failed_config_read_outcome(
         ),
         Ok(_) => {
             #[cfg(not(unix))]
-            if matches!(source, ConfigSource::AutoProject | ConfigSource::System) {
+            if non_unix_source_is_unsupported(source) {
                 return (
                     ConfigFileStatus::IgnoredUnsupported,
                     Some(
@@ -9698,12 +9764,12 @@ low = "disabled"
             true,
         );
         let traced_outcome = traced_outcome.expect("tracing requested");
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             assert!(traced_layer.is_some());
             assert_eq!(traced_outcome.status, ConfigFileStatus::Loaded);
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             assert!(traced_layer.is_none());
             assert_eq!(traced_outcome.status, ConfigFileStatus::IgnoredUnsupported);
@@ -9892,7 +9958,54 @@ low = "disabled"
         assert!(read_config_file_bounded(&path, ConfigSource::System).is_none());
     }
 
-    #[cfg(not(unix))]
+    /// Windows loads a regular automatic project config and refuses a
+    /// symlinked one, matching the Unix `O_NOFOLLOW` policy; the system layer
+    /// stays ignored there (no ACL validation).
+    #[cfg(windows)]
+    #[test]
+    fn windows_auto_project_config_loads_regular_files_and_rejects_reparse_points() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join(".dcg.toml");
+        std::fs::write(&path, "[general]\nfail_closed = true\n").unwrap();
+
+        assert!(read_config_file_bounded(&path, ConfigSource::AutoProject).is_some());
+        let (layer, outcome) = Config::load_layer_from_file_with_outcome(
+            &path,
+            ConfigSource::AutoProject,
+            ConfigFileLayer::AutomaticProject,
+            ConfigFileAuthority::EnforcementOnly,
+            true,
+        );
+        assert!(layer.is_some());
+        assert_eq!(
+            outcome.expect("tracing requested").status,
+            ConfigFileStatus::Loaded
+        );
+        assert!(
+            read_config_file_bounded(
+                &temp.path().join("missing.dcg.toml"),
+                ConfigSource::AutoProject
+            )
+            .is_none()
+        );
+        assert!(
+            read_config_file_bounded(temp.path(), ConfigSource::AutoProject).is_none(),
+            "a directory is not a regular file"
+        );
+
+        // Symlink creation needs Developer Mode or elevation; when the host
+        // allows it, the link itself must be refused.
+        let link = temp.path().join("linked.dcg.toml");
+        if std::os::windows::fs::symlink_file(&path, &link).is_ok() {
+            assert!(read_config_file_bounded(&link, ConfigSource::AutoProject).is_none());
+        }
+
+        assert!(read_config_file_bounded(&path, ConfigSource::System).is_none());
+    }
+
+    #[cfg(not(any(unix, windows)))]
     #[test]
     fn non_unix_auto_project_config_is_ignored_even_when_regular() {
         use tempfile::TempDir;
@@ -9912,13 +10025,6 @@ low = "disabled"
         assert_eq!(
             outcome.expect("tracing requested").status,
             ConfigFileStatus::IgnoredUnsupported
-        );
-        assert!(
-            read_config_file_bounded(
-                &temp.path().join("missing.dcg.toml"),
-                ConfigSource::AutoProject
-            )
-            .is_none()
         );
     }
 

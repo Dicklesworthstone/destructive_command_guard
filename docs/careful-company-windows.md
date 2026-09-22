@@ -80,8 +80,9 @@ centrally managed file before the agent session starts:
 $env:DCG_CONFIG = 'C:\Company\Security\dcg-config.toml'
 ```
 
-The implicit `%ProgramData%\dcg` layer and automatic repository config are not
-trusted on native Windows until dcg can validate Windows ACLs and reparse points.
+The implicit `%ProgramData%\dcg` layer is not trusted on native Windows until dcg
+can validate Windows ACLs (standard users may create folders under
+`ProgramData`). Automatic repository config is loaded, enforcement-only.
 See [Windows paths and limitations](windows.md#file-locations-on-windows).
 
 ## Why ordinary development still works
