@@ -514,7 +514,6 @@ When a command is blocked, dcg outputs JSON to stdout:
     "ruleId": "core.git:reset-hard",
     "packId": "core.git",
     "severity": "critical",
-    "confidence": 0.95,
     "allowOnceCode": "a1b2c3",
     "allowOnceFullHash": "sha256:abc123...",
     "remediation": {
@@ -533,7 +532,7 @@ When a command is blocked, dcg outputs JSON to stdout:
 | `ruleId` | `string` | Stable pattern ID (e.g., `"core.git:reset-hard"`) for allowlisting |
 | `packId` | `string` | Pack that matched (e.g., `"core.git"`) |
 | `severity` | `string` | `"critical"`, `"high"`, `"medium"`, or `"low"` |
-| `confidence` | `number` | Match confidence 0.0-1.0 |
+| `confidence` | `number?` | **Reserved; not currently emitted.** The evaluator computes a score (`crate::confidence::compute_match_confidence`) and uses it for warn thresholds, but it is not plumbed to the wire — both deny sites in `src/main.rs` pass `None` ("confidence not yet available in `PatternMatch`"), and serde omits it. Measured absent on all five denial shapes: core.git, core.filesystem, an embedded AST rule, a credential write, and the PowerShell semantic classifier. Do not key on it. |
 | `allowOnceCode` | `string` | Short code for `dcg allow-once` |
 | `remediation.safeAlternative` | `string?` | Suggested safe command |
 
