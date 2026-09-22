@@ -559,7 +559,7 @@ fn lex(segment: &str, dialect: ShellDialect) -> Vec<Vec<Lexed>> {
         let separator = match byte {
             b'\n' | b'|' | b')' => true,
             // Grouping at a command's start; an argument expression after it.
-            b'(' => !(powershell && !current_is_empty),
+            b'(' => !powershell || current_is_empty,
             b';' => powershell,
             b'{' | b'}' => powershell,
             b'&' => {
@@ -1107,7 +1107,11 @@ mod tests {
             "echo x > ~/.ssh/authorized_keys",
             "Write-Output x >> $HOME/.ssh/authorized_keys",
             "Write-Output x >> $env:HOME/.ssh/authorized_keys",
-            "Write-Output x >> ${env:USERPROFILE}\\.ssh\\authorized_keys",
+            // Braced `${env:…}`; split so it cannot read as a format argument.
+            concat!(
+                "Write-Output x >> ${",
+                "env:USERPROFILE}\\.ssh\\authorized_keys"
+            ),
             "Write-Output x >> \"$env:USERPROFILE\\.ssh\\authorized_keys\"",
             "Write-Output x >> C:\\Users\\bob\\.ssh\\authorized_keys",
             "Write-Output x>>~/.ssh/authorized_keys",
