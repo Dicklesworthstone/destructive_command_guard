@@ -158,6 +158,75 @@ fn allows_checkout_discard_during_rebase() {
     );
 }
 
+/// Every worktree-discard spelling recovers, and nothing else does.
+///
+/// `RECOVERY_PATTERNS` is a list of rule NAMES, so it silently falls behind the
+/// moment `core.git` gains another way to spell the same discard. That is not
+/// hypothetical: `checkout-discard-cwd` was added without being listed, and the
+/// damage was wider than the one new spelling. Recovery unblocked the
+/// `checkout-discard` that `git checkout -- .` reports, the residual re-scan
+/// then matched the unlisted `checkout-discard-cwd` on the same line, and the
+/// deny stood — so five spellings stopped recovering, including ones whose own
+/// rule had been listed since the feature shipped.
+///
+/// This asserts the behaviour instead of the list. A new rule in this family
+/// fails here by doing the wrong thing, which is the only version of this check
+/// that cannot itself go stale.
+///
+/// The second half is what keeps it honest: a rebase in progress must not be a
+/// skeleton key. `reset --hard`, `clean`, a force push, and the two history
+/// rewrites added alongside `checkout-discard-cwd` all stay denied.
+#[test]
+fn recovery_covers_every_worktree_discard_spelling() {
+    let repo = TempRepo::new("discard-spelling-matrix");
+    repo.start_rebase_merge();
+    let outside = TempRepo::new("discard-spelling-outside");
+
+    for command in [
+        "git checkout -- .",
+        "git checkout .",
+        "git checkout -- src/",
+        "git checkout ./src",
+        "git checkout HEAD .",
+        "git checkout HEAD -- .",
+        "git checkout main -- .",
+        "git restore .",
+        "git restore -- .",
+        "git restore src/",
+        "git restore --worktree .",
+    ] {
+        let during = run_hook_in(&repo.root, command);
+        assert!(
+            during.trim().is_empty(),
+            "a rebase is in progress, so {command:?} is the recovery operation \
+             this module exists for and must be allowed; got: {during}"
+        );
+
+        // The same spelling outside a rebase must still deny, or the row above
+        // is measuring a rule that stopped matching rather than recovery.
+        let normally = run_hook_in(&outside.root, command);
+        assert!(
+            !normally.trim().is_empty(),
+            "{command:?} must still be blocked outside a rebase; got: {normally}"
+        );
+    }
+
+    // A recovery signal unblocks the discard family and nothing else.
+    for command in [
+        concat!("git re", "set --hard"),
+        concat!("git cl", "ean -fd"),
+        concat!("git pu", "sh --force"),
+        "git filter-branch --all",
+        "git reflog expire --expire=now --all",
+    ] {
+        let during = run_hook_in(&repo.root, command);
+        assert!(
+            !during.trim().is_empty(),
+            "a rebase in progress must not unblock {command:?}; got: {during}"
+        );
+    }
+}
+
 #[test]
 fn rebase_recovery_history_records_final_allow_only() {
     history_test::retry_history_scenario("rebase recovery history", rebase_history_attempt);

@@ -53,9 +53,26 @@ pub const MAX_PERMIT_TTL_SECS: u64 = 600;
 ///
 /// Any of these pattern IDs may be unblocked when a recovery signal is
 /// active. Everything else stays on the normal block path.
+///
+/// **This list has to grow whenever a new worktree-discard rule is added to
+/// `core.git`, and a missing entry fails loudly in two different ways.** When
+/// `checkout-discard-cwd` arrived without being added here, the `--`-spelled
+/// `git checkout -- .` broke too, not only the bare form: recovery unblocked
+/// the `checkout-discard` the command reported, the residual re-scan then
+/// matched the unlisted `checkout-discard-cwd` on the same line, and the deny
+/// stood under a rule the caller was never offered a permit for. Five
+/// spellings stopped recovering from one omission.
+///
+/// `recovery_covers_every_worktree_discard_spelling` asserts the behaviour
+/// rather than the list, so the next rule in this family is caught by what it
+/// does rather than by anyone remembering to edit this array.
 pub const RECOVERY_PATTERNS: &[&str] = &[
     "checkout-discard",
     "checkout-ref-discard",
+    // `git checkout .` / `git checkout HEAD .` — the same discard, spelled
+    // without `--`. Restarting from a clean worktree is the recovery operation
+    // this module exists for, so the two spellings cannot disagree.
+    "checkout-discard-cwd",
     "restore-worktree",
     "restore-worktree-explicit",
 ];

@@ -363,6 +363,11 @@ fn test_audit_backtracking_requirements() {
         (
             "core.git",
             HashSet::from([
+                // `git checkout .` must not fire on `checkout -b .` or
+                // `checkout --orphan .`, and "not one of these subcommands" is
+                // a pair of negative lookaheads, so this rule is on the
+                // backtracking engine like its `checkout-ref-discard` sibling.
+                "checkout-discard-cwd",
                 "checkout-ref-discard",
                 // The clean rules walk from the subcommand to their flag over
                 // git's real option-parsing window, which ends at a bare `--`
