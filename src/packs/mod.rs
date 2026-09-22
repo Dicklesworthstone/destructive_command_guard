@@ -1537,6 +1537,21 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "/sed",
             "perl",
             "/perl",
+            // Windows disk-destruction verbs (cross-platform baseline, #451):
+            // `format-volume` / `clear-disk` / `vssadmin-delete-shadows` /
+            // `wmic-shadowcopy-delete` in `core::filesystem`. This quick-reject
+            // is case-sensitive, so every case the pack's keyword list carries
+            // is repeated here, exactly as the `windows.system` row does.
+            "Format-Volume",
+            "format-volume",
+            "FORMAT-VOLUME",
+            "Clear-Disk",
+            "clear-disk",
+            "CLEAR-DISK",
+            "vssadmin",
+            "VSSADMIN",
+            "wmic",
+            "WMIC",
             // `redirect-truncate-git-internals-relative` needs this: a relative
             // target carries none of the redirect keywords below, which all
             // require the path to begin with `/`, `~`, `$` or a quote. Without

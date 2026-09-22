@@ -1056,6 +1056,66 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
             ),
         ],
     );
+    // Windows disk-destruction verbs (cross-platform baseline, #451).
+    m.insert(
+        "core.filesystem:format-volume",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Confirm the target volume with `Get-Volume` before reformatting anything",
+            )
+            .with_command("Get-Volume"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Add `-WhatIf` to report what Format-Volume would do without erasing the volume",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Reformatting a volume must be run interactively by a human who has confirmed the target drive",
+            ),
+        ],
+    );
+    m.insert(
+        "core.filesystem:clear-disk",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Inspect the disk with `Get-Disk` before removing its partitions and data",
+            )
+            .with_command("Get-Disk"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Add `-WhatIf` to preview Clear-Disk without changing the disk",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Wiping a disk must be run interactively by a human who has confirmed the target disk number",
+            ),
+        ],
+    );
+    let shadow_copy_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "List the shadow copies first with `vssadmin list shadows`",
+        )
+        .with_command("vssadmin list shadows"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Manage restore points through System Protection instead of deleting shadow copies",
+        ),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Deleting Volume Shadow Copies destroys the local means of recovery; do not run it unattended",
+        ),
+    ];
+    m.insert(
+        "core.filesystem:vssadmin-delete-shadows",
+        shadow_copy_suggestions.clone(),
+    );
+    m.insert(
+        "core.filesystem:wmic-shadowcopy-delete",
+        shadow_copy_suggestions,
+    );
 }
 
 /// Register suggestions for heredoc pattern rules.

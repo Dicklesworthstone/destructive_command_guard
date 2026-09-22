@@ -107,6 +107,16 @@ Commands containing these keywords are checked against this pack:
 - `install`
 - `sed`
 - `perl`
+- `Format-Volume`
+- `format-volume`
+- `FORMAT-VOLUME`
+- `Clear-Disk`
+- `clear-disk`
+- `CLEAR-DISK`
+- `vssadmin`
+- `VSSADMIN`
+- `wmic`
+- `WMIC`
 - `.git/`
 - `.ssh/`
 - `.gnupg/`
@@ -226,6 +236,10 @@ These patterns match potentially destructive commands:
 | `redirect-append-git-internals-relative` | shell appending redirect into a .git directory adds repository configuration or hook code that git runs on its next invocation. | critical |
 | `redirect-truncate-dynamic-path` | shell redirect to a dynamic or escaped path may truncate a sensitive file and requires human approval. | high |
 | `fork-bomb` | This is a fork bomb: it recursively spawns processes until the system is unusable. | critical |
+| `format-volume` | PowerShell Format-Volume erases a volume and everything on it. | critical |
+| `clear-disk` | PowerShell Clear-Disk removes a disk's partitions and data. | critical |
+| `vssadmin-delete-shadows` | vssadmin delete shadows destroys Volume Shadow Copies (System Restore and backups). | critical |
+| `wmic-shadowcopy-delete` | wmic shadowcopy delete destroys Volume Shadow Copies. | critical |
 
 ### Allowlist Guidance
 

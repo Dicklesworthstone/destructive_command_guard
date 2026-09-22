@@ -61,14 +61,22 @@
           ">/",
           ">|",
           ">~",
+          "CLEAR-DISK",
+          "Clear-Disk",
+          "FORMAT-VOLUME",
+          "Format-Volume",
+          "VSSADMIN",
+          "WMIC",
           "btrfs",
           "cgdisk",
+          "clear-disk",
           "cp",
           "dd",
           "diskutil",
           "dmsetup",
           "fdisk",
           "find",
+          "format-volume",
           "gdisk",
           "git",
           "install",
@@ -100,7 +108,9 @@
           "unlink",
           "vgreduce",
           "vgremove",
-          "wipefs"
+          "vssadmin",
+          "wipefs",
+          "wmic"
         ],
         "first_match": "core.git"
       }

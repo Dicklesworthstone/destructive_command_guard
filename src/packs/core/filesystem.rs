@@ -1545,8 +1545,27 @@ fn command_contains_empty_paren_pair(command: &str) -> bool {
 /// Mirroring that necessary lexical condition here preserves a superset of the
 /// pack's matches without cold-initializing the pack for unrelated commands.
 pub(crate) fn filesystem_keyword_candidate(command: &str) -> bool {
+    // The trailing four are the Windows disk-destruction verbs (cross-platform
+    // baseline, #451), matched case-insensitively so the base spelling covers
+    // every case. `wmic` alone selects the pack; the `wmic-shadowcopy-delete`
+    // regex then requires `shadowcopy delete`, so ordinary `wmic` queries still
+    // fall through to Allow.
     const COMMAND_WORDS: &[&str] = &[
-        "rm", "find", "unlink", "truncate", "shred", "tar", "dd", "mv", "cp", "ln", "rsync",
+        "rm",
+        "find",
+        "unlink",
+        "truncate",
+        "shred",
+        "tar",
+        "dd",
+        "mv",
+        "cp",
+        "ln",
+        "rsync",
+        "vssadmin",
+        "wmic",
+        "format-volume",
+        "clear-disk",
     ];
     // `credential-file-write` writers (plus the GNU-prefixed spellings macOS
     // users install from Homebrew coreutils). These are common words —
@@ -3596,6 +3615,19 @@ pub fn create_pack() -> Pack {
             "install",
             "sed",
             "perl",
+            // Windows disk-destruction verbs (cross-platform baseline, #451).
+            // Case variants are listed because the boundary-aware quick-reject
+            // matcher is case-sensitive, exactly as `windows.system` does.
+            "Format-Volume",
+            "format-volume",
+            "FORMAT-VOLUME",
+            "Clear-Disk",
+            "clear-disk",
+            "CLEAR-DISK",
+            "vssadmin",
+            "VSSADMIN",
+            "wmic",
+            "WMIC",
             ".git/",
             ".ssh/",
             ".gnupg/",
@@ -5120,6 +5152,66 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              needs a hard reboot, losing all unsaved work in every application.\n\n\
              There is no legitimate reason to run this shape. If you are testing \
              process limits, use `ulimit -u` in a disposable VM or container."
+        ),
+        // ----- Windows disk-destruction verbs (cross-platform baseline, #451/#252) -----
+        //
+        // The full Windows coverage lives in the `windows.system` pack, which is
+        // compiled everywhere but only DEFAULT-ENABLED on `cfg(windows)`
+        // (`packs/windows/mod.rs`). So on a macOS/Linux dcg driving a Windows box
+        // — over SSH, or a cross-platform agent — these verbs pass. These core
+        // rows give the highest-severity, zero-false-positive ones a baseline
+        // that is enabled everywhere, exactly as `powershell-remove-item-recursive`
+        // does for recursive `Remove-Item`. They are meaningless outside Windows,
+        // so matching them in any dialect (including the `powershell -Command
+        // '...'` / `cmd /c '...'` wrapper that re-evaluates its payload) is safe.
+        // Regexes are kept byte-identical to `windows.system`'s so the two cannot
+        // diverge silently; `windows.system` owns the fuller set (diskpart,
+        // Remove-Partition, cipher, bcdedit, …) for a real Windows build.
+        destructive_pattern!(
+            "format-volume",
+            r"(?i)\bformat-volume\b",
+            "PowerShell Format-Volume erases a volume and everything on it.",
+            Critical,
+            "`Format-Volume` reformats a volume, destroying every file on it with no undo. \
+             Under an agent hook this must be run by a human who has confirmed the target \
+             drive.\n\n\
+             Safer alternatives:\n\
+             - Confirm the volume first: `Get-Volume`.\n\
+             - Add `-WhatIf` to report what would happen without doing it."
+        ),
+        destructive_pattern!(
+            "clear-disk",
+            r"(?i)\bclear-disk\b",
+            "PowerShell Clear-Disk removes a disk's partitions and data.",
+            Critical,
+            "`Clear-Disk -RemoveData` deletes all partitions and data from a disk. There is \
+             no undo.\n\n\
+             Safer alternatives:\n\
+             - Inspect the disk first: `Get-Disk`.\n\
+             - Add `-WhatIf` to preview without changing anything."
+        ),
+        destructive_pattern!(
+            "vssadmin-delete-shadows",
+            r"(?i)\bvssadmin(?:\.exe)?\s+(?:[^|&\r\n]*\s+)?delete\s+shadows\b",
+            "vssadmin delete shadows destroys Volume Shadow Copies (System Restore and backups).",
+            Critical,
+            "`vssadmin delete shadows /all` removes the Volume Shadow Copies that System \
+             Restore and many backup tools depend on — a hallmark of ransomware, because it \
+             destroys the local means of recovery.\n\n\
+             Safer alternatives:\n\
+             - List them first: `vssadmin list shadows`.\n\
+             - Manage restore points through System Protection instead."
+        ),
+        destructive_pattern!(
+            "wmic-shadowcopy-delete",
+            r"(?i)\bwmic(?:\.exe)?\s+shadowcopy\s+delete\b",
+            "wmic shadowcopy delete destroys Volume Shadow Copies.",
+            Critical,
+            "`wmic shadowcopy delete` removes Volume Shadow Copies — the same \
+             recovery-destroying operation as `vssadmin delete shadows`, through a different \
+             tool.\n\n\
+             Safer alternatives:\n\
+             - List them first: `vssadmin list shadows`."
         ),
     ]
 }
@@ -8556,5 +8648,51 @@ mod classifier_guidance_tests {
             pack.check("rm -rf *").and_then(|matched| matched.name),
             Some(RM_RF_GENERAL_NAME)
         );
+    }
+
+    /// Windows disk-destruction verbs are caught on a non-Windows build too, so
+    /// a macOS/Linux dcg driving a Windows box does not miss them (#451). The
+    /// fuller set lives in the `cfg(windows)`-default-enabled `windows.system`
+    /// pack; these are its highest-severity, zero-false-positive baseline.
+    #[test]
+    fn windows_disk_destruction_verbs_block_cross_platform() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("Format-Volume -DriveLetter C", "format-volume"),
+            ("format-volume -driveletter c", "format-volume"),
+            ("FORMAT-VOLUME -DriveLetter D", "format-volume"),
+            ("Clear-Disk -Number 0 -RemoveData", "clear-disk"),
+            (
+                "vssadmin delete shadows /all /quiet",
+                "vssadmin-delete-shadows",
+            ),
+            (
+                "vssadmin.exe Delete Shadows /All",
+                "vssadmin-delete-shadows",
+            ),
+            ("wmic shadowcopy delete", "wmic-shadowcopy-delete"),
+        ] {
+            let matched = pack
+                .check(command)
+                .unwrap_or_else(|| panic!("{command} must be denied"));
+            assert_eq!(matched.name, Some(rule), "{command}");
+            assert_eq!(matched.severity, Severity::Critical, "{command}");
+        }
+
+        // The read-only / unrelated spellings of the same tools stay allowed —
+        // only the destructive subcommand blocks.
+        for command in [
+            "vssadmin list shadows",
+            "wmic process list",
+            "Get-Volume",
+            "Get-Disk",
+            "git format-patch -1",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|matched| matched.name)
+            );
+        }
     }
 }
