@@ -1235,6 +1235,19 @@ mod tests {
         }
     }
 
+    /// `path` spelled for a POSIX command line. On Windows that is the
+    /// git-bash form `C:/…`: the canonical `\\?\C:\…` would be read as
+    /// backslash escapes, which makes a resolver answer `None` for the wrong
+    /// reason and a fail-closed assertion pass vacuously.
+    fn sh(path: &Path) -> String {
+        let shown = path.display().to_string();
+        if cfg!(windows) {
+            shown.trim_start_matches(r"\\?\").replace('\\', "/")
+        } else {
+            shown
+        }
+    }
+
     impl Drop for Tree {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
@@ -1280,11 +1293,7 @@ mod tests {
         let base = tree.path("other");
         let repo = tree.path("repo");
         assert_eq!(
-            effective(
-                &tree,
-                &base,
-                &format!("cd {} && rm -rf build", repo.display())
-            ),
+            effective(&tree, &base, &format!("cd {} && rm -rf build", sh(&repo))),
             Some(repo.clone())
         );
         // Relative, and `..` collapsed the way `cd -P` would.
@@ -1332,7 +1341,7 @@ mod tests {
                 &base,
                 &format!(
                     "rm -rf build && cd {} && rm -rf build",
-                    tree.path("repo").display()
+                    sh(&tree.path("repo"))
                 )
             ),
             None
@@ -1371,11 +1380,11 @@ mod tests {
         let repo = tree.path("repo");
         for command in [
             // A `cd` the segment walk cannot see must not resolve to `base`.
-            format!("bash -c 'cd {} && rm -rf build'", repo.display()),
-            format!("eval \"cd {} && rm -rf build\"", repo.display()),
+            format!("bash -c 'cd {} && rm -rf build'", sh(&repo)),
+            format!("eval \"cd {} && rm -rf build\"", sh(&repo)),
             "xargs -I{} sh -c 'cd {} && rm -rf build'".to_string(),
             // Even an inert mention is a mention: dcg cannot prove it inert.
-            format!("cd {} && rm -rf cd", repo.display()),
+            format!("cd {} && rm -rf cd", sh(&repo)),
         ] {
             assert_eq!(
                 effective(&tree, &base, &command),
@@ -1433,10 +1442,7 @@ mod tests {
     fn recovery_cwd_follows_absolute_cd() {
         let tree = Tree::new("abs-cd");
         let repo = tree.path("repo");
-        let command = format!(
-            "cd {} && git restore --worktree --ours -- f.txt",
-            repo.display()
-        );
+        let command = format!("cd {} && git restore --worktree --ours -- f.txt", sh(&repo));
         assert_eq!(
             resolve(&tree, &tree.path("other"), &command),
             Some(repo.clone())
@@ -1524,7 +1530,7 @@ mod tests {
             ),
             Some(repo.join("sub"))
         );
-        let absolute = format!("git -C {} restore -- f", repo.display());
+        let absolute = format!("git -C {} restore -- f", sh(&repo));
         assert_eq!(
             resolve(&tree, &tree.path("other"), &absolute),
             Some(repo.clone())

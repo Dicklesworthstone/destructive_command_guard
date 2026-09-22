@@ -20837,8 +20837,18 @@ mod tests {
 
     // ---- Crush installer (#388) -------------------------------------------
 
+    /// A Unix-style absolute test path made absolute on the host too:
+    /// `is_absolute` is host-specific, so `/opt/dcg` needs a drive on Windows.
+    fn host_abs(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_string()
+        }
+    }
+
     fn crush_entry_for(path: &str) -> serde_json::Value {
-        crush_dcg_hook_entry_for_executable(std::path::Path::new(path)).expect("entry")
+        crush_dcg_hook_entry_for_executable(std::path::Path::new(&host_abs(path))).expect("entry")
     }
 
     fn crush_pre_tool_use(config: &serde_json::Value) -> &Vec<serde_json::Value> {
@@ -20852,7 +20862,16 @@ mod tests {
         let entry = crush_entry_for("/opt/tools/dcg");
         assert_eq!(entry["name"], "dcg");
         assert_eq!(entry["matcher"], "^bash$");
-        assert_eq!(entry["command"], "/opt/tools/dcg");
+        assert_eq!(
+            dcg_command_program(entry["command"].as_str().unwrap()),
+            Some(host_abs("/opt/tools/dcg"))
+        );
+        if cfg!(unix) {
+            assert_eq!(
+                entry["command"], "/opt/tools/dcg",
+                "a plain path stays unquoted"
+            );
+        }
         assert_eq!(entry["timeout"], 5);
         // Crush's entry is flat: no Claude-style nested `hooks`/`type`.
         assert!(entry.get("hooks").is_none());
@@ -20945,7 +20964,11 @@ mod tests {
 
         let entries = crush_pre_tool_use(&config);
         assert_eq!(entries.len(), 2, "dcg first, then the user's hook");
-        assert_eq!(entries[0]["command"], "/new/dcg", "dcg-owned: refreshed");
+        assert_eq!(
+            entries[0]["command"],
+            crush_entry_for("/new/dcg")["command"],
+            "dcg-owned: refreshed"
+        );
         assert_eq!(entries[0]["matcher"], "^bash$", "dcg-owned: refreshed");
         assert_eq!(entries[0]["name"], "my-guard", "host-owned: preserved");
         assert_eq!(entries[0]["timeout"], 30, "host-owned: preserved");
@@ -29486,12 +29509,21 @@ exclude = ["target/**"]
         );
 
         let unknown = evaluate_at_dialect(command, DialectArg::Unknown);
-        assert!(
-            !matches!(unknown, EvaluationDecision::Deny),
-            "the default dialect now denies this, so the union is complete: \
-             invert this assertion and remove the caveats from `dcg test --help` \
-             and `DialectArg::Unknown` (#451)"
-        );
+        if cfg!(windows) {
+            // The windows.* packs are default-on only on Windows builds, and
+            // their Unknown-dialect regex fallback covers this spelling there.
+            assert!(
+                matches!(unknown, EvaluationDecision::Deny),
+                "a Windows build's default packs must deny this in every dialect"
+            );
+        } else {
+            assert!(
+                !matches!(unknown, EvaluationDecision::Deny),
+                "the default dialect now denies this, so the union is complete: \
+                 invert this assertion and remove the caveats from `dcg test --help` \
+                 and `DialectArg::Unknown` (#451)"
+            );
+        }
     }
 
     fn evaluate_at_dialect(command: &str, dialect: DialectArg) -> EvaluationDecision {
