@@ -34014,9 +34014,11 @@ mod tests {
                 result.pattern_info
             );
         }
-        // PowerShell spellings are not classified by this rule; the redirect
-        // rules keep judging them on their own terms.
-        assert_ne!(
+        // #477: this asserted the opposite — that a PowerShell payload was
+        // not classified — which is exactly how an append to a login file got
+        // through from a PowerShell tool. The payload's dialect decides how
+        // the words are read, not whether they are judged.
+        assert_eq!(
             rule("echo x >> ~/.zshrc", ShellDialect::PowerShell),
             credential
         );
