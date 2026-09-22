@@ -8,6 +8,267 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+#[test]
+fn ruby_flags_options_cannot_hide_truncation_from_hook_or_cli() {
+    let home = home();
+    for (source, blocked) in [
+        (
+            "File.open('.ssh/known_hosts', 'a', flags: File::TRUNC)",
+            true,
+        ),
+        (
+            "File.open('.ssh/known_hosts', flags: File::TRUNC, mode: 'a')",
+            true,
+        ),
+        (
+            "File.open('.ssh/known_hosts', mode: 'w', flags: File::APPEND)",
+            true,
+        ),
+        (
+            "File.write('.ssh/known_hosts', 'host', mode: 'a', flags: File::TRUNC)",
+            true,
+        ),
+        (
+            "File.write('.ssh/known_hosts', 'host', flags: File::APPEND)",
+            true,
+        ),
+        ("File.open('.bashrc', flags: File::WRONLY)", true),
+        ("File.open('.ssh/known_hosts', **options, mode: 'a')", true),
+        (
+            "File.open('.ssh/known_hosts', mode: File::WRONLY, flags: File::APPEND)",
+            false,
+        ),
+        (
+            "File.write('.ssh/known_hosts', {flags: File::TRUNC}, mode: 'a')",
+            false,
+        ),
+        (
+            "File.open('/etc/shadow', mode: 'r', flags: File::NOFOLLOW)",
+            false,
+        ),
+        ("File.open('/tmp/proposal', 'a', flags: File::TRUNC)", false),
+    ] {
+        assert_program(
+            "ruby",
+            source,
+            home.path(),
+            blocked.then_some("credential-file-write"),
+        );
+    }
+}
+
+#[test]
+fn low_level_open_apis_reach_hook_cli_and_stdin() {
+    let home = home();
+    for (exe, source) in [
+        (
+            "python3",
+            "import os; os.open('/etc/shadow', os.O_WRONLY | os.O_TRUNC)",
+        ),
+        (
+            "python3",
+            "from os import open as acquire, O_WRONLY as W; acquire(path='.bashrc', flags=W)",
+        ),
+        (
+            "python3",
+            "import os; os.open(os.path.expanduser('~/.ssh/authorized_keys'), os.O_WRONLY | os.O_APPEND)",
+        ),
+        ("node", "require('fs').openSync('.bashrc', 'w')"),
+        ("node", "require('node:fs/promises').open('.bashrc', 'a')"),
+        (
+            "node",
+            "const {openSync: acquire, constants: C} = require('fs'); acquire('.bashrc', C.O_WRONLY | C.O_CREAT)",
+        ),
+        (
+            "node",
+            "const fs = require('fs'); fs.open('/etc/shadow', fs.constants.O_RDWR, () => {})",
+        ),
+        ("ruby", "File.sysopen('.bashrc', 'w')"),
+        ("ruby", "IO.sysopen('.bashrc', File::WRONLY | File::TRUNC)"),
+        (
+            "ruby",
+            "F = File; flags = F::WRONLY | F::APPEND; F.open('.bashrc', flags)",
+        ),
+        ("ruby", "IO.write('.bashrc', 'data')"),
+    ] {
+        assert_program(exe, source, home.path(), Some("credential-file-write"));
+        let quoted = format!("'{}'", source.replace('\'', "'\\''"));
+        assert_decision(
+            &format!("{exe} 0<<< {quoted}"),
+            home.path(),
+            Some("credential-file-write"),
+        );
+    }
+}
+
+#[test]
+fn low_level_open_modes_preserve_only_real_append_exemptions() {
+    let home = home();
+    for (exe, source, blocked) in [
+        (
+            "python3",
+            "import os; os.open('.ssh/known_hosts', os.O_WRONLY | os.O_APPEND)",
+            false,
+        ),
+        (
+            "python3",
+            "import os; os.open('.ssh/known_hosts', os.O_WRONLY | os.O_APPEND | os.O_TRUNC)",
+            true,
+        ),
+        (
+            "python3",
+            "import os; os.open('.ssh/known_hosts', os.O_WRONLY | os.O_APPEND | extra)",
+            true,
+        ),
+        (
+            "node",
+            "const fs = require('fs'); fs.openSync('.ssh/known_hosts', fs.constants.O_WRONLY | fs.constants.O_APPEND)",
+            false,
+        ),
+        (
+            "node",
+            "const fs = require('fs'); fs.openSync('.ssh/known_hosts', fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_TRUNC)",
+            true,
+        ),
+        (
+            "node",
+            "require('fs').openSync('.ssh/known_hosts', 'a')",
+            false,
+        ),
+        (
+            "node",
+            "require('fs').openSync('.ssh/known_hosts', 'r+')",
+            true,
+        ),
+        (
+            "ruby",
+            "File.open('.ssh/known_hosts', mode: File::WRONLY | File::APPEND)",
+            false,
+        ),
+        (
+            "ruby",
+            "File.open('.ssh/known_hosts', mode: File::WRONLY | File::APPEND | File::TRUNC)",
+            true,
+        ),
+        ("ruby", "File.sysopen('.ssh/known_hosts', File::RDWR)", true),
+    ] {
+        assert_program(
+            exe,
+            source,
+            home.path(),
+            blocked.then_some("credential-file-write"),
+        );
+    }
+}
+
+#[test]
+fn low_level_open_reads_safe_paths_and_data_remain_allowed() {
+    let home = home();
+    for (exe, source) in [
+        (
+            "python3",
+            "import os; os.open('/etc/shadow', os.O_RDONLY | os.O_CLOEXEC)",
+        ),
+        (
+            "python3",
+            "import os; os.open('/tmp/proposal', os.O_WRONLY | os.O_CREAT)",
+        ),
+        (
+            "python3",
+            "import os; os = storage; os.open('.bashrc', os.O_WRONLY)",
+        ),
+        ("node", "require('fs').openSync('/etc/shadow', 'r')"),
+        (
+            "node",
+            "const fs = require('fs'); fs.openSync('/etc/shadow', fs.constants.O_RDONLY)",
+        ),
+        ("node", "require('fs').openSync('/tmp/proposal', 'w')"),
+        (
+            "node",
+            "const fs = require('unrelated'); fs.openSync('.bashrc', 'w')",
+        ),
+        ("ruby", "File.sysopen('/etc/shadow', File::RDONLY)"),
+        ("ruby", "File.sysopen('/tmp/proposal', 'w')"),
+        ("ruby", "IO.open('.bashrc', 'w')"),
+        ("ruby", "puts \"File.sysopen('.bashrc', 'w')\""),
+    ] {
+        assert_program(exe, source, home.path(), None);
+    }
+    assert_decision(
+        "cat <<'DATA'\nimport os; os.open('/etc/shadow', os.O_WRONLY)\nDATA",
+        home.path(),
+        None,
+    );
+}
+
+#[test]
+fn low_level_open_rule_grants_remain_independent() {
+    for (allowed, denied, target) in [
+        ("credential-file-write", "git-internals-write", ".bashrc"),
+        (
+            "git-internals-write",
+            "credential-file-write",
+            ".git/config",
+        ),
+    ] {
+        let home = home();
+        fs::write(
+            home.path().join("xdg/dcg/allowlist.toml"),
+            format!(
+                "[[allow]]\nrule = \"core.filesystem:{allowed}\"\nreason = \"one reviewed rule\"\n"
+            ),
+        )
+        .expect("rule allowlist");
+        for (exe, first, second) in [
+            (
+                "python3",
+                format!("import os; os.open('{target}', os.O_WRONLY)"),
+                "import os; os.open('.bashrc', os.O_WRONLY); os.open('.git/config', os.O_WRONLY)",
+            ),
+            (
+                "node",
+                format!("require('fs').openSync('{target}', 'w')"),
+                "const fs = require('fs'); fs.openSync('.git/config', 'w'); fs.openSync('.bashrc', 'w')",
+            ),
+            (
+                "ruby",
+                format!("File.sysopen('{target}', 'w')"),
+                "File.sysopen('.bashrc', 'w'); File.sysopen('.git/config', 'w')",
+            ),
+        ] {
+            assert_program(exe, &first, home.path(), None);
+            assert_program(exe, second, home.path(), Some(denied));
+        }
+    }
+}
+
+#[test]
+fn ruby_write_data_is_not_an_append_mode_option() {
+    let home = home();
+    for (source, blocked) in [
+        ("File.write('.ssh/known_hosts', {mode: 'a'})", true),
+        (
+            "File.binwrite('.ssh/known_hosts', {nested: {mode: 'a'}})",
+            true,
+        ),
+        (
+            "File.write('.ssh/known_hosts', {mode: 'w'}, mode: 'a')",
+            false,
+        ),
+        (
+            "File.write('.ssh/known_hosts', 'host', mode: 'a', **options)",
+            true,
+        ),
+    ] {
+        assert_program(
+            "ruby",
+            source,
+            home.path(),
+            blocked.then_some("credential-file-write"),
+        );
+    }
+}
+
 fn home() -> tempfile::TempDir {
     let home = tempfile::tempdir().expect("isolated home");
     fs::create_dir_all(home.path().join("xdg/dcg")).expect("config directory");

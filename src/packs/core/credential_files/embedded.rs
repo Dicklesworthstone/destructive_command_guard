@@ -114,6 +114,91 @@ enum Access {
     Write,
 }
 
+/// Semantic effects of proven standard-library open constants, NOT native
+/// numeric flag values. The latter differ between Linux, macOS and Windows;
+/// interpreting the analyzed program with this host's libc would be unsound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenFlags(u8);
+
+impl OpenFlags {
+    const WRITE: u8 = 1;
+    const CREATE: u8 = 2;
+    const TRUNCATE: u8 = 4;
+    const APPEND: u8 = 8;
+    const UNKNOWN: u8 = 16;
+
+    fn named(name: &str) -> Option<Self> {
+        let effects = match name {
+            "WRONLY" | "RDWR" => Self::WRITE,
+            "CREAT" => Self::CREATE,
+            "TRUNC" => Self::TRUNCATE,
+            "APPEND" => Self::APPEND,
+            "RDONLY" | "EXCL" | "NOFOLLOW" | "CLOEXEC" | "SYNC" | "DSYNC" | "RSYNC"
+            | "NONBLOCK" | "NDELAY" | "NOCTTY" | "BINARY" | "TEXT" | "LARGEFILE" | "NOATIME"
+            | "DIRECTORY" | "DIRECT" => 0,
+            _ => return None,
+        };
+        Some(Self(effects))
+    }
+
+    fn prefixed(name: &str) -> Option<Self> {
+        Self::named(name.strip_prefix("O_")?)
+    }
+
+    /// Keep creation/truncation effects until Ruby has ORed its `flags:`
+    /// option into the mode. In particular, `w` plus APPEND still truncates.
+    fn from_mode(mode: &str) -> Option<Self> {
+        let access = mode_access(mode)?;
+        let effects = match mode.as_bytes().first()? {
+            b'w' => Self::WRITE | Self::CREATE | Self::TRUNCATE,
+            b'x' => Self::WRITE | Self::CREATE,
+            b'a' => Self::WRITE | Self::CREATE | Self::APPEND,
+            b'r' if access == Access::Write => Self::WRITE,
+            b'r' => 0,
+            _ => return None,
+        };
+        Some(Self(effects))
+    }
+
+    fn access(self) -> Option<Access> {
+        // O_APPEND controls later writes; it cannot undo O_TRUNC at open.
+        if self.0 & Self::TRUNCATE != 0 {
+            return Some(Access::Write);
+        }
+        if self.0 & (Self::WRITE | Self::CREATE) != 0 {
+            return Some(if self.0 & (Self::APPEND | Self::UNKNOWN) == Self::APPEND {
+                Access::Append
+            } else {
+                Access::Write
+            });
+        }
+        (self.0 & Self::UNKNOWN == 0).then_some(Access::Read)
+    }
+}
+
+/// Preserve known mutation bits across OR with an opaque operand, but never
+/// use a partial flag expression to grant the append-only exception. Do not
+/// apply this rule to AND/XOR/addition: they can clear or change known bits.
+fn combine_open_flags(left: Option<Value>, right: Option<Value>) -> Option<Value> {
+    match (left, right) {
+        (Some(Value::Flags(left)), Some(Value::Flags(right))) => {
+            Some(Value::Flags(OpenFlags(left.0 | right.0)))
+        }
+        (Some(Value::Flags(flags)), _) | (_, Some(Value::Flags(flags))) => {
+            Some(Value::Flags(OpenFlags(flags.0 | OpenFlags::UNKNOWN)))
+        }
+        _ => None,
+    }
+}
+
+fn flag_access(node: &Syntax<'_>, language: Language, env: &Bindings) -> Option<Access> {
+    match value(node, language, env, 0)? {
+        Value::Text(mode) => mode_access(&mode),
+        Value::Flags(flags) => flags.access(),
+        _ => None,
+    }
+}
+
 /// Read/update distinction matters: `r+` writes, while plain `r` does not.
 /// Append/update still uses O_APPEND. Invalid or dynamic modes are not proof
 /// of append-only access; callers that are explicit writers treat them as Write.
@@ -428,6 +513,10 @@ enum Value {
     GetEnv,
     PythonJoin,
     OsTruncate,
+    OsOpen,
+    Flags(OpenFlags),
+    FsConstants,
+    RubyOpenConstants,
     Shutil,
     Transfer(transfers::Operation),
     ExpandUser,
@@ -671,6 +760,7 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
                 (Some("builtins"), "str") => Some(Value::StringifyPath),
                 (Some("pathlib"), "Path" | "PosixPath") => Some(Value::PathConstructor),
                 (Some("os"), "truncate") => Some(Value::OsTruncate),
+                (Some("os"), "open") => Some(Value::OsOpen),
                 (Some("os"), "rename" | "replace") => {
                     Some(Value::Transfer(transfers::Operation::Rename))
                 }
@@ -678,6 +768,7 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
                 (Some("os"), "path") => Some(Value::OsPath),
                 (Some("os"), "environ") => Some(Value::Environment),
                 (Some("os"), "getenv") => Some(Value::GetEnv),
+                (Some("os"), name) => OpenFlags::prefixed(name).map(Value::Flags),
                 (Some("os.path"), "expanduser") => Some(Value::ExpandUser),
                 (Some("os.path"), "join") => Some(Value::PythonJoin),
                 // `import os.path as p` binds `p` to the `os.path` module.
@@ -792,6 +883,8 @@ fn js_module(module: &str) -> Option<Value> {
 fn js_member(object: &Value, name: &str) -> Option<Value> {
     match (object, name) {
         (Value::Fs, "promises") => Some(Value::Fs),
+        (Value::Fs, "constants") => Some(Value::FsConstants),
+        (Value::FsConstants, name) => OpenFlags::prefixed(name).map(Value::Flags),
         (Value::Fs, name) if is_js_api(name) => Some(Value::Api(name.into())),
         (Value::NodeOs, "homedir") => Some(Value::HomeDirectory),
         (Value::NodePath, "posix") => Some(Value::NodePath),
@@ -807,6 +900,8 @@ fn is_js_api(name: &str) -> bool {
     matches!(
         name,
         "writeFile"
+            | "open"
+            | "openSync"
             | "writeFileSync"
             | "appendFile"
             | "appendFileSync"
@@ -823,6 +918,16 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
     if let Some(text) = literal(node, language) {
         return Some(Value::Text(text));
     }
+    if matches!(
+        node.kind().as_ref(),
+        "binary_operator" | "binary_expression" | "binary"
+    ) && node.field("operator").is_some_and(|op| op.text() == "|")
+    {
+        return combine_open_flags(
+            value(&node.field("left")?, language, env, depth + 1),
+            value(&node.field("right")?, language, env, depth + 1),
+        );
+    }
     match node.kind().as_ref() {
         "identifier" | "constant" => env.get(node.text().as_ref()).cloned(),
         "parenthesized_expression" => value(
@@ -831,6 +936,18 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
             env,
             depth + 1,
         ),
+        "parenthesized_statements" if language == Language::Ruby => {
+            // Ruby permits a statement sequence in parentheses. Only unwrap
+            // a single expression: earlier statements could change bindings.
+            let mut children = node
+                .children()
+                .filter(|child| child.is_named() && child.kind() != "comment");
+            let child = children.next()?;
+            if children.next().is_some() {
+                return None;
+            }
+            value(&child, language, env, depth + 1)
+        }
         "attribute" | "member_expression" => {
             let object = value(&node.field("object")?, language, env, depth + 1)?;
             let member = node
@@ -842,6 +959,7 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                 (Value::Io | Value::Builtins, "open") => Some(Value::Open),
                 (Value::Builtins, "str") => Some(Value::StringifyPath),
                 (Value::Os, "truncate") => Some(Value::OsTruncate),
+                (Value::Os, "open") => Some(Value::OsOpen),
                 (Value::Os, "rename" | "replace") => {
                     Some(Value::Transfer(transfers::Operation::Rename))
                 }
@@ -849,6 +967,7 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                 (Value::Os, "path") => Some(Value::OsPath),
                 (Value::Os, "environ") => Some(Value::Environment),
                 (Value::Os, "getenv") => Some(Value::GetEnv),
+                (Value::Os, name) => OpenFlags::prefixed(name).map(Value::Flags),
                 (Value::Environment, "get") => Some(Value::EnvironmentGet),
                 (Value::OsPath, "expanduser") => Some(Value::ExpandUser),
                 (Value::OsPath, "join") => Some(Value::PythonJoin),
@@ -860,6 +979,17 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                 (Value::Path(path), "open") => Some(Value::PathOpen(path)),
                 (Value::Path(path), "rename" | "replace") => Some(Value::PathTransfer(path)),
                 (object, name) if language == Language::Node => js_member(&object, name),
+                _ => None,
+            }
+        }
+        "scope_resolution" if language == Language::Ruby => {
+            let scope = value(&node.field("scope")?, language, env, depth + 1)?;
+            let name = node.field("name")?;
+            match (scope, name.text().as_ref()) {
+                (Value::File | Value::Io, "Constants") => Some(Value::RubyOpenConstants),
+                (Value::File | Value::Io | Value::RubyOpenConstants, name) => {
+                    OpenFlags::named(name).map(Value::Flags)
+                }
                 _ => None,
             }
         }
@@ -1190,47 +1320,7 @@ fn write_call(
     }
     let args = arguments(node);
     if language == Language::Ruby {
-        if value(&node.field("receiver")?, language, env, 0)? != Value::File {
-            return None;
-        }
-        let method = node.field("method")?.text().into_owned();
-        if !matches!(
-            method.as_str(),
-            "write" | "binwrite" | "open" | "new" | "truncate"
-        ) {
-            return None;
-        }
-        let (path, expands) = path_value(args.first()?, language, env)?;
-        if method == "truncate" {
-            return Some(("File.truncate".into(), path, Access::Write, expands));
-        }
-        let opener = matches!(method.as_str(), "open" | "new");
-        let mut mode = if opener {
-            args.get(1)
-                .filter(|n| !matches!(n.kind().as_ref(), "pair" | "hash"))
-                .map(|n| text_value(n, language, env))
-        } else {
-            None
-        };
-        for arg in &args {
-            for pair in arg.dfs().filter(|n| n.kind() == "pair") {
-                let key = pair.field("key")?.text().into_owned();
-                if key.trim_matches([':', '\'', '"']) == "mode" {
-                    mode = Some(
-                        pair.field("value")
-                            .and_then(|n| text_value(&n, language, env)),
-                    );
-                }
-            }
-        }
-        let access = match mode {
-            Some(Some(mode)) => mode_access(&mode)?,
-            Some(None) if opener => return None,
-            Some(None) => Access::Write,
-            None if opener => Access::Read,
-            None => Access::Write,
-        };
-        return Some((format!("File.{method}"), path, access, expands));
+        return ruby_write_call(node, &args, env);
     }
     let function = node.field("function")?;
     match value(&function, language, env, 0)? {
@@ -1257,10 +1347,27 @@ fn write_call(
             let (path, expands) = path_value(&python_argument(&args, 0, "path")?, language, env)?;
             Some((function.text().into_owned(), path, Access::Write, expands))
         }
+        Value::OsOpen if language == Language::Python => {
+            let (path, expands) = path_value(&python_argument(&args, 0, "path")?, language, env)?;
+            let flags = python_argument(&args, 1, "flags")?;
+            // os.open accepts integer flags, unlike the high-level open's
+            // string mode. A mode string here is not a valid file operation.
+            let Value::Flags(flags) = value(&flags, language, env, 0)? else {
+                return None;
+            };
+            Some((function.text().into_owned(), path, flags.access()?, expands))
+        }
         Value::Api(api)
             if language == Language::Node && transfers::js_operation(&api).is_none() =>
         {
             let (path, expands) = path_value(args.first()?, language, env)?;
+            if matches!(api.as_str(), "open" | "openSync") {
+                let access = match args.get(1) {
+                    Some(flags) => flag_access(flags, language, env)?,
+                    None => Access::Read,
+                };
+                return Some((format!("fs.{api}"), path, access, expands));
+            }
             if matches!(api.as_str(), "truncate" | "truncateSync") {
                 return Some((format!("fs.{api}"), path, Access::Write, expands));
             }
@@ -1275,6 +1382,122 @@ fn write_call(
             let access = js_access(options, if stream { "flags" } else { "flag" }, default, env);
             Some((format!("fs.{api}"), path, access, expands))
         }
+        _ => None,
+    }
+}
+
+fn ruby_write_call(
+    node: &Syntax<'_>,
+    args: &[Syntax<'_>],
+    env: &Bindings,
+) -> Option<(String, String, Access, bool)> {
+    let receiver = value(&node.field("receiver")?, Language::Ruby, env, 0)?;
+    let method = node.field("method")?.text().into_owned();
+    let class = match receiver {
+        Value::File => "File",
+        // IO.open/new take a descriptor, not a filename. Do not assign File's
+        // path semantics to those methods simply because of inheritance.
+        Value::Io if matches!(method.as_str(), "sysopen" | "write" | "binwrite") => "IO",
+        _ => return None,
+    };
+    if !matches!(
+        method.as_str(),
+        "write" | "binwrite" | "open" | "new" | "sysopen" | "truncate"
+    ) {
+        return None;
+    }
+    let (path, expands) = path_value(args.first()?, Language::Ruby, env)?;
+    let api = format!("{class}.{method}");
+    if method == "truncate" {
+        return Some((api, path, Access::Write, expands));
+    }
+    if method == "sysopen" {
+        let access = match args.get(1) {
+            Some(flags) => flag_access(flags, Language::Ruby, env)?,
+            None => Access::Read,
+        };
+        return Some((api, path, access, expands));
+    }
+    let opener = matches!(method.as_str(), "open" | "new");
+    let mut mode = if opener {
+        args.get(1)
+            .filter(|n| !matches!(n.kind().as_ref(), "pair" | "hash"))
+            .map(|n| ruby_mode_flags(n, env))
+    } else {
+        None
+    };
+    let mut extra_flags = OpenFlags(0);
+    // Only top-level options after the path (and write payload) affect mode.
+    // File.write(path, {mode: 'a'}) writes that hash as DATA using default
+    // truncation. Recursing into it would wrongly exempt known_hosts.
+    for arg in args.iter().skip(if opener { 1 } else { 2 }) {
+        for option in std::iter::once(arg.clone()).chain(arg.children()) {
+            if option.kind() == "hash_splat_argument" {
+                mode = Some(None);
+                extra_flags = OpenFlags(OpenFlags::UNKNOWN);
+                continue;
+            }
+            if option.kind() != "pair" {
+                continue;
+            }
+            let key = option.field("key")?.text().into_owned();
+            match key.trim_matches([':', '\'', '"']) {
+                "mode" => {
+                    mode = Some(option.field("value").and_then(|n| ruby_mode_flags(&n, env)));
+                }
+                "flags" => {
+                    // Unlike `mode`, this option requires integer flags.
+                    extra_flags = option
+                        .field("value")
+                        .and_then(|n| value(&n, Language::Ruby, env, 0))
+                        .and_then(|value| match value {
+                            Value::Flags(flags) => Some(flags),
+                            _ => None,
+                        })
+                        .unwrap_or(OpenFlags(OpenFlags::UNKNOWN));
+                }
+                _ => {}
+            }
+        }
+    }
+    let mode = match mode {
+        Some(Some(mode)) => mode,
+        Some(None) => OpenFlags(OpenFlags::UNKNOWN),
+        None if opener => OpenFlags(0),
+        // Default writes truncate unless an offset is supplied. An opaque
+        // offset cannot prove append-only access; explicit modes still can.
+        None => {
+            let offset = args.get(2).is_some_and(|node| {
+                !matches!(
+                    node.kind().as_ref(),
+                    "pair" | "hash" | "hash_splat_argument"
+                )
+            });
+            OpenFlags(
+                OpenFlags::WRITE
+                    | OpenFlags::CREATE
+                    | if offset {
+                        OpenFlags::UNKNOWN
+                    } else {
+                        OpenFlags::TRUNCATE
+                    },
+            )
+        }
+    };
+    // `flags:` is bitwise-ORed with mode, independent of option order. A
+    // truncation bit therefore wins even when the mode promises appending.
+    let access = match OpenFlags(mode.0 | extra_flags.0).access() {
+        Some(access) => access,
+        None if opener => return None,
+        None => Access::Write,
+    };
+    Some((api, path, access, expands))
+}
+
+fn ruby_mode_flags(node: &Syntax<'_>, env: &Bindings) -> Option<OpenFlags> {
+    match value(node, Language::Ruby, env, 0)? {
+        Value::Text(mode) => OpenFlags::from_mode(&mode),
+        Value::Flags(flags) => Some(flags),
         _ => None,
     }
 }
@@ -1311,8 +1534,7 @@ fn js_access(options: Option<&Syntax<'_>>, key: &str, default: Access, env: &Bin
         if name == key {
             access = property
                 .field("value")
-                .and_then(|n| text_value(&n, Language::Node, env))
-                .and_then(|mode| mode_access(&mode))
+                .and_then(|n| flag_access(&n, Language::Node, env))
                 .unwrap_or(Access::Write);
         } else if name.starts_with('[') {
             access = Access::Write;

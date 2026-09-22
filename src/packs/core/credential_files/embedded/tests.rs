@@ -1,5 +1,416 @@
 use super::*;
 
+#[test]
+fn ruby_flags_options_are_combined_with_the_effective_mode() {
+    for (source, blocked) in [
+        (
+            "File.open('.ssh/known_hosts', 'a', flags: File::TRUNC)",
+            true,
+        ),
+        (
+            "File.open('.ssh/known_hosts', flags: File::TRUNC, mode: 'a')",
+            true,
+        ),
+        (
+            "File.new('.ssh/known_hosts', mode: 'ab:utf-8', flags: File::TRUNC)",
+            true,
+        ),
+        (
+            "File.open('.ssh/known_hosts', mode: 'w', flags: File::APPEND)",
+            true,
+        ),
+        ("File.open('.bashrc', flags: File::WRONLY)", true),
+        ("File.open('.bashrc', mode: 'r', flags: File::CREAT)", true),
+        (
+            "File.write('.ssh/known_hosts', 'host', flags: File::TRUNC, mode: 'a')",
+            true,
+        ),
+        (
+            "IO.binwrite('.ssh/known_hosts', 'host', mode: 'a', flags: File::TRUNC)",
+            true,
+        ),
+        (
+            "File.write('.ssh/known_hosts', 'host', flags: File::APPEND)",
+            true,
+        ),
+        (
+            "File.open('.ssh/known_hosts', mode: 'a', flags: extra)",
+            true,
+        ),
+        ("File.open('.ssh/known_hosts', **options, mode: 'a')", true),
+        (
+            "File.open('.ssh/known_hosts', mode: 'a', flags: File::NONBLOCK)",
+            false,
+        ),
+        (
+            "File.open('.ssh/known_hosts', mode: File::WRONLY, flags: File::APPEND)",
+            false,
+        ),
+        (
+            "File.write('.ssh/known_hosts', 'host', mode: 'a', flags: File::NONBLOCK)",
+            false,
+        ),
+        (
+            "File.write('.ssh/known_hosts', {flags: File::TRUNC}, mode: 'a')",
+            false,
+        ),
+        (
+            "File.open('/etc/shadow', mode: 'r', flags: File::NOFOLLOW)",
+            false,
+        ),
+        (
+            "File.open('/tmp/proposal', mode: 'a', flags: File::TRUNC)",
+            false,
+        ),
+    ] {
+        let hits = scan_extracted(source, ScriptLanguage::Ruby).expect("complete analysis");
+        assert_eq!(!hits.is_empty(), blocked, "{source}: {hits:?}");
+    }
+}
+
+#[test]
+fn ruby_parenthesized_flags_require_one_expression() {
+    for (source, blocked) in [
+        ("File.sysopen('.bashrc', (File::WRONLY))", true),
+        (
+            "File.sysopen('.ssh/known_hosts', (File::WRONLY | File::APPEND))",
+            false,
+        ),
+        (
+            "File.sysopen('.ssh/known_hosts', (File::WRONLY | File::APPEND | File::TRUNC))",
+            true,
+        ),
+        (
+            "File.sysopen('.ssh/known_hosts', (File::WRONLY; File::RDONLY))",
+            false,
+        ),
+        ("File.sysopen('.ssh/known_hosts', ())", false),
+    ] {
+        let hits = scan_extracted(source, ScriptLanguage::Ruby).expect("complete analysis");
+        assert_eq!(!hits.is_empty(), blocked, "{source}: {hits:?}");
+    }
+}
+
+#[test]
+fn low_level_open_writers_reach_the_shared_policy() {
+    for (language, source) in [
+        (
+            ScriptLanguage::Python,
+            "import os; os.open('/etc/shadow', os.O_WRONLY | os.O_TRUNC)",
+        ),
+        (
+            ScriptLanguage::Python,
+            "from os import open as acquire, O_WRONLY as W, O_CREAT as C; acquire(path='.bashrc', flags=W | C)",
+        ),
+        (
+            ScriptLanguage::Python,
+            "import os as disk; flags = disk.O_RDWR; acquire = disk.open; acquire('.bashrc', flags)",
+        ),
+        (
+            ScriptLanguage::Python,
+            "import os; os.open(os.path.expanduser('~/.ssh/authorized_keys'), os.O_WRONLY | os.O_APPEND)",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "require('fs').openSync('.bashrc', 'w')",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "require('fs').open('.bashrc', 'r+', () => {})",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "require('node:fs/promises').open('.bashrc', 'a')",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "import {open as acquire, constants as C} from 'node:fs/promises'; acquire('.bashrc', C.O_WRONLY | C.O_CREAT)",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "const {openSync: acquire, constants: C} = require('fs'); const {O_WRONLY: W} = C; acquire('.bashrc', W | C.O_TRUNC)",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "const fs = require('fs'); fs['openSync']('.bashrc', fs['constants']['O_WRONLY'])",
+        ),
+        (
+            ScriptLanguage::TypeScript,
+            "import * as fs from 'node:fs'; const mode: number = fs.constants.O_RDWR; fs.openSync('.bashrc', mode)",
+        ),
+        (ScriptLanguage::Ruby, "File.sysopen('.bashrc', 'w')"),
+        (
+            ScriptLanguage::Ruby,
+            "IO.sysopen('.bashrc', File::WRONLY | File::TRUNC)",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "F = File; mode = F::WRONLY | F::CREAT; F.open('.bashrc', mode)",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "File.new('.bashrc', File::Constants::RDWR)",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "File.open('.bashrc', mode: File::WRONLY | File::APPEND)",
+        ),
+        (ScriptLanguage::Ruby, "IO.write('.bashrc', 'data')"),
+        (ScriptLanguage::Ruby, "IO.binwrite('.bashrc', 'data')"),
+    ] {
+        let hits = scan_extracted(source, language).expect("complete analysis");
+        assert_eq!(hits.len(), 1, "{source}: {hits:?}");
+        assert_eq!(hits[0].rule, shell::CREDENTIAL_FILE_WRITE_NAME, "{source}");
+        assert!(source.get(hits[0].span.clone()).is_some(), "{source}");
+    }
+}
+
+#[test]
+fn low_level_open_append_requires_complete_non_truncating_flags() {
+    for (language, prefix, operation, append, truncate) in [
+        (
+            ScriptLanguage::Python,
+            "import os; ",
+            "os.open",
+            "os.O_WRONLY | os.O_CREAT | os.O_APPEND",
+            "os.O_TRUNC",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "const fs = require('fs'); ",
+            "fs.openSync",
+            "fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND",
+            "fs.constants.O_TRUNC",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "",
+            "File.sysopen",
+            "File::WRONLY | File::CREAT | File::APPEND",
+            "File::TRUNC",
+        ),
+    ] {
+        for (flags, blocked) in [
+            (append.to_string(), false),
+            (format!("{append} | {truncate}"), true),
+            (format!("{truncate} | ({append})"), true),
+            (format!("{append} | extra"), true),
+            (format!("extra | ({append})"), true),
+        ] {
+            let source = format!("{prefix}{operation}('/home/u/.ssh/known_hosts', {flags})");
+            let hits = scan_extracted(&source, language).expect("complete analysis");
+            assert_eq!(!hits.is_empty(), blocked, "{source}: {hits:?}");
+        }
+    }
+    for source in [
+        "const fs = require('fs'); fs.writeFileSync('.ssh/known_hosts', 'host', {flag: fs.constants.O_WRONLY | fs.constants.O_APPEND})",
+        "const fs = require('fs'); fs.createWriteStream('.ssh/known_hosts', {flags: fs.constants.O_WRONLY | fs.constants.O_APPEND})",
+    ] {
+        assert!(
+            scan_extracted(source, ScriptLanguage::JavaScript)
+                .unwrap()
+                .is_empty(),
+            "{source}"
+        );
+    }
+    let source = "const fs = require('fs'); fs.appendFileSync('.ssh/known_hosts', 'host', {flag: fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_TRUNC})";
+    assert_eq!(
+        scan_extracted(source, ScriptLanguage::JavaScript)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn low_level_open_read_modes_and_unproven_receivers_stay_clear() {
+    for (language, source) in [
+        (
+            ScriptLanguage::Python,
+            "import os; os.open('/etc/shadow', os.O_RDONLY | os.O_CLOEXEC)",
+        ),
+        (
+            ScriptLanguage::Python,
+            "import os; os.open('/etc/shadow', flags)",
+        ),
+        (
+            ScriptLanguage::Python,
+            "import os; os.open('/etc/shadow', 'w')",
+        ),
+        (
+            ScriptLanguage::Python,
+            "import os; open('/etc/shadow', os.O_WRONLY)",
+        ),
+        (
+            ScriptLanguage::Python,
+            "import os; os = storage; os.open('/etc/shadow', os.O_WRONLY)",
+        ),
+        (
+            ScriptLanguage::Python,
+            "from unrelated import open, O_WRONLY; open('/etc/shadow', O_WRONLY)",
+        ),
+        (
+            ScriptLanguage::Python,
+            "import os; os.open('/tmp/output', os.O_WRONLY | os.O_TRUNC)",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "require('fs').openSync('/etc/shadow')",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "const fs = require('fs'); fs.openSync('/etc/shadow', fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "const fs = require('fs'); const constants = storage; fs.openSync('/etc/shadow', constants.O_WRONLY)",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "function f(require) { require('fs').openSync('/etc/shadow', 'w') }",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "require('fs').openSync('/tmp/output', 'w')",
+        ),
+        (ScriptLanguage::Ruby, "File.sysopen('/etc/shadow')"),
+        (
+            ScriptLanguage::Ruby,
+            "File.open('/etc/shadow', File::RDONLY | File::NONBLOCK)",
+        ),
+        (ScriptLanguage::Ruby, "IO.open('/etc/shadow', 'w')"),
+        (ScriptLanguage::Ruby, "IO.new('/etc/shadow', 'w')"),
+        (
+            ScriptLanguage::Ruby,
+            "File = Store; File.sysopen('/etc/shadow', 'w')",
+        ),
+        (ScriptLanguage::Ruby, "File.sysopen('~/.bashrc', 'w')"),
+        (
+            ScriptLanguage::Ruby,
+            "puts \"File.sysopen('/etc/shadow', 'w')\"",
+        ),
+    ] {
+        assert!(
+            scan_extracted(source, language)
+                .expect("complete analysis")
+                .is_empty(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn low_level_open_creating_and_read_write_flags_are_not_read_only() {
+    for (language, source) in [
+        (
+            ScriptLanguage::Python,
+            "import os; os.open('.bashrc', os.O_RDONLY | os.O_CREAT)",
+        ),
+        (
+            ScriptLanguage::Python,
+            "import os; os.open('.ssh/known_hosts', os.O_RDWR)",
+        ),
+        (
+            ScriptLanguage::Python,
+            "import os; os.open('.ssh/known_hosts', os.O_RDONLY | os.O_TRUNC)",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "const fs = require('fs'); fs.openSync('.ssh/known_hosts', fs.constants.O_CREAT | fs.constants.O_EXCL)",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "File.open('.ssh/known_hosts', File::RDWR)",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "File.write('.ssh/known_hosts', 'host', mode: File::WRONLY | File::TRUNC)",
+        ),
+    ] {
+        assert_eq!(
+            scan_extracted(source, language).unwrap().len(),
+            1,
+            "{source}"
+        );
+    }
+    // Internal semantic bits must never be confused with native numeric flags.
+    assert_eq!(
+        OpenFlags::named("RDONLY").unwrap().access(),
+        Some(Access::Read)
+    );
+    assert!(OpenFlags::prefixed("WRONLY").is_none());
+    assert!(OpenFlags::named("CUSTOM_FLAG").is_none());
+    assert!(combine_open_flags(None, None).is_none());
+    let Some(Value::Flags(partial)) = combine_open_flags(
+        Some(Value::Flags(OpenFlags::named("RDONLY").unwrap())),
+        None,
+    ) else {
+        panic!("partial flags");
+    };
+    assert_eq!(partial.access(), None);
+}
+
+#[test]
+fn ruby_write_payload_cannot_supply_an_append_only_mode() {
+    for source in [
+        "File.write('.ssh/known_hosts', {mode: 'a'})",
+        "File.binwrite('.ssh/known_hosts', {nested: {mode: 'a'}})",
+        "IO.write('.ssh/known_hosts', {mode: 'a'})",
+        "File.write('.ssh/known_hosts', 'host', mode: 'a', **options)",
+    ] {
+        assert_eq!(
+            scan_extracted(source, ScriptLanguage::Ruby).unwrap().len(),
+            1,
+            "{source}"
+        );
+    }
+    for source in [
+        "File.write('.ssh/known_hosts', {mode: 'w'}, mode: 'a')",
+        "File.write('.ssh/known_hosts', 'host', mode: File::WRONLY | File::APPEND)",
+        "IO.write('.ssh/known_hosts', 'host', mode: 'a')",
+    ] {
+        assert!(
+            scan_extracted(source, ScriptLanguage::Ruby)
+                .unwrap()
+                .is_empty(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn low_level_open_keeps_both_rules_and_assignment_effects() {
+    for (language, source) in [
+        (
+            ScriptLanguage::Python,
+            "import os; os.open('.bashrc', os.O_WRONLY); os = os.open('.git/config', os.O_WRONLY)",
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            "let fs = require('fs'); fs.openSync('.git/config', 'w'); fs = fs.openSync('.bashrc', 'w')",
+        ),
+        (
+            ScriptLanguage::Ruby,
+            "File.sysopen('.bashrc', 'w'); File = File.sysopen('.git/config', 'w')",
+        ),
+    ] {
+        let mut actual: Vec<_> = scan_extracted(source, language)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.rule)
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(
+            actual,
+            [
+                shell::CREDENTIAL_FILE_WRITE_NAME,
+                shell::GIT_INTERNALS_WRITE_NAME
+            ],
+            "{source}"
+        );
+    }
+}
+
 fn denied(code: &str, language: Language) -> bool {
     let mut hits = Vec::new();
     inspect(code, language, 0..code.len(), &mut hits);
