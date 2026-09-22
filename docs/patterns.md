@@ -264,6 +264,14 @@ Some patterns refine their rule IDs based on detected arguments:
 - For Ruby `system`/`exec`/`Open3`/backticks and Perl shell calls, literal
   payloads produce rule IDs with suffixes such as `.rm_rf` and
   `.rm_rf_catastrophic`.
+- For Go `exec.Command`, a destructive literal payload produces the same
+  suffixes (example: `heredoc.go.exec_command.rm_rf_catastrophic`), read from
+  the call's arguments as the argv they are — so the split spelling
+  `exec.Command("rm", "-rf", "/home/user")` refines exactly like the single
+  literal `exec.Command("sh", "-c", "rm -rf /home/user")`. All four Go exec
+  rows report under `exec_command`: `.Run()`, `.Output()` and
+  `.CombinedOutput()` wrap that same call, and refining them separately would
+  mean two blocking IDs for one command.
 - For a **recursive delete** with a literal target outside a temp directory,
   `.non_temp` is appended and the severity becomes Critical (example:
   `heredoc.ruby.fileutils_rm_rf.non_temp`). Python's `shutil.rmtree` and Go's
@@ -287,6 +295,7 @@ command it denies:
 | `heredoc.ruby.fileutils_rm_rf` | `…fileutils_rm_rf.catastrophic` | accepted, never matches |
 | `heredoc.python.shutil_rmtree` | `…shutil_rmtree` | works |
 | `heredoc.go.os_removeall` | `…os_removeall` | works |
+| `heredoc.go.exec_command` | `…exec_command.rm_rf_catastrophic` | accepted, never matches |
 | `core.filesystem:rm-rf-root-home` | `core.filesystem:rm-rf-root-home` | works |
 
 The pattern is that a base ID is grantable exactly when the rule is sometimes

@@ -1499,6 +1499,36 @@ fn refine_go_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMatchMe
         suggestion: meta.suggestion.clone(),
     };
 
+    // Exact ids, not a prefix test, for the reason `refine_python_match` gives:
+    // an exec-sink pattern missing from this set registers at Medium and never
+    // escalates, so it warns on a real `rm -rf` and the command still runs.
+    // That is what all four of these did until #472 — Go registered the
+    // patterns, reported the finding, and allowed the command, while every
+    // other language denied the same payload.
+    //
+    // `detect_destructive_in_args` already reads a call's literals back as the
+    // argv they are, and its own docstring names `exec.Command("rm","-rf","/x")`
+    // as a shape it handles; nothing had ever called it for Go.
+    if is_go_exec_sink_rule(&meta.rule_id) {
+        if let Some(hit) = detect_destructive_in_args(matched_text) {
+            // Escalate to at least High so the AST path blocks even for a
+            // non-catastrophic target: the sink unambiguously runs the command.
+            let severity = match hit.severity {
+                Severity::Critical => Severity::Critical,
+                _ => Severity::High,
+            };
+            return RefinedMatchMeta {
+                rule_id: format!("{}.{}", meta.rule_id, hit.rule_suffix),
+                reason: hit.reason.to_string(),
+                severity,
+                suggestion: hit.suggestion.map(str::to_string),
+            };
+        }
+
+        // Dynamic / non-destructive payload: keep warn-only meta (fail-open).
+        return unchanged();
+    }
+
     if !is_recursive_delete_rule(&meta.rule_id) {
         return unchanged();
     }
@@ -3042,6 +3072,21 @@ fn is_temp_scratch_path(path: &str) -> bool {
     let candidate = path.strip_prefix("/private").unwrap_or(path);
     (has_path_prefix(candidate, "/tmp") || has_path_prefix(candidate, "/var/tmp"))
         && !contains_path_traversal(candidate)
+}
+
+/// Go's exec-sink rule ids, the set `refine_go_match` escalates (#472).
+///
+/// Only `exec.Command` itself is here. The three chained spellings
+/// (`.Run()`, `.Output()`, `.CombinedOutput()`) wrap the *same* call, and the
+/// bare pattern matches that inner call in every one of them, so escalating a
+/// chained id as well would report two blocking ids for one command — the
+/// allowlist trap #467 describes, where granting the id dcg showed you leaves
+/// the command denied under the id it did not. The chained patterns keep
+/// matching and keep reporting; they simply are not the ones that block.
+/// `every_go_exec_sink_escalates_a_destructive_payload_issue_472` asserts both
+/// halves: every shape blocks, and each blocks exactly once.
+fn is_go_exec_sink_rule(rule_id: &str) -> bool {
+    rule_id == "heredoc.go.exec_command"
 }
 
 /// Recursive-delete rule ids, by language, under #455's single policy.
@@ -5380,6 +5425,106 @@ mod tests {
             .expect("os.Remove should match");
         assert_eq!(single.rule_id, "heredoc.go.os_remove");
         assert_eq!(single.severity, Severity::High);
+    }
+
+    /// Go's exec sinks must escalate a destructive payload, and exactly once.
+    ///
+    /// This is #458's policy applied to the one language that never got it.
+    /// Go's four `exec.Command` patterns register at `Medium` under a comment
+    /// saying they are "refined at match time", but `refine_go_match` only ever
+    /// handled #455's temp carve-out, so nothing escalated them. The failure is
+    /// the quiet one `refine_python_match` warns about: the pattern matches, a
+    /// finding is reported, and the command runs.
+    ///
+    /// Nothing else caught it either. The exec-sink backstop is scoped out of
+    /// Go on the stated ground that Go "uses its own primary path", and the
+    /// raw-shell rescan needs contiguous destructive text a Go argv does not
+    /// have. Measured through the real hook, every spelling below was `allow`
+    /// while the Python twin denied under `heredoc.python:subprocess_run.*`.
+    ///
+    /// The single-blocking-id assertion is #467's invariant: `exec.Command($$$)`
+    /// and `exec.Command($$$).Run()` describe the same command, so escalating
+    /// both would report two blocking ids for one call and leave an allowlist
+    /// entry for the reported one denied under the other.
+    #[test]
+    fn every_go_exec_sink_escalates_a_destructive_payload_issue_472() {
+        let ast_matcher = AstMatcher::new();
+
+        fn program(statement: &str) -> String {
+            format!("package main\n\nimport \"os/exec\"\n\nfunc main() {{\n\t{statement}\n}}\n")
+        }
+        // Assembled rather than written out, so this file does not carry the
+        // literal text of a guarded command — same reason as the Python twin.
+        let rmrf = format!("{}{}{}", "rm", "\", \"-", "rf");
+
+        // Every call shape, in both payload spellings: the argv-split form,
+        // which only the AST path can read back as a command, and the single
+        // literal form.
+        for call in [
+            String::new(),
+            ".Run()".to_string(),
+            ".Output()".to_string(),
+            ".CombinedOutput()".to_string(),
+        ] {
+            let bind = if call.is_empty() || call == ".Run()" {
+                "_ ="
+            } else {
+                "_, _ ="
+            };
+            for payload in [
+                format!("\"{rmrf}\", \"/home/user\""),
+                format!(
+                    "\"sh\", \"-c\", \"{} /home/user\"",
+                    rmrf.replace("\", \"", " ")
+                ),
+            ] {
+                let code = program(&format!("{bind} exec.Command({payload}){call}"));
+                let matches = ast_matcher.find_matches(&code, ScriptLanguage::Go).unwrap();
+                let blocking: Vec<&str> = matches
+                    .iter()
+                    .filter(|hit| hit.severity.blocks_by_default())
+                    .map(|hit| hit.rule_id.as_str())
+                    .collect();
+                assert!(
+                    !blocking.is_empty(),
+                    "exec.Command({payload}){call} must block; got {:?}",
+                    matches
+                        .iter()
+                        .map(|hit| (&hit.rule_id, hit.severity))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    blocking.len(),
+                    1,
+                    "exec.Command({payload}){call} produced {blocking:?}; a second \
+                     blocking id for the same call shadows the reported rule and \
+                     defeats an allowlist entry for it (#467)"
+                );
+            }
+        }
+
+        // The other half of the refinement's job: the same sinks with a benign
+        // payload stay warn-only, so the assertions above measure escalation
+        // rather than a blanket deny on `exec.Command`.
+        for call in ["", ".Run()"] {
+            let code = program(&format!("_ = exec.Command(\"ls\", \"-l\"){call}"));
+            let matches = ast_matcher.find_matches(&code, ScriptLanguage::Go).unwrap();
+            assert!(
+                !matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                "exec.Command(\"ls\", \"-l\"){call} must stay warn-only; got {:?}",
+                matches
+                    .iter()
+                    .map(|hit| (&hit.rule_id, hit.severity))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                matches
+                    .iter()
+                    .any(|hit| hit.rule_id.starts_with("heredoc.go.exec_command")),
+                "the benign call must still be REPORTED, or the negative above \
+                 would pass on a pattern that stopped matching entirely"
+            );
+        }
     }
 
     #[test]

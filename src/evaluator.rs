@@ -25745,6 +25745,14 @@ fn evaluate_heredoc(
         // Php/Go use their own primary paths, so it finds nothing for them
         // without a caller-side check. Perl's scans are re-run there because a
         // timed-out `find_matches` takes them down with it.
+        //
+        // "Go uses its own primary path" was true of the patterns and false of
+        // the verdict until #472: all four `exec.Command` rows registered at
+        // Medium and `refine_go_match` had no exec-sink branch, so Go's primary
+        // path matched, reported, and allowed. Scoping a language out of this
+        // backstop asserts that its primary path *blocks*, not merely that it
+        // matches — `every_go_exec_sink_escalates_a_destructive_payload_issue_472`
+        // is what now holds up the Go half of that claim.
         if let Some(blocked) =
             exec_sink_backstop_verdict(command, &content, context, first_allowlist_hit)
         {
