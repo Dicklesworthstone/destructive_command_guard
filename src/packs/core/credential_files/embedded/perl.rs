@@ -1,7 +1,7 @@
 //! Bounded Perl protected-write fallback. Perl has no ast-grep grammar.
 //!
 //! A linear token regex separates executable words from comments and quoted
-//! data. Only open/sysopen, scalar constants, concatenation and proven Fcntl
+//! data. Only open/sysopen/truncate, scalar constants, concatenation and proven Fcntl
 //! flags are interpreted. This is not a Perl parser or a runtime evaluator.
 
 use super::{
@@ -10,7 +10,8 @@ use super::{
     resolved_path,
 };
 use regex::Regex;
-use std::collections::HashSet;
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::LazyLock;
 
@@ -39,10 +40,24 @@ struct Token<'a> {
 
 struct State {
     values: Bindings,
+    handles: HashMap<String, (ResolvedPath, Access)>,
     imports: HashSet<String>,
     fcntl: bool,
     home: bool,
     shadowed: HashSet<String>,
+    work: Cell<usize>,
+}
+
+/// Bound total token visits as well as source size and nesting. Otherwise
+/// overlapping argument scans could keep a quadratic worker alive after the
+/// caller's wall-clock deadline has expired.
+fn charge(work: &Cell<usize>) -> Result<(), &'static str> {
+    let left = work
+        .get()
+        .checked_sub(1)
+        .ok_or("protected-write Perl exceeds the work limit")?;
+    work.set(left);
+    Ok(())
 }
 
 pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str> {
@@ -52,10 +67,12 @@ pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str>
     let tokens = lex(code)?;
     let mut state = State {
         values: Bindings::new(),
+        handles: HashMap::new(),
         imports: HashSet::new(),
         fcntl: false,
         home: true,
         shadowed: HashSet::new(),
+        work: Cell::new(MAX_NODES * 8),
     };
     // Bare calls can be overridden by a declared sub, even when its body is
     // later in the source. CORE::open/sysopen remain unambiguous.
@@ -70,12 +87,13 @@ pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str>
         while pending.last().is_some_and(|(end, _, _)| *end <= index) {
             if let Some((_, name, value)) = pending.pop() {
                 state.values.remove(&name);
+                state.handles.remove(&name);
                 if let Some(value) = value {
                     state.values.insert(name, value);
                 }
             }
         }
-        if state.values.len() > 1024 || pending.len() > MAX_DEPTH {
+        if state.values.len() + state.handles.len() > 1024 || pending.len() > MAX_DEPTH {
             return Err("protected-write Perl source exceeds the binding limit");
         }
         let token = &tokens[index];
@@ -86,7 +104,7 @@ pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str>
         {
             state.fcntl = true;
             if token.text == "use" {
-                let end = statement_end(&tokens, index + 2)?;
+                let end = statement_end(&tokens, index + 2, &state.work)?;
                 let options = &tokens[index + 2..end];
                 if options.is_empty() {
                     state.imports.insert(":DEFAULT".into());
@@ -102,7 +120,7 @@ pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str>
         }
         if token.kind == Kind::Variable {
             if token.text == "$ENV" && tokens.get(index + 1).is_some_and(|next| next.text == "{") {
-                let end = matching_end(&tokens, index + 1)?;
+                let end = matching_end(&tokens, index + 1, &state.work)?;
                 if tokens
                     .get(end + 1)
                     .is_some_and(|next| matches!(next.text, "=" | ".=" | "|="))
@@ -114,7 +132,7 @@ pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str>
                 .get(index + 1)
                 .filter(|next| matches!(next.text, "=" | ".=" | "|=" | "+=" | "-="))
             {
-                let end = statement_end(&tokens, index + 2)?;
+                let end = statement_end(&tokens, index + 2, &state.work)?;
                 let right = value(&tokens[index + 2..end], &state, 0);
                 let before = state.values.get(token.text).cloned();
                 let assigned = match operator.text {
@@ -130,7 +148,7 @@ pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str>
             }
         }
         let api = token.text.strip_prefix("CORE::").unwrap_or(token.text);
-        if token.kind != Kind::Word || !matches!(api, "open" | "sysopen") {
+        if token.kind != Kind::Word || !matches!(api, "open" | "sysopen" | "truncate" | "close") {
             continue;
         }
         if token.text == api && state.shadowed.contains(api) {
@@ -139,7 +157,14 @@ pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str>
         if index > 0 && matches!(tokens[index - 1].text, "->" | "sub" | "&") {
             continue;
         }
-        let (args, end) = call_arguments(&tokens, index + 1)?;
+        let (args, end) = call_arguments(&tokens, index + 1, &state.work)?;
+        let handle = args.first().copied().and_then(handle_name);
+        if api == "close" {
+            if let Some(name) = handle {
+                state.handles.remove(name);
+            }
+            continue;
+        }
         let finding = if api == "open" {
             match args.as_slice() {
                 [_, specification] => two_argument_open(specification, &state),
@@ -156,7 +181,15 @@ pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str>
                 }
                 _ => None,
             }
-        } else if matches!(args.len(), 3 | 4) {
+        } else if api == "truncate" && args.len() == 2 {
+            if let Some((path, access)) = handle.and_then(|name| state.handles.get(name)) {
+                (*access != Access::Read).then(|| (path.clone(), Access::Write))
+            } else {
+                value(args[0], &state, 0)
+                    .and_then(resolved_path)
+                    .map(|path| (path, Access::Write))
+            }
+        } else if api == "sysopen" && matches!(args.len(), 3 | 4) {
             let flags = value(args[2], &state, 0).and_then(|value| match value {
                 Value::Flags(flags) => flags.access(),
                 _ => None,
@@ -169,6 +202,17 @@ pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str>
         } else {
             None
         };
+        if matches!(api, "open" | "sysopen") {
+            if let Some(name) = handle {
+                // A filehandle target is an output, not a path-valued scalar.
+                // Reopening it with an unresolved target also kills old proof.
+                state.values.remove(name);
+                state.handles.remove(name);
+                if let Some(finding) = &finding {
+                    state.handles.insert(name.to_string(), finding.clone());
+                }
+            }
+        }
         if let Some((path, access)) = finding {
             let end = tokens
                 .get(end.saturating_sub(1))
@@ -182,11 +226,22 @@ pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str>
             );
         }
     }
+    charge(&state.work)?;
     Ok(hits)
+}
+
+fn handle_name<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {
+    let token = match tokens {
+        [token] => token,
+        [declaration, token] if matches!(declaration.text, "my" | "our" | "local") => token,
+        _ => return None,
+    };
+    matches!(token.kind, Kind::Variable | Kind::Word).then_some(token.text)
 }
 
 fn lex(code: &str) -> Result<Vec<Token<'_>>, &'static str> {
     let mut tokens: Vec<Token<'_>> = Vec::new();
+    let mut heredocs = Vec::new();
     let mut offset = 0;
     while offset < code.len() {
         if tokens.len() >= MAX_NODES {
@@ -194,7 +249,12 @@ fn lex(code: &str) -> Result<Vec<Token<'_>>, &'static str> {
         }
         let rest = &code[offset..];
         let line_start = offset == 0 || code.as_bytes()[offset - 1] == b'\n';
-        if line_start && (rest.starts_with("__DATA__") || rest.starts_with("__END__")) {
+        if line_start
+            && matches!(
+                rest.lines().next().unwrap_or("").trim_end(),
+                "__DATA__" | "__END__"
+            )
+        {
             break;
         }
         if line_start
@@ -208,12 +268,36 @@ fn lex(code: &str) -> Result<Vec<Token<'_>>, &'static str> {
             }
             break;
         }
+        if let Some((label, indented, end)) = heredoc_header(code, offset)?
+            && crate::heredoc::is_literal_perl_print_heredoc(code, offset..end)
+        {
+            if heredocs.len() == MAX_DEPTH {
+                return Err("protected-write Perl exceeds the heredoc limit");
+            }
+            heredocs.push((label, indented));
+            tokens.push(Token {
+                text: &code[offset..end],
+                kind: Kind::Opaque,
+                span: offset..end,
+            });
+            offset = end;
+            continue;
+        }
         let found = TOKEN
             .find(rest)
             .ok_or("protected-write Perl tokenization failed")?;
         let raw = found.as_str();
         let start = offset;
         offset += raw.len();
+        if !heredocs.is_empty() && raw.chars().all(char::is_whitespace) {
+            if let Some(newline) = raw.find('\n') {
+                offset = start + newline + 1;
+                for (label, indented) in std::mem::take(&mut heredocs) {
+                    offset = heredoc_end(code, offset, label, indented)?;
+                }
+                continue;
+            }
+        }
         if raw.starts_with('#') || raw.chars().all(char::is_whitespace) {
             continue;
         }
@@ -234,7 +318,10 @@ fn lex(code: &str) -> Result<Vec<Token<'_>>, &'static str> {
                 return Err("protected-write Perl has an unterminated quote");
             }
             text = &raw[1..raw.len() - 1];
-        } else if matches!(raw, "q" | "qq" | "qw" | "qr" | "m" | "s" | "tr" | "y") {
+        } else if matches!(
+            raw,
+            "q" | "qq" | "qw" | "qx" | "qr" | "m" | "s" | "tr" | "y"
+        ) {
             let delimiter = offset + code[offset..].len() - code[offset..].trim_start().len();
             if code[delimiter..]
                 .chars()
@@ -257,13 +344,14 @@ fn lex(code: &str) -> Result<Vec<Token<'_>>, &'static str> {
                     offset = end;
                 }
             }
-        } else if raw == "/"
-            && tokens.last().is_none_or(|last| {
-                matches!(
-                    last.text,
-                    "=" | "=~" | "!~" | "(" | "," | "print" | "say" | "return"
-                )
-            })
+        } else if raw == "`"
+            || (raw == "/"
+                && tokens.last().is_none_or(|last| {
+                    matches!(
+                        last.text,
+                        "=" | "=~" | "!~" | "(" | "," | "print" | "say" | "return"
+                    )
+                }))
         {
             let (_, end) = quoted_span(code, start)?;
             offset = end;
@@ -278,7 +366,76 @@ fn lex(code: &str) -> Result<Vec<Token<'_>>, &'static str> {
             span: start..offset,
         });
     }
+    if !heredocs.is_empty() {
+        return Err("protected-write Perl has an unterminated heredoc");
+    }
     Ok(tokens)
+}
+
+/// Locate a Perl heredoc header. The caller skips its body ONLY for a proven
+/// literal print statement; eval-fed and interpolating bodies remain visible
+/// to the conservative fallback just as they were before data skipping.
+fn heredoc_header(code: &str, start: usize) -> Result<Option<(&str, bool, usize)>, &'static str> {
+    let Some(rest) = code[start..].strip_prefix("<<") else {
+        return Ok(None);
+    };
+    let indented = rest.starts_with('~');
+    let start = start + 2 + usize::from(indented);
+    let rest = &code[start..];
+    let trimmed = rest.trim_start_matches([' ', '\t']);
+    let spaced = rest.len() != trimmed.len();
+    let position = start + rest.len() - trimmed.len();
+    let Some(first) = trimmed.chars().next() else {
+        return Ok(None);
+    };
+    if matches!(first, '\'' | '"' | '`') {
+        let (body, end) = quoted_span(code, position)?;
+        let label = &code[body];
+        if label.contains(['\n', '\r', '\\']) {
+            return Err("protected-write Perl has an unsupported heredoc delimiter");
+        }
+        return Ok(Some((label, indented, end)));
+    }
+    if spaced {
+        return Ok(None);
+    }
+    let position = position + usize::from(first == '\\');
+    let rest = &code[position..];
+    if !rest
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+    {
+        return Ok(None);
+    }
+    let length = rest
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        .count();
+    Ok(Some((&rest[..length], indented, position + length)))
+}
+
+fn heredoc_end(
+    code: &str,
+    mut offset: usize,
+    label: &str,
+    indented: bool,
+) -> Result<usize, &'static str> {
+    while offset < code.len() {
+        let rest = &code[offset..];
+        let length = rest.find('\n').unwrap_or(rest.len());
+        let line = rest[..length].trim_end_matches('\r');
+        let line = if indented {
+            line.trim_start_matches([' ', '\t'])
+        } else {
+            line
+        };
+        offset += length + usize::from(length < rest.len());
+        if line == label {
+            return Ok(offset);
+        }
+    }
+    Err("protected-write Perl has an unterminated heredoc")
 }
 
 fn quoted_span(code: &str, start: usize) -> Result<(Range<usize>, usize), &'static str> {
@@ -320,9 +477,14 @@ fn quoted_span(code: &str, start: usize) -> Result<(Range<usize>, usize), &'stat
     Err("protected-write Perl has an unterminated quote")
 }
 
-fn matching_end(tokens: &[Token<'_>], start: usize) -> Result<usize, &'static str> {
+fn matching_end(
+    tokens: &[Token<'_>],
+    start: usize,
+    work: &Cell<usize>,
+) -> Result<usize, &'static str> {
     let mut stack = Vec::new();
     for (index, token) in tokens.iter().enumerate().skip(start) {
+        charge(work)?;
         if token.kind != Kind::Punctuation {
             continue;
         }
@@ -347,11 +509,16 @@ fn matching_end(tokens: &[Token<'_>], start: usize) -> Result<usize, &'static st
     Err("protected-write Perl has an unterminated argument list")
 }
 
-fn statement_end(tokens: &[Token<'_>], start: usize) -> Result<usize, &'static str> {
+fn statement_end(
+    tokens: &[Token<'_>],
+    start: usize,
+    work: &Cell<usize>,
+) -> Result<usize, &'static str> {
     let mut index = start;
     while let Some(token) = tokens.get(index) {
+        charge(work)?;
         if token.kind == Kind::Punctuation && matches!(token.text, "(" | "[" | "{") {
-            index = matching_end(tokens, index)? + 1;
+            index = matching_end(tokens, index, work)? + 1;
         } else if (token.kind == Kind::Punctuation && matches!(token.text, ";" | "}" | "||" | "&&"))
             || (token.kind == Kind::Word && matches!(token.text, "or" | "and"))
         {
@@ -366,22 +533,24 @@ fn statement_end(tokens: &[Token<'_>], start: usize) -> Result<usize, &'static s
 fn call_arguments<'a, 's>(
     tokens: &'a [Token<'s>],
     start: usize,
+    work: &Cell<usize>,
 ) -> Result<(Vec<&'a [Token<'s>]>, usize), &'static str> {
     let parenthesized = tokens
         .get(start)
         .is_some_and(|token| token.text == "(" && token.kind == Kind::Punctuation);
     let end = if parenthesized {
-        matching_end(tokens, start)?
+        matching_end(tokens, start, work)?
     } else {
-        statement_end(tokens, start)?
+        statement_end(tokens, start, work)?
     };
     let mut begin = start + usize::from(parenthesized);
     let mut index = begin;
     let mut args = Vec::new();
     while index < end {
+        charge(work)?;
         let token = &tokens[index];
         if token.kind == Kind::Punctuation && matches!(token.text, "(" | "[" | "{") {
-            index = matching_end(tokens, index)? + 1;
+            index = matching_end(tokens, index, work)? + 1;
         } else {
             if token.kind == Kind::Punctuation && token.text == "," {
                 args.push(&tokens[begin..index]);
@@ -397,13 +566,14 @@ fn call_arguments<'a, 's>(
 }
 
 fn value(tokens: &[Token<'_>], state: &State, depth: usize) -> Option<Value> {
+    charge(&state.work).ok()?;
     if depth > 24 || tokens.len() > 1024 {
         return None;
     }
     if tokens
         .first()
         .is_some_and(|token| token.text == "(" && token.kind == Kind::Punctuation)
-        && matching_end(tokens, 0).ok()? == tokens.len() - 1
+        && matching_end(tokens, 0, &state.work).ok()? == tokens.len() - 1
     {
         return value(&tokens[1..tokens.len() - 1], state, depth + 1);
     }
@@ -411,9 +581,10 @@ fn value(tokens: &[Token<'_>], state: &State, depth: usize) -> Option<Value> {
         let mut index = 0;
         let mut split = None;
         while index < tokens.len() {
+            charge(&state.work).ok()?;
             let token = &tokens[index];
             if token.kind == Kind::Punctuation && matches!(token.text, "(" | "[" | "{") {
-                index = matching_end(tokens, index).ok()? + 1;
+                index = matching_end(tokens, index, &state.work).ok()? + 1;
             } else {
                 if token.kind == Kind::Punctuation && token.text == operator {
                     split = Some(index);
@@ -696,6 +867,67 @@ mod tests {
             allowed(code);
         }
         denied("print q{ignored}; open(FH, '>', '/etc/shadow');");
+    }
+
+    #[test]
+    fn perl_heredoc_data_and_shell_strings_are_not_perl_calls() {
+        for code in [
+            "print <<'DATA';\nopen(FH, '>', '/etc/shadow');\nDATA\n",
+            "print <<~'DATA';\n  open(FH, '>', '/etc/shadow');\n  DATA\n",
+            "print <<'FIRST';\nopen(FH, '>', '/etc/shadow');\nFIRST\nprint <<'SECOND';\nopen(FH, '>', '/etc/shadow');\nSECOND\n",
+            "print qx{printf \"open(FH, '>', '/etc/shadow')\"};",
+            "print `printf \"open(FH, '>', '/etc/shadow')\"`;",
+        ] {
+            allowed(code);
+        }
+        denied("print <<'DATA';\nopen(FH, '>', '/tmp/out');\nDATA\nopen(FH, '>', '/etc/shadow');");
+        denied("__DATA__suffix(); open(FH, '>', '/etc/shadow');");
+        assert!(scan("print <<'DATA';\nunterminated\n").is_err());
+    }
+
+    #[test]
+    fn perl_truncation_does_not_inherit_the_append_exception() {
+        for code in [
+            "truncate('/etc/shadow', 0);",
+            "truncate '/home/u/.ssh/known_hosts', 0;",
+            "open(my $fh, '>>', '/home/u/.ssh/known_hosts'); truncate($fh, 0);",
+            "open(FH, '>>', '/home/u/.ssh/known_hosts'); CORE::truncate FH, 0;",
+            "use Fcntl; sysopen(FH, '/home/u/.ssh/known_hosts', O_WRONLY | O_APPEND); truncate(FH, 0);",
+        ] {
+            denied(code);
+        }
+        for code in [
+            "truncate('/tmp/out', 0);",
+            "open(FH, '<', '/etc/shadow'); truncate(FH, 0);",
+            "open(FH, '>>', '/home/u/.ssh/known_hosts'); open(FH, '<', '/etc/shadow'); truncate(FH, 0);",
+            "open(FH, '>>', '/home/u/.ssh/known_hosts'); open(FH, '>', $unknown); truncate(FH, 0);",
+            "open(my $fh, '>>', '/home/u/.ssh/known_hosts'); $fh = unknown(); truncate($fh, 0);",
+            "open(FH, '>>', '/home/u/.ssh/known_hosts'); close(FH); truncate(FH, 0);",
+            "$p = '/etc/shadow'; open($p, '>', '/tmp/out'); truncate($p, 0);",
+        ] {
+            allowed(code);
+        }
+    }
+
+    #[test]
+    fn perl_overlapping_scans_have_an_aggregate_work_budget() {
+        let code = format!("{}FH, '>', '/etc/shadow';", "open ".repeat(1000));
+        assert_eq!(
+            scan(&code).unwrap_err(),
+            "protected-write Perl exceeds the work limit"
+        );
+    }
+
+    #[test]
+    fn perl_eval_and_interpolating_heredocs_remain_executable() {
+        for code in [
+            "eval <<'CODE';\nopen(FH, '>', '/etc/shadow');\nCODE",
+            "print eval <<'CODE';\nopen(FH, '>', '/etc/shadow');\nCODE",
+            "$program = <<'CODE';\nopen(FH, '>', '/etc/shadow');\nCODE\neval $program;",
+            "print <<\"CODE\";\n${\\ do { open(FH, '>', '/etc/shadow'); '' }}\nCODE",
+        ] {
+            denied(code);
+        }
     }
 
     #[test]

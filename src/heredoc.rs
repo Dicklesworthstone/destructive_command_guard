@@ -3588,10 +3588,37 @@ fn extract_heredocs(
     }
 
     let mut hit_limit = false;
+    let mut foreign_body_ranges = None;
     for cap in HEREDOC_EXTRACTOR.captures_iter(command) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
+        let full_match = cap.get(0).unwrap();
+        // Retain executable/interpolating heredocs, but do not reclassify the
+        // literal argument of a plain Perl print statement as a new program.
+        // The outer shell AST must independently prove ownership as well.
+        let nested = extracted.iter().any(|source| {
+            source.quoted
+                && source.target_command.as_deref().is_some_and(|target| {
+                    ScriptLanguage::from_command(target) == ScriptLanguage::Perl
+                })
+                && source
+                    .content_range
+                    .as_ref()
+                    .is_some_and(|body| body.contains(&full_match.start()))
+        });
+        if nested
+            && is_literal_perl_print_heredoc(command, full_match.start()..full_match.end())
+            && foreign_body_ranges
+                .get_or_insert_with(|| {
+                    quoted_non_shell_heredoc_ranges(command, limits.max_heredocs)
+                })
+                .iter()
+                .any(|body| body.contains(&full_match.start()))
+        {
+            continue;
+        }
+        // A duplicate inside data must not consume the extraction quota either.
         if extracted.len() >= limits.max_heredocs {
             hit_limit = true;
             break;
@@ -3634,7 +3661,6 @@ fn extract_heredocs(
             _ => HeredocType::Standard,
         };
 
-        let full_match = cap.get(0).unwrap();
         let mut start_pos = full_match.end();
 
         // Heredoc bodies start on the next line. If there are trailing tokens after the delimiter
@@ -3683,6 +3709,93 @@ fn extract_heredocs(
             limit: limits.max_heredocs,
         });
     }
+}
+
+/// A deliberately small Perl data-only statement: a single-quoted heredoc is
+/// the sole argument to a plain print/say terminated on its header line.
+/// `eval`, assignments with unknown later consumers, interpolation, additional
+/// arguments and transformations retain conservative analysis. This predicate
+/// is shared by extraction and the bounded Perl lexer, not a Perl evaluator.
+pub(crate) fn is_literal_perl_print_heredoc(command: &str, operator: Range<usize>) -> bool {
+    let Some(header) = command.get(operator.clone()) else {
+        return false;
+    };
+    let Some(delimiter) = header.strip_prefix("<<") else {
+        return false;
+    };
+    let delimiter = delimiter
+        .strip_prefix('~')
+        .unwrap_or(delimiter)
+        .trim_start_matches([' ', '\t']);
+    if !delimiter.starts_with('\'') || header.contains(['\n', '\r']) {
+        return false;
+    }
+    let prefix = command[..operator.start]
+        .rsplit('\n')
+        .next()
+        .unwrap_or("")
+        .trim();
+    let suffix = command[operator.end..]
+        .split('\n')
+        .next()
+        .unwrap_or("")
+        .trim();
+    matches!(prefix, "print" | "say" | "CORE::print" | "CORE::say") && suffix == ";"
+}
+
+/// AST-proven quoted stdin owned by a concrete non-shell interpreter. This
+/// does NOT mark the program safe: the complete body is still analyzed. It
+/// only permits a proven literal print argument to retain its program owner.
+/// Shells, expanding bodies and overridden receivers
+/// retain the old conservative scan.
+///
+/// Do not call `active_heredocs` or the fallback-capable override helper here:
+/// their recovery paths call this extractor. A single direct parse avoids that
+/// cycle, and a parse error supplies no exemption. The caller caches the result;
+/// at most the extraction quota's worth of name-override walks can be required.
+fn quoted_non_shell_heredoc_ranges(command: &str, limit: usize) -> Vec<Range<usize>> {
+    if command.len() > 256 * 1024 {
+        return Vec::new();
+    }
+    let ast = AstGrep::new(command, SupportLang::Bash);
+    let mut heredocs = Vec::new();
+    let mut parse_error = false;
+    collect_active_heredocs(ast.root(), &mut heredocs, &mut parse_error);
+    if parse_error {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    for heredoc in heredocs.into_iter().take(limit) {
+        let ActiveHeredocBody::Heredoc {
+            body_start,
+            body_end,
+            delimiter_quoted: true,
+        } = heredoc.body
+        else {
+            continue;
+        };
+        let Some((target, wrapped)) =
+            extract_heredoc_target_resolution(command, heredoc.operator_start)
+        else {
+            continue;
+        };
+        if wrapped || !is_non_shell_interpreter_stdin_command(&target) {
+            continue;
+        }
+        let basename = target.rsplit(['/', '\\']).next().unwrap_or(&target);
+        let mut overridden = false;
+        let mut override_parse_error = false;
+        find_shell_name_override_deep(
+            ast.root(),
+            basename,
+            &mut overridden,
+            &mut override_parse_error,
+        );
+        if !overridden && !override_parse_error {
+            ranges.push(body_start..body_end);
+        }
+    }
+    ranges
 }
 
 /// Extract the command that receives a heredoc or here-string.
@@ -7061,6 +7174,62 @@ mod tests {
                 test_limits.timeout_ms = 5_000;
             }
             super::super::extract_content(command, &test_limits)
+        }
+
+        #[test]
+        fn perl_data_heredoc_keeps_its_complete_program_owner() {
+            let command =
+                "perl <<'PERL'\nprint <<'DATA';\nopen(FH, '>', '/etc/shadow');\nDATA\nPERL";
+            let limits = ExtractionLimits {
+                max_heredocs: 1,
+                ..ExtractionLimits::default()
+            };
+            let ExtractionResult::Extracted(contents) = extract_content(command, &limits) else {
+                panic!("a nested Perl string is neither a program nor a quota overflow");
+            };
+            assert_eq!(contents.len(), 1);
+            assert_eq!(contents[0].delimiter.as_deref(), Some("PERL"));
+            assert_eq!(contents[0].language, ScriptLanguage::Perl);
+            assert_eq!(
+                contents[0].content,
+                "print <<'DATA';\nopen(FH, '>', '/etc/shadow');\nDATA"
+            );
+        }
+
+        #[test]
+        fn nested_data_suppression_keeps_later_executable_heredocs() {
+            let command = "perl <<'PERL'\nprint <<'DATA';\nopen(FH, '>', '/tmp/out');\nDATA\nPERL\nperl <<'NEXT'\nopen(FH, '>', '/etc/shadow');\nNEXT";
+            let ExtractionResult::Extracted(contents) =
+                extract_content(command, &ExtractionLimits::default())
+            else {
+                panic!("both actual Perl programs must be extracted");
+            };
+            assert_eq!(contents.len(), 2);
+            assert_eq!(contents[0].delimiter.as_deref(), Some("PERL"));
+            assert_eq!(contents[1].delimiter.as_deref(), Some("NEXT"));
+            assert!(contents[1].content.contains("/etc/shadow"));
+        }
+
+        #[test]
+        fn nested_heredoc_filter_requires_nonexpanding_unrebound_source() {
+            for command in [
+                "bash <<'OUTER'\ncat <<'DATA'\nhello\nDATA\nOUTER",
+                "perl <<OUTER\nprint <<'DATA';\nhello\nDATA\nOUTER",
+                "perl() { bash; }; perl <<'OUTER'\ncat <<'DATA'\nhello\nDATA\nOUTER",
+                "echo \"perl <<'OUTER'\"\ncat <<'DATA'\nhello\nDATA\nOUTER",
+            ] {
+                let ExtractionResult::Extracted(contents) =
+                    extract_content(command, &ExtractionLimits::default())
+                else {
+                    panic!("uncertain input must retain the conservative scan: {command}");
+                };
+                assert!(
+                    contents
+                        .iter()
+                        .any(|source| source.delimiter.as_deref() == Some("DATA")),
+                    "{command}"
+                );
+            }
         }
 
         #[test]

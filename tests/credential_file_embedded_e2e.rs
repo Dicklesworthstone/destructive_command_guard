@@ -161,6 +161,28 @@ fn php_perl_issue_466_benign_controls_reach_real_entry_points() {
 }
 
 #[test]
+fn perl_fallback_preserves_data_and_rejects_later_truncation() {
+    let home = home();
+    for command in [
+        "perl <<'PERL'\nprint <<'DATA';\nopen(FH, '>', '/etc/shadow');\nDATA\nPERL",
+        "perl -e 'truncate(\"/tmp/out.txt\", 0);'",
+        "perl -e 'open(FH, \"<\", \"/etc/shadow\"); truncate(FH, 0);'",
+    ] {
+        assert_allowed(command, home.path());
+    }
+    for command in [
+        "perl <<'PERL'\neval <<'CODE';\nopen(FH, '>', '/etc/shadow');\nCODE\nPERL",
+        "perl <<'PERL'\nprint eval <<'CODE';\nopen(FH, '>', '/etc/shadow');\nCODE\nPERL",
+        "perl <<'PERL'\nprint <<\"CODE\";\n${\\ do { open(FH, '>', '/etc/shadow'); '' }}\nCODE\nPERL",
+        "perl -e 'truncate(\"/home/user/.ssh/known_hosts\", 0);'",
+        "perl -e 'open(FH, \">>\", \"/home/user/.ssh/known_hosts\"); truncate(FH, 0);'",
+        "perl <<'PERL'\nprint <<'DATA';\nopen(FH, '>', '/tmp/out.txt');\nDATA\nopen(FH, '>', '/etc/shadow');\nPERL",
+    ] {
+        assert_denied(command, home.path());
+    }
+}
+
+#[test]
 fn embedded_writes_reach_the_core_rule_through_the_hook() {
     let home = home();
     for command in [
