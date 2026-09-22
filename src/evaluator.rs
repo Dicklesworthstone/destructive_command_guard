@@ -38741,6 +38741,55 @@ mod tests {
             }
         }
 
+        /// On the incomplete-extraction path the credential-write and exec-sink
+        /// backstops run in turn, and allowlisting one must not hide the other:
+        /// a reviewed `.bashrc` write in the same body as `rm -rf /` still
+        /// denies the delete, and a reviewed delete still denies the write.
+        ///
+        /// This is the timeout path specifically — on the completed path the
+        /// delete is caught by its own AST pattern under a different rule id, a
+        /// separate mechanism with its own coverage.
+        #[test]
+        fn timeout_backstops_do_not_mask_each_other() {
+            let settings = forced_extraction_timeout();
+            // Credential write and an argv delete in one body, in two languages
+            // so neither backstop is always the one that fires first.
+            let py = "python3 <<'PY'\nopen('/home/example/.bashrc', 'w')\n\
+                      import subprocess\nsubprocess.run(['rm', '-rf', '/'])\nPY";
+            let js = "node <<'JS'\nrequire('fs').writeFileSync('/home/example/.bashrc', 'x')\n\
+                      require('child_process').spawnSync('rm', ['-rf', '/'])\nJS";
+
+            let cred_allowed =
+                project_allowlists_for_rule("core.filesystem:credential-file-write", "reviewed");
+            for cmd in [py, js] {
+                let result = eval_with_heredoc_and_allowlists(cmd, &settings, &cred_allowed);
+                assert!(result.is_denied(), "{cmd:?} -> {result:?}");
+                assert!(
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref())
+                        .is_some_and(|name| name.contains("rm_rf")),
+                    "an allowlisted credential write must not hide the delete: {cmd:?} -> {result:?}"
+                );
+            }
+
+            let delete_allowed = project_allowlists_for_rule(
+                "heredoc.python:exec_sink.rm_rf_catastrophic",
+                "reviewed",
+            );
+            let result = eval_with_heredoc_and_allowlists(py, &settings, &delete_allowed);
+            assert!(result.is_denied(), "{result:?}");
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some("credential-file-write"),
+                "an allowlisted delete must not hide the credential write"
+            );
+        }
+
         /// Every exec-sink match in a body is weighed, on both paths.
         ///
         /// Ruby's pass returned its first hit whatever its severity, so a
