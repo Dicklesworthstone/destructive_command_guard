@@ -373,6 +373,9 @@ fn test_audit_backtracking_requirements() {
                 // backtracking engine like its `checkout-ref-discard` sibling.
                 "checkout-discard-cwd",
                 "checkout-ref-discard",
+                // `git rm -f` must not fire with `--cached` (worktree kept) or
+                // a dry run anywhere in the segment: a negative lookahead.
+                "rm-force",
                 // The clean rules walk from the subcommand to their flag over
                 // git's real option-parsing window, which ends at a bare `--`
                 // (#429, #434). "Not a bare `--`" is a negative lookahead, so
