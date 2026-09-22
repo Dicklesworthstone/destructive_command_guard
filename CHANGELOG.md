@@ -61,10 +61,35 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   The *other* incomplete-analysis backstop — `check_fallback_patterns`, which
   runs on the raw command when extraction itself is incomplete — is what decides
   that path, and `92cebef` (#452) widened its JavaScript entries to the same
-  chained spelling. Four shapes remain allowed there because they are names that
-  backstop does not carry: `require('fs').unlinkSync(…)`,
-  `require('fs').promises.rm(…)`, `require('node:fs/promises').rm(…)` and the
-  computed `require('fs')['rmSync'](…)`. Tracked on #468.
+  chained spelling.
+
+- **`require('fs').unlinkSync('/home/user/.ssh/id_rsa')` and the promise-API
+  deletions were still allowed when extraction was incomplete** (#468), after the
+  `rmSync`/`rmdirSync` names were fixed. Measured at a clean tree on a release
+  binary, 6/6 per row before and after, so the change is the only variable:
+
+  | body | before | after |
+  | --- | --- | --- |
+  | `require('fs').unlinkSync('/home/user/.ssh/id_rsa')` | allow | **deny** |
+  | `require('fs').promises.rm('/home/user', …)` | allow | **deny** |
+  | `require('node:fs/promises').rm('/home/user', …)` | allow | **deny** |
+  | `require('fs').mkdirSync` / `readFileSync` / `confirmSync` | allow | allow |
+
+  `unlinkSync` joins the existing alternation: same `fs` family, same call shape,
+  and it destroys an SSH private key rather than a tree. The promise `rm` gets two
+  **qualified** entries instead — the `.promises.` member and the `fs/promises`
+  specifier the chained form closes over — deliberately not a bare `\brm\s*\(`.
+  This backstop performs no target check, so an unqualified `rm(` would block a
+  project's own `rm('./build')` helper whenever analysis was incomplete; both that
+  and the destructured `const { rm } = require('fs/promises')` spelling are pinned
+  as negatives, and the destructured one is left to the extracted-body backstop,
+  which does check the target.
+
+  `fs.promises.rmdir` is excluded on purpose: it needs an already-empty directory,
+  the same reason `FileUtils.rmdir` and Perl's `rmdir` are outside #455's
+  recursive-delete family. The computed `require('fs')['rmSync'](…)` spelling also
+  remains — that is a different shape rather than a missing name, and the AST
+  patterns do not cover it either. Both noted on #468.
 
 ### Fixed
 

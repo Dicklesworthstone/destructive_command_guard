@@ -26132,7 +26132,25 @@ fn check_fallback_patterns(command: &str) -> Option<EvaluationResult> {
             // below. A bare mention (`# cleanup uses rmSync`) carries no paren,
             // and a quoted one is masked by `sanitize_for_pattern_matching`
             // before this set runs.
-            r"\b(?:rmSync|rmdirSync)\s*\(",
+            // `unlinkSync` belongs with them: it is the same `fs` family, the
+            // same call shape, and it deletes an SSH private key rather than a
+            // tree. It was absent, so `require('fs').unlinkSync(
+            // '/home/user/.ssh/id_rsa')` was allowed on this path while the two
+            // names above denied (#468).
+            r"\b(?:rmSync|rmdirSync|unlinkSync)\s*\(",
+            // The promise API's `rm` needs its own entries, because a bare
+            // `\brm\s*\(` here would be the least qualified pattern in this set
+            // and this backstop performs no target check — it would block a
+            // user's own `rm('./build')` helper whenever analysis was incomplete.
+            // Both of these keep the qualifier that makes the call unambiguous:
+            // the `.promises.` member, and the `fs/promises` specifier that the
+            // chained form closes over. The destructured spelling
+            // (`import { rm } from 'node:fs/promises'`) carries no qualifier at
+            // all on this path and is left to the extracted-body backstop, whose
+            // `JS_FS_SINK_LITERAL` covers a receiver-less `rm(` with a target
+            // check to bound it (#459).
+            r"\.\s*promises\s*\.\s*rm\s*\(",
+            r#"fs/promises['"]\s*\)\s*\.\s*rm\s*\("#,
             r"child_process\.execSync",
             r"child_process\.spawnSync",
             r"os\.RemoveAll",
@@ -39041,11 +39059,54 @@ mod tests {
                     "php -r unlink",
                     r#"php -r "unlink('/home/user/.ssh/id_rsa');""#,
                 ),
+                // #468: the same `fs` family, measured allowed on this path after
+                // the two names above were fixed. `unlinkSync` deletes an SSH
+                // private key; the promise spellings delete a tree.
+                (
+                    "node -e fs.unlinkSync",
+                    r#"node -e "require('fs').unlinkSync('/home/user/.ssh/id_rsa')""#,
+                ),
+                (
+                    "node -e fs.promises.rm",
+                    r#"node -e "require('fs').promises.rm('/home/user', {recursive: true})""#,
+                ),
+                (
+                    "node -e bound fs.promises.rm",
+                    r#"node -e "const fs = require('fs'); fs.promises.rm('/home/user', {recursive: true})""#,
+                ),
+                (
+                    "node -e node:fs/promises rm",
+                    r#"node -e "require('node:fs/promises').rm('/home/user', {recursive: true})""#,
+                ),
+                (
+                    "node -e fs/promises rm",
+                    r#"node -e "require('fs/promises').rm('/home/user', {recursive: true})""#,
+                ),
             ] {
                 assert!(
                     check_fallback_patterns(cmd).is_some(),
                     "{label}: the bounded fallback must match a one-liner, or an AST \
                      timeout allows this command outright (#452): {cmd}"
+                );
+            }
+
+            // The promise entries are deliberately qualified rather than a bare
+            // `\brm\s*\(`, because this backstop applies no target check: an
+            // unqualified `rm(` would block a project's own helper whenever
+            // analysis was incomplete. These must therefore stay unmatched here,
+            // and are covered by the extracted-body backstop instead, which does
+            // check the target (#468).
+            for (label, cmd) in [
+                ("a user's own rm helper", r#"node -e "rm('./build')""#),
+                (
+                    "a destructured promise rm",
+                    r#"node -e "const { rm } = require('fs/promises'); rm('./build')""#,
+                ),
+            ] {
+                assert!(
+                    check_fallback_patterns(cmd).is_none(),
+                    "{label}: an unqualified rm( must not reach this target-blind \
+                     backstop (#468): {cmd}"
                 );
             }
 
