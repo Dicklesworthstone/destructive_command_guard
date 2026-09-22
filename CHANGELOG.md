@@ -17,20 +17,9 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Security
 
-- **`require('fs').rmSync('/home/user', {recursive: true})` in a `node` heredoc
-  was allowed whenever embedded analysis was incomplete** (#468), while the bound
-  `const fs = require('fs'); fs.rmSync(…)` spelling denied and the Python, Ruby
-  and Go equivalents denied. Measured as a release-to-release A/B with
-  `heredoc.max_body_lines = 1` as a load-independent stand-in for incomplete
-  analysis, the fix being the only variable:
-
-  | body | before | after |
-  | --- | --- | --- |
-  | `require('fs').rmSync('/home/user', {recursive: true})` | allow | **deny** |
-  | the same, single-quoted and whitespace-padded | allow | **deny** |
-  | `require('fs').rmdirSync('/home/user')` | allow | **deny** |
-  | `(await import('fs')).rmSync('/home/user', …)` | allow | **deny** |
-  | `const fs = require('fs'); fs.rmSync(…)` | deny | deny |
+- **The filesystem-sink fallback could not express a call in receiver position**
+  (#468), so `require('fs').rmSync('/home/user', {recursive: true})` was
+  unmatchable by it while the bound `fs.rmSync(…)` spelling matched.
 
   `JS_FS_SINK_LITERAL`'s receiver chain was identifier-dot only
   (`(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*`), which `fs.rmSync(` fills and
@@ -59,19 +48,23 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   `JS_EXEC_SINK_LITERAL` was checked and is unaffected — it anchors on the sink
   name with no receiver requirement at all.
 
-  A `/tmp` target now denies on this path too, where it previously did not. That
-  is a widening and it is the intended direction: the bound `fs.rmSync('/tmp/…')`
-  spelling already denied there before this change, so the two spellings now
-  agree, and a *bounded* fallback reached because analysis was incomplete is
-  deliberately coarser than the AST pass it stands in for.
+  Verified on the pure function, not end to end, and that limit is worth stating.
+  `scan_filesystem_sink_fallback` is consulted with an *extracted* body, so
+  reaching it while the AST pass has not already decided requires an AST timeout,
+  which is a function of host load rather than of the command. The size lever
+  cannot substitute: `MAX_AST_INPUT_BYTES` is 1 MiB while stdin is capped at
+  256 KiB, so a body can never exceed it. That is the same conclusion #452
+  reaches for the same reason, and why its test also asserts on the pure
+  function. So this closes a gap in the pattern; it does not come with an
+  end-to-end demonstration.
 
-  Still allowed on the same path, measured and **not** fixed here:
-  `require('fs').unlinkSync(…)`, `require('fs').promises.rm(…)` and
-  `require('node:fs/promises').rm(…)`. Two backstops cover the
-  incomplete-analysis paths and only one of them is in this file; extending the
-  other means editing `src/evaluator.rs`, which is under active edit elsewhere.
-  Which of the two decides any given row is not something this change established
-  — the measured behaviour above is, and the remaining rows are tracked on #468.
+  The *other* incomplete-analysis backstop — `check_fallback_patterns`, which
+  runs on the raw command when extraction itself is incomplete — is what decides
+  that path, and `92cebef` (#452) widened its JavaScript entries to the same
+  chained spelling. Four shapes remain allowed there because they are names that
+  backstop does not carry: `require('fs').unlinkSync(…)`,
+  `require('fs').promises.rm(…)`, `require('node:fs/promises').rm(…)` and the
+  computed `require('fs')['rmSync'](…)`. Tracked on #468.
 
 ### Fixed
 
