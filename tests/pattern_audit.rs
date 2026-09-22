@@ -333,6 +333,10 @@ fn test_audit_backtracking_requirements() {
                 // truncating one.
                 "redirect-truncate-git-internals-relative",
                 "redirect-truncate-root-home",
+                // Needs a negative lookahead (no `--dry-run`/`-n` in the
+                // segment) and a positive one (`--delete*` present anywhere
+                // before the destination), neither of which is linear.
+                "rsync-delete-sensitive-dest",
                 "rsync-sensitive-then-delete",
                 "shred-root-home",
                 "shred-tmp",
