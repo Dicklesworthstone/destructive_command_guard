@@ -506,3 +506,96 @@ fn explicit_language_filters_preserve_other_interpreters_and_shell_writes() {
         );
     }
 }
+
+#[test]
+fn python_composed_paths_reach_hook_cli_and_stdin() {
+    for settings in [
+        "[heredoc]\nenabled = true\ntimeout_ms = 5000\n",
+        "[heredoc]\nenabled = false\n",
+    ] {
+        let home = home();
+        fs::write(home.path().join("config.toml"), settings).unwrap();
+        for (source, rule) in [
+            (
+                "from pathlib import Path; (Path.home() / '.ssh' / 'id_rsa').write_text('x')",
+                Some("credential-file-write"),
+            ),
+            (
+                "import os; open(os.path.join(os.environ['HOME'], '.aws', 'credentials'), 'w')",
+                Some("credential-file-write"),
+            ),
+            (
+                "from pathlib import Path; import shutil; shutil.copy2('staged', Path.home().joinpath('.bashrc'))",
+                Some("credential-file-write"),
+            ),
+            (
+                "from pathlib import Path; Path('.git', 'config').write_text('x')",
+                Some("git-internals-write"),
+            ),
+            (
+                "from pathlib import Path; Path('~/.bashrc').write_text('x')",
+                None,
+            ),
+            (
+                "from pathlib import Path; (Path.home() / 'notes.txt').write_text('x')",
+                None,
+            ),
+            (
+                "from pathlib import Path; Path.home().joinpath('.ssh', 'known_hosts').open('a')",
+                None,
+            ),
+            (
+                "from pathlib import Path; (Path.home() / '/tmp/dcg-preview').write_text('x')",
+                None,
+            ),
+        ] {
+            assert_program("python3", source, home.path(), rule);
+            let quoted = format!("'{}'", source.replace('\'', "'\\''"));
+            assert_decision(&format!("env python3 - 0<<< {quoted}"), home.path(), rule);
+        }
+    }
+}
+
+#[test]
+fn python_composed_paths_cannot_hide_a_rename_endpoint_behind_a_grant() {
+    for (allowed, denied, control) in [
+        (
+            "credential-file-write",
+            "git-internals-write",
+            "Path.home().joinpath('.bashrc')",
+        ),
+        (
+            "git-internals-write",
+            "credential-file-write",
+            "Path('.git', 'config')",
+        ),
+    ] {
+        let home = home();
+        fs::write(
+            home.path().join("config.toml"),
+            "[heredoc]\nenabled = false\n",
+        )
+        .unwrap();
+        fs::write(
+            home.path().join("xdg/dcg/allowlist.toml"),
+            format!(
+                "[[allow]]\nrule = \"core.filesystem:{allowed}\"\nreason = \"one endpoint only\"\n"
+            ),
+        )
+        .unwrap();
+        assert_program(
+            "python3",
+            &format!("from pathlib import Path; {control}.write_text('x')"),
+            home.path(),
+            None,
+        );
+        for source in [
+            "from pathlib import Path; (Path.home() / '.bashrc').replace('.git/config')",
+            "from pathlib import Path; Path('.git', 'config').replace(Path.home().joinpath('.bashrc'))",
+        ] {
+            assert_program("python3", source, home.path(), Some(denied));
+            let quoted = format!("'{}'", source.replace('\'', "'\\''"));
+            assert_decision(&format!("python3 0<<< {quoted}"), home.path(), Some(denied));
+        }
+    }
+}

@@ -12,8 +12,8 @@
 //! No candidate is executed and no directory is traversed to determine its type.
 
 use super::{
-    Access, Bindings, CredentialFileWrite, Language, ShellDialect, Syntax, Value, arguments,
-    path_value, protected, python_argument, quote_policy_path, shell, value,
+    Access, Bindings, CredentialFileWrite, Language, ResolvedPath, ShellDialect, Syntax, Value,
+    arguments, path_value, protected, python_argument, quote_policy_path, shell, value,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,8 +42,6 @@ pub(super) fn js_operation(name: &str) -> Option<Operation> {
         _ => None,
     }
 }
-
-type ResolvedPath = (String, bool);
 
 struct Transfer {
     operation: Operation,
@@ -90,7 +88,7 @@ fn classify(node: &Syntax<'_>, language: Language, env: &Bindings) -> Option<Tra
             let destination = python_argument(&args, 0, "target")?;
             Some(Transfer {
                 operation: Operation::Rename,
-                source: Some((source, false)),
+                source: Some(source),
                 destination: path(&destination),
                 api: function.text().into_owned(),
             })

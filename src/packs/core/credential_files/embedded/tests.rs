@@ -7,6 +7,135 @@ fn denied(code: &str, language: Language) -> bool {
 }
 
 #[test]
+fn python_composed_paths_reach_the_shared_policy() {
+    for code in [
+        "from pathlib import Path; (Path.home() / '.ssh' / 'id_rsa').write_text('x')",
+        "from pathlib import Path as P; P.home().joinpath('.aws', 'credentials').write_bytes(b'x')",
+        "import pathlib; pathlib.Path('/etc', 'shadow').write_text('x')",
+        "from pathlib import PosixPath as P; P('/etc').joinpath('shadow').open(mode='r+')",
+        "from pathlib import Path; Path('~/.bashrc').expanduser().write_text('x')",
+        "from pathlib import Path; (Path('~').expanduser() / '.bashrc').write_text('x')",
+        "from pathlib import Path; import os; Path(os.path.expanduser('~'), '.bashrc').write_text('x')",
+        "from pathlib import Path; open(str(Path.home()) + '/.bashrc', 'w')",
+        "from pathlib import Path; ('/etc' / Path('shadow')).write_text('x')",
+        "from pathlib import Path; (Path('/tmp') / '/etc' / 'shadow').write_text('x')",
+        "from pathlib import Path; Path(unknown_base, '/etc', 'shadow').write_text('x')",
+        "import os; open(os.path.join(os.path.expanduser('~'), '.bashrc'), 'w')",
+        "from os.path import join as J, expanduser as H; open(J(H('~'), '.ssh', 'authorized_keys'), 'a')",
+        "import os.path as p; open(p.join('/etc', 'sha' + 'dow'), 'w')",
+        "import os; open(os.environ['HOME'] + '/.bashrc', 'w')",
+        "from os import environ as E; open(E['HOME'] + '/.bashrc', 'a')",
+        "from os import getenv as H; open(H('HOME') + '/.bashrc', 'w')",
+        "import os; open(os.environ.get('HOME') + '/.bashrc', 'w')",
+        "from pathlib import Path; root = Path.home(); save = root.joinpath('.bashrc').write_text; save('x')",
+    ] {
+        let hits = scan_extracted(code, ScriptLanguage::Python).expect(code);
+        assert_eq!(hits.len(), 1, "{code}: {hits:?}");
+        assert_eq!(hits[0].rule, shell::CREDENTIAL_FILE_WRITE_NAME, "{code}");
+        assert!(code.get(hits[0].span.clone()).is_some(), "{code}");
+    }
+}
+
+#[test]
+fn python_composed_paths_keep_literal_and_read_controls() {
+    for code in [
+        "from pathlib import Path; Path('~/.bashrc').write_text('x')",
+        "from pathlib import Path; (Path('~') / '.bashrc').write_text('x')",
+        "from pathlib import Path; (Path.home() / 'notes.txt').write_text('x')",
+        "from pathlib import Path; (Path.home() / '/tmp/dcg-preview').write_text('x')",
+        "import os; open(os.path.join(os.path.expanduser('~'), '/tmp/dcg-preview'), 'w')",
+        "from pathlib import Path; Path('/etc', 'shadow').read_text()",
+        "from pathlib import Path; (Path.home() / '.ssh' / 'id_rsa').open('r')",
+        "from pathlib import Path; Path.home().joinpath('.ssh', 'known_hosts').open('a')",
+        "from pathlib import Path; (unknown_root / '.bashrc').write_text('x')",
+        "from pathlib import Path; Path = Store; (Path.home() / '.bashrc').write_text('x')",
+        "import os; os = store; open(os.environ['HOME'] + '/.bashrc', 'w')",
+        "from os import environ as E; E['HOME'] = unknown; open(E['HOME'] + '/.bashrc', 'w')",
+        "from os.path import join as J; J = store; open(J('/etc', 'shadow'), 'w')",
+        "import os; open(os.path.join(unknown, '.bashrc'), 'w')",
+        "print(\"Path.home().joinpath('.bashrc').write_text('x')\")",
+    ] {
+        assert!(!denied(code, Language::Python), "{code}");
+    }
+}
+
+#[test]
+fn python_composed_paths_preserve_both_transfer_effects() {
+    for code in [
+        "from pathlib import Path; (Path.home() / '.bashrc').replace('.git/config')",
+        "from pathlib import Path; Path('.git', 'config').rename(Path.home().joinpath('.bashrc'))",
+        "from pathlib import Path; import shutil; shutil.move(Path.home().joinpath('.bashrc'), '.git')",
+    ] {
+        let hits = scan_extracted(code, ScriptLanguage::Python).expect(code);
+        assert_eq!(hits.len(), 2, "{code}: {hits:?}");
+        assert!(
+            hits.iter()
+                .any(|hit| hit.rule == shell::CREDENTIAL_FILE_WRITE_NAME)
+        );
+        assert!(
+            hits.iter()
+                .any(|hit| hit.rule == shell::GIT_INTERNALS_WRITE_NAME)
+        );
+        assert_eq!(hits[0].span, hits[1].span, "{code}");
+    }
+    assert!(!denied(
+        "from pathlib import Path; import shutil; shutil.copyfile(Path.home().joinpath('.bashrc'), '/tmp/dcg-backup')",
+        Language::Python,
+    ));
+}
+
+#[test]
+fn python_composed_paths_join_and_concatenate_without_host_state() {
+    for (base, next, expected) in [
+        (("~", true), (".bashrc", false), ("~/.bashrc", true)),
+        (
+            ("~", true),
+            ("/tmp/preview", false),
+            ("/tmp/preview", false),
+        ),
+        (("/tmp", false), ("~/.bashrc", true), ("~/.bashrc", true)),
+        (
+            ("/tmp", false),
+            ("~/.bashrc", false),
+            ("/tmp/~/.bashrc", false),
+        ),
+        (("", false), ("/etc/shadow", false), ("/etc/shadow", false)),
+    ] {
+        assert_eq!(
+            python_join_path(Some((base.0.into(), base.1)), (next.0.into(), next.1)),
+            Some((expected.0.into(), expected.1)),
+        );
+    }
+    assert_eq!(
+        python_join_path(None, ("/etc/shadow".into(), false)),
+        Some(("/etc/shadow".into(), false)),
+    );
+    assert!(python_join_path(None, (".bashrc".into(), false)).is_none());
+    assert!(
+        concatenate_text(
+            Value::Path(("/etc".into(), false)),
+            Value::Text("/shadow".into())
+        )
+        .is_none()
+    );
+    assert!(concatenate_text(Value::Text("prefix".into()), Value::HomePath("~".into())).is_none());
+    assert!(
+        concatenate_text(
+            Value::Text("x".repeat(MAX_STATIC_PATH_BYTES)),
+            Value::Text("x".into())
+        )
+        .is_none()
+    );
+    assert!(
+        python_join_path(
+            Some(("x".repeat(MAX_STATIC_PATH_BYTES), false)),
+            ("y".into(), false)
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn every_language_uses_the_existing_target_policy() {
     for path in [
         "/home/test/.ssh/authorized_keys",

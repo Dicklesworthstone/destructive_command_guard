@@ -24,6 +24,10 @@ type Syntax<'a> = Node<'a, StrDoc<SupportLang>>;
 const MAX_BYTES: usize = 256 * 1024;
 const MAX_DEPTH: usize = 128;
 const MAX_NODES: usize = 40_000;
+// A small source can repeatedly double a bound string. Bound folded values
+// separately from input bytes so path construction cannot amplify it without
+// limit. This is an analysis bound, not a query of the host filesystem.
+const MAX_STATIC_PATH_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Language {
@@ -413,11 +417,16 @@ fn reads_stdin(words: &[String], language: Language) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Value {
     Text(String),
+    StringifyPath,
     Open,
     Io,
     Builtins,
     Os,
     OsPath,
+    Environment,
+    EnvironmentGet,
+    GetEnv,
+    PythonJoin,
     OsTruncate,
     Shutil,
     Transfer(transfers::Operation),
@@ -426,10 +435,13 @@ enum Value {
     HomePath(String),
     Pathlib,
     PathConstructor,
-    Path(String),
-    PathWrite(String),
-    PathOpen(String),
-    PathTransfer(String),
+    PathHome,
+    Path(ResolvedPath),
+    PathJoin(ResolvedPath),
+    PathExpandUser(ResolvedPath),
+    PathWrite(ResolvedPath),
+    PathOpen(ResolvedPath),
+    PathTransfer(ResolvedPath),
     Require,
     Fs,
     File,
@@ -437,6 +449,11 @@ enum Value {
 }
 
 type Bindings = HashMap<String, Value>;
+
+/// A static path plus proof that a leading tilde represents an expanded home.
+/// Keep this proof through path constructors and bound methods; a literal
+/// `Path("~/.bashrc")` is not equivalent to `Path.home() / ".bashrc"`.
+type ResolvedPath = (String, bool);
 
 fn inspect(
     code: &str,
@@ -472,6 +489,7 @@ fn scan_source(
     match language {
         Language::Python => {
             bindings.insert("open".into(), Value::Open);
+            bindings.insert("str".into(), Value::StringifyPath);
         }
         Language::Ruby => {
             bindings.insert("File".into(), Value::File);
@@ -640,14 +658,18 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
                 (None, "os") => Some(Value::Os),
                 (None, "shutil") => Some(Value::Shutil),
                 (Some("io" | "builtins"), "open") => Some(Value::Open),
-                (Some("pathlib"), "Path") => Some(Value::PathConstructor),
+                (Some("builtins"), "str") => Some(Value::StringifyPath),
+                (Some("pathlib"), "Path" | "PosixPath") => Some(Value::PathConstructor),
                 (Some("os"), "truncate") => Some(Value::OsTruncate),
                 (Some("os"), "rename" | "replace") => {
                     Some(Value::Transfer(transfers::Operation::Rename))
                 }
                 (Some("shutil"), name) => transfers::shutil_operation(name).map(Value::Transfer),
                 (Some("os"), "path") => Some(Value::OsPath),
+                (Some("os"), "environ") => Some(Value::Environment),
+                (Some("os"), "getenv") => Some(Value::GetEnv),
                 (Some("os.path"), "expanduser") => Some(Value::ExpandUser),
+                (Some("os.path"), "join") => Some(Value::PythonJoin),
                 // `import os.path as p` binds `p` to the `os.path` module.
                 // Without this the aliased form fell through to `None`, left
                 // `p` unbound, and `open(p.expanduser('~/.ssh/x'), 'a')` was
@@ -721,7 +743,13 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
                         env.insert(name, Value::Api(source.text().into_owned()));
                     }
                 }
-            } else if let Some(object) = left.field("object") {
+            } else if let Some(mut object) = left.field("object").or_else(|| left.field("value")) {
+                // Attribute/subscript assignment can replace a module member
+                // or mutate an imported environment mapping. Do not retain a
+                // proven runtime API after its root binding was modified.
+                while let Some(parent) = object.field("object").or_else(|| object.field("value")) {
+                    object = parent;
+                }
                 env.remove(object.text().as_ref());
             }
         }
@@ -772,20 +800,38 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                 .into_owned();
             match (object, member.as_str()) {
                 (Value::Io | Value::Builtins, "open") => Some(Value::Open),
+                (Value::Builtins, "str") => Some(Value::StringifyPath),
                 (Value::Os, "truncate") => Some(Value::OsTruncate),
                 (Value::Os, "rename" | "replace") => {
                     Some(Value::Transfer(transfers::Operation::Rename))
                 }
                 (Value::Shutil, name) => transfers::shutil_operation(name).map(Value::Transfer),
                 (Value::Os, "path") => Some(Value::OsPath),
+                (Value::Os, "environ") => Some(Value::Environment),
+                (Value::Os, "getenv") => Some(Value::GetEnv),
+                (Value::Environment, "get") => Some(Value::EnvironmentGet),
                 (Value::OsPath, "expanduser") => Some(Value::ExpandUser),
-                (Value::Pathlib, "Path") => Some(Value::PathConstructor),
+                (Value::OsPath, "join") => Some(Value::PythonJoin),
+                (Value::Pathlib, "Path" | "PosixPath") => Some(Value::PathConstructor),
+                (Value::PathConstructor | Value::Path(_), "home") => Some(Value::PathHome),
+                (Value::Path(path), "joinpath") => Some(Value::PathJoin(path)),
+                (Value::Path(path), "expanduser") => Some(Value::PathExpandUser(path)),
                 (Value::Path(path), "write_text" | "write_bytes") => Some(Value::PathWrite(path)),
                 (Value::Path(path), "open") => Some(Value::PathOpen(path)),
                 (Value::Path(path), "rename" | "replace") => Some(Value::PathTransfer(path)),
                 (Value::Fs, "promises") => Some(Value::Fs),
                 (Value::Fs, name) if is_js_api(name) => Some(Value::Api(name.into())),
                 _ => None,
+            }
+        }
+        "subscript" if language == Language::Python => {
+            if value(&node.field("value")?, language, env, depth + 1)? == Value::Environment
+                && value(&node.field("subscript")?, language, env, depth + 1)?
+                    == Value::Text("HOME".into())
+            {
+                Some(Value::HomePath("~".into()))
+            } else {
+                None
             }
         }
         "call" if language == Language::Ruby => {
@@ -811,10 +857,30 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                     };
                     is_fs_module(&module).then_some(Value::Fs)
                 }
-                Value::PathConstructor => match value(args.first()?, language, env, depth + 1)? {
-                    Value::Text(path) | Value::Path(path) => Some(Value::Path(path)),
-                    _ => None,
-                },
+                Value::PathHome if args.is_empty() => Some(Value::Path(("~".into(), true))),
+                Value::PathConstructor => {
+                    let base = if args.is_empty() { "." } else { "" };
+                    python_join_paths(&args, env, depth, Some((base.into(), false)))
+                        .map(Value::Path)
+                }
+                Value::PathJoin(base) => {
+                    python_join_paths(&args, env, depth, Some(base)).map(Value::Path)
+                }
+                Value::PathExpandUser((path, _)) if args.is_empty() => {
+                    Some(Value::Path((path, true)))
+                }
+                Value::PythonJoin if !args.is_empty() => {
+                    python_join_paths(&args, env, depth, Some((String::new(), false)))
+                        .map(path_as_text)
+                }
+                Value::StringifyPath if args.len() == 1 => {
+                    resolved_path(value(&args[0], language, env, depth + 1)?).map(path_as_text)
+                }
+                Value::GetEnv | Value::EnvironmentGet if args.len() == 1 => {
+                    let key = python_argument(&args, 0, "key")?;
+                    (value(&key, language, env, depth + 1)? == Value::Text("HOME".into()))
+                        .then(|| Value::HomePath("~".into()))
+                }
                 Value::ExpandUser => match value(args.first()?, language, env, depth + 1)? {
                     Value::Text(path) => Some(Value::HomePath(path)),
                     _ => None,
@@ -823,16 +889,17 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
             }
         }
         "binary_operator" | "binary_expression" => {
-            if node.field("operator")?.text() != "+" {
-                return None;
+            let left = value(&node.field("left")?, language, env, depth + 1)?;
+            let right = value(&node.field("right")?, language, env, depth + 1)?;
+            match node.field("operator")?.text().as_ref() {
+                "/" if language == Language::Python
+                    && (matches!(left, Value::Path(_)) || matches!(right, Value::Path(_))) =>
+                {
+                    python_join_path(resolved_path(left), resolved_path(right)?).map(Value::Path)
+                }
+                "+" => concatenate_text(left, right),
+                _ => None,
             }
-            let Value::Text(left) = value(&node.field("left")?, language, env, depth + 1)? else {
-                return None;
-            };
-            let Value::Text(right) = value(&node.field("right")?, language, env, depth + 1)? else {
-                return None;
-            };
-            Some(Value::Text(left + &right))
         }
         _ => None,
     }
@@ -840,18 +907,87 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
 
 fn text_value(node: &Syntax<'_>, language: Language, env: &Bindings) -> Option<String> {
     match value(node, language, env, 0)? {
-        Value::Text(text) | Value::Path(text) => Some(text),
+        Value::Text(text) | Value::Path((text, false)) => Some(text),
         _ => None,
     }
 }
 
 /// Keep path expansion separate from mode/module strings.
-fn path_value(node: &Syntax<'_>, language: Language, env: &Bindings) -> Option<(String, bool)> {
-    match value(node, language, env, 0)? {
-        Value::Text(text) | Value::Path(text) => Some((text, false)),
+fn path_value(node: &Syntax<'_>, language: Language, env: &Bindings) -> Option<ResolvedPath> {
+    resolved_path(value(node, language, env, 0)?)
+}
+
+fn resolved_path(value: Value) -> Option<ResolvedPath> {
+    match value {
+        Value::Text(text) => Some((text, false)),
         Value::HomePath(text) => Some((text, true)),
+        Value::Path(path) => Some(path),
         _ => None,
     }
+}
+
+fn path_as_text((path, home): ResolvedPath) -> Value {
+    if home {
+        Value::HomePath(path)
+    } else {
+        Value::Text(path)
+    }
+}
+
+/// Python joins reset at an absolute operand, including a symbolic runtime
+/// home. Never expand `~` merely because it occurs in a literal segment, and
+/// never use this host's PathBuf semantics or current working directory.
+fn python_join_path(base: Option<ResolvedPath>, next: ResolvedPath) -> Option<ResolvedPath> {
+    let (next, home) = next;
+    if next.starts_with('/') || (home && next.starts_with('~')) {
+        return Some((next, home));
+    }
+    let (mut path, expanded) = base?;
+    if path.is_empty() {
+        return Some((next, home));
+    }
+    if path.len().checked_add(next.len())?.checked_add(1)? > MAX_STATIC_PATH_BYTES {
+        return None;
+    }
+    if !path.ends_with('/') {
+        path.push('/');
+    }
+    path.push_str(&next);
+    Some((path, expanded))
+}
+
+fn python_join_paths(
+    args: &[Syntax<'_>],
+    env: &Bindings,
+    depth: usize,
+    mut path: Option<ResolvedPath>,
+) -> Option<ResolvedPath> {
+    for arg in args {
+        path = value(arg, Language::Python, env, depth + 1)
+            .and_then(resolved_path)
+            .and_then(|next| python_join_path(path, next));
+    }
+    path
+}
+
+/// Concatenation is not path joining. A home on the right is not absolute
+/// after a nonempty literal prefix, and Path objects do not support `+`.
+fn concatenate_text(left: Value, right: Value) -> Option<Value> {
+    let (mut text, home) = match left {
+        Value::Text(text) => (text, false),
+        Value::HomePath(text) => (text, true),
+        _ => return None,
+    };
+    let suffix = match right {
+        Value::Text(text) => text,
+        Value::HomePath(path) if text.is_empty() => return Some(Value::HomePath(path)),
+        _ => return None,
+    };
+    if text.len().checked_add(suffix.len())? > MAX_STATIC_PATH_BYTES {
+        return None;
+    }
+    text.push_str(&suffix);
+    Some(path_as_text((text, home)))
 }
 
 fn arguments<'a>(node: &Syntax<'a>) -> Vec<Syntax<'a>> {
@@ -935,7 +1071,7 @@ fn write_call(
         Value::Open | Value::PathOpen(_) if language == Language::Python => {
             let resolved = value(&function, language, env, 0)?;
             let ((path, expands), index) = if let Value::PathOpen(path) = resolved {
-                ((path, false), 0)
+                (path, 0)
             } else {
                 (
                     path_value(&python_argument(&args, 0, "file")?, language, env)?,
@@ -948,8 +1084,8 @@ fn write_call(
             };
             Some((function.text().into_owned(), path, access, expands))
         }
-        Value::PathWrite(path) if language == Language::Python => {
-            Some((function.text().into_owned(), path, Access::Write, false))
+        Value::PathWrite((path, expands)) if language == Language::Python => {
+            Some((function.text().into_owned(), path, Access::Write, expands))
         }
         Value::OsTruncate if language == Language::Python => {
             let (path, expands) = path_value(&python_argument(&args, 0, "path")?, language, env)?;
