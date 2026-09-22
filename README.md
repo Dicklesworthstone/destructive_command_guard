@@ -2934,9 +2934,15 @@ actually resolvable. Configuring them anywhere else is inert, and
 | `core.filesystem:rm-recursive-general` | Every `rm` operand |
 | `core.filesystem:rm-recursive-root-home` | Every `rm` operand |
 
-Note that `rm -rf ~/...` is attributed to `rm-rf-root-home`, not
-`rm-rf-general`: any `~`- or `/`-rooted operand is the Critical root/home rule.
-Check `dcg explain "<command>"` for the rule id you actually need.
+Note that many `~`- and `/`-rooted operands are attributed to the Critical
+`rm-rf-root-home`, not `rm-rf-general`: root, any direct child of `/`, a home
+directory (`~`, `$HOME`, `/home/<user>`, `/Users/<user>`) and its top-level
+entries, dotfile trees such as `~/.claude/...`, anything under a system or mount
+directory (`/etc`, `/usr`, `/var`, `/mnt`, ...), and any operand containing an
+expansion, glob, or `..`. A static path two or more levels into a project inside
+a home directory (`~/proj/dist`) or outside the system directories
+(`/data/proj/dist`) is `rm-rf-general`. Check `dcg explain "<command>"` for the
+rule id you actually need.
 
 **Dynamic paths are never exempted.**
 `core.filesystem:redirect-truncate-dynamic-path` deliberately supports no

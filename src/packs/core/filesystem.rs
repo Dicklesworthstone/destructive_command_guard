@@ -3539,21 +3539,129 @@ fn path_is_root_home(path: &PathToken<'_>) -> bool {
     false
 }
 
+/// Top-level directories whose subtrees are the operating system, another
+/// user's data, or a whole mounted volume. A recursive delete anywhere under
+/// one of these keeps the Critical root/home severity at any depth.
+const CRITICAL_TOP_LEVEL_DIRS: &[&str] = &[
+    "Applications",
+    "Library",
+    "Program Files",
+    "Program Files (x86)",
+    "ProgramData",
+    "System",
+    "Volumes",
+    "Windows",
+    "bin",
+    "boot",
+    "cores",
+    "dev",
+    "etc",
+    "lib",
+    "lib32",
+    "lib64",
+    "libx32",
+    "media",
+    "mnt",
+    "nix",
+    "opt",
+    "private",
+    "proc",
+    "root",
+    "sbin",
+    "snap",
+    "srv",
+    "sys",
+    "usr",
+    "var",
+];
+
+/// Directories whose direct children are user home directories.
+const HOME_PARENT_DIRS: &[&str] = &["home", "Users"];
+
+/// Whether a recursive delete of `text` earns the Critical root/home rule.
+///
+/// Critical means "this can take out the OS or a whole home directory", so it
+/// covers root, a home root (`~`, `~user`, `$HOME`, `/home/<u>`, `/Users/<u>`,
+/// `/root`), a home's top-level entries and dotfile trees (`~/Documents`,
+/// `~/.ssh/...`), any direct child of `/`, and anything under a system or
+/// mount directory. A path two or more real components into a home directory
+/// (`/home/u/proj/dist`) or outside the system dirs (`/data/proj/dist`) is
+/// still denied, under the general rule at High: calling it "destroy your
+/// entire operating system" was inaccurate (#196).
+///
+/// Every doubt resolves to Critical. A component that can expand at runtime
+/// (`$`, backtick, glob, brace, tilde) or a `..` anywhere could make the
+/// operand name a shallower directory than it reads as, so either keeps the
+/// Critical rule.
 fn path_text_is_root_home(text: &str) -> bool {
-    // Absolute paths starting with / are dangerous regardless of quotes
-    // e.g. rm -rf "/" is just as deadly as rm -rf /
-    if text.starts_with('/') {
-        return true;
+    if let Some(rest) = text.strip_prefix('~') {
+        // `~` and `~user` both name a home root; only the part after the
+        // first `/` can take the operand below it.
+        return match rest.find('/') {
+            Some(slash) => !path_is_deep_below_home(&rest[slash..]),
+            None => true,
+        };
     }
 
-    if text.starts_with('~') {
-        return true;
+    for home in ["$HOME", "${HOME}"] {
+        if let Some(rest) = text.strip_prefix(home) {
+            if rest.is_empty() {
+                return true;
+            }
+            if rest.starts_with('/') {
+                return !path_is_deep_below_home(rest);
+            }
+        }
     }
 
-    text == "$HOME"
-        || text.starts_with("$HOME/")
-        || text == "${HOME}"
-        || text.starts_with("${HOME}/")
+    // Absolute paths are judged regardless of quotes: rm -rf "/" is just as
+    // deadly as rm -rf /.
+    text.starts_with('/') && absolute_path_is_critical(text)
+}
+
+/// Split a path into components, or `None` when any component could change
+/// what the path names at runtime (expansion, globbing, `..`).
+fn static_path_components(path: &str) -> Option<Vec<&str>> {
+    let components: Vec<&str> = path
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect();
+    let dynamic = components.iter().any(|component| {
+        *component == ".."
+            || component
+                .bytes()
+                .any(|byte| matches!(byte, b'$' | b'`' | b'*' | b'?' | b'[' | b'{' | b'~' | b'\\'))
+    });
+    (!dynamic).then_some(components)
+}
+
+/// `rest` is what follows a home root. Deep means two or more static
+/// components whose first is not a dotfile tree like `.ssh` or `.config`.
+fn path_is_deep_below_home(rest: &str) -> bool {
+    static_path_components(rest)
+        .is_some_and(|components| components.len() >= 2 && !components[0].starts_with('.'))
+}
+
+fn absolute_path_is_critical(path: &str) -> bool {
+    let Some(mut components) = static_path_components(path) else {
+        return true;
+    };
+    // Git-bash / MSYS spell a Windows drive root as `/c/...`; judge the rest
+    // exactly as if it started at `/`.
+    if components
+        .first()
+        .is_some_and(|first| first.len() == 1 && first.as_bytes()[0].is_ascii_alphabetic())
+    {
+        components.remove(0);
+    }
+    match components.as_slice() {
+        [] | [_] => true,
+        [first, ..] if CRITICAL_TOP_LEVEL_DIRS.contains(first) => true,
+        [parent, _user, rest @ ..] if HOME_PARENT_DIRS.contains(parent) => {
+            rest.len() < 2 || rest[0].starts_with('.')
+        }
+        _ => false,
+    }
 }
 
 /// Create the core filesystem pack.
@@ -4192,7 +4300,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //     expands to the user's home directory before rm sees it
         destructive_pattern!(
             "rm-rf-root-home",
-            r#"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+['"\\]?(?:[/~]|\$\{?HOME\b)|rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
+            r#"(?:^|[^A-Za-z0-9_.-])rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+['"\\]?(?:[/~]|\$\{?HOME\b)|(?:^|[^A-Za-z0-9_.-])rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
             "rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed. Ask the user to run it manually if truly needed.",
             Critical,
             "This command would recursively delete files starting from the root filesystem (/) \
@@ -4223,7 +4331,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Critical root deletion.
         destructive_pattern!(
             "rm-r-f-separate-root-home",
-            r#"rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+['"\\]?(?:[/~]|\$\{?HOME\b)|rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
+            r#"(?:^|[^A-Za-z0-9_.-])rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+['"\\]?(?:[/~]|\$\{?HOME\b)|(?:^|[^A-Za-z0-9_.-])rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
             "rm with separate -r -f flags targeting root or home is EXTREMELY DANGEROUS.",
             Critical,
             "Separate `-r -f` flags on `/` or `~` have identical effect to `rm -rf /`: \
@@ -4240,7 +4348,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // (`rm --recursive --force /`, `rm --force --recursive /`).
         destructive_pattern!(
             "rm-recursive-force-root-home",
-            r#"rm\s+.*--recursive.*--force\s+['"\\]?(?:[/~]|\$\{?HOME\b)|rm\s+.*--force.*--recursive\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
+            r#"(?:^|[^A-Za-z0-9_.-])rm\s+.*--recursive.*--force\s+['"\\]?(?:[/~]|\$\{?HOME\b)|(?:^|[^A-Za-z0-9_.-])rm\s+.*--force.*--recursive\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
             "rm --recursive --force targeting root or home is EXTREMELY DANGEROUS.",
             Critical,
             "The long-flag form has identical effect to `rm -rf /`: recursive, forced, \
@@ -4255,7 +4363,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // General rm -rf (caught after safe patterns) - High because temp paths are allowed
         destructive_pattern!(
             "rm-rf-general",
-            r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f|rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR]",
+            r"(?:^|[^A-Za-z0-9_.-])rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f|(?:^|[^A-Za-z0-9_.-])rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR]",
             "rm -rf is destructive and requires human approval. Explain what you want to delete and why, then ask the user to run the command manually.",
             High,
             "rm -rf recursively removes files and directories without confirmation prompts. \
@@ -4305,7 +4413,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rm -r -f (separate flags)
         destructive_pattern!(
             "rm-r-f-separate",
-            r"rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f|rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]",
+            r"(?:^|[^A-Za-z0-9_.-])rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f|(?:^|[^A-Za-z0-9_.-])rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]",
             "rm with separate -r -f flags is destructive and requires human approval.",
             High,
             "rm with separate -r and -f flags has the same effect as rm -rf: recursive \
@@ -4331,7 +4439,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rm --recursive --force (long flags)
         destructive_pattern!(
             "rm-recursive-force-long",
-            r"rm\s+.*--recursive.*--force|rm\s+.*--force.*--recursive",
+            r"(?:^|[^A-Za-z0-9_.-])rm\s+.*--recursive.*--force|(?:^|[^A-Za-z0-9_.-])rm\s+.*--force.*--recursive",
             "rm --recursive --force is destructive and requires human approval.",
             High,
             "rm --recursive --force is the long-form equivalent of rm -rf. While more \
@@ -7064,6 +7172,26 @@ mod tests {
         }
     }
 
+    /// The rm regexes are anchored on the executable (bd-migo): `rm` inside a
+    /// longer word is not an invocation, even for a caller that uses
+    /// `Pack::check` without the evaluator's argv0 gating. Path-qualified and
+    /// subcommand spellings still match.
+    #[test]
+    fn rm_regexes_do_not_match_inside_a_longer_word() {
+        let pack = create_pack();
+        for command in [
+            "charm -r -f build",
+            "swarm -r -f nodes",
+            "charm -rf /",
+            "swarm --recursive --force nodes",
+            "farm -fr ~/",
+        ] {
+            assert_allows(&pack, command);
+        }
+        assert_blocks_with_pattern(&pack, "/bin/rm -rf build", "rm-rf-general");
+        assert_blocks_with_pattern(&pack, "echo ok; rm -rf build", "rm-rf-general");
+    }
+
     #[test]
     fn test_rm_rf_root_critical() {
         let pack = create_pack();
@@ -7762,6 +7890,66 @@ mod tests {
             RM_RF_ROOT_HOME_NAME,
             Severity::Critical,
         );
+    }
+
+    /// #196 case 2: any absolute path used to get the "destroy your entire
+    /// operating system" rule, including a build directory inside a project.
+    /// Deep project paths now deny under the general rule; everything that can
+    /// reach the OS or a whole home directory stays Critical.
+    #[test]
+    fn root_home_severity_is_reserved_for_root_home_issue_196() {
+        for command in [
+            "rm -rf /home/ubuntu/proj/dist",
+            "rm -rf ~/proj/dist",
+            "rm -rf $HOME/proj/dist",
+            r#"rm -rf "${HOME}/proj/node_modules""#,
+            "rm -rf ~alice/proj/dist",
+            "rm -rf /Users/alice/code/app/build",
+            "rm -rf /data/projects/app/target",
+            "rm -rf /c/Users/bob/src/app/out",
+        ] {
+            assert_rm_parser_denies(command, RM_RF_GENERAL_NAME, Severity::High);
+        }
+        assert_rm_parser_denies(
+            "rm -r /home/ubuntu/proj/dist",
+            RM_RECURSIVE_GENERAL_NAME,
+            Severity::High,
+        );
+
+        for command in [
+            // Root, top-level dirs, and home roots.
+            "rm -rf /",
+            "rm -rf /data",
+            "rm -rf /home",
+            "rm -rf /home/ubuntu",
+            "rm -rf /root/proj/dist",
+            "rm -rf ~",
+            "rm -rf ~/",
+            "rm -rf ~alice",
+            "rm -rf $HOME",
+            // A home's top-level entries and dotfile trees.
+            "rm -rf ~/Documents",
+            "rm -rf /home/ubuntu/proj",
+            "rm -rf ~/.config/app",
+            "rm -rf /home/ubuntu/.ssh/keys",
+            // System and mount directories at any depth.
+            "rm -rf /usr/local/lib",
+            "rm -rf /var/lib/docker",
+            "rm -rf /etc/nginx/sites",
+            "rm -rf /mnt/backup/2026",
+            "rm -rf /Volumes/Backup/photos",
+            "rm -rf /c/Windows/System32",
+            "rm -rf /c/Users/bob/Desktop",
+            // Anything that can expand or climb to a shallower directory.
+            "rm -rf ~/proj/../..",
+            "rm -rf /home/ubuntu/proj/../../..",
+            "rm -rf ~/$DIR/dist",
+            "rm -rf /home/ubuntu/*/dist",
+            "rm -rf ~/{a,b}/dist",
+            "rm -rf /data/`pwd`/dist",
+        ] {
+            assert_rm_parser_denies(command, RM_RF_ROOT_HOME_NAME, Severity::Critical);
+        }
     }
 
     #[test]
