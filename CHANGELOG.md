@@ -91,6 +91,29 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   remains — that is a different shape rather than a missing name, and the AST
   patterns do not cover it either. Both noted on #468.
 
+- **Go's `os.Remove` had no bounded-fallback entry while `os.RemoveAll` did**
+  (#468), so `os.Remove('/home/user/.ssh/id_rsa')` in a Go body was allowed
+  whenever analysis was incomplete and the tree delete beside it denied. The entry
+  is now the prefix `os\.Remove`, covering both, exactly as the Ruby entry is a
+  prefix over the `FileUtils` deletion family. Go's patterns could not match
+  anything at all until #465, which is why the pair was never exercised.
+
+  Found by auditing the whole corpus rather than one language at a time, and that
+  audit is now a test. `every_blocking_ast_pattern_has_a_backstop_entry_issue_468`
+  instantiates every AST pattern registered at a blocking severity and asserts
+  `check_fallback_patterns` matches it, so adding a blocking pattern forces a
+  decision: give it a backstop entry, or exempt it with a reason. `ScriptLanguage::Bash`
+  is the one exemption — a Bash heredoc body *is* shell, so the ordinary pack rules
+  scan it in the raw command, verified rather than assumed (`rm -r /home/user` and
+  `git clean -fd` past `max_body_lines` both deny). The test carries its own
+  self-checks so a green result is meaningful: that the instantiation unwraps a
+  contextual pattern to its call and resolves a metavariable receiver, and that
+  the backstop does *not* match an arbitrary sink.
+
+  This pair had silently disagreed three times before the test existed — Ruby
+  absent entirely (#452), JavaScript's `unlinkSync` and promise `rm` missing, and
+  now Go — each found by hand.
+
 ### Fixed
 
 - **Allowlisting the rule id dcg reports did not always allow the command**

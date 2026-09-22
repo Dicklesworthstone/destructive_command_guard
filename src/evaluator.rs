@@ -26233,7 +26233,17 @@ fn check_fallback_patterns(command: &str) -> Option<EvaluationResult> {
             r#"fs/promises['"]\s*\)\s*\.\s*rm\s*\("#,
             r"child_process\.execSync",
             r"child_process\.spawnSync",
-            r"os\.RemoveAll",
+            // Go. A prefix, for the same reason the Ruby entry below is one: both
+            // of Go's deletions start with `os.Remove`, and only `RemoveAll` was
+            // here. `os.Remove` deletes a single file — an SSH private key, say —
+            // and is registered at High in the AST corpus, so the two disagreed
+            // about a blocking rule: `os.RemoveAll('/home/user')` denied on an
+            // incomplete analysis while `os.Remove('/home/user/.ssh/id_rsa')` was
+            // allowed. Found by auditing every blocking AST pattern against this
+            // set rather than one language at a time (#468). Go's patterns could
+            // not match anything at all until #465, which is why the pair was
+            // never exercised. There is no third `os.Remove*` to over-match.
+            r"os\.Remove",
             // Ruby. Deliberately a prefix match with NO trailing `\b`: every
             // `FileUtils` method whose name starts with `rm` or `remove` is a
             // deletion (rm, rm_f, rm_r, rm_rf, rmdir, remove, remove_dir,
@@ -39104,6 +39114,91 @@ mod tests {
         /// property directly on the pure function instead — *if* the fallback
         /// runs on this string it denies — which is the half that regressed and
         /// the half a timing-dependent test cannot pin.
+        /// Every blocking AST pattern must have a backstop entry (#468).
+        ///
+        /// `check_fallback_patterns` is the only thing between an incomplete
+        /// analysis and an allow, so a pattern that blocks in the AST corpus but
+        /// has no counterpart here is a false negative waiting for a slow host.
+        /// That pair has silently disagreed three times: Ruby was absent
+        /// entirely (#452), JavaScript's `unlinkSync` and promise `rm` were
+        /// missing, and Go had `os.RemoveAll` but not its `os.Remove` sibling —
+        /// each found by hand, one language at a time. This asks the question for
+        /// the whole corpus, so the next one fails here instead of in the field.
+        ///
+        /// Adding a blocking pattern therefore forces a decision: give it a
+        /// backstop entry, or exempt it here with a reason.
+        #[test]
+        fn every_blocking_ast_pattern_has_a_backstop_entry_issue_468() {
+            /// Instantiate a pattern into a plausible call, the same way the
+            /// liveness audit does: `$$$` becomes one string argument and a
+            /// metavariable receiver becomes an identifier. A contextual pattern
+            /// carries its own `func f() { … }` wrapper, so unwrap to the call.
+            fn instantiate(pattern: &str, selector: Option<&str>) -> String {
+                let mut call = pattern.replace("$$$", "\"/home/user\"");
+                while let Some(start) = call.find('$') {
+                    let end = call[start + 1..]
+                        .find(|c: char| !c.is_ascii_uppercase() && c != '_')
+                        .map_or(call.len(), |offset| start + 1 + offset);
+                    call.replace_range(start..end, "fs");
+                }
+                if selector.is_some()
+                    && let Some(open) = call.find('{')
+                    && let Some(close) = call.rfind('}')
+                    && open < close
+                {
+                    call = call[open + 1..close].trim().to_string();
+                }
+                call
+            }
+
+            // Self-checks, so a green result means something. Without these the
+            // assertion below would also pass if `instantiate` produced garbage,
+            // or if the backstop matched everything handed to it.
+            assert_eq!(
+                instantiate("func f() { os.RemoveAll($$$) }", Some("call_expression")),
+                "os.RemoveAll(\"/home/user\")",
+                "a contextual pattern must unwrap to its call"
+            );
+            assert_eq!(
+                instantiate("$FS.rmSync($$$)", None),
+                "fs.rmSync(\"/home/user\")",
+                "a metavariable receiver must become an identifier"
+            );
+            assert!(
+                check_fallback_patterns("os.Truncate(\"/home/user\")").is_none(),
+                "the backstop must not match an arbitrary sink, or the assertion \
+                 below is vacuous"
+            );
+
+            let mut gaps: Vec<String> = Vec::new();
+            for (language, patterns) in crate::ast_matcher::default_patterns() {
+                // A Bash heredoc body IS shell, so the ordinary pack rules scan
+                // it in the raw command and it needs no separate entry here.
+                // Verified rather than assumed: `rm -r /home/user` and
+                // `git clean -fd` in a body past `max_body_lines` both deny.
+                if language == crate::heredoc::ScriptLanguage::Bash {
+                    continue;
+                }
+                for meta in patterns {
+                    if !meta.severity.blocks_by_default() {
+                        continue;
+                    }
+                    let call = instantiate(&meta.pattern_str, meta.selector.as_deref());
+                    if check_fallback_patterns(&call).is_none() {
+                        gaps.push(format!("{language:?} {} => {call}", meta.rule_id));
+                    }
+                }
+            }
+
+            assert!(
+                gaps.is_empty(),
+                "{} blocking pattern(s) have no bounded-fallback entry, so an \
+                 incomplete analysis allows them outright:\n{}",
+                gaps.len(),
+                gaps.join("\n")
+            );
+        }
+
         #[test]
         fn the_bounded_fallback_reaches_inline_one_liners_issue_452() {
             for (label, cmd) in [
@@ -39161,6 +39256,19 @@ mod tests {
                 (
                     "node -e fs/promises rm",
                     r#"node -e "require('fs/promises').rm('/home/user', {recursive: true})""#,
+                ),
+                // Go's two deletions must both be here. Only `RemoveAll` was,
+                // so the sibling that deletes a single file was allowed on this
+                // path while the tree delete denied (#468).
+                (
+                    "go os.RemoveAll",
+                    "go run - <<'GO'\npackage main\nimport \"os\"\n\
+                     func main() {\n\tos.RemoveAll(\"/home/user\")\n}\nGO",
+                ),
+                (
+                    "go os.Remove",
+                    "go run - <<'GO'\npackage main\nimport \"os\"\n\
+                     func main() {\n\tos.Remove(\"/home/user/.ssh/id_rsa\")\n}\nGO",
                 ),
             ] {
                 assert!(

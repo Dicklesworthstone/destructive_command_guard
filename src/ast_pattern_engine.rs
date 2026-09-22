@@ -3132,7 +3132,16 @@ fn push_regex_match(
 /// These patterns detect destructive operations in embedded scripts.
 /// Each pattern has a stable rule ID for allowlisting.
 #[allow(clippy::too_many_lines)]
-fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
+/// The built-in AST corpus.
+///
+/// `pub(crate)` so the evaluator can assert that every pattern registered at a
+/// blocking severity also has an entry in its incomplete-analysis backstop. That
+/// pair has silently disagreed three times — Ruby absent entirely (#452),
+/// JavaScript's `unlinkSync` and promise `rm` absent, and Go's `os.Remove`
+/// present only as `os.RemoveAll` (#468) — and each disagreement was a false
+/// negative rather than cosmetic drift, because the backstop is the only thing
+/// between an incomplete analysis and an allow.
+pub(crate) fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
     let mut patterns = HashMap::new();
 
     // Python patterns
