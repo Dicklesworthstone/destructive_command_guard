@@ -730,7 +730,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // delete -f with directory (batch deletion)
         destructive_pattern!(
             "delete-from-directory",
-            r"kubectl\b.*?\bdelete\s+-f\s+\.\s*$|kubectl\b.*?\bdelete\s+-f\s+\./|kubectl\b.*?\bdelete\s+--recursive\s+-f|kubectl\b.*?\bdelete\s+-f.*--recursive",
+            // The last alternative: any `-f`/`--filename` path ending in `/`
+            // is a directory (`kubectl delete -f k8s/`); only `.` and `./…`
+            // spellings were recognised, so the usual spelling was allowed.
+            r#"kubectl\b.*?\bdelete\s+-f\s+\.\s*$|kubectl\b.*?\bdelete\s+-f\s+\./|kubectl\b.*?\bdelete\s+--recursive\s+-f|kubectl\b.*?\bdelete\s+-f.*--recursive|kubectl\b.*?\bdelete\b[^|;&]*?(?:-f|--filename)(?:=|\s+)["']?[^\s"'|;&]*/["']?(?:\s|$)"#,
             "kubectl delete -f with directories or --recursive deletes many resources at once.",
             High,
             "Deleting from a directory or recursively removes ALL resources defined in those files:\n\n\
@@ -743,6 +746,28 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Delete specific files instead:\n  \
              kubectl delete -f <specific-file.yaml>",
             DELETE_FROM_DIR_SUGGESTIONS
+        ),
+        // `kubectl apply --prune` deletes every live object in scope that the
+        // applied manifests do not mention — with `--all`, across every
+        // resource type. A dry run (client or server) only reports it.
+        destructive_pattern!(
+            "apply-prune",
+            r"kubectl\b(?![^|;&]*--dry-run(?:=(?:client|server)|\s|$))[^|;&]*?\bapply\b[^|;&]*--prune\b",
+            "kubectl apply --prune deletes live resources that are missing from the applied manifests.",
+            High,
+            "With --prune, apply also DELETES objects in the selected scope that the \
+             manifests no longer contain. A partial manifest directory, a wrong -l selector, \
+             or --all can remove far more than intended, and deleted workloads, services and \
+             their data-bearing claims do not come back.\n\n\
+             Preview exactly what would be pruned:\n  \
+             kubectl apply --prune --dry-run=server -f <dir>\n  \
+             kubectl diff -f <dir>",
+            &const {
+                [PatternSuggestion::new(
+                    "kubectl apply --prune --dry-run=server -f {directory}",
+                    "List what would be pruned without deleting anything",
+                )]
+            }
         ),
     ]
 }
@@ -1122,5 +1147,33 @@ mod tests {
         assert_no_match(&pack, "ls -la");
         assert_no_match(&pack, "git status");
         assert_no_match(&pack, "echo kubectl");
+    }
+
+    /// `kubectl delete -f k8s/` (a directory without `./`) and
+    /// `kubectl apply --prune` were allowed.
+    #[test]
+    fn directory_delete_and_apply_prune_are_denied() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("kubectl delete -f k8s/", "delete-from-directory"),
+            (
+                "kubectl delete -f deploy/overlays/prod/",
+                "delete-from-directory",
+            ),
+            ("kubectl delete --filename=k8s/", "delete-from-directory"),
+            ("kubectl apply --prune -f k8s/ --all", "apply-prune"),
+            ("kubectl apply -f k8s/ --prune -l app=api", "apply-prune"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+        for command in [
+            "kubectl apply -f k8s/",
+            "kubectl apply --prune --dry-run=server -f k8s/ --all",
+            "kubectl apply -f k8s/ --prune --dry-run=client -l app=api",
+            "kubectl get -f k8s/",
+            "kubectl diff -f k8s/",
+        ] {
+            assert_allows(&pack, command);
+        }
     }
 }
