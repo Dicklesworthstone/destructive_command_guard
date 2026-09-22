@@ -38,3 +38,36 @@ pub(crate) fn classify_embedded_credential_file_writes(
 ) -> Vec<CredentialFileWrite> {
     embedded::scan_command(command, dialect, source_is_exempt)
 }
+
+#[cfg(test)]
+mod source_ownership_tests {
+    use super::scan_extracted;
+    use crate::heredoc::{ExtractionLimits, ExtractionResult, extract_content};
+
+    #[test]
+    fn executable_perl_heredocs_must_not_be_exempted_as_literal_print_data() {
+        for source in [
+            "eval <<'CODE';\nopen(FH, '>', '/etc/shadow');\nCODE",
+            "print eval <<'CODE';\nopen(FH, '>', '/etc/shadow');\nCODE",
+            "$program = <<'CODE';\nopen(FH, '>', '/etc/shadow');\nCODE\neval $program;",
+            "print <<\"CODE\";\n${\\ do { open(FH, '>', '/etc/shadow'); '' }}\nCODE",
+        ] {
+            let command = format!("perl <<'PERL'\n{source}\nPERL");
+            let ExtractionResult::Extracted(contents) =
+                extract_content(&command, &ExtractionLimits::structural_scan())
+            else {
+                panic!("executable source must remain extractable: {command}");
+            };
+            let code = contents
+                .iter()
+                .find(|content| content.delimiter.as_deref() == Some("CODE"))
+                .unwrap_or_else(|| panic!("executable heredoc was suppressed: {command}"));
+            assert!(
+                !scan_extracted(&code.content, code.language)
+                    .expect("bounded Perl source")
+                    .is_empty(),
+                "the protected write must remain visible: {command}"
+            );
+        }
+    }
+}
