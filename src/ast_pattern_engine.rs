@@ -366,10 +366,43 @@ impl AstMatcher {
 /// so the reporter's false positive stays fixed.
 ///
 /// Returns the first blocking match, or `None`. Language-scoped to the
-/// non-shell interpreter languages that get masked.
+/// non-shell interpreter languages that get masked. A caller that honours
+/// allowlists wants [`scan_executing_sink_matches`] instead.
 #[must_use]
 pub fn scan_executing_sink_fallback(code: &str, language: ScriptLanguage) -> Option<PatternMatch> {
+    scan_executing_sink_matches(code, language)
+        .into_iter()
+        .next()
+}
+
+/// Every BLOCKING exec-sink match in `code` (see
+/// [`scan_executing_sink_fallback`] for what counts as one).
+///
+/// All of them, because a caller that honours allowlists must weigh each: an
+/// allowlisted `./build` delete must not hide a `/` delete beside it. And only
+/// blocking ones, so a harmless hit never stands in for the body — Ruby's pass
+/// used to return its first hit whatever its severity, and `system('rm',
+/// '-rf', '/tmp/x')` ahead of `system('rm', '-rf', '/')` ALLOWED the pair.
+///
+/// Perl is covered too. Its `system`/`exec`, backtick, `qx//` and
+/// `File::Path` scans are regex work like this one, but they run inside
+/// `find_matches` and are lost with it when that call times out, so they are
+/// re-run here without the matcher's deadline.
+#[must_use]
+pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<PatternMatch> {
+    if language == ScriptLanguage::Perl {
+        return find_matches_perl(code, Instant::now(), Duration::MAX, u64::MAX)
+            .map(|matches| {
+                matches
+                    .into_iter()
+                    .filter(|m| m.severity.blocks_by_default())
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
     let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
+    let mut out = Vec::new();
 
     // Ruby has command-execution forms whose payload is NOT a quoted string
     // literal (`%x(rm -rf /etc)`, backticks `` `rm -rf /etc` ``). Handle those
@@ -377,18 +410,16 @@ pub fn scan_executing_sink_fallback(code: &str, language: ScriptLanguage) -> Opt
     // the heredoc masking never converts a real executing deletion into a false
     // negative (#136).
     if language == ScriptLanguage::Ruby {
-        if let Some(m) = scan_ruby_exec_sink_fallback(code, &newline_positions) {
-            return Some(m);
-        }
+        out.extend(scan_ruby_exec_sink_matches(code, &newline_positions));
     }
 
     let sink_regex: &Regex = match language {
         ScriptLanguage::JavaScript | ScriptLanguage::TypeScript => &JS_EXEC_SINK_LITERAL,
         ScriptLanguage::Python => &PY_EXEC_SINK_LITERAL,
         ScriptLanguage::Ruby => &RUBY_EXEC_SINK_LITERAL,
-        // Bash is never masked; Perl/Php/Go use their own primary paths and have
-        // no aliasing gap this backstop needs to close for the #136 scope.
-        _ => return None,
+        // Bash is never masked; Php/Go use their own primary paths and have no
+        // aliasing gap this backstop needs to close for the #136 scope.
+        _ => return out,
     };
 
     for caps in sink_regex.captures_iter(code) {
@@ -441,7 +472,7 @@ pub fn scan_executing_sink_fallback(code: &str, language: ScriptLanguage) -> Opt
         };
         let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
 
-        return Some(PatternMatch {
+        out.push(PatternMatch {
             rule_id: format!("heredoc.{lang_id}.exec_sink.{}", hit.rule_suffix),
             reason: format!("{} via {sink}() exec sink", hit.reason),
             matched_text_preview: truncate_preview(code.get(m.start()..m.end()).unwrap_or(""), 60),
@@ -453,7 +484,7 @@ pub fn scan_executing_sink_fallback(code: &str, language: ScriptLanguage) -> Opt
         });
     }
 
-    None
+    out
 }
 
 /// High-signal filesystem sink fallback for cases where the full AST pass is
@@ -677,11 +708,17 @@ fn is_javascript_executable_offset(code: &str, offset: usize) -> bool {
 
 /// Ruby-specific exec-sink backstop covering forms whose destructive payload is
 /// not a quoted string literal (`%x(...)`/`%x{...}`/`%x[...]`, backticks) as well
-/// as quoted-arg sinks (`system`/`exec`/`spawn`, `IO.popen`, `Open3.*`). Any
-/// confirmed destructive payload is escalated to a blocking severity (>= High) via
-/// the shared escalation rule, so even a non-catastrophic `rm -rf <relpath>`
-/// inside one of these sinks BLOCKS (#136).
-fn scan_ruby_exec_sink_fallback(code: &str, newline_positions: &[usize]) -> Option<PatternMatch> {
+/// as quoted-arg sinks (`system`/`exec`/`spawn`, `IO.popen`, `Open3.*`). Each
+/// payload carries the severity `detect_rm_rf_destructive` gives it (see
+/// `ruby_exec_sink_match`), and only the blocking ones are returned.
+fn scan_ruby_exec_sink_matches(code: &str, newline_positions: &[usize]) -> Vec<PatternMatch> {
+    let mut out = Vec::new();
+    let mut keep = |m: PatternMatch| {
+        if m.severity.blocks_by_default() {
+            out.push(m);
+        }
+    };
+
     // 1) `%x(...)` / `%x{...}` / `%x[...]` command-substitution literals and
     //    backticks: the payload IS the delimited text, not a nested string.
     for caps in RUBY_PERCENT_X_LITERAL.captures_iter(code) {
@@ -691,14 +728,14 @@ fn scan_ruby_exec_sink_fallback(code: &str, newline_positions: &[usize]) -> Opti
             .find_map(|name| caps.name(name).map(|c| c.as_str()))
             .unwrap_or("");
         if let Some(hit) = detect_shell_payload(cmd) {
-            return Some(ruby_exec_sink_match(code, newline_positions, m, "%x", &hit));
+            keep(ruby_exec_sink_match(code, newline_positions, m, "%x", &hit));
         }
     }
     for caps in RUBY_BACKTICKS_LITERAL.captures_iter(code) {
         let Some(m) = caps.get(0) else { continue };
         let cmd = caps.name("cmd").map_or("", |c| c.as_str());
         if let Some(hit) = detect_shell_payload(cmd) {
-            return Some(ruby_exec_sink_match(
+            keep(ruby_exec_sink_match(
                 code,
                 newline_positions,
                 m,
@@ -716,11 +753,11 @@ fn scan_ruby_exec_sink_fallback(code: &str, newline_positions: &[usize]) -> Opti
         let arg_region = exec_sink_arg_region(code, m.start());
         if let Some(hit) = detect_destructive_in_args(arg_region) {
             let sink = caps.name("sink").map_or("exec", |s| s.as_str());
-            return Some(ruby_exec_sink_match(code, newline_positions, m, sink, &hit));
+            keep(ruby_exec_sink_match(code, newline_positions, m, sink, &hit));
         }
     }
 
-    None
+    out
 }
 
 fn ruby_exec_sink_match(
@@ -6045,6 +6082,64 @@ def cleanup():
                 scan_executing_sink_fallback(&code, ScriptLanguage::Bash).is_none(),
                 "bash bodies are never masked, so the backstop is a no-op for them"
             );
+        }
+
+        /// A harmless first hit must not stand in for the body. Ruby's pass
+        /// returned its first hit whatever its severity, so the temp delete
+        /// ahead of the `/` delete made the backstop report `Medium`.
+        #[test]
+        fn fallback_reports_blocking_hits_behind_a_harmless_one() {
+            for code in [
+                "system('rm', '-rf', '/tmp/x')\nsystem('rm', '-rf', '/')\n",
+                "%x(rm -rf /tmp/x)\nsystem('rm', '-rf', '/')\n",
+            ] {
+                let hit = scan_executing_sink_fallback(code, ScriptLanguage::Ruby);
+                assert!(
+                    hit.as_ref()
+                        .is_some_and(|m| m.severity == Severity::Critical),
+                    "{code:?}: {hit:?}"
+                );
+            }
+            // Every blocking match is returned, from both passes, and no
+            // harmless one. (A quoted `system` call is seen by both passes, so
+            // count lines rather than matches.)
+            let code =
+                "system('rm', '-rf', './build')\n`rm -rf ./dist`\nsystem('rm', '-rf', '/tmp/x')\n";
+            let matches = scan_executing_sink_matches(code, ScriptLanguage::Ruby);
+            let lines: std::collections::BTreeSet<usize> =
+                matches.iter().map(|m| m.line_number).collect();
+            assert_eq!(
+                lines,
+                std::collections::BTreeSet::from([1, 2]),
+                "{matches:?}"
+            );
+            assert!(matches.iter().all(|m| m.severity.blocks_by_default()));
+        }
+
+        /// Perl's scans run inside `find_matches` and die with it on a timeout,
+        /// so the backstop re-runs them.
+        #[test]
+        fn fallback_covers_perl() {
+            for code in [
+                "system('rm', '-rf', '/');\n",
+                "exec 'rm', '-rf', './build';\n",
+                "use File::Path;\nrmtree(['/tmp/x', '/']);\n",
+            ] {
+                assert!(
+                    scan_executing_sink_fallback(code, ScriptLanguage::Perl).is_some(),
+                    "{code:?}"
+                );
+            }
+            for code in [
+                "system('rm', '-rf', '/tmp/x');\n",
+                "unlink('/tmp/x');\n",
+                "print 'rm -rf /';\n",
+            ] {
+                assert!(
+                    scan_executing_sink_fallback(code, ScriptLanguage::Perl).is_none(),
+                    "{code:?}"
+                );
+            }
         }
 
         #[test]
