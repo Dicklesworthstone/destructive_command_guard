@@ -225,6 +225,11 @@ fn classifier_only_guidance_participates_in_registry_wide_checks() {
             "powershell-remove-item-recursive",
             "rm-bare-glob",
             "rm-bare-glob-root",
+            // #469: a non-recursive `rm` of a protected credential file. Like
+            // its neighbours it exists only inside the semantic classifier, so
+            // its guidance is authored in `classifier_rule_guidance` rather
+            // than on a `destructive_patterns` entry.
+            "rm-protected-file",
         ],
         "update the classifier-only inventory and keep its suggestions in the registry-wide checks",
     );

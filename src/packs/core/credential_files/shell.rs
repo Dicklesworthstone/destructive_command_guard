@@ -153,6 +153,56 @@ pub(crate) fn is_credential_writer(executable: &str) -> bool {
     writer_kind(executable).is_some()
 }
 
+/// Whether one operand names a file in the protected credential and
+/// login-startup set (#469).
+///
+/// `rm /etc/shadow` and `rm ~/.ssh/authorized_keys` were allowed because the
+/// `rm` rules all require a recursive flag, while `unlink`, `shred -u` and
+/// `truncate -s 0` deny the same targets. The obvious repair — reusing
+/// `path_is_root_home`, which the recursive rules use — is measurably wrong:
+/// that predicate matches anything under `/home`, `/etc` or `/var`, so it would
+/// also deny `rm /home/user/notes.txt`, i.e. the single most common operation
+/// an agent performs in its own working tree. A wide net is affordable for
+/// `rm -rf` and is not affordable here.
+///
+/// This table is the narrow predicate that case needs, and it already exists —
+/// it is what `credential-file-write` decides on. What was missing was a way to
+/// ask it a path-only question. So this is the same `resolve` + [`exact`] pair
+/// [`judge_file_target`] uses, with the writer dropped:
+///
+/// - No [`Writer`], because deletion has no write mode. `append_ok` is a
+///   write-mode carve-out (`~/.ssh/known_hosts` may be appended to) and says
+///   nothing about deleting the file, so it is deliberately ignored.
+/// - [`Exact::Parent`] is not a hit. It means "an ancestor of a protected
+///   path", which for a non-recursive delete is either a directory `rm` cannot
+///   remove or a bare root.
+/// - An unresolved spelling — a `..` climb, or an expansion that stops the
+///   literal prefix early — returns `None` rather than the write path's
+///   "cannot be verified" denial. A delete rule is the wrong place to spend a
+///   false positive on an unprovable path, and the recursive rules still judge
+///   the same operand under their own predicate.
+///
+/// `*.pub` files stay clear through [`ssh_entry`]: they are public key
+/// material, so losing one is not credential loss.
+///
+/// Returns a plain `bool` rather than the matched entry because the caller's
+/// denial reason is `&'static str`, as every `rm` rule's is — none of them name
+/// the operand, and the reported span already points at it. Returning a display
+/// string nothing could print would be a field that exists to look thorough.
+pub(crate) fn names_protected_file(operand: &str) -> bool {
+    let (word, _) = read_word(operand, 0);
+    let Some(spelling) = resolve(&word) else {
+        return false;
+    };
+    if spelling.escaped || spelling.partial.is_some() {
+        return false;
+    }
+    matches!(
+        exact(spelling.root, &spelling.comps),
+        Exact::Protected { .. }
+    )
+}
+
 /// Cheap lexical superset of every spelling [`resolve`] can turn into a
 /// protected root: `~`/`~user`, `$HOME` and the relocation variables, and the
 /// absolute `/etc`, `/private/etc`, `/home/<u>`, `/Users/<u>`, `/root`, and

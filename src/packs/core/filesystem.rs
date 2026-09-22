@@ -393,6 +393,8 @@ const RM_RECURSIVE_UNVERIFIED_NAME: &str = "rm-recursive-unverified";
 const RM_RECURSIVE_UNVERIFIED_REASON: &str = "a dynamically resolved executable may be rm and is followed by recursive deletion syntax that cannot be verified safe before shell expansion.";
 const POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME: &str = "powershell-remove-item-recursive";
 const POWERSHELL_REMOVE_ITEM_RECURSIVE_REASON: &str = "PowerShell Remove-Item (or an alias) with -Recurse permanently deletes an entire item tree without using the Recycle Bin.";
+const RM_PROTECTED_FILE_NAME: &str = "rm-protected-file";
+const RM_PROTECTED_FILE_REASON: &str = "rm on a protected credential or login-startup file is one-shot data destruction with no recovery. EXTREMELY DANGEROUS.";
 
 // ============================================================================
 // Guidance for classifier-only rules (#348)
@@ -506,6 +508,48 @@ const RM_BARE_GLOB_EXPLANATION: &str = "A bare * (or ./*) handed to rm is expand
      rm -i *                          # interactive; needs a terminal - with stdin closed it deletes nothing and exits 0\n  \
      mv ./file /tmp/delete-me-<literal-timestamp>   # move aside instead of deleting";
 
+const RM_PROTECTED_FILE_EXPLANATION: &str = "This deletes a protected credential or login-startup file: an SSH or GPG key, a \
+     cloud or container credential, a shell startup file, or a system account \
+     file such as /etc/shadow or /etc/sudoers. Losing one of these is not a file \
+     you can rebuild from the repository - it is a locked-out account, a revoked \
+     deploy key, or a machine that no longer authenticates.\n\n\
+     There is NO recovery without backups.\n\n\
+     dcg already blocks every other single-file spelling of this - unlink, \
+     shred -u, truncate -s 0 - and every embedded-language spelling. Plain rm was \
+     the one that got through, because the rm rules all require a recursive flag \
+     and -r is exactly the flag you do not need to delete one file.\n\n\
+     This rule is narrow on purpose: it decides on the protected-file table, not \
+     on a directory prefix, so ordinary deletes under a home directory \
+     (rm ~/notes.txt, rm ~/project/src/main.rs) are untouched.\n\n\
+     Safer alternatives (dcg allows all of these):\n  \
+     ls -la {path}                                  # confirm what this actually names\n  \
+     mv {path} /tmp/delete-me-<literal-timestamp>   # move aside; reversible while you verify\n  \
+     cp {path} {path}.bak                           # keep an explicit copy before anything else\n\n\
+     For an SSH key specifically, remove the authorized entry rather than the \
+     key file, so an existing session is not the last one you have.";
+
+/// Deliberately no `cp {path} {path}.bak && rm {path}`.
+///
+/// That is the shape `UNLINK_SUGGESTIONS` offers, and it is right there because
+/// `unlink` keeps working once a backup exists. It cannot be offered here: the
+/// `rm {path}` half is the command this very rule denies, so suggesting it
+/// would send the caller back into the same wall. The backup and the deletion
+/// are split instead, and the move-aside form carries the actual remedy.
+const RM_PROTECTED_FILE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "ls -la {path}",
+        "Confirm which file this actually names before deleting it",
+    ),
+    PatternSuggestion::new(
+        "mv {path} /tmp/delete-me-{timestamp}",
+        "Move it aside instead: reversible, and proves nothing depended on it",
+    ),
+    PatternSuggestion::new(
+        "cp {path} {path}.bak",
+        "Keep an explicit copy before doing anything irreversible",
+    ),
+];
+
 const RM_BARE_GLOB_ROOT_EXPLANATION: &str = "rm /* expands to every top-level entry of the filesystem root. Without -r the \
      directories survive, but on systems where /bin, /lib, and /sbin are symlinks \
      into /usr, deleting those symlinks bricks the machine - no shell, no rescue \
@@ -595,6 +639,9 @@ pub(crate) fn classifier_rule_guidance(
         n if n == RM_BARE_GLOB_ROOT_NAME => {
             Some((RM_BARE_GLOB_ROOT_EXPLANATION, RM_BARE_GLOB_SUGGESTIONS))
         }
+        n if n == RM_PROTECTED_FILE_NAME => {
+            Some((RM_PROTECTED_FILE_EXPLANATION, RM_PROTECTED_FILE_SUGGESTIONS))
+        }
         _ => None,
     }
 }
@@ -618,6 +665,7 @@ pub(crate) const CLASSIFIER_RULE_NAMES: &[&str] = &[
     POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME,
     RM_BARE_GLOB_NAME,
     RM_BARE_GLOB_ROOT_NAME,
+    RM_PROTECTED_FILE_NAME,
 ];
 
 pub(crate) fn is_pre_rm_propagation_rule(name: Option<&str>) -> bool {
@@ -670,6 +718,13 @@ pub(crate) enum RmExecutableCertainty {
 #[derive(Debug)]
 struct PathToken<'a> {
     unquoted: &'a str,
+    /// The operand exactly as spelled, quotes and all.
+    ///
+    /// `unquoted` has already had the outer quotes removed, which loses the
+    /// one distinction the protected-file classifier depends on: `rm ~/x`
+    /// expands to the home directory and `rm "~/x"` does not. That classifier
+    /// does its own quote and escape decoding, so it wants the raw word (#469).
+    raw: &'a str,
     quote: QuoteKind,
     range: Range<usize>,
     /// The byte right after the operand is an unquoted `(`.
@@ -2772,6 +2827,7 @@ fn parse_rm_segment_with_option_scanning(
         let glued_to_paren = command.as_bytes().get(token.byte_range.end) == Some(&b'(');
         paths.push(PathToken {
             unquoted,
+            raw: text,
             quote,
             range: token.byte_range.clone(),
             glued_to_paren,
@@ -2794,7 +2850,20 @@ fn parse_rm_segment_with_option_scanning(
     let Some(flag_state) = flags.resolve() else {
         // Non-recursive rm has no dangerous flag shape of its own, but a bare
         // `*` operand still hands the shell an unbounded deletion set (#334).
-        return parse_bare_glob_rm(
+        let bare_glob = parse_bare_glob_rm(
+            &paths,
+            interactive_prompts,
+            automated_stdin,
+            redirected_stdin,
+        );
+        if !matches!(bare_glob, RmParseDecision::NoMatch) {
+            return bare_glob;
+        }
+        // …and a named operand can still be a protected credential or
+        // login-startup file, which `rm` alone was letting through (#469).
+        // Ordered after the glob rules so the broader attribution wins when a
+        // command somehow satisfies both.
+        return parse_protected_file_rm(
             &paths,
             interactive_prompts,
             automated_stdin,
@@ -2910,6 +2979,78 @@ fn parse_rm_segment_with_option_scanning(
 /// `build/*`) stay untouched — they name a reviewable shape — as do quoted
 /// operands (`rm '*'` is one literal file) and genuinely interactive
 /// invocations, which prompt per file exactly like the recursive forms.
+/// A non-recursive `rm` whose operand names a protected credential or
+/// login-startup file (#469).
+///
+/// `rm /etc/shadow` and `rm ~/.ssh/authorized_keys` were allowed while
+/// `unlink`, `shred -u` and `truncate -s 0` denied the same nine targets, and so
+/// did all six embedded languages. The cause is structural rather than a gap in
+/// the path matching: every `rm` rule requires a recursive flag, and `-r` is
+/// exactly the flag you do not need in order to delete one file. `rm -rf` on the
+/// same paths has always denied.
+///
+/// The predicate is `core::credential_files`' protected-file table, not
+/// `path_is_root_home`. That distinction is the whole design. `path_is_root_home`
+/// matches anything under `/home`, `/etc` or `/var`, which is affordable for
+/// `rm -rf` — recursive deletion under a home directory is rare — and is not
+/// affordable here, where it would deny `rm ~/notes.txt` and
+/// `rm ~/project/src/main.rs`. The credential table separates `~/.ssh/id_rsa`
+/// from `~/notes.txt`, which is the separation this rule needs and the reason it
+/// can be Critical without being noisy.
+///
+/// Severity matches the three sibling rules, which are all Critical on these
+/// paths. The usual argument for softening it — that `rm` carries far more
+/// traffic than `unlink` — is answered by the narrower predicate rather than by
+/// a lower severity: the commands this fires on are the ones where the file is
+/// irrecoverable.
+///
+/// The interactive carve-out is the same one `parse_bare_glob_rm` applies, for
+/// the same reason, so `rm -i` keeps behaving identically across both.
+fn parse_protected_file_rm(
+    paths: &[PathToken<'_>],
+    interactive_prompts: bool,
+    automated_stdin: bool,
+    redirected_stdin: bool,
+) -> RmParseDecision {
+    if paths.is_empty() {
+        return RmParseDecision::NoMatch;
+    }
+    if interactive_prompts && !automated_stdin && !redirected_stdin {
+        // The per-file prompt bounds the deletion; with stdin closed, as
+        // under a hook, rm deletes nothing and exits 0.
+        return RmParseDecision::NoMatch;
+    }
+
+    // The raw operand, not `unquoted`: the classifier does its own quote and
+    // escape decoding, and it needs an unquoted `~` or `$HOME` to survive in
+    // order to recognise the root. Handing it the stripped spelling would lose
+    // the difference between `rm ~/.ssh/id_rsa`, which expands to the key, and
+    // `rm "~/.ssh/id_rsa"`, which names a directory literally called `~`.
+    // `may_name_protected_path` first: `rm` runs constantly, and this is the
+    // cheap lexical superset the classifier publishes for exactly this
+    // purpose. `rm ./build/stamp` and `rm target/debug/app` fail it on a
+    // substring test and never pay for word decoding.
+    let Some(path) = paths.iter().find(|path| {
+        crate::packs::core::credential_files::may_name_protected_path(path.raw)
+            && crate::packs::core::credential_files::names_protected_file(path.raw)
+    }) else {
+        return RmParseDecision::NoMatch;
+    };
+
+    if rm_targets_exempted_for_rule(RM_PROTECTED_FILE_NAME, paths) {
+        // Only this rule stands down (#284); other rules still see the
+        // command, so report no-match rather than a shielding allow.
+        return RmParseDecision::NoMatch;
+    }
+
+    RmParseDecision::Deny(RmParseMatch {
+        pattern_name: RM_PROTECTED_FILE_NAME,
+        reason: RM_PROTECTED_FILE_REASON,
+        severity: Severity::Critical,
+        span: Some(path.range.clone()),
+    })
+}
+
 fn parse_bare_glob_rm(
     paths: &[PathToken<'_>],
     interactive_prompts: bool,
@@ -7268,6 +7409,113 @@ mod tests {
                 unreachable!("Expected rm parser to return NoMatch for '{command}', got {other:?}")
             }
         }
+    }
+
+    /// A non-recursive `rm` of a protected credential file denies (#469).
+    ///
+    /// `rm /etc/shadow` and `rm ~/.ssh/authorized_keys` were allowed while
+    /// `unlink`, `shred -u` and `truncate -s 0` denied the same nine targets,
+    /// and so did all six embedded languages. Every `rm` rule required a
+    /// recursive flag, and `-r` is exactly the flag you do not need to delete
+    /// one file.
+    #[test]
+    fn rm_of_a_protected_credential_file_denies_issue_469() {
+        for target in [
+            "/home/user/.ssh/id_rsa",
+            "/home/user/.ssh/authorized_keys",
+            "/home/user/.bashrc",
+            "/home/user/.gnupg/secring.gpg",
+            "/home/user/.aws/credentials",
+            "/etc/shadow",
+            "/etc/passwd",
+            "/etc/sudoers",
+            "/root/.ssh/id_rsa",
+        ] {
+            assert_rm_parser_denies(
+                &format!("rm {target}"),
+                RM_PROTECTED_FILE_NAME,
+                Severity::Critical,
+            );
+        }
+
+        // The flag and spelling surface measured as allowed before the fix.
+        for command in [
+            "rm -f /home/user/.ssh/id_rsa",
+            "rm -v /home/user/.ssh/id_rsa",
+            "rm -- /home/user/.ssh/id_rsa",
+            r#"rm "/home/user/.ssh/id_rsa""#,
+            "/bin/rm /home/user/.ssh/id_rsa",
+            "rm ~/.ssh/id_rsa",
+            "rm $HOME/.aws/credentials",
+            // One protected operand among benign ones is still a deletion of
+            // the protected one.
+            "rm /home/user/notes.txt /home/user/.ssh/id_rsa",
+        ] {
+            assert_rm_parser_denies(command, RM_PROTECTED_FILE_NAME, Severity::Critical);
+        }
+    }
+
+    /// The boundaries #469 must not cross, and the reason it is a new predicate
+    /// rather than a reuse of `path_is_root_home`.
+    ///
+    /// `path_is_root_home` matches anything under `/home`, `/etc` or `/var`.
+    /// Reusing it here would deny `rm /home/user/notes.txt` and
+    /// `rm /home/user/project/src/main.rs` — the single most common operation
+    /// an agent performs in its own tree. Those two rows are the countermetric
+    /// for this rule: if either ever starts denying, the predicate has been
+    /// widened into the one that was measured unusable.
+    #[test]
+    fn rm_of_an_ordinary_file_still_allows_issue_469() {
+        for command in [
+            // Relative paths carry no anchor at all.
+            "rm ./build/stamp",
+            "rm target/debug/app",
+            "rm node_modules/.cache/x",
+            // Temp, which the sibling rules already carve out.
+            "rm /tmp/scratch.txt",
+            "rm /var/tmp/x.log",
+            // The rows the obvious fix breaks.
+            "rm /home/user/notes.txt",
+            "rm /home/user/project/src/main.rs",
+            "rm ~/notes.txt",
+            // Under a protected prefix but not protected files: `unlink`
+            // denies both of these, and that breadth deliberately does not
+            // transfer to `rm`.
+            "rm /etc/hosts",
+            "rm /var/log/app.log",
+            // Public key material is not credential loss (`ssh_entry`).
+            "rm ~/.ssh/id_rsa.pub",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+    }
+
+    /// The recursive rules keep their own attribution (#467's invariant).
+    ///
+    /// `rm -rf ~/.ssh/id_rsa` must still report `rm-rf-root-home` and not also
+    /// the new rule: two blocking ids for one command would mean an allowlist
+    /// entry for the reported one leaves it denied under the other. The new
+    /// rule is reachable only when `flags.resolve()` yields `None`, which is
+    /// exactly the non-recursive case, so this is structural — the test pins it.
+    #[test]
+    fn recursive_rm_keeps_its_own_rule_issue_469() {
+        assert_rm_parser_denies(
+            "rm -rf /home/user/.ssh/id_rsa",
+            RM_RF_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+        assert_rm_parser_denies(
+            "rm -r /etc/shadow",
+            RM_RECURSIVE_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+        assert_rm_parser_denies(
+            "rm -r -f /etc/shadow",
+            RM_R_F_SEPARATE_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+        // And the temp exemption for recursive rm is untouched.
+        assert_rm_parser_allows("rm -rf /tmp/build");
     }
 
     #[test]

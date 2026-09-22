@@ -909,6 +909,26 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         ],
     );
 
+    m.insert(
+        "core.filesystem:rm-protected-file",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Confirm which file the operand actually names before deleting it",
+            )
+            .with_command("ls -la"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Move the file aside instead: reversible, and it proves nothing depended on it",
+            )
+            .with_command("mv /path/to/file /tmp/delete-me-reviewed"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "For an SSH key, remove the authorized entry rather than the key file, so a live session is not the last one you have",
+            ),
+        ],
+    );
+
     // redirect-truncate-*: shell-syntax truncate-equivalent. These need
     // redirect-specific guidance; deletion suggestions read as a non sequitur
     // on a redirect denial (issues #316/#317).
