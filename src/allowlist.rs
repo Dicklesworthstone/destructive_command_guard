@@ -1299,8 +1299,19 @@ pub fn scope_match_path(cwd: &Path) -> String {
 /// and Windows' extended-length canonical form is unwrapped: `canonicalize`
 /// returns `\\?\C:\work`, which no user would ever write a `paths = [...]`
 /// pattern against.
-fn normalize_resolved_path(path: &Path) -> String {
-    let text = path.to_string_lossy().replace('\\', "/");
+pub(crate) fn normalize_resolved_path(path: &Path) -> String {
+    normalize_scope_text(&path.to_string_lossy())
+}
+
+/// `/`-separate `text` and unwrap Windows' extended-length prefix.
+///
+/// Applied to patterns as well as to working directories: a pattern written
+/// in canonical form — `\\?\C:\proj\**`, which is what the interactive
+/// "current directory only" scope used to store — otherwise never matched,
+/// because the `?` of the prefix is a glob wildcard and the working directory
+/// it is compared with is unwrapped.
+fn normalize_scope_text(text: &str) -> String {
+    let text = text.replace('\\', "/");
     if let Some(rest) = text.strip_prefix("//?/UNC/") {
         return format!("//{rest}");
     }
@@ -1323,8 +1334,9 @@ fn normalize_resolved_path(path: &Path) -> String {
 /// pattern that globs from the root, or a prefix that does not exist), and
 /// when resolution is a no-op.
 fn canonicalize_pattern_prefix(pattern: &str) -> Option<String> {
-    // Patterns are matched with `/` separators on every platform.
-    let pattern = pattern.replace('\\', "/");
+    // Patterns are matched with `/` separators on every platform, without the
+    // extended-length prefix (whose `?` would end the literal prefix).
+    let pattern = normalize_scope_text(pattern);
     // A relative pattern has nothing to anchor to, and must not be given one.
     if !Path::new(&pattern).is_absolute() {
         return None;
@@ -1679,8 +1691,8 @@ pub fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
 /// Path separators are normalized to `/` for cross-platform compatibility.
 #[must_use]
 pub fn path_matches_glob(pattern: &str, path: &str) -> bool {
-    let normalized_path = path.replace('\\', "/");
-    let normalized_pattern = pattern.replace('\\', "/");
+    let normalized_path = normalize_scope_text(path);
+    let normalized_pattern = normalize_scope_text(pattern);
 
     if normalized_pattern == "*" {
         return true;
@@ -1749,7 +1761,7 @@ pub fn resolve_path_for_matching(
         absolute_path
     };
 
-    Ok(resolved.to_string_lossy().replace('\\', "/"))
+    Ok(normalize_resolved_path(&resolved))
 }
 
 /// Load allowlist files using the default locations.
@@ -3354,6 +3366,25 @@ mod tests {
     fn test_validate_glob_pattern_invalid() {
         assert!(validate_glob_pattern("").is_err()); // Empty pattern
         assert!(validate_glob_pattern("[abc").is_err()); // Unclosed bracket
+    }
+
+    #[test]
+    fn extended_length_patterns_match_like_their_plain_spelling() {
+        // `canonicalize` on Windows yields `\\?\C:\proj`; the interactive
+        // "current directory only" scope stored exactly that, and its `?` is
+        // a glob wildcard, so the grant never applied.
+        assert!(path_matches_glob(r"\\?\C:\proj", r"C:\proj"));
+        assert!(path_matches_glob(r"\\?\C:\proj\**", r"C:\proj\sub\dir"));
+        assert!(path_matches_glob(r"C:\proj\**", r"\\?\C:\proj\sub"));
+        assert!(path_matches_glob(
+            r"\\?\UNC\server\share\**",
+            r"\\server\share\team"
+        ));
+        assert!(!path_matches_glob(r"\\?\C:\proj\**", r"C:\other"));
+        assert_eq!(
+            normalize_resolved_path(Path::new(r"\\?\C:\proj")),
+            "C:/proj"
+        );
     }
 
     #[test]

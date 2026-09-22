@@ -350,10 +350,13 @@ function Test-NonBashTool { param([string]$Tool, [string]$Desc)
 function Test-MalformedInput { param([string]$Raw, [string]$Desc)
     Log-TestStart $Desc
     $r = Invoke-Dcg -Json $Raw -EnvOverrides (Get-BaseEnv)
-    if ([string]::IsNullOrWhiteSpace($r.StdOut) -and [string]::IsNullOrWhiteSpace($r.StdErr)) {
+    # Empty stdout is the protocol's allow. dcg deliberately warns on stderr
+    # when it fails open on unparseable input, so stderr is not asserted —
+    # the same contract scripts/e2e_test.sh checks.
+    if ([string]::IsNullOrWhiteSpace($r.StdOut)) {
         Log-Pass "HANDLED malformed: $Desc"
     } else {
-        Log-Fail "Should ALLOW malformed: $Desc" "<empty stdout and stderr>" "stdout=$($r.StdOut.Trim()) stderr=$($r.StdErr.Trim())"
+        Log-Fail "Should ALLOW malformed: $Desc" "<empty stdout>" "stdout=$($r.StdOut.Trim()) stderr=$($r.StdErr.Trim())"
     }
 }
 
@@ -570,7 +573,9 @@ try {
     # -----------------------------------------------------------------------
     Log-Section "Heredoc / inline script"
     Test-Verdict "node <<EOF`nconst fs = require('fs');`nfs.rmSync('/etc', { recursive: true });`nEOF`n" "block" "node heredoc rmSync /etc"
-    Test-Verdict "python3 <<EOF`nimport shutil`nshutil.rmtree('/tmp/test')`nEOF`n" "block" "python3 heredoc shutil.rmtree (embedded code always blocked)"
+    # Not /tmp: #455 made a recursive delete of a temp literal warn-only in
+    # every language (mirrors 505db08 in scripts/e2e_test.sh).
+    Test-Verdict "python3 <<EOF`nimport shutil`nshutil.rmtree('/')`nEOF`n" "block" "python3 heredoc shutil.rmtree('/')"
     Test-Verdict "bash <<EOF`nrm -rf /etc`nEOF`n" "block" "bash heredoc rm -rf /etc"
     Test-Verdict "node <<EOF`nconsole.log('hello');`nEOF`n" "allow" "node heredoc safe"
     Test-Verdict 'bash -c "rm -rf /"' "block" "bash -c execution context"
@@ -673,7 +678,9 @@ try {
         "Remove-Partition -DriveLetter D", "Initialize-Disk -Number 1", "Disable-ComputerRestore C:\",
         "Remove-VM -Name Prod",
         "Remove-Item HKLM:\Software\Foo", "Remove-ItemProperty -Path HKLM:\Foo -Name Bar",
-        "Remove-LocalUser -Name attacker"
+        "Remove-LocalUser -Name attacker",
+        # -WhatIf:$false turns the preview off; the cmdlet really runs.
+        'Format-Volume -DriveLetter D -WhatIf:$false', 'Remove-Partition -DriveLetter D -WhatIf:$false'
     )
     foreach ($c in $winPowerShellBlock) { Test-Verdict $c "block" "win-powershell: $c" $winAll $null $powerShellTool }
 

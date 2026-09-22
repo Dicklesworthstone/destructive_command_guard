@@ -4489,7 +4489,9 @@ fn prompt_allowlist_target(rule_id: Option<&str>) -> InteractiveAllowlistTarget 
 fn prompt_allowlist_path_scope() -> Vec<String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let scope_path = cwd.canonicalize().unwrap_or(cwd);
-    let scope_path_str = scope_path.to_string_lossy().into_owned();
+    // The form scope matching compares against: `/`-separated, without the
+    // Windows `\\?\` prefix `canonicalize` adds.
+    let scope_path_str = crate::allowlist::normalize_resolved_path(&scope_path);
 
     let scoped = format!("Current directory only ({scope_path_str})");
     let global = "All directories (global)".to_string();
@@ -20870,7 +20872,7 @@ mod tests {
     /// A Unix-style absolute test path made absolute on the host too:
     /// `is_absolute` is host-specific, so `/opt/dcg` needs a drive on Windows.
     fn host_abs(path: &str) -> String {
-        if cfg!(windows) {
+        if cfg!(windows) && path.starts_with('/') {
             format!("C:{path}")
         } else {
             path.to_string()
