@@ -32789,9 +32789,13 @@ mod tests {
             // `/etc/passwd` is a system authentication file, so the
             // credential rule claims it ahead of the generic truncation rule.
             ("rm -ri ./tree > /etc/passwd", "credential-file-write"),
+            // Only the Cmd reading of this unknown-dialect command sees a
+            // redirect (`'` does not quote in Cmd). Since #477 the credential
+            // rule reads Cmd too, so it claims `/etc/passwd` here exactly as
+            // it does in the row above.
             (
                 "rm -ri ./tree 'literal > /etc/passwd",
-                "redirect-truncate-root-home",
+                "credential-file-write",
             ),
             ("rm -ri ./tree $(unlink /etc/passwd)", "unlink-root-home"),
         ];

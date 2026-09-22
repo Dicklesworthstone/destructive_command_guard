@@ -665,25 +665,25 @@ fn lex(segment: &str, dialect: ShellDialect) -> Vec<Vec<Lexed>> {
             i = (close + 1).min(bytes.len());
             continue;
         }
-        if let Some((mode, after)) = redirect(bytes, i, powershell) {
+        if let Some((kind, after)) = redirect(bytes, i, powershell) {
             let mut j = after;
             while matches!(bytes.get(j), Some(b' ' | b'\t')) {
                 j += 1;
             }
             i = j;
-            let Some(mode) = mode else {
-                // A descriptor merge (`2>&1`) or an input redirect.
+            if kind == Redirect::Merge || j >= bytes.len() {
                 continue;
-            };
-            if j < bytes.len() {
-                let (arg, end) = read_word(segment, j, dialect);
-                i = end.max(j + 1);
-                if let Some(command) = commands.last_mut() {
-                    command.push(Lexed::Write {
-                        mode,
-                        target: arg.word,
-                    });
-                }
+            }
+            let (arg, end) = read_word(segment, j, dialect);
+            i = end.max(j + 1);
+            // An input operand is consumed so it is not read as an argument.
+            if let Redirect::Output(mode) = kind
+                && let Some(command) = commands.last_mut()
+            {
+                command.push(Lexed::Write {
+                    mode,
+                    target: arg.word,
+                });
             }
             continue;
         }
@@ -782,13 +782,23 @@ fn here_string(segment: &str, start: usize) -> Option<(Arg, usize)> {
 
 /// A redirect operator at byte `i`: its write mode (or `None` for one that
 /// opens no output file) and the offset just past it.
-fn redirect(bytes: &[u8], i: usize, powershell: bool) -> Option<(Option<WriteMode>, usize)> {
+fn redirect(bytes: &[u8], i: usize, powershell: bool) -> Option<(Redirect, usize)> {
     let mut j = i;
     match bytes.get(j)? {
         b'0'..=b'9' => j += 1,
         b'*' if powershell => j += 1,
-        b'<' if !powershell => return Some((None, i + 1)),
         _ => {}
+    }
+    // Input — and `<>`, which opens read-write WITHOUT truncating, the same
+    // reading the POSIX tokenizer gives it. PowerShell reserves `<` and
+    // refuses to run the command at all; either way nothing is written, and
+    // the `>` of `<>` must not be taken for an output redirect.
+    if bytes.get(j) == Some(&b'<') {
+        j += 1;
+        if bytes.get(j) == Some(&b'>') {
+            j += 1;
+        }
+        return Some((Redirect::Input, j));
     }
     if bytes.get(j) != Some(&b'>') {
         return None;
@@ -801,9 +811,18 @@ fn redirect(bytes: &[u8], i: usize, powershell: bool) -> Option<(Option<WriteMod
         WriteMode::Replace
     };
     if bytes.get(j) == Some(&b'&') && bytes.get(j + 1).is_some_and(u8::is_ascii_digit) {
-        return Some((None, j + 2));
+        return Some((Redirect::Merge, j + 2));
     }
-    Some((Some(mode), j))
+    Some((Redirect::Output(mode), j))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Redirect {
+    Output(WriteMode),
+    /// Reads its operand (`< file`, `<> file`).
+    Input,
+    /// A descriptor merge (`2>&1`): no file at all.
+    Merge,
 }
 
 /// Decode one word. Returns it with the byte offset just past it.
@@ -1210,6 +1229,10 @@ mod tests {
             "Write-Output x `>`> ~/.ssh/authorized_keys",
             "Write-Output x # >> ~/.ssh/authorized_keys",
             "'x' | Tee-Object -Variable keys",
+            // `<>` opens read-write without truncating (and PowerShell
+            // refuses `<` outright); its `>` is not an output redirect.
+            "Get-Content x <> /etc/passwd",
+            "Get-Content x < ~/.bashrc",
             "New-Item -ItemType Directory -Path ~/projects/app",
         ] {
             assert!(
@@ -1252,6 +1275,8 @@ mod tests {
             "copy %USERPROFILE%\\.ssh\\authorized_keys C:\\backup\\",
             "echo x ^>^> %USERPROFILE%\\.ssh\\authorized_keys",
             "echo x >> %USERPROFILE%\\.ssh\\known_hosts",
+            "sort <> %USERPROFILE%\\.bashrc",
+            "sort < %USERPROFILE%\\.bashrc > %TEMP%\\sorted.txt",
         ] {
             assert!(
                 cmd(command).is_none(),
