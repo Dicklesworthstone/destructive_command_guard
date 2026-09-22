@@ -1947,6 +1947,9 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "DROP",
             "TRUNCATE",
             "DELETE",
+            // `update-without-where`; the rule needs `UPDATE <table> SET`, so
+            // `apt update` only costs a candidate check.
+            "UPDATE",
         ],
         database::postgresql::create_pack,
     ),

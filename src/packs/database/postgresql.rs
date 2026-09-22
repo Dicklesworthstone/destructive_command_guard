@@ -301,7 +301,7 @@ pub fn create_pack() -> Pack {
                       TRUNCATE, and dropdb",
         keywords: &[
             "psql", "dropdb", "DROP", "TRUNCATE", "pg_dump", "postgres", "DELETE", "delete",
-            "drop", "truncate",
+            "drop", "truncate", "UPDATE", "update",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -425,6 +425,36 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              SELECT COUNT(*) FROM tablename;  -- all rows!\n  \
              SELECT * FROM tablename LIMIT 10;",
             DELETE_WITHOUT_WHERE_SUGGESTIONS
+        ),
+        // UPDATE without WHERE rewrites every row — the same unscoped blast
+        // radius as the DELETE rule above, which denied while this allowed.
+        destructive_pattern!(
+            "update-without-where",
+            r#"(?i)\bUPDATE\s+(?:ONLY\s+)?(?:[a-zA-Z_][a-zA-Z0-9_]*|"[^"]+")(?:\.(?:[a-zA-Z_][a-zA-Z0-9_]*|"[^"]+"))?\s+(?:AS\s+\w+\s+)?SET\b(?:(?!\bWHERE\b)[^;])*(?:;|$)"#,
+            "UPDATE without WHERE clause overwrites the column in ALL rows. Add a WHERE clause.",
+            High,
+            "UPDATE without WHERE changes every row in the table, replacing whatever values \
+             were there. Unless it runs inside a transaction you then roll back, the previous \
+             values are gone.\n\n\
+             Scope it:\n  \
+             UPDATE tablename SET col = value WHERE condition;\n\n\
+             Preview what would change:\n  \
+             SELECT COUNT(*) FROM tablename WHERE condition;\n\n\
+             Or wrap it: BEGIN; UPDATE …; SELECT …; ROLLBACK/COMMIT;"
+        ),
+        // ALTER TABLE … DROP COLUMN deletes that column's data for every row.
+        // `ALTER COLUMN c DROP DEFAULT | NOT NULL | IDENTITY | EXPRESSION` and
+        // `DROP CONSTRAINT` change metadata only and stay allowed.
+        destructive_pattern!(
+            "drop-column",
+            r"(?i)\bALTER\s+TABLE\b[^;]*?\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?(?!(?:CONSTRAINT|DEFAULT|NOT\s+NULL|IDENTITY|EXPRESSION)\b)[A-Za-z_\x22]",
+            "ALTER TABLE ... DROP COLUMN permanently deletes that column's data in every row.",
+            High,
+            "Dropping a column removes its values from every row. PostgreSQL does not keep \
+             them anywhere you can restore from without a backup.\n\n\
+             Back up the column first:\n  \
+             CREATE TABLE tablename_col_backup AS SELECT id, col FROM tablename;\n\n\
+             Or keep it for now: stop reading it in the application, then drop it later."
         ),
         // dropdb CLI command
         destructive_pattern!(
@@ -777,5 +807,44 @@ mod tests {
         // And a later statement on the same line is still reachable.
         let masked = mask_comments("rm -rf /*/*; dropdb mydb");
         assert!(masked.contains("dropdb mydb"), "{masked:?}");
+    }
+
+    /// Unscoped UPDATE and DROP COLUMN destroy data like the already-denied
+    /// unscoped DELETE and DROP TABLE, and were allowed.
+    #[test]
+    fn unscoped_update_and_drop_column_are_denied() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("UPDATE users SET admin = true;", "update-without-where"),
+            (
+                "update public.users set email = null",
+                "update-without-where",
+            ),
+            ("UPDATE users AS u SET name = 'x'", "update-without-where"),
+            ("ALTER TABLE users DROP COLUMN email;", "drop-column"),
+            ("alter table users drop email", "drop-column"),
+            (
+                "ALTER TABLE users DROP COLUMN IF EXISTS email",
+                "drop-column",
+            ),
+            (
+                "ALTER TABLE users ADD COLUMN x int, DROP COLUMN y",
+                "drop-column",
+            ),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+        for command in [
+            "UPDATE users SET admin = true WHERE id = 1;",
+            "update users set x = 1 where x is null",
+            "ALTER TABLE users ALTER COLUMN email DROP NOT NULL",
+            "ALTER TABLE users ALTER COLUMN email DROP DEFAULT",
+            "ALTER TABLE users DROP CONSTRAINT users_email_key",
+            "ALTER TABLE users ADD COLUMN email text",
+            "apt update",
+            "brew update && brew upgrade",
+        ] {
+            assert_no_match(&pack, command);
+        }
     }
 }
