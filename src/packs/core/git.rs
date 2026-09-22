@@ -5814,6 +5814,35 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 ]
             }
         ),
+        // `git push origin +main` / `+HEAD:main` / `+refs/heads/*:refs/heads/*`:
+        // a leading `+` on a refspec is git's per-ref force flag — the same
+        // overwrite as `--force` for that ref, with no flag for the two rules
+        // above to see. Same bounded walker, so it stays inside one command.
+        destructive_pattern!(
+            "push-force-refspec",
+            r#"(?:^|[^[:alnum:]_-])git(?:\s+(?:[^\s&;|`()<>]+\s+)*|-)push\s+(?:[^\s&;|`()<>]+\s+)*['"]?\+[^\s&;|`()<>]+"#,
+            "A '+' refspec force-pushes that ref and can destroy remote history. Use --force-with-lease if necessary.",
+            Critical,
+            "In `git push <remote> +<ref>`, the leading `+` forces that one update exactly as \
+             --force would, overwriting remote history with your local history. Commits \
+             others already pushed to that ref are discarded from the remote.\n\n\
+             Safer alternative:\n\
+             - git push --force-with-lease <remote> <ref>: only forces if the remote still \
+             matches what you last fetched\n\n\
+             Check remote state first:\n  git fetch && git log origin/<branch>..HEAD",
+            &const {
+                [
+                    PatternSuggestion::new(
+                        "git push --force-with-lease origin {branch}",
+                        "Fails if remote has new commits you haven't fetched",
+                    ),
+                    PatternSuggestion::new(
+                        "git fetch && git log origin/{branch}..HEAD",
+                        "Preview what you're about to overwrite on the remote",
+                    ),
+                ]
+            }
+        ),
         // Branch deletion and forced ref updates cross a user-intent boundary.
         // Lowercase `-d` checks merge state, but still removes the branch name,
         // tracking configuration, and convenient reflog anchor. Agents must
@@ -7477,6 +7506,12 @@ git x",
             ("git rm -r --force src", "rm-force"),
             ("git rm -rf .", "rm-force"),
             ("git update-ref -d refs/heads/main", "update-ref-delete"),
+            ("git push origin +main", "push-force-refspec"),
+            ("git push origin +HEAD:main", "push-force-refspec"),
+            (
+                "git push origin '+refs/heads/*:refs/heads/*'",
+                "push-force-refspec",
+            ),
             (
                 "git update-ref --delete refs/heads/main",
                 "update-ref-delete",
@@ -7503,6 +7538,9 @@ git x",
             "git rm -n -rf .",
             "git rm --dry-run -f src",
             "git update-ref refs/heads/main HEAD",
+            "git push origin main",
+            "git push origin main+fix",
+            "git push --force-with-lease origin main",
         ] {
             assert!(
                 pack.check(command).is_none(),

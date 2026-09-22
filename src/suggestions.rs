@@ -321,6 +321,10 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
         ),
     ];
     m.insert("core.git:push-force-long", force_push_suggestions.clone());
+    m.insert(
+        "core.git:push-force-refspec",
+        force_push_suggestions.clone(),
+    );
     m.insert("core.git:push-force-short", force_push_suggestions);
 
     // Checkout patterns that discard changes
