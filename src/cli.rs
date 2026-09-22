@@ -456,9 +456,16 @@ pub enum Command {
     /// `dcg test` evaluates the command line you give it.
     ///
     /// The hook is told which tool it is gating, so a `Bash` payload is
-    /// evaluated as POSIX. `dcg test` has no such context and evaluates the
-    /// conservative union of the POSIX, PowerShell and Cmd views, which can
-    /// deny where the hook allows.
+    /// evaluated as POSIX. `dcg test` has no such context and defaults to
+    /// `--dialect unknown`, which can deny where the hook allows.
+    ///
+    /// That union is not complete in both directions today, so do not read an
+    /// `allow` here as "no hook would block this". Measured:
+    /// `Remove-Item -Recurse -Force /etc` denies under `--dialect ps` and
+    /// under a `PowerShell` hook payload, and is ALLOWED by the default
+    /// `--dialect unknown`. Pass the dialect you actually care about when the
+    /// answer matters; `--dialect posix` reproduces the `Bash` hook path
+    /// exactly (#451).
     #[command(name = "test")]
     TestCommand {
         /// Command to test
@@ -1907,7 +1914,13 @@ pub enum SimulateFormat {
 /// pin the same dialect the hook resolves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum DialectArg {
-    /// Evaluate every dialect (CLI default; matches no single hook path)
+    /// Union over dialects (CLI default; matches no single hook path).
+    ///
+    /// Not a complete union today — `Remove-Item -Recurse -Force /etc` denies
+    /// under `ps` and allows here — so an `allow` at this dialect does not mean
+    /// no hook would block the command (#451). This is also the dialect the
+    /// hook itself resolves for any tool name that is not
+    /// `bash`/`powershell`/`pwsh`/`cmd`, so it is not CLI-only.
     #[default]
     Unknown,
     /// POSIX shell — the dialect the `Bash` PreToolUse hook resolves
@@ -29397,6 +29410,70 @@ exclude = ["target/**"]
             &heredoc_settings,
             None,
         )
+    }
+
+    /// The default dialect is NOT a complete union, and the help text says so.
+    ///
+    /// `--dialect unknown` is documented as denying where the hook allows, and
+    /// it does — `rd /s /q C:\x` in the test below is exactly that. What it does
+    /// not do is deny everything any single dialect denies:
+    /// `Remove-Item -Recurse -Force /etc` is denied by `--dialect ps` and by a
+    /// `PowerShell` hook payload, and allowed at the default (#451).
+    ///
+    /// That is asserted here rather than left implicit for two reasons. It is a
+    /// user-facing safety claim — an `allow` from `dcg test` reads as "no hook
+    /// would block this", and for this command that is wrong — and `Unknown` is
+    /// not CLI-only: `shell_dialect_for_tool_name` resolves it for every tool
+    /// name that is not `bash`/`powershell`/`pwsh`/`cmd`, so the gap is reachable
+    /// from a real payload.
+    ///
+    /// **When the union is completed, invert this test and drop the caveats from
+    /// `TestCommand`'s doc comment and from `DialectArg::Unknown`.** It pins the
+    /// gap so the documentation cannot drift back to the stronger claim while
+    /// the behaviour stays as it is; it is not an endorsement of the behaviour.
+    #[test]
+    fn default_dialect_is_not_a_complete_union_issue_451() {
+        let command = "Remove-Item -Recurse -Force /etc";
+
+        let ps = evaluate_at_dialect(command, DialectArg::Ps);
+        assert!(
+            matches!(ps, EvaluationDecision::Deny),
+            "the PowerShell view must still deny this; if it does not, #451 has \
+             regressed and this test is measuring the wrong thing"
+        );
+
+        let unknown = evaluate_at_dialect(command, DialectArg::Unknown);
+        assert!(
+            !matches!(unknown, EvaluationDecision::Deny),
+            "the default dialect now denies this, so the union is complete: \
+             invert this assertion and remove the caveats from `dcg test --help` \
+             and `DialectArg::Unknown` (#451)"
+        );
+    }
+
+    fn evaluate_at_dialect(command: &str, dialect: DialectArg) -> EvaluationDecision {
+        let config = Config::default();
+        let compiled_overrides = config.overrides.compile();
+        let allowlists = crate::allowlist::LayeredAllowlist::default();
+        let heredoc_settings = config.heredoc_settings();
+        let enabled_packs = config.enabled_pack_ids();
+        let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+        let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+        let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            command,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled_overrides,
+            &allowlists,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+            dialect.into(),
+        )
+        .decision
     }
 
     #[test]
