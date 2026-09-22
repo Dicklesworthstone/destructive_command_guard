@@ -606,6 +606,61 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
             ),
         ],
     );
+    let force_switch = || {
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "See exactly what the force would discard: `git status` and `git diff`",
+            )
+            .with_command("git status"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Save the changes first with `git stash`, switch, then `git stash pop`",
+            )
+            .with_command("git stash"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Check the other branch out alongside: `git worktree add ../other <branch>`",
+            ),
+        ]
+    };
+    m.insert("core.git:checkout-force", force_switch());
+    m.insert("core.git:switch-discard", force_switch());
+    m.insert(
+        "core.git:rm-force",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Preview which files would be removed: `git rm -n <path>`",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Stop tracking but keep the file on disk: `git rm --cached <path>`",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Commit or stash the modifications, then `git rm` without -f",
+            ),
+        ],
+    );
+    m.insert(
+        "core.git:update-ref-delete",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Review the ref first: `git branch -vv`",
+            )
+            .with_command("git branch -vv"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Use the porcelain delete, which refuses unmerged branches: `git branch -d <branch>`",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Keep a pointer before deleting: `git branch backup/<name> <ref>`",
+            ),
+        ],
+    );
 }
 
 /// Recursive rm rules whose target is a root, home, or sensitive system path.

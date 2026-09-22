@@ -153,8 +153,15 @@ expected = "deny"
 
 [[case]]
 description = "find with quoted expression is safe"
-command = "find . -name '*.txt' -exec rm {} \\;"
+command = "find . -name '*.txt' -exec cat {} \\;"
 expected = "allow"
+
+# `-exec rm {}` deletes every found file, the same deletion as the denied
+# `find . -name '*.txt' -delete`; it used to be allowed while `-delete` was not.
+[[case]]
+description = "find -exec rm on the found files is a recursive delete"
+command = "find . -name '*.txt' -exec rm {} \\;"
+expected = "deny"
 
 [[case]]
 description = "xargs with quoted command is safe"

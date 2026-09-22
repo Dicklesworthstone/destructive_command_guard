@@ -4535,7 +4535,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // `(find /etc -delete)` and `find /etc -delete | tee log`
             // both fire. Without `)` in the set, subshell forms
             // silently bypass.
-            r#"\bfind\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s-delete(?:\s|$|[;&|)\n])"#,
+            // The action is `-delete` or `-exec`/`-execdir rm … {}`: the second
+            // is the same deletion of the found files spelled the older way,
+            // and was allowed. `{}` may be quoted or escaped.
+            r#"\bfind\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s(?:-delete(?:\s|$|[;&|)\n])|-exec(?:dir)?\s+(?:[^\s;&|]*/)?rm(?:\s+-\S+)*\s+(?:['"]?\{\}['"]?|\\\{\\\})(?:\s|$))"#,
             "find ... -delete naming root, home, or a system directory requires explicit approval. dcg gates on the paths the command names, not on the -name/-maxdepth filters that may narrow what it deletes. This command will NOT be executed.",
             Critical,
             "`find <path> -delete` removes every file the predicate matches beneath \
@@ -4581,7 +4584,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // `\b`) so `-delete-this-not-a-flag` — where `\b` happily
             // allows the following `-` — does NOT false-positive, while
             // shell separators and subshell-close are still accepted.
-            r"\bfind\b[^|;&]*\s-delete(?:\s|$|[;&|)\n])",
+            // `-exec rm {} \;` / `-execdir rm -f {} +` deletes the found files,
+            // the same deletion as `-delete`; only `-delete` was recognised,
+            // so the older, more common spelling walked straight through. An
+            // `-exec rm` of a fixed operand (not `{}`) is left to the rm rules.
+            r#"\bfind\b[^|;&]*\s(?:-delete(?:\s|$|[;&|)\n])|-exec(?:dir)?\s+(?:[^\s;&|]*/)?rm(?:\s+-\S+)*\s+(?:['"]?\{\}['"]?|\\\{\\\})(?:\s|$))"#,
             "find ... -delete is destructive (bytewise-equivalent to rm -rf on the matched tree) and requires human approval.",
             High,
             "`find ... -delete` recursively deletes every path matched by the find \
@@ -8957,6 +8964,51 @@ mod classifier_guidance_tests {
             "rsync -a --delete /etc/ /backup/",
             "rsync -a /src/ /etc/",
             "rsync -avz /src/ backup:/dst/",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|matched| matched.name)
+            );
+        }
+    }
+
+    /// `find … -exec rm {}` deletes every found file — the same deletion as
+    /// the already-denied `find … -delete` — and was allowed, because each
+    /// `-exec` child was judged as a lone non-recursive `rm`.
+    #[test]
+    fn find_exec_rm_of_the_found_files_is_a_find_delete() {
+        let pack = create_pack();
+        for (command, rule) in [
+            (r"find . -type f -exec rm {} \;", "find-delete-general"),
+            ("find . -type f -exec rm -f {} +", "find-delete-general"),
+            (
+                r"find src -name '*.rs' -execdir rm '{}' \;",
+                "find-delete-general",
+            ),
+            (r"find . -exec /bin/rm -f \{\} \;", "find-delete-general"),
+            (
+                r"find ~ -name '*.log' -exec rm {} \;",
+                "find-delete-root-home",
+            ),
+            (
+                "find /etc -type f -exec rm -f {} +",
+                "find-delete-root-home",
+            ),
+        ] {
+            assert_eq!(
+                pack.check(command).and_then(|matched| matched.name),
+                Some(rule),
+                "{command}"
+            );
+        }
+        // A fixed operand is the rm rules' business, and non-deleting actions
+        // over the found files stay allowed.
+        for command in [
+            r"find . -name '*.txt' -exec cat {} \;",
+            r"find . -type f -exec grep -l rm {} +",
+            r"find ./root -exec rm /tmp/scratch/marker \;",
+            "find . -name '*.rs' -print",
         ] {
             assert!(
                 pack.check(command).is_none(),

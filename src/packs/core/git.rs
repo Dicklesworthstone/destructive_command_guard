@@ -5438,6 +5438,77 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Let the reflog expire on its default schedule (90 days)\n\
              - Recover what you need first: git reflog, then git branch <name> <sha>"
         ),
+        // `git checkout -f <branch>` / `--force`: switching with force throws
+        // away every uncommitted change to tracked files — the effect of the
+        // Critical `reset --hard`, and the reflex an agent reaches for when a
+        // plain checkout refuses ("your local changes would be overwritten").
+        // fe556e9 deferred it as a posture call; the posture this project
+        // states is that an extra prompt beats lost work. `-f` inside a short
+        // cluster counts (`-qf`); `--ours`/`--theirs`/`--conflict=` do not.
+        destructive_pattern!(
+            "checkout-force",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\b[^;&|\n<>()]*?\s(?:--force|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
+            "git checkout -f/--force discards all uncommitted changes to tracked files. Use 'git stash' first.",
+            High,
+            "git checkout --force switches branches (or rewrites paths) even when that \
+             overwrites local modifications, and those modifications are discarded. They \
+             were never committed, so they cannot be recovered — the same outcome as \
+             git reset --hard.\n\n\
+             Safer alternatives:\n\
+             - git stash: save the changes, switch, then 'git stash pop'\n\
+             - git worktree add ../other <branch>: check the branch out alongside\n\
+             - git status / git diff: see exactly what the force would discard"
+        ),
+        // `git switch -f` / `--force` / `--discard-changes`: the modern
+        // spelling of the same force-switch discard.
+        destructive_pattern!(
+            "switch-discard",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)switch\b[^;&|\n<>()]*?\s(?:--force|--discard-changes|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
+            "git switch --discard-changes/-f discards all uncommitted changes to tracked files. Use 'git stash' first.",
+            High,
+            "git switch --discard-changes (alias -f/--force) switches branches and throws \
+             away local modifications that would otherwise block the switch. They were never \
+             committed, so they cannot be recovered.\n\n\
+             Safer alternatives:\n\
+             - git stash: save the changes, switch, then 'git stash pop'\n\
+             - git switch -c <new-branch>: carry the changes to a new branch instead\n\
+             - git worktree add ../other <branch>: check the branch out alongside"
+        ),
+        // `git rm -f` deletes the files from the working tree even when they
+        // carry uncommitted modifications — the up-to-date check `-f` exists
+        // to override. `git rm -rf .` was only denied by accident, by the
+        // filesystem `rm -rf` text rule, and `git rm -f <file>` was allowed.
+        // `--cached` (index only, worktree kept) and dry runs stay allowed.
+        destructive_pattern!(
+            "rm-force",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)rm\b(?![^;&|\n]*\s(?:--cached|--dry-run|-[A-Za-z]*n[A-Za-z]*)(?:\s|$))[^;&|\n<>()]*?\s(?:--force|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
+            "git rm -f deletes files even when they have uncommitted modifications. Commit or stash them first.",
+            High,
+            "git rm --force removes the named files from the index AND the working tree, \
+             bypassing the check that would otherwise refuse when they differ from HEAD. \
+             Committed content can be restored from history, but any uncommitted edits to \
+             those files are gone.\n\n\
+             Safer alternatives:\n\
+             - git rm --cached <path>: stop tracking but keep the file on disk\n\
+             - git rm -n <path>: preview which files would be removed\n\
+             - git stash or git commit first, then git rm without -f"
+        ),
+        // `git update-ref -d <ref>` deletes a branch or any other ref outright
+        // — the plumbing spelling of `git branch -D`, which already requires
+        // approval (README FAQ: every branch deletion is an approval boundary).
+        destructive_pattern!(
+            "update-ref-delete",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)update-ref\b[^;&|\n<>()]*?\s(?:-d|--delete)(?:\s|$)",
+            "git update-ref -d deletes a ref (e.g. a branch) outright, like git branch -D.",
+            High,
+            "git update-ref -d is the plumbing form of deleting a ref. Pointed at \
+             refs/heads/<branch> it is git branch -D without the safety messages; commits \
+             reachable only from that ref survive only in the reflog.\n\n\
+             Safer alternatives:\n\
+             - git branch -vv: review the ref first\n\
+             - git branch backup/<name> <ref>: keep a pointer before deleting\n\
+             - git branch -d <branch>: the porcelain delete, which refuses unmerged branches"
+        ),
         // `git show <ref>:<path>` is safe on its own (stdout only), and the
         // checkout-ref-discard remediation above recommends it. But redirected
         // back onto the SAME path it reaches the identical end state that rule
@@ -6111,9 +6182,16 @@ mod tests {
         let view =
             syntax_view_for_pattern_matching(command, sanitized.as_ref(), ShellDialect::Posix)
                 .expect("a bounded symbolic git executable synthesizes a view");
+        // Since `checkout-force`, `git checkout -fdx` is itself destructive
+        // (a force-checkout discards uncommitted changes), so either reading
+        // satisfies #428; what must never be presented is only a benign one.
         assert!(
-            view.contains("git clean -fdx"),
-            "the destructive reading must be the one presented: {view:?}"
+            view.contains("git clean -fdx") || view.contains("git checkout -fdx"),
+            "a destructive reading must be the one presented: {view:?}"
+        );
+        assert!(
+            create_pack().check(&view).is_some(),
+            "the presented reading must deny: {view:?}"
         );
 
         // The benign candidate is still presented when no reading is
@@ -7380,6 +7458,59 @@ git x",
     // =========================================================================
     // High Severity Pattern Tests
     // =========================================================================
+
+    /// Force-switches, forced `git rm` and ref deletion discard work the same
+    /// way the blocked `reset --hard`, `checkout -- .` and `branch -D` do, and
+    /// were all allowed. Their read-only and non-forcing neighbours are not.
+    #[test]
+    fn force_switch_forced_rm_and_ref_delete_are_denied() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("git checkout -f", "checkout-force"),
+            ("git checkout --force main", "checkout-force"),
+            ("git checkout -qf main", "checkout-force"),
+            ("git -C sub checkout -f main", "checkout-force"),
+            ("git switch -f main", "switch-discard"),
+            ("git switch --force main", "switch-discard"),
+            ("git switch --discard-changes main", "switch-discard"),
+            ("git rm -f src/main.rs", "rm-force"),
+            ("git rm -r --force src", "rm-force"),
+            ("git rm -rf .", "rm-force"),
+            ("git update-ref -d refs/heads/main", "update-ref-delete"),
+            (
+                "git update-ref --delete refs/heads/main",
+                "update-ref-delete",
+            ),
+            (
+                "git update-ref -m why -d refs/heads/main",
+                "update-ref-delete",
+            ),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+        for command in [
+            "git checkout main",
+            "git checkout -b feature",
+            "git checkout --ours file.txt",
+            "git checkout --theirs file.txt",
+            "git checkout --conflict=diff3 file.txt",
+            "git switch main",
+            "git switch -c feature",
+            "git switch -C feature",
+            "git rm src/main.rs",
+            "git rm -r --cached src",
+            "git rm -rf --cached .",
+            "git rm -n -rf .",
+            "git rm --dry-run -f src",
+            "git update-ref refs/heads/main HEAD",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|m| m.name)
+            );
+        }
+    }
 
     #[test]
     fn test_checkout_discard_high() {
