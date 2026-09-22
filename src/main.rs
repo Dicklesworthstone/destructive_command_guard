@@ -27,7 +27,8 @@ use destructive_command_guard::config::{CompiledOverrides, Config, HeredocSettin
 #[cfg(test)]
 use destructive_command_guard::evaluator::evaluate_command_with_pack_order_deadline_at_path;
 use destructive_command_guard::evaluator::{
-    EvaluationDecision, evaluate_command_with_pack_order_deadline_at_path_in_dialect,
+    EvaluationDecision, EvaluationResult,
+    evaluate_command_with_pack_order_deadline_at_path_in_dialect,
 };
 #[allow(unused_imports)]
 use destructive_command_guard::exit_codes::{
@@ -583,6 +584,7 @@ fn try_deny_unparseable_payload(
         || "<unknown>".to_string(),
         |path| path.to_string_lossy().to_string(),
     );
+    let decision_logger = destructive_command_guard::logging::DecisionLogger::new(&config.logging);
 
     let eval_context = HookEvalContext {
         config,
@@ -605,6 +607,7 @@ fn try_deny_unparseable_payload(
         hook_protocol,
         history_agent_type,
         max_command_bytes,
+        decision_logger: decision_logger.as_ref(),
     };
 
     // History is deliberately not passed to resolve: the fail-open fallback
@@ -939,6 +942,30 @@ struct HookEvalContext<'a> {
     hook_protocol: hook::HookProtocol,
     history_agent_type: &'a str,
     max_command_bytes: usize,
+    /// `[logging]` decision log; `None` unless `enabled = true` (the default
+    /// is off, so the common path pays nothing).
+    decision_logger: Option<&'a destructive_command_guard::logging::DecisionLogger>,
+}
+
+impl HookEvalContext<'_> {
+    /// Record one command's final outcome in the `[logging]` decision log.
+    fn log_decision(
+        &self,
+        result: &EvaluationResult,
+        command: &str,
+        mode: DecisionMode,
+        elapsed: Duration,
+    ) {
+        if let Some(logger) = self.decision_logger {
+            logger.log(
+                result,
+                command,
+                None,
+                mode,
+                u64::try_from(elapsed.as_micros()).ok(),
+            );
+        }
+    }
 }
 
 /// Outcome of checking a denied command against the rebase-recovery window.
@@ -1125,6 +1152,7 @@ fn resolve_hook_command(
     let eval_duration = eval_start.elapsed();
 
     if result.decision == EvaluationDecision::Indeterminate || result.skipped_due_to_budget {
+        ctx.log_decision(&result, command, DecisionMode::Deny, eval_duration);
         return ResolvedCommandOutcome::DeadlineExhausted {
             command: command.to_string(),
             stage: "evaluation",
@@ -1132,6 +1160,7 @@ fn resolve_hook_command(
     }
 
     if result.decision != EvaluationDecision::Deny {
+        ctx.log_decision(&result, command, DecisionMode::Log, eval_duration);
         // Build the would-be Allow history row only when history is enabled;
         // the caller logs it only when this entry is the primary and the
         // whole request resolves all-allow.
@@ -1243,6 +1272,10 @@ fn resolve_hook_command(
             }
         }
     }
+
+    // The resolved outcome — deny, ask, warn or log — after policy,
+    // confidence, and any rebase-recovery residual.
+    ctx.log_decision(&result, command, mode, eval_duration);
 
     let Some(ref info) = result.pattern_info else {
         // Only reachable through a residual result, which by construction
@@ -1700,6 +1733,7 @@ fn main() {
 
     // Load configuration
     let config = Config::load();
+    destructive_command_guard::output::install_theme_config(&config);
     let detected_agent = detect_agent();
 
     // Check if bypass is requested (escape hatch)
@@ -1917,6 +1951,7 @@ fn main() {
         Some(path) => Some(path).filter(|path| path.is_absolute() && path.is_dir()),
         None => cwd_path.as_deref(),
     };
+    let decision_logger = destructive_command_guard::logging::DecisionLogger::new(&config.logging);
 
     let eval_context = HookEvalContext {
         config: &config,
@@ -1934,6 +1969,7 @@ fn main() {
         hook_protocol,
         history_agent_type,
         max_command_bytes,
+        decision_logger: decision_logger.as_ref(),
     };
 
     // Resolve EVERY command in the request before publishing anything (issue

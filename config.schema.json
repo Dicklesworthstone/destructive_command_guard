@@ -220,7 +220,7 @@
       "type": "object",
       "properties": {
         "color": {
-          "description": "Color output mode: \"auto\", \"always\", \"never\".",
+          "description": "Color output mode: \"auto\", \"always\", \"never\". \"never\" turns color off;\n\"auto\" and \"always\" both follow terminal detection (`NO_COLOR`, `CI`,\nand a non-TTY stdout still disable it).",
           "type": "string",
           "default": "auto"
         },

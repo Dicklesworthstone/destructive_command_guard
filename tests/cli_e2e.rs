@@ -1275,6 +1275,89 @@ mod allow_once_flow_tests {
         }
     }
 
+    /// `[logging] enabled = true` writes one structured line per hook decision.
+    /// The section was parsed, validated and exported in the schema, and
+    /// `DecisionLogger` was implemented and unit-tested, but nothing ever
+    /// constructed it: the file stayed empty whatever the config said.
+    #[test]
+    fn logging_section_records_hook_decisions() {
+        let env = FlowTestEnv::new();
+        let log_path = env.temp.path().join("decisions.jsonl");
+        let config = format!(
+            "[logging]\nenabled = true\nfile = {:?}\nformat = \"json\"\n\
+             [logging.events]\ndeny = true\nallow = true\n",
+            log_path.to_string_lossy()
+        );
+        for dir in [
+            env.xdg_config_dir.join("dcg"),
+            env.home_dir.join(".config").join("dcg"),
+        ] {
+            std::fs::create_dir_all(&dir).expect("config dir");
+            std::fs::write(dir.join("config.toml"), &config).expect("write config");
+        }
+
+        assert_is_denial(&env.run_hook("git reset --hard"));
+        assert_is_allowed(&env.run_hook("git status"));
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let entries: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("json log line"))
+            .collect();
+        assert_eq!(entries.len(), 2, "one line per decision:\n{log}");
+        assert_eq!(entries[0]["decision"], "deny");
+        assert_eq!(entries[0]["rule_id"], "core.git:reset-hard");
+        assert_eq!(entries[1]["decision"], "allow");
+        assert_eq!(entries[1]["mode"], "allow");
+    }
+
+    /// `dcg explain` must agree with `dcg test` on a path-scoped grant and say
+    /// which grant allowed the command. It used to evaluate with no project
+    /// path, so a `paths = [...]` entry never applied and explain reported
+    /// DENY where the hook and `dcg test` allowed; and when a grant did apply
+    /// it printed a bare ALLOW, naming neither the layer nor the entry.
+    #[test]
+    fn explain_names_the_allowlist_grant_and_honours_its_paths() {
+        let env = FlowTestEnv::new();
+        let project = env.temp.path().canonicalize().expect("canonical temp");
+        let allowlist = format!(
+            "[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"reviewed reset\"\n\
+             added_at = \"2026-09-22T00:00:00Z\"\npaths = [{:?}, {:?}]\n",
+            project.to_string_lossy(),
+            project.join("**").to_string_lossy()
+        );
+        for dir in [
+            env.xdg_config_dir.join("dcg"),
+            env.home_dir.join(".config").join("dcg"),
+        ] {
+            std::fs::create_dir_all(&dir).expect("config dir");
+            std::fs::write(dir.join("allowlist.toml"), &allowlist).expect("write allowlist");
+        }
+
+        let test_json: serde_json::Value = serde_json::from_slice(
+            &env.run_cli(&["test", "--format", "json", "git reset --hard"])
+                .stdout,
+        )
+        .expect("test json");
+        let explain_json: serde_json::Value = serde_json::from_slice(
+            &env.run_cli(&["explain", "--format", "json", "git reset --hard"])
+                .stdout,
+        )
+        .expect("explain json");
+
+        assert_eq!(test_json["decision"], "allow", "{test_json}");
+        assert_eq!(explain_json["decision"], "allow", "{explain_json}");
+        assert_eq!(explain_json["allowlist"]["layer"], "user", "{explain_json}");
+        assert_eq!(
+            explain_json["allowlist"]["entry_reason"], "reviewed reset",
+            "{explain_json}"
+        );
+        assert_eq!(
+            explain_json["allowlist"]["original_match"]["rule_id"], "core.git:reset-hard",
+            "{explain_json}"
+        );
+    }
+
     /// #262: without `--yes` and without a terminal, the confirmation can
     /// never be answered. dcg must refuse *before* printing a confirmation
     /// block that reads like a granted allowance, must say so on stderr, and

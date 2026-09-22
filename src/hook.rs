@@ -2350,9 +2350,14 @@ pub(crate) fn print_colorful_warning_to(
         .map(to_output_severity)
         .unwrap_or(ThemeSeverity::High);
 
-    let explanation_text = explanation.map(str::trim).filter(|text| !text.is_empty());
+    // `[output] explanations_enabled` / `highlight_enabled` (default on). The
+    // JSON denial on stdout is unaffected: these shape the human box only.
+    let explanation_text = explanation
+        .map(str::trim)
+        .filter(|text| !text.is_empty() && crate::output::explanations_enabled());
 
     let span = matched_span
+        .filter(|_| crate::output::highlight_enabled())
         .map(|s| HighlightSpan::new(s.start, s.end))
         .unwrap_or_else(|| HighlightSpan::new(0, 0));
 

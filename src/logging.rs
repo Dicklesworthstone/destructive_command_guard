@@ -164,11 +164,14 @@ impl LogEntry {
             EvaluationDecision::Indeterminate => "indeterminate",
         };
 
-        let mode_str = match mode {
-            DecisionMode::Deny => "deny",
-            DecisionMode::Ask => "ask",
-            DecisionMode::Warn => "warn",
-            DecisionMode::Log => "log",
+        // No policy mode applies to an allowed command; report the outcome
+        // itself rather than whichever placeholder the caller passed.
+        let mode_str = match (result.decision, mode) {
+            (EvaluationDecision::Allow, _) => "allow",
+            (_, DecisionMode::Deny) => "deny",
+            (_, DecisionMode::Ask) => "ask",
+            (_, DecisionMode::Warn) => "warn",
+            (_, DecisionMode::Log) => "log",
         };
 
         let (pack_id, pattern_name, rule_id, reason) =

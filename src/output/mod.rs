@@ -153,31 +153,97 @@ fn should_use_rich_output_with_env(
 ///
 /// This is the recommended way to get a theme - it automatically
 /// selects rich or plain output based on the environment.
+///
+/// Once [`install_theme_config`] has run, the configured `[theme]` palette,
+/// `use_color` and `use_unicode`, and `[output] high_contrast` apply here too.
 #[must_use]
 pub fn auto_theme() -> Theme {
-    if should_use_rich_output() {
-        if env_flag_enabled("DCG_HIGH_CONTRAST") {
-            Theme::high_contrast()
-        } else {
-            Theme::default()
-        }
-    } else {
-        Theme::no_color()
+    match INSTALLED_THEME_CONFIG.get() {
+        Some(installed) if installed.color_never => Theme::no_color(),
+        Some(installed) => theme_for(installed.high_contrast, &installed.theme),
+        None => theme_for(false, &crate::config::ThemeConfig::default()),
     }
+}
+
+/// The user's display settings, installed once per process after config loads.
+struct InstalledTheme {
+    high_contrast: bool,
+    /// `general.color = "never"` (or `DCG_COLOR=never`).
+    color_never: bool,
+    /// `[output] highlight_enabled` / `explanations_enabled` (default on).
+    highlight: bool,
+    explanations: bool,
+    theme: crate::config::ThemeConfig,
+}
+
+/// Whether the denial box should highlight the matched span
+/// (`[output] highlight_enabled`, default on).
+#[must_use]
+pub fn highlight_enabled() -> bool {
+    INSTALLED_THEME_CONFIG
+        .get()
+        .is_none_or(|installed| installed.highlight)
+}
+
+/// Whether the denial box should include the rule's long explanation
+/// (`[output] explanations_enabled`, default on).
+#[must_use]
+pub fn explanations_enabled() -> bool {
+    INSTALLED_THEME_CONFIG
+        .get()
+        .is_none_or(|installed| installed.explanations)
+}
+
+static INSTALLED_THEME_CONFIG: OnceLock<InstalledTheme> = OnceLock::new();
+
+/// Make [`auto_theme`] honour the loaded config.
+///
+/// The README documents `[theme] palette = "colorblind"` and `[output]
+/// high_contrast = true`, but every renderer — the hook's denial box
+/// included — called the environment-only [`auto_theme`], so those settings
+/// had no effect anywhere; only `DCG_HIGH_CONTRAST` worked. Installing the
+/// settings once here reaches every caller without threading `Config`
+/// through each one. The TTY/`--no-color` decision is still made per call.
+/// `general.color = "never"` was likewise only ever printed back by
+/// `dcg config`; it now turns color off.
+pub fn install_theme_config(config: &Config) {
+    let _ = INSTALLED_THEME_CONFIG.set(InstalledTheme {
+        high_contrast: config.output.high_contrast_enabled(),
+        color_never: config.general.color.trim().eq_ignore_ascii_case("never"),
+        highlight: config.output.highlight_enabled(),
+        explanations: config.output.explanations_enabled(),
+        theme: config.theme.clone(),
+    });
 }
 
 /// Returns the appropriate theme based on config and environment.
 #[must_use]
 pub fn auto_theme_with_config(config: &Config) -> Theme {
-    if !should_use_rich_output() {
+    theme_for(config.output.high_contrast_enabled(), &config.theme)
+}
+
+fn theme_for(high_contrast: bool, theme_config: &crate::config::ThemeConfig) -> Theme {
+    select_theme(
+        should_use_rich_output(),
+        env_flag_enabled("DCG_HIGH_CONTRAST") || high_contrast,
+        theme_config,
+    )
+}
+
+/// The theme for already-decided terminal facts; pure, so it is testable
+/// without a TTY.
+fn select_theme(
+    rich: bool,
+    high_contrast: bool,
+    theme_config: &crate::config::ThemeConfig,
+) -> Theme {
+    if !rich {
         return Theme::no_color();
     }
 
-    let palette = if env_flag_enabled("DCG_HIGH_CONTRAST") || config.output.high_contrast_enabled()
-    {
+    let palette = if high_contrast {
         ThemePalette::HighContrast
-    } else if let Some(palette) = config
-        .theme
+    } else if let Some(palette) = theme_config
         .palette
         .as_deref()
         .and_then(|value| value.parse::<ThemePalette>().ok())
@@ -189,13 +255,13 @@ pub fn auto_theme_with_config(config: &Config) -> Theme {
 
     let mut theme = Theme::from_palette(palette);
 
-    if let Some(use_color) = config.theme.use_color {
+    if let Some(use_color) = theme_config.use_color {
         if !use_color {
             theme = theme.without_colors();
         }
     }
 
-    if let Some(use_unicode) = config.theme.use_unicode {
+    if let Some(use_unicode) = theme_config.use_unicode {
         if palette != ThemePalette::HighContrast {
             theme.border_style = if use_unicode {
                 BorderStyle::Unicode
@@ -321,6 +387,38 @@ pub fn suggestions_requested() -> bool {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    /// The documented `[theme]`/`[output]` settings select what they say.
+    #[test]
+    fn configured_theme_settings_select_the_documented_theme() {
+        let config = |palette: Option<&str>, use_color, use_unicode| crate::config::ThemeConfig {
+            palette: palette.map(str::to_string),
+            use_color,
+            use_unicode,
+        };
+
+        let colorblind = select_theme(true, false, &config(Some("colorblind"), None, None));
+        let expected = Theme::colorblind_safe();
+        assert_eq!(
+            colorblind.severity_colors.critical,
+            expected.severity_colors.critical
+        );
+        assert!(colorblind.colors_enabled);
+
+        let high = select_theme(true, true, &config(Some("colorblind"), None, None));
+        assert_eq!(high.border_style, Theme::high_contrast().border_style);
+
+        let monochrome = select_theme(true, false, &config(None, Some(false), None));
+        assert!(!monochrome.colors_enabled);
+
+        let ascii = select_theme(true, false, &config(None, None, Some(false)));
+        assert_eq!(ascii.border_style, BorderStyle::Ascii);
+
+        // A non-rich terminal is plain whatever the config asks for.
+        assert!(
+            !select_theme(false, false, &config(Some("colorblind"), None, None)).colors_enabled
+        );
+    }
 
     fn test_env<'a>(
         entries: &'a [(&'a str, &'a str)],

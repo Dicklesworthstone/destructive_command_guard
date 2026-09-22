@@ -1804,7 +1804,9 @@ fn content_hash(content: &str) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct GeneralConfig {
-    /// Color output mode: "auto", "always", "never".
+    /// Color output mode: "auto", "always", "never". "never" turns color off;
+    /// "auto" and "always" both follow terminal detection (`NO_COLOR`, `CI`,
+    /// and a non-TTY stdout still disable it).
     pub color: String,
 
     /// Path to log file for blocked commands (optional).

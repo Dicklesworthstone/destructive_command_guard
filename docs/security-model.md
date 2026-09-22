@@ -272,8 +272,8 @@ fn generate_verification_code(length: usize) -> String {
 
 - Case-insensitive comparison (reduce typo frustration)
 - Trim whitespace from input
-- Single attempt per code (no retries with same code)
-- On failure: generate new code, restart timeout
+- Single attempt: a wrong code, empty input, or timeout ends the prompt and
+  the command stays blocked (re-run the command to get a fresh code)
 
 ### Configuration
 
@@ -296,17 +296,12 @@ timeout_seconds = 5
 # Verification code length (4-8, default 4)
 code_length = 4
 
-# Allow fallback to non-interactive when stdin is not a tty
-# When true: non-tty stdin causes immediate block (default)
-# When false: error if stdin is not a tty
-allow_non_tty_fallback = true
-
-# Maximum attempts before lockout (1-10, default 3)
-max_attempts = 3
-
-# Lockout duration in seconds after max attempts (0 = no lockout)
-lockout_seconds = 60
 ```
+
+`max_attempts` and `allow_non_tty_fallback` are accepted for forward
+compatibility but not enforced today, and there is no lockout setting: every
+prompt allows exactly one attempt, and a non-TTY stdin always blocks without
+prompting. Both are stricter than any value those keys could express.
 
 ### Allowlist Scopes
 

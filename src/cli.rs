@@ -2392,6 +2392,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         (Config::load(), None)
     };
+    crate::output::install_theme_config(&config);
     let verbosity = Verbosity::from_cli(&cli);
     let explicit_omp_agent = is_explicit_omp_agent(cli.agent.as_deref());
     maybe_show_update_notice(&cli, &config, verbosity);
@@ -8053,6 +8054,12 @@ fn handle_explain(
     // Start tracing
     let mut collector = TraceCollector::new(command);
 
+    // Scope path-aware allowlist entries (#186) to where explain runs, exactly
+    // as `dcg test` does. Passing no path made every `paths = [...]` grant
+    // inapplicable here, so explain reported DENY for a command the hook and
+    // `dcg test` both allow.
+    let project_path = std::env::current_dir().ok();
+
     // Evaluate with timing
     collector.begin_step();
     let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
@@ -8064,7 +8071,7 @@ fn handle_explain(
         &allowlists,
         &heredoc_settings,
         None, // allow_once_audit
-        None, // project_path
+        project_path.as_deref(),
         None, // deadline
         dialect.into(),
     );
@@ -8091,27 +8098,41 @@ fn handle_explain(
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
-        None, // project_path: matches the evaluation above
+        project_path.as_deref(), // matches the evaluation above
     );
 
-    // Add match info if present
-    if let Some(ref pattern) = result.pattern_info {
-        let rule_id = pattern
+    let match_info = |pattern: &crate::evaluator::PatternMatch| MatchInfo {
+        rule_id: pattern
             .pack_id
             .as_ref()
             .zip(pattern.pattern_name.as_ref())
-            .map(|(pack, name)| format!("{pack}:{name}"));
-        collector.set_match(MatchInfo {
-            rule_id,
-            pack_id: pattern.pack_id.clone(),
-            pattern_name: pattern.pattern_name.clone(),
-            severity: pattern.severity,
-            reason: pattern.reason.clone(),
-            source: pattern.source,
-            match_start: pattern.matched_span.map(|s| s.start),
-            match_end: pattern.matched_span.map(|s| s.end),
-            matched_text_preview: pattern.matched_text_preview.clone(),
-            explanation: pattern.explanation.clone(),
+            .map(|(pack, name)| format!("{pack}:{name}")),
+        pack_id: pattern.pack_id.clone(),
+        pattern_name: pattern.pattern_name.clone(),
+        severity: pattern.severity,
+        reason: pattern.reason.clone(),
+        source: pattern.source,
+        match_start: pattern.matched_span.map(|s| s.start),
+        match_end: pattern.matched_span.map(|s| s.end),
+        matched_text_preview: pattern.matched_text_preview.clone(),
+        explanation: pattern.explanation.clone(),
+    };
+
+    // Add match info if present
+    if let Some(ref pattern) = result.pattern_info {
+        collector.set_match(match_info(pattern));
+    }
+
+    // An allowlisted command is an ALLOW that configuration produced: name the
+    // layer, the entry's reason, and the rule it lifted. The trace renderers
+    // (pretty, compact, JSON) always had a section for this, but nothing ever
+    // filled it, so explain reported a bare ALLOW with no hint of which grant
+    // caused it — the one question explain exists to answer.
+    if let Some(ref allowlisted) = result.allowlist_override {
+        collector.set_allowlist(crate::trace::AllowlistInfo {
+            layer: allowlisted.layer,
+            entry_reason: allowlisted.reason.clone(),
+            original_match: match_info(&allowlisted.matched),
         });
     }
 

@@ -129,9 +129,21 @@ pub static SUGGESTION_REGISTRY: LazyLock<HashMap<&'static str, Vec<Suggestion>>>
 ///     }
 /// }
 /// ```
+///
+/// A refined embedded-code rule id (`heredoc.javascript:fs_rmsync.catastrophic`)
+/// falls back to its base rule's suggestions. Every blocking `fs.rmSync`
+/// match carries such a refinement, so the exact-key lookup alone meant the
+/// registered `heredoc.javascript:fs_rmsync` guidance was never shown.
 #[must_use]
 pub fn get_suggestions(rule_id: &str) -> Option<&'static [Suggestion]> {
-    SUGGESTION_REGISTRY.get(rule_id).map(Vec::as_slice)
+    if let Some(found) = SUGGESTION_REGISTRY.get(rule_id) {
+        return Some(found.as_slice());
+    }
+    let (pack, pattern) = rule_id.split_once(':')?;
+    let (base, _refinement) = pattern.split_once('.')?;
+    SUGGESTION_REGISTRY
+        .get(format!("{pack}:{base}").as_str())
+        .map(Vec::as_slice)
 }
 
 /// Get the first suggestion of a specific kind for a rule.
@@ -2601,6 +2613,27 @@ mod tests {
             .as_deref(),
             Some("ls -la /"),
         );
+    }
+
+    /// The ids a blocking `fs.rmSync` match actually reports are refined; they
+    /// must reach the base rule's guidance.
+    #[test]
+    fn refined_heredoc_rule_ids_fall_back_to_the_base_rule() {
+        let base = get_suggestions("heredoc.javascript:fs_rmsync").expect("base registered");
+        for refined in [
+            "heredoc.javascript:fs_rmsync.catastrophic",
+            "heredoc.javascript:fs_rmsync.non_temp",
+        ] {
+            assert_eq!(
+                get_suggestions(refined).map(<[Suggestion]>::len),
+                Some(base.len()),
+                "{refined}"
+            );
+        }
+        // An unregistered base stays unregistered, and pack-level dots in the
+        // id are never mistaken for a refinement.
+        assert!(get_suggestions("heredoc.javascript:no_such_rule.catastrophic").is_none());
+        assert!(get_suggestions("core.git").is_none());
     }
 
     #[test]
