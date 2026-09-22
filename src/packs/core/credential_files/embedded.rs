@@ -1,4 +1,5 @@
-//! Structural recognition of Python, Ruby, and Node file-write APIs (#461).
+//! Structural recognition of embedded file-write APIs (#461, #466).
+//! PHP uses its grammar; Perl uses a bounded, quote-aware fallback.
 //!
 //! Shell callers first establish that the source belongs to an interpreter.
 //! The evaluator also calls `scan_extracted` directly on executable source:
@@ -15,6 +16,8 @@ use ast_grep_language::SupportLang;
 use std::collections::HashMap;
 use std::ops::Range;
 
+mod perl;
+mod php;
 mod transfers;
 
 type Syntax<'a> = Node<'a, StrDoc<SupportLang>>;
@@ -34,6 +37,8 @@ enum Language {
     Python,
     Ruby,
     Node,
+    Php,
+    Perl,
 }
 
 fn interpreter(executable: &str) -> Option<Language> {
@@ -45,6 +50,8 @@ fn interpreter(executable: &str) -> Option<Language> {
         ("ruby", Language::Ruby),
         ("nodejs", Language::Node),
         ("node", Language::Node),
+        ("php", Language::Php),
+        ("perl", Language::Perl),
     ] {
         if name == base
             || name.strip_prefix(base).is_some_and(|suffix| {
@@ -72,6 +79,8 @@ pub(crate) fn source_scan_required(code: &str, language: ScriptLanguage) -> bool
             | ScriptLanguage::Ruby
             | ScriptLanguage::JavaScript
             | ScriptLanguage::TypeScript
+            | ScriptLanguage::Php
+            | ScriptLanguage::Perl
     ) && source_has_sink_name(code)
 }
 
@@ -85,6 +94,7 @@ fn source_has_sink_name(code: &str) -> bool {
     ]
     .iter()
     .any(|word| code.contains(word))
+        || php::has_sink_name(code)
 }
 
 /// Inspect already-extracted executable source, never shell tokens. Return
@@ -102,6 +112,8 @@ pub(crate) fn scan_extracted(
         ScriptLanguage::Ruby => (Language::Ruby, SupportLang::Ruby),
         ScriptLanguage::JavaScript => (Language::Node, SupportLang::JavaScript),
         ScriptLanguage::TypeScript => (Language::Node, SupportLang::TypeScript),
+        ScriptLanguage::Php => return php::scan(code),
+        ScriptLanguage::Perl => return perl::scan(code),
         _ => return Ok(Vec::new()),
     };
     scan_source(code, language, grammar)
@@ -248,6 +260,8 @@ pub(super) fn scan_command(
             Language::Python => ScriptLanguage::Python,
             Language::Ruby => ScriptLanguage::Ruby,
             Language::Node => ScriptLanguage::JavaScript,
+            Language::Php => ScriptLanguage::Php,
+            Language::Perl => ScriptLanguage::Perl,
         };
         if !source_is_exempt(code, script_language) {
             inspect(code, language, span, &mut hits);
@@ -402,7 +416,7 @@ fn here_string_source(command: &Syntax<'_>) -> Option<(String, Range<usize>)> {
 }
 
 /// Follow interpreter option boundaries, not a substring `-c` or `-e` in a
-/// filename or argv data. Ruby's repeated -e arguments are one program.
+/// filename or argv data. Ruby/Perl repeated -e arguments are one program.
 fn inline_code(words: &[String], language: Language) -> Option<String> {
     let mut index = 1;
     let mut scripts = Vec::new();
@@ -410,9 +424,14 @@ fn inline_code(words: &[String], language: Language) -> Option<String> {
         if word == "--" || word == "-" || !word.starts_with('-') {
             break;
         }
+        if language == Language::Php && php_non_source_option(word) {
+            break;
+        }
         let long = if language == Language::Node {
             word.strip_prefix("--eval=")
                 .or_else(|| word.strip_prefix("--print="))
+        } else if language == Language::Php {
+            word.strip_prefix("--run=")
         } else {
             None
         };
@@ -421,14 +440,18 @@ fn inline_code(words: &[String], language: Language) -> Option<String> {
         }
         let flag = match language {
             Language::Python => 'c',
-            Language::Ruby | Language::Node => 'e',
+            Language::Ruby | Language::Node | Language::Perl => 'e',
+            Language::Php => 'r',
         };
-        let is_long = language == Language::Node && matches!(word.as_str(), "--eval" | "--print");
+        let is_long = (language == Language::Node && matches!(word.as_str(), "--eval" | "--print"))
+            || (language == Language::Php && word == "--run");
         let short = word.strip_prefix('-').filter(|s| !s.starts_with('-'));
         let position = short.and_then(|s| {
             let position = s.find(flag).or_else(|| {
                 if language == Language::Node {
                     s.find('p')
+                } else if language == Language::Perl {
+                    s.find('E')
                 } else {
                     None
                 }
@@ -437,6 +460,8 @@ fn inline_code(words: &[String], language: Language) -> Option<String> {
                 Language::Python => "bBdEiIOPqRsSuvx",
                 Language::Ruby => "adlnpsw",
                 Language::Node => "ip",
+                Language::Php => "nq",
+                Language::Perl => "alnpstwW",
             };
             s[..position]
                 .chars()
@@ -454,7 +479,7 @@ fn inline_code(words: &[String], language: Language) -> Option<String> {
                 attached
             };
             scripts.push(code.to_string());
-            if language != Language::Ruby {
+            if !matches!(language, Language::Ruby | Language::Perl) {
                 break;
             }
         } else if option_takes_value(word, language) {
@@ -473,7 +498,34 @@ fn option_takes_value(word: &str, language: Language) -> bool {
             word,
             "-r" | "--require" | "--import" | "--loader" | "--experimental-loader" | "--input-type"
         ),
+        Language::Php => matches!(word, "-c" | "--php-ini" | "-d" | "--define"),
+        Language::Perl => matches!(word, "-I" | "-M" | "-m" | "-F"),
     }
+}
+
+/// These PHP invocations do not consume their argv/stdin as executable source.
+/// Do not inspect a filename, ini argument, syntax listing or help as a script.
+fn php_non_source_option(word: &str) -> bool {
+    matches!(
+        word,
+        "-f" | "--file"
+            | "-l"
+            | "--syntax-check"
+            | "-s"
+            | "--syntax-highlight"
+            | "-w"
+            | "--strip"
+            | "-h"
+            | "--help"
+            | "-v"
+            | "--version"
+            | "-i"
+            | "--info"
+            | "-m"
+            | "--modules"
+            | "--ini"
+    ) || word.starts_with("--file=")
+        || (word.starts_with("-f") && !word.starts_with("--"))
 }
 
 fn reads_stdin(words: &[String], language: Language) -> bool {
@@ -482,6 +534,9 @@ fn reads_stdin(words: &[String], language: Language) -> bool {
     }
     let mut index = 1;
     while let Some(word) = words.get(index) {
+        if language == Language::Php && php_non_source_option(word) {
+            return false;
+        }
         if word == "-" {
             return true;
         }
@@ -559,12 +614,14 @@ fn inspect(
     span: Range<usize>,
     hits: &mut Vec<CredentialFileWrite>,
 ) {
-    let grammar = match language {
-        Language::Python => SupportLang::Python,
-        Language::Ruby => SupportLang::Ruby,
-        Language::Node => SupportLang::JavaScript,
+    let found = match language {
+        Language::Python => scan_source(code, language, SupportLang::Python),
+        Language::Ruby => scan_source(code, language, SupportLang::Ruby),
+        Language::Node => scan_source(code, language, SupportLang::JavaScript),
+        Language::Php => php::scan(code),
+        Language::Perl => perl::scan(code),
     };
-    if let Ok(found) = scan_source(code, language, grammar) {
+    if let Ok(found) = found {
         for mut hit in found {
             if !hits.iter().any(|existing| existing.rule == hit.rule) {
                 hit.span = span.clone();
@@ -598,6 +655,8 @@ fn scan_source(
             bindings.insert("require".into(), Value::Require);
             bindings.insert("process".into(), Value::Process);
         }
+        Language::Php => return php::scan(code),
+        Language::Perl => return perl::scan(code),
     }
     let mut hits = Vec::new();
     let mut remaining_nodes = MAX_NODES;
@@ -831,6 +890,28 @@ fn protected(path: &str, access: Access, expands_home: bool) -> Option<&'static 
     // Use the exact shared path table and rule identity, including .git.
     shell::classify_credential_file_write(&format!("tee {append}-- {quoted}"), ShellDialect::Posix)
         .map(|hit| hit.rule)
+}
+
+/// Both new frontends produce the same path/mode facts as the AST interpreters.
+/// Preserve one finding per independently allowlistable rule, including both
+/// ends of a rename. This adapter never opens a file or consults the host HOME.
+fn record_write(
+    hits: &mut Vec<CredentialFileWrite>,
+    span: Range<usize>,
+    api: &str,
+    (path, expands_home): ResolvedPath,
+    access: Access,
+) {
+    let Some(rule) = protected(&path, access, expands_home) else {
+        return;
+    };
+    if !hits.iter().any(|hit| hit.rule == rule) {
+        hits.push(CredentialFileWrite {
+            span,
+            rule,
+            reason: format!("{api} writes protected credential, login-startup, or trust target {path:?}. Reads remain allowed; only append-only known_hosts updates are exempt. Show the user the proposed change or use dcg allow-once."),
+        });
+    }
 }
 
 fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
@@ -1764,6 +1845,89 @@ fn literal(node: &Syntax<'_>, language: Language) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod php_perl_command_tests {
+    use super::*;
+
+    fn quoted(code: &str) -> String {
+        format!("'{}'", code.replace('\'', "'\\''"))
+    }
+
+    #[test]
+    fn php_perl_command_delivery_and_wrappers() {
+        for (interpreter, flag, code) in [
+            ("php", "-r", "file_put_contents('/etc/shadow', 'x');"),
+            ("php8.4", "--run", "FILE_PUT_CONTENTS('/etc/shadow', 'x');"),
+            ("perl", "-e", "open(my $fh, '>>', '/etc/shadow');"),
+            ("perl5.40", "-E", "open(my $fh, '+<', '/etc/shadow');"),
+        ] {
+            for wrapper in ["", "sudo ", "env ", "FOO=1 "] {
+                let command = format!("{wrapper}{interpreter} {flag} {}", quoted(code));
+                let hits = scan_command(&command, ShellDialect::Posix, |_, _| false);
+                assert_eq!(hits.len(), 1, "{command}: {hits:?}");
+                assert!(command.get(hits[0].span.clone()).is_some());
+            }
+        }
+        for command in [
+            "php <<'PHP'\n<?php fopen('/etc/shadow', 'w');\nPHP",
+            "php <<< \"<?php fopen('/etc/shadow', 'w');\"",
+            "perl <<'PERL'\nopen(FH, '>', '/etc/shadow');\nPERL",
+            "perl <<< \"open(FH, '>', '/etc/shadow');\"",
+            "perl -e '$p = \"/etc/shadow\";' -e 'open(FH, \">\", $p);'",
+            "php -n -d display_errors=0 -r \"fopen('/etc/shadow', 'c');\"",
+        ] {
+            assert_eq!(
+                scan_command(command, ShellDialect::Posix, |_, _| false).len(),
+                1,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn php_perl_keep_source_ownership_and_option_boundaries() {
+        for command in [
+            "php -f script.php -r \"fopen('/etc/shadow', 'w');\"",
+            "php -c \"fopen('/etc/shadow', 'w');\" -r 'echo 1;'",
+            "php -- --run \"fopen('/etc/shadow', 'w');\"",
+            "php -l <<< \"<?php fopen('/etc/shadow', 'w');\"",
+            "php script.php <<< \"<?php fopen('/etc/shadow', 'w');\"",
+            "php 3<<< \"<?php fopen('/etc/shadow', 'w');\"",
+            "perl -I \"open(FH, '>', '/etc/shadow');\" -e 'print 1;'",
+            "perl script.pl -e \"open(FH, '>', '/etc/shadow');\"",
+            "perl -e 'print 1;' <<< \"open(FH, '>', '/etc/shadow');\"",
+            "cat <<'DATA'\n<?php fopen('/etc/shadow', 'w');\nDATA",
+            "echo \"perl -e 'open(FH, q(>), q(/etc/shadow));'\"",
+        ] {
+            assert!(
+                scan_command(command, ShellDialect::Posix, |_, _| false).is_empty(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn php_perl_exemptions_and_rule_families_are_local() {
+        let command =
+            "php -r \"fopen('/etc/shadow', 'w');\"; perl -e \"open(FH, '>', '.git/config');\"";
+        let hits = scan_command(command, ShellDialect::Posix, |_, language| {
+            language == ScriptLanguage::Php
+        });
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].rule, shell::GIT_INTERNALS_WRITE_NAME);
+        for (language, code) in [
+            (
+                ScriptLanguage::Php,
+                "FILE_PUT_CONTENTS('/etc/shadow', 'x');",
+            ),
+            (ScriptLanguage::Perl, "open(FH, '>', '/etc/shadow');"),
+        ] {
+            assert!(source_scan_required(code, language));
+            assert_eq!(scan_extracted(code, language).unwrap().len(), 1);
+        }
+    }
+}
 
 #[cfg(test)]
 mod here_string_tests {

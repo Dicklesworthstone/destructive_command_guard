@@ -112,6 +112,55 @@ fn assert_allowed(command: &str, home: &Path) {
 }
 
 #[test]
+fn php_perl_issue_466_reported_writes_reach_real_entry_points() {
+    let home = home();
+    // The issue's 18 cells: three protected shapes, three deliveries per
+    // language. Candidate programs are data sent to dcg, never executed.
+    for path in [
+        "/etc/shadow",
+        "/home/user/.ssh/authorized_keys",
+        "/home/user/.bashrc",
+    ] {
+        let php = format!("file_put_contents('{path}', 'x');");
+        let perl = format!("open(my $fh, '>>', '{path}'); print $fh 'x';");
+        let quote = |code: &str| format!("'{}'", code.replace('\'', "'\\''"));
+        for command in [
+            format!("php <<'PHP'\n<?php {php}\nPHP"),
+            format!("php -r {}", quote(&php)),
+            format!("php <<'PHP'\n<?php fopen('{path}', 'w');\nPHP"),
+            format!("perl <<'PERL'\nopen(my $fh, '>', '{path}');\nPERL"),
+            format!("perl -e {}", quote(&perl)),
+            format!(
+                "printf '%s\\n' {} | perl",
+                quote(&format!("open(my $fh, '>', '{path}');"))
+            ),
+        ] {
+            assert_denied(&command, home.path());
+        }
+    }
+}
+
+#[test]
+fn php_perl_issue_466_benign_controls_reach_real_entry_points() {
+    let home = home();
+    for command in [
+        "php -r \"file_put_contents('/tmp/out.txt', 'x');\"",
+        "php -r \"fopen('/etc/shadow', 'r');\"",
+        "php -r \"file_put_contents('/home/user/.ssh/known_hosts', 'x', FILE_APPEND);\"",
+        "php -r \"fopen('/home/user/.ssh/known_hosts', 'a+');\"",
+        "php -r \"file_put_contents('/home/user/.ssh/id_rsa.pub', 'x');\"",
+        "php -r \"file_put_contents('~/.bashrc', 'x');\"",
+        "perl -e 'open(my $fh, \">\", \"/tmp/out.txt\");'",
+        "perl -e 'open(my $fh, \"<\", \"/etc/shadow\");'",
+        "perl -e 'open(my $fh, \">>\", \"/home/user/.ssh/known_hosts\");'",
+        "perl -e 'open(my $fh, \">\", \"/home/user/.ssh/id_rsa.pub\");'",
+        "perl -e 'open(my $fh, \">\", \"~/.bashrc\");'",
+    ] {
+        assert_allowed(command, home.path());
+    }
+}
+
+#[test]
 fn embedded_writes_reach_the_core_rule_through_the_hook() {
     let home = home();
     for command in [
