@@ -81,7 +81,7 @@ pub(crate) fn source_scan_required(code: &str, language: ScriptLanguage) -> bool
 fn source_has_sink_name(code: &str) -> bool {
     [
         "open", "write", "Write", "append", "truncate", "File", "Path", "copy", "rename",
-        "replace", "move",
+        "replace", "move", "link",
     ]
     .iter()
     .any(|word| code.contains(word))
@@ -531,6 +531,7 @@ enum Value {
     PathWrite(ResolvedPath),
     PathOpen(ResolvedPath),
     PathTransfer(ResolvedPath),
+    PathLink(ResolvedPath, transfers::Operation),
     Require,
     NodeOs,
     NodePath,
@@ -764,6 +765,10 @@ fn bind(node: &Syntax<'_>, language: Language, env: &mut Bindings) {
                 (Some("os"), "rename" | "replace") => {
                     Some(Value::Transfer(transfers::Operation::Rename))
                 }
+                (Some("os"), "link") => Some(Value::Transfer(transfers::Operation::HardLink)),
+                (Some("os"), "symlink") => {
+                    Some(Value::Transfer(transfers::Operation::SymbolicLink))
+                }
                 (Some("shutil"), name) => transfers::shutil_operation(name).map(Value::Transfer),
                 (Some("os"), "path") => Some(Value::OsPath),
                 (Some("os"), "environ") => Some(Value::Environment),
@@ -963,6 +968,8 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                 (Value::Os, "rename" | "replace") => {
                     Some(Value::Transfer(transfers::Operation::Rename))
                 }
+                (Value::Os, "link") => Some(Value::Transfer(transfers::Operation::HardLink)),
+                (Value::Os, "symlink") => Some(Value::Transfer(transfers::Operation::SymbolicLink)),
                 (Value::Shutil, name) => transfers::shutil_operation(name).map(Value::Transfer),
                 (Value::Os, "path") => Some(Value::OsPath),
                 (Value::Os, "environ") => Some(Value::Environment),
@@ -978,6 +985,12 @@ fn value(node: &Syntax<'_>, language: Language, env: &Bindings, depth: usize) ->
                 (Value::Path(path), "write_text" | "write_bytes") => Some(Value::PathWrite(path)),
                 (Value::Path(path), "open") => Some(Value::PathOpen(path)),
                 (Value::Path(path), "rename" | "replace") => Some(Value::PathTransfer(path)),
+                (Value::Path(path), "hardlink_to") => {
+                    Some(Value::PathLink(path, transfers::Operation::HardLink))
+                }
+                (Value::Path(path), "symlink_to") => {
+                    Some(Value::PathLink(path, transfers::Operation::SymbolicLink))
+                }
                 (object, name) if language == Language::Node => js_member(&object, name),
                 _ => None,
             }
@@ -1433,8 +1446,13 @@ fn ruby_write_call(
     for arg in args.iter().skip(if opener { 1 } else { 2 }) {
         for option in std::iter::once(arg.clone()).chain(arg.children()) {
             if option.kind() == "hash_splat_argument" {
-                mode = Some(None);
-                extra_flags = OpenFlags(OpenFlags::UNKNOWN);
+                // Opaque options are not evidence of read-only access. Keep
+                // an earlier known write, but revoke any append-only proof.
+                mode = Some(
+                    mode.flatten()
+                        .map(|flags| OpenFlags(flags.0 | OpenFlags::UNKNOWN)),
+                );
+                extra_flags = OpenFlags(extra_flags.0 | OpenFlags::UNKNOWN);
                 continue;
             }
             if option.kind() != "pair" {

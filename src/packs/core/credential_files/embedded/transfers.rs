@@ -10,6 +10,8 @@
 //! directory; copytree writes the destination tree itself, not dst/basename(src).
 //! The existing shell classifier supplies the path table and placement policy.
 //! No candidate is executed and no directory is traversed to determine its type.
+//! Links create the destination name, never remove or write their source. A
+//! symbolic link can redirect an entire protected tree; a hard link cannot.
 
 use super::{
     Access, Bindings, CredentialFileWrite, Language, ResolvedPath, ShellDialect, Syntax, Value,
@@ -23,6 +25,8 @@ pub(super) enum Operation {
     Copy,
     Move,
     CopyTree,
+    HardLink,
+    SymbolicLink,
 }
 
 pub(super) fn shutil_operation(name: &str) -> Option<Operation> {
@@ -39,6 +43,8 @@ pub(super) fn js_operation(name: &str) -> Option<Operation> {
     match name {
         "copyFile" | "copyFileSync" => Some(Operation::CopyFile),
         "rename" | "renameSync" => Some(Operation::Rename),
+        "link" | "linkSync" => Some(Operation::HardLink),
+        "symlink" | "symlinkSync" => Some(Operation::SymbolicLink),
         _ => None,
     }
 }
@@ -61,6 +67,8 @@ fn classify(node: &Syntax<'_>, language: Language, env: &Bindings) -> Option<Tra
         let receiver = value(&node.field("receiver")?, language, env, 0)?;
         let (operation, api) = match (receiver, method.as_str()) {
             (Value::File, "rename") => (Operation::Rename, "File.rename"),
+            (Value::File, "link") => (Operation::HardLink, "File.link"),
+            (Value::File, "symlink") => (Operation::SymbolicLink, "File.symlink"),
             (Value::Io | Value::File, "copy_stream") => (Operation::CopyFile, "IO.copy_stream"),
             _ => return None,
         };
@@ -90,6 +98,18 @@ fn classify(node: &Syntax<'_>, language: Language, env: &Bindings) -> Option<Tra
                 operation: Operation::Rename,
                 source: Some(source),
                 destination: path(&destination),
+                api: function.text().into_owned(),
+            })
+        }
+        Value::PathLink(destination, operation) if language == Language::Python => {
+            // pathlib reverses os.link/os.symlink: the receiver is the NEW
+            // name, and `target` is what it refers to. Keep this distinction
+            // even when the target value is dynamic or the method is aliased.
+            let source = python_argument(&args, 0, "target")?;
+            Some(Transfer {
+                operation,
+                source: path(&source),
+                destination: Some(destination),
                 api: function.text().into_owned(),
             })
         }
@@ -137,6 +157,20 @@ pub(super) fn scan(
             transfer.destination.as_ref(),
             hits,
         ),
+        Operation::HardLink => record(
+            node,
+            &transfer.api,
+            "creates a hard link at",
+            transfer.destination.as_ref(),
+            hits,
+        ),
+        Operation::SymbolicLink => record_tree(
+            node,
+            &transfer.api,
+            "creates a symbolic link at",
+            transfer.destination.as_ref(),
+            hits,
+        ),
     }
     match transfer.operation {
         Operation::Rename => record(
@@ -156,7 +190,11 @@ pub(super) fn scan(
             transfer.source.as_ref(),
             hits,
         ),
-        Operation::CopyFile | Operation::Copy | Operation::CopyTree => {}
+        Operation::CopyFile
+        | Operation::Copy
+        | Operation::CopyTree
+        | Operation::HardLink
+        | Operation::SymbolicLink => {}
     }
 }
 
@@ -273,6 +311,278 @@ mod tests {
             assert!(source.get(hit.span.clone()).is_some(), "{source}: {hit:?}");
         }
         hits.into_iter().map(|hit| hit.rule).collect()
+    }
+
+    #[test]
+    fn link_apis_and_aliases_reach_the_shared_policy() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "import os; os.link('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os; os.symlink('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "from os import link as publish; publish(dst='.bashrc', src=source)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "from os import symlink as publish; publish(src=source, dst='.bashrc')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os as disk; disk.symlink('missing', disk.path.join(disk.environ['HOME'], '.aws', 'credentials'))",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('fs').linkSync('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('fs').link('staged', '.bashrc', () => {})",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('node:fs').symlinkSync('missing', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('node:fs').symlink(source, '.bashrc', () => {})",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('fs').promises.link('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('fs/promises').symlink('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const {symlinkSync: publish} = require('node:fs'); publish('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "import {link as publish} from 'node:fs/promises'; publish('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const fs = require('fs'); fs['symlinkSync']('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('fs').symlinkSync('staged', require('path').join(require('os').homedir(), '.bashrc'))",
+            ),
+            (
+                ScriptLanguage::TypeScript,
+                "import * as fs from 'node:fs'; const path: string = '.bashrc'; fs.linkSync('staged', path)",
+            ),
+            (ScriptLanguage::Ruby, "File.link('staged', '.bashrc')"),
+            (ScriptLanguage::Ruby, "File.symlink(source, '.bashrc')"),
+            (
+                ScriptLanguage::Ruby,
+                "F = File; F.symlink('missing', File.join(Dir.home, '.bashrc'))",
+            ),
+        ] {
+            assert_eq!(
+                rules(source, language),
+                ["credential-file-write"],
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn pathlib_links_write_the_receiver_not_the_target() {
+        for method in ["hardlink_to", "symlink_to"] {
+            for source in [
+                format!("from pathlib import Path; Path('.bashrc').{method}('staged')"),
+                format!("from pathlib import Path; Path('.bashrc').{method}(target=unknown)"),
+                format!(
+                    "from pathlib import Path as P; publish = P.home().joinpath('.bashrc').{method}; publish('staged')"
+                ),
+            ] {
+                assert_eq!(
+                    rules(&source, ScriptLanguage::Python),
+                    ["credential-file-write"],
+                    "{source}"
+                );
+            }
+            for source in [
+                format!("from pathlib import Path; Path('/tmp/alias').{method}('.bashrc')"),
+                format!("from pathlib import Path; Path('~/.bashrc').{method}('staged')"),
+            ] {
+                assert!(
+                    rules(&source, ScriptLanguage::Python).is_empty(),
+                    "{source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn symbolic_links_protect_credential_directory_roots() {
+        // A link to a tree can redirect future trust-file reads even when
+        // the directory root itself is not a single protected file.
+        for (path, rule) in [
+            ("/home/u/.aws", "credential-file-write"),
+            ("/home/u/.config", "credential-file-write"),
+            ("/home/u/.ssh", "credential-file-write"),
+            (".git", "git-internals-write"),
+        ] {
+            for (language, source) in [
+                (
+                    ScriptLanguage::Python,
+                    format!("import os; os.symlink('staged', '{path}', target_is_directory=True)"),
+                ),
+                (
+                    ScriptLanguage::Python,
+                    format!(
+                        "from pathlib import Path; Path('{path}').symlink_to(target=source, target_is_directory=True)"
+                    ),
+                ),
+                (
+                    ScriptLanguage::JavaScript,
+                    format!("require('fs').symlinkSync('staged', '{path}', 'dir')"),
+                ),
+                (
+                    ScriptLanguage::Ruby,
+                    format!("File.symlink('staged', '{path}')"),
+                ),
+            ] {
+                assert_eq!(rules(&source, language), [rule], "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn links_classify_only_the_new_name_and_never_grant_append() {
+        for (source, destination, rule) in [
+            (".bashrc", ".git/config", "git-internals-write"),
+            (".git/config", ".bashrc", "credential-file-write"),
+            ("staged", ".ssh/known_hosts", "credential-file-write"),
+        ] {
+            for (language, program) in [
+                (
+                    ScriptLanguage::Python,
+                    format!("import os; os.link('{source}', '{destination}')"),
+                ),
+                (
+                    ScriptLanguage::Python,
+                    format!("import os; os.symlink('{source}', '{destination}')"),
+                ),
+                (
+                    ScriptLanguage::Python,
+                    format!(
+                        "from pathlib import Path; Path('{destination}').hardlink_to('{source}')"
+                    ),
+                ),
+                (
+                    ScriptLanguage::Python,
+                    format!(
+                        "from pathlib import Path; Path('{destination}').symlink_to('{source}')"
+                    ),
+                ),
+                (
+                    ScriptLanguage::JavaScript,
+                    format!("require('fs').linkSync('{source}', '{destination}')"),
+                ),
+                (
+                    ScriptLanguage::JavaScript,
+                    format!("require('fs/promises').symlink('{source}', '{destination}')"),
+                ),
+                (
+                    ScriptLanguage::Ruby,
+                    format!("File.link('{source}', '{destination}')"),
+                ),
+                (
+                    ScriptLanguage::Ruby,
+                    format!("File.symlink('{source}', '{destination}')"),
+                ),
+            ] {
+                assert_eq!(rules(&program, language), [rule], "{program}");
+            }
+        }
+    }
+
+    #[test]
+    fn link_reads_literals_and_unrelated_receivers_stay_clear() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "import os; os.link('.bashrc', '/tmp/alias')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os; os.symlink('/home/u/.aws', '/tmp/alias')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os; os.symlink('.bashrc', destination)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os; os.symlink('staged', '~/.bashrc')",
+            ),
+            (ScriptLanguage::Python, "import os; os.readlink('.bashrc')"),
+            // Importing an alias must not invent a binding under the old name.
+            (
+                ScriptLanguage::Python,
+                "import os as disk; disk.symlink('missing', os.path.join(os.environ['HOME'], '.aws', 'credentials'))",
+            ),
+            (
+                ScriptLanguage::Python,
+                "from os import symlink as publish; publish = store; publish('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "from unrelated import link; link('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "print(\"os.symlink('staged', '.bashrc')\")",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('fs').symlinkSync('.bashrc', '/tmp/alias')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('fs').linkSync('.bashrc', destination)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "require('fs').readlinkSync('.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const fs = require('unrelated'); fs.linkSync('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const fs = require('fs'); fs = store; fs.symlinkSync('staged', '.bashrc')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "console.log(\"require('fs').symlinkSync('staged', '.bashrc')\")",
+            ),
+            (ScriptLanguage::Ruby, "File.link('.bashrc', '/tmp/alias')"),
+            (
+                ScriptLanguage::Ruby,
+                "File.symlink('/home/u/.aws', '/tmp/alias')",
+            ),
+            (ScriptLanguage::Ruby, "File.readlink('.bashrc')"),
+            (ScriptLanguage::Ruby, "Store.symlink('staged', '.bashrc')"),
+            (
+                ScriptLanguage::Ruby,
+                "File = Store; File.link('staged', '.bashrc')",
+            ),
+        ] {
+            assert!(rules(source, language).is_empty(), "{source}");
+        }
     }
 
     #[test]

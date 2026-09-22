@@ -1,6 +1,45 @@
 use super::*;
 
 #[test]
+fn opaque_ruby_options_preserve_known_write_evidence() {
+    for (source, expected) in [
+        (
+            "File.open('.bashrc', 'w', **options)",
+            Some("credential-file-write"),
+        ),
+        (
+            "File.open('.ssh/known_hosts', 'a', **options)",
+            Some("credential-file-write"),
+        ),
+        (
+            "File.open('.bashrc', flags: File::WRONLY, **options)",
+            Some("credential-file-write"),
+        ),
+        (
+            "File.open('.git/config', 'w', **options)",
+            Some("git-internals-write"),
+        ),
+        (
+            "File.open('/etc/shadow', **options, mode: 'r', flags: File::RDONLY)",
+            None,
+        ),
+        (
+            "File.open('.ssh/known_hosts', **options, mode: 'a', flags: File::NONBLOCK)",
+            None,
+        ),
+        ("File.open('/etc/shadow', 'r', **options)", None),
+        ("File.open('/tmp/proposal', 'w', **options)", None),
+    ] {
+        let hits = scan_extracted(source, ScriptLanguage::Ruby).expect("complete analysis");
+        assert_eq!(
+            hits.first().map(|hit| hit.rule),
+            expected,
+            "{source}: {hits:?}"
+        );
+    }
+}
+
+#[test]
 fn ruby_flags_options_are_combined_with_the_effective_mode() {
     for (source, blocked) in [
         (

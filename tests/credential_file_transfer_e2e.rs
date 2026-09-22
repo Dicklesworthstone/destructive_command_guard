@@ -9,6 +9,230 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 #[test]
+fn opaque_ruby_options_cannot_suppress_hook_or_cli_writes() {
+    let home = home();
+    for (source, rule) in [
+        (
+            "File.open('.bashrc', 'w', **options)",
+            Some("credential-file-write"),
+        ),
+        (
+            "File.open('.ssh/known_hosts', 'a', **options)",
+            Some("credential-file-write"),
+        ),
+        (
+            "File.open('.bashrc', flags: File::WRONLY, **options)",
+            Some("credential-file-write"),
+        ),
+        (
+            "File.open('.git/config', 'w', **options)",
+            Some("git-internals-write"),
+        ),
+        (
+            "File.open('/etc/shadow', **options, mode: 'r', flags: File::RDONLY)",
+            None,
+        ),
+        (
+            "File.open('.ssh/known_hosts', **options, mode: 'a', flags: File::NONBLOCK)",
+            None,
+        ),
+        ("File.open('/etc/shadow', 'r', **options)", None),
+        ("File.open('/tmp/proposal', 'w', **options)", None),
+    ] {
+        assert_program("ruby", source, home.path(), rule);
+    }
+}
+
+fn assert_link_cases(exe: &str, cases: &[(&str, Option<&str>)]) {
+    for settings in [
+        "[heredoc]\nenabled = true\ntimeout_ms = 5000\n",
+        "[heredoc]\nenabled = true\ntimeout_ms = 0\n",
+        "[heredoc]\nenabled = false\n",
+    ] {
+        let home = home();
+        fs::write(home.path().join("config.toml"), settings).unwrap();
+        for &(source, rule) in cases {
+            assert_program(exe, source, home.path(), rule);
+            let quoted = format!("'{}'", source.replace('\'', "'\\''"));
+            assert_decision(&format!("env {exe} - 0<<< {quoted}"), home.path(), rule);
+        }
+    }
+}
+
+#[test]
+fn python_link_creation_reaches_hook_cli_and_stdin() {
+    assert_link_cases(
+        "python3",
+        &[
+            (
+                "import os; os.symlink('staged', '.bashrc')",
+                Some("credential-file-write"),
+            ),
+            (
+                "from os import link as publish; publish(src=unknown, dst='.ssh/known_hosts')",
+                Some("credential-file-write"),
+            ),
+            (
+                "from pathlib import Path; (Path.home() / '.bashrc').hardlink_to(target='staged')",
+                Some("credential-file-write"),
+            ),
+            (
+                "from pathlib import Path; publish = Path('.git/config').symlink_to; publish(source)",
+                Some("git-internals-write"),
+            ),
+            (
+                "import os; os.symlink('staged', '/home/u/.aws', target_is_directory=True)",
+                Some("credential-file-write"),
+            ),
+            (
+                "import os; os.symlink('staged', '.git', target_is_directory=True)",
+                Some("git-internals-write"),
+            ),
+            ("import os; os.link('.bashrc', '/tmp/alias')", None),
+            (
+                "from pathlib import Path; Path('/tmp/alias').symlink_to('.bashrc')",
+                None,
+            ),
+            ("import os; os.symlink('staged', '~/.bashrc')", None),
+            ("print(\"os.symlink('staged', '.bashrc')\")", None),
+        ],
+    );
+}
+
+#[test]
+fn node_link_creation_reaches_hook_cli_and_stdin() {
+    assert_link_cases(
+        "node",
+        &[
+            (
+                "require('fs').symlinkSync('staged', '.bashrc')",
+                Some("credential-file-write"),
+            ),
+            (
+                "const {linkSync: publish} = require('node:fs'); publish(source, '.ssh/known_hosts')",
+                Some("credential-file-write"),
+            ),
+            (
+                "require('fs/promises').link('staged', '.git/config')",
+                Some("git-internals-write"),
+            ),
+            (
+                "require('fs').symlinkSync('staged', require('path').join(require('os').homedir(), '.aws'), 'dir')",
+                Some("credential-file-write"),
+            ),
+            (
+                "require('fs').symlinkSync('staged', '.git', 'dir')",
+                Some("git-internals-write"),
+            ),
+            ("require('fs').linkSync('.bashrc', '/tmp/alias')", None),
+            (
+                "require('fs').symlinkSync('/home/u/.aws', '/tmp/alias')",
+                None,
+            ),
+            ("require('fs').symlinkSync('staged', '~/.bashrc')", None),
+            (
+                "const fs = require('unrelated'); fs.symlinkSync('staged', '.bashrc')",
+                None,
+            ),
+        ],
+    );
+}
+
+#[test]
+fn ruby_link_creation_reaches_hook_cli_and_stdin() {
+    assert_link_cases(
+        "ruby",
+        &[
+            (
+                "File.symlink('staged', '.bashrc')",
+                Some("credential-file-write"),
+            ),
+            (
+                "F = File; F.link(source, '.ssh/known_hosts')",
+                Some("credential-file-write"),
+            ),
+            (
+                "File.link('staged', '.git/config')",
+                Some("git-internals-write"),
+            ),
+            (
+                "File.symlink('staged', File.join(Dir.home, '.aws'))",
+                Some("credential-file-write"),
+            ),
+            (
+                "File.symlink('staged', '.git')",
+                Some("git-internals-write"),
+            ),
+            ("File.link('.bashrc', '/tmp/alias')", None),
+            ("File.symlink('/home/u/.aws', '/tmp/alias')", None),
+            ("File.symlink('staged', '~/.bashrc')", None),
+            ("Store.symlink('staged', '.bashrc')", None),
+        ],
+    );
+}
+
+#[test]
+fn link_rule_grants_apply_to_the_new_name_only() {
+    for (allowed, denied, granted, other) in [
+        (
+            "credential-file-write",
+            "git-internals-write",
+            ".bashrc",
+            ".git/config",
+        ),
+        (
+            "git-internals-write",
+            "credential-file-write",
+            ".git/config",
+            ".bashrc",
+        ),
+    ] {
+        let home = home();
+        fs::write(
+            home.path().join("config.toml"),
+            "[heredoc]\nenabled = false\n",
+        )
+        .unwrap();
+        fs::write(
+            home.path().join("xdg/dcg/allowlist.toml"),
+            format!("[[allow]]\nrule = \"core.filesystem:{allowed}\"\nreason = \"one destination only\"\n"),
+        ).unwrap();
+        for (source, destination, rule) in [
+            ("staged", granted, None),      // Proves the grant is loaded.
+            (other, granted, None),         // The referenced source is not a write.
+            (granted, other, Some(denied)), // The other destination still denies.
+        ] {
+            for (exe, program) in [
+                (
+                    "python3",
+                    format!("import os; os.link('{source}', '{destination}')"),
+                ),
+                (
+                    "python3",
+                    format!(
+                        "from pathlib import Path; Path('{destination}').symlink_to('{source}')"
+                    ),
+                ),
+                (
+                    "node",
+                    format!("require('fs').linkSync('{source}', '{destination}')"),
+                ),
+                (
+                    "node",
+                    format!("require('fs/promises').symlink('{source}', '{destination}')"),
+                ),
+                ("ruby", format!("File.symlink('{source}', '{destination}')")),
+                ("ruby", format!("File.link('{source}', '{destination}')")),
+            ] {
+                assert_program(exe, &program, home.path(), rule);
+                let quoted = format!("'{}'", program.replace('\'', "'\\''"));
+                assert_decision(&format!("{exe} 0<<< {quoted}"), home.path(), rule);
+            }
+        }
+    }
+}
+
+#[test]
 fn ruby_flags_options_cannot_hide_truncation_from_hook_or_cli() {
     let home = home();
     for (source, blocked) in [
