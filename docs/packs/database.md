@@ -36,6 +36,8 @@ Commands containing these keywords are checked against this pack:
 - `delete`
 - `drop`
 - `truncate`
+- `UPDATE`
+- `update`
 
 ### Safe Patterns (Allowed)
 
@@ -58,6 +60,8 @@ These patterns match potentially destructive commands:
 | `drop-schema` | DROP SCHEMA permanently deletes the schema and all its objects (even with IF EXISTS). | critical |
 | `truncate-table` | TRUNCATE permanently deletes all rows without logging individual deletions. | high |
 | `delete-without-where` | DELETE without WHERE clause deletes ALL rows. Add a WHERE clause or use TRUNCATE intentionally. | high |
+| `update-without-where` | UPDATE without WHERE clause overwrites the column in ALL rows. Add a WHERE clause. | high |
+| `drop-column` | ALTER TABLE ... DROP COLUMN permanently deletes that column's data in every row. | high |
 | `dropdb-cli` | dropdb permanently deletes the entire database. Verify the database name carefully. | critical |
 | `pg-dump-clean` | pg_dump --clean drops objects before creating them. This can be destructive on restore. | high |
 

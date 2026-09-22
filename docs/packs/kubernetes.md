@@ -68,6 +68,7 @@ These patterns match potentially destructive commands:
 | `apply-force` | kubectl apply --force deletes and recreates resources, causing downtime. | high |
 | `delete-from-stdin` | kubectl delete -f - deletes every resource described by stdin without a reviewable manifest path. | high |
 | `delete-from-directory` | kubectl delete -f with directories or --recursive deletes many resources at once. | high |
+| `apply-prune` | kubectl apply --prune deletes live resources that are missing from the applied manifests. | high |
 
 ### Allowlist Guidance
 
