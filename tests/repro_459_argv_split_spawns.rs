@@ -83,6 +83,10 @@ fn perl(body: &str) -> String {
     format!("perl -e \"{body}\"")
 }
 
+fn python(body: &str) -> String {
+    format!("python3 -c \"import subprocess; {body}\"")
+}
+
 #[test]
 fn javascript_argv_split_spawns_deny_for_catastrophic_targets() {
     // Every row from the issue's JavaScript table that was ALLOWED. None of
@@ -238,4 +242,51 @@ fn every_operand_counts_and_options_do_not() {
     ));
     assert_allowed(&ruby("system('rm','-rf','/tmp/x',out: '/dev/null')"));
     assert_allowed(&perl("system('rm','-rf','/tmp/x','/var/tmp/y')"));
+}
+
+/// Argv-split spawns of destructive verbs the rm/git backstop does NOT know
+/// still reach their pack rule.
+///
+/// `dd`/`mkfs`/`wipefs`/`truncate` deny in shell form because the raw-shell
+/// rescan sees contiguous text; argv-split splits that across literals, so
+/// `spawnSync('dd', ['if=/dev/zero', 'of=/dev/sda'])` reached no layer and was
+/// ALLOWED. The reconstruction rejoins the argv and evaluates it through the
+/// same packs the shell form hits — one source of truth for every verb.
+#[test]
+fn argv_split_non_rm_verbs_reach_their_pack_rules() {
+    for body in [
+        "cp.spawnSync('dd',['if=/dev/zero','of=/dev/sda'])",
+        "cp.spawnSync('mkfs.ext4',['/dev/sda1'])",
+        "cp.spawnSync('wipefs',['-a','/dev/sda'])",
+        "cp.execFile('truncate',['-s','0','/home/u/.bashrc'])",
+    ] {
+        assert_blocked(&node(body));
+    }
+    for body in [
+        "subprocess.run(['dd','if=/dev/zero','of=/dev/sda'])",
+        "subprocess.run(['wipefs','-a','/dev/sda'])",
+    ] {
+        assert_blocked(&python(body));
+    }
+    assert_blocked(&ruby("system('dd','if=/dev/zero','of=/dev/sda')"));
+
+    // Ordinary tooling is untouched: a reconstructed command that matches no
+    // destructive pack rule still passes.
+    for body in [
+        "cp.spawnSync('tar',['-czf','out.tgz','src'])",
+        "cp.spawnSync('npm',['install'])",
+        "cp.spawnSync('git',['status'])",
+        "cp.execFile('mkdir',['-p','build/out'])",
+    ] {
+        assert_allowed(&node(body));
+    }
+
+    // The reconstruction routes through the same nested evaluation that
+    // `sh -c '<cmd>'` uses. That path already blocks `dd of=/tmp/x` (it does
+    // not apply the top-level `dd-tmp` safe pattern), so the argv form does
+    // too — an over-block that errs safe and matches the nested `sh -c`
+    // spelling, while every device/`mkfs`/`wipefs` target denies as intended.
+    assert_blocked(&node(
+        "cp.spawnSync('dd',['if=/dev/zero','of=/tmp/scratch'])",
+    ));
 }

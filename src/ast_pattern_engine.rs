@@ -531,6 +531,81 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
     out
 }
 
+/// One exec-sink call reconstructed as the shell command line it runs.
+pub struct ReconstructedCommand {
+    /// The command word and its arguments, space-joined — e.g.
+    /// `dd if=/dev/zero of=/dev/sda`.
+    pub command: String,
+    /// Byte span of the sink call in the scanned `code`, for span mapping.
+    pub start: usize,
+    /// End of that span.
+    pub end: usize,
+}
+
+/// Each exec-sink argv-split call in `code`, reconstructed as the shell command
+/// line it runs, for evaluation through the full pack pipeline.
+///
+/// [`scan_executing_sink_matches`] covers the `rm` and `git` argv forms under
+/// dedicated `exec_sink.*` rule ids, so a call it already flags is skipped here
+/// (routing it to the packs too would deny an allowlisted `rm`/`git` under a
+/// second rule id). EVERY other destructive verb — `dd`, `mkfs`, `wipefs`,
+/// `truncate`, `shred`, `chmod -R`, … — is known only to the packs, and an
+/// argv-split spawn (`spawnSync('dd', ['if=…', 'of=/dev/sda'])`) leaves no
+/// contiguous command text for the raw-shell rescan, so re-joining its argv and
+/// evaluating THAT is the only way it reaches its pack rule. This is the #459
+/// gap generalized past `rm`.
+///
+/// Only a multi-literal argv is reconstructed: a single-string sink argument
+/// (`execSync('dd if=… of=…')`) is contiguous command text the raw-shell rescan
+/// already sees, so re-evaluating it would add nothing.
+#[must_use]
+pub fn exec_sink_reconstructed_commands(
+    code: &str,
+    language: ScriptLanguage,
+) -> Vec<ReconstructedCommand> {
+    let sink_regex: &Regex = match language {
+        ScriptLanguage::JavaScript | ScriptLanguage::TypeScript => &JS_EXEC_SINK_LITERAL,
+        ScriptLanguage::Python => &PY_EXEC_SINK_LITERAL,
+        ScriptLanguage::Ruby => &RUBY_EXEC_SINK_LITERAL,
+        ScriptLanguage::Perl => &PERL_SYSTEM_EXEC_LITERAL,
+        _ => return Vec::new(),
+    };
+    // Perl comments can hold a `system(...)` that never runs; mask them so a
+    // commented call is not reconstructed and over-blocked. Masking preserves
+    // length, so the sink spans still line up with `code`.
+    let masked = if language == ScriptLanguage::Perl {
+        mask_perl_comments(code)
+    } else {
+        std::borrow::Cow::Borrowed(code)
+    };
+    let haystack = masked.as_ref();
+
+    let mut out = Vec::new();
+    for caps in sink_regex.captures_iter(haystack) {
+        let Some(m) = caps.get(0) else { continue };
+        let region = exec_sink_arg_region(haystack, m.start());
+        // A call the rm/git backstop owns (any `detect_destructive_in_args`
+        // hit) is left to it, so an allowlisted `rm`/`git` is not re-denied
+        // here under a pack rule id.
+        if detect_destructive_in_args(region).is_some() {
+            continue;
+        }
+        let literals: Vec<&str> = ANY_STRING_LITERAL
+            .captures_iter(exec_argv_region(region))
+            .filter_map(|caps| string_literal_from_caps(&caps))
+            .collect();
+        if literals.len() < 2 {
+            continue;
+        }
+        out.push(ReconstructedCommand {
+            command: literals.join(" "),
+            start: m.start(),
+            end: m.end(),
+        });
+    }
+    out
+}
+
 /// High-signal filesystem sink fallback for cases where the full AST pass is
 /// unavailable or too close to the hook deadline.
 ///
@@ -6511,6 +6586,66 @@ def cleanup():
                     "{code:?}"
                 );
             }
+        }
+
+        /// The reconstruction rejoins an argv-split spawn's literals into the
+        /// command line, for verbs the rm/git backstop does not own, and skips
+        /// the calls it does own.
+        #[test]
+        fn reconstructs_non_rm_argv_commands() {
+            let lines = |code, lang| {
+                exec_sink_reconstructed_commands(code, lang)
+                    .into_iter()
+                    .map(|c| c.command)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                lines(
+                    "cp.spawnSync('dd', ['if=/dev/zero', 'of=/dev/sda'])",
+                    ScriptLanguage::JavaScript
+                ),
+                vec!["dd if=/dev/zero of=/dev/sda".to_string()]
+            );
+            assert_eq!(
+                lines(
+                    "subprocess.run(['wipefs', '-a', '/dev/sda'])",
+                    ScriptLanguage::Python
+                ),
+                vec!["wipefs -a /dev/sda".to_string()]
+            );
+            assert_eq!(
+                lines(
+                    "system('dd', 'if=/dev/zero', 'of=/dev/sda')",
+                    ScriptLanguage::Perl
+                ),
+                vec!["dd if=/dev/zero of=/dev/sda".to_string()]
+            );
+            // rm and git are the backstop's; they are not reconstructed here.
+            assert!(
+                lines(
+                    "cp.spawnSync('rm', ['-rf', '/'])",
+                    ScriptLanguage::JavaScript
+                )
+                .is_empty()
+            );
+            assert!(lines("system('git', 'reset', '--hard')", ScriptLanguage::Ruby).is_empty());
+            // A single-string sink argument is contiguous command text the raw
+            // rescan already sees, so it is not reconstructed.
+            assert!(
+                lines(
+                    "cp.execSync('dd if=/dev/zero of=/dev/sda')",
+                    ScriptLanguage::JavaScript
+                )
+                .is_empty()
+            );
+            // A commented-out Perl call runs nothing.
+            assert!(
+                lines(
+                    "# system('dd', 'if=/x', 'of=/dev/sda')\n",
+                    ScriptLanguage::Perl
+                )
+                .is_empty()
+            );
         }
 
         #[test]

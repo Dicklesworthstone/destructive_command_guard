@@ -25750,6 +25750,12 @@ fn evaluate_heredoc(
         {
             return Some(blocked);
         }
+        // Destructive verbs the rm/git backstop does not know (`dd`, `mkfs`,
+        // `wipefs`, `truncate`, …), reconstructed from an argv-split spawn and
+        // sent through the packs.
+        if let Some(blocked) = exec_sink_pack_verdict(command, &content, context) {
+            return Some(blocked);
+        }
     }
 
     if fallback_needed {
@@ -25820,6 +25826,77 @@ fn exec_sink_backstop_verdict(
     None
 }
 
+/// Destructive verbs OTHER than `rm`/`git` reached through an argv-split
+/// exec sink.
+///
+/// `exec_sink_backstop_verdict` knows only `rm` and `git`; the packs know every
+/// other destructive verb (`dd`, `mkfs`, `wipefs`, `truncate`, `shred`,
+/// `chmod -R`, …). Their shell form is caught because the raw-shell rescan sees
+/// contiguous text, but `spawnSync('dd', ['if=/dev/zero', 'of=/dev/sda'])`
+/// splits that text across argv literals and reaches no layer — so it was
+/// ALLOWED while the string form denied. This reconstructs each such call's
+/// argv into a command line and evaluates it through the same pack pipeline the
+/// inner-command loop uses, one source of truth for the verb rules and their
+/// allowlists. Calls the rm/git backstop owns are skipped inside
+/// `exec_sink_reconstructed_commands`, so this never re-denies them.
+fn exec_sink_pack_verdict(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    context: HeredocEvaluationContext<'_>,
+) -> Option<EvaluationResult> {
+    for reconstructed in
+        crate::ast_matcher::exec_sink_reconstructed_commands(&content.content, content.language)
+    {
+        if deadline_exceeded(context.deadline) {
+            return Some(EvaluationResult::indeterminate_due_to_budget());
+        }
+        let result = evaluate_command_with_pack_order_deadline_at_path_inner(
+            &reconstructed.command,
+            context.enabled_keywords,
+            context.ordered_packs,
+            context.keyword_index,
+            context.compiled_overrides,
+            context.allowlists,
+            context.heredoc_settings,
+            context.allow_once_audit,
+            context.project_path,
+            context.deadline,
+            crate::normalize::ShellDialect::Posix,
+            context.nested_command_depth + 1,
+            context.inherited_automated_stdin,
+        );
+        // A nested evaluator can stop short of the deadline; propagate that
+        // exactly rather than reading incomplete analysis as Allow.
+        if nested_evaluation_incomplete(&result) {
+            return Some(EvaluationResult::indeterminate_due_to_budget());
+        }
+        if result.is_denied() {
+            let mut result = result;
+            if let Some(info) = result.pattern_info.as_mut() {
+                info.reason = wrap_embedded_shell_denial_reason(
+                    &info.reason,
+                    content.heredoc_type.is_some(),
+                    content.target_command.as_deref(),
+                    content.content[..reconstructed.start.min(content.content.len())]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count()
+                        + 1,
+                );
+                info.source = MatchSource::HeredocAst;
+                info.matched_span =
+                    map_heredoc_span(command, content, reconstructed.start, reconstructed.end);
+                info.matched_text_preview = info
+                    .matched_span
+                    .as_ref()
+                    .map(|span| extract_match_preview(command, span));
+            }
+            return Some(result);
+        }
+    }
+    None
+}
+
 /// Exec-sink backstop for an incomplete extraction.
 ///
 /// `check_fallback_patterns` recognises deletions by sink NAME (`shutil.rmtree`,
@@ -25863,6 +25940,9 @@ fn check_exec_sink_fallback(
         if let Some(blocked) =
             exec_sink_backstop_verdict(command, &item, context, first_allowlist_hit)
         {
+            return Some(blocked);
+        }
+        if let Some(blocked) = exec_sink_pack_verdict(command, &item, context) {
             return Some(blocked);
         }
     }
