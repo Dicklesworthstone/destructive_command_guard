@@ -113,6 +113,13 @@ built-in rule IDs. Use these IDs for allowlisting and tests.
 
 ### Go
 
+The Pattern column is the call each rule matches. Go's patterns are *registered*
+inside enclosing context — `func f() { os.RemoveAll($$$) }` with a
+`call_expression` selector — because Go's grammar has no top-level expression
+statement, so a bare call is not a parseable fragment and compiles to a tree that
+can never match (#465). The selector discards the wrapper, so the call below is
+what is matched and what the reported span covers.
+
 | Rule ID | Pattern | Reason |
 | --- | --- | --- |
 | `heredoc.go.os_remove` | `os.Remove($$$)` | deletes files |
@@ -155,7 +162,7 @@ built-in rule IDs. Use these IDs for allowlisting and tests.
 
 | Rule ID | Pattern | Reason |
 | --- | --- | --- |
-| `heredoc.python.shutil_rmtree` | `shutil.rmtree($$$)` | recursively deletes directories |
+| `heredoc.python.shutil_rmtree` | `$M.rmtree($$$)` | recursively deletes directories |
 | `heredoc.python.os_remove` | `os.remove($$$)` | deletes files |
 | `heredoc.python.os_rmdir` | `os.rmdir($$$)` | deletes directories |
 | `heredoc.python.os_unlink` | `os.unlink($$$)` | deletes files |
@@ -194,6 +201,32 @@ built-in rule IDs. Use these IDs for allowlisting and tests.
 | `heredoc.ruby.open3_capture3` | `Open3.capture3($$$)` | executes shell commands |
 | `heredoc.ruby.open3_popen3` | `Open3.popen3($$$)` | executes shell commands |
 | `heredoc.ruby.backticks` | `` `$$$` `` | executes shell commands |
+
+### PHP
+
+| Rule ID | Pattern | Reason |
+| --- | --- | --- |
+| `heredoc.php.unlink` | `unlink($$$)` | deletes files |
+| `heredoc.php.rmdir` | `rmdir($$$)` | deletes directories |
+| `heredoc.php.exec` | `exec($$$)` | executes shell commands |
+| `heredoc.php.system` | `system($$$)` | executes shell commands |
+| `heredoc.php.shell_exec` | `shell_exec($$$)` | executes shell commands |
+| `heredoc.php.passthru` | `passthru($$$)` | executes shell commands |
+| `heredoc.php.proc_open` | `proc_open($$$)` | executes shell commands |
+| `heredoc.php.popen` | `popen($$$)` | executes shell commands |
+| `heredoc.php.backticks` | `` `$$$` `` | executes shell commands |
+
+`unlink` and `rmdir` are also registered in their namespace-escaped spellings
+(`\unlink`, `\rmdir`), which PHP code inside a namespace uses to reach the global
+function; both spellings report the same rule ID.
+
+Only `unlink` and `rmdir` block by default. The seven execution helpers are
+registered at Medium, and unlike the other languages PHP has no arm in
+`refine_match_meta`, so they never escalate on a destructive literal payload the
+way Python's and Ruby's exec sinks do — a PHP `system('rm -rf …')` is caught by
+the conservative raw-shell rescan finding that text, not by the rule above. An
+argv-split payload (`pcntl_exec('/bin/rm', ['-rf', …])`) has no such text and is
+allowed. See #459.
 
 ### Perl
 
