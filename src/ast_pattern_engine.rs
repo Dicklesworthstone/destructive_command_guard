@@ -5039,6 +5039,83 @@ mod tests {
         }
     }
 
+    /// `docs/patterns.md` must list every rule id, and no others.
+    ///
+    /// Those tables are what a user copies into an allowlist: `dcg allowlist add`
+    /// keys on the exact string, so a stale id documented there is an exception
+    /// that silently never matches, and a missing id is a rule nobody can
+    /// discover or grant. The file is hand-maintained and had drifted five ways
+    /// at once — all nine PHP rules undocumented, four `fspromises_*` rows left
+    /// behind by #467, three rows still advertising a pre-#459 spelling, six Go
+    /// rows added by #465, and `shutil_rmtree` understating its own receiver.
+    ///
+    /// Only rule ids are asserted, not the Pattern column. Go's patterns are
+    /// registered inside a `func f() { … }` wrapper the selector discards, and
+    /// some rows legitimately document two spellings in one cell, so comparing
+    /// the text would be noise. The id is the part that has to be exact.
+    ///
+    /// `src/perf.rs` does the same thing for the CI workflow's coverage
+    /// thresholds; this is that pattern applied to the pattern inventory.
+    #[test]
+    fn documented_rule_ids_match_the_corpus() {
+        const DOCS: &str = include_str!("../docs/patterns.md");
+
+        // A table row's first cell, backtick-quoted. Derived ids (`.catastrophic`,
+        // `.temp`, `.non_temp`, a payload suffix) are documented in prose under
+        // "Derived Rule IDs" rather than as rows, and carry a fourth segment, so
+        // requiring exactly three tells them apart from a registered id. Perl is
+        // absent by construction: its rules come from `precompile_perl_patterns`
+        // rather than this corpus, and its docs are a bullet list, not a table.
+        let documented: std::collections::BTreeSet<&str> = DOCS
+            .lines()
+            .filter(|line| line.starts_with('|'))
+            .filter_map(|line| line.split('|').nth(1))
+            .map(|cell| cell.trim().trim_matches('`'))
+            .filter(|id| id.starts_with("heredoc.") && id.split('.').count() == 3)
+            .collect();
+
+        let registered: std::collections::BTreeSet<String> = default_patterns()
+            .into_values()
+            .flatten()
+            .map(|meta| meta.rule_id)
+            .collect();
+
+        // The two set differences below imply equality, and a parser that found
+        // nothing would make the first one fail — but BOTH sets being empty would
+        // pass vacuously, so pin a floor. The corpus was 72 ids across six
+        // languages when this was written; the bound is deliberately loose because
+        // the point is "not empty", not a count to maintain.
+        assert!(
+            registered.len() > 50 && documented.len() > 50,
+            "expected a populated corpus and doc set, got {} registered and {} \
+             documented — this test would otherwise pass vacuously",
+            registered.len(),
+            documented.len()
+        );
+
+        let undocumented: Vec<&String> = registered
+            .iter()
+            .filter(|id| !documented.contains(id.as_str()))
+            .collect();
+        let stale: Vec<&&str> = documented
+            .iter()
+            .filter(|id| !registered.contains(**id))
+            .collect();
+
+        assert!(
+            undocumented.is_empty(),
+            "{} rule id(s) exist but are not in docs/patterns.md, so no user can \
+             discover or allowlist them: {undocumented:?}",
+            undocumented.len()
+        );
+        assert!(
+            stale.is_empty(),
+            "{} rule id(s) are documented but no longer exist, so an allowlist \
+             entry copied from the docs would never match: {stale:?}",
+            stale.len()
+        );
+    }
+
     /// Compiling is not matching: every language's corpus must actually fire.
     ///
     /// `default_patterns_all_precompile` above passed for the entire life of
