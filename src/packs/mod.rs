@@ -2241,6 +2241,17 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "lvresize",
             "pvmove",
             "lvconvert",
+            // Whole-device wipe / erase tools (mirror `system::disk::create_pack`).
+            // `zpool`/`zfs` carry no `/dev/`, so they need their own keyword.
+            "blkdiscard",
+            "cryptsetup",
+            "hdparm",
+            "nvme",
+            "badblocks",
+            "sg_format",
+            "zpool",
+            "zfs",
+            "nwipe",
         ],
         system::disk::create_pack,
     ),

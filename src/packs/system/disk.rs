@@ -130,6 +130,21 @@ pub fn create_pack() -> Pack {
             "lvreduce",
             "lvresize",
             "pvmove",
+            // Whole-device wipe / erase tools. Most already reach the pack via
+            // the `/dev/` keyword, but naming them selects the pack even when
+            // the target is a mapped name (`cryptsetup luksErase mydev`) or a
+            // pool name (`zpool destroy tank`, which carries no `/dev/`).
+            "blkdiscard",
+            "cryptsetup",
+            "hdparm",
+            "nvme",
+            "badblocks",
+            "sg_format",
+            "zpool",
+            "zfs",
+            // `nwipe --autonuke` carries no `/dev/`; `scrub`/`wipe` reach the
+            // pack via their required `/dev/` target, so they need no keyword.
+            "nwipe",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -566,6 +581,84 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              List APFS structure first:\n  \
              diskutil apfs list",
             executables = ["diskutil"]
+        ),
+        // ----- Whole-device wipe / secure-erase tools -----
+        //
+        // These sit in the same class as `mkfs`/`dd of=/dev/...`/`wipefs`:
+        // one command destroys an entire device or its encryption keys with no
+        // confirmation and no undo. Each rule targets the destructive
+        // subcommand/flag only, so the read-only spellings (`hdparm -I`,
+        // `nvme list`, `cryptsetup status`, `zpool status`, `zfs list`,
+        // `badblocks` without `-w`, `fstrim`) stay allowed.
+        destructive_pattern!(
+            "blkdiscard",
+            r"\bblkdiscard\b",
+            "blkdiscard discards (TRIMs) every block on the device, destroying all data instantly with no undo.",
+            Critical
+        ),
+        destructive_pattern!(
+            "cryptsetup-erase",
+            r"\bcryptsetup\b(?:\s+--?\S+)*\s+(?:luksErase|luksFormat|erase|luksKillSlot)\b",
+            "cryptsetup erase/luksErase/luksFormat destroys the LUKS key material; the encrypted volume becomes permanently unreadable.",
+            Critical
+        ),
+        destructive_pattern!(
+            "hdparm-security-erase",
+            r"\bhdparm\b[^|;&\r\n]*--security-erase(?:-enhanced)?\b",
+            "hdparm --security-erase issues an ATA secure erase of the WHOLE drive at the firmware level. Unrecoverable.",
+            Critical
+        ),
+        destructive_pattern!(
+            "nvme-format-sanitize",
+            r"\bnvme\s+(?:format|sanitize)\b",
+            "nvme format/sanitize erases an NVMe namespace (or the entire controller). All data is destroyed.",
+            Critical
+        ),
+        destructive_pattern!(
+            "badblocks-write",
+            r"\bbadblocks\b[^|;&\r\n]*\s-[A-Za-z]*w",
+            "badblocks -w (write mode) overwrites every block on the device with test patterns, destroying all existing data.",
+            Critical
+        ),
+        destructive_pattern!(
+            "sg_format",
+            r"\bsg_format\b[^|;&\r\n]*--format\b",
+            "sg_format --format performs a SCSI low-level format, erasing all data on the medium.",
+            Critical
+        ),
+        destructive_pattern!(
+            "zpool-destroy",
+            r"\bzpool\s+destroy\b",
+            "zpool destroy removes a ZFS pool and every dataset, snapshot, and byte of data it contains.",
+            Critical
+        ),
+        destructive_pattern!(
+            "zfs-destroy",
+            r"\bzfs\s+destroy\b",
+            "zfs destroy removes a ZFS dataset, volume, or snapshot; with -r it destroys the whole descendant tree.",
+            Critical
+        ),
+        destructive_pattern!(
+            "nwipe",
+            r"\bnwipe\b",
+            "nwipe (the dban successor) overwrites an entire disk with wipe patterns; `--autonuke` targets every disk. All data is destroyed.",
+            Critical
+        ),
+        // `scrub` and `wipe` are common English words, so both rules require a
+        // `/dev/` target after the command. That keys on the destructive
+        // device-overwrite use and never fires on the READ-ONLY, pool/mount-
+        // targeted `zpool scrub tank` / `btrfs scrub /mnt`.
+        destructive_pattern!(
+            "scrub-device",
+            r"\bscrub\b\s+(?:[^|;&\r\n]*\s)?/dev/\S",
+            "scrub overwrites a device with data-destruction patterns (DoD/Gutmann/etc.); its contents are gone.",
+            Critical
+        ),
+        destructive_pattern!(
+            "wipe-device",
+            r"\bwipe\b\s+(?:[^|;&\r\n]*\s)?/dev/\S",
+            "wipe securely overwrites the target device, destroying all data on it.",
+            Critical
         ),
     ]
 }
@@ -1476,6 +1569,79 @@ mod tests {
             "tee \"/dev/null\"",
             "cp file '/dev/null'",
             "cp file /dev/shm/buffer",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
+    /// Whole-device wipe / secure-erase tools that were previously fail-open in
+    /// this default-on pack: blkdiscard, cryptsetup erase, ATA/NVMe secure
+    /// erase, write-mode badblocks, SCSI low-level format, and ZFS destroy.
+    #[test]
+    fn whole_device_wipe_tools_block() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("blkdiscard /dev/sda", "blkdiscard"),
+            ("blkdiscard -f /dev/nvme0n1", "blkdiscard"),
+            ("cryptsetup luksErase /dev/sda", "cryptsetup-erase"),
+            ("cryptsetup erase /dev/sda", "cryptsetup-erase"),
+            (
+                "cryptsetup --verbose luksKillSlot mydev 0",
+                "cryptsetup-erase",
+            ),
+            ("cryptsetup luksFormat /dev/sdb", "cryptsetup-erase"),
+            (
+                "hdparm --user-master u --security-erase p /dev/sda",
+                "hdparm-security-erase",
+            ),
+            (
+                "hdparm --security-erase-enhanced p /dev/sda",
+                "hdparm-security-erase",
+            ),
+            ("nvme format /dev/nvme0n1", "nvme-format-sanitize"),
+            ("nvme sanitize -a 2 /dev/nvme0n1", "nvme-format-sanitize"),
+            ("badblocks -w /dev/sda", "badblocks-write"),
+            ("badblocks -svw /dev/sda", "badblocks-write"),
+            ("sg_format --format /dev/sg0", "sg_format"),
+            ("zpool destroy tank", "zpool-destroy"),
+            ("zfs destroy -r tank/data", "zfs-destroy"),
+            ("zfs destroy tank/data@snap", "zfs-destroy"),
+            ("nwipe --autonuke /dev/sda", "nwipe"),
+            ("nwipe --autonuke", "nwipe"),
+            ("scrub -p dod /dev/sda", "scrub-device"),
+            ("scrub /dev/sdb", "scrub-device"),
+            ("wipe /dev/sda", "wipe-device"),
+            ("wipe -q /dev/nvme0n1", "wipe-device"),
+        ] {
+            let matched = pack
+                .check(command)
+                .unwrap_or_else(|| panic!("{command} must be denied"));
+            assert_eq!(matched.name, Some(rule), "{command}");
+            assert_eq!(matched.severity, Severity::Critical, "{command}");
+        }
+
+        // Read-only / non-destructive spellings of the same tools stay allowed.
+        for command in [
+            "blkid /dev/sda",
+            "fstrim /",
+            "fstrim -av",
+            "hdparm -I /dev/sda",
+            "hdparm -t /dev/sda",
+            "nvme list",
+            "nvme id-ctrl /dev/nvme0n1",
+            "cryptsetup status mydev",
+            "cryptsetup open /dev/sda mydev",
+            "badblocks -sv /dev/sda",
+            "badblocks -o bad.txt /dev/sda",
+            "zpool status",
+            "zpool list -H",
+            "zfs list",
+            "zfs get all tank",
+            // `scrub`/`wipe` on a pool or mountpoint (not a /dev/ node) are the
+            // read-only ZFS/btrfs verbs and ordinary file ops — must stay allowed.
+            "zpool scrub tank",
+            "btrfs scrub start /mnt",
+            "wipe notes.txt",
         ] {
             assert_allows(&pack, command);
         }

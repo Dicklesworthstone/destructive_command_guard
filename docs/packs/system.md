@@ -43,6 +43,15 @@ Commands containing these keywords are checked against this pack:
 - `lvreduce`
 - `lvresize`
 - `pvmove`
+- `blkdiscard`
+- `cryptsetup`
+- `hdparm`
+- `nvme`
+- `badblocks`
+- `sg_format`
+- `zpool`
+- `zfs`
+- `nwipe`
 
 ### Safe Patterns (Allowed)
 
@@ -122,6 +131,17 @@ These patterns match potentially destructive commands:
 | `diskutil-erase` | diskutil erase operations DESTROY all data on the target disk or volume. | critical |
 | `diskutil-partition` | diskutil partitioning operations rewrite the partition map and erase data. | critical |
 | `diskutil-apfs-delete` | diskutil apfs delete/erase operations permanently remove APFS containers, volumes, or snapshots. | critical |
+| `blkdiscard` | blkdiscard discards (TRIMs) every block on the device, destroying all data instantly with no undo. | critical |
+| `cryptsetup-erase` | cryptsetup erase/luksErase/luksFormat destroys the LUKS key material; the encrypted volume becomes permanently unreadable. | critical |
+| `hdparm-security-erase` | hdparm --security-erase issues an ATA secure erase of the WHOLE drive at the firmware level. Unrecoverable. | critical |
+| `nvme-format-sanitize` | nvme format/sanitize erases an NVMe namespace (or the entire controller). All data is destroyed. | critical |
+| `badblocks-write` | badblocks -w (write mode) overwrites every block on the device with test patterns, destroying all existing data. | critical |
+| `sg_format` | sg_format --format performs a SCSI low-level format, erasing all data on the medium. | critical |
+| `zpool-destroy` | zpool destroy removes a ZFS pool and every dataset, snapshot, and byte of data it contains. | critical |
+| `zfs-destroy` | zfs destroy removes a ZFS dataset, volume, or snapshot; with -r it destroys the whole descendant tree. | critical |
+| `nwipe` | nwipe (the dban successor) overwrites an entire disk with wipe patterns; `--autonuke` targets every disk. All data is destroyed. | critical |
+| `scrub-device` | scrub overwrites a device with data-destruction patterns (DoD/Gutmann/etc.); its contents are gone. | critical |
+| `wipe-device` | wipe securely overwrites the target device, destroying all data on it. | critical |
 
 ### Allowlist Guidance
 
