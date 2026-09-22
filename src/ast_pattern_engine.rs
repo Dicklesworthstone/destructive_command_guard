@@ -1489,9 +1489,7 @@ fn refine_javascript_match(meta: &CompiledPattern, matched_text: &str) -> Option
         });
     }
 
-    if rule_id.starts_with("heredoc.javascript.fs_")
-        || rule_id.starts_with("heredoc.javascript.fspromises_")
-    {
+    if rule_id.starts_with("heredoc.javascript.fs_") {
         // Prefer the argument of the deletion call itself; fall back to the
         // first string only when the method-anchored form finds nothing.
         let path = JS_FS_DELETE_PATH_ARG
@@ -1509,8 +1507,6 @@ fn refine_javascript_match(meta: &CompiledPattern, matched_text: &str) -> Option
                 | "heredoc.javascript.fs_rmdirsync"
                 | "heredoc.javascript.fs_rm"
                 | "heredoc.javascript.fs_rmdir"
-                | "heredoc.javascript.fspromises_rm"
-                | "heredoc.javascript.fspromises_rmdir"
         );
 
         if needs_recursive && !recursive_relevant && !catastrophic {
@@ -1608,9 +1604,7 @@ fn refine_typescript_match(meta: &CompiledPattern, matched_text: &str) -> Option
         });
     }
 
-    if rule_id.starts_with("heredoc.typescript.fs_")
-        || rule_id.starts_with("heredoc.typescript.fspromises_")
-        || rule_id == "heredoc.typescript.deno_remove"
+    if rule_id.starts_with("heredoc.typescript.fs_") || rule_id == "heredoc.typescript.deno_remove"
     {
         // Prefer the argument of the deletion call itself; fall back to the
         // first string only when the method-anchored form finds nothing.
@@ -1628,8 +1622,6 @@ fn refine_typescript_match(meta: &CompiledPattern, matched_text: &str) -> Option
                 | "heredoc.typescript.fs_rmdirsync"
                 | "heredoc.typescript.fs_rm"
                 | "heredoc.typescript.fs_rmdir"
-                | "heredoc.typescript.fspromises_rm"
-                | "heredoc.typescript.fspromises_rmdir"
                 | "heredoc.typescript.deno_remove"
         );
 
@@ -2987,14 +2979,10 @@ fn is_recursive_delete_rule(rule_id: &str) -> bool {
             | "heredoc.javascript.fs_rmdirsync"
             | "heredoc.javascript.fs_rm"
             | "heredoc.javascript.fs_rmdir"
-            | "heredoc.javascript.fspromises_rm"
-            | "heredoc.javascript.fspromises_rmdir"
             | "heredoc.typescript.fs_rmsync"
             | "heredoc.typescript.fs_rmdirsync"
             | "heredoc.typescript.fs_rm"
             | "heredoc.typescript.fs_rmdir"
-            | "heredoc.typescript.fspromises_rm"
-            | "heredoc.typescript.fspromises_rmdir"
     )
 }
 
@@ -3278,41 +3266,28 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
                 Severity::Low,
                 None,
             ),
-            // Promise-based fs variants. `$FS.promises.rm(...)` is the member
-            // spelling — `fs.promises.rm(...)` and
-            // `require('fs').promises.rm(...)` — which is the API Node's own
-            // docs recommend for removing a tree, and which was absent
-            // entirely under any spelling (#453). `fsPromises.rm(...)` stays
-            // for the `const fsPromises = require('fs/promises')` binding,
-            // where there is no `.promises` member to match.
-            CompiledPattern::new(
-                "$FS.promises.rm($$$)".to_string(),
-                "heredoc.javascript.fspromises_rm".to_string(),
-                "fs.promises.rm() deletes files/directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "$FS.promises.rmdir($$$)".to_string(),
-                "heredoc.javascript.fspromises_rmdir".to_string(),
-                "fs.promises.rmdir() deletes directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "fsPromises.rm($$$)".to_string(),
-                "heredoc.javascript.fspromises_rm".to_string(),
-                "fsPromises.rm() deletes files/directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "fsPromises.rmdir($$$)".to_string(),
-                "heredoc.javascript.fspromises_rmdir".to_string(),
-                "fsPromises.rmdir() deletes directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
+            // No separate promise-based entries: `$FS.rm`/`$FS.rmdir` above
+            // already cover every promise spelling, and a second pattern on the
+            // same call was actively harmful.
+            //
+            // #453 added `$FS.promises.rm($$$)` for the member spelling and kept
+            // `fsPromises.rm($$$)` for the `require('fs/promises')` binding,
+            // "where there is no `.promises` member to match". Generalising the
+            // receiver to a metavariable (#459) made both redundant, because a
+            // metavariable matches the whole receiver node whatever its shape.
+            // Measured, not assumed:
+            //
+            //   $FS.rm($$$)           fs.rm, fs.promises.rm, fsPromises.rm,
+            //                         require('fs').promises.rm   (all four)
+            //   $FS.promises.rm($$$)  fs.promises.rm, require('fs').promises.rm
+            //   fsPromises.rm($$$)    fsPromises.rm
+            //
+            // So each removed pattern matched a strict subset. What the overlap
+            // cost was an allowlist: both patterns fired on one call, `explain`
+            // reported only the winner (`fs_rm`), and allowlisting that id left
+            // the command denied under `fspromises_rm` — an id the user was
+            // never shown. `fs.rm` allowlisted correctly because only one
+            // pattern matched it.
         ],
     );
 
@@ -3399,36 +3374,10 @@ fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
                 Severity::Low,
                 None,
             ),
-            // The `.promises` member spelling, which was absent entirely:
-            // `fs.promises.rm(...)` and `require('fs').promises.rm(...)`.
-            CompiledPattern::new(
-                "$FS.promises.rm($$$)".to_string(),
-                "heredoc.typescript.fspromises_rm".to_string(),
-                "fs.promises.rm() deletes files/directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "$FS.promises.rmdir($$$)".to_string(),
-                "heredoc.typescript.fspromises_rmdir".to_string(),
-                "fs.promises.rmdir() deletes directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "fsPromises.rm($$$)".to_string(),
-                "heredoc.typescript.fspromises_rm".to_string(),
-                "fsPromises.rm() deletes files/directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "fsPromises.rmdir($$$)".to_string(),
-                "heredoc.typescript.fspromises_rmdir".to_string(),
-                "fsPromises.rmdir() deletes directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
+            // No separate promise-based entries, for the reason spelled out on
+            // the JavaScript side above: `$FS.rm`/`$FS.rmdir` match every
+            // promise spelling, and a second pattern on the same call defeated
+            // an allowlist entry for the rule id `explain` reported.
         ],
     );
 
@@ -5132,6 +5081,54 @@ mod tests {
             "chained match span should cover .Run(): {:?}",
             source.get(run.start..run.end)
         );
+    }
+
+    /// One deletion call must produce exactly one deletion rule id (#467).
+    ///
+    /// Two patterns matching the same call is not merely redundant, it breaks
+    /// allowlisting: `explain` reports one winner, and allowlisting that id
+    /// leaves the command denied under the shadowed rule, which the user was
+    /// never shown. That is what `fsPromises.rm` and `$FS.promises.rm` did
+    /// alongside `$FS.rm` — `fs.rm` allowlisted correctly because only one
+    /// pattern matched it, and `fsPromises.rm` did not.
+    ///
+    /// Asserting one id per call is what keeps a future receiver-specific
+    /// pattern from silently reintroducing the trap.
+    #[test]
+    fn one_deletion_call_yields_one_deletion_rule_issue_467() {
+        for language in [ScriptLanguage::JavaScript, ScriptLanguage::TypeScript] {
+            let lang_id = if language == ScriptLanguage::JavaScript {
+                "javascript"
+            } else {
+                "typescript"
+            };
+            for receiver in ["fs", "fs.promises", "fsPromises", "require('fs').promises"] {
+                for (method, expected) in [("rm", "fs_rm"), ("rmdir", "fs_rmdir")] {
+                    let source =
+                        format!("{receiver}.{method}('/home/user', {{ recursive: true }});\n");
+                    let hits = DEFAULT_MATCHER
+                        .find_matches(&source, language)
+                        .unwrap_or_else(|error| panic!("{source} should scan: {error:?}"));
+                    let deletions: Vec<&str> = hits
+                        .iter()
+                        .filter(|hit| hit.rule_id.starts_with(&format!("heredoc.{lang_id}.")))
+                        .map(|hit| hit.rule_id.as_str())
+                        .collect();
+                    assert_eq!(
+                        deletions.len(),
+                        1,
+                        "{language:?} {source:?} produced {deletions:?}; a second \
+                         matching pattern would shadow the reported rule and defeat \
+                         an allowlist entry for it"
+                    );
+                    assert_eq!(
+                        deletions[0],
+                        format!("heredoc.{lang_id}.{expected}.catastrophic"),
+                        "{language:?} {source:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// Go's recursive delete follows #455's temp policy, and only that far.

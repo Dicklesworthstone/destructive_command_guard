@@ -126,14 +126,12 @@ built-in rule IDs. Use these IDs for allowlisting and tests.
 
 | Rule ID | Pattern | Reason |
 | --- | --- | --- |
-| `heredoc.javascript.fs_rm` | `fs.rm($$$)` | deletes files/directories |
-| `heredoc.javascript.fs_rmdir` | `fs.rmdir($$$)` | deletes directories |
+| `heredoc.javascript.fs_rm` | `$FS.rm($$$)` | deletes files/directories |
+| `heredoc.javascript.fs_rmdir` | `$FS.rmdir($$$)` | deletes directories |
 | `heredoc.javascript.fs_rmsync` | `$FS.rmSync($$$)` | deletes files/directories |
 | `heredoc.javascript.fs_rmdirsync` | `$FS.rmdirSync($$$)` | deletes directories |
-| `heredoc.javascript.fs_unlink` | `fs.unlink($$$)` | deletes files |
+| `heredoc.javascript.fs_unlink` | `$FS.unlink($$$)` | deletes files |
 | `heredoc.javascript.fs_unlinksync` | `$FS.unlinkSync($$$)` | deletes files |
-| `heredoc.javascript.fspromises_rm` | `fsPromises.rm($$$)` | deletes files/directories |
-| `heredoc.javascript.fspromises_rmdir` | `fsPromises.rmdir($$$)` | deletes directories |
 | `heredoc.javascript.execsync` | `child_process.execSync($$$)` | executes shell commands |
 | `heredoc.javascript.require_execsync` | `require('child_process').execSync($$$)` | executes shell commands |
 | `heredoc.javascript.spawnsync` | `child_process.spawnSync($$$)` | executes shell commands |
@@ -142,14 +140,12 @@ built-in rule IDs. Use these IDs for allowlisting and tests.
 
 | Rule ID | Pattern | Reason |
 | --- | --- | --- |
-| `heredoc.typescript.fs_rm` | `fs.rm($$$)` | deletes files/directories |
-| `heredoc.typescript.fs_rmdir` | `fs.rmdir($$$)` | deletes directories |
+| `heredoc.typescript.fs_rm` | `$FS.rm($$$)` | deletes files/directories |
+| `heredoc.typescript.fs_rmdir` | `$FS.rmdir($$$)` | deletes directories |
 | `heredoc.typescript.fs_rmsync` | `$FS.rmSync($$$)` | deletes files/directories |
 | `heredoc.typescript.fs_rmdirsync` | `$FS.rmdirSync($$$)` | deletes directories |
-| `heredoc.typescript.fs_unlink` | `fs.unlink($$$)` | deletes files |
+| `heredoc.typescript.fs_unlink` | `$FS.unlink($$$)` | deletes files |
 | `heredoc.typescript.fs_unlinksync` | `$FS.unlinkSync($$$)` | deletes files |
-| `heredoc.typescript.fspromises_rm` | `fsPromises.rm($$$)` | deletes files/directories |
-| `heredoc.typescript.fspromises_rmdir` | `fsPromises.rmdir($$$)` | deletes directories |
 | `heredoc.typescript.execsync` | `child_process.execSync($$$)` | executes shell commands |
 | `heredoc.typescript.require_execsync` | `require('child_process').execSync($$$)` | executes shell commands |
 | `heredoc.typescript.spawnsync` | `child_process.spawnSync($$$)` | executes shell commands |
@@ -224,9 +220,11 @@ Supported `<suffix>` values (from shell-payload detection):
 
 Some patterns refine their rule IDs based on detected arguments:
 
-- For JavaScript/TypeScript `fs.*` and `fsPromises.*` patterns, a literal
+- For JavaScript/TypeScript `fs.*` patterns, a literal
   catastrophic path appends `.catastrophic` to the rule ID
-  (example: `heredoc.javascript.fs_rmsync.catastrophic`).
+  (example: `heredoc.javascript.fs_rmsync.catastrophic`). The receiver is a
+  metavariable, so one rule covers every spelling — `fs.rm`, `fs.promises.rm`,
+  `fsPromises.rm` and `require('fs').promises.rm` all report `fs_rm`.
 - For TypeScript `deno_remove`, a catastrophic path appends `.catastrophic`.
 - For Ruby `FileUtils`/`File`/`Dir` patterns, catastrophic paths append
   `.catastrophic`.
@@ -249,7 +247,8 @@ All derived rule IDs are valid allowlist targets.
 `rm -rf`, `shutil.rmtree`, `os.RemoveAll` (Go), `FileUtils.rm_rf`/`rm_r`/
 `remove_entry`/`remove_entry_secure`/`remove_dir`,
 `fs.rmSync`/`rmdirSync`/`rm`/`rmdir`
-(and the `fsPromises` and TypeScript spellings) with `recursive: true`, and
+(under any receiver spelling, including the promise APIs, in both JavaScript and
+TypeScript) with `recursive: true`, and
 Perl's `File::Path::rmtree`/`remove_tree` all answer the same question the same
 way: a literal target outside a temp directory is denied, and a temp target is
 warn-only.

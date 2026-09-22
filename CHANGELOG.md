@@ -15,6 +15,38 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
+### Fixed
+
+- **Allowlisting the rule id dcg reports did not always allow the command**
+  (#467). `dcg explain` on a `fsPromises.rm('/home/user', { recursive: true })`
+  heredoc reported `heredoc.javascript:fs_rm.catastrophic`; allowlisting exactly
+  that left the command denied under `heredoc.javascript:fspromises_rm`, an id
+  that had never appeared in any output, so there was nothing to tell the user
+  what to allowlist next. The `fs.rm` spelling allowlisted correctly, which is
+  what showed the allowlist mechanism was fine and the duplicate rule was not.
+
+  Two patterns matched the same call, and `find_matches_ast` collects a hit for
+  every pattern, so granting the reported rule simply promoted the shadowed one
+  to winner. The duplication was leftover scaffolding: #453 added
+  `$FS.promises.rm($$$)` for the member spelling and kept `fsPromises.rm($$$)`
+  for the `require('fs/promises')` binding, "where there is no `.promises` member
+  to match", and generalising the receiver to a metavariable in #459 made both
+  redundant — a metavariable matches the whole receiver node whatever its shape.
+  Measured against one file holding all four spellings, `$FS.rm($$$)` matches
+  `fs.rm`, `fs.promises.rm`, `fsPromises.rm` and `require('fs').promises.rm`,
+  while each removed pattern matched a strict subset, so no coverage was lost.
+
+  All four promise-specific patterns are gone (eight `CompiledPattern` entries,
+  since each rule id was registered twice), along with the now-dead
+  `fspromises_` arms in `refine_javascript_match`, `refine_typescript_match` and
+  `is_recursive_delete_rule`. Severity, the `.catastrophic` suffix and #455's
+  temp policy are unchanged, because `fs_rm` and `fspromises_rm` were already in
+  the same refinement sets. `one_deletion_call_yields_one_deletion_rule_issue_467`
+  asserts one deletion rule per call across all four receivers × `rm`/`rmdir` ×
+  both languages. `docs/patterns.md` was stale in the same area and is corrected:
+  the `fs_rm`/`fs_rmdir`/`fs_unlink` rows still showed the pre-#459 `fs.rm($$$)`
+  spelling.
+
 ### Security
 
 - **Every Go pattern was incapable of matching anything, including
