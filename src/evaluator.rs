@@ -21873,6 +21873,51 @@ fn parse_posix_variable_with_literal_suffix(token: &str) -> Option<(&str, &str)>
     (valid_name && literal_suffix).then_some((name, suffix))
 }
 
+/// Strip a declaration keyword that can precede an assignment without
+/// changing which shell performs it.
+///
+/// The binding match below required the segment to START with `NAME=`, so a
+/// declaration word in front of it defeated the proof entirely -- and it did so
+/// in BOTH directions, which is why this is a correctness fix rather than a
+/// trade-off. Measured before this, with a private key and a temp dir:
+///
+/// ```text
+/// T=<key>; rm $T                 deny     (proof resolves the target)
+/// export T=<key>; rm $T          ALLOW    (false negative)
+///
+/// T=/tmp/build; rm -rf $T       allow    (proof resolves the target)
+/// export T=/tmp/build; rm -rf $T   DENY  (false positive)
+/// ```
+///
+/// Only the bare keyword is stripped, never one carrying options. `declare -a
+/// T=(...)` binds an array rather than the scalar the callers reason about, and
+/// `declare -i` applies arithmetic evaluation to the value, so an option is a
+/// reason to leave the proof unprovable rather than a spelling to see through.
+///
+/// `local` is deliberately absent: it binds a function-local name, and nothing
+/// here reasons about function scope, so treating it as a parent-shell binding
+/// would claim to know something this pass does not.
+///
+/// A stripped segment is still an ordinary binding to everything downstream, so
+/// a second one -- in either spelling -- still makes the value ambiguous and
+/// refuses the proof.
+fn strip_assignment_declaration(segment: &str) -> &str {
+    let trimmed = segment.trim_start();
+    for keyword in ["export", "declare", "typeset", "readonly"] {
+        if let Some(rest) = trimmed.strip_prefix(keyword) {
+            if let Some(rest) = rest.strip_prefix([' ', '\t']) {
+                let rest = rest.trim_start();
+                // An option means the declaration can change what the value
+                // IS, not merely who can see it.
+                if !rest.starts_with('-') {
+                    return rest;
+                }
+            }
+        }
+    }
+    trimmed
+}
+
 /// Upper bound on `for`-loop candidate values a proof will enumerate.
 const MAX_LOOP_CANDIDATES: usize = 16;
 
@@ -21915,7 +21960,7 @@ fn resolved_variable_values(
         // the case the exemption must not cover.
         let binds_in_parent = !nested && segment_binding_reaches_parent_shell(source, start, end);
         if binds_in_parent {
-            if let Some(raw) = segment
+            if let Some(raw) = strip_assignment_declaration(segment)
                 .strip_prefix(name)
                 .and_then(|rest| rest.strip_prefix('='))
             {
@@ -26877,6 +26922,99 @@ pub fn apply_branch_strictness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A declaration keyword before an assignment must not defeat the proof
+    /// (#479).
+    ///
+    /// `resolved_variable_values` required the segment to start with `NAME=`,
+    /// so `export T=…` was never recognised as a binding. It broke the guard in
+    /// BOTH directions, which is what makes this a correctness fix rather than
+    /// a posture choice: the protected target stopped being denied, and the
+    /// temp target stopped being allowed. Both rows are asserted, because
+    /// fixing only one of them would look like a pass.
+    #[test]
+    fn a_declaration_keyword_does_not_defeat_variable_resolution_issue_479() {
+        const KEY: &str = "/home/user/.ssh/id_rsa";
+        for keyword in ["", "export ", "declare ", "typeset ", "readonly "] {
+            // Deny direction: the binding resolves a protected target.
+            let protected = format!("{keyword}T={KEY}; rm $T");
+            assert!(
+                evaluate_with_pack_ids(&protected, &["core.filesystem"]).is_denied(),
+                "{protected:?}: the binding names a protected file and must deny"
+            );
+
+            // Exempt direction: the same binding resolves a temp target, and
+            // refusing to read it is a false positive on an ordinary cleanup.
+            let temp = format!("{keyword}T=/tmp/build; rm -rf $T");
+            assert!(
+                evaluate_with_pack_ids(&temp, &["core.filesystem"]).is_allowed(),
+                "{temp:?}: the binding names a temp directory and must allow"
+            );
+        }
+    }
+
+    /// The three things the strip must NOT see through (#479).
+    ///
+    /// Each would be a claim this pass cannot support: an option can change
+    /// what the value IS rather than who can see it, `local` binds a
+    /// function-local name in a pass that does not model function scope, and a
+    /// keyword-shaped variable name is an ordinary assignment.
+    #[test]
+    fn the_declaration_strip_is_bounded_issue_479() {
+        // An option leaves the proof unprovable, so the temp exemption does
+        // not apply and the conservative answer stands.
+        for segment in [
+            "declare -a T=/tmp/build",
+            "declare -i T=/tmp/build",
+            "export -p T=/tmp/build",
+        ] {
+            let command = format!("{segment}; rm -rf $T");
+            assert!(
+                evaluate_with_pack_ids(&command, &["core.filesystem"]).is_denied(),
+                "{command:?}: an option means the value is not provably the \
+                 literal, so the exemption must not apply"
+            );
+        }
+
+        // `local` is not a parent-shell binding this pass can reason about.
+        assert!(
+            evaluate_with_pack_ids("local T=/tmp/build; rm -rf $T", &["core.filesystem"])
+                .is_denied(),
+            "`local` binds a function-local name; treating it as a parent-shell \
+             binding would claim knowledge this pass does not have"
+        );
+
+        // A variable whose name merely starts with a keyword is an ordinary
+        // assignment, so the strip must require whitespace after the keyword.
+        for name in ["exported", "declares", "readonlyish"] {
+            let command = format!("{name}=/home/user/.ssh/id_rsa; rm ${name}");
+            assert!(
+                evaluate_with_pack_ids(&command, &["core.filesystem"]).is_denied(),
+                "{command:?}: {name} is a variable name, not a declaration keyword"
+            );
+        }
+    }
+
+    /// Ambiguity still refuses, in every spelling (#479).
+    ///
+    /// The strip makes a declaration segment an ordinary binding, so a second
+    /// one has to make the value ambiguous exactly as two bare assignments do.
+    /// Without this the fix would turn "two possible values" into "the last one
+    /// I recognised".
+    #[test]
+    fn two_bindings_still_refuse_the_proof_issue_479() {
+        for command in [
+            "T=/tmp/build; T=/home/user/.ssh/id_rsa; rm $T",
+            "T=/tmp/build; export T=/home/user/.ssh/id_rsa; rm $T",
+            "export T=/tmp/build; declare T=/home/user/.ssh/id_rsa; rm $T",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &["core.filesystem"]).is_allowed(),
+                "{command:?}: two bindings make the value ambiguous, and an \
+                 unprovable binding must not resolve to either one"
+            );
+        }
+    }
 
     /// The hazard scan dispatches on this exact word, so a printf segment has
     /// to report itself as `printf` for the `-v` check to run at all.

@@ -367,6 +367,10 @@ fn test_audit_backtracking_requirements() {
         (
             "core.git",
             HashSet::from([
+                // `git rm --force` must not fire on `--cached`, `--dry-run`
+                // or `-n`, and "none of these appear in this segment" is a
+                // negative lookahead.
+                "rm-force",
                 // `git checkout .` must not fire on `checkout -b .` or
                 // `checkout --orphan .`, and "not one of these subcommands" is
                 // a pair of negative lookaheads, so this rule is on the
