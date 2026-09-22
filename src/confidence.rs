@@ -328,8 +328,11 @@ fn invoked_at_command_position(command: &str, match_start: usize) -> bool {
     // starts in: a span may start AT the command word (`man rm -rf` can
     // report `rm -rf`), and then that word is the candidate owner, not the
     // one before it.
+    // A quote also starts one: in `bash -c 'rm -rf ./x'` the code inside the
+    // quotes is its own command line, whose first word is `rm`. Where the
+    // quoted text is data instead, signal 2 already scores it as data.
     let segment_start = prefix
-        .rfind(['|', ';', '&', '(', '`', '\n'])
+        .rfind(['|', ';', '&', '(', '`', '\n', '\'', '"'])
         .map_or(0, |at| at + 1);
     // Spans can begin on the separating space (`man rm -rf` reports
     // ` rm -rf`), so the word is the first one after any leading blanks.
@@ -404,6 +407,8 @@ mod tests {
             ("cd /x && rm -rf ./build", "-rf"),
             ("find . -name x | xargs rm -rf", "-rf"),
             ("rm -rf ./build", "rm -rf"),
+            ("bash -c 'rm -rf ./build'", "-rf"),
+            ("sh -c \"rm -rf ./build\"", "-rf"),
         ] {
             let value = score_at(command, span);
             assert!(value >= 0.9, "{command:?} at {span:?} scored {value}");
