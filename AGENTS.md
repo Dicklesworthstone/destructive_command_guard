@@ -195,9 +195,15 @@ platform-sensitive, follow these conventions:
 - **`.exe` suffix.** When constructing a path to the dcg binary, use
   `env!("CARGO_BIN_EXE_dcg")` / `assert_cmd::cargo::cargo_bin("dcg")` in tests, or
   `std::env::consts::EXE_SUFFIX` in `src`. **Never** a bare `push("dcg")` — the
-  Windows CI job greps for it and fails. Use `dirs::home_dir()` (not `HOME`,
-  which is unset on Windows) and set `USERPROFILE`/`TEMP`/`TMP` alongside `HOME`
-  in test isolation.
+  Windows CI job greps for it and fails. Resolve per-user paths only through
+  `config::home_dir()` / `user_config_dir()` / `user_data_dir()` /
+  `user_data_local_dir()` / `user_cache_dir()` — never `dirs::*` (clippy's
+  `disallowed-methods` rejects it) and never raw `HOME` (unset on Windows).
+  `dirs` resolves the Windows profile via the known-folder API and ignores
+  `USERPROFILE`, so a sandboxed Windows test run used to rewrite the operator's
+  real `~\.claude\settings.json` and allow-once store (bd-b2b1). Set
+  `USERPROFILE`/`TEMP`/`TMP` alongside `HOME` in test isolation; `USERPROFILE`
+  alone now relocates `%APPDATA%`/`%LOCALAPPDATA%` too when those are unset.
 - **Verify Windows branches from Linux** without a Windows box: `mingw` + the
   `x86_64-pc-windows-gnu` target are installed, so
   `cargo check --target x86_64-pc-windows-gnu --lib` (or `--bin dcg` / `--tests`)
@@ -318,10 +324,11 @@ Rules:
   front. Assert `general.hook_timeout_source` too — a bare `>= 1000` check
   cannot tell the shipped default from an inherited 5000.
 - **Set `DCG_SELF_HEAL_HOOK=0` before the installer runs, not after.** dcg
-  repairs a missing/stale hook entry whenever it runs in hook mode, and native
-  Windows resolves the settings path via the Win32 known-folder API, which
-  `USERPROFILE` cannot redirect — so a late disable can rewrite a real
-  machine's agent config.
+  repairs a missing/stale hook entry whenever it runs in hook mode, and
+  released binaries up to v0.14.4 resolve the Windows settings path via the
+  Win32 known-folder API, which `USERPROFILE` cannot redirect — so a late
+  disable can rewrite a real machine's agent config. Current source honors
+  `USERPROFILE` (bd-b2b1), but the installer may still fetch an older release.
 - **Never hard-code the budget in `.github/workflows/ci.yml`.** It is grepped
   out of `HOOK_EVALUATION_BUDGET_MS`; `perf::tests::ci_enforces_absolute_latency_gate_against_shipped_budget`
   fails if that wiring is removed or the margin is loosened past 60%.

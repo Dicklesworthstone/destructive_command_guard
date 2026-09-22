@@ -8701,7 +8701,7 @@ fn handle_stats_command(
     } else if let Some(ref log_file) = config.general.log_file {
         // Expand ~ in path
         if log_file.starts_with("~/") {
-            dirs::home_dir().map_or_else(
+            crate::config::home_dir().map_or_else(
                 || std::path::PathBuf::from(log_file),
                 |h| h.join(&log_file[2..]),
             )
@@ -8710,7 +8710,7 @@ fn handle_stats_command(
         }
     } else {
         // Default log file location
-        dirs::data_local_dir()
+        crate::config::user_data_local_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share"))
             .join("dcg")
             .join("blocked.log")
@@ -10822,7 +10822,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     let grok_session_present = std::env::var_os("GROK_SESSION_ID").is_some()
         || std::env::var_os("GROK_HOOK_EVENT").is_some()
         || std::env::var_os("GROK_WORKSPACE_ROOT").is_some();
-    let grok_home = dirs::home_dir().map(|h| h.join(".grok"));
+    let grok_home = crate::config::home_dir().map(|h| h.join(".grok"));
     let grok_home_exists = grok_home.as_ref().is_some_and(|p| p.exists() && p.is_dir());
     if grok_session_present || grok_home_exists {
         print!("Checking Grok hook registration... ");
@@ -12207,7 +12207,7 @@ fn collect_doctor_report(
     let grok_session_present = std::env::var_os("GROK_SESSION_ID").is_some()
         || std::env::var_os("GROK_HOOK_EVENT").is_some()
         || std::env::var_os("GROK_WORKSPACE_ROOT").is_some();
-    let grok_home = dirs::home_dir().map(|h| h.join(".grok"));
+    let grok_home = crate::config::home_dir().map(|h| h.join(".grok"));
     let grok_home_exists = grok_home.as_ref().is_some_and(|p| p.exists() && p.is_dir());
     if grok_session_present || grok_home_exists {
         let user_hook = grok_user_hook_path();
@@ -13506,7 +13506,7 @@ fn install_antigravity_hook(force: bool, project: bool) -> Result<(), Box<dyn st
 /// old path to it. Both paths resolve to this file, so editing it is correct
 /// regardless of which one `agy` was last run with.
 fn antigravity_hooks_path() -> std::path::PathBuf {
-    dirs::home_dir()
+    crate::config::home_dir()
         .unwrap_or_default()
         .join(".gemini")
         .join("config")
@@ -13550,7 +13550,7 @@ fn crush_user_config_path() -> std::path::PathBuf {
     crush_user_config_path_for(
         std::env::var_os("CRUSH_GLOBAL_CONFIG"),
         std::env::var_os("XDG_CONFIG_HOME"),
-        dirs::home_dir().unwrap_or_default(),
+        crate::config::home_dir().unwrap_or_default(),
     )
 }
 
@@ -13892,7 +13892,11 @@ fn opencode_user_plugin_path() -> std::path::PathBuf {
     let config_root = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map_or_else(
-            || dirs::home_dir().unwrap_or_default().join(".config"),
+            || {
+                crate::config::home_dir()
+                    .unwrap_or_default()
+                    .join(".config")
+            },
             std::path::PathBuf::from,
         );
     config_root
@@ -14125,7 +14129,7 @@ fn probe_opencode_plugin(path: &std::path::Path) -> OpencodePluginProbe {
 
 /// User-level Codex hooks file (written by the dcg install script).
 fn codex_hooks_json_path() -> std::path::PathBuf {
-    dirs::home_dir()
+    crate::config::home_dir()
         .unwrap_or_default()
         .join(".codex")
         .join("hooks.json")
@@ -14134,7 +14138,7 @@ fn codex_hooks_json_path() -> std::path::PathBuf {
 /// User-level Codex configuration, which carries the `[hooks.state]` trust
 /// and enablement table.
 fn codex_config_toml_path() -> std::path::PathBuf {
-    dirs::home_dir()
+    crate::config::home_dir()
         .unwrap_or_default()
         .join(".codex")
         .join("config.toml")
@@ -14372,7 +14376,7 @@ fn codex_hook_command_exists(command: &str) -> bool {
         return false;
     }
     if let Some(rest) = program.strip_prefix("~/") {
-        return dirs::home_dir().is_some_and(|home| home.join(rest).is_file());
+        return crate::config::home_dir().is_some_and(|home| home.join(rest).is_file());
     }
     if program.contains(['/', '\\']) {
         return std::path::Path::new(program).is_file();
@@ -14762,6 +14766,8 @@ fn omp_default_agent_dir_from(
     std::path::PathBuf::from(agent_dir_override)
 }
 
+// The only error is the Unix UTF-8 check; the signature stays uniform.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn omp_coding_agent_dir_env_value(
     value: Option<std::ffi::OsString>,
 ) -> std::io::Result<Option<std::ffi::OsString>> {
@@ -14781,7 +14787,7 @@ fn omp_coding_agent_dir_env_value(
 /// `PI_CODING_AGENT_DIR` override when a named profile is active, so dcg does
 /// the same.
 fn omp_user_agent_dir() -> std::io::Result<std::path::PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| {
+    let home = crate::config::home_dir().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "could not determine the home directory for Oh My Pi",
@@ -15485,7 +15491,8 @@ fn omp_appears_in_use() -> bool {
     {
         return true;
     }
-    let default_root_exists = dirs::home_dir().is_some_and(|home| home.join(".omp").is_dir());
+    let default_root_exists =
+        crate::config::home_dir().is_some_and(|home| home.join(".omp").is_dir());
     default_root_exists
         || omp_user_agent_dir().is_ok_and(|path| path.is_dir())
         || project_omp_extension_path()
@@ -15945,7 +15952,7 @@ fn run_shell_check_setup(
         return Ok(());
     }
 
-    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    let home = crate::config::home_dir().ok_or("Could not determine home directory")?;
 
     // Collect candidate RC files that actually exist (or that the user's
     // current shell would source).
@@ -16579,7 +16586,7 @@ Write-Output ([string]$created.ProcessId)
 "#;
 
 fn windows_update_log_path() -> std::path::PathBuf {
-    dirs::cache_dir()
+    crate::config::user_cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("dcg")
         .join("update.log")
@@ -16776,7 +16783,7 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
 
 /// Get the path to user-level Claude Code settings (`~/.claude/settings.json`).
 fn claude_settings_path() -> std::path::PathBuf {
-    dirs::home_dir()
+    crate::config::home_dir()
         .unwrap_or_default()
         .join(".claude")
         .join("settings.json")
@@ -16799,7 +16806,7 @@ fn project_claude_settings_path() -> Result<std::path::PathBuf, Box<dyn std::err
 /// than editing `~/.grok/user-settings.json`) keeps installs/uninstalls
 /// independent of unrelated user settings.
 fn grok_user_hook_path() -> std::path::PathBuf {
-    dirs::home_dir()
+    crate::config::home_dir()
         .unwrap_or_default()
         .join(".grok")
         .join("hooks")
@@ -16820,7 +16827,7 @@ fn project_grok_hook_path() -> Result<std::path::PathBuf, Box<dyn std::error::Er
 /// Prefers `$XDG_CONFIG_HOME/dcg/`, then XDG-style `~/.config/dcg/` if it exists,
 /// otherwise falls back to the platform-native location. This ensures users can
 /// use `~/.config/dcg/` on all platforms, including macOS where
-/// `dirs::config_dir()` returns `~/Library/Application Support`.
+/// `crate::config::user_config_dir()` returns `~/Library/Application Support`.
 fn config_dir() -> std::path::PathBuf {
     // Check XDG_CONFIG_HOME first (if set)
     if let Ok(xdg_home) = std::env::var("XDG_CONFIG_HOME") {
@@ -16830,7 +16837,7 @@ fn config_dir() -> std::path::PathBuf {
     }
 
     // Check XDG-style path next (~/.config/dcg/)
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::config::home_dir() {
         let xdg_dir = home.join(".config").join("dcg");
         if xdg_dir.exists() {
             return xdg_dir;
@@ -16838,8 +16845,12 @@ fn config_dir() -> std::path::PathBuf {
     }
 
     // Fall back to platform-native or default to ~/.config/dcg
-    dirs::config_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
+    crate::config::user_config_dir()
+        .unwrap_or_else(|| {
+            crate::config::home_dir()
+                .unwrap_or_default()
+                .join(".config")
+        })
         .join("dcg")
 }
 
@@ -16855,14 +16866,14 @@ fn config_path() -> std::path::PathBuf {
         }
     }
 
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::config::home_dir() {
         let path = home.join(".config").join("dcg").join("config.toml");
         if path.exists() {
             return path;
         }
     }
 
-    if let Some(config_dir) = dirs::config_dir() {
+    if let Some(config_dir) = crate::config::user_config_dir() {
         let path = config_dir.join("dcg").join("config.toml");
         if path.exists() {
             return path;
@@ -22809,7 +22820,7 @@ if ($errors.Count -ne 0) {
         let original_dir = std::env::current_dir().expect("current directory before probe");
         std::env::set_current_dir(&root).expect("enter persistent project fixture");
         assert_eq!(
-            dirs::home_dir().as_deref(),
+            crate::config::home_dir().as_deref(),
             Some(isolated_home.as_path()),
             "run this gate with HOME bound to its isolated-home fixture"
         );

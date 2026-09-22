@@ -339,7 +339,7 @@ impl DecisionLogger {
 fn expand_tilde(path: &str) -> String {
     // Expand a leading `~/` or `~\` using $HOME first (honored for test
     // isolation), then the platform home dir (USERPROFILE on Windows). On native
-    // Windows `HOME` is normally unset, so the `dirs::home_dir()` fallback is what
+    // Windows `HOME` is normally unset, so the `config::home_dir()` fallback is what
     // keeps `~`-prefixed log paths from collapsing into a junk relative path.
     if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
         if let Some(home) = home_dir_string() {
@@ -355,7 +355,7 @@ fn expand_tilde(path: &str) -> String {
 
 /// Resolve the user's home directory as a `String`, preferring `$HOME` (so tests
 /// can override it for isolation) and falling back to the platform home
-/// (`USERPROFILE` on Windows) via the `dirs` crate.
+/// (`USERPROFILE` on Windows) via [`crate::config::home_dir`].
 fn home_dir_string() -> Option<String> {
     if let Some(home) = std::env::var_os("HOME") {
         let s = home.to_string_lossy();
@@ -363,7 +363,7 @@ fn home_dir_string() -> Option<String> {
             return Some(s.into_owned());
         }
     }
-    dirs::home_dir().map(|p| p.to_string_lossy().into_owned())
+    crate::config::home_dir().map(|p| p.to_string_lossy().into_owned())
 }
 
 fn open_log_file(path: &str) -> std::io::Result<File> {
@@ -1131,7 +1131,7 @@ mod tests {
     fn expand_tilde_backslash_form_and_bare_tilde() {
         // `~\` (Windows-style) must expand just like `~/`, and bare `~` resolves
         // to the home dir. Uses home_dir_string(), which falls back to
-        // dirs::home_dir() (USERPROFILE on Windows) when $HOME is unset, so this
+        // config::home_dir() (USERPROFILE on Windows) when $HOME is unset, so this
         // runs on any host.
         if home_dir_string().is_some() {
             let result = expand_tilde(r"~\test\path");

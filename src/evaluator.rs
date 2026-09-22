@@ -17656,7 +17656,7 @@ fn command_argument_payloads(
             .as_ref()
             .map(PathBuf::from)
             .or(inherited_value)
-            .or_else(|| dirs::home_dir().map(|home| home.join(".psqlrc")));
+            .or_else(|| crate::config::home_dir().map(|home| home.join(".psqlrc")));
         if let Some(value) = startup_path {
             let dynamic = masked
                 .dynamic_markers
@@ -23314,7 +23314,7 @@ fn redirect_targets_are_new_home_files_with_home(
 /// it is exactly what `dcg create-new` exists for when exclusive creation must
 /// be guaranteed.
 fn redirect_targets_are_new_home_files(command: &str, dialect: ShellDialect) -> bool {
-    dirs::home_dir()
+    crate::config::home_dir()
         .is_some_and(|home| redirect_targets_are_new_home_files_with_home(command, dialect, &home))
 }
 

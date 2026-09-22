@@ -1,0 +1,7 @@
+disallowed-methods = [
+    { path = "dirs::home_dir", reason = "use crate::config::home_dir (honors USERPROFILE on Windows; bd-b2b1)" },
+    { path = "dirs::config_dir", reason = "use crate::config::user_config_dir (honors APPDATA on Windows; bd-b2b1)" },
+    { path = "dirs::data_dir", reason = "use crate::config::user_data_dir (honors APPDATA on Windows; bd-b2b1)" },
+    { path = "dirs::data_local_dir", reason = "use crate::config::user_data_local_dir (honors LOCALAPPDATA on Windows; bd-b2b1)" },
+    { path = "dirs::cache_dir", reason = "use crate::config::user_cache_dir (honors LOCALAPPDATA on Windows; bd-b2b1)" },
+]

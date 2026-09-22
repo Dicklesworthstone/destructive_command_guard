@@ -212,10 +212,10 @@ fn existing_legacy_db_path() -> Option<PathBuf> {
             bases.push(xdg);
         }
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::config::home_dir() {
         bases.push(home.join(".config"));
     }
-    if let Some(native) = dirs::config_dir() {
+    if let Some(native) = crate::config::user_config_dir() {
         bases.push(native);
     }
     bases
@@ -228,8 +228,8 @@ fn existing_legacy_db_path() -> Option<PathBuf> {
 fn default_state_db_path() -> PathBuf {
     state_db_path_from(
         env::var_os("XDG_STATE_HOME").as_deref(),
-        dirs::home_dir().as_deref(),
-        dirs::data_local_dir().as_deref(),
+        crate::config::home_dir().as_deref(),
+        crate::config::user_data_local_dir().as_deref(),
     )
 }
 
@@ -1488,7 +1488,7 @@ mod tests {
 
     #[test]
     fn env_override_expands_tilde_and_relative_paths() {
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = crate::config::home_dir() else {
             return;
         };
         let resolved = ResolvedHistoryPath::from_parts(

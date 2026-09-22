@@ -15,3 +15,8 @@ tests/snapshots/** text eol=lf
 tests/e2e/fixtures/** text eol=lf
 # E2E shell harnesses must stay LF (they run under bash / git-bash).
 *.sh text eol=lf
+# Generated artifacts whose freshness tests compare bytes against the generator
+# (tests/generate_pack_docs.rs, tests/config_schema_drift.rs). A CRLF checkout
+# made both fail on every native Windows run (bd-b2b1).
+docs/packs/*.md text eol=lf
+config.schema.json text eol=lf

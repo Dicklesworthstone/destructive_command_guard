@@ -3404,7 +3404,7 @@ pub fn log_blocked_command(
 
     // Expand ~ in path
     let path = if log_file.starts_with("~/") {
-        dirs::home_dir().map_or_else(
+        crate::config::home_dir().map_or_else(
             || std::path::PathBuf::from(log_file),
             |h| h.join(&log_file[2..]),
         )
@@ -3451,7 +3451,7 @@ pub fn log_budget_skip(
 
     // Expand ~ in path
     let path = if log_file.starts_with("~/") {
-        dirs::home_dir().map_or_else(
+        crate::config::home_dir().map_or_else(
             || std::path::PathBuf::from(log_file),
             |h| h.join(&log_file[2..]),
         )

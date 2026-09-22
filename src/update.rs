@@ -106,7 +106,7 @@ pub struct BackupEntry {
 /// Get the path to the backup directory.
 #[must_use]
 pub fn backup_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join("dcg").join("backups"))
+    crate::config::user_data_dir().map(|d| d.join("dcg").join("backups"))
 }
 
 fn is_valid_backup_artifact_name(name: &str) -> bool {
@@ -512,7 +512,7 @@ pub fn format_backup_list(backups: &[BackupEntry], use_color: bool) -> String {
 
 /// Get the path to the version check cache file.
 fn cache_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("dcg").join("version_check.json"))
+    crate::config::user_cache_dir().map(|d| d.join("dcg").join("version_check.json"))
 }
 
 /// Read cached version check if it exists and is still valid.

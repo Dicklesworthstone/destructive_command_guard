@@ -267,7 +267,7 @@ impl PendingExceptionStore {
         }
 
         // Check XDG-style path first (~/.config/dcg/), then platform-native
-        let xdg_base = dirs::home_dir().map(|h| h.join(".config"));
+        let xdg_base = crate::config::home_dir().map(|h| h.join(".config"));
         let xdg_path = xdg_base
             .as_ref()
             .map(|b| b.join("dcg").join(PENDING_EXCEPTIONS_FILE));
@@ -283,8 +283,11 @@ impl PendingExceptionStore {
         }
 
         // Fall back to platform-native
-        let base = dirs::config_dir()
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"));
+        let base = crate::config::user_config_dir().unwrap_or_else(|| {
+            crate::config::home_dir()
+                .unwrap_or_default()
+                .join(".config")
+        });
         base.join("dcg").join(PENDING_EXCEPTIONS_FILE)
     }
 
@@ -570,7 +573,7 @@ impl AllowOnceStore {
         }
 
         // Check XDG-style path first (~/.config/dcg/), then platform-native
-        let xdg_base = dirs::home_dir().map(|h| h.join(".config"));
+        let xdg_base = crate::config::home_dir().map(|h| h.join(".config"));
         let xdg_path = xdg_base
             .as_ref()
             .map(|b| b.join("dcg").join(ALLOW_ONCE_FILE));
@@ -586,8 +589,11 @@ impl AllowOnceStore {
         }
 
         // Fall back to platform-native
-        let base = dirs::config_dir()
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"));
+        let base = crate::config::user_config_dir().unwrap_or_else(|| {
+            crate::config::home_dir()
+                .unwrap_or_default()
+                .join(".config")
+        });
         base.join("dcg").join(ALLOW_ONCE_FILE)
     }
 
@@ -1239,7 +1245,7 @@ fn expand_log_path(log_file: &str) -> PathBuf {
     if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
         return PathBuf::from(home).join(rest);
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::config::home_dir() {
         return home.join(rest);
     }
     PathBuf::from(log_file)
@@ -1631,7 +1637,7 @@ mod tests {
         let home = std::env::var_os("HOME")
             .filter(|h| !h.is_empty())
             .map(PathBuf::from)
-            .or_else(dirs::home_dir);
+            .or_else(crate::config::home_dir);
 
         if let Some(home) = home {
             assert_eq!(expand_log_path("~/logs/dcg.log"), home.join("logs/dcg.log"));

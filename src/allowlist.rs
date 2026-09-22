@@ -1805,15 +1805,19 @@ pub(crate) fn user_allowlist_path() -> PathBuf {
         return xdg_home.join("dcg").join("allowlist.toml");
     }
 
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::config::home_dir() {
         let xdg_path = home.join(".config").join("dcg").join("allowlist.toml");
         if xdg_path.exists() {
             return xdg_path;
         }
     }
 
-    dirs::config_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
+    crate::config::user_config_dir()
+        .unwrap_or_else(|| {
+            crate::config::home_dir()
+                .unwrap_or_default()
+                .join(".config")
+        })
         .join("dcg")
         .join("allowlist.toml")
 }

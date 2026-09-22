@@ -926,9 +926,87 @@ pub(crate) fn system_config_dir() -> PathBuf {
     }
 }
 
+// === Per-user directories =================================================
+//
+// Every per-user path dcg reads or writes resolves through these functions,
+// never through `dirs::*` directly (clippy.toml's `disallowed-methods` enforces
+// it). The reason is Windows: `dirs` resolves the profile and AppData through
+// `SHGetKnownFolderPath`, which ignores `USERPROFILE`/`APPDATA`/`LOCALAPPDATA`.
+// On POSIX `HOME=/tmp/x dcg ...` relocates every file dcg touches; on Windows
+// the same redirection was silently impossible, so a sandboxed test run or a
+// hermetic installer probe read and rewrote the operator's real
+// `~\.claude\settings.json`, allow-once grants and pending codes (bd-b2b1).
+// Honoring the environment first gives Windows the POSIX contract; the known
+// folder remains the fallback when the variable is unset or empty.
+
+/// The user's home directory: `HOME` on POSIX, `USERPROFILE` on Windows,
+/// falling back to the platform lookup when the variable is unset.
+#[must_use]
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::home_dir().filter(|path| !path.as_os_str().is_empty())
+}
+
+/// A Windows AppData directory: the environment variable when set, else the
+/// conventional location under [`home_dir`] (so `USERPROFILE` alone relocates
+/// it, as `HOME` does on POSIX), else `None` for the caller's known-folder
+/// fallback.
+#[cfg(windows)]
+fn windows_app_data_dir(env_name: &str, under_profile: &str) -> Option<PathBuf> {
+    std::env::var_os(env_name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(under_profile)))
+}
+
+/// The per-user roaming configuration directory: `%APPDATA%` on Windows,
+/// `$XDG_CONFIG_HOME` / `~/.config` on Linux, `~/Library/Application Support`
+/// on macOS.
+#[must_use]
+#[allow(clippy::disallowed_methods)] // the one sanctioned `dirs` call
+pub fn user_config_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(dir) = windows_app_data_dir("APPDATA", r"AppData\Roaming") {
+        return Some(dir);
+    }
+    dirs::config_dir()
+}
+
+/// The per-user roaming data directory (`%APPDATA%` on Windows).
+#[must_use]
+#[allow(clippy::disallowed_methods)] // the one sanctioned `dirs` call
+pub fn user_data_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(dir) = windows_app_data_dir("APPDATA", r"AppData\Roaming") {
+        return Some(dir);
+    }
+    dirs::data_dir()
+}
+
+/// The per-user machine-local data directory (`%LOCALAPPDATA%` on Windows).
+#[must_use]
+#[allow(clippy::disallowed_methods)] // the one sanctioned `dirs` call
+pub fn user_data_local_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(dir) = windows_app_data_dir("LOCALAPPDATA", r"AppData\Local") {
+        return Some(dir);
+    }
+    dirs::data_local_dir()
+}
+
+/// The per-user cache directory (`%LOCALAPPDATA%` on Windows).
+#[must_use]
+#[allow(clippy::disallowed_methods)] // the one sanctioned `dirs` call
+pub fn user_cache_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(dir) = windows_app_data_dir("LOCALAPPDATA", r"AppData\Local") {
+        return Some(dir);
+    }
+    dirs::cache_dir()
+}
+
 fn expand_tilde_path(value: &str) -> (PathBuf, bool) {
     if value == "~" {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = home_dir() {
             return (home, true);
         }
         return (PathBuf::from(value), false);
@@ -940,7 +1018,7 @@ fn expand_tilde_path(value: &str) -> (PathBuf, bool) {
     else {
         return (PathBuf::from(value), false);
     };
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = home_dir() else {
         return (PathBuf::from(value), false);
     };
     (home.join(rest), true)
@@ -2128,7 +2206,7 @@ impl PacksConfig {
 
             // Then expand tilde.
             let expanded = if after_repo_root.starts_with("~/") || after_repo_root == "~" {
-                if let Some(home) = dirs::home_dir() {
+                if let Some(home) = home_dir() {
                     if after_repo_root == "~" {
                         home.to_string_lossy().into_owned()
                     } else {
@@ -2496,9 +2574,9 @@ pub(crate) fn normalize_literal_target_path(raw: &str) -> Option<String> {
     }
 
     let expanded = if raw == "~" {
-        dirs::home_dir()?.to_string_lossy().into_owned()
+        home_dir()?.to_string_lossy().into_owned()
     } else if let Some(rest) = raw.strip_prefix("~/") {
-        let home = dirs::home_dir()?;
+        let home = home_dir()?;
         format!("{}/{rest}", home.to_string_lossy().trim_end_matches('/'))
     } else if raw.starts_with('~') {
         // `~user` needs the passwd database to resolve; never guess.
@@ -2539,13 +2617,13 @@ fn normalize_target_glob(raw: &str) -> Result<String, String> {
     }
 
     let expanded = if trimmed == "~" {
-        dirs::home_dir()
+        home_dir()
             .ok_or_else(|| "`~` cannot be expanded: no home directory".to_string())?
             .to_string_lossy()
             .into_owned()
     } else if let Some(rest) = trimmed.strip_prefix("~/") {
-        let home = dirs::home_dir()
-            .ok_or_else(|| "`~` cannot be expanded: no home directory".to_string())?;
+        let home =
+            home_dir().ok_or_else(|| "`~` cannot be expanded: no home directory".to_string())?;
         format!("{}/{rest}", home.to_string_lossy().trim_end_matches('/'))
     } else if trimmed.starts_with('~') {
         return Err("only `~` and `~/` are expanded; `~user` is not supported".to_string());
@@ -4136,11 +4214,11 @@ impl Config {
             }
         }
 
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = home_dir() {
             push_unique(home.join(".config").join("dcg").join(CONFIG_FILE_NAME));
         }
 
-        if let Some(config_dir) = dirs::config_dir() {
+        if let Some(config_dir) = user_config_dir() {
             push_unique(config_dir.join("dcg").join(CONFIG_FILE_NAME));
         }
 
@@ -5168,15 +5246,15 @@ impl Config {
 
         let config_dir = if let Some(config_dir) = config_dir {
             config_dir
-        } else if let Some(home) = dirs::home_dir() {
+        } else if let Some(home) = home_dir() {
             let xdg_dir = home.join(".config").join("dcg");
             if xdg_dir.exists() {
                 home.join(".config")
             } else {
-                dirs::config_dir().unwrap_or_else(|| home.join(".config"))
+                user_config_dir().unwrap_or_else(|| home.join(".config"))
             }
         } else {
-            dirs::config_dir()?
+            user_config_dir()?
         };
         let guard_dir = config_dir.join("dcg");
 
@@ -6453,7 +6531,7 @@ batch_flush_interval_ms = 29
 
     #[test]
     fn test_history_database_path_expansion() {
-        if dirs::home_dir().is_none() {
+        if home_dir().is_none() {
             return;
         }
 

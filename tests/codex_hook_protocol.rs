@@ -2925,31 +2925,80 @@ fn sequential_vs_parallel_codex_denies_exit_normally() {
 // P2.14.3 — Real HOME not touched by hermetic tests
 // ---------------------------------------------------------------------------
 
+/// Redirecting the home directory must relocate every file dcg writes.
+///
+/// Asserted positively — the writes land inside the redirected home — because
+/// the earlier form (real-home mtime unchanged) returned early wherever `HOME`
+/// is unset, i.e. on every Windows host, which is the one platform where the
+/// redirection did not work: dcg resolved the profile through the known-folder
+/// API and ignored `USERPROFILE`, so a sandboxed run rewrote the operator's real
+/// `~\.claude\settings.json` and minted allow-once grants in the real store
+/// (bd-b2b1). Only `HOME`/`USERPROFILE` are set, no `APPDATA`: the profile
+/// variable alone has to be enough, as `HOME` is on POSIX.
 #[test]
-fn hermetic_tests_do_not_touch_real_home() {
-    let real_home = match std::env::var("HOME") {
-        Ok(h) => PathBuf::from(h),
-        Err(_) => return, // skip if no real HOME
-    };
-    let real_pending = real_home.join(".config/dcg/pending");
+fn redirected_home_receives_every_hook_write() {
+    let home = make_hermetic_home();
+    let claude_dir = home.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    let settings = claude_dir.join("settings.json");
+    std::fs::write(&settings, "{}").unwrap();
 
-    // Record mtime before (if dir exists)
-    let mtime_before = std::fs::metadata(&real_pending)
-        .ok()
-        .and_then(|m| m.modified().ok());
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to spawn dcg process");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(build_claude_payload("git reset --hard HEAD~1").as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"deny\""),
+        "expected a deny; stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    // Run a deny that writes to pending store
-    let outcome = run_codex_hook("git reset --hard HEAD~1");
-    assert!(outcome.is_codex_block_shape());
-    assert_ne!(outcome.home_dir, real_home);
+    // Self-heal repaired the settings file in the redirected profile.
+    let healed = std::fs::read_to_string(&settings).unwrap();
+    assert!(
+        healed.contains("PreToolUse") && healed.contains("dcg"),
+        "self-heal must write the redirected profile's settings.json, got: {healed}"
+    );
 
-    // Verify mtime unchanged
-    let mtime_after = std::fs::metadata(&real_pending)
-        .ok()
-        .and_then(|m| m.modified().ok());
-    assert_eq!(
-        mtime_before, mtime_after,
-        "real HOME pending dir mtime must not change during hermetic test"
+    // The deny's pending record was written somewhere under the redirected home.
+    let mut stack = vec![home.path().to_path_buf()];
+    let mut pending = None;
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .is_some_and(|n| n == "pending_exceptions.jsonl")
+            {
+                pending = Some(path);
+            }
+        }
+    }
+    let pending =
+        pending.expect("pending_exceptions.jsonl must be written under the redirected home");
+    assert!(
+        std::fs::read_to_string(&pending)
+            .unwrap()
+            .contains("git reset --hard HEAD~1"),
+        "pending record at {} must hold the denied command",
+        pending.display()
     );
 }
 
