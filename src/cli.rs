@@ -18634,8 +18634,33 @@ fn allowlist_add_rule_with_paths(
         layer.label()
     );
     println!("  File: {}", path.display());
+    if let Some(note) = refined_rule_grant_note(&parsed_rule) {
+        eprintln!("{note}");
+    }
 
     Ok(())
+}
+
+/// A note for a base embedded-code rule id, which may never match (#470).
+///
+/// Allowlists match the exact reported id, and many embedded-code rules only
+/// ever block under a refined id: every blocking `fs.rmSync` match reports
+/// `heredoc.javascript:fs_rmsync.catastrophic` (or `.non_temp`), never the
+/// base id `docs/patterns.md` tabulates. Such a grant was accepted with a
+/// success message and changed nothing. Widening a base grant to cover its
+/// refinements would be the wrong repair — a grant written for a benign
+/// Medium report of `heredoc.go:exec_command` must not also admit
+/// `exec_command.rm_rf_catastrophic` — so say what the grant does instead.
+fn refined_rule_grant_note(rule: &RuleId) -> Option<String> {
+    if !rule.pack_id.starts_with("heredoc.") || rule.pattern_name.contains(['.', '*']) {
+        return None;
+    }
+    Some(format!(
+        "  Note: this grant matches only a denial reported as exactly `{}:{}`. Embedded-code \
+         rules usually block under a refined id such as `{}:{}.catastrophic`; if the denial you \
+         are granting named a longer id, grant that id (`dcg explain '<command>'` prints it).",
+        rule.pack_id, rule.pattern_name, rule.pack_id, rule.pattern_name
+    ))
 }
 
 /// Add an exact command to the allowlist.
@@ -26057,6 +26082,20 @@ console.log(JSON.stringify({
     // ========================================================================
     // Allowlist CLI tests
     // ========================================================================
+
+    #[test]
+    fn base_embedded_rule_grants_carry_a_refinement_note_470() {
+        let note = |id: &str| refined_rule_grant_note(&RuleId::parse(id).expect("valid id"));
+        let base = note("heredoc.javascript:fs_rmsync").expect("base heredoc id gets a note");
+        assert!(
+            base.contains("heredoc.javascript:fs_rmsync.catastrophic"),
+            "{base}"
+        );
+        // Already refined, wildcarded, or not an embedded-code rule: no note.
+        assert!(note("heredoc.javascript:fs_rmsync.catastrophic").is_none());
+        assert!(note("heredoc.python:*").is_none());
+        assert!(note("core.git:reset-hard").is_none());
+    }
 
     #[test]
     fn test_cli_parse_allowlist_add() {
