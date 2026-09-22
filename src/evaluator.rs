@@ -23695,25 +23695,41 @@ fn evaluate_core_filesystem_pack(
         // The same classifier decides (-WhatIf, rule id, severity); only a
         // deny is taken, so this can never make the segment more permitted.
         if shell_dialect == ShellDialect::PowerShell
-            && rm_automated_stdin
             && matches!(
                 rm_decision,
                 crate::packs::core::filesystem::RmParseDecision::NoMatch
             )
-            && crate::packs::core::filesystem::powershell_recursive_listing_feeds(
-                dialect_segment_source,
-                dialect_segment_start,
-            )
+            && ((rm_automated_stdin
+                && crate::packs::core::filesystem::powershell_recursive_listing_feeds(
+                    dialect_segment_source,
+                    dialect_segment_start,
+                ))
+                || crate::packs::core::filesystem::powershell_foreach_block_fed_by_recursive_listing(
+                    dialect_segment_source,
+                    dialect_segment_start,
+                ))
         {
-            let as_recursive = format!("{} -Recurse", dialect_segment.trim_end());
-            if let deny @ crate::packs::core::filesystem::RmParseDecision::Deny(_) =
-                crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
-                    &as_recursive,
-                    rm_automated_stdin,
-                    shell_dialect,
-                )
-            {
-                rm_decision = deny;
+            // `… | ForEach-Object { Remove-Item $_ -Force }` runs its block
+            // once per item, so each statement in it stands in for the piped
+            // Remove-Item; otherwise the segment itself is the consumer.
+            let statements = crate::packs::core::filesystem::powershell_foreach_block_statements(
+                dialect_segment,
+            )
+            .unwrap_or_else(|| vec![dialect_segment]);
+            for statement in statements {
+                // A statement split out of a block keeps the block's `}`.
+                let statement = statement.trim_end().trim_end_matches('}').trim_end();
+                let as_recursive = format!("{statement} -Recurse");
+                if let deny @ crate::packs::core::filesystem::RmParseDecision::Deny(_) =
+                    crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
+                        &as_recursive,
+                        rm_automated_stdin,
+                        shell_dialect,
+                    )
+                {
+                    rm_decision = deny;
+                    break;
+                }
             }
         }
         // A `$VAR` operand proven to resolve to the literal path the temp
@@ -32979,6 +32995,10 @@ mod tests {
             "ls -Recurse ./src | rm",
             "dir -Depth 3 ./src | del -Force",
             r"Get-ChildItem C:\src -Recurse -Filter *.log | Remove-Item",
+            // The per-item script block spelling of the same delete.
+            "Get-ChildItem -Recurse | ForEach-Object { Remove-Item $_.FullName -Force }",
+            "gci -r ./src | % { rm $_ }",
+            "ls -Recurse ./src | foreach { Write-Host $_; Remove-Item $_ }",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,
@@ -33003,6 +33023,9 @@ mod tests {
             "Get-ChildItem -Recurse ./src | Remove-Item -WhatIf",
             "Get-ChildItem -Recurse ./src | Select-Object Name",
             "Get-Content list.txt | Remove-Item",
+            "Get-ChildItem -Recurse | ForEach-Object { Write-Host $_.FullName }",
+            "Get-ChildItem ./logs | ForEach-Object { Remove-Item $_ }",
+            "Get-ChildItem -Recurse | ForEach-Object { Remove-Item $_ -WhatIf }",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,

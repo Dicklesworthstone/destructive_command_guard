@@ -1621,6 +1621,14 @@ fn powershell_segment_requires_rm_semantic_scan(segment: &str) -> bool {
     if segment.starts_with('&') {
         return true;
     }
+    // `… | ForEach-Object { Remove-Item $_ }`: the Remove-Item is inside the
+    // block, so the segment's first word is ForEach-Object and the pack was
+    // never selected for the evaluator's per-item check to run.
+    if let Some(statements) = powershell_foreach_block_statements(segment) {
+        return statements
+            .iter()
+            .any(|statement| powershell_segment_requires_rm_semantic_scan(statement));
+    }
     let tokens = tokenize_for_shell_dialect(segment, ShellDialect::PowerShell);
     let Some(raw) = tokens
         .iter()
@@ -1999,6 +2007,72 @@ pub(crate) fn powershell_recursive_listing_feeds(command: &str, segment_start: u
                         || powershell_switch_value(word.as_ref(), "depth", 2, false).is_some()
                 })
         })
+}
+
+/// Whether the segment at `segment_start` is a statement inside a
+/// `ForEach-Object { … }` block that a recursive listing feeds.
+///
+/// PowerShell segments split at `;` even inside braces, so in
+/// `gci -Recurse | % { Write-Host $_; Remove-Item $_ }` the Remove-Item is its
+/// own segment whose prefix ends in `;`, not `|`. Walk back to the enclosing
+/// unmatched `{`, require the ForEach word before it, and ask the ordinary
+/// pipeline question about the stage feeding that word.
+pub(crate) fn powershell_foreach_block_fed_by_recursive_listing(
+    command: &str,
+    segment_start: usize,
+) -> bool {
+    let Some(prefix) = command.get(..segment_start) else {
+        return false;
+    };
+    let mut depth = 0usize;
+    let mut open = None;
+    for (index, byte) in prefix.bytes().enumerate().rev() {
+        match byte {
+            b'}' => depth += 1,
+            b'{' if depth == 0 => {
+                open = Some(index);
+                break;
+            }
+            b'{' => depth -= 1,
+            _ => {}
+        }
+    }
+    let Some(open) = open else {
+        return false;
+    };
+    let head = prefix[..open].trim_end();
+    let word_start = head
+        .rfind(|ch: char| ch.is_whitespace() || ch == '|')
+        .map_or(0, |at| at + 1);
+    let word = &head[word_start..];
+    ["foreach-object", "%", "foreach"]
+        .iter()
+        .any(|alias| word.eq_ignore_ascii_case(alias))
+        && powershell_recursive_listing_feeds(command, word_start)
+}
+
+/// The statements inside a `ForEach-Object { … }` (or `%`, `foreach`) script
+/// block, when `segment` is one. `gci -Recurse | % { Remove-Item $_ -Force }`
+/// is the other common tree delete: the block runs once per item of the tree,
+/// so each statement in it is judged like a directly piped Remove-Item.
+pub(crate) fn powershell_foreach_block_statements(segment: &str) -> Option<Vec<&str>> {
+    let segment = segment.trim();
+    let first = segment.split_whitespace().next()?;
+    if !["foreach-object", "%", "foreach"]
+        .iter()
+        .any(|alias| first.eq_ignore_ascii_case(alias))
+    {
+        return None;
+    }
+    let open = segment.find('{')?;
+    let close = segment.rfind('}').filter(|close| *close > open)?;
+    Some(
+        segment[open + 1..close]
+            .split([';', '\n'])
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+            .collect(),
+    )
 }
 
 fn powershell_remove_item_alias(executable: &str) -> bool {
