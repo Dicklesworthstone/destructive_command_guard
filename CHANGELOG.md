@@ -15,6 +15,64 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
+### Security
+
+- **`require('fs').rmSync('/home/user', {recursive: true})` in a `node` heredoc
+  was allowed whenever embedded analysis was incomplete** (#468), while the bound
+  `const fs = require('fs'); fs.rmSync(…)` spelling denied and the Python, Ruby
+  and Go equivalents denied. Measured as a release-to-release A/B with
+  `heredoc.max_body_lines = 1` as a load-independent stand-in for incomplete
+  analysis, the fix being the only variable:
+
+  | body | before | after |
+  | --- | --- | --- |
+  | `require('fs').rmSync('/home/user', {recursive: true})` | allow | **deny** |
+  | the same, single-quoted and whitespace-padded | allow | **deny** |
+  | `require('fs').rmdirSync('/home/user')` | allow | **deny** |
+  | `(await import('fs')).rmSync('/home/user', …)` | allow | **deny** |
+  | `const fs = require('fs'); fs.rmSync(…)` | deny | deny |
+
+  `JS_FS_SINK_LITERAL`'s receiver chain was identifier-dot only
+  (`(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*`), which `fs.rmSync(` fills and
+  `require("fs").rmSync(` cannot, because `require("fs")` is a call rather than
+  an identifier. It now admits one optional leading call. That is the same
+  omission #453 and #459 fixed on the AST side — the patterns took a
+  metavariable receiver precisely so the chained `require('fs')` spelling
+  matched, and the literal fallback never got the equivalent, so the two lists
+  disagreed about the shorter spelling a `node -e` one-liner actually writes.
+
+  The receiver call's argument is restricted to a single quoted string rather
+  than anything at all, so the new group stays unambiguous with the identifier
+  chain after it — one requires parentheses, the other forbids them. That is
+  deliberate rather than incidental: an ambiguous pattern here fails OPEN at the
+  backtrack limit, so it would be a bypass and not merely a slowdown.
+
+  `filesystem_fallback_reaches_a_call_receiver_issue_468` covers
+  `require('fs').rmSync`, `.rmdirSync`, `.unlinkSync`, `.promises.rm`,
+  `require('node:fs/promises').rm`, the `await` form, the whitespace-padded
+  `require ( 'fs' ) . rmSync (`, and the TypeScript side, which shares the
+  pattern. `filesystem_fallback_call_receiver_is_not_overbroad_issue_468` holds
+  the line the other way: a non-deleting method behind the same `require`, a
+  `/tmp` target, a non-recursive relative delete, `confirmSync` (an identifier
+  that merely ends in a sink name), and prose mentioning the call.
+
+  `JS_EXEC_SINK_LITERAL` was checked and is unaffected — it anchors on the sink
+  name with no receiver requirement at all.
+
+  A `/tmp` target now denies on this path too, where it previously did not. That
+  is a widening and it is the intended direction: the bound `fs.rmSync('/tmp/…')`
+  spelling already denied there before this change, so the two spellings now
+  agree, and a *bounded* fallback reached because analysis was incomplete is
+  deliberately coarser than the AST pass it stands in for.
+
+  Still allowed on the same path, measured and **not** fixed here:
+  `require('fs').unlinkSync(…)`, `require('fs').promises.rm(…)` and
+  `require('node:fs/promises').rm(…)`. Two backstops cover the
+  incomplete-analysis paths and only one of them is in this file; extending the
+  other means editing `src/evaluator.rs`, which is under active edit elsewhere.
+  Which of the two decides any given row is not something this change established
+  — the measured behaviour above is, and the remaining rows are tracked on #468.
+
 ### Fixed
 
 - **Allowlisting the rule id dcg reports did not always allow the command**

@@ -928,9 +928,24 @@ static RUBY_FILEUTILS_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
 /// Over-matching is bounded exactly as before: the caller still requires a
 /// catastrophic literal target, or `recursive: true` on a non-temp literal,
 /// before this blocks. A user-defined `rm('./build')` therefore does not.
+///
+/// The receiver chain admits one leading **call**, because an identifier chain
+/// alone could not express the chained `require('fs')` spelling: `fs.rmSync(p)`
+/// matched while `require('fs').rmSync(p)` did not, so whenever the AST pass was
+/// unavailable the chained form — the shorter one, and the one a `node -e`
+/// one-liner actually writes — was allowed at a catastrophic target (#468). The
+/// AST side already took a metavariable receiver for this reason; this is the
+/// literal fallback catching up, the same omission in the same pair of lists.
+///
+/// The call's argument is restricted to a single quoted string rather than
+/// anything at all. That keeps the group unambiguous with the identifier chain
+/// after it — one requires parentheses, the other forbids them — so there is no
+/// alternation for a crafted body to backtrack through. An ambiguous regex here
+/// would fail OPEN at the backtrack limit, which is a bypass rather than a
+/// slowdown.
 static JS_FS_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"(?m){STATEMENT_START}(?:await[ \t]+)?(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*(?P<sink>rmdirSync|unlinkSync|rmSync|rm)\b\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#
+        r#"(?m){STATEMENT_START}(?:await[ \t]+)?(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\(\s*(?:"[^"\n]*"|'[^'\n]*')\s*\)\s*\.\s*)?(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*(?P<sink>rmdirSync|unlinkSync|rmSync|rm)\b\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#
     ))
     .expect("JavaScript filesystem sink literal regex compiles")
 });
@@ -6612,6 +6627,99 @@ def cleanup():
                     .unwrap_or_else(|| panic!("fallback must catch {code}"));
                 assert_eq!(hit.rule_id, expected, "wrong rule id for {code}");
                 assert!(hit.severity.blocks_by_default(), "must block: {code}");
+            }
+        }
+
+        /// The chained `require('fs')` receiver reaches the fallback too (#468).
+        ///
+        /// The test above covers a receiver that is an identifier or an identifier
+        /// chain, which is what the pattern could express. It could not express a
+        /// receiver that is itself a *call*, so `require('fs').rmSync('/home/user',
+        /// {recursive: true})` was allowed whenever the AST pass was unavailable
+        /// while the bound `fs.rmSync(...)` denied — measured end to end through
+        /// the hook with `heredoc.max_body_lines = 1`, 12/12 allowed against 12/12
+        /// denied for the bound spelling.
+        ///
+        /// This is the chained spelling the AST patterns already took a
+        /// metavariable receiver for, so the two lists simply disagreed.
+        #[test]
+        fn filesystem_fallback_reaches_a_call_receiver_issue_468() {
+            for (code, expected) in [
+                (
+                    "require('fs').rmSync('/home/user', { recursive: true });",
+                    "heredoc.javascript.fs_rmsync.catastrophic",
+                ),
+                (
+                    r#"require("fs").rmSync("/home/user", { recursive: true });"#,
+                    "heredoc.javascript.fs_rmsync.catastrophic",
+                ),
+                (
+                    "require('fs').rmdirSync('/home/user');",
+                    "heredoc.javascript.fs_rmdirsync.catastrophic",
+                ),
+                (
+                    "require('fs').unlinkSync('/home/user/.ssh/id_rsa');",
+                    "heredoc.javascript.fs_unlinksync.catastrophic",
+                ),
+                // A call receiver followed by a member chain.
+                (
+                    "require('fs').promises.rm('/home/user', { recursive: true });",
+                    "heredoc.javascript.fs_rm.catastrophic",
+                ),
+                (
+                    "require('node:fs/promises').rm('/home/user', { recursive: true });",
+                    "heredoc.javascript.fs_rm.catastrophic",
+                ),
+                // `await` in front of a call receiver.
+                (
+                    "await require('fs').promises.rm('/home/user');",
+                    "heredoc.javascript.fs_rm.catastrophic",
+                ),
+                // Whitespace around the call and the member access.
+                (
+                    "require ( 'fs' ) . rmSync ('/home/user', { recursive: true });",
+                    "heredoc.javascript.fs_rmsync.catastrophic",
+                ),
+            ] {
+                let hit = scan_filesystem_sink_fallback(code, ScriptLanguage::JavaScript)
+                    .unwrap_or_else(|| panic!("fallback must catch {code}"));
+                assert_eq!(hit.rule_id, expected, "wrong rule id for {code}");
+                assert!(hit.severity.blocks_by_default(), "must block: {code}");
+            }
+
+            // TypeScript shares the pattern, so it must gain the same coverage.
+            let hit = scan_filesystem_sink_fallback(
+                "require('fs').rmSync('/home/user', { recursive: true });",
+                ScriptLanguage::TypeScript,
+            )
+            .expect("typescript fallback must catch a call receiver");
+            assert_eq!(hit.rule_id, "heredoc.typescript.fs_rmsync.catastrophic");
+        }
+
+        /// Negative control for the call-receiver widening (#468).
+        ///
+        /// Admitting a call in receiver position must not admit anything else: a
+        /// non-deleting method behind the same `require`, a non-qualifying target,
+        /// and a receiver call whose argument is not a plain string literal.
+        #[test]
+        fn filesystem_fallback_call_receiver_is_not_overbroad_issue_468() {
+            for code in [
+                // Same receiver shape, not a deletion.
+                "require('fs').mkdirSync('/home/user/newdir');",
+                "require('fs').readFileSync('/home/user/.bashrc');",
+                "require('fs').writeFileSync('/home/user/notes.txt', 'x');",
+                // Deletion behind the receiver, but the target does not qualify.
+                "require('fs').rmSync('/tmp/scratch/x', { recursive: true });",
+                "require('fs').rmSync('./build/stamp');",
+                // An identifier that merely ends in a sink name.
+                "require('fs').confirmSync('/home/user');",
+                // Prose mentioning the call.
+                "// require('fs').rmSync is what we avoid",
+            ] {
+                assert!(
+                    scan_filesystem_sink_fallback(code, ScriptLanguage::JavaScript).is_none(),
+                    "fallback must stay quiet: {code}"
+                );
             }
         }
 
