@@ -22768,22 +22768,40 @@ fn rm_segment_denied_in_proven_directory(
     segment_ranges: &[(usize, usize)],
     segment_start: usize,
     segment: &str,
+    stripped_prefix: Option<&str>,
     automated_stdin: bool,
     dialect: ShellDialect,
 ) -> Option<crate::packs::core::filesystem::RmParseDecision> {
-    let anchored = cwd_anchored_segment(source, segment_ranges, segment_start, segment, dialect)?;
-    match crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
-        &anchored,
-        automated_stdin,
+    let anchored = cwd_anchored_segment(
+        source,
+        segment_ranges,
+        segment_start,
+        segment,
+        stripped_prefix,
         dialect,
-    ) {
-        crate::packs::core::filesystem::RmParseDecision::Deny(mut hit) => {
-            // The hit's span indexes the anchored text; point at the segment.
-            hit.span = Some(0..segment.len());
-            Some(crate::packs::core::filesystem::RmParseDecision::Deny(hit))
-        }
-        _ => None,
-    }
+    )?;
+    let judge =
+        |text: &str| match crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
+            text,
+            automated_stdin,
+            dialect,
+        ) {
+            crate::packs::core::filesystem::RmParseDecision::Deny(mut hit) => {
+                // The hit's span indexes the anchored text; point at the segment.
+                hit.span = Some(0..segment.len());
+                Some(crate::packs::core::filesystem::RmParseDecision::Deny(hit))
+            }
+            _ => None,
+        };
+    // The protected-file rule reads named files, and a glob names none. The
+    // gate already found that a filled-in match of it would be protected
+    // (`cd ~/.ssh && rm id_*`), so judge that representative name.
+    judge(&anchored).or_else(|| {
+        anchored
+            .contains(['*', '?'])
+            .then(|| judge(&anchored.replace(['*', '?'], "x")))
+            .flatten()
+    })
 }
 
 /// The rm decision for a segment once its literal `$(echo …)`/`$(printf …)`
@@ -22825,11 +22843,15 @@ fn rm_segment_denied_after_literal_substitution(
 /// `segment` with its relative operands anchored to the directory a literal
 /// `cd` before it provably moved the shell into, or `None` when there is no
 /// such directory or no anchored word names a protected file (#480).
+///
+/// `stripped_prefix` is the text normalization removed ahead of the command
+/// (`env -C ~/.ssh ` before `rm id_rsa`); it applies to the first segment.
 fn cwd_anchored_segment(
     source: &str,
     segment_ranges: &[(usize, usize)],
     segment_start: usize,
     segment: &str,
+    stripped_prefix: Option<&str>,
     dialect: ShellDialect,
 ) -> Option<String> {
     // The walk is linear in the segments before this one, per segment; past
@@ -22842,11 +22864,60 @@ fn cwd_anchored_segment(
         return None;
     }
     let before = source.get(..segment_start)?;
-    if !before.contains("cd") && !before.contains("pushd") {
-        return None;
-    }
-    let directory = proven_cd_directory(source, segment_ranges, segment_start)?;
+    let inherited = || {
+        (before.contains("cd") || before.contains("pushd"))
+            .then(|| proven_cd_directory(source, segment_ranges, segment_start))
+            .flatten()
+    };
+    // `env -C ~/.ssh rm id_rsa` changes directory for this one command.
+    let wrapper_target = wrapper_chdir_target(segment).or_else(|| {
+        stripped_prefix
+            .filter(|_| segment_start == 0)
+            .and_then(wrapper_chdir_target)
+    });
+    let directory = match wrapper_target {
+        Some(target) if target.starts_with(['/', '~', '$']) => target,
+        Some(target) => format!("{}/{target}", inherited()?.trim_end_matches('/')),
+        None => inherited()?,
+    };
     anchor_relative_words(segment, &directory)
+}
+
+/// The literal directory a leading `env -C DIR` / `env --chdir=DIR` or
+/// `sudo -D DIR` / `sudo --chdir=DIR` runs the wrapped command in.
+fn wrapper_chdir_target(segment: &str) -> Option<String> {
+    let mut words = segment
+        .split_ascii_whitespace()
+        .skip_while(|word| word_is_redirect_or_assignment_prefix(word))
+        .peekable();
+    let wrapper = *words.peek()?;
+    let short = match wrapper {
+        "env" => "-C",
+        "sudo" => "-D",
+        _ => return None,
+    };
+    words.next();
+    while let Some(word) = words.next() {
+        if let Some(target) = word.strip_prefix("--chdir=") {
+            return literal_cd_target(target);
+        }
+        if word == "--chdir" || word == short {
+            return literal_cd_target(words.next()?);
+        }
+        if wrapper == "env"
+            && let Some(target) = word.strip_prefix(short).filter(|rest| !rest.is_empty())
+        {
+            return literal_cd_target(target);
+        }
+        if !word.starts_with('-') || word == "--" {
+            return None;
+        }
+        // `env -u NAME`, `sudo -u root`: the option's value is not the command.
+        if matches!(word, "-u" | "-g" | "-h" | "-p" | "-C" | "-U" | "-r" | "-t") {
+            words.next();
+        }
+    }
+    None
 }
 
 /// The directory the `cd`/`pushd` segments before `segment_start` leave the
@@ -23067,7 +23138,10 @@ fn anchor_relative_words(segment: &str, directory: &str) -> Option<String> {
                 || matches!(word, "(" | "{" | "!")
                 || ANCHOR_COMMAND_WRAPPERS.contains(&word)
                 || word.starts_with('-');
-            pending_wrapper_value = matches!(word, "-u" | "-g" | "-h" | "-p" | "-C" | "-D" | "-n");
+            pending_wrapper_value = matches!(
+                word,
+                "-u" | "-g" | "-h" | "-p" | "-C" | "-D" | "-n" | "--chdir"
+            );
             command_seen = !prefix;
         } else if !options_ended && word.starts_with('-') {
             options_ended = word == "--";
@@ -23093,7 +23167,16 @@ fn anchor_relative_words(segment: &str, directory: &str) -> Option<String> {
             continue;
         }
         let anchored = format!("{base}/{target}");
-        names_protected |= crate::packs::core::credential_files::names_protected_file(&anchored);
+        // A glob names nothing, but one inside a protected directory may
+        // match a protected file (`cd ~/.ssh && rm id_*`): judge it by a
+        // representative name with the wildcards filled in.
+        let representative = if anchored.contains(['*', '?', '[']) {
+            Cow::Owned(anchored.replace(['*', '?', '[', ']'], "x"))
+        } else {
+            Cow::Borrowed(anchored.as_str())
+        };
+        names_protected |=
+            crate::packs::core::credential_files::names_protected_file(&representative);
         out.push_str(&segment[cursor..start + offset]);
         // `>>authorized_keys` becomes `>> ~/.ssh/authorized_keys`: the same
         // redirection, with the tilde at the start of a word where every
@@ -23880,6 +23963,11 @@ fn evaluate_core_filesystem_pack(
     let mut embedded_credential_scanned = false;
     // Likewise for the whole-command PowerShell credential read below.
     let mut powershell_credential_scanned = false;
+    // What normalization stripped ahead of the command, e.g. `env -C ~/.ssh `
+    // (#480): it still decides the directory the first segment runs in.
+    let stripped_prefix = normalized_offset
+        .filter(|&offset| offset > 0)
+        .and_then(|offset| original_command.get(..offset));
 
     for &(segment_start, segment_end) in segment_ranges {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
@@ -23977,6 +24065,7 @@ fn evaluate_core_filesystem_pack(
                     segment_ranges,
                     segment_start,
                     masked.as_ref(),
+                    stripped_prefix,
                     shell_dialect,
                 )?;
                 crate::packs::core::credential_files::classify_credential_file_write(
@@ -24265,6 +24354,7 @@ fn evaluate_core_filesystem_pack(
             segment_ranges,
             segment_start,
             dialect_segment,
+            stripped_prefix,
             rm_automated_stdin,
             shell_dialect,
         ) {
@@ -27503,6 +27593,13 @@ mod tests {
             "rm $(echo /home/user/.ssh/id_rsa)",
             "rm `echo /home/user/.ssh/id_rsa`",
             "rm $(printf /home/user/.ssh/id_rsa)",
+            // A wrapper that changes directory for the one command.
+            "env -C /home/user/.ssh rm id_rsa",
+            "env --chdir=/home/user/.ssh rm id_rsa",
+            "env -u FOO --chdir /home/user/.ssh rm id_rsa",
+            "sudo -D /home/user/.ssh rm id_rsa",
+            // A glob inside a protected directory, as `rm ~/.ssh/id_*` is.
+            "cd ~/.ssh && rm id_*",
         ] {
             // POSIX is the Bash hook's path; a relative redirect spells no
             // pack keyword, so this also proves the quick-reject lets it in.
@@ -27548,6 +27645,9 @@ mod tests {
             // not static at all (the `rm $UNKNOWN` posture).
             "rm $(echo /home/user/notes.txt)",
             "rm $(cat list.txt)",
+            "env -C /tmp rm id_rsa",
+            "env -C ~/project rm notes.txt",
+            "cd ~/project && rm *.o",
         ] {
             assert!(
                 evaluate_with_pack_ids(command, &["core.filesystem"]).is_allowed(),
