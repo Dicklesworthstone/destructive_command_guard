@@ -755,8 +755,31 @@ enum RmInteractiveMode {
 }
 
 impl RmInteractiveMode {
-    const fn prompts(self) -> bool {
-        matches!(self, Self::Once | Self::Always)
+    /// Whether this mode makes GNU `rm` actually prompt for the command
+    /// described by `recursive` and `operands`.
+    ///
+    /// `-i` (`Always`) prompts before every file, so it needs no context. `-I`
+    /// (`Once`) does not, and the condition is the whole point of the flag:
+    ///
+    /// > `-I`, `--interactive=once` — prompt once before removing more than
+    /// > three files, or when removing recursively
+    ///
+    /// Treating `Once` as unconditional made `rm -I <private key>` read as
+    /// bounded by a prompt that GNU never issues, so the rules that stand down
+    /// for an interactive command stood down for a silent deletion (#481). One,
+    /// two and three named files all deleted without a prompt and were allowed.
+    ///
+    /// A glob is ONE operand here even though the shell may expand it to many,
+    /// because whether `-I` prompts is then not knowable from the command text.
+    /// Counting it as one keeps the answer "no proven prompt", which leaves the
+    /// rule standing — the conservative direction, and the one that leaves the
+    /// glob rules to make their own case.
+    const fn prompts_for(self, recursive: bool, operands: usize) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Once => recursive || operands > 3,
+            Self::Default | Self::Never => false,
+        }
     }
 }
 
@@ -2990,7 +3013,9 @@ fn parse_rm_segment_with_option_scanning(
         .take_while(|token| token.kind != NormalizeTokenKind::Separator)
         .filter_map(|token| token.text(command))
         .any(starts_with_shell_stdin_redirection);
-    let interactive_prompts = flags.interactive_mode.prompts();
+    // Non-recursive here: `flags.resolve()` below returns `None` without a
+    // recursive span, and that is the branch these two rules serve.
+    let interactive_prompts = flags.interactive_mode.prompts_for(false, paths.len());
 
     let Some(flag_state) = flags.resolve() else {
         // Non-recursive rm has no dangerous flag shape of its own, but a bare
@@ -3023,7 +3048,12 @@ fn parse_rm_segment_with_option_scanning(
         return RmParseDecision::NoMatch;
     }
 
-    if flag_state.interactive_mode.prompts() && !automated_stdin && !redirected_stdin {
+    // Recursive by construction: `resolve()` requires a recursive span, and
+    // `-I` does prompt when recursing.
+    if flag_state.interactive_mode.prompts_for(true, paths.len())
+        && !automated_stdin
+        && !redirected_stdin
+    {
         return RmParseDecision::Allow;
     }
 
@@ -7870,6 +7900,94 @@ mod tests {
             "rm ~/.ssh/id_rsa.pub",
         ] {
             assert_rm_parser_no_match(command);
+        }
+    }
+
+    /// `-I` prompts only for more than three files, or when recursing (#481).
+    ///
+    /// `prompts()` treated `-I` exactly like `-i`, so every rule that stands
+    /// down for an interactive command stood down for a deletion GNU performs
+    /// silently. `rm -I <private key>` deleted the key with no prompt at all
+    /// and was allowed on the strength of one that never happens.
+    ///
+    /// From `man rm`: "-I, --interactive=once — prompt once before removing
+    /// more than three files, or when removing recursively".
+    ///
+    /// The boundary is asserted on both sides at three-versus-four operands,
+    /// because a fix that simply dropped the carve-out would pass a
+    /// deny-only test and break the case the flag exists for.
+    #[test]
+    fn interactive_once_prompts_only_past_three_files_issue_481() {
+        const KEY: &str = "/home/user/.ssh/id_rsa";
+
+        // One, two and three named files: GNU does not prompt, so the rule
+        // that guards the protected file must still decide.
+        for operands in [
+            "",
+            " /home/user/.ssh/a",
+            " /home/user/.ssh/a /home/user/.ssh/b",
+        ] {
+            for flag in ["-I", "--interactive=once"] {
+                let command = format!("rm {flag} {KEY}{operands}");
+                assert_rm_parser_denies(&command, RM_PROTECTED_FILE_NAME, Severity::Critical);
+            }
+        }
+
+        // Four operands: GNU prompts once, and with stdin closed under a hook
+        // that prompt deletes nothing, so the carve-out is right here.
+        assert_rm_parser_no_match(&format!(
+            "rm -I {KEY} /home/user/.ssh/a /home/user/.ssh/b /home/user/.ssh/c"
+        ));
+
+        // `-i` prompts before every file whatever the count, so it keeps the
+        // carve-out at one operand. This is the row that proves the fix reads
+        // the two modes differently rather than deleting the carve-out.
+        assert_rm_parser_no_match(&format!("rm -i {KEY}"));
+        assert_rm_parser_no_match(&format!("rm -i {KEY} /home/user/.ssh/a"));
+
+        // A later `-f` still wins over either, so the command is not
+        // interactive at all.
+        assert_rm_parser_denies(
+            &format!("rm -I -f {KEY}"),
+            RM_PROTECTED_FILE_NAME,
+            Severity::Critical,
+        );
+    }
+
+    /// The prompt predicate itself, at the boundary (#481).
+    ///
+    /// Asserted directly as well as through the parser because the parser can
+    /// only reach it with operands a rule cares about, and the recursive arm is
+    /// the one whose answer must NOT change.
+    #[test]
+    fn interactive_once_prompt_predicate_issue_481() {
+        use RmInteractiveMode::{Always, Default as Dflt, Never, Once};
+
+        // Non-recursive: the count decides, and the boundary is "more than".
+        for operands in 0..=3 {
+            assert!(
+                !Once.prompts_for(false, operands),
+                "-I does not prompt for {operands} files"
+            );
+        }
+        assert!(Once.prompts_for(false, 4), "-I prompts past three files");
+
+        // Recursive: `-I` prompts regardless of count, which is why the
+        // recursive rules are unaffected by this fix.
+        for operands in 0..=4 {
+            assert!(
+                Once.prompts_for(true, operands),
+                "-I prompts when recursing, at {operands} operands"
+            );
+        }
+
+        // The other three modes do not depend on either fact.
+        for recursive in [false, true] {
+            for operands in [0usize, 1, 4] {
+                assert!(Always.prompts_for(recursive, operands));
+                assert!(!Never.prompts_for(recursive, operands));
+                assert!(!Dflt.prompts_for(recursive, operands));
+            }
         }
     }
 
