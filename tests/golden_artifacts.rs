@@ -64,7 +64,13 @@ fn run_dcg(args: &[&str]) -> DcgOutput {
         .env("XDG_CONFIG_HOME", home.path().join(".config"))
         .env("NO_COLOR", "1")
         .env("CLICOLOR", "0")
-        .env("TERM", "dumb");
+        .env("TERM", "dumb")
+        // A golden pins WHICH layer answered (`first_match: heredoc.python`),
+        // so it must not double as a deadline test: under parallel load the
+        // production budgets let the fallback answer instead (#476, #438).
+        // Both variables only raise their budgets.
+        .env("DCG_AST_TIMEOUT_MS", "5000")
+        .env("DCG_HEREDOC_TIMEOUT_MS", "5000");
 
     let output = cmd.output().expect("failed to run dcg");
 

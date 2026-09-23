@@ -351,8 +351,7 @@ fn keyword_index_matches_legacy_might_match_on_regression_corpus() {
     let mut saw_quoted_command_word = false;
     let mut failures = Vec::new();
 
-    for (category, file, case) in &all_cases {
-        let command = case.command.as_str();
+    let snapshot_pair = |command: &str| {
         let with_index = EvalSnapshot::from_result(
             command,
             &evaluate_command_with_pack_order(
@@ -377,6 +376,24 @@ fn keyword_index_matches_legacy_might_match_on_regression_corpus() {
                 &heredoc_settings,
             ),
         );
+        (with_index, legacy)
+    };
+
+    for (category, file, case) in &all_cases {
+        let command = case.command.as_str();
+        let (mut with_index, mut legacy) = snapshot_pair(command);
+        // Each side is a full evaluation, and embedded-code analysis runs
+        // under a millisecond budget. On a loaded host one side can finish the
+        // AST pass while the other falls back, and the snapshots then disagree
+        // about which layer answered (#476), which has nothing to do with the
+        // keyword index. A real divergence is deterministic and survives a
+        // re-run; a scheduling split does not.
+        for _ in 0..3 {
+            if with_index == legacy {
+                break;
+            }
+            (with_index, legacy) = snapshot_pair(command);
+        }
 
         saw_substring_digit |= command.starts_with("digit ");
         saw_wrapper_prefix |= command.starts_with("sudo ")

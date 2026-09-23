@@ -23,21 +23,39 @@ fn test_python_exe_bypass() {
     // Command using python.exe (Windows style)
     let command = r#"python.exe -c "import shutil; shutil.rmtree('/')""#;
 
-    let result = evaluate_command(
-        command,
-        &config,
-        &enabled_keywords,
-        &compiled_overrides,
-        &allowlists,
-    );
+    let evaluate = || {
+        evaluate_command(
+            command,
+            &config,
+            &enabled_keywords,
+            &compiled_overrides,
+            &allowlists,
+        )
+    };
+    let mut result = evaluate();
 
     // This should be DENIED because it contains shutil.rmtree
     assert!(
         result.decision != EvaluationDecision::Allow,
         "python.exe bypass detected! Command was allowed: {command}"
     );
-
     assert!(result.is_denied());
+
+    // Which layer answers is budget-dependent in an integration test: the AST
+    // matcher keeps its production budget here, and on a loaded host it can
+    // time out and let the legacy fallback deny instead (#476). If `python.exe`
+    // were not recognised as Python, the AST layer would never answer, so a
+    // bounded re-run separates a scheduling miss from that regression.
+    for _ in 0..3 {
+        if result
+            .pattern_info
+            .as_ref()
+            .is_some_and(|info| info.source == MatchSource::HeredocAst)
+        {
+            break;
+        }
+        result = evaluate();
+    }
     let info = result.pattern_info.as_ref().unwrap();
 
     // Verify it was blocked by heredoc scanning, not something else
