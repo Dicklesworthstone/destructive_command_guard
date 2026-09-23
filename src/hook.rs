@@ -73,6 +73,11 @@ pub struct HookInput {
     /// alias: Grok sends both spellings, and serde would reject the pair.
     pub tool_use_id: Option<serde_json::Value>,
 
+    /// Claude-shaped permission mode (`default`, `acceptEdits`,
+    /// `bypassPermissions`, `dontAsk`, …). Raw JSON value for the same
+    /// parse-robustness reason as `tool_use_id`; no camelCase alias (Grok).
+    pub permission_mode: Option<serde_json::Value>,
+
     /// Antigravity CLI (`agy`) tool-call envelope. Unlike Claude/Gemini/Grok,
     /// `agy` nests the tool name and arguments under a `toolCall` object:
     /// `{"toolCall": {"name": "run_command", "args": {"CommandLine": "...",
@@ -1495,6 +1500,28 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             | "run_terminal_cmd"
             | "run_terminal_command"
         )
+}
+
+impl HookInput {
+    /// Whether the payload declares a permission mode in which no human is
+    /// guaranteed to answer a prompt (`bypassPermissions`, `dontAsk`).
+    ///
+    /// Claude Code documents that a hook `deny` blocks in every mode,
+    /// including `bypassPermissions`, but not what a hook `ask` does there.
+    /// dcg answers an unverified command (deadline or size exhausted) with
+    /// `ask` by default, which in these modes may be waved through for
+    /// exactly the command dcg declined to inspect, so such payloads get the
+    /// `unverified_decision = "deny"` posture automatically.
+    #[must_use]
+    pub fn declares_unattended_permission_mode(&self) -> bool {
+        self.permission_mode
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|mode| {
+                mode.eq_ignore_ascii_case("bypassPermissions")
+                    || mode.eq_ignore_ascii_case("dontAsk")
+            })
+    }
 }
 
 /// Infer the command parser's dialect from an explicit, trustworthy shell
@@ -4094,6 +4121,39 @@ mod tests {
     /// code, remediation) instead of Codex's minimal one. Anything else —
     /// OpenAI `call_…` ids, no id, a non-string id — keeps the #125 Codex
     /// treatment, because answering Codex in Claude shape fails open.
+    #[test]
+    fn unattended_permission_mode_detection() {
+        let parse = |mode: &str| -> HookInput {
+            serde_json::from_str(&format!(
+                r#"{{"tool_name":"Bash","tool_input":{{"command":"ls"}},"permission_mode":{mode}}}"#
+            ))
+            .expect("an odd permission_mode must not fail the whole parse")
+        };
+        for mode in [
+            r#""bypassPermissions""#,
+            r#""dontAsk""#,
+            r#""BYPASSPERMISSIONS""#,
+            r#""dontask""#,
+        ] {
+            assert!(parse(mode).declares_unattended_permission_mode(), "{mode}");
+        }
+        for mode in [
+            r#""default""#,
+            r#""acceptEdits""#,
+            r#""plan""#,
+            r#""""#,
+            r#"" bypassPermissions""#,
+            "null",
+            "true",
+            r#"["bypassPermissions"]"#,
+        ] {
+            assert!(!parse(mode).declares_unattended_permission_mode(), "{mode}");
+        }
+        let absent: HookInput =
+            serde_json::from_str(r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#).unwrap();
+        assert!(!absent.declares_unattended_permission_mode());
+    }
+
     #[test]
     fn test_claude_powershell_tool_is_claude_compatible() {
         let _lock = test_env::lock();

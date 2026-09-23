@@ -494,6 +494,52 @@ fn bare_hook_unverified_decision_controls_oversized_fallback() {
     );
 }
 
+/// A payload that declares `bypassPermissions`/`dontAsk` gets the unattended
+/// posture without configuration: Claude Code documents that a hook `deny`
+/// holds in those modes but not what a hook `ask` does there, and an `ask`
+/// waved through would run exactly the command dcg could not inspect.
+#[test]
+fn bare_hook_unattended_permission_mode_denies_unverified_commands() {
+    let padding = "x".repeat(70 * 1024);
+    let payload = |mode: &str| {
+        format!(
+            r#"{{"hook_event_name":"PreToolUse","permission_mode":"{mode}","tool_name":"Bash","tool_input":{{"command":"echo {padding}"}}}}"#
+        )
+        .into_bytes()
+    };
+
+    for mode in ["bypassPermissions", "dontAsk"] {
+        let out = run_dcg_hook_raw(&payload(mode), &[]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("\"permissionDecision\":\"deny\""),
+            "{mode}: an unverified command must be denied, not asked.\nstdout: {stdout}"
+        );
+    }
+    for mode in ["default", "acceptEdits", "plan"] {
+        let out = run_dcg_hook_raw(&payload(mode), &[]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("\"permissionDecision\":\"ask\""),
+            "{mode}: a human can answer, so the default ask stays.\nstdout: {stdout}"
+        );
+    }
+    // An explicit operator choice still wins.
+    let out = run_dcg_hook_raw(
+        &payload("bypassPermissions"),
+        &[("DCG_UNVERIFIED_DECISION", "ask")],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"ask\""),
+        "explicit DCG_UNVERIFIED_DECISION=ask must be honoured.\nstdout: {stdout}"
+    );
+    // Verified commands are untouched: a safe command stays silent.
+    let safe = br#"{"permission_mode":"bypassPermissions","tool_name":"Bash","tool_input":{"command":"git status"}}"#;
+    let out = run_dcg_hook_raw(safe, &[]);
+    assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+}
+
 /// Run bare `dcg` with raw stdin, optional env, and an optional user config
 /// file written to `XDG_CONFIG_HOME/dcg/config.toml`.
 fn run_dcg_hook_raw_cfg(

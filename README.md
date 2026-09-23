@@ -947,6 +947,11 @@ actionable (shrink or split the command; raise `hook_timeout_ms` /
 unaffected. A repository `.dcg.toml` may set `unverified_decision = "deny"`
 (tightening) but never relax an operator's `deny` back to `ask`.
 
+A payload that itself declares `"permission_mode": "bypassPermissions"` or
+`"dontAsk"` gets the `deny` posture automatically: Claude Code documents that a
+hook `deny` holds in those modes, but not what a hook `ask` does there. Only an
+explicit `DCG_UNVERIFIED_DECISION=ask` overrides this.
+
 The default is **fail-open** (unparseable input is allowed) and is unchanged
 unless you opt in. With fail-closed enabled, a genuinely unparseable hook
 payload produces a deny (a `permissionDecision: deny` for Claude-style hooks; a

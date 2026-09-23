@@ -1843,6 +1843,16 @@ fn main() {
         }
     };
 
+    // A payload declaring bypassPermissions/dontAsk has no human guaranteed to
+    // answer an `ask`, so unverified commands are denied instead (the
+    // `unverified_decision = "deny"` posture). An explicit
+    // DCG_UNVERIFIED_DECISION still wins; see `Config::unverified_denies`.
+    let mut config = config;
+    if hook_input.declares_unattended_permission_mode() {
+        config.general.unverified_decision =
+            destructive_command_guard::config::UnverifiedDecision::Deny;
+    }
+
     let Some(extracted_command) = hook::extract_command_with_context(&hook_input) else {
         return;
     };
