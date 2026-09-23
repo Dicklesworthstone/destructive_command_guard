@@ -72,9 +72,16 @@ impl State {
 /// the shared lowercase vocabulary in `source_has_sink_name` — `Create`,
 /// `Truncate` and `Rename` contain none of its words at all.
 pub(super) fn has_sink_name(code: &str) -> bool {
-    ["WriteFile", "Create", "OpenFile", "Truncate", "Rename"]
-        .iter()
-        .any(|word| code.contains(word))
+    [
+        "WriteFile",
+        "Create",
+        "OpenFile",
+        "Truncate",
+        "Rename",
+        "Link",
+    ]
+    .iter()
+    .any(|word| code.contains(word))
 }
 
 pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str> {
@@ -305,6 +312,14 @@ fn inspect_call(node: &Syntax<'_>, state: &State, hits: &mut Vec<CredentialFileW
                 if let Some(path) = target(index) {
                     record(path, Access::Write);
                 }
+            }
+        }
+        // `os.Link(oldname, newname)` and `os.Symlink(oldname, newname)` both
+        // CREATE `newname`, which is argument 1 (#484). Only that end is a
+        // write: a link never alters what it points at.
+        (Pkg::Os, "Link" | "Symlink") => {
+            if let Some(path) = target(1) {
+                record(path, Access::Write);
             }
         }
         _ => {}
