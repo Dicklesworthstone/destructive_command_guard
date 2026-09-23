@@ -54,7 +54,7 @@
           "type": "number",
           "minimum": 0.0,
           "maximum": 1.0,
-          "description": "Reserved; not currently emitted. The evaluator computes a confidence score and uses it for warn thresholds, but it is not plumbed to the hook output: both deny sites in src/main.rs pass None, and the field is omitted when absent. Declared so a future version can populate it without a schema change; do not key on it today."
+          "description": "Match confidence from 0.0 to 1.0, rounded to two decimals: how clearly the matched span is executed (1.0) rather than quoted data, a comment, or an argument to an inert command. The same score the [confidence] warn threshold reads. Omitted when the match has no source span (for example a match inside a command substitution, or a structural verdict)."
         },
         "remediation": {
           "type": "object",
@@ -87,6 +87,7 @@
         "ruleId": "core.git:reset-hard",
         "packId": "core.git",
         "severity": "critical",
+        "confidence": 1.0,
         "allowOnceCode": "123456",
         "allowOnceFullHash": "abc123def456abc123def456abc123def456abc123def456abc123def456abc1",
         "remediation": {

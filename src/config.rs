@@ -3342,6 +3342,12 @@ impl std::fmt::Display for StrictnessLevel {
 
 /// Git branch-aware strictness configuration.
 ///
+/// **`[git_awareness]` is not applied to hook decisions.** Its strictness can
+/// only relax a denial, and the agent being guarded can choose its branch
+/// before the command it wants run, so honoring them would be a
+/// self-service downgrade. `dcg config` and `dcg doctor` warn when
+/// `enabled = true`.
+///
 /// This allows different strictness levels based on the current git branch,
 /// providing more protection on important branches and more freedom on
 /// experimental branches.
@@ -5194,6 +5200,58 @@ impl Config {
     /// on top of the base configuration.
     #[must_use]
     pub fn enabled_pack_ids_for_agent(&self, agent: &crate::agent::Agent) -> HashSet<String> {
+        self.enabled_pack_ids_for_agent_and_payload(agent, false)
+    }
+
+    /// Warnings for configured keys that parse but change nothing, surfaced
+    /// by `dcg config` and `dcg doctor` so a silently ignored key is
+    /// distinguishable from one that simply didn't match.
+    ///
+    /// `[git_awareness] enabled = true` is one. Its strictness is never applied
+    /// to a hook decision, and deliberately so: as implemented it only ever
+    /// relaxes (a relaxed branch turns a High denial into an allow), and the
+    /// agent being guarded can choose its branch (`git checkout -b feature/x`)
+    /// before the command it wants run.
+    #[must_use]
+    pub fn inert_config_warnings(&self) -> Vec<String> {
+        let mut warnings = self.overrides.removed_key_warnings();
+        if self.git_awareness.enabled {
+            warnings.push(
+                "`[git_awareness]` is not applied to hook decisions: its branch strictness \
+                 can only relax a denial, and the agent being guarded can pick the branch \
+                 (`git checkout -b feature/x`) before the command it wants run. To loosen a \
+                 rule, allowlist it with a reason (`dcg allowlist add`)."
+                    .to_string(),
+            );
+        }
+        // Hook decisions are never graduated: dcg runs once per command, so
+        // the session count is always 1, and graduating would make every
+        // first High finding a warning rather than a block.
+        if self.response.enabled {
+            warnings.push(
+                "`[response]` graduation is advisory: `dcg test` reports the graduated \
+                 response, but hook decisions are not graduated (a first High finding \
+                 still blocks)."
+                    .to_string(),
+            );
+        }
+        warnings
+    }
+
+    /// [`Self::enabled_pack_ids_for_agent`], for a request whose payload is
+    /// known to be PowerShell or Cmd.
+    ///
+    /// The `windows.*` packs are default-on for Windows *payloads*, wherever
+    /// dcg itself runs (#451). A PowerShell tool on macOS or Linux (pwsh) runs
+    /// the same `Clear-Content`/`Format-Volume` cmdlets as one on Windows, and
+    /// keying the default on the build host left those cmdlets unguarded
+    /// there. `disabled = ["windows"]` still wins, as it does on Windows.
+    #[must_use]
+    pub fn enabled_pack_ids_for_agent_and_payload(
+        &self,
+        agent: &crate::agent::Agent,
+        windows_payload: bool,
+    ) -> HashSet<String> {
         let profile = self.agents.profile_for_agent(agent);
         let packs_config = if self.projects.is_empty() {
             self.packs.clone()
@@ -5206,7 +5264,7 @@ impl Config {
         // A profile can cancel a preset contribution from the base config, but
         // it must not remove member packs that were also enabled independently
         // (including Windows' default-on filesystem/system packs).
-        let mut base_requested = packs_config.requested_pack_ids(cfg!(windows));
+        let mut base_requested = packs_config.requested_pack_ids(cfg!(windows) || windows_payload);
         PacksConfig::remove_disabled_preset_markers(&mut base_requested, &profile.disabled_packs);
         let mut packs =
             PacksConfig::resolve_requested_pack_ids(base_requested, &packs_config.disabled);
@@ -5684,7 +5742,8 @@ max_size_mb = 500
 [response]
 # Enable the graduated response system.
 # When enabled, repeated occurrences of the same command escalate
-# from warning → soft block → hard block.
+# from warning → soft block → hard block. Advisory: `dcg test` reports the
+# graduated response; hook decisions are not graduated.
 enabled = false
 
 # Global graduation mode: "paranoid" | "strict" | "standard" | "lenient" | "warning_only" | "disabled"
@@ -8216,6 +8275,21 @@ enabled = false
         )
         .expect("plain overrides must parse");
         assert!(overrides.removed_key_warnings().is_empty());
+    }
+
+    /// Opt-in features that never change a hook decision say so, rather than
+    /// parsing and silently doing nothing.
+    #[test]
+    fn inert_opt_in_features_are_reported() {
+        let mut config = Config::default();
+        assert!(config.inert_config_warnings().is_empty());
+
+        config.git_awareness.enabled = true;
+        config.response.enabled = true;
+        let warnings = config.inert_config_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("[git_awareness]"));
+        assert!(warnings[1].contains("[response]"));
     }
 
     // ========================================================================

@@ -324,6 +324,13 @@ fn invoked_at_command_position(command: &str, match_start: usize) -> bool {
     else {
         return false;
     };
+    // A redirection target is opened by the shell itself: in
+    // `echo x >> ~/.ssh/authorized_keys` the write is as executed as the
+    // command word, though the span sits where an argument would (#471).
+    let before = prefix.trim_end();
+    if before.ends_with('>') || before.ends_with(">|") || rest.trim_start().starts_with('>') {
+        return true;
+    }
     // The segment that holds the match, through the end of the word the span
     // starts in: a span may start AT the command word (`man rm -rf` can
     // report `rm -rf`), and then that word is the candidate owner, not the
@@ -488,6 +495,31 @@ mod tests {
         assert!(is_command_position("echo foo | rm -rf /", 11));
         assert!(is_command_position("foo && rm -rf /", 7));
         assert!(!is_command_position("git commit -m 'rm'", 15));
+    }
+
+    /// The shell opens a redirection target itself, so a span on one is
+    /// executed, not an argument (#471: a credential write scored 0.6).
+    #[test]
+    fn redirect_targets_are_executed_positions() {
+        let command = "echo x >> ~/.ssh/authorized_keys";
+        let target = command.find('~').expect("target present");
+        assert!(invoked_at_command_position(command, target));
+        let command = "cat k >| .git/config";
+        assert!(invoked_at_command_position(
+            command,
+            command.find(".git").unwrap()
+        ));
+        let command = "echo x > out.txt";
+        assert!(invoked_at_command_position(
+            command,
+            command.find('>').unwrap()
+        ));
+        // An ordinary argument still is not.
+        let command = "echo ~/.ssh/authorized_keys";
+        assert!(!invoked_at_command_position(
+            command,
+            command.find('~').unwrap()
+        ));
     }
 
     #[test]

@@ -1464,6 +1464,22 @@ fn publish_decisive_response(
             } else {
                 None
             };
+            // The documented `confidence` field (#471): the scorer's view of
+            // the matched span, the same score the `[confidence]` downgrade
+            // reads. Absent when the match has no span to score.
+            let confidence = info.matched_span.as_ref().map(|span| {
+                let sanitized =
+                    destructive_command_guard::context::sanitize_for_pattern_matching(&command);
+                let score = destructive_command_guard::confidence::compute_match_confidence(
+                    &destructive_command_guard::confidence::ConfidenceContext {
+                        command: &command,
+                        sanitized_command: Some(sanitized.as_ref()),
+                        match_start: span.start,
+                        match_end: span.end,
+                    },
+                );
+                (f64::from(score.value) * 100.0).round() / 100.0
+            });
             let delivery = if mode == DecisionMode::Ask {
                 hook::output_review_request_for_protocol(
                     ctx.hook_protocol,
@@ -1475,7 +1491,7 @@ fn publish_decisive_response(
                     allow_once_info.as_ref(),
                     info.matched_span.as_ref(),
                     info.severity,
-                    None, // confidence not yet available in PatternMatch
+                    confidence,
                     info.suggestions,
                     branch_ctx,
                 )
@@ -1490,7 +1506,7 @@ fn publish_decisive_response(
                     allow_once_info.as_ref(),
                     info.matched_span.as_ref(),
                     info.severity,
-                    None, // confidence not yet available in PatternMatch
+                    confidence,
                     info.suggestions,
                     branch_ctx,
                 )
@@ -1897,7 +1913,12 @@ fn main() {
     // environment variables.
     let allowlists = load_effective_allowlists_for_agent(&config, &effective_agent);
 
-    let mut enabled_packs: HashSet<String> = config.enabled_pack_ids_for_agent(&effective_agent);
+    // A PowerShell or Cmd payload gets the windows.* packs on any host (#451).
+    let windows_payload = std::iter::once(shell_dialect)
+        .chain(additional_commands.iter().map(|(_, dialect)| *dialect))
+        .any(|dialect| matches!(dialect, ShellDialect::PowerShell | ShellDialect::Cmd));
+    let mut enabled_packs: HashSet<String> =
+        config.enabled_pack_ids_for_agent_and_payload(&effective_agent, windows_payload);
 
     // Auto-enable external packs: packs loaded via custom_paths are implicitly enabled.
     // This avoids requiring users to both add a path AND explicitly enable the pack ID.

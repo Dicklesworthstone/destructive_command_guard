@@ -6640,7 +6640,7 @@ fn show_config(config: &Config, sources: &[ConfigSourceOutcome]) {
     // Removed config keys (#327): a key that parses but is never enforced is
     // indistinguishable from one that simply didn't match, so say it here —
     // the command a user actually runs to check their configuration.
-    let removed_key_warnings = config.overrides.removed_key_warnings();
+    let removed_key_warnings = config.inert_config_warnings();
     if !removed_key_warnings.is_empty() {
         println!();
         println!("Warnings:");
@@ -6755,7 +6755,7 @@ fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
             "packs": policy_packs_view,
             "rules": policy_rules_view,
         },
-        "warnings": config.overrides.removed_key_warnings(),
+        "warnings": config.inert_config_warnings(),
     });
 
     println!(
@@ -17503,7 +17503,7 @@ fn validate_config_diagnostics(
     // Removed config keys that still parse are indistinguishable from working
     // ones without a warning; surface them the same way inert exemptions are
     // (#327).
-    diag.removed_key_warnings = config.overrides.removed_key_warnings();
+    diag.removed_key_warnings = config.inert_config_warnings();
 
     diag
 }
