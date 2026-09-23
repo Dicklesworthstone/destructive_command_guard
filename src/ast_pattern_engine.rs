@@ -1483,17 +1483,16 @@ fn refine_python_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMat
         // `subprocess.run(["sh", "-c", "rm -rf /etc"])` whose first literal
         // (`"sh"`) is inert but which genuinely executes `rm -rf` (#136).
         if let Some(hit) = detect_destructive_in_args(matched_text) {
-            // A destructive shell command is being executed. Escalate to at
-            // least High so the AST path blocks even for non-catastrophic
-            // targets (the sink unambiguously runs `rm -rf`/`git reset`).
-            let severity = match hit.severity {
-                Severity::Critical => Severity::Critical,
-                _ => Severity::High,
-            };
+            // Carry the payload's own severity, as the generic sink pass and
+            // Ruby/JavaScript/Perl do (#485). It is High for every
+            // non-temp target and Critical for a catastrophic one; only a
+            // literal `/tmp`/`/var/tmp` delete is Medium, which is the #455
+            // carve-out shell already applies. Escalating that one case made
+            // Python deny what every other language allowed.
             return RefinedMatchMeta {
                 rule_id: format!("{rule_id}.{}", hit.rule_suffix),
                 reason: hit.reason.to_string(),
-                severity,
+                severity: hit.severity,
                 suggestion: hit.suggestion.map(str::to_string),
             };
         }
@@ -1580,16 +1579,12 @@ fn refine_go_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMatchMe
     // as a shape it handles; nothing had ever called it for Go.
     if is_go_exec_sink_rule(&meta.rule_id) {
         if let Some(hit) = detect_destructive_in_args(matched_text) {
-            // Escalate to at least High so the AST path blocks even for a
-            // non-catastrophic target: the sink unambiguously runs the command.
-            let severity = match hit.severity {
-                Severity::Critical => Severity::Critical,
-                _ => Severity::High,
-            };
+            // Carry the payload's own severity (#485), as in
+            // `refine_python_match`.
             return RefinedMatchMeta {
                 rule_id: format!("{}.{}", meta.rule_id, hit.rule_suffix),
                 reason: hit.reason.to_string(),
-                severity,
+                severity: hit.severity,
                 suggestion: hit.suggestion.map(str::to_string),
             };
         }
@@ -1659,16 +1654,11 @@ fn refine_php_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMatchM
         return unchanged();
     };
 
-    // Escalate to at least High so the AST path blocks even for a
-    // non-catastrophic target: the sink unambiguously runs the command.
-    let severity = match hit.severity {
-        Severity::Critical => Severity::Critical,
-        _ => Severity::High,
-    };
+    // Carry the payload's own severity (#485), as in `refine_python_match`.
     RefinedMatchMeta {
         rule_id: format!("{}.{}", meta.rule_id, hit.rule_suffix),
         reason: hit.reason.to_string(),
-        severity,
+        severity: hit.severity,
         suggestion: hit.suggestion.map(str::to_string),
     }
 }
@@ -2695,13 +2685,56 @@ fn concatenated_operands(region: &str) -> Vec<Cow<'_, str>> {
             if let Some(last) = operands.last_mut() {
                 last.to_mut().push_str(literal);
             }
+        } else if joins_runtime_value_before(region, whole.start()) {
+            operands.push(Cow::Owned(format!("{RUNTIME_VALUE}{literal}")));
         } else {
             operands.push(Cow::Borrowed(literal));
+        }
+        if joins_runtime_value_after(region, whole.end())
+            && let Some(last) = operands.last_mut()
+        {
+            last.to_mut().push_str(RUNTIME_VALUE);
         }
         previous_end = Some(whole.end());
     }
 
     operands
+}
+
+/// What an operand carries in place of a value only known at run time.
+///
+/// `"/tmp/" + name` is not the path `/tmp/`: `name` may be `../home/user`. The
+/// operand keeps its literal text, so a catastrophic or protected prefix still
+/// reads as one, and gains an expansion, which is exactly what the shell's
+/// `rm -rf /tmp/$name` looks like and what disqualifies a temp target (#485).
+const RUNTIME_VALUE: &str = "${dcg_runtime_value}";
+
+/// Whether a concatenation operator right after `end` joins a non-literal.
+fn joins_runtime_value_after(region: &str, end: usize) -> bool {
+    let Some(rest) = region.get(end..).map(str::trim_start) else {
+        return false;
+    };
+    let Some(operand) = rest.strip_prefix(['+', '.']).map(str::trim_start) else {
+        return false;
+    };
+    operand
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '('))
+}
+
+/// Whether a concatenation operator right before `start` joins a non-literal.
+fn joins_runtime_value_before(region: &str, start: usize) -> bool {
+    let Some(before) = region.get(..start).map(str::trim_end) else {
+        return false;
+    };
+    let Some(operand) = before.strip_suffix(['+', '.']).map(str::trim_end) else {
+        return false;
+    };
+    operand
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | ')' | ']'))
 }
 
 /// Whether the text between two string literals is exactly one concatenation.
@@ -3262,8 +3295,13 @@ fn is_catastrophic_path(path: &str) -> bool {
 /// `/tmp/../etc` names `/etc`, not a scratch directory.
 fn is_temp_scratch_path(path: &str) -> bool {
     let candidate = path.strip_prefix("/private").unwrap_or(path);
+    // Only a literal path is a temp target. An expansion anywhere can climb
+    // out (`/tmp/$name` with `name=../home/user`), which is why the shell
+    // rules deny `rm -rf /tmp/$x`; `concatenated_operands` marks a literal
+    // joined to a runtime value the same way (#485).
     (has_path_prefix(candidate, "/tmp") || has_path_prefix(candidate, "/var/tmp"))
         && !contains_path_traversal(candidate)
+        && !candidate.contains(['$', '`'])
 }
 
 /// Go's exec-sink rule ids, the set `refine_go_match` escalates (#472).
@@ -5666,6 +5704,64 @@ mod tests {
     /// and `exec.Command($$$).Run()` describe the same command, so escalating
     /// both would report two blocking ids for one call and leave an allowlist
     /// entry for the reported one denied under the other.
+    /// One temp policy across languages (#485). A literal `/tmp`/`/var/tmp`
+    /// target is the #455 carve-out that shell, JavaScript, Ruby and Perl
+    /// already apply; Python, Go and PHP escalated it to a block. A
+    /// non-temp target still blocks, and a temp prefix joined to a runtime
+    /// value is not a temp target (`"/tmp/" + name` may climb out).
+    #[test]
+    fn exec_sinks_share_one_temp_policy_issue_485() {
+        let ast_matcher = AstMatcher::new();
+        // Assembled so this file does not carry a guarded command verbatim.
+        let rm = format!("{}{}", "r", "m");
+        let cases = |target: &str| {
+            [
+                (
+                    ScriptLanguage::Python,
+                    format!("import subprocess\nsubprocess.run([\"{rm}\", \"-rf\", {target}])\n"),
+                ),
+                (
+                    ScriptLanguage::Go,
+                    format!(
+                        "package main\n\nimport \"os/exec\"\n\nfunc main() {{\n\t_ = exec.Command(\"{rm}\", \"-rf\", {target}).Run()\n}}\n"
+                    ),
+                ),
+                (
+                    ScriptLanguage::Php,
+                    format!("<?php\nsystem(\"{rm} -rf \" . {target});\n?>\n"),
+                ),
+            ]
+        };
+        let blocks = |language: ScriptLanguage, code: &str| {
+            ast_matcher
+                .find_matches(code, language)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.severity.blocks_by_default())
+        };
+
+        for (language, code) in cases("\"/tmp/build\"") {
+            assert!(
+                !blocks(language, &code),
+                "{language:?}: a literal temp target is the carve-out:\n{code}"
+            );
+        }
+        for target in ["\"/home/user\"", "\"/tmp/\" + name", "\"/tmp/\" . $name"] {
+            for (language, code) in cases(target) {
+                // Each language only reads its own concatenation operator.
+                if (target.contains(" + ") && language == ScriptLanguage::Php)
+                    || (target.contains(" . ") && language != ScriptLanguage::Php)
+                {
+                    continue;
+                }
+                assert!(
+                    blocks(language, &code),
+                    "{language:?}: {target} must still block:\n{code}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_go_exec_sink_escalates_a_destructive_payload_issue_472() {
         let ast_matcher = AstMatcher::new();
