@@ -207,12 +207,28 @@ fn pad_inside_command_envelope() -> String {
     .to_string()
 }
 
+/// Budget these tests pin so the salvage scan can finish.
+///
+/// The deny they assert requires the multi-megabyte window scan to COMPLETE;
+/// an exhausted budget is a different, also-correct answer (`ask`), and which
+/// one you get otherwise depends on how loaded the host is. Measured on a busy
+/// build machine, the 2 MiB scan exceeds the shipped 1000ms budget and these
+/// tests then see `ask`, which is what `issue_475_…` asserts on purpose.
+///
+/// Pinning it here is the same discipline that test uses in the other
+/// direction, and it is why the two can both hold on any machine. It is
+/// deliberately NOT a perf claim: `scripts/perf_baseline.py` owns the budget
+/// gate, and it scrubs `DCG_*` precisely so a test-local value like this one
+/// can never reach it.
+const SALVAGE_SCAN_BUDGET_MS: u64 = 30_000;
+
 /// Assert that an oversized payload produced the normal protocol denial.
 fn assert_denied(label: &str, input: &str) {
     let temp = tempfile::tempdir().expect("tempdir");
     assert!(input.len() > 256 * 1024, "{label}: must exceed the limit");
 
-    let (stdout, stderr, exit_code) = run_hook_raw(input, temp.path());
+    let (stdout, stderr, exit_code) =
+        run_hook_raw_with_budget(input, temp.path(), Some(SALVAGE_SCAN_BUDGET_MS));
 
     assert_eq!(exit_code, 0, "{label}: hook mode exits 0\nstderr: {stderr}");
     let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
