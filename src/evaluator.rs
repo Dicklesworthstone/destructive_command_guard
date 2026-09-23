@@ -26548,10 +26548,9 @@ fn evaluate_heredoc(
         // Position is the gate now. Every blocking AST match has already returned
         // above, so this runs only when the authoritative path found nothing,
         // which keeps rule attribution with the specific pattern where one exists.
-        // Language scoping lives inside the scanner: Bash is never masked and
-        // Php/Go use their own primary paths, so it finds nothing for them
-        // without a caller-side check. Perl's scans are re-run there because a
-        // timed-out `find_matches` takes them down with it.
+        // Language scoping lives inside the scanner: Bash is never masked, so it
+        // has no extraction layer to lose. Perl's scans are re-run there because
+        // a timed-out `find_matches` takes them down with it.
         //
         // "Go uses its own primary path" was true of the patterns and false of
         // the verdict until #472: all four `exec.Command` rows registered at
@@ -26560,6 +26559,13 @@ fn evaluate_heredoc(
         // backstop asserts that its primary path *blocks*, not merely that it
         // matches — `every_go_exec_sink_escalates_a_destructive_payload_issue_472`
         // is what now holds up the Go half of that claim.
+        //
+        // It asserts something further that #472 could not supply: that the
+        // primary path RUNS. Go's is the AST layer, and truncated heredoc
+        // extraction removes that layer entirely — which is Perl's exposure
+        // exactly, and Perl is re-scanned here for exactly that reason. Go and
+        // PHP are now scanned here too, so an argv-split payload no longer
+        // depends on a layer that load can take away.
         if let Some(blocked) =
             exec_sink_backstop_verdict(command, &content, context, first_allowlist_hit)
         {
