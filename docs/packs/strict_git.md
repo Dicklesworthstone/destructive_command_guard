@@ -28,6 +28,9 @@ These patterns match potentially destructive commands:
 |--------------|--------|----------|
 | `push-force-any` | Force push (even with --force-with-lease) can rewrite remote history. Disabled in strict mode. | high |
 | `push-mirror` | git push --mirror force-updates and deletes remote refs. Disabled in strict mode. | high |
+| `push-delete` | git push --delete removes refs from the remote. Disabled in strict mode. | high |
+| `push-delete-refspec` | git push <remote> :<ref> (empty source) deletes the ref from the remote. Disabled in strict mode. | high |
+| `push-prune` | git push --prune deletes remote refs that have no local counterpart. Disabled in strict mode. | high |
 | `push-dynamic-argument` | Force push risk: a shell-expanded or escaped git push argument cannot be verified as non-forcing. Use literal remote and refspec arguments in strict mode. | high |
 | `rebase` | git rebase rewrites commit history. Disabled in strict mode. | high |
 | `commit-amend` | git commit --amend rewrites the last commit. Disabled in strict mode. | high |

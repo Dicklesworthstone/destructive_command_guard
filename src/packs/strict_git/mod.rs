@@ -55,6 +55,35 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "git push --mirror force-updates and deletes remote refs. Disabled in strict mode.",
             executables = ["git", "git-push"]
         ),
+        // Deleting a remote ref is the half of --mirror that the per-ref
+        // spellings reach one ref at a time: a teammate's branch or a release
+        // tag is gone for everyone who has not fetched it. git accepts any
+        // unambiguous prefix of `--delete` (`--de` up; `--d` is ambiguous with
+        // --dry-run) and bundles short flags (`-nd`, `-qd`). `-o` takes a
+        // value, so it is excluded from the bundle class.
+        destructive_pattern!(
+            "push-delete",
+            r"git\b.*?\bpush\b[^\n;&|]*\s(?:--de(?:l(?:e(?:te?)?)?)?|-[46fnqvu]*d[46fnqvu]*)(?:\s|$)",
+            "git push --delete removes refs from the remote. Disabled in strict mode.",
+            executables = ["git", "git-push"]
+        ),
+        // `git push origin :feature` is the refspec spelling of --delete. A
+        // bare `:` (push matching branches) is not a deletion.
+        destructive_pattern!(
+            "push-delete-refspec",
+            r#"git\b.*?\bpush\b[^\n;&|]*\s['"]?:[^\s'":]"#,
+            "git push <remote> :<ref> (empty source) deletes the ref from the remote. Disabled in strict mode.",
+            executables = ["git", "git-push"]
+        ),
+        // --prune deletes every remote ref under the pushed refspecs that has
+        // no local counterpart — --mirror's deletion without the flag's name.
+        // `--pr` is ambiguous with --progress, so `--pru` is the shortest.
+        destructive_pattern!(
+            "push-prune",
+            r"git\b.*?\bpush\b[^\n;&|]*\s--pru(?:ne?)?(?:\s|$)",
+            "git push --prune deletes remote refs that have no local counterpart. Disabled in strict mode.",
+            executables = ["git", "git-push"]
+        ),
         // A dynamically constructed push argument can render Git's leading
         // `+refspec` force syntax only after the shell expands it. Strict mode
         // cannot prove such a push is non-forcing, so fail closed instead of
@@ -394,6 +423,62 @@ mod tests {
         assert_allows(&pack, "git push origin feature-main");
         assert_allows(&pack, "git push origin main-fix");
         assert_allows(&pack, "git push origin maintain");
+    }
+
+    /// Remote ref deletion in every spelling git accepts, checked against
+    /// git 2.55: `--de`..`--delete`, bundled short flags, the empty-source
+    /// refspec, and `--pru`..`--prune`.
+    #[test]
+    fn test_push_remote_ref_deletion() {
+        let pack = create_pack();
+        for command in [
+            "git push origin --delete feature",
+            "git push --delete origin v1.0",
+            "git push origin --de feature",
+            "git push origin --delet feature",
+            "git push -d origin feature",
+            "git push -nd origin feature",
+            "git push -qd origin feature",
+            "git push -dn origin feature",
+            "git-push -d origin feature",
+            "git -C /repo push -d origin feature",
+        ] {
+            assert_blocks(&pack, command, "removes refs from the remote");
+        }
+        for command in [
+            "git push origin :feature",
+            "git push origin :refs/tags/v1.0",
+            "git push origin ':feature'",
+            "git push origin topic :stale",
+        ] {
+            assert_blocks(&pack, command, "empty source");
+        }
+        for command in [
+            "git push --prune origin",
+            "git push --pru origin 'refs/heads/*:refs/heads/*'",
+            "git push origin --prun",
+        ] {
+            assert_blocks(&pack, command, "no local counterpart");
+        }
+
+        // Not deletions. (Rules outside this test still apply to some, e.g.
+        // push-main; these commands avoid main/master.)
+        for command in [
+            "git push origin feature",
+            "git push -u origin feature",
+            "git push origin feature-d",
+            "git push origin HEAD:feature",
+            "git push origin :",
+            "git push --dry-run origin feature",
+            "git push --no-prune origin feature",
+            "git push --progress origin feature",
+            "git push -o ci.skip origin feature",
+            "git push origin feature && ls -d build",
+            "git branch -d feature",
+            "git fetch --prune origin",
+        ] {
+            assert_allows(&pack, command);
+        }
     }
 
     #[test]
