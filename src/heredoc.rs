@@ -123,8 +123,11 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 29] = [
     r#"\bphp[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*r[A-Za-z]*(?:\s|['"]|$)"#,
     // Lua inline execution
     r#"\blua[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
-    // Shell inline execution (sh -c, bash -c, zsh -c, fish -c, bash -lc, etc.)
-    r#"\b(?:sh|bash|zsh|fish)(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)"#,
+    // Shell inline execution (sh -c, bash -c, zsh -c, fish -c, bash -lc, etc.).
+    // dash/ksh/mksh are ordinary POSIX shells: without them `dash -c "git
+    // reset --hard"` was never unwrapped, and command-position rules such as
+    // core.git never saw the payload.
+    r#"\b(?:sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)"#,
     // PowerShell inline execution (powershell -Command '...', pwsh -c "...",
     // and Windows full-path forms like
     //   "C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command '...'
@@ -641,6 +644,9 @@ impl ScriptLanguage {
             || matches_interpreter("bash")
             || matches_interpreter("zsh")
             || matches_interpreter("fish")
+            || matches_interpreter("dash")
+            || matches_interpreter("ksh")
+            || matches_interpreter("mksh")
             // PowerShell (`powershell`, `powershell.exe`, `pwsh`) running an
             // inner command via `-Command`/`-c`. We re-check the body as a
             // shell command: destructive command names (git, rm, etc.) are
@@ -1135,7 +1141,7 @@ static INLINE_SCRIPT_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // `(?i:powershell|pwsh)` matches the Windows PowerShell host case-insensitively;
     // `["']?` after the interpreter swallows the closing quote of a quoted full
     // path (e.g. `"...\powershell.exe" -Command '...'`) before flags (#125).
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*'([^']*)'"#)
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*'([^']*)'"#)
         .expect("inline script single-quote regex compiles")
 });
 
@@ -1147,7 +1153,7 @@ static INLINE_SCRIPT_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // Supports Windows .exe extensions: python.exe, python3.11.exe, etc.
     // PowerShell host + quoted-path closing quote handled as in the single-quote
     // variant above (#125).
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*"([^"]*)""#)
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*"([^"]*)""#)
         .expect("inline script double-quote regex compiles")
 });
 
