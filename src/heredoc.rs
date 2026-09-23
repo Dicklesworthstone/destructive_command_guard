@@ -1157,6 +1157,18 @@ static INLINE_SCRIPT_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("inline script double-quote regex compiles")
 });
 
+/// A POSIX shell `-c` whose operand is UNQUOTED and is a single expansion or
+/// command substitution: `sh -c $CMD`, `bash -c $(cat f)`, `` dash -c `x` ``.
+/// Only this dynamic shape is extracted; an unquoted literal operand runs just
+/// its first word (`bash -c rm -rf /` runs `rm` with `-rf` as `$0`), which the
+/// quoted patterns' semantics do not describe. The extracted source is wholly
+/// dynamic, so the evaluator fails it closed like the quoted forms (bd-vweh).
+/// Groups match the quoted patterns: (1) shell, (2) unused, (3) flag, (4) operand.
+static INLINE_SCRIPT_UNQUOTED_DYNAMIC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?()\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*c[A-Za-z]*)\s+(\$\{[^}\s]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?!$-]|\$\([^()]*\)|`[^`]*`)(?:\s|$|[;&|)])")
+        .expect("inline script unquoted-dynamic regex compiles")
+});
+
 /// Regex for `cmd /c "..."` / `cmd /k ...` inline execution (the Windows analog of
 /// `bash -c`). Group 1 = double-quoted inner, group 2 = single-quoted inner,
 /// group 3 = unquoted rest-of-line. The inner command line is re-evaluated by the
@@ -1737,6 +1749,7 @@ fn extract_inline_scripts(
     // Extract from both single-quoted and double-quoted patterns
     extract_from_pattern(&INLINE_SCRIPT_SINGLE_QUOTE);
     extract_from_pattern(&INLINE_SCRIPT_DOUBLE_QUOTE);
+    extract_from_pattern(&INLINE_SCRIPT_UNQUOTED_DYNAMIC);
 
     if hit_limit {
         skip_reasons.push(SkipReason::ExceededHeredocLimit {
