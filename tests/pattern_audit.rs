@@ -314,6 +314,10 @@ fn test_audit_backtracking_requirements() {
                 "find-delete-tmpdir",
                 "find-delete-tmpdir-brace",
                 "find-delete-var-tmp",
+                // Same `$`/backtick guard as find-delete-tmp, plus "no
+                // backslash except the terminating `\;`": lookaheads.
+                "find-exec-rm-tmp",
+                "find-exec-rm-var-tmp",
                 "ln-symlink-sensitive-then-delete",
                 "mv-relative-into-home",
                 "mv-sensitive-source-root-home",
