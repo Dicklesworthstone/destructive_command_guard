@@ -3617,6 +3617,16 @@ pub(crate) fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>
                 Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
                 Some("Verify target path carefully before running".to_string()),
             ),
+            // The synchronous twin: same deletion, same refinement, same rule id
+            // (so one grant covers both spellings). Only the async form was
+            // modeled, so `Deno.removeSync('/etc', {recursive: true})` was allowed.
+            CompiledPattern::new(
+                "Deno.removeSync($$$)".to_string(),
+                "heredoc.typescript.deno_remove".to_string(),
+                "Deno.removeSync() deletes files/directories".to_string(),
+                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
+                Some("Verify target path carefully before running".to_string()),
+            ),
             CompiledPattern::new(
                 "child_process.execSync($$$)".to_string(),
                 "heredoc.typescript.execsync".to_string(),
@@ -6484,6 +6494,24 @@ mod tests {
                     .any(|m| m.rule_id.ends_with(".rm_rf_catastrophic")
                         && m.severity.blocks_by_default()),
                 "spawnSync('rm', ['-rf','/']) should block"
+            );
+        }
+
+        #[test]
+        fn deno_remove_sync_catastrophic_blocks() {
+            let ast_matcher = AstMatcher::new();
+            let matches = ast_matcher
+                .find_matches(
+                    "Deno.removeSync('/etc', { recursive: true });",
+                    ScriptLanguage::TypeScript,
+                )
+                .unwrap();
+            assert!(
+                matches.iter().any(
+                    |m| m.rule_id == "heredoc.typescript.deno_remove.catastrophic"
+                        && m.severity.blocks_by_default()
+                ),
+                "catastrophic Deno.removeSync should block: {matches:?}"
             );
         }
 

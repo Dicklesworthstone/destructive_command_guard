@@ -33182,6 +33182,72 @@ mod tests {
         }
     }
 
+    /// `Start-Process <file> -ArgumentList '<args>'` runs `<file> <args>`; the
+    /// wrapper hid the line from every rule. Asserted with the packs a native
+    /// Windows install has on by default. Residual: with core packs alone (pwsh
+    /// on Linux/macOS), a nested `powershell -Command` inner line is still
+    /// quick-rejected, although `iex` of the same payload denies.
+    #[test]
+    fn start_process_argument_lists_are_reevaluated() {
+        let windows_defaults = ["core.filesystem", "windows.filesystem", "windows.system"];
+        for command in [
+            r#"Start-Process powershell -ArgumentList '-Command "Remove-Item -Recurse -Force C:\src"'"#,
+            r#"Start-Process -FilePath pwsh -ArgumentList:'-c "Remove-Item -Recurse C:\src"' -Wait"#,
+            r"Start-Process cmd -ArgumentList '/c rd /s /q C:\src'",
+            r#"saps bash -Args "-c 'rm -rf /'""#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &windows_defaults,
+                ShellDialect::PowerShell,
+            );
+            assert!(result.is_denied(), "{command}: {:?}", result.pattern_info);
+        }
+        for command in [
+            "Start-Process notepad -ArgumentList 'README.md'",
+            "Start-Process cmd -ArgumentList '/c dir C:\\src'",
+            "Start-Process https://example.com",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &windows_defaults,
+                ShellDialect::PowerShell,
+            );
+            assert!(
+                !result.is_denied(),
+                "{command} must not deny: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// `deno eval "<code>"` is Deno's `node -e`; its payload was never
+    /// extracted, and `Deno.removeSync` was not modeled either.
+    #[test]
+    fn deno_eval_payloads_are_judged_like_node_e() {
+        for command in [
+            r#"deno eval "Deno.removeSync('/etc', {recursive: true})""#,
+            r#"deno eval --allow-all "Deno.removeSync('/', {recursive: true})""#,
+            r#"deno eval -p "require('fs').rmSync('/home/user', {recursive: true})""#,
+            r#"deno "eval" 'Deno.remove("/etc", {recursive: true})'"#,
+        ] {
+            let result = evaluate_with_pack_ids(command, &["core.filesystem"]);
+            assert!(result.is_denied(), "{command}: {:?}", result.pattern_info);
+        }
+        for command in [
+            r#"deno eval "console.log(Deno.version)""#,
+            "deno run --allow-read main.ts",
+            r#"deno eval "Deno.removeSync('/tmp/scratch/x')""#,
+        ] {
+            let result = evaluate_with_pack_ids(command, &["core.filesystem"]);
+            assert!(
+                !result.is_denied(),
+                "{command} must not deny: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
     /// `Get-ChildItem -Recurse | Remove-Item` is the idiomatic PowerShell tree
     /// delete; the recursion is on the producer, so it was allowed.
     #[test]

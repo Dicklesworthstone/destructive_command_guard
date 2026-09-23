@@ -63,7 +63,7 @@ use tracing::{debug, instrument, trace, warn};
 /// quote-aware scanner so we can suppress obvious false positives inside quoted
 /// literals (commit messages, search patterns, etc.) without introducing false
 /// negatives for real shell syntax (including `$()`/backtick substitutions).
-const HEREDOC_TRIGGER_PATTERNS: [&str; 27] = [
+const HEREDOC_TRIGGER_PATTERNS: [&str; 29] = [
     // Inline interpreter execution. These patterns intentionally allow:
     // - interleaved flags (python -I -c, bash --norc -c)
     // - combined short-flag clusters (bash -lc, node -pe, perl -pi -e)
@@ -92,11 +92,14 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 27] = [
     r#"\b(?:bun|deno)[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
     // Bun's `exec` subcommand hands its argument to a shell, so it is an inline
     // shell payload under a subcommand rather than a flag (issue #397).
-    // The optional quote matches `bun_exec_inline_payload`, which dequotes the
+    // The optional quote matches `subcommand_inline_payload`, which dequotes the
     // subcommand because quoting it does not change the argv Bun receives.
     // Without it, tier 1 rejected `bun "exec" '<payload>'` and the tier-2
     // walker that handles that spelling was unreachable.
     r#"\bbun[0-9.]*(?:\.exe)?\s+['"]?exec\b"#,
+    // Deno's inline form is the `eval` subcommand, not a flag, so the
+    // flag-shaped Bun/Deno trigger above never saw `deno eval "<code>"`.
+    r#"\bdeno[0-9.]*(?:\.exe)?\s+['"]?eval\b"#,
     // awk hands `system(…)` and its two command-pipe forms to /bin/sh (#399).
     // Keyed on the awk-program shapes, not the executable, so an ordinary
     // `awk '{print $1}' file.txt` never reaches extraction.
@@ -145,6 +148,9 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 27] = [
     // PowerShell Invoke-Expression / its `iex` alias: executes a string as code. Tier 2
     // extracts the quoted argument and re-evaluates it.
     r"(?i)(?:^|[\s;|&({])(?:iex|invoke-expression)\b",
+    // PowerShell Start-Process (`saps`) with an argument list runs
+    // `<file> <args>`; Tier 2 reconstructs that line and re-evaluates it.
+    r"(?i)(?:^|[\s;|&({])(?:start-process|saps)\b[^\n]*\s(?:-ArgumentList|-Args)\b",
     // Piped execution to interpreters (versioned, with optional .exe)
     r"\|\s*(?:python[0-9.]*|ruby[0-9.]*|perl[0-9.]*|node(?:js)?[0-9.]*|php[0-9.]*|lua[0-9.]*|sh|bash)(?:\.exe)?\b",
     // Piped to xargs (can execute arbitrary commands)
@@ -1164,6 +1170,17 @@ static IEX_INLINE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| {
         .expect("iex inline script regex compiles")
 });
 
+/// Regex for `Start-Process [-FilePath] <file> -ArgumentList '<args>'` (or
+/// `saps`, `-Args`, `-FilePath:`/`-ArgumentList:` colon forms). Group 1 = the
+/// file, group 2/3 = the double/single-quoted argument string. A comma list
+/// or a variable is not reconstructed (no extraction, no change).
+static START_PROCESS_INLINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)(?:^|[\s;|&({])(?:start-process|saps)\s+(?:-FilePath\s*:?\s*)?['"]?([^\s'",;|$()]+)['"]?\s+(?:-ArgumentList|-Args)\s*:?\s*(?:"([^"]*)"|'([^']*)')(?:\s|$|[;|&)])"#,
+    )
+    .expect("start-process inline regex compiles")
+});
+
 /// Regex for `powershell -EncodedCommand <base64>` (flag abbreviates to any prefix
 /// of `-encodedcommand`, min `-e`). Group 1 = the base64 token, which Tier 2 decodes
 /// (base64 -> UTF-16LE -> text) and re-evaluates.
@@ -1439,6 +1456,15 @@ fn extract_content_with_scan_view(
 
     // Extract `bun exec <payload>` inline shell payloads (#397)
     extract_bun_exec_inline_scripts(
+        scan_view,
+        limits,
+        start_time,
+        timeout,
+        &mut extracted,
+        &mut skip_reasons,
+    );
+    // Extract `deno eval <code>` inline JavaScript/TypeScript payloads
+    extract_deno_eval_inline_scripts(
         scan_view,
         limits,
         start_time,
@@ -1810,6 +1836,32 @@ fn extract_windows_inline_scripts(
             ) {
                 return;
             }
+        }
+    }
+
+    // Start-Process <file> -ArgumentList '<args>': the process runs `<file>
+    // <args>`, so `Start-Process cmd -ArgumentList '/c rd /s /q C:\src'` is the
+    // same deletion as the denied `cmd /c rd /s /q C:\src`. The reconstructed
+    // line is not a substring of the command, so there is no content_range.
+    for cap in START_PROCESS_INLINE.captures_iter(command) {
+        if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+            return;
+        }
+        let (Some(file), Some(args)) = (cap.get(1), cap.get(2).or_else(|| cap.get(3))) else {
+            continue;
+        };
+        let full = cap.get(0).expect("group 0 always present");
+        let line = format!("{} {}", file.as_str(), args.as_str());
+        if !push_windows_inner(
+            extracted,
+            skip_reasons,
+            limits,
+            &line,
+            full.start()..full.end(),
+            None,
+            "start-process",
+        ) {
+            return;
         }
     }
 
@@ -2383,7 +2435,7 @@ fn extract_bun_exec_inline_scripts(
         if basename != "bun" {
             continue;
         }
-        let Some(payload) = bun_exec_inline_payload(command, &tokens, index) else {
+        let Some(payload) = subcommand_inline_payload(command, &tokens, index, "exec", &[]) else {
             continue;
         };
         let Some(content) = command.get(payload.content.clone()) else {
@@ -2403,20 +2455,106 @@ fn extract_bun_exec_inline_scripts(
     }
 }
 
-/// Locate the shell payload of the `bun exec` invocation whose executable token
-/// is at `start`. See [`extract_bun_exec_inline_scripts`] for the grammar.
-fn bun_exec_inline_payload(
+/// `deno eval [options] "<code>"` runs `<code>` as JavaScript/TypeScript: the
+/// Deno counterpart of `node -e`. Deno has no `-e` flag, so the flag-shaped
+/// inline extraction never saw it and `deno eval "Deno.removeSync('src',
+/// {recursive: true})"` was allowed while the `node -e` spelling of the same
+/// deletion denied. Same conservative walk as `bun exec`, with Deno's
+/// no-value options modeled (see [`DENO_EVAL_OPTIONS`]).
+fn extract_deno_eval_inline_scripts(
+    command: &str,
+    limits: &ExtractionLimits,
+    start_time: Instant,
+    timeout: Duration,
+    extracted: &mut Vec<ExtractedContent>,
+    skip_reasons: &mut Vec<SkipReason>,
+) {
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons)
+        || !command.contains("deno")
+    {
+        return;
+    }
+    let tokens = crate::normalize::tokenize_for_normalization(command);
+    for index in 0..tokens.len() {
+        let token = &tokens[index];
+        if token.kind != crate::normalize::NormalizeTokenKind::Word {
+            continue;
+        }
+        let Some(word) = token.text(command) else {
+            continue;
+        };
+        let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
+        let basename = basename
+            .strip_suffix(".exe")
+            .or_else(|| basename.strip_suffix(".EXE"))
+            .unwrap_or(basename);
+        if basename != "deno" {
+            continue;
+        }
+        let Some(payload) =
+            subcommand_inline_payload(command, &tokens, index, "eval", DENO_EVAL_OPTIONS)
+        else {
+            continue;
+        };
+        let Some(content) = command.get(payload.content.clone()) else {
+            continue;
+        };
+        if extracted.len() >= limits.max_heredocs {
+            skip_reasons.push(SkipReason::ExceededHeredocLimit {
+                limit: limits.max_heredocs,
+            });
+            return;
+        }
+        if content.len() > limits.max_body_bytes {
+            continue;
+        }
+        extracted.push(ExtractedContent {
+            content: content.to_string(),
+            language: ScriptLanguage::from_command("deno"),
+            delimiter: None,
+            byte_range: payload.full,
+            content_range: Some(payload.content),
+            quoted: true,
+            heredoc_type: None,
+            target_command: Some("deno".to_string()),
+        });
+    }
+}
+
+/// Options `deno eval` accepts that take no separate value word. `--name=value`
+/// spellings are accepted generically by the walker; anything else (a
+/// value-taking option spelled `--config file`) ends the walk unextracted.
+const DENO_EVAL_OPTIONS: &[&str] = &[
+    "-p",
+    "--print",
+    "-T",
+    "--ts",
+    "-A",
+    "--allow-all",
+    "-q",
+    "--quiet",
+];
+
+/// Locate the payload of a `<executable> <subcommand> [options] <payload>`
+/// invocation whose executable token is at `start` (`bun exec`, `deno eval`).
+/// `options` lists the no-value options allowed between the subcommand and
+/// the payload; `--name=value` and Deno's `--allow-*`/`--deny-*`/`--unstable*`
+/// families are also skipped when any options are modeled.
+fn subcommand_inline_payload(
     command: &str,
     tokens: &[crate::normalize::NormalizeToken],
     start: usize,
+    subcommand: &str,
+    options: &[&str],
 ) -> Option<MiseInlinePayload> {
     use crate::normalize::NormalizeTokenKind;
 
     let full_start = tokens.get(start)?.byte_range.start;
     let mut index = start + 1;
 
-    // Phase 1: reach the `exec` subcommand. Quoting a subcommand does not change
-    // the argv Bun receives, so `bun "exec" '<payload>'` walks the same grammar.
+    // Phase 1: reach the subcommand. Quoting a subcommand does not change the
+    // argv the program receives, so `bun "exec" '<payload>'` walks the same
+    // grammar.
     let token = tokens.get(index)?;
     if token.kind != NormalizeTokenKind::Word {
         return None;
@@ -2428,21 +2566,36 @@ fn bun_exec_inline_payload(
     );
     // Any other word is a different subcommand (`bun run`, `bun install`), and
     // any option before the subcommand has unmodeled arity.
-    if word != "exec" {
+    if word != subcommand {
         return None;
     }
     index += 1;
 
-    // Phase 2: the payload is the next word. An option token there is unmodeled
-    // grammar, so extract nothing rather than guess.
+    // Phase 2: skip the modeled no-value options, then the payload is the next
+    // word. Any other option is unmodeled grammar, so extract nothing rather
+    // than guess.
+    loop {
+        let value = tokens.get(index)?;
+        if value.kind != NormalizeTokenKind::Word {
+            return None;
+        }
+        let text = command.get(value.byte_range.clone())?;
+        if !text.starts_with('-') {
+            break;
+        }
+        let modeled = !options.is_empty()
+            && (options.contains(&text)
+                || (text.starts_with("--") && text.contains('='))
+                || ["--allow-", "--deny-", "--unstable"]
+                    .iter()
+                    .any(|family| text.starts_with(family)));
+        if !modeled {
+            return None;
+        }
+        index += 1;
+    }
     let value = tokens.get(index)?;
-    if value.kind != NormalizeTokenKind::Word {
-        return None;
-    }
     let text = command.get(value.byte_range.clone())?;
-    if text.starts_with('-') {
-        return None;
-    }
     Some(MiseInlinePayload {
         content: unquoted_payload_range(text, value.byte_range.start),
         full: full_start..value.byte_range.end,
