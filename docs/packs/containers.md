@@ -174,6 +174,7 @@ These patterns match potentially destructive commands:
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
 | `system-prune` | podman system prune removes ALL unused containers, pods, images. Use 'podman system df' to preview. | high |
+| `system-reset` | podman system reset deletes ALL containers, pods, images, networks and volumes. | critical |
 | `volume-prune` | podman volume prune removes ALL unused volumes and their data permanently. | critical |
 | `pod-prune` | podman pod prune removes ALL stopped pods. | medium |
 | `image-prune` | podman image prune removes unused images. Use 'podman images' to review first. | medium |

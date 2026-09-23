@@ -96,6 +96,24 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - podman container prune: Only remove stopped containers\n\
              - podman image prune: Only remove dangling images"
         ),
+        // system reset - a superset of `system prune -a --volumes`: it removes
+        // every container, pod, image, network and volume, in use or not.
+        destructive_pattern!(
+            "system-reset",
+            r"podman\b.*?\bsystem\s+reset\b",
+            "podman system reset deletes ALL containers, pods, images, networks and volumes.",
+            Critical,
+            "podman system reset returns Podman storage to its initial state. Unlike \
+             system prune it does not stop at unused data:\n\n\
+             - Every container and pod, running or stopped\n\
+             - Every image, including ones in use\n\
+             - Every volume and the data in it\n\
+             - Every network and the build cache\n\n\
+             There is no recovery. Safer alternatives:\n\
+             - podman system df: See what is using space\n\
+             - podman system prune: Remove only unused data\n\
+             - podman volume ls: Check for volumes holding data first"
+        ),
         // volume prune - removes all unused volumes
         destructive_pattern!(
             "volume-prune",
@@ -265,6 +283,15 @@ mod tests {
         let pack = create_pack();
         assert_blocks(&pack, "podman system prune", "prune");
         assert_blocks(&pack, "podman system prune --all", "prune");
+        for command in [
+            "podman system reset",
+            "podman system reset -f",
+            "podman --remote system reset --force",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "system-reset");
+        }
+        assert_allows(&pack, "podman system df");
+        assert_allows(&pack, "podman system info");
         assert_blocks(&pack, "podman volume prune", "prune");
         assert_blocks(&pack, "podman pod prune", "prune");
         assert_blocks(&pack, "podman image prune", "prune");

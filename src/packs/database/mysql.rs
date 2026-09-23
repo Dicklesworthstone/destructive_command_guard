@@ -232,10 +232,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             High,
             "Materialize and review the exact SQL before piping or redirecting it into the client."
         ),
-        // DROP DATABASE
+        // DROP DATABASE. In MySQL/MariaDB `DROP SCHEMA` is a synonym, not a
+        // narrower operation, so it shares the rule id.
         destructive_pattern!(
             "drop-database",
-            r"(?i)\bDROP\s+DATABASE\b",
+            r"(?i)\bDROP\s+(?:DATABASE|SCHEMA)\b",
             "DROP DATABASE permanently deletes the entire database. Verify and back up first.",
             Critical,
             "DROP DATABASE completely removes a database and ALL its contents:\n\n\
@@ -602,6 +603,15 @@ mod tests {
             "DROP DATABASE IF EXISTS mydb;",
             "permanently deletes the entire database",
         );
+        // `DROP SCHEMA` is MySQL's synonym for `DROP DATABASE`.
+        for command in [
+            "DROP SCHEMA mydb;",
+            "mysql -u root -e \"drop schema prod\"",
+            "DROP SCHEMA IF EXISTS mydb",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "drop-database");
+        }
+        assert_allows(&pack, "SELECT schema_name FROM information_schema.schemata");
     }
 
     #[test]

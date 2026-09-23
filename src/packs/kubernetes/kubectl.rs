@@ -428,10 +428,23 @@ fn kubectl_command_contains_dynamic_shell_syntax(command: &str) -> bool {
 #[allow(clippy::too_many_lines)]
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
-        // delete namespace
+        // The four resource-typed delete rules below share one argument
+        // grammar (the macro takes only a literal, so it is spelled out in
+        // each). kubectl resolves a resource by its singular, plural, short
+        // name or case-insensitive Kind, optionally group-qualified
+        // (`deployments.apps`), in a comma list (`svc,deploy`) or as
+        // `type/name`, after any flags. Matching only the singular name
+        // directly after `delete` let `kubectl delete namespaces prod`,
+        // `deploy web`, `sts db` and `Deployment web` through.
+        //
+        // Value-taking flags (`-f`, `-k`, `-l`, `-n`, `-o`, `--filename`, …)
+        // must consume their value, so a path such as `-f deploy/app.yaml` or
+        // a namespace named `-n ns` is never read as the resource type. An
+        // unknown boolean long flag ends the argument walk, which errs toward
+        // allowing exactly as the old adjacency requirement did.
         destructive_pattern!(
             "delete-namespace",
-            r"kubectl\b.*?\bdelete\s+(?:namespace|ns)\b",
+            r"kubectl\b.*?\bdelete(?:\s+(?:-[fklnosv](?:=\S*|\s+\S+|[^\s=]\S*)|--(?:filename|kustomize|selector|namespace|output|field-selector|context|cluster|user|kubeconfig|server|grace-period|timeout|cascade|template|as|as-group|token|chunk-size)(?:=\S*|\s+\S+)|--[a-z][a-z-]*=\S*|--(?:all|all-namespaces|force|now|wait|ignore-not-found|recursive|interactive)|-[A-Za-eg-jmp-rt-uw-z][A-Za-z]*|[^\s/-][^\s/]*/\S+))*\s+(?:[^\s,/-][^\s,/]*,)*(?i:namespaces?|ns)(?:[,/]\S*)?(?:\s|$)",
             "kubectl delete namespace removes the entire namespace and ALL resources within it.",
             Critical,
             "Deleting a namespace destroys EVERYTHING inside it:\n\n\
@@ -538,7 +551,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // delete deployment/statefulset/daemonset
         destructive_pattern!(
             "delete-workload",
-            r"kubectl\b.*?\bdelete\s+(?:deployment|statefulset|daemonset|replicaset)\b",
+            r"kubectl\b.*?\bdelete(?:\s+(?:-[fklnosv](?:=\S*|\s+\S+|[^\s=]\S*)|--(?:filename|kustomize|selector|namespace|output|field-selector|context|cluster|user|kubeconfig|server|grace-period|timeout|cascade|template|as|as-group|token|chunk-size)(?:=\S*|\s+\S+)|--[a-z][a-z-]*=\S*|--(?:all|all-namespaces|force|now|wait|ignore-not-found|recursive|interactive)|-[A-Za-eg-jmp-rt-uw-z][A-Za-z]*|[^\s/-][^\s/]*/\S+))*\s+(?:[^\s,/-][^\s,/]*,)*(?i:deployments?|deploy|statefulsets?|sts|daemonsets?|ds|replicasets?|rs)(?:\.(?:v1\.)?(?:apps|extensions))?(?:[,/]\S*)?(?:\s|$)",
             "kubectl delete deployment/statefulset/daemonset removes the workload. Use --dry-run first.",
             High,
             "Deleting a workload terminates all its pods:\n\n\
@@ -555,7 +568,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // delete pvc (persistent volume claim)
         destructive_pattern!(
             "delete-pvc",
-            r"kubectl\b.*?\bdelete\s+(?:pvc|persistentvolumeclaim)\b",
+            r"kubectl\b.*?\bdelete(?:\s+(?:-[fklnosv](?:=\S*|\s+\S+|[^\s=]\S*)|--(?:filename|kustomize|selector|namespace|output|field-selector|context|cluster|user|kubeconfig|server|grace-period|timeout|cascade|template|as|as-group|token|chunk-size)(?:=\S*|\s+\S+)|--[a-z][a-z-]*=\S*|--(?:all|all-namespaces|force|now|wait|ignore-not-found|recursive|interactive)|-[A-Za-eg-jmp-rt-uw-z][A-Za-z]*|[^\s/-][^\s/]*/\S+))*\s+(?:[^\s,/-][^\s,/]*,)*(?i:persistentvolumeclaims?|pvc)(?:[,/]\S*)?(?:\s|$)",
             "kubectl delete pvc may permanently delete data if ReclaimPolicy is Delete.",
             Critical,
             "Deleting a PVC can cause permanent data loss depending on the PV's reclaimPolicy:\n\n\
@@ -573,7 +586,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // delete pv (persistent volume)
         destructive_pattern!(
             "delete-pv",
-            r"kubectl\b.*?\bdelete\s+(?:pv|persistentvolume)\b",
+            r"kubectl\b.*?\bdelete(?:\s+(?:-[fklnosv](?:=\S*|\s+\S+|[^\s=]\S*)|--(?:filename|kustomize|selector|namespace|output|field-selector|context|cluster|user|kubeconfig|server|grace-period|timeout|cascade|template|as|as-group|token|chunk-size)(?:=\S*|\s+\S+)|--[a-z][a-z-]*=\S*|--(?:all|all-namespaces|force|now|wait|ignore-not-found|recursive|interactive)|-[A-Za-eg-jmp-rt-uw-z][A-Za-z]*|[^\s/-][^\s/]*/\S+))*\s+(?:[^\s,/-][^\s,/]*,)*(?i:persistentvolumes?|pv)(?:[,/]\S*)?(?:\s|$)",
             "kubectl delete pv may permanently delete the underlying storage.",
             Critical,
             "Deleting a PersistentVolume can permanently destroy the underlying storage:\n\n\
@@ -1139,6 +1152,63 @@ mod tests {
         assert!(dry_run_is_effectively_safe(
             "kubectl -v6 delete ns prod --dry-run=server"
         ));
+    }
+
+    /// kubectl names a resource by singular, plural, short name or Kind, and
+    /// accepts it group-qualified, in a comma list, as `type/name`, or after
+    /// flags. Every one of these was allowed while the singular spelling
+    /// directly after `delete` denied.
+    #[test]
+    fn resource_spellings_kubectl_accepts_are_all_denied() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("kubectl delete namespaces prod", "delete-namespace"),
+            ("kubectl delete Namespace prod", "delete-namespace"),
+            ("kubectl delete namespace/prod", "delete-namespace"),
+            ("kubectl delete ns", "delete-namespace"),
+            ("kubectl delete --wait=false ns prod", "delete-namespace"),
+            ("kubectl delete deployments web", "delete-workload"),
+            ("kubectl delete deploy web", "delete-workload"),
+            ("kubectl delete deploy/web", "delete-workload"),
+            ("kubectl delete Deployment web", "delete-workload"),
+            ("kubectl delete deployments.apps web", "delete-workload"),
+            ("kubectl delete deployment.v1.apps web", "delete-workload"),
+            ("kubectl -n prod delete deploy web", "delete-workload"),
+            ("kubectl delete -n prod deploy web", "delete-workload"),
+            ("kubectl delete --namespace prod sts db", "delete-workload"),
+            ("kubectl delete statefulsets db", "delete-workload"),
+            ("kubectl delete ds agent", "delete-workload"),
+            ("kubectl delete rs web-7c9", "delete-workload"),
+            ("kubectl delete svc,deploy web", "delete-workload"),
+            ("kubectl delete svc/web deploy/web", "delete-workload"),
+            ("kubectl delete persistentvolumeclaims data", "delete-pvc"),
+            ("kubectl delete PersistentVolumeClaim data", "delete-pvc"),
+            ("kubectl delete -l app=db pvc", "delete-pvc"),
+            ("kubectl delete persistentvolumes pv1", "delete-pv"),
+            ("kubectl delete pv/pv1", "delete-pv"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+
+        // A value is never the resource type: a manifest path or a namespace
+        // that happens to be named like one, and names that merely start with
+        // one.
+        for command in [
+            "kubectl delete -f deploy/app.yaml",
+            "kubectl delete --filename deploy/app.yaml",
+            "kubectl delete -k deploy/overlays/prod",
+            "kubectl delete pod web -n ns",
+            "kubectl delete pod web -n deploy",
+            "kubectl delete -n ns pod web",
+            "kubectl delete pod deploy-7c9",
+            "kubectl delete secret ns-token",
+            "kubectl delete configmap deployment-settings",
+            "kubectl delete pod/web",
+            "kubectl get deployments",
+            "kubectl get ns",
+        ] {
+            assert_allows(&pack, command);
+        }
     }
 
     #[test]
