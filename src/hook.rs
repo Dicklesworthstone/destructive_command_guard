@@ -66,6 +66,13 @@ pub struct HookInput {
     #[serde(alias = "turnId")]
     pub turn_id: Option<String>,
 
+    /// Tool-use identifier. Claude Code's are Anthropic tool-use ids
+    /// (`toolu_…`); Codex's are OpenAI call ids (`call_…`). Kept as a raw JSON
+    /// value so an unexpected type degrades to "unknown" instead of failing
+    /// the whole payload parse (a parse failure fails open). No camelCase
+    /// alias: Grok sends both spellings, and serde would reject the pair.
+    pub tool_use_id: Option<serde_json::Value>,
+
     /// Antigravity CLI (`agy`) tool-call envelope. Unlike Claude/Gemini/Grok,
     /// `agy` nests the tool name and arguments under a `toolCall` object:
     /// `{"toolCall": {"name": "run_command", "args": {"CommandLine": "...",
@@ -1354,9 +1361,9 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     }
 
     // Explicit Windows-shell tool names ("powershell"/"pwsh"/"cmd"/"cmd.exe")
-    // are only ever emitted by Codex-style payloads -- Claude Code's shell
-    // tool is always "Bash" (or "launch-process"), so this cannot collide with
-    // Claude Code. On Windows, Codex does not always populate `turn_id`
+    // are emitted by Codex-style payloads and by Claude Code's Windows
+    // `PowerShell` tool; the two are told apart by the tool-use id below.
+    // On Windows, Codex does not always populate `turn_id`
     // (issue #125), so the turn_id-gated check above misses these tools and the
     // destructive command would otherwise slip through as a ClaudeCompatible
     // result whose extension fields Codex's strict parser drops. Classify an
@@ -1368,7 +1375,20 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         tool_name.as_str(),
         "powershell" | "pwsh" | "cmd" | "cmd.exe"
     );
-    if is_explicit_windows_shell {
+    // Claude Code on Windows DOES send `PowerShell` (dcg's own installer
+    // registers its Claude hook for `Bash|PowerShell`), and classifying those
+    // payloads as Codex answered every deny in the minimal shape — no ruleId,
+    // packId, severity, allow-once code or remediation. An Anthropic tool-use
+    // id (`toolu_…`) is the precise wire marker: Codex never emits one. The
+    // environment is deliberately not consulted — a Codex session launched
+    // inside Claude Code inherits `CLAUDECODE`, and answering Codex in Claude
+    // shape is the direction that fails open.
+    let has_anthropic_tool_use_id = input
+        .tool_use_id
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| id.starts_with("toolu_"));
+    if is_explicit_windows_shell && !has_anthropic_tool_use_id {
         return HookProtocol::Codex;
     }
 
@@ -4034,9 +4054,9 @@ mod tests {
         // PowerShell or cmd.exe but does not always send `turn_id`. Without
         // the explicit-Windows-shell fallback this payload would be classified as
         // ClaudeCompatible (exit 0 + JSON that Codex's strict parser drops),
-        // letting the destructive command through. These tool names are
-        // Codex-only (Claude Code always uses "Bash"/"launch-process"), so
-        // they must classify as Codex even with no turn_id.
+        // letting the destructive command through. Without an Anthropic
+        // tool-use id (see the next test) these tool names must classify as
+        // Codex even with no turn_id.
         //
         // Ambient `PA_PROJECT_DIR` (the Posit Assistant marker checked ahead
         // of the Windows-shell rule) would legitimately steer these payloads
@@ -4066,6 +4086,40 @@ mod tests {
                 extract_command(&input),
                 Some("git reset --hard HEAD~1".to_string())
             );
+        }
+    }
+
+    /// Claude Code's Windows `PowerShell` tool carries an Anthropic tool-use id
+    /// (`toolu_…`) and must get the full Claude answer (ruleId, allow-once
+    /// code, remediation) instead of Codex's minimal one. Anything else —
+    /// OpenAI `call_…` ids, no id, a non-string id — keeps the #125 Codex
+    /// treatment, because answering Codex in Claude shape fails open.
+    #[test]
+    fn test_claude_powershell_tool_is_claude_compatible() {
+        let _lock = test_env::lock();
+        let _no_posit_env = EnvVarGuard::remove("PA_PROJECT_DIR");
+        let payload = |tool: &str, id: &str| {
+            format!(
+                r#"{{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"{tool}","tool_input":{{"command":"git reset --hard"}},"tool_use_id":{id}}}"#
+            )
+        };
+        for tool in ["PowerShell", "pwsh", "cmd"] {
+            let input: HookInput =
+                serde_json::from_str(&payload(tool, r#""toolu_01ABC""#)).unwrap();
+            assert_eq!(
+                detect_protocol(&input),
+                HookProtocol::ClaudeCompatible,
+                "{tool} with an Anthropic tool-use id"
+            );
+            for id in [r#""call_abc123""#, "null", "42", r#"{"x":1}"#, r#""""#] {
+                let input: HookInput = serde_json::from_str(&payload(tool, id))
+                    .expect("an odd tool_use_id must not fail the whole parse");
+                assert_eq!(
+                    detect_protocol(&input),
+                    HookProtocol::Codex,
+                    "{tool} with tool_use_id {id}"
+                );
+            }
         }
     }
 
@@ -4157,10 +4211,18 @@ mod tests {
 
         {
             let _no_env = EnvVarGuard::remove("PA_PROJECT_DIR");
+            // Posit Assistant's Anthropic tool-use id alone already selects
+            // the Claude shape it reads.
+            assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+            let bare: HookInput = serde_json::from_str(
+                &json.replace(r#""tool_use_id":"toolu_posit_01""#, r#""unrelated":"x""#),
+            )
+            .unwrap();
+            assert!(bare.tool_use_id.is_none());
             assert_eq!(
-                detect_protocol(&input),
+                detect_protocol(&bare),
                 HookProtocol::Codex,
-                "without the env marker a bare `powershell` tool stays Codex"
+                "without the env marker or an Anthropic id a bare `powershell` tool stays Codex"
             );
         }
 
