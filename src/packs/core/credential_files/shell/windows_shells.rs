@@ -241,6 +241,16 @@ fn cmdlet(name: &str) -> Option<Cmdlet> {
             COPY_ITEM_PARAMS,
             &[Role::Source, Role::Target],
         ),
+        // `Rename-Item <path> <newName>` destroys the old name exactly as a
+        // move does, and its second operand is a NAME relative to the item's
+        // own parent rather than a path. Reading it as a move means the
+        // source-side judgement above answers it, which is the half that
+        // matters — the new name resolves to nothing on its own (#451).
+        "rename-item" | "ren" | "rni" | "rn" => (
+            WriterKind::MoveItem,
+            COPY_ITEM_PARAMS,
+            &[Role::Source, Role::Target],
+        ),
         _ => return None,
     };
     Some(Cmdlet {
@@ -431,11 +441,35 @@ fn join(parent: &Word, name: &Word) -> Word {
 /// A copy or move onto `destination`, judged by the POSIX `cp` logic: a file
 /// destination is judged as a file, a directory one by where each source
 /// lands. `--` keeps a source spelled like an option from reading as one.
+///
+/// A MOVE also judges its sources, because moving a protected file away
+/// destroys it exactly as deleting it does — the name stops resolving to the
+/// key. POSIX catches that with its own `mv-sensitive-source-root-home` rule,
+/// which is a `mv`-anchored regex and so never saw `Move-Item` or cmd's
+/// `move`: measured, `mv ~/.ssh/id_rsa /tmp/x` denied while both Windows
+/// spellings of the same move allowed (#451). This is the policy the embedded
+/// languages already apply — `transfers.rs` records a move's source removal
+/// and a copy's does not, for the same reason: a copy only READS its source.
 fn judge_copy(
     kind: WriterKind,
     sources: &[Word],
     destination: &Word,
 ) -> Option<CredentialFileWrite> {
+    if matches!(kind, WriterKind::MoveItem | WriterKind::CmdMove) {
+        let removal = Writer {
+            kind: Some(kind),
+            // A move removes the source name whatever the write mode is, so the
+            // append carve-out must not exempt it: appending to
+            // `~/.ssh/known_hosts` is fine, moving it away is not.
+            mode: WriteMode::Replace,
+        };
+        if let Some(hit) = sources
+            .iter()
+            .find_map(|source| judge_file_target(source, removal))
+        {
+            return Some(hit);
+        }
+    }
     let end_of_options = Word {
         text: vec!['-', '-'],
         literal: vec![true, true],
@@ -459,7 +493,10 @@ fn judge_copy(
 fn classify_cmd_builtin(name: &str, args: &[Arg]) -> Option<CredentialFileWrite> {
     let kind = match name {
         "copy" | "xcopy" => WriterKind::CmdCopy,
-        "move" => WriterKind::CmdMove,
+        // `ren`/`rename` destroys the old name the same way `move` does; its
+        // second operand is a bare new name, which the source-side judgement
+        // does not need (#451).
+        "move" | "ren" | "rename" => WriterKind::CmdMove,
         _ => return None,
     };
     let operands: Vec<&Arg> = args
@@ -506,6 +543,12 @@ const WRITER_WORDS: &[&str] = &[
     "copy",
     "xcopy",
     "move",
+    // Rename destroys the old name the same way a move does (#451).
+    "rename-item",
+    "rni",
+    "rn",
+    "ren",
+    "rename",
 ];
 
 pub(super) fn names_writer(command: &str) -> bool {
@@ -1113,6 +1156,61 @@ mod tests {
 
     fn cmd(command: &str) -> Option<CredentialFileWrite> {
         super::super::classify_credential_file_write(command, ShellDialect::Cmd)
+    }
+
+    /// Moving or renaming a protected file AWAY destroys it (#451).
+    ///
+    /// The name stops resolving to the key, which is the same loss a delete
+    /// causes. POSIX catches this with `mv-sensitive-source-root-home`, a
+    /// regex anchored on the POSIX verb, so it never saw `Move-Item` or cmd's
+    /// `move`: measured, the POSIX move of a key denied while both Windows
+    /// spellings of the same move allowed.
+    #[test]
+    fn windows_move_away_from_a_protected_file_denies_issue_451() {
+        for command in [
+            "Move-Item $HOME/.ssh/id_rsa C:/tmp/x",
+            "Move-Item -Path $HOME/.ssh/id_rsa -Destination C:/tmp/x",
+            "mi $HOME/.aws/credentials C:/tmp/x",
+            "Rename-Item $HOME/.ssh/id_rsa id_rsa.bak",
+            "rni $HOME/.ssh/id_rsa id_rsa.bak",
+        ] {
+            let found = ps(command).unwrap_or_else(|| panic!("must deny: {command}"));
+            assert_eq!(found.rule, CREDENTIAL_FILE_WRITE_NAME, "{command}");
+        }
+        for command in [
+            "move %USERPROFILE%/.ssh/id_rsa C:/tmp/x",
+            "ren %USERPROFILE%/.ssh/id_rsa id_rsa.bak",
+            "rename %USERPROFILE%/.aws/credentials creds.bak",
+        ] {
+            let found = cmd(command).unwrap_or_else(|| panic!("must deny: {command}"));
+            assert_eq!(found.rule, CREDENTIAL_FILE_WRITE_NAME, "{command}");
+        }
+    }
+
+    /// A COPY only reads its source, so the source side must stay allowed
+    /// (#451). Without this the test above would pass on a blanket deny of any
+    /// command naming a protected path.
+    #[test]
+    fn windows_copy_from_a_protected_file_stays_allowed_issue_451() {
+        for command in [
+            "Copy-Item $HOME/.ssh/id_rsa C:/tmp/x",
+            "cpi $HOME/.ssh/id_rsa C:/tmp/x",
+            "Copy-Item -Path $HOME/.ssh/id_rsa -Destination C:/tmp/x",
+            // An ordinary move is nobody's business.
+            "Move-Item C:/app/a.txt C:/app/b.txt",
+            "Rename-Item C:/app/a.txt b.txt",
+            // The public half of a key pair.
+            "Move-Item $HOME/.ssh/id_rsa.pub C:/tmp/x",
+        ] {
+            assert!(ps(command).is_none(), "must stay allowed: {command}");
+        }
+        for command in [
+            "copy %USERPROFILE%/.ssh/id_rsa C:/tmp/x",
+            "move C:/app/a.txt C:/app/b.txt",
+            "ren C:/app/a.txt b.txt",
+        ] {
+            assert!(cmd(command).is_none(), "must stay allowed: {command}");
+        }
     }
 
     /// The #477 matrix: every row the Bash tool denies must deny from a
