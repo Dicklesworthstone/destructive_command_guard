@@ -662,9 +662,38 @@ fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
             bash_payload.as_bytes(),
             &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
         );
+        // `turn_id` makes this a Codex payload. Codex labels its shell `Bash`
+        // on every platform, but on a Windows host that shell is PowerShell by
+        // default, so the label is down-trusted there (#379,
+        // `codex_host_shell_dialect`) and the escape IS reconstructed.
+        if cfg!(windows) {
+            assert!(
+                bash_outcome.is_codex_block_shape(),
+                "a Codex Bash payload on a Windows host must adopt the PowerShell/cmd \
+                 reading of {command:?}\n{bash_outcome}"
+            );
+        } else {
+            assert!(
+                bash_outcome.is_allow_shape(),
+                "Bash must not reinterpret Windows shell escapes in {command:?}\n{bash_outcome}"
+            );
+        }
+
+        // Claude Code's Bash tool is Git Bash on every host, so its label is
+        // never down-trusted for escape syntax alone.
+        let claude_payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+        })
+        .to_string();
+        let claude_outcome = run_hook_raw(
+            claude_payload.as_bytes(),
+            &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+        );
         assert!(
-            bash_outcome.is_allow_shape(),
-            "Bash must not reinterpret Windows shell escapes in {command:?}\n{bash_outcome}"
+            claude_outcome.is_allow_shape(),
+            "Claude's Bash must not reinterpret Windows shell escapes in {command:?}\n{claude_outcome}"
         );
 
         let unknown_payload = serde_json::json!({
