@@ -1377,6 +1377,44 @@ pub(crate) fn parse_rm_command_segment_in_dialect(
     parse_unverified_rm_command_segment(command, pipeline_stdin, dialect)
 }
 
+/// Whether a PowerShell `Remove-Item` target names a protected file (#451).
+///
+/// The classifier that owns the protected-path table reads POSIX spelling, so
+/// the Windows one is translated rather than duplicated — a second table is
+/// exactly the drift that #441/#452/#465/#468 were:
+///
+/// - `\` becomes `/`. PowerShell accepts both, and `$HOME\.ssh\id_rsa` and
+///   `$HOME/.ssh/id_rsa` name the same file.
+/// - `$env:USERPROFILE` and `$env:HOME` become `$HOME`, which is the anchor the
+///   table already recognises. This is a rename of the same concept, not a new
+///   root: on Windows `%USERPROFILE%` IS the home directory, and dcg's own
+///   `config::home_dir()` resolves it that way (bd-b2b1).
+///
+/// Everything else is left alone, so a target the classifier cannot prove
+/// literal still declines there rather than here.
+fn powershell_target_is_protected(target: &str) -> bool {
+    let mut candidate = target.replace('\\', "/");
+    for alias in ["$env:USERPROFILE", "$env:HOME", "${env:USERPROFILE}"] {
+        if let Some(rest) = candidate
+            .strip_prefix(alias)
+            .or_else(|| strip_prefix_ascii_case_insensitive(&candidate, alias))
+        {
+            candidate = format!("$HOME{rest}");
+            break;
+        }
+    }
+    crate::packs::core::credential_files::may_name_protected_path(&candidate)
+        && crate::packs::core::credential_files::names_protected_file(&candidate)
+}
+
+/// `str::strip_prefix` with an ASCII case-insensitive comparison, because
+/// PowerShell variable names are case-insensitive (`$env:userprofile`).
+fn strip_prefix_ascii_case_insensitive<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = value.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &value[prefix.len()..])
+}
+
 fn powershell_variable_assignment(command: &str) -> bool {
     let Some(mut tail) = command.trim_start().strip_prefix('$') else {
         return false;
@@ -1895,6 +1933,10 @@ fn parse_powershell_remove_item_segment(command: &str, automated_stdin: bool) ->
     // Pipeline-fed targets are invisible here, so they can never all be
     // proven literal temp subpaths (#285).
     let mut targets_are_literal_temp = !automated_stdin;
+    // The literal targets, kept so a NON-recursive delete can still be judged
+    // against the protected-file table (#451). Pipeline-fed targets never land
+    // here, which is the same literal-only stance the POSIX rule takes.
+    let mut literal_targets: Vec<String> = Vec::new();
     let mut index = command_index + 1;
     while let Some(token) = tokens.get(index) {
         if token.kind == NormalizeTokenKind::Separator {
@@ -1965,14 +2007,43 @@ fn parse_powershell_remove_item_segment(command: &str, automated_stdin: bool) ->
             }) {
                 has_target = true;
                 targets_are_literal_temp &= windows_literal_user_temp_subpath(value);
+                literal_targets.push(value.to_string());
             }
             continue;
         }
         has_target = true;
         targets_are_literal_temp &= windows_literal_user_temp_subpath(word);
+        literal_targets.push(word.to_string());
     }
 
-    if !recurse || !has_target {
+    if !recurse {
+        // A non-recursive `Remove-Item` still deletes the file it names, and
+        // `rm ~/.ssh/id_rsa` — the POSIX spelling of the very same deletion —
+        // denies under `rm-protected-file` in this same always-on pack. Measured
+        // before this, all six protected targets and all five delete verbs
+        // (`Remove-Item`, `ri`, `del`, `erase`, `rm`) were allowed with and
+        // without `-Force`, on every host and pack set, because this parser
+        // returned NoMatch for anything that did not recurse (#451).
+        //
+        // `-WhatIf` still allows: it reports the removal without performing it,
+        // the same carve-out the recursive arm makes just below.
+        if !what_if
+            && let Some(target) = literal_targets
+                .iter()
+                .find(|target| powershell_target_is_protected(target))
+        {
+            return RmParseDecision::Deny(RmParseMatch {
+                pattern_name: RM_PROTECTED_FILE_NAME,
+                reason: RM_PROTECTED_FILE_REASON,
+                severity: Severity::Critical,
+                span: command
+                    .find(target.as_str())
+                    .map(|at| at..at + target.len()),
+            });
+        }
+        return RmParseDecision::NoMatch;
+    }
+    if !has_target {
         return RmParseDecision::NoMatch;
     }
     if what_if {
@@ -9507,6 +9578,92 @@ mod classifier_guidance_tests {
             r"find /tmp/x\ /etc -exec rm {} \;",
         ] {
             assert!(pack.check(command).is_some(), "{command} must stay denied");
+        }
+    }
+}
+
+#[cfg(test)]
+mod powershell_protected_file_tests {
+    use super::*;
+
+    /// A non-recursive PowerShell delete of a protected file (#451).
+    ///
+    /// `rm ~/.ssh/id_rsa` denies under `rm-protected-file`; the PowerShell
+    /// spelling of the very same deletion was allowed on every host and every
+    /// pack set, because this parser returned `NoMatch` for anything that did
+    /// not recurse. Measured before the fix: all six protected targets below,
+    /// and all five delete verbs, allowed with and without `-Force`.
+    #[test]
+    fn powershell_delete_of_a_protected_file_denies_issue_451() {
+        for target in [
+            "$HOME\\.ssh\\id_rsa",
+            "$HOME/.ssh/id_rsa",
+            "$HOME\\.ssh\\authorized_keys",
+            "$HOME\\.aws\\credentials",
+            "$HOME\\.bashrc",
+            "/etc/shadow",
+            "~/.ssh/id_rsa",
+            // Windows spells home `%USERPROFILE%`, and dcg's own path
+            // resolution treats it as the home directory (bd-b2b1).
+            "$env:USERPROFILE\\.ssh\\id_rsa",
+            "$env:userprofile\\.ssh\\id_rsa",
+        ] {
+            for verb in ["Remove-Item", "ri", "del", "erase", "rm"] {
+                for command in [
+                    format!("{verb} {target}"),
+                    format!("{verb} -Force {target}"),
+                ] {
+                    match parse_rm_command_segment_in_dialect(
+                        &command,
+                        false,
+                        ShellDialect::PowerShell,
+                    ) {
+                        RmParseDecision::Deny(hit) => {
+                            assert_eq!(
+                                hit.pattern_name, RM_PROTECTED_FILE_NAME,
+                                "{command} must deny under the same rule the POSIX twin uses"
+                            );
+                            assert_eq!(hit.severity, Severity::Critical);
+                        }
+                        other => unreachable!(
+                            "PowerShell delete of a protected file must deny: {command}: {other:?}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The rule turns on the TARGET, not on the verb (#451).
+    ///
+    /// Without these the test above would pass on a blanket deny of
+    /// `Remove-Item`, which is the failure mode a new rule arm invites.
+    #[test]
+    fn powershell_protected_delete_still_turns_on_the_target_issue_451() {
+        for command in [
+            // Ordinary files are nobody's business.
+            "Remove-Item ./notes.txt",
+            "Remove-Item -Force ./build/app.exe",
+            "Remove-Item C:\\temp\\scratch.log",
+            "Remove-Item $HOME\\Documents\\report.docx",
+            // `*.pub` is the public half of a key pair: protected directory,
+            // exempt file. The shared classifier owns that carve-out.
+            "Remove-Item $HOME\\.ssh\\id_rsa.pub",
+            // `-WhatIf` reports the removal without performing it, the same
+            // carve-out the recursive arm makes.
+            "Remove-Item $HOME\\.ssh\\id_rsa -WhatIf",
+            "Remove-Item -WhatIf $HOME\\.ssh\\id_rsa",
+            // A non-delete cmdlet that merely names the path.
+            "Get-Content $HOME\\.ssh\\id_rsa",
+            "Get-ChildItem $HOME\\.ssh",
+        ] {
+            assert!(
+                matches!(
+                    parse_rm_command_segment_in_dialect(command, false, ShellDialect::PowerShell),
+                    RmParseDecision::NoMatch | RmParseDecision::Allow
+                ),
+                "{command} must stay allowed"
+            );
         }
     }
 }
