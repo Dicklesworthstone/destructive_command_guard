@@ -5427,7 +5427,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // the lost commits become truly unrecoverable.
         destructive_pattern!(
             "reflog-expire-now",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reflog\s+expire\b[^|;&\r\n]*--expire(?:-unreachable)?=(?:now|all|0)\b",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reflog\s+expire\b[^|;&\r\n]*--expire(?:-(?:u(?:n(?:r(?:e(?:a(?:c(?:h(?:a(?:b(?:le?)?)?)?)?)?)?)?)?)?)?)?=(?:now|all|0)\b",
             "git reflog expire --expire=now destroys the reflog, removing the ability to recover lost commits.",
             High,
             "The reflog records where HEAD and each branch pointed, and is what lets you \
@@ -5447,7 +5447,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // cluster counts (`-qf`); `--ours`/`--theirs`/`--conflict=` do not.
         destructive_pattern!(
             "checkout-force",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\b[^;&|\n<>()]*?\s(?:--force|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\b[^;&|\n<>()]*?\s(?:--f(?:o(?:r(?:ce?)?)?)?|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
             "git checkout -f/--force discards all uncommitted changes to tracked files. Use 'git stash' first.",
             High,
             "git checkout --force switches branches (or rewrites paths) even when that \
@@ -5463,7 +5463,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // spelling of the same force-switch discard.
         destructive_pattern!(
             "switch-discard",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)switch\b[^;&|\n<>()]*?\s(?:--force|--discard-changes|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)switch\b[^;&|\n<>()]*?\s(?:--force|--di(?:s(?:c(?:a(?:r(?:d(?:-(?:c(?:h(?:a(?:n(?:g(?:es?)?)?)?)?)?)?)?)?)?)?)?)?|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
             "git switch --discard-changes/-f discards all uncommitted changes to tracked files. Use 'git stash' first.",
             High,
             "git switch --discard-changes (alias -f/--force) switches branches and throws \
@@ -5481,7 +5481,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `--cached` (index only, worktree kept) and dry runs stay allowed.
         destructive_pattern!(
             "rm-force",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)rm\b(?![^;&|\n]*\s(?:--cached|--dry-run|-[A-Za-z]*n[A-Za-z]*)(?:\s|$))[^;&|\n<>()]*?\s(?:--force|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)rm\b(?![^;&|\n]*\s(?:--cached|--dry-run|-[A-Za-z]*n[A-Za-z]*)(?:\s|$))[^;&|\n<>()]*?\s(?:--f(?:o(?:r(?:ce?)?)?)?|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
             "git rm -f deletes files even when they have uncommitted modifications. Commit or stash them first.",
             High,
             "git rm --force removes the named files from the index AND the working tree, \
@@ -5625,9 +5625,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             }
         ),
         // reset --hard destroys uncommitted work (CRITICAL - extremely common mistake)
+        //
+        // `--hard` may follow other arguments (`git reset HEAD~1 --hard`,
+        // `git reset -q --hard`), and git accepts any unambiguous prefix of a
+        // long option, down to `--h` here. Both were allowed while only
+        // `reset --hard` in first position denied.
         destructive_pattern!(
             "reset-hard",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\s+--hard",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\b[^;&|\n<>()]*?\s--h(?:a(?:rd?)?)?\b",
             "git reset --hard destroys uncommitted changes. Use 'git stash' first.",
             Critical,
             "git reset --hard discards ALL uncommitted changes in your working directory \
@@ -5665,7 +5670,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "reset-merge",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\s+--merge",
+            // Anywhere in the reset, and down to `--me` (`--m` is ambiguous
+            // with `--mixed`), for the same reasons as `reset-hard`.
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\b[^;&|\n<>()]*?\s--me(?:r(?:ge?)?)?\b",
             "git reset --merge can lose uncommitted changes.",
             High,
             "git reset --merge resets the index and updates files in the working tree that \
@@ -5693,7 +5700,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // clean -f deletes untracked files (CRITICAL - permanently removes files)
         destructive_pattern!(
             "clean-force",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)clean(?:\s+(?!--(?:\s|$))[^\s;&|<>()]+)*\s+(?:-[a-z]*f|--force\b)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)clean(?:\s+(?!--(?:\s|$))[^\s;&|<>()]+)*\s+(?:-[a-z]*f|--f(?:o(?:r(?:ce?)?)?)?\b)",
             "git clean -f/--force removes untracked files permanently. Review with 'git clean -n' first.",
             Critical,
             "git clean -f permanently deletes untracked files from your working directory. \
@@ -7264,6 +7271,53 @@ git x",
     // =========================================================================
     // Critical Severity Pattern Tests
     // =========================================================================
+
+    /// An option may follow other arguments, and git accepts any unambiguous
+    /// prefix of a long option. Every row below was allowed while the full,
+    /// first-position spelling denied. The prefix floors are the shortest
+    /// forms git 2.50 accepts: `--m`, `--d` and switch's `--f`..`--forc` are
+    /// ambiguous (`--mixed`, `--detach`, `--force-create`) and git rejects them.
+    #[test]
+    fn abbreviated_and_trailing_long_options_still_deny() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("git reset HEAD~1 --hard", "reset-hard"),
+            ("git reset -q --hard", "reset-hard"),
+            ("git reset origin/main --hard", "reset-hard"),
+            ("git reset --har", "reset-hard"),
+            ("git reset --ha HEAD~1", "reset-hard"),
+            ("git reset --h", "reset-hard"),
+            ("git reset HEAD --merge", "reset-merge"),
+            ("git reset --me", "reset-merge"),
+            ("git clean --forc -d", "clean-force"),
+            ("git clean --f", "clean-force"),
+            ("git checkout --forc", "checkout-force"),
+            ("git checkout --f main", "checkout-force"),
+            ("git switch --discard main", "switch-discard"),
+            ("git switch --di main", "switch-discard"),
+            ("git rm --forc file.txt", "rm-force"),
+            ("git rm --f file.txt", "rm-force"),
+            (
+                "git reflog expire --expire-unr=now --all",
+                "reflog-expire-now",
+            ),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+        for command in [
+            "git reset --soft HEAD~1",
+            "git reset --mixed HEAD~1",
+            "git reset HEAD file.txt",
+            "git reset --keep HEAD~1",
+            "git clean -n",
+            "git clean --dry-run",
+            "git checkout main",
+            "git switch --detach main",
+            "git switch -c feature",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
 
     #[test]
     fn test_reset_hard_critical() {

@@ -1191,7 +1191,8 @@ mod tests {
             .expect("core.git reset-hard regex should be present");
 
         assert!(regex.contains("reset"));
-        assert!(regex.contains("--hard"));
+        // The rule spells every prefix git accepts (`--h`, `--ha`, `--har`).
+        assert!(regex.contains("--h(?:a(?:rd?)?)?\\b"));
     }
 
     #[test]
