@@ -135,3 +135,13 @@ expected = "allow"
 description = "unbalanced quote in an rm flag is a syntax error, not a bypass"
 command = "rm -r'f /"
 expected = "allow"
+
+[[case]]
+description = "a cd into a project does not make its ordinary files protected (#480)"
+command = "cd ~/project && rm notes.txt"
+expected = "allow"
+
+[[case]]
+description = "a cd inside a subshell that already exited moves nothing (#480)"
+command = "( cd ~/.ssh ); rm id_rsa"
+expected = "allow"

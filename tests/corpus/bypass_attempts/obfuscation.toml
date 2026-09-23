@@ -181,3 +181,18 @@ expected = "deny"
 description = "trash rescue does not launder a sensitive source"
 command = "mv /etc ~/.Trash/"
 expected = "deny"
+
+[[case]]
+description = "a literal cd makes a relative rm operand a protected file (#480)"
+command = "cd ~/.ssh && rm id_rsa"
+expected = "deny"
+
+[[case]]
+description = "a literal cd makes a relative redirect target a credential file (#480)"
+command = "cd /home/user/.ssh; echo k >>authorized_keys"
+expected = "deny"
+
+[[case]]
+description = "a glued relative redirect is not echo data (#480)"
+command = "echo x >.git/config"
+expected = "deny"

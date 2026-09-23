@@ -1534,6 +1534,14 @@ pub(crate) fn filesystem_semantic_scan_required(command: &str, dialect: ShellDia
         // credential classifier could not run on the idiomatic spellings.
         || (dialect != ShellDialect::Posix
             && super::credential_files::names_windows_shell_writer(command))
+        // `cd ~/.ssh && echo k > authorized_keys` (#480): the redirect target
+        // is relative, so no keyword spells the protected path; the `cd` does.
+        // The evaluator anchors the target to that directory.
+        || (matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+            && command.contains('>')
+            && (contains_ascii_command_word(command, "cd")
+                || contains_ascii_command_word(command, "pushd"))
+            && super::credential_files::may_name_protected_path(command))
         // Fork-bomb reachability (issue #302): the `fork-bomb` rule matches a
         // shell function-definition shape (`name() { … }`). The paren pair is
         // pure syntax that keyword-based quick-reject cannot see, and POSIX
@@ -7306,6 +7314,18 @@ mod tests {
         ] {
             assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
         }
+        // A relative target is a redirection too; the split used to require
+        // a rooted or quoted one, so these were masked as echo data.
+        assert_blocks_with_pattern(
+            &pack,
+            "echo x >.git/config",
+            "redirect-truncate-git-internals-relative",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "printf x >.git/HEAD",
+            "redirect-truncate-git-internals-relative",
+        );
     }
 
     #[test]
@@ -8821,6 +8841,38 @@ mod tests {
             assert!(
                 !filesystem_semantic_scan_required(command, dialect),
                 "inert data or ordinary POSIX syntax must not require a dialect fallback scan: {command}"
+            );
+        }
+    }
+
+    /// A relative redirect after a `cd` spells no pack keyword, so without the
+    /// override the quick-reject drops it before the evaluator can anchor the
+    /// target to the directory (#480).
+    #[test]
+    fn a_cd_then_relative_redirect_forces_the_scan_issue_480() {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for command in [
+                "cd ~/.ssh && echo k > authorized_keys",
+                "cd /etc; printf x >sudoers",
+                "pushd $HOME/.aws && echo x >> credentials",
+            ] {
+                assert!(
+                    filesystem_semantic_scan_required(command, dialect),
+                    "{command:?} ({dialect:?}) must reach core.filesystem"
+                );
+            }
+        }
+        // No `cd`, no redirect, or a directory that cannot be protected.
+        // (Unknown also reads each line as PowerShell, whose own triggers
+        // are not this rule's to pin.)
+        for command in [
+            "echo k > out.log",
+            "cd ~/.ssh && ls",
+            "cd src && echo x > out.log",
+        ] {
+            assert!(
+                !filesystem_semantic_scan_required(command, ShellDialect::Posix),
+                "{command:?} must stay quick-rejectable"
             );
         }
     }

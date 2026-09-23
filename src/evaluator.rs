@@ -22754,6 +22754,416 @@ fn rm_segment_resolves_to_denied_literals(
     }
 }
 
+/// The rm decision for a segment once a literal `cd` before it has been
+/// applied to its relative operands, when that is a DENY the segment's own
+/// text did not produce (#480).
+///
+/// `cd ~/.ssh && rm id_rsa` deleted the key while `rm ~/.ssh/id_rsa` denied:
+/// the operand never appears in rooted form, and nothing resolved it against
+/// the `cd`. Deny-only, like the #421 variable resolution beside it, and gated
+/// on an anchored word naming a protected file — so `cd ~/project && rm -rf
+/// target` is never re-read as a rooted delete under `/home`.
+fn rm_segment_denied_in_proven_directory(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    segment: &str,
+    automated_stdin: bool,
+    dialect: ShellDialect,
+) -> Option<crate::packs::core::filesystem::RmParseDecision> {
+    let anchored = cwd_anchored_segment(source, segment_ranges, segment_start, segment, dialect)?;
+    match crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
+        &anchored,
+        automated_stdin,
+        dialect,
+    ) {
+        crate::packs::core::filesystem::RmParseDecision::Deny(mut hit) => {
+            // The hit's span indexes the anchored text; point at the segment.
+            hit.span = Some(0..segment.len());
+            Some(crate::packs::core::filesystem::RmParseDecision::Deny(hit))
+        }
+        _ => None,
+    }
+}
+
+/// The rm decision for a segment once its literal `$(echo …)`/`$(printf …)`
+/// substitutions are rendered, when that is a DENY the segment's own text did
+/// not produce (#480).
+///
+/// `rm $(echo /home/u/.ssh/id_rsa)` names the key as literally as
+/// `rm /home/u/.ssh/id_rsa` does; the substitution only hid it from the
+/// operand scan. The rendering is the bounded producer model core.git already
+/// uses, and any substitution it cannot prove refuses the whole view, so a
+/// genuinely dynamic operand keeps the posture `rm $UNKNOWN` has.
+fn rm_segment_denied_after_literal_substitution(
+    segment: &str,
+    automated_stdin: bool,
+    dialect: ShellDialect,
+) -> Option<crate::packs::core::filesystem::RmParseDecision> {
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        || !(segment.contains("$(") || segment.contains('`'))
+    {
+        return None;
+    }
+    let view = crate::packs::core::git::posix_substitution_view(segment).ok()?;
+    if view.has_dynamic || view.command == segment {
+        return None;
+    }
+    match crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
+        &view.command,
+        automated_stdin,
+        dialect,
+    ) {
+        crate::packs::core::filesystem::RmParseDecision::Deny(mut hit) => {
+            hit.span = Some(0..segment.len());
+            Some(crate::packs::core::filesystem::RmParseDecision::Deny(hit))
+        }
+        _ => None,
+    }
+}
+
+/// `segment` with its relative operands anchored to the directory a literal
+/// `cd` before it provably moved the shell into, or `None` when there is no
+/// such directory or no anchored word names a protected file (#480).
+fn cwd_anchored_segment(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    segment: &str,
+    dialect: ShellDialect,
+) -> Option<String> {
+    // The walk is linear in the segments before this one, per segment; past
+    // this many a pathological payload would make it quadratic, and the
+    // feature only ever adds a denial, so it simply stands aside.
+    const MAX_SEGMENTS: usize = 256;
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        || segment_ranges.len() > MAX_SEGMENTS
+    {
+        return None;
+    }
+    let before = source.get(..segment_start)?;
+    if !before.contains("cd") && !before.contains("pushd") {
+        return None;
+    }
+    let directory = proven_cd_directory(source, segment_ranges, segment_start)?;
+    anchor_relative_words(segment, &directory)
+}
+
+/// The directory the `cd`/`pushd` segments before `segment_start` leave the
+/// shell in, spelled as a shell word (`/etc`, `~/.ssh`, `$HOME/.aws`).
+///
+/// Only a literal target counts. A relative one joins the directory already
+/// known; `cd -`, `popd`, `eval`, `source`, a dynamic target, or a relative
+/// target with nothing to join make the directory unknown again. A `cd` in a
+/// pipeline stage, a backgrounded one, or one inside a `( … )` that closes
+/// before the segment never reaches it and is skipped. This only ever feeds a
+/// deny, so the remaining imprecision (a `cd` that fails, `CDPATH`) can cost an
+/// over-block but never an allow.
+fn proven_cd_directory(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+) -> Option<String> {
+    let mut directory: Option<String> = None;
+    for &(start, end) in segment_ranges {
+        if end > segment_start || segment_range_is_nested(segment_ranges, start, end) {
+            continue;
+        }
+        let Some(text) = source.get(start..end) else {
+            continue;
+        };
+        let trimmed = text
+            .trim_start_matches(|c: char| c.is_ascii_whitespace() || matches!(c, '(' | '{'))
+            .trim_end_matches(|c: char| c.is_ascii_whitespace() || matches!(c, ')' | '}' | ';'));
+        let mut words = trimmed
+            .split_ascii_whitespace()
+            .skip_while(|word| matches!(*word, "builtin" | "command"));
+        let verb = words.next().unwrap_or("");
+        match verb {
+            "cd" | "pushd" => {}
+            "popd" | "eval" | "source" | "." => {
+                directory = None;
+                continue;
+            }
+            _ => continue,
+        }
+        let verb_start = start
+            + (text.len()
+                - text
+                    .trim_start_matches(|c: char| c.is_ascii_whitespace() || matches!(c, '(' | '{'))
+                    .len());
+        if !directory_change_reaches(source, start, end, verb_start, segment_start) {
+            continue;
+        }
+        let mut operands = Vec::new();
+        let mut unknown = false;
+        for word in words {
+            match word {
+                "-P" | "-L" | "-e" | "-@" | "--" => {}
+                // `pushd -n` does not change directory, and any other option
+                // is one this walk does not model.
+                option if option.starts_with('-') && option.len() > 1 => unknown = true,
+                operand => operands.push(operand),
+            }
+        }
+        let target = match operands.as_slice() {
+            _ if unknown => None,
+            [] if verb == "cd" => Some("~".to_owned()),
+            [target] => literal_cd_target(target),
+            _ => None,
+        };
+        directory = match target {
+            Some(target) if target.starts_with(['/', '~', '$']) => Some(target),
+            Some(target) => {
+                directory.map(|known| format!("{}/{target}", known.trim_end_matches('/')))
+            }
+            None => None,
+        };
+    }
+    directory
+}
+
+/// Whether a `cd` segment changes the directory of the shell that later runs
+/// the segment at `segment_start`: not a pipeline stage, not backgrounded, and
+/// not inside a group that closes in between.
+fn directory_change_reaches(
+    source: &str,
+    start: usize,
+    end: usize,
+    verb_start: usize,
+    segment_start: usize,
+) -> bool {
+    let bytes = source.as_bytes();
+    let mut after = end;
+    while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+        after += 1;
+    }
+    if let Some(&next) = bytes.get(after)
+        && matches!(next, b'|' | b'&')
+        && bytes.get(after + 1) != Some(&next)
+    {
+        return false;
+    }
+    let mut before = start;
+    while before > 0 && bytes[before - 1].is_ascii_whitespace() {
+        before -= 1;
+    }
+    if before > 0 && bytes[before - 1] == b'|' && (before < 2 || bytes[before - 2] != b'|') {
+        return false;
+    }
+    // A `)` that closes a group opened before the `cd` ends the subshell the
+    // `cd` ran in: `( cd ~/.ssh ); rm id_rsa` removes `./id_rsa`.
+    let Some(between) = source.get(verb_start..segment_start) else {
+        return false;
+    };
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut index = 0;
+    let between = between.as_bytes();
+    while index < between.len() {
+        let byte = between[index];
+        match quote {
+            Some(open) if byte == b'\\' && open == b'"' => index += 1,
+            Some(open) if byte == open => quote = None,
+            Some(_) => {}
+            None => match byte {
+                b'\\' => index += 1,
+                b'\'' | b'"' => quote = Some(byte),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return false;
+                    }
+                }
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    true
+}
+
+/// A `cd` operand whose directory is fixed by the text: a plain path, with
+/// only `~`/`~/` (unquoted) or `$HOME`/`${HOME}` (unquoted or double-quoted)
+/// as the expanding prefix. Returned as it should be spliced, quotes removed.
+fn literal_cd_target(word: &str) -> Option<String> {
+    let (body, quote) = match word.as_bytes().first() {
+        Some(&open @ (b'\'' | b'"')) => (
+            word.strip_prefix(open as char)?
+                .strip_suffix(open as char)?,
+            Some(open),
+        ),
+        _ => (word, None),
+    };
+    if body.is_empty() || body == "-" {
+        return None;
+    }
+    let rest = if quote != Some(b'\'')
+        && let Some(rest) = body
+            .strip_prefix("${HOME}")
+            .or_else(|| body.strip_prefix("$HOME"))
+    {
+        if !rest.is_empty() && !rest.starts_with('/') {
+            return None;
+        }
+        rest
+    } else if quote.is_none() && (body == "~" || body.starts_with("~/")) {
+        &body[1..]
+    } else {
+        body
+    };
+    rest.bytes()
+        .all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+' | b'@' | b':' | b',')
+        })
+        .then(|| body.to_owned())
+}
+
+/// Wrappers that run the next word as the command.
+const ANCHOR_COMMAND_WRAPPERS: &[&str] = &[
+    "sudo", "doas", "env", "command", "builtin", "exec", "nice", "nohup", "time", "stdbuf",
+    "ionice",
+];
+
+/// `segment` with every relative operand and output-redirect target joined
+/// onto `directory`, when at least one joined word names a protected file.
+fn anchor_relative_words(segment: &str, directory: &str) -> Option<String> {
+    let base = directory.trim_end_matches('/');
+    let mut out = String::with_capacity(segment.len() + 64);
+    let mut cursor = 0;
+    let mut names_protected = false;
+    let mut command_seen = false;
+    let mut options_ended = false;
+    let mut pending_output = false;
+    let mut pending_input = false;
+    let mut pending_wrapper_value = false;
+    for (start, end) in unquoted_word_ranges(segment) {
+        let word = &segment[start..end];
+        let mut anchor_at = None;
+        if pending_output {
+            pending_output = false;
+            anchor_at = Some(0);
+        } else if pending_input {
+            pending_input = false;
+        } else if pending_wrapper_value {
+            // `sudo -u root rm …`: `root` is the option's value, not the command.
+            pending_wrapper_value = false;
+        } else if let Some(operator) = redirect_operator_len(word) {
+            let op = &word[..operator];
+            // `2>&1`, `>&2`: a descriptor, not a file.
+            if !op.ends_with('&') && op.contains('>') {
+                if operator == word.len() {
+                    pending_output = true;
+                } else {
+                    anchor_at = Some(operator);
+                }
+            } else if operator == word.len() {
+                pending_input = true;
+            }
+        } else if !command_seen {
+            let prefix = word_is_redirect_or_assignment_prefix(word)
+                || matches!(word, "(" | "{" | "!")
+                || ANCHOR_COMMAND_WRAPPERS.contains(&word)
+                || word.starts_with('-');
+            pending_wrapper_value = matches!(word, "-u" | "-g" | "-h" | "-p" | "-C" | "-D" | "-n");
+            command_seen = !prefix;
+        } else if !options_ended && word.starts_with('-') {
+            options_ended = word == "--";
+        } else if !word.contains('=') {
+            anchor_at = Some(0);
+        }
+        let Some(offset) = anchor_at else {
+            continue;
+        };
+        let target = &word[offset..];
+        let first = target
+            .trim_start_matches(['"', '\''])
+            .as_bytes()
+            .first()
+            .copied();
+        // Rooted or dynamic words need no anchor; a closing `)`/`}` is syntax.
+        if first.is_none_or(|byte| {
+            matches!(
+                byte,
+                b'/' | b'~' | b'$' | b'`' | b'(' | b')' | b'{' | b'}' | b'-' | b';' | b'&' | b'|'
+            )
+        }) {
+            continue;
+        }
+        let anchored = format!("{base}/{target}");
+        names_protected |= crate::packs::core::credential_files::names_protected_file(&anchored);
+        out.push_str(&segment[cursor..start + offset]);
+        // `>>authorized_keys` becomes `>> ~/.ssh/authorized_keys`: the same
+        // redirection, with the tilde at the start of a word where every
+        // reader expands it.
+        if offset > 0 {
+            out.push(' ');
+        }
+        out.push_str(&anchored);
+        cursor = end;
+    }
+    out.push_str(&segment[cursor..]);
+    names_protected.then_some(out)
+}
+
+/// Length of the redirection operator a word starts with (`>`, `2>>`, `&>`,
+/// `<`, `>|`, `2>&`), if it starts with one.
+fn redirect_operator_len(word: &str) -> Option<usize> {
+    let bytes = word.as_bytes();
+    let mut index = bytes
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if bytes.get(index) == Some(&b'&') && bytes.get(index + 1) == Some(&b'>') {
+        index += 1;
+    }
+    if !matches!(bytes.get(index), Some(b'>' | b'<')) {
+        return None;
+    }
+    index += 1;
+    while matches!(bytes.get(index), Some(b'>' | b'<' | b'|' | b'&')) {
+        index += 1;
+    }
+    Some(index)
+}
+
+/// Byte ranges of the words of a simple command, split at unquoted whitespace.
+fn unquoted_word_ranges(segment: &str) -> Vec<(usize, usize)> {
+    let bytes = segment.as_bytes();
+    let mut words = Vec::new();
+    let mut start = None;
+    let mut quote: Option<u8> = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(open) if byte == b'\\' && open == b'"' => index += 1,
+            Some(open) if byte == open => quote = None,
+            Some(_) => {}
+            None if byte.is_ascii_whitespace() => {
+                if let Some(word_start) = start.take() {
+                    words.push((word_start, index));
+                }
+            }
+            None => {
+                start.get_or_insert(index);
+                match byte {
+                    b'\\' => index += 1,
+                    b'\'' | b'"' => quote = Some(byte),
+                    _ => {}
+                }
+            }
+        }
+        index += 1;
+    }
+    if let Some(word_start) = start {
+        words.push((word_start, bytes.len()));
+    }
+    words
+}
+
 fn filesystem_non_pre_rm_non_redirect_pattern(name: Option<&str>) -> bool {
     filesystem_non_pre_rm_pattern(name) && !filesystem_redirect_pattern(name)
 }
@@ -23547,11 +23957,40 @@ fn evaluate_core_filesystem_pack(
                 .map(|hit| (hit, 0, Some(0)))
             }
         } else {
+            let masked =
+                mask_nested_segment_ranges(dialect_segment, segment_start, &nested_segment_ranges);
             crate::packs::core::credential_files::classify_credential_file_write(
-                mask_nested_segment_ranges(dialect_segment, segment_start, &nested_segment_ranges)
-                    .as_ref(),
+                masked.as_ref(),
                 shell_dialect,
             )
+            .or_else(|| {
+                // `cd ~/.ssh && echo k > authorized_keys`: the relative target
+                // names the key file once the literal `cd` is applied (#480).
+                let source =
+                    if shell_dialect != ShellDialect::Unknown && normalized_offset == Some(0) {
+                        original_command
+                    } else {
+                        command_for_packs
+                    };
+                let anchored = cwd_anchored_segment(
+                    source,
+                    segment_ranges,
+                    segment_start,
+                    masked.as_ref(),
+                    shell_dialect,
+                )?;
+                crate::packs::core::credential_files::classify_credential_file_write(
+                    &anchored,
+                    shell_dialect,
+                )
+                .map(|hit| {
+                    crate::packs::core::credential_files::CredentialFileWrite {
+                        // The span indexes the anchored text; point at the segment.
+                        span: 0..masked.len(),
+                        ..hit
+                    }
+                })
+            })
             .map(|hit| (hit, segment_start, normalized_offset))
         };
         // Embedded interpreter code is delivered out-of-band, so no single
@@ -23810,6 +24249,30 @@ fn evaluate_core_filesystem_pack(
             redirect_source,
             segment_ranges,
             segment_start,
+            dialect_segment,
+            rm_automated_stdin,
+            shell_dialect,
+        ) {
+            rm_decision = denied;
+        } else if matches!(
+            &rm_decision,
+            crate::packs::core::filesystem::RmParseDecision::NoMatch
+        ) && let Some(denied) = rm_segment_denied_in_proven_directory(
+            // A literal `cd` before this segment decides what its relative
+            // operands name (#480). Deny-only, and only reached when the
+            // segment's own text reached no rm verdict.
+            redirect_source,
+            segment_ranges,
+            segment_start,
+            dialect_segment,
+            rm_automated_stdin,
+            shell_dialect,
+        ) {
+            rm_decision = denied;
+        } else if matches!(
+            &rm_decision,
+            crate::packs::core::filesystem::RmParseDecision::NoMatch
+        ) && let Some(denied) = rm_segment_denied_after_literal_substitution(
             dialect_segment,
             rm_automated_stdin,
             shell_dialect,
@@ -27014,6 +27477,100 @@ mod tests {
                  unprovable binding must not resolve to either one"
             );
         }
+    }
+
+    /// A literal `cd` decides what a later relative operand names (#480).
+    ///
+    /// `cd ~/.ssh && rm id_rsa` deleted the key while `rm ~/.ssh/id_rsa`
+    /// denied. The protected-file rules now see the operand anchored to the
+    /// directory the `cd` provably left the shell in.
+    #[test]
+    fn a_literal_cd_anchors_relative_operands_issue_480() {
+        for command in [
+            "cd /home/user/.ssh && rm id_rsa",
+            "cd /home/user/.ssh; rm id_rsa",
+            "( cd /home/user/.ssh && rm id_rsa )",
+            "cd /etc && rm shadow",
+            "cd ~/.ssh && rm -- id_rsa",
+            "cd ~ && cd .ssh && rm id_rsa",
+            "cd \"$HOME/.aws\" && rm credentials",
+            "cd ~/.ssh && sudo rm id_rsa",
+            "cd ~/.ssh && sudo -u root rm id_rsa",
+            "cd /home/user/.ssh && echo x > authorized_keys",
+            "cd ~/.ssh && echo x >>authorized_keys",
+            "cd ~/.ssh && cat /tmp/k > authorized_keys",
+            // The same literal path, hidden in a provably static substitution.
+            "rm $(echo /home/user/.ssh/id_rsa)",
+            "rm `echo /home/user/.ssh/id_rsa`",
+            "rm $(printf /home/user/.ssh/id_rsa)",
+        ] {
+            // POSIX is the Bash hook's path; a relative redirect spells no
+            // pack keyword, so this also proves the quick-reject lets it in.
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                assert!(
+                    evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect)
+                        .is_denied(),
+                    "{command:?} ({dialect:?}): the cd makes the relative operand a protected file"
+                );
+            }
+        }
+    }
+
+    /// Where a `cd` does NOT provably decide the directory, or the anchored
+    /// operand is not protected, nothing changes (#480's bounds).
+    #[test]
+    fn a_cd_that_proves_nothing_changes_nothing_issue_480() {
+        for command in [
+            // The subshell has exited, the pipeline stage and the background
+            // job are subshells, and the later directory change wins.
+            "( cd /home/user/.ssh ); rm id_rsa",
+            "cd /home/user/.ssh | rm id_rsa",
+            "cd /home/user/.ssh & rm id_rsa",
+            "cd /home/user/.ssh && cd /tmp && rm id_rsa",
+            "cd /home/user/.ssh && popd && rm id_rsa",
+            "pushd -n /home/user/.ssh && rm id_rsa",
+            // Not provable from the text.
+            "cd - && rm id_rsa",
+            "cd \"$DIR\" && rm id_rsa",
+            "cd .ssh && rm id_rsa",
+            // Anchored, but not a protected file.
+            "cd /etc && rm ./hosts",
+            "cd ~/project && rm notes.txt",
+            "cd ~/project && echo x > out.log",
+            "cd ~/.ssh && rm id_rsa.pub",
+            "cd ~/.ssh && ls -la",
+            "cd ~/.ssh && echo hi 2>&1 > /tmp/x",
+            // The sanitizer now exposes every glued redirect; a quoted or
+            // escaped arrow is still echo's data.
+            "echo \"a>.git/config\"",
+            "echo a\\>.git/config",
+            // A static substitution naming an ordinary file, and one that is
+            // not static at all (the `rm $UNKNOWN` posture).
+            "rm $(echo /home/user/notes.txt)",
+            "rm $(cat list.txt)",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &["core.filesystem"]).is_allowed(),
+                "{command:?}: no proven directory makes this a protected file"
+            );
+        }
+
+        assert_eq!(
+            anchor_relative_words("echo x > authorized_keys", "~/.ssh").as_deref(),
+            Some("echo ~/.ssh/x > ~/.ssh/authorized_keys")
+        );
+        assert_eq!(
+            anchor_relative_words("rm -f -- id_rsa 2>&1", "/home/user/.ssh").as_deref(),
+            Some("rm -f -- /home/user/.ssh/id_rsa 2>&1")
+        );
+        assert_eq!(anchor_relative_words("rm notes.txt", "~/project"), None);
+        assert_eq!(literal_cd_target("'~/.ssh'"), None);
+        assert_eq!(literal_cd_target("~user/.ssh"), None);
+        assert_eq!(literal_cd_target("$HOMEX"), None);
+        assert_eq!(
+            literal_cd_target("\"${HOME}/.ssh\"").as_deref(),
+            Some("${HOME}/.ssh")
+        );
     }
 
     /// The hazard scan dispatches on this exact word, so a printf segment has

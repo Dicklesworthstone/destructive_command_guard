@@ -1347,10 +1347,9 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
             // `/etc/passwd` arrives at sanitize as a single token. Mask
             // only the prefix BEFORE the operator (echo's data part);
             // leave the operator and target visible so the destructive
-            // regex can match. The split heuristic requires the byte
-            // after `>` to be a path-start (`/`, `~`, `$`) or a quote
-            // (`"`, `'`), so plain-data arrows like `echo "user>admin"`
-            // remain fully masked (the `>` is followed by `a`, no split).
+            // regex can match. Only an unquoted, unescaped `>` splits,
+            // which is exactly when bash reads one as a redirection, so
+            // quoted arrows like `echo "user>admin"` remain fully masked.
             if is_shell_redirect_operator(token_text) {
                 next_token_is_redirect_target = true;
                 continue;
@@ -2247,14 +2246,16 @@ enum SanitizeTokenKind {
     Comment,
 }
 
-/// Returns the byte position of an unquoted glued shell-redirect operator
-/// inside `token` whose immediate next byte looks like a path-target start.
-/// Matches `>` followed by `/`, `~`, `$`, `"`, or `'` — exactly the set
-/// of characters that begin the redirect-truncate-root-home regex's
-/// sensitive-path arms (incl. the optional ANSI-C `$'...'` and locale
-/// `$"..."` quoting forms). Returns `None` when no glued redirect is
-/// found, so plain-data arrows like `"user>admin"` and redirect-looking text
-/// inside a quoted argument stay fully masked.
+/// Returns the byte position of the first unquoted, unescaped `>` inside
+/// `token`: bash ends the word there and opens a redirection, whatever
+/// follows. Returns `None` when there is none, so plain-data arrows inside
+/// quotes (`"user>admin"`) and escaped ones (`a\>b`) stay fully masked.
+///
+/// An earlier version split only when the target began with `/`, `~`, `$`
+/// or a quote, which kept every RELATIVE target masked: `echo x >.git/config`
+/// was allowed while `echo x > .git/config` denied under
+/// `redirect-truncate-git-internals-relative`, and a `cd` into a protected
+/// directory followed by `echo k >authorized_keys` could not be judged (#480).
 ///
 /// Used by `sanitize_for_pattern_matching` to handle `echo`/`printf`
 /// args of the form `data>/etc/passwd` where the dcg tokenizer keeps
@@ -2275,12 +2276,9 @@ fn glued_redirect_split_position(token: &str) -> Option<usize> {
         match bytes[i] {
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
-            b'>' if !in_single
-                && !in_double
-                && matches!(bytes[i + 1], b'/' | b'~' | b'$' | b'"' | b'\'') =>
-            {
-                return Some(i);
-            }
+            // `\>` is a literal `>`; inside double quotes `\` still escapes.
+            b'\\' if !in_single => i += 1,
+            b'>' if !in_single && !in_double => return Some(i),
             _ => {}
         }
         i += 1;
