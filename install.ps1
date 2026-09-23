@@ -1136,7 +1136,10 @@ function Configure-CursorHook {
   if ($null -eq $hooks) { $hooks = [pscustomobject][ordered]@{} }
   if (-not (Test-JsonObject $hooks)) { return "invalid" }
 
-  $entries = Get-JsonArray (Get-ObjectPropertyValue $hooks "beforeShellExecution")
+  # @(): PowerShell unrolls a one-element array returned from a function, and a
+  # bare PSCustomObject has no .Count on Windows PowerShell 5.1, so an already
+  # configured hooks.json was reported "merged" and rewritten on every run.
+  $entries = @(Get-JsonArray (Get-ObjectPropertyValue $hooks "beforeShellExecution"))
   $isDcg = { param($e) (Test-JsonObject $e) -and ($e.command -eq $hookCmd) }
   $matching = @($entries | Where-Object { & $isDcg $_ })
   $first = if ($entries.Count -gt 0 -and (Test-JsonObject $entries[0])) { $entries[0].command } else { $null }

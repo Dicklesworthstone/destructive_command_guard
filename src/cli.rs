@@ -13729,11 +13729,21 @@ fn install_crush_hook_into_config(
     let original = hooks.clone();
 
     let previous = remove_dcg_hooks_from_crush_hooks(hooks)?;
+    let desired_keys: Vec<String> = desired_entry
+        .as_object()
+        .map(|desired| desired.keys().cloned().collect())
+        .unwrap_or_default();
     let mut merged = match previous.as_ref().and_then(serde_json::Value::as_object) {
         Some(previous) => {
+            // Owned keys the new entry still carries are overwritten in place
+            // below, so a re-install keeps the key order it wrote the first
+            // time; removing and re-inserting them moved them after `name` and
+            // `timeout`, rewriting an unchanged crush.json on every --force.
             let mut merged = previous.clone();
             for key in DCG_OWNED_CRUSH_HOOK_KEYS {
-                merged.remove(*key);
+                if !desired_keys.iter().any(|desired| desired == key) {
+                    merged.remove(*key);
+                }
             }
             merged
         }
@@ -20973,6 +20983,14 @@ mod tests {
                 .expect("install ok");
         assert!(changed, "--force always reports a rewrite");
         assert_eq!(crush_pre_tool_use(&config).len(), 1);
+
+        // Map equality ignores key order, so also compare the bytes a
+        // re-install writes: on native Windows a forced re-install reordered
+        // the entry's keys and rewrote an otherwise unchanged crush.json.
+        let fresh = serde_json::to_string_pretty(&config).unwrap();
+        install_crush_hook_into_config(&mut config, true, crush_entry_for("/opt/dcg"))
+            .expect("install ok");
+        assert_eq!(serde_json::to_string_pretty(&config).unwrap(), fresh);
     }
 
     #[test]
