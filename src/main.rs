@@ -1731,15 +1731,17 @@ fn main() {
         return;
     }
 
+    // Check if bypass is requested (escape hatch). It is an environment check
+    // only, so it runs before config loading and agent detection: the escape
+    // hatch must not pay for work whose result it discards.
+    if Config::is_bypassed() {
+        return;
+    }
+
     // Load configuration
     let config = Config::load();
     destructive_command_guard::output::install_theme_config(&config);
     let detected_agent = detect_agent();
-
-    // Check if bypass is requested (escape hatch)
-    if Config::is_bypassed() {
-        return;
-    }
 
     // Read hook input FIRST, before the deadline starts: how long the client
     // takes to write stdin is outside dcg's control and must not eat the
