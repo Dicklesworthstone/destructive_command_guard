@@ -3213,9 +3213,18 @@ fn parse_protected_file_rm(
     // cheap lexical superset the classifier publishes for exactly this
     // purpose. `rm ./build/stamp` and `rm target/debug/app` fail it on a
     // substring test and never pay for word decoding.
+    //
+    // A literal brace alternation is enumerable, not unknown: the shell turns
+    // `~/.ssh/{id_rsa,id_ed25519}` into two named files, so each is judged
+    // (#482). Anything the expansion cannot prove declines, as before.
+    let names_protected = |raw: &str| {
+        crate::packs::core::credential_files::may_name_protected_path(raw)
+            && crate::packs::core::credential_files::names_protected_file(raw)
+    };
     let Some(path) = paths.iter().find(|path| {
-        crate::packs::core::credential_files::may_name_protected_path(path.raw)
-            && crate::packs::core::credential_files::names_protected_file(path.raw)
+        names_protected(path.raw)
+            || literal_brace_expansions(path.raw)
+                .is_some_and(|expansions| expansions.iter().any(|word| names_protected(word)))
     }) else {
         return RmParseDecision::NoMatch;
     };
@@ -3232,6 +3241,60 @@ fn parse_protected_file_rm(
         severity: Severity::Critical,
         span: Some(path.range.clone()),
     })
+}
+
+/// The words bash brace-expands an unquoted `a{b,c}d` operand into, when every
+/// alternative is literal (#482).
+///
+/// `None` when there is nothing to expand or the expansion is not provable
+/// from the text: quoting or escapes anywhere in the word, an expansion
+/// (`$`, `` ` ``) inside a group, a nested or unbalanced brace, a range
+/// (`{1..3}`), or more than [`MAX_BRACE_EXPANSIONS`] results. A group with no
+/// comma (`{id_rsa}`) is not an expansion at all — bash keeps it literally —
+/// so it stays in the word unchanged.
+pub(crate) fn literal_brace_expansions(raw: &str) -> Option<Vec<String>> {
+    const MAX_BRACE_EXPANSIONS: usize = 64;
+    if !raw.contains('{') || raw.contains(['\'', '"', '\\']) {
+        return None;
+    }
+    let mut expansions = vec![String::new()];
+    let mut expanded = false;
+    let mut rest = raw;
+    while let Some(open) = rest.find('{') {
+        let (prefix, after) = rest.split_at(open);
+        let close = after.find('}')?;
+        let body = &after[1..close];
+        if body.contains('{') {
+            return None;
+        }
+        for word in &mut expansions {
+            word.push_str(prefix);
+        }
+        if body.contains(',') {
+            if body.contains(['$', '`']) || body.contains("..") {
+                return None;
+            }
+            let alternatives: Vec<&str> = body.split(',').collect();
+            if expansions.len() * alternatives.len() > MAX_BRACE_EXPANSIONS {
+                return None;
+            }
+            expansions = expansions
+                .iter()
+                .flat_map(|word| alternatives.iter().map(move |alt| format!("{word}{alt}")))
+                .collect();
+            expanded = true;
+        } else {
+            // No comma: bash leaves the braces as literal characters.
+            for word in &mut expansions {
+                word.push_str(&after[..=close]);
+            }
+        }
+        rest = &after[close + 1..];
+    }
+    for word in &mut expansions {
+        word.push_str(rest);
+    }
+    expanded.then_some(expansions)
 }
 
 fn parse_bare_glob_rm(
@@ -7984,6 +8047,47 @@ mod tests {
             RM_PROTECTED_FILE_NAME,
             Severity::Critical,
         );
+    }
+
+    /// A literal brace alternation is two named files, not an unknown one
+    /// (#482).
+    #[test]
+    fn rm_of_a_braced_protected_file_denies_issue_482() {
+        for command in [
+            "rm /home/user/.ssh/{id_rsa,id_ed25519}",
+            "rm /home/user/{.ssh,.aws}/credentials",
+            "rm ~/.ssh/{notes.txt,id_rsa}",
+            "rm -f $HOME/.ssh/{a,b,authorized_keys}",
+            "rm /home/user/{.ssh/id_rsa,notes.txt}",
+        ] {
+            assert_rm_parser_denies(command, RM_PROTECTED_FILE_NAME, Severity::Critical);
+        }
+        for command in [
+            // No comma: bash keeps `{id_rsa}` literally, a file of that name.
+            "rm /home/user/.ssh/{id_rsa}",
+            // Every alternative ordinary.
+            "rm /home/user/{notes,todo}.txt",
+            "rm ~/.ssh/{id_rsa,id_ed25519}.pub",
+            // Quoted braces do not expand (and a quoted name under `.ssh/` is
+            // judged as that literal file); dynamic ones are not provable.
+            "rm \"/home/user/{notes,id_rsa}\"",
+            "rm /home/user/.ssh/{$a,$b}",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+
+        assert_eq!(
+            literal_brace_expansions("a{b,c}d{1,2}"),
+            Some(vec![
+                "abd1".to_string(),
+                "abd2".to_string(),
+                "acd1".to_string(),
+                "acd2".to_string()
+            ])
+        );
+        assert_eq!(literal_brace_expansions("a{b}c"), None);
+        assert_eq!(literal_brace_expansions("a{b,{c,d}}"), None);
+        assert_eq!(literal_brace_expansions("{1..3}"), None);
     }
 
     /// The prompt predicate itself, at the boundary (#481).

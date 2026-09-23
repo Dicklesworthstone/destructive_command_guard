@@ -196,3 +196,8 @@ expected = "deny"
 description = "a glued relative redirect is not echo data (#480)"
 command = "echo x >.git/config"
 expected = "deny"
+
+[[case]]
+description = "a literal brace alternation names each protected file (#482)"
+command = "rm ~/.ssh/{id_rsa,id_ed25519}"
+expected = "deny"

@@ -23157,13 +23157,16 @@ fn anchor_relative_words(segment: &str, directory: &str) -> Option<String> {
             .as_bytes()
             .first()
             .copied();
-        // Rooted or dynamic words need no anchor; a closing `)`/`}` is syntax.
-        if first.is_none_or(|byte| {
-            matches!(
-                byte,
-                b'/' | b'~' | b'$' | b'`' | b'(' | b')' | b'{' | b'}' | b'-' | b';' | b'&' | b'|'
-            )
-        }) {
+        // Rooted or dynamic words need no anchor; a bare `{`/`}` or a `)` is
+        // syntax. `{a,b}` is a brace expansion the prefix distributes over.
+        if matches!(target, "{" | "}")
+            || first.is_none_or(|byte| {
+                matches!(
+                    byte,
+                    b'/' | b'~' | b'$' | b'`' | b'(' | b')' | b'}' | b'-' | b';' | b'&' | b'|'
+                )
+            })
+        {
             continue;
         }
         let anchored = format!("{base}/{target}");
@@ -23176,7 +23179,14 @@ fn anchor_relative_words(segment: &str, directory: &str) -> Option<String> {
             Cow::Borrowed(anchored.as_str())
         };
         names_protected |=
-            crate::packs::core::credential_files::names_protected_file(&representative);
+            crate::packs::core::credential_files::names_protected_file(&representative)
+                || crate::packs::core::filesystem::literal_brace_expansions(&anchored).is_some_and(
+                    |words| {
+                        words.iter().any(|word| {
+                            crate::packs::core::credential_files::names_protected_file(word)
+                        })
+                    },
+                );
         out.push_str(&segment[cursor..start + offset]);
         // `>>authorized_keys` becomes `>> ~/.ssh/authorized_keys`: the same
         // redirection, with the tilde at the start of a word where every
@@ -27600,6 +27610,8 @@ mod tests {
             "sudo -D /home/user/.ssh rm id_rsa",
             // A glob inside a protected directory, as `rm ~/.ssh/id_*` is.
             "cd ~/.ssh && rm id_*",
+            // And a brace alternation there (#482).
+            "cd ~/.ssh && rm {notes.txt,id_rsa}",
         ] {
             // POSIX is the Bash hook's path; a relative redirect spells no
             // pack keyword, so this also proves the quick-reject lets it in.
