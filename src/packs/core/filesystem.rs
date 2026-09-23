@@ -4056,6 +4056,18 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "find-delete-var-tmp",
             r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
         ),
+        // The `-exec rm … {}` spelling of the same temp-only delete. Since
+        // `find-delete-*` learned that action it denied here while `-delete`
+        // was allowed. Same literal temp roots; the only backslash admitted is
+        // the terminating `\;`.
+        safe_pattern!(
+            "find-exec-rm-tmp",
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:(?:/private)?/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
+        ),
+        safe_pattern!(
+            "find-exec-rm-var-tmp",
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:(?:/private)?/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
+        ),
         // -----------------------------------------------------------------
         // `unlink <file>` safe whitelist for temp directories.
         //
@@ -9268,6 +9280,23 @@ mod classifier_guidance_tests {
                 "{command} must stay allowed, matched {:?}",
                 pack.check(command).and_then(|matched| matched.name)
             );
+        }
+        // Inside literal temp roots `-exec rm {}` is allowed exactly as
+        // `-delete` is; a climb, a variable, or a backslash anywhere but the
+        // terminating `\;` keeps the deny.
+        for command in [
+            r"find /tmp/build -name '*.o' -exec rm {} \;",
+            "find /tmp/build -type f -exec rm -f {} +",
+            r"find /var/tmp/cache -exec /bin/rm {} \;",
+        ] {
+            crate::packs::test_helpers::assert_allows(&pack, command);
+        }
+        for command in [
+            r"find /tmp/../etc -exec rm {} \;",
+            r"find /tmp/$D -exec rm {} \;",
+            r"find /tmp/x\ /etc -exec rm {} \;",
+        ] {
+            assert!(pack.check(command).is_some(), "{command} must stay denied");
         }
     }
 }
