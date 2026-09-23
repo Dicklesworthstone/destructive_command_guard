@@ -1367,6 +1367,12 @@ pub(crate) fn parse_rm_command_segment_in_dialect(
         if !matches!(cmd, RmParseDecision::NoMatch) {
             return cmd;
         }
+        // The decoder above only runs for commands carrying `^`, so the plain
+        // spelling of a protected-file delete reached nothing (#451).
+        let protected = parse_cmd_protected_file_segment(command);
+        if !matches!(protected, RmParseDecision::NoMatch) {
+            return protected;
+        }
     }
 
     let exact = parse_rm_command_segment(command, pipeline_stdin);
@@ -1377,34 +1383,95 @@ pub(crate) fn parse_rm_command_segment_in_dialect(
     parse_unverified_rm_command_segment(command, pipeline_stdin, dialect)
 }
 
-/// Whether a PowerShell `Remove-Item` target names a protected file (#451).
+/// Whether a Windows-dialect delete target names a protected file (#451).
 ///
 /// The classifier that owns the protected-path table reads POSIX spelling, so
 /// the Windows one is translated rather than duplicated — a second table is
 /// exactly the drift that #441/#452/#465/#468 were:
 ///
-/// - `\` becomes `/`. PowerShell accepts both, and `$HOME\.ssh\id_rsa` and
+/// - `\` becomes `/`. Both shells accept either, and `$HOME\.ssh\id_rsa` and
 ///   `$HOME/.ssh/id_rsa` name the same file.
-/// - `$env:USERPROFILE` and `$env:HOME` become `$HOME`, which is the anchor the
-///   table already recognises. This is a rename of the same concept, not a new
-///   root: on Windows `%USERPROFILE%` IS the home directory, and dcg's own
-///   `config::home_dir()` resolves it that way (bd-b2b1).
+/// - Every Windows spelling of the home directory becomes `$HOME`, the anchor
+///   the table already recognises: PowerShell's `$env:USERPROFILE` and cmd's
+///   `%USERPROFILE%` / `%HOMEPATH%`. This is a rename of the same concept, not
+///   a new root — on Windows `%USERPROFILE%` IS the home directory, and dcg's
+///   own `config::home_dir()` resolves it that way (bd-b2b1).
 ///
 /// Everything else is left alone, so a target the classifier cannot prove
 /// literal still declines there rather than here.
-fn powershell_target_is_protected(target: &str) -> bool {
+fn windows_target_is_protected(target: &str) -> bool {
+    /// Windows home anchors, longest first so `%HOMEDRIVE%%HOMEPATH%` is not
+    /// half-consumed by the `%HOMEPATH%` entry.
+    const HOME_ALIASES: &[&str] = &[
+        "%HOMEDRIVE%%HOMEPATH%",
+        "${env:USERPROFILE}",
+        "$env:USERPROFILE",
+        "%USERPROFILE%",
+        "${env:HOME}",
+        "$env:HOME",
+        "%HOMEPATH%",
+        "%HOME%",
+    ];
+
     let mut candidate = target.replace('\\', "/");
-    for alias in ["$env:USERPROFILE", "$env:HOME", "${env:USERPROFILE}"] {
-        if let Some(rest) = candidate
-            .strip_prefix(alias)
-            .or_else(|| strip_prefix_ascii_case_insensitive(&candidate, alias))
-        {
+    for alias in HOME_ALIASES {
+        if let Some(rest) = strip_prefix_ascii_case_insensitive(&candidate, alias) {
             candidate = format!("$HOME{rest}");
             break;
         }
     }
     crate::packs::core::credential_files::may_name_protected_path(&candidate)
         && crate::packs::core::credential_files::names_protected_file(&candidate)
+}
+
+/// A plain `del`/`erase` of a protected file, in the cmd dialect (#451).
+///
+/// `parse_cmd_decoded_rm_segment` only runs for commands carrying `^`, because
+/// it exists to undo cmd's escape obfuscation. The ordinary spelling therefore
+/// reached no protected-file judgment at all: measured, `del
+/// %USERPROFILE%\.ssh\id_rsa` was allowed while `rm ~/.ssh/id_rsa` denied, for
+/// five target files and every `del`/`erase` switch combination.
+///
+/// Only the two file-deleting verbs are read here. `rd`/`rmdir` remove a
+/// directory and are the recursive rules' business, not this one's.
+fn parse_cmd_protected_file_segment(command: &str) -> RmParseDecision {
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::Cmd);
+    let mut words = tokens
+        .iter()
+        .take_while(|token| token.kind != NormalizeTokenKind::Separator)
+        .filter_map(|token| token.text(command));
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Cmd);
+    let Some(executable) = words
+        .next()
+        .and_then(|word| decoder.decode(word, ShellTokenRole::Syntax))
+    else {
+        return RmParseDecision::NoMatch;
+    };
+    if !cmd_file_delete_verb(executable.as_ref()) {
+        return RmParseDecision::NoMatch;
+    }
+
+    for word in words {
+        // cmd switches are `/f`, `/q`, `/s`, … — a leading slash is an option
+        // here, never a POSIX root.
+        if word.starts_with('/') {
+            continue;
+        }
+        let Some(decoded) = decoder.decode(word, ShellTokenRole::Data) else {
+            continue;
+        };
+        let target = strip_outer_quotes(decoded.as_ref()).1;
+        if target.is_empty() || !windows_target_is_protected(target) {
+            continue;
+        }
+        return RmParseDecision::Deny(RmParseMatch {
+            pattern_name: RM_PROTECTED_FILE_NAME,
+            reason: RM_PROTECTED_FILE_REASON,
+            severity: Severity::Critical,
+            span: None,
+        });
+    }
+    RmParseDecision::NoMatch
 }
 
 /// `str::strip_prefix` with an ASCII case-insensitive comparison, because
@@ -1477,9 +1544,19 @@ pub(crate) fn rm_semantic_scan_required(command: &str, dialect: ShellDialect) ->
                 .any(powershell_segment_requires_rm_semantic_scan)
         }
         ShellDialect::Cmd => {
-            if !command.contains(['^', '%', '!']) {
-                return false;
-            }
+            // There used to be a `!command.contains(['^', '%', '!'])`
+            // short-circuit here, on the same theory the PowerShell arm above
+            // used to hold: a command with no obfuscation character would
+            // already have been selected by the bytewise pack keywords. That
+            // holds for `rm`, which is a keyword. It does not hold for cmd's
+            // OWN delete verbs — `del` and `erase` are not core.filesystem
+            // keywords — so `del %USERPROFILE%\.ssh\id_rsa` fell between the
+            // two mechanisms exactly as the plain cmdlets did, and the
+            // protected-file rule never ran for it (#451).
+            //
+            // The segment check below is the authoritative test. Only Cmd and
+            // Unknown dialects reach this arm, so the tokenizing cost does not
+            // land on the POSIX hot path.
             crate::packs::split_command_segments_in_dialect(command, dialect)
                 .into_iter()
                 .any(cmd_segment_requires_rm_semantic_scan)
@@ -1725,10 +1802,25 @@ fn cmd_segment_requires_rm_semantic_scan(segment: &str) -> bool {
     let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) else {
         return false;
     };
-    matches!(
+    if matches!(
         rm_executable_certainty(decoded.as_ref(), ShellDialect::Cmd),
         RmExecutableCertainty::Exact | RmExecutableCertainty::MayBeRm
-    )
+    ) {
+        return true;
+    }
+    // `rm_executable_certainty` answers `Exact` only for a literal `rm`, so
+    // cmd's own file-deleting verbs are invisible to it. They are what a cmd
+    // caller actually writes, and neither is a pack keyword (#451).
+    cmd_file_delete_verb(decoded.as_ref())
+}
+
+/// cmd's file-deleting verbs. `rd`/`rmdir` are deliberately absent: they remove
+/// a directory, which is the recursive rules' business rather than the
+/// protected-file rule's.
+fn cmd_file_delete_verb(executable: &str) -> bool {
+    let executable = strip_outer_quotes(executable).1;
+    let basename = rm_frontend_basename(executable).to_ascii_lowercase();
+    matches!(basename.trim_end_matches(".exe"), "del" | "erase")
 }
 
 fn parse_cmd_decoded_rm_segment(command: &str, automated_stdin: bool) -> RmParseDecision {
@@ -2030,7 +2122,7 @@ fn parse_powershell_remove_item_segment(command: &str, automated_stdin: bool) ->
         if !what_if
             && let Some(target) = literal_targets
                 .iter()
-                .find(|target| powershell_target_is_protected(target))
+                .find(|target| windows_target_is_protected(target))
         {
             return RmParseDecision::Deny(RmParseMatch {
                 pattern_name: RM_PROTECTED_FILE_NAME,
@@ -9663,6 +9755,109 @@ mod powershell_protected_file_tests {
                     RmParseDecision::NoMatch | RmParseDecision::Allow
                 ),
                 "{command} must stay allowed"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cmd_protected_file_tests {
+    use super::*;
+
+    /// A plain cmd `del` of a protected file (#451).
+    ///
+    /// The cmd decoder only runs for commands carrying `^`, so the ordinary
+    /// spelling reached no protected-file judgment at all. Measured before the
+    /// fix: five protected targets and every `del`/`erase` switch combination
+    /// allowed, while `rm ~/.ssh/id_rsa` denied.
+    #[test]
+    fn cmd_delete_of_a_protected_file_denies_issue_451() {
+        for target in [
+            "%USERPROFILE%\\.ssh\\id_rsa",
+            "%USERPROFILE%\\.ssh\\authorized_keys",
+            "%USERPROFILE%\\.aws\\credentials",
+            "%USERPROFILE%\\.bashrc",
+            "%HOMEPATH%\\.ssh\\id_rsa",
+            "%userprofile%\\.ssh\\id_rsa",
+            // POSIX spellings reach cmd too: a caller can pass either.
+            "~/.ssh/id_rsa",
+            "$HOME/.ssh/id_rsa",
+        ] {
+            for verb in ["del", "erase", "del /f", "del /q", "del /f /q"] {
+                let command = format!("{verb} {target}");
+                match parse_rm_command_segment_in_dialect(&command, false, ShellDialect::Cmd) {
+                    RmParseDecision::Deny(hit) => {
+                        assert_eq!(
+                            hit.pattern_name, RM_PROTECTED_FILE_NAME,
+                            "{command} must deny under the same rule the POSIX twin uses"
+                        );
+                        assert_eq!(hit.severity, Severity::Critical);
+                    }
+                    other => unreachable!(
+                        "cmd delete of a protected file must deny: {command}: {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The removed `['^', '%', '!']` prefilter must not make the signal fire
+    /// for every cmd command (#451).
+    ///
+    /// Negative control for dropping it: if this were always true,
+    /// core.filesystem would be force-selected on every cmd payload and the
+    /// quick-reject would stop meaning anything.
+    #[test]
+    fn ordinary_cmd_commands_still_skip_the_semantic_scan_issue_451() {
+        for command in [
+            "dir C:\\src",
+            "type C:\\app\\x.conf",
+            "echo hello",
+            "copy a.txt b.txt",
+            "move a.txt b.txt",
+            "cd %USERPROFILE%",
+            "set PATH=%PATH%;C:\\bin",
+        ] {
+            assert!(
+                !crate::packs::core::filesystem::filesystem_semantic_scan_required(
+                    command,
+                    ShellDialect::Cmd
+                ),
+                "an ordinary cmd command must not force core.filesystem selection: {command}"
+            );
+        }
+        for command in ["del %USERPROFILE%\\.ssh\\id_rsa", "erase ~/.ssh/id_rsa"] {
+            assert!(
+                crate::packs::core::filesystem::filesystem_semantic_scan_required(
+                    command,
+                    ShellDialect::Cmd
+                ),
+                "a cmd delete verb must force core.filesystem selection: {command}"
+            );
+        }
+    }
+
+    /// The cmd rule turns on the TARGET, not on the verb (#451).
+    #[test]
+    fn cmd_protected_delete_still_turns_on_the_target_issue_451() {
+        for command in [
+            "del C:\\temp\\scratch.log",
+            "del /q .\\build\\app.exe",
+            "del %USERPROFILE%\\Documents\\report.docx",
+            // The public half of a key pair stays exempt.
+            "del %USERPROFILE%\\.ssh\\id_rsa.pub",
+            // Reading is not deleting.
+            "type %USERPROFILE%\\.ssh\\id_rsa",
+            "dir %USERPROFILE%\\.ssh",
+            // `rd`/`rmdir` remove a directory; the recursive rules own those.
+            "rd /s /q %USERPROFILE%\\.ssh",
+        ] {
+            assert!(
+                matches!(
+                    parse_rm_command_segment_in_dialect(command, false, ShellDialect::Cmd),
+                    RmParseDecision::NoMatch | RmParseDecision::Allow
+                ),
+                "{command} must not deny under {RM_PROTECTED_FILE_NAME}"
             );
         }
     }
