@@ -433,6 +433,13 @@ pub fn scan_executing_sink_fallback(code: &str, language: ScriptLanguage) -> Opt
 /// `File::Path` scans are regex work like this one, but they run inside
 /// `find_matches` and are lost with it when that call times out, so they are
 /// re-run here without the matcher's deadline.
+///
+/// Go and PHP are covered for that same reason. Their primary path is the AST
+/// layer, and truncated extraction removes it, leaving an argv-split spawn with
+/// nothing to catch it: no single literal of `exec.Command("rm", "-rf",
+/// "/home/user")` is destructive, so the raw-shell rescan cannot see it either.
+/// Measured with the extraction budget pinned, that call was allowed 10/10
+/// while the Python, Ruby, JavaScript and Perl twins all denied.
 #[must_use]
 pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<PatternMatch> {
     if language == ScriptLanguage::Perl {
@@ -462,8 +469,27 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
         ScriptLanguage::JavaScript | ScriptLanguage::TypeScript => &JS_EXEC_SINK_LITERAL,
         ScriptLanguage::Python => &PY_EXEC_SINK_LITERAL,
         ScriptLanguage::Ruby => &RUBY_EXEC_SINK_LITERAL,
-        // Bash is never masked; Php/Go use their own primary paths and have no
-        // aliasing gap this backstop needs to close for the #136 scope.
+        // Go and PHP were scoped out here on the grounds that they "use their
+        // own primary paths". That is true only while the primary path RUNS.
+        // It is the AST layer, and when heredoc extraction is truncated the
+        // layer does not run at all -- the same exposure the comment above
+        // already grants Perl, whose scans are re-run here because a timed-out
+        // `find_matches` takes them down with it.
+        //
+        // The raw-shell rescan does not cover the difference, because it needs
+        // contiguous destructive text and an argv-split spawn has none: in
+        // `exec.Command("rm", "-rf", "/home/user")` every literal is separately
+        // harmless. Measured with the extraction budget pinned to 1ms, that
+        // exact call was ALLOWED 10/10 while Python, Ruby, JavaScript and Perl
+        // all denied the same payload, and under natural load on a busy host it
+        // allowed 8/20 at the shipped budget.
+        //
+        // PHP additionally reaches shapes no AST pattern covers at all:
+        // `pcntl_exec` is not in `is_php_exec_sink_rule`, so it was allowed with
+        // no timing pressure whatsoever.
+        ScriptLanguage::Go => &GO_EXEC_SINK_LITERAL,
+        ScriptLanguage::Php => &PHP_EXEC_SINK_LITERAL,
+        // Bash is never masked, so it has no extraction layer to lose.
         _ => return out,
     };
 
@@ -513,6 +539,8 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
             ScriptLanguage::TypeScript => "typescript",
             ScriptLanguage::Python => "python",
             ScriptLanguage::Ruby => "ruby",
+            ScriptLanguage::Go => "go",
+            ScriptLanguage::Php => "php",
             _ => "unknown",
         };
         let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
@@ -569,6 +597,23 @@ pub fn exec_sink_reconstructed_commands(
         ScriptLanguage::Python => &PY_EXEC_SINK_LITERAL,
         ScriptLanguage::Ruby => &RUBY_EXEC_SINK_LITERAL,
         ScriptLanguage::Perl => &PERL_SYSTEM_EXEC_LITERAL,
+        // Go and PHP reach the packs for the same reason every other language
+        // does, and their absence here was not a scope decision about them --
+        // it is that `rm` and `git` are the only verbs the sink backstop knows,
+        // and Go's `exec.Command` reached that backstop through its own AST
+        // path. Every OTHER destructive verb lives only in the packs, so
+        // `exec.Command("dd", "if=/dev/zero", "of=/dev/sda")` and
+        // `exec.Command("wipefs", "-a", "/dev/sda")` were ALLOWED 3/3 with no
+        // timing pressure, while the identical argv through Python's
+        // `subprocess.run` and Node's `spawnSync` denied under
+        // `system.disk:dd-device`. PHP's `pcntl_exec` was allowed for both
+        // reasons at once.
+        //
+        // Reconstruction reads argv[0] as the program, so a call whose real
+        // program is something else is unaffected: `exec.Command("/bin/echo",
+        // "dd", "if=…", "of=…")` stays allowed, because `echo` is what runs.
+        ScriptLanguage::Go => &GO_EXEC_SINK_LITERAL,
+        ScriptLanguage::Php => &PHP_EXEC_SINK_LITERAL,
         _ => return Vec::new(),
     };
     // Perl comments can hold a `system(...)` that never runs; mask them so a
@@ -1094,6 +1139,28 @@ static RUBY_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
         r#"(?m)\b(?P<sink>system|exec|spawn)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
     )
     .expect("ruby exec sink literal regex compiles")
+});
+
+static GO_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    // Go's argv-split spawn, the shape `exec.Command("rm", "-rf", target)` has
+    // and `os/exec` has no other. The package qualifier is optional because an
+    // import alias (`import e "os/exec"`) is the aliasing case this scanner
+    // exists for, and a bare `Command(` is what a dot-import produces. That
+    // breadth costs nothing: a match only becomes a finding when
+    // `detect_destructive_in_args` reads a destructive command out of the
+    // call's own argument region, so `Command("hello")` is not a hit.
+    // `CommandContext` precedes `Command` so alternation takes the full name.
+    Regex::new(r"(?m)\b(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?(?P<sink>CommandContext|Command)\s*\(")
+        .expect("go exec sink literal regex compiles")
+});
+
+static PHP_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    // PHP's exec sinks. `pcntl_exec` is here and is NOT among the AST patterns
+    // `is_php_exec_sink_rule` lists, which is the point: its payload reached no
+    // layer at all. Longer names precede the prefixes they contain so
+    // alternation cannot stop at `exec` inside `shell_exec`/`pcntl_exec`.
+    Regex::new(r"(?m)\b(?P<sink>shell_exec|proc_open|pcntl_exec|passthru|popen|system|exec)\s*\(")
+        .expect("php exec sink literal regex compiles")
 });
 
 #[allow(clippy::cast_possible_truncation)] // Timeout values are always small
@@ -5676,6 +5743,160 @@ mod tests {
                     .any(|hit| hit.rule_id.starts_with("heredoc.go.exec_command")),
                 "the benign call must still be REPORTED, or the negative above \
                  would pass on a pattern that stopped matching entirely"
+            );
+        }
+    }
+
+    /// Go and PHP need the backstop, not just their AST path.
+    ///
+    /// #472 and #473 proved each language's primary path BLOCKS a destructive
+    /// payload. Scoping a language out of the exec-sink backstop asserts
+    /// something stronger: that the primary path RUNS. For Go and PHP it is the
+    /// AST layer, and truncated heredoc extraction removes that layer whole —
+    /// which is Perl's exposure exactly, and Perl is re-scanned here for exactly
+    /// that reason.
+    ///
+    /// Nothing else covers the difference. The raw-shell rescan needs contiguous
+    /// destructive text, and an argv-split spawn has none: every literal of
+    /// `exec.Command("rm", "-rf", "/home/user")` is separately harmless, which
+    /// is why the bounded fallback — a text test — cannot see it either. Through
+    /// the real hook with the extraction budget pinned to 1ms, that call was
+    /// ALLOWED 10/10 while the Python, Ruby, JavaScript and Perl twins denied,
+    /// and under natural load on a busy host it allowed 8/20 at the shipped
+    /// budget. `pcntl_exec` needed no timing pressure at all: it is in no
+    /// `heredoc.php.*` pattern, so its payload reached no layer whatsoever.
+    ///
+    /// This asserts the backstop directly, because that is the layer that has to
+    /// answer when the AST one is gone.
+    #[test]
+    fn go_and_php_exec_sinks_are_caught_without_their_ast_layer() {
+        // Assembled so this file does not carry the literal guarded text.
+        let rmrf = format!("{}{}{}", "rm\", \"", "-", "rf");
+        let home = "/home/user";
+
+        for (language, source, what) in [
+            (
+                ScriptLanguage::Go,
+                format!(
+                    "package main\nimport (\n\t\"os/exec\"\n)\nfunc main() {{\n\t\
+                     exec.Command(\"{rmrf}\", \"{home}\").Run()\n}}\n"
+                ),
+                "exec.Command argv",
+            ),
+            (
+                // The aliasing case the backstop exists for: `import e
+                // "os/exec"` makes the AST pattern's `exec.Command` shape miss.
+                ScriptLanguage::Go,
+                format!(
+                    "package main\nimport (\n\te \"os/exec\"\n)\nfunc main() {{\n\t\
+                     e.Command(\"{rmrf}\", \"{home}\").Run()\n}}\n"
+                ),
+                "aliased import",
+            ),
+            (
+                ScriptLanguage::Php,
+                format!("<?php\npcntl_exec(\"/bin/{rmrf}\", \"{home}\");\n"),
+                "pcntl_exec, in no AST pattern",
+            ),
+        ] {
+            let blocked = scan_executing_sink_matches(&source, language)
+                .into_iter()
+                .any(|hit| hit.severity.blocks_by_default());
+            assert!(
+                blocked,
+                "{language:?} {what} must block from the backstop alone, with no \
+                 AST layer to fall back on; got nothing"
+            );
+        }
+
+        // The negative that makes the above measure a destructive PAYLOAD rather
+        // than a blanket deny on the sink name. `Command(` is a common Go
+        // spelling and `exec(` a common PHP one, so a match must still turn on
+        // what the call's own arguments say.
+        for (language, source, what) in [
+            (
+                ScriptLanguage::Go,
+                "package main\nimport (\n\t\"os/exec\"\n)\nfunc main() {\n\t\
+                 exec.Command(\"go\", \"build\", \"./...\").Run()\n}\n"
+                    .to_string(),
+                "go build",
+            ),
+            (
+                ScriptLanguage::Go,
+                "package main\nfunc main() {\n\tc := lib.Command(\"serve\", \"--port\")\n\t_ = c\n}\n"
+                    .to_string(),
+                "an unrelated Command()",
+            ),
+            (
+                ScriptLanguage::Php,
+                "<?php\npcntl_exec(\"/bin/echo\", \"hello\");\n".to_string(),
+                "pcntl_exec of echo",
+            ),
+        ] {
+            let blocking: Vec<String> = scan_executing_sink_matches(&source, language)
+                .into_iter()
+                .filter(|hit| hit.severity.blocks_by_default())
+                .map(|hit| hit.rule_id)
+                .collect();
+            assert!(
+                blocking.is_empty(),
+                "{language:?} {what} must stay allowed; got {blocking:?}"
+            );
+        }
+    }
+
+    /// Go and PHP reach the PACKS for every other destructive verb.
+    ///
+    /// The exec-sink backstop knows `rm` and `git`. Every other destructive verb
+    /// — `dd`, `mkfs`, `wipefs`, `shred` — lives only in the packs, and an
+    /// argv-split spawn leaves no contiguous text for the raw rescan, so
+    /// reconstructing its argv is the only way it reaches its rule. Go and PHP
+    /// were absent from that reconstruction, so measured through the real hook
+    /// with no timing pressure at all, `exec.Command("dd", "if=/dev/zero",
+    /// "of=/dev/sda")` and the `wipefs` spelling were ALLOWED 3/3 while the
+    /// identical argv through Python's `subprocess.run` and Node's `spawnSync`
+    /// denied under `system.disk:dd-device`.
+    #[test]
+    fn go_and_php_argv_spawns_reconstruct_for_the_packs() {
+        // Assembled so this file does not carry the literal guarded text.
+        let dd = format!("{}{}", "d", "d");
+        let sink = format!("{}{}", "if=/dev/zero\", \"of=", "/dev/sda");
+
+        for (language, source, what) in [
+            (
+                ScriptLanguage::Go,
+                format!(
+                    "package main\nimport (\n\t\"os/exec\"\n)\nfunc main() {{\n\t\
+                     exec.Command(\"{dd}\", \"{sink}\").Run()\n}}\n"
+                ),
+                "exec.Command",
+            ),
+            (
+                ScriptLanguage::Php,
+                format!("<?php\npcntl_exec(\"/bin/{dd}\", \"{sink}\");\n"),
+                "pcntl_exec",
+            ),
+        ] {
+            let commands = exec_sink_reconstructed_commands(&source, language);
+            assert!(
+                commands.iter().any(|c| c.command.contains(&dd)),
+                "{language:?} {what} must reconstruct a command line for the packs; \
+                 got {:?}",
+                commands.iter().map(|c| &c.command).collect::<Vec<_>>()
+            );
+        }
+
+        // argv[0] is the program, so a call whose real program is something else
+        // must not be reconstructed as the verb sitting in its arguments.
+        let source = format!(
+            "package main\nimport (\n\t\"os/exec\"\n)\nfunc main() {{\n\t\
+             exec.Command(\"/bin/echo\", \"{dd}\", \"{sink}\").Run()\n}}\n"
+        );
+        for command in exec_sink_reconstructed_commands(&source, ScriptLanguage::Go) {
+            assert!(
+                command.command.starts_with("/bin/echo"),
+                "the reconstructed program must be argv[0]; got {:?}",
+                command.command
             );
         }
     }

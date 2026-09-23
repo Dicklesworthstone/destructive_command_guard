@@ -45,6 +45,11 @@ pub(super) fn js_operation(name: &str) -> Option<Operation> {
         "rename" | "renameSync" => Some(Operation::Rename),
         "link" | "linkSync" => Some(Operation::HardLink),
         "symlink" | "symlinkSync" => Some(Operation::SymbolicLink),
+        // `fs.cp` is Node's recursive copy and the twin of `shutil.copytree`,
+        // which Python already covers (#484). It is a TREE write rather than a
+        // placement: unlike `cp(1)`, it writes `dest` itself and never
+        // `dest/basename(src)`.
+        "cp" | "cpSync" => Some(Operation::CopyTree),
         _ => None,
     }
 }
@@ -66,17 +71,40 @@ fn classify(node: &Syntax<'_>, language: Language, env: &Bindings) -> Option<Tra
         let method = node.field("method")?.text().into_owned();
         let receiver = value(&node.field("receiver")?, language, env, 0)?;
         let (operation, api) = match (receiver, method.as_str()) {
-            (Value::File, "rename") => (Operation::Rename, "File.rename"),
-            (Value::File, "link") => (Operation::HardLink, "File.link"),
-            (Value::File, "symlink") => (Operation::SymbolicLink, "File.symlink"),
-            (Value::Io | Value::File, "copy_stream") => (Operation::CopyFile, "IO.copy_stream"),
+            (Value::File, "rename") => (Operation::Rename, "File.rename".to_string()),
+            (Value::File, "link") => (Operation::HardLink, "File.link".to_string()),
+            (Value::File, "symlink") => (Operation::SymbolicLink, "File.symlink".to_string()),
+            (Value::Io | Value::File, "copy_stream") => {
+                (Operation::CopyFile, "IO.copy_stream".to_string())
+            }
+            // FileUtils is Ruby's shutil, and every verb here has a Python twin
+            // this module already reads (#484). The placement/exact split is the
+            // same one shutil gets: `cp`, `cp_r` and `install` put the source
+            // basename INSIDE dest when dest is a directory, while `copy_file`
+            // names the destination itself.
+            //
+            // `touch` is absent on purpose: it creates or restamps, it does not
+            // truncate, so it destroys nothing. The `rm_*` family is absent for
+            // the opposite reason -- it is a deletion, and the recursive-delete
+            // policy in `ast_pattern_engine` already owns those spellings.
+            (Value::FileUtils, method_name) => {
+                let operation = match method_name {
+                    "cp" | "copy" | "cp_r" | "copy_entry" | "install" => Operation::Copy,
+                    "copy_file" => Operation::CopyFile,
+                    "mv" | "move" => Operation::Move,
+                    "ln" | "link" | "link_entry" => Operation::HardLink,
+                    "ln_s" | "ln_sf" | "symlink" => Operation::SymbolicLink,
+                    _ => return None,
+                };
+                (operation, format!("FileUtils.{method_name}"))
+            }
             _ => return None,
         };
         return Some(Transfer {
             operation,
             source: path(args.first()?),
             destination: path(args.get(1)?),
-            api: api.into(),
+            api,
         });
     }
     let function = node.field("function")?;

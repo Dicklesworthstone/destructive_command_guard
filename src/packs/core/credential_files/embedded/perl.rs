@@ -148,7 +148,26 @@ pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str>
             }
         }
         let api = token.text.strip_prefix("CORE::").unwrap_or(token.text);
-        if token.kind != Kind::Word || !matches!(api, "open" | "sysopen" | "truncate" | "close") {
+        if token.kind != Kind::Word
+            || !matches!(
+                api,
+                "open"
+                    | "sysopen"
+                    | "truncate"
+                    | "close"
+                    // Transfers (#484). `rename`, `symlink` and `link` are
+                    // builtins; `copy`/`move`/`cp`/`mv` come from File::Copy,
+                    // which exports them into the caller's namespace, so they
+                    // are read unqualified the way the module is actually used.
+                    | "rename"
+                    | "symlink"
+                    | "link"
+                    | "copy"
+                    | "move"
+                    | "cp"
+                    | "mv"
+            )
+        {
             continue;
         }
         if token.text == api && state.shadowed.contains(api) {
@@ -199,6 +218,24 @@ pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str>
                     .and_then(resolved_path)
                     .map(|path| (path, access))
             })
+        } else if is_transfer(api) && args.len() == 2 {
+            // The destination is argument 1 in every one of them: `rename(from,
+            // to)`, `symlink(target, link)`, `link(old, new)`, `copy(from, to)`
+            // and `move(from, to)` (#484). The source end is judged separately
+            // below, because a rename or move destroys a protected file by
+            // taking its NAME away, not by writing over it.
+            value(args[1], &state, 0)
+                .and_then(resolved_path)
+                .map(|path| (path, Access::Write))
+        } else {
+            None
+        };
+        // `symlink`, `link` and `copy` read their source and leave it in place,
+        // so only a move removes one.
+        let removed_source = if matches!(api, "rename" | "move" | "mv") && args.len() == 2 {
+            value(args[0], &state, 0)
+                .and_then(resolved_path)
+                .map(|path| (path, Access::Write))
         } else {
             None
         };
@@ -213,7 +250,7 @@ pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str>
                 }
             }
         }
-        if let Some((path, access)) = finding {
+        for (path, access) in finding.into_iter().chain(removed_source) {
             let end = tokens
                 .get(end.saturating_sub(1))
                 .map_or(token.span.end, |last| last.span.end);
@@ -228,6 +265,14 @@ pub(super) fn scan(code: &str) -> Result<Vec<CredentialFileWrite>, &'static str>
     }
     charge(&state.work)?;
     Ok(hits)
+}
+
+/// The two-argument transfer verbs, builtin or File::Copy (#484).
+fn is_transfer(api: &str) -> bool {
+    matches!(
+        api,
+        "rename" | "symlink" | "link" | "copy" | "move" | "cp" | "mv"
+    )
 }
 
 fn handle_name<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {

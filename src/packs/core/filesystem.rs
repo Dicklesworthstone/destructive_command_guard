@@ -8127,6 +8127,60 @@ mod tests {
         }
     }
 
+    /// The shapes a one-group `.ssh` alternation does not reach (#482).
+    ///
+    /// `rm_of_a_braced_protected_file_denies_issue_482` covers the canonical
+    /// key-pair spelling. These are the rows around it: the product of two
+    /// groups reaching the parser (not just the expander), a braced operand
+    /// that is not the only operand, and the Etc-rooted and home-dotfile
+    /// entries, whose classifier arms are separate from the `.ssh` one.
+    #[test]
+    fn a_brace_alternation_names_each_path_it_expands_to_issue_482() {
+        for command in [
+            "rm /home/user/{.ssh,.aws}/{credentials,id_rsa}",
+            "rm /tmp/x /home/user/.ssh/{id_rsa,b}",
+            "rm /etc/{shadow,passwd}",
+            "rm /home/user/{.bashrc,.profile}",
+        ] {
+            assert_rm_parser_denies(command, RM_PROTECTED_FILE_NAME, Severity::Critical);
+        }
+
+        // Each row here is a shape where expanding would be WRONG, so a fix
+        // that expanded eagerly would pass the rows above and start denying
+        // commands that touch nothing protected.
+        for command in [
+            // A nested brace is legal shell this pass deliberately does not
+            // read; declining leaves the operand judged as written.
+            "rm /home/user/x/{a,{b,c}}",
+            // An unmatched brace is not an alternation at all.
+            "rm /home/user/x/{a,b",
+            // Ordinary braces stay ordinary.
+            "rm /tmp/{a,b}",
+            "rm ./build/{a.o,b.o}",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+    }
+
+    /// The expander's own bound, and the spellings it refuses outright (#482).
+    ///
+    /// The cap matters because the product of N two-way groups is 2^N and this
+    /// runs on the path of every `rm`; nothing else asserts where it falls.
+    #[test]
+    fn brace_expansion_is_bounded_issue_482() {
+        // Six two-way groups is exactly 64 and still expands; seven is 128 and
+        // is refused, so the bound is inclusive and is reached, not exceeded.
+        let at_bound = literal_brace_expansions(&"{a,b}".repeat(6))
+            .expect("six two-way groups sit on the bound");
+        assert_eq!(at_bound.len(), 64);
+        assert_eq!(literal_brace_expansions(&"{a,b}".repeat(7)), None);
+
+        // An escape means the brace may not be a brace, so the word is not one
+        // this pass can prove; same for a group that is never closed.
+        assert_eq!(literal_brace_expansions(r"a\{b,c}"), None);
+        assert_eq!(literal_brace_expansions("a{b,c"), None);
+    }
+
     /// The recursive rules keep their own attribution (#467's invariant).
     ///
     /// `rm -rf ~/.ssh/id_rsa` must still report `rm-rf-root-home` and not also

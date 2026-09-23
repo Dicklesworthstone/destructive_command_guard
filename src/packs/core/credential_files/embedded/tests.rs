@@ -1519,3 +1519,198 @@ fn parenthesized_plain_assignment_replaces_old_mode_and_path_proofs() {
         }
     }
 }
+
+/// Every language's transfer surface reaches the same policy (#484).
+///
+/// Python was complete and the other five were not, each missing a whole
+/// family rather than an odd verb: all of Ruby's `FileUtils` (its `shutil`),
+/// Node's `fs.cp`, PHP's link and upload-placement calls, every Perl transfer,
+/// and Go's two link calls. Measured through the real hook, 19 APIs wrote
+/// `~/.ssh/authorized_keys` and were allowed while a control in the SAME
+/// language denied — so each was a coverage gap, not a routing problem.
+///
+/// Asserted per language against a control for exactly that reason: a control
+/// that denies proves the language reaches the classifier at all, so an `allow`
+/// beside it can only be the missing verb.
+#[test]
+fn every_language_reaches_the_same_transfer_policy_issue_484() {
+    const KEY: &str = "/home/user/.ssh/authorized_keys";
+    const SRC: &str = "/tmp/x";
+
+    for (language, control, added) in [
+        (
+            ScriptLanguage::Ruby,
+            format!("File.rename('{SRC}', '{KEY}')"),
+            vec![
+                format!("FileUtils.cp('{SRC}', '{KEY}')"),
+                format!("FileUtils.copy('{SRC}', '{KEY}')"),
+                format!("FileUtils.copy_file('{SRC}', '{KEY}')"),
+                format!("FileUtils.cp_r('{SRC}', '{KEY}')"),
+                format!("FileUtils.mv('{SRC}', '{KEY}')"),
+                format!("FileUtils.move('{SRC}', '{KEY}')"),
+                format!("FileUtils.install('{SRC}', '{KEY}')"),
+                format!("FileUtils.ln('{SRC}', '{KEY}')"),
+                format!("FileUtils.ln_s('{SRC}', '{KEY}')"),
+            ],
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            format!("require('fs').copyFileSync('{SRC}', '{KEY}')"),
+            vec![
+                format!("require('fs').cpSync('{SRC}', '{KEY}')"),
+                format!("require('fs').cp('{SRC}', '{KEY}', () => 0)"),
+                format!("require('fs').promises.cp('{SRC}', '{KEY}')"),
+            ],
+        ),
+        (
+            ScriptLanguage::Php,
+            format!("<?php\ncopy('{SRC}', '{KEY}');"),
+            vec![
+                format!("<?php\nsymlink('{SRC}', '{KEY}');"),
+                format!("<?php\nlink('{SRC}', '{KEY}');"),
+                format!("<?php\nmove_uploaded_file('{SRC}', '{KEY}');"),
+            ],
+        ),
+        (
+            ScriptLanguage::Perl,
+            format!("truncate('{KEY}', 0);"),
+            vec![
+                format!("rename('{SRC}', '{KEY}');"),
+                format!("symlink('{SRC}', '{KEY}');"),
+                format!("link('{SRC}', '{KEY}');"),
+                format!("use File::Copy; copy('{SRC}', '{KEY}');"),
+                format!("use File::Copy; move('{SRC}', '{KEY}');"),
+            ],
+        ),
+        (
+            ScriptLanguage::Go,
+            format!(
+                "package main\nimport (\n\t\"os\"\n)\nfunc main() {{\n\tos.Create(\"{KEY}\")\n}}\n"
+            ),
+            vec![
+                format!(
+                    "package main\nimport (\n\t\"os\"\n)\nfunc main() {{\n\tos.Link(\"{SRC}\", \"{KEY}\")\n}}\n"
+                ),
+                format!(
+                    "package main\nimport (\n\t\"os\"\n)\nfunc main() {{\n\tos.Symlink(\"{SRC}\", \"{KEY}\")\n}}\n"
+                ),
+            ],
+        ),
+    ] {
+        assert!(
+            !scan_extracted(&control, language)
+                .expect("complete analysis")
+                .is_empty(),
+            "{language:?} control must deny, or the rows below measure routing \
+             rather than coverage: {control}"
+        );
+        for source in added {
+            assert!(
+                !scan_extracted(&source, language)
+                    .expect("complete analysis")
+                    .is_empty(),
+                "{language:?} must deny a transfer onto a protected path: {source}"
+            );
+        }
+    }
+}
+
+/// The transfers above must turn on the DESTINATION, not on the verb (#484).
+///
+/// Without these the test above would pass on a blanket deny, which is the
+/// failure mode a vocabulary extension invites. Three separate carve-outs are
+/// checked because each is decided by different code: an ordinary destination,
+/// a `*.pub` key (protected directory, exempt file), and reading FROM a key,
+/// which a copy does and a move does not.
+#[test]
+fn transfer_coverage_still_turns_on_the_destination_issue_484() {
+    const KEY: &str = "/home/user/.ssh/authorized_keys";
+    const PUB: &str = "/home/user/.ssh/id_rsa.pub";
+    const SRC: &str = "/tmp/x";
+    const ORDINARY: &str = "/tmp/dest.txt";
+
+    for (language, source) in [
+        // An ordinary destination is nobody's business.
+        (
+            ScriptLanguage::Ruby,
+            format!("FileUtils.cp('{SRC}', '{ORDINARY}')"),
+        ),
+        (
+            ScriptLanguage::Ruby,
+            format!("FileUtils.ln_s('{SRC}', 'node_modules')"),
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            format!("require('fs').cpSync('{SRC}', '{ORDINARY}')"),
+        ),
+        (
+            ScriptLanguage::Php,
+            format!("<?php\nsymlink('{SRC}', 'vendor');"),
+        ),
+        (
+            ScriptLanguage::Perl,
+            "rename('a.tmp', 'a.txt');".to_string(),
+        ),
+        (
+            ScriptLanguage::Perl,
+            "use File::Copy; copy('a.txt', 'b.txt');".to_string(),
+        ),
+        // `*.pub` is the public half. Protected directory, exempt file.
+        (
+            ScriptLanguage::Ruby,
+            format!("FileUtils.cp('{SRC}', '{PUB}')"),
+        ),
+        (
+            ScriptLanguage::JavaScript,
+            format!("require('fs').cpSync('{SRC}', '{PUB}')"),
+        ),
+        (
+            ScriptLanguage::Perl,
+            format!("use File::Copy; copy('{SRC}', '{PUB}');"),
+        ),
+        // Reading FROM a key is not destroying it, so a copy is not a hit at
+        // either end. A move is, and is asserted separately below.
+        (
+            ScriptLanguage::Ruby,
+            format!("FileUtils.cp('{KEY}', '{SRC}')"),
+        ),
+        (
+            ScriptLanguage::Perl,
+            format!("use File::Copy; copy('{KEY}', '{SRC}');"),
+        ),
+        // `touch` creates or restamps; it does not truncate, so it destroys
+        // nothing. The `rm_*` family is the deletion engine's, not this one's.
+        (ScriptLanguage::Ruby, format!("FileUtils.touch('{KEY}')")),
+        (
+            ScriptLanguage::Ruby,
+            "FileUtils.rm('build/a.o')".to_string(),
+        ),
+    ] {
+        assert_eq!(
+            scan_extracted(&source, language).expect("complete analysis"),
+            vec![],
+            "{language:?} must stay allowed: {source}"
+        );
+    }
+
+    // A move DOES take the protected name away, so the source end is a hit —
+    // the half that `cp` above proves is not applied indiscriminately.
+    for (language, source) in [
+        (
+            ScriptLanguage::Ruby,
+            format!("FileUtils.mv('{KEY}', '{SRC}')"),
+        ),
+        (ScriptLanguage::Perl, format!("rename('{KEY}', '{SRC}');")),
+        (
+            ScriptLanguage::Perl,
+            format!("use File::Copy; move('{KEY}', '{SRC}');"),
+        ),
+    ] {
+        assert!(
+            !scan_extracted(&source, language)
+                .expect("complete analysis")
+                .is_empty(),
+            "{language:?} must deny moving a protected file away: {source}"
+        );
+    }
+}

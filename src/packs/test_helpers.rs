@@ -1057,7 +1057,28 @@ pub fn load_corpus_dir(
 /// ```
 #[must_use]
 pub fn eval_snapshot(command: &str) -> EvalSnapshot {
-    eval_snapshot_with_config(command, &Config::default())
+    eval_snapshot_with_config(command, &corpus_config())
+}
+
+/// The configuration the regression corpus is judged under: the defaults,
+/// minus the packs that are default-on only on Windows builds.
+///
+/// The corpus is one set of expectations for every host. `windows.filesystem`
+/// and `windows.system` join the defaults only under `cfg(windows)`, and their
+/// all-dialect fallback reads POSIX text such as `$(echo hello)` or
+/// `rm -r -f /tmp/x` as PowerShell, so the same corpus reported eight
+/// "failures" on native Windows that were a different pack set, not a
+/// regression (bd-bl3b). A Windows hook still evaluates `Bash` payloads as
+/// POSIX; the Windows packs have their own tests.
+#[must_use]
+pub fn corpus_config() -> Config {
+    let mut config = Config::default();
+    config.packs.disabled.extend(
+        ["windows.filesystem", "windows.system"]
+            .into_iter()
+            .map(String::from),
+    );
+    config
 }
 
 /// Evaluate a command with a specific configuration and return a snapshot.
@@ -1165,7 +1186,7 @@ pub fn diff_snapshots(expected: &EvalSnapshot, actual: &EvalSnapshot) -> Option<
 #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
 pub fn verify_corpus_case(case: &CorpusTestCase, category: CorpusCategory) -> Result<(), String> {
     // Get both snapshot (for most checks) and full result (for reason_contains check)
-    let config = Config::default();
+    let config = corpus_config();
     let enabled_packs = config.enabled_pack_ids();
     let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);

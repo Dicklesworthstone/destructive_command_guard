@@ -93,6 +93,11 @@ fn source_has_sink_name(code: &str) -> bool {
     [
         "open", "write", "Write", "append", "truncate", "File", "Path", "copy", "rename",
         "replace", "move", "link",
+        // Node's `fs.cp`/`fs.cpSync`/`fs.promises.cp` spell a copy with no
+        // substring any of the above catches (#484). Qualified, because the
+        // analyser can only resolve the member form anyway, and a bare `cp`
+        // would admit far more source for the classifier to walk.
+        ".cp",
     ]
     .iter()
     .any(|word| code.contains(word))
@@ -602,6 +607,8 @@ enum Value {
     Fs,
     File,
     RubyDir,
+    /// Ruby's `FileUtils`, the receiver its transfer verbs hang off (#484).
+    FileUtils,
     Api(String),
 }
 
@@ -654,6 +661,10 @@ fn scan_source(
             bindings.insert("File".into(), Value::File);
             bindings.insert("IO".into(), Value::Io);
             bindings.insert("Dir".into(), Value::RubyDir);
+            // Without this the receiver resolves to nothing and `transfers`
+            // returns before it ever reads the method, so every `FileUtils`
+            // verb was invisible while `File.rename` beside it denied (#484).
+            bindings.insert("FileUtils".into(), Value::FileUtils);
         }
         Language::Node => {
             bindings.insert("require".into(), Value::Require);

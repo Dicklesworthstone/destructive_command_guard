@@ -49,6 +49,10 @@ pub(super) fn has_sink_name(code: &str) -> bool {
         "ftruncate",
         "copy",
         "rename",
+        // Creating a name is creating the file the name resolves to (#484).
+        "symlink",
+        "link",
+        "move_uploaded_file",
     ]
     .iter()
     .any(|word| {
@@ -410,6 +414,20 @@ fn inspect_call(node: &Syntax<'_>, state: &State, hits: &mut Vec<CredentialFileW
                 if let Some(path) = target(0, "from") {
                     record(path, Access::Write);
                 }
+            }
+        }
+        // The destination is argument 1 in all three (#484). `symlink`/`link`
+        // take (target, link) and create `link`; `move_uploaded_file` takes
+        // (from, to). Only the created name is a write -- a link never alters
+        // what it points at, and the upload source is a request temp file.
+        "symlink" | "link" => {
+            if let Some(path) = target(1, "link") {
+                record(path, Access::Write);
+            }
+        }
+        "move_uploaded_file" => {
+            if let Some(path) = target(1, "to") {
+                record(path, Access::Write);
             }
         }
         "fwrite" | "fputs" | "ftruncate" => {
