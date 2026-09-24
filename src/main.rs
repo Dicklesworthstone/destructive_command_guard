@@ -1960,9 +1960,25 @@ fn main() {
     let allowlists = load_effective_allowlists_for_agent(&config, &effective_agent);
 
     // A PowerShell or Cmd payload gets the windows.* packs on any host (#451).
-    let windows_payload = std::iter::once(shell_dialect)
-        .chain(additional_commands.iter().map(|(_, dialect)| *dialect))
-        .any(|dialect| matches!(dialect, ShellDialect::PowerShell | ShellDialect::Cmd));
+    //
+    // The dialect alone is not sufficient evidence. A Windows payload that
+    // arrives mislabeled as `Bash` — the #322/#252 case, which is the one
+    // #451 exists for — is refined to `Unknown`, not to PowerShell or Cmd, so
+    // matching on the dialect alone never activated the packs for it. The
+    // command's own shape is the signal that survives a wrong label, and
+    // `Unknown` by itself is not it: an unrecognised tool name produces
+    // `Unknown` too and proves nothing about the payload.
+    let windows_payload = std::iter::once((command.as_str(), shell_dialect))
+        .chain(
+            additional_commands
+                .iter()
+                .map(|(entry, dialect)| (entry.as_str(), *dialect)),
+        )
+        .any(|(entry, dialect)| match dialect {
+            ShellDialect::PowerShell | ShellDialect::Cmd => true,
+            ShellDialect::Unknown => hook::command_is_windows_shell_payload(entry),
+            ShellDialect::Posix => false,
+        });
     let mut enabled_packs: HashSet<String> =
         config.enabled_pack_ids_for_agent_and_payload(&effective_agent, windows_payload);
 

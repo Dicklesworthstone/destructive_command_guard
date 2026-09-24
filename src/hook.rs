@@ -2132,6 +2132,27 @@ pub fn refine_shell_dialect(command: &str, labeled: ShellDialect) -> ShellDialec
     }
 }
 
+/// Whether the command's own shape marks it a Windows-shell payload, which is
+/// what `windows.*` pack activation asks (#451).
+///
+/// Activation matched `PowerShell | Cmd` only, and [`refine_shell_dialect`]
+/// down-trusts a mislabeled `Bash` payload to `Unknown` — so on a non-Windows
+/// host the packs never activated for the very payload shape #451 exists to
+/// cover, and six rules that deny when the packs are explicitly enabled were
+/// allowed by default. `format D: /q` is the sharpest case:
+/// [`segment_is_format_drive_invocation`] was added *specifically* so that
+/// command would reach `windows.filesystem:format-drive`, and the widening it
+/// performs could not activate the pack it was widening for.
+///
+/// `Unknown` on its own must not activate the packs — it is also what an
+/// unrecognised tool name produces, which proves nothing about the payload.
+/// The command's shape is the signal, and it is the same one the refinement
+/// already trusts enough to re-decide the entire dialect on.
+pub fn command_is_windows_shell_payload(command: &str) -> bool {
+    let visible = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    command_has_powershell_shape(visible.as_ref())
+}
+
 pub(crate) fn is_shell_hook_candidate(input: &HookInput) -> bool {
     if is_supported_shell_tool(input.tool_name.as_deref()) {
         return true;
