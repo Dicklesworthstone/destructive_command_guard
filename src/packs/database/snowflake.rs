@@ -1,5 +1,9 @@
 //! Snowflake CLI (`snow sql`) protection.
 //!
+//! The legacy SnowSQL client (`snowsql`) exposes the same SQL, file and stdin
+//! surfaces; [`snowsql_args_as_snow_sql`] maps its argv onto `snow sql` so both
+//! share this analysis, and its `!system` shell escape is a guarded directive.
+//!
 //! Snowflake's modern CLI accepts SQL through inline queries, files, standard
 //! input, and transitive `!source` / `!load` directives. Regexes over the raw
 //! shell command are not sufficient: they either miss file/stdin payloads or
@@ -68,6 +72,165 @@ fn snow_executable(word: &str) -> bool {
     basename.eq_ignore_ascii_case("snow") || basename.eq_ignore_ascii_case("snow.exe")
 }
 
+fn snowsql_executable(word: &str) -> bool {
+    let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    basename.eq_ignore_ascii_case("snowsql") || basename.eq_ignore_ascii_case("snowsql.exe")
+}
+
+/// Rewrite a legacy SnowSQL (`snowsql`) argv as the `snow sql` argv with the
+/// same executable surface, so both clients share one fail-closed analyzer.
+///
+/// SnowSQL takes SQL from `-q`/`--query`, files from `-f`/`--filename`, and
+/// otherwise reads stdin or opens a REPL -- the same three surfaces `snow sql`
+/// has. Connection and session options are consumed with their documented
+/// arity and dropped. Anything else -- an unknown option, a positional, `--`,
+/// or `-v` followed by a bare word (its value is optional, so its arity is
+/// ambiguous) -- is passed through or replaced by an unknown option, which the
+/// `snow sql` parser already fails closed on. Returns `None` for `--help`.
+#[must_use]
+pub(crate) fn snowsql_args_as_snow_sql(args: &[String]) -> Option<Vec<String>> {
+    const VALUE_SHORT: &[&str] = &[
+        "-a", "-u", "-d", "-s", "-r", "-w", "-h", "-p", "-m", "-o", "-c", "-D",
+    ];
+    const VALUE_LONG: &[&str] = &[
+        "accountname",
+        "username",
+        "dbname",
+        "schemaname",
+        "rolename",
+        "warehouse",
+        "host",
+        "port",
+        "region",
+        "mfa-passcode",
+        "authenticator",
+        "token",
+        "variable",
+        "option",
+        "query_tag",
+        "config",
+        "private-key-path",
+        "connection",
+    ];
+    const FLAG_SHORT: &[&str] = &["-P", "-M", "-U", "-K"];
+    const FLAG_LONG: &[&str] = &[
+        "mfa-passcode-in-password",
+        "abort-detached-query",
+        "probe-connection",
+        "prompt",
+        "mfa-prompt",
+        "noup",
+        "versions",
+        "single-transaction",
+        "disable-request-pooling",
+        "upgrade",
+        "client-session-keep-alive",
+        "include_connector_version",
+    ];
+    const AMBIGUOUS: &str = "--dcg-snowsql-ambiguous-option-arity";
+
+    let mut out = vec!["sql".to_string()];
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if matches!(arg, "-?" | "--help") {
+            return None;
+        }
+        if arg == "--" {
+            out.extend(args[index..].iter().cloned());
+            break;
+        }
+        // SQL and file sources keep their spelling; `snow sql` accepts the
+        // same `-q`/`--query`/`-f`/`--filename` forms, attached or not.
+        if matches!(arg, "-q" | "--query" | "-f" | "--filename") {
+            out.push(if arg.contains('q') { "-q" } else { "-f" }.to_string());
+            if let Some(value) = args.get(index + 1) {
+                out.push(value.clone());
+            }
+            index += 2;
+            continue;
+        }
+        if arg.starts_with("--query=")
+            || arg.starts_with("--filename=")
+            || (arg.len() > 2 && (arg.starts_with("-q") || arg.starts_with("-f")))
+        {
+            out.push(arg.to_string());
+            index += 1;
+            continue;
+        }
+        if matches!(arg, "-v" | "--version") {
+            if args
+                .get(index + 1)
+                .is_some_and(|next| !next.starts_with('-'))
+            {
+                out.push(AMBIGUOUS.to_string());
+                break;
+            }
+            index += 1;
+            continue;
+        }
+        if VALUE_SHORT.contains(&arg) {
+            if args.get(index + 1).is_none() {
+                out.push(AMBIGUOUS.to_string());
+                break;
+            }
+            index += 2;
+            continue;
+        }
+        if FLAG_SHORT.contains(&arg) {
+            index += 1;
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, attached) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            if VALUE_LONG.contains(&name) || name == "version" {
+                if attached.is_none() {
+                    if args.get(index + 1).is_none() {
+                        out.push(AMBIGUOUS.to_string());
+                        break;
+                    }
+                    index += 1;
+                }
+                index += 1;
+                continue;
+            }
+            if FLAG_LONG.contains(&name) && attached.is_none() {
+                index += 1;
+                continue;
+            }
+            out.push(arg.to_string());
+            index += 1;
+            continue;
+        }
+        // An attached short value (`-aACCOUNT`) for a value option.
+        if arg.len() > 2 && VALUE_SHORT.contains(&&arg[..2]) {
+            index += 1;
+            continue;
+        }
+        // Unknown short options and positionals: `snow sql` rejects both.
+        out.push(arg.to_string());
+        index += 1;
+    }
+    Some(out)
+}
+
+/// Present a `snowsql` invocation to executable-keyed consumers as the
+/// equivalent `snow sql` one; every other invocation is returned unchanged.
+#[must_use]
+pub(crate) fn canonical_snow_invocation(
+    executable: String,
+    args: Vec<String>,
+) -> (String, Vec<String>) {
+    if snowsql_executable(&executable) {
+        if let Some(translated) = snowsql_args_as_snow_sql(&args) {
+            return ("snow".to_string(), translated);
+        }
+    }
+    (executable, args)
+}
+
 fn decode_static_words(input: &str, dialect: ShellDialect) -> Option<Vec<String>> {
     let tokens = tokenize_for_shell_dialect(input, dialect);
     if tokens.len() > MAX_SNOWFLAKE_CLI_TOKENS
@@ -104,9 +267,14 @@ fn snow_args_from_segment(segment: &str, dialect: ShellDialect) -> Option<Vec<St
         if let Some((executable, tail)) =
             crate::packs::core::git::powershell_static_call_executable(segment)
         {
-            return executable
-                .filter(|executable| snow_executable(executable))
-                .and_then(|_| decode_static_words(tail, dialect));
+            let executable = executable?;
+            if snowsql_executable(&executable) {
+                return decode_static_words(tail, dialect)
+                    .and_then(|args| snowsql_args_as_snow_sql(&args));
+            }
+            return snow_executable(&executable)
+                .then(|| decode_static_words(tail, dialect))
+                .flatten();
         }
     }
 
@@ -167,16 +335,19 @@ fn snow_args_from_segment(segment: &str, dialect: ShellDialect) -> Option<Vec<St
     }
 
     let (_, executable) = words.get(index)?;
-    if !snow_executable(executable) {
+    let is_snowsql = snowsql_executable(executable);
+    if !snow_executable(executable) && !is_snowsql {
         return None;
     }
-    Some(
-        words
-            .into_iter()
-            .skip(index + 1)
-            .map(|(_, word)| word)
-            .collect(),
-    )
+    let args: Vec<String> = words
+        .into_iter()
+        .skip(index + 1)
+        .map(|(_, word)| word)
+        .collect();
+    if is_snowsql {
+        return snowsql_args_as_snow_sql(&args);
+    }
+    Some(args)
 }
 
 fn powershell_dynamic_snow_sql_target(segment: &str) -> bool {
@@ -334,6 +505,7 @@ pub fn create_pack() -> Pack {
                       ingestion, compute, and account privileges",
         keywords: &[
             "snow",
+            "snowsql",
             "Snow",
             "SNOW",
             "DROP",
@@ -687,6 +859,15 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "!edit executes SQL modified in an external editor that dcg cannot inspect in advance.",
             High,
             "Materialize the final SQL in a reviewed local file and execute it with snow sql -f.",
+            REVIEW_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "shell-escape",
+            r"(?!)",
+            "!system runs a shell command from inside the SnowSQL session, outside dcg's shell analysis.",
+            High,
+            "SnowSQL's !system passes its operand to the operating-system shell. Run that \
+             command directly in the shell instead, where dcg evaluates it like any other command.",
             REVIEW_SUGGESTIONS
         ),
         destructive_pattern!(
@@ -1322,6 +1503,11 @@ pub fn scan_sql_report_with_options(
             )),
             DirectiveKind::Edit => Some(RankedMatch::new(
                 "interactive-edit",
+                Severity::High,
+                directive.span.clone(),
+            )),
+            DirectiveKind::System => Some(RankedMatch::new(
+                "shell-escape",
                 Severity::High,
                 directive.span.clone(),
             )),
@@ -2167,6 +2353,8 @@ enum DirectiveKind {
     Source,
     Abort,
     Edit,
+    /// SnowSQL's `!system <command>`: a shell escape, not SQL.
+    System,
 }
 
 #[derive(Debug, Clone)]
@@ -2204,6 +2392,8 @@ fn scan_directives(payload: &str) -> Result<Vec<Directive>, SnowflakeSqlError> {
                 Some((DirectiveKind::Abort, "!abort".len()))
             } else if directive_boundary(&lower, "!edit") {
                 Some((DirectiveKind::Edit, "!edit".len()))
+            } else if directive_boundary(&lower, "!system") {
+                Some((DirectiveKind::System, "!system".len()))
             } else {
                 None
             }
@@ -2217,7 +2407,9 @@ fn scan_directives(payload: &str) -> Result<Vec<Directive>, SnowflakeSqlError> {
         };
 
         let remainder = strip_directive_comment(&trimmed[command_len..]);
-        let operand = if kind == DirectiveKind::Edit {
+        // `!edit` takes no path, and `!system`'s operand is shell text whose
+        // quoting is not ours to parse.
+        let operand = if matches!(kind, DirectiveKind::Edit | DirectiveKind::System) {
             None
         } else {
             let words = shell_words::split(remainder.trim().trim_end_matches(';'))

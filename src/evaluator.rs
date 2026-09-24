@@ -14453,6 +14453,9 @@ fn indirect_flow_for_consumer(
     let snowflake = (pack_id == "database.snowflake")
         .then(|| command_tokens(consumer))
         .flatten()
+        .map(|(executable, args)| {
+            crate::packs::database::snowflake::canonical_snow_invocation(executable, args)
+        })
         .filter(|(executable, _)| executable == "snow")
         .map(|(_, args)| {
             let analysis = crate::packs::database::snowflake::analyze_snow_sql_args(&args);
@@ -14942,6 +14945,8 @@ fn analyze_nsupdate_args(args: &[String]) -> NsupdateCliAnalysis<'_> {
 
 fn pipe_consumer_pack(command: &str) -> Option<&'static str> {
     let (executable, args) = command_tokens(command)?;
+    let (executable, args) =
+        crate::packs::database::snowflake::canonical_snow_invocation(executable, args);
     match executable.as_str() {
         "redis-cli" | "valkey-cli" | "keydb-cli"
             if analyze_redis_cli_args(&args).reads_stdin_as_code =>
@@ -17548,6 +17553,8 @@ fn command_argument_payloads(
     let Some((executable, args)) = command_tokens(&masked.command) else {
         return Ok(Vec::new());
     };
+    let (executable, args) =
+        crate::packs::database::snowflake::canonical_snow_invocation(executable, args);
     let snowflake_analysis = (executable == "snow")
         .then(|| crate::packs::database::snowflake::analyze_snow_sql_args(&args));
 
@@ -29931,6 +29938,74 @@ mod tests {
                 evaluate_with_pack_ids(command, &["database.redis"]).is_denied(),
                 "Redis stdin option form must block: {command}"
             );
+        }
+    }
+
+    /// bd-w53v: the legacy SnowSQL client reached no layer. Its SQL, file and
+    /// stdin surfaces are the ones `snow sql` has, so it is analysed as the
+    /// equivalent `snow sql` invocation; `!system` is a shell escape.
+    #[test]
+    fn legacy_snowsql_client_reaches_the_snowflake_analyzer() {
+        let pack = ["database.snowflake"];
+        for (command, rule) in [
+            ("snowsql -q 'DROP DATABASE prod'", "drop-database"),
+            ("snowsql --query \"drop table users\"", "drop-table"),
+            (
+                "snowsql --query='TRUNCATE TABLE prod.events'",
+                "truncate-table",
+            ),
+            (
+                "snowsql -a acct -u me -d db -w wh -o friendly=false -q 'DROP SCHEMA prod.old'",
+                "drop-schema",
+            ),
+            (
+                "snowsql -c prod -P -q 'DROP DATABASE prod'",
+                "drop-database",
+            ),
+            (
+                "/opt/snowsql/snowsql -qDROP\\ DATABASE\\ prod",
+                "drop-database",
+            ),
+            // The static producer is resolved, so the piped SQL is judged.
+            ("printf 'DROP TABLE t' | snowsql -c prod", "drop-table"),
+            ("cat \"$MIGRATION\" | snowsql -c prod", "stdin-unverified"),
+            ("snowsql -q '!system rm -rf /srv'", "shell-escape"),
+            ("snowsql -q 'SELECT &cmd'", "stdin-unverified"),
+            // Ambiguous or unmodelled arity fails closed.
+            (
+                "snowsql --future-option x -q 'SELECT 1'",
+                "stdin-unverified",
+            ),
+            ("snowsql -v 1.2.30 -q 'SELECT 1'", "stdin-unverified"),
+            ("snowsql -q DROP DATABASE prod", "stdin-unverified"),
+            // No SQL source opens the REPL, which `snow sql` also fails closed
+            // on: what arrives on stdin cannot be proven from the hook.
+            ("snowsql -c prod", "stdin-unverified"),
+        ] {
+            let result = evaluate_with_pack_ids(command, &pack);
+            let info = result.pattern_info.as_ref();
+            assert!(
+                !result.is_allowed(),
+                "{command} must not be allowed: {result:?}"
+            );
+            assert_eq!(
+                info.and_then(|info| info.pack_id.as_deref()),
+                Some("database.snowflake"),
+                "{command}"
+            );
+            assert_eq!(
+                info.and_then(|info| info.pattern_name.as_deref()),
+                Some(rule),
+                "{command}"
+            );
+        }
+        for command in [
+            "snowsql -q 'SELECT COUNT(*) FROM prod.users'",
+            "snowsql -a acct -u me -q 'SHOW TABLES'",
+            "snowsql --help",
+        ] {
+            let result = evaluate_with_pack_ids(command, &pack);
+            assert!(result.is_allowed(), "{command} -> {result:?}");
         }
     }
 

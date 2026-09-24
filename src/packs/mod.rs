@@ -2086,6 +2086,9 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         "database.snowflake",
         &[
             "snow",
+            // The legacy SnowSQL client. `snow` is word-bounded, and the SQL
+            // verbs below are usually inside the quoted `-q` value.
+            "snowsql",
             "Snow",
             "SNOW",
             "DROP",

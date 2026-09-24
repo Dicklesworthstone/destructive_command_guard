@@ -521,6 +521,7 @@ Protects modern `snow sql` queries, files, stdin, nested sources, data, ingestio
 Commands containing these keywords are checked against this pack:
 
 - `snow`
+- `snowsql`
 - `Snow`
 - `SNOW`
 - `DROP`
@@ -589,6 +590,7 @@ These patterns match potentially destructive commands:
 | `warehouse-settings` | ALTER WAREHOUSE SET can create availability or cost risk. | medium |
 | `abort-query` | !abort cancels an active Snowflake query. | medium |
 | `interactive-edit` | !edit executes SQL modified in an external editor that dcg cannot inspect in advance. | high |
+| `shell-escape` | !system runs a shell command from inside the SnowSQL session, outside dcg's shell analysis. | high |
 | `execute-immediate` | EXECUTE IMMEDIATE runs generated SQL whose rendered semantics require explicit review. | medium |
 | `cli-object-drop-database` | snow object drop database/schema removes the object and everything inside it. | critical |
 | `cli-object-drop` | snow object drop permanently removes a Snowflake object. | high |
