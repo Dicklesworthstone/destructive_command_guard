@@ -4355,21 +4355,22 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!("truncate-help", r"^truncate\s+(?:--help|--version)\s*$"),
         // Growing operations: -s +<N>, --size=+<N> (pure growth — no
         // data destroyed). We only whitelist the explicit `+` form because
-        // absolute sizes can shrink existing files. The `-s` short form
-        // takes its value as a separate token (`-s +1G`); `--size=` packs
-        // value into the same token (`--size=+1G`).
+        // absolute sizes can shrink existing files. getopt accepts the size
+        // in every spelling -- `-s +1G`, `-s+1G`, `-cs +1G` (bundled with
+        // `-c`/`-o`), `--size=+1G`, `--size +1G` -- and the safe and
+        // destructive rules below must agree on all of them.
         safe_pattern!(
             "truncate-grow",
-            r"^truncate\s+(?:-s\s+\+\S+|--size=\+\S+)\s+\S+\s*$"
+            r"^truncate\s+(?:-[co]*s\s*\+\S+|--size(?:=|\s+)\+\S+)\s+\S+\s*$"
         ),
         // Temp-directory truncate (any size).
         safe_pattern!(
             "truncate-tmp",
-            r"^(?![^|;&]*[\\$`])truncate\s+(?:-s\s+\S+|--size=\S+)\s+(?:--\s+)?(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])truncate\s+(?:-[co]*s\s*\S+|--size(?:=|\s+)\S+)\s+(?:--\s+)?(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         safe_pattern!(
             "truncate-var-tmp",
-            r"^(?![^|;&]*[\\$`])truncate\s+(?:-s\s+\S+|--size=\S+)\s+(?:--\s+)?(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])truncate\s+(?:-[co]*s\s*\S+|--size(?:=|\s+)\S+)\s+(?:--\s+)?(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         // -r/--reference <ref-file> <file> uses the size of ref-file.
         // This is a copy-size, not a destruction primitive — allowed when
@@ -5085,7 +5086,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `truncate-grow` safe pattern above.
         destructive_pattern!(
             "truncate-zero-root-home",
-            r#"\btruncate\b[^|;&]*?(?:\s-s\s+(?!\+)\S+|\s--size=(?!\+)\S+)[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
+            r#"\btruncate\b[^|;&]*?(?:\s-[co]*s\s*(?!\+)\S+|\s--size(?:=|\s+)(?!\+)\S+)[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
             "truncate with a potentially shrinking size on a sensitive system or home path destroys data. EXTREMELY DANGEROUS.",
             Critical,
             "`truncate -s 0 <file>` zeros a file in place. `truncate -s -<N> <file>` \
@@ -5102,7 +5103,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // ----- destructive `truncate -s/--size` (High: any other target) -----
         destructive_pattern!(
             "truncate-zero-general",
-            r"\btruncate\b[^|;&]*?(?:\s-s\s+(?!\+)\S+|\s--size=(?!\+)\S+)",
+            r"\btruncate\b[^|;&]*?(?:\s-[co]*s\s*(?!\+)\S+|\s--size(?:=|\s+)(?!\+)\S+)",
             "truncate with an absolute or shrinking size can destroy file content and requires human approval.",
             High,
             "`truncate -s 0 <file>` zeros a file in place; `truncate -s -<N> <file>` \
@@ -6439,6 +6440,37 @@ mod tests {
             "truncate --reference=ref.bin out.bin",
         ] {
             assert_no_match(&pack, cmd);
+        }
+    }
+
+    /// getopt accepts the size attached (`-s0`), separated from a long option
+    /// (`--size 0`), and bundled (`-cs0`). Only `-s 0` and `--size=0` were
+    /// recognised, so the other spellings zeroed a key or /etc/passwd
+    /// unexamined -- and the safe rules had the same blind spot, so both
+    /// sides move together.
+    #[test]
+    fn truncate_every_size_spelling_is_judged_alike() {
+        let pack = create_pack();
+        for cmd in [
+            "truncate -s0 ~/.ssh/id_ed25519",
+            "truncate --size 0 ~/.ssh/id_ed25519",
+            "truncate -cs0 /etc/passwd",
+            "truncate -c -s0 /etc/shadow",
+            "truncate -s-100 ~/.bashrc",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+        }
+        for cmd in ["truncate -s0 ./data.bin", "truncate --size 0 build/out.log"] {
+            assert_blocks_with_severity(&pack, cmd, Severity::High);
+        }
+        for cmd in [
+            "truncate -s+1G ./disk.img",
+            "truncate --size +1G ./disk.img",
+            "truncate -cs+4K ./sparse.bin",
+            "truncate -s0 /tmp/scratch/out.log",
+            "truncate --size 0 /var/tmp/job.log",
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
         }
     }
 

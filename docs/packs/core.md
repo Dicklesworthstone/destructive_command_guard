@@ -199,9 +199,9 @@ These patterns match safe commands that are always allowed:
 | `unlink-var-tmp` | `^(?![^\|;&]*[\\$`])unlink\s+(?:--\s+)?(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
 | `unlink-help` | `^unlink\s+(?:--help\|--version)\s*$` |
 | `truncate-help` | `^truncate\s+(?:--help\|--version)\s*$` |
-| `truncate-grow` | `^truncate\s+(?:-s\s+\+\S+\|--size=\+\S+)\s+\S+\s*$` |
-| `truncate-tmp` | `^(?![^\|;&]*[\\$`])truncate\s+(?:-s\s+\S+\|--size=\S+)\s+(?:--\s+)?(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
-| `truncate-var-tmp` | `^(?![^\|;&]*[\\$`])truncate\s+(?:-s\s+\S+\|--size=\S+)\s+(?:--\s+)?(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
+| `truncate-grow` | `^truncate\s+(?:-[co]*s\s*\+\S+\|--size(?:=\|\s+)\+\S+)\s+\S+\s*$` |
+| `truncate-tmp` | `^(?![^\|;&]*[\\$`])truncate\s+(?:-[co]*s\s*\S+\|--size(?:=\|\s+)\S+)\s+(?:--\s+)?(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
+| `truncate-var-tmp` | `^(?![^\|;&]*[\\$`])truncate\s+(?:-[co]*s\s*\S+\|--size(?:=\|\s+)\S+)\s+(?:--\s+)?(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
 | `shred-help` | `^shred\s+(?:--help\|--version)\s*$` |
 | `shred-tmp` | `^(?![^\|;&]*[\\$`])shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s+(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s*$` |
 | `shred-var-tmp` | `^(?![^\|;&]*[\\$`])shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s+(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s*$` |
