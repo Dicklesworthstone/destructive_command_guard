@@ -1,13 +1,15 @@
 //! #442 guard: the build must actually link the *patched* bash scanner.
 //!
 //! The repair for #442 is a two-line change to `tree-sitter-bash`'s C external
-//! scanner, vendored under `vendor/tree-sitter-bash` and selected by the root
-//! `[patch.crates-io]`. A Cargo patch is silent when it stops applying: if the
-//! dependency graph ever asks for a `tree-sitter-bash` the vendored copy does
-//! not satisfy — an `ast-grep-language` bump is the likely way, since it
-//! requires `^0.25.0` today — Cargo prints "patch ... was not used in the crate
-//! graph" as a *warning*, links the unpatched registry crate, and the build
-//! succeeds.
+//! scanner, vendored under `vendor/tree-sitter-bash` and published as
+//! `tree-sitter-bash-dcg`. dcg reaches the Bash grammar only through
+//! `ast-grep-language`, so it depends on `ast-grep-language-dcg`
+//! (`vendor/ast-grep-language`), which is ast-grep-language built against the
+//! patched grammar. This replaced a `[patch.crates-io]`, which `cargo publish`
+//! drops, so every crates.io build had silently compiled the unpatched scanner.
+//! The same failure is still possible if the graph ever picks up a stock
+//! `ast-grep-language` or `tree-sitter-bash` alongside, or instead of, the
+//! forks. The build would succeed and link the unpatched scanner.
 //!
 //! Nothing else in the tree notices that. `scripts/check_scanner_safety.py`
 //! compiles `vendor/tree-sitter-bash/src/scanner.c` directly with `cc`, so it
@@ -103,57 +105,67 @@ fn narrow_ctype_calls(source: &str) -> Vec<String> {
 }
 
 #[test]
-fn the_patch_section_selects_the_vendored_scanner() {
+fn the_manifests_select_the_patched_grammar_crates() {
     let manifest = read("Cargo.toml");
-    let patched = tables(&manifest, "[patch.crates-io]");
-    assert_eq!(
-        patched.len(),
-        1,
-        "Cargo.toml must declare exactly one [patch.crates-io] table"
-    );
-    let entry = field(&patched[0], "tree-sitter-bash").expect(
-        "Cargo.toml [patch.crates-io] must patch tree-sitter-bash — without it the build links \
-         the unpatched registry scanner and #442's out-of-domain isdigit read comes back",
+    let dependency = manifest
+        .lines()
+        .find(|line| line.trim_start().starts_with("ast-grep-language ="))
+        .expect("Cargo.toml must depend on ast-grep-language");
+    assert!(
+        dependency.contains("package = \"ast-grep-language-dcg\""),
+        "dcg must take ast-grep-language from the ast-grep-language-dcg fork — the stock crate \
+         links the unpatched tree-sitter-bash scanner (#442): {dependency}"
     );
     assert!(
-        entry.contains("path = \"vendor/tree-sitter-bash\""),
-        "the tree-sitter-bash patch must point at the vendored copy, not {entry:?}"
+        tables(&manifest, "[patch.crates-io]").is_empty(),
+        "a [patch.crates-io] is dropped by `cargo publish`; the grammar fix must travel through \
+         the published -dcg crates instead"
+    );
+
+    let fork = read("vendor/ast-grep-language/Cargo.toml");
+    let bash = tables(&fork, "[dependencies.tree-sitter-bash]");
+    assert_eq!(bash.len(), 1, "the fork must declare its tree-sitter-bash dependency");
+    assert_eq!(
+        field(&bash[0], "package"),
+        Some("tree-sitter-bash-dcg"),
+        "ast-grep-language-dcg must build against the patched grammar crate"
     );
 }
 
 #[test]
-fn the_lockfile_resolves_tree_sitter_bash_to_the_vendored_path() {
+fn the_lockfile_links_only_the_patched_grammar() {
     let lockfile = read("Cargo.lock");
     let packages = tables(&lockfile, "[[package]]");
-    let resolved: Vec<_> = packages
-        .iter()
-        .filter(|body| field(body, "name") == Some("tree-sitter-bash"))
-        .collect();
+    let named = |name: &str| -> Vec<_> {
+        packages
+            .iter()
+            .filter(|body| field(body, "name") == Some(name))
+            .collect()
+    };
+
+    // Either stock crate in the graph means some path links the unpatched
+    // scanner, however the rest of the graph is wired.
+    for stock in ["tree-sitter-bash", "ast-grep-language"] {
+        assert!(
+            named(stock).is_empty(),
+            "Cargo.lock contains the stock `{stock}`, so the build links the unpatched \
+             tree-sitter-bash scanner (#442). Everything must go through the -dcg forks."
+        );
+    }
+
+    let patched = named("tree-sitter-bash-dcg");
     assert_eq!(
-        resolved.len(),
+        patched.len(),
         1,
-        "expected exactly one tree-sitter-bash in Cargo.lock, found {}",
-        resolved.len()
+        "expected exactly one tree-sitter-bash-dcg in Cargo.lock, found {}",
+        patched.len()
     );
-
-    // A patched path package carries no `source`; a registry package carries
-    // `source` and `checksum`. This is the one place the resolved graph — not
-    // the file on disk — says which scanner will be compiled.
-    assert_eq!(
-        field(resolved[0], "source"),
-        None,
-        "Cargo.lock resolves tree-sitter-bash from a registry, so [patch.crates-io] is not in \
-         effect and the build links the unpatched upstream scanner (#442). Cargo reports this \
-         only as a warning. Re-point the patch at a vendored copy of the version the graph now \
-         requires."
-    );
-
     let vendored = read("vendor/tree-sitter-bash/Cargo.toml");
     let package = tables(&vendored, "[package]");
     assert_eq!(
-        field(resolved[0], "version"),
+        field(patched[0], "version"),
         field(&package[0], "version"),
-        "the locked tree-sitter-bash version and the vendored package version disagree"
+        "the locked tree-sitter-bash-dcg version and the vendored package version disagree"
     );
 }
 

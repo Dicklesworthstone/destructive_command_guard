@@ -195,7 +195,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tree-sitter-bash"
+name = "tree-sitter-bash-dcg"
 version = "0.25.1"
 dependencies = [
  "cc",

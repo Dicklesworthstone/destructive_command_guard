@@ -11,7 +11,7 @@
 
 [package]
 edition = "2021"
-name = "tree-sitter-bash"
+name = "tree-sitter-bash-dcg"
 version = "0.25.1"
 authors = [
     "Max Brunsfeld <maxbrunsfeld@gmail.com>",
@@ -31,7 +31,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Bash grammar for tree-sitter"
+description = "tree-sitter-bash 0.25.1 with the scanner and redirection fixes destructive_command_guard depends on (dcg #442, #461)"
 readme = "README.md"
 keywords = [
     "incremental",
@@ -44,7 +44,8 @@ categories = [
     "text-editors",
 ]
 license = "MIT"
-repository = "https://github.com/tree-sitter/tree-sitter-bash"
+repository = "https://github.com/Dicklesworthstone/destructive_command_guard"
+homepage = "https://github.com/tree-sitter/tree-sitter-bash"
 
 [lib]
 name = "tree_sitter_bash"

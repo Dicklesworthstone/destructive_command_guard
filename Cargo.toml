@@ -26,6 +26,8 @@ exclude = [
     "*.webp",
     "agent_baseline/",
     "action/",
+    # Published separately as tree-sitter-bash-dcg / ast-grep-language-dcg.
+    "vendor/",
 ]
 
 # Primary binary with short alias
@@ -64,7 +66,14 @@ rayon = { version = "1.11", optional = true }
 
 # AST-based pattern matching for heredoc/inline-script content
 ast-grep-core = "0.45"
-ast-grep-language = { version = "0.45", default-features = false, features = [
+# The Bash grammar carries dcg's #442/#461 fixes (scanner memory safety on glibc;
+# explicit stdin descriptors and mixed file/here-string redirections). It used to
+# arrive through `[patch.crates-io]`, which `cargo publish` drops, so a crates.io
+# build silently compiled the unpatched grammar. The patched grammar is now
+# published as `tree-sitter-bash-dcg`, and `ast-grep-language-dcg` is
+# ast-grep-language 0.45.3 built against it. Both live under vendor/, and the
+# `path` keys are used for local builds while `version` is what gets published.
+ast-grep-language = { package = "ast-grep-language-dcg", version = "0.45.3", path = "vendor/ast-grep-language", default-features = false, features = [
     "tree-sitter-bash",
     "tree-sitter-python",
     "tree-sitter-javascript",
@@ -100,12 +109,6 @@ tru = "0.2.2"
 # Markdown renderer used by dcg; the syntax feature pulls in an obsolete parser
 # stack and the regex renderer below already has a purpose-built highlighter.
 rich_rust = { version = "0.2.2", features = ["markdown"], optional = true }
-
-[patch.crates-io]
-# #442/#461: retain the Unicode scanner safety fixes and repair explicit
-# stdin descriptors and mixed file/here-string redirection sequences.
-# Generated parser artifacts are checked in alongside the patched grammar.
-tree-sitter-bash = { path = "vendor/tree-sitter-bash" }
 
 [build-dependencies]
 vergen-gix = { version = "10.0.0-beta.8", features = ["build", "cargo", "rustc"] }
