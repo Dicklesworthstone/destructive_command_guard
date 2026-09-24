@@ -497,6 +497,11 @@ fn classify_cmd_builtin(name: &str, args: &[Arg]) -> Option<CredentialFileWrite>
         // second operand is a bare new name, which the source-side judgement
         // does not need (#451).
         "move" | "ren" | "rename" => WriterKind::CmdMove,
+        // Replacing a key with a link is the classic substitution: the file
+        // the daemon reads becomes one the caller controls. POSIX `ln -sf` and
+        // PowerShell's `New-Item -ItemType SymbolicLink` both deny it; cmd's
+        // spelling did not (#451).
+        "mklink" => WriterKind::CmdMklink,
         _ => return None,
     };
     let operands: Vec<&Arg> = args
@@ -511,6 +516,20 @@ fn classify_cmd_builtin(name: &str, args: &[Arg]) -> Option<CredentialFileWrite>
                     .all(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == ':'))
         })
         .collect();
+    // `mklink [/D|/H|/J] <link> <target>` puts the name it CREATES first,
+    // the opposite way round from `copy` and `move`. Only that name is
+    // written; the target is merely pointed at, exactly as POSIX `ln`'s
+    // second operand is the one judged (#451).
+    if kind == WriterKind::CmdMklink {
+        let link = operands.first()?;
+        return judge_file_target(
+            &link.word,
+            Writer {
+                kind: Some(kind),
+                mode: WriteMode::Replace,
+            },
+        );
+    }
     let (destination, sources) = operands.split_last()?;
     if sources.is_empty() {
         return None;
@@ -549,6 +568,8 @@ const WRITER_WORDS: &[&str] = &[
     "rn",
     "ren",
     "rename",
+    // Creating a link AT a protected path replaces what that path resolves to.
+    "mklink",
 ];
 
 pub(super) fn names_writer(command: &str) -> bool {
@@ -1156,6 +1177,49 @@ mod tests {
 
     fn cmd(command: &str) -> Option<CredentialFileWrite> {
         super::super::classify_credential_file_write(command, ShellDialect::Cmd)
+    }
+
+    /// `mklink` creates the link at its FIRST operand (#451).
+    ///
+    /// Replacing a key with a link is the classic substitution: the file the
+    /// daemon reads becomes one the caller controls. POSIX `ln -sf` and
+    /// PowerShell's `New-Item -ItemType SymbolicLink` both deny it; cmd's
+    /// spelling allowed every form. The operand order is the trap — `mklink
+    /// <link> <target>` names what it CREATES first, the opposite way round
+    /// from `copy` and `move`, so reading it as a copy would judge the wrong
+    /// path and quietly find nothing.
+    #[test]
+    fn cmd_mklink_at_a_protected_path_denies_issue_451() {
+        let key = "%USERPROFILE%/.ssh/authorized_keys";
+        for command in [
+            format!("mklink {key} C:/tmp/evil"),
+            // /D symbolic directory, /H hard link, /J junction.
+            format!("mklink /D {key} C:/tmp/evil"),
+            format!("mklink /H {key} C:/tmp/evil"),
+            "mklink /J %USERPROFILE%/.ssh C:/tmp/evil".to_string(),
+        ] {
+            let found = cmd(&command).unwrap_or_else(|| panic!("must deny: {command}"));
+            assert_eq!(found.rule, CREDENTIAL_FILE_WRITE_NAME, "{command}");
+        }
+    }
+
+    /// The link rule turns on WHERE the link is created, not on `mklink` (#451).
+    ///
+    /// The second operand is only pointed at, so naming a protected path there
+    /// is a read and must stay allowed — the same asymmetry POSIX `ln` has.
+    #[test]
+    fn cmd_mklink_still_turns_on_the_created_name_issue_451() {
+        for command in [
+            "mklink C:/app/link C:/app/target",
+            "mklink /D C:/app/link C:/app/target",
+            // Pointing a NEW ordinary link at a key reads the key; it does not
+            // replace it.
+            "mklink C:/app/link %USERPROFILE%/.ssh/authorized_keys",
+            // The public half stays exempt.
+            "mklink %USERPROFILE%/.ssh/id_rsa.pub C:/tmp/evil",
+        ] {
+            assert!(cmd(command).is_none(), "must stay allowed: {command}");
+        }
     }
 
     /// Moving or renaming a protected file AWAY destroys it (#451).

@@ -1573,6 +1573,7 @@ enum WriterKind {
     MoveItem,
     CmdCopy,
     CmdMove,
+    CmdMklink,
 }
 
 fn writer_kind(executable: &str) -> Option<WriterKind> {
@@ -1634,6 +1635,7 @@ impl Writer {
             (Some(WriterKind::MoveItem), _) => "`Move-Item` replaces",
             (Some(WriterKind::CmdCopy), _) => "`copy` writes",
             (Some(WriterKind::CmdMove), _) => "`move` replaces",
+            (Some(WriterKind::CmdMklink), _) => "`mklink` creates a link at",
         }
     }
 }
@@ -2039,7 +2041,8 @@ fn classify_simple_command(tokens: &[Token]) -> Option<CredentialFileWrite> {
         | WriterKind::CopyItem
         | WriterKind::MoveItem
         | WriterKind::CmdCopy
-        | WriterKind::CmdMove => None,
+        | WriterKind::CmdMove
+        | WriterKind::CmdMklink => None,
     }
 }
 
