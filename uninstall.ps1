@@ -606,6 +606,42 @@ function Unconfigure-CrushHook {
   $removed
 }
 
+function Get-ReasonixSettingsPaths {
+  # Reasonix's user settings (#358). Its home is REASONIX_HOME, else
+  # %APPDATA%\reasonix, else %USERPROFILE%\AppData\Roaming\reasonix. Without
+  # REASONIX_HOME, Reasonix also reads the legacy ~\.reasonix\settings.json
+  # while the primary file is missing, so both are cleaned.
+  param([string]$HomeDir = $HOME)
+  if (-not [string]::IsNullOrWhiteSpace($env:REASONIX_HOME)) {
+    return @((Join-Path $env:REASONIX_HOME 'settings.json'))
+  }
+  $base = if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
+    $env:APPDATA
+  } else {
+    Join-Path (Join-Path $HomeDir 'AppData') 'Roaming'
+  }
+  @(
+    (Join-Path (Join-Path $base 'reasonix') 'settings.json'),
+    (Join-Path (Join-Path $HomeDir '.reasonix') 'settings.json')
+  )
+}
+
+function Unconfigure-ReasonixHook {
+  # User-level settings plus any repo-local .reasonix\settings.json written by
+  # `dcg install --reasonix --project`. The entries are `hooks.PreToolUse[]`
+  # objects with a `command`, the shape the Crush editor already handles.
+  param([string]$HomeDir = $HOME, [string]$RepoRoot = '')
+  $paths = @(Get-ReasonixSettingsPaths -HomeDir $HomeDir)
+  if (-not [string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $paths += (Join-Path (Join-Path $RepoRoot '.reasonix') 'settings.json')
+  }
+  $removed = $false
+  foreach ($path in $paths) {
+    if (Remove-DcgHooksFromCrushConfig -Path $path) { $removed = $true }
+  }
+  $removed
+}
+
 function Get-DcgRepositoryRoot {
   param([string]$StartDir = (Get-Location).Path)
   try {
@@ -878,6 +914,8 @@ if (Remove-DcgHooksFromJsonFile -Path $agyHooks -DeleteEmptyFile) {
 if (Unconfigure-OmpExtension) { Write-Ok "Removed Oh My Pi extension" }
 
 if (Unconfigure-CrushHook -RepoRoot (Get-DcgRepositoryRoot)) { Write-Ok "Removed Crush hook" }
+
+if (Unconfigure-ReasonixHook -RepoRoot (Get-DcgRepositoryRoot)) { Write-Ok "Removed Reasonix hook" }
 
 if (Test-Path $binary -PathType Leaf) {
   Remove-Item -Force -Path $binary

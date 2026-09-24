@@ -22,6 +22,8 @@ $savedGrok = $env:GROK_SESSION_ID
 $savedHermesHome = $env:HERMES_HOME
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedOs = $env:OS
+$savedReasonixHome = $env:REASONIX_HOME
+$savedAppData = $env:APPDATA
 $ompSelectorNames = @('OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'PI_CODING_AGENT_DIR')
 $savedOmpSelectors = @{}
 foreach ($name in $ompSelectorNames) {
@@ -52,6 +54,8 @@ try {
     $env:PI_CONFIG_DIR = $null
     $env:CRUSH_GLOBAL_CONFIG = $null  # no Crush config-path override leaks (#388)
     $env:XDG_CONFIG_HOME = $null
+    $env:REASONIX_HOME = $null     # no Reasonix home leaks (#358)
+    $env:APPDATA = $null
 
     Write-Host "Test 1: detects only the agents whose config dir is present"
     $h1 = New-TempHome
@@ -70,6 +74,7 @@ try {
     Check ($a['Posit'] -eq $false) "Posit Assistant NOT detected"
     Check ($a['Omp'] -eq $false) "Oh My Pi NOT detected"
     Check ($a['Crush'] -eq $false) "Crush NOT detected (no ~/.config/crush, no crush on PATH)"
+    Check ($a['Reasonix'] -eq $false) "Reasonix NOT detected (no Reasonix home, no reasonix on PATH)"
     $names = Get-DetectedAgentNames $a
     Check (($names -join ',') -eq 'Claude,Gemini,Grok') "summary lists detected agents in config order (got '$($names -join ',')')"
     Remove-Item -Recurse -Force $h1 -ErrorAction SilentlyContinue
@@ -124,6 +129,26 @@ try {
     Check ($a1h['Crush'] -eq $true) "Crush detected via CRUSH_GLOBAL_CONFIG"
     $env:CRUSH_GLOBAL_CONFIG = $null
     Remove-Item -Recurse -Force $h1h -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1i: Reasonix detected from each home it reads (#358)"
+    $h1i = New-TempHome
+    New-Item -ItemType Directory -Force -Path (Join-Path $h1i '.reasonix') | Out-Null
+    $a1i = Detect-Agents -HomeDir $h1i
+    Check ($a1i['Reasonix'] -eq $true) "Reasonix detected via the legacy ~/.reasonix"
+    $names1i = Get-DetectedAgentNames $a1i
+    Check (($names1i -join ',') -eq 'Reasonix') "summary lists only Reasonix (got '$($names1i -join ',')')"
+    Remove-Item -Recurse -Force $h1i -ErrorAction SilentlyContinue
+
+    $h1j = New-TempHome
+    $env:APPDATA = Join-Path $h1j 'Roaming'
+    New-Item -ItemType Directory -Force -Path (Join-Path $env:APPDATA 'reasonix') | Out-Null
+    Check ((Detect-Agents -HomeDir $h1j)['Reasonix'] -eq $true) "Reasonix detected via %APPDATA%\reasonix"
+    $env:APPDATA = $null
+    $env:REASONIX_HOME = Join-Path $h1j 'isolated'
+    New-Item -ItemType Directory -Force -Path $env:REASONIX_HOME | Out-Null
+    Check ((Detect-Agents -HomeDir $h1j)['Reasonix'] -eq $true) "Reasonix detected via REASONIX_HOME"
+    $env:REASONIX_HOME = $null
+    Remove-Item -Recurse -Force $h1j -ErrorAction SilentlyContinue
 
     Write-Host "Test 1f: Oh My Pi detected from PI_CONFIG_DIR"
     $h1f = New-TempHome
@@ -226,6 +251,8 @@ try {
     $env:HERMES_HOME = $savedHermesHome
     $env:LOCALAPPDATA = $savedLocalAppData
     $env:OS = $savedOs
+    $env:REASONIX_HOME = $savedReasonixHome
+    $env:APPDATA = $savedAppData
     foreach ($name in $ompSelectorNames) {
         if ($null -eq $savedOmpSelectors[$name]) {
             Microsoft.PowerShell.Management\Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue

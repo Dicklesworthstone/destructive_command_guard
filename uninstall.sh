@@ -1162,11 +1162,12 @@ unconfigure_opencode() {
 # file is preserved byte-for-value.
 unconfigure_crush_file() {
     local config_file="$1"
+    local agent="${2:-Crush}"
     [ -f "$config_file" ] || return 0
     grep -q 'dcg' "$config_file" 2>/dev/null || return 0
 
     if ! command -v python3 >/dev/null 2>&1; then
-        warn "python3 not available - cannot safely edit Crush config"
+        warn "python3 not available - cannot safely edit $agent config"
         warn "Please manually remove dcg from $config_file"
         return 1
     fi
@@ -1246,6 +1247,25 @@ unconfigure_crush() {
     fi
     for config_file in "${configs[@]}"; do
         unconfigure_crush_file "$config_file" || true
+    done
+    return 0
+}
+
+unconfigure_reasonix() {
+    # Reasonix hook (#358): <Reasonix home>/settings.json (REASONIX_HOME, else
+    # ~/.reasonix) plus any repo-local .reasonix/settings.json written by
+    # `dcg install --reasonix --project`. Its entries are `hooks.PreToolUse[]`
+    # objects with a `command`, the shape the Crush editor above already
+    # handles. A hook left behind after the binary is gone makes Reasonix
+    # warn on every shell call.
+    local config_file
+    local repo_root=""
+    local -a configs=("${REASONIX_HOME:-$HOME/.reasonix}/settings.json")
+    if repo_root=$(current_repo_root); then
+        configs+=("$repo_root/.reasonix/settings.json")
+    fi
+    for config_file in "${configs[@]}"; do
+        unconfigure_crush_file "$config_file" Reasonix || true
     done
     return 0
 }
@@ -1768,6 +1788,7 @@ main() {
     report_unconfigure "Posit Assistant hook" unconfigure_posit_assistant
     report_unconfigure "OpenCode plugin" unconfigure_opencode
     report_unconfigure "Crush hook" unconfigure_crush
+    report_unconfigure "Reasonix hook" unconfigure_reasonix
     report_unconfigure "Oh My Pi extension" unconfigure_omp
 
     # Remove Aider config

@@ -1699,6 +1699,24 @@ mod env_tests {
         assert_eq!(agent_from_process_name("crush-tui"), None);
     }
 
+    /// #358: Reasonix sets no environment marker, so its process name (and
+    /// the hook protocol) are what identify it.
+    #[test]
+    fn test_reasonix_identity_mappings() {
+        assert_eq!(Agent::Reasonix.config_key(), "reasonix");
+        assert!(Agent::Reasonix.is_known());
+        assert_eq!(Agent::from_name("reasonix"), Agent::Reasonix);
+        assert_eq!(Agent::from_name("Reasonix"), Agent::Reasonix);
+        assert_eq!(Agent::from_name("deepseek-reasonix"), Agent::Reasonix);
+        assert_eq!(format!("{}", Agent::Reasonix), "Reasonix");
+        assert_eq!(agent_from_process_name("reasonix"), Some(Agent::Reasonix));
+        assert_eq!(
+            agent_from_process_name("/opt/homebrew/bin/reasonix"),
+            Some(Agent::Reasonix)
+        );
+        assert_eq!(agent_from_process_name("reasonixd"), None);
+    }
+
     #[test]
     fn test_omp_identity_mappings() {
         assert_eq!(Agent::Omp.config_key(), "omp");

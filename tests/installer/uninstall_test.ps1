@@ -675,6 +675,42 @@ foreach ($case in $profileCases19) {
     $resolved = Get-OmpAgentDir -HomeDir $h18
     Check ([string]::Equals($resolved, $case.Expected, [System.StringComparison]::Ordinal)) "OMP: $($case.Name) resolves to '$($case.Expected)' (got '$resolved')"
 }
+
+Write-Host "Test R: Reasonix (#358) - primary, legacy and project settings lose only dcg"
+$hr = New-Tmp; New-Item -ItemType Directory -Path $hr -Force | Out-Null
+$savedReasonixHome = $env:REASONIX_HOME
+$savedAppData = $env:APPDATA
+try {
+    $env:REASONIX_HOME = $null
+    $env:APPDATA = Join-Path $hr 'Roaming'
+    $primary = Join-Path (Join-Path $env:APPDATA 'reasonix') 'settings.json'
+    $legacy = Join-Path (Join-Path $hr '.reasonix') 'settings.json'
+    $repo = Join-Path $hr 'repo'
+    $project = Join-Path (Join-Path $repo '.reasonix') 'settings.json'
+    foreach ($p in @($primary, $legacy, $project)) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $p) | Out-Null
+        @{ theme = 'dark'; hooks = @{ PreToolUse = @(
+            @{ match = 'bash|pwsh'; command = "`"$dcg`""; timeout = 5000 },
+            @{ match = 'bash'; command = 'node check.js' }) } } |
+            ConvertTo-Json -Depth 20 | Set-Content $p
+    }
+    Check ((Unconfigure-ReasonixHook -HomeDir $hr -RepoRoot $repo) -eq $true) "Reasonix: returns true (removed)"
+    foreach ($p in @($primary, $legacy, $project)) {
+        $cfg = Get-Content -Raw $p | ConvertFrom-Json
+        $cmds = @($cfg.hooks.PreToolUse | ForEach-Object { $_.command })
+        Check (($cmds -join ',') -eq 'node check.js') "Reasonix: only the coexisting hook remains in $p (got '$($cmds -join ',')')"
+        Check ($cfg.theme -eq 'dark') "Reasonix: unrelated keys kept in $p"
+        Check (Test-NoBom $p) "Reasonix: $p written without a BOM"
+    }
+    Check ((Unconfigure-ReasonixHook -HomeDir $hr -RepoRoot $repo) -eq $false) "Reasonix: second run is a noop"
+
+    $env:REASONIX_HOME = Join-Path $hr 'isolated'
+    Check (((Get-ReasonixSettingsPaths -HomeDir $hr) -join '|') -eq (Join-Path $env:REASONIX_HOME 'settings.json')) "Reasonix: REASONIX_HOME is the only user-level path"
+} finally {
+    $env:REASONIX_HOME = $savedReasonixHome
+    $env:APPDATA = $savedAppData
+    Remove-Item -Recurse -Force $hr -ErrorAction SilentlyContinue
+}
 } finally {
     foreach ($name in $ompSelectorNames) {
         if ($null -eq $savedOmpSelectors[$name]) {

@@ -4761,3 +4761,155 @@ PYEOF
     [[ "$output" == *"removed"* ]]
     ! grep -q '/usr/local/bin/dcg' "$TEST_WORKDIR/crush.json"
 }
+
+# ============================================================================
+# Reasonix Configuration Tests (#358)
+# ============================================================================
+
+# The real settings.json merge is covered by Rust tests against the real
+# binary (tests/cli_e2e.rs). These cover configure_reasonix's detection
+# gating, delegation to `dcg install --reasonix --force`, status mapping, and
+# the uninstaller.
+
+make_reasonix_mock_dcg() {
+    # $1 = behavior: "ok" writes settings.json and exits 0; "fail" exits 1.
+    local behavior="$1"
+    cat > "$DEST/dcg" << MOCKEOF
+#!/bin/bash
+if [ "\$1" = "install" ] && [ "\$2" = "--reasonix" ]; then
+    case "$behavior" in
+        ok)
+            home_dir="\${REASONIX_HOME:-\$HOME/.reasonix}"
+            mkdir -p "\$home_dir"
+            printf '{"hooks":{"PreToolUse":[{"match":"bash|pwsh","command":"%s","timeout":5000}]}}\n' "$DEST/dcg" > "\$home_dir/settings.json"
+            echo "Reasonix hook installed successfully!"
+            exit 0
+            ;;
+        fail)
+            echo "Invalid Reasonix settings.json (expected a JSON object with a \"hooks\" key)" >&2
+            exit 1
+            ;;
+    esac
+fi
+echo "dcg 1.0.0"
+MOCKEOF
+    chmod +x "$DEST/dcg"
+}
+
+@test "detect_agents: Reasonix detected from ~/.reasonix" {
+    unset REASONIX_HOME
+    mkdir -p "$HOME/.reasonix"
+    DETECTED_AGENTS=()
+
+    detect_agents
+
+    is_agent_detected "reasonix"
+}
+
+@test "detect_agents: Reasonix detected from the REASONIX_HOME directory" {
+    export REASONIX_HOME="$TEST_TMPDIR/reasonix-home"
+    mkdir -p "$REASONIX_HOME"
+    DETECTED_AGENTS=()
+
+    detect_agents
+
+    is_agent_detected "reasonix"
+    unset REASONIX_HOME
+}
+
+@test "detect_agents: Reasonix NOT detected without home dir or CLI" {
+    unset REASONIX_HOME
+    DETECTED_AGENTS=()
+
+    detect_agents
+
+    ! is_agent_detected "reasonix"
+}
+
+@test "configure_reasonix: skipped when Reasonix not detected" {
+    unset REASONIX_HOME
+    DETECTED_AGENTS=()
+    REASONIX_STATUS=""
+
+    configure_reasonix
+
+    [ "$REASONIX_STATUS" = "skipped" ]
+    [ ! -f "$HOME/.reasonix/settings.json" ]
+}
+
+@test "configure_reasonix: delegates to dcg install --reasonix and reports created" {
+    unset REASONIX_HOME
+    DETECTED_AGENTS=("reasonix")
+    REASONIX_STATUS=""
+    AUTO_CONFIGURED=0
+    make_reasonix_mock_dcg ok
+
+    configure_reasonix
+
+    log_test "REASONIX_STATUS=$REASONIX_STATUS"
+    [ "$REASONIX_STATUS" = "created" ]
+    [ "$AUTO_CONFIGURED" -eq 1 ]
+    grep -q '"match":"bash|pwsh"' "$HOME/.reasonix/settings.json"
+}
+
+@test "configure_reasonix: reports merged when settings.json already existed" {
+    unset REASONIX_HOME
+    DETECTED_AGENTS=("reasonix")
+    REASONIX_STATUS=""
+    make_reasonix_mock_dcg ok
+    mkdir -p "$HOME/.reasonix"
+    printf '{"theme":"dark"}\n' > "$HOME/.reasonix/settings.json"
+
+    configure_reasonix
+
+    [ "$REASONIX_STATUS" = "merged" ]
+}
+
+@test "configure_reasonix: maps failures to failed with reason" {
+    unset REASONIX_HOME
+    DETECTED_AGENTS=("reasonix")
+    REASONIX_STATUS=""
+    make_reasonix_mock_dcg fail
+
+    configure_reasonix || true
+
+    [ "$REASONIX_STATUS" = "failed" ]
+    [ -n "$REASONIX_FAILURE_REASON" ]
+}
+
+@test "unconfigure_reasonix: removes only dcg entries, user and project level" {
+    unset REASONIX_HOME
+    mkdir -p "$HOME/.reasonix" "$TEST_WORKDIR/.git" "$TEST_WORKDIR/.reasonix"
+    cat > "$HOME/.reasonix/settings.json" << 'JSON'
+{"theme":"dark","hooks":{"PreToolUse":[{"match":"bash|pwsh","command":"\"/Users/Jane Doe/.local/bin/dcg\"","timeout":5000},{"match":"bash","command":"node check.js"}],"Stop":[{"command":"echo done"}]}}
+JSON
+    printf '{"hooks":{"PreToolUse":[{"match":"bash|pwsh","command":"/usr/local/bin/dcg"}]}}\n' > "$TEST_WORKDIR/.reasonix/settings.json"
+
+    run unconfigure_reasonix
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"removed"* ]]
+    python3 - "$HOME/.reasonix/settings.json" << 'PYEOF'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+assert cfg["theme"] == "dark"
+assert [e["command"] for e in cfg["hooks"]["PreToolUse"]] == ["node check.js"]
+assert cfg["hooks"]["Stop"] == [{"command": "echo done"}]
+PYEOF
+    ! grep -q '/usr/local/bin/dcg' "$TEST_WORKDIR/.reasonix/settings.json"
+}
+
+@test "unconfigure_reasonix: honors REASONIX_HOME and is a noop without dcg" {
+    export REASONIX_HOME="$TEST_TMPDIR/reasonix-home"
+    run unconfigure_reasonix
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"removed"* ]]
+
+    mkdir -p "$REASONIX_HOME"
+    printf '{"hooks":{"PreToolUse":[{"command":"/opt/dcg"},{"command":"./mine.sh"}]}}\n' > "$REASONIX_HOME/settings.json"
+    run unconfigure_reasonix
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"removed"* ]]
+    ! grep -q '/opt/dcg' "$REASONIX_HOME/settings.json"
+    grep -q 'mine.sh' "$REASONIX_HOME/settings.json"
+    unset REASONIX_HOME
+}

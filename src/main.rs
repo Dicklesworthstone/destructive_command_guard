@@ -326,6 +326,9 @@ fn hook_protocol_for_agent(agent: &Agent) -> hook::HookProtocol {
         Agent::Grok => hook::HookProtocol::Grok,
         Agent::Antigravity => hook::HookProtocol::Antigravity,
         Agent::Crush => hook::HookProtocol::Crush,
+        // Reasonix reads only the exit status: the Claude-shaped fallback
+        // below would exit 0 and let the command run.
+        Agent::Reasonix => hook::HookProtocol::Reasonix,
         _ => hook::HookProtocol::ClaudeCompatible,
     }
 }
@@ -1332,7 +1335,9 @@ fn resolve_hook_command(
 /// Returns the process exit status: `EXIT_SUCCESS` whenever the verdict
 /// reached stdout (or needed no stdout), the protocol's blocking status when
 /// a deny, ask, or indeterminate verdict could not be written (see
-/// `blocking_verdict_exit_code`).
+/// `blocking_verdict_exit_code`). Reasonix reads only the status, so there a
+/// blocking verdict always exits 2 and a warning exits
+/// `EXIT_REASONIX_WARNING` (#358).
 #[allow(clippy::too_many_lines)]
 fn publish_decisive_response(
     ctx: &HookEvalContext<'_>,
@@ -2323,6 +2328,42 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #358: Reasonix reads only the exit status, so every delivered blocking
+    /// verdict must exit 2 there, while stdout-JSON protocols keep exit 0. A
+    /// fail-closed parse failure attributed to Reasonix must use its protocol
+    /// too; the Claude-shaped fallback would exit 0 and let the command run.
+    #[test]
+    fn reasonix_blocks_by_exit_status_on_every_path() {
+        use destructive_command_guard::exit_codes::EXIT_HOOK_BLOCK;
+        assert_eq!(
+            blocking_verdict_exit_code(hook::HookProtocol::Reasonix, Ok(())),
+            EXIT_HOOK_BLOCK
+        );
+        assert_eq!(
+            blocking_verdict_exit_code(
+                hook::HookProtocol::Reasonix,
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            ),
+            EXIT_HOOK_BLOCK
+        );
+        for json_protocol in [
+            hook::HookProtocol::ClaudeCompatible,
+            hook::HookProtocol::Copilot,
+            hook::HookProtocol::Crush,
+        ] {
+            assert_eq!(
+                blocking_verdict_exit_code(json_protocol, Ok(())),
+                EXIT_SUCCESS
+            );
+        }
+        assert_eq!(
+            hook_protocol_for_agent(&Agent::Reasonix),
+            hook::HookProtocol::Reasonix
+        );
+        assert_ne!(EXIT_REASONIX_WARNING, EXIT_SUCCESS);
+        assert_ne!(EXIT_REASONIX_WARNING, EXIT_HOOK_BLOCK);
+    }
 
     #[test]
     fn indeterminate_reason_uses_configured_budget_and_stage() {

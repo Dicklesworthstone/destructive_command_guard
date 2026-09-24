@@ -1337,7 +1337,10 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // deny that Reasonix never reads, and the command ran.
     if is_crush_event
         && input.tool_input.is_none()
-        && input.tool_args.as_ref().is_some_and(serde_json::Value::is_object)
+        && input
+            .tool_args
+            .as_ref()
+            .is_some_and(serde_json::Value::is_object)
     {
         return HookProtocol::Reasonix;
     }
@@ -1587,7 +1590,8 @@ pub(crate) fn shell_dialect_for_tool_name(tool_name: Option<&str>) -> ShellDiale
     }
 }
 
-/// Resolve the dialect a `Bash`-labeled Codex payload is evaluated under.
+/// Resolve the dialect a `Bash`-labeled Codex or Reasonix payload is evaluated
+/// under.
 ///
 /// Codex names its shell tool `Bash` on every platform (its hooks schema
 /// mirrors Claude Code's), but its PreToolUse payload carries only
@@ -1613,12 +1617,17 @@ pub(crate) fn shell_dialect_for_tool_name(tool_name: Option<&str>) -> ShellDiale
 /// (#322). A command the parser refuses for its size says nothing about the
 /// shell and keeps the union.
 ///
+/// Reasonix (#358) has the same ambiguity. Its shell tool is named `bash`
+/// unless the host rebinds it as `pwsh`, and the interpreter behind the name
+/// is "real bash, or PowerShell on a Windows host without bash"
+/// (`internal/tool/builtin/bash.go`). So a `bash`-labeled Reasonix payload on
+/// Windows gets the same resolution.
+///
 /// Claude Code's `Bash` tool on Windows is Git Bash, so the resolution is
-/// gated on the Codex protocol; and because a hook always runs on the host
-/// that executes the command, `host_is_windows` (`cfg!(windows)` at the call
-/// site) is the platform signal — a Codex session under WSL runs a Linux dcg
-/// and keeps POSIX. Explicit `powershell`/`pwsh`/`cmd` labels are never
-/// touched.
+/// gated on those two protocols. A hook always runs on the host that executes
+/// the command, so `host_is_windows` (`cfg!(windows)` at the call site) is
+/// the platform signal: a Codex session under WSL runs a Linux dcg and keeps
+/// POSIX. Explicit `powershell`/`pwsh`/`cmd` labels are never touched.
 #[must_use]
 pub(crate) fn codex_host_shell_dialect(
     labeled: ShellDialect,
@@ -1626,7 +1635,8 @@ pub(crate) fn codex_host_shell_dialect(
     host_is_windows: bool,
     command: &str,
 ) -> ShellDialect {
-    if labeled != ShellDialect::Posix || protocol != HookProtocol::Codex || !host_is_windows {
+    let label_is_ambiguous = matches!(protocol, HookProtocol::Codex | HookProtocol::Reasonix);
+    if labeled != ShellDialect::Posix || !label_is_ambiguous || !host_is_windows {
         return labeled;
     }
     if command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
@@ -2679,14 +2689,8 @@ pub fn write_denial_to(
     // hosts receive as `permissionDecisionReason`, without the decorated
     // terminal box, and nothing goes to stdout. The caller exits 2.
     if protocol.blocks_by_exit_status() {
-        let message = format_denial_message(
-            command,
-            reason,
-            explanation,
-            pack,
-            pattern,
-            allow_once_code,
-        );
+        let message =
+            format_denial_message(command, reason, explanation, pack, pattern, allow_once_code);
         let _ = writeln!(stderr, "{message}");
         return;
     }
@@ -3836,6 +3840,34 @@ mod tests {
         for command in std::iter::once(ps_only).chain(posix_parseable) {
             assert_eq!(
                 codex_host_shell_dialect(ShellDialect::Posix, HookProtocol::Codex, false, command),
+                ShellDialect::Posix,
+                "{command:?}"
+            );
+        }
+        // Reasonix's `bash` tool is PowerShell on a Windows host without bash
+        // (#358), so it resolves exactly like Codex, and keeps POSIX elsewhere.
+        assert_eq!(
+            codex_host_shell_dialect(ShellDialect::Posix, HookProtocol::Reasonix, true, ps_only),
+            ShellDialect::PowerShell
+        );
+        for command in posix_parseable {
+            assert_eq!(
+                codex_host_shell_dialect(
+                    ShellDialect::Posix,
+                    HookProtocol::Reasonix,
+                    true,
+                    command
+                ),
+                ShellDialect::Unknown,
+                "{command:?}"
+            );
+            assert_eq!(
+                codex_host_shell_dialect(
+                    ShellDialect::Posix,
+                    HookProtocol::Reasonix,
+                    false,
+                    command
+                ),
                 ShellDialect::Posix,
                 "{command:?}"
             );
@@ -6635,11 +6667,20 @@ mod tests {
         assert!(stdout.is_empty(), "Reasonix never reads stdout");
         assert!(stderr.starts_with("BLOCKED by dcg"), "{stderr}");
         assert!(stderr.contains("Rule: core.git:reset-hard"), "{stderr}");
-        assert!(!stderr.contains("+---"), "no decorated box for the model: {stderr}");
+        assert!(
+            !stderr.contains("+---"),
+            "no decorated box for the model: {stderr}"
+        );
 
         let mut stdout = FlushProbe::default();
         let mut stderr = FlushProbe::default();
-        write_indeterminate_to(&mut stdout, &mut stderr, HookProtocol::Reasonix, "unverified", false);
+        write_indeterminate_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Reasonix,
+            "unverified",
+            false,
+        );
         assert!(stdout.bytes.is_empty());
         assert!(String::from_utf8_lossy(&stderr.bytes).contains("unverified"));
     }

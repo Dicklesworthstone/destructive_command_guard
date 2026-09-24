@@ -1829,6 +1829,13 @@ function Detect-Agents {
   } else {
     Join-Path (Join-Path $HomeDir '.config') 'crush'
   }
+  # Reasonix (#358): REASONIX_HOME, else %APPDATA%\reasonix, plus the legacy
+  # ~\.reasonix it still reads settings from.
+  $reasonixHomes = @(
+    $env:REASONIX_HOME,
+    $(if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) { Join-Path $env:APPDATA 'reasonix' }),
+    (Join-Path $HomeDir '.reasonix')
+  ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
   [ordered]@{
     'Claude'  = ((_dir '.claude')  -or (_has 'claude'))
     'Codex'   = ((_dir '.codex')   -or (_has 'codex'))
@@ -1852,6 +1859,9 @@ function Detect-Agents {
       (Test-Path Env:OMP_PROFILE) -or (_has 'omp'))
     'Crush'   = ((Test-Path -LiteralPath $crushConfigDir -PathType Container -ErrorAction SilentlyContinue) -or
       (_has 'crush'))
+    'Reasonix' = ((@($reasonixHomes | Where-Object {
+          Test-Path -LiteralPath $_ -PathType Container -ErrorAction SilentlyContinue
+        }).Count -gt 0) -or (_has 'reasonix'))
   }
 }
 
@@ -1859,7 +1869,7 @@ function Get-DetectedAgentNames {
   # The display-names of agents Detect-Agents flagged as present, in order.
   param($Agents)
   @(
-    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit', 'Omp', 'Crush')) {
+    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit', 'Omp', 'Crush', 'Reasonix')) {
       if ($Agents[$name]) { $name }
     }
   )
@@ -1896,6 +1906,7 @@ Configured agents (when detected, or with -Force/-EasyMode):
   Posit Assistant (~/.posit/assistant/settings.json)
   Oh My Pi     (active profile's extensions/dcg-guard.ts via dcg install --omp)
   Crush        (~/.config/crush/crush.json hooks.PreToolUse via dcg install --crush)
+  Reasonix     (%APPDATA%\reasonix\settings.json hooks.PreToolUse via dcg install --reasonix)
   Grok / agy   via dcg install --grok / --agy under -EasyMode when detected
 '@
   exit 0
@@ -2329,6 +2340,22 @@ if ($detectedAgents['Crush'] -or $forceConfig) {
   }
 } else {
   Write-Info "Crush not detected; re-run with -EasyMode to configure its hook anyway"
+}
+
+# Configure Reasonix through the Rust installer (#358): it resolves the
+# settings.json Reasonix actually loads (including the legacy ~\.reasonix
+# fallback) and merges a hooks.PreToolUse entry, keeping every other key.
+if ($detectedAgents['Reasonix'] -or $forceConfig) {
+  Write-Host ""
+  try {
+    & $dcgExe install --reasonix --force | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Ok "Configured Reasonix hook via 'dcg install --reasonix'" }
+    else { Write-Warn "'dcg install --reasonix' exited with code $LASTEXITCODE" }
+  } catch {
+    Write-Warn "Reasonix hook configuration failed: $_"
+  }
+} else {
+  Write-Info "Reasonix not detected; re-run with -EasyMode to configure its hook anyway"
 }
 
 # Grok (xAI) and Antigravity (agy): configured via the dcg binary itself rather

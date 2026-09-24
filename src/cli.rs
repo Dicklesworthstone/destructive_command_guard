@@ -12407,6 +12407,61 @@ fn collect_doctor_report(
         });
     }
 
+    // Reasonix hook registration (#358). Mirrored in `doctor_pretty`. Reasonix
+    // reads native hooks only from its own settings.json.
+    if reasonix_appears_in_use() {
+        let mut reasonix_fixed = false;
+        let settings_path = reasonix_user_settings_path();
+        let (status, message, remediation) = match reasonix_user_settings_register_dcg() {
+            Ok(true) => (
+                DoctorCheckStatus::Ok,
+                format!(
+                    "Reasonix dcg hook registered in {}",
+                    settings_path.display()
+                ),
+                None,
+            ),
+            Ok(false) => {
+                issues += 1;
+                if fix && install_reasonix_hook_at(&settings_path, false).is_ok() {
+                    fixed += 1;
+                    reasonix_fixed = true;
+                    (
+                        DoctorCheckStatus::Ok,
+                        format!("Installed Reasonix dcg hook in {}", settings_path.display()),
+                        None,
+                    )
+                } else {
+                    (
+                        DoctorCheckStatus::Error,
+                        format!(
+                            "Reasonix is in use but {} has no dcg PreToolUse hook — its shell \
+                             tool calls are not guarded",
+                            settings_path.display()
+                        ),
+                        Some("Run 'dcg install --reasonix'".to_string()),
+                    )
+                }
+            }
+            Err(err) => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    format!("{} cannot be parsed: {err}", settings_path.display()),
+                    Some("Fix the JSON by hand, then run 'dcg install --reasonix'".to_string()),
+                )
+            }
+        };
+        checks.push(DoctorCheck {
+            id: "reasonix_hook",
+            name: "Reasonix hook registration",
+            status,
+            message,
+            remediation,
+            fixed: reasonix_fixed,
+        });
+    }
+
     // Codex hook registration AND enablement (#368). Mirrored in
     // `doctor_pretty` — see the renderer-parity note above the Grok block. A
     // hook that is registered in hooks.json but untrusted (no [hooks.state]
@@ -13982,18 +14037,18 @@ fn crush_appears_in_use() -> bool {
             .is_some_and(std::path::Path::is_dir)
 }
 
-/// The `match` regex dcg's Reasonix hook uses (#358). Reasonix exposes one
-/// shell tool per host, `bash` on POSIX and `pwsh` on Windows
-/// (`docs/TOOL_CONTRACT.md` of esengine/DeepSeek-Reasonix); the match is
-/// anchored by Reasonix, so this names exactly those two tools.
+/// The `match` regex dcg's Reasonix hook uses (#358). Reasonix passes hooks
+/// the canonical name of its shell tool: `bash`, or `pwsh` when the host
+/// rebinds the tool to PowerShell (`ResolveCall` in `internal/tool/tool.go` of
+/// esengine/DeepSeek-Reasonix). The match is anchored by Reasonix, so this
+/// names exactly those two tools.
 const REASONIX_SHELL_MATCH: &str = "bash|pwsh";
 
 /// The `hooks` key Reasonix reads for pre-execution hooks.
 const REASONIX_PRE_TOOL_USE_EVENT: &str = "PreToolUse";
 
-/// Reasonix home (#358): `REASONIX_HOME` when set, otherwise `~/.reasonix` on
-/// macOS/Linux and `%APPDATA%\reasonix` on Windows
-/// (`docs/CONFIG_PATHS.md` of esengine/DeepSeek-Reasonix).
+/// Reasonix home (#358), resolved as `reasonixHomeDir` in Reasonix's
+/// `internal/config/paths.go` resolves it.
 fn reasonix_home() -> std::path::PathBuf {
     reasonix_home_for(
         std::env::var_os("REASONIX_HOME"),
@@ -14003,7 +14058,9 @@ fn reasonix_home() -> std::path::PathBuf {
     )
 }
 
-/// Pure resolver behind [`reasonix_home`].
+/// Pure resolver behind [`reasonix_home`]. The order is `REASONIX_HOME`, then
+/// `%APPDATA%\reasonix` on Windows (`%USERPROFILE%\AppData\Roaming\reasonix`
+/// when `APPDATA` is unset), then `~/.reasonix` elsewhere.
 fn reasonix_home_for(
     reasonix_home: Option<std::ffi::OsString>,
     appdata: Option<std::ffi::OsString>,
@@ -14013,15 +14070,56 @@ fn reasonix_home_for(
     if let Some(dir) = reasonix_home.filter(|value| !value.is_empty()) {
         return std::path::PathBuf::from(dir);
     }
-    if windows && let Some(appdata) = appdata.filter(|value| !value.is_empty()) {
-        return std::path::PathBuf::from(appdata).join("reasonix");
+    if windows {
+        if let Some(appdata) = appdata.filter(|value| !value.is_empty()) {
+            return std::path::PathBuf::from(appdata).join("reasonix");
+        }
+        return home.join("AppData").join("Roaming").join("reasonix");
     }
     home.join(".reasonix")
 }
 
-/// `<Reasonix home>/settings.json`, where Reasonix reads global hooks.
+/// The user-level settings.json that Reasonix actually loads global hooks
+/// from (see [`reasonix_user_settings_path_for`]).
 fn reasonix_user_settings_path() -> std::path::PathBuf {
-    reasonix_home().join("settings.json")
+    reasonix_user_settings_path_for(
+        &reasonix_home(),
+        std::env::var_os("REASONIX_HOME").is_some_and(|value| !value.is_empty()),
+        &crate::config::home_dir().unwrap_or_default(),
+        |path| {
+            !matches!(
+                std::fs::metadata(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        },
+    )
+}
+
+/// Pure resolver behind [`reasonix_user_settings_path`].
+///
+/// Reasonix normally reads `<home>/settings.json`. When that file does not
+/// exist, it falls back to the legacy `~/.reasonix/settings.json`, except
+/// under `REASONIX_HOME` or when the two paths coincide (`Load` in
+/// `internal/hook/hook.go`). The two differ only on Windows. Creating the
+/// primary file there would make Reasonix stop reading a legacy file the user
+/// still relies on, and silently drop every hook in it. So dcg edits the file
+/// Reasonix actually reads.
+fn reasonix_user_settings_path_for(
+    reasonix_home: &std::path::Path,
+    isolated: bool,
+    user_home: &std::path::Path,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> std::path::PathBuf {
+    let primary = reasonix_home.join("settings.json");
+    if isolated || exists(&primary) {
+        return primary;
+    }
+    let legacy_home = user_home.join(".reasonix");
+    if legacy_home == reasonix_home {
+        return primary;
+    }
+    let legacy = legacy_home.join("settings.json");
+    if exists(&legacy) { legacy } else { primary }
 }
 
 /// `<repo>/.reasonix/settings.json`, Reasonix's project-level hooks file.
@@ -14117,7 +14215,10 @@ fn install_reasonix_hook_into_settings(
         .as_array_mut()
         .ok_or("Invalid hooks.PreToolUse format in Reasonix settings.json (expected JSON array)")?;
 
-    let previous = entries.iter().find(|entry| reasonix_hook_entry_is_dcg(entry)).cloned();
+    let previous = entries
+        .iter()
+        .find(|entry| reasonix_hook_entry_is_dcg(entry))
+        .cloned();
     entries.retain(|entry| !reasonix_hook_entry_is_dcg(entry));
     let mut entry = desired_entry;
     if let (Some(previous), Some(entry)) = (
@@ -14220,7 +14321,11 @@ fn uninstall_reasonix_hook() -> Result<(), Box<dyn std::error::Error>> {
 
     let path = reasonix_user_settings_path();
     if !path.exists() {
-        println!("{} {}", "No Reasonix settings found at".yellow(), path.display());
+        println!(
+            "{} {}",
+            "No Reasonix settings found at".yellow(),
+            path.display()
+        );
         return Ok(());
     }
     let mut settings = read_reasonix_settings(&path)?;
@@ -14249,9 +14354,10 @@ fn reasonix_user_settings_register_dcg() -> Result<bool, String> {
         .is_some_and(|entries| entries.iter().any(reasonix_hook_entry_is_dcg)))
 }
 
-/// Whether Reasonix is plausibly in use on this machine: its home exists.
+/// Whether Reasonix is plausibly in use on this machine: its home, or the
+/// settings file it reads, exists.
 fn reasonix_appears_in_use() -> bool {
-    reasonix_home().is_dir()
+    reasonix_home().is_dir() || reasonix_user_settings_path().is_file()
 }
 
 /// Ownership marker embedded in the generated OpenCode plugin (#318).
@@ -21458,6 +21564,216 @@ mod tests {
         assert_eq!(
             crush_user_config_path_for(Some(OsString::new()), Some(OsString::new()), home),
             std::path::PathBuf::from("/home/jane/.config/crush/crush.json")
+        );
+    }
+
+    /// #358: Reasonix's home follows its own `reasonixHomeDir` order.
+    #[test]
+    fn reasonix_home_follows_reasonix_precedence() {
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+        let home = PathBuf::from("/home/jane");
+        assert_eq!(
+            reasonix_home_for(None, None, false, home.clone()),
+            PathBuf::from("/home/jane/.reasonix")
+        );
+        // APPDATA means nothing off Windows.
+        assert_eq!(
+            reasonix_home_for(None, Some(OsString::from("/appdata")), false, home.clone()),
+            PathBuf::from("/home/jane/.reasonix")
+        );
+        assert_eq!(
+            reasonix_home_for(None, Some(OsString::from("/appdata")), true, home.clone()),
+            PathBuf::from("/appdata/reasonix")
+        );
+        // Windows without APPDATA: the Roaming directory under the profile,
+        // never ~/.reasonix.
+        assert_eq!(
+            reasonix_home_for(None, Some(OsString::new()), true, home.clone()),
+            home.join("AppData").join("Roaming").join("reasonix")
+        );
+        // REASONIX_HOME wins everywhere; empty is unset.
+        for windows in [false, true] {
+            assert_eq!(
+                reasonix_home_for(
+                    Some(OsString::from("/iso")),
+                    Some(OsString::from("/appdata")),
+                    windows,
+                    home.clone()
+                ),
+                PathBuf::from("/iso")
+            );
+        }
+        assert_eq!(
+            reasonix_home_for(Some(OsString::new()), None, false, home),
+            PathBuf::from("/home/jane/.reasonix")
+        );
+    }
+
+    /// #358: when the primary settings file is missing, Reasonix reads the
+    /// legacy `~/.reasonix/settings.json`. dcg must edit that file rather
+    /// than create the primary one, which would hide every legacy hook from
+    /// Reasonix.
+    #[test]
+    fn reasonix_settings_path_follows_the_file_reasonix_loads() {
+        use std::path::{Path, PathBuf};
+        let user_home = Path::new("/home/jane");
+        let windows_home = Path::new("/appdata/reasonix");
+        let primary = windows_home.join("settings.json");
+        let legacy = PathBuf::from("/home/jane/.reasonix/settings.json");
+
+        let only = |present: &'static [&'static str]| {
+            move |path: &Path| present.iter().any(|p| Path::new(p) == path)
+        };
+        // Only the legacy file exists: that is the one Reasonix reads.
+        assert_eq!(
+            reasonix_user_settings_path_for(
+                windows_home,
+                false,
+                user_home,
+                only(&["/home/jane/.reasonix/settings.json"])
+            ),
+            legacy
+        );
+        // Once the primary exists, Reasonix stops reading the legacy file.
+        assert_eq!(
+            reasonix_user_settings_path_for(
+                windows_home,
+                false,
+                user_home,
+                only(&[
+                    "/appdata/reasonix/settings.json",
+                    "/home/jane/.reasonix/settings.json"
+                ])
+            ),
+            primary
+        );
+        // Neither exists: create the primary.
+        assert_eq!(
+            reasonix_user_settings_path_for(windows_home, false, user_home, only(&[])),
+            primary
+        );
+        // REASONIX_HOME isolates Reasonix from the legacy location.
+        assert_eq!(
+            reasonix_user_settings_path_for(
+                windows_home,
+                true,
+                user_home,
+                only(&["/home/jane/.reasonix/settings.json"])
+            ),
+            primary
+        );
+        // On macOS/Linux the two locations are the same directory.
+        assert_eq!(
+            reasonix_user_settings_path_for(
+                Path::new("/home/jane/.reasonix"),
+                false,
+                user_home,
+                only(&[])
+            ),
+            legacy
+        );
+    }
+
+    fn reasonix_entry_for(path: &str) -> serde_json::Value {
+        reasonix_dcg_hook_entry_for_executable(std::path::Path::new(path), false)
+            .expect("absolute path")
+    }
+
+    /// #358: the settings merge keeps foreign keys and hooks, is idempotent,
+    /// refreshes a stale path in place, keeps a user-tuned timeout, and
+    /// refuses shapes it cannot read.
+    #[test]
+    fn reasonix_settings_merge_preserves_user_state() {
+        let mut settings = serde_json::json!({
+            "theme": "dark",
+            "hooks": {
+                "PreToolUse": [{ "match": "bash", "command": "node check.js" }],
+                "Stop": [{ "command": "echo done" }]
+            }
+        });
+        assert!(
+            install_reasonix_hook_into_settings(
+                &mut settings,
+                false,
+                reasonix_entry_for("/opt/dcg")
+            )
+            .unwrap()
+        );
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["command"], "/opt/dcg");
+        assert_eq!(entries[0]["match"], "bash|pwsh");
+        assert_eq!(entries[0]["timeout"], 5000);
+        assert_eq!(entries[1]["command"], "node check.js");
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(settings["hooks"]["Stop"][0]["command"], "echo done");
+
+        // Same entry again: nothing to do.
+        assert!(
+            !install_reasonix_hook_into_settings(
+                &mut settings,
+                false,
+                reasonix_entry_for("/opt/dcg")
+            )
+            .unwrap()
+        );
+
+        // A moved binary replaces the stale entry; the user's timeout stays.
+        settings["hooks"]["PreToolUse"][0]["timeout"] = serde_json::json!(9000);
+        assert!(
+            install_reasonix_hook_into_settings(
+                &mut settings,
+                false,
+                reasonix_entry_for("/new place/dcg")
+            )
+            .unwrap()
+        );
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "{settings}");
+        assert_eq!(entries[0]["command"], "\"/new place/dcg\"");
+        assert_eq!(entries[0]["timeout"], 9000);
+
+        assert!(uninstall_dcg_hook_from_reasonix_settings(&mut settings).unwrap());
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["command"], "node check.js");
+        assert!(!uninstall_dcg_hook_from_reasonix_settings(&mut settings).unwrap());
+
+        // Shapes dcg cannot read are refused, never rewritten.
+        for unreadable in [
+            serde_json::json!([]),
+            serde_json::json!({ "PreToolUse": [] }),
+            serde_json::json!({ "hooks": [] }),
+            serde_json::json!({ "hooks": { "PreToolUse": {} } }),
+        ] {
+            let mut settings = unreadable.clone();
+            assert!(
+                install_reasonix_hook_into_settings(
+                    &mut settings,
+                    false,
+                    reasonix_entry_for("/opt/dcg")
+                )
+                .is_err(),
+                "{unreadable}"
+            );
+            assert_eq!(settings, unreadable);
+        }
+    }
+
+    /// #358: the Windows command form is a double-quoted path, which Reasonix
+    /// hands to `cmd.exe /d /s /c "<command>"`; dcg must recognize it as its
+    /// own on reinstall and uninstall.
+    #[test]
+    fn reasonix_windows_entry_is_quoted_and_recognized() {
+        let entry =
+            reasonix_dcg_hook_entry_for_executable(std::path::Path::new("/opt/my tools/dcg"), true)
+                .unwrap();
+        assert_eq!(entry["command"], "\"/opt/my tools/dcg\"");
+        assert!(reasonix_hook_entry_is_dcg(&entry));
+        assert!(
+            reasonix_dcg_hook_entry_for_executable(std::path::Path::new("dcg"), false).is_err(),
+            "a relative path is never written"
         );
     }
 
