@@ -98,6 +98,7 @@ These patterns match potentially destructive commands:
 | `copy-to-device` | Copying or moving onto a device OVERWRITES that device, exactly as dd would. Extremely dangerous! | high |
 | `dd-device` | dd to a block device will OVERWRITE all data on that device. Extremely dangerous! | high |
 | `dd-wipe` | dd from /dev/zero or /dev/urandom to a device will WIPE all data! | high |
+| `ddrescue-device` | ddrescue --force writes its output onto a device, overwriting all data on it, exactly as dd would. | critical |
 | `sfdisk-modify` | sfdisk rewrites the partition table: options act immediately, and a bare invocation reads a new layout from stdin. | high |
 | `fdisk-edit` | fdisk can modify partition tables and cause data loss. | high |
 | `parted-modify` | parted can modify partition tables and cause data loss. | high |

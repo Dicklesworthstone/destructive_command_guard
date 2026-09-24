@@ -1179,9 +1179,13 @@ fn test_audit_backtracking_requirements() {
             // even with no option (a layout on stdin), so it is denied unless a
             // read-only option is present, which only a negative lookahead can
             // say, plus the same `/dev/` requirement.
+            //
+            // `ddrescue-device` needs `-f`/`--force` anywhere in the segment
+            // AND a `/dev/` operand, in either order: a positive lookahead.
             HashSet::from([
                 "copy-to-device",
                 "dd-discard",
+                "ddrescue-device",
                 "fdisk-edit",
                 "gdisk-edit",
                 "parted-modify",

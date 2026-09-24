@@ -253,6 +253,19 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             r#"dd\s+.*if=['"]?/dev/(?:zero|urandom|random).*of=['"]?/dev/"#,
             "dd from /dev/zero or /dev/urandom to a device will WIPE all data!"
         ),
+        // GNU ddrescue copies `infile` onto `outfile` and refuses a device
+        // outfile unless forced: `-f`/`--force` is "needed when outfile is not
+        // a regular file, but a device or partition". So `-f` (alone or in a
+        // short cluster such as `-fn`) beside a `/dev/` operand is the
+        // device-overwriting shape, e.g. the disk clone `ddrescue -f /dev/sda
+        // /dev/sdb map` that destroys sdb. Imaging a failing disk to a file
+        // (`ddrescue -d /dev/sda disk.img map`) needs no `-f` and stays allowed.
+        destructive_pattern!(
+            "ddrescue-device",
+            r"\bddrescue\b(?=[^|;&\r\n]*\s(?:-[A-Za-z]*f[A-Za-z0-9]*|--force)(?:\s|$))[^|;&\r\n]*\s['\x22]?/dev/\S",
+            "ddrescue --force writes its output onto a device, overwriting all data on it, exactly as dd would.",
+            Critical
+        ),
         // sfdisk writes a partition table whenever it is pointed at a device
         // without a read-only option: `--delete`, `--part-type`, `--wipe` and
         // friends act immediately, and a bare `sfdisk /dev/sda` reads a new
@@ -1690,6 +1703,18 @@ mod tests {
             ("scrub /dev/sdb", "scrub-device"),
             ("wipe /dev/sda", "wipe-device"),
             ("wipe -q /dev/nvme0n1", "wipe-device"),
+            ("ddrescue -f /dev/zero /dev/sda", "ddrescue-device"),
+            (
+                "ddrescue -f -n /dev/sda /dev/sdb rescue.map",
+                "ddrescue-device",
+            ),
+            (
+                "ddrescue -d -r3 -f /dev/sda /dev/sdb map",
+                "ddrescue-device",
+            ),
+            ("ddrescue -fn /dev/sda /dev/sdb map", "ddrescue-device"),
+            ("ddrescue --force disk.img /dev/sdb", "ddrescue-device"),
+            ("sudo ddrescue -f image.img '/dev/sdc'", "ddrescue-device"),
         ] {
             let matched = pack
                 .check(command)
@@ -1720,6 +1745,12 @@ mod tests {
             "zpool scrub tank",
             "btrfs scrub start /mnt",
             "wipe notes.txt",
+            // Imaging a failing disk to a file needs no --force.
+            "ddrescue -d /dev/sda disk.img rescue.map",
+            "ddrescue -n -r3 /dev/sda disk.img rescue.map",
+            "ddrescue --help",
+            "ddrescue -f disk.img copy.img map",
+            "ddrescue -d /dev/sda disk.img map && echo -f",
         ] {
             assert_allows(&pack, command);
         }
