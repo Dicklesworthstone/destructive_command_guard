@@ -1829,10 +1829,19 @@ function Detect-Agents {
   } else {
     Join-Path (Join-Path $HomeDir '.config') 'crush'
   }
-  # Reasonix (#358): REASONIX_HOME, else %APPDATA%\reasonix, plus the legacy
-  # ~\.reasonix it still reads settings from.
+  # Reasonix (#358): REASONIX_HOME (trimmed, leading `~` expanded, as Reasonix
+  # reads it), else %APPDATA%\reasonix, plus the legacy ~\.reasonix it still
+  # reads settings from.
+  $reasonixOverride = if ([string]::IsNullOrWhiteSpace($env:REASONIX_HOME)) {
+    $null
+  } else {
+    $trimmed = $env:REASONIX_HOME.Trim()
+    if ($trimmed -eq '~') { $HomeDir }
+    elseif ($trimmed.StartsWith('~/') -or $trimmed.StartsWith('~\')) { Join-Path $HomeDir $trimmed.Substring(2) }
+    else { $trimmed }
+  }
   $reasonixHomes = @(
-    $env:REASONIX_HOME,
+    $reasonixOverride,
     $(if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) { Join-Path $env:APPDATA 'reasonix' }),
     (Join-Path $HomeDir '.reasonix')
   ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }

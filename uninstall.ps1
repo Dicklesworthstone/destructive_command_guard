@@ -606,24 +606,35 @@ function Unconfigure-CrushHook {
   $removed
 }
 
-function Get-ReasonixSettingsPaths {
-  # Reasonix's user settings (#358). Its home is REASONIX_HOME, else
-  # %APPDATA%\reasonix, else %USERPROFILE%\AppData\Roaming\reasonix. Without
-  # REASONIX_HOME, Reasonix also reads the legacy ~\.reasonix\settings.json
-  # while the primary file is missing, so both are cleaned.
+function Get-ReasonixHomeOverride {
+  # REASONIX_HOME as Reasonix reads it (#358): trimmed, with a leading `~`
+  # expanded; $null when unset or blank.
   param([string]$HomeDir = $HOME)
-  if (-not [string]::IsNullOrWhiteSpace($env:REASONIX_HOME)) {
-    return @((Join-Path $env:REASONIX_HOME 'settings.json'))
-  }
+  if ([string]::IsNullOrWhiteSpace($env:REASONIX_HOME)) { return $null }
+  $dir = $env:REASONIX_HOME.Trim()
+  if ($dir -eq '~') { return $HomeDir }
+  if ($dir.StartsWith('~/') -or $dir.StartsWith('~\')) { return (Join-Path $HomeDir $dir.Substring(2)) }
+  $dir
+}
+
+function Get-ReasonixSettingsPaths {
+  # Every user-level settings file a dcg Reasonix hook can live in (#358):
+  # REASONIX_HOME, %APPDATA%\reasonix (or %USERPROFILE%\AppData\Roaming\reasonix),
+  # and the legacy ~\.reasonix that Reasonix still reads while the primary file
+  # is missing. All are cleaned: an install made under different settings may
+  # have written any of them, and only dcg's own entries are removed.
+  param([string]$HomeDir = $HOME)
   $base = if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
     $env:APPDATA
   } else {
     Join-Path (Join-Path $HomeDir 'AppData') 'Roaming'
   }
-  @(
-    (Join-Path (Join-Path $base 'reasonix') 'settings.json'),
-    (Join-Path (Join-Path $HomeDir '.reasonix') 'settings.json')
-  )
+  $homes = @(
+    (Get-ReasonixHomeOverride -HomeDir $HomeDir),
+    (Join-Path $base 'reasonix'),
+    (Join-Path $HomeDir '.reasonix')
+  ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  @($homes | ForEach-Object { Join-Path $_ 'settings.json' } | Select-Object -Unique)
 }
 
 function Unconfigure-ReasonixHook {

@@ -4817,6 +4817,27 @@ MOCKEOF
     unset REASONIX_HOME
 }
 
+@test "reasonix_home_dir: trims REASONIX_HOME and expands a leading tilde" {
+    unset REASONIX_HOME
+    [ "$(reasonix_home_dir)" = "$HOME/.reasonix" ]
+    REASONIX_HOME="   " ; [ "$(reasonix_home_dir)" = "$HOME/.reasonix" ]
+    REASONIX_HOME="  ~/rx " ; [ "$(reasonix_home_dir)" = "$HOME/rx" ]
+    REASONIX_HOME="~" ; [ "$(reasonix_home_dir)" = "$HOME" ]
+    REASONIX_HOME="/opt/rx" ; [ "$(reasonix_home_dir)" = "/opt/rx" ]
+    unset REASONIX_HOME
+}
+
+@test "detect_agents: Reasonix detected from a tilde REASONIX_HOME" {
+    export REASONIX_HOME="~/rx-home"
+    mkdir -p "$HOME/rx-home"
+    DETECTED_AGENTS=()
+
+    detect_agents
+
+    is_agent_detected "reasonix"
+    unset REASONIX_HOME
+}
+
 @test "detect_agents: Reasonix NOT detected without home dir or CLI" {
     unset REASONIX_HOME
     DETECTED_AGENTS=()
@@ -4911,5 +4932,20 @@ PYEOF
     [[ "$output" == *"removed"* ]]
     ! grep -q '/opt/dcg' "$REASONIX_HOME/settings.json"
     grep -q 'mine.sh' "$REASONIX_HOME/settings.json"
+    unset REASONIX_HOME
+}
+
+@test "unconfigure_reasonix: a tilde REASONIX_HOME and ~/.reasonix are both cleaned" {
+    export REASONIX_HOME="~/rx-home"
+    mkdir -p "$HOME/rx-home" "$HOME/.reasonix"
+    printf '{"hooks":{"PreToolUse":[{"command":"/opt/dcg"}]}}\n' > "$HOME/rx-home/settings.json"
+    printf '{"hooks":{"PreToolUse":[{"command":"/usr/local/bin/dcg"},{"command":"./keep.sh"}]}}\n' > "$HOME/.reasonix/settings.json"
+
+    run unconfigure_reasonix
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"removed"* ]]
+    ! grep -q '/opt/dcg' "$HOME/rx-home/settings.json"
+    ! grep -q '/usr/local/bin/dcg' "$HOME/.reasonix/settings.json"
+    grep -q 'keep.sh' "$HOME/.reasonix/settings.json"
     unset REASONIX_HOME
 }

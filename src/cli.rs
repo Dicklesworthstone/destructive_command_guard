@@ -14051,24 +14051,109 @@ const REASONIX_PRE_TOOL_USE_EVENT: &str = "PreToolUse";
 /// `internal/config/paths.go` resolves it.
 fn reasonix_home() -> std::path::PathBuf {
     reasonix_home_for(
-        std::env::var_os("REASONIX_HOME"),
+        reasonix_home_override(),
         std::env::var_os("APPDATA"),
         cfg!(windows),
         crate::config::home_dir().unwrap_or_default(),
     )
 }
 
-/// Pure resolver behind [`reasonix_home`]. The order is `REASONIX_HOME`, then
-/// `%APPDATA%\reasonix` on Windows (`%USERPROFILE%\AppData\Roaming\reasonix`
-/// when `APPDATA` is unset), then `~/.reasonix` elsewhere.
+/// `REASONIX_HOME`, normalized as Reasonix's `cleanEnvDir` normalizes it, or
+/// `None` when it is unset or blank (see
+/// [`normalize_reasonix_home_override`]).
+fn reasonix_home_override() -> Option<std::path::PathBuf> {
+    let raw = std::env::var_os("REASONIX_HOME")?;
+    normalize_reasonix_home_override(
+        &raw.to_string_lossy(),
+        &crate::config::home_dir().unwrap_or_default(),
+        |name| std::env::var(name).ok().filter(|value| !value.is_empty()),
+    )
+}
+
+/// Pure normalizer behind [`reasonix_home_override`], mirroring `cleanEnvDir`
+/// in Reasonix's `internal/config/paths.go`: trim, expand `${VAR}` and
+/// `${VAR:-default}`, expand a leading `~`, then make the path absolute. Using
+/// the raw value instead made `REASONIX_HOME=~/rx` write
+/// `./~/rx/settings.json` under the current directory, a file Reasonix never
+/// reads.
+fn normalize_reasonix_home_override(
+    raw: &str,
+    home: &std::path::Path,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<std::path::PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let expanded = expand_reasonix_env_refs(trimmed, &lookup);
+    let path = if expanded == "~" && !home.as_os_str().is_empty() {
+        home.to_path_buf()
+    } else if let Some(rest) = expanded
+        .strip_prefix("~/")
+        .or_else(|| expanded.strip_prefix("~\\"))
+        .filter(|_| !home.as_os_str().is_empty())
+    {
+        home.join(rest)
+    } else {
+        std::path::PathBuf::from(expanded)
+    };
+    Some(std::path::absolute(&path).unwrap_or(path))
+}
+
+/// Reasonix's `ExpandVars` (`internal/config/expand.go`): each `${NAME}` or
+/// `${NAME:-default}` is replaced by the variable's non-empty value, else the
+/// default, else nothing. Anything that is not such a reference stays literal.
+fn expand_reasonix_env_refs(value: &str, lookup: &impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let name_len = after
+            .char_indices()
+            .take_while(|&(index, character)| {
+                character == '_'
+                    || character.is_ascii_alphabetic()
+                    || (index > 0 && character.is_ascii_digit())
+            })
+            .count();
+        let (name, tail) = after.split_at(name_len);
+        let reference = if name.is_empty() {
+            None
+        } else if let Some(remaining) = tail.strip_prefix('}') {
+            Some((None, remaining))
+        } else if let Some(default_and_rest) = tail.strip_prefix(":-") {
+            default_and_rest
+                .find('}')
+                .map(|end| (Some(&default_and_rest[..end]), &default_and_rest[end + 1..]))
+        } else {
+            None
+        };
+        if let Some((default, remaining)) = reference {
+            let replacement = lookup(name).or_else(|| default.map(str::to_string));
+            out.push_str(&replacement.unwrap_or_default());
+            rest = remaining;
+        } else {
+            out.push_str("${");
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Pure resolver behind [`reasonix_home`]. The order is `REASONIX_HOME`
+/// (already normalized), then `%APPDATA%\reasonix` on Windows
+/// (`%USERPROFILE%\AppData\Roaming\reasonix` when `APPDATA` is unset), then
+/// `~/.reasonix` elsewhere.
 fn reasonix_home_for(
-    reasonix_home: Option<std::ffi::OsString>,
+    reasonix_home: Option<std::path::PathBuf>,
     appdata: Option<std::ffi::OsString>,
     windows: bool,
     home: std::path::PathBuf,
 ) -> std::path::PathBuf {
-    if let Some(dir) = reasonix_home.filter(|value| !value.is_empty()) {
-        return std::path::PathBuf::from(dir);
+    if let Some(dir) = reasonix_home {
+        return dir;
     }
     if windows {
         if let Some(appdata) = appdata.filter(|value| !value.is_empty()) {
@@ -14084,7 +14169,7 @@ fn reasonix_home_for(
 fn reasonix_user_settings_path() -> std::path::PathBuf {
     reasonix_user_settings_path_for(
         &reasonix_home(),
-        std::env::var_os("REASONIX_HOME").is_some_and(|value| !value.is_empty()),
+        reasonix_home_override().is_some(),
         &crate::config::home_dir().unwrap_or_default(),
         |path| {
             !matches!(
@@ -21592,11 +21677,11 @@ mod tests {
             reasonix_home_for(None, Some(OsString::new()), true, home.clone()),
             home.join("AppData").join("Roaming").join("reasonix")
         );
-        // REASONIX_HOME wins everywhere; empty is unset.
+        // REASONIX_HOME (normalized) wins everywhere.
         for windows in [false, true] {
             assert_eq!(
                 reasonix_home_for(
-                    Some(OsString::from("/iso")),
+                    Some(PathBuf::from("/iso")),
                     Some(OsString::from("/appdata")),
                     windows,
                     home.clone()
@@ -21604,10 +21689,43 @@ mod tests {
                 PathBuf::from("/iso")
             );
         }
+    }
+
+    /// #358: `REASONIX_HOME` is normalized as Reasonix's `cleanEnvDir` does,
+    /// so dcg edits the directory Reasonix reads rather than a literal
+    /// `./~/...` under the current directory.
+    #[test]
+    fn reasonix_home_override_is_normalized_like_reasonix() {
+        use std::path::{Path, PathBuf};
+        let home = Path::new("/home/jane");
+        let lookup = |name: &str| match name {
+            "BASE" => Some("/srv/base".to_string()),
+            _ => None,
+        };
+        let normalize = |raw: &str| normalize_reasonix_home_override(raw, home, lookup);
+
+        // Blank is unset.
+        assert_eq!(normalize(""), None);
+        assert_eq!(normalize("   "), None);
+        // Absolute values pass through, trimmed.
+        assert_eq!(normalize("  /iso  "), Some(PathBuf::from("/iso")));
+        // A leading tilde is the user's home.
+        assert_eq!(normalize("~"), Some(PathBuf::from("/home/jane")));
+        assert_eq!(normalize("~/rx"), Some(PathBuf::from("/home/jane/rx")));
+        assert_eq!(normalize("~\\rx"), Some(home.join("rx")));
+        // `${VAR}` and `${VAR:-default}`; an unset reference without a default
+        // expands to nothing, and non-references stay literal.
+        assert_eq!(normalize("${BASE}/rx"), Some(PathBuf::from("/srv/base/rx")));
         assert_eq!(
-            reasonix_home_for(Some(OsString::new()), None, false, home),
-            PathBuf::from("/home/jane/.reasonix")
+            normalize("${MISSING:-/fallback}/rx"),
+            Some(PathBuf::from("/fallback/rx"))
         );
+        assert_eq!(normalize("/a${MISSING}/rx"), Some(PathBuf::from("/a/rx")));
+        assert_eq!(normalize("/a/${1}/rx"), Some(PathBuf::from("/a/${1}/rx")));
+        assert_eq!(normalize("/a/$BASE"), Some(PathBuf::from("/a/$BASE")));
+        assert_eq!(normalize("/a/${BASE"), Some(PathBuf::from("/a/${BASE")));
+        // A relative value is made absolute, never left relative.
+        assert!(normalize("rel/dir").is_some_and(|path| path.is_absolute()));
     }
 
     /// #358: when the primary settings file is missing, Reasonix reads the

@@ -247,6 +247,29 @@ fn blocking_verdict_exit_code(protocol: hook::HookProtocol, delivery: io::Result
     }
 }
 
+/// The protocol for a verdict published WITHOUT a parsed payload: a
+/// fail-closed parse failure, or a proven deny salvaged from an oversized or
+/// non-UTF-8 payload.
+///
+/// Normally that is the env/process-detected agent's protocol
+/// ([`hook_protocol_for_agent`]). When no agent was identified, that falls
+/// back to the Claude shape, which answers with exit 0, and a host that reads
+/// only the exit status takes exit 0 as a pass. That is the ordinary case for
+/// Reasonix (#358): it sets no env marker, and process-ancestry detection is
+/// Unix-only. So when the agent is unknown, the envelope markers still
+/// readable in the raw `prefix` decide instead
+/// ([`hook::protocol_from_truncated_json`]). They never override an
+/// identified agent: a planted marker must not be able to switch, say,
+/// Codex's JSON deny into an exit status Codex treats as a pass.
+fn payloadless_hook_protocol(detected_agent: &Agent, prefix: Option<&str>) -> hook::HookProtocol {
+    if !detected_agent.is_known() {
+        if let Some(protocol) = prefix.and_then(hook::protocol_from_truncated_json) {
+            return protocol;
+        }
+    }
+    hook_protocol_for_agent(detected_agent)
+}
+
 /// Leave hook mode with `exit_code`.
 ///
 /// Exit 0 is the ordinary return from `main`. A non-zero status goes through
@@ -423,8 +446,14 @@ fn handle_unparseable_hook_input(
 
     // Fail-closed: emit an agent-appropriate denial. Without a parsed payload we
     // cannot run protocol detection, so derive the protocol from the
-    // env/process-detected agent.
-    let protocol = hook_protocol_for_agent(detected_agent);
+    // env/process-detected agent, or from whatever envelope markers the raw
+    // bytes still show when no agent was identified.
+    let raw_prefix = match read_err {
+        hook::HookReadError::InputTooLarge { prefix, .. } => Some(prefix.as_str()),
+        hook::HookReadError::InvalidUtf8 { lossy, .. } => Some(lossy.as_str()),
+        hook::HookReadError::Io(_) | hook::HookReadError::Json(_) => None,
+    };
+    let protocol = payloadless_hook_protocol(detected_agent, raw_prefix);
     let reason = if matches!(read_err, hook::HookReadError::InputTooLarge { .. }) {
         "BLOCKED by dcg: the hook input exceeds the size limit and cannot be evaluated; \
          DCG_FAIL_CLOSED is set (fail-closed mode)."
@@ -561,8 +590,9 @@ fn try_deny_unparseable_payload(
     }
 
     // No parsed payload exists, so protocol detection falls back to the
-    // env/process-detected agent (same rule as the fail-closed deny path).
-    let hook_protocol = hook_protocol_for_agent(detected_agent);
+    // env/process-detected agent, or to the prefix's envelope markers when no
+    // agent was identified (same rule as the fail-closed deny path).
+    let hook_protocol = payloadless_hook_protocol(detected_agent, Some(prefix));
     let effective_agent = effective_agent_for_hook_protocol(hook_protocol, detected_agent);
     let history_agent_type = history_agent_type_for_protocol(hook_protocol, detected_agent);
 
@@ -2363,6 +2393,39 @@ mod tests {
         );
         assert_ne!(EXIT_REASONIX_WARNING, EXIT_SUCCESS);
         assert_ne!(EXIT_REASONIX_WARNING, EXIT_HOOK_BLOCK);
+
+        // Without a parsed payload, the raw envelope markers decide only
+        // when no agent was identified.
+        let reasonix_prefix =
+            r#"{"event":"PreToolUse","toolName":"bash","toolArgs":{"command":"git reset --hard"#;
+        let claude_prefix = r#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"#;
+        assert_eq!(
+            payloadless_hook_protocol(&Agent::Unknown, Some(reasonix_prefix)),
+            hook::HookProtocol::Reasonix
+        );
+        assert_eq!(
+            payloadless_hook_protocol(&Agent::Custom("x".into()), Some(reasonix_prefix)),
+            hook::HookProtocol::Reasonix
+        );
+        assert_eq!(
+            payloadless_hook_protocol(&Agent::Unknown, Some(claude_prefix)),
+            hook::HookProtocol::ClaudeCompatible
+        );
+        assert_eq!(
+            payloadless_hook_protocol(&Agent::Unknown, None),
+            hook::HookProtocol::ClaudeCompatible
+        );
+        for (agent, protocol) in [
+            (Agent::CodexCli, hook::HookProtocol::Codex),
+            (Agent::ClaudeCode, hook::HookProtocol::ClaudeCompatible),
+            (Agent::Crush, hook::HookProtocol::Crush),
+        ] {
+            assert_eq!(
+                payloadless_hook_protocol(&agent, Some(reasonix_prefix)),
+                protocol,
+                "{agent:?}: planted markers must not override an identified agent"
+            );
+        }
     }
 
     #[test]

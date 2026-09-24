@@ -1257,10 +1257,23 @@ unconfigure_reasonix() {
     # `dcg install --reasonix --project`. Its entries are `hooks.PreToolUse[]`
     # objects with a `command`, the shape the Crush editor above already
     # handles. A hook left behind after the binary is gone makes Reasonix
-    # warn on every shell call.
+    # warn on every shell call. REASONIX_HOME is trimmed and a leading `~`
+    # expanded as Reasonix does; ~/.reasonix is cleaned as well, since an
+    # earlier install without REASONIX_HOME may have written there, and only
+    # dcg's own entries are ever removed.
     local config_file
     local repo_root=""
-    local -a configs=("${REASONIX_HOME:-$HOME/.reasonix}/settings.json")
+    local home_dir="${REASONIX_HOME:-}"
+    home_dir="${home_dir#"${home_dir%%[![:space:]]*}"}"
+    home_dir="${home_dir%"${home_dir##*[![:space:]]}"}"
+    case "$home_dir" in
+        "~") home_dir="$HOME" ;;
+        "~/"*) home_dir="$HOME/${home_dir#"~/"}" ;;
+    esac
+    local -a configs=("$HOME/.reasonix/settings.json")
+    if [ -n "$home_dir" ] && [ "$home_dir" != "$HOME/.reasonix" ]; then
+        configs+=("$home_dir/settings.json")
+    fi
     if repo_root=$(current_repo_root); then
         configs+=("$repo_root/.reasonix/settings.json")
     fi

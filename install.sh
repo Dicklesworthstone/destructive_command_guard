@@ -383,6 +383,23 @@ resolve_omp_config_root() {
   printf '%s\n' "$result"
 }
 
+# The Reasonix home as Reasonix resolves it on macOS/Linux (#358): REASONIX_HOME,
+# trimmed, with a leading `~` expanded, else ~/.reasonix. (Reasonix also expands
+# `${VAR}` references inside the value; `dcg install --reasonix` does too, and
+# is what actually writes the file. This probe only decides detection and the
+# created/merged wording.)
+reasonix_home_dir() {
+  local dir="${REASONIX_HOME:-}"
+  dir="${dir#"${dir%%[![:space:]]*}"}"
+  dir="${dir%"${dir##*[![:space:]]}"}"
+  case "$dir" in
+    "") dir="$HOME/.reasonix" ;;
+    "~") dir="$HOME" ;;
+    "~/"*) dir="$HOME/${dir#"~/"}" ;;
+  esac
+  printf '%s\n' "$dir"
+}
+
 detect_agents() {
   DETECTED_AGENTS=()
 
@@ -475,11 +492,12 @@ detect_agents() {
     [[ -n "$crush_bin" ]] && CRUSH_VERSION=$(try_version "$crush_bin")
   fi
 
-  # Reasonix (esengine/DeepSeek-Reasonix) — home at ${REASONIX_HOME:-~/.reasonix},
-  # optional `reasonix` CLI on PATH. Resolved the same way as Crush above.
+  # Reasonix (esengine/DeepSeek-Reasonix) — home at ${REASONIX_HOME:-~/.reasonix}
+  # (see reasonix_home_dir), optional `reasonix` CLI on PATH. The CLI is
+  # resolved the same way as Crush's above.
   local reasonix_bin
   reasonix_bin=$(builtin type -P reasonix 2>/dev/null || true)
-  if [[ -d "${REASONIX_HOME:-$HOME/.reasonix}" ]] \
+  if [[ -d "$(reasonix_home_dir)" ]] \
     || [[ -n "$reasonix_bin" && -f "$reasonix_bin" && -x "$reasonix_bin" ]]; then
     DETECTED_AGENTS+=("reasonix")
     [[ -n "$reasonix_bin" ]] && REASONIX_VERSION=$(try_version "$reasonix_bin")
@@ -4077,7 +4095,8 @@ configure_reasonix() {
     return 1
   fi
 
-  local settings_path="${REASONIX_HOME:-$HOME/.reasonix}/settings.json"
+  local settings_path
+  settings_path="$(reasonix_home_dir)/settings.json"
   local existed=0
   [ -f "$settings_path" ] && existed=1
 

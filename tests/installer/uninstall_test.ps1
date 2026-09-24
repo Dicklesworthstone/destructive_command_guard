@@ -705,7 +705,11 @@ try {
     Check ((Unconfigure-ReasonixHook -HomeDir $hr -RepoRoot $repo) -eq $false) "Reasonix: second run is a noop"
 
     $env:REASONIX_HOME = Join-Path $hr 'isolated'
-    Check (((Get-ReasonixSettingsPaths -HomeDir $hr) -join '|') -eq (Join-Path $env:REASONIX_HOME 'settings.json')) "Reasonix: REASONIX_HOME is the only user-level path"
+    $paths = @(Get-ReasonixSettingsPaths -HomeDir $hr)
+    Check ($paths[0] -eq (Join-Path $env:REASONIX_HOME 'settings.json')) "Reasonix: REASONIX_HOME is cleaned first"
+    Check ($paths -contains $legacy -and $paths -contains $primary) "Reasonix: default locations are cleaned too"
+    $env:REASONIX_HOME = '  ~/rx '
+    Check ((@(Get-ReasonixSettingsPaths -HomeDir $hr))[0] -eq (Join-Path (Join-Path $hr 'rx') 'settings.json')) "Reasonix: REASONIX_HOME is trimmed and ~ expanded"
 } finally {
     $env:REASONIX_HOME = $savedReasonixHome
     $env:APPDATA = $savedAppData

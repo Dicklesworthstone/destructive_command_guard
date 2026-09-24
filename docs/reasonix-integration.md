@@ -51,7 +51,9 @@ the file alone:
 
 The user-level file is `<Reasonix home>/settings.json`. The Reasonix home is
 `$REASONIX_HOME` if set, else `~/.reasonix` on macOS/Linux and
-`%APPDATA%\reasonix` on Windows. On Windows, when that file does not exist,
+`%APPDATA%\reasonix` on Windows. dcg reads `$REASONIX_HOME` as Reasonix
+does: trimmed, with `${VAR}` references and a leading `~` expanded. On
+Windows, when that file does not exist,
 Reasonix still reads a legacy `~\.reasonix\settings.json`. dcg then edits
 the legacy file, because creating the new one would make Reasonix silently
 stop loading every hook in it.
@@ -76,11 +78,20 @@ the exit status:
 |---|---|---|
 | allow | 0 | runs the command |
 | deny, or an indeterminate result that fails closed | 2 | blocks it and shows dcg's stderr to you and the model |
-| warn | 1 | runs the command and shows the warning |
+| warn | 1 | runs the command and shows you the warning (not the model) |
 
 Reasonix has no "ask" answer. dcg rules that ask for review therefore block
 here, and the stderr message says how to allow the command, e.g. with
 `dcg allow-once`. A hook timeout also blocks, so a slow dcg fails closed.
+
+Reasonix sets no environment variable that identifies it, and dcg's
+process-ancestry detection works only on macOS/Linux. A payload dcg cannot
+parse (larger than `max_hook_input_bytes`, or not valid UTF-8) therefore
+often arrives with no agent identified. dcg still blocks it with exit 2 when
+the salvaged command is destructive (or under `DCG_FAIL_CLOSED`), because
+the Reasonix envelope markers, a `PreToolUse` `event` and a `toolArgs`
+object, remain readable in the raw bytes. Those markers are consulted only
+when no agent was identified.
 
 On Windows, Reasonix's shell tool runs PowerShell when no bash is installed,
 and it can still be named `bash` then. A `bash`-labeled Reasonix command on a

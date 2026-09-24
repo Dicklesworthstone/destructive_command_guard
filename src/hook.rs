@@ -1115,6 +1115,48 @@ pub fn shell_tool_from_truncated_json(prefix: &str) -> Option<(String, ShellDial
         })
 }
 
+/// The hook protocol a truncated or undecodable payload declares through its
+/// envelope markers, when they are unambiguous.
+///
+/// A payload dcg cannot parse is otherwise answered in the protocol of the
+/// env/process-detected agent. Reasonix (#358) sets no env marker and is
+/// often undetected, and the Claude-shaped fallback answers with exit 0,
+/// which Reasonix treats as a pass. Its envelope is recognized here with the
+/// same markers [`detect_protocol`] reads on the parsed path: a `PreToolUse`
+/// `event`, a `toolArgs` *object*, and no `tool_input` (which would make it
+/// Crush). Reasonix writes those markers before the tool arguments, so they
+/// survive truncation. A command string cannot forge a key: inside a JSON
+/// string its quotes are escaped. Returns `None` for every other shape.
+#[must_use]
+pub fn protocol_from_truncated_json(prefix: &str) -> Option<HookProtocol> {
+    let pre_tool_use_event = extract_string_values_for_key(prefix, "\"event\"")
+        .iter()
+        .any(|event| event.eq_ignore_ascii_case("PreToolUse"));
+    let object_tool_args = ["\"toolArgs\"", "\"tool_args\""]
+        .iter()
+        .any(|key| has_object_value_for_key(prefix, key));
+    let tool_input = prefix.contains("\"tool_input\"") || prefix.contains("\"toolInput\"");
+    (pre_tool_use_event && object_tool_args && !tool_input).then_some(HookProtocol::Reasonix)
+}
+
+/// Whether a raw JSON `key` (given with its surrounding quotes) is followed by
+/// an object value anywhere in a possibly-truncated prefix.
+fn has_object_value_for_key(prefix: &str, key: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(found) = prefix[search_from..].find(key) {
+        let key_start = search_from + found;
+        search_from = key_start + 1;
+        let rest = prefix[key_start + key.len()..].trim_start();
+        if rest
+            .strip_prefix(':')
+            .is_some_and(|value| value.trim_start().starts_with('{'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Collect every cleanly decodable string value for a raw JSON `key` (given
 /// with its surrounding quotes) in a possibly-truncated prefix.
 fn extract_string_values_for_key(prefix: &str, key: &str) -> Vec<String> {
@@ -6616,6 +6658,44 @@ mod tests {
                 assert_eq!(json["message"], REASON);
             }
         }
+    }
+
+    /// #358: an unparseable payload's protocol comes from its raw envelope
+    /// markers only for the unambiguous Reasonix shape.
+    #[test]
+    fn reasonix_protocol_is_read_from_truncated_envelope_markers() {
+        let reasonix = r#"{"event":"PreToolUse","sessionId":"s","cwd":"/r","toolName":"bash","toolArgs":{"command":"git reset --hard AAAA"#;
+        assert_eq!(
+            protocol_from_truncated_json(reasonix),
+            Some(HookProtocol::Reasonix)
+        );
+        let spaced = r#"{ "event" : "pretooluse", "toolArgs" : { "command": "x"#;
+        assert_eq!(
+            protocol_from_truncated_json(spaced),
+            Some(HookProtocol::Reasonix)
+        );
+        for other in [
+            // Claude / Codex / Gemini: no top-level event.
+            r#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"#,
+            // Crush: PascalCase event, but tool_input.
+            r#"{"event":"PreToolUse","tool_name":"bash","tool_input":{"command":"x"#,
+            // Copilot: hyphenated event, string toolArgs.
+            r#"{"event":"pre-tool-use","toolName":"bash","toolArgs":"{\"command\":\"x"#,
+            r#"{"event":"PreToolUse","toolName":"bash","toolArgs":"{\"command\":\"x"#,
+            // No event at all.
+            r#"{"toolName":"bash","toolArgs":{"command":"x"#,
+        ] {
+            assert_eq!(protocol_from_truncated_json(other), None, "{other}");
+        }
+        // Keys inside a command string are escaped, so a command cannot plant
+        // a `tool_input` key (or an event) to change the answer.
+        let planted = r#"{"event":"PreToolUse","toolName":"bash","toolArgs":{"command":"echo \"tool_input\": 1"#;
+        assert_eq!(
+            protocol_from_truncated_json(planted),
+            Some(HookProtocol::Reasonix)
+        );
+        let planted_event = r#"{"tool_name":"Bash","tool_input":{"command":"echo \"event\":\"PreToolUse\",\"toolArgs\":{"#;
+        assert_eq!(protocol_from_truncated_json(planted_event), None);
     }
 
     /// Reasonix reads only the exit status (#358): its payload must be

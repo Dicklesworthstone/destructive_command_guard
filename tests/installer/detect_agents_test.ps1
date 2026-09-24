@@ -147,6 +147,9 @@ try {
     $env:REASONIX_HOME = Join-Path $h1j 'isolated'
     New-Item -ItemType Directory -Force -Path $env:REASONIX_HOME | Out-Null
     Check ((Detect-Agents -HomeDir $h1j)['Reasonix'] -eq $true) "Reasonix detected via REASONIX_HOME"
+    New-Item -ItemType Directory -Force -Path (Join-Path $h1j 'tilde-home') | Out-Null
+    $env:REASONIX_HOME = ' ~/tilde-home '
+    Check ((Detect-Agents -HomeDir $h1j)['Reasonix'] -eq $true) "Reasonix detected via a trimmed, tilde REASONIX_HOME"
     $env:REASONIX_HOME = $null
     Remove-Item -Recurse -Force $h1j -ErrorAction SilentlyContinue
 
