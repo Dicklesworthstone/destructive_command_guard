@@ -371,6 +371,23 @@ Directories dcg creates for the database are `0700` on Unix. `dcg doctor`
 reports the resolved path, its source, and whether the hook can write there
 (check id `history` in `--format json`).
 
+## Decision Log
+
+```toml
+[logging]
+enabled = false              # opt-in
+file = "~/.local/state/dcg/decisions.log"
+format = "text"              # "text" | "json"
+# caller_env = "FLYWHEEL_AGENT_ID"
+```
+
+`caller_env` names an environment variable whose value identifies the caller.
+It is recorded on every entry as `caller` (JSON) or `[caller:…]` (text), for
+setups where one host runs many agents and the built-in agent detection only
+recognises vendor variables. Whoever sets the variable controls it, so it is
+treated as a label and never as input: it is reduced to printable ASCII on a
+single line, capped at 64 characters, and never consulted by any decision.
+
 ## Editor Autocomplete & Validation (JSON Schema)
 
 dcg publishes a JSON Schema for `config.toml` so editors can offer field

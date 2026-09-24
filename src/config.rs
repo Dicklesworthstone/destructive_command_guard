@@ -900,6 +900,7 @@ struct LoggingConfigLayer {
     format: Option<crate::logging::LogFormat>,
     redaction: Option<RedactionConfigLayer>,
     events: Option<LogEventFilterLayer>,
+    caller_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -4601,6 +4602,9 @@ impl Config {
             if let Some(allow) = events.allow {
                 self.logging.events.allow = allow;
             }
+        }
+        if let Some(caller_env) = logging.caller_env {
+            self.logging.caller_env = Some(caller_env);
         }
     }
 

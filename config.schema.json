@@ -109,7 +109,8 @@
           "deny": true,
           "warn": true,
           "allow": false
-        }
+        },
+        "caller_env": null
       }
     },
     "history": {
@@ -815,6 +816,14 @@
             "warn": true,
             "allow": false
           }
+        },
+        "caller_env": {
+          "description": "Name of an environment variable whose value identifies the caller,\nrecorded as `caller` on each entry (#378), e.g. `FLYWHEEL_AGENT_ID`.\nOpt-in. The value is a label only: it is sanitized, bounded, and never\nconsulted by any decision.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         }
       }
     },

@@ -1613,8 +1613,9 @@ Sometimes you need to run a blocked command temporarily without permanently modi
 # Use the short code to create a temporary exception
 dcg allow-once 123456
 
-# Or, use --single-use to make the exception one-shot
-dcg allow-once 123456 --single-use
+# The exception is consumed by the first run. To keep it for repeated runs
+# until it expires:
+dcg allow-once 123456 --reusable
 ```
 
 **How Allow-Once Works**:
@@ -1623,7 +1624,7 @@ dcg allow-once 123456 --single-use
 2. The code is tied to the exact command that was blocked
 3. Running `dcg allow-once <code>` creates a temporary exception
 4. The exception is stored in `~/.config/dcg/pending_exceptions.jsonl`
-5. Exceptions expire after 24 hours (or after first use if `--single-use` is used)
+5. Exceptions are consumed by their first use, or expire after 24 hours (with `--reusable`, they last until expiry)
 6. While active, the exception allows the same command in the same directory scope
 
 This workflow is useful for:

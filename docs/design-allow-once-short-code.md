@@ -47,8 +47,9 @@ dcg allow-once <code> --index <n>
 ```
 
 Behavior:
-- Default is reusable until expiry (exact command + cwd match).
-- `--single-use` marks the exception as consumed after the first allow.
+- Default is single-use: consumed after the first allow (#378; exact command
+  + cwd match). `--reusable` keeps it valid until expiry; `--single-use` is
+  accepted and matches the default.
 - `--show-raw` reveals the raw command when resolving collisions.
 - `--hash` or `--index` disambiguates collisions non-interactively.
 - If the code maps to multiple pending entries, the CLI must disambiguate

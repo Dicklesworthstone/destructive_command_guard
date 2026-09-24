@@ -31,6 +31,11 @@ pub struct LoggingConfig {
     pub redaction: RedactionConfig,
     /// Events to log.
     pub events: LogEventFilter,
+    /// Name of an environment variable whose value identifies the caller,
+    /// recorded as `caller` on each entry (#378), e.g. `FLYWHEEL_AGENT_ID`.
+    /// Opt-in. The value is a label only: it is sanitized, bounded, and never
+    /// consulted by any decision.
+    pub caller_env: Option<String>,
 }
 
 impl Default for LoggingConfig {
@@ -41,8 +46,34 @@ impl Default for LoggingConfig {
             format: LogFormat::Text,
             redaction: RedactionConfig::default(),
             events: LogEventFilter::default(),
+            caller_env: None,
         }
     }
+}
+
+/// Longest caller label recorded, in characters.
+const MAX_CALLER_CHARS: usize = 64;
+
+/// The caller label from the configured environment variable, if set (#378).
+///
+/// Anyone who can set the variable controls it, so it is reduced to a short,
+/// single-line label (printable ASCII only), fit for an audit record and
+/// unable to forge log structure.
+#[must_use]
+pub fn caller_label(config: &LoggingConfig) -> Option<String> {
+    let name = config.caller_env.as_deref()?;
+    sanitize_caller_label(&std::env::var(name).ok()?)
+}
+
+/// Reduce a raw caller value to the label [`caller_label`] records.
+fn sanitize_caller_label(raw: &str) -> Option<String> {
+    let label: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(MAX_CALLER_CHARS)
+        .collect();
+    let label = label.trim().to_string();
+    (!label.is_empty()).then_some(label)
 }
 
 /// Log output format.
@@ -133,6 +164,9 @@ pub struct LogEntry {
     pub budget_skip: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowlist_layer: Option<String>,
+    /// Caller label from `[logging] caller_env` (#378).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller: Option<String>,
 }
 
 impl LogEntry {
@@ -215,6 +249,7 @@ impl LogEntry {
                 None
             },
             allowlist_layer,
+            caller: None,
         }
     }
 
@@ -239,6 +274,9 @@ impl LogEntry {
         }
         if let Some(ref layer) = self.allowlist_layer {
             parts.push(format!("[allowlist:{layer}]"));
+        }
+        if let Some(ref caller) = self.caller {
+            parts.push(format!("[caller:{caller}]"));
         }
         parts.join(" ")
     }
@@ -299,6 +337,10 @@ impl DecisionLogger {
             &self.config.redaction,
             elapsed_us,
         );
+        let entry = LogEntry {
+            caller: caller_label(&self.config),
+            ..entry
+        };
         let line = match self.config.format {
             LogFormat::Text => entry.format_text(),
             LogFormat::Json => entry.format_json(),
@@ -1036,6 +1078,41 @@ pub fn log_allow_once_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The caller label is attacker-settable text in an audit record (#378):
+    /// single-line, printable, bounded, and absent when empty.
+    #[test]
+    fn caller_label_is_a_bounded_single_line_label_issue_378() {
+        assert_eq!(
+            sanitize_caller_label("agent-7 (swarm)").as_deref(),
+            Some("agent-7 (swarm)")
+        );
+        assert_eq!(
+            sanitize_caller_label("ok\n[DENY] forged\x1b[31m").as_deref(),
+            Some("ok[DENY] forged[31m"),
+            "newlines and control bytes cannot forge log structure"
+        );
+        assert_eq!(
+            sanitize_caller_label(&"x".repeat(500)).map(|l| l.len()),
+            Some(64)
+        );
+        assert_eq!(sanitize_caller_label("  \t\n "), None);
+
+        let entry = LogEntry {
+            caller: Some("agent-7".to_string()),
+            ..LogEntry::from_result(
+                &EvaluationResult::allowed(),
+                "ls",
+                None,
+                DecisionMode::Deny,
+                &RedactionConfig::default(),
+                None,
+            )
+        };
+        assert!(entry.format_text().ends_with("[caller:agent-7]"));
+        assert!(entry.format_json().contains("\"caller\":\"agent-7\""));
+        assert!(LoggingConfig::default().caller_env.is_none(), "opt-in");
+    }
 
     #[test]
     fn logging_config_defaults() {

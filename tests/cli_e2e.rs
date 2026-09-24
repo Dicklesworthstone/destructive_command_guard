@@ -1087,6 +1087,11 @@ mod allow_once_flow_tests {
 
         /// Run dcg in hook mode with JSON input.
         fn run_hook(&self, command: &str) -> HookRunOutput {
+            self.run_hook_with_env(command, &[])
+        }
+
+        /// [`Self::run_hook`] with extra environment variables for the child.
+        fn run_hook_with_env(&self, command: &str, extra_env: &[(&str, &str)]) -> HookRunOutput {
             let input = serde_json::json!({
                 "tool_name": "Bash",
                 "tool_input": {
@@ -1103,6 +1108,7 @@ mod allow_once_flow_tests {
                 .env("DCG_PACKS", "core.git,core.filesystem")
                 .env("DCG_PENDING_EXCEPTIONS_PATH", &self.pending_path)
                 .env("DCG_ALLOW_ONCE_PATH", &self.allow_once_path)
+                .envs(extra_env.iter().copied())
                 .current_dir(self.temp.path())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -1279,9 +1285,10 @@ mod allow_once_flow_tests {
         let result2 = env.run_hook(command);
         assert_is_allowed(&result2);
 
-        // Step 4: Run it again to verify reusable (not single-use)
+        // Step 4: the grant was single-use (the default since #378), so the
+        // same command is denied again.
         let result3 = env.run_hook(command);
-        assert_is_allowed(&result3);
+        assert_is_denial(&result3);
     }
 
     /// With `general.log_file` set, the allow-once lifecycle is audited: the
@@ -1355,6 +1362,74 @@ mod allow_once_flow_tests {
         assert_eq!(entries[0]["rule_id"], "core.git:reset-hard");
         assert_eq!(entries[1]["decision"], "allow");
         assert_eq!(entries[1]["mode"], "allow");
+    }
+
+    /// `[logging] caller_env` attributes each record to a caller the built-in
+    /// agent detection does not know (#378), sanitized to a single line.
+    #[test]
+    fn logging_records_the_configured_caller_issue_378() {
+        let env = FlowTestEnv::new();
+        let log_path = env.temp.path().join("decisions.jsonl");
+        let config = format!(
+            "[logging]\nenabled = true\nfile = {:?}\nformat = \"json\"\n\
+             caller_env = \"DCG_TEST_CALLER\"\n[logging.events]\ndeny = true\n",
+            log_path.to_string_lossy()
+        );
+        for dir in [
+            env.xdg_config_dir.join("dcg"),
+            env.home_dir.join(".config").join("dcg"),
+        ] {
+            std::fs::create_dir_all(&dir).expect("config dir");
+            std::fs::write(dir.join("config.toml"), &config).expect("write config");
+        }
+
+        assert_is_denial(&env.run_hook_with_env(
+            "git reset --hard",
+            &[("DCG_TEST_CALLER", "agent-7\nforged")],
+        ));
+        assert_is_denial(&env.run_hook("git reset --hard"));
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let entries: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("json log line"))
+            .collect();
+        assert_eq!(entries.len(), 2, "{log}");
+        assert_eq!(entries[0]["caller"], "agent-7forged", "{log}");
+        assert!(
+            entries[1].get("caller").is_none(),
+            "unset variable, no label: {log}"
+        );
+    }
+
+    /// An allow-once grant is consumed by its first use unless `--reusable`
+    /// asks otherwise (#378): "allow once" means once.
+    #[test]
+    fn allow_once_is_single_use_by_default_issue_378() {
+        let env = FlowTestEnv::new();
+        let command = "git reset --hard";
+
+        let code = extract_code_from_denial(&assert_is_denial(&env.run_hook(command)))
+            .expect("denial carries a code");
+        assert!(
+            env.run_cli(&["allow-once", &code, "--yes"])
+                .status
+                .success()
+        );
+        assert_is_allowed(&env.run_hook(command));
+        assert_is_denial(&env.run_hook(command));
+
+        let code = extract_code_from_denial(&assert_is_denial(&env.run_hook(command)))
+            .expect("a fresh denial carries a code");
+        let reusable = env.run_cli(&["allow-once", &code, "--yes", "--reusable"]);
+        assert!(
+            reusable.status.success(),
+            "reusable grant failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&reusable.stdout),
+            String::from_utf8_lossy(&reusable.stderr)
+        );
+        assert_is_allowed(&env.run_hook(command));
+        assert_is_allowed(&env.run_hook(command));
     }
 
     /// `dcg explain` must agree with `dcg test` on a path-scoped grant and say

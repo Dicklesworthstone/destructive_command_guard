@@ -11,7 +11,8 @@ When dcg blocks a command, it prints a 6-digit numeric code that can be used to 
 **Key properties:**
 - Exceptions are scoped to the exact command + directory (project root in git repos, cwd otherwise)
 - Exceptions expire after 24 hours
-- By default, exceptions are reusable until expiry
+- By default an exception is single-use: it is consumed by the first command
+  it allows (`--reusable` keeps it valid until expiry instead)
 - All exceptions are logged for audit
 
 ---
@@ -57,15 +58,18 @@ This creates a temporary exception that:
 - Expires after 24 hours
 - Can be used multiple times until expiry
 
-### Single-Use Exceptions
+### Single-Use (Default) and Reusable Exceptions
 
-For a one-time exception that's consumed after the first use:
+An allow-once grant is consumed by the first command it allows. To keep it valid
+for repeated runs of the same command until it expires:
 
 ```bash
-dcg allow-once 123456 --single-use
+dcg allow-once 123456 --reusable
 ```
 
-This is more restrictive and recommended when you only need to run the command once.
+A reusable grant is a bypass with a time window, so use it only when you really
+need to repeat the command. `--single-use` is still accepted and matches the
+default. Before #378 the default was reusable.
 
 ---
 
@@ -203,7 +207,7 @@ dcg allow-once clear --all
 
 ```bash
 dcg allow-once <CODE>              # Apply an allow-once code
-dcg allow-once <CODE> --single-use # Apply as one-time exception
+dcg allow-once <CODE> --reusable   # Keep the exception until it expires
 dcg allow-once <CODE> --force      # Override config blocklist
 dcg allow-once <CODE> --dry-run    # Preview without applying
 ```
@@ -237,7 +241,8 @@ Without disambiguation, the CLI will show a list of matching entries to choose f
 | `--json` | Output JSON for automation |
 | `--show-raw` | Show unredacted command text |
 | `--dry-run` | Preview without applying |
-| `--single-use` | Consumed after first allow |
+| `--single-use` | Consumed after first allow (the default) |
+| `--reusable` | Stay valid until expiry instead of being consumed |
 | `--force` | Override config blocklist |
 | `--pick <N>` | Select by index when codes collide |
 | `--hash <HASH>` | Select by full hash when codes collide |
@@ -292,7 +297,7 @@ Keep the secret stable within the environment where you expect to resolve codes.
 
 ## Best Practices
 
-1. **Use `--single-use` for one-off operations** - Prefer single-use exceptions when you only need to run a command once.
+1. **Reach for `--reusable` sparingly** - The default single-use grant covers a one-off operation; a reusable grant keeps the bypass open until it expires.
 
 2. **Review before applying** - Use `dcg explain "<command>"` to understand why the command was blocked before allowing it.
 

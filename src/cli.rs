@@ -2174,9 +2174,15 @@ pub struct AllowOnceCommand {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Allow a single use only (consumed after first allow) (apply-only)
-    #[arg(long)]
+    /// Allow a single use only (consumed after first allow). This is the
+    /// default; the flag is kept so existing scripts keep working (apply-only)
+    #[arg(long, conflicts_with = "reusable")]
     pub single_use: bool,
+
+    /// Keep the grant reusable until it expires instead of consuming it on
+    /// first use (the pre-#378 default) (apply-only)
+    #[arg(long)]
+    pub reusable: bool,
 
     /// Override explicit config blocklist (extra confirmation required) (apply-only)
     #[arg(long)]
@@ -18003,6 +18009,9 @@ fn handle_allow_once_command(
     // already been printed — which read as a successful grant while the store
     // was never written (#262).
     let needs_prompt = !(cmd.yes || cmd.dry_run);
+    // "Allow once" means once (#378): a grant is consumed on first use unless
+    // `--reusable` asks for the old reuse-until-expiry behaviour.
+    let single_use = !cmd.reusable;
     if needs_prompt && !std::io::stdin().is_terminal() {
         return Err(format!(
             "Allow-once needs an interactive confirmation, but stdin is not a terminal, so the \
@@ -18030,7 +18039,7 @@ fn handle_allow_once_command(
         now,
         scope_kind,
         &scope_path_str,
-        cmd.single_use,
+        single_use,
         cmd.force && is_config_block,
         &config.logging.redaction,
     );
@@ -18040,7 +18049,7 @@ fn handle_allow_once_command(
             "status": "ok",
             "code": code,
             "dry_run": cmd.dry_run,
-            "single_use": cmd.single_use,
+            "single_use": single_use,
             "force": entry.force_allow_config,
             "scope_kind": format!("{scope_kind:?}").to_lowercase(),
             "scope_path": scope_path_str,
@@ -18063,10 +18072,10 @@ fn handle_allow_once_command(
         println!("  CWD: {}", selected.cwd);
         println!("  Expires: {}", entry.expires_at);
         println!("  Scope: {scope_kind:?} ({scope_path_str})");
-        if cmd.single_use {
+        if single_use {
             println!("  Mode: single-use");
         } else {
-            println!("  Mode: reusable until expiry");
+            println!("  Mode: reusable until expiry (--reusable)");
         }
 
         if needs_prompt {
@@ -18488,6 +18497,18 @@ fn select_pending_entry<'a>(
 ) -> Result<&'a PendingExceptionRecord, Box<dyn std::error::Error>> {
     if matches.len() == 1 {
         return Ok(&matches[0]);
+    }
+
+    // The same command denied twice in one second (an agent retrying) writes
+    // two records with the same hash: the hash covers the second, the cwd and
+    // the command, so they are one grant, not a choice. Asking the user to
+    // disambiguate them was unanswerable, since `--hash` cannot tell them apart.
+    if let Some(first) = matches.first()
+        && matches
+            .iter()
+            .all(|record| record.full_hash == first.full_hash)
+    {
+        return Ok(first);
     }
 
     if let Some(hash) = cmd.hash.as_deref() {
@@ -26328,6 +26349,29 @@ console.log(JSON.stringify({
         }
     }
 
+    /// Single-use is the default; `--reusable` is the opt-out, and it cannot
+    /// be combined with an explicit `--single-use` (#378).
+    #[test]
+    fn allow_once_reusable_is_opt_in_issue_378() {
+        let cli = Cli::parse_from(["dcg", "allow-once", "ab12", "--reusable", "--yes"]);
+        let Some(Command::AllowOnce(cmd)) = cli.command else {
+            panic!("expected allow-once");
+        };
+        assert!(cmd.reusable);
+        assert!(!cmd.single_use);
+
+        let cli = Cli::parse_from(["dcg", "allow-once", "ab12", "--yes"]);
+        let Some(Command::AllowOnce(cmd)) = cli.command else {
+            panic!("expected allow-once");
+        };
+        assert!(!cmd.reusable, "with no flag the grant is single-use");
+
+        assert!(
+            Cli::try_parse_from(["dcg", "allow-once", "ab12", "--reusable", "--single-use"])
+                .is_err()
+        );
+    }
+
     #[test]
     fn test_cli_parse_allow_once() {
         let cli = Cli::parse_from([
@@ -28668,6 +28712,7 @@ exclude = ["target/**"]
             dry_run: true,
             json: true,
             single_use: false,
+            reusable: false,
             force: false,
             pick: Some(2),
             hash: None,
@@ -28684,6 +28729,7 @@ exclude = ["target/**"]
             dry_run: true,
             json: true,
             single_use: false,
+            reusable: false,
             force: false,
             pick: None,
             hash: Some(b.full_hash.clone()),
@@ -28691,6 +28737,46 @@ exclude = ["target/**"]
         let records = [a, b.clone()];
         let selected = select_pending_entry(&records, &cmd_hash).unwrap();
         assert_eq!(selected.full_hash, b.full_hash);
+    }
+
+    /// Two records for one denial (same second, cwd and command) share their
+    /// full hash; redeeming the code must not demand a choice between them.
+    #[test]
+    fn identical_pending_records_are_one_grant() {
+        use crate::logging::RedactionConfig;
+
+        let ts = chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let redaction = RedactionConfig::default();
+        let record = || {
+            PendingExceptionRecord::new(
+                ts,
+                "/repo",
+                "git reset --hard",
+                "blocked",
+                &redaction,
+                false,
+                None,
+            )
+        };
+        let records = [record(), record()];
+        assert_eq!(records[0].full_hash, records[1].full_hash);
+
+        let cmd = AllowOnceCommand {
+            action: None,
+            code: Some(records[0].short_code.clone()),
+            yes: true,
+            show_raw: false,
+            dry_run: true,
+            json: true,
+            single_use: false,
+            reusable: false,
+            force: false,
+            pick: None,
+            hash: None,
+        };
+        assert!(select_pending_entry(&records, &cmd).is_ok());
     }
 
     #[test]
@@ -28727,6 +28813,7 @@ exclude = ["target/**"]
             dry_run: true,
             json: true,
             single_use: false,
+            reusable: false,
             force: false,
             pick: Some(3),
             hash: None,
