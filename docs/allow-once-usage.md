@@ -56,7 +56,7 @@ This creates a temporary exception that:
 - Allows the exact command that was blocked
 - Is scoped to the project root (if in a git repo) or current directory (otherwise)
 - Expires after 24 hours
-- Can be used multiple times until expiry
+- Is consumed by the first matching command (unless created with `--reusable`)
 
 ### Single-Use (Default) and Reusable Exceptions
 
