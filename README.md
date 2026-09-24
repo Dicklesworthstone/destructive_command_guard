@@ -1035,6 +1035,33 @@ brew install dicklesworthstone/tap/dcg
 dcg install
 ```
 
+### Manual install (no `curl | bash`)
+
+Every release archive is signed, so you can verify it yourself and never run
+the installer script:
+
+```bash
+V=v0.14.4; T=aarch64-apple-darwin   # or x86_64-unknown-linux-musl, etc.
+curl -fLO "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/$V/dcg-$T.tar.xz"
+curl -fLO "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/$V/dcg-$T.tar.xz.minisig"
+minisign -Vm "dcg-$T.tar.xz" -P RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO
+tar -xJf "dcg-$T.tar.xz" && install -m 0755 dcg ~/.local/bin/dcg
+dcg install   # configure agent hooks
+```
+
+Each archive also has a `.sha256` and a `.sigstore.json` bundle. Verify the
+bundle with `cosign verify-blob --new-bundle-format --key <pub> --bundle
+dcg-$T.tar.xz.sigstore.json dcg-$T.tar.xz`, where `<pub>` is the key pinned
+as `COSIGN_RELEASE_PUBLIC_KEY` in `install.sh`.
+
+**crates.io is not a supported channel.** dcg builds its shell parser from a
+vendored, patched `tree-sitter-bash` (`[patch.crates-io]` in `Cargo.toml`),
+and `cargo publish` drops that patch. A crates.io build would silently use the
+unpatched grammar, which has a scanner memory-safety bug on glibc and
+misparses some redirections that the guard needs to read correctly. The
+package there is frozen at an old version; to build from source, clone the
+repository and run `cargo install --path .`.
+
 **Other options:**
 
 Interactive mode (prompts for each step; prompts read your terminal via
