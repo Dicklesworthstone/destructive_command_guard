@@ -1903,6 +1903,23 @@ fn is_powershell_cmdlet_token(token: &str) -> bool {
 /// shape (see [`segment_is_windows_alias_invocation`]).
 const WINDOWS_DESTRUCTIVE_ALIASES: &[&str] = &["rm", "ri", "del", "rd", "rmdir", "erase"];
 
+/// Cmd built-ins that write, rename or link a file the credential/`.git`
+/// classifier already judges. `core::credential_files::shell::windows_shells`
+/// implements every one of them, but `classify_cmd_builtin` is reached only
+/// under `ShellDialect::Cmd`, and a `Bash`-labeled payload never became `Cmd`:
+/// `command_has_powershell_shape` recognised cmd *deleters* (`del /s /q`) and
+/// `format D:` but no cmd *writer*, so `copy nul .git\config` kept the Posix
+/// dialect, where `\config` is an escape rather than a separator, and was
+/// allowed. Prepending an unrelated `Get-Item z;` to the identical command
+/// denied it, which is what isolates this to the dialect rather than to the
+/// rules behind it.
+///
+/// These are ordinary English words, so — exactly as with the aliases above —
+/// the bare verb is never enough; see [`segment_is_cmd_writer_invocation`].
+const CMD_WRITER_VERBS: &[&str] = &[
+    "copy", "xcopy", "robocopy", "move", "ren", "rename", "mklink",
+];
+
 /// PowerShell `Remove-Item` parameter names used as the discriminator. A
 /// single-dash token whose name is a >=3-character prefix of one of these is
 /// unmistakably PowerShell: POSIX/GNU `rm` never accepts a single-dash
@@ -1979,6 +1996,60 @@ fn segment_is_windows_alias_invocation(segment: &str) -> bool {
         .any(|token| is_powershell_parameter_token(token) || is_cmd_switch_token(token))
 }
 
+/// Return whether `token` is a Windows *path* rather than a POSIX word: a
+/// drive-letter root (`C:\tmp\x`), a `%VAR%` expansion (`%USERPROFILE%\…`), or
+/// a backslash used as a separator (`.git\config`).
+///
+/// The separator test requires the byte after `\` to be alphanumeric, which is
+/// what keeps POSIX escapes out: `foo\ bar` (escaped space), `a\*b` and `a\$b`
+/// all put punctuation there. A quoted `\n` would qualify, but this predicate
+/// is only ever consulted once the leading token is already a cmd writer verb,
+/// so that is not a shape a POSIX command reaches.
+fn is_windows_path_token(token: &str) -> bool {
+    let token = token.trim_matches(['"', '\'']);
+    let bytes = token.as_bytes();
+    let drive_root = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    let percent_expansion = token
+        .split_once('%')
+        .and_then(|(_, rest)| rest.split_once('%'))
+        .is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        });
+    let backslash_separator = bytes
+        .windows(2)
+        .any(|pair| pair[0] == b'\\' && pair[1].is_ascii_alphanumeric());
+    drive_root || percent_expansion || backslash_separator
+}
+
+/// Return whether a single statement segment is a cmd *writer* invocation:
+/// one of [`CMD_WRITER_VERBS`] carrying a Windows-path-shaped operand.
+///
+/// The operand requirement is the same discipline
+/// [`segment_is_windows_alias_invocation`] applies, and for the same reason —
+/// `copy`, `move` and `rename` are ordinary words, and a POSIX script named
+/// `copy` must keep the Posix dialect. `--` ends the scan as POSIX
+/// end-of-options.
+fn segment_is_cmd_writer_invocation(segment: &str) -> bool {
+    let mut tokens = segment.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let lowered = first.to_ascii_lowercase();
+    let name = lowered.strip_suffix(".exe").unwrap_or(&lowered);
+    if !CMD_WRITER_VERBS.contains(&name) {
+        return false;
+    }
+    tokens
+        .take_while(|token| *token != "--")
+        .any(is_windows_path_token)
+}
+
 /// Return whether a segment runs Windows `format` against a drive letter
 /// (`format D: /q`, `/c/Windows/System32/format.com E:`).
 ///
@@ -2011,8 +2082,9 @@ fn segment_is_format_drive_invocation(segment: &str) -> bool {
 
 /// Return whether any statement/pipeline segment of `command` is unmistakably
 /// Windows shell: a PowerShell cmdlet-shaped leading token (`Remove-Item …`,
-/// `… ; Clear-Content …`) or a destructive alias carrying a Windows-shell-only
-/// argument (`rm -Recurse -Force …`, `del /s /q …`).
+/// `… ; Clear-Content …`), a destructive alias carrying a Windows-shell-only
+/// argument (`rm -Recurse -Force …`, `del /s /q …`), or a cmd writer carrying a
+/// Windows path (`copy nul .git\config`).
 fn command_has_powershell_shape(command: &str) -> bool {
     command
         .split(['|', ';', '&', '\n', '\r', '(', '{'])
@@ -2022,6 +2094,7 @@ fn command_has_powershell_shape(command: &str) -> bool {
                 .next()
                 .is_some_and(is_powershell_cmdlet_token)
                 || segment_is_windows_alias_invocation(segment)
+                || segment_is_cmd_writer_invocation(segment)
                 || segment_is_format_drive_invocation(segment)
         })
 }
@@ -4198,6 +4271,106 @@ mod tests {
             refine_shell_dialect("Remove-Item x", ShellDialect::Unknown),
             ShellDialect::Unknown
         );
+    }
+
+    /// Cmd *writers* must widen the dialect the way cmd *deleters* already do.
+    ///
+    /// `core::credential_files::shell::windows_shells::classify_cmd_builtin`
+    /// implements `copy`/`xcopy`/`move`/`ren`/`mklink` and is reached only
+    /// under `ShellDialect::Cmd`, which a `Bash`-labeled payload never became:
+    /// only PowerShell shapes, `del /s /q` and `format D:` widened. So
+    /// `copy nul .git\config` was evaluated as POSIX — where `\c` is an escape
+    /// naming `.gitconfig`, not a separator naming `.git/config` — and allowed,
+    /// while `Copy-Item x .git\config` denied. Measured end-to-end before the
+    /// fix: prepending an unrelated `Get-Item z;` to the identical command
+    /// denied it, which is what isolates this to the dialect rather than to the
+    /// classifier or the rules behind it.
+    #[test]
+    fn cmd_writer_invocations_widen_the_dialect() {
+        // A cmd writer carrying a Windows path is not a POSIX command.
+        for command in [
+            r"copy nul .git\config",
+            r"copy /y nul .git\HEAD",
+            r"copy C:\tmp\x .git\hooks\pre-commit",
+            r"copy nul %USERPROFILE%\.ssh\authorized_keys",
+            r"xcopy C:\tmp\x .git\",
+            r"robocopy C:\tmp .git\objects",
+            r"move /y C:\tmp\x .git\config",
+            r"move C:\tmp\x .git/config",
+            r"ren .git\config config.bak",
+            r"rename .git\HEAD HEAD.bak",
+            r"mklink .git\config C:\tmp\x",
+            r"mklink /h .git\HEAD C:\tmp\x",
+            r"Copy.exe C:\tmp\x .git\config",
+            r"echo ok && copy nul .git\config",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "cmd writer invocation must widen: {command:?}"
+            );
+        }
+
+        // `copy`, `move` and `rename` are ordinary words, so the bare verb is
+        // never enough — the same bar the destructive aliases are held to. A
+        // POSIX script named `copy` must keep the Posix dialect.
+        for command in [
+            "copy src dst",
+            "copy -r src dst",
+            "move old new",
+            "rename 's/a/b/' *.txt",
+            "ren a b",
+            "./copy file.txt backup.txt",
+            "npm run copy-assets",
+            // Backslash as a POSIX escape, not a separator: the byte after `\`
+            // is punctuation in every one of these.
+            r"copy foo\ bar dst",
+            r"copy 'a\*b' dst",
+            r"move a\$b dst",
+            // POSIX end-of-options ends the scan.
+            r"copy -- C:\tmp\x",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "plain POSIX writer usage must not widen: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_path_tokens_are_distinguished_from_posix_words() {
+        for token in [
+            r"C:\tmp\x",
+            r"c:/tmp",
+            r".git\config",
+            r"%USERPROFILE%\.ssh",
+            "%APPDATA%",
+            r#""C:\Program Files""#,
+        ] {
+            assert!(
+                is_windows_path_token(token),
+                "must be a Windows path: {token:?}"
+            );
+        }
+        for token in [
+            "src",
+            "./dst",
+            "/etc/passwd",
+            "~/.ssh/authorized_keys",
+            r"foo\ bar",
+            r"a\*b",
+            r"a\$b",
+            "100%",
+            "%",
+            "%%",
+            "-r",
+        ] {
+            assert!(
+                !is_windows_path_token(token),
+                "must not be a Windows path: {token:?}"
+            );
+        }
     }
 
     #[test]
