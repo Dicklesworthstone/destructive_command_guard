@@ -665,18 +665,65 @@ pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Op
     let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
 
     if language == ScriptLanguage::Ruby {
-        for caps in RUBY_FILEUTILS_LITERAL.captures_iter(code) {
-            let Some(m) = caps.get(0) else { continue };
-            let Some(path) = string_literal_from_caps(&caps) else {
+        // Every call is weighed and a blocking one wins. Returning the first
+        // literal whatever its verdict let a harmless call launder a later
+        // catastrophic one: `FileUtils.rm "/tmp/x.log"; FileUtils.rm_rf "/"`
+        // was allowed, because the parenless second call is visible only
+        // here (the AST pattern needs parentheses). The first non-blocking
+        // finding is still reported when nothing blocks.
+        //
+        // Every operand is weighed too, as the Perl `rmtree` scan does: string
+        // literals, `%w[...]` words, and a home-directory expression. Only the
+        // first literal was read, so `FileUtils.rm_rf ["/tmp/x", "/"]` and
+        // `FileUtils.rm_rf %w[/]` were allowed.
+        let mut first_non_blocking: Option<PatternMatch> = None;
+        for caps in RUBY_DELETE_CALL.captures_iter(code) {
+            let Some(call) = caps.name("call") else {
                 continue;
             };
-            let fn_name = caps.name("fn").map_or("rm_rf", |s| s.as_str());
-            let catastrophic = is_catastrophic_path(path);
+            let (family, receiver, fn_name) = if let Some(f) = caps.name("fu") {
+                ("fileutils", "FileUtils", f.as_str())
+            } else if let Some(f) = caps.name("file") {
+                ("file", "File", f.as_str())
+            } else if let Some(f) = caps.name("dir") {
+                ("dir", "Dir", f.as_str())
+            } else {
+                continue;
+            };
+            let rule_base = format!("heredoc.ruby.{family}_{fn_name}");
+
+            // A parenless call ends with its line; a parenthesized one may
+            // span lines, and `exec_argv_region` stops at its closing paren.
+            let tail = &code[call.start()..];
+            let parenthesized = tail[call.len()..]
+                .trim_start_matches([' ', '\t'])
+                .starts_with('(');
+            let call_text = if parenthesized {
+                tail
+            } else {
+                tail.split('\n').next().unwrap_or(tail)
+            };
+            let region = exec_argv_region(call_text);
+            let mut paths: Vec<&str> = ANY_STRING_LITERAL
+                .captures_iter(region)
+                .filter_map(|caps| string_literal_from_caps(&caps))
+                .collect();
+            for words in RUBY_WORD_ARRAY.captures_iter(region) {
+                if let Some(body) = ["b", "p", "c", "a"].iter().find_map(|g| words.name(g)) {
+                    paths.extend(body.as_str().split_whitespace());
+                }
+            }
+            let home = RUBY_HOME_DIR_OPERAND.is_match(region.trim());
+            if paths.is_empty() && !home {
+                continue;
+            }
+
+            let catastrophic = home || paths.iter().any(|path| is_catastrophic_path(path));
             // #455: the fallback has to reach the same verdict the AST pass
             // would, or an AST timeout quietly relaxes the policy.
             let non_temp_recursive = !catastrophic
-                && is_recursive_delete_rule(&format!("heredoc.ruby.fileutils_{fn_name}"))
-                && !is_temp_scratch_path(path);
+                && is_recursive_delete_rule(&rule_base)
+                && paths.iter().any(|path| !is_temp_scratch_path(path));
             let severity = if catastrophic || non_temp_recursive {
                 Severity::Critical
             } else {
@@ -689,55 +736,37 @@ pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Op
             } else {
                 ""
             };
-            let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
+            let start = call.start();
+            let end = region.as_ptr() as usize - code.as_ptr() as usize + region.len();
+            let end = end.max(call.end());
+            let line_number = newline_positions.partition_point(|&idx| idx < start) + 1;
 
-            return Some(PatternMatch {
-                rule_id: format!("heredoc.ruby.fileutils_{fn_name}{suffix}"),
+            let hit = PatternMatch {
+                rule_id: format!("{rule_base}{suffix}"),
                 reason: if catastrophic {
                     format!(
-                        "FileUtils.{fn_name}() deletes files/directories (catastrophic target path)"
+                        "{receiver}.{fn_name}() deletes files/directories (catastrophic target path)"
                     )
                 } else if non_temp_recursive {
                     format!(
-                        "FileUtils.{fn_name}() recursively deletes files/directories outside a temp directory"
+                        "{receiver}.{fn_name}() recursively deletes files/directories outside a temp directory"
                     )
                 } else {
-                    format!("FileUtils.{fn_name}() deletes files/directories")
+                    format!("{receiver}.{fn_name}() deletes files/directories")
                 },
-                matched_text_preview: truncate_preview(
-                    code.get(m.start()..m.end()).unwrap_or(""),
-                    60,
-                ),
-                start: m.start(),
-                end: m.end(),
+                matched_text_preview: truncate_preview(code.get(start..end).unwrap_or(""), 60),
+                start,
+                end,
                 line_number,
                 severity,
                 suggestion: Some("Verify target path carefully before running".to_string()),
-            });
+            };
+            if hit.severity.blocks_by_default() {
+                return Some(hit);
+            }
+            first_non_blocking.get_or_insert(hit);
         }
-        // The home directory as an expression, including the parenless
-        // `FileUtils.rm_rf Dir.home` the AST pattern cannot see.
-        if let Some(caps) = RUBY_FILEUTILS_HOME.captures(code) {
-            let m = caps.get(0)?;
-            let fn_name = caps.name("fn").map_or("rm_rf", |s| s.as_str());
-            let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
-            return Some(PatternMatch {
-                rule_id: format!("heredoc.ruby.fileutils_{fn_name}.catastrophic"),
-                reason: format!(
-                    "FileUtils.{fn_name}() deletes the home directory (catastrophic target path)"
-                ),
-                matched_text_preview: truncate_preview(
-                    code.get(m.start()..m.end()).unwrap_or(""),
-                    60,
-                ),
-                start: m.start(),
-                end: m.end(),
-                line_number,
-                severity: Severity::Critical,
-                suggestion: Some("Verify target path carefully before running".to_string()),
-            });
-        }
-        return None;
+        return first_non_blocking;
     }
 
     if matches!(
@@ -1081,11 +1110,24 @@ const STATEMENT_START: &str = r"(?:^|[;&|{(]|=>|\bdo\b|\bthen\b)[ \t]*";
 /// already applied to `FileUtils.rm('/')`, which raises rather than deleting:
 /// a catastrophic literal target is treated as the signal, not the syscall's
 /// likely outcome.
-static RUBY_FILEUTILS_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+///
+/// The regex locates the call only; its operands are weighed separately (see
+/// [`scan_filesystem_sink_fallback`]). It covers `FileUtils.`/`FileUtils::`
+/// and the single-file `File.delete`/`File.unlink`, `Dir.rmdir`/`Dir.delete`,
+/// with or without parentheses. The parenless spellings are visible only here,
+/// because the AST patterns (`FileUtils.rm_rf($$$)`) require parentheses.
+static RUBY_DELETE_CALL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"(?m){STATEMENT_START}FileUtils\.(?P<fn>rm_rf|rmdir|rm_r|rm_f|rm|remove_entry_secure|remove_entry|remove_file|remove_dir|remove)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#
+        r"(?m){STATEMENT_START}(?P<call>(?:FileUtils(?:\.|::)(?P<fu>rm_rf|rmdir|rm_r|rm_f|rm|remove_entry_secure|remove_entry|remove_file|remove_dir|remove)|File\.(?P<file>delete|unlink)|Dir\.(?P<dir>rmdir|delete))\b)(?:\s*\(|[ \t]+)"
     ))
-    .expect("ruby FileUtils literal regex compiles")
+    .expect("ruby delete call regex compiles")
+});
+
+/// A Ruby word array (`%w[/ /tmp]`, `%W(...)`): its elements are string
+/// operands without quotes.
+static RUBY_WORD_ARRAY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"%[wW](?:\[(?P<b>[^\]]*)\]|\((?P<p>[^)]*)\)|\{(?P<c>[^}]*)\}|<(?P<a>[^>]*)>)")
+        .expect("ruby word array regex compiles")
 });
 
 /// Name-anchored filesystem-delete sinks, the way [`JS_EXEC_SINK_LITERAL`] is
@@ -1471,22 +1513,21 @@ static JS_HOME_DIR_DELETE_ARG: LazyLock<Regex> = LazyLock::new(|| {
 const JS_HOME_DIR_EXPR: &str = r#"(?:(?:require\s*\(\s*['"](?:node:)?os['"]\s*\)|[A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*homedir\s*\(\s*\)|process\s*\.\s*env\s*(?:\.\s*(?:HOME|USERPROFILE)\b|\[\s*['"](?:HOME|USERPROFILE)['"]\s*\])|Deno\s*\.\s*env\s*\.\s*get\s*\(\s*['"](?:HOME|USERPROFILE)['"]\s*\))(?:\s*\+\s*['"`]/['"`])?"#;
 
 /// The Ruby home-directory expressions [`RUBY_HOME_DIR_FIRST_ARG`] and
-/// [`RUBY_FILEUTILS_HOME`] accept as a whole argument.
+/// [`RUBY_HOME_DIR_OPERAND`] accept as a whole argument.
 const RUBY_HOME_DIR_EXPR: &str = r#"(?:Dir\s*\.\s*home(?:\s*\(\s*\))?|ENV\s*\[\s*['"]HOME['"]\s*\]|ENV\s*\.\s*fetch\s*\(\s*['"]HOME['"][^)]*\)|Gem\s*\.\s*user_home|Etc\s*\.\s*getpwuid(?:\s*\([^)]*\))?\s*\.\s*dir)"#;
 
-/// Statement-anchored `FileUtils` delete of the home directory, for the
-/// filesystem backstop ([`scan_filesystem_sink_fallback`]). It catches the
-/// parenless `FileUtils.rm_rf Dir.home`, which the AST pattern
-/// `FileUtils.rm_rf($$$)` does not match, and it keeps the verdict when the
-/// AST pass is unavailable.
-static RUBY_FILEUTILS_HOME: LazyLock<Regex> = LazyLock::new(|| {
+/// A Ruby delete call's operand region (see [`exec_argv_region`]) that holds a
+/// home-directory expression as a whole operand: `Dir.home`, `[Dir.home]`,
+/// `"/tmp/x", Dir.home`. `File.join(Dir.home, "x")` is not one.
+static RUBY_HOME_DIR_OPERAND: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"(?m){STATEMENT_START}FileUtils\.(?P<fn>rm_rf|rmdir|rm_r|rm_f|rm|remove_entry_secure|remove_entry|remove_file|remove_dir|remove)\b(?:\s*\(\s*|\s+){RUBY_HOME_DIR_EXPR}\s*(?:[,);]|$)"
+        r"(?:\A|[\[,])\s*{RUBY_HOME_DIR_EXPR}\s*(?:[,\]]|\z)"
     ))
-    .expect("ruby FileUtils home-directory regex compiles")
+    .expect("ruby home-directory operand regex compiles")
 });
 
-/// The JavaScript counterpart of [`RUBY_FILEUTILS_HOME`], shaped like
+/// Statement-anchored JavaScript `fs` delete of the home directory, for the
+/// filesystem backstop ([`scan_filesystem_sink_fallback`]), shaped like
 /// [`JS_FS_SINK_LITERAL`].
 static JS_FS_SINK_HOME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
@@ -3963,7 +4004,7 @@ pub(crate) fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>
             // as `rm_r` with `force: true`); it only differs by propagating
             // errors instead of swallowing them. It must be listed separately
             // here for the same reason it needs its own alternative in
-            // `RUBY_FILEUTILS_LITERAL`: these are exact method names, so a
+            // `RUBY_DELETE_CALL`: these are exact method names, so a
             // covered `rm_rf` grants `rm_r` nothing (#454).
             CompiledPattern::new(
                 "FileUtils.rm_r($$$)".to_string(),
@@ -8255,6 +8296,103 @@ def cleanup():
                     "one-liner must reach the JavaScript fallback: {code}"
                 );
             }
+        }
+
+        /// The Ruby backstop weighs every delete call and every operand, and
+        /// is the only thing that sees parenless calls (the AST patterns need
+        /// parentheses). It returned the first `FileUtils` literal whatever its
+        /// verdict and read only that one literal, so a harmless call or
+        /// operand laundered a catastrophic one, and the `::`, `File.delete`
+        /// and `Dir.rmdir` parenless spellings were never scanned at all.
+        #[test]
+        fn ruby_fallback_weighs_every_call_and_operand() {
+            for (code, rule) in [
+                (
+                    "require 'fileutils'; FileUtils.rm \"/tmp/x.log\"; FileUtils.rm_rf \"/\"",
+                    "heredoc.ruby.fileutils_rm_rf.catastrophic",
+                ),
+                (
+                    "FileUtils.rm_f '/tmp/x.log'\nFileUtils.rm_rf 'build'",
+                    "heredoc.ruby.fileutils_rm_rf.non_temp",
+                ),
+                (
+                    "FileUtils.rm '/tmp/a'; FileUtils.rm_rf Dir.home",
+                    "heredoc.ruby.fileutils_rm_rf.catastrophic",
+                ),
+                (
+                    "FileUtils.rm_rf ['/tmp/x', '/']",
+                    "heredoc.ruby.fileutils_rm_rf.catastrophic",
+                ),
+                (
+                    "FileUtils.rm_rf(['/tmp/x', '/'])",
+                    "heredoc.ruby.fileutils_rm_rf.catastrophic",
+                ),
+                (
+                    "FileUtils.rm_rf %w[/tmp/x /]",
+                    "heredoc.ruby.fileutils_rm_rf.catastrophic",
+                ),
+                (
+                    "FileUtils.rm_rf('/tmp/x', '/etc')",
+                    "heredoc.ruby.fileutils_rm_rf.catastrophic",
+                ),
+                (
+                    "FileUtils::rm_rf '/'",
+                    "heredoc.ruby.fileutils_rm_rf.catastrophic",
+                ),
+                (
+                    "File.delete '/etc/passwd'",
+                    "heredoc.ruby.file_delete.catastrophic",
+                ),
+                (
+                    "File.unlink('notes.txt', '/etc/passwd')",
+                    "heredoc.ruby.file_unlink.catastrophic",
+                ),
+                ("Dir.rmdir '/'", "heredoc.ruby.dir_rmdir.catastrophic"),
+                (
+                    "FileUtils.rm_rf(\n  '/tmp/x',\n  '/'\n)",
+                    "heredoc.ruby.fileutils_rm_rf.catastrophic",
+                ),
+            ] {
+                let hit = scan_filesystem_sink_fallback(code, ScriptLanguage::Ruby);
+                assert!(
+                    hit.as_ref()
+                        .is_some_and(|m| m.rule_id == rule && m.severity.blocks_by_default()),
+                    "{code:?}: expected {rule}, got {hit:?}"
+                );
+            }
+
+            for code in [
+                "FileUtils.rm_rf '/tmp/build'",
+                "FileUtils.rm_rf '/tmp/x', verbose: true",
+                "FileUtils.rm_rf '/tmp/x' if File.exist?('/')",
+                "FileUtils.rm_rf %w[/tmp/a /tmp/b]",
+                "FileUtils.rm_rf(Dir.glob('/tmp/cache-*'))",
+                "FileUtils.rm_f 'notes.txt'",
+                "File.delete 'notes.txt'",
+                "Dir.delete 'emptydir'",
+                "FileUtils.rm_rf(tmpdir)",
+                "FileUtils.rm_rf(File.join(Dir.home, '.cache'))",
+                // A parenless call ends with its line: the next line's `/` is
+                // not one of its operands.
+                "FileUtils.rm_f '/tmp/x.log'\nputs '/'",
+                "puts 'FileUtils.rm_rf \"/\"'",
+            ] {
+                let hit = scan_filesystem_sink_fallback(code, ScriptLanguage::Ruby);
+                assert!(
+                    !hit.as_ref()
+                        .is_some_and(|m| m.severity.blocks_by_default()
+                            && m.rule_id.contains("catastrophic")),
+                    "{code:?} must not be catastrophic, got {hit:?}"
+                );
+            }
+            // Nothing blocks: the first finding is still reported, not blocked.
+            let hit = scan_filesystem_sink_fallback(
+                "FileUtils.rm_f '/tmp/a.log'; FileUtils.rm_rf '/tmp/b'",
+                ScriptLanguage::Ruby,
+            )
+            .expect("non-blocking finding");
+            assert_eq!(hit.rule_id, "heredoc.ruby.fileutils_rm_f");
+            assert!(!hit.severity.blocks_by_default());
         }
 
         /// The property the old `^[ \t]*` anchor was actually protecting: a

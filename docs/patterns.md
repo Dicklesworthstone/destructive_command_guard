@@ -260,7 +260,16 @@ Some patterns refine their rule IDs based on detected arguments:
   `fsPromises.rm` and `require('fs').promises.rm` all report `fs_rm`.
 - For TypeScript `deno_remove`, a catastrophic path appends `.catastrophic`.
 - For Ruby `FileUtils`/`File`/`Dir` patterns, catastrophic paths append
-  `.catastrophic`.
+  `.catastrophic`. Every operand counts, including list and `%w[...]` elements
+  and parenless calls (`FileUtils.rm_rf ["/tmp/x", "/"]` is catastrophic).
+- The **home directory written as an expression** is a catastrophic target, the
+  same as a literal `~`: `os.homedir()`, `process.env.HOME`/`USERPROFILE` and
+  `Deno.env.get("HOME")` in JavaScript/TypeScript, `Dir.home`, `ENV["HOME"]`,
+  `ENV.fetch("HOME")`, `Gem.user_home` and `Etc.getpwuid.dir` in Ruby, and
+  `$ENV{HOME}`, `glob("~")` and `File::HomeDir->my_home` in Perl (reported under
+  the plain `rmtree`/`remove_tree` ID, as Perl's catastrophic literals are). It
+  must be the whole argument: a directory under home, such as
+  `path.join(os.homedir(), ".cache")`, is classified like any other target.
 - For Ruby `system`/`exec`/`Open3`/backticks and Perl shell calls, literal
   payloads produce rule IDs with suffixes such as `.rm_rf` and
   `.rm_rf_catastrophic`.
@@ -359,7 +368,8 @@ A **dynamic** target is still judged per language: `shutil.rmtree(d)` and Go's
 `os.RemoveAll(dir)` deny,
 while the Ruby and JavaScript equivalents warn. Raising those would block
 `fs.rmSync(buildDir, { recursive: true })` in most Node build scripts, which is
-a wider change than #455 decided.
+a wider change than #455 decided. A home-directory expression is not dynamic in
+this sense: it names `~`, so it is catastrophic (see the rule-ID list above).
 
 ## Limitations and False Positive Notes
 
