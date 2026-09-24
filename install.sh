@@ -3217,6 +3217,19 @@ def deny(reason):
         "agent_message": reason,
     })
 
+# dcg answers "ask" when it could not finish checking a command (deadline or
+# size exceeded). Cursor supports `permission: "ask"`; mapping it to allow
+# would run exactly the command dcg declined to vouch for.
+def ask(reason):
+    emit({
+        "permission": "ask",
+        "continue": True,
+        "userMessage": reason,
+        "agentMessage": reason,
+        "user_message": reason,
+        "agent_message": reason,
+    })
+
 def main():
     try:
         payload = json.load(sys.stdin)
@@ -3276,6 +3289,9 @@ def main():
 
     if decision == "deny":
         deny(reason)
+        return 0
+    if decision == "ask":
+        ask(reason)
         return 0
 
     allow()

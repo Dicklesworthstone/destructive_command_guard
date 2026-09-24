@@ -108,6 +108,12 @@ else {
         $allow = (@{ command = 'git status'; cwd = $h5 } | ConvertTo-Json -Compress | pwsh -NoProfile -File $bridge | Out-String)
         $a = $allow | ConvertFrom-Json
         Check ($a.permission -eq 'allow') "safe command -> Cursor permission=allow (got '$($a.permission)')"
+        # A command over max_command_bytes is unverified: dcg answers ask, and
+        # the bridge must pass that through rather than allow it.
+        $long = 'echo ' + ('x' * 71680)
+        $askOut = (@{ command = $long; cwd = $h5 } | ConvertTo-Json -Compress | pwsh -NoProfile -File $bridge | Out-String)
+        $k = $askOut | ConvertFrom-Json
+        Check ($k.permission -eq 'ask') "unverified command -> Cursor permission=ask (got '$($k.permission)')"
     } finally { Remove-Item -Recurse -Force $h5 -ErrorAction SilentlyContinue }
 }
 

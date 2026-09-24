@@ -1059,6 +1059,11 @@ function Send-Allow {
 function Send-Deny($r) {
   Write-CursorOut @{ permission = 'deny'; continue = $false; userMessage = $r; agentMessage = $r; user_message = $r; agent_message = $r }
 }
+# dcg answers 'ask' when it could not finish checking a command; Cursor
+# supports permission=ask, and mapping it to allow would run that command.
+function Send-Ask($r) {
+  Write-CursorOut @{ permission = 'ask'; continue = $true; userMessage = $r; agentMessage = $r; user_message = $r; agent_message = $r }
+}
 try { $raw = [Console]::In.ReadToEnd() } catch { Send-Allow; exit 0 }
 if ([string]::IsNullOrWhiteSpace($raw)) { Send-Allow; exit 0 }
 try { $payload = $raw | ConvertFrom-Json } catch { Send-Allow; exit 0 }
@@ -1073,7 +1078,9 @@ try { $dcg = $out | ConvertFrom-Json } catch { Send-Allow; exit 0 }
 $decision = $dcg.hookSpecificOutput.permissionDecision
 $reason = $dcg.hookSpecificOutput.permissionDecisionReason
 if ([string]::IsNullOrEmpty($reason)) { $reason = 'Blocked by dcg' }
-if ($decision -eq 'deny') { Send-Deny $reason } else { Send-Allow }
+if ($decision -eq 'deny') { Send-Deny $reason }
+elseif ($decision -eq 'ask') { Send-Ask $reason }
+else { Send-Allow }
 exit 0
 '@
   $header + $body

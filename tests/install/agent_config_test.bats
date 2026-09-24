@@ -1420,6 +1420,34 @@ JSON
     [[ "$output" == *'blocked by mock dcg'* ]]
 }
 
+@test "configure_cursor: generated hook passes dcg's ask through instead of allowing" {
+    log_test "Testing Cursor hook ask mapping..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_cursor
+    cat > "$DEST/dcg" << 'MOCKEOF'
+#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"could not verify"}}'
+MOCKEOF
+    chmod +x "$DEST/dcg"
+
+    configure_cursor
+
+    local python_bin
+    python_bin="$(command -v python3)"
+    local output
+    output=$(PATH="/usr/bin:/bin" DCG_BIN= "$python_bin" "$CURSOR_HOOK_SCRIPT" <<'JSON'
+{"command":"echo long","cwd":""}
+JSON
+)
+
+    log_test "Cursor hook output: $output"
+    # dcg's unverified verdict must reach Cursor as `ask`, never `allow`.
+    [[ "$output" == *'"permission": "ask"'* ]]
+    [[ "$output" == *'could not verify'* ]]
+}
+
 @test "configure_cursor: does not treat hook script path outside entries as installed" {
     log_test "Testing Cursor exact hook entry detection..."
     command -v python3 &>/dev/null || skip "python3 not available"
