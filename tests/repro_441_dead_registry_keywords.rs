@@ -253,3 +253,45 @@ fn system_permissions_chgrp_is_reachable() {
         );
     }
 }
+
+/// The Windows permission verbs need BOTH keyword lists, same as `chgrp` did.
+///
+/// `icacls`, `cacls` and `takeown` share none of the POSIX words, so a rule
+/// added to the pack without its registry row would be quick-rejected before
+/// the pack was a candidate and would never run — with the pack-level test
+/// passing the whole time, because it calls `create_pack()` directly and never
+/// traverses this gate.
+#[test]
+fn system_permissions_windows_verbs_are_reachable() {
+    for command in [
+        r"icacls C:\Windows /grant Everyone:F /t",
+        r"icacls C:\ /reset /t",
+        r"cacls C:\Windows /e /t /p Everyone:F",
+        r"takeown /f C:\Windows /r",
+        r"takeown /f %SystemRoot% /r",
+        r"icacls C:\myapp /grant Everyone:F",
+    ] {
+        assert_eq!(
+            decision(command, "system.permissions"),
+            "deny",
+            "registry row must make the Windows verbs reachable: {command}"
+        );
+    }
+
+    // The carve-outs, through the same path: the ordinary Windows
+    // administration these rules must not fire on.
+    for command in [
+        r"icacls C:\Users\bob\project /reset /t",
+        r"takeown /f C:\Users\bob\project /r",
+        r"icacls C:\Windows /reset",
+        r"icacls data /grant Everyone:R",
+        r"icacls data /grant bob:F",
+        r"icacls C:\Windows",
+    ] {
+        assert_eq!(
+            decision(command, "system.permissions"),
+            "allow",
+            "ordinary Windows permission work must stay allowed: {command}"
+        );
+    }
+}

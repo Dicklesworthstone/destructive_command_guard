@@ -1194,7 +1194,28 @@ fn test_audit_backtracking_requirements() {
                 "tee-device",
             ]),
         ),
-        ("system.permissions", HashSet::from(["chmod-non-recursive"])),
+        (
+            "system.permissions",
+            HashSet::from([
+                "chmod-non-recursive",
+                // The Windows rules select the backtracking engine on purpose.
+                // `icacls <path> … /t` and `takeown /f <path> /r` put the
+                // recursion switch on either side of the path, so the switch is
+                // proven with a lookahead over the segment while the path is
+                // matched in place; ordering them positionally would need one
+                // alternative per permutation and would still miss a new one.
+                // `icacls-grant-everyone` uses a trailing lookahead so
+                // `Everyone:(F)` and `Everyone:(OI)(CI)F` both end the match
+                // without consuming the closing paren.
+                //
+                // The cost is bounded: all three are gated behind the
+                // `icacls`/`cacls`/`takeown` keywords, so they never run on an
+                // ordinary POSIX command, and this pack is opt-in.
+                "icacls-recursive-system",
+                "takeown-recursive-system",
+                "icacls-grant-everyone",
+            ]),
+        ),
         (
             "system.services",
             HashSet::from([

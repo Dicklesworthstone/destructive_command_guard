@@ -2328,7 +2328,14 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         // entry documents. So `chgrp -R nogroup /` reached no rule even after
         // one existed: the pack-level test calls `create_pack()` directly and
         // never sees this row (#451).
-        &["chmod", "chown", "chgrp", "setfacl"],
+        //
+        // The Windows verbs are here for the same reason and must stay in sync
+        // with the pack's own list: `takeown /f C:\Windows /r` carries none of
+        // the POSIX words, so without them this gate drops it before the pack
+        // is a candidate and the rules written for it never run.
+        &[
+            "chmod", "chown", "chgrp", "setfacl", "icacls", "cacls", "takeown",
+        ],
         system::permissions::create_pack,
     ),
     PackEntry::new(

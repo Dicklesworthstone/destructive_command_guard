@@ -189,6 +189,9 @@ Commands containing these keywords are checked against this pack:
 - `chown`
 - `chgrp`
 - `setfacl`
+- `icacls`
+- `cacls`
+- `takeown`
 
 ### Safe Patterns (Allowed)
 
@@ -212,6 +215,9 @@ These patterns match potentially destructive commands:
 | `chmod-recursive-root` | chmod -R on system directories can break system permissions. | critical |
 | `chown-recursive-root` | chown -R on system directories can break system ownership. | high |
 | `chgrp-recursive-root` | chgrp -R on system directories can break system group ownership. | high |
+| `icacls-recursive-system` | icacls /t on a Windows system tree rewrites ACLs recursively and can break the system. | critical |
+| `takeown-recursive-system` | takeown /r on a Windows system tree seizes ownership recursively and is hard to undo. | high |
+| `icacls-grant-everyone` | granting Everyone full/modify/write access makes the target world-writable. | high |
 | `chmod-setuid` | Setting setuid bit (chmod u+s) is a security-sensitive operation. | high |
 | `chmod-setgid` | Setting setgid bit (chmod g+s) is a security-sensitive operation. | high |
 | `chown-to-root` | Changing ownership to root should be done carefully. | high |

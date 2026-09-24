@@ -65,7 +65,12 @@ pub fn create_pack() -> Pack {
         name: "Permissions",
         description: "Protects against dangerous permission changes like chmod 777, \
                       recursive chmod/chown on system directories",
-        keywords: &["chmod", "chown", "chgrp", "setfacl"],
+        // The Windows verbs are listed alongside the POSIX ones because this
+        // pack now claims both spellings of the same shapes. Quick-rejection is
+        // ASCII case-insensitive, so `ICACLS`/`TakeOwn` need no separate entry.
+        keywords: &[
+            "chmod", "chown", "chgrp", "setfacl", "icacls", "cacls", "takeown",
+        ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
@@ -193,6 +198,77 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Check current ownership first:\n  \
              ls -la /path/to/directory",
             executables = ["chgrp"]
+        ),
+        // ----- Windows equivalents of the three rules above -----
+        //
+        // This pack was POSIX-only: `chown -R nobody C:\Windows` has no POSIX
+        // spelling, and the Windows one (`takeown /f C:\Windows /r`) reached no
+        // rule. These are the SAME shapes the pack already claims -- a
+        // recursive permission or ownership change across a system tree, and a
+        // world-writable grant -- spelled the way Windows spells them, so they
+        // are a missing route into stated scope rather than new scope.
+        //
+        // The target set mirrors the POSIX one deliberately, including its
+        // depth carve-out: `C:\Users` and a whole single-user profile
+        // `C:\Users\bob` are blocked, while `C:\Users\bob\project` is NOT,
+        // exactly as `/home` and `/home/user` are blocked and
+        // `/home/user/project` is allowed (#301). `%SystemRoot%`-style
+        // expansions are recognised because that is how a script writes them.
+        destructive_pattern!(
+            "icacls-recursive-system",
+            r#"(?i)\b(?:icacls|cacls)\b(?=[^;&|]*\s/t(?:\s|$))[^;&|]*?\s(?:["']?[A-Za-z]:[\\/](?:(?:Windows|ProgramData|System32)\b|Program Files(?: \(x86\))?|Users(?:[\\/][^\\/\s"']+)?[\\/]?(?:["'\s]|$)|["']?(?:\s|$))|%(?:SystemRoot|windir|SystemDrive|ProgramFiles(?:\(x86\))?|ProgramData)%|\$env:(?:SystemRoot|windir|ProgramFiles|ProgramData))"#,
+            "icacls /t on a Windows system tree rewrites ACLs recursively and can break the system.",
+            Critical,
+            "`/t` applies the ACL change to every file and subdirectory. Across \
+             `C:\\Windows`, `C:\\Program Files` or the drive root that rewrites the \
+             access control the OS and every installed product depend on, and Windows \
+             does not keep an undo: the previous ACLs are gone once the walk starts. \
+             Service accounts lose the rights they were granted at install time, and \
+             SFC/DISM will not restore ACLs.\n\n\
+             Inspect first:\n  \
+             icacls <path>\n\n\
+             Save the current ACLs before changing anything:\n  \
+             icacls <path> /save acl.txt /t\n  \
+             icacls <path> /restore acl.txt\n\n\
+             Apply the change to the specific subdirectory that needs it instead of \
+             the whole tree.",
+            executables = ["icacls", "cacls"]
+        ),
+        destructive_pattern!(
+            "takeown-recursive-system",
+            r#"(?i)\btakeown\b(?=[^;&|]*\s/r(?:\s|$))[^;&|]*?\s/f\s+(?:["']?[A-Za-z]:[\\/](?:(?:Windows|ProgramData|System32)\b|Program Files(?: \(x86\))?|Users(?:[\\/][^\\/\s"']+)?[\\/]?(?:["'\s]|$)|["']?(?:\s|$))|%(?:SystemRoot|windir|SystemDrive|ProgramFiles(?:\(x86\))?|ProgramData)%|\$env:(?:SystemRoot|windir|ProgramFiles|ProgramData))"#,
+            "takeown /r on a Windows system tree seizes ownership recursively and is hard to undo.",
+            High,
+            "`takeown /r` makes the current user the owner of every file in the tree. \
+             On a system tree that displaces `TrustedInstaller`, which is what Windows \
+             Update and the servicing stack rely on to replace protected files, so \
+             updates and repair operations begin to fail. Restoring the original owner \
+             is manual and per-file.\n\n\
+             Check the current owner first:\n  \
+             icacls <path>\n\n\
+             Take ownership of the single path that needs it rather than the tree, and \
+             record what it was so it can be handed back.",
+            executables = ["takeown"]
+        ),
+        // The Windows spelling of `chmod 777`: a full-control, modify, or write
+        // grant to Everyone. `:R` (read) and `:RX` (read+execute) are
+        // deliberately unmatched -- widening a read grant is not the same act,
+        // and matching it would fire on ordinary share setup.
+        destructive_pattern!(
+            "icacls-grant-everyone",
+            r"(?i)\b(?:icacls|cacls)\b[^;&|]*\b(?:Everyone|Todos|BUILTIN\\Users)\s*:\s*(?:\([A-Za-z]{2}\)\s*)*\(?[FMW](?=[)\s,;&|]|$)",
+            "granting Everyone full/modify/write access makes the target world-writable.",
+            High,
+            "`Everyone` includes every authenticated and guest principal on the machine, \
+             so an `F` (full), `M` (modify) or `W` (write) grant lets any local account \
+             replace the contents -- and `F` additionally lets it rewrite the ACL, so the \
+             grant cannot be relied on to stay as set. This is the Windows spelling of \
+             `chmod 777`.\n\n\
+             Grant the specific principal the specific right it needs:\n  \
+             icacls <path> /grant \"DOMAIN\\user\":(RX)\n\n\
+             If a service needs write access, grant it to that service's account rather \
+             than to Everyone. Read-only sharing (`:R` / `:RX`) is unaffected by this rule.",
+            executables = ["icacls", "cacls"]
         ),
         // chmod u+s (setuid)
         destructive_pattern!(
@@ -400,6 +476,8 @@ mod tests {
                 Some("chown-recursive-root" | "chown-to-root") => &["chown"],
                 Some("chgrp-recursive-root") => &["chgrp"],
                 Some("setfacl-all") => &["setfacl"],
+                Some("icacls-recursive-system" | "icacls-grant-everyone") => &["icacls", "cacls"],
+                Some("takeown-recursive-system") => &["takeown"],
                 other => panic!("unhandled permissions rule {other:?} — declare its executable"),
             };
             assert_eq!(
@@ -408,6 +486,88 @@ mod tests {
                 "executables for {:?}",
                 pattern.name
             );
+        }
+    }
+
+    /// The Windows spellings of the shapes this pack already claims.
+    ///
+    /// `chown -R nobody /etc` denied while `takeown /f C:\Windows /r` — the
+    /// same act on the same kind of tree — reached no rule at all, because the
+    /// pack was POSIX-only.
+    #[test]
+    fn windows_permission_equivalents_are_claimed() {
+        let pack = create_pack();
+        for (command, rule) in [
+            (
+                r"icacls C:\Windows /grant Everyone:F /t",
+                "icacls-recursive-system",
+            ),
+            (r"icacls C:\Windows /reset /t", "icacls-recursive-system"),
+            (
+                r#"icacls "C:\Program Files" /reset /T"#,
+                "icacls-recursive-system",
+            ),
+            (r"icacls C:\ /reset /t", "icacls-recursive-system"),
+            (r"icacls C:\Users /reset /t", "icacls-recursive-system"),
+            (r"icacls C:\Users\bob /reset /t", "icacls-recursive-system"),
+            (r"icacls %SystemRoot% /reset /t", "icacls-recursive-system"),
+            (
+                r"cacls C:\Windows /e /t /p Everyone:F",
+                "icacls-recursive-system",
+            ),
+            (r"takeown /f C:\Windows /r", "takeown-recursive-system"),
+            (r"takeown /f C:\ /r", "takeown-recursive-system"),
+            (
+                r#"takeown /f "C:\Program Files" /r"#,
+                "takeown-recursive-system",
+            ),
+            (r"takeown /f %SystemRoot% /r", "takeown-recursive-system"),
+            (r"takeown /f C:\Users\bob /r", "takeown-recursive-system"),
+            (
+                r"icacls C:\myapp /grant Everyone:F",
+                "icacls-grant-everyone",
+            ),
+            (r"icacls data /grant Everyone:(F)", "icacls-grant-everyone"),
+            (
+                r"icacls data /grant:r Everyone:(OI)(CI)F",
+                "icacls-grant-everyone",
+            ),
+            (r"icacls data /grant Everyone:M", "icacls-grant-everyone"),
+            (r"cacls data /e /p Everyone:W", "icacls-grant-everyone"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+    }
+
+    /// The Windows rules inherit the POSIX depth carve-out and the
+    /// least-privilege carve-out, because getting either wrong turns the most
+    /// ordinary Windows administration there is into a false positive.
+    #[test]
+    fn windows_permission_rules_keep_the_depth_and_right_carve_outs() {
+        let pack = create_pack();
+        for command in [
+            // `C:\Users\bob\project` is the ordinary working tree, exactly as
+            // `/home/user/project` is — only the profile ROOT is blocked (#301).
+            r"icacls C:\Users\bob\project /reset /t",
+            r"takeown /f C:\Users\bob\project /r",
+            // Not a system tree at all.
+            r"icacls C:\myapp /reset /t",
+            r"takeown /f C:\myapp /r",
+            // Non-recursive: the recursive rules must not claim it.
+            r"icacls C:\Windows /reset",
+            r"takeown /f C:\Windows",
+            // Read and read+execute grants are not world-WRITABLE.
+            r"icacls data /grant Everyone:R",
+            r"icacls data /grant Everyone:(RX)",
+            r"icacls data /grant Everyone:(OI)(CI)RX",
+            // A named principal is least privilege, not Everyone.
+            r"icacls data /grant bob:F",
+            // Removing an ACE is the safe direction.
+            r"icacls data /remove Everyone",
+            // Ordinary inspection.
+            r"icacls C:\Windows",
+        ] {
+            assert_allows(&pack, command);
         }
     }
 
