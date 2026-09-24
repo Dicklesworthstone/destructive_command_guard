@@ -715,6 +715,28 @@ pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Op
                 suggestion: Some("Verify target path carefully before running".to_string()),
             });
         }
+        // The home directory as an expression, including the parenless
+        // `FileUtils.rm_rf Dir.home` the AST pattern cannot see.
+        if let Some(caps) = RUBY_FILEUTILS_HOME.captures(code) {
+            let m = caps.get(0)?;
+            let fn_name = caps.name("fn").map_or("rm_rf", |s| s.as_str());
+            let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
+            return Some(PatternMatch {
+                rule_id: format!("heredoc.ruby.fileutils_{fn_name}.catastrophic"),
+                reason: format!(
+                    "FileUtils.{fn_name}() deletes the home directory (catastrophic target path)"
+                ),
+                matched_text_preview: truncate_preview(
+                    code.get(m.start()..m.end()).unwrap_or(""),
+                    60,
+                ),
+                start: m.start(),
+                end: m.end(),
+                line_number,
+                severity: Severity::Critical,
+                suggestion: Some("Verify target path carefully before running".to_string()),
+            });
+        }
         return None;
     }
 
@@ -771,6 +793,42 @@ pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Op
                         "fs.{sink}() recursively deletes files/directories outside a temp directory"
                     )
                 },
+                matched_text_preview: truncate_preview(
+                    code.get(m.start()..m.end()).unwrap_or(""),
+                    60,
+                ),
+                start: m.start(),
+                end: m.end(),
+                line_number,
+                severity: Severity::Critical,
+                suggestion: Some("Verify target path carefully before running".to_string()),
+            });
+        }
+        // The home directory as an expression: the same verdict the AST pass
+        // reaches through JS_HOME_DIR_DELETE_ARG.
+        for caps in JS_FS_SINK_HOME.captures_iter(code) {
+            let Some(m) = caps.get(0) else { continue };
+            if !is_javascript_executable_offset(code, m.start()) {
+                continue;
+            }
+            let sink = caps.name("sink").map_or("rmSync", |s| s.as_str());
+            let rule_suffix = match sink {
+                "rmdirSync" => "fs_rmdirsync",
+                "unlinkSync" => "fs_unlinksync",
+                "rm" => "fs_rm",
+                _ => "fs_rmsync",
+            };
+            let lang_id = if language == ScriptLanguage::TypeScript {
+                "typescript"
+            } else {
+                "javascript"
+            };
+            let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
+            return Some(PatternMatch {
+                rule_id: format!("heredoc.{lang_id}.{rule_suffix}.catastrophic"),
+                reason: format!(
+                    "fs.{sink}() deletes the home directory (catastrophic target path)"
+                ),
                 matched_text_preview: truncate_preview(
                     code.get(m.start()..m.end()).unwrap_or(""),
                     60,
@@ -1391,6 +1449,74 @@ static JS_FS_DELETE_PATH_ARG: LazyLock<Regex> = LazyLock::new(|| {
     .expect("js fs delete path arg regex compiles")
 });
 
+/// An `fs` / Deno deletion call whose whole first argument is the user's home
+/// directory: `os.homedir()` under any `os` binding, `require('os').homedir()`,
+/// `process.env.HOME` / `USERPROFILE`, or `Deno.env.get("HOME")`, optionally
+/// with `+ '/'` appended (still the home directory).
+///
+/// A dynamic target is otherwise warn-only (#455), but these are not unknown
+/// targets. They name `~`, which is catastrophic as a literal, and
+/// `fs.rmSync(os.homedir(), {recursive: true, force: true})` was allowed while
+/// `fs.rmSync('~', ...)` blocked. The expression must be the entire argument, so
+/// `path.join(os.homedir(), 'cache')` keeps the ordinary policy.
+static JS_HOME_DIR_DELETE_ARG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"\.(?:rmSync|rmdirSync|unlinkSync|rm|rmdir|unlink|remove|removeSync)\s*\(\s*{JS_HOME_DIR_EXPR}\s*[,)]"
+    ))
+    .expect("js home-directory delete argument regex compiles")
+});
+
+/// The JavaScript home-directory expressions [`JS_HOME_DIR_DELETE_ARG`] and
+/// [`JS_FS_SINK_HOME`] accept as a whole argument.
+const JS_HOME_DIR_EXPR: &str = r#"(?:(?:require\s*\(\s*['"](?:node:)?os['"]\s*\)|[A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*homedir\s*\(\s*\)|process\s*\.\s*env\s*(?:\.\s*(?:HOME|USERPROFILE)\b|\[\s*['"](?:HOME|USERPROFILE)['"]\s*\])|Deno\s*\.\s*env\s*\.\s*get\s*\(\s*['"](?:HOME|USERPROFILE)['"]\s*\))(?:\s*\+\s*['"`]/['"`])?"#;
+
+/// The Ruby home-directory expressions [`RUBY_HOME_DIR_FIRST_ARG`] and
+/// [`RUBY_FILEUTILS_HOME`] accept as a whole argument.
+const RUBY_HOME_DIR_EXPR: &str = r#"(?:Dir\s*\.\s*home(?:\s*\(\s*\))?|ENV\s*\[\s*['"]HOME['"]\s*\]|ENV\s*\.\s*fetch\s*\(\s*['"]HOME['"][^)]*\)|Gem\s*\.\s*user_home|Etc\s*\.\s*getpwuid(?:\s*\([^)]*\))?\s*\.\s*dir)"#;
+
+/// Statement-anchored `FileUtils` delete of the home directory, for the
+/// filesystem backstop ([`scan_filesystem_sink_fallback`]). It catches the
+/// parenless `FileUtils.rm_rf Dir.home`, which the AST pattern
+/// `FileUtils.rm_rf($$$)` does not match, and it keeps the verdict when the
+/// AST pass is unavailable.
+static RUBY_FILEUTILS_HOME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"(?m){STATEMENT_START}FileUtils\.(?P<fn>rm_rf|rmdir|rm_r|rm_f|rm|remove_entry_secure|remove_entry|remove_file|remove_dir|remove)\b(?:\s*\(\s*|\s+){RUBY_HOME_DIR_EXPR}\s*(?:[,);]|$)"
+    ))
+    .expect("ruby FileUtils home-directory regex compiles")
+});
+
+/// The JavaScript counterpart of [`RUBY_FILEUTILS_HOME`], shaped like
+/// [`JS_FS_SINK_LITERAL`].
+static JS_FS_SINK_HOME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r#"(?m){STATEMENT_START}(?:await[ \t]+)?(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\(\s*(?:"[^"\n]*"|'[^'\n]*')\s*\)\s*\.\s*)?(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*(?P<sink>rmdirSync|unlinkSync|rmSync|rm)\b\s*\(\s*{JS_HOME_DIR_EXPR}\s*[,)]"#
+    ))
+    .expect("JavaScript filesystem sink home-directory regex compiles")
+});
+
+/// The Ruby counterpart of [`JS_HOME_DIR_DELETE_ARG`], anchored at the start of
+/// the matched call (`FileUtils.rm_rf(Dir.home)`, `FileUtils.rm_r Dir.home`):
+/// `Dir.home`, `ENV["HOME"]`, `ENV.fetch("HOME")`, `Gem.user_home`, or
+/// `Etc.getpwuid.dir` as the entire first argument.
+static RUBY_HOME_DIR_FIRST_ARG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"\A[A-Za-z_][A-Za-z0-9_]*(?:(?:\.|::)[A-Za-z_][A-Za-z0-9_]*[!?]?)*(?:\s*\(\s*|\s+){RUBY_HOME_DIR_EXPR}\s*(?:[,)]|\z|\n|;)"
+    ))
+    .expect("ruby home-directory first argument regex compiles")
+});
+
+/// Perl `rmtree` / `remove_tree` whose whole first argument is the user's home
+/// directory: `$ENV{HOME}`, `glob('~')`, or `File::HomeDir->my_home`, bare or
+/// as the first element of the legacy array form, optionally with `. '/'`
+/// appended (still the home directory).
+static PERL_FILE_PATH_RMTREE_HOME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?m)\b(?:File::Path::)?(?P<fn>rmtree|remove_tree)\b(?:\s*\(\s*|\s+)\[?\s*(?:\$ENV\s*\{\s*['"]?HOME['"]?\s*\}|glob\s*\(\s*['"]~/?['"]\s*\)|File::HomeDir\s*->\s*my_home(?:\s*\(\s*\))?)(?:\s*\.\s*['"]/['"])?\s*(?:[,)\];]|$)"#,
+    )
+    .expect("perl rmtree home-directory regex compiles")
+});
+
 static RUBY_SYSTEM_EXEC_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     // Matches:
     // - system("...") / system '...'
@@ -1731,7 +1857,8 @@ fn refine_javascript_match(meta: &CompiledPattern, matched_text: &str) -> Option
             .and_then(|caps| string_literal_from_caps(&caps));
 
         let recursive_relevant = JS_RECURSIVE_TRUE.is_match(matched_text);
-        let catastrophic = path.is_some_and(is_catastrophic_path);
+        let catastrophic =
+            path.is_some_and(is_catastrophic_path) || JS_HOME_DIR_DELETE_ARG.is_match(matched_text);
 
         // For fs.rm* / fs.rmdir* we only care about recursive deletion (or catastrophic literal paths).
         let needs_recursive = matches!(
@@ -1847,7 +1974,8 @@ fn refine_typescript_match(meta: &CompiledPattern, matched_text: &str) -> Option
             .and_then(|caps| string_literal_from_caps(&caps));
 
         let recursive_relevant = JS_RECURSIVE_TRUE.is_match(matched_text);
-        let catastrophic = path.is_some_and(is_catastrophic_path);
+        let catastrophic =
+            path.is_some_and(is_catastrophic_path) || JS_HOME_DIR_DELETE_ARG.is_match(matched_text);
 
         let needs_recursive = matches!(
             rule_id,
@@ -1948,7 +2076,10 @@ fn refine_ruby_match(meta: &CompiledPattern, matched_text: &str) -> Option<Refin
             .captures(matched_text)
             .and_then(|caps| string_literal_from_caps(&caps));
 
-        let catastrophic = path.is_some_and(is_catastrophic_path);
+        // A home-directory expression (`Dir.home`, `ENV["HOME"]`, ...) names
+        // `~`, which is catastrophic as a literal; see JS_HOME_DIR_DELETE_ARG.
+        let catastrophic = path.is_some_and(is_catastrophic_path)
+            || RUBY_HOME_DIR_FIRST_ARG.is_match(matched_text);
         if catastrophic {
             return Some(RefinedMatchMeta {
                 rule_id: format!("{rule_id}.catastrophic"),
@@ -2351,6 +2482,28 @@ fn scan_perl_file_path(
             &rule_id,
             &reason,
             severity,
+            Some("Verify target path carefully before running".to_string()),
+            m.start(),
+            m.end(),
+        );
+    }
+
+    // The home directory as an expression (`rmtree($ENV{HOME})`) is not a
+    // literal, so the pass above never sees it, yet it names `~`, which is
+    // catastrophic as a literal. See JS_HOME_DIR_DELETE_ARG.
+    for caps in PERL_FILE_PATH_RMTREE_HOME.captures_iter(haystack) {
+        perl_check_timeout(start_time, timeout, budget_ms)?;
+        let Some(m) = caps.get(0) else {
+            continue;
+        };
+        let fn_name = caps.name("fn").map_or("rmtree", |m| m.as_str());
+        push_regex_match(
+            out,
+            code,
+            newline_positions,
+            &format!("heredoc.perl.file_path.{fn_name}"),
+            &format!("File::Path::{fn_name}() recursively deletes the home directory"),
+            Severity::Critical,
             Some("Verify target path carefully before running".to_string()),
             m.start(),
             m.end(),
@@ -6327,6 +6480,173 @@ mod tests {
                         && m.severity.blocks_by_default()),
                 "catastrophic FileUtils.rm_rf should block"
             );
+        }
+
+        /// A recursive delete of the home directory spelled as an expression
+        /// (`Dir.home`, `os.homedir()`, `$ENV{HOME}`, ...) was allowed in Ruby,
+        /// JavaScript, TypeScript and Perl: a dynamic target is warn-only, but
+        /// these name `~`, which blocks as a literal. Python's `shutil.rmtree`
+        /// already blocked every target. Only the whole argument counts, so a
+        /// subdirectory under home keeps the ordinary policy.
+        #[test]
+        fn home_directory_expression_targets_are_catastrophic() {
+            let ast_matcher = AstMatcher::new();
+            let blocks = |code: &str, language: ScriptLanguage, rule: &str| {
+                let matches = ast_matcher.find_matches(code, language).unwrap();
+                assert!(
+                    matches
+                        .iter()
+                        .any(|m| m.rule_id == rule && m.severity.blocks_by_default()),
+                    "{code:?} must block as {rule}, got {:?}",
+                    matches
+                        .iter()
+                        .map(|m| (&m.rule_id, m.severity))
+                        .collect::<Vec<_>>()
+                );
+            };
+            let not_catastrophic = |code: &str, language: ScriptLanguage| {
+                let matches = ast_matcher.find_matches(code, language).unwrap();
+                assert!(
+                    !matches.iter().any(|m| m.rule_id.ends_with(".catastrophic")),
+                    "{code:?} is not the home directory itself: {:?}",
+                    matches.iter().map(|m| &m.rule_id).collect::<Vec<_>>()
+                );
+            };
+
+            for code in [
+                "require 'fileutils'\nFileUtils.rm_rf(Dir.home)",
+                "require 'fileutils'\nFileUtils.rm_rf(Dir.home())",
+                "require 'fileutils'\nFileUtils.rm_rf(ENV['HOME'])",
+                "require 'fileutils'\nFileUtils.rm_rf(ENV.fetch(\"HOME\"))",
+                "require 'fileutils'\nFileUtils.rm_rf(Gem.user_home)",
+                "require 'fileutils'\nFileUtils.rm_rf(Etc.getpwuid.dir)",
+                "require 'fileutils'\nFileUtils.rm_rf(Dir.home, secure: true)",
+            ] {
+                blocks(
+                    code,
+                    ScriptLanguage::Ruby,
+                    "heredoc.ruby.fileutils_rm_rf.catastrophic",
+                );
+            }
+            blocks(
+                "require 'fileutils'\nFileUtils.remove_dir(Dir.home)",
+                ScriptLanguage::Ruby,
+                "heredoc.ruby.fileutils_remove_dir.catastrophic",
+            );
+            for code in [
+                "const fs = require('fs'); const os = require('os');\nfs.rmSync(os.homedir(), { recursive: true, force: true });",
+                "import * as os from 'os';\nimport fs from 'fs';\nfs.rmSync(os.homedir(), { recursive: true });",
+                "const fs = require('fs');\nfs.rmSync(require('node:os').homedir(), { recursive: true });",
+                "const fs = require('fs');\nfs.rmSync(process.env.HOME, { recursive: true });",
+                "const fs = require('fs');\nfs.rmSync(process.env['USERPROFILE'], { recursive: true });",
+                "const fs = require('fs'); const os = require('os');\nfs.rmSync(os.homedir() + '/', { recursive: true });",
+            ] {
+                blocks(
+                    code,
+                    ScriptLanguage::JavaScript,
+                    "heredoc.javascript.fs_rmsync.catastrophic",
+                );
+            }
+            blocks(
+                "import * as fs from 'fs';\nimport * as os from 'os';\nfs.rmSync(os.homedir(), { recursive: true });",
+                ScriptLanguage::TypeScript,
+                "heredoc.typescript.fs_rmsync.catastrophic",
+            );
+            for code in [
+                "use File::Path;\nrmtree($ENV{HOME});",
+                "use File::Path;\nrmtree $ENV{HOME};",
+                "use File::Path;\nrmtree($ENV{'HOME'}, 1);",
+                "use File::Path;\nrmtree([$ENV{HOME}]);",
+                "use File::Path;\nrmtree(glob('~'));",
+                "use File::Path;\nrmtree($ENV{HOME} . '/');",
+                "use File::HomeDir;\nuse File::Path;\nrmtree(File::HomeDir->my_home);",
+            ] {
+                blocks(code, ScriptLanguage::Perl, "heredoc.perl.file_path.rmtree");
+            }
+            blocks(
+                "use File::Path qw(remove_tree);\nremove_tree($ENV{HOME});",
+                ScriptLanguage::Perl,
+                "heredoc.perl.file_path.remove_tree",
+            );
+
+            // A directory UNDER home is not the home directory.
+            not_catastrophic(
+                "require 'fileutils'\nFileUtils.rm_rf(File.join(Dir.home, 'cache'))",
+                ScriptLanguage::Ruby,
+            );
+            not_catastrophic(
+                "const fs = require('fs'); const path = require('path'); const os = require('os');\nfs.rmSync(path.join(os.homedir(), '.cache', 'x'), { recursive: true });",
+                ScriptLanguage::JavaScript,
+            );
+            not_catastrophic(
+                "const fs = require('fs'); const os = require('os');\nfs.rmSync(os.homedir() + '/.cache', { recursive: true });",
+                ScriptLanguage::JavaScript,
+            );
+            let perl_subdir = ast_matcher
+                .find_matches(
+                    "use File::Path;\nrmtree($ENV{HOME} . '/.cache');",
+                    ScriptLanguage::Perl,
+                )
+                .unwrap();
+            assert!(
+                perl_subdir.is_empty(),
+                "a subdirectory of home keeps the dynamic-target policy: {perl_subdir:?}"
+            );
+
+            // The filesystem backstop reaches the same verdict: it is what sees
+            // the parenless Ruby call (the AST pattern needs parentheses), and
+            // it is what remains when the AST pass is unavailable.
+            for (code, language, rule) in [
+                (
+                    "require 'fileutils'\nFileUtils.rm_rf Dir.home",
+                    ScriptLanguage::Ruby,
+                    "heredoc.ruby.fileutils_rm_rf.catastrophic",
+                ),
+                (
+                    "FileUtils.rm_r(ENV['HOME'], force: true)",
+                    ScriptLanguage::Ruby,
+                    "heredoc.ruby.fileutils_rm_r.catastrophic",
+                ),
+                (
+                    "const fs = require('fs'); const os = require('os');\nfs.rmSync(os.homedir(), { recursive: true });",
+                    ScriptLanguage::JavaScript,
+                    "heredoc.javascript.fs_rmsync.catastrophic",
+                ),
+                (
+                    "await fs.promises.rm(process.env.HOME, { recursive: true });",
+                    ScriptLanguage::TypeScript,
+                    "heredoc.typescript.fs_rm.catastrophic",
+                ),
+            ] {
+                let hit = scan_filesystem_sink_fallback(code, language);
+                assert!(
+                    hit.as_ref()
+                        .is_some_and(|m| m.rule_id == rule && m.severity.blocks_by_default()),
+                    "{code:?}: backstop must block as {rule}, got {hit:?}"
+                );
+            }
+            for (code, language) in [
+                (
+                    "FileUtils.rm_rf(File.join(Dir.home, 'cache'))",
+                    ScriptLanguage::Ruby,
+                ),
+                ("# FileUtils.rm_rf Dir.home", ScriptLanguage::Ruby),
+                (
+                    "fs.rmSync(path.join(os.homedir(), 'cache'), { recursive: true });",
+                    ScriptLanguage::JavaScript,
+                ),
+                (
+                    "// fs.rmSync(os.homedir(), { recursive: true });",
+                    ScriptLanguage::JavaScript,
+                ),
+            ] {
+                let hit = scan_filesystem_sink_fallback(code, language);
+                assert!(
+                    !hit.as_ref()
+                        .is_some_and(|m| m.rule_id.ends_with(".catastrophic")),
+                    "{code:?}: not a home-directory delete, got {hit:?}"
+                );
+            }
         }
 
         /// #455, the Ruby half. See the JavaScript twin for the reasoning.
