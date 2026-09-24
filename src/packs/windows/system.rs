@@ -3,11 +3,13 @@
 //! Covers the catastrophic Windows disk/system operations that are *not* plain
 //! filesystem deletes (those live in `windows.filesystem`):
 //!   - **Volume Shadow Copy destruction** — `vssadmin delete shadows`,
-//!     `wmic shadowcopy delete`. This is the hallmark of ransomware and a common
+//!     `wmic shadowcopy delete`, and `Win32_ShadowCopy` instances removed
+//!     through WMI/CIM. This is the hallmark of ransomware and a common
 //!     accidental data-loss vector: it destroys System Restore points and the
 //!     shadow copies many backup tools rely on.
 //!   - **Whole-volume / partition destruction** — `diskpart`, `Format-Volume`,
-//!     `Clear-Disk`, `Remove-Partition`, `Initialize-Disk`, `Reset-PhysicalDisk`.
+//!     `Clear-Disk`, `Remove-Partition`, `Remove-VirtualDisk`, `Initialize-Disk`,
+//!     `Reset-PhysicalDisk`.
 //!   - **Free-space wipe / boot config** — `cipher /w` (makes deleted files
 //!     unrecoverable), `bcdedit /delete` (boot configuration).
 //!
@@ -59,9 +61,11 @@ pub fn create_pack() -> Pack {
         id: "windows.system".to_string(),
         name: "Windows Disk & System",
         description: "Protects against catastrophic Windows disk/system operations: \
-                      `vssadmin delete shadows` / `wmic shadowcopy delete` (Volume Shadow Copy \
-                      destruction), `wbadmin delete` (backup recovery points), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, \
-                      `Initialize-Disk`, `Reset-PhysicalDisk`, `cipher /w`, and `bcdedit /delete`.",
+                      `vssadmin delete shadows` / `wmic shadowcopy delete` / `Win32_ShadowCopy` \
+                      deletion through WMI or CIM (Volume Shadow Copy destruction), `wbadmin \
+                      delete` (backup recovery points), `diskpart`, `Format-Volume`, `Clear-Disk`, \
+                      `Remove-Partition`, `Remove-VirtualDisk`, `Initialize-Disk`, \
+                      `Reset-PhysicalDisk`, `cipher /w`, and `bcdedit /delete`.",
         // Conventional keyword casings retained for readable metadata; the
         // quick-reject itself is ASCII case-insensitive. See packs::windows.
         keywords: &[
@@ -72,6 +76,11 @@ pub fn create_pack() -> Pack {
             "shadowcopy",
             "ShadowCopy",
             "SHADOWCOPY",
+            // Boundary-aware quick-reject: `shadowcopy` never matches inside
+            // `Win32_ShadowCopy` (the `_` before it is a word character).
+            "Win32_ShadowCopy",
+            "win32_shadowcopy",
+            "WIN32_SHADOWCOPY",
             "diskpart",
             "DISKPART",
             "Format-Volume",
@@ -83,6 +92,9 @@ pub fn create_pack() -> Pack {
             "Remove-Partition",
             "remove-partition",
             "REMOVE-PARTITION",
+            "Remove-VirtualDisk",
+            "remove-virtualdisk",
+            "REMOVE-VIRTUALDISK",
             "Initialize-Disk",
             "initialize-disk",
             "INITIALIZE-DISK",
@@ -107,7 +119,7 @@ pub fn create_pack() -> Pack {
 /// A storage cmdlet previewed with a bare `-WhatIf` switch; see
 /// `create_safe_patterns`. Shared with the core.filesystem baseline so the two
 /// packs cannot disagree about what a preview is.
-pub(crate) const STORAGE_WHATIF_SAFE: &str = r#"(?i)^\s*(?:format-volume|clear-disk|remove-partition|initialize-disk|reset-physicaldisk)\b[^|&;\r\n'"`$@(){}]*\s-whatif(?:\s[^|&;\r\n'"`$@(){}]*)?$"#;
+pub(crate) const STORAGE_WHATIF_SAFE: &str = r#"(?i)^\s*(?:format-volume|clear-disk|remove-partition|remove-virtualdisk|initialize-disk|reset-physicaldisk)\b[^|&;\r\n'"`$@(){}]*\s-whatif(?:\s[^|&;\r\n'"`$@(){}]*)?$"#;
 
 /// The `storage-whatif` safe pattern (see [`STORAGE_WHATIF_SAFE`]).
 pub(crate) fn storage_whatif_safe_pattern() -> SafePattern {
@@ -190,6 +202,29 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Back up before removing any recovery points",
             SHADOW_SUGGESTIONS
         ),
+        // The PowerShell spelling of the same deletion: the `Win32_ShadowCopy`
+        // WMI/CIM class piped into `Remove-WmiObject`/`Remove-CimInstance` (or
+        // their `rwmi`/`rcim` aliases), or its instances' `.Delete()` method,
+        // directly (`(Get-WmiObject Win32_ShadowCopy).Delete()`) or per item
+        // (`| ForEach-Object { $_.Delete() }`). It is the form current
+        // ransomware uses once `vssadmin`/`wmic` are watched, and it was
+        // allowed while those two were Critical. Listing or selecting shadow
+        // copies stays allowed.
+        destructive_pattern!(
+            "wmi-shadowcopy-delete",
+            r"(?i)\bwin32_shadowcopy\b[^\r\n;]*?(?:\|\s*(?:remove-wmiobject|rwmi|remove-ciminstance|rcim)\b|\.delete\s*\()",
+            "Deleting Win32_ShadowCopy instances destroys Volume Shadow Copies.",
+            Critical,
+            "Piping `Win32_ShadowCopy` (from `Get-WmiObject` / `Get-CimInstance`) into \
+             `Remove-WmiObject` / `Remove-CimInstance`, or calling `.Delete()` on its instances, \
+             deletes Volume Shadow Copies exactly like `vssadmin delete shadows`: the snapshots \
+             behind System Restore, Previous Versions and many backup tools. It is a standard \
+             ransomware step and an irreversible loss of local recovery.\n\n\
+             Safer alternatives:\n\
+             - Get-CimInstance Win32_ShadowCopy / vssadmin list shadows: inspect first\n\
+             - Back up before removing any recovery points",
+            SHADOW_SUGGESTIONS
+        ),
         // === Whole-volume / partition destruction ===
         destructive_pattern!(
             "diskpart",
@@ -241,6 +276,23 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Safer alternatives:\n\
              - Get-Partition: confirm the disk/partition numbers first\n\
              - Back up the partition's data before removing it",
+            DISK_SUGGESTIONS
+        ),
+        // A Storage Spaces virtual disk is the volume's backing store:
+        // `Remove-VirtualDisk` deletes it and every byte on it, the
+        // Storage-Spaces counterpart of Remove-Partition. (`Remove-StoragePool`
+        // refuses while virtual disks remain, so it is not the data-loss step.)
+        destructive_pattern!(
+            "remove-virtualdisk",
+            r"(?i)\bremove-virtualdisk\b",
+            "Remove-VirtualDisk deletes a Storage Spaces virtual disk and all data on it.",
+            Critical,
+            "`Remove-VirtualDisk` deletes a Storage Spaces virtual disk: the volume on it and \
+             every file it holds are gone, with no undo. A wrong friendly name destroys a live \
+             data volume.\n\n\
+             Safer alternatives:\n\
+             - Get-VirtualDisk: confirm the exact disk and that its data is backed up\n\
+             - Add -WhatIf to preview",
             DISK_SUGGESTIONS
         ),
         destructive_pattern!(
@@ -340,10 +392,49 @@ mod tests {
                 "WBADMIN.EXE DELETE BACKUP -keepVersions:0 -quiet",
                 "wbadmin-delete",
             ),
+            (
+                "Get-WmiObject Win32_ShadowCopy | Remove-WmiObject",
+                "wmi-shadowcopy-delete",
+            ),
+            (
+                "Get-CimInstance Win32_ShadowCopy | Remove-CimInstance",
+                "wmi-shadowcopy-delete",
+            ),
+            (
+                "gcim -ClassName Win32_ShadowCopy | Where-Object { $_.VolumeName -like '*C*' } | rcim",
+                "wmi-shadowcopy-delete",
+            ),
+            (
+                "(Get-WmiObject Win32_ShadowCopy).Delete()",
+                "wmi-shadowcopy-delete",
+            ),
+            (
+                "gwmi win32_shadowcopy | ForEach-Object { $_.Delete() }",
+                "wmi-shadowcopy-delete",
+            ),
+            (
+                "Get-WmiObject -Query 'select * from Win32_ShadowCopy' | rwmi",
+                "wmi-shadowcopy-delete",
+            ),
         ];
         for (command, expected) in checks {
             assert_blocks_with_pattern(&pack, command, expected);
             assert_blocks_with_severity(&pack, command, Severity::Critical);
+            assert!(
+                pack.might_match(command),
+                "keyword gate must admit {command}"
+            );
+        }
+        for command in [
+            "Get-CimInstance Win32_ShadowCopy",
+            "Get-WmiObject Win32_ShadowCopy | Select-Object ID, InstallDate",
+            "Get-CimInstance Win32_ShadowCopy | Measure-Object",
+            "Get-WmiObject Win32_ShadowCopy; Remove-Item .\\old.log",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} lists shadow copies and must stay allowed"
+            );
         }
     }
 
@@ -357,6 +448,16 @@ mod tests {
             &pack,
             "Remove-Partition -DiskNumber 1 -PartitionNumber 2",
             "remove-partition",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "Remove-VirtualDisk -FriendlyName Data -Confirm:$false",
+            "remove-virtualdisk",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "Get-VirtualDisk Data | Remove-VirtualDisk",
+            "remove-virtualdisk",
         );
         assert_blocks_with_pattern(
             &pack,
@@ -394,6 +495,7 @@ mod tests {
             "Format-Volume -DriveLetter D -WhatIf",
             "Clear-Disk -Number 1 -RemoveData -WhatIf",
             "Remove-Partition -DiskNumber 1 -PartitionNumber 2 -WhatIf",
+            "Remove-VirtualDisk -FriendlyName Data -WhatIf",
             "Initialize-Disk -Number 2 -WhatIf",
             "Reset-PhysicalDisk -FriendlyName Disk1 -WhatIf",
             "bcdedit /enum",

@@ -1552,6 +1552,10 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "VSSADMIN",
             "wmic",
             "WMIC",
+            // `wmi-shadowcopy-delete`: the WMI class every spelling names.
+            "Win32_ShadowCopy",
+            "win32_shadowcopy",
+            "WIN32_SHADOWCOPY",
             // `redirect-truncate-git-internals-relative` needs this: a relative
             // target carries none of the redirect keywords below, which all
             // require the path to begin with `/`, `~`, `$` or a quote. Without
@@ -2413,6 +2417,9 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "WMIC",
             "shadowcopy",
             "ShadowCopy",
+            "Win32_ShadowCopy",
+            "win32_shadowcopy",
+            "WIN32_SHADOWCOPY",
             "diskpart",
             "DISKPART",
             "Format-Volume",
@@ -2423,6 +2430,9 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "CLEAR-DISK",
             "Remove-Partition",
             "remove-partition",
+            "Remove-VirtualDisk",
+            "remove-virtualdisk",
+            "REMOVE-VIRTUALDISK",
             "Initialize-Disk",
             "initialize-disk",
             "Reset-PhysicalDisk",

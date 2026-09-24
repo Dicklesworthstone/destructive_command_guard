@@ -1258,6 +1258,10 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
     );
     m.insert(
         "core.filesystem:wmic-shadowcopy-delete",
+        shadow_copy_suggestions.clone(),
+    );
+    m.insert(
+        "core.filesystem:wmi-shadowcopy-delete",
         shadow_copy_suggestions,
     );
     m.insert(

@@ -1717,6 +1717,9 @@ pub(crate) fn filesystem_keyword_candidate(command: &str) -> bool {
         "wmic",
         "format-volume",
         "clear-disk",
+        // `wmi-shadowcopy-delete`: the class name is the one word every
+        // spelling carries (`Get-WmiObject Win32_ShadowCopy | Remove-WmiObject`).
+        "win32_shadowcopy",
     ];
     // `credential-file-write` writers (plus the GNU-prefixed spellings macOS
     // users install from Homebrew coreutils). These are common words —
@@ -4126,6 +4129,9 @@ pub fn create_pack() -> Pack {
             "VSSADMIN",
             "wmic",
             "WMIC",
+            "Win32_ShadowCopy",
+            "win32_shadowcopy",
+            "WIN32_SHADOWCOPY",
             ".git/",
             ".ssh/",
             ".gnupg/",
@@ -5776,6 +5782,20 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              tool.\n\n\
              Safer alternatives:\n\
              - List them first: `vssadmin list shadows`."
+        ),
+        // The PowerShell spelling of the same deletion (see the twin in
+        // `windows.system`): `Win32_ShadowCopy` instances piped into
+        // Remove-WmiObject/Remove-CimInstance or deleted with `.Delete()`.
+        destructive_pattern!(
+            "wmi-shadowcopy-delete",
+            r"(?i)\bwin32_shadowcopy\b[^\r\n;]*?(?:\|\s*(?:remove-wmiobject|rwmi|remove-ciminstance|rcim)\b|\.delete\s*\()",
+            "Deleting Win32_ShadowCopy instances destroys Volume Shadow Copies.",
+            Critical,
+            "Piping `Win32_ShadowCopy` into `Remove-WmiObject` / `Remove-CimInstance`, or \
+             calling `.Delete()` on its instances, removes Volume Shadow Copies: the same \
+             recovery-destroying operation as `vssadmin delete shadows`, through PowerShell.\n\n\
+             Safer alternatives:\n\
+             - List them first: `Get-CimInstance Win32_ShadowCopy` or `vssadmin list shadows`."
         ),
     ]
 }
@@ -9620,7 +9640,23 @@ mod classifier_guidance_tests {
                 "vssadmin-delete-shadows",
             ),
             ("wmic shadowcopy delete", "wmic-shadowcopy-delete"),
+            (
+                "Get-WmiObject Win32_ShadowCopy | Remove-WmiObject",
+                "wmi-shadowcopy-delete",
+            ),
+            (
+                "GET-CIMINSTANCE WIN32_SHADOWCOPY | REMOVE-CIMINSTANCE",
+                "wmi-shadowcopy-delete",
+            ),
+            (
+                "(Get-WmiObject Win32_ShadowCopy).Delete()",
+                "wmi-shadowcopy-delete",
+            ),
         ] {
+            assert!(
+                filesystem_keyword_candidate(command),
+                "{command} must reach the pack"
+            );
             let matched = pack
                 .check(command)
                 .unwrap_or_else(|| panic!("{command} must be denied"));
@@ -9639,6 +9675,8 @@ mod classifier_guidance_tests {
             // A bare -WhatIf is a preview (windows.system's carve-out).
             "Format-Volume -DriveLetter D -WhatIf",
             "Clear-Disk -Number 1 -RemoveData -WhatIf",
+            "Get-CimInstance Win32_ShadowCopy",
+            "Get-WmiObject Win32_ShadowCopy | Select-Object ID, InstallDate",
         ] {
             assert!(
                 pack.check(command).is_none(),

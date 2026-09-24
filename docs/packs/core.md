@@ -126,6 +126,9 @@ Commands containing these keywords are checked against this pack:
 - `VSSADMIN`
 - `wmic`
 - `WMIC`
+- `Win32_ShadowCopy`
+- `win32_shadowcopy`
+- `WIN32_SHADOWCOPY`
 - `.git/`
 - `.ssh/`
 - `.gnupg/`
@@ -178,7 +181,7 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `storage-whatif` | `(?i)^\s*(?:format-volume\|clear-disk\|remove-partition\|initialize-disk\|reset-physicaldisk)\b[^\|&;\r\n'"`$@(){}]*\s-whatif(?:\s[^\|&;\r\n'"`$@(){}]*)?$` |
+| `storage-whatif` | `(?i)^\s*(?:format-volume\|clear-disk\|remove-partition\|remove-virtualdisk\|initialize-disk\|reset-physicaldisk)\b[^\|&;\r\n'"`$@(){}]*\s-whatif(?:\s[^\|&;\r\n'"`$@(){}]*)?$` |
 | `rm-rf-tmp` | `^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
 | `rm-fr-tmp` | `^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
 | `rm-rf-var-tmp` | `^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
@@ -261,6 +264,7 @@ These patterns match potentially destructive commands:
 | `clear-disk` | PowerShell Clear-Disk removes a disk's partitions and data. | critical |
 | `vssadmin-delete-shadows` | vssadmin delete shadows destroys Volume Shadow Copies (System Restore and backups). | critical |
 | `wmic-shadowcopy-delete` | wmic shadowcopy delete destroys Volume Shadow Copies. | critical |
+| `wmi-shadowcopy-delete` | Deleting Win32_ShadowCopy instances destroys Volume Shadow Copies. | critical |
 
 ### Allowlist Guidance
 

@@ -106,7 +106,7 @@ risk_acknowledged = true
 
 **Pack ID:** `windows.system`
 
-Protects against catastrophic Windows disk/system operations: `vssadmin delete shadows` / `wmic shadowcopy delete` (Volume Shadow Copy destruction), `wbadmin delete` (backup recovery points), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `Initialize-Disk`, `Reset-PhysicalDisk`, `cipher /w`, and `bcdedit /delete`.
+Protects against catastrophic Windows disk/system operations: `vssadmin delete shadows` / `wmic shadowcopy delete` / `Win32_ShadowCopy` deletion through WMI or CIM (Volume Shadow Copy destruction), `wbadmin delete` (backup recovery points), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `Remove-VirtualDisk`, `Initialize-Disk`, `Reset-PhysicalDisk`, `cipher /w`, and `bcdedit /delete`.
 
 ### Keywords
 
@@ -119,6 +119,9 @@ Commands containing these keywords are checked against this pack:
 - `shadowcopy`
 - `ShadowCopy`
 - `SHADOWCOPY`
+- `Win32_ShadowCopy`
+- `win32_shadowcopy`
+- `WIN32_SHADOWCOPY`
 - `diskpart`
 - `DISKPART`
 - `Format-Volume`
@@ -130,6 +133,9 @@ Commands containing these keywords are checked against this pack:
 - `Remove-Partition`
 - `remove-partition`
 - `REMOVE-PARTITION`
+- `Remove-VirtualDisk`
+- `remove-virtualdisk`
+- `REMOVE-VIRTUALDISK`
 - `Initialize-Disk`
 - `initialize-disk`
 - `INITIALIZE-DISK`
@@ -151,7 +157,7 @@ These patterns match safe commands that are always allowed:
 |--------------|----------|
 | `vssadmin-list` | `(?i)^\s*vssadmin(?:\.exe)?\s+list\b[^\|&;\r\n]*$` |
 | `diskpart-list` | `(?i)^\s*diskpart(?:\.exe)?\s+(?:/s\s+\S+\s+)?list\b[^\|&;\r\n]*$` |
-| `storage-whatif` | `(?i)^\s*(?:format-volume\|clear-disk\|remove-partition\|initialize-disk\|reset-physicaldisk)\b[^\|&;\r\n'"`$@(){}]*\s-whatif(?:\s[^\|&;\r\n'"`$@(){}]*)?$` |
+| `storage-whatif` | `(?i)^\s*(?:format-volume\|clear-disk\|remove-partition\|remove-virtualdisk\|initialize-disk\|reset-physicaldisk)\b[^\|&;\r\n'"`$@(){}]*\s-whatif(?:\s[^\|&;\r\n'"`$@(){}]*)?$` |
 
 ### Destructive Patterns (Blocked)
 
@@ -162,10 +168,12 @@ These patterns match potentially destructive commands:
 | `vssadmin-delete-shadows` | vssadmin delete shadows destroys Volume Shadow Copies (System Restore + backups). | critical |
 | `wbadmin-delete` | wbadmin delete destroys Windows backup recovery points or the backup catalog. | critical |
 | `wmic-shadowcopy-delete` | wmic shadowcopy delete destroys Volume Shadow Copies. | critical |
+| `wmi-shadowcopy-delete` | Deleting Win32_ShadowCopy instances destroys Volume Shadow Copies. | critical |
 | `diskpart` | diskpart with clean/delete/format/script reconfigures or wipes disks and partitions. | high |
 | `format-volume` | Format-Volume erases a volume's filesystem and data. | critical |
 | `clear-disk` | Clear-Disk removes all partitions and data from a disk. | critical |
 | `remove-partition` | Remove-Partition deletes a partition and its data. | critical |
+| `remove-virtualdisk` | Remove-VirtualDisk deletes a Storage Spaces virtual disk and all data on it. | critical |
 | `initialize-or-reset-disk` | Initialize-Disk / Reset-PhysicalDisk wipe disk metadata and data. | high |
 | `cipher-wipe` | cipher /w overwrites free space, making deleted files unrecoverable. | high |
 | `bcdedit-delete` | bcdedit /delete removes a boot configuration entry. | high |
