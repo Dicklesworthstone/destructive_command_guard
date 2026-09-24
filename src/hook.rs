@@ -656,8 +656,8 @@ impl HookProtocol {
     /// | `Copilot` | blocks (`preToolUse` hooks that exit 2 deny the call) |
     /// | `Crush` | blocks; stderr is the reason (`internal/hooks/runner.go`) |
     /// | `Grok` | blocks (exit 2 is a documented explicit deny) |
-    /// | `Codex` | logged as a hook failure, then fails open — the same outcome as exit 0 with no JSON |
-    /// | `Hermes` | warning logged, never aborts — same as exit 0 with no JSON |
+    /// | `Codex` | blocks in current releases ("use exit code 2 and write the blocking reason to stderr", Codex hooks docs); some earlier builds logged it as a hook failure and failed open |
+    /// | `Hermes` | blocks in current releases (a `pre_tool_call` hook that exits 2 "blocks the tool call even when its stdout carries no block JSON"); earlier builds only logged a warning |
     /// | `Antigravity` | logged, does not reliably abort — same as exit 0 with no JSON |
     /// | `Reasonix` | blocks — exit 2 is its only blocking channel (see [`Self::blocks_by_exit_status`]) |
     ///

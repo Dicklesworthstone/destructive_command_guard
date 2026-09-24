@@ -432,7 +432,10 @@ How hosts read exit 2 with nothing on stdout:
 | Copilot CLI | Blocks (`preToolUse` hooks that exit 2 deny the call) |
 | Crush | Blocks; stderr is the reason |
 | Grok | Blocks (exit 2 is a documented explicit deny) |
-| Codex CLI, Hermes, Antigravity (`agy`) | Logged as a hook failure, then fails open — the same outcome as exit 0 with no JSON, but visible |
+| Codex CLI | Blocks in current releases (exit 2 with the reason on stderr is documented); some earlier builds logged it as a hook failure and failed open |
+| Hermes | Blocks in current releases (a `pre_tool_call` hook exiting 2 blocks even with no JSON on stdout); earlier builds only warned |
+| Reasonix | Blocks — exit 2 is its only blocking channel, so dcg always uses it there |
+| Antigravity (`agy`) | Logged as a hook failure, then fails open — the same outcome as exit 0 with no JSON, but visible |
 
 Hook mode never exits 2 for any other reason, and never exits 141: every
 hook-mode write tolerates a closed pipe. `EXIT_BROKEN_PIPE` belongs to the
