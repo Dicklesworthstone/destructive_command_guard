@@ -214,6 +214,74 @@ where
     ))
 }
 
+/// Replace every unpaired UTF-16 surrogate escape (`\uD800`–`\uDFFF` without
+/// its partner) with `�` before parsing.
+///
+/// JavaScript strings can hold a lone surrogate, and `JSON.stringify` emits
+/// it as exactly such an escape -- so a Node-based host (Claude Code, Gemini
+/// CLI, Copilot CLI) that `JSON.parse`d a model's tool input containing the
+/// escape `\ud800` forwards it. serde_json rejects a lone surrogate, the whole
+/// parse failed, and a failed parse fails open: `rm -rf ~ # \ud800` was
+/// allowed. The replacement character is inert text, so the rest of the
+/// command is judged as written. `\\` pairs are consumed together, so an
+/// escaped backslash followed by `u` stays literal text.
+fn neutralize_lone_surrogate_escapes(json: &str) -> Cow<'_, str> {
+    fn hex4(bytes: &[u8], at: usize) -> Option<u16> {
+        let digits = bytes.get(at..at + 4)?;
+        let text = std::str::from_utf8(digits).ok()?;
+        u16::from_str_radix(text, 16).ok()
+    }
+    fn is_escape_u(bytes: &[u8], at: usize) -> bool {
+        bytes.get(at) == Some(&b'\\') && matches!(bytes.get(at + 1), Some(b'u' | b'U'))
+    }
+
+    let bytes = json.as_bytes();
+    if !bytes.windows(2).any(|pair| pair == b"\\u") {
+        return Cow::Borrowed(json);
+    }
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            index += 1;
+            continue;
+        }
+        if !is_escape_u(bytes, index) {
+            // Any other escape, including `\\`, is two bytes.
+            index += 2;
+            continue;
+        }
+        let Some(unit) = hex4(bytes, index + 2) else {
+            index += 2;
+            continue;
+        };
+        let high = (0xD800..=0xDBFF).contains(&unit);
+        let low = (0xDC00..=0xDFFF).contains(&unit);
+        if high
+            && is_escape_u(bytes, index + 6)
+            && hex4(bytes, index + 8).is_some_and(|next| (0xDC00..=0xDFFF).contains(&next))
+        {
+            index += 12; // A well-formed pair.
+            continue;
+        }
+        if high || low {
+            let buffer = out.get_or_insert_with(|| String::with_capacity(json.len()));
+            buffer.push_str(&json[copied..index]);
+            buffer.push_str("\\uFFFD");
+            copied = index + 6;
+        }
+        index += 6;
+    }
+    match out {
+        Some(mut buffer) => {
+            buffer.push_str(&json[copied..]);
+            Cow::Owned(buffer)
+        }
+        None => Cow::Borrowed(json),
+    }
+}
+
 /// A string envelope field whose value has an unexpected type degrades to
 /// `None` (a number keeps its text) instead of failing the whole parse, which
 /// would fail open. A GitHub Copilot CLI `timestamp` arrives as a number and
@@ -970,6 +1038,8 @@ const HOOK_INPUT_ALIAS_GROUPS: &[(&str, &[&str])] = &[
 /// carries no reconcilable alias conflict, or still does not fit [`HookInput`]
 /// after canonicalization. Behaviour for those inputs is unchanged.
 pub fn parse_hook_input(json: &str) -> Result<HookInput, serde_json::Error> {
+    let neutralized = neutralize_lone_surrogate_escapes(json);
+    let json = neutralized.as_ref();
     let first_error = match serde_json::from_str::<HookInput>(json) {
         Ok(input) => return Ok(input),
         Err(err) => err,
@@ -5034,6 +5104,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(detect_protocol(&gemini), HookProtocol::Gemini);
+    }
+
+    /// A lone surrogate escape -- what `JSON.stringify` emits for a lone
+    /// surrogate in a JavaScript string -- failed the whole parse, which
+    /// fails open. It is neutralized to U+FFFD so the command is judged.
+    #[test]
+    fn lone_surrogate_escapes_do_not_fail_the_parse() {
+        for escape in [r"\ud800", r"\uDBFF", r"\udc00", r"\uDFFF", r"\ud800\ud800"] {
+            let json = format!(
+                r#"{{"tool_name":"Bash","tool_input":{{"command":"rm -rf ~ # {escape}"}}}}"#
+            );
+            let input = parse_hook_input(&json).unwrap_or_else(|error| {
+                panic!("{escape}: parse failed ({error}), which fails open")
+            });
+            let command = extract_command(&input).expect("command extracted");
+            assert!(command.starts_with("rm -rf ~ # "), "{escape}: {command:?}");
+            assert!(command.contains('\u{FFFD}'), "{escape}: {command:?}");
+        }
+        // A well-formed pair is kept exactly (U+1F600).
+        let pair =
+            parse_hook_input(r#"{"tool_name":"Bash","tool_input":{"command":"echo 😀"}}"#).unwrap();
+        assert_eq!(extract_command(&pair).as_deref(), Some("echo \u{1F600}"));
+        // An escaped backslash before `u` is literal text, not an escape.
+        let literal =
+            parse_hook_input(r#"{"tool_name":"Bash","tool_input":{"command":"printf '\\ud800'"}}"#)
+                .unwrap();
+        assert_eq!(
+            extract_command(&literal).as_deref(),
+            Some(r"printf '\ud800'")
+        );
+        // Nothing to neutralize borrows the input unchanged.
+        assert!(matches!(
+            neutralize_lone_surrogate_escapes(r#"{"a":"A"}"#),
+            Cow::Borrowed(_)
+        ));
     }
 
     /// No envelope field may fail the parse by its type: a failed parse fails

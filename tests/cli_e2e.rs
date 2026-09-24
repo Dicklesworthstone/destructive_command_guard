@@ -498,6 +498,24 @@ fn bare_hook_unverified_decision_controls_oversized_fallback() {
 /// posture without configuration: Claude Code documents that a hook `deny`
 /// holds in those modes but not what a hook `ask` does there, and an `ask`
 /// waved through would run exactly the command dcg could not inspect.
+/// Through the real binary: a lone surrogate escape used to fail the parse
+/// and so allow the destructive command beside it (fail-open).
+#[test]
+fn bare_hook_lone_surrogate_escape_does_not_fail_open() {
+    let raw = br#"{"tool_name":"Bash","tool_input":{"command":"rm -rf ~ # \ud800"}}"#;
+    let out = run_dcg_hook_raw(raw, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"deny\""),
+        "a lone surrogate must not make the command fail open.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("could not parse hook input"),
+        "stderr: {stderr}"
+    );
+}
+
 #[test]
 fn bare_hook_unattended_permission_mode_denies_unverified_commands() {
     let padding = "x".repeat(70 * 1024);
