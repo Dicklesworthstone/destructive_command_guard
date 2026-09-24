@@ -1139,6 +1139,20 @@ fn powershell_segment_semantic_decision(
         return WindowsFilesystemSemanticDecision::Unverified;
     };
     let executable = executable_word(decoded, ShellDialect::PowerShell);
+    // `format` is not a PowerShell alias or cmdlet, so at a PowerShell prompt
+    // `format C: /q /y` runs format.com exactly as cmd.exe would. With a proven
+    // PowerShell caller this parser is authoritative (the whole-string
+    // `format-drive` regex is skipped), and without this branch the
+    // drive-erasing command was allowed from every PowerShell tool while the
+    // identical cmd payload was denied.
+    if !executable.dynamic
+        && matches!(
+            executable.decoded.to_ascii_lowercase().as_str(),
+            "format" | "format.com" | "format.exe"
+        )
+    {
+        return powershell_format_drive_decision(&mut decoder, &raw_words[1..]);
+    }
     if !POWERSHELL_PROTECTED_EXECUTABLES
         .iter()
         .any(|candidate| symbolic_word_may_equal(&executable, ShellDialect::PowerShell, candidate))
@@ -1458,6 +1472,160 @@ fn powershell_segment_semantic_decision(
         return WindowsFilesystemSemanticDecision::Unverified;
     }
     WindowsFilesystemSemanticDecision::NoMatch
+}
+
+/// The placeholder word a masked parenthesized argument becomes: plain data
+/// (no dash, no `$`), so it binds like a literal path wherever it stands.
+const POWERSHELL_MASKED_GROUP_WORD: &str = "DcgSubexpression";
+
+/// The PowerShell statement that begins at `start`, with every top-level
+/// parenthesized group (`(...)`, `$(...)`, `@(...)`) replaced by one data word.
+///
+/// The segment splitter treats `(` and `)` as separators, which is right for
+/// grouping statements but wrong for an argument: in `Remove-Item (Resolve-Path
+/// ~) -Recurse -Force` the parenthesized path is ONE argument, and splitting at
+/// it cut `-Recurse -Force` away from `Remove-Item`. `-Path (Get-Location)
+/// -Recurse` was worse: `-Path` then looked like it was missing its value, a
+/// binding error that means "the cmdlet never runs". Both were allowed. The
+/// statement ends at a top-level `;`, `|`, `&`, newline, or an unmatched
+/// closer; the groups' own contents are still analyzed as their own segments.
+/// `None` when the statement has no such group (or a group is unbalanced), so
+/// the ordinary segment result stands.
+fn powershell_statement_with_masked_groups(command: &str, start: usize) -> Option<String> {
+    let tail = command.get(start..)?;
+    let mut out = String::with_capacity(tail.len());
+    let mut chars = tail.char_indices().peekable();
+    let mut quote: Option<char> = None;
+    let mut depth = 0usize;
+    let mut replaced = false;
+    while let Some((index, ch)) = chars.next() {
+        if let Some(open_quote) = quote {
+            out.push(ch);
+            if ch == '`' && open_quote == '"' {
+                if let Some((_, escaped)) = chars.next() {
+                    out.push(escaped);
+                }
+            } else if ch == open_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                out.push(ch);
+            }
+            '`' => {
+                out.push(ch);
+                if let Some((_, escaped)) = chars.next() {
+                    out.push(escaped);
+                }
+            }
+            '(' => {
+                let end = powershell_group_end(tail, index)?;
+                if out.ends_with(['$', '@']) {
+                    out.pop();
+                }
+                // Only an ARGUMENT is masked. A group in the executable
+                // position (`$(producer) branch -d feature`) is a dynamic
+                // command, and replacing it with a literal data word would
+                // turn "unknown executable, fail closed" into a harmless name.
+                if out.trim().is_empty() {
+                    return None;
+                }
+                out.push(' ');
+                out.push_str(POWERSHELL_MASKED_GROUP_WORD);
+                out.push(' ');
+                replaced = true;
+                while chars.next_if(|&(next, _)| next <= end).is_some() {}
+            }
+            '[' | '{' => {
+                depth += 1;
+                out.push(ch);
+            }
+            ']' | '}' => {
+                let Some(inner) = depth.checked_sub(1) else {
+                    break;
+                };
+                depth = inner;
+                out.push(ch);
+            }
+            ')' => break,
+            ';' | '|' | '&' | '\n' | '\r' if depth == 0 => break,
+            _ => out.push(ch),
+        }
+    }
+    replaced.then_some(out)
+}
+
+/// Byte index of the `)` closing the group opened at `open`, respecting
+/// nesting and PowerShell quoting; `None` when it is never closed.
+fn powershell_group_end(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (offset, ch) in text.get(open..)?.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if let Some(open_quote) = quote {
+            if ch == '`' && open_quote == '"' {
+                escaped = true;
+            } else if ch == open_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '`' => escaped = true,
+            '\'' | '"' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `format <drive>:` invoked from PowerShell (see the call site). Mirrors the
+/// cmd scanner: a literal drive designator among the operands is
+/// `format-drive`, a runtime-expanded operand could be one and is unverified,
+/// and a bare `/?` is help.
+fn powershell_format_drive_decision(
+    decoder: &mut ShellTokenDecoder,
+    raw_arguments: &[&str],
+) -> WindowsFilesystemSemanticDecision {
+    let mut dynamic_operand = false;
+    let mut help = false;
+    for raw in raw_arguments {
+        let Some(decoded) = decode_syntax_word(decoder, raw, ShellDialect::PowerShell) else {
+            return WindowsFilesystemSemanticDecision::Unverified;
+        };
+        if decoded.dynamic {
+            dynamic_operand = true;
+            continue;
+        }
+        if decoded.decoded == "/?" {
+            help = true;
+            continue;
+        }
+        if cmd_drive_target(&decoded.decoded) {
+            return WindowsFilesystemSemanticDecision::Destructive("format-drive");
+        }
+    }
+    if dynamic_operand {
+        WindowsFilesystemSemanticDecision::Unverified
+    } else if help {
+        WindowsFilesystemSemanticDecision::Safe
+    } else {
+        WindowsFilesystemSemanticDecision::NoMatch
+    }
 }
 
 /// Evaluate PowerShell call-operator targets before the generic segment pass.
@@ -1853,7 +2021,17 @@ pub(crate) fn windows_filesystem_semantic_decision_in_dialect(
                 // executable by the generic segment pass.
                 WindowsFilesystemSemanticDecision::NoMatch
             }
-            ShellDialect::PowerShell => powershell_segment_semantic_decision(segment, false),
+            ShellDialect::PowerShell => {
+                // A parenthesized argument must not split the statement it
+                // belongs to; see `powershell_statement_with_masked_groups`.
+                match segment_range
+                    .as_ref()
+                    .and_then(|range| powershell_statement_with_masked_groups(command, range.start))
+                {
+                    Some(statement) => powershell_segment_semantic_decision(&statement, false),
+                    None => powershell_segment_semantic_decision(segment, false),
+                }
+            }
             ShellDialect::Cmd => cmd_segment_semantic_decision(segment),
             ShellDialect::Posix | ShellDialect::Unknown => {
                 WindowsFilesystemSemanticDecision::NoMatch
@@ -2728,6 +2906,119 @@ mod tests {
             assert!(
                 windows_filesystem_semantic_scan_required(command, ShellDialect::Cmd),
                 "escaped executable must override keyword candidate selection: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_powershell_parenthesized_argument_keeps_its_statement() {
+        // A parenthesized argument is one value, not a statement boundary.
+        // Splitting at it cut `-Recurse -Force` (or `-Path`'s value) away from
+        // Remove-Item, and every one of these was allowed.
+        for command in [
+            "Remove-Item (Resolve-Path ~) -Recurse -Force",
+            "Remove-Item (Join-Path $env:USERPROFILE 'src') -Recurse -Force",
+            "Remove-Item -Path (Get-Location) -Recurse -Force",
+            "Remove-Item -Recurse -Force -Path (Resolve-Path ~)",
+            "Remove-Item $(Resolve-Path ~) -Recurse -Force",
+            "Remove-Item ((Get-Item ~).FullName) -Recurse -Force",
+            "rm (gi ~) -r -fo",
+            "Get-Date; Remove-Item (Resolve-Path ~) -Recurse -Force",
+        ] {
+            assert!(
+                matches!(
+                    windows_filesystem_semantic_decision_in_dialect(
+                        command,
+                        ShellDialect::PowerShell
+                    ),
+                    WindowsFilesystemSemanticDecision::Destructive(_)
+                        | WindowsFilesystemSemanticDecision::Unverified
+                ),
+                "{command} must block"
+            );
+        }
+        for command in [
+            // -WhatIf is still a preview.
+            "Remove-Item (Resolve-Path .\\build) -Recurse -WhatIf",
+            // Non-deleting commands with a parenthesized argument.
+            "Get-ChildItem (Get-Location) -Recurse",
+            "Write-Output (Get-Date)",
+            "Copy-Item (Join-Path $HOME 'a') -Destination . -Recurse -Force",
+        ] {
+            assert!(
+                !matches!(
+                    windows_filesystem_semantic_decision_in_dialect(
+                        command,
+                        ShellDialect::PowerShell
+                    ),
+                    WindowsFilesystemSemanticDecision::Destructive(_)
+                        | WindowsFilesystemSemanticDecision::Unverified
+                ),
+                "{command} must stay allowed"
+            );
+        }
+        // Only arguments are masked: a group in the executable position stays
+        // a dynamic command, and the helper declines to rewrite it.
+        assert_eq!(
+            powershell_statement_with_masked_groups("$(producer) branch -d feature", 0),
+            None
+        );
+        assert_eq!(
+            powershell_statement_with_masked_groups("Remove-Item (x) -Recurse", 0).as_deref(),
+            Some("Remove-Item  DcgSubexpression  -Recurse")
+        );
+        // An unbalanced group leaves the ordinary segment result in place.
+        assert_eq!(
+            powershell_statement_with_masked_groups("Remove-Item (x -Recurse", 0),
+            None
+        );
+    }
+
+    #[test]
+    fn semantic_powershell_format_drive_matches_cmd() {
+        // At a PowerShell prompt `format` is format.com (no alias or cmdlet
+        // shadows it). With the dialect proven, the semantic parser decides
+        // alone, so it has to know `format` itself; it was allowed while the
+        // identical cmd payload was denied.
+        for command in [
+            "format C: /q /y",
+            "format.com C: /q /y",
+            "FORMAT.EXE /FS:NTFS E: /Q",
+            "format \"D:\" /q",
+            "f`ormat C: /q",
+            "Get-Date; format C: /q /y",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell),
+                WindowsFilesystemSemanticDecision::Destructive("format-drive"),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                "format $drive /q",
+                ShellDialect::PowerShell
+            ),
+            WindowsFilesystemSemanticDecision::Unverified,
+            "a runtime drive can be any volume"
+        );
+        for command in [
+            "format /?",
+            "Get-Process | Format-Table",
+            "Format-List -Property *",
+            "Write-Output 'format C: /q'",
+            "format notes.txt",
+        ] {
+            assert!(
+                !matches!(
+                    windows_filesystem_semantic_decision_in_dialect(
+                        command,
+                        ShellDialect::PowerShell
+                    ),
+                    WindowsFilesystemSemanticDecision::Destructive(_)
+                        | WindowsFilesystemSemanticDecision::Unverified
+                ),
+                "{command} must stay allowed"
             );
         }
     }
