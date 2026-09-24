@@ -13074,6 +13074,38 @@ fn evaluate_command_in_single_dialect_view(
                 Some((matched, allowlist_override.layer, allowlist_override.reason));
         }
     }
+    // A POSIX alias body is a command that runs whenever the alias is
+    // invoked, but as the quoted operand of `alias` it is classified as data,
+    // so `alias x='rm -rf ~'; x` was allowed. Evaluate every visible body
+    // through the same recursive pipeline, invoked or not: defining an alias
+    // whose body would be denied has no purpose but to run it later.
+    if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        for body in posix_alias_definition_bodies(command) {
+            let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+                &body,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                allow_once_audit,
+                project_path,
+                deadline,
+                ShellDialect::Posix,
+                nested_command_depth + 1,
+                inherited_automated_stdin,
+            );
+            if nested_evaluation_incomplete(&result) || result.effective_mode.is_some() {
+                // The nested span indexes the alias body, not this command.
+                if let Some(info) = result.pattern_info.as_mut() {
+                    info.matched_span = None;
+                }
+                return result;
+            }
+        }
+    }
+
     let posix_executable_masked =
         mask_modeled_posix_executable_assignments(command, &posix_executable_model);
     let command = posix_executable_masked.as_ref();
@@ -14046,6 +14078,43 @@ fn posix_declaration_option(builtin: &str, option: &str) -> bool {
         _ => return false,
     };
     flags.chars().all(|flag| allowed.contains(flag))
+}
+
+/// Bodies of the POSIX `alias NAME=BODY ...` definitions in top-level
+/// segments, after shell unquoting. Bounded; options (`alias -p`) and bare
+/// names (a lookup, not a definition) contribute nothing.
+fn posix_alias_definition_bodies(command: &str) -> Vec<String> {
+    const MAX_ALIAS_BODIES: usize = 16;
+    if !command.contains("alias") {
+        return Vec::new();
+    }
+    let mut bodies = Vec::new();
+    for (start, end) in top_level_segment_ranges(command) {
+        let Ok(tokens) = shell_words::split(command[start..end].trim()) else {
+            continue;
+        };
+        let mut words = tokens.iter().skip_while(|token| {
+            matches!(token.as_str(), "builtin" | "command")
+                || (token.contains('=') && !token.starts_with('-'))
+        });
+        if words.next().map(String::as_str) != Some("alias") {
+            continue;
+        }
+        for word in words {
+            if word.starts_with('-') {
+                continue;
+            }
+            if let Some((_, body)) = word.split_once('=')
+                && !body.trim().is_empty()
+            {
+                bodies.push(body.to_string());
+                if bodies.len() >= MAX_ALIAS_BODIES {
+                    return bodies;
+                }
+            }
+        }
+    }
+    bodies
 }
 
 fn has_posix_database_executable_alias(command: &str) -> bool {
@@ -28086,6 +28155,37 @@ mod tests {
 
     fn evaluate_with_pack_ids(command: &str, pack_ids: &[&str]) -> EvaluationResult {
         evaluate_with_pack_ids_at_path(command, pack_ids, None)
+    }
+
+    /// A POSIX alias body runs when the alias is invoked, but as a quoted
+    /// operand of `alias` it was classified as data. Every visible body is now
+    /// evaluated, invoked or not.
+    #[test]
+    fn posix_alias_bodies_are_evaluated_as_commands() {
+        let packs = ["core.filesystem", "core.git"];
+        for command in [
+            "alias x='rm -rf ~'; x",
+            "alias x='rm -rf ~'",
+            "alias ll='ls -la' nuke='git reset --hard'; nuke",
+            "alias -- x=\"rm -rf $HOME\"",
+            "builtin alias x='git clean -fdx'",
+            "cd /srv && alias wipe='rm -rf /' && wipe",
+        ] {
+            let result = evaluate_with_pack_ids(command, &packs);
+            assert!(!result.is_allowed(), "{command} -> {result:?}");
+        }
+        for command in [
+            "alias ll='ls -la'",
+            "alias gs='git status' gd='git diff'; gs",
+            "alias",
+            "alias -p",
+            "alias ll",
+            "echo \"alias x='rm -rf ~'\"",
+            "grep alias ~/.bashrc",
+        ] {
+            let result = evaluate_with_pack_ids(command, &packs);
+            assert!(result.is_allowed(), "{command} -> {result:?}");
+        }
     }
 
     /// A URL is an argument, and arguments get quoted. The global quick reject
