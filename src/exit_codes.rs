@@ -111,7 +111,19 @@ pub const EXIT_BROKEN_PIPE: i32 = 141;
 /// This is the same number as [`EXIT_WARNING`], which belongs to robot-mode
 /// subcommands (`dcg --robot test --fail-on warn`); the two never share a
 /// process. Hook mode never exits 2 for any other reason.
+///
+/// Reasonix (#358) is the one protocol that reads *only* the exit status, so
+/// there exit 2 is also the ordinary blocking answer, not just the fallback.
 pub const EXIT_HOOK_BLOCK: i32 = 2;
+
+/// Hook-mode warning status for Reasonix (#358).
+///
+/// Reasonix shows a hook's output only when the hook does not pass, and
+/// treats any status other than 0 and 2 as a non-blocking warning. A dcg
+/// warn-mode verdict therefore exits 1 there: the command proceeds and the
+/// warning is visible. Every other protocol carries warnings in stdout JSON
+/// beside exit 0.
+pub const EXIT_REASONIX_WARNING: i32 = 1;
 
 /// Convert an exit code constant to [`std::process::ExitCode`].
 ///

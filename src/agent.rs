@@ -125,6 +125,13 @@ pub enum Agent {
     /// "tool_input":{"command":...}}` to the hook's stdin, and sets `CRUSH=1`
     /// in every hook and `bash`-tool subprocess (#388).
     Crush,
+    /// Reasonix (<https://github.com/esengine/DeepSeek-Reasonix>). Reads
+    /// `hooks.PreToolUse[{match, command, timeout}]` from
+    /// `~/.reasonix/settings.json` (`%APPDATA%\reasonix\settings.json` on
+    /// Windows), pipes `{"event":"PreToolUse","cwd":...,"toolName":"bash",
+    /// "toolArgs":{"command":...}}` to the hook's stdin, and blocks on exit 2
+    /// (#358). Identified from that wire shape; it sets no marker variable.
+    Reasonix,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -155,6 +162,7 @@ impl Agent {
             Self::OpenCode => "opencode",
             Self::Omp => "omp",
             Self::Crush => "crush",
+            Self::Reasonix => "reasonix",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -181,6 +189,7 @@ impl Agent {
                 | Self::OpenCode
                 | Self::Omp
                 | Self::Crush
+                | Self::Reasonix
         )
     }
 
@@ -206,6 +215,7 @@ impl Agent {
     /// - `"posit-assistant"`, `"posit_assistant"`, `"posit"`, `"pa"` -> `PositAssistant`
     /// - `"omp"`, `"oh-my-pi"` -> `Omp`
     /// - `"crush"`, `"charm-crush"` -> `Crush`
+    /// - `"reasonix"`, `"deepseek-reasonix"` -> `Reasonix`
     /// - `"unknown"` -> `Unknown`
     /// - Any other value -> `Custom(value)`
     #[must_use]
@@ -228,6 +238,7 @@ impl Agent {
             "opencode" | "opencodecli" => Self::OpenCode,
             "omp" | "ohmypi" => Self::Omp,
             "crush" | "charmcrush" | "crushcli" => Self::Crush,
+            "reasonix" | "deepseekreasonix" => Self::Reasonix,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -253,6 +264,7 @@ impl fmt::Display for Agent {
             Self::OpenCode => write!(f, "OpenCode"),
             Self::Omp => write!(f, "Oh My Pi"),
             Self::Crush => write!(f, "Crush"),
+            Self::Reasonix => write!(f, "Reasonix"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -896,6 +908,7 @@ fn agent_for_basename(basename: &str) -> Option<Agent> {
         "opencode" => Some(Agent::OpenCode),
         "omp" | "oh-my-pi" => Some(Agent::Omp),
         "crush" => Some(Agent::Crush),
+        "reasonix" => Some(Agent::Reasonix),
         // "pa" is a dangerous prefix (pacman, pactl, pass, patch, ...); the
         // exact-match table is what keeps those from misclassifying.
         "pa" | "posit-assistant" => Some(Agent::PositAssistant),

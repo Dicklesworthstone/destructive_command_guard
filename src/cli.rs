@@ -312,7 +312,7 @@ pub enum Command {
     },
 
     /// Install the hook into Claude Code settings (or another agent with
-    /// `--grok`, `--agy`, `--opencode`, `--omp`, or `--crush`)
+    /// `--grok`, `--agy`, `--opencode`, `--omp`, `--crush`, or `--reasonix`)
     #[command(name = "install")]
     Install {
         /// Force overwrite existing hook configuration
@@ -329,7 +329,7 @@ pub enum Command {
         /// (when combined with `--project`). Grok also picks up dcg from
         /// `~/.claude/settings.json` via its Claude-Code compatibility layer,
         /// but the native path gives the cleanest doctor output.
-        #[arg(long, conflicts_with_all = ["agy", "opencode", "omp", "crush"])]
+        #[arg(long, conflicts_with_all = ["agy", "opencode", "omp", "crush", "reasonix"])]
         grok: bool,
 
         /// Install the dcg PreToolUse hook for the Antigravity CLI (`agy`) at
@@ -337,7 +337,7 @@ pub enum Command {
         /// `<repo>/.gemini/config/hooks.json` (with `--project`). `agy` reads
         /// Claude-Code-compatible `PreToolUse` hooks from this file and aborts
         /// its `run_command` shell tool when dcg returns a block decision.
-        #[arg(long, conflicts_with_all = ["grok", "opencode", "omp", "crush"])]
+        #[arg(long, conflicts_with_all = ["grok", "opencode", "omp", "crush", "reasonix"])]
         agy: bool,
 
         /// Install a native OpenCode plugin at
@@ -347,7 +347,7 @@ pub enum Command {
         /// `tool.execute.before` hook: every bash tool call is routed through
         /// dcg's Claude-compatible hook protocol, and a deny aborts the tool
         /// call with dcg's reason. Restart OpenCode after installing (#318).
-        #[arg(long, conflicts_with_all = ["grok", "agy", "omp", "crush"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "omp", "crush", "reasonix"])]
         opencode: bool,
 
         /// Install a native Oh My Pi (`omp`) `tool_call` extension at the
@@ -356,7 +356,7 @@ pub enum Command {
         /// `<cwd>/.omp/extensions/dcg-guard.ts` (with `--project`). OMP's
         /// extension discovery is cwd-only and does not walk Git ancestors.
         /// Every OMP bash tool call is routed through dcg before execution.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "crush"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "crush", "reasonix"])]
         omp: bool,
 
         /// Install the dcg PreToolUse hook for Charm Crush by merging a
@@ -365,8 +365,18 @@ pub enum Command {
         /// and `CRUSH_GLOBAL_CONFIG`) or the repo's `crush.json` (with
         /// `--project`). Crush pipes every bash tool call to dcg's stdin and
         /// blocks the call when dcg answers `{"decision":"deny"}`.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp", "reasonix"])]
         crush: bool,
+
+        /// Install the dcg PreToolUse hook for Reasonix by merging a
+        /// `hooks.PreToolUse` entry (match `bash|pwsh`) into
+        /// `<Reasonix home>/settings.json` (`~/.reasonix`, `%APPDATA%\reasonix`
+        /// on Windows, or `REASONIX_HOME`) or the repo's
+        /// `.reasonix/settings.json` (with `--project`). Reasonix pipes every
+        /// shell tool call to dcg's stdin and blocks it when dcg exits 2.
+        /// Restart Reasonix afterwards: hooks load when a session is built.
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush"])]
+        reasonix: bool,
     },
 
     /// Full setup: install hook + add shell startup check
@@ -389,7 +399,8 @@ pub enum Command {
         no_shell_check: bool,
     },
 
-    /// Remove the hook from Claude Code settings (or from Crush with `--crush`)
+    /// Remove the hook from Claude Code settings (or from Crush with `--crush`,
+    /// Reasonix with `--reasonix`)
     #[command(name = "uninstall")]
     Uninstall {
         /// Also remove configuration files
@@ -398,8 +409,13 @@ pub enum Command {
 
         /// Remove the dcg hook entry from `~/.config/crush/crush.json` instead
         /// of Claude Code settings
-        #[arg(long, conflicts_with = "purge")]
+        #[arg(long, conflicts_with_all = ["purge", "reasonix"])]
         crush: bool,
+
+        /// Remove the dcg hook entry from `<Reasonix home>/settings.json`
+        /// instead of Claude Code settings
+        #[arg(long, conflicts_with = "purge")]
+        reasonix: bool,
     },
 
     /// Update dcg to the latest release (re-runs the installer)
@@ -2443,6 +2459,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             opencode,
             omp,
             crush,
+            reasonix,
         }) => {
             if grok {
                 install_grok_hook(force, project)?;
@@ -2454,6 +2471,8 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 install_omp_extension(force, project, true)?;
             } else if crush {
                 install_crush_hook(force, project)?;
+            } else if reasonix {
+                install_reasonix_hook(force, project)?;
             } else {
                 install_hook(force, project)?;
             }
@@ -2465,9 +2484,15 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }) => {
             run_setup(force, shell_check, no_shell_check)?;
         }
-        Some(Command::Uninstall { purge, crush }) => {
+        Some(Command::Uninstall {
+            purge,
+            crush,
+            reasonix,
+        }) => {
             if crush {
                 uninstall_crush_hook()?;
+            } else if reasonix {
+                uninstall_reasonix_hook()?;
             } else {
                 uninstall_hook(purge)?;
             }
@@ -10962,6 +10987,44 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         }
     }
 
+    // Check 3b1b: Reasonix hook registration (#358). Reasonix reads native
+    // hooks only from its own settings.json; an unregistered hook means the
+    // guard is not guarding.
+    if reasonix_appears_in_use() {
+        print!("Checking Reasonix hook registration... ");
+        let settings_path = reasonix_user_settings_path();
+        match reasonix_user_settings_register_dcg() {
+            Ok(true) => {
+                println!("{}", "OK".green());
+                println!("  Found: {}", settings_path.display());
+            }
+            Ok(false) => {
+                println!("{}", "NOT REGISTERED".yellow());
+                issues += 1;
+                if fix {
+                    println!("  Attempting install...");
+                    if install_reasonix_hook_at(&settings_path, false).is_ok() {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    } else {
+                        println!("  {}", "Failed to fix".red());
+                    }
+                } else {
+                    println!(
+                        "  → Run 'dcg install --reasonix' to register the hook in {}",
+                        settings_path.display()
+                    );
+                }
+            }
+            Err(err) => {
+                println!("{}", "INVALID".red());
+                issues += 1;
+                println!("  {} cannot be parsed: {err}", settings_path.display());
+                println!("  → Fix the JSON by hand, then run 'dcg install --reasonix'");
+            }
+        }
+    }
+
     // Check 3b2: Codex hook registration AND enablement (#368). Codex loads
     // PreToolUse hooks from ~/.codex/hooks.json but only RUNS a hook the user
     // has approved: a `[hooks.state."<file>:pre_tool_use:<i>:<j>"]` entry in
@@ -13917,6 +13980,278 @@ fn crush_appears_in_use() -> bool {
         || crush_user_config_path()
             .parent()
             .is_some_and(std::path::Path::is_dir)
+}
+
+/// The `match` regex dcg's Reasonix hook uses (#358). Reasonix exposes one
+/// shell tool per host, `bash` on POSIX and `pwsh` on Windows
+/// (`docs/TOOL_CONTRACT.md` of esengine/DeepSeek-Reasonix); the match is
+/// anchored by Reasonix, so this names exactly those two tools.
+const REASONIX_SHELL_MATCH: &str = "bash|pwsh";
+
+/// The `hooks` key Reasonix reads for pre-execution hooks.
+const REASONIX_PRE_TOOL_USE_EVENT: &str = "PreToolUse";
+
+/// Reasonix home (#358): `REASONIX_HOME` when set, otherwise `~/.reasonix` on
+/// macOS/Linux and `%APPDATA%\reasonix` on Windows
+/// (`docs/CONFIG_PATHS.md` of esengine/DeepSeek-Reasonix).
+fn reasonix_home() -> std::path::PathBuf {
+    reasonix_home_for(
+        std::env::var_os("REASONIX_HOME"),
+        std::env::var_os("APPDATA"),
+        cfg!(windows),
+        crate::config::home_dir().unwrap_or_default(),
+    )
+}
+
+/// Pure resolver behind [`reasonix_home`].
+fn reasonix_home_for(
+    reasonix_home: Option<std::ffi::OsString>,
+    appdata: Option<std::ffi::OsString>,
+    windows: bool,
+    home: std::path::PathBuf,
+) -> std::path::PathBuf {
+    if let Some(dir) = reasonix_home.filter(|value| !value.is_empty()) {
+        return std::path::PathBuf::from(dir);
+    }
+    if windows && let Some(appdata) = appdata.filter(|value| !value.is_empty()) {
+        return std::path::PathBuf::from(appdata).join("reasonix");
+    }
+    home.join(".reasonix")
+}
+
+/// `<Reasonix home>/settings.json`, where Reasonix reads global hooks.
+fn reasonix_user_settings_path() -> std::path::PathBuf {
+    reasonix_home().join("settings.json")
+}
+
+/// `<repo>/.reasonix/settings.json`, Reasonix's project-level hooks file.
+fn project_reasonix_settings_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let repo_root = find_repo_root_from_cwd()
+        .ok_or("Not inside a git repository — cannot determine project root")?;
+    Ok(repo_root.join(".reasonix").join("settings.json"))
+}
+
+/// The `hooks.PreToolUse[]` entry dcg writes into Reasonix's settings.
+///
+/// Reasonix runs `command` through `sh -c` on macOS/Linux and `cmd /c` on
+/// Windows, pipes the tool call to stdin, and blocks the call when the hook
+/// exits 2. dcg recognizes the envelope itself, so no arguments are needed.
+/// The timeout is in milliseconds; Reasonix blocks on a timeout too, and 5s is
+/// its own default for blocking hooks and far above dcg's fast path.
+fn reasonix_dcg_hook_entry_for_executable(
+    executable: &std::path::Path,
+    windows: bool,
+) -> std::io::Result<serde_json::Value> {
+    if !executable.is_absolute() {
+        return Err(std::io::Error::other(format!(
+            "dcg hook executable path is not absolute: {}",
+            executable.display()
+        )));
+    }
+    let executable = executable.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "dcg hook executable path is not valid UTF-8: {}",
+                executable.display()
+            ),
+        )
+    })?;
+    let command = if windows {
+        format!("\"{executable}\"")
+    } else {
+        posix_quote_hook_program(executable)
+    };
+    Ok(serde_json::json!({
+        "match": REASONIX_SHELL_MATCH,
+        "command": command,
+        "description": "dcg: block destructive shell commands",
+        "timeout": 5000
+    }))
+}
+
+fn reasonix_hook_entry_is_dcg(entry: &serde_json::Value) -> bool {
+    entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(is_dcg_command)
+}
+
+/// Install (or refresh) dcg's entry in an in-memory Reasonix settings object.
+///
+/// Stale dcg entries are removed and the fresh one is inserted first:
+/// Reasonix runs a scope's hooks in array order and stops at the first block.
+/// A user's own `timeout` or `description` on the previous dcg entry is kept.
+/// Returns `Ok(true)` when the settings changed (always `true` with `force`).
+///
+/// # Errors
+///
+/// Returns an error for a shape dcg does not understand (not an object, a
+/// non-object `hooks`, a non-array `PreToolUse`, or the editor's bare
+/// event-keyed shorthand); dcg never rewrites what it cannot read.
+fn install_reasonix_hook_into_settings(
+    settings: &mut serde_json::Value,
+    force: bool,
+    desired_entry: serde_json::Value,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let settings_obj = settings
+        .as_object_mut()
+        .ok_or("Invalid Reasonix settings.json (expected a JSON object with a \"hooks\" key)")?;
+    if !settings_obj.contains_key("hooks") && settings_obj.contains_key(REASONIX_PRE_TOOL_USE_EVENT)
+    {
+        return Err(
+            "Reasonix settings.json uses the bare event-keyed shorthand; save it once from \
+             Reasonix (Settings -> Hooks) so it is written as {\"hooks\": ...}, then retry"
+                .into(),
+        );
+    }
+    let hooks = settings_obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    let original = hooks.clone();
+    let entries = hooks
+        .as_object_mut()
+        .ok_or("Invalid hooks format in Reasonix settings.json (expected JSON object)")?
+        .entry(REASONIX_PRE_TOOL_USE_EVENT)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or("Invalid hooks.PreToolUse format in Reasonix settings.json (expected JSON array)")?;
+
+    let previous = entries.iter().find(|entry| reasonix_hook_entry_is_dcg(entry)).cloned();
+    entries.retain(|entry| !reasonix_hook_entry_is_dcg(entry));
+    let mut entry = desired_entry;
+    if let (Some(previous), Some(entry)) = (
+        previous.as_ref().and_then(serde_json::Value::as_object),
+        entry.as_object_mut(),
+    ) {
+        for key in ["timeout", "description"] {
+            if let Some(value) = previous.get(key) {
+                entry.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    entries.insert(0, entry);
+
+    Ok(force || *hooks != original)
+}
+
+/// Remove dcg's entries from an in-memory Reasonix settings object. Returns
+/// `Ok(true)` when at least one entry was removed.
+fn uninstall_dcg_hook_from_reasonix_settings(
+    settings: &mut serde_json::Value,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(entries) = settings
+        .get_mut("hooks")
+        .and_then(|hooks| hooks.get_mut(REASONIX_PRE_TOOL_USE_EVENT))
+    else {
+        return Ok(false);
+    };
+    let entries = entries
+        .as_array_mut()
+        .ok_or("Invalid hooks.PreToolUse format in Reasonix settings.json (expected JSON array)")?;
+    let before = entries.len();
+    entries.retain(|entry| !reasonix_hook_entry_is_dcg(entry));
+    Ok(entries.len() != before)
+}
+
+fn read_reasonix_settings(
+    path: &std::path::Path,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    if content.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    Ok(serde_json::from_str(&content)?)
+}
+
+/// Merge dcg's hook entry into the Reasonix settings at `path` without
+/// printing (shared by `dcg install --reasonix` and `dcg doctor --fix`).
+/// Returns `Ok(true)` when the file was (re)written.
+fn install_reasonix_hook_at(
+    path: &std::path::Path,
+    force: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut settings = if path.exists() {
+        read_reasonix_settings(path)?
+    } else {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        serde_json::json!({})
+    };
+    let entry = reasonix_dcg_hook_entry_for_executable(&current_dcg_executable()?, cfg!(windows))?;
+    let changed = install_reasonix_hook_into_settings(&mut settings, force, entry)?;
+    if changed {
+        std::fs::write(path, serde_json::to_string_pretty(&settings)?)?;
+    }
+    Ok(changed)
+}
+
+/// Install the dcg hook into Reasonix's settings (#358).
+fn install_reasonix_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let path = if project {
+        project_reasonix_settings_path()?
+    } else {
+        reasonix_user_settings_path()
+    };
+    if !install_reasonix_hook_at(&path, force)? {
+        println!("{}", "Hook already installed!".yellow());
+        println!("Use --force to reinstall");
+        return Ok(());
+    }
+    let level = if project { "project" } else { "user" };
+    println!("{}", "Reasonix hook installed successfully!".green().bold());
+    println!("Settings updated ({level}): {}", path.display());
+    println!();
+    println!(
+        "{}",
+        "Restart Reasonix for the change to take effect (hooks load when a session is \
+         built; /new does not reload them)."
+            .yellow()
+    );
+    Ok(())
+}
+
+/// Remove the dcg hook entry from Reasonix's user-level settings (#358).
+fn uninstall_reasonix_hook() -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let path = reasonix_user_settings_path();
+    if !path.exists() {
+        println!("{} {}", "No Reasonix settings found at".yellow(), path.display());
+        return Ok(());
+    }
+    let mut settings = read_reasonix_settings(&path)?;
+    if uninstall_dcg_hook_from_reasonix_settings(&mut settings)? {
+        std::fs::write(&path, serde_json::to_string_pretty(&settings)?)?;
+        println!("{}", "Reasonix hook removed successfully!".green().bold());
+        println!("Settings updated: {}", path.display());
+    } else {
+        println!("{}", "No dcg hook found in Reasonix settings.".yellow());
+    }
+    Ok(())
+}
+
+/// Whether the user-level Reasonix settings register a dcg `PreToolUse` hook.
+/// `Err` means the file exists but cannot be parsed.
+fn reasonix_user_settings_register_dcg() -> Result<bool, String> {
+    let path = reasonix_user_settings_path();
+    if !path.exists() {
+        return Ok(false);
+    }
+    let settings = read_reasonix_settings(&path).map_err(|error| error.to_string())?;
+    Ok(settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get(REASONIX_PRE_TOOL_USE_EVENT))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entries| entries.iter().any(reasonix_hook_entry_is_dcg)))
+}
+
+/// Whether Reasonix is plausibly in use on this machine: its home exists.
+fn reasonix_appears_in_use() -> bool {
+    reasonix_home().is_dir()
 }
 
 /// Ownership marker embedded in the generated OpenCode plugin (#318).
@@ -22061,6 +22396,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(!force);
@@ -22086,6 +22422,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(force);
@@ -22111,6 +22448,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(!force);
@@ -22136,6 +22474,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(!force);
@@ -22161,6 +22500,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(!force);
@@ -22186,6 +22526,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(!force);
@@ -22211,6 +22552,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(!force);
@@ -22236,6 +22578,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(force);
@@ -22261,6 +22604,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(force);
@@ -22286,6 +22630,7 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            reasonix: _,
         }) = cli.command
         {
             assert!(force);
@@ -22303,7 +22648,7 @@ if ($errors.Count -ne 0) {
     #[test]
     fn test_cli_parse_uninstall_crush_excludes_purge() {
         let cli = Cli::parse_from(["dcg", "uninstall", "--crush"]);
-        if let Some(Command::Uninstall { purge, crush }) = cli.command {
+        if let Some(Command::Uninstall { purge, crush, .. }) = cli.command {
             assert!(!purge);
             assert!(crush);
         } else {

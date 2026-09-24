@@ -32,7 +32,7 @@ use destructive_command_guard::evaluator::{
 };
 #[allow(unused_imports)]
 use destructive_command_guard::exit_codes::{
-    EXIT_BROKEN_PIPE, EXIT_DENIED, EXIT_PARSE_ERROR, EXIT_SUCCESS,
+    EXIT_BROKEN_PIPE, EXIT_DENIED, EXIT_PARSE_ERROR, EXIT_REASONIX_WARNING, EXIT_SUCCESS,
 };
 use destructive_command_guard::history::{
     CommandEntry, HistoryWriter, Outcome as HistoryOutcome, ResolvedHistoryPath,
@@ -151,6 +151,7 @@ fn history_agent_type_for_protocol(protocol: hook::HookProtocol, detected_agent:
         hook::HookProtocol::Grok => Agent::Grok.config_key(),
         hook::HookProtocol::Antigravity => Agent::Antigravity.config_key(),
         hook::HookProtocol::Crush => Agent::Crush.config_key(),
+        hook::HookProtocol::Reasonix => Agent::Reasonix.config_key(),
         hook::HookProtocol::ClaudeCompatible => detected_agent.config_key(),
     }
 }
@@ -167,6 +168,7 @@ fn effective_agent_for_hook_protocol(
         hook::HookProtocol::Grok => Agent::Grok,
         hook::HookProtocol::Antigravity => Agent::Antigravity,
         hook::HookProtocol::Crush => Agent::Crush,
+        hook::HookProtocol::Reasonix => Agent::Reasonix,
         hook::HookProtocol::ClaudeCompatible => detected_agent.clone(),
     }
 }
@@ -231,6 +233,9 @@ fn format_indeterminate_reason(stage: &str, budget: Duration) -> String {
 /// that closed stderr too simply gets the status.
 fn blocking_verdict_exit_code(protocol: hook::HookProtocol, delivery: io::Result<()>) -> i32 {
     match delivery {
+        // Reasonix reads only the exit status (#358): exit 0 would let the
+        // command run whatever was written.
+        Ok(()) if protocol.blocks_by_exit_status() => protocol.undeliverable_block_exit_code(),
         Ok(()) => EXIT_SUCCESS,
         Err(error) => {
             let exit_code = protocol.undeliverable_block_exit_code();
@@ -1534,7 +1539,13 @@ fn publish_decisive_response(
                 pattern,
                 explanation,
             );
-            EXIT_SUCCESS
+            // Reasonix shows a hook's output only when it does not pass, and
+            // treats any status other than 0 or 2 as a non-blocking warning.
+            if ctx.hook_protocol.blocks_by_exit_status() {
+                EXIT_REASONIX_WARNING
+            } else {
+                EXIT_SUCCESS
+            }
         }
         // Unreachable: Log-mode entries are handled at resolve time.
         DecisionMode::Log => EXIT_SUCCESS,

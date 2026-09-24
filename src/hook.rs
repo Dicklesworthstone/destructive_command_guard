@@ -548,6 +548,20 @@ pub enum HookProtocol {
     /// `permissionDecision` envelope Crush does not read, so a block was
     /// silently downgraded to "no opinion" — dcg failed open under Crush.
     Crush,
+    /// Reasonix (DeepSeek-Reasonix) native hooks (#358). Wire shape: stdin
+    /// carries one line of camelCase JSON, `{"event": "PreToolUse", "cwd":
+    /// "...", "toolName": "bash", "toolArgs": {"command": "..."}}`, with no
+    /// session id and no `tool_input`. Reasonix reads **only the exit
+    /// status**: exit 2 (or a timeout) blocks, and stderr, falling back to
+    /// stdout, becomes the reason shown to the user and the model. Exit 0
+    /// passes, and any other non-zero status is a non-blocking warning.
+    /// There is no `ask`. So every blocking verdict (deny, review,
+    /// indeterminate) exits 2 with dcg's plain-text reason on stderr, and a
+    /// warning exits 1. Before this variant the payload matched the
+    /// Copilot arm (`event` + `toolArgs`), dcg exited 0 with a JSON deny
+    /// Reasonix never reads, and the command ran.
+    /// Documented in `docs/DESKTOP_HOOKS.zh-CN.md` of esengine/DeepSeek-Reasonix.
+    Reasonix,
 }
 
 impl HookProtocol {
@@ -571,6 +585,7 @@ impl HookProtocol {
     /// | `Codex` | logged as a hook failure, then fails open — the same outcome as exit 0 with no JSON |
     /// | `Hermes` | warning logged, never aborts — same as exit 0 with no JSON |
     /// | `Antigravity` | logged, does not reliably abort — same as exit 0 with no JSON |
+    /// | `Reasonix` | blocks — exit 2 is its only blocking channel (see [`Self::blocks_by_exit_status`]) |
     ///
     /// Every arm maps to [`EXIT_HOOK_BLOCK`] today; the match is spelled out
     /// so a new protocol has to state its contract here rather than inherit
@@ -587,13 +602,26 @@ impl HookProtocol {
     pub const fn undeliverable_block_exit_code(self) -> i32 {
         match self {
             // Exit 2 is the blocking status of the protocol itself.
-            Self::ClaudeCompatible | Self::Gemini | Self::Copilot | Self::Crush | Self::Grok => {
-                EXIT_HOOK_BLOCK
-            }
+            Self::ClaudeCompatible
+            | Self::Gemini
+            | Self::Copilot
+            | Self::Crush
+            | Self::Grok
+            | Self::Reasonix => EXIT_HOOK_BLOCK,
             // Non-zero is logged and fails open: no worse than exit 0, and
             // visibly a hook failure rather than a silent allow.
             Self::Codex | Self::Hermes | Self::Antigravity => EXIT_HOOK_BLOCK,
         }
+    }
+
+    /// Whether the host reads the verdict from the exit status alone.
+    ///
+    /// Every other protocol reads JSON from stdout and dcg exits 0 beside it.
+    /// Reasonix never reads stdout for `PreToolUse`: a blocking verdict must
+    /// exit 2, with the reason on stderr, or the command runs.
+    #[must_use]
+    pub const fn blocks_by_exit_status(self) -> bool {
+        matches!(self, Self::Reasonix)
     }
 }
 
@@ -1297,6 +1325,21 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         .is_some_and(|event| event.eq_ignore_ascii_case("PreToolUse"));
     if is_crush_event && input.tool_input.is_some() && input.tool_args.is_none() {
         return HookProtocol::Crush;
+    }
+
+    // --- Reasonix indicators (checked before Copilot) ---
+    // Reasonix's native envelope is `{"event": "PreToolUse", "cwd",
+    // "toolName": "bash", "toolArgs": {"command": ...}}` (#358). It shares
+    // Copilot's `toolArgs` key, but Copilot's event is the hyphenated
+    // "pre-tool-use" and its `toolArgs` is a JSON-encoded *string*; Reasonix
+    // sends PascalCase "PreToolUse" and a JSON *object*, and no `tool_input`
+    // (which is Crush's). Misrouted to Copilot, dcg exited 0 beside a JSON
+    // deny that Reasonix never reads, and the command ran.
+    if is_crush_event
+        && input.tool_input.is_none()
+        && input.tool_args.as_ref().is_some_and(serde_json::Value::is_object)
+    {
+        return HookProtocol::Reasonix;
     }
 
     // --- Copilot indicators (checked first) ---
@@ -2630,6 +2673,24 @@ pub fn write_denial_to(
     branch_context: Option<&crate::evaluator::BranchContext>,
 ) {
     let allow_once_code = allow_once.map(|info| info.code.as_str());
+
+    // Reasonix reads the exit status and shows stderr, verbatim, to the user
+    // and the model (#358). The reason goes there as the same plain text other
+    // hosts receive as `permissionDecisionReason`, without the decorated
+    // terminal box, and nothing goes to stdout. The caller exits 2.
+    if protocol.blocks_by_exit_status() {
+        let message = format_denial_message(
+            command,
+            reason,
+            explanation,
+            pack,
+            pattern,
+            allow_once_code,
+        );
+        let _ = writeln!(stderr, "{message}");
+        return;
+    }
+
     let warning_audience = match protocol {
         HookProtocol::Codex => WarningAudience::CodexModel,
         HookProtocol::ClaudeCompatible
@@ -2638,7 +2699,8 @@ pub fn write_denial_to(
         | HookProtocol::Hermes
         | HookProtocol::Grok
         | HookProtocol::Antigravity
-        | HookProtocol::Crush => WarningAudience::HumanOperator,
+        | HookProtocol::Crush
+        | HookProtocol::Reasonix => WarningAudience::HumanOperator,
     };
 
     print_colorful_warning_to(
@@ -2847,6 +2909,8 @@ pub fn write_denial_to(
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }
+        // Returned above: exit-status protocols get their reason on stderr.
+        HookProtocol::Reasonix => {}
     }
 }
 
@@ -2952,7 +3016,8 @@ pub fn write_review_request_to(
         | HookProtocol::Hermes
         | HookProtocol::Grok
         | HookProtocol::Antigravity
-        | HookProtocol::Crush => {
+        | HookProtocol::Crush
+        | HookProtocol::Reasonix => {
             unreachable!("non-review protocols returned through write_denial_to")
         }
     }
@@ -3239,6 +3304,10 @@ pub fn write_indeterminate_to(
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }
+        // No `ask` exists: the reason above is on stderr, and the caller exits
+        // 2 (`blocks_by_exit_status`), so an unverified command is blocked
+        // whatever `unverified_decision` says.
+        HookProtocol::Reasonix => {}
     }
 
     // A deadline response is useful only if the hook runner receives it before
@@ -3312,6 +3381,9 @@ pub(crate) fn write_warning_to(
         // Keeping warn distinct from ask preserves the documented policy:
         // warn proceeds, while ask requires an explicit operator decision.
         HookProtocol::ClaudeCompatible | HookProtocol::Copilot | HookProtocol::Codex => {}
+        // The warning above is on stderr; the caller exits 1, which Reasonix
+        // shows as a non-blocking warning (exit 0 would hide it).
+        HookProtocol::Reasonix => {}
         HookProtocol::Gemini => {
             // Gemini hooks support allow/deny only. Preserve dcg warn as
             // non-blocking while still surfacing the warning text to Gemini.
@@ -6498,6 +6570,9 @@ mod tests {
                 | HookProtocol::Grok
                 | HookProtocol::Antigravity
                 | HookProtocol::Crush => (json["decision"].as_str(), json["reason"].as_str()),
+                HookProtocol::Reasonix => {
+                    unreachable!("exit-status protocol, covered by the Reasonix test below")
+                }
             };
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
@@ -6509,6 +6584,64 @@ mod tests {
                 assert_eq!(json["message"], REASON);
             }
         }
+    }
+
+    /// Reasonix reads only the exit status (#358): its payload must be
+    /// recognized as such, and every blocking verdict must put a plain reason
+    /// on stderr and nothing on stdout, since the caller exits 2.
+    #[test]
+    fn reasonix_is_detected_and_answered_through_stderr_issue_358() {
+        let reasonix: HookInput = serde_json::from_str(
+            r#"{"event":"PreToolUse","cwd":"/repo","toolName":"bash","toolArgs":{"command":"git reset --hard"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&reasonix), HookProtocol::Reasonix);
+        // Copilot shares `toolArgs` but sends a hyphenated event and a string.
+        let copilot: HookInput = serde_json::from_str(
+            r#"{"event":"pre-tool-use","toolName":"bash","toolArgs":"{\"command\":\"ls\"}"}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&copilot), HookProtocol::Copilot);
+        // Crush shares the PascalCase event but sends snake_case tool_input.
+        let crush: HookInput = serde_json::from_str(
+            r#"{"event":"PreToolUse","session_id":"s","tool_name":"bash","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&crush), HookProtocol::Crush);
+
+        assert!(HookProtocol::Reasonix.blocks_by_exit_status());
+        assert!(!HookProtocol::Crush.blocks_by_exit_status());
+        assert!(!HookProtocol::ClaudeCompatible.blocks_by_exit_status());
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        write_denial_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Reasonix,
+            "git reset --hard",
+            "git reset --hard destroys uncommitted changes.",
+            Some("core.git"),
+            Some("reset-hard"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+        );
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stdout.is_empty(), "Reasonix never reads stdout");
+        assert!(stderr.starts_with("BLOCKED by dcg"), "{stderr}");
+        assert!(stderr.contains("Rule: core.git:reset-hard"), "{stderr}");
+        assert!(!stderr.contains("+---"), "no decorated box for the model: {stderr}");
+
+        let mut stdout = FlushProbe::default();
+        let mut stderr = FlushProbe::default();
+        write_indeterminate_to(&mut stdout, &mut stderr, HookProtocol::Reasonix, "unverified", false);
+        assert!(stdout.bytes.is_empty());
+        assert!(String::from_utf8_lossy(&stderr.bytes).contains("unverified"));
     }
 
     /// #338: `general.unverified_decision = "deny"` must convert the
@@ -6557,6 +6690,9 @@ mod tests {
                 | HookProtocol::Grok
                 | HookProtocol::Antigravity
                 | HookProtocol::Crush => (json["decision"].as_str(), json["reason"].as_str()),
+                HookProtocol::Reasonix => {
+                    unreachable!("exit-status protocol, covered by the Reasonix test")
+                }
             };
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
@@ -6626,6 +6762,9 @@ mod tests {
                 | HookProtocol::Grok
                 | HookProtocol::Antigravity
                 | HookProtocol::Crush => (json["decision"].as_str(), json["reason"].as_str()),
+                HookProtocol::Reasonix => {
+                    unreachable!("exit-status protocol, covered by the Reasonix test")
+                }
             };
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");

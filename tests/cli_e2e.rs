@@ -2315,6 +2315,116 @@ mod config_tests {
         assert!(cwd.join(".omp/extensions/dcg-guard.ts").is_file());
     }
 
+    /// #358: `dcg install --reasonix` merges a `hooks.PreToolUse` entry into
+    /// `<Reasonix home>/settings.json`, keeps unrelated settings and hooks, is
+    /// idempotent, and keeps a user's timeout on reinstall. The installed
+    /// command is then run the way Reasonix runs it (`sh -c`, the Reasonix
+    /// payload on stdin): exit 2 with the reason on stderr blocks a
+    /// destructive command, exit 0 lets a safe one through. `dcg uninstall
+    /// --reasonix` removes exactly what it added.
+    #[test]
+    fn install_reasonix_hook_blocks_through_the_installed_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
+        let reasonix_home = temp.path().join("reasonix-home");
+        let settings_path = reasonix_home.join("settings.json");
+        std::fs::create_dir_all(&reasonix_home).expect("reasonix home");
+        std::fs::write(
+            &settings_path,
+            r#"{"theme":"dark","hooks":{"PreToolUse":[{"match":"bash","command":"node check.js"}],"Stop":[{"command":"echo done"}]}}"#,
+        )
+        .expect("seed settings.json");
+
+        let run = |args: &[&str]| {
+            std::process::Command::new(dcg_binary())
+                .args(args)
+                .env_clear()
+                .env("HOME", &home_dir)
+                .env("USERPROFILE", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                .env("REASONIX_HOME", &reasonix_home)
+                .current_dir(temp.path())
+                .output()
+                .expect("run dcg")
+        };
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("settings.json stays valid JSON")
+        };
+
+        let output = run(&["install", "--reasonix"]);
+        assert!(
+            output.status.success(),
+            "install --reasonix: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let settings = read();
+        assert_eq!(settings["theme"], "dark", "unrelated settings kept");
+        assert_eq!(settings["hooks"]["Stop"][0]["command"], "echo done");
+        let entries = settings["hooks"]["PreToolUse"].as_array().expect("array");
+        assert_eq!(entries.len(), 2, "{settings}");
+        assert_eq!(entries[0]["match"], "bash|pwsh");
+        assert_eq!(entries[0]["timeout"], 5000);
+        assert_eq!(entries[1]["command"], "node check.js");
+        let command = entries[0]["command"].as_str().expect("command").to_string();
+
+        // Idempotent, and a user's timeout survives a forced reinstall.
+        assert!(
+            String::from_utf8_lossy(&run(&["install", "--reasonix"]).stdout)
+                .contains("already installed")
+        );
+        let mut settings = read();
+        settings["hooks"]["PreToolUse"][0]["timeout"] = serde_json::json!(8000);
+        std::fs::write(&settings_path, settings.to_string()).expect("edit timeout");
+        assert!(run(&["install", "--reasonix", "--force"]).status.success());
+        assert_eq!(read()["hooks"]["PreToolUse"][0]["timeout"], 8000);
+        assert_eq!(read()["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+
+        // The installed command, run as Reasonix runs it.
+        #[cfg(unix)]
+        {
+            let hook = |shell_command: &str| {
+                let payload = serde_json::json!({
+                    "event": "PreToolUse",
+                    "cwd": temp.path(),
+                    "toolName": "bash",
+                    "toolArgs": { "command": shell_command },
+                });
+                let mut child = std::process::Command::new("sh")
+                    .args(["-c", &command])
+                    .env_clear()
+                    .env("HOME", &home_dir)
+                    .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                    .env("PATH", "/usr/bin:/bin")
+                    .current_dir(temp.path())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("spawn installed hook");
+                serde_json::to_writer(child.stdin.as_mut().unwrap(), &payload).unwrap();
+                child.wait_with_output().expect("hook output")
+            };
+            let blocked = hook("git reset --hard");
+            assert_eq!(blocked.status.code(), Some(2), "exit 2 blocks in Reasonix");
+            assert!(blocked.stdout.is_empty(), "Reasonix never reads stdout");
+            let reason = String::from_utf8_lossy(&blocked.stderr);
+            assert!(reason.contains("BLOCKED by dcg"), "{reason}");
+            assert!(reason.contains("core.git:reset-hard"), "{reason}");
+
+            let allowed = hook("git status");
+            assert_eq!(allowed.status.code(), Some(0), "exit 0 passes");
+        }
+
+        let output = run(&["uninstall", "--reasonix"]);
+        assert!(output.status.success());
+        let settings = read();
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{settings}");
+        assert_eq!(entries[0]["command"], "node check.js");
+        assert_eq!(settings["theme"], "dark");
+    }
+
     /// #388: `dcg install --crush` merges a flat `hooks.PreToolUse` entry into
     /// Crush's user config (`$XDG_CONFIG_HOME/crush/crush.json`), preserves
     /// unrelated keys and hooks, is idempotent without --force, honors the
