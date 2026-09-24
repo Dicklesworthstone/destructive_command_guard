@@ -81,10 +81,31 @@ pub fn create_pack() -> Pack {
 
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
-        // chmod on files (not directories recursively)
+        // A non-recursive chmod on an ordinary file is routine, so it is
+        // exempted. The exemption keyed only on "the target does not begin with
+        // `/`", and a safe match short-circuits the whole pack, so every other
+        // way of naming an absolute or home path walked straight through it:
+        //
+        //   chmod 777 /etc/shadow        denied
+        //   chmod 777 "/etc/shadow"      ALLOWED   <- same file, one quote
+        //   chmod 777 ~/.ssh/id_rsa      ALLOWED
+        //   chmod 777 $HOME/.ssh/id_rsa  ALLOWED
+        //   chmod 4755 ~/bin/tool        ALLOWED   <- setuid, same cause
+        //
+        // The quoted spelling is the sharpest: the shell unquotes it to the
+        // identical path, so the deny and the allow name the same file. This is
+        // the `~`/`$HOME` family that #489 fixed for the RECURSIVE rules, in
+        // the one place that is a safe pattern rather than a destructive one —
+        // and `quote_bypass_does_not_evade_system_dir_block` pinned only the
+        // recursive half.
+        //
+        // Excluding `~`, `$`, `"` and `'` alongside `/` costs nothing real:
+        // those four never begin an ordinary relative filename, and a target
+        // that is genuinely plain (`notes.txt`, `./build`) still matches. The
+        // exemption is narrowed, never a destructive pattern widened.
         safe_pattern!(
             "chmod-non-recursive",
-            r"chmod\s+(?!-[rR])(?:\d{3,4}|[ugoa][+-][rwxXst]+)\s+[^/]"
+            r#"chmod\s+(?!-[rR])(?:\d{3,4}|[ugoa][+-][rwxXst]+)\s+[^/~$"']"#
         ),
         // stat is safe (read-only), but only when stat is what runs. As a bare
         // word it matched anywhere in the segment, and a safe match
@@ -434,6 +455,47 @@ mod tests {
         assert_patterns_compile(&pack);
         assert_all_patterns_have_reasons(&pack);
         assert_unique_pattern_names(&pack);
+    }
+
+    /// The non-recursive exemption keyed only on a leading `/`, so every other
+    /// spelling of an absolute or home path walked through it — and because a
+    /// safe match short-circuits the pack, that meant `chmod-777` and
+    /// `chmod-setuid` never ran on those targets.
+    ///
+    /// `chmod 777 "/etc/shadow"` is the sharpest case: the shell unquotes it to
+    /// the identical path that `chmod 777 /etc/shadow` denies.
+    #[test]
+    fn the_non_recursive_exemption_does_not_cover_quoted_or_home_targets() {
+        let pack = create_pack();
+        for (command, rule) in [
+            (r#"chmod 777 "/etc/shadow""#, "chmod-777"),
+            (r"chmod 777 '/etc/shadow'", "chmod-777"),
+            (r"chmod 777 ~/.ssh/id_rsa", "chmod-777"),
+            (r"chmod 777 ~/.ssh/authorized_keys", "chmod-777"),
+            (r"chmod 777 $HOME/.ssh/id_rsa", "chmod-777"),
+            (r"chmod 777 ${HOME}/.ssh/id_rsa", "chmod-777"),
+            // Same cause, different rule: the exemption also hid setuid.
+            (r"chmod 4755 ~/bin/tool", "chmod-setuid"),
+            (r"chmod u+s ~/bin/tool", "chmod-setuid"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+
+        // A genuinely plain target keeps the exemption — this is the whole
+        // reason it exists, and narrowing it must not cost the routine case.
+        for command in [
+            "chmod 777 notes.txt",
+            "chmod 644 notes.txt",
+            "chmod 755 ./build",
+            "chmod u+x ./script.sh",
+            "chmod 700 ./mydir",
+            // Hardening a key is the safe direction and stays allowed.
+            "chmod 600 ~/.ssh/id_rsa",
+            "chmod 0600 $HOME/.ssh/id_rsa",
+            r#"chmod 600 "/etc/shadow""#,
+        ] {
+            assert_allows(&pack, command);
+        }
     }
 
     #[test]
