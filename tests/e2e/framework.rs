@@ -483,6 +483,19 @@ impl E2ETestContext {
 
 /// Find the DCG binary, preferring local build artifacts.
 fn find_dcg_binary() -> PathBuf {
+    // The binary Cargo built for THIS test crate, recorded at compile time.
+    // It has to come first. cargo-nextest does not set the runtime
+    // `CARGO_BIN_EXE_*` variables read below, and with a non-default
+    // CARGO_TARGET_DIR the `./target` probes find nothing (or a stale build),
+    // so golden tests under nextest silently exercised whatever older `dcg`
+    // was on PATH and reported phantom mismatches.
+    if let Some(path) = option_env!("CARGO_BIN_EXE_dcg")
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+    {
+        return std::fs::canonicalize(&path).unwrap_or(path);
+    }
+
     // Cargo integration tests expose built binaries via CARGO_BIN_EXE_* env vars.
     for env_var in [
         "CARGO_BIN_EXE_dcg",

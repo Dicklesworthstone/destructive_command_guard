@@ -3,7 +3,6 @@ use std::fs;
 use tempfile::tempdir;
 
 #[test]
-#[allow(deprecated)]
 fn test_config_load_swallows_parse_error() {
     // Create a temp directory
     let temp_dir = tempdir().expect("failed to create temp dir");
@@ -19,7 +18,9 @@ invalid_syntax_here =
     fs::write(&config_path, invalid_toml).expect("failed to write config file");
 
     // Run `dcg config` pointing to this file
-    let mut cmd = Command::cargo_bin("dcg").expect("failed to find binary");
+    // The compile-time path: the deprecated `Command::cargo_bin` reads
+    // `CARGO_BIN_EXE_dcg` at RUN time, which cargo-nextest does not set.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dcg"));
     cmd.env("DCG_CONFIG", &config_path).arg("config");
 
     // We EXPECT it to succeed (exit 0) but ignore the file (so verbose=false default).
