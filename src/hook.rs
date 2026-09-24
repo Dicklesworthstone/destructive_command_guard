@@ -1920,6 +1920,34 @@ const CMD_WRITER_VERBS: &[&str] = &[
     "copy", "xcopy", "robocopy", "move", "ren", "rename", "mklink",
 ];
 
+/// Executable names with no POSIX counterpart, each already a keyword on a
+/// default-on `windows.*` row with a rule behind it.
+///
+/// Unlike [`WINDOWS_DESTRUCTIVE_ALIASES`] and [`CMD_WRITER_VERBS`], these need
+/// no corroborating argument shape: nothing on a POSIX system is called
+/// `diskpart` or `bcdedit`, so the command word alone settles the payload.
+///
+/// Each was MEASURED allow-by-default and deny-when-the-pack-is-named before
+/// being listed, because a name with no rule behind it would widen the hot
+/// path and buy nothing — the same trade `KEYWORDS_DEAD_BUT_COVERED` records
+/// for the registry rows:
+///
+/// ```text
+/// diskpart /s script.txt          -> windows.system:diskpart
+/// bcdedit /deletevalue safeboot   -> windows.system:bcdedit-delete
+/// cipher /w:C:\                   -> windows.system:cipher-wipe
+/// wbadmin delete catalog -quiet   -> windows.system:wbadmin-delete
+/// ```
+///
+/// Deliberately absent, each for its own reason: `reg`, `sc` and `net` collide
+/// with POSIX (samba ships `net`) and belong to the opt-in `windows.misc`;
+/// `fsutil`, `schtasks`, `takeown`, `icacls`, `cacls` and `attrib` have no rule
+/// claiming them yet, so listing them would be a dead widening; and `format`
+/// keeps its drive-letter requirement in
+/// [`segment_is_format_drive_invocation`] because the bare word is ordinary
+/// English.
+const WINDOWS_ONLY_EXECUTABLES: &[&str] = &["diskpart", "bcdedit", "cipher", "wbadmin"];
+
 /// PowerShell `Remove-Item` parameter names used as the discriminator. A
 /// single-dash token whose name is a >=3-character prefix of one of these is
 /// unmistakably PowerShell: POSIX/GNU `rm` never accepts a single-dash
@@ -2050,6 +2078,25 @@ fn segment_is_cmd_writer_invocation(segment: &str) -> bool {
         .any(is_windows_path_token)
 }
 
+/// Return whether a segment's command word is one of
+/// [`WINDOWS_ONLY_EXECUTABLES`].
+///
+/// The name is taken after stripping any directory prefix and an `.exe`
+/// suffix, so `C:\Windows\System32\diskpart.exe` and a git-bash
+/// `/c/Windows/System32/bcdedit` both count.
+fn segment_is_windows_only_executable(segment: &str) -> bool {
+    let Some(first) = segment.split_whitespace().next() else {
+        return false;
+    };
+    let lowered = first.trim_matches(['"', '\'']).to_ascii_lowercase();
+    let base = lowered
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(lowered.as_str());
+    let name = base.strip_suffix(".exe").unwrap_or(base);
+    WINDOWS_ONLY_EXECUTABLES.contains(&name)
+}
+
 /// Return whether a segment runs Windows `format` against a drive letter
 /// (`format D: /q`, `/c/Windows/System32/format.com E:`).
 ///
@@ -2095,6 +2142,7 @@ fn command_has_powershell_shape(command: &str) -> bool {
                 .is_some_and(is_powershell_cmdlet_token)
                 || segment_is_windows_alias_invocation(segment)
                 || segment_is_cmd_writer_invocation(segment)
+                || segment_is_windows_only_executable(segment)
                 || segment_is_format_drive_invocation(segment)
         })
 }
@@ -4355,6 +4403,51 @@ mod tests {
                 refine_shell_dialect(command, ShellDialect::Posix),
                 ShellDialect::Posix,
                 "plain POSIX writer usage must not widen: {command:?}"
+            );
+        }
+    }
+
+    /// Bare Windows-only executables widen the dialect on the name alone.
+    ///
+    /// Each of these has a rule waiting on a default-on `windows.*` pack
+    /// (`diskpart`, `bcdedit-delete`, `cipher-wipe`, `wbadmin-delete`) that was
+    /// unreachable because nothing marked the payload Windows: the name is not
+    /// a cmdlet, not a destructive alias, not a cmd writer, and not
+    /// `format <drive>:`.
+    #[test]
+    fn bare_windows_only_executables_widen_the_dialect() {
+        for command in [
+            "diskpart /s script.txt",
+            "diskpart",
+            "bcdedit /deletevalue safeboot",
+            "cipher /w:C:\\",
+            "wbadmin delete catalog -quiet",
+            "wbadmin delete backup -keepVersions:0",
+            "DISKPART.EXE /s x.txt",
+            "C:\\Windows\\System32\\bcdedit.exe /deletevalue safeboot",
+            "/c/Windows/System32/diskpart /s x.txt",
+            "echo ok && cipher /w:D:\\",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "windows-only executable must widen: {command:?}"
+            );
+        }
+
+        // The name has to be the COMMAND word, not an argument or a substring:
+        // widening on a mention would down-trust ordinary Bash.
+        for command in [
+            "echo diskpart is a windows tool",
+            "grep -rn bcdedit notes.md",
+            "git commit -m 'document cipher usage'",
+            "./diskpart-notes.sh",
+            "cat wbadmin.log",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "a mention must not widen: {command:?}"
             );
         }
     }

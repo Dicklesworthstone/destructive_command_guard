@@ -96,6 +96,14 @@ fn windows_default_on_packs_activate_from_a_bash_labeled_payload() {
         // windows.system, reached by PowerShell cmdlet shape.
         "Initialize-Disk -Number 0",
         "Remove-Partition -DiskNumber 0 -PartitionNumber 1",
+        // windows.system, reached by the bare executable name: these match no
+        // cmdlet, no destructive alias, no cmd writer and no `format <drive>:`,
+        // so nothing marked the payload Windows and the rules behind them were
+        // unreachable even once activation itself was fixed.
+        "diskpart /s script.txt",
+        "bcdedit /deletevalue safeboot",
+        "cipher /w:C:\\",
+        "wbadmin delete catalog -quiet",
     ] {
         assert_eq!(
             default_config_decision(command),
@@ -138,6 +146,10 @@ fn posix_commands_keep_the_default_pack_set() {
         // drive-letter operand is what the signal requires, not the word.
         "dir C:\\",
         "echo format D: is a windows command",
+        // A Windows-only executable named as data rather than run: the signal
+        // reads the command word, so a mention must not acquire the packs.
+        "echo diskpart is a windows tool",
+        "grep -rn bcdedit notes.md",
     ] {
         assert_eq!(
             default_config_decision(command),
