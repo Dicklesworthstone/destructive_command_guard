@@ -1632,10 +1632,14 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "cicd.jenkins",
-        &["jenkins-cli", "jenkins", "doDelete"],
+        &["jenkins-cli", "jenkins", "doDelete", "curl"],
         cicd::jenkins::create_pack,
     ),
-    PackEntry::new("cicd.circleci", &["circleci"], cicd::circleci::create_pack),
+    PackEntry::new(
+        "cicd.circleci",
+        &["circleci", "curl"],
+        cicd::circleci::create_pack,
+    ),
     PackEntry::new("secrets.vault", &["vault"], secrets::vault::create_pack),
     PackEntry::new(
         "secrets.aws_secrets",
@@ -1719,6 +1723,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "cloudflare",
             "api.cloudflare.com",
             "dns-records",
+            "curl",
         ],
         dns::cloudflare::create_pack,
     ),
@@ -1756,17 +1761,17 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         // fire solely by coincidence of hostname. Same shape as
         // `monitoring.prometheus`, which carries `/api/dashboards` beside
         // `grafana-cli` for exactly this reason.
-        &["flipt", "/api/v1/"],
+        &["flipt", "/api/v1/", "curl"],
         featureflags::flipt::create_pack,
     ),
     PackEntry::new(
         "featureflags.launchdarkly",
-        &["ldcli", "launchdarkly"],
+        &["ldcli", "launchdarkly", "curl"],
         featureflags::launchdarkly::create_pack,
     ),
     PackEntry::new(
         "featureflags.split",
-        &["split", "api.split.io"],
+        &["split", "api.split.io", "curl"],
         featureflags::split::create_pack,
     ),
     PackEntry::new(
@@ -1774,7 +1779,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         // `/api/admin/` is what the three `unleash-api-delete-*` rules and the
         // `unleash-api-get` exemption key on; Unleash is self-hosted, so the
         // vendor name is not reliably in the command (#447).
-        &["unleash", "/api/admin/"],
+        &["unleash", "/api/admin/", "curl"],
         featureflags::unleash::create_pack,
     ),
     PackEntry::new(
@@ -1789,7 +1794,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "loadbalancer.traefik",
-        &["traefik", "ingressroute"],
+        &["traefik", "ingressroute", "curl"],
         loadbalancer::traefik::create_pack,
     ),
     PackEntry::new(
@@ -1807,22 +1812,22 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "monitoring.splunk",
-        &["splunk"],
+        &["splunk", "curl"],
         monitoring::splunk::create_pack,
     ),
     PackEntry::new(
         "monitoring.datadog",
-        &["datadog-ci", "datadoghq", "datadog"],
+        &["datadog-ci", "datadoghq", "datadog", "curl"],
         monitoring::datadog::create_pack,
     ),
     PackEntry::new(
         "monitoring.pagerduty",
-        &["pd", "pagerduty", "api.pagerduty.com"],
+        &["pd", "pagerduty", "api.pagerduty.com", "curl"],
         monitoring::pagerduty::create_pack,
     ),
     PackEntry::new(
         "monitoring.newrelic",
-        &["newrelic", "api.newrelic.com", "graphql"],
+        &["newrelic", "api.newrelic.com", "graphql", "curl"],
         monitoring::newrelic::create_pack,
     ),
     PackEntry::new(
@@ -1830,6 +1835,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         &[
             "promtool",
             "grafana-cli",
+            "curl",
             "/api/v1/admin/tsdb/delete_series",
             "delete_series",
             "/api/dashboards",
@@ -1845,7 +1851,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "payment.stripe",
-        &["stripe", "api.stripe.com"],
+        &["stripe", "api.stripe.com", "curl"],
         payment::stripe::create_pack,
     ),
     PackEntry::new(
@@ -1858,6 +1864,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "gateway.merchant_account.",
             "gateway.payment_method.",
             "gateway.subscription.",
+            "curl",
         ],
         payment::braintree::create_pack,
     ),
@@ -1868,6 +1875,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "api.squareup.com",
             "connect.squareup.com",
             "connect.squareupsandbox.com",
+            "curl",
         ],
         payment::square::create_pack,
     ),
@@ -1898,6 +1906,8 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         "search.elasticsearch",
         &[
             "elasticsearch",
+            "curl",
+            "http",
             "9200",
             "_search",
             "_cluster",
@@ -1912,6 +1922,8 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         "search.opensearch",
         &[
             "opensearch",
+            "curl",
+            "http",
             "9200",
             "_search",
             "_cluster",
@@ -1929,7 +1941,15 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "search.meilisearch",
-        &["meili", "meilisearch", "7700", "/indexes", "/keys"],
+        &[
+            "meili",
+            "meilisearch",
+            "7700",
+            "/indexes",
+            "/keys",
+            "curl",
+            "http",
+        ],
         search::meilisearch::create_pack,
     ),
     PackEntry::new("backup.borg", &["borg"], backup::borg::create_pack),
@@ -2104,7 +2124,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         "kubernetes.kubectl",
         // `/api/v1/` and `/apis/` reach the `api-delete-*` rules: the same
         // deletion spelled as a raw API call carries no "kubectl" (#449).
-        &["kubectl", "/api/v1/", "/apis/"],
+        &["kubectl", "/api/v1/", "/apis/", "curl"],
         kubernetes::kubectl::create_pack,
     ),
     PackEntry::new("kubernetes.helm", &["helm"], kubernetes::helm::create_pack),
@@ -2142,7 +2162,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "apigateway.kong",
-        &["kong", "deck", "8001"],
+        &["kong", "deck", "8001", "curl"],
         apigateway::kong::create_pack,
     ),
     PackEntry::new(
@@ -6442,11 +6462,7 @@ mod tests {
             ("messaging.kafka", "kafka-console-consumer"),
             ("messaging.kafka", "kafka-console-producer"),
             ("messaging.kafka", "kafka-broker-api-versions"),
-            ("search.elasticsearch", "curl"),
-            ("search.elasticsearch", "http"),
             ("search.opensearch", "aws"),
-            ("search.opensearch", "curl"),
-            ("search.opensearch", "http"),
             ("database.mysql", "mysqladmin"),
             ("database.mysql", "delete"),
             ("database.mysql", "drop"),
@@ -7123,6 +7139,52 @@ mod tests {
             ("kubernetes.kubectl", "/api/v1/"),
             ("kubernetes.kubectl", "/apis/"),
         ];
+
+        /// A rule that matches an HTTP client needs that client in the gate.
+        ///
+        /// The global quick reject reads keywords only from spans that
+        /// execute; a quoted URL is data there. A row gated only on URL
+        /// fragments (`9200`, `/api/v1/`, `api.stripe.com`) therefore skipped
+        /// its own pack for `curl -X DELETE '<url>'` -- the usual spelling --
+        /// while the unquoted spelling denied. The client stays outside the
+        /// quotes, so it is the keyword that reliably reaches these rules.
+        /// Derived from the regex sources, so a new curl-keyed rule is covered
+        /// without a table row.
+        #[test]
+        fn a_rule_that_matches_an_http_client_has_that_client_in_its_gate() {
+            // These match curl beside an anchor that is never inside the URL,
+            // and their rows carry that anchor: `--mail-rcpt`/`--mail-from`
+            // (curl's SMTP mode needs a recipient flag to send anything) and
+            // `iex`/`Invoke-Expression` (the download-and-execute pipe).
+            const ANCHORED_OUTSIDE_THE_URL: &[&str] = &[
+                "careful_company_running_windows.email",
+                "careful_company_running_windows.guardrails",
+            ];
+            let mut missing = Vec::new();
+            for entry in &PACK_ENTRIES {
+                if ANCHORED_OUTSIDE_THE_URL.contains(&entry.id) {
+                    continue;
+                }
+                let Some(pack) = REGISTRY.get(entry.id) else {
+                    continue;
+                };
+                for (client, marker) in [("curl", "curl"), ("http", r"http\s")] {
+                    let keyed = pack
+                        .destructive_patterns
+                        .iter()
+                        .any(|p| p.regex.as_str().contains(marker));
+                    if keyed && !entry.keywords.contains(&client) {
+                        missing.push(format!("{}: {client:?}", entry.id));
+                    }
+                }
+            }
+            assert!(
+                missing.is_empty(),
+                "these packs have rules matching an HTTP client that their PACK_ENTRIES \
+                 row does not carry, so quoting the URL skips the pack:\n  {}",
+                missing.join("\n  ")
+            );
+        }
 
         /// A rule keyed on a URL path needs that path in the gate.
         ///

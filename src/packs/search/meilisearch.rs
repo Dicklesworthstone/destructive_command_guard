@@ -149,7 +149,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "meili-http-delete-documents",
-            r"http\s+DELETE\s+(?:https?://)?\S*(?:meili|:7700)\S*/indexes/\S+/documents(?:[\s?]|$)",
+            r#"http\s+DELETE\s+(?:https?://)?\S*(?:meili|:7700)\S*/indexes/\S+/documents(?:[\s?'"]|$)"#,
             "http DELETE against /documents removes documents from Meilisearch.",
             High,
             "Deleting all documents removes every record from the index while preserving \
@@ -188,7 +188,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "meili-http-delete-index",
-            r"http\s+DELETE\s+(?:https?://)?\S*(?:meili|:7700)\S*/indexes/\S+(?:[\s?]|$)",
+            r#"http\s+DELETE\s+(?:https?://)?\S*(?:meili|:7700)\S*/indexes/\S+(?:[\s?'"]|$)"#,
             "http DELETE against /indexes/{uid} deletes a Meilisearch index.",
             Critical,
             "Deleting a Meilisearch index permanently removes all documents, settings, \

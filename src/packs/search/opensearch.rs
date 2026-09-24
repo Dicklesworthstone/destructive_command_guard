@@ -168,7 +168,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "os-http-delete-index",
-            r"http\s+DELETE\s+(?:https?://)?\S*(?:opensearch|:9200)\S*/(?:_all|\*|[a-z0-9][a-z0-9._-]*)(?:[\s?]|$)",
+            r#"http\s+DELETE\s+(?:https?://)?\S*(?:opensearch|:9200)\S*/(?:_all|\*|[a-z0-9][a-z0-9._-]*)(?:[\s?'"]|$)"#,
             "http DELETE against an OpenSearch index (or _all/*) deletes data permanently.",
             Critical,
             "Deleting an OpenSearch index permanently removes all documents, mappings, and \

@@ -175,7 +175,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "es-http-delete-index",
-            r"http\s+DELETE\s+(?:https?://)?\S*(?:elastic|:9200)\S*/(?:_all|\*|[a-z0-9][a-z0-9._-]*)(?:[\s?]|$)",
+            r#"http\s+DELETE\s+(?:https?://)?\S*(?:elastic|:9200)\S*/(?:_all|\*|[a-z0-9][a-z0-9._-]*)(?:[\s?'"]|$)"#,
             "http DELETE against an Elasticsearch index (or _all/*) deletes data permanently.",
             Critical,
             "Deleting an index permanently removes all documents, mappings, and settings. \

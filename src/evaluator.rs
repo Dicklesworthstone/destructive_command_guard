@@ -28081,6 +28081,100 @@ mod tests {
         evaluate_with_pack_ids_at_path(command, pack_ids, None)
     }
 
+    /// A URL is an argument, and arguments get quoted. The global quick reject
+    /// reads keywords only from spans that execute, and a quoted URL is data
+    /// there, so a pack gated on a URL fragment (`9200`, `/api/v1/`, …) was
+    /// skipped entirely for the most common spelling of its own commands --
+    /// while the evaluator behind the gate matches the quoted URL fine. The
+    /// client (`curl`, httpie's `http`) is what stays outside the quotes, so it
+    /// has to be in the gate too.
+    #[test]
+    fn url_keyed_pack_rules_fire_when_the_url_is_quoted() {
+        for (pack, command) in [
+            (
+                "search.elasticsearch",
+                "curl -X DELETE 'http://es:9200/logs'",
+            ),
+            (
+                "search.elasticsearch",
+                "curl -XDELETE \"localhost:9200/_all\"",
+            ),
+            (
+                "search.elasticsearch",
+                "curl 'http://es:9200/logs' -X DELETE",
+            ),
+            ("search.elasticsearch", "http DELETE 'http://es:9200/logs'"),
+            (
+                "search.opensearch",
+                "curl -X DELETE 'https://search:9200/logs'",
+            ),
+            (
+                "kubernetes.kubectl",
+                "curl -X DELETE 'https://k8s.internal/api/v1/namespaces/production'",
+            ),
+            (
+                "featureflags.flipt",
+                "curl -X DELETE 'https://flags.internal/api/v1/namespaces/default/flags/f'",
+            ),
+            (
+                "featureflags.unleash",
+                "curl -X DELETE 'https://ff.internal/api/admin/projects/default/features/f'",
+            ),
+            (
+                "monitoring.prometheus",
+                "curl -X POST 'http://prom:9090/api/v1/admin/tsdb/delete_series?match[]=up'",
+            ),
+            (
+                "payment.stripe",
+                "curl -X DELETE 'https://api.stripe.com/v1/customers/cus_1'",
+            ),
+            (
+                "featureflags.split",
+                "curl -X DELETE 'https://api.split.io/internal/api/v2/splits/ws/w/f'",
+            ),
+            (
+                "apigateway.kong",
+                "curl -X DELETE 'http://localhost:8001/services/api'",
+            ),
+            (
+                "cicd.circleci",
+                "curl -X DELETE 'https://circleci.com/api/v2/project/gh/org/repo/envvar/FOO'",
+            ),
+            (
+                "search.meilisearch",
+                "http DELETE 'http://meili:7700/indexes/movies'",
+            ),
+        ] {
+            let result = evaluate_with_pack_ids(command, &[pack]);
+            assert!(result.is_denied(), "{pack}: {command} -> {result:?}");
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|p| p.pack_id.as_deref()),
+                Some(pack),
+                "{command}"
+            );
+        }
+        // The widened gate admits the command; it does not decide it. Reads
+        // stay allowed, and quoted documentation piped to an inert consumer
+        // is still data.
+        for (pack, command) in [
+            ("search.elasticsearch", "curl 'http://es:9200/_cat/indices'"),
+            (
+                "kubernetes.kubectl",
+                "curl 'https://k8s.internal/api/v1/namespaces'",
+            ),
+            (
+                "search.elasticsearch",
+                "echo 'curl -X DELETE http://es:9200/logs' | cat",
+            ),
+        ] {
+            let result = evaluate_with_pack_ids(command, &[pack]);
+            assert!(result.is_allowed(), "{pack}: {command} -> {result:?}");
+        }
+    }
+
     // =========================================================================
     // Issue #401: a PowerShell assignment is not a POSIX launcher, and a
     // CamelCase parameter is not a cluster of short flags.
