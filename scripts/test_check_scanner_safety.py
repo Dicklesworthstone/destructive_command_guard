@@ -73,7 +73,10 @@ class ScannerSafetyTests(unittest.TestCase):
         inherited = {"ASAN_OPTIONS": "halt_on_error=0:exitcode=0",
                      "UBSAN_OPTIONS": "halt_on_error=0:exitcode=0"}
         with patch.dict(os.environ, inherited):
-            with self.assertRaisesRegex(RuntimeError, "exited 1, expected 0"):
+            # Any nonzero status: Linux honours exitcode=1, while macOS's UBSan
+            # runtime aborts under -fno-sanitize-recover (SIGABRT, -6). Both
+            # fail the gate, which is the property under test.
+            with self.assertRaisesRegex(RuntimeError, r"exited (?!0,)-?\d+, expected 0"):
                 safety.native(self.vendor, "overflow-control", safety.SANITIZER_FLAGS)
             for name, value in inherited.items():
                 self.assertEqual(os.environ[name], value)
