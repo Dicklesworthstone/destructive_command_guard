@@ -2283,6 +2283,14 @@ pub fn format_denial_message(
     pattern: Option<&str>,
     allow_once_code: Option<&str>,
 ) -> String {
+    // An external pack may author the closing instruction (#416): for a
+    // redirect-style rule, "have the user run it by hand" is the wrong
+    // recovery. The `BLOCKED` header, rule and reason stay dcg's.
+    let trailer = pack
+        .and_then(|pack_id| crate::packs::external_denial_trailer(pack_id, pattern))
+        .unwrap_or(
+            "If this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
+        );
     let mut message = format_matched_message(
         "BLOCKED by dcg",
         command,
@@ -2290,7 +2298,7 @@ pub fn format_denial_message(
         explanation,
         pack,
         pattern,
-        "If this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
+        trailer,
     );
     if let Some(code) = allow_once_code {
         use std::fmt::Write as _;

@@ -49,6 +49,26 @@ pub struct DenialBox {
 }
 
 impl DenialBox {
+    /// The banner text after `BLOCKED:`. It is "Destructive Command Detected"
+    /// unless an external pack authored its own (#416), such as a redirect
+    /// pack's "Use the hosted pipeline". The `BLOCKED` marker is never
+    /// pack-authored.
+    fn headline(&self) -> &str {
+        self.authored_banner()
+            .unwrap_or("Destructive Command Detected")
+    }
+
+    /// The banner an external pack authored for this rule, if any (#416).
+    fn authored_banner(&self) -> Option<&'static str> {
+        let (pack, rule) = self
+            .pattern_id
+            .split_once(':')
+            .map_or((self.pattern_id.as_str(), None), |(pack, rule)| {
+                (pack, Some(rule))
+            });
+        crate::packs::external_denial_banner(pack, rule)
+    }
+
     /// Create a new denial box.
     #[must_use]
     pub fn new(
@@ -191,6 +211,10 @@ impl DenialBox {
                     "[{severity_markup}]🛑 BLOCKED (Branch: {branch})[/]"
                 ));
             }
+        } else if let Some(banner) = self.authored_banner() {
+            lines.push(format!(
+                "[{severity_markup}]🛑 COMMAND BLOCKED: {banner}[/]"
+            ));
         } else {
             lines.push(format!("[{severity_markup}]🛑 COMMAND BLOCKED[/]"));
         }
@@ -284,7 +308,7 @@ impl DenialBox {
                 let _ = writeln!(output, "BLOCKED (Branch: {branch})");
             }
         } else {
-            let _ = writeln!(output, "BLOCKED: Destructive Command Detected");
+            let _ = writeln!(output, "BLOCKED: {}", self.headline());
         }
         let _ = writeln!(output);
 
@@ -353,7 +377,7 @@ impl DenialBox {
                 format!(" \u{26d4}  BLOCKED (Branch: {branch}) ")
             }
         } else {
-            " \u{26d4}  BLOCKED: Destructive Command Detected ".to_string()
+            format!(" \u{26d4}  BLOCKED: {} ", self.headline())
         };
         let header_len = header.chars().count();
         let top_pad = width.saturating_sub(header_len);
@@ -560,7 +584,7 @@ impl DenialBox {
                 format!(" !  BLOCKED (Branch: {branch}) ")
             }
         } else {
-            " !  BLOCKED: Destructive Command Detected ".to_string()
+            format!(" !  BLOCKED: {} ", self.headline())
         };
         let header_len = header.chars().count();
         let top_pad = width.saturating_sub(header_len);
@@ -688,8 +712,9 @@ impl DenialBox {
         // Header with color
         let _ = writeln!(
             output,
-            "\x1b[{}m\u{26d4}  BLOCKED\x1b[0m: Destructive Command Detected",
-            &severity_code
+            "\x1b[{}m\u{26d4}  BLOCKED\x1b[0m: {}",
+            &severity_code,
+            self.headline()
         );
         let _ = writeln!(output);
 

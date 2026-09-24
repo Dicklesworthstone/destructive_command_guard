@@ -89,6 +89,40 @@ pub struct ExternalPack {
     /// Safe patterns that explicitly allow commands.
     #[serde(default)]
     pub safe_patterns: Vec<ExternalSafePattern>,
+
+    /// Replaces "Destructive Command Detected" in the human-facing denial
+    /// banner for this pack's rules (#416). The `BLOCKED` marker, rule id and
+    /// decision are never pack-authored. A rule's own `denial_banner` wins.
+    #[serde(default)]
+    pub denial_banner: Option<String>,
+
+    /// Replaces the closing instruction of the agent-facing denial reason (by
+    /// default "ask the user … run the command manually"), for rules whose
+    /// right recovery is something else, such as a redirect to a sanctioned
+    /// tool (#416). A rule's own `denial_trailer` wins.
+    #[serde(default)]
+    pub denial_trailer: Option<String>,
+}
+
+/// Longest accepted `denial_banner`, in characters.
+pub const MAX_DENIAL_BANNER_CHARS: usize = 80;
+/// Longest accepted `denial_trailer`, in characters.
+pub const MAX_DENIAL_TRAILER_CHARS: usize = 400;
+
+/// Validate pack-authored denial text: agent-facing, so bounded and free of
+/// control characters (a newline or escape could forge structure in the
+/// reason the agent parses).
+fn validate_denial_text(field: &str, text: &str, max_chars: usize) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    if text.chars().count() > max_chars {
+        return Err(format!("{field} exceeds {max_chars} characters"));
+    }
+    if text.chars().any(char::is_control) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    Ok(())
 }
 
 /// Default schema version for packs that don't specify one.
@@ -130,6 +164,14 @@ pub struct ExternalDestructivePattern {
     /// without a path or a `.exe`/`.cmd`/`.bat`/`.com` extension.
     #[serde(default, deserialize_with = "deserialize_present_executables")]
     pub executables: Option<Vec<String>>,
+
+    /// Per-rule override of the pack's `denial_banner` (#416).
+    #[serde(default)]
+    pub denial_banner: Option<String>,
+
+    /// Per-rule override of the pack's `denial_trailer` (#416).
+    #[serde(default)]
+    pub denial_trailer: Option<String>,
 }
 
 /// Deserialize an explicitly present `executables` key.
@@ -280,6 +322,9 @@ pub enum PackParseError {
     /// Empty pack (no patterns defined).
     EmptyPack,
 
+    /// A `denial_banner` / `denial_trailer` failed validation (#416).
+    InvalidDenialText { location: String, reason: String },
+
     /// Pack ID collides with a built-in pack.
     ///
     /// External packs cannot override built-in security packs to prevent
@@ -319,6 +364,9 @@ impl fmt::Display for PackParseError {
             }
             Self::DuplicatePattern { name } => {
                 write!(f, "Duplicate pattern name: {name}")
+            }
+            Self::InvalidDenialText { location, reason } => {
+                write!(f, "Invalid denial text in {location}: {reason}")
             }
             Self::EmptyExecutables { pattern_name } => {
                 write!(
@@ -504,6 +552,31 @@ fn validate_pack(pack: &ExternalPack) -> Result<(), PackParseError> {
     // Check for empty pack
     if pack.destructive_patterns.is_empty() && pack.safe_patterns.is_empty() {
         return Err(PackParseError::EmptyPack);
+    }
+
+    // Pack-authored denial text is agent-facing (#416), so it is bounded and
+    // free of control characters, at pack level and per rule.
+    let denial_texts = std::iter::once((
+        format!("pack '{}'", pack.id),
+        pack.denial_banner.as_deref(),
+        pack.denial_trailer.as_deref(),
+    ))
+    .chain(pack.destructive_patterns.iter().map(|pattern| {
+        (
+            format!("pattern '{}'", pattern.name),
+            pattern.denial_banner.as_deref(),
+            pattern.denial_trailer.as_deref(),
+        )
+    }));
+    for (location, banner, trailer) in denial_texts {
+        let checks = [
+            banner.map(|text| validate_denial_text("denial_banner", text, MAX_DENIAL_BANNER_CHARS)),
+            trailer
+                .map(|text| validate_denial_text("denial_trailer", text, MAX_DENIAL_TRAILER_CHARS)),
+        ];
+        if let Some(Err(reason)) = checks.into_iter().flatten().find(Result::is_err) {
+            return Err(PackParseError::InvalidDenialText { location, reason });
+        }
     }
 
     // Collect all pattern names for duplicate checking

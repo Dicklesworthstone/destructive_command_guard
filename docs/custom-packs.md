@@ -64,6 +64,8 @@ safe_patterns:                       # Patterns that explicitly allow
 | `keywords` | array | `[]` | Keywords that trigger pattern matching |
 | `destructive_patterns` | array | `[]` | Patterns that block or warn |
 | `safe_patterns` | array | `[]` | Patterns that explicitly allow |
+| `denial_banner` | string | none | Replaces "Destructive Command Detected" in the denial banner (see below) |
+| `denial_trailer` | string | none | Replaces the closing instruction the agent reads (see below) |
 
 ### Destructive Pattern Fields
 
@@ -76,6 +78,37 @@ safe_patterns:                       # Patterns that explicitly allow
 | `explanation` | string | no | Detailed explanation for verbose output |
 | `executables` | array | no | Restrict the rule to segments run by these programs (see below) |
 | `suggestions` | array | no | Safer alternatives. Accepted and validated, **not yet rendered** (see below) |
+| `denial_banner` | string | no | Per-rule override of the pack's `denial_banner` |
+| `denial_trailer` | string | no | Per-rule override of the pack's `denial_trailer` |
+
+### Custom Denial Wording (redirect-style packs)
+
+By default a denial is titled "Destructive Command Detected", and the reason the
+agent reads ends with "ask the user for explicit permission and have them run the
+command manually". For a pack that *redirects*, where the command is fine but
+should go through a sanctioned route, both are wrong. The trailer is also
+actively misleading: it tells the agent to stop and ask a human instead of
+following your `explanation`.
+
+```yaml
+id: example.hosted_ci
+denial_banner: Use the hosted pipeline
+denial_trailer: Run this through the hosted Semaphore pipeline instead; load the /semaphore skill.
+destructive_patterns:
+  - name: sem-direct
+    pattern: '\bsem\b'
+    executables: [sem]
+  - name: terraform-apply
+    pattern: '\bterraform\s+apply\b'
+    denial_trailer: Open a pipeline run for this workspace instead.
+```
+
+A rule's own text wins over the pack's. Only the wording changes. The command is
+still denied, and the `BLOCKED` marker, the rule id and the reason stay dcg's.
+The text reaches the agent, so it is validated when the pack loads: the banner
+is at most 80 characters, the trailer at most 400, and neither may be empty or
+contain control characters (a newline could forge structure in the reason). A
+pack that fails validation does not load.
 
 ### Offering Safer Alternatives
 

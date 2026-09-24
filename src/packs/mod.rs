@@ -2979,6 +2979,41 @@ pub struct ExternalPackStore {
     /// configuration (issue #402). Recording it here lets the global reject
     /// stand down, restoring the documented contract.
     keywordless_pack_ids: Vec<String>,
+    /// Pack-authored denial wording, keyed by pack id (#416).
+    denial_text: HashMap<String, ExternalDenialText>,
+}
+
+/// Pack-authored denial wording for one external pack (#416), validated at
+/// load time. A rule's own text wins over the pack's.
+#[derive(Debug, Clone, Default)]
+struct ExternalDenialText {
+    banner: Option<String>,
+    trailer: Option<String>,
+    /// Rule name → (banner, trailer).
+    rules: HashMap<String, (Option<String>, Option<String>)>,
+}
+
+impl ExternalDenialText {
+    fn from_pack(pack: &external::ExternalPack) -> Option<Self> {
+        let rules: HashMap<String, (Option<String>, Option<String>)> = pack
+            .destructive_patterns
+            .iter()
+            .filter(|rule| rule.denial_banner.is_some() || rule.denial_trailer.is_some())
+            .map(|rule| {
+                (
+                    rule.name.clone(),
+                    (rule.denial_banner.clone(), rule.denial_trailer.clone()),
+                )
+            })
+            .collect();
+        (pack.denial_banner.is_some() || pack.denial_trailer.is_some() || !rules.is_empty()).then(
+            || Self {
+                banner: pack.denial_banner.clone(),
+                trailer: pack.denial_trailer.clone(),
+                rules,
+            },
+        )
+    }
 }
 
 impl ExternalPackStore {
@@ -2989,7 +3024,28 @@ impl ExternalPackStore {
             keywords: Vec::new(),
             warnings: Vec::new(),
             keywordless_pack_ids: Vec::new(),
+            denial_text: HashMap::new(),
         }
+    }
+
+    /// The pack-authored banner for a denial by `pack_id` (and `rule`, when
+    /// known), if the pack sets one (#416).
+    #[must_use]
+    pub fn denial_banner(&self, pack_id: &str, rule: Option<&str>) -> Option<&str> {
+        let text = self.denial_text.get(pack_id)?;
+        rule.and_then(|rule| text.rules.get(rule))
+            .and_then(|(banner, _)| banner.as_deref())
+            .or(text.banner.as_deref())
+    }
+
+    /// The pack-authored trailer for a denial by `pack_id` (and `rule`, when
+    /// known), if the pack sets one (#416).
+    #[must_use]
+    pub fn denial_trailer(&self, pack_id: &str, rule: Option<&str>) -> Option<&str> {
+        let text = self.denial_text.get(pack_id)?;
+        rule.and_then(|rule| text.rules.get(rule))
+            .and_then(|(_, trailer)| trailer.as_deref())
+            .or(text.trailer.as_deref())
     }
 
     /// Get a pack by ID.
@@ -3167,6 +3223,9 @@ pub fn load_external_packs(paths: &[String]) -> &'static ExternalPackStore {
         // Convert and store loaded packs
         for loaded in result.packs {
             let id = loaded.id.clone();
+            if let Some(text) = ExternalDenialText::from_pack(&loaded.pack) {
+                store.denial_text.insert(id.clone(), text);
+            }
             let pack = loaded.pack.into_pack();
 
             // Collect keywords
@@ -3191,6 +3250,18 @@ pub fn load_external_packs(paths: &[String]) -> &'static ExternalPackStore {
 #[must_use]
 pub fn get_external_packs() -> Option<&'static ExternalPackStore> {
     EXTERNAL_PACKS.get()
+}
+
+/// The pack-authored denial banner for `pack_id`/`rule`, if any (#416).
+#[must_use]
+pub fn external_denial_banner(pack_id: &str, rule: Option<&str>) -> Option<&'static str> {
+    get_external_packs()?.denial_banner(pack_id, rule)
+}
+
+/// The pack-authored denial trailer for `pack_id`/`rule`, if any (#416).
+#[must_use]
+pub fn external_denial_trailer(pack_id: &str, rule: Option<&str>) -> Option<&'static str> {
+    get_external_packs()?.denial_trailer(pack_id, rule)
 }
 
 /// Pre-compiled finders for core quick rejection (git/rm).
@@ -4179,6 +4250,72 @@ fn pack_aware_quick_reject_from_normalized_spans(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pack-authored denial text (#416): a rule's text wins, the pack's is
+    /// the fallback, an unknown pack has none, and invalid text is refused at
+    /// load time.
+    #[test]
+    fn external_denial_text_precedence_and_validation_issue_416() {
+        let pack = external::parse_pack_string(
+            r"
+schema_version: 1
+id: custom.hostedci
+name: Hosted CI
+version: 1.0.0
+keywords: [sem]
+denial_banner: Use the hosted pipeline
+denial_trailer: Load the /semaphore skill.
+destructive_patterns:
+  - name: sem-direct
+    pattern: \bsem\b
+  - name: sem-apply
+    pattern: \bsem\s+apply\b
+    denial_trailer: Open a pipeline run instead.
+",
+        )
+        .expect("valid pack");
+        let mut store = ExternalPackStore::new();
+        store.denial_text.insert(
+            "custom.hostedci".to_string(),
+            ExternalDenialText::from_pack(&pack).expect("pack authors text"),
+        );
+
+        assert_eq!(
+            store.denial_trailer("custom.hostedci", Some("sem-apply")),
+            Some("Open a pipeline run instead.")
+        );
+        assert_eq!(
+            store.denial_trailer("custom.hostedci", Some("sem-direct")),
+            Some("Load the /semaphore skill.")
+        );
+        // No rule-level banner, so the pack's applies to both rules.
+        assert_eq!(
+            store.denial_banner("custom.hostedci", Some("sem-apply")),
+            Some("Use the hosted pipeline")
+        );
+        assert_eq!(store.denial_trailer("core.git", Some("reset-hard")), None);
+
+        for bad in [
+            "denial_trailer: \"a\\nb\"",
+            "denial_banner: \"\\u001b[31mred\"",
+            "denial_banner: \"   \"",
+        ] {
+            let yaml = format!(
+                "schema_version: 1\nid: custom.bad\nname: Bad\nversion: 1.0.0\n{bad}\n\
+                 destructive_patterns:\n  - name: x\n    pattern: \\bx\\b\n"
+            );
+            assert!(
+                external::parse_pack_string(&yaml).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        let long = "x".repeat(external::MAX_DENIAL_BANNER_CHARS + 1);
+        let yaml = format!(
+            "schema_version: 1\nid: custom.bad\nname: Bad\nversion: 1.0.0\n\
+             denial_banner: {long}\ndestructive_patterns:\n  - name: x\n    pattern: \\bx\\b\n"
+        );
+        assert!(external::parse_pack_string(&yaml).is_err());
+    }
 
     #[test]
     fn pack_aware_quick_reject_empty_keywords_is_conservative() {
