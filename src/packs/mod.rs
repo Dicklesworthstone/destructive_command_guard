@@ -1573,6 +1573,21 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             ".docker/",
             ".bashrc.d/",
             ".zshrc.d/",
+            // The same anchors spelled the Windows way, for the same reason.
+            // `echo x > .ssh\authorized_keys` from a cmd or PowerShell payload
+            // carries none of the forward-slash entries above, so this gate
+            // dropped it before core.filesystem was a candidate and the
+            // relative half of `credential-file-write` never ran. Resolution
+            // already handles `\`: the identical target denies as soon as a
+            // writer word is present.
+            ".git\\",
+            ".ssh\\",
+            ".gnupg\\",
+            ".aws\\",
+            ".kube\\",
+            ".docker\\",
+            ".bashrc.d\\",
+            ".zshrc.d\\",
             // Login-shell startup files: writing one is code execution on the
             // next shell, and a bare redirect to it carries no other keyword.
             ".bashrc",

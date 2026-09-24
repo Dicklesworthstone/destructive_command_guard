@@ -4134,6 +4134,22 @@ pub fn create_pack() -> Pack {
             ".docker/",
             ".bashrc.d/",
             ".zshrc.d/",
+            // The same anchors spelled the Windows way. A PowerShell or cmd
+            // caller writes `.ssh\authorized_keys`, which carries none of the
+            // forward-slash entries above, so a bare redirect to it selected
+            // no pack and the rule never ran. Path resolution already handles
+            // `\` — the identical targets deny as soon as any writer word is
+            // present (`copy`, `Set-Content`) — so this is purely the
+            // candidate gate, which is the mechanism #407 added these anchors
+            // for in the first place.
+            ".git\\",
+            ".ssh\\",
+            ".gnupg\\",
+            ".aws\\",
+            ".kube\\",
+            ".docker\\",
+            ".bashrc.d\\",
+            ".zshrc.d\\",
             // The login-shell startup files, for the same reason: a bare
             // `echo x > .bashrc` carries no other keyword in this row.
             ".bashrc",
@@ -5804,6 +5820,53 @@ mod tests {
             dequote_rm_flag_token("-rf"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    /// A bare redirect to a Windows-spelled relative anchor must select the
+    /// pack (#451).
+    ///
+    /// `.ssh/authorized_keys` and `.git/config` are keywords because a bare
+    /// redirect to them carries no other one (#407). A PowerShell or cmd
+    /// caller writes `.ssh\authorized_keys`, which matched none of them, so
+    /// the quick-reject dropped the command before core.filesystem was a
+    /// candidate and the relative half of `credential-file-write` never ran.
+    ///
+    /// Resolution was never the problem: the same targets deny as soon as any
+    /// writer word is present. This asserts the gate itself.
+    #[test]
+    fn windows_spelled_relative_anchors_select_the_pack_issue_451() {
+        let pack = create_pack();
+        let bs = char::from(92);
+        for target in [
+            format!(".ssh{bs}authorized_keys"),
+            format!(".git{bs}config"),
+            format!(".aws{bs}credentials"),
+            format!(".gnupg{bs}secring.gpg"),
+            format!(".kube{bs}config"),
+            format!(".docker{bs}config.json"),
+        ] {
+            let command = format!("echo x > {target}");
+            assert!(
+                pack.might_match(&command),
+                "a bare redirect to a Windows-spelled anchor must select the pack: {command}"
+            );
+        }
+
+        // Negative control: an ordinary relative Windows path carries none of
+        // these anchors, so the quick-reject must still drop it. Without this
+        // the assertions above would pass on a keyword row so broad that the
+        // gate stopped meaning anything.
+        for target in [
+            format!("build{bs}out.txt"),
+            format!("docs{bs}readme.md"),
+            format!("src{bs}main.rs"),
+        ] {
+            let command = format!("echo x > {target}");
+            assert!(
+                !pack.might_match(&command),
+                "an ordinary relative Windows path must not select the pack: {command}"
+            );
+        }
     }
 
     /// Issue #302: the canonical fork bomb and word-named variants are

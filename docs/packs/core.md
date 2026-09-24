@@ -133,6 +133,14 @@ Commands containing these keywords are checked against this pack:
 - `.docker/`
 - `.bashrc.d/`
 - `.zshrc.d/`
+- `.git\`
+- `.ssh\`
+- `.gnupg\`
+- `.aws\`
+- `.kube\`
+- `.docker\`
+- `.bashrc.d\`
+- `.zshrc.d\`
 - `.bashrc`
 - `.bash_profile`
 - `.bash_login`
