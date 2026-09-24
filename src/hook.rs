@@ -38,8 +38,11 @@ pub struct HookInput {
     /// Gemini working directory.
     pub cwd: Option<String>,
 
-    /// Gemini event timestamp.
-    pub timestamp: Option<String>,
+    /// Event timestamp: an RFC 3339 string from Gemini, a number (epoch
+    /// milliseconds) from GitHub Copilot CLI. Raw JSON value, like
+    /// `tool_use_id`: typed as a string, every native Copilot payload failed
+    /// the whole parse and so failed open, allowing the command unexamined.
+    pub timestamp: Option<serde_json::Value>,
 
     /// The name of the tool being invoked (e.g., "Bash", "runTerminalCommand").
     #[serde(alias = "toolName")]
@@ -4642,6 +4645,37 @@ mod tests {
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(extract_command(&input), Some("git status".to_string()));
         assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+    }
+
+    /// The native preToolUse input from the Copilot hooks reference:
+    /// `{sessionId, timestamp, cwd, toolName, toolArgs}`, with a *numeric*
+    /// timestamp and no `event` field. Every fixture above carries an `event`
+    /// and no timestamp, so none noticed that a numeric timestamp failed the
+    /// whole parse -- and a failed parse fails open.
+    #[test]
+    fn test_parse_copilot_native_envelope_with_numeric_timestamp() {
+        for tool_args in [
+            r#"{"command":"git reset --hard"}"#,
+            r#""{\"command\":\"git reset --hard\"}""#,
+        ] {
+            let json = format!(
+                r#"{{"sessionId":"a1b2","timestamp":1771286400000,"cwd":"/repo","toolName":"bash","toolArgs":{tool_args}}}"#
+            );
+            let input: HookInput =
+                serde_json::from_str(&json).expect("the documented Copilot payload must parse");
+            assert_eq!(detect_protocol(&input), HookProtocol::Copilot, "{json}");
+            assert_eq!(
+                extract_command(&input),
+                Some("git reset --hard".to_string()),
+                "{json}"
+            );
+        }
+        // Gemini's RFC 3339 string still parses.
+        let gemini: HookInput = serde_json::from_str(
+            r#"{"hook_event_name":"BeforeTool","timestamp":"2026-02-24T00:00:00Z","tool_name":"run_shell_command","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&gemini), HookProtocol::Gemini);
     }
 
     #[test]
