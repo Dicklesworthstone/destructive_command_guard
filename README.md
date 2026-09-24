@@ -959,6 +959,14 @@ payload produces a deny (a `permissionDecision: deny` for Claude-style hooks; a
 Transient IO read errors still fail open even in this mode, since they are not
 attacker-controlled malformed payloads.
 
+Even under the fail-open default, an unparseable, oversized or non-UTF-8
+payload is not allowed blind: dcg scans the raw text for a shell tool's
+`"command"` value and evaluates it. A command that would be denied (or asked
+about) gets that answer; only a payload with no evaluable shell command, or one
+whose command is allowed, falls through to the fail-open allow. Unpaired UTF-16
+surrogate escapes (`\ud800`), which JavaScript hosts can emit, are replaced
+with U+FFFD before parsing rather than failing it.
+
 > A leading UTF-8 BOM (`EF BB BF`) is stripped before parsing in all hook
 > paths, so a BOM-prefixed but otherwise-valid command is correctly evaluated
 > (and blocked if dangerous) rather than allowed through as "unparseable".

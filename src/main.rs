@@ -369,7 +369,7 @@ fn handle_unparseable_hook_input(
     // malformed payloads.
     let blockable = matches!(
         read_err,
-        hook::HookReadError::Json(_)
+        hook::HookReadError::Json { .. }
             | hook::HookReadError::InputTooLarge { .. }
             | hook::HookReadError::InvalidUtf8 { .. }
     );
@@ -420,7 +420,7 @@ fn handle_unparseable_hook_input(
                     "[dcg] Warning: stdin input ({len} bytes) exceeds limit ({max_input_bytes} bytes); allowing command (fail-open)"
                 );
             }
-            hook::HookReadError::Json(err) => {
+            hook::HookReadError::Json { error: err, .. } => {
                 emit_stderr!(
                     "[dcg] Warning: could not parse hook input ({err}); allowing command (fail-open). Set DCG_FAIL_CLOSED=1 to block instead."
                 );
@@ -451,7 +451,8 @@ fn handle_unparseable_hook_input(
     let raw_prefix = match read_err {
         hook::HookReadError::InputTooLarge { prefix, .. } => Some(prefix.as_str()),
         hook::HookReadError::InvalidUtf8 { lossy, .. } => Some(lossy.as_str()),
-        hook::HookReadError::Io(_) | hook::HookReadError::Json(_) => None,
+        hook::HookReadError::Json { raw, .. } => Some(raw.as_str()),
+        hook::HookReadError::Io(_) => None,
     };
     let protocol = payloadless_hook_protocol(detected_agent, raw_prefix);
     let reason = if matches!(read_err, hook::HookReadError::InputTooLarge { .. }) {
@@ -1874,14 +1875,19 @@ fn main() {
             // every pack. A proven deny/ask on the embedded command emits the
             // normal protocol response; anything else keeps fail-open.
             if !config.is_fail_closed() {
-                // Both unparseable-payload kinds that still carry bytes get the
-                // same best-effort scan. Invalid UTF-8 needs it as much as
+                // Every unparseable-payload kind that still carries bytes gets
+                // the same best-effort scan. Invalid UTF-8 needs it as much as
                 // oversized input does: one stray byte appended to an ordinary
                 // envelope is far cheaper to write than megabytes of padding.
+                // A JSON parse error needs it too: each specific parse hole
+                // found so far (a numeric Copilot `timestamp`, a wrong-typed
+                // field, a lone surrogate escape) failed open with the command
+                // in plain view, and this judges the next unforeseen one.
                 let salvageable = match &read_err {
                     hook::HookReadError::InputTooLarge { prefix, .. } => Some(prefix.as_str()),
                     hook::HookReadError::InvalidUtf8 { lossy, .. } => Some(lossy.as_str()),
-                    hook::HookReadError::Io(_) | hook::HookReadError::Json(_) => None,
+                    hook::HookReadError::Json { raw, .. } => Some(raw.as_str()),
+                    hook::HookReadError::Io(_) => None,
                 };
                 if let Some(prefix) = salvageable {
                     if let Some(exit_code) = try_deny_unparseable_payload(

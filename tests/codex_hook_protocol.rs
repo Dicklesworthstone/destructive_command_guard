@@ -1835,7 +1835,8 @@ fn failopen_empty_stdin() {
 
 #[test]
 fn failopen_truncated_json() {
-    let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": "git reset --ha"#;
+    // Truncated JSON whose visible command is benign still fails open.
+    let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": "echo hel"#;
     let outcome = run_hook_raw(payload, &[]);
     assert_eq!(
         outcome.exit_code, 0,
@@ -1844,6 +1845,20 @@ fn failopen_truncated_json() {
     assert!(
         outcome.stdout.is_empty(),
         "no stdout on fail-open\n{outcome}"
+    );
+}
+
+/// An unparseable payload gets the same best-effort scan as an oversized one,
+/// so a destructive command visible in it is judged rather than allowed blind.
+/// `--ha` is Git's unambiguous abbreviation of `--hard`.
+#[test]
+fn truncated_json_with_a_visible_destructive_command_is_denied() {
+    let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": "git reset --ha"#;
+    let outcome = run_hook_raw(payload, &[]);
+    assert_eq!(outcome.exit_code, 0, "{outcome}");
+    assert!(
+        String::from_utf8_lossy(&outcome.stdout).contains("\"deny\""),
+        "the visible destructive command must be denied\n{outcome}"
     );
 }
 

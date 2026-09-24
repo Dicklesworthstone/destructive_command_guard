@@ -498,6 +498,42 @@ fn bare_hook_unverified_decision_controls_oversized_fallback() {
 /// posture without configuration: Claude Code documents that a hook `deny`
 /// holds in those modes but not what a hook `ask` does there, and an `ask`
 /// waved through would run exactly the command dcg could not inspect.
+/// A payload serde still cannot parse -- nesting past its recursion limit, a
+/// trailing comma -- gets the best-effort scan the oversized and invalid-UTF-8
+/// payloads already had, instead of failing open with the destructive command
+/// in plain view. Malformed input with no visible shell command still fails
+/// open (the documented default).
+#[test]
+fn bare_hook_unparseable_json_with_a_visible_destructive_command_is_denied() {
+    let deep = format!(
+        r#"{{"tool_name":"Bash","tool_input":{{"command":"rm -rf ~"}},"x":{}{}}}"#,
+        "[".repeat(200),
+        "]".repeat(200)
+    );
+    let trailing_comma = r#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"},}"#;
+    for raw in [deep.as_str(), trailing_comma] {
+        let out = run_dcg_hook_raw(raw.as_bytes(), &[]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("\"permissionDecision\":\"deny\""),
+            "unparseable payload with a destructive command must be judged.\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    for raw in [
+        r#"{"tool_name":"Bash","tool_input":{"command":"git status"},}"#,
+        r#"{"tool_name":"Read","tool_input":{"command":"rm -rf ~"},}"#,
+        "not json at all",
+    ] {
+        let out = run_dcg_hook_raw(raw.as_bytes(), &[]);
+        assert!(
+            String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            "{raw}: stdout {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
 /// Through the real binary: a lone surrogate escape used to fail the parse
 /// and so allow the destructive command beside it (fail-open).
 #[test]

@@ -906,7 +906,16 @@ pub enum HookReadError {
         lossy: String,
     },
     /// Failed to parse JSON input.
-    Json(serde_json::Error),
+    Json {
+        /// The parser's error, for the operator-facing diagnostic.
+        error: serde_json::Error,
+        /// The payload text, carried for the best-effort scanner like the
+        /// oversized and invalid-UTF-8 variants' bytes. Every specific parse
+        /// hole closed so far (a numeric `timestamp`, a wrong-typed field, a
+        /// lone surrogate escape) failed open with the destructive command in
+        /// plain view; this lets the next unforeseen one still be judged.
+        raw: String,
+    },
 }
 
 /// Hard cap on how much stdin is drained into the best-effort scan buffer once
@@ -977,7 +986,10 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
     // not skip a leading BOM on its own.
     let to_parse = input.strip_prefix('\u{feff}').unwrap_or(input.as_str());
 
-    parse_hook_input(to_parse).map_err(HookReadError::Json)
+    parse_hook_input(to_parse).map_err(|error| HookReadError::Json {
+        error,
+        raw: to_parse.to_string(),
+    })
 }
 
 /// Snake_case hook fields that also accept a camelCase spelling, with every
