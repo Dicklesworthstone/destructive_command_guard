@@ -124,7 +124,11 @@ fn the_manifests_select_the_patched_grammar_crates() {
 
     let fork = read("vendor/ast-grep-language/Cargo.toml");
     let bash = tables(&fork, "[dependencies.tree-sitter-bash]");
-    assert_eq!(bash.len(), 1, "the fork must declare its tree-sitter-bash dependency");
+    assert_eq!(
+        bash.len(),
+        1,
+        "the fork must declare its tree-sitter-bash dependency"
+    );
     assert_eq!(
         field(&bash[0], "package"),
         Some("tree-sitter-bash-dcg"),
@@ -134,39 +138,45 @@ fn the_manifests_select_the_patched_grammar_crates() {
 
 #[test]
 fn the_lockfile_links_only_the_patched_grammar() {
-    let lockfile = read("Cargo.lock");
-    let packages = tables(&lockfile, "[[package]]");
-    let named = |name: &str| -> Vec<_> {
-        packages
-            .iter()
-            .filter(|body| field(body, "name") == Some(name))
-            .collect()
-    };
+    // The fuzz crate is its own workspace with its own lockfile. The old
+    // `[patch.crates-io]` never reached it, so the fuzzers exercised the
+    // unpatched scanner; it is held to the same rule now.
+    for lock_path in ["Cargo.lock", "fuzz/Cargo.lock"] {
+        let lockfile = read(lock_path);
+        let packages = tables(&lockfile, "[[package]]");
+        let named = |name: &str| -> Vec<_> {
+            packages
+                .iter()
+                .filter(|body| field(body, "name") == Some(name))
+                .collect()
+        };
 
-    // Either stock crate in the graph means some path links the unpatched
-    // scanner, however the rest of the graph is wired.
-    for stock in ["tree-sitter-bash", "ast-grep-language"] {
-        assert!(
-            named(stock).is_empty(),
-            "Cargo.lock contains the stock `{stock}`, so the build links the unpatched \
-             tree-sitter-bash scanner (#442). Everything must go through the -dcg forks."
+        // Either stock crate in the graph means some path links the unpatched
+        // scanner, however the rest of the graph is wired.
+        for stock in ["tree-sitter-bash", "ast-grep-language"] {
+            assert!(
+                named(stock).is_empty(),
+                "{lock_path} contains the stock `{stock}`, so the build links the unpatched \
+                 tree-sitter-bash scanner (#442). Everything must go through the -dcg forks."
+            );
+        }
+
+        let patched = named("tree-sitter-bash-dcg");
+        assert_eq!(
+            patched.len(),
+            1,
+            "expected exactly one tree-sitter-bash-dcg in {lock_path}, found {}",
+            patched.len()
+        );
+        let vendored = read("vendor/tree-sitter-bash/Cargo.toml");
+        let package = tables(&vendored, "[package]");
+        assert_eq!(
+            field(patched[0], "version"),
+            field(&package[0], "version"),
+            "the tree-sitter-bash-dcg version locked in {lock_path} and the vendored package \
+             version disagree"
         );
     }
-
-    let patched = named("tree-sitter-bash-dcg");
-    assert_eq!(
-        patched.len(),
-        1,
-        "expected exactly one tree-sitter-bash-dcg in Cargo.lock, found {}",
-        patched.len()
-    );
-    let vendored = read("vendor/tree-sitter-bash/Cargo.toml");
-    let package = tables(&vendored, "[package]");
-    assert_eq!(
-        field(patched[0], "version"),
-        field(&package[0], "version"),
-        "the locked tree-sitter-bash-dcg version and the vendored package version disagree"
-    );
 }
 
 #[test]
