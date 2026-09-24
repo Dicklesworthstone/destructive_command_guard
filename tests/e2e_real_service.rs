@@ -494,7 +494,7 @@ fn expected_deny_shape() -> Value {
         "hookSpecificOutput": {
             "allowOnceCode": "<present>",
             "allowOnceFullHash": "<present>",
-            "confidence": "<null>",
+            "confidence": "<number>",
             "hookEventName": "PreToolUse",
             "packId": "core.git",
             "permissionDecision": "deny",
@@ -519,7 +519,7 @@ fn expected_ask_shape() -> Value {
         "hookSpecificOutput": {
             "allowOnceCode": "<present>",
             "allowOnceFullHash": "<present>",
-            "confidence": "<null>",
+            "confidence": "<number>",
             "hookEventName": "PreToolUse",
             "packId": "core.git",
             "permissionDecision": "ask",
