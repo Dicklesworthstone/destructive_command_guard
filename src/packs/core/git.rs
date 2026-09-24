@@ -5509,6 +5509,29 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - git branch backup/<name> <ref>: keep a pointer before deleting\n\
              - git branch -d <branch>: the porcelain delete, which refuses unmerged branches"
         ),
+        // `git read-tree --reset -u <tree>` is the plumbing under `git reset
+        // --hard`: `--reset` loads the tree into the index discarding every
+        // staged and unmerged entry, and `-u` then rewrites the working tree
+        // to match, overwriting uncommitted modifications. It was allowed
+        // while its porcelain was Critical. `--reset` needs `-u` to touch the
+        // worktree, so both must be present (either order, `-u` alone or in a
+        // short cluster such as `-vu`; git accepts `--res`/`--rese` too).
+        // `-m -u` is not matched: a merge refuses to overwrite local changes.
+        destructive_pattern!(
+            "read-tree-reset",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)read-tree\b(?=[^;&|\n<>()]*\s--res(?:e(?:t)?)?(?:\s|$|[;&|)]))(?=[^;&|\n<>()]*\s-[A-Za-z]*u[A-Za-z]*(?:\s|$|[;&|)]))",
+            "git read-tree --reset -u overwrites the working tree like git reset --hard, destroying uncommitted changes.",
+            Critical,
+            "git read-tree --reset -u is the plumbing form of git reset --hard. It replaces \
+             the index with the given tree, discarding staged and unmerged entries, and -u \
+             then rewrites the working tree to match, overwriting every uncommitted \
+             modification to tracked files. Those changes were never committed, so they \
+             cannot be recovered.\n\n\
+             Safer alternatives:\n\
+             - git stash: save the changes first, restore later with 'git stash pop'\n\
+             - git read-tree -m -u <tree>: a merge that refuses to overwrite local changes\n\
+             - git status / git diff: see exactly what would be discarded"
+        ),
         // `git show <ref>:<path>` is safe on its own (stdout only), and the
         // checkout-ref-discard remediation above recommends it. But redirected
         // back onto the SAME path it reaches the identical end state that rule
@@ -7536,6 +7559,41 @@ git x",
 
         assert_blocks_with_severity(&pack, "git stash clear", Severity::Critical);
         assert_blocks_with_pattern(&pack, "git stash clear", "stash-clear");
+    }
+
+    /// `git read-tree --reset -u` is the plumbing under `reset --hard` and was
+    /// allowed. It needs both flags, in either order; a merge (`-m -u`) and
+    /// an index-only reset keep the working tree and stay allowed.
+    #[test]
+    fn read_tree_reset_update_is_denied_like_reset_hard() {
+        let pack = create_pack();
+        for command in [
+            "git read-tree --reset -u HEAD",
+            "git read-tree -u --reset HEAD~3",
+            "git read-tree --reset -vu HEAD",
+            "git read-tree --res -u origin/main",
+            "git -C sub read-tree --reset -u HEAD",
+            "git read-tree --reset -u HEAD && git status",
+            "/usr/lib/git-core/git-read-tree --reset -u HEAD",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "read-tree-reset");
+            assert_blocks_with_severity(&pack, command, Severity::Critical);
+        }
+        for command in [
+            "git read-tree HEAD",
+            "git read-tree --reset HEAD",
+            "git read-tree -m -u HEAD origin/main",
+            "git read-tree -u -m HEAD",
+            "git read-tree --prefix=sub/ -u HEAD",
+            "git read-tree --reset HEAD; git checkout-index --all",
+            "git read-tree --reset HEAD && echo -u",
+        ] {
+            assert!(
+                pack.check(command)
+                    .is_none_or(|m| m.name != Some("read-tree-reset")),
+                "{command} must not match read-tree-reset"
+            );
+        }
     }
 
     // =========================================================================

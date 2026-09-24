@@ -52,6 +52,7 @@ These patterns match potentially destructive commands:
 | `switch-discard` | git switch --discard-changes/-f discards all uncommitted changes to tracked files. Use 'git stash' first. | high |
 | `rm-force` | git rm -f deletes files even when they have uncommitted modifications. Commit or stash them first. | high |
 | `update-ref-delete` | git update-ref -d deletes a ref (e.g. a branch) outright, like git branch -D. | high |
+| `read-tree-reset` | git read-tree --reset -u overwrites the working tree like git reset --hard, destroying uncommitted changes. | critical |
 | `show-redirect-overwrite-source` | git show <ref>:<path> redirected onto the same <path> overwrites the working tree file, exactly like the denied 'git checkout <ref> -- <path>'. | high |
 | `restore-worktree` | git restore discards uncommitted changes. Use 'git stash' or 'git diff' first. | high |
 | `restore-worktree-explicit` | git restore --worktree/-W discards uncommitted changes permanently. | high |

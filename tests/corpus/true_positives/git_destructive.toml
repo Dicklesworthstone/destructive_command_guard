@@ -58,6 +58,18 @@ expected = "deny"
 rule_id = "core.git:update-ref-delete"
 
 [[case]]
+description = "git read-tree --reset -u is the plumbing form of reset --hard"
+command = "git read-tree --reset -u HEAD"
+expected = "deny"
+rule_id = "core.git:read-tree-reset"
+
+[[case]]
+description = "git read-tree -u --reset, flags in the other order"
+command = "git read-tree -u --reset HEAD~3"
+expected = "deny"
+rule_id = "core.git:read-tree-reset"
+
+[[case]]
 description = "a '+' refspec is a per-ref force push"
 command = "git push origin +main"
 expected = "deny"

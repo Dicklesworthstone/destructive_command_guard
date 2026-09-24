@@ -648,6 +648,24 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
         ],
     );
     m.insert(
+        "core.git:read-tree-reset",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "See what would be discarded: `git status` and `git diff`",
+            )
+            .with_command("git status"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Save the changes first: `git stash`, then restore with `git stash pop`",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Merge instead, which refuses to overwrite local changes: `git read-tree -m -u <tree>`",
+            ),
+        ],
+    );
+    m.insert(
         "core.git:update-ref-delete",
         vec![
             Suggestion::new(

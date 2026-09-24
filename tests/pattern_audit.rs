@@ -397,6 +397,9 @@ fn test_audit_backtracking_requirements() {
                 "restore-worktree",
                 // Backreference pins redirect target == shown path (#373).
                 "show-redirect-overwrite-source",
+                // `--reset` and `-u` may appear in either order, so each is
+                // a positive lookahead from the subcommand.
+                "read-tree-reset",
                 // Git LFS verb guards (Refs PR #383). `lfs-prune-dry-run` ran
                 // on the linear engine after 91715d5 replaced its trailing
                 // `(?![\w-])` lookahead with `(?:\s|$)`; it is back here
