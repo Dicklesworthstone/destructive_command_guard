@@ -477,13 +477,13 @@ pub enum Command {
     /// evaluated as POSIX. `dcg test` has no such context and defaults to
     /// `--dialect unknown`, which can deny where the hook allows.
     ///
-    /// That union is not complete in both directions today, so do not read an
-    /// `allow` here as "no hook would block this". Measured:
-    /// `Remove-Item -Recurse -Force /etc` denies under `--dialect ps` and
-    /// under a `PowerShell` hook payload, and is ALLOWED by the default
-    /// `--dialect unknown`. Pass the dialect you actually care about when the
-    /// answer matters; `--dialect posix` reproduces the `Bash` hook path
-    /// exactly (#451).
+    /// That union is not proven complete in both directions, so do not read an
+    /// `allow` here as "no hook would block this". The example this warning
+    /// used to carry is fixed — `Remove-Item -Recurse -Force /etc` denied under
+    /// `--dialect ps` and was ALLOWED by the default, and now denies under both
+    /// (#491) — but only that one command was measured, not every pack. Pass
+    /// the dialect you actually care about when the answer matters;
+    /// `--dialect posix` reproduces the `Bash` hook path exactly (#451).
     #[command(name = "test")]
     TestCommand {
         /// Command to test
@@ -1934,11 +1934,16 @@ pub enum SimulateFormat {
 pub enum DialectArg {
     /// Union over dialects (CLI default; matches no single hook path).
     ///
-    /// Not a complete union today — `Remove-Item -Recurse -Force /etc` denies
-    /// under `ps` and allows here — so an `allow` at this dialect does not mean
-    /// no hook would block the command (#451). This is also the dialect the
-    /// hook itself resolves for any tool name that is not
-    /// `bash`/`powershell`/`pwsh`/`cmd`, so it is not CLI-only.
+    /// The semantic delete front ends are covered here as of #491:
+    /// `Remove-Item -Recurse -Force /etc`, which used to deny under `ps` and
+    /// allow here, now denies at this dialect too.
+    ///
+    /// Completeness across every pack is NOT claimed, because it has not been
+    /// measured. An `allow` at this dialect is evidence, not proof, that no hook
+    /// would block the command. This is also the dialect the hook itself
+    /// resolves for any tool name that is not `bash`/`powershell`/`pwsh`/`cmd`,
+    /// so any remaining gap is reachable from a real payload rather than
+    /// CLI-only (#451).
     #[default]
     Unknown,
     /// POSIX shell — the dialect the `Bash` PreToolUse hook resolves
@@ -2936,6 +2941,32 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
         REGISTRY.build_enabled_keyword_index(&ordered_packs)
     };
 
+    // A PowerShell or Cmd payload activates the windows.* packs on any host
+    // (#451). The plain hook path computes that from the payload it just read;
+    // this reader builds one pack set for the WHOLE stream before reading any
+    // line, so it could only ever ask the payload-blind question — and the
+    // same command that denied through `dcg` was allowed through
+    // `dcg hook --batch` (#493).
+    //
+    // Both views are built up front rather than lazily. It costs one extra
+    // keyword-index build per invocation, on a bulk path that is not the hook
+    // hot path, and in exchange the per-line choice is a borrow rather than a
+    // build — so the rayon loop below composes with it unchanged, with no
+    // synchronisation. When the two pack sets are identical (a Windows host,
+    // or a config that already enables the windows packs) the second view is
+    // not built at all and every line uses the first.
+    let windows_view = build_windows_payload_view(config, cmd, external_store, &enabled_packs);
+    let windows_view_ref = windows_view.as_ref().map(|view| PackView {
+        enabled_keywords: &view.0,
+        ordered_packs: &view.1,
+        keyword_index: view.2.as_ref(),
+    });
+    let base_view = PackView {
+        enabled_keywords: &enabled_keywords,
+        ordered_packs: &ordered_packs,
+        keyword_index: keyword_index.as_ref(),
+    };
+
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut stdout_lock = stdout.lock();
@@ -2988,9 +3019,8 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
                         batch_line_outcome(
                             config,
                             line,
-                            &enabled_keywords,
-                            &ordered_packs,
-                            keyword_index.as_ref(),
+                            base_view,
+                            windows_view_ref,
                             &compiled_overrides,
                             &allowlists,
                             &heredoc_settings,
@@ -3009,9 +3039,8 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
                     batch_line_outcome(
                         config,
                         line,
-                        &enabled_keywords,
-                        &ordered_packs,
-                        keyword_index.as_ref(),
+                        base_view,
+                        windows_view_ref,
                         &compiled_overrides,
                         &allowlists,
                         &heredoc_settings,
@@ -3065,9 +3094,8 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
             let mut result = batch_line_outcome(
                 config,
                 line,
-                &enabled_keywords,
-                &ordered_packs,
-                keyword_index.as_ref(),
+                base_view,
+                windows_view_ref,
                 &compiled_overrides,
                 &allowlists,
                 &heredoc_settings,
@@ -3145,12 +3173,69 @@ fn batch_read_can_continue(line: &std::io::Result<String>) -> bool {
 /// assign the index, and decide the exit code, exactly as it does for a
 /// syntactically malformed line.
 #[allow(clippy::too_many_arguments)]
+/// The pack-derived evaluation inputs for one `dcg hook` line.
+///
+/// `dcg hook` builds these once for the whole stream, which is why the
+/// payload-driven `windows.*` activation needed a second view rather than a
+/// recomputation (#493). Borrowed, never owned, so selecting between views is
+/// free and thread-safe inside the rayon loop.
+#[derive(Clone, Copy)]
+struct PackView<'a> {
+    enabled_keywords: &'a [&'a str],
+    ordered_packs: &'a [String],
+    keyword_index: Option<&'a crate::packs::EnabledKeywordIndex>,
+}
+
+/// Build the windows-payload pack view, or `None` when it would be identical
+/// to the base view (a Windows host, or a config that already enables them).
+///
+/// Mirrors the base construction above step for step — `--with-packs`,
+/// external packs, ordered expansion, and the index's external-pack carve-out
+/// — because a view that disagreed with the base on anything except the
+/// `windows.*` packs would make the two paths differ for a second reason.
+fn build_windows_payload_view(
+    config: &Config,
+    cmd: &HookCommand,
+    external_store: &crate::packs::ExternalPackStore,
+    base_pack_ids: &std::collections::HashSet<String>,
+) -> Option<(
+    Vec<&'static str>,
+    Vec<String>,
+    Option<crate::packs::EnabledKeywordIndex>,
+)> {
+    let mut packs = config.enabled_pack_ids_for_payload(true);
+    if let Some(extra) = cmd.with_packs.as_ref() {
+        for pack in extra {
+            packs.insert(pack.clone());
+        }
+    }
+    for id in external_store.pack_ids() {
+        packs.insert(id.clone());
+    }
+    if &packs == base_pack_ids {
+        return None;
+    }
+    let mut keywords = REGISTRY.collect_enabled_keywords(&packs);
+    keywords.extend(external_store.keywords().iter().copied());
+    let mut ordered = REGISTRY.expand_enabled_ordered(&packs);
+    for id in external_store.pack_ids() {
+        if !ordered.contains(id) {
+            ordered.push(id.clone());
+        }
+    }
+    let index = if external_store.pack_ids().next().is_some() {
+        None
+    } else {
+        REGISTRY.build_enabled_keyword_index(&ordered)
+    };
+    Some((keywords, ordered, index))
+}
+
 fn batch_line_outcome(
     config: &Config,
     line: std::io::Result<String>,
-    enabled_keywords: &[&str],
-    ordered_packs: &[String],
-    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    base_view: PackView<'_>,
+    windows_view: Option<PackView<'_>>,
     compiled_overrides: &crate::config::CompiledOverrides,
     allowlists: &crate::allowlist::LayeredAllowlist,
     heredoc_settings: &crate::config::HeredocSettings,
@@ -3159,9 +3244,8 @@ fn batch_line_outcome(
         Ok(text) => evaluate_batch_line(
             config,
             &text,
-            enabled_keywords,
-            ordered_packs,
-            keyword_index,
+            base_view,
+            windows_view,
             compiled_overrides,
             allowlists,
             heredoc_settings,
@@ -3187,9 +3271,8 @@ fn batch_line_outcome(
 fn evaluate_batch_line(
     config: &Config,
     line: &str,
-    enabled_keywords: &[&str],
-    ordered_packs: &[String],
-    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    base_view: PackView<'_>,
+    windows_view: Option<PackView<'_>>,
     compiled_overrides: &crate::config::CompiledOverrides,
     allowlists: &crate::allowlist::LayeredAllowlist,
     heredoc_settings: &crate::config::HeredocSettings,
@@ -3252,16 +3335,37 @@ fn evaluate_batch_line(
     // a fail-open once `[policy]` could turn that entry into a warn/log
     // `allow` (#330): the entries after it were never evaluated.
     let project_path = std::env::current_dir().ok();
-    let mut decisive: Option<BatchEntryOutcome> = None;
-    for (command, dialect) in
+    let entries: Vec<(String, crate::normalize::ShellDialect)> =
         std::iter::once((extracted_command.command, extracted_command.dialect))
             .chain(extracted_command.additional_commands)
-    {
+            .collect();
+
+    // Decide the pack set for the LINE, not per entry, and by the same rule
+    // `main.rs` uses: an explicit PowerShell/Cmd dialect, or a payload whose
+    // own shape says Windows even though the tool label said `Bash`. Deciding
+    // per line rather than per entry is what keeps this identical to the plain
+    // path, which activates the packs for the whole request once any entry
+    // qualifies (#493).
+    let windows_payload = entries.iter().any(|(command, dialect)| match dialect {
+        crate::normalize::ShellDialect::PowerShell | crate::normalize::ShellDialect::Cmd => true,
+        crate::normalize::ShellDialect::Unknown => {
+            crate::hook::command_is_windows_shell_payload(command)
+        }
+        crate::normalize::ShellDialect::Posix => false,
+    });
+    let view = if windows_payload {
+        windows_view.unwrap_or(base_view)
+    } else {
+        base_view
+    };
+
+    let mut decisive: Option<BatchEntryOutcome> = None;
+    for (command, dialect) in entries {
         let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
             &command,
-            enabled_keywords,
-            ordered_packs,
-            keyword_index,
+            view.enabled_keywords,
+            view.ordered_packs,
+            view.keyword_index,
             compiled_overrides,
             allowlists,
             heredoc_settings,
@@ -21318,9 +21422,16 @@ mod tests {
                 let mut result = evaluate_batch_line(
                     &ctx.config,
                     line,
-                    &ctx.enabled_keywords,
-                    &ctx.ordered_packs,
-                    ctx.keyword_index.as_ref(),
+                    PackView {
+                        enabled_keywords: &ctx.enabled_keywords,
+                        ordered_packs: &ctx.ordered_packs,
+                        keyword_index: ctx.keyword_index.as_ref(),
+                    },
+                    // These helpers build the DEFAULT pack set only, so there is
+                    // no windows-payload view to offer; the selection inside
+                    // falls back to the base view, exactly as it does on a
+                    // Windows host where the two sets are identical.
+                    None,
                     &ctx.compiled_overrides,
                     &ctx.allowlists,
                     &ctx.heredoc_settings,
@@ -30417,27 +30528,26 @@ exclude = ["target/**"]
         )
     }
 
-    /// The default dialect is NOT a complete union, and the help text says so.
+    /// The default dialect now covers the semantic delete front ends (#491).
     ///
-    /// `--dialect unknown` is documented as denying where the hook allows, and
-    /// it does — `rd /s /q C:\x` in the test below is exactly that. What it does
-    /// not do is deny everything any single dialect denies:
-    /// `Remove-Item -Recurse -Force /etc` is denied by `--dialect ps` and by a
-    /// `PowerShell` hook payload, and allowed at the default (#451).
+    /// This test used to pin the OPPOSITE, and it carried its own retirement
+    /// instruction: "when the union is completed, invert this test and drop the
+    /// caveats". `Remove-Item -Recurse -Force /etc` was denied by `--dialect ps`
+    /// and allowed at the default, because
+    /// `parse_rm_command_segment_in_dialect` dispatched its Windows front ends
+    /// on an EXACT dialect and `Unknown` matched no arm. It now tries POSIX
+    /// first and then both Windows front ends, so the gap this test was written
+    /// to record is closed and the assertion is inverted.
     ///
-    /// That is asserted here rather than left implicit for two reasons. It is a
-    /// user-facing safety claim — an `allow` from `dcg test` reads as "no hook
-    /// would block this", and for this command that is wrong — and `Unknown` is
-    /// not CLI-only: `shell_dialect_for_tool_name` resolves it for every tool
-    /// name that is not `bash`/`powershell`/`pwsh`/`cmd`, so the gap is reachable
-    /// from a real payload.
-    ///
-    /// **When the union is completed, invert this test and drop the caveats from
-    /// `TestCommand`'s doc comment and from `DialectArg::Unknown`.** It pins the
-    /// gap so the documentation cannot drift back to the stronger claim while
-    /// the behaviour stays as it is; it is not an endorsement of the behaviour.
+    /// The claim is deliberately no broader than that. This pins the ONE
+    /// command the caveat named; it does not assert that `Unknown` denies
+    /// everything some concrete dialect denies, which has not been measured
+    /// across every pack. `DialectArg::Unknown`'s doc says the same, in the same
+    /// terms — if a future spelling is found that denies under `ps` or `cmd` and
+    /// allows here, that is a new instance of the same shape, not a regression
+    /// of this one.
     #[test]
-    fn default_dialect_is_not_a_complete_union_issue_451() {
+    fn default_dialect_covers_the_semantic_delete_front_ends_issue_491() {
         let command = "Remove-Item -Recurse -Force /etc";
 
         let ps = evaluate_at_dialect(command, DialectArg::Ps);
@@ -30448,21 +30558,23 @@ exclude = ["target/**"]
         );
 
         let unknown = evaluate_at_dialect(command, DialectArg::Unknown);
-        if cfg!(windows) {
-            // The windows.* packs are default-on only on Windows builds, and
-            // their Unknown-dialect regex fallback covers this spelling there.
-            assert!(
-                matches!(unknown, EvaluationDecision::Deny),
-                "a Windows build's default packs must deny this in every dialect"
-            );
-        } else {
-            assert!(
-                !matches!(unknown, EvaluationDecision::Deny),
-                "the default dialect now denies this, so the union is complete: \
-                 invert this assertion and remove the caveats from `dcg test --help` \
-                 and `DialectArg::Unknown` (#451)"
-            );
-        }
+        assert!(
+            matches!(unknown, EvaluationDecision::Deny),
+            "#491: the default dialect must deny what the PowerShell view denies \
+             for this command — the Unknown fan-out in \
+             `parse_rm_command_segment_in_dialect` is what closes it"
+        );
+
+        // The POSIX reading is tried first and is unaffected: an ordinary
+        // recursive delete of a project path keeps its own rule, and a literal
+        // temp path keeps its carve-out.
+        assert!(
+            !matches!(
+                evaluate_at_dialect("rm -rf /tmp/scratch/x", DialectArg::Unknown),
+                EvaluationDecision::Deny
+            ),
+            "#491: the fan-out must not disturb the literal-temp carve-out"
+        );
     }
 
     fn evaluate_at_dialect(command: &str, dialect: DialectArg) -> EvaluationDecision {

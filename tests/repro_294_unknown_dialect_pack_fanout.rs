@@ -350,3 +350,83 @@ fn unquoted_caret_obfuscation_still_denies_under_unknown_dialect() {
         );
     }
 }
+
+/// The semantic `rm` path had the defect #294 fixed for the regex packs.
+///
+/// `parse_rm_command_segment_in_dialect` dispatched its Windows front ends on
+/// an EXACT dialect (`== PowerShell`, `== Cmd`), and `refine_shell_dialect`
+/// down-trusts a mislabeled `Bash` payload to `Unknown` — which matched no arm.
+/// So a Windows single-file delete of a protected path fell through to the
+/// POSIX parse and was allowed, while the POSIX spelling of the same act
+/// denied. The code those commands needed already existed and was already
+/// wired; only the dialect gate stood in front of it (#486, #491).
+///
+/// Unlike the regex fan-out above, forcing `Unknown` did NOT reveal this: the
+/// concrete-dialect replay never reached this path, so `dcg explain` reported
+/// no `dialect_divergence` at all.
+#[test]
+fn windows_protected_file_deletes_deny_under_unknown_dialect() {
+    for (command, concrete) in [
+        (r"Remove-Item .git\config", ShellDialect::PowerShell),
+        (r"ri .git\config", ShellDialect::PowerShell),
+        (
+            r"Remove-Item $env:USERPROFILE\.ssh\authorized_keys",
+            ShellDialect::PowerShell,
+        ),
+        (
+            r"Remove-Item -Path $env:USERPROFILE\.ssh\id_rsa",
+            ShellDialect::PowerShell,
+        ),
+        (r"del .git\config", ShellDialect::Cmd),
+        (r"erase .git\HEAD", ShellDialect::Cmd),
+        (r"del %USERPROFILE%\.ssh\authorized_keys", ShellDialect::Cmd),
+        (r"del /f /q %USERPROFILE%\.ssh\id_rsa", ShellDialect::Cmd),
+    ] {
+        let concrete_result = evaluate_all_packs(command, concrete);
+        assert!(
+            concrete_result.is_denied(),
+            "{command:?} must deny under {concrete:?}, got {concrete_result:?}"
+        );
+
+        let unknown = evaluate_all_packs(command, ShellDialect::Unknown);
+        assert!(
+            unknown.is_denied(),
+            "#491: {command:?} must deny under the unknown dialect too, got {unknown:?}"
+        );
+        assert_eq!(
+            rule_id(&unknown).as_deref(),
+            rule_id(&concrete_result).as_deref(),
+            "the unknown-dialect deny must carry the rule id the {concrete:?} view reports for {command:?}"
+        );
+    }
+}
+
+/// POSIX is tried FIRST under `Unknown`, which is the safety argument for the
+/// fan-out above: an ordinary command keeps its own reading, and only one the
+/// POSIX parser declines is offered to the Windows front ends.
+#[test]
+fn the_unknown_dialect_fanout_does_not_claim_ordinary_posix_deletes() {
+    for command in [
+        "rm build/out.txt",
+        "rm -f build/out.txt",
+        "rm -rf /tmp/scratch/x",
+        "rm ./notes.txt",
+        // `ri` is Ruby's documentation browser; without a protected target the
+        // PowerShell front end must decline it.
+        "ri Array",
+        "ri --no-pager String#split",
+        // A caret in ordinary POSIX data must not be read as cmd obfuscation
+        // of a delete.
+        "grep -rn '^fn main' src/",
+        "sed -n '/^use /p' src/lib.rs",
+        // Reads of the very paths the rules protect.
+        "cat .git/config",
+        "diff ~/.ssh/authorized_keys /tmp/expected",
+    ] {
+        let unknown = evaluate_all_packs(command, ShellDialect::Unknown);
+        assert!(
+            unknown.is_allowed(),
+            "#491: the unknown-dialect fan-out must not claim {command:?}, got {unknown:?}"
+        );
+    }
+}

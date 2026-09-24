@@ -1356,22 +1356,10 @@ pub(crate) fn parse_rm_command_segment_in_dialect(
     if dialect == ShellDialect::PowerShell && powershell_variable_assignment(command) {
         return RmParseDecision::NoMatch;
     }
-    if dialect == ShellDialect::PowerShell {
-        let powershell = parse_powershell_remove_item_segment(command, pipeline_stdin);
-        if !matches!(powershell, RmParseDecision::NoMatch) {
-            return powershell;
-        }
-    }
-    if dialect == ShellDialect::Cmd {
-        let cmd = parse_cmd_decoded_rm_segment(command, pipeline_stdin);
-        if !matches!(cmd, RmParseDecision::NoMatch) {
-            return cmd;
-        }
-        // The decoder above only runs for commands carrying `^`, so the plain
-        // spelling of a protected-file delete reached nothing (#451).
-        let protected = parse_cmd_protected_file_segment(command);
-        if !matches!(protected, RmParseDecision::NoMatch) {
-            return protected;
+    if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Cmd) {
+        let windows = parse_windows_rm_segment(command, pipeline_stdin, dialect);
+        if !matches!(windows, RmParseDecision::NoMatch) {
+            return windows;
         }
     }
 
@@ -1380,7 +1368,70 @@ pub(crate) fn parse_rm_command_segment_in_dialect(
         return exact;
     }
 
+    // Under `Unknown` the honest answer is the fail-closed union. Every arm
+    // above keys on an EXACT dialect, and `hook::refine_shell_dialect`
+    // down-trusts a mislabeled `Bash` payload to `Unknown` -- which matched no
+    // arm, so a Windows payload fell through to the POSIX parse and
+    // `Remove-Item .git\config`, `del %USERPROFILE%\.ssh\authorized_keys` and
+    // their siblings were allowed while `rm .git/config` and
+    // `rm ~/.ssh/authorized_keys` denied (#491).
+    //
+    // The code those commands needed already existed and was already wired:
+    // `parse_cmd_protected_file_segment` was written for exactly them (#486).
+    // Only the dialect gate stood in front of it. Two controls said so: forcing
+    // `Unknown` changed nothing (it is the value neither arm accepts), and
+    // `dcg explain` reported no `dialect_divergence` at all, so it was not a
+    // case of one dialect denying and the hook reading the wrong one.
+    //
+    // POSIX IS TRIED FIRST, ABOVE. That ordering is the whole safety argument:
+    // an ordinary `rm` keeps its own reading, and only a command the POSIX
+    // parser declines is offered to the Windows front ends. It is also the
+    // convention `credential_files::shell::classify` already established for
+    // this same situation (`posix().or_else(PowerShell).or_else(Cmd)`), so this
+    // follows it rather than inventing a second one.
+    if dialect == ShellDialect::Unknown {
+        for windows in [ShellDialect::PowerShell, ShellDialect::Cmd] {
+            let hit = parse_windows_rm_segment(command, pipeline_stdin, windows);
+            if !matches!(hit, RmParseDecision::NoMatch) {
+                return hit;
+            }
+        }
+    }
+
     parse_unverified_rm_command_segment(command, pipeline_stdin, dialect)
+}
+
+/// The Windows delete front ends for one CONCRETE dialect.
+///
+/// Split out of [`parse_rm_command_segment_in_dialect`] so the `Unknown` union
+/// runs exactly the same code the concrete dialects do, rather than a second
+/// copy that could drift from it.
+fn parse_windows_rm_segment(
+    command: &str,
+    pipeline_stdin: bool,
+    dialect: ShellDialect,
+) -> RmParseDecision {
+    match dialect {
+        ShellDialect::PowerShell => {
+            // A PowerShell assignment is an expression statement, not an
+            // invocation; see the caller's note. The guard travels with the
+            // front end so the union cannot bypass it.
+            if powershell_variable_assignment(command) {
+                return RmParseDecision::NoMatch;
+            }
+            parse_powershell_remove_item_segment(command, pipeline_stdin)
+        }
+        ShellDialect::Cmd => {
+            let decoded = parse_cmd_decoded_rm_segment(command, pipeline_stdin);
+            if !matches!(decoded, RmParseDecision::NoMatch) {
+                return decoded;
+            }
+            // The decoder above only runs for commands carrying `^`, so the
+            // plain spelling of a protected-file delete reached nothing (#451).
+            parse_cmd_protected_file_segment(command)
+        }
+        ShellDialect::Posix | ShellDialect::Unknown => RmParseDecision::NoMatch,
+    }
 }
 
 /// Whether a Windows-dialect delete target names a protected file (#451).

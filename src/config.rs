@@ -2210,7 +2210,23 @@ impl PacksConfig {
     /// Get enabled pack IDs as a deduplicated set.
     #[must_use]
     pub fn enabled_pack_ids(&self) -> HashSet<String> {
-        Self::resolve_requested_pack_ids(self.requested_pack_ids(cfg!(windows)), &self.disabled)
+        self.enabled_pack_ids_for_payload(false)
+    }
+
+    /// As [`Self::enabled_pack_ids`], but for a caller that has seen the
+    /// payload and knows it is a Windows shell command (#451).
+    ///
+    /// The agent-aware sibling on `Config` takes the same flag. This one
+    /// exists for `dcg hook`'s JSONL reader, which builds its pack set before
+    /// reading any line and so could only ever ask the payload-blind question —
+    /// which is why the same command denied through the plain hook path and
+    /// was allowed through `dcg hook`.
+    #[must_use]
+    pub fn enabled_pack_ids_for_payload(&self, windows_payload: bool) -> HashSet<String> {
+        Self::resolve_requested_pack_ids(
+            self.requested_pack_ids(cfg!(windows) || windows_payload),
+            &self.disabled,
+        )
     }
 
     /// Expand custom_paths, resolving tilde, ${repo_root}, and glob patterns.
@@ -5137,15 +5153,24 @@ impl Config {
     /// Get enabled pack IDs as a deduplicated set.
     #[must_use]
     pub fn enabled_pack_ids(&self) -> HashSet<String> {
+        self.enabled_pack_ids_for_payload(false)
+    }
+
+    /// As [`Self::enabled_pack_ids`], but for a caller that has already seen
+    /// the payload and knows it is a Windows shell command (#451).
+    #[must_use]
+    pub fn enabled_pack_ids_for_payload(&self, windows_payload: bool) -> HashSet<String> {
         if self.projects.is_empty() {
-            return self.packs.enabled_pack_ids();
+            return self.packs.enabled_pack_ids_for_payload(windows_payload);
         }
 
         if let Ok(cwd) = std::env::current_dir() {
-            return self.effective_packs_for_project(&cwd).enabled_pack_ids();
+            return self
+                .effective_packs_for_project(&cwd)
+                .enabled_pack_ids_for_payload(windows_payload);
         }
 
-        self.packs.enabled_pack_ids()
+        self.packs.enabled_pack_ids_for_payload(windows_payload)
     }
 
     /// Effective end-to-end hook evaluation budget in milliseconds.
