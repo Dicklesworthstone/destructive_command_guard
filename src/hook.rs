@@ -2036,6 +2036,31 @@ const CMD_WRITER_VERBS: &[&str] = &[
 /// English.
 const WINDOWS_ONLY_EXECUTABLES: &[&str] = &["diskpart", "bcdedit", "cipher", "wbadmin", "fsutil"];
 
+/// Windows verbs that delete a single FILE, as opposed to a tree.
+///
+/// [`WINDOWS_DESTRUCTIVE_ALIASES`] already covers the tree deletes, but it
+/// requires a Windows-shell-only SWITCH (`-Recurse`, `/s`) to corroborate the
+/// name — which is right for `rm`/`rd`, and is exactly what a single-file
+/// delete never carries. So `del .git\config` and
+/// `del %USERPROFILE%\.ssh\authorized_keys` kept the Posix dialect, and the
+/// protected-file rule written for precisely them (`parse_cmd_protected_file_segment`,
+/// #486) never ran: measured allowed while `rm .git/config` and
+/// `rm ~/.ssh/authorized_keys` denied (#491).
+///
+/// `rm` is DELIBERATELY ABSENT. It is the most common destructive command
+/// there is, and it takes POSIX escapes — `rm foo\ bar` would widen every
+/// ordinary Bash deletion of a filename containing an escaped space. `rd` and
+/// `rmdir` are absent for a different reason: they are directory verbs, the
+/// switch rule already covers them, and `rd /s /q` is the spelling that
+/// matters.
+///
+/// `ri` is PowerShell's `Remove-Item` alias and is here rather than in the
+/// executables list because it is also Ruby's documentation browser: `ri Array`
+/// must keep the Posix dialect, which the operand requirement below enforces
+/// and `the_unknown_dialect_fanout_does_not_claim_ordinary_posix_deletes`
+/// pins.
+const WINDOWS_FILE_DELETE_VERBS: &[&str] = &["del", "erase", "ri"];
+
 /// PowerShell `Remove-Item` parameter names used as the discriminator. A
 /// single-dash token whose name is a >=3-character prefix of one of these is
 /// unmistakably PowerShell: POSIX/GNU `rm` never accepts a single-dash
@@ -2166,6 +2191,27 @@ fn segment_is_cmd_writer_invocation(segment: &str) -> bool {
         .any(is_windows_path_token)
 }
 
+/// Return whether a segment is a Windows single-FILE delete of a Windows path:
+/// one of [`WINDOWS_FILE_DELETE_VERBS`] carrying a Windows-path-shaped operand.
+///
+/// The operand requirement is the same discipline the aliases and the cmd
+/// writers are held to, and here it is what separates `del .git\config` from
+/// `del notes.txt` and `ri .git\config` from `ri Array`.
+fn segment_is_windows_file_delete_invocation(segment: &str) -> bool {
+    let mut tokens = segment.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let lowered = first.to_ascii_lowercase();
+    let name = lowered.strip_suffix(".exe").unwrap_or(&lowered);
+    if !WINDOWS_FILE_DELETE_VERBS.contains(&name) {
+        return false;
+    }
+    tokens
+        .take_while(|token| *token != "--")
+        .any(is_windows_path_token)
+}
+
 /// Return whether a segment's command word is one of
 /// [`WINDOWS_ONLY_EXECUTABLES`].
 ///
@@ -2230,6 +2276,7 @@ fn command_has_powershell_shape(command: &str) -> bool {
                 .is_some_and(is_powershell_cmdlet_token)
                 || segment_is_windows_alias_invocation(segment)
                 || segment_is_cmd_writer_invocation(segment)
+                || segment_is_windows_file_delete_invocation(segment)
                 || segment_is_windows_only_executable(segment)
                 || segment_is_format_drive_invocation(segment)
         })
@@ -4491,6 +4538,57 @@ mod tests {
                 refine_shell_dialect(command, ShellDialect::Posix),
                 ShellDialect::Posix,
                 "plain POSIX writer usage must not widen: {command:?}"
+            );
+        }
+    }
+
+    /// Windows single-FILE deletes widen the dialect (#491).
+    ///
+    /// `WINDOWS_DESTRUCTIVE_ALIASES` requires a switch (`-Recurse`, `/s`) to
+    /// corroborate the verb, which a single-file delete never carries — so
+    /// `del .git\config` kept the Posix dialect and the protected-file rule
+    /// written for it never ran, while `rm .git/config` denied.
+    #[test]
+    fn windows_single_file_deletes_widen_the_dialect() {
+        for command in [
+            r"del .git\config",
+            r"erase .git\HEAD",
+            r"del %USERPROFILE%\.ssh\authorized_keys",
+            r"del /f /q %USERPROFILE%\.ssh\id_rsa",
+            r"ri .git\config",
+            r"ri $env:USERPROFILE\.ssh\id_rsa",
+            r"DEL.EXE C:\Windows\System32\config\SAM",
+            r"echo ok && del .git\config",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "windows single-file delete must widen: {command:?}"
+            );
+        }
+
+        // The verb alone is never enough, for the same reason it is not enough
+        // for the aliases and the cmd writers.
+        for command in [
+            // `ri` is Ruby's documentation browser.
+            "ri Array",
+            "ri --no-pager String#split",
+            // Ordinary relative targets.
+            "del notes.txt",
+            "erase build/out.txt",
+            // `rm` is deliberately NOT in the verb list: a POSIX escape must
+            // not widen the most common destructive command there is.
+            r"rm foo\ bar",
+            r"rm a\*b",
+            r"rm -rf ./build",
+            // A mention, not a command word.
+            "echo del is a windows verb",
+            "grep -rn erase notes.md",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "must not widen: {command:?}"
             );
         }
     }
