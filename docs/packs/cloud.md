@@ -276,6 +276,7 @@ These patterns match potentially destructive commands:
 | `functionapp-delete` | az functionapp delete removes the Azure Function App. | high |
 | `cosmosdb-delete` | az cosmosdb delete permanently destroys the Cosmos DB resource. | critical |
 | `keyvault-delete` | az keyvault delete removes the Key Vault. Secrets may be unrecoverable. | critical |
+| `keyvault-purge` | az keyvault purge permanently destroys a soft-deleted Key Vault and every secret, key and certificate in it. | critical |
 | `vnet-delete` | az network vnet delete removes the virtual network. | high |
 | `acr-delete` | az acr delete removes the container registry and all images. | critical |
 | `acr-repository-delete` | az acr repository delete permanently deletes the repository and its images. | high |

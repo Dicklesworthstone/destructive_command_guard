@@ -1674,7 +1674,11 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         ],
         secrets::disclosure::create_pack,
     ),
-    PackEntry::new("platform.github", &["gh"], platform::github::create_pack),
+    PackEntry::new(
+        "platform.github",
+        &["gh", "curl"],
+        platform::github::create_pack,
+    ),
     PackEntry::new(
         "platform.gitlab",
         &["glab", "gitlab-rails", "gitlab-rake"],

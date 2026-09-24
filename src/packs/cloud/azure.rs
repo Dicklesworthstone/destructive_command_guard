@@ -255,6 +255,21 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Vault name reserved for recovery period\n\n\
              Check protection: az keyvault show --name NAME --query properties.enablePurgeProtection"
         ),
+        // keyvault purge: the step soft-delete exists to make recoverable.
+        // `keyvault-item-delete-or-purge` covers keys/secrets/certificates;
+        // this is the whole vault.
+        destructive_pattern!(
+            "keyvault-purge",
+            r"az\b.*?\bkeyvault\s+purge\b",
+            "az keyvault purge permanently destroys a soft-deleted Key Vault and every secret, key and certificate in it.",
+            Critical,
+            "Purging bypasses soft-delete: the vault and ALL of its contents are \
+             destroyed immediately and cannot be recovered.\n\n\
+             Safer alternatives:\n\
+             - az keyvault list-deleted: Review soft-deleted vaults first\n\
+             - az keyvault recover --name NAME: Restore it instead\n\
+             - Let the retention period expire rather than purging early"
+        ),
         // network vnet delete
         destructive_pattern!(
             "vnet-delete",
@@ -875,6 +890,14 @@ mod tests {
             "az keyvault delete --name myvault",
             "keyvault-delete",
         );
+        assert_blocks_with_pattern(&pack, "az keyvault purge -n myvault", "keyvault-purge");
+        assert_blocks_with_pattern(
+            &pack,
+            "az keyvault purge --name myvault --location eastus",
+            "keyvault-purge",
+        );
+        assert_blocks_with_severity(&pack, "az keyvault purge -n kv", Severity::Critical);
+        assert_allows(&pack, "az keyvault list-deleted");
         assert_blocks_with_pattern(
             &pack,
             "az network vnet delete --name myvnet -g rg",

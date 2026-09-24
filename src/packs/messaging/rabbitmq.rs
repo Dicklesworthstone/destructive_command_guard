@@ -95,6 +95,30 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Consume and process messages instead of purging\n\
              - Set message TTL for automatic expiration"
         ),
+        // The same two operations through rabbitmqctl, which spells them as
+        // single snake_case commands rather than rabbitmqadmin's verb + noun.
+        destructive_pattern!(
+            "rabbitmqctl-delete-queue",
+            r"rabbitmqctl(?:\s+--?\S+(?:\s+\S+)?)*\s+delete_queue\b",
+            "rabbitmqctl delete_queue deletes the queue and ALL messages in it.",
+            Critical,
+            "Deleting a queue removes its messages permanently and breaks every \
+             consumer and binding that refers to it.\n\n\
+             Safer alternatives:\n\
+             - rabbitmqctl list_queues name messages consumers: Check it first\n\
+             - rabbitmqctl delete_queue <name> --if-empty --if-unused: Refuse when in use"
+        ),
+        destructive_pattern!(
+            "rabbitmqctl-purge-queue",
+            r"rabbitmqctl(?:\s+--?\S+(?:\s+\S+)?)*\s+purge_queue\b",
+            "rabbitmqctl purge_queue deletes ALL messages in the queue.",
+            High,
+            "Purging a queue deletes every message waiting to be consumed. This \
+             cannot be undone.\n\n\
+             Safer alternatives:\n\
+             - rabbitmqctl list_queues name messages: Check the message count first\n\
+             - Consume and process messages instead of purging"
+        ),
         destructive_pattern!(
             "rabbitmqctl-delete-vhost",
             r"rabbitmqctl(?:\s+--?\S+(?:\s+\S+)?)*\s+delete_vhost\b",
@@ -210,6 +234,26 @@ mod tests {
         );
         assert_blocks_with_pattern(&pack, "rabbitmqctl reset", "rabbitmqctl-reset");
         assert_blocks_with_pattern(&pack, "rabbitmqctl force_reset", "rabbitmqctl-force-reset");
+        // rabbitmqctl's spellings of the rabbitmqadmin queue operations above.
+        for (command, rule) in [
+            (
+                "rabbitmqctl delete_queue orders",
+                "rabbitmqctl-delete-queue",
+            ),
+            (
+                "rabbitmqctl -p /prod delete_queue orders",
+                "rabbitmqctl-delete-queue",
+            ),
+            ("rabbitmqctl purge_queue orders", "rabbitmqctl-purge-queue"),
+            (
+                "rabbitmqctl --vhost /prod purge_queue orders",
+                "rabbitmqctl-purge-queue",
+            ),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+        assert_blocks_with_severity(&pack, "rabbitmqctl delete_queue orders", Severity::Critical);
+        assert_allows(&pack, "rabbitmqctl list_queues name messages");
     }
 
     #[test]

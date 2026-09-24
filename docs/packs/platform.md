@@ -24,6 +24,7 @@ Protects against destructive GitHub CLI operations like changing repository visi
 Commands containing these keywords are checked against this pack:
 
 - `gh`
+- `curl`
 
 ### Safe Patterns (Allowed)
 
@@ -69,6 +70,7 @@ These patterns match potentially destructive commands:
 | `gh-api-delete-deploy-key` | gh api DELETE keys removes deploy keys. | high |
 | `gh-api-delete-release` | gh api DELETE releases removes GitHub releases. | high |
 | `gh-api-delete-repo` | gh api DELETE /repos/{owner}/{repo} permanently deletes a GitHub repository. This cannot be undone. | high |
+| `curl-api-delete-repo` | curl DELETE /repos/{owner}/{repo} permanently deletes a GitHub repository. This cannot be undone. | high |
 | `gh-api-delete-generic` | gh api DELETE calls can be destructive. Please verify the endpoint. | high |
 
 ### Allowlist Guidance

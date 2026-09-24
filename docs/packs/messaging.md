@@ -122,6 +122,8 @@ These patterns match potentially destructive commands:
 | `rabbitmqadmin-delete-queue` | rabbitmqadmin delete queue permanently deletes a queue. | critical |
 | `rabbitmqadmin-delete-exchange` | rabbitmqadmin delete exchange removes an exchange and its bindings. | high |
 | `rabbitmqadmin-purge-queue` | rabbitmqadmin purge queue deletes ALL messages in the queue. | high |
+| `rabbitmqctl-delete-queue` | rabbitmqctl delete_queue deletes the queue and ALL messages in it. | critical |
+| `rabbitmqctl-purge-queue` | rabbitmqctl purge_queue deletes ALL messages in the queue. | high |
 | `rabbitmqctl-delete-vhost` | rabbitmqctl delete_vhost removes a vhost and all its resources. | critical |
 | `rabbitmqctl-forget-cluster-node` | rabbitmqctl forget_cluster_node permanently removes a node from the cluster. | high |
 | `rabbitmqctl-reset` | rabbitmqctl reset wipes all configuration, queues, and bindings on the node. | critical |
