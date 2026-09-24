@@ -15,10 +15,6 @@ keywords = ["destructive", "safety", "claude", "hook", "guard"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 rust-version = "1.95"
-# Not published to crates.io (#411): `cargo publish` drops the
-# `[patch.crates-io]` vendored tree-sitter-bash below, so a registry build would
-# ship the unpatched parser (#442 scanner UB on glibc, #461 redirect parsing).
-publish = false
 exclude = [
     ".beads/",
     "scripts/",

@@ -1054,14 +1054,6 @@ bundle with `cosign verify-blob --new-bundle-format --key <pub> --bundle
 dcg-$T.tar.xz.sigstore.json dcg-$T.tar.xz`, where `<pub>` is the key pinned
 as `COSIGN_RELEASE_PUBLIC_KEY` in `install.sh`.
 
-**crates.io is not a supported channel.** dcg builds its shell parser from a
-vendored, patched `tree-sitter-bash` (`[patch.crates-io]` in `Cargo.toml`),
-and `cargo publish` drops that patch. A crates.io build would silently use the
-unpatched grammar, which has a scanner memory-safety bug on glibc and
-misparses some redirections that the guard needs to read correctly. The
-package there is frozen at an old version; to build from source, clone the
-repository and run `cargo install --path .`.
-
 **Other options:**
 
 Interactive mode (prompts for each step; prompts read your terminal via
