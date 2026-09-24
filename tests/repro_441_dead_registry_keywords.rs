@@ -212,3 +212,44 @@ fn a_disabled_pack_still_does_not_fire() {
         );
     }
 }
+
+/// `system.permissions` carried `chgrp` on the pack's own keyword row and not
+/// on its `PACK_ENTRIES` row, so the command was quick-rejected before the pack
+/// was even a candidate.
+///
+/// A fresh instance of this issue's exact shape, found in 2026-09 while
+/// measuring the permissions pack: `chown -R nobody /` denied while
+/// `chgrp -R nogroup /` allowed, though both change the same access-control
+/// metadata on the same tree. The pack-level test added alongside the new rule
+/// passed the whole time, because it calls `create_pack()` directly and never
+/// reaches the registry gate — which is precisely what this file exists to
+/// catch.
+#[test]
+fn system_permissions_chgrp_is_reachable() {
+    for command in [
+        "chgrp -R nogroup /",
+        "chgrp -R nogroup /etc",
+        "chgrp -R nogroup /usr",
+        "chgrp --recursive nogroup /var",
+    ] {
+        assert_eq!(
+            decision(command, "system.permissions"),
+            "deny",
+            "registry row must make chgrp reachable: {command}"
+        );
+    }
+
+    // The carve-outs the sibling rules get, through the same path: a recursive
+    // chgrp inside a project tree is an ordinary command.
+    for command in [
+        "chgrp -R staff ./build",
+        "chgrp -R staff /home/user/project",
+        "chgrp staff ./out",
+    ] {
+        assert_eq!(
+            decision(command, "system.permissions"),
+            "allow",
+            "ordinary chgrp must stay allowed: {command}"
+        );
+    }
+}

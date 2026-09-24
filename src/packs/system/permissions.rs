@@ -133,9 +133,22 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // deeper paths, so a routine `chmod -R /home/user/project` stays
         // allowed while `chmod -R /home` (locks out every account) is blocked
         // (issue #301; `/Users` parity mirrors the filesystem #325 fix).
+        // `~` and `$HOME` name the SAME directory `/home/user` does, and were
+        // the only spellings that escaped: `chmod -R 000 /home/user` denied
+        // while `chmod -R 000 ~`, `~/` and `$HOME` all allowed. An agent writes
+        // the short form, so the covered spelling was the one it never uses.
+        //
+        // The depth carve-out above is preserved exactly: `~/project` is the
+        // `/home/user/project` case and stays allowed, because the home
+        // alternatives only match at end-of-argument.
+        //
+        // Quoting follows the shell rather than being approximated. A tilde
+        // expands only when UNQUOTED, so `"~"` is a directory literally named
+        // `~` and is deliberately not matched; `$HOME` expands inside double
+        // quotes but not single ones, so it takes an optional `"` only.
         destructive_pattern!(
             "chmod-recursive-root",
-            r#"chmod\s+(?:.*(?:-[rR]|--recursive)).*\s+['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))"#,
+            r#"chmod\s+(?:.*(?:-[rR]|--recursive)).*\s+(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))"#,
             "chmod -R on system directories can break system permissions.",
             Critical,
             "Recursively changing permissions on system directories can render the system \
@@ -149,7 +162,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chown -R on root or system directories
         destructive_pattern!(
             "chown-recursive-root",
-            r#"chown\s+(?:.*(?:-[rR]|--recursive)).*\s+['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))"#,
+            r#"chown\s+(?:.*(?:-[rR]|--recursive)).*\s+(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))"#,
             "chown -R on system directories can break system ownership.",
             High,
             "Recursive ownership changes on system directories can disrupt services, \
@@ -157,6 +170,29 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              path or a shallow find before applying broader changes.",
             CHOWN_RECURSIVE_SUGGESTIONS,
             executables = ["chown"]
+        ),
+        // `chgrp` was in this pack's keyword row from the start but no rule
+        // ever claimed it, so the keyword selected the pack and nothing
+        // matched: `chown -R nobody /` denied while `chgrp -R nogroup /`
+        // allowed. Group ownership is the same access-control surface owner
+        // ownership is -- a recursive chgrp across `/usr` or `/etc` breaks
+        // every group-readable service file the same way.
+        //
+        // Same target set and same spellings as the two rules above, so the
+        // three answer alike; severity matches `chown-recursive-root` because
+        // the effect is the same kind of change to the same metadata.
+        destructive_pattern!(
+            "chgrp-recursive-root",
+            r#"chgrp\s+(?:.*(?:-[rR]|--recursive)).*\s+(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))"#,
+            "chgrp -R on system directories can break system group ownership.",
+            High,
+            "Recursive group changes on system directories can disrupt services that \
+             rely on group-readable or group-writable files, break package-managed \
+             ownership, and be difficult to undo. Start with a single path or a \
+             shallow find before applying broader changes.\n\n\
+             Check current ownership first:\n  \
+             ls -la /path/to/directory",
+            executables = ["chgrp"]
         ),
         // chmod u+s (setuid)
         destructive_pattern!(
@@ -362,6 +398,7 @@ mod tests {
                     &["chmod"]
                 }
                 Some("chown-recursive-root" | "chown-to-root") => &["chown"],
+                Some("chgrp-recursive-root") => &["chgrp"],
                 Some("setfacl-all") => &["setfacl"],
                 other => panic!("unhandled permissions rule {other:?} — declare its executable"),
             };
@@ -371,6 +408,84 @@ mod tests {
                 "executables for {:?}",
                 pattern.name
             );
+        }
+    }
+
+    /// `~` and `$HOME` name the same directory `/home/user` does.
+    ///
+    /// The rules anchored on `/`, so the absolute spelling denied while every
+    /// short form allowed — and the short form is the one an agent writes.
+    #[test]
+    fn recursive_root_covers_the_home_shorthands() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("chmod -R 000 ~", "chmod-recursive-root"),
+            ("chmod -R 000 ~/", "chmod-recursive-root"),
+            ("chmod -R 000 $HOME", "chmod-recursive-root"),
+            ("chmod -R 000 ${HOME}", "chmod-recursive-root"),
+            ("chmod -R 000 \"$HOME\"", "chmod-recursive-root"),
+            ("chown -R nobody ~", "chown-recursive-root"),
+            ("chown -R nobody $HOME", "chown-recursive-root"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+    }
+
+    /// The home shorthands keep the depth carve-out, and the shell's quoting
+    /// rules.
+    ///
+    /// `/home/user/project` is deliberately allowed — only the home ROOT is
+    /// blocked — so `~/project` must be too, or this becomes a false-positive
+    /// engine for the most ordinary command there is. And a tilde expands only
+    /// when UNQUOTED, so `"~"` is a directory literally named `~`.
+    #[test]
+    fn home_shorthands_keep_the_depth_and_quoting_rules() {
+        let pack = create_pack();
+        for command in [
+            "chmod -R 755 ~/project",
+            "chmod -R 755 $HOME/project",
+            "chmod -R 755 ~/.config/app",
+            "chown -R me ~/project",
+            // Quoted tilde is a literal directory name, not home.
+            "chmod -R 000 \"~\"",
+            "chmod -R 000 '~'",
+            // Single quotes do not expand `$HOME` either.
+            "chmod -R 000 '$HOME'",
+        ] {
+            assert_no_match(&pack, command);
+        }
+    }
+
+    /// `chgrp` was a keyword with no rule behind it (#441's shape).
+    ///
+    /// It sat in the pack's keyword row from the start, so the keyword
+    /// selected the pack and nothing matched: `chown -R nobody /` denied while
+    /// `chgrp -R nogroup /` allowed, though both change the same
+    /// access-control metadata on the same tree.
+    #[test]
+    fn chgrp_recursive_root_is_covered_like_chown() {
+        let pack = create_pack();
+        for command in [
+            "chgrp -R nogroup /",
+            "chgrp -R nogroup /etc",
+            "chgrp -R nogroup /usr",
+            "chgrp -R nogroup /home/user",
+            "chgrp -R nogroup ~",
+            "chgrp -R nogroup $HOME",
+            "chgrp --recursive nogroup /var",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "chgrp-recursive-root");
+        }
+
+        // The same carve-outs the other two rules get, so this cannot pass on
+        // a blanket deny of `chgrp`.
+        for command in [
+            "chgrp -R staff ./build",
+            "chgrp -R staff /home/user/project",
+            "chgrp -R staff ~/project",
+            "chgrp staff ./out",
+        ] {
+            assert_no_match(&pack, command);
         }
     }
 

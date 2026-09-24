@@ -210,6 +210,7 @@ These patterns match potentially destructive commands:
 | `chmod-777` | chmod 777 makes files world-writable. This is a security risk. | high |
 | `chmod-recursive-root` | chmod -R on system directories can break system permissions. | critical |
 | `chown-recursive-root` | chown -R on system directories can break system ownership. | high |
+| `chgrp-recursive-root` | chgrp -R on system directories can break system group ownership. | high |
 | `chmod-setuid` | Setting setuid bit (chmod u+s) is a security-sensitive operation. | high |
 | `chmod-setgid` | Setting setgid bit (chmod g+s) is a security-sensitive operation. | high |
 | `chown-to-root` | Changing ownership to root should be done carefully. | high |

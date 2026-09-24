@@ -2318,7 +2318,13 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "system.permissions",
-        &["chmod", "chown", "setfacl"],
+        // `chgrp` has been in the pack's OWN keyword row since it was written
+        // but was missing from this one, which is the gate that actually
+        // decides candidacy — the same divergence `core.filesystem`'s `.git/`
+        // entry documents. So `chgrp -R nogroup /` reached no rule even after
+        // one existed: the pack-level test calls `create_pack()` directly and
+        // never sees this row (#451).
+        &["chmod", "chown", "chgrp", "setfacl"],
         system::permissions::create_pack,
     ),
     PackEntry::new(
@@ -6738,7 +6744,11 @@ destructive_patterns:
             ("database.snowflake", "EXECUTE"),
             ("database.snowflake", "execute"),
             ("infrastructure.ansible", "playbook"), // `ansible-playbook` carries `ansible`
-            ("system.permissions", "chgrp"),        // `chgrp -R … /etc` has no rule
+            // `("system.permissions", "chgrp")` was here, noted as "`chgrp -R …
+            // /etc` has no rule" — accurate, and the right call while that was
+            // true: a keyword that buys no coverage is not worth a wider hot
+            // path. `chgrp-recursive-root` now exists, so the keyword buys
+            // coverage and has moved to the row proper.
             // ---- A deliberate omission rather than an oversight. The row carries
             // `sqlite3`, the binary modern systems ship; `sqlite` is SQLite 2's
             // CLI. Admitting it would make the pack a candidate for any command
