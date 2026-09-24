@@ -253,6 +253,30 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             r#"dd\s+.*if=['"]?/dev/(?:zero|urandom|random).*of=['"]?/dev/"#,
             "dd from /dev/zero or /dev/urandom to a device will WIPE all data!"
         ),
+        // sfdisk writes a partition table whenever it is pointed at a device
+        // without a read-only option: `--delete`, `--part-type`, `--wipe` and
+        // friends act immediately, and a bare `sfdisk /dev/sda` reads a new
+        // layout from stdin -- the usual `echo ',,L' | sfdisk /dev/sda` form.
+        // `fdisk-edit` used to reach the bare form only because `fdisk` is a
+        // substring of `sfdisk`, and missed every option-first spelling. As
+        // with `sgdisk-modify`, the read-only surface is the closed list, the
+        // lookahead refuses to cross a quote, and `-n`/`--no-act` is the dry
+        // run.
+        destructive_pattern!(
+            "sfdisk-modify",
+            r#"\bsfdisk\b(?![^\n;&|'"]*[ \t]--?(?:l|list|F|list-free|d|dump|J|json|s|show-size|g|show-geometry|V|verify|n|no-act|h|help|v|version)\b)(?=[^\n;&|]*['"]?/dev/)"#,
+            "sfdisk rewrites the partition table: options act immediately, and a bare invocation reads a new layout from stdin.",
+            High,
+            "sfdisk is non-interactive by design. Pointed at a device it either applies \
+             the requested change (`--delete`, `--part-type`, `--wipe`, `--relocate`) or \
+             replaces the whole table with the script on stdin. There is no confirmation \
+             and no undo.\n\n\
+             What stays allowed:\n\
+             - Inspecting: `sfdisk -l /dev/sda`, `sfdisk --json /dev/sda`.\n\
+             - Saving the table: `sfdisk --dump /dev/sda > table.sfdisk`.\n\
+             - Rehearsing: add `-n`/`--no-act`.",
+            executables = ["sfdisk"]
+        ),
         // fdisk (partition editing).
         // `['"]?` allows quoted variants like `fdisk "/dev/sda"` to match.
         destructive_pattern!(
@@ -268,8 +292,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             r#"parted\b[^\n;&|]*?['"]?/dev/\S+['"]?(?:\s+--)?\s+(?:(?!\s*(?:align-check|help|h|print|p|quit|q|select|unit|u)\b)|[^\n;&|]*\b(?:print|p)\b\s+(?:(?:devices|free|list|all|\d+)\s+\S+|(?!devices\b|free\b|list\b|all\b|\d+\b)\S+)|[^\n;&|]*\b(?:disk_set|disk_toggle|mklabel|mktable|mkpart|name|rescue|resizepart|rm|set|toggle|type)\b)"#,
             "parted can modify partition tables and cause data loss."
         ),
-        // The GPT-native tools. `fdisk-edit` reaches `sfdisk` by substring and
-        // `parted-modify` covers GNU parted, but nothing covered gdisk's
+        // The GPT-native tools. `sfdisk-modify` and `fdisk-edit` cover the
+        // util-linux editors and `parted-modify` covers GNU parted, but nothing covered gdisk's
         // family — which is the family an agent reaches for on a UEFI system.
         // `sgdisk --zap-all /dev/sda` erases the GPT *and* the protective MBR,
         // strictly more than the `parted mklabel` the rule above denies (#456).
@@ -936,6 +960,45 @@ mod tests {
                 .check(cmd)
                 .unwrap_or_else(|| panic!("interactive GPT editor must block: {cmd}"));
             assert_eq!(matched.name, Some("gdisk-edit"), "wrong rule for {cmd}");
+        }
+    }
+
+    /// sfdisk acts on its options immediately and treats a bare device as
+    /// "read a new layout from stdin". `--delete` was allowed outright, and
+    /// the bare form reached `fdisk-edit` only by substring.
+    #[test]
+    fn sfdisk_writes_are_denied_and_reads_are_not() {
+        let pack = create_pack();
+        for cmd in [
+            "sfdisk --delete /dev/sda",
+            "sfdisk --delete /dev/sda 2",
+            "sfdisk --part-type /dev/sda 1 83",
+            "sfdisk --wipe always /dev/sdb",
+            "sfdisk /dev/sda < layout.sfdisk",
+            "sfdisk /dev/sda",
+            "/sbin/sfdisk --relocate gpt-bak-std /dev/nvme0n1",
+            "sfdisk -X gpt \"/dev/sda\"",
+        ] {
+            let matched = pack
+                .check(cmd)
+                .unwrap_or_else(|| panic!("sfdisk write must block: {cmd}"));
+            assert_eq!(matched.name, Some("sfdisk-modify"), "wrong rule for {cmd}");
+        }
+        for cmd in [
+            "sfdisk -l /dev/sda",
+            "sfdisk --list /dev/sda",
+            "sfdisk --dump /dev/sda",
+            "sfdisk -d /dev/sda",
+            "sfdisk --json /dev/sda",
+            "sfdisk -s /dev/sda",
+            "sfdisk --verify /dev/sda",
+            "sfdisk --list-free /dev/sda",
+            "sfdisk -n /dev/sda",
+            "sfdisk --no-act --delete /dev/sda",
+            "sfdisk --version",
+            "echo sfdisk --delete",
+        ] {
+            assert_no_match(&pack, cmd);
         }
     }
 

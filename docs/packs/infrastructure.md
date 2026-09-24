@@ -23,6 +23,7 @@ Commands containing these keywords are checked against this pack:
 
 - `terraform`
 - `tofu`
+- `terragrunt`
 - `destroy`
 - `taint`
 - `state`
@@ -33,17 +34,17 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `terraform-plan` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+plan(?=\s\|$)(?!\s+.*-destroy)` |
-| `terraform-init` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+init(?=\s\|$)` |
-| `terraform-validate` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+validate(?=\s\|$)` |
-| `terraform-fmt` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+fmt(?=\s\|$)` |
-| `terraform-show` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s\|$)` |
-| `terraform-output` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+output(?=\s\|$)` |
-| `terraform-state-list` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+list(?=\s\|$)` |
-| `terraform-state-show` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+show(?=\s\|$)` |
-| `terraform-graph` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+graph(?=\s\|$)` |
-| `terraform-version` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s\|$)` |
-| `terraform-providers` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+providers(?=\s\|$)` |
+| `terraform-plan` | `(?:terraform\|tofu\|terragrunt)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+plan(?=\s\|$)(?!\s+.*-destroy)` |
+| `terraform-init` | `(?:terraform\|tofu\|terragrunt)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+init(?=\s\|$)` |
+| `terraform-validate` | `(?:terraform\|tofu\|terragrunt)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+validate(?=\s\|$)` |
+| `terraform-fmt` | `(?:terraform\|tofu\|terragrunt)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+fmt(?=\s\|$)` |
+| `terraform-show` | `(?:terraform\|tofu\|terragrunt)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s\|$)` |
+| `terraform-output` | `(?:terraform\|tofu\|terragrunt)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+output(?=\s\|$)` |
+| `terraform-state-list` | `(?:terraform\|tofu\|terragrunt)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+list(?=\s\|$)` |
+| `terraform-state-show` | `(?:terraform\|tofu\|terragrunt)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+show(?=\s\|$)` |
+| `terraform-graph` | `(?:terraform\|tofu\|terragrunt)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+graph(?=\s\|$)` |
+| `terraform-version` | `(?:terraform\|tofu\|terragrunt)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s\|$)` |
+| `terraform-providers` | `(?:terraform\|tofu\|terragrunt)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+providers(?=\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 

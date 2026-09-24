@@ -91,6 +91,8 @@ Commands containing these keywords are checked against this pack:
 
 - `docker-compose`
 - `docker compose`
+- `podman-compose`
+- `podman compose`
 - `compose`
 
 ### Safe Patterns (Allowed)
@@ -99,13 +101,13 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `compose-config` | `(?:docker-compose\|docker\s+compose)\s+config` |
-| `compose-ps` | `(?:docker-compose\|docker\s+compose)\s+ps` |
-| `compose-logs` | `(?:docker-compose\|docker\s+compose)\s+logs` |
-| `compose-up` | `(?:docker-compose\|docker\s+compose)\s+up` |
-| `compose-build` | `(?:docker-compose\|docker\s+compose)\s+build` |
-| `compose-pull` | `(?:docker-compose\|docker\s+compose)\s+pull` |
-| `compose-down-no-volumes` | `(?:docker-compose\|docker\s+compose)\s+(?:-[^\s;\|&`()<>]*\s+(?:[^\s;\|&`()<>-][^\s;\|&`()<>]*\s+)?)*down(?!\s+.*(?:-[vt]*v[vt]*\b\|--volumes\|--rmi))(?:\s\|$)` |
+| `compose-config` | `(?:docker-compose\|docker\s+compose\|podman-compose\|podman\s+compose)\s+config` |
+| `compose-ps` | `(?:docker-compose\|docker\s+compose\|podman-compose\|podman\s+compose)\s+ps` |
+| `compose-logs` | `(?:docker-compose\|docker\s+compose\|podman-compose\|podman\s+compose)\s+logs` |
+| `compose-up` | `(?:docker-compose\|docker\s+compose\|podman-compose\|podman\s+compose)\s+up` |
+| `compose-build` | `(?:docker-compose\|docker\s+compose\|podman-compose\|podman\s+compose)\s+build` |
+| `compose-pull` | `(?:docker-compose\|docker\s+compose\|podman-compose\|podman\s+compose)\s+pull` |
+| `compose-down-no-volumes` | `(?:docker-compose\|docker\s+compose\|podman-compose\|podman\s+compose)\s+(?:-[^\s;\|&`()<>]*\s+(?:[^\s;\|&`()<>-][^\s;\|&`()<>]*\s+)?)*down(?!\s+.*(?:-[vt]*v[vt]*\b\|--volumes\|--rmi))(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 

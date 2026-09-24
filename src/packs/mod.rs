@@ -2134,7 +2134,12 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "containers.compose",
-        &["docker-compose", "docker compose"],
+        &[
+            "docker-compose",
+            "docker compose",
+            "podman-compose",
+            "podman compose",
+        ],
         containers::compose::create_pack,
     ),
     PackEntry::new(
@@ -2194,7 +2199,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
     ),
     PackEntry::new(
         "infrastructure.terraform",
-        &["terraform", "tofu"],
+        &["terraform", "tofu", "terragrunt"],
         infrastructure::terraform::create_pack,
     ),
     PackEntry::new(
@@ -2350,7 +2355,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         // also names its manager.
         &[
             "npm", "yarn", "pnpm", "pip", "cargo", "gem", "composer", "go", "apt", "yum", "dnf",
-            "brew", "poetry", "mvn", "mvnw", "gradle", "gradlew",
+            "brew", "poetry", "mvn", "mvnw", "gradle", "gradlew", "nuget",
         ],
         package_managers::create_pack,
     ),

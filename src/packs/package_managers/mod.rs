@@ -149,7 +149,7 @@ pub fn create_pack() -> Pack {
                       packages and removing critical system packages",
         keywords: &[
             "npm", "yarn", "pnpm", "pip", "apt", "yum", "dnf", "cargo", "gem", "brew", "poetry",
-            "mvn", "mvnw", "gradle", "gradlew", "publish",
+            "mvn", "mvnw", "gradle", "gradlew", "publish", "nuget",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -339,6 +339,19 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "gem-push",
             r"\bgem\b.*?\bpush\b",
             "gem push releases a gem to rubygems.org. Verify before publishing."
+        ),
+        // The registry-side removals that sit beside `npm unpublish` and
+        // `cargo yank`: RubyGems' `gem yank` and NuGet's `delete` (which
+        // unlists or deletes a published version, `dotnet nuget delete` too).
+        destructive_pattern!(
+            "gem-yank",
+            r"\bgem\b.*?\byank(?:\s|$)",
+            "gem yank removes a published version from rubygems.org. This can break dependent projects."
+        ),
+        destructive_pattern!(
+            "nuget-delete",
+            r"\bnuget(?:\.exe)?\b.*?\bdelete(?:\s|$)",
+            "nuget delete removes or unlists a published package version. This can break dependent projects."
         ),
         // brew uninstall. `(?=\s|$)` so `brew install uninstall-helper` doesn't
         // false-match the destructive rule.
@@ -637,5 +650,36 @@ mod tests {
         assert_blocks(&pack, "brew uninstall wget", "brew uninstall");
         assert_blocks(&pack, "apt remove nginx", "apt remove");
         assert_blocks(&pack, "cargo yank --version 1.0 my-crate", "yank");
+    }
+
+    /// RubyGems and NuGet's registry removals, beside `npm unpublish` and
+    /// `cargo yank`, were allowed.
+    #[test]
+    fn gem_yank_and_nuget_delete_are_denied() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("gem yank mygem -v 1.0.0", "gem-yank"),
+            ("gem yank mygem --version 1.0.0 --platform ruby", "gem-yank"),
+            (
+                "nuget delete MyPkg 1.0.0 -Source nuget.org -NonInteractive",
+                "nuget-delete",
+            ),
+            ("nuget.exe delete MyPkg 1.0.0", "nuget-delete"),
+            (
+                "dotnet nuget delete MyPkg 1.0.0 --source https://api.nuget.org/v3/index.json",
+                "nuget-delete",
+            ),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+        for command in [
+            "gem install yank-helper",
+            "gem list",
+            "nuget restore",
+            "dotnet nuget list source",
+            "nuget install delete-helper",
+        ] {
+            assert_allows(&pack, command);
+        }
     }
 }

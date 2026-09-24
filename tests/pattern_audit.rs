@@ -1171,12 +1171,18 @@ fn test_audit_backtracking_requirements() {
             // `sgdisk-modify` is built out of three of them — the dry-run
             // withdrawal, the device requirement, and the "this option is not
             // one of the read-only ones" test.
+            //
+            // `sfdisk-modify` is `sgdisk-modify`'s shape inverted: sfdisk writes
+            // even with no option (a layout on stdin), so it is denied unless a
+            // read-only option is present, which only a negative lookahead can
+            // say, plus the same `/dev/` requirement.
             HashSet::from([
                 "copy-to-device",
                 "dd-discard",
                 "fdisk-edit",
                 "gdisk-edit",
                 "parted-modify",
+                "sfdisk-modify",
                 "sgdisk-modify",
                 "tee-device",
             ]),

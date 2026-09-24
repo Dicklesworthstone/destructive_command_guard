@@ -1,5 +1,8 @@
 //! Docker Compose patterns - protections against destructive compose commands.
 //!
+//! `podman-compose` and `podman compose` implement the same `down`/`rm`
+//! interface, so every rule matches all four spellings of the executable.
+//!
 //! This includes patterns for:
 //! - down with volumes flag
 //! - rm with volumes
@@ -16,7 +19,13 @@ pub fn create_pack() -> Pack {
         name: "Docker Compose",
         description: "Protects against destructive Docker Compose operations like \
                       'down -v' which removes volumes",
-        keywords: &["docker-compose", "docker compose", "compose"],
+        keywords: &[
+            "docker-compose",
+            "docker compose",
+            "podman-compose",
+            "podman compose",
+            "compose",
+        ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
@@ -30,26 +39,32 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // config validation is safe
         safe_pattern!(
             "compose-config",
-            r"(?:docker-compose|docker\s+compose)\s+config"
+            r"(?:docker-compose|docker\s+compose|podman-compose|podman\s+compose)\s+config"
         ),
         // ps is safe (read-only)
-        safe_pattern!("compose-ps", r"(?:docker-compose|docker\s+compose)\s+ps"),
+        safe_pattern!(
+            "compose-ps",
+            r"(?:docker-compose|docker\s+compose|podman-compose|podman\s+compose)\s+ps"
+        ),
         // logs is safe
         safe_pattern!(
             "compose-logs",
-            r"(?:docker-compose|docker\s+compose)\s+logs"
+            r"(?:docker-compose|docker\s+compose|podman-compose|podman\s+compose)\s+logs"
         ),
         // up is generally safe (creates)
-        safe_pattern!("compose-up", r"(?:docker-compose|docker\s+compose)\s+up"),
+        safe_pattern!(
+            "compose-up",
+            r"(?:docker-compose|docker\s+compose|podman-compose|podman\s+compose)\s+up"
+        ),
         // build is safe
         safe_pattern!(
             "compose-build",
-            r"(?:docker-compose|docker\s+compose)\s+build"
+            r"(?:docker-compose|docker\s+compose|podman-compose|podman\s+compose)\s+build"
         ),
         // pull is safe
         safe_pattern!(
             "compose-pull",
-            r"(?:docker-compose|docker\s+compose)\s+pull"
+            r"(?:docker-compose|docker\s+compose|podman-compose|podman\s+compose)\s+pull"
         ),
         // down without -v/--rmi is less destructive. The global-option walker
         // skips only *option-like* tokens (`-f`, `--project-name`) and their
@@ -66,7 +81,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // `--remove-orphans`.
         safe_pattern!(
             "compose-down-no-volumes",
-            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*down(?!\s+.*(?:-[vt]*v[vt]*\b|--volumes|--rmi))(?:\s|$)"
+            r"(?:docker-compose|docker\s+compose|podman-compose|podman\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*down(?!\s+.*(?:-[vt]*v[vt]*\b|--volumes|--rmi))(?:\s|$)"
         ),
     ]
 }
@@ -86,7 +101,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // containing `v` (`-vt`, `-tv`, `-v`) so `docker compose down -vt
             // 5` is caught, without matching inside a `--verbose`/`--rmi`-style
             // long option (down's only short flags are `-v` and `-t`).
-            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*down\s+.*(?:-[vt]*v[vt]*\b|--volumes)",
+            r"(?:docker-compose|docker\s+compose|podman-compose|podman\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*down\s+.*(?:-[vt]*v[vt]*\b|--volumes)",
             "docker-compose down -v removes volumes and their data permanently.",
             Critical,
             "The -v/--volumes flag causes docker-compose down to remove named volumes declared \
@@ -103,7 +118,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // down --rmi all removes images
         destructive_pattern!(
             "down-rmi-all",
-            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*down\s+.*--rmi\s+all",
+            r"(?:docker-compose|docker\s+compose|podman-compose|podman\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*down\s+.*--rmi\s+all",
             "docker-compose down --rmi all removes all images used by services.",
             High,
             "The --rmi all flag removes all images used by services in the Compose file. \
@@ -123,7 +138,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // containing `v` (`-fsv`, `-vf`, `-vs`, `-v`) so `docker compose rm
             // -fsv` is caught (rm's short flags are `-f`/`-s`/`-v`), without
             // matching inside a long option.
-            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*rm\s+.*(?:-[fsv]*v[fsv]*\b|--volumes)",
+            r"(?:docker-compose|docker\s+compose|podman-compose|podman\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*rm\s+.*(?:-[fsv]*v[fsv]*\b|--volumes)",
             "docker-compose rm -v removes volumes attached to containers.",
             High,
             "The -v flag with docker-compose rm removes anonymous volumes attached to the \
@@ -139,7 +154,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rm -f force removes
         destructive_pattern!(
             "rm-force",
-            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*rm\s+.*(?:-[fsv]*f[fsv]*\b|--force)",
+            r"(?:docker-compose|docker\s+compose|podman-compose|podman\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*rm\s+.*(?:-[fsv]*f[fsv]*\b|--force)",
             "docker-compose rm -f forcibly removes containers without confirmation.",
             Medium,
             "The -f/--force flag removes containers without asking for confirmation. While \
@@ -168,6 +183,12 @@ mod tests {
         assert_blocks(&pack, "docker-compose down --volumes", "removes volumes");
         assert_blocks(&pack, "docker compose down -v", "removes volumes");
         assert_blocks(&pack, "docker compose down --volumes", "removes volumes");
+        // podman's two compose front ends take the same flags.
+        assert_blocks(&pack, "podman-compose down -v", "removes volumes");
+        assert_blocks(&pack, "podman compose down --volumes", "removes volumes");
+        assert_blocks(&pack, "podman-compose -f prod.yml rm -fv", "volumes");
+        assert_allows(&pack, "podman-compose down");
+        assert_allows(&pack, "podman compose ps");
     }
 
     #[test]
