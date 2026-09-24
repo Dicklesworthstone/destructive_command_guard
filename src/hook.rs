@@ -19,23 +19,40 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::time::Duration;
 
 /// Input structure from supported hook protocols.
+///
+/// Every envelope field is shape-tolerant: a value of an unexpected JSON type
+/// degrades that one field instead of failing the whole parse, because a
+/// failed parse fails open and allows the command unexamined. Strings are
+/// read through [`deserialize_string_tolerant`], and open-ended fields are
+/// kept as raw [`serde_json::Value`]s.
 #[derive(Debug, Deserialize)]
 pub struct HookInput {
     /// Hook event name (used by some clients, e.g. Copilot CLI: "pre-tool-use").
+    #[serde(default, deserialize_with = "deserialize_string_tolerant")]
     pub event: Option<String>,
 
     /// Gemini hook event name (e.g., "BeforeTool").
-    #[serde(alias = "hookEventName")]
+    #[serde(
+        alias = "hookEventName",
+        default,
+        deserialize_with = "deserialize_string_tolerant"
+    )]
     pub hook_event_name: Option<String>,
 
     /// Session id (Gemini snake_case; VS Code Agent Host camelCase).
-    #[serde(alias = "sessionId")]
+    #[serde(
+        alias = "sessionId",
+        default,
+        deserialize_with = "deserialize_string_tolerant"
+    )]
     pub session_id: Option<String>,
 
     /// Gemini transcript path.
+    #[serde(default, deserialize_with = "deserialize_string_tolerant")]
     pub transcript_path: Option<String>,
 
     /// Gemini working directory.
+    #[serde(default, deserialize_with = "deserialize_string_tolerant")]
     pub cwd: Option<String>,
 
     /// Event timestamp: an RFC 3339 string from Gemini, a number (epoch
@@ -45,11 +62,19 @@ pub struct HookInput {
     pub timestamp: Option<serde_json::Value>,
 
     /// The name of the tool being invoked (e.g., "Bash", "runTerminalCommand").
-    #[serde(alias = "toolName")]
+    #[serde(
+        alias = "toolName",
+        default,
+        deserialize_with = "deserialize_string_tolerant"
+    )]
     pub tool_name: Option<String>,
 
     /// Tool-specific input parameters.
-    #[serde(alias = "toolInput")]
+    #[serde(
+        alias = "toolInput",
+        default,
+        deserialize_with = "deserialize_tool_input_tolerant"
+    )]
     pub tool_input: Option<ToolInput>,
 
     /// Alternate tool arguments format used by some clients.
@@ -66,7 +91,11 @@ pub struct HookInput {
     /// `turn_id` is present and non-blank we switch to Codex's minimal
     /// `hookSpecificOutput` deny payload because Codex's parser can reject the
     /// dcg-only fields carried by the extended Claude-compatible response.
-    #[serde(alias = "turnId")]
+    #[serde(
+        alias = "turnId",
+        default,
+        deserialize_with = "deserialize_string_tolerant"
+    )]
     pub turn_id: Option<String>,
 
     /// Tool-use identifier. Claude Code's are Anthropic tool-use ids
@@ -87,7 +116,11 @@ pub struct HookInput {
     /// "Cwd": "..."}}, "conversationId": "...", "stepIdx": 4, ...}`. The shell
     /// command lives in `toolCall.args.CommandLine`. Verified empirically by
     /// capturing the stdin `agy` passes to a `PreToolUse` hook.
-    #[serde(alias = "toolCall")]
+    #[serde(
+        alias = "toolCall",
+        default,
+        deserialize_with = "deserialize_tool_call_tolerant"
+    )]
     pub tool_call: Option<ToolCall>,
 
     /// VS Code "Agent Host" batched tool-call envelope (issue #252). The
@@ -142,6 +175,7 @@ pub struct ToolInput {
 #[derive(Debug, Deserialize)]
 pub struct ToolCall {
     /// The tool name (e.g. `"run_command"` for the shell tool).
+    #[serde(default, deserialize_with = "deserialize_string_tolerant")]
     pub name: Option<String>,
 
     /// Tool arguments. For `run_command`, this carries `CommandLine`.
@@ -178,6 +212,43 @@ where
             .filter_map(|entry| serde_json::from_value::<ToolCall>(entry).ok())
             .collect(),
     ))
+}
+
+/// A string envelope field whose value has an unexpected type degrades to
+/// `None` (a number keeps its text) instead of failing the whole parse, which
+/// would fail open. A GitHub Copilot CLI `timestamp` arrives as a number and
+/// did exactly that until it was made a raw value.
+fn deserialize_string_tolerant<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            Some(serde_json::Value::String(text)) => Some(text),
+            Some(serde_json::Value::Number(number)) => Some(number.to_string()),
+            _ => None,
+        },
+    )
+}
+
+/// `tool_input` degraded to `None` when it is not an object.
+fn deserialize_tool_input_tolerant<'de, D>(deserializer: D) -> Result<Option<ToolInput>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
+        .and_then(|value| serde_json::from_value::<ToolInput>(value).ok()))
+}
+
+/// The `agy` `toolCall` object, degraded to `None` when it does not fit
+/// [`ToolCall`] -- the single-object counterpart of
+/// [`deserialize_tool_calls_tolerant`].
+fn deserialize_tool_call_tolerant<'de, D>(deserializer: D) -> Result<Option<ToolCall>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
+        .and_then(|value| serde_json::from_value::<ToolCall>(value).ok()))
 }
 
 /// Output structure for denying a command.
@@ -4678,6 +4749,38 @@ mod tests {
         assert_eq!(detect_protocol(&gemini), HookProtocol::Gemini);
     }
 
+    /// No envelope field may fail the parse by its type: a failed parse fails
+    /// open. Every string field, and the object-shaped ones, arrive here with
+    /// the wrong JSON type beside a destructive command that must still be
+    /// found.
+    #[test]
+    fn envelope_fields_of_the_wrong_type_never_fail_the_parse() {
+        for bad in ["42", "true", "[1,2]", r#"{"k":"v"}"#, "null"] {
+            let json = format!(
+                r#"{{"event":{bad},"hook_event_name":{bad},"session_id":{bad},"transcript_path":{bad},"cwd":{bad},"timestamp":{bad},"turn_id":{bad},"tool_use_id":{bad},"permission_mode":{bad},"toolCall":{bad},"toolCalls":{bad},"tool_name":"Bash","tool_input":{{"command":"git reset --hard"}}}}"#
+            );
+            let input: HookInput = serde_json::from_str(&json)
+                .unwrap_or_else(|error| panic!("{bad}: parse failed ({error}), which fails open"));
+            assert_eq!(
+                extract_command(&input),
+                Some("git reset --hard".to_string()),
+                "{bad}"
+            );
+        }
+        // A tool name or tool_input of the wrong type degrades to "no
+        // command" rather than an error; a numeric tool name keeps its text.
+        let input: HookInput =
+            serde_json::from_str(r#"{"tool_name":7,"tool_input":"git reset --hard"}"#).unwrap();
+        assert_eq!(input.tool_name.as_deref(), Some("7"));
+        assert!(input.tool_input.is_none());
+        // Formerly a hard parse error (and so a fail-open allow): an object
+        // where the tool name belongs.
+        let input =
+            parse_hook_input(r#"{"tool_name":{"nested":true},"tool_input":{"command":"ls"}}"#)
+                .expect("a wrong-typed tool name degrades, it does not fail the parse");
+        assert!(input.tool_name.is_none());
+    }
+
     #[test]
     fn test_parse_copilot_tool_args_json_string() {
         let json = r#"{"event":"pre-tool-use","toolName":"bash","toolArgs":"{\"command\":\"rm -rf /tmp/build\"}"}"#;
@@ -5775,7 +5878,13 @@ mod tests {
         let input: HookInput =
             serde_json::from_str(json).expect("unfit entries must be skipped, not fatal");
         let calls = input.tool_calls.as_ref().expect("array shape is kept");
-        assert_eq!(calls.len(), 1, "only the fitting entry survives");
+        // `{"name":7}` is an object, so it fits once its name is read
+        // tolerantly; it carries no args and contributes no command.
+        assert_eq!(
+            calls.len(),
+            2,
+            "object entries survive, scalars are skipped"
+        );
         let extracted = extract_command_with_context(&input).expect("kept entry must extract");
         assert_eq!(extracted.command, "echo hi");
         assert!(extracted.additional_commands.is_empty());
@@ -6003,13 +6112,15 @@ mod tests {
     #[test]
     fn malformed_json_without_an_alias_conflict_keeps_its_original_error() {
         // Canonicalization is a targeted retry, not a general tolerance knob:
-        // input that is not an object, or that has no colliding alias group,
-        // must still be reported as the parse failure it is.
+        // input that is not a JSON object must still be reported as the parse
+        // failure it is. (A field of the wrong *type* inside a valid object is
+        // different: each envelope field degrades on its own, because a failed
+        // parse fails open -- see
+        // `envelope_fields_of_the_wrong_type_never_fail_the_parse`.)
         for json in [
             r#"{"session_id":"s1","tool_name":"Bash","tool_input":}"#,
             "not json at all",
             "[1,2,3]",
-            r#"{"tool_name":{"nested":true},"tool_input":{"command":"ls"}}"#,
         ] {
             assert!(parse_hook_input(json).is_err(), "must still reject: {json}");
         }
