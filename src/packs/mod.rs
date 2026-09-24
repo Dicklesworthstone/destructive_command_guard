@@ -2450,6 +2450,8 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "BCDEDIT",
             "wbadmin",
             "WBADMIN",
+            "fsutil",
+            "FSUTIL",
         ],
         windows::system::create_pack,
     ),

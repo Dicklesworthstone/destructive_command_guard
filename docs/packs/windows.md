@@ -106,7 +106,7 @@ risk_acknowledged = true
 
 **Pack ID:** `windows.system`
 
-Protects against catastrophic Windows disk/system operations: `vssadmin delete shadows` / `wmic shadowcopy delete` / `Win32_ShadowCopy` deletion through WMI or CIM (Volume Shadow Copy destruction), `wbadmin delete` (backup recovery points), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `Remove-VirtualDisk`, `Initialize-Disk`, `Reset-PhysicalDisk`, `cipher /w`, and `bcdedit /delete`.
+Protects against catastrophic Windows disk/system operations: `vssadmin delete shadows` / `wmic shadowcopy delete` / `Win32_ShadowCopy` deletion through WMI or CIM (Volume Shadow Copy destruction), `wbadmin delete` (backup recovery points), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `Remove-VirtualDisk`, `Initialize-Disk`, `Reset-PhysicalDisk`, `cipher /w`, `bcdedit /delete`, and destructive `fsutil` file/volume operations.
 
 ### Keywords
 
@@ -148,6 +148,8 @@ Commands containing these keywords are checked against this pack:
 - `BCDEDIT`
 - `wbadmin`
 - `WBADMIN`
+- `fsutil`
+- `FSUTIL`
 
 ### Safe Patterns (Allowed)
 
@@ -177,6 +179,8 @@ These patterns match potentially destructive commands:
 | `initialize-or-reset-disk` | Initialize-Disk / Reset-PhysicalDisk wipe disk metadata and data. | high |
 | `cipher-wipe` | cipher /w overwrites free space, making deleted files unrecoverable. | high |
 | `bcdedit-delete` | bcdedit /delete removes a boot configuration entry. | high |
+| `fsutil-setzerodata` | fsutil file setzerodata zeroes a byte range of a file in place. | high |
+| `fsutil-volume-dismount` | fsutil volume dismount forcibly dismounts a volume, invalidating open handles. | high |
 
 ### Allowlist Guidance
 

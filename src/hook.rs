@@ -2003,20 +2003,26 @@ const CMD_WRITER_VERBS: &[&str] = &[
 /// for the registry rows:
 ///
 /// ```text
-/// diskpart /s script.txt          -> windows.system:diskpart
-/// bcdedit /deletevalue safeboot   -> windows.system:bcdedit-delete
-/// cipher /w:C:\                   -> windows.system:cipher-wipe
-/// wbadmin delete catalog -quiet   -> windows.system:wbadmin-delete
+/// diskpart /s script.txt                 -> windows.system:diskpart
+/// bcdedit /deletevalue safeboot          -> windows.system:bcdedit-delete
+/// cipher /w:C:\                          -> windows.system:cipher-wipe
+/// wbadmin delete catalog -quiet          -> windows.system:wbadmin-delete
+/// fsutil file setzerodata … C:\data.db   -> windows.system:fsutil-setzerodata
+/// fsutil volume dismount C:              -> windows.system:fsutil-volume-dismount
 /// ```
+///
+/// `icacls`, `cacls` and `takeown` are NOT here even though
+/// `system.permissions` now claims them: that pack is opt-in, so the name would
+/// widen the dialect for every host while buying coverage only where the pack
+/// is enabled. They reach their rules through that pack's own keyword rows.
 ///
 /// Deliberately absent, each for its own reason: `reg`, `sc` and `net` collide
 /// with POSIX (samba ships `net`) and belong to the opt-in `windows.misc`;
-/// `fsutil`, `schtasks`, `takeown`, `icacls`, `cacls` and `attrib` have no rule
-/// claiming them yet, so listing them would be a dead widening; and `format`
-/// keeps its drive-letter requirement in
+/// `schtasks` and `attrib` have no rule claiming them yet, so listing them
+/// would be a dead widening; and `format` keeps its drive-letter requirement in
 /// [`segment_is_format_drive_invocation`] because the bare word is ordinary
 /// English.
-const WINDOWS_ONLY_EXECUTABLES: &[&str] = &["diskpart", "bcdedit", "cipher", "wbadmin"];
+const WINDOWS_ONLY_EXECUTABLES: &[&str] = &["diskpart", "bcdedit", "cipher", "wbadmin", "fsutil"];
 
 /// PowerShell `Remove-Item` parameter names used as the discriminator. A
 /// single-dash token whose name is a >=3-character prefix of one of these is
@@ -4480,7 +4486,8 @@ mod tests {
     /// Bare Windows-only executables widen the dialect on the name alone.
     ///
     /// Each of these has a rule waiting on a default-on `windows.*` pack
-    /// (`diskpart`, `bcdedit-delete`, `cipher-wipe`, `wbadmin-delete`) that was
+    /// (`diskpart`, `bcdedit-delete`, `cipher-wipe`, `wbadmin-delete`, and
+    /// `fsutil` zeroing/dismount rules) that was
     /// unreachable because nothing marked the payload Windows: the name is not
     /// a cmdlet, not a destructive alias, not a cmd writer, and not
     /// `format <drive>:`.
@@ -4493,6 +4500,8 @@ mod tests {
             "cipher /w:C:\\",
             "wbadmin delete catalog -quiet",
             "wbadmin delete backup -keepVersions:0",
+            "fsutil file setzerodata offset=0 length=4096 C:\\data.db",
+            "fsutil volume dismount C:",
             "DISKPART.EXE /s x.txt",
             "C:\\Windows\\System32\\bcdedit.exe /deletevalue safeboot",
             "/c/Windows/System32/diskpart /s x.txt",
@@ -4513,6 +4522,7 @@ mod tests {
             "git commit -m 'document cipher usage'",
             "./diskpart-notes.sh",
             "cat wbadmin.log",
+            "echo fsutil is a windows tool",
         ] {
             assert_eq!(
                 refine_shell_dialect(command, ShellDialect::Posix),

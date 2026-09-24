@@ -12,6 +12,8 @@
 //!     `Reset-PhysicalDisk`.
 //!   - **Free-space wipe / boot config** — `cipher /w` (makes deleted files
 //!     unrecoverable), `bcdedit /delete` (boot configuration).
+//!   - **Data zeroing / forced dismount** — `fsutil file setzerodata` and
+//!     `fsutil volume dismount`.
 //!
 //! Design note: a *dedicated* `windows.system` pack is used rather than
 //! extending the existing default-on-everywhere `system.disk` pack (mkfs/dd/
@@ -65,7 +67,8 @@ pub fn create_pack() -> Pack {
                       deletion through WMI or CIM (Volume Shadow Copy destruction), `wbadmin \
                       delete` (backup recovery points), `diskpart`, `Format-Volume`, `Clear-Disk`, \
                       `Remove-Partition`, `Remove-VirtualDisk`, `Initialize-Disk`, \
-                      `Reset-PhysicalDisk`, `cipher /w`, and `bcdedit /delete`.",
+                      `Reset-PhysicalDisk`, `cipher /w`, `bcdedit /delete`, and \
+                      destructive `fsutil` file/volume operations.",
         // Conventional keyword casings retained for readable metadata; the
         // quick-reject itself is ASCII case-insensitive. See packs::windows.
         keywords: &[
@@ -107,6 +110,8 @@ pub fn create_pack() -> Pack {
             "BCDEDIT",
             "wbadmin",
             "WBADMIN",
+            "fsutil",
+            "FSUTIL",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -342,6 +347,42 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Export with `bcdedit /export` before modifying anything",
             WIPE_SUGGESTIONS
         ),
+        // === fsutil ===
+        //
+        // `setzerodata` is the Windows spelling of zeroing a file in place —
+        // the same primitive `core.filesystem` already denies on the POSIX side
+        // as a shrink-or-zero truncation. The effect was inside a pack's stated
+        // scope while this spelling reached no rule at any dialect.
+        destructive_pattern!(
+            "fsutil-setzerodata",
+            r"(?i)\bfsutil(?:\.exe)?\s+file\s+setzerodata\b",
+            "fsutil file setzerodata zeroes a byte range of a file in place.",
+            High,
+            "`fsutil file setzerodata offset=<n> length=<n> <file>` overwrites that range with \
+             zeroes directly on disk. The previous contents are gone with no confirmation, no \
+             recycle bin and no backup — the same act as zeroing a file on POSIX, which is \
+             already denied. Pointed at a database, a VHD or a log, it destroys the region \
+             without the file changing size, so the damage is not obvious afterwards.\n\n\
+             Safer alternatives:\n\
+             - Confirm the target and range first: `fsutil file queryvaliddata <file>`\n\
+             - Copy the file aside before modifying it\n\
+             - To reclaim space, delete the file normally and let the filesystem free it",
+            WIPE_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "fsutil-volume-dismount",
+            r"(?i)\bfsutil(?:\.exe)?\s+volume\s+dismount\b",
+            "fsutil volume dismount forcibly dismounts a volume, invalidating open handles.",
+            High,
+            "`fsutil volume dismount <drive>` forces the volume offline. Every open handle is \
+             invalidated, so processes writing to it lose buffered data and can leave files \
+             half-written; on a system or data volume this is an outage, not a cleanup step. \
+             It is the Windows neighbour of a forced unmount, which is already denied.\n\n\
+             Safer alternatives:\n\
+             - Stop the services using the volume first, then dismount\n\
+             - `fsutil volume diskfree <drive>` / `mountvol` to inspect without dismounting",
+            WIPE_SUGGESTIONS
+        ),
     ]
 }
 
@@ -359,6 +400,40 @@ mod tests {
         assert_patterns_compile(&pack);
         assert_all_patterns_have_reasons(&pack);
         assert_unique_pattern_names(&pack);
+    }
+
+    /// `fsutil` had no rule at all, at any dialect, with every pack enabled.
+    ///
+    /// `setzerodata` is the Windows spelling of zeroing a file in place, which
+    /// `core.filesystem` already denies on the POSIX side, so the effect was
+    /// inside a pack's stated scope while this spelling reached nothing.
+    #[test]
+    fn blocks_fsutil_data_destruction() {
+        let pack = create_pack();
+        for (command, rule) in [
+            (
+                r"fsutil file setzerodata offset=0 length=4096 C:\data.db",
+                "fsutil-setzerodata",
+            ),
+            (
+                r"fsutil.exe file setZeroData offset=0 length=1 C:\x",
+                "fsutil-setzerodata",
+            ),
+            ("fsutil volume dismount C:", "fsutil-volume-dismount"),
+            ("FSUTIL VOLUME DISMOUNT D:", "fsutil-volume-dismount"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+
+        // Read-only and unrelated fsutil subcommands are ordinary inspection.
+        for command in [
+            "fsutil volume diskfree C:",
+            "fsutil file queryvaliddata C:\\data.db",
+            "fsutil fsinfo drives",
+            "fsutil dirty query C:",
+        ] {
+            assert_allows(&pack, command);
+        }
     }
 
     #[test]
