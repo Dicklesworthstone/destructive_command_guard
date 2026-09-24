@@ -226,9 +226,16 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             SHADOW_SUGGESTIONS
         ),
         // === Whole-volume / partition destruction ===
+        //
+        // diskpart reads its script from `/s <file>`, from stdin redirected
+        // from a file (`diskpart < wipe.txt`), or from a pipe. The pipe form
+        // puts the commands BEFORE the word diskpart (`(echo select disk 1 &
+        // echo clean) | diskpart`), where the lookahead never looked, so it
+        // was allowed; the second alternative reads the producer side of a
+        // pipe that ends in diskpart.
         destructive_pattern!(
             "diskpart",
-            r"(?i)\bdiskpart(?:\.exe)?\b(?=[^|&\r\n]*(?:/s\b|\bclean\b|\bdelete\b|\bformat\b))",
+            r"(?i)\bdiskpart(?:\.exe)?\b(?=[^|&\r\n]*(?:/s\b|<|\bclean\b|\bdelete\b|\bformat\b))|\b(?:clean|delete|format)\b[^\r\n]*\|\s*diskpart(?:\.exe)?\b",
             "diskpart with clean/delete/format/script reconfigures or wipes disks and partitions.",
             High,
             "`diskpart` is the low-level disk-partitioning tool. Driven by a script (`/s file.txt`) or \
@@ -442,6 +449,27 @@ mod tests {
     fn blocks_disk_and_partition_destruction() {
         let pack = create_pack();
         assert_blocks_with_pattern(&pack, "diskpart /s wipe.txt", "diskpart");
+        // A script on stdin: redirected from a file, or piped in, where the
+        // commands come before the word diskpart.
+        for command in [
+            "diskpart < wipe.txt",
+            "(echo select disk 1 & echo clean) | diskpart",
+            "echo select disk 0 ^& clean | diskpart",
+            "echo delete partition override | diskpart.exe",
+            "(echo select volume 3 & echo format fs=ntfs quick) | diskpart",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "diskpart");
+        }
+        for command in [
+            "echo list disk | diskpart",
+            "(echo list volume) | diskpart",
+            "diskpart /?",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} only lists and must stay allowed"
+            );
+        }
         assert_blocks_with_pattern(&pack, "Format-Volume -DriveLetter D", "format-volume");
         assert_blocks_with_pattern(&pack, "Clear-Disk -Number 1 -RemoveData", "clear-disk");
         assert_blocks_with_pattern(

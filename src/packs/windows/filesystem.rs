@@ -706,6 +706,61 @@ fn cmd_drive_target(decoded: &str) -> bool {
         && (bytes.len() == 2 || matches!(bytes[2], b'\\' | b'/'))
 }
 
+/// Split the switch spellings cmd.exe accepts without spaces.
+///
+/// cmd.exe ends an internal command's name at `/`, so `rd/s/q X` is `rd /s /q
+/// X`, and it reads packed single-letter switches, so `/s/q` is `/s /q`. The
+/// tokenizer splits only on whitespace, so `rd/s/q C:\Users\me`, `rd /s/q …`,
+/// `del/s/q …` and `format/q C:` never showed the parser their command or
+/// their `/s`, and every one was allowed. Only plain words are split (no
+/// `^`, `%`, `!` or quotes, whose decoding stays with the decoder), a command
+/// word only when its prefix is exactly a protected internal command, and a
+/// switch word only when every piece is a one-letter switch or `/?`, so a
+/// path or a `/fs:NTFS`-style valued switch is never taken apart.
+fn cmd_expand_glued_switches(words: Vec<&str>) -> Vec<String> {
+    fn plain(word: &str) -> bool {
+        !word.contains(['^', '%', '!', '"'])
+    }
+    fn switch_pieces(rest: &str) -> Option<Vec<String>> {
+        let pieces: Vec<String> = rest.split('/').map(|piece| format!("/{piece}")).collect();
+        pieces
+            .iter()
+            .all(|piece| {
+                piece == "/?" || (piece.len() == 2 && piece.as_bytes()[1].is_ascii_alphabetic())
+            })
+            .then_some(pieces)
+    }
+    let mut out = Vec::with_capacity(words.len());
+    for (index, word) in words.into_iter().enumerate() {
+        if plain(word) {
+            if index == 0 {
+                if let Some((name, rest)) = word.split_once('/') {
+                    let is_internal = matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "del" | "erase" | "rd" | "rmdir" | "format"
+                    );
+                    if is_internal {
+                        if let Some(pieces) = switch_pieces(rest) {
+                            out.push(name.to_string());
+                            out.extend(pieces);
+                            continue;
+                        }
+                    }
+                }
+            } else if let Some(rest) = word.strip_prefix('/') {
+                if rest.contains('/') {
+                    if let Some(pieces) = switch_pieces(rest) {
+                        out.extend(pieces);
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(word.to_string());
+    }
+    out
+}
+
 fn cmd_segment_semantic_decision(segment: &str) -> WindowsFilesystemSemanticDecision {
     let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Cmd);
     let word_count = tokens
@@ -716,10 +771,14 @@ fn cmd_segment_semantic_decision(segment: &str) -> WindowsFilesystemSemanticDeci
         return WindowsFilesystemSemanticDecision::NoMatch;
     }
 
-    let mut raw_words = tokens
-        .iter()
-        .filter(|token| token.kind == NormalizeTokenKind::Word)
-        .filter_map(|token| token.text(segment));
+    let expanded_words = cmd_expand_glued_switches(
+        tokens
+            .iter()
+            .filter(|token| token.kind == NormalizeTokenKind::Word)
+            .filter_map(|token| token.text(segment))
+            .collect(),
+    );
+    let mut raw_words = expanded_words.iter().map(String::as_str);
     let Some(mut raw_executable) = raw_words.next() else {
         return WindowsFilesystemSemanticDecision::NoMatch;
     };
