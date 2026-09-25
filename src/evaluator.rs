@@ -13074,6 +13074,42 @@ fn evaluate_command_in_single_dialect_view(
                 Some((matched, allowlist_override.layer, allowlist_override.reason));
         }
     }
+    // `$IFS`/`${IFS}` word-splits to whitespace by default, so
+    // `rm${IFS}-rf${IFS}~` runs `rm -rf ~` while presenting no whitespace the
+    // tokenizer can split on. When IFS is not reassigned in the command, expand
+    // the unquoted uses to a space and evaluate the reconstruction. This only
+    // adds a recursive check of a proven expansion; the original command is
+    // still evaluated normally below, so nothing already caught is lost.
+    if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        && let Some(expanded) = posix_ifs_expansion_view(command)
+    {
+        let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+            &expanded,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            ShellDialect::Posix,
+            nested_command_depth + 1,
+            inherited_automated_stdin,
+        );
+        if result.is_denied()
+            || nested_evaluation_incomplete(&result)
+            || result.effective_mode.is_some()
+        {
+            // The nested span indexes the reconstructed text, not this command.
+            if let Some(info) = result.pattern_info.as_mut() {
+                info.matched_span = None;
+            }
+            return result;
+        }
+    }
+
     // A POSIX alias body is a command that runs whenever the alias is
     // invoked, but as the quoted operand of `alias` it is classified as data,
     // so `alias x='rm -rf ~'; x` was allowed. Evaluate every visible body
@@ -14078,6 +14114,85 @@ fn posix_declaration_option(builtin: &str, option: &str) -> bool {
         _ => return false,
     };
     flags.chars().all(|flag| allowed.contains(flag))
+}
+
+/// A view of `command` with every unquoted `$IFS`/`${IFS}` replaced by a
+/// space, or `None` when there is nothing to expand or the value cannot be
+/// proven to be the default.
+///
+/// `$IFS` defaults to space, tab and newline, so unquoted `rm${IFS}-rf${IFS}~`
+/// runs `rm -rf ~` while carrying no separator the tokenizer sees. The proof
+/// bails when the command assigns `IFS` (the value may not be whitespace) and
+/// leaves single-quoted `$IFS` untouched (single quotes suppress expansion, so
+/// it is literal text such as a `grep '$IFS'` pattern). Double-quoted uses do
+/// expand and are replaced; that can over-split a quoted argument, which errs
+/// toward detection and never masks a command.
+fn posix_ifs_expansion_view(command: &str) -> Option<String> {
+    // `${IFS}` puts a `{` between the `$` and the name, so match both spellings.
+    if !(command.contains("$IFS") || command.contains("${IFS"))
+        || segment_text_may_assign(command, "IFS")
+    {
+        return None;
+    }
+    let bytes = command.as_bytes();
+    let mut out = String::with_capacity(command.len());
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut replaced = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\'' && !command_byte_is_escaped(bytes, index) {
+            in_single = !in_single;
+            out.push('\'');
+            index += 1;
+            continue;
+        }
+        if !in_single
+            && byte == b'$'
+            && !command_byte_is_escaped(bytes, index)
+            && let Some(after) = ifs_reference_end(bytes, index)
+        {
+            out.push(' ');
+            index = after;
+            replaced = true;
+            continue;
+        }
+        // Preserve multi-byte UTF-8 sequences intact.
+        let char_len = command[index..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&command[index..index + char_len]);
+        index += char_len;
+    }
+    (replaced && out != command).then_some(out)
+}
+
+/// Whether the byte at `index` is preceded by an odd run of backslashes.
+fn command_byte_is_escaped(bytes: &[u8], index: usize) -> bool {
+    let mut backslashes = 0usize;
+    while index > backslashes && bytes[index - 1 - backslashes] == b'\\' {
+        backslashes += 1;
+    }
+    backslashes % 2 == 1
+}
+
+/// If `$` at `index` begins an `$IFS` or `${IFS}` reference, the byte index
+/// just past it; otherwise `None`. `$IFSX`/`${IFSX}` name a different variable
+/// and do not match.
+fn ifs_reference_end(bytes: &[u8], index: usize) -> Option<usize> {
+    let braced = bytes.get(index + 1) == Some(&b'{');
+    let name_start = index + if braced { 2 } else { 1 };
+    if bytes.get(name_start..name_start + 3) != Some(b"IFS") {
+        return None;
+    }
+    let after_name = name_start + 3;
+    if braced {
+        (bytes.get(after_name) == Some(&b'}')).then_some(after_name + 1)
+    } else {
+        // A bare `$IFS` ends at any non-identifier byte or end of input.
+        let ends = bytes
+            .get(after_name)
+            .is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+        ends.then_some(after_name)
+    }
 }
 
 /// Bodies of the POSIX `alias NAME=BODY ...` definitions in top-level
@@ -28155,6 +28270,57 @@ mod tests {
 
     fn evaluate_with_pack_ids(command: &str, pack_ids: &[&str]) -> EvaluationResult {
         evaluate_with_pack_ids_at_path(command, pack_ids, None)
+    }
+
+    /// `$IFS` word-splits to whitespace by default, so `rm${IFS}-rf${IFS}~`
+    /// runs `rm -rf ~` with no separator the tokenizer sees. The unquoted uses
+    /// are now expanded and the reconstruction evaluated.
+    #[test]
+    fn posix_ifs_word_splitting_is_evaluated() {
+        let packs = ["core.filesystem", "core.git"];
+        for command in [
+            "rm${IFS}-rf${IFS}~",
+            "rm$IFS-rf$IFS~",
+            "git${IFS}reset${IFS}--hard",
+            "cd /srv;rm${IFS}-rf${IFS}/etc",
+        ] {
+            let result = evaluate_with_pack_ids(command, &packs);
+            assert!(!result.is_allowed(), "{command} -> {result:?}");
+        }
+        for command in [
+            // IFS reassigned: the value is no longer provably whitespace.
+            "IFS=x; echo${IFS}hi",
+            // Single-quoted: `$IFS` is literal text, not an expansion.
+            "grep '$IFS' file.txt",
+            "echo '${IFS}'",
+            // A different variable.
+            "rm$IFSX -rf /tmp/x",
+            // Benign reconstruction stays allowed.
+            "ls${IFS}-la",
+            "echo${IFS}hello",
+        ] {
+            let result = evaluate_with_pack_ids(command, &packs);
+            assert!(result.is_allowed(), "{command} -> {result:?}");
+        }
+    }
+
+    #[test]
+    fn posix_ifs_expansion_view_is_precise() {
+        assert_eq!(
+            posix_ifs_expansion_view("rm${IFS}-rf${IFS}~").as_deref(),
+            Some("rm -rf ~")
+        );
+        assert_eq!(
+            posix_ifs_expansion_view("rm$IFS-rf$IFS~").as_deref(),
+            Some("rm -rf ~")
+        );
+        // Nothing to expand, IFS reassigned, literal in single quotes, or a
+        // different variable: no view.
+        assert_eq!(posix_ifs_expansion_view("rm -rf ~"), None);
+        assert_eq!(posix_ifs_expansion_view("IFS=,; a$IFSb"), None);
+        assert_eq!(posix_ifs_expansion_view("echo '$IFS'"), None);
+        assert_eq!(posix_ifs_expansion_view("echo $IFSX"), None);
+        assert_eq!(posix_ifs_expansion_view(r"echo \$IFS"), None);
     }
 
     /// A POSIX alias body runs when the alias is invoked, but as a quoted
