@@ -2146,6 +2146,51 @@ fn segment_is_windows_alias_invocation(segment: &str) -> bool {
 /// all put punctuation there. A quoted `\n` would qualify, but this predicate
 /// is only ever consulted once the leading token is already a cmd writer verb,
 /// so that is not a shape a POSIX command reaches.
+/// Return whether `token` is a cmd.exe `%VAR%` expansion.
+///
+/// Split out of [`is_windows_path_token`] so the command-word test can ask for
+/// it WITHOUT the backslash-separator branch: `\rm -rf /tmp/x` is an ordinary
+/// POSIX idiom for bypassing an alias, and a command word carrying a backslash
+/// must not widen the dialect on that alone.
+fn is_percent_expansion(token: &str) -> bool {
+    token
+        .split_once('%')
+        .and_then(|(_, rest)| rest.split_once('%'))
+        .is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+}
+
+/// Return whether the segment's COMMAND WORD is assembled with cmd.exe syntax:
+/// a `^` escape (`doc^ker`) or a `%VAR%` expansion (`%COMSPEC%`).
+///
+/// `cmd_caret_escaped_executable_denies_under_unknown_dialect` proves the
+/// decoder behind this works — but it forces `ShellDialect::Unknown`, and
+/// nothing widened a bare caret, so through the real hook
+/// `doc^ker system prune -af` was ALLOWED while `docker system prune -af`
+/// denied. A test that supplies the dialect cannot prove the dialect is
+/// reachable.
+///
+/// A caret ANYWHERE is emphatically not the signal. `grep -rn '^fn main' src/`
+/// and `sed -n 's/^use //p' src/lib.rs` are ordinary Bash, and widening on
+/// those would down-trust a large fraction of real commands into the
+/// fail-closed union. Restricting the test to the FIRST token is what
+/// separates them, and it is exactly where the obfuscation has to sit to
+/// change which executable runs. A quoted first token is data to whatever
+/// shell runs it, not an executable name being assembled, so it is excluded.
+fn segment_command_word_is_cmd_assembled(segment: &str) -> bool {
+    let Some(first) = segment.split_whitespace().next() else {
+        return false;
+    };
+    if first.starts_with(['"', '\'']) {
+        return false;
+    }
+    first.contains('^') || is_percent_expansion(first)
+}
+
 fn is_windows_path_token(token: &str) -> bool {
     let token = token.trim_matches(['"', '\'']);
     let bytes = token.as_bytes();
@@ -2278,6 +2323,7 @@ fn command_has_powershell_shape(command: &str) -> bool {
                 || segment_is_cmd_writer_invocation(segment)
                 || segment_is_windows_file_delete_invocation(segment)
                 || segment_is_windows_only_executable(segment)
+                || segment_command_word_is_cmd_assembled(segment)
                 || segment_is_format_drive_invocation(segment)
         })
 }
@@ -4538,6 +4584,58 @@ mod tests {
                 refine_shell_dialect(command, ShellDialect::Posix),
                 ShellDialect::Posix,
                 "plain POSIX writer usage must not widen: {command:?}"
+            );
+        }
+    }
+
+    /// A cmd-assembled COMMAND WORD widens the dialect.
+    ///
+    /// `repro_294`'s caret test forces `ShellDialect::Unknown` and passes, but
+    /// nothing widened a bare caret, so through the real hook
+    /// `doc^ker system prune -af` was ALLOWED while `docker system prune -af`
+    /// denied. The decoder was never the problem; the route to it was.
+    #[test]
+    fn a_cmd_assembled_command_word_widens_the_dialect() {
+        for command in [
+            "doc^ker system prune -af",
+            "dock^er volume prune -f",
+            "psq^l -c 'DROP TABLE users'",
+            "g^it reset --hard",
+            "r^m -rf /etc",
+            "%COMSPEC% /c git reset --hard",
+            "%SystemRoot%\\System32\\cmd.exe /c del x",
+            "echo ok && doc^ker system prune -af",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "cmd-assembled command word must widen: {command:?}"
+            );
+        }
+
+        // A caret ANYWHERE is not the signal — only in the command word.
+        // These are ordinary Bash and must keep the Posix dialect, or a large
+        // fraction of real commands would be down-trusted into the union.
+        for command in [
+            "grep -rn '^fn main' src/",
+            "grep -E '^(a|b)$' file.txt",
+            "sed -n 's/^use //p' src/lib.rs",
+            "sed -i 's/^//' notes.txt",
+            "awk '/^ERROR/ {print}' app.log",
+            "rg '^\\s*fn ' src/",
+            "echo a^b",
+            "git commit -m 'fix ^ handling'",
+            "python3 -c 'print(2 ^ 3)'",
+            // A quoted first token is data, not an assembled executable name.
+            "'doc^ker' --help",
+            // Ordinary percent usage that is not a %VAR% expansion.
+            "echo 100% done",
+            "df -h | awk '{print $5}'",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "a caret outside the command word must not widen: {command:?}"
             );
         }
     }
