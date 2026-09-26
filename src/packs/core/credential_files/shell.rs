@@ -793,6 +793,27 @@ impl Word {
         self.text.iter().collect()
     }
 
+    /// The value carried inside an option token (`-o<dir>`,
+    /// `--directory=<dir>`), as a word in its own right.
+    ///
+    /// Splitting is sound because `literal` is per CHARACTER, so the suffix
+    /// keeps each character's own provenance — a `~` or `$` in the path stays
+    /// non-literal and the resolver still declines to prove it. `prefix_len`
+    /// counts characters, and every prefix this is used with is ASCII, so the
+    /// byte range narrows by the same amount; the range is only used to point
+    /// a reported span at the path rather than the whole token.
+    fn value_suffix(&self, prefix_len: usize) -> Option<Self> {
+        if self.text.len() <= prefix_len {
+            return None;
+        }
+        Some(Self {
+            text: self.text[prefix_len..].to_vec(),
+            literal: self.literal[prefix_len..].to_vec(),
+            range: (self.range.start + prefix_len)..self.range.end,
+            glued_paren: self.glued_paren,
+        })
+    }
+
     fn starts_with(&self, prefix: &str) -> bool {
         let prefix: Vec<char> = prefix.chars().collect();
         self.text.starts_with(&prefix)
@@ -1560,6 +1581,12 @@ enum WriterKind {
     Sed,
     Perl,
     Rsync,
+    /// `tar -x -C <dir>`, `unzip -d <dir>`, `7z x -o<dir>`, `bsdtar -x -C <dir>`.
+    ///
+    /// The archive's MEMBERS are unknowable, so the destination directory is
+    /// the only thing worth judging — and it is judged exactly where a
+    /// `cp`/`rsync` destination already is.
+    ArchiveExtract,
     // PowerShell cmdlets and Cmd built-ins (#477). Never produced by
     // [`writer_kind`], which names POSIX executables: `windows_shells` binds
     // their parameters itself and reuses the judges below.
@@ -1591,6 +1618,14 @@ fn writer_kind(executable: &str) -> Option<WriterKind> {
         "sed" => Some(WriterKind::Sed),
         "perl" => Some(WriterKind::Perl),
         "rsync" => Some(WriterKind::Rsync),
+        // Extraction writes whatever the archive carries into the destination
+        // directory. `tar -xf payload.tar -C ~/.ssh` was allowed while
+        // `cp -r payload/ ~/.ssh/` and `rsync -a payload/ ~/.ssh/` denied, so
+        // this is a missing route into scope the pack already claims, not a
+        // new posture. `tar` also reaches the unrelated `tar --remove-files`
+        // rule; `classify_archive_extract` declines anything that is not an
+        // extraction with an explicit destination, so the two do not collide.
+        "tar" | "bsdtar" | "unzip" | "7z" | "7za" | "7zr" => Some(WriterKind::ArchiveExtract),
         _ => None,
     }
 }
@@ -1619,6 +1654,7 @@ impl Writer {
             (Some(WriterKind::Install), _) => "`install` writes",
             (Some(WriterKind::Ln), _) => "`ln` replaces",
             (Some(WriterKind::Rsync), _) => "`rsync` writes",
+            (Some(WriterKind::ArchiveExtract), _) => "extracting an archive writes into",
             (Some(WriterKind::Dd), WriteMode::Replace) => "`dd` overwrites",
             (Some(WriterKind::Dd), WriteMode::Append) => "`dd oflag=append` appends to",
             (Some(WriterKind::Sed), _) => "`sed -i` rewrites",
@@ -2030,6 +2066,7 @@ fn classify_simple_command(tokens: &[Token]) -> Option<CredentialFileWrite> {
         WriterKind::Sed => classify_sed(args),
         WriterKind::Perl => classify_perl(args),
         WriterKind::Rsync => classify_rsync(args),
+        WriterKind::ArchiveExtract => classify_archive_extract(&executable_name(argv0)?, args),
         // `writer_kind` names POSIX executables only; these are bound by
         // `windows_shells`, which calls the judges directly.
         WriterKind::AddContent
@@ -2318,6 +2355,115 @@ fn classify_rsync(args: &[&Word]) -> Option<CredentialFileWrite> {
     judge_transfer_destination(writer, dest, sources)
 }
 
+/// Classify an archive extraction by its DESTINATION DIRECTORY.
+///
+/// `tar -xf payload.tar -C ~/.ssh` was allowed while `cp -r payload/ ~/.ssh/`
+/// and `rsync -a payload/ ~/.ssh/` denied, for the same destinations and the
+/// same effect. Measured before the fix:
+///
+/// ```text
+/// destination   cp / rsync                      extraction
+/// ~/.ssh/       deny credential-file-write      ALLOW
+/// .git/         deny git-internals-write        ALLOW
+/// /etc/         allow                           allow
+/// ```
+///
+/// The `/etc` row is what keeps this narrow: dcg does not judge
+/// `cp -r payload/ /etc/` either, so extraction there stays allowed for the
+/// same reason. Nothing here is a new "extraction is dangerous" posture.
+///
+/// Only an extraction with an EXPLICIT destination is judged. Without one the
+/// archive lands in the working directory, which is the ordinary case and is
+/// not this rule's business — and declining there is also what keeps this from
+/// colliding with `tar --remove-files`, which is about the source.
+fn classify_archive_extract(name: &str, args: &[&Word]) -> Option<CredentialFileWrite> {
+    let extracting = match name {
+        // `7z x` / `7z e` extract; `a` adds to an archive.
+        "7z" | "7za" | "7zr" => args
+            .iter()
+            .find(|word| !word.as_string().starts_with('-'))
+            .is_some_and(|word| matches!(word.as_string().as_str(), "x" | "e")),
+        // unzip extracts by default.
+        "unzip" => true,
+        // tar needs an explicit extract verb; `-czf` creates.
+        _ => args.iter().any(|word| {
+            let text = word.as_string();
+            text == "--extract"
+                || (text.starts_with('-') && !text.starts_with("--") && text.contains('x'))
+        }),
+    };
+    if !extracting {
+        return None;
+    }
+
+    // An option that carries its value inside the same token is split, so the
+    // judges see the PATH rather than `-o/home/user/.ssh`. Judging the whole
+    // token instead silently declines, which an end-to-end test caught.
+    let mut destination: Option<Word> = None;
+    let mut index = 0;
+    while index < args.len() {
+        let text = args[index].as_string();
+        // `-o<dir>` (7z) carries its value with no space.
+        if matches!(name, "7z" | "7za" | "7zr") && text.starts_with("-o") && text.len() > 2 {
+            destination = args[index].value_suffix(2);
+            break;
+        }
+        if text.starts_with("--directory=") {
+            destination = args[index].value_suffix("--directory=".chars().count());
+            break;
+        }
+        let takes_next = text == "-C"
+            || text == "--directory"
+            || (name == "unzip" && text == "-d")
+            // A tar short cluster ending in `C` takes the next word
+            // (`tar -xzfC` is not valid, but `tar -xC` is).
+            || (text.starts_with('-')
+                && !text.starts_with("--")
+                && text.ends_with('C'));
+        if takes_next {
+            destination = args.get(index + 1).map(|word| (*word).clone());
+            break;
+        }
+        index += 1;
+    }
+    let dest = &destination?;
+    let writer = Writer {
+        kind: Some(WriterKind::ArchiveExtract),
+        mode: WriteMode::Replace,
+    };
+    judge_extraction_destination(writer, dest)
+}
+
+/// Judge a destination directory that will receive UNKNOWN archive members.
+///
+/// This mirrors the `Exact::Parent` branch of [`judge_placement`], but without
+/// a source: an extraction can create ANY name in the directory, which is the
+/// same position a wildcard source puts `cp` in. Naming the first protected
+/// descendant is what makes the reason concrete rather than abstract.
+fn judge_extraction_destination(writer: Writer, dest: &Word) -> Option<CredentialFileWrite> {
+    let destination = resolve(dest)?;
+    if destination.escaped || destination.partial.is_some() {
+        return judge_file_target(dest, writer);
+    }
+    let span = dest.range.clone();
+    match exact(destination.root, &destination.comps) {
+        Exact::Protected { display, what, .. } => {
+            protected_hit(writer, &display, what, rule_for(&destination.comps), span)
+        }
+        // A directory that merely CONTAINS protected files is not itself a
+        // protected destination. `/etc` is the case that matters: dcg allows
+        // `cp -r payload/ /etc/` and `rsync -a payload/ /etc/`, so extraction
+        // there is out of scope for the same reason, and denying it would make
+        // this rule a false-positive engine for the most ordinary install step
+        // there is. `~/.ssh` and `.git` deny because the DIRECTORY itself is in
+        // the protected set, not because of what is under it.
+        //
+        // Measured: denying `Exact::Parent` too flagged `tar -xf payload.tar -C
+        // /etc`, which the negative test caught before this shipped.
+        Exact::Parent | Exact::Clear => None,
+    }
+}
+
 /// Whether an rsync operand names a remote host rather than a local path.
 ///
 /// `host:path` and `user@host:path` are remote; a colon that appears after the
@@ -2463,6 +2609,67 @@ mod tests {
 
     fn hit(command: &str) -> Option<CredentialFileWrite> {
         classify_credential_file_write(command, ShellDialect::Posix)
+    }
+
+    /// Archive extraction writes a protected destination like every sibling.
+    ///
+    /// Measured before the fix: `tar -xf payload.tar -C ~/.ssh` was ALLOWED
+    /// while `cp -r payload/ ~/.ssh/` and `rsync -a payload/ ~/.ssh/` denied,
+    /// for the same destination and the same effect. The archive's members are
+    /// unknowable before it runs, which is the same position a wildcard source
+    /// puts `cp` in, so the destination is judged and the reason names the
+    /// protected descendant it can land on.
+    #[test]
+    fn archive_extraction_guards_its_destination_directory() {
+        for command in [
+            "tar -xf payload.tar -C /home/user/.ssh",
+            "tar -xzf payload.tar.gz -C /home/user/.ssh",
+            "tar --extract --directory /home/user/.ssh -f payload.tar",
+            "tar -xf payload.tar -C /home/user/.ssh/",
+            "bsdtar -xf payload.tar -C /home/user/.ssh",
+            "unzip -o payload.zip -d /home/user/.ssh",
+            "unzip payload.zip -d /home/user/.ssh",
+            "7z x payload.7z -o/home/user/.ssh",
+            "7za x payload.7z -o/home/user/.ssh",
+        ] {
+            assert!(
+                hit(command).is_some(),
+                "extraction must guard its destination like every other writer: {command}"
+            );
+        }
+    }
+
+    /// The carve-outs, which are what keep this from being a false-positive
+    /// engine for the most ordinary build step there is.
+    #[test]
+    fn archive_extraction_leaves_ordinary_destinations_alone() {
+        for command in [
+            // No explicit destination: the archive lands in the working
+            // directory, which is not this rule's business.
+            "tar -xf payload.tar",
+            "unzip payload.zip",
+            // Ordinary destinations.
+            "tar -xf payload.tar -C ./build",
+            "tar -xf payload.tar -C /tmp/scratch",
+            "unzip -o payload.zip -d ./dist",
+            // Reading, not extracting.
+            "tar -tf payload.tar",
+            "unzip -l payload.zip",
+            // Creating an archive is the opposite direction, even when the
+            // SOURCE is a protected path.
+            "tar -czf backup.tar.gz ./src",
+            "tar -cf keys.tar /home/user/.ssh",
+            // `7z a` adds to an archive rather than extracting from one.
+            "7z a payload.7z /home/user/.ssh",
+            // `/etc` is deliberately out of scope: dcg does not judge
+            // `cp -r payload/ /etc/` either.
+            "tar -xf payload.tar -C /etc",
+        ] {
+            assert!(
+                hit(command).is_none(),
+                "ordinary extraction must stay allowed: {command}"
+            );
+        }
     }
 
     /// `rsync` writes a protected destination like every sibling (#478).

@@ -295,3 +295,50 @@ fn system_permissions_windows_verbs_are_reachable() {
         );
     }
 }
+
+/// Archive-extraction tools need BOTH keyword lists, same as `chgrp` did.
+///
+/// `tar` was already on the `PACK_ENTRIES` row for the source-deleting rule,
+/// but `bsdtar`, `unzip` and the `7z` family carry no other rule at all — so
+/// that row is the only thing deciding whether the extraction classifier is
+/// ever a candidate. A pack-level test calls `classify_credential_file_write`
+/// directly and never traverses it, so it would pass with the row unchanged.
+#[test]
+fn archive_extraction_tools_are_reachable() {
+    for command in [
+        "tar -xf payload.tar -C /home/user/.ssh",
+        "tar --extract --directory /home/user/.ssh -f payload.tar",
+        "bsdtar -xf payload.tar -C /home/user/.ssh",
+        "unzip -o payload.zip -d /home/user/.ssh",
+        "7z x payload.7z -o/home/user/.ssh",
+    ] {
+        assert_eq!(
+            decision(command, "core.filesystem"),
+            "deny",
+            "registry row must make the extraction classifier reachable: {command}"
+        );
+    }
+
+    // The carve-outs, through the same path: extraction is one of the most
+    // ordinary build steps there is and must not become a false-positive
+    // engine.
+    for command in [
+        "tar -xf payload.tar",
+        "tar -xf payload.tar -C ./build",
+        "tar -xf payload.tar -C /tmp/scratch",
+        "unzip -o payload.zip -d ./dist",
+        "tar -tf payload.tar",
+        "unzip -l payload.zip",
+        "tar -czf backup.tar.gz ./src",
+        "7z a payload.7z /home/user/.ssh",
+        // `/etc` is deliberately out of scope, exactly as `cp -r payload/
+        // /etc/` is.
+        "tar -xf payload.tar -C /etc",
+    ] {
+        assert_eq!(
+            decision(command, "core.filesystem"),
+            "allow",
+            "ordinary extraction must stay allowed: {command}"
+        );
+    }
+}

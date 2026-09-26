@@ -1516,6 +1516,21 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "/shred",
             "tar",
             "/tar",
+            // Archive extraction destinations (`tar -x -C <dir>`,
+            // `unzip -d <dir>`, `7z x -o<dir>`). `tar` is already above for the
+            // source-deleting rule, but these three carry no other rule at all,
+            // so this row is what decides whether the extraction classifier is
+            // ever a candidate — the same gate `chgrp` and `.git/` needed.
+            "bsdtar",
+            "/bsdtar",
+            "unzip",
+            "/unzip",
+            "7z",
+            "/7z",
+            "7za",
+            "/7za",
+            "7zr",
+            "/7zr",
             "dd",
             "/dd",
             "mv",

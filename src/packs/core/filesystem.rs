@@ -1759,6 +1759,16 @@ pub(crate) fn filesystem_keyword_candidate(command: &str) -> bool {
         "truncate",
         "shred",
         "tar",
+        // Archive extraction writes the archive's members into the destination
+        // directory, and is judged exactly where a `cp`/`rsync` destination
+        // already is. `tar` is listed above for the source-deleting rule; these
+        // carry no other rule, so without them the extraction classifier is
+        // never reached.
+        "bsdtar",
+        "unzip",
+        "7z",
+        "7za",
+        "7zr",
         "dd",
         "mv",
         "cp",
