@@ -11,6 +11,40 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased
+
+Work on `main` after the v0.15.1 tag. Nothing here is in a published binary
+yet.
+
+### Fixed
+
+- **A heredoc with an unquoted delimiter that only stores text was judged as
+  commands.** `cat <<EOF > notes.md` documenting `watch '…'`, `sh -c '…'`,
+  `ssh host '…'` or `eval "$x"` was denied, while the same note behind
+  `<<'EOF'` was allowed. Only the parts the shell runs while reading such a
+  body — `$(…)`, backquotes, and arithmetic that may be a subshell — are
+  judged now; a body whose substitutions cannot be bounded is judged whole,
+  as before. A body that a shell runs is still judged: piped or fed to one,
+  read as an awk or sed program (`awk -f - <<EOF`), and now also written to
+  a file the same command then runs (`tee x.sh <<EOF … EOF; sh x.sh`), which
+  was allowed with either delimiter.
+
+- **More spellings that hid a command.** A quoted option around a shell's
+  `-c` (`bash -c -o 'errexit' '…'`, `bash '-c' '…'`); a runner named through
+  `$'…'` escapes (`$'\x77atch' '…'`) or assembled at run time
+  (`w${x}atch '…'`, `sudo $W '…'`); a command word that is a substitution
+  printing the command (`$(echo git reset --hard)`); a quoted `find` action
+  (`find ~ '-delete'`, `find ~ -de''lete`); a relative write after `cd` to `/`
+  or another ancestor of a protected directory (`cd / && echo x >>
+  etc/sudoers`); a dashed Git built-in behind `xargs` or `find -exec`
+  (`xargs git-reset --hard`); `$\<newline>(…)`; and an `eval` after a
+  reserved word (`… | while read l; do eval "$l"; done`). All of these were
+  allowed on v0.14.4 and v0.15.1.
+
+- **A long run of option-like words before a shell's `-c` took seconds.**
+  Each inline-code flag rescanned its segment, so `c -c -c … sh -c '…'` took
+  7-16 s at 60 KB; it is linear now (under 0.2 s).
+
 ## [v0.15.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.1) -- 2026-09-29 [Release]
 
 Two fixes. One made the Oh My Pi bridge let a command through unjudged; the

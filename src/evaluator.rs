@@ -6979,7 +6979,14 @@ fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) 
                 index += 1;
                 continue;
             };
-            if crate::normalize::is_env_assignment(decoded.as_ref()) {
+            // `while read l; do eval "$l"; done`: a reserved word opens the
+            // segment and the eval after it still runs.
+            if crate::normalize::is_env_assignment(decoded.as_ref())
+                || matches!(
+                    decoded.as_ref(),
+                    "do" | "then" | "else" | "elif" | "{" | "!" | "if" | "while" | "until"
+                )
+            {
                 index += 1;
                 continue;
             }
@@ -23198,9 +23205,30 @@ fn proven_cd_directory(
                 directory.map(|known| format!("{}/{target}", known.trim_end_matches('/')))
             }
             None => None,
-        };
+        }
+        .map(lexical_directory);
     }
     directory
+}
+
+/// An absolute directory with `.`, `..` and repeated slashes resolved the way
+/// `cd` (logical, its default) resolves them: `/usr/..` is `/`, `//etc/.`
+/// is `/etc`. Other spellings are returned unchanged.
+fn lexical_directory(directory: String) -> String {
+    let Some(path) = directory.strip_prefix('/') else {
+        return directory;
+    };
+    let mut components: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            other => components.push(other),
+        }
+    }
+    format!("/{}", components.join("/"))
 }
 
 /// Whether a `cd` segment changes the directory of the shell that later runs
@@ -28111,6 +28139,16 @@ pub fn apply_branch_strictness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cd_directories_resolve_dot_segments_like_logical_cd() {
+        assert_eq!(lexical_directory("/usr/..".to_string()), "/");
+        assert_eq!(lexical_directory("//etc/./".to_string()), "/etc");
+        assert_eq!(lexical_directory("/a/b/../c".to_string()), "/a/c");
+        assert_eq!(lexical_directory("/..".to_string()), "/");
+        assert_eq!(lexical_directory("~/.ssh/..".to_string()), "~/.ssh/..");
+        assert_eq!(lexical_directory("$HOME/x".to_string()), "$HOME/x");
+    }
 
     /// A declaration keyword before an assignment must not defeat the proof
     /// (#479).

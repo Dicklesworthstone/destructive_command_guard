@@ -732,3 +732,138 @@ fn windows_wrappers_and_here_strings_behind_redirects_are_judged() {
         assert!(!lab.claude_hook_denies(&command), "{command:?}");
     }
 }
+
+/// Eighth review (A13): the prose of a data heredoc with an UNQUOTED
+/// delimiter was read as live commands. `cat <<EOF > notes.md` documenting
+/// `watch '…'`, `sh -c '…'` or `ssh h '…'` was denied although `cat` only
+/// stores the text; the quoted-delimiter spelling was allowed. The shell runs
+/// only the body's substitutions while reading it, so those are still judged,
+/// and a body a shell runs — piped to one, fed to one, or written to a file
+/// the same command then runs — is judged whole.
+#[test]
+fn expanding_data_heredoc_bodies_judge_only_what_the_shell_runs() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "cat <<EOF > notes.md\nwatch 'git reset --hard'\nEOF",
+        "cat <<EOF > notes.md\nsh -c 'git reset --hard'\nEOF",
+        "cat <<EOF > notes.md\nsh 2>/dev/null -c 'git reset --hard'\nEOF",
+        "cat <<EOF > notes.md\nuse a<(watch 'git reset --hard')\nEOF",
+        "cat <<EOF > notes.md\nssh h 'git reset --hard'\nEOF",
+        "cat <<-EOF > notes.md\n\tuse a<(watch 'git reset --hard')\n\tEOF",
+        "git commit -F - <<EOF\nfix: cat a<(ssh h 'git reset --hard') was allowed\nEOF",
+        "cat <<EOF > notes.md\neval \"$x\"\nEOF",
+        "cat <<EOF > notes.md\nbuilt $(date +%F): watch 'git reset --hard'\nEOF",
+        "cat <<EOF > notes.md\nrm -rf ~/src\nEOF\ngit add notes.md",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "cat <<EOF > notes.md\n$(git reset --hard)\nEOF",
+        "cat <<EOF > notes.md\n`git reset --hard`\nEOF",
+        "cat <<EOF > notes.md\nx $(watch 'git reset --hard') y\nEOF",
+        "cat <<EOF > notes.md\n${x:-$(git reset --hard)}\nEOF",
+        "cat <<EOF > notes.md\n$(( $(git reset --hard) ))\nEOF",
+        "cat <<EOF > notes.md\n$\\\n(git reset --hard)\nEOF",
+        "cat <<EOF | sh\nwatch 'git reset --hard'\nEOF",
+        "bash <<EOF\nwatch 'git reset --hard'\nEOF",
+        "ssh h <<EOF\ngit reset --hard\nEOF",
+        "tee x.sh <<EOF\nrm -rf ~/src\nEOF\nsh x.sh",
+        "cat <<EOF > x.sh && ./x.sh\nrm -rf ~/src\nEOF",
+        "cat > x.sh <<'EOF'\nrm -rf ~/src\nEOF\ncat x.sh | bash",
+        "cat <<EOF > x.sh; . ./x.sh\ngit reset --hard\nEOF",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+}
+
+/// Eighth review (A14): spellings that still hid a command from the rules
+/// (all allowed on v0.14.4 and v0.15.1).
+#[test]
+fn eighth_review_spellings_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        // A quoted option after a shell's `-c`.
+        "bash -c -o 'errexit' 'git reset --hard'",
+        "sh -c -O 'extglob' 'git reset --hard'",
+        "bash -c '-e' 'git reset --hard'",
+        // A runner named through `$'…'` escapes.
+        "$'\\x77atch' 'git reset --hard'",
+        "$'\\167atch' 'git reset --hard'",
+        "w$'\\x61'tch 'git reset --hard'",
+        // A runner named at run time.
+        "w${x}atch 'git reset --hard'",
+        "${W}atch 'git reset --hard'",
+        "sudo $W 'git reset --hard'",
+        "$(echo watch) 'git reset --hard'",
+        // A command word that is a substitution printing the command.
+        "$(echo git reset --hard)",
+        "$(printf 'git reset --hard')",
+        "$(echo git reset) --hard",
+        "\"$(echo git)\" reset --hard",
+        // A find action spelled through quoting.
+        "find ~/src '-delete'",
+        "find ~/src -de''lete",
+        "find ~/src -de\\lete",
+        "find ~/src -perm -u+x \"-delete\"",
+        // A relative write after `cd` to `/` or an ancestor of a protected root.
+        "cd / && echo x >> etc/sudoers",
+        "cd // && echo x > etc/passwd",
+        "cd /usr/.. && echo x >> etc/sudoers",
+        "cd / ; tee -a etc/sudoers <<< x",
+        "cd /home && echo x >> luna/.netrc",
+        // A dashed Git built-in behind a wrapper.
+        "xargs git-reset --hard",
+        "echo . | xargs -0 git-clean -fdx",
+        "find . -exec git-clean -fdx \\;",
+        // Found by the self-review of this round (pre-existing).
+        "bash '-c' 'git reset --hard'",
+        "bash -o 'errexit' -c 'git reset --hard'",
+        "f'ind' ~/src '-delete'",
+        "echo $\\\n(git reset --hard)",
+        "awk -f - <<'EOF'\nBEGIN{system(\"rm -rf ~/src\")}\nEOF",
+        "echo 'git reset --hard' | while read l; do eval \"$l\"; done",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "bash -c -o 'errexit' 'ls'",
+        "$'\\x77atch' 'uptime'",
+        "w${x}atch 'df -h'",
+        "echo w${x}atch 'git reset --hard'",
+        "$HOME/.local/bin/tool 'git reset --hard'",
+        "sudo -u \"$USER\" git commit -m 'rm -rf is dangerous'",
+        "awk -f prog.awk <<'EOF'\nrm -rf ~/src\nEOF",
+        "$(echo ls) -la",
+        "echo $(echo git reset --hard)",
+        "git commit -m \"$(echo git reset --hard)\"",
+        "find ~/src -name '-delete'",
+        "find ~/src -exec grep '-delete' {} \\;",
+        "cd / && ls etc/sudoers",
+        "cd /tmp && echo x >> etc/sudoers",
+        "xargs git-log",
+        "echo git-reset --hard",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+}
+
+/// Eighth review: a long run of option-like words before a shell's `-c`
+/// (`c -c -c … sh -c '…'`) took seconds; the hook must answer in time and
+/// still find the payload.
+#[test]
+fn long_option_runs_before_a_command_string_answer_fast() {
+    let lab = Lab::new(DEFAULTS);
+    for unit in ["c -", "c -c ", "sh -c -e "] {
+        let long = format!(
+            "{} sh -c 'git reset --hard'",
+            unit.repeat(30_000 / unit.len())
+        );
+        let started = std::time::Instant::now();
+        assert!(lab.claude_hook_denies(&long), "{unit:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{unit:?}: {:?}",
+            started.elapsed()
+        );
+    }
+}

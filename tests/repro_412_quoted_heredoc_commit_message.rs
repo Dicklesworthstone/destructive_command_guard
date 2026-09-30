@@ -262,6 +262,10 @@ fn a_documented_command_inside_a_data_heredoc_is_allowed() {
         "cat > /tmp/notes/notes.md <<'EOF'\nssh host 'rm -rf ~/x'\nEOF",
         "cat > /tmp/notes/notes.md <<'EOF'\nawk 'BEGIN{ system(\"rm -rf ~/x\") }'\nEOF",
         "tee /tmp/notes/notes.md <<'EOF'\nperl -e 'unlink glob \"~/x/*\"'\nEOF",
+        // An unquoted delimiter expands the body, but expansion runs only its
+        // substitutions; the rest is the same documentation.
+        "cat > /tmp/notes/notes.md <<EOF\nbash -c \"rm -rf ~/x\"\nEOF",
+        "cat > /tmp/notes/notes.md <<EOF\nssh host 'rm -rf ~/x' ($(date))\nEOF",
     ] {
         assert_eq!(
             decision(command),
@@ -277,8 +281,8 @@ fn a_live_payload_outside_a_data_heredoc_still_denies() {
         // A shell interpreter receiving the body executes it.
         "bash <<'EOF'\nrm -rf ~/x\nEOF",
         "sh <<'EOF'\nrm -rf ~/x\nEOF",
-        // An unquoted delimiter expands, so the body stays visible.
-        "cat > /tmp/notes/notes.md <<EOF\nbash -c \"rm -rf ~/x\"\nEOF",
+        // An unquoted delimiter runs the body's substitutions.
+        "cat > /tmp/notes/notes.md <<EOF\n$(bash -c \"rm -rf ~/x\")\nEOF",
         // Executable text outside any heredoc body is untouched by this.
         "bash -c \"rm -rf ~/x\"",
         "cat > /tmp/notes/notes.md <<'EOF'\nharmless\nEOF\nbash -c \"rm -rf ~/x\"",
