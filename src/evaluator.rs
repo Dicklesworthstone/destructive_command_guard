@@ -12673,11 +12673,23 @@ fn unknown_dialect_fanout_candidate(
 /// `docker system prune -af`. The normalized view a replay would actually match
 /// on is the authority on that, so ask it directly.
 ///
-/// Cost is bounded to commands that already carry the view's escape byte: the
-/// caller has proven a dialect-divergent byte is present, and the extra
-/// normalize runs only when that byte is this view's own escape character *and*
-/// the raw text names no keyword. A benign `echo he^llo` decodes to `echo
-/// hello`, which still names nothing, so it never reaches a replay.
+/// Cost is bounded to commands that already carry the view's escape byte in an
+/// executable position, and, beyond that, to ones whose decode actually rewrites
+/// the command relative to the POSIX view. A benign `echo he^llo` decodes to
+/// `echo hello`, which names nothing any pack protects, so it never reaches a
+/// replay; `git log --format=%H%n` decodes differently but exposes no keyword
+/// the POSIX view did not already have, so it does not either.
+///
+/// The keyword question is asked *per keyword*, against the POSIX view rather
+/// than against "does the raw text name anything at all". That weaker test
+/// suppressed the replay whenever some unrelated keyword appeared anywhere on
+/// the line — `/dev/` in `crypt^setup luksErase /dev/sdb`, or `erase`/`rd`
+/// contributed by an unrelated enabled pack and matched inside `luksErase` and
+/// `card`. It made a more dangerous spelling *less* detected than a less
+/// dangerous one, and made coverage non-monotone in the enabled-pack set, which
+/// is how the hook (which selects the wider Windows pack view for exactly these
+/// caret-shaped payloads) came to allow commands `dcg explain` denied
+/// (dcg#499, dcg#500).
 fn view_decode_exposes_pack_keyword(
     command: &str,
     view: ShellDialect,
@@ -12703,18 +12715,21 @@ fn view_decode_exposes_pack_keyword(
         return false;
     }
     let view_normalized = crate::normalize::normalize_command_in_dialect(command, view);
-    let Some(index) = keyword_index else {
-        // No index to ask, so fail closed exactly like the candidate gate's
-        // keyword half does: replay whenever this view's normalized text
-        // differs from the POSIX one, because that difference is the only
-        // thing that could have reconstructed an executable.
-        return view_normalized
-            != crate::normalize::normalize_command_in_dialect(command, ShellDialect::Posix);
-    };
-    if index.has_any_keyword(command) {
+    let posix_normalized =
+        crate::normalize::normalize_command_in_dialect(command, ShellDialect::Posix);
+    // A decode that leaves the command where the POSIX view already had it
+    // cannot have reconstructed an executable; that difference is the only
+    // thing that could have.
+    if view_normalized == posix_normalized {
         return false;
     }
-    index.has_any_keyword(view_normalized.as_ref())
+    let Some(index) = keyword_index else {
+        // No index to ask, so fail closed exactly like the candidate gate's
+        // keyword half does: the two views disagree, and only this view's
+        // decode could have made them.
+        return true;
+    };
+    index.exposes_keyword_absent_from(view_normalized.as_ref(), posix_normalized.as_ref())
 }
 
 /// Whether `view`'s parse of `command` exposes command segments the POSIX parse
@@ -43709,6 +43724,89 @@ mod tests {
             ShellDialect::Cmd,
             None
         ));
+    }
+
+    /// dcg#500: an unrelated keyword elsewhere on the line must not suppress
+    /// the replay for the keyword the escape actually hid.
+    ///
+    /// The gate used to ask "does the raw text name *any* enabled keyword",
+    /// which a device path answers for a completely different rule. That made
+    /// the more dangerous spelling the less detected one: `crypt^setup
+    /// luksErase mydev` denied while the same command against a real device
+    /// allowed, because only the latter carries `/dev/`.
+    #[test]
+    fn issue_500_unrelated_keyword_does_not_suppress_the_decode_replay() {
+        let ordered =
+            crate::packs::REGISTRY.expand_enabled_ordered(&["system.disk".to_string()].into());
+        let index = crate::packs::REGISTRY
+            .build_enabled_keyword_index(&ordered)
+            .expect("keyword index should build");
+
+        for command in [
+            "crypt^setup luksErase /dev/sdb",
+            "blkdis^card /dev/sdb",
+            "d^d if=/dev/zero of=/dev/sda",
+            "wipe^fs /dev/sda",
+        ] {
+            assert!(
+                dialect_view_may_expose_hidden_execution(
+                    command,
+                    ShellDialect::Cmd,
+                    Some(&index)
+                ),
+                "{command:?} hides its command word behind a caret; the `/dev/` \
+                 operand belongs to a different rule and cannot stand in for it"
+            );
+        }
+
+        // The cost bound the old early return existed for still holds: a decode
+        // that exposes no keyword the POSIX view lacked does not replay.
+        for command in ["echo he^llo", "git log --oneline -5"] {
+            assert!(
+                !dialect_view_may_expose_hidden_execution(
+                    command,
+                    ShellDialect::Cmd,
+                    Some(&index)
+                ),
+                "{command:?} exposes no keyword its POSIX view did not already have"
+            );
+        }
+    }
+
+    /// dcg#499/#500: enabling a pack must never remove a denial.
+    ///
+    /// `windows.filesystem` contributes the keywords `erase` and `rd`, which
+    /// the substring matcher finds inside the unrelated words `luksErase` and
+    /// `card`. Under the old gate that was enough to suppress the decode
+    /// replay, so turning that pack on silently un-shipped `system.disk`'s
+    /// `cryptsetup-erase` and `blkdiscard` rules for their caret spellings.
+    /// The hook selects exactly this wider Windows pack view for caret-shaped
+    /// payloads, which is why it allowed commands `dcg explain` denied.
+    #[test]
+    fn issue_499_enabling_a_pack_never_removes_a_denial() {
+        for command in [
+            "crypt^setup luksErase mydev",
+            "blkdis^card mydev",
+            "crypt^setup luksErase /dev/sdb",
+        ] {
+            let narrow =
+                evaluate_with_pack_ids_in_dialect(command, &["system.disk"], ShellDialect::Unknown);
+            let wide = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["system.disk", "windows.filesystem"],
+                ShellDialect::Unknown,
+            );
+            assert!(
+                !narrow.is_allowed(),
+                "{command:?} must deny with system.disk alone"
+            );
+            assert!(
+                !wide.is_allowed(),
+                "{command:?} denied with system.disk alone but was allowed once \
+                 windows.filesystem was added: coverage must be monotone in the \
+                 enabled-pack set"
+            );
+        }
     }
 
     /// dcg#294: the headline repro, at the evaluator seam.

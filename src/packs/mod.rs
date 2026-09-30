@@ -1369,6 +1369,65 @@ impl EnabledKeywordIndex {
 
         mask
     }
+
+    /// Whether `decoded` names an enabled-pack keyword that `baseline` does not.
+    ///
+    /// The unknown-dialect fan-out asks this to decide whether replaying a
+    /// command under a concrete dialect could reach a rule the POSIX view could
+    /// not (dcg#294): a cmd.exe caret or a PowerShell backtick can split an
+    /// executable word without adding a separator, so the decoded text names
+    /// something a pack protects while the POSIX text does not.
+    ///
+    /// The question has to be asked per keyword. A plain "does the baseline
+    /// name *any* keyword" test answers a different one, and answers it wrong
+    /// whenever the line carries an unrelated keyword: `/dev/` in
+    /// `crypt^setup luksErase /dev/sdb` belongs to a rule about device targets,
+    /// not to the command word the caret split, yet it made the replay look
+    /// redundant and the command was allowed while the same line without a
+    /// device path denied. The same test also made coverage *non-monotone* in
+    /// the enabled-pack set: enabling `windows.filesystem` contributes `erase`
+    /// and `rd`, which appear inside the unrelated words `luksErase` and
+    /// `card`, so turning that pack on silently un-shipped `system.disk`'s
+    /// `cryptsetup-erase` and `blkdiscard` rules for their caret spellings
+    /// (dcg#499, dcg#500).
+    ///
+    /// Pattern ids are compared rather than keyword text so the two sides use
+    /// one matcher and one notion of a match, including the overlapping
+    /// substring semantics `candidate_pack_mask` documents.
+    #[must_use]
+    pub fn exposes_keyword_absent_from(&self, decoded: &str, baseline: &str) -> bool {
+        // A pack with no keyword list is checked against every command, so it
+        // is checked against the decoded text too — and that text is exactly
+        // what it has not seen yet.
+        if self.always_check_mask != 0 {
+            return true;
+        }
+
+        if self.core_git_mask != 0
+            && crate::packs::core::git::contains_git_ascii_case_insensitive(decoded)
+            && !crate::packs::core::git::contains_git_ascii_case_insensitive(baseline)
+        {
+            return true;
+        }
+
+        if let Some(ac) = &self.keyword_matcher {
+            let baseline_hits: std::collections::BTreeSet<usize> = ac
+                .find_overlapping_iter(baseline)
+                .map(|m| m.pattern().as_usize())
+                .collect();
+            if ac
+                .find_overlapping_iter(decoded)
+                .any(|m| !baseline_hits.contains(&m.pattern().as_usize()))
+            {
+                return true;
+            }
+        }
+
+        self.whitespace_keywords.iter().any(|keyword| {
+            keyword_matches_substring(decoded, keyword)
+                && !keyword_matches_substring(baseline, keyword)
+        })
+    }
 }
 
 /// Packs the `careful_company_running_windows` preset pulls in beyond its own
@@ -5346,6 +5405,42 @@ destructive_patterns:
             "echo has no pack keywords"
         );
         assert!(!index.has_any_keyword("cd /tmp"), "cd has no pack keywords");
+    }
+
+    /// dcg#499/#500: the decode gate asks a per-keyword question, so an
+    /// unrelated keyword in the baseline cannot answer it.
+    #[test]
+    fn exposes_keyword_absent_from_is_per_keyword_not_any_keyword() {
+        let enabled: HashSet<String> = ["system.disk".to_string()].into_iter().collect();
+        let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+        let index = REGISTRY
+            .build_enabled_keyword_index(&ordered)
+            .expect("should build index");
+
+        // `cryptsetup` is new even though `/dev/` is on both sides; the device
+        // path belongs to a different rule and cannot stand in for the command
+        // word the caret split.
+        assert!(index.exposes_keyword_absent_from(
+            "cryptsetup luksErase /dev/sdb",
+            "crypt^setup luksErase /dev/sdb"
+        ));
+        assert!(index.exposes_keyword_absent_from(
+            "dd if=/dev/zero of=/dev/sda",
+            "d^d if=/dev/zero of=/dev/sda"
+        ));
+
+        // Same keywords on both sides: nothing new, so no replay is warranted.
+        assert!(!index.exposes_keyword_absent_from(
+            "dd if=/dev/zero of=/dev/sda",
+            "dd if=/dev/zero of=/dev/sda"
+        ));
+        assert!(!index.exposes_keyword_absent_from("echo hello", "echo he^llo"));
+
+        // Polarity is directional: dropping a keyword is not exposing one.
+        assert!(!index.exposes_keyword_absent_from(
+            "crypt^setup luksErase /dev/sdb",
+            "cryptsetup luksErase /dev/sdb"
+        ));
     }
 
     #[test]
