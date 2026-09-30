@@ -11,9 +11,155 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## [Unreleased]
+## Unreleased
 
-Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
+Work on `main` after the v0.15.1 tag. Nothing here is in a published binary
+yet.
+
+### Fixed
+
+- **A heredoc with an unquoted delimiter that only stores text was judged as
+  commands.** `cat <<EOF > notes.md` documenting `watch '…'`, `sh -c '…'`,
+  `ssh host '…'` or `eval "$x"` was denied, while the same note behind
+  `<<'EOF'` was allowed. Only the parts the shell runs while reading such a
+  body — `$(…)`, backquotes, and arithmetic that may be a subshell — are
+  judged now; a body whose substitutions cannot be bounded is judged whole,
+  as before. A body that a shell runs is still judged: piped or fed to one,
+  read as an awk or sed program (`awk -f - <<EOF`), and now also written to
+  a file the same command then runs (`tee x.sh <<EOF … EOF; sh x.sh`), which
+  was allowed with either delimiter.
+
+- **More spellings that hid a command.** A quoted option around a shell's
+  `-c` (`bash -c -o 'errexit' '…'`, `bash '-c' '…'`); a runner named through
+  `$'…'` escapes (`$'\x77atch' '…'`) or assembled at run time
+  (`w${x}atch '…'`, `sudo $W '…'`); a command word that is a substitution
+  printing the command (`$(echo git reset --hard)`); a quoted `find` action
+  (`find ~ '-delete'`, `find ~ -de''lete`); a relative write after `cd` to `/`
+  or another ancestor of a protected directory (`cd / && echo x >>
+  etc/sudoers`); a dashed Git built-in behind `xargs` or `find -exec`
+  (`xargs git-reset --hard`); `$\<newline>(…)`; and an `eval` after a
+  reserved word (`… | while read l; do eval "$l"; done`). All of these were
+  allowed on v0.14.4 and v0.15.1.
+
+- **A brace list that makes the command, and commands the shell runs later,
+  were judged as data.** `{rm,-rf,~}` and `{git,reset,--hard}` run `rm -rf ~`
+  and `git reset --hard` once bash expands them, and `rm {-rf,~}` expands to
+  the same options. A `trap` handler (`trap 'rm -rf ~' EXIT` runs when the
+  tool call's shell exits), `PROMPT_COMMAND`, a prompt's substitutions
+  (`PS1='$(…)'`, `PS4` under `set -x`) and `BASH_ENV=<(…)` hold a command the
+  shell runs later. All were allowed; each is judged now. (bd-2bm3, bd-v9hh)
+
+- **A long run of option-like words before a shell's `-c` took seconds.**
+  Each inline-code flag rescanned its segment, so `c -c -c … sh -c '…'` took
+  7-16 s at 60 KB; it is linear now (under 0.2 s).
+
+## [v0.15.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.1) -- 2026-09-29 [Release]
+
+Two fixes. One made the Oh My Pi bridge let a command through unjudged; the
+other made the installers skip signature checking with some distro builds of
+cosign.
+
+**Oh My Pi users: refresh the bridge after upgrading.** The fix for #504 is in
+the generated `dcg-guard.ts` file, not only in the dcg binary, so an existing
+bridge keeps the old behaviour until it is rewritten.
+
+- `dcg update` rewrites your user/profile bridge for you when `omp` is on your
+  `PATH` (it runs the new installer, which runs `dcg install --omp --force`).
+  It does not if you pass `--no-configure`.
+- If you upgraded any other way (package manager, manual download,
+  `dcg update --no-configure`), run `dcg install --omp --force`. Without
+  `--force` the command sees the existing bridge and leaves it alone.
+- A project-scoped bridge (`dcg install --omp --project`) is never touched by
+  `dcg update`. Run `dcg install --omp --force --project` in that project, or
+  `dcg doctor --fix` there, which refreshes every stale dcg-owned bridge OMP
+  loads.
+- `dcg doctor` reports an old bridge as "OUTDATED OR DAMAGED".
+
+Restart omp afterwards so it loads the new file.
+
+### Fixed
+
+- **The OMP bridge judged nothing when the command's working directory did not
+  exist (#504).** The bridge started dcg inside the command's working
+  directory. When that directory was missing (a removed scratch directory, or
+  one the command itself would create), starting dcg failed with an `ENOENT`
+  error that named the dcg binary, and the bridge logged it and let the
+  command run with no verdict and no audit record, even with
+  `DCG_UNVERIFIED_DECISION=deny`. The bridge now starts dcg from the nearest
+  existing parent directory, so the same project config, allowlists and Git
+  branch apply, and tells dcg the real working directory. Allowlist entries
+  scoped to a directory are not applied when the reported directory does not
+  exist, so a grant for the parent is never borrowed. If dcg still cannot be
+  started, the log names the binary and both directories, and
+  `DCG_UNVERIFIED_DECISION=deny` now blocks the command; without that setting
+  the behaviour is unchanged (the command is allowed, as documented in #346).
+  (38de715)
+
+- **The installers skipped signature verification with cosign builds that add
+  a version suffix (#505).** `install.sh` and `install.ps1` refuse cosign
+  releases older than the CVE-2026-22703 fixes, but their version check could
+  not read a version with anything after the patch number. Arch's cosign
+  reports `v3.1.3+dirty`, so it was treated as unpatched and the Sigstore
+  bundle check was skipped with a warning. Both installers now read the
+  version as SemVer: build metadata such as `+dirty` is ignored, and a
+  pre-release such as `v3.0.4-rc.1` still counts as older than `v3.0.4`.
+  Versions that cannot be read are still refused, and the warning now shows
+  what cosign reported. (6ba4a76)
+
+## [v0.15.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.0) -- 2026-09-29 [Release]
+
+A safety release. Most of what follows is commands that v0.14.4 allowed and
+should have blocked. The minor version bump is because several of those fixes
+change verdicts you may see day to day; nothing was removed from the
+configuration or the hook protocols.
+
+**In short:**
+
+- **A warning no longer hides a later block** (#498). A rule set to `warn`,
+  `log` or `ask` used to be the whole answer for the command line, so
+  `git stash drop && git reset --hard` was allowed. dcg now keeps looking past
+  a non-blocking match and reports the strictest result.
+- **Credential and startup files are protected wherever the home directory
+  lives** (#502). Synology (`/volume1/homes/<u>`, `/var/services/homes/<u>`),
+  `/var/home`, `/usr/home`, `/export/home`, a container's own `$HOME`, macOS
+  firmlinks, WSL and Cygwin mounts of a Windows profile, and many spellings of
+  those paths (quotes, `.`/`..`, globs, brace lists, ANSI-C escapes) are now
+  recognised. Review rounds on this fix found and closed a long list of
+  further bypass classes, listed under Security below.
+- **The PowerShell profile check stops warning "Hook missing" when the hook is
+  installed** (#503). Running `dcg install` rewrites an old profile block in
+  place, and paths containing `''` (for example `O''Brien`) are read
+  correctly.
+- **Commands handed to another program to run are judged.** `watch '…'`,
+  `su -c '…'`, `parallel ::: '…'`, `env -S'…'`, `flock -c`, `nix-shell --run`,
+  `ssh host …`, `docker exec` and similar runners and wrappers pass their
+  command through dcg the way `sh -c '…'` always did.
+- **A redirect or option no longer hides `sh -c`'s script.**
+  `sh 2>/dev/null -c '…'`, `bash -c -e '…'`, `sh <<<x -c '…'`,
+  `powershell 2>&1 -EncodedCommand …` and similar spellings are judged.
+- **Pathological input fails closed quickly instead of stalling the hook.**
+  Very long pipelines, long runs of unclosed brackets, deep glob or `$var`
+  paths and exponential glob patterns are bounded.
+
+**Behaviour changes you may notice:**
+
+- A pipeline of more than 1,024 stages is denied without being parsed
+  (`heredoc.shell:analysis-bounds`).
+- A write target whose path has more than 64 components that the shell can
+  rewrite (`/*/*/…`, `/$x/$x/…`) is denied as a possible credential-file write.
+- `ssh host git commit -m 'rm -rf x'` is now denied. ssh joins its arguments
+  and the remote shell re-parses them, so the remote side really runs
+  `rm -rf x`. Quote the whole remote command
+  (`ssh host "git commit -m 'rm -rf x'"`) if you mean the message.
+- An unquoted heredoc body that contains a command-string runner, such as
+  `cat > notes.md <<EOF` with `watch 'git reset --hard'` inside, can be denied,
+  as `sh -c '…'` in the same place already was. Quote the delimiter
+  (`<<'EOF'`) for text that is only data.
+- Rules that were warn-only in your `[policy]` no longer let later deny rules
+  on the same line through. A line that only matches a warn rule is still a
+  warn.
+
+The full list follows.
 
 ### Security
 
@@ -107,6 +253,14 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   with no comma hid the slash-spanning list inside it
   (`tee /tmp/{{a/,b}}/../../etc/sudoers`), and the brace scan was quadratic
   in unclosed `{`; both fixed.
+  A fifth review found the runner still missed behind `2>&1` (read as a
+  background `&` and a command `1`), inside `function f { …; }` and
+  `coproc NAME { …; }` bodies, behind a redirect before its payload
+  (`watch 2>/dev/null '…'`, `ssh host 2>/dev/null '…'`), under a quoted or
+  escaped name (`\watch`, `w\atch`, `'su'`, `\ssh`), inside a process
+  substitution (`cat <(watch '…')`), and behind `chrt`, `busybox`,
+  `eatmydata`, `fakeroot`, `cgexec`, `flatpak-spawn`, `pkexec` and `run0`
+  (which also let `eatmydata git reset --hard` through). All now deny.
 
 - **The filesystem-sink fallback could not express a call in receiver position**
   (#468), so `require('fs').rmSync('/home/user', {recursive: true})` was
@@ -206,6 +360,26 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   now Go — each found by hand.
 
 ### Fixed
+
+- **A redirect or an option around a shell's `-c` hid the command string.**
+  `sh 2>/dev/null -c '…'`, `bash &>log -c '…'`, `sh -c 2>/dev/null '…'`,
+  `sh -c -- '…'`, `bash -c -e '…'` and `bash +e -c '…'` all run `…`, but the
+  inline-script reader expected the options before `-c` and the command
+  string right after it, so the payload ran unjudged (since before v0.14.4;
+  `python3 2>/dev/null -c '…'` too). The same `&>`, `>|` and `{fd}>`
+  redirects, `wat$'c'h`, and a process substitution inside a word
+  (`--x=<(watch '…')`) still hid a command-string runner's payload. So did
+  a here-string before `-c` (`sh <<<x -c '…'`), and a redirect between a
+  Windows wrapper and its flag (`powershell 2>&1 -EncodedCommand …`,
+  `cmd 2>nul /c …`).
+
+- **A pipeline of thousands of stages, or a run of unclosed `[`, held the hook
+  past its deadline.** tree-sitter-bash parses one long pipeline in
+  superlinear time, so `x | env | … | env -S 'ls'` (60 KB) answered `ask`
+  after 6–9 s; a pipeline of more than 1,024 stages is no longer parsed and
+  fails closed at once (`heredoc.shell:analysis-bounds`). The git expansion
+  check and the PowerShell `[scriptblock]` search rescanned the rest of the
+  command at every `[`/`{`; both are one pass now.
 
 - **The PowerShell profile check warned "Hook missing" although the hook was
   installed** (#503). A profile keeps the check block from whichever

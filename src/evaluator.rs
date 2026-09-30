@@ -6979,7 +6979,14 @@ fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) 
                 index += 1;
                 continue;
             };
-            if crate::normalize::is_env_assignment(decoded.as_ref()) {
+            // `while read l; do eval "$l"; done`: a reserved word opens the
+            // segment and the eval after it still runs.
+            if crate::normalize::is_env_assignment(decoded.as_ref())
+                || matches!(
+                    decoded.as_ref(),
+                    "do" | "then" | "else" | "elif" | "{" | "!" | "if" | "while" | "until"
+                )
+            {
                 index += 1;
                 continue;
             }
@@ -9472,6 +9479,16 @@ fn collect_posix_pipeline_executable_sinks(command: &str, sinks: &mut Vec<Execut
     if !command.as_bytes().contains(&b'|') {
         return;
     }
+    if crate::heredoc::longest_pipeline_stages(command) > crate::heredoc::MAX_PARSED_PIPELINE_STAGES
+    {
+        // Not parsed (see `MAX_PARSED_PIPELINE_STAGES`), so its consumers are
+        // unverified: fail closed rather than let a long pipeline hide one.
+        sinks.push(ExecutableTextSink::Unverified {
+            rule: SINK_ANALYSIS_BOUNDS_RULE,
+            reason: "POSIX pipeline has too many stages to verify its consumers",
+        });
+        return;
+    }
     let ast = AstGrep::new(command, SupportLang::Bash);
     if ast_contains_error(ast.root()) {
         return;
@@ -9996,26 +10013,33 @@ fn find_powershell_code_marker(command: &str, marker: &str, start: usize) -> Opt
 }
 
 fn find_powershell_scriptblock_type_literal(command: &str, start: usize) -> Option<(usize, usize)> {
-    let mut search_start = start;
-    while search_start < command.len() {
-        let type_start = find_powershell_code_marker(command, "[", search_start)?;
-        let Some(relative_close) = command.get(type_start + 1..)?.find(']') else {
-            search_start = type_start + 1;
-            continue;
-        };
-        let type_end = type_start + relative_close + 2;
-        let normalized: String = command[type_start + 1..type_end - 1]
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect();
-        if normalized.eq_ignore_ascii_case("scriptblock")
-            || normalized.eq_ignore_ascii_case("system.management.automation.scriptblock")
-        {
-            return Some((type_start, type_end));
+    // One pass: each `[` is paired with the first `]` after it, which is
+    // shared by every `[` before that `]`, so it is found once; and a `[`
+    // with another `[` before its `]` holds a `[` in its name and is skipped
+    // without copying it. A run of unclosed `[` (`[[[…`, 60 KB) otherwise
+    // rescanned the rest of the command at each one.
+    let mut type_start = find_powershell_code_marker(command, "[", start)?;
+    let mut close: Option<usize> = None;
+    loop {
+        if close.is_none_or(|close| close <= type_start) {
+            // No `]` after this `[` means none after any later one either.
+            close = Some(type_start + 1 + command.get(type_start + 1..)?.find(']')?);
         }
-        search_start = type_start + 1;
+        let close_at = close?;
+        let following = find_powershell_code_marker(command, "[", type_start + 1);
+        if following.is_none_or(|next| next > close_at) {
+            let normalized: String = command[type_start + 1..close_at]
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
+            if normalized.eq_ignore_ascii_case("scriptblock")
+                || normalized.eq_ignore_ascii_case("system.management.automation.scriptblock")
+            {
+                return Some((type_start, close_at + 1));
+            }
+        }
+        type_start = following?;
     }
-    None
 }
 
 fn find_powershell_scriptblock_create(command: &str, start: usize) -> Option<(usize, usize)> {
@@ -13158,6 +13182,41 @@ fn evaluate_command_in_single_dialect_view(
         }
     }
 
+    // A command the shell runs later — a `trap` handler, `PROMPT_COMMAND`, a
+    // prompt's substitutions, what `BASH_ENV=<(…)` prints — and a brace list
+    // that expands into the command (`{rm,-rf,~}`) are data to every rule as
+    // written (bd-v9hh, bd-2bm3). Evaluate each as the command it becomes,
+    // after the text before it, so `tmp=$(mktemp -d); trap 'rm -rf "$tmp"'
+    // EXIT` is judged exactly like `tmp=$(mktemp -d); rm -rf "$tmp"`. Add-only,
+    // like the passes above.
+    if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        for view in posix_deferred_command_views(command) {
+            let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+                &view,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                allow_once_audit,
+                project_path,
+                deadline,
+                ShellDialect::Posix,
+                nested_command_depth + 1,
+                inherited_automated_stdin,
+            );
+            if nested_result_decides(&result) {
+                // The nested span indexes the reconstruction, not this command.
+                if let Some(info) = result.pattern_info.as_mut() {
+                    info.matched_span = None;
+                }
+                return result;
+            }
+            record_nested_allowlist_hit(&mut heredoc_allowlist_hit, &mut result);
+        }
+    }
+
     let posix_executable_masked =
         mask_modeled_posix_executable_assignments(command, &posix_executable_model);
     let command = posix_executable_masked.as_ref();
@@ -14246,6 +14305,159 @@ fn posix_alias_definition_bodies(command: &str) -> Vec<String> {
         }
     }
     bodies
+}
+
+/// The command lines a POSIX command holds for later or spells through a
+/// brace list, each after the text that precedes its segment (bd-v9hh,
+/// bd-2bm3). Bounded.
+///
+/// - `trap [--] HANDLER SIGNAL…`: the handler. `trap - SIG`, `trap '' SIG`,
+///   `trap SIG` and `trap -p` set none.
+/// - `PROMPT_COMMAND=…` (a scalar or an array), assigned before the command
+///   word or by `export`/`declare`/`typeset`/`readonly`/`local`: the value,
+///   run before each prompt.
+/// - `PS0`/`PS1`/`PS2`/`PS4` so assigned whose value holds `$(`/backquotes:
+///   `: VALUE`, whose substitutions run when the prompt is shown (`PS4`
+///   under `set -x`).
+/// - `BASH_ENV=<(…)`/`ENV=<(…)`: what the process substitution prints,
+///   which a starting shell sources.
+/// - A segment whose brace lists make its program or options:
+///   [`crate::heredoc::brace_expanded_command`].
+fn posix_deferred_command_views(command: &str) -> Vec<String> {
+    const MAX_VIEWS: usize = 16;
+    let bytes = command.as_bytes();
+    let trap = command.match_indices("trap").any(|(at, _)| {
+        (at == 0
+            || !(bytes[at - 1].is_ascii_alphanumeric() || matches!(bytes[at - 1], b'_' | b'-')))
+            && bytes.get(at + 4).is_some_and(u8::is_ascii_whitespace)
+    });
+    let variables = command.contains("PROMPT_COMMAND")
+        || command.contains("ENV=<(")
+        || ["PS0", "PS1", "PS2", "PS4"]
+            .iter()
+            .any(|name| command.contains(name));
+    let brace = crate::heredoc::may_brace_expand_a_command(command);
+    if !trap && !variables && !brace {
+        return Vec::new();
+    }
+    let mut views = Vec::new();
+    for (start, end) in top_level_segment_ranges(command) {
+        if views.len() >= MAX_VIEWS {
+            break;
+        }
+        let prefix = &command[..start];
+        let segment = &command[start..end];
+        if brace && let Some(expanded) = crate::heredoc::brace_expanded_command(segment) {
+            views.push(format!("{prefix}{expanded}"));
+        }
+        if !trap && !variables {
+            continue;
+        }
+        let Ok(words) = shell_words::split(segment.trim()) else {
+            continue;
+        };
+        let mut index = 0usize;
+        let mut declaring = false;
+        let mut function_name = false;
+        while let Some(word) = words.get(index) {
+            if let Some((name, value)) = word.split_once('=')
+                && is_shell_assignment(word)
+            {
+                let name = name.strip_suffix('+').unwrap_or(name);
+                match name {
+                    "PROMPT_COMMAND" if !value.trim().is_empty() => {
+                        // An array's elements arrive with its parentheses.
+                        let value = value.trim_start_matches('(').trim_end_matches(')');
+                        views.push(format!("{prefix}{value}"));
+                    }
+                    "PS0" | "PS1" | "PS2" | "PS4"
+                        if value.contains("$(") || value.contains('`') =>
+                    {
+                        views.push(format!("{prefix}: {value}"));
+                    }
+                    "BASH_ENV" | "ENV" => {
+                        // The raw text: shell word splitting mangles `<(…)`.
+                        if let Some(at) = segment.find(&format!("{name}=<(")) {
+                            let open = at + name.len() + 3;
+                            let segment_bytes = segment.as_bytes();
+                            let close = crate::normalize::consume_shell_paren_construct(
+                                segment_bytes,
+                                open,
+                                segment_bytes.len(),
+                            );
+                            if let Some(body) = segment.get(open..close.saturating_sub(1)) {
+                                let printed = crate::heredoc::echoed_words(body);
+                                if !printed.is_empty() {
+                                    views.push(format!("{prefix}{}", printed.join(" ")));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                index += 1;
+                continue;
+            }
+            if declaring {
+                index += 1;
+                continue;
+            }
+            // What may open a command before its program: a group or
+            // subshell (`{ trap …; }`, `(trap …)`), a reserved word
+            // (`then trap …`), `builtin`/`command`, and a function
+            // definition's name (`f() { trap …; }`, `function f { … }`).
+            let bare = word.trim_start_matches(['(', '{']);
+            if std::mem::take(&mut function_name)
+                || bare.is_empty()
+                || word.ends_with("()")
+                || matches!(
+                    bare,
+                    "!" | "if"
+                        | "then"
+                        | "else"
+                        | "elif"
+                        | "do"
+                        | "while"
+                        | "until"
+                        | "time"
+                        | "builtin"
+                        | "command"
+                )
+            {
+                index += 1;
+                continue;
+            }
+            if bare == "function" {
+                function_name = true;
+                index += 1;
+                continue;
+            }
+            match bare {
+                "export" | "declare" | "typeset" | "readonly" | "local" => {
+                    declaring = true;
+                    index += 1;
+                }
+                "trap" => {
+                    let operands: Vec<&String> = words[index + 1..]
+                        .iter()
+                        .skip_while(|word| word.len() > 1 && word.starts_with('-') && *word != "--")
+                        .skip_while(|word| *word == "--")
+                        .take(2)
+                        .collect();
+                    if let [handler, _] = operands.as_slice()
+                        && !handler.is_empty()
+                        && handler.as_str() != "-"
+                    {
+                        views.push(format!("{prefix}{handler}"));
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+    views.truncate(MAX_VIEWS);
+    views
 }
 
 fn has_posix_database_executable_alias(command: &str) -> bool {
@@ -23196,9 +23408,30 @@ fn proven_cd_directory(
                 directory.map(|known| format!("{}/{target}", known.trim_end_matches('/')))
             }
             None => None,
-        };
+        }
+        .map(lexical_directory);
     }
     directory
+}
+
+/// An absolute directory with `.`, `..` and repeated slashes resolved the way
+/// `cd` (logical, its default) resolves them: `/usr/..` is `/`, `//etc/.`
+/// is `/etc`. Other spellings are returned unchanged.
+fn lexical_directory(directory: String) -> String {
+    let Some(path) = directory.strip_prefix('/') else {
+        return directory;
+    };
+    let mut components: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            other => components.push(other),
+        }
+    }
+    format!("/{}", components.join("/"))
 }
 
 /// Whether a `cd` segment changes the directory of the shell that later runs
@@ -28109,6 +28342,71 @@ pub fn apply_branch_strictness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_commands_and_brace_commands_are_viewed_after_their_prefix() {
+        let views = |command: &str| posix_deferred_command_views(command);
+        assert_eq!(views("trap 'rm -rf ~' EXIT"), ["rm -rf ~"]);
+        assert_eq!(
+            views("tmp=$(mktemp -d); trap -- 'rm -rf \"$tmp\"' INT TERM"),
+            ["tmp=$(mktemp -d); rm -rf \"$tmp\""]
+        );
+        assert_eq!(
+            views("export PROMPT_COMMAND='git reset --hard'"),
+            ["git reset --hard"]
+        );
+        assert_eq!(
+            views("PROMPT_COMMAND=('git reset --hard')"),
+            ["git reset --hard"]
+        );
+        assert_eq!(
+            views("PS1='$(git reset --hard)'"),
+            [": $(git reset --hard)"]
+        );
+        assert_eq!(
+            views("BASH_ENV=<(echo 'rm -rf ~') bash -c true"),
+            ["rm -rf ~"]
+        );
+        assert_eq!(views("x; {git,reset,--hard}"), ["x; git reset --hard"]);
+        for command in [
+            "builtin trap 'rm -rf ~' EXIT",
+            "command trap 'rm -rf ~' EXIT",
+            "{ trap 'rm -rf ~' EXIT; }",
+            "(trap 'rm -rf ~' EXIT)",
+            "if true; then trap 'rm -rf ~' EXIT; fi",
+            "f() { trap 'rm -rf ~' RETURN; }; f",
+            "function f { trap 'rm -rf ~' RETURN; }; f",
+        ] {
+            assert!(
+                views(command).iter().any(|view| view.ends_with("rm -rf ~")),
+                "{command:?}: {:?}",
+                views(command)
+            );
+        }
+        for command in [
+            "trap - EXIT",
+            "trap '' INT",
+            "trap EXIT",
+            "trap -p",
+            "echo trap 'rm -rf ~' EXIT",
+            "echo PROMPT_COMMAND='x'",
+            "PS1='\\u@\\h '",
+            "mkdir -p src/{a,b}",
+            "git status",
+        ] {
+            assert!(views(command).is_empty(), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn cd_directories_resolve_dot_segments_like_logical_cd() {
+        assert_eq!(lexical_directory("/usr/..".to_string()), "/");
+        assert_eq!(lexical_directory("//etc/./".to_string()), "/etc");
+        assert_eq!(lexical_directory("/a/b/../c".to_string()), "/a/c");
+        assert_eq!(lexical_directory("/..".to_string()), "/");
+        assert_eq!(lexical_directory("~/.ssh/..".to_string()), "~/.ssh/..");
+        assert_eq!(lexical_directory("$HOME/x".to_string()), "$HOME/x");
+    }
 
     /// A declaration keyword before an assignment must not defeat the proof
     /// (#479).
@@ -43991,5 +44289,45 @@ mod tests {
             let outer = "python3 - <<'PY'\nx = 1\nPY\n: > \"$HOME/.bashrc\"";
             assert!(denied(outer), "a real outer redirect must stay denied");
         }
+    }
+
+    /// Fifth review: the `[scriptblock]` type-literal search rescanned the rest
+    /// of the command at every unclosed `[`, and copied the text up to a
+    /// shared `]` at every `[` before it; both are one pass now.
+    #[test]
+    fn scriptblock_type_literal_search_is_linear_and_keeps_its_answers() {
+        for (command, expected) in [
+            ("[scriptblock]::Create('x')", Some((0, 13))),
+            ("[ScriptBlock ]::Create('x')", Some((0, 14))),
+            ("[[scriptblock]", Some((1, 14))),
+            ("[a[scriptblock]", Some((2, 15))),
+            (
+                "[a] [System.Management.Automation.ScriptBlock]",
+                Some((4, 46)),
+            ),
+            ("'[scriptblock]' [x]", None),
+            ("[scriptblock", None),
+            ("[x] [y]", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                find_powershell_scriptblock_type_literal(command, 0),
+                expected,
+                "{command:?}"
+            );
+        }
+        let started = std::time::Instant::now();
+        for command in [
+            "[".repeat(200_000),
+            format!("{}]", "[".repeat(200_000)),
+            format!("{}]", "[ ".repeat(100_000)),
+        ] {
+            assert_eq!(find_powershell_scriptblock_type_literal(&command, 0), None);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

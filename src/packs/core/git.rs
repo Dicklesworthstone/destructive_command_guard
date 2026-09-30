@@ -1315,11 +1315,19 @@ struct VisibleAliasDefinition {
 /// POSIX-family shells expand a brace group only when it closes in the same
 /// word and contains a `,` alternative or a `..` sequence — `{}` (xargs's
 /// conventional replacement token) and `{word}` are literal text.
-fn posix_brace_remainder_may_expand(remainder: &str) -> bool {
-    remainder.find('}').is_some_and(|close| {
-        let inner = &remainder[..close];
-        inner.contains(',') || inner.contains("..")
-    })
+/// For a `{` whose text starts at `from`: the first `}` after it (or
+/// `usize::MAX`), and the last position before that `}` where a `,` or a
+/// whole `..` starts. A `{` at `index < close` has a `,`/`..` between it and
+/// its `}` (so the brace may expand) exactly when that position is after it,
+/// so every `{` sharing the `}` reuses one scan instead of rescanning the
+/// rest of the word (`{{{…`, 20,000 of them, was quadratic).
+fn posix_brace_region(raw: &str, from: usize) -> (usize, Option<usize>) {
+    let Some(inner_len) = raw.get(from..).and_then(|rest| rest.find('}')) else {
+        return (usize::MAX, None);
+    };
+    let inner = &raw[from..from + inner_len];
+    let last = inner.rfind(',').max(inner.rfind("..")).map(|at| from + at);
+    (from + inner_len, last)
 }
 
 fn git_token_has_active_expansion(raw: &str, dialect: ShellDialect) -> bool {
@@ -1328,6 +1336,11 @@ fn git_token_has_active_expansion(raw: &str, dialect: ShellDialect) -> bool {
             let mut chars = raw.char_indices().peekable();
             let mut single = false;
             let mut double = false;
+            // The lookahead for a bracket's `]` and a brace's `}` is computed
+            // once, not per `[`/`{`: a word of 20,000 unclosed `[` rescanned
+            // its remainder at each one.
+            let last_bracket_close = raw.rfind(']');
+            let mut brace_region: Option<(usize, Option<usize>)> = None;
             while let Some((index, ch)) = chars.next() {
                 match ch {
                     '\\' if !single => {
@@ -1347,14 +1360,21 @@ fn git_token_has_active_expansion(raw: &str, dialect: ShellDialect) -> bool {
                     // can glob-expand into a different executable. Brace
                     // groups additionally need a `,`/`..` inside — `{}` and
                     // `{word}` are literal.
-                    '[' if !single && !double && raw[index + ch.len_utf8()..].contains(']') => {
-                        return true;
-                    }
-                    '{' if !single
+                    '[' if !single
                         && !double
-                        && posix_brace_remainder_may_expand(&raw[index + ch.len_utf8()..]) =>
+                        && last_bracket_close.is_some_and(|at| at > index) =>
                     {
                         return true;
+                    }
+                    '{' if !single && !double => {
+                        let (close, last_expanding) = match brace_region {
+                            Some(region) if index < region.0 => region,
+                            _ => posix_brace_region(raw, index + 1),
+                        };
+                        brace_region = Some((close, last_expanding));
+                        if last_expanding.is_some_and(|at| at > index) {
+                            return true;
+                        }
                     }
                     '<' | '>' if !single && matches!(chars.peek(), Some((_, '('))) => return true,
                     _ => {}
@@ -1412,6 +1432,9 @@ fn git_token_expansion_may_split(raw: &str, dialect: ShellDialect) -> bool {
             let mut chars = raw.char_indices().peekable();
             let mut single = false;
             let mut double = false;
+            // Linear lookahead, as in `git_token_has_active_expansion`.
+            let last_bracket_close = raw.rfind(']');
+            let mut brace_region: Option<(usize, Option<usize>)> = None;
             while let Some((index, ch)) = chars.next() {
                 match ch {
                     '\\' if !single => {
@@ -1423,14 +1446,21 @@ fn git_token_expansion_may_split(raw: &str, dialect: ShellDialect) -> bool {
                     // See `git_token_has_active_expansion`: `[`/`{` without a
                     // later closing delimiter in the same word are literal,
                     // and brace groups additionally need a `,`/`..` inside.
-                    '[' if !single && !double && raw[index + ch.len_utf8()..].contains(']') => {
-                        return true;
-                    }
-                    '{' if !single
+                    '[' if !single
                         && !double
-                        && posix_brace_remainder_may_expand(&raw[index + ch.len_utf8()..]) =>
+                        && last_bracket_close.is_some_and(|at| at > index) =>
                     {
                         return true;
+                    }
+                    '{' if !single && !double => {
+                        let (close, last_expanding) = match brace_region {
+                            Some(region) if index < region.0 => region,
+                            _ => posix_brace_region(raw, index + 1),
+                        };
+                        brace_region = Some((close, last_expanding));
+                        if last_expanding.is_some_and(|at| at > index) {
+                            return true;
+                        }
                     }
                     '<' | '>' if !single && !double && matches!(chars.peek(), Some((_, '('))) => {
                         return true;
@@ -4695,6 +4725,12 @@ pub(crate) fn unmodeled_exec_wrapper(basename: &str, next: Option<&str>) -> bool
             | "systemd-inhibit"
             | "script"
             | "gdb"
+            | "eatmydata"
+            | "fakeroot"
+            | "cgexec"
+            | "flatpak-spawn"
+            | "pkexec"
+            | "run0"
             // The remote command `ssh` runs is judged like a local one
             // (#326); unquoted it was never extracted, and git there was
             // never in executable position.
@@ -8735,5 +8771,61 @@ git x",
                 pack.check(command).and_then(|matched| matched.name)
             );
         }
+    }
+
+    /// Fifth review (#498/#502 follow-up): the bracket and brace lookahead
+    /// rescanned the rest of the word at every `[`/`{`, quadratic in a run of
+    /// unclosed ones; the answers themselves are unchanged.
+    #[test]
+    fn expansion_lookahead_is_linear_and_keeps_its_answers() {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for (raw, expands) in [
+                ("git", false),
+                ("[", false),
+                ("[[", false),
+                ("g[i]t", true),
+                ("[a", false),
+                ("[a]", true),
+                ("{", false),
+                ("{}", false),
+                ("{git}", false),
+                ("{a,b}", true),
+                ("{a..c}", true),
+                ("{a.}", false),
+                ("{a}{b,c}", true),
+                ("{{a}", false),
+                ("{,{a}", true),
+                ("{a,{b}", true),
+                ("{.}.", false),
+                ("'{a,b}'", false),
+                ("\"[a]\"", false),
+            ] {
+                assert_eq!(
+                    git_token_has_active_expansion(raw, dialect),
+                    expands,
+                    "{raw:?} {dialect:?}"
+                );
+                assert_eq!(
+                    git_token_expansion_may_split(raw, dialect),
+                    expands,
+                    "{raw:?} {dialect:?}"
+                );
+            }
+        }
+        let started = std::time::Instant::now();
+        for raw in [
+            "[".repeat(200_000),
+            "[:".repeat(100_000),
+            "{".repeat(200_000),
+            format!("{}}}", "{".repeat(200_000)),
+        ] {
+            assert!(!git_token_has_active_expansion(&raw, ShellDialect::Posix));
+            assert!(!git_token_expansion_may_split(&raw, ShellDialect::Posix));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

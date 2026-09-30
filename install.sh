@@ -1410,35 +1410,69 @@ verify_minisign_signature() {
   return 0
 }
 
+# Print the version string a cosign binary reports: `gitVersion` from
+# `cosign version --json`, or the `GitVersion:` line of the plain-text output
+# for builds whose JSON is missing or unusable. Prints nothing when neither
+# is present.
+cosign_reported_version() {
+  local cosign_bin="$1"
+  local output=""
+  local reported=""
+
+  output=$("$cosign_bin" version --json 2>/dev/null) || output=""
+  reported=$(printf '%s\n' "$output" |
+    sed -nE 's/.*"gitVersion"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' |
+    head -n 1) || true
+  if [ -z "$reported" ]; then
+    output=$("$cosign_bin" version 2>&1) || return 0
+    reported=$(printf '%s\n' "$output" |
+      sed -nE 's/^[[:space:]]*GitVersion:[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p' |
+      head -n 1) || true
+  fi
+  printf '%s' "$reported"
+}
+
 # Return success only for cosign releases that contain the repaired bundle
 # verification logic from CVE-2026-22703 (>=2.6.2 or >=3.0.4).
+#
+# The version is read as SemVer: an optional `v`, MAJOR.MINOR.PATCH, an
+# optional `-pre.release`, and optional `+build` metadata. Build metadata has
+# no bearing on precedence (distro builds report e.g. `v3.1.3+dirty`, GH #505),
+# so it is ignored. A pre-release precedes its release, so `v3.0.4-rc.1` is
+# not patched; a pre-release (including git-describe `-N-gSHA` and `-dirty`
+# suffixes) counts only when its core version is strictly above the floor.
+# Anything that does not parse is rejected rather than trusted.
 cosign_version_is_patched() {
   local cosign_bin="$1"
-  local version_json=""
-  local version=""
-  local major=""
-  local minor=""
-  local patch=""
+  local reported=""
+  local semver_re='^v?([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+  local major=0
+  local minor=0
+  local patch=0
+  local prerelease=""
+  local floor_minor=0
+  local floor_patch=0
 
-  version_json=$("$cosign_bin" version --json 2>/dev/null) || return 1
-  version=$(printf '%s\n' "$version_json" |
-    sed -nE 's/.*"gitVersion"[[:space:]]*:[[:space:]]*"v([0-9]+)\.([0-9]+)\.([0-9]+)".*/\1.\2.\3/p' |
-    head -n 1)
-  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
-  IFS=. read -r major minor patch <<< "$version"
+  reported=$(cosign_reported_version "$cosign_bin")
+  [[ "$reported" =~ $semver_re ]] || return 1
+  major=$((10#${BASH_REMATCH[1]}))
+  minor=$((10#${BASH_REMATCH[2]}))
+  patch=$((10#${BASH_REMATCH[3]}))
+  prerelease="${BASH_REMATCH[4]}"
 
   if (( major > 3 )); then
     return 0
   fi
-  if (( major == 3 )); then
-    (( minor > 0 || (minor == 0 && patch >= 4) ))
+  case "$major" in
+    3) floor_minor=0; floor_patch=4 ;;
+    2) floor_minor=6; floor_patch=2 ;;
+    *) return 1 ;;
+  esac
+  if [ -n "$prerelease" ]; then
+    (( minor > floor_minor || (minor == floor_minor && patch > floor_patch) ))
     return
   fi
-  if (( major == 2 )); then
-    (( minor > 6 || (minor == 6 && patch >= 2) ))
-    return
-  fi
-  return 1
+  (( minor > floor_minor || (minor == floor_minor && patch >= floor_patch) ))
 }
 
 # Verify Sigstore/cosign bundle for a file (best-effort).
@@ -1469,7 +1503,9 @@ verify_sigstore_bundle() {
   fi
 
   if ! cosign_version_is_patched "$cosign_bin"; then
-    warn "cosign is missing required bundle-verification security fixes (need >=2.6.2 or >=3.0.4); skipping signature verification (checksum already verified)"
+    local reported_version=""
+    reported_version=$(cosign_reported_version "$cosign_bin")
+    warn "cosign reports version '${reported_version:-unknown}', which is not a release known to carry the CVE-2026-22703 bundle-verification fixes (need >=2.6.2 or >=3.0.4); skipping signature verification (checksum already verified)"
     return 0
   fi
 

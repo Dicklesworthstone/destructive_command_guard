@@ -901,6 +901,7 @@ an oversized extracted command as proof that execution is safe.
 | Extracted command exceeds `max_command_bytes` | Explicit indeterminate result | Review-capable clients receive `ask` (`unverified_decision = "deny"` turns this into a deny); other clients block |
 | Absolute evaluation deadline expires | Explicit indeterminate result | Review-capable clients receive `ask` (`unverified_decision = "deny"` turns this into a deny); other clients block |
 | Heredoc extraction/parse/AST failure | Run the bounded fallback scanner | `fallback_on_parse_error = false` or `fallback_on_timeout = false` blocks |
+| Oh My Pi bridge gets no verdict (dcg cannot start, crashes, or is killed) | Allow with a visible `infrastructure failure` diagnostic | `DCG_UNVERIFIED_DECISION=deny` in OMP's environment blocks; the config-file setting cannot apply because dcg never read it |
 
 **Configurable Strictness**:
 
@@ -1049,7 +1050,7 @@ Every release archive is signed, so you can verify it yourself and never run
 the installer script:
 
 ```bash
-V=v0.14.4; T=aarch64-apple-darwin   # or x86_64-unknown-linux-musl, etc.
+V=v0.15.0; T=aarch64-apple-darwin   # or x86_64-unknown-linux-musl, etc.
 curl -fLO "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/$V/dcg-$T.tar.xz"
 curl -fLO "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/$V/dcg-$T.tar.xz.minisig"
 minisign -Vm "dcg-$T.tar.xz" -P RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO

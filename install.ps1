@@ -1436,26 +1436,54 @@ function Invoke-DcgMinisignVerification {
   Write-Ok "Signature verified (minisign key $minisignKeyId)"
 }
 
-function Test-DcgPatchedCosignVersion {
-  # CVE-2026-22703 is repaired in 2.6.2 and 3.0.4. Reject unknown/development
-  # version strings rather than trusting a potentially vulnerable verifier.
-  param([string]$VersionJson)
+function Get-DcgCosignReportedVersion {
+  # The version string cosign reports: `gitVersion` from `cosign version
+  # --json`, or the `GitVersion:` line of the plain-text output. $null when
+  # neither is present.
+  param([string]$VersionOutput)
 
-  if ($VersionJson -notmatch '"gitVersion"\s*:\s*"v([0-9]+)\.([0-9]+)\.([0-9]+)"') {
+  if ($VersionOutput -match '"gitVersion"\s*:\s*"([^"]*)"') {
+    return $Matches[1]
+  }
+  if ($VersionOutput -match '(?m)^\s*GitVersion:\s*(\S+)\s*$') {
+    return $Matches[1]
+  }
+  return $null
+}
+
+function Test-DcgPatchedCosignVersion {
+  # CVE-2026-22703 is repaired in 2.6.2 and 3.0.4. The reported version is
+  # read as SemVer: optional `v`, MAJOR.MINOR.PATCH, optional `-pre.release`,
+  # optional `+build`. Build metadata does not affect precedence (distro
+  # builds report e.g. `v3.1.3+dirty`, GH #505) and is ignored. A pre-release
+  # precedes its release, so it counts only when its core version is strictly
+  # above the floor. Unknown/development strings are rejected rather than
+  # trusting a potentially vulnerable verifier.
+  param([string]$VersionOutput)
+
+  $reported = Get-DcgCosignReportedVersion -VersionOutput $VersionOutput
+  if (-not $reported) { return $false }
+  if ($reported -cnotmatch '^v?([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$') {
     return $false
   }
   $major = [int]$Matches[1]
   $minor = [int]$Matches[2]
   $patch = [int]$Matches[3]
+  $isPrerelease = [bool]$Matches[4]
 
   if ($major -gt 3) { return $true }
   if ($major -eq 3) {
-    return (($minor -gt 0) -or (($minor -eq 0) -and ($patch -ge 4)))
+    $floorMinor = 0
+    $floorPatch = 4
+  } elseif ($major -eq 2) {
+    $floorMinor = 6
+    $floorPatch = 2
+  } else {
+    return $false
   }
-  if ($major -eq 2) {
-    return (($minor -gt 6) -or (($minor -eq 6) -and ($patch -ge 2)))
-  }
-  return $false
+  if ($minor -ne $floorMinor) { return ($minor -gt $floorMinor) }
+  if ($isPrerelease) { return ($patch -gt $floorPatch) }
+  return ($patch -ge $floorPatch)
 }
 
 function Invoke-DcgSigstoreVerification {
@@ -1486,9 +1514,24 @@ function Invoke-DcgSigstoreVerification {
     return
   }
 
-  $versionJson = (& $cosign.Source version --json 2>&1 | Out-String)
-  if (($LASTEXITCODE -ne 0) -or (-not (Test-DcgPatchedCosignVersion -VersionJson $versionJson))) {
-    Write-Warn "cosign is missing required bundle-verification security fixes (need >=2.6.2 or >=3.0.4); skipping signature verification (checksum already verified)"
+  # Native stderr must not become a terminating error under Windows
+  # PowerShell 5.1; the exit code and the parsed version decide.
+  $savedErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = "Continue"
+    $versionOutput = (& $cosign.Source version --json 2>&1 | Out-String)
+    if (($LASTEXITCODE -ne 0) -or (-not (Get-DcgCosignReportedVersion -VersionOutput $versionOutput))) {
+      # Builds without usable JSON still print a `GitVersion:` line.
+      $versionOutput = (& $cosign.Source version 2>&1 | Out-String)
+      if ($LASTEXITCODE -ne 0) { $versionOutput = "" }
+    }
+  } finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+  }
+  if (-not (Test-DcgPatchedCosignVersion -VersionOutput $versionOutput)) {
+    $reportedVersion = Get-DcgCosignReportedVersion -VersionOutput $versionOutput
+    if (-not $reportedVersion) { $reportedVersion = "unknown" }
+    Write-Warn "cosign reports version '$reportedVersion', which is not a release known to carry the CVE-2026-22703 bundle-verification fixes (need >=2.6.2 or >=3.0.4); skipping signature verification (checksum already verified)"
     return
   }
 

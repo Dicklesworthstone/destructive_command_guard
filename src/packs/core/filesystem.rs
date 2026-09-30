@@ -1703,11 +1703,20 @@ pub(crate) fn filesystem_semantic_scan_required(command: &str, dialect: ShellDia
         // `cd ~/.ssh && echo k > authorized_keys` (#480): the redirect target
         // is relative, so no keyword spells the protected path; the `cd` does.
         // The evaluator anchors the target to that directory.
+        //
+        // A `cd` to `/` or another ancestor of a protected root leaves the
+        // protected part of the path to the relative target, which no needle
+        // spells: `cd / && echo x >> etc/sudoers`. The file writers the
+        // classifier knows write as `>` does (`cd / && tee -a etc/sudoers`).
         || (matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
-            && command.contains('>')
+            && (command.contains('>')
+                || ["tee", "cp", "mv", "install", "ln", "dd", "sed"]
+                    .iter()
+                    .any(|writer| contains_ascii_command_word(command, writer)))
             && (contains_ascii_command_word(command, "cd")
                 || contains_ascii_command_word(command, "pushd"))
-            && super::credential_files::may_name_protected_path(command))
+            && (super::credential_files::may_name_protected_path(command)
+                || cd_reaches_a_protected_ancestor(command)))
         // Fork-bomb reachability (issue #302): the `fork-bomb` rule matches a
         // shell function-definition shape (`name() { … }`). The paren pair is
         // pure syntax that keyword-based quick-reject cannot see, and POSIX
@@ -1716,6 +1725,73 @@ pub(crate) fn filesystem_semantic_scan_required(command: &str, dialect: ShellDia
         // tolerant scan here forces core.filesystem to run whenever an empty
         // paren pair is present; the regex then does the precise matching.
         || command_contains_empty_paren_pair(command)
+}
+
+/// Roots under which [`super::credential_files`] protects files, as path
+/// components; `/private/etc` is macOS's real `/etc`.
+const PROTECTED_ROOT_COMPONENTS: &[&[&str]] = &[
+    &["etc"],
+    &["private", "etc"],
+    &["home"],
+    &["homes"],
+    &["Users"],
+    &["root"],
+    &["var", "home"],
+    &["usr", "home"],
+    &["export", "home"],
+    &["var", "services", "homes"],
+];
+
+/// Whether some `cd`/`pushd` in `command` moves to `/`, a protected root, or
+/// an ancestor of one (`/`, `//`, `/usr/..`, `/home`, `/var`, `/private`,
+/// `/volume1`), from where a relative path can reach protected files without
+/// spelling any root a needle knows. The target is read lexically, with `.`
+/// and `..` resolved; a quoted target counts. Linear.
+fn cd_reaches_a_protected_ancestor(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    ["cd", "pushd"].iter().any(|verb| {
+        command.match_indices(verb).any(|(at, _)| {
+            let starts_word = at == 0
+                || matches!(
+                    bytes[at - 1],
+                    b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b'{'
+                );
+            let end = at + verb.len();
+            if !starts_word || !matches!(bytes.get(end), Some(b' ' | b'\t')) {
+                return false;
+            }
+            let target = command[end..]
+                .split_ascii_whitespace()
+                .find(|word| !matches!(*word, "-P" | "-L" | "-e" | "-@" | "--"))
+                .unwrap_or("")
+                .trim_matches(['\'', '"'])
+                .trim_end_matches([';', '&', '|', ')', '}']);
+            let Some(path) = target.strip_prefix('/') else {
+                return false;
+            };
+            let mut components: Vec<&str> = Vec::new();
+            for component in path.split('/') {
+                match component {
+                    "" | "." => {}
+                    ".." => {
+                        components.pop();
+                    }
+                    other => components.push(other),
+                }
+            }
+            let volume = |component: &str| {
+                component.strip_prefix("volume").is_some_and(|number| {
+                    !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+                })
+            };
+            components.is_empty()
+                || (components.len() == 1 && volume(components[0]))
+                || PROTECTED_ROOT_COMPONENTS.iter().any(|root| {
+                    components.len() <= root.len()
+                        && components.iter().zip(root.iter()).all(|(a, b)| a == b)
+                })
+        })
+    })
 }
 
 /// True when the command contains `(` followed by only ASCII whitespace and
@@ -5893,6 +5969,35 @@ mod tests {
     use super::*;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    #[test]
+    fn cd_to_root_or_an_ancestor_of_a_protected_root_is_recognised() {
+        for command in [
+            "cd / && echo x >> etc/sudoers",
+            "cd // && x",
+            "cd /usr/.. && x",
+            "cd -P / && x",
+            "cd '/' && x",
+            "pushd /var && x",
+            "cd /home && x",
+            "cd /private && x",
+            "cd /volume1 && x",
+            "x; cd /; y",
+        ] {
+            assert!(cd_reaches_a_protected_ancestor(command), "{command:?}");
+        }
+        for command in [
+            "cd /tmp && x",
+            "cd /home/u/proj && x",
+            "cd src && x",
+            "abcd / && x",
+            "echo cd",
+            "cd",
+            "cd /usr/local && x",
+        ] {
+            assert!(!cd_reaches_a_protected_ancestor(command), "{command:?}");
+        }
+    }
 
     #[test]
     fn dequote_rm_flag_token_collapses_balanced_quotes() {

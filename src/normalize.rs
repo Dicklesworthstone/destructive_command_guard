@@ -1574,7 +1574,7 @@ pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
     i
 }
 
-fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usize) -> usize {
+pub(crate) fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usize) -> usize {
     let mut depth = 1usize;
 
     while i < len {

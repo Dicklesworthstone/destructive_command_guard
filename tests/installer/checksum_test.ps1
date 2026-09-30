@@ -131,20 +131,38 @@ try {
         "uses the retired key only for v0.6.7"
 
     Write-Host "Test 11: patched cosign version floors reject vulnerable builds"
-    Check (-not (Test-DcgPatchedCosignVersion -VersionJson '{"gitVersion":"v2.6.1"}')) `
-        "rejects cosign 2.6.1"
-    Check (Test-DcgPatchedCosignVersion -VersionJson '{"gitVersion":"v2.6.2"}') `
-        "accepts cosign 2.6.2"
-    Check (-not (Test-DcgPatchedCosignVersion -VersionJson '{"gitVersion":"v3.0.3"}')) `
-        "rejects cosign 3.0.3"
-    Check (Test-DcgPatchedCosignVersion -VersionJson '{"gitVersion":"v3.0.4"}') `
-        "accepts cosign 3.0.4"
-    Check (Test-DcgPatchedCosignVersion -VersionJson '{"gitVersion":"v3.1.2"}') `
-        "accepts newer cosign 3.x"
-    Check (-not (Test-DcgPatchedCosignVersion -VersionJson '{"gitVersion":"v3.0.4-rc.1"}')) `
-        "rejects prerelease builds at the patched floor"
-    Check (-not (Test-DcgPatchedCosignVersion -VersionJson '{"gitVersion":"devel"}')) `
-        "rejects unknown development builds"
+    $cosignCases = @(
+        @('v2.6.1', $false, 'rejects cosign 2.6.1'),
+        @('v2.6.2', $true, 'accepts cosign 2.6.2'),
+        @('v3.0.3', $false, 'rejects cosign 3.0.3'),
+        @('v3.0.4', $true, 'accepts cosign 3.0.4'),
+        @('v3.1.2', $true, 'accepts newer cosign 3.x'),
+        @('v3.0.4-rc.1', $false, 'rejects prerelease builds at the patched floor'),
+        @('v2.6.2-rc.1', $false, 'rejects a 2.x prerelease at the patched floor'),
+        @('devel', $false, 'rejects unknown development builds'),
+        @('v3.1.3+dirty', $true, 'accepts distro build metadata above the floor (GH #505)'),
+        @('v3.0.4+dirty', $true, 'build metadata does not lower the floor release'),
+        @('v3.0.3+dirty', $false, 'build metadata does not raise a vulnerable release'),
+        @('3.1.3', $true, 'accepts a version without the v prefix'),
+        @('v3.1.3-dirty', $true, 'accepts a git-describe dirty suffix above the floor'),
+        @('v3.0.4-dirty', $false, 'rejects a dirty suffix at the floor'),
+        @('v3.0.4-3-gabc1234', $false, 'rejects git-describe builds at the floor'),
+        @('v3.1.0-rc.1+build.5', $true, 'accepts a prerelease whose core is above the floor'),
+        @('v2.6.10', $true, 'compares numerically, not lexically'),
+        @('v4.0.0-rc.1', $true, 'accepts a future major prerelease'),
+        @('v1.13.9', $false, 'rejects cosign 1.x'),
+        @('v3.1', $false, 'rejects a truncated version'),
+        @('v3.1.3 junk', $false, 'rejects trailing junk')
+    )
+    foreach ($case in $cosignCases) {
+        $json = '{"gitVersion":"' + $case[0] + '"}'
+        Check ((Test-DcgPatchedCosignVersion -VersionOutput $json) -eq $case[1]) "$($case[2]) [$($case[0])]"
+    }
+    $prettyJson = "{`n  ""gitVersion"": ""v3.1.3+dirty"",`n  ""gitTreeState"": ""dirty""`n}"
+    Check (Test-DcgPatchedCosignVersion -VersionOutput $prettyJson) "reads pretty-printed JSON"
+    $textOutput = "  ______   ______.   _______.`nGitVersion:    v3.1.3+dirty`nGitCommit:     11926fa`n"
+    Check (Test-DcgPatchedCosignVersion -VersionOutput $textOutput) "reads the plain-text GitVersion line"
+    Check (-not (Test-DcgPatchedCosignVersion -VersionOutput "")) "rejects empty output"
 
     Write-Host "Test 12: a present invalid minisign signature is always fatal"
     Set-MinisignApplicationMock -Directory $mockBin -ExitCode 1 | Out-Null
@@ -165,6 +183,63 @@ try {
             -SignatureSource $signature -TempDirectory $tmp -Require
     } catch { $shimThrew = $true }
     Check $shimThrew "function shim cannot satisfy -RequireMinisign"
+
+    Write-Host "Test 14: a distro cosign build is used for bundle verification (GH #505)"
+    if ($env:OS -eq 'Windows_NT') {
+        Write-Host "  skip: the mock cosign is a POSIX shell script"
+    } else {
+        $env:PATH = $savedPath
+        $cosignBin = Join-Path $tmp "cosign-bin"
+        New-Item -ItemType Directory -Path $cosignBin | Out-Null
+        $cosignMock = Join-Path $cosignBin 'cosign'
+        $cosignBody = @'
+#!/bin/sh
+if [ "$1" = version ]; then
+  if [ "$2" = --json ]; then
+    [ "$DCG_MOCK_COSIGN_JSON" = 0 ] && exit 1
+    printf '{\n  "gitVersion": "%s",\n  "gitTreeState": "dirty"\n}\n' "$DCG_MOCK_COSIGN_VERSION"
+  else
+    printf 'GitVersion:    %s\nGitTreeState:  dirty\n' "$DCG_MOCK_COSIGN_VERSION"
+  fi
+  exit 0
+fi
+if [ "$1" = verify-blob ] && [ "$2" = --help ]; then
+  echo 'Usage: cosign verify-blob --bundle FILE --key FILE'
+  exit 0
+fi
+printf '%s\n' "$*" > "$DCG_COSIGN_ARGS_FILE"
+case " $* " in
+  *" --key "*) exit 0 ;;
+  *) exit 1 ;;
+esac
+'@
+        Set-Content -LiteralPath $cosignMock -Value ($cosignBody -replace "`r`n", "`n") -Encoding ascii -NoNewline
+        & chmod +x $cosignMock
+        # The bundle is copied into -TempDirectory, so it must live elsewhere.
+        $bundle = Join-Path $cosignBin "release.sigstore.json"
+        Set-Content -LiteralPath $bundle -Value "{}" -NoNewline
+        $env:PATH = "$cosignBin$([System.IO.Path]::PathSeparator)$savedPath"
+        $env:DCG_COSIGN_ARGS_FILE = Join-Path $tmp "cosign.args"
+        $sigstoreCases = @(
+            @('v3.1.3+dirty', '1', $true, 'JSON gitVersion with build metadata is verified'),
+            @('v3.1.3+dirty', '0', $true, 'plain-text GitVersion fallback is verified'),
+            @('v3.0.3+dirty', '1', $false, 'a vulnerable release with build metadata is still skipped')
+        )
+        foreach ($case in $sigstoreCases) {
+            Remove-Item -LiteralPath $env:DCG_COSIGN_ARGS_FILE -Force -ErrorAction SilentlyContinue
+            $env:DCG_MOCK_COSIGN_VERSION = $case[0]
+            $env:DCG_MOCK_COSIGN_JSON = $case[1]
+            Invoke-DcgSigstoreVerification -ArtifactPath $zip -BundleSource $bundle -TempDirectory $tmp `
+                -IdentityRegex 'unused' -OidcIssuer 'unused'
+            $ran = Test-Path -LiteralPath $env:DCG_COSIGN_ARGS_FILE
+            Check ($ran -eq $case[2]) "$($case[3]) [$($case[0])]"
+            if ($case[2] -and $ran) {
+                Check ((Get-Content -Raw -LiteralPath $env:DCG_COSIGN_ARGS_FILE) -match '--key') `
+                    "verifies against the pinned release key [$($case[0])]"
+            }
+        }
+        Remove-Item Env:DCG_MOCK_COSIGN_VERSION, Env:DCG_MOCK_COSIGN_JSON, Env:DCG_COSIGN_ARGS_FILE -ErrorAction SilentlyContinue
+    }
 } finally {
     $env:PATH = $savedPath
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue

@@ -527,3 +527,418 @@ fn many_command_string_runners_answer_fast_and_fail_closed() {
         started.elapsed()
     );
 }
+
+/// Fifth review of the command-string runners (2bd9167). Each positive row
+/// was allowed through the hook on 2bd9167 (and on 90f3ba6):
+///
+/// - `2>&1`, `>&2` and `<&0` carry their target, but were taken to consume
+///   the next word, so the runner behind them was read as a file name;
+/// - `function NAME { … }` and `coproc NAME { … }` read NAME as the command,
+///   so the body's first word was an argument;
+/// - a redirect before the payload ended the runner's words (`watch
+///   2>/dev/null '<cmd>'`, `ssh host 2>/dev/null '<cmd>'`), although the
+///   local shell removes it wherever it stands;
+/// - a quoted or escaped runner name (`\watch`, `w\atch`, `'su'`, `\ssh`)
+///   was not recognized, and the substring prefilter never saw `w\atch`;
+/// - a process substitution (`cat <(watch '<cmd>')`) is one word to the
+///   tokenizer, so the runner inside it was never at a command position;
+/// - `chrt`, `busybox`, `eatmydata`, `fakeroot`, `cgexec`, `flatpak-spawn`,
+///   `pkexec` and `run0` run their arguments but were not known wrappers
+///   (`eatmydata git reset --hard` itself was allowed).
+#[test]
+fn command_string_runners_behind_fd_duplications_names_quoting_and_substitutions_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "2>&1 watch 'git reset --hard'",
+        ">&2 su -c 'rm -rf ./build'",
+        "<&0 watch 'git reset --hard'",
+        "FOO=1 2>&1 watch 'git reset --hard'",
+        "function f { watch 'git reset --hard'; }; f",
+        "function f { parallel ::: 'rm -rf ./build'; }; f",
+        "coproc NAME { su -c 'git reset --hard'; }",
+        "watch 2>/dev/null 'git reset --hard'",
+        "watch > /dev/null 'rm -rf ./build'",
+        "su 2>/dev/null -c 'git reset --hard'",
+        "env >/dev/null -S'git reset --hard'",
+        "parallel 2>/dev/null ::: 'git reset --hard'",
+        "ssh host 2>/dev/null 'git reset --hard'",
+        "ssh 2>/dev/null host 'rm -rf ./build'",
+        "\\watch 'git reset --hard'",
+        "w\\atch 'git reset --hard'",
+        "'su' -c 'git reset --hard'",
+        "\"parallel\" ::: 'rm -rf ./build'",
+        "\\ssh host 'git reset --hard'",
+        "'ssh' host 'rm -rf ./build'",
+        "cat <(watch 'git reset --hard')",
+        "diff <(true) <(ssh host 'git reset --hard')",
+        "echo >(su -c 'rm -rf ./build')",
+        "cat <(cat <(env -S'git reset --hard'))",
+        "chrt -f 1 watch 'git reset --hard'",
+        "busybox watch 'git reset --hard'",
+        "fakeroot su -c 'rm -rf ./build'",
+        "cgexec -g cpu:x watch 'git reset --hard'",
+        "eatmydata git reset --hard",
+        "flatpak-spawn --host git reset --hard",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "2>&1 watch 'df -h'",
+        "function f { watch 'ls'; }; f",
+        "echo function watch 'git reset --hard'",
+        "coproc NAME { su -c 'ls'; }",
+        "watch 2>/dev/null 'git status'",
+        "ssh host 'git status' 2>&1",
+        "ssh h \"ls 2>/dev/null\" 2>&1",
+        "ssh host ls /tmp 2>/dev/null",
+        "\\watch 'ls'",
+        "cat <(ls) <(watch -n1 'date')",
+        "diff <(sort a) <(sort b)",
+        "eatmydata git status",
+        "chrt -f 1 watch 'uptime'",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+    // Past the bound on process substitution bodies the reading is partial
+    // and the bounded fallback judges the whole command.
+    let many = format!("cat {}<(watch 'git reset --hard')", "<(ls) ".repeat(70));
+    assert!(lab.claude_hook_denies(&many));
+    assert!(!lab.claude_hook_denies(&format!("cat {}", "<(ls) ".repeat(70))));
+}
+
+/// Fifth review: a pipeline of thousands of stages went to the bash parser,
+/// which reads one long pipeline in superlinear time, so the hook answered
+/// `ask` after its deadline, seconds late (`x | env | … | env -S 'ls'`,
+/// 60 KB: ~9 s). Past `MAX_PARSED_PIPELINE_STAGES` it is not parsed and its
+/// unverified consumers fail closed at once; below it nothing changes.
+#[test]
+fn a_pipeline_of_thousands_of_stages_answers_fast() {
+    let lab = Lab::new(DEFAULTS);
+    let long = format!("x {}| sh -c ls", "| cat ".repeat(3000));
+    let started = std::time::Instant::now();
+    assert!(lab.claude_hook_denies(&long));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    let substitution = format!("echo $(true) {}| sh -c ls", "| cat ".repeat(3000));
+    assert!(lab.claude_hook_denies(&substitution));
+    assert!(!lab.claude_hook_denies(&format!("x {}| sh -c ls", "| cat ".repeat(50))));
+    assert!(!lab.claude_hook_denies(&format!("x {}| sh -c ls", "; cat ".repeat(3000))));
+}
+
+/// Sixth review: a redirect or an option around a shell's `-c` hid the
+/// command string from the inline-script reader, which expected the options
+/// before `-c` and the quoted string right after it. The shell removes a
+/// redirect wherever it stands and takes its first operand as the command
+/// string, so each of these runs `git reset --hard` (bash, dash, zsh and
+/// busybox sh checked). The same redirects (`&>`, `>|`, `{fd}>`), an ANSI-C
+/// quoted name (`wat$'c'h`), a quoted name whose plain spelling also stands
+/// elsewhere (`echo watch; w\atch …`) and a process substitution inside a
+/// word (`--x=<(…)`, which bash expands there too) also still hid a
+/// command-string runner's payload.
+#[test]
+fn shell_command_strings_behind_redirects_and_options_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "sh 2>/dev/null -c 'git reset --hard'",
+        "sh 2>&1 -c 'git reset --hard'",
+        "sh >/dev/null 2>&1 -c 'git reset --hard'",
+        "sh 2> /dev/null -c \"git reset --hard\"",
+        "bash &>/dev/null -c 'git reset --hard'",
+        "zsh >|/tmp/o -c 'git reset --hard'",
+        "dash {fd}>/dev/null -c 'git reset --hard'",
+        "busybox sh 2>/dev/null -c 'git reset --hard'",
+        "sudo ksh 2>/dev/null -c 'git reset --hard'",
+        "sh -c 2>/dev/null 'git reset --hard'",
+        "sh -c -- 'git reset --hard'",
+        "sh -c - 'git reset --hard'",
+        "sh -c -e \"git reset --hard\"",
+        "bash -c -o errexit 'git reset --hard'",
+        "bash -c 2>&1 -- 'git reset --hard'",
+        "bash +e -c 'git reset --hard'",
+        "bash -c +e 'git reset --hard'",
+        "sh 2>/dev/null -c $CMD",
+        "sh -c -- $CMD",
+        "python3 2>/dev/null -c 'import shutil; shutil.rmtree(\"/etc\")'",
+        "watch &>/dev/null 'git reset --hard'",
+        "watch &>>/tmp/log 'git reset --hard'",
+        "watch >|/tmp/o 'git reset --hard'",
+        ">|/tmp/o watch 'git reset --hard'",
+        "{fd}>/dev/null watch 'git reset --hard'",
+        "watch {fd}>/dev/null 'git reset --hard'",
+        "su &>/dev/null -c 'git reset --hard'",
+        "su -c &>/dev/null 'git reset --hard'",
+        "ssh host &>/dev/null 'git reset --hard'",
+        "ssh host >|/tmp/o 'git reset --hard'",
+        "wat$'c'h 'git reset --hard'",
+        "s$'s'h host 'git reset --hard'",
+        "echo watch; w\\atch 'git reset --hard'",
+        "echo watch; wat$'c'h 'git reset --hard'",
+        "cat --x=<(watch 'git reset --hard')",
+        "cat a<(ssh host 'git reset --hard')",
+        "diff --from-file=<(cat <(watch 'git reset --hard')) b",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "sh 2>/dev/null -c 'ls -la'",
+        "bash -c -- 'echo hi'",
+        "sh -c -e 'git status'",
+        "sh 2>/dev/null -c \"git status\"",
+        "bash -lc 'cargo build' 2>&1 | tail",
+        "bash -c 'git status' >/dev/null 2>&1",
+        "python3 2>/dev/null -c 'print(1)'",
+        "echo 'sh 2>/dev/null -c git reset --hard'",
+        "git commit -m 'sh -c -- git reset --hard is bad'",
+        "watch &>/dev/null 'ls'",
+        "watch >|/tmp/o 'uptime'",
+        "ssh host &>/dev/null 'git status'",
+        "wat$'c'h 'df -h'",
+        "diff --from-file=<(sort a) b<(sort c)",
+        "echo \"--x=<(watch 'git reset --hard')\"",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+}
+
+/// Seventh review: the Windows wrappers did not read the redirect view the
+/// sixth review added for `sh -c`, so `powershell 2>&1 -EncodedCommand …`
+/// and `cmd 2>nul /c …` still hid their payloads; a here-string
+/// (`sh <<<x -c …`) was not taken for a redirect either.
+#[test]
+fn windows_wrappers_and_here_strings_behind_redirects_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    // "git reset --hard" and "Get-Date" as base64 UTF-16LE.
+    let reset = "ZwBpAHQAIAByAGUAcwBlAHQAIAAtAC0AaABhAHIAZAA=";
+    let date = "RwBlAHQALQBEAGEAdABlAA==";
+    for command in [
+        format!("powershell 2>&1 -EncodedCommand {reset}"),
+        "cmd 2>nul /c \"git reset --hard\"".to_string(),
+        "cmd >nul /c git reset --hard".to_string(),
+        "sh <<<x -c 'git reset --hard'".to_string(),
+        "bash <<<'a b' -c 'git reset --hard'".to_string(),
+    ] {
+        assert!(lab.claude_hook_denies(&command), "{command:?}");
+    }
+    for command in [
+        format!("powershell 2>&1 -EncodedCommand {date}"),
+        "cmd 2>nul /c \"dir\"".to_string(),
+        "cmd /c dir 2>nul".to_string(),
+        "sh <<<x -c 'ls'".to_string(),
+        "cat <<<'sh 2>/dev/null -c git reset --hard'".to_string(),
+    ] {
+        assert!(!lab.claude_hook_denies(&command), "{command:?}");
+    }
+}
+
+/// Eighth review (A13): the prose of a data heredoc with an UNQUOTED
+/// delimiter was read as live commands. `cat <<EOF > notes.md` documenting
+/// `watch '…'`, `sh -c '…'` or `ssh h '…'` was denied although `cat` only
+/// stores the text; the quoted-delimiter spelling was allowed. The shell runs
+/// only the body's substitutions while reading it, so those are still judged,
+/// and a body a shell runs — piped to one, fed to one, or written to a file
+/// the same command then runs — is judged whole.
+#[test]
+fn expanding_data_heredoc_bodies_judge_only_what_the_shell_runs() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "cat <<EOF > notes.md\nwatch 'git reset --hard'\nEOF",
+        "cat <<EOF > notes.md\nsh -c 'git reset --hard'\nEOF",
+        "cat <<EOF > notes.md\nsh 2>/dev/null -c 'git reset --hard'\nEOF",
+        "cat <<EOF > notes.md\nuse a<(watch 'git reset --hard')\nEOF",
+        "cat <<EOF > notes.md\nssh h 'git reset --hard'\nEOF",
+        "cat <<-EOF > notes.md\n\tuse a<(watch 'git reset --hard')\n\tEOF",
+        "git commit -F - <<EOF\nfix: cat a<(ssh h 'git reset --hard') was allowed\nEOF",
+        "cat <<EOF > notes.md\neval \"$x\"\nEOF",
+        "cat <<EOF > notes.md\nbuilt $(date +%F): watch 'git reset --hard'\nEOF",
+        "cat <<EOF > notes.md\nrm -rf ~/src\nEOF\ngit add notes.md",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "cat <<EOF > notes.md\n$(git reset --hard)\nEOF",
+        "cat <<EOF > notes.md\n`git reset --hard`\nEOF",
+        "cat <<EOF > notes.md\nx $(watch 'git reset --hard') y\nEOF",
+        "cat <<EOF > notes.md\n${x:-$(git reset --hard)}\nEOF",
+        "cat <<EOF > notes.md\n$(( $(git reset --hard) ))\nEOF",
+        "cat <<EOF > notes.md\n$\\\n(git reset --hard)\nEOF",
+        "cat <<EOF | sh\nwatch 'git reset --hard'\nEOF",
+        "bash <<EOF\nwatch 'git reset --hard'\nEOF",
+        "ssh h <<EOF\ngit reset --hard\nEOF",
+        "tee x.sh <<EOF\nrm -rf ~/src\nEOF\nsh x.sh",
+        "cat <<EOF > x.sh && ./x.sh\nrm -rf ~/src\nEOF",
+        "cat > x.sh <<'EOF'\nrm -rf ~/src\nEOF\ncat x.sh | bash",
+        "cat <<EOF > x.sh; . ./x.sh\ngit reset --hard\nEOF",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+}
+
+/// Eighth review (A14): spellings that still hid a command from the rules
+/// (all allowed on v0.14.4 and v0.15.1).
+#[test]
+fn eighth_review_spellings_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        // A quoted option after a shell's `-c`.
+        "bash -c -o 'errexit' 'git reset --hard'",
+        "sh -c -O 'extglob' 'git reset --hard'",
+        "bash -c '-e' 'git reset --hard'",
+        // A runner named through `$'…'` escapes.
+        "$'\\x77atch' 'git reset --hard'",
+        "$'\\167atch' 'git reset --hard'",
+        "w$'\\x61'tch 'git reset --hard'",
+        // A runner named at run time.
+        "w${x}atch 'git reset --hard'",
+        "${W}atch 'git reset --hard'",
+        "sudo $W 'git reset --hard'",
+        "$(echo watch) 'git reset --hard'",
+        // A command word that is a substitution printing the command.
+        "$(echo git reset --hard)",
+        "$(printf 'git reset --hard')",
+        "$(echo git reset) --hard",
+        "\"$(echo git)\" reset --hard",
+        // A find action spelled through quoting.
+        "find ~/src '-delete'",
+        "find ~/src -de''lete",
+        "find ~/src -de\\lete",
+        "find ~/src -perm -u+x \"-delete\"",
+        // A relative write after `cd` to `/` or an ancestor of a protected root.
+        "cd / && echo x >> etc/sudoers",
+        "cd // && echo x > etc/passwd",
+        "cd /usr/.. && echo x >> etc/sudoers",
+        "cd / ; tee -a etc/sudoers <<< x",
+        "cd /home && echo x >> luna/.netrc",
+        // A dashed Git built-in behind a wrapper.
+        "xargs git-reset --hard",
+        "echo . | xargs -0 git-clean -fdx",
+        "find . -exec git-clean -fdx \\;",
+        // Found by the self-review of this round (pre-existing).
+        "bash '-c' 'git reset --hard'",
+        "bash -o 'errexit' -c 'git reset --hard'",
+        "f'ind' ~/src '-delete'",
+        "echo $\\\n(git reset --hard)",
+        "awk -f - <<'EOF'\nBEGIN{system(\"rm -rf ~/src\")}\nEOF",
+        "echo 'git reset --hard' | while read l; do eval \"$l\"; done",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "bash -c -o 'errexit' 'ls'",
+        "$'\\x77atch' 'uptime'",
+        "w${x}atch 'df -h'",
+        "echo w${x}atch 'git reset --hard'",
+        "$HOME/.local/bin/tool 'git reset --hard'",
+        "sudo -u \"$USER\" git commit -m 'rm -rf is dangerous'",
+        "awk -f prog.awk <<'EOF'\nrm -rf ~/src\nEOF",
+        "$(echo ls) -la",
+        "echo $(echo git reset --hard)",
+        "git commit -m \"$(echo git reset --hard)\"",
+        "find ~/src -name '-delete'",
+        "find ~/src -exec grep '-delete' {} \\;",
+        "cd / && ls etc/sudoers",
+        "cd /tmp && echo x >> etc/sudoers",
+        "xargs git-log",
+        "echo git-reset --hard",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+}
+
+/// Eighth review: a long run of option-like words before a shell's `-c`
+/// (`c -c -c … sh -c '…'`) took seconds; the hook must answer in time and
+/// still find the payload.
+#[test]
+fn long_option_runs_before_a_command_string_answer_fast() {
+    let lab = Lab::new(DEFAULTS);
+    for unit in ["c -", "c -c ", "sh -c -e "] {
+        let long = format!(
+            "{} sh -c 'git reset --hard'",
+            unit.repeat(30_000 / unit.len())
+        );
+        let started = std::time::Instant::now();
+        assert!(lab.claude_hook_denies(&long), "{unit:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{unit:?}: {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+/// bd-2bm3: bash brace-expands a list in command position into the command
+/// it runs, so `{rm,-rf,~}` is `rm -rf ~`; a list whose alternatives are
+/// options makes those options (`rm {-rf,~}`). Lists naming files stay as
+/// they were.
+#[test]
+fn brace_lists_that_make_the_command_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "{rm,-rf,~}",
+        "{git,reset,--hard}",
+        "echo x; {git,reset,--hard}",
+        "sudo {git,reset,--hard}",
+        "{git,reset} --hard",
+        "{rm,-rf} ~/src",
+        "rm {-rf,~/src}",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "echo {a,b}",
+        "mkdir -p src/{a,b}",
+        "{echo,hi}",
+        "cp config.toml{,.bak}",
+        "touch file{1,2,3}",
+        // Judged as the command it becomes, like `rm -rf /tmp/build-x`.
+        "{rm,-rf,/tmp/build-x}",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+}
+
+/// bd-v9hh: a command the shell runs later — a `trap` handler (EXIT fires
+/// when the tool call's shell exits), `PROMPT_COMMAND`, a prompt's
+/// substitutions, the file `BASH_ENV` names — was argv data to every rule.
+#[test]
+fn deferred_shell_commands_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "trap 'rm -rf ~' EXIT",
+        "trap \"git reset --hard\" EXIT; true",
+        "trap -- 'git reset --hard' INT TERM EXIT",
+        "trap 'git reset --hard' ERR; false",
+        "PROMPT_COMMAND='rm -rf ~'",
+        "export PROMPT_COMMAND='git reset --hard'",
+        "PROMPT_COMMAND=('git reset --hard')",
+        "PS1='$(git reset --hard)'",
+        "PS4='`git reset --hard`' bash -xc true",
+        "builtin trap 'rm -rf ~' EXIT",
+        "{ trap 'rm -rf ~' EXIT; }",
+        "(trap 'rm -rf ~' EXIT)",
+        "f() { trap 'rm -rf ~' RETURN; }; f",
+        "BASH_ENV=<(echo 'rm -rf ~') bash -c true",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "trap - EXIT",
+        "trap '' INT",
+        "trap 'rm -f /tmp/lock' EXIT",
+        "tmp=$(mktemp) && trap 'rm -f \"$tmp\"' EXIT",
+        "trap -p",
+        "echo trap 'rm -rf ~' EXIT",
+        "PROMPT_COMMAND='history -a'",
+        "PS1='\\u@\\h:\\w\\$ '",
+        "echo PROMPT_COMMAND='rm -rf ~'",
+        // A handler is judged after the text before it, as if it ran there:
+        // these clean up what that text made or a temporary path.
+        "tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT",
+        "trap 'rm -rf /tmp/build-x' EXIT",
+        "PS4='+ $(date +%s) ' bash -x script.sh",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+}

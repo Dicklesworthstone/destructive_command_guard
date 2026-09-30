@@ -169,14 +169,19 @@ fn ordinary_dangerous_text_in_such_a_body_is_allowed() {
 #[test]
 fn a_body_the_shell_expands_is_still_scanned() {
     // An UNQUOTED delimiter is a real difference: the shell expands the body
-    // before the data sink ever sees it, so the substitution really runs. A fix
-    // for #440 must not extend to these.
+    // before the data sink ever sees it, so its substitutions really run. They
+    // are judged; the Ruby around them is still data.
+    for command in [
+        "cat > /tmp/x.rb <<OUTER\n$(rm -rf /)\nOUTER",
+        "cat > /tmp/x.rb <<OUTER\nx = \"$(eval \"$y\")\"\nOUTER",
+    ] {
+        assert_eq!(decision(command), "deny", "should be denied: {command}");
+    }
     for command in [
         "cat > /tmp/x.rb <<OUTER\neval <<~'S'\n  puts 1\nS\nOUTER",
         "cat > /tmp/x.rb <<OUTER\neval \"$(cat foo)\"\nOUTER",
-        "cat > /tmp/x.rb <<OUTER\n$(rm -rf /)\nOUTER",
     ] {
-        assert_eq!(decision(command), "deny", "should be denied: {command}");
+        assert_eq!(decision(command), "allow", "should be allowed: {command}");
     }
 }
 

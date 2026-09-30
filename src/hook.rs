@@ -4425,10 +4425,13 @@ mod tests {
         // commit message must not down-trust real Bash (issue #412). Bodies the
         // masker cannot delimit — an unbalanced quote inside `"$(…)"` defeats
         // the trigger scanner — still widen; that residue is tracked in #412.
+        // An unquoted body that feeds a data sink is data too, except for its
+        // substitutions, which the shell runs.
         for command in [
             "git commit -q -F - <<'EOF'\na \" b\nRead-only\nEOF",
             "cat > msg.txt <<'EOF'\nRemove-Item -Recurse -Force C:\\x\nEOF",
             "git commit -q -m \"$(cat <<'EOF'\nRead-only\nEOF\n)\"",
+            "cat <<EOF\nRemove-Item -Recurse -Force C:\\x\nEOF",
         ] {
             assert_eq!(
                 refine_shell_dialect(command, ShellDialect::Posix),
@@ -4437,10 +4440,10 @@ mod tests {
             );
         }
 
-        // An UNquoted heredoc expands, and anything outside any heredoc body is
-        // still command text, so both still widen.
+        // A substitution in an UNquoted heredoc runs, and anything outside
+        // any heredoc body is still command text, so both still widen.
         for command in [
-            "cat <<EOF\nRemove-Item -Recurse -Force C:\\x\nEOF",
+            "cat <<EOF\n$(Remove-Item -Recurse -Force C:\\x)\nEOF",
             "Remove-Item -Recurse -Force C:\\x; cat <<'EOF'\nRead-only\nEOF",
         ] {
             assert_eq!(
