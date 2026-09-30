@@ -4341,6 +4341,72 @@ fn extract_respelled_commands(
     }
 }
 
+/// `segment` (one simple command) with its brace lists expanded as bash
+/// expands them, when that changes the program or its options (bd-2bm3):
+/// the command word is a list (`{rm,-rf,~}` runs `rm -rf ~`,
+/// `sudo {git,reset,--hard}`), or a list's alternatives are options
+/// (`rm {-rf,~}`). Lists that only name files (`mkdir -p src/{a,b}`,
+/// `cp f{,.bak}`) change neither and give `None`, as does anything
+/// [`crate::packs::core::filesystem::literal_brace_expansions`] declines
+/// (quotes, escapes, `$`, backquotes, ranges).
+pub(crate) fn brace_expanded_command(segment: &str) -> Option<String> {
+    use crate::normalize::NormalizeTokenKind;
+    let tokens = crate::normalize::tokenize_for_normalization(segment);
+    let positions = command_word_positions(segment, &tokens);
+    let primary = primary_command_positions(segment, &tokens, &positions);
+    let at = (0..tokens.len()).find(|&index| primary[index])?;
+    if !tokens[at..]
+        .iter()
+        .take_while(|token| token.kind == NormalizeTokenKind::Word)
+        .any(|token| token.text(segment).is_some_and(|word| word.contains('{')))
+    {
+        return None;
+    }
+    let mut out = segment[..tokens[at].byte_range.start].to_string();
+    let mut changed = false;
+    for (offset, token) in tokens[at..]
+        .iter()
+        .take_while(|token| token.kind == NormalizeTokenKind::Word)
+        .enumerate()
+    {
+        let text = token.text(segment)?;
+        if offset > 0 {
+            out.push(' ');
+        }
+        match crate::packs::core::filesystem::literal_brace_expansions(text) {
+            Some(words)
+                if primary[at + offset] || words.iter().any(|word| word.starts_with('-')) =>
+            {
+                out.push_str(&words.join(" "));
+                changed = true;
+            }
+            _ => out.push_str(text),
+        }
+    }
+    changed.then_some(out)
+}
+
+/// Whether a brace list starts a word (`{rm,-rf,~}`, `rm {-rf,~}`): the cheap
+/// superset of what [`brace_expanded_command`] reads. Each list is scanned a
+/// bounded distance, so a run of `{` stays linear.
+pub(crate) fn may_brace_expand_a_command(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    memchr::memchr_iter(b'{', bytes).any(|at| {
+        let starts_word = at == 0
+            || matches!(
+                bytes[at - 1],
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'('
+            );
+        if !starts_word {
+            return false;
+        }
+        let rest = &bytes[at + 1..bytes.len().min(at + 1 + 256)];
+        rest.iter()
+            .position(|byte| matches!(byte, b'}' | b' ' | b'\t' | b'\n'))
+            .is_some_and(|close| rest[close] == b'}' && rest[..close].contains(&b','))
+    })
+}
+
 /// find primaries that take no value, so the word after one is a primary of
 /// its own rather than that primary's argument.
 const FIND_VALUELESS_PRIMARIES: &[&str] = &[
@@ -5382,6 +5448,29 @@ fn substitution_command_line(
     word: &str,
 ) -> Option<String> {
     let body = whole_substitution_body(word)?;
+    let mut words = echoed_words(body);
+    if words.is_empty() {
+        return None;
+    }
+    // The outer words keep their quoting: the line is parsed again as shell.
+    for token in tokens[index + 1..]
+        .iter()
+        .take_while(|token| token.kind == crate::normalize::NormalizeTokenKind::Word)
+    {
+        if let Some(text) = token.text(command) {
+            words.push(text.to_string());
+        }
+    }
+    Some(words.join(" "))
+}
+
+/// What a command line prints, read as if each of its commands echoed its
+/// arguments: every segment's words after its program, quoting removed,
+/// without `echo`'s leading options or a `printf` format holding a directive.
+/// The model behind [`substitution_command_line`] and the evaluator's
+/// `BASH_ENV=<(…)` view: `echo git reset --hard` and
+/// `printf '%s' 'git reset --hard'` print `git reset --hard`.
+pub(crate) fn echoed_words(body: &str) -> Vec<String> {
     let body_tokens = crate::normalize::tokenize_for_normalization(body);
     let mut words: Vec<String> = Vec::new();
     // The current body segment's program, and whether its leading options
@@ -5414,19 +5503,7 @@ fn substitution_command_line(
         }
         words.push(decoded);
     }
-    if words.is_empty() {
-        return None;
-    }
-    // The outer words keep their quoting: the line is parsed again as shell.
-    for token in tokens[index + 1..]
-        .iter()
-        .take_while(|token| token.kind == crate::normalize::NormalizeTokenKind::Word)
-    {
-        if let Some(text) = token.text(command) {
-            words.push(text.to_string());
-        }
-    }
-    Some(words.join(" "))
+    words
 }
 
 /// Whether a command word holding a run-time expansion may name one of the
@@ -9384,6 +9461,48 @@ mod tests {
             let at = command.find("<<").unwrap();
             assert!(!stdin_is_the_program(command, at), "{command:?}");
         }
+    }
+
+    #[test]
+    fn brace_lists_that_make_the_command_are_expanded() {
+        assert_eq!(
+            brace_expanded_command("{rm,-rf,~}").as_deref(),
+            Some("rm -rf ~")
+        );
+        assert_eq!(
+            brace_expanded_command("{git,reset} --hard x").as_deref(),
+            Some("git reset --hard x")
+        );
+        assert_eq!(
+            brace_expanded_command("sudo {git,reset,--hard}").as_deref(),
+            Some("sudo git reset --hard")
+        );
+        assert_eq!(
+            brace_expanded_command("rm {-rf,~/a}").as_deref(),
+            Some("rm -rf ~/a")
+        );
+        assert_eq!(brace_expanded_command("mkdir -p src/{a,b}"), None);
+        assert_eq!(brace_expanded_command("cp f{,.bak}"), None);
+        assert_eq!(brace_expanded_command("echo {a,b}"), None);
+        assert_eq!(brace_expanded_command("{a}"), None);
+        assert_eq!(brace_expanded_command("{ ls; }"), None);
+
+        for command in ["{rm,-rf,~}", "x; {a,b}", "rm {-rf,~}"] {
+            assert!(may_brace_expand_a_command(command), "{command:?}");
+        }
+        for command in [
+            "mkdir -p src/{a,b}",
+            "cp f{,.bak}",
+            "{ ls; }",
+            "awk '{print}'",
+        ] {
+            assert!(!may_brace_expand_a_command(command), "{command:?}");
+        }
+        // A run of `{` is scanned a bounded distance per brace.
+        let long = "{".repeat(200_000);
+        let started = Instant::now();
+        assert!(!may_brace_expand_a_command(&long));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

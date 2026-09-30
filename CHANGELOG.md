@@ -41,6 +41,14 @@ yet.
   reserved word (`… | while read l; do eval "$l"; done`). All of these were
   allowed on v0.14.4 and v0.15.1.
 
+- **A brace list that makes the command, and commands the shell runs later,
+  were judged as data.** `{rm,-rf,~}` and `{git,reset,--hard}` run `rm -rf ~`
+  and `git reset --hard` once bash expands them, and `rm {-rf,~}` expands to
+  the same options. A `trap` handler (`trap 'rm -rf ~' EXIT` runs when the
+  tool call's shell exits), `PROMPT_COMMAND`, a prompt's substitutions
+  (`PS1='$(…)'`, `PS4` under `set -x`) and `BASH_ENV=<(…)` hold a command the
+  shell runs later. All were allowed; each is judged now. (bd-2bm3, bd-v9hh)
+
 - **A long run of option-like words before a shell's `-c` took seconds.**
   Each inline-code flag rescanned its segment, so `c -c -c … sh -c '…'` took
   7-16 s at 60 KB; it is linear now (under 0.2 s).

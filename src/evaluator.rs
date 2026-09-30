@@ -13167,6 +13167,41 @@ fn evaluate_command_in_single_dialect_view(
         }
     }
 
+    // A command the shell runs later — a `trap` handler, `PROMPT_COMMAND`, a
+    // prompt's substitutions, what `BASH_ENV=<(…)` prints — and a brace list
+    // that expands into the command (`{rm,-rf,~}`) are data to every rule as
+    // written (bd-v9hh, bd-2bm3). Evaluate each as the command it becomes,
+    // after the text before it, so `tmp=$(mktemp -d); trap 'rm -rf "$tmp"'
+    // EXIT` is judged exactly like `tmp=$(mktemp -d); rm -rf "$tmp"`. Add-only,
+    // like the passes above.
+    if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        for view in posix_deferred_command_views(command) {
+            let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+                &view,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                allow_once_audit,
+                project_path,
+                deadline,
+                ShellDialect::Posix,
+                nested_command_depth + 1,
+                inherited_automated_stdin,
+            );
+            if nested_result_decides(&result) {
+                // The nested span indexes the reconstruction, not this command.
+                if let Some(info) = result.pattern_info.as_mut() {
+                    info.matched_span = None;
+                }
+                return result;
+            }
+            record_nested_allowlist_hit(&mut heredoc_allowlist_hit, &mut result);
+        }
+    }
+
     let posix_executable_masked =
         mask_modeled_posix_executable_assignments(command, &posix_executable_model);
     let command = posix_executable_masked.as_ref();
@@ -14255,6 +14290,128 @@ fn posix_alias_definition_bodies(command: &str) -> Vec<String> {
         }
     }
     bodies
+}
+
+/// The command lines a POSIX command holds for later or spells through a
+/// brace list, each after the text that precedes its segment (bd-v9hh,
+/// bd-2bm3). Bounded.
+///
+/// - `trap [--] HANDLER SIGNAL…`: the handler. `trap - SIG`, `trap '' SIG`,
+///   `trap SIG` and `trap -p` set none.
+/// - `PROMPT_COMMAND=…` (a scalar or an array), assigned before the command
+///   word or by `export`/`declare`/`typeset`/`readonly`/`local`: the value,
+///   run before each prompt.
+/// - `PS0`/`PS1`/`PS2`/`PS4` so assigned whose value holds `$(`/backquotes:
+///   `: VALUE`, whose substitutions run when the prompt is shown (`PS4`
+///   under `set -x`).
+/// - `BASH_ENV=<(…)`/`ENV=<(…)`: what the process substitution prints,
+///   which a starting shell sources.
+/// - A segment whose brace lists make its program or options:
+///   [`crate::heredoc::brace_expanded_command`].
+fn posix_deferred_command_views(command: &str) -> Vec<String> {
+    const MAX_VIEWS: usize = 16;
+    let bytes = command.as_bytes();
+    let trap = command.match_indices("trap").any(|(at, _)| {
+        (at == 0
+            || !(bytes[at - 1].is_ascii_alphanumeric() || matches!(bytes[at - 1], b'_' | b'-')))
+            && bytes.get(at + 4).is_some_and(u8::is_ascii_whitespace)
+    });
+    let variables = command.contains("PROMPT_COMMAND")
+        || command.contains("ENV=<(")
+        || ["PS0", "PS1", "PS2", "PS4"]
+            .iter()
+            .any(|name| command.contains(name));
+    let brace = crate::heredoc::may_brace_expand_a_command(command);
+    if !trap && !variables && !brace {
+        return Vec::new();
+    }
+    let mut views = Vec::new();
+    for (start, end) in top_level_segment_ranges(command) {
+        if views.len() >= MAX_VIEWS {
+            break;
+        }
+        let prefix = &command[..start];
+        let segment = &command[start..end];
+        if brace && let Some(expanded) = crate::heredoc::brace_expanded_command(segment) {
+            views.push(format!("{prefix}{expanded}"));
+        }
+        if !trap && !variables {
+            continue;
+        }
+        let Ok(words) = shell_words::split(segment.trim()) else {
+            continue;
+        };
+        let mut index = 0usize;
+        let mut declaring = false;
+        while let Some(word) = words.get(index) {
+            if let Some((name, value)) = word.split_once('=')
+                && is_shell_assignment(word)
+            {
+                let name = name.strip_suffix('+').unwrap_or(name);
+                match name {
+                    "PROMPT_COMMAND" if !value.trim().is_empty() => {
+                        // An array's elements arrive with its parentheses.
+                        let value = value.trim_start_matches('(').trim_end_matches(')');
+                        views.push(format!("{prefix}{value}"));
+                    }
+                    "PS0" | "PS1" | "PS2" | "PS4"
+                        if value.contains("$(") || value.contains('`') =>
+                    {
+                        views.push(format!("{prefix}: {value}"));
+                    }
+                    "BASH_ENV" | "ENV" => {
+                        // The raw text: shell word splitting mangles `<(…)`.
+                        if let Some(at) = segment.find(&format!("{name}=<(")) {
+                            let open = at + name.len() + 3;
+                            let segment_bytes = segment.as_bytes();
+                            let close = crate::normalize::consume_shell_paren_construct(
+                                segment_bytes,
+                                open,
+                                segment_bytes.len(),
+                            );
+                            if let Some(body) = segment.get(open..close.saturating_sub(1)) {
+                                let printed = crate::heredoc::echoed_words(body);
+                                if !printed.is_empty() {
+                                    views.push(format!("{prefix}{}", printed.join(" ")));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                index += 1;
+                continue;
+            }
+            if declaring {
+                index += 1;
+                continue;
+            }
+            match word.as_str() {
+                "export" | "declare" | "typeset" | "readonly" | "local" => {
+                    declaring = true;
+                    index += 1;
+                }
+                "trap" => {
+                    let operands: Vec<&String> = words[index + 1..]
+                        .iter()
+                        .skip_while(|word| word.len() > 1 && word.starts_with('-') && *word != "--")
+                        .skip_while(|word| *word == "--")
+                        .take(2)
+                        .collect();
+                    if let [handler, _] = operands.as_slice()
+                        && !handler.is_empty()
+                        && handler.as_str() != "-"
+                    {
+                        views.push(format!("{prefix}{handler}"));
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+    views.truncate(MAX_VIEWS);
+    views
 }
 
 fn has_posix_database_executable_alias(command: &str) -> bool {
@@ -28139,6 +28296,46 @@ pub fn apply_branch_strictness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_commands_and_brace_commands_are_viewed_after_their_prefix() {
+        let views = |command: &str| posix_deferred_command_views(command);
+        assert_eq!(views("trap 'rm -rf ~' EXIT"), ["rm -rf ~"]);
+        assert_eq!(
+            views("tmp=$(mktemp -d); trap -- 'rm -rf \"$tmp\"' INT TERM"),
+            ["tmp=$(mktemp -d); rm -rf \"$tmp\""]
+        );
+        assert_eq!(
+            views("export PROMPT_COMMAND='git reset --hard'"),
+            ["git reset --hard"]
+        );
+        assert_eq!(
+            views("PROMPT_COMMAND=('git reset --hard')"),
+            ["git reset --hard"]
+        );
+        assert_eq!(
+            views("PS1='$(git reset --hard)'"),
+            [": $(git reset --hard)"]
+        );
+        assert_eq!(
+            views("BASH_ENV=<(echo 'rm -rf ~') bash -c true"),
+            ["rm -rf ~"]
+        );
+        assert_eq!(views("x; {git,reset,--hard}"), ["x; git reset --hard"]);
+        for command in [
+            "trap - EXIT",
+            "trap '' INT",
+            "trap EXIT",
+            "trap -p",
+            "echo trap 'rm -rf ~' EXIT",
+            "echo PROMPT_COMMAND='x'",
+            "PS1='\\u@\\h '",
+            "mkdir -p src/{a,b}",
+            "git status",
+        ] {
+            assert!(views(command).is_empty(), "{command:?}");
+        }
+    }
 
     #[test]
     fn cd_directories_resolve_dot_segments_like_logical_cd() {

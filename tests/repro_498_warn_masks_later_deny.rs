@@ -867,3 +867,74 @@ fn long_option_runs_before_a_command_string_answer_fast() {
         );
     }
 }
+
+/// bd-2bm3: bash brace-expands a list in command position into the command
+/// it runs, so `{rm,-rf,~}` is `rm -rf ~`; a list whose alternatives are
+/// options makes those options (`rm {-rf,~}`). Lists naming files stay as
+/// they were.
+#[test]
+fn brace_lists_that_make_the_command_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "{rm,-rf,~}",
+        "{git,reset,--hard}",
+        "echo x; {git,reset,--hard}",
+        "sudo {git,reset,--hard}",
+        "{git,reset} --hard",
+        "{rm,-rf} ~/src",
+        "rm {-rf,~/src}",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "echo {a,b}",
+        "mkdir -p src/{a,b}",
+        "{echo,hi}",
+        "cp config.toml{,.bak}",
+        "touch file{1,2,3}",
+        // Judged as the command it becomes, like `rm -rf /tmp/build-x`.
+        "{rm,-rf,/tmp/build-x}",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+}
+
+/// bd-v9hh: a command the shell runs later — a `trap` handler (EXIT fires
+/// when the tool call's shell exits), `PROMPT_COMMAND`, a prompt's
+/// substitutions, the file `BASH_ENV` names — was argv data to every rule.
+#[test]
+fn deferred_shell_commands_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "trap 'rm -rf ~' EXIT",
+        "trap \"git reset --hard\" EXIT; true",
+        "trap -- 'git reset --hard' INT TERM EXIT",
+        "trap 'git reset --hard' ERR; false",
+        "PROMPT_COMMAND='rm -rf ~'",
+        "export PROMPT_COMMAND='git reset --hard'",
+        "PROMPT_COMMAND=('git reset --hard')",
+        "PS1='$(git reset --hard)'",
+        "PS4='`git reset --hard`' bash -xc true",
+        "BASH_ENV=<(echo 'rm -rf ~') bash -c true",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "trap - EXIT",
+        "trap '' INT",
+        "trap 'rm -f /tmp/lock' EXIT",
+        "tmp=$(mktemp) && trap 'rm -f \"$tmp\"' EXIT",
+        "trap -p",
+        "echo trap 'rm -rf ~' EXIT",
+        "PROMPT_COMMAND='history -a'",
+        "PS1='\\u@\\h:\\w\\$ '",
+        "echo PROMPT_COMMAND='rm -rf ~'",
+        // A handler is judged after the text before it, as if it ran there:
+        // these clean up what that text made or a temporary path.
+        "tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT",
+        "trap 'rm -rf /tmp/build-x' EXIT",
+        "PS4='+ $(date +%s) ' bash -x script.sh",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+}
