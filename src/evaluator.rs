@@ -14343,6 +14343,7 @@ fn posix_deferred_command_views(command: &str) -> Vec<String> {
         };
         let mut index = 0usize;
         let mut declaring = false;
+        let mut function_name = false;
         while let Some(word) = words.get(index) {
             if let Some((name, value)) = word.split_once('=')
                 && is_shell_assignment(word)
@@ -14386,7 +14387,37 @@ fn posix_deferred_command_views(command: &str) -> Vec<String> {
                 index += 1;
                 continue;
             }
-            match word.as_str() {
+            // What may open a command before its program: a group or
+            // subshell (`{ trap …; }`, `(trap …)`), a reserved word
+            // (`then trap …`), `builtin`/`command`, and a function
+            // definition's name (`f() { trap …; }`, `function f { … }`).
+            let bare = word.trim_start_matches(['(', '{']);
+            if std::mem::take(&mut function_name)
+                || bare.is_empty()
+                || word.ends_with("()")
+                || matches!(
+                    bare,
+                    "!" | "if"
+                        | "then"
+                        | "else"
+                        | "elif"
+                        | "do"
+                        | "while"
+                        | "until"
+                        | "time"
+                        | "builtin"
+                        | "command"
+                )
+            {
+                index += 1;
+                continue;
+            }
+            if bare == "function" {
+                function_name = true;
+                index += 1;
+                continue;
+            }
+            match bare {
                 "export" | "declare" | "typeset" | "readonly" | "local" => {
                     declaring = true;
                     index += 1;
@@ -28322,6 +28353,21 @@ mod tests {
             ["rm -rf ~"]
         );
         assert_eq!(views("x; {git,reset,--hard}"), ["x; git reset --hard"]);
+        for command in [
+            "builtin trap 'rm -rf ~' EXIT",
+            "command trap 'rm -rf ~' EXIT",
+            "{ trap 'rm -rf ~' EXIT; }",
+            "(trap 'rm -rf ~' EXIT)",
+            "if true; then trap 'rm -rf ~' EXIT; fi",
+            "f() { trap 'rm -rf ~' RETURN; }; f",
+            "function f { trap 'rm -rf ~' RETURN; }; f",
+        ] {
+            assert!(
+                views(command).iter().any(|view| view.ends_with("rm -rf ~")),
+                "{command:?}: {:?}",
+                views(command)
+            );
+        }
         for command in [
             "trap - EXIT",
             "trap '' INT",

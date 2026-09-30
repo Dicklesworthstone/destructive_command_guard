@@ -915,6 +915,10 @@ fn deferred_shell_commands_are_judged() {
         "PROMPT_COMMAND=('git reset --hard')",
         "PS1='$(git reset --hard)'",
         "PS4='`git reset --hard`' bash -xc true",
+        "builtin trap 'rm -rf ~' EXIT",
+        "{ trap 'rm -rf ~' EXIT; }",
+        "(trap 'rm -rf ~' EXIT)",
+        "f() { trap 'rm -rf ~' RETURN; }; f",
         "BASH_ENV=<(echo 'rm -rf ~') bash -c true",
     ] {
         assert!(lab.claude_hook_denies(command), "{command:?}");
