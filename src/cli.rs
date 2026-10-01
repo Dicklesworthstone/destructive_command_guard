@@ -14670,15 +14670,19 @@ fn project_opencode_plugin_path() -> Result<std::path::PathBuf, Box<dyn std::err
 /// Generate the OpenCode `tool.execute.before` plugin source (#318).
 ///
 /// The legacy OpenCode v1 plugin routes every `bash` tool call through dcg's
-/// Claude-compatible hook protocol: an empty stdout means allow; a
-/// `hookSpecificOutput.permissionDecision` of `deny` (or `ask`, since
-/// OpenCode has no operator-review state) aborts the v1 tool hook by throwing.
+/// Claude-compatible hook protocol with `"dcg_explicit_verdict": true`, so an
+/// allowed command is answered with `{"dcg_verdict":"allow"}` rather than
+/// silence; a `hookSpecificOutput.permissionDecision` of `deny` (or `ask`,
+/// since OpenCode has no operator-review state) aborts the v1 tool hook by
+/// throwing.
 /// OpenCode v2 changed both its module/runtime contract and its interception
 /// APIs; dcg refuses to install or bless this v1 bridge when v2+ is detected
-/// until an authoritative veto path is verified (#419). Infrastructure
-/// failures (dcg missing/unrunnable) fail open with a stderr notice, matching
-/// the hook-envelope failure policy; the *evaluation* itself stays fail-closed
-/// inside dcg.
+/// until an authoritative veto path is verified (#419).
+///
+/// A dcg that ran but gave no verdict (killed by a signal or the plugin's
+/// timeout, a non-zero exit, or exit 0 without the allow line) blocks unless
+/// `DCG_BRIDGE_CRASH_DECISION=allow`. Only a dcg that could not be started at
+/// all (missing or not executable) fails open, with a stderr notice.
 ///
 /// The dcg binary path is embedded as a JSON string literal (valid JSON
 /// strings are valid JS string literals), NOT shell-quoted — the plugin
@@ -14718,16 +14722,38 @@ import {{ spawnSync }} from "node:child_process";
 
 const DCG_BIN = {path_literal};
 
-// Returns a deny reason, or null to allow. Infrastructure failures (dcg
-// missing, unrunnable, timed out) fail OPEN with a stderr notice, matching
-// the hook-envelope failure policy; the *evaluation* itself stays fail-closed
-// inside dcg.
+// dcg's own boolean spelling for environment flags.
+function envFlag(name) {{
+  const value = process.env[name];
+  return typeof value === "string" && ["1", "true", "yes", "y", "on"].includes(value.trim().toLowerCase());
+}}
+
+// dcg ran but gave no verdict: it was killed (a signal, or this plugin's
+// timeout), exited non-zero, or exited 0 without its explicit allow line.
+// That is not an allow. Block, unless the operator opted out with
+// DCG_BRIDGE_CRASH_DECISION=allow.
+function noVerdict(detail) {{
+  const setting = process.env.DCG_BRIDGE_CRASH_DECISION;
+  if (typeof setting === "string" && setting.trim().toLowerCase() === "allow") {{
+    console.error(`[dcg] OpenCode guard got no verdict from dcg (${{detail}}); allowed because DCG_BRIDGE_CRASH_DECISION=allow`);
+    return null;
+  }}
+  console.error(`[dcg] OpenCode guard got no verdict from dcg (${{detail}}); blocking`);
+  return `Blocked by dcg: the command could not be verified because dcg gave no verdict (${{detail}}). Set DCG_BRIDGE_CRASH_DECISION=allow to let commands through when dcg fails.`;
+}}
+
+// Returns a deny reason, or null to allow. dcg is asked for an explicit allow
+// line, so an empty stdout means it never answered. Only a dcg that could not
+// be started at all (missing or not executable) fails OPEN, with a stderr
+// notice, so that a broken install does not block every command.
 function dcgDenyReason(command) {{
   if (typeof command !== "string" || command.length === 0) return null;
+  // dcg's escape hatch exits before reading its input, so it never answers.
+  if (envFlag("DCG_BYPASS")) return null;
   let result;
   try {{
     result = spawnSync(process.env.DCG_BIN || DCG_BIN, {{
-      input: JSON.stringify({{ tool_name: "Bash", tool_input: {{ command }} }}),
+      input: JSON.stringify({{ tool_name: "Bash", tool_input: {{ command }}, dcg_explicit_verdict: true }}),
       encoding: "utf8",
       env: {{ ...process.env, OPENCODE: "1" }},
       timeout: 10000,
@@ -14736,27 +14762,43 @@ function dcgDenyReason(command) {{
     console.error(`[dcg] OpenCode guard could not run dcg: ${{err}}`);
     return null;
   }}
-  if (!result || result.error) {{
-    console.error(`[dcg] OpenCode guard could not run dcg: ${{result && result.error}}`);
+  if (!result) {{
+    console.error("[dcg] OpenCode guard could not run dcg: no result");
+    return null;
+  }}
+  // Never started: Node reports status null, Bun leaves it undefined.
+  if (result.error && result.status == null && !result.signal) {{
+    console.error(`[dcg] OpenCode guard could not run dcg: ${{result.error}}`);
     return null;
   }}
 
   const text = (result.stdout || "").trim();
-  if (!text) return null; // empty stdout = allow
-
-  let decision;
-  try {{
-    decision = JSON.parse(text);
-  }} catch {{
-    return null; // non-JSON stdout: treat as allow (matches other harnesses)
+  let decision = null;
+  if (text) {{
+    try {{
+      decision = JSON.parse(text);
+    }} catch {{
+      decision = null;
+    }}
   }}
-  const hso = decision.hookSpecificOutput;
+  const hso = decision && typeof decision === "object" ? decision.hookSpecificOutput : undefined;
   const verdict = hso && hso.permissionDecision;
-  // OpenCode has no operator-review state, so `ask` fails closed.
+  // OpenCode has no operator-review state, so `ask` fails closed. A blocking
+  // verdict stands whatever happened to the process afterwards.
   if (verdict === "deny" || verdict === "ask") {{
     return (hso && hso.permissionDecisionReason) || "Blocked by dcg";
   }}
-  return null;
+
+  const stderr = (result.stderr || "").trim().slice(-500);
+  const tail = stderr ? `: ${{stderr}}` : "";
+  if (result.signal) {{
+    const timedOut = result.error && result.error.code === "ETIMEDOUT" ? ", timed out" : "";
+    return noVerdict(`dcg was killed by ${{result.signal}}${{timedOut}}${{tail}}`);
+  }}
+  if (result.status !== 0) return noVerdict(`dcg exited ${{result.status}}${{tail}}`);
+  if (!text) return noVerdict(`dcg exited 0 with nothing on stdout${{tail}}`);
+  if (decision && typeof decision === "object" && decision.dcg_verdict === "allow") return null;
+  return noVerdict("dcg stdout was not a verdict");
 }}
 
 // OpenCode v1: named export, hook map, command in `output.args`.
@@ -15605,9 +15647,11 @@ fn project_omp_extension_path() -> std::io::Result<std::path::PathBuf> {
 /// Generate an OMP ExtensionAPI module that gates every `bash` tool call on
 /// dcg's robot-mode evaluator. The command is sent on stdin and dcg is spawned
 /// directly (never through a shell). A deny-like JSON verdict or exit 1 is a
-/// safety block; status-only infrastructure failures fail open with a visible
-/// diagnostic, consistent with dcg's other generated integration bridges,
-/// unless `DCG_UNVERIFIED_DECISION=deny` asks for a block. A cwd that does not
+/// safety block. A dcg that started and then died without a blocking verdict
+/// (a signal, or an exit status dcg never uses for a verdict) is a crash and
+/// blocks unless `DCG_BRIDGE_CRASH_DECISION=allow`; a dcg that could not be
+/// started at all fails open with a visible diagnostic unless
+/// `DCG_UNVERIFIED_DECISION=deny`, which blocks both. A cwd that does not
 /// exist still gets a verdict: dcg starts from its nearest existing ancestor
 /// and receives the real cwd as `--command-cwd` (#504). A
 /// separate generous parent-side ceiling kills a pathologically wedged child;
@@ -15639,7 +15683,7 @@ export const DCG_STDIN_CHUNK_CODE_UNITS = {OMP_CHILD_STDIN_CHUNK_CODE_UNITS};
 const DCG_SIGNAL_CODE_MAX_CHARS = 64;
 type DcgChildOutcome = "spawn-throw" | "exit-0" | "exit-1" | "exit-2" | "exit-other" | "signal";
 type DcgParsedVerdict = "empty" | "malformed" | "allow" | "deny" | "ask" | "indeterminate" | "unknown";
-type DcgBridgeAction = "allow" | "block" | "infrastructure";
+type DcgBridgeAction = "allow" | "block" | "infrastructure" | "crash";
 type DcgParsedOutput = {{
   verdict: DcgParsedVerdict;
   reason?: string;
@@ -15665,14 +15709,17 @@ const BLOCKING_DECISIONS: ReadonlySet<DcgParsedVerdict> = new Set<DcgParsedVerdi
 const DCG_OBSERVATION_ABORTED = Symbol("dcg-child-observation-aborted");
 // Bun exposes no stdout when spawn itself throws, so the runtime catch reads
 // the "spawn-throw" row's empty-output cell: a visible infrastructure failure
-// that the unverified posture may still turn into a block.
+// that the unverified posture may still turn into a block. A dcg that started
+// and then died (a signal, or an exit status dcg never uses for a verdict)
+// without a blocking verdict is a "crash": it blocks unless
+// DCG_BRIDGE_CRASH_DECISION=allow.
 const DCG_CHILD_TRANSITIONS: Record<DcgChildOutcome, Record<DcgParsedVerdict, DcgBridgeAction>> = {{
   "spawn-throw": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
   "exit-0": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
   "exit-1": {{ empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }},
   "exit-2": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
-  "exit-other": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
-  "signal": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
+  "exit-other": {{ empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }},
+  "signal": {{ empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }},
 }};
 
 // OMP's agent loop schema-validates built-in bash arguments before emitting
@@ -15798,6 +15845,19 @@ export function unverifiedPostureDenies(): boolean {{
 
 function unverifiedBlockReason(detail: string): string {{
   return `Blocked by dcg: the command could not be verified (${{detail}}) and DCG_UNVERIFIED_DECISION=deny`;
+}}
+
+// A dcg that started and then crashed or was killed gave no verdict. That
+// blocks by default: dcg ran, so the install works, and the failure says
+// nothing about the command. DCG_BRIDGE_CRASH_DECISION=allow restores the
+// fail-open posture for crashes.
+export function crashPostureAllows(): boolean {{
+  const value = process.env.DCG_BRIDGE_CRASH_DECISION;
+  return typeof value === "string" && value.trim().toLowerCase() === "allow";
+}}
+
+function crashBlockReason(terminationDetail: string): string {{
+  return `Blocked by dcg: dcg ended without a verdict${{terminationDetail}}, so the command could not be verified. Set DCG_BRIDGE_CRASH_DECISION=allow to let commands through when dcg fails.`;
 }}
 
 function isDcgSignalName(signalCode: string): boolean {{
@@ -16280,6 +16340,7 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
     }}
     const hasInfrastructureDiagnostic =
       classification.action === "infrastructure" ||
+      classification.action === "crash" ||
       childOutcome === "exit-other" ||
       isDcgSignalCode(signalCode) ||
       Boolean(protocolDetail) ||
@@ -16290,8 +16351,12 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
       console.error(`[dcg] OMP guard infrastructure failure${{terminationDetail}}${{details ? `: ${{details}}` : ""}}`);
       // A collection fault is not allowed to erase a completed deny-like
       // stdout verdict or the independent blocking exit-1 signal.
-      if (classification.action === "infrastructure" && unverifiedPostureDenies()) {{
+      const unverified = classification.action === "infrastructure" || classification.action === "crash";
+      if (unverified && unverifiedPostureDenies()) {{
         return {{ block: true, reason: unverifiedBlockReason(`dcg infrastructure failure${{terminationDetail}}`) }};
+      }}
+      if (classification.action === "crash" && !crashPostureAllows()) {{
+        return {{ block: true, reason: crashBlockReason(terminationDetail) }};
       }}
       if (classification.action !== "block") return;
     }}
@@ -24783,8 +24848,8 @@ if ($errors.Count -ne 0) {
             r#""exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#,
             r#""exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }"#,
             r#""exit-2": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#,
-            r#""exit-other": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
-            r#""signal": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
+            r#""exit-other": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }"#,
+            r#""signal": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }"#,
         ] {
             assert!(
                 source.contains(row),
@@ -25057,8 +25122,8 @@ const expectedActions = {
   "exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" },
   "exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" },
   "exit-2": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" },
-  "exit-other": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
-  "signal": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
+  "exit-other": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" },
+  "signal": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" },
 } as const;
 const transitionCaseIds: string[] = [];
 for (const outcome of outcomes) {
@@ -25526,6 +25591,12 @@ try {
     };
   };
 
+  // A dcg that started and died without a blocking verdict blocks by default.
+  const crashBlock = (terminationDetail: string) => ({
+    block: true,
+    reason: `Blocked by dcg: dcg ended without a verdict${terminationDetail}, so the command could not be verified. Set DCG_BRIDGE_CRASH_DECISION=allow to let commands through when dcg fails.`,
+  });
+
   let replay = await invoke("callback/other-tool", { toolName: "read", input: {} });
   equal(replay.result, undefined, "callback/other-tool/result");
   equal(replay.spawns.length, 0, "callback/other-tool/spawn-count");
@@ -25755,7 +25826,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitError: "synthetic exit status failure" },
   );
-  equal(replay.result, undefined, "callback/exit-reject-no-verdict/result");
+  equal(replay.result, crashBlock(" (exit status unavailable)"), "callback/exit-reject-no-verdict/result");
   equal(replay.spawns[0]!.killCalls, 1, "callback/exit-reject-no-verdict/direct-child-kill");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status unavailable): exit status failed: Error: synthetic exit status failure"], "callback/exit-reject-no-verdict/diagnostics-without-unobserved-signal");
 
@@ -25788,7 +25859,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { stdout: "", stderr: "child crash", exitCode: 9 },
   );
-  equal(replay.result, undefined, "callback/infrastructure-exit/result");
+  equal(replay.result, crashBlock(" (exit 9)"), "callback/infrastructure-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 9): child crash"], "callback/infrastructure-exit/diagnostics");
 
   replay = await invoke(
@@ -25804,7 +25875,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: 137, signalCode: null },
   );
-  equal(replay.result, undefined, "callback/normal-exit-137/result");
+  equal(replay.result, crashBlock(" (exit 137)"), "callback/normal-exit-137/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137)"], "callback/normal-exit-137/diagnostics");
 
   replay = await invoke(
@@ -25820,7 +25891,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: 137, signalCode: "SIGKILL" },
   );
-  equal(replay.result, undefined, "callback/sigkill-no-verdict/result");
+  equal(replay.result, crashBlock(" (signal SIGKILL)"), "callback/sigkill-no-verdict/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL)"], "callback/sigkill-no-verdict/diagnostics");
 
   replay = await invoke(
@@ -25849,7 +25920,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: undefined },
   );
-  equal(replay.result, undefined, "callback/undefined-exit/result");
+  equal(replay.result, crashBlock(" (exit status unavailable)"), "callback/undefined-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status unavailable)"], "callback/undefined-exit/diagnostics");
 
   replay = await invoke(
@@ -25857,7 +25928,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: null },
   );
-  equal(replay.result, undefined, "callback/null-exit/result");
+  equal(replay.result, crashBlock(" (exit status null)"), "callback/null-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status null)"], "callback/null-exit/diagnostics");
 
   replay = await invoke(
@@ -25865,7 +25936,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: "137\n\u001b[31mFORGED" },
   );
-  equal(replay.result, undefined, "callback/control-exit/result");
+  equal(replay.result, crashBlock(" (exit status invalid: string)"), "callback/control-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status invalid: string)"], "callback/control-exit/diagnostics");
 
   replay = await invoke(
@@ -25873,7 +25944,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: "7".repeat(DCG_STDERR_MAX_BYTES + 1) },
   );
-  equal(replay.result, undefined, "callback/oversized-exit/result");
+  equal(replay.result, crashBlock(" (exit status invalid: string)"), "callback/oversized-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status invalid: string)"], "callback/oversized-exit/diagnostics");
 
   replay = await invoke(
@@ -25881,7 +25952,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: { toString(): string { throw new Error("invalid exit status must not be coerced"); } } },
   );
-  equal(replay.result, undefined, "callback/hostile-object-exit/result");
+  equal(replay.result, crashBlock(" (exit status invalid: object)"), "callback/hostile-object-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status invalid: object)"], "callback/hostile-object-exit/diagnostics");
 
   replay = await invoke(
@@ -25889,7 +25960,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: 137, signalCode: { signal: "SIGKILL" } },
   );
-  equal(replay.result, undefined, "callback/invalid-signal/result");
+  equal(replay.result, crashBlock(" (exit 137)"), "callback/invalid-signal/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137): signal status invalid: object"], "callback/invalid-signal/diagnostics");
 
   replay = await invoke(
@@ -25897,7 +25968,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: 137, signalCode: "SIGKILL\n\u001b[31mFORGED" },
   );
-  equal(replay.result, undefined, "callback/control-signal/result");
+  equal(replay.result, crashBlock(" (exit 137)"), "callback/control-signal/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137): signal status invalid: string"], "callback/control-signal/diagnostics");
 
   replay = await invoke(
@@ -25905,7 +25976,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: 137, signalCode: "S".repeat(DCG_STDERR_MAX_BYTES + 1) },
   );
-  equal(replay.result, undefined, "callback/oversized-signal/result");
+  equal(replay.result, crashBlock(" (exit 137)"), "callback/oversized-signal/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137): signal status invalid: string"], "callback/oversized-signal/diagnostics");
 
   replay = await invoke(
@@ -26090,7 +26161,7 @@ try {
     { stuckUntilTimeout: true },
   );
   check(replay.elapsedMs < 1_000, "callback/timeout-no-verdict/remained-bounded");
-  equal(replay.result, undefined, "callback/timeout-no-verdict/result");
+  equal(replay.result, crashBlock(" (signal SIGKILL)"), "callback/timeout-no-verdict/result");
   equal(replay.spawns.length, 1, "callback/timeout-no-verdict/spawn-count");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL)"], "callback/timeout-no-verdict/diagnostics");
 
@@ -26192,6 +26263,40 @@ try {
   } finally {
     delete process.env.DCG_UNVERIFIED_DECISION;
   }
+
+  // DCG_BRIDGE_CRASH_DECISION=allow restores fail-open for a crash only: a
+  // deny written before the crash, and DCG_UNVERIFIED_DECISION=deny, still win.
+  process.env.DCG_BRIDGE_CRASH_DECISION = " Allow ";
+  try {
+    replay = await invoke(
+      "callback/crash-opt-out-allows",
+      { toolName: "bash", input: { command: "echo safe" } },
+      { exitCode: 137, signalCode: "SIGKILL" },
+    );
+    equal(replay.result, undefined, "callback/crash-opt-out-allows/result");
+    equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL)"], "callback/crash-opt-out-allows/diagnostics");
+
+    replay = await invoke(
+      "callback/crash-opt-out-keeps-deny",
+      { toolName: "bash", input: { command: "danger" } },
+      { stdout: JSON.stringify({ decision: "deny", reason: "deny survives the opt-out" }), exitCode: 9 },
+    );
+    equal(replay.result, { block: true, reason: "deny survives the opt-out" }, "callback/crash-opt-out-keeps-deny/result");
+
+    process.env.DCG_UNVERIFIED_DECISION = "deny";
+    replay = await invoke(
+      "callback/crash-opt-out-loses-to-unverified-deny",
+      { toolName: "bash", input: { command: "echo safe" } },
+      { exitCode: 9 },
+    );
+    equal(replay.result, {
+      block: true,
+      reason: "Blocked by dcg: the command could not be verified (dcg infrastructure failure (exit 9)) and DCG_UNVERIFIED_DECISION=deny",
+    }, "callback/crash-opt-out-loses-to-unverified-deny/result");
+  } finally {
+    delete process.env.DCG_BRIDGE_CRASH_DECISION;
+    delete process.env.DCG_UNVERIFIED_DECISION;
+  }
 } finally {
   (Bun as unknown as { spawn: typeof Bun.spawn }).spawn = originalSpawn;
   console.error = originalConsoleError;
@@ -26244,6 +26349,7 @@ console.log(JSON.stringify({
             .env("DCG_BIN", root.join("ambient-decoy-dcg"))
             .env_remove("PI_NO_PTY")
             .env_remove("DCG_UNVERIFIED_DECISION")
+            .env_remove("DCG_BRIDGE_CRASH_DECISION")
             .output()
             .expect("launch Bun OMP bridge replay")
     }
@@ -26533,6 +26639,9 @@ console.log(JSON.stringify({
                 "callback/infrastructure-exit-unverified-deny",
                 "callback/allow-unaffected-by-unverified-deny",
                 "callback/spawn-throw-unverified-ask",
+                "callback/crash-opt-out-allows",
+                "callback/crash-opt-out-keeps-deny",
+                "callback/crash-opt-out-loses-to-unverified-deny",
             ]
             .map(str::to_string)
         );
@@ -26670,9 +26779,11 @@ console.log(JSON.stringify({
             "the executable corpus vacuously accepted echoing hostile exit-status bytes\nstdout:\n{}",
             String::from_utf8_lossy(&unsafe_exit_mutant_output.stdout)
         );
+        // The crash block reason carries the same termination detail, so the
+        // forged bytes are caught at the case's result or its diagnostics.
         assert!(
             String::from_utf8_lossy(&unsafe_exit_mutant_output.stderr)
-                .contains("callback/control-exit/diagnostics"),
+                .contains("callback/control-exit/"),
             "unsafe invalid-exit mutant red must identify the control-injection callback\nstderr:\n{}",
             String::from_utf8_lossy(&unsafe_exit_mutant_output.stderr)
         );

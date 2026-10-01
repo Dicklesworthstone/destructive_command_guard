@@ -2083,9 +2083,16 @@ fn main() {
             destructive_command_guard::config::UnverifiedDecision::Deny;
     }
 
+    // dcg's OpenCode plugin asks for an explicit allow so that silence can
+    // mean "dcg died" there instead of "allowed".
+    let explicit_verdict = hook_input.requests_explicit_verdict();
+
     let Some(extracted_command) = hook::extract_command_with_context(&hook_input) else {
         // Not a shell tool call: dcg has no opinion, and that is the answer.
         set_hook_panic_policy(None);
+        if explicit_verdict {
+            let _ = hook::output_explicit_allow();
+        }
         return;
     };
     let hook::ExtractedHookCommand {
@@ -2308,6 +2315,13 @@ fn main() {
         }
         EXIT_SUCCESS
     };
+
+    // The command proceeds (allowed, warned, or logged). A caller that asked
+    // for an explicit verdict gets one; when a document was already written
+    // (a deny or ask answered with exit 0) the stdout claim makes this a no-op.
+    if explicit_verdict && exit_code == EXIT_SUCCESS {
+        let _ = hook::output_explicit_allow();
+    }
 
     // A fail-closed exit goes through `process::exit`, which skips `Drop`:
     // flush the audit row first.

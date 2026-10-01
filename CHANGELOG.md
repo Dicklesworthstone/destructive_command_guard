@@ -61,6 +61,26 @@ yet.
   the quoted argument it runs, which the scorer would read as data. The
   hook's reported `confidence` is omitted when the span does not address the
   command.
+- **The OpenCode plugin let a command through when dcg died.** It read
+  dcg's empty stdout as "allow", so a dcg killed by a signal (including the
+  plugin's own timeout), one that exited non-zero, or one that exited 0
+  without answering, allowed the command. The plugin now asks dcg for an
+  explicit `{"dcg_verdict":"allow"}` line and blocks when there is none, with
+  the reason in the error. A dcg that cannot be started at all still fails
+  open, and `DCG_BRIDGE_CRASH_DECISION=allow` restores fail-open for crashes.
+- **The Oh My Pi bridge let a command through when dcg crashed or was
+  killed.** A signal (including the bridge's own timeout kill) or an exit
+  status dcg never uses for a verdict now blocks, unless a deny was already
+  written or `DCG_BRIDGE_CRASH_DECISION=allow` is set. A dcg that cannot be
+  started still fails open, and `DCG_UNVERIFIED_DECISION=deny` still blocks
+  both.
+
+**OpenCode and Oh My Pi users: refresh the plugin or bridge after upgrading**
+(`dcg install --opencode --force`, `dcg install --omp --force`; `dcg update`
+does it for you when its installer detects the agent, unless you pass
+`--no-configure`). The fixes live in the
+generated files. An old file keeps working with the new dcg, without the new
+blocking.
 
 - **A heredoc with an unquoted delimiter that only stores text was judged as
   commands.** `cat <<EOF > notes.md` documenting `watch '…'`, `sh -c '…'`,

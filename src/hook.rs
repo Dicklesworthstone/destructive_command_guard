@@ -145,6 +145,17 @@ pub struct HookInput {
     )]
     pub tool_calls: Option<Vec<ToolCall>>,
 
+    /// Sent only by dcg's own generated OpenCode plugin: `true` asks for an
+    /// explicit allow line ([`EXPLICIT_ALLOW_VERDICT`]) instead of the
+    /// protocol's silent allow.
+    ///
+    /// With silence meaning allow, a caller cannot tell an allowed command
+    /// from a dcg that died before answering. The plugin sets this so that an
+    /// empty stdout means "no verdict" and blocks. No host sends the field, so
+    /// every hook protocol keeps its own allow encoding. Raw JSON value for
+    /// the same parse-robustness reason as `permission_mode`.
+    pub dcg_explicit_verdict: Option<serde_json::Value>,
+
     /// Command strings displaced by a *conflicting* snake_case/camelCase alias
     /// pair in the raw envelope (issue #410).
     ///
@@ -788,6 +799,24 @@ fn deliver_verdict(payload: &[u8]) -> io::Result<()> {
     let mut handle = stdout.lock();
     handle.write_all(payload)?;
     handle.flush()
+}
+
+/// The explicit allow line written for a caller that sent
+/// `"dcg_explicit_verdict": true` (dcg's OpenCode plugin).
+///
+/// Deliberately not any host's allow shape: in Claude Code a
+/// `permissionDecision` of `allow` skips the user's own permission prompt, so
+/// this line uses a dcg-only key that no host acts on.
+pub const EXPLICIT_ALLOW_VERDICT: &[u8] = b"{\"dcg_verdict\":\"allow\"}\n";
+
+/// Write [`EXPLICIT_ALLOW_VERDICT`] unless a verdict document has already
+/// claimed stdout (a deny, ask, or warning was written for this request).
+///
+/// # Errors
+///
+/// The stdout write or flush failed.
+pub fn output_explicit_allow() -> io::Result<()> {
+    deliver_verdict(EXPLICIT_ALLOW_VERDICT)
 }
 
 /// Set once something has begun writing this process's single verdict
@@ -1769,6 +1798,16 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
 }
 
 impl HookInput {
+    /// Whether the caller asked for an explicit allow line (see
+    /// [`Self::dcg_explicit_verdict`]). Only a JSON `true` counts.
+    #[must_use]
+    pub fn requests_explicit_verdict(&self) -> bool {
+        matches!(
+            self.dcg_explicit_verdict,
+            Some(serde_json::Value::Bool(true))
+        )
+    }
+
     /// Whether the payload declares a permission mode in which no human is
     /// guaranteed to answer a prompt (`bypassPermissions`, `dontAsk`).
     ///

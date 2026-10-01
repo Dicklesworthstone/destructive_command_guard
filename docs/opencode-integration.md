@@ -1,6 +1,6 @@
 # OpenCode Integration
 
-> Last updated: 2026-08-19 (first-party plugin, issue #318)
+> Last updated: 2026-10-01 (a dcg that gives no verdict blocks; first-party plugin, issue #318)
 
 [OpenCode](https://opencode.ai) does not expose PreToolUse-style hook config
 files the way Claude Code, Codex, or Gemini do. Its interception surface is a
@@ -29,16 +29,24 @@ The generated `dcg-guard.js`:
 2. Spawns the dcg binary (absolute path embedded at install time — never a
    bare `PATH` lookup, since agent-spawned processes often run with a reduced
    `PATH`) with the Claude-compatible hook envelope on stdin:
-   `{"tool_name":"Bash","tool_input":{"command":"…"}}`, and `OPENCODE=1` in
-   the environment so dcg identifies the calling agent.
-3. Interprets dcg's stdout exactly like the other harnesses: **empty stdout
-   means allow**; a `hookSpecificOutput.permissionDecision` of `"deny"` — or
-   `"ask"`, since OpenCode has no operator-review state, so review requests
-   fail closed — aborts the tool call by throwing an `Error` carrying dcg's
-   full block message (reason, rule id, allow-once code, suggestions).
-4. Fails **open** only on infrastructure errors (dcg binary missing or
-   unrunnable), with a `[dcg]` notice on OpenCode's stderr. The safety
-   *evaluation* itself keeps dcg's bounded fail-closed semantics.
+   `{"tool_name":"Bash","tool_input":{"command":"…"},"dcg_explicit_verdict":true}`,
+   and `OPENCODE=1` in the environment so dcg identifies the calling agent.
+3. Reads dcg's answer. `dcg_explicit_verdict` makes dcg answer an allowed
+   command with `{"dcg_verdict":"allow"}` instead of the silence other hosts
+   get, so silence can mean "dcg never answered". A
+   `hookSpecificOutput.permissionDecision` of `"deny"` — or `"ask"`, since
+   OpenCode has no operator-review state, so review requests fail closed —
+   aborts the tool call by throwing an `Error` carrying dcg's full block
+   message (reason, rule id, allow-once code, suggestions).
+4. **Blocks** when dcg ran but gave no verdict: it was killed by a signal
+   (including the plugin's 10-second timeout), exited non-zero, or exited 0
+   without the allow line. The error says why. A deny dcg wrote before dying
+   still stands with its own reason. Set `DCG_BRIDGE_CRASH_DECISION=allow` in
+   OpenCode's environment to let such commands through instead.
+5. Fails **open** only when dcg cannot be started at all (binary missing or
+   not executable), with a `[dcg]` notice on OpenCode's stderr, so that a
+   broken install does not block every command. `DCG_BYPASS=1` skips the
+   check, as it does in every host.
 
 ## Ownership and uninstall
 
@@ -71,8 +79,8 @@ with `BLOCKED by dcg` and the expected rule id.
 echo '{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}' | dcg
 # → denial JSON on stdout (plugin throws)
 
-echo '{"tool_name":"Bash","tool_input":{"command":"git status"}}' | dcg
-# → empty stdout, exit 0 (plugin allows)
+echo '{"tool_name":"Bash","tool_input":{"command":"git status"},"dcg_explicit_verdict":true}' | dcg
+# → {"dcg_verdict":"allow"}, exit 0 (plugin allows)
 ```
 
 ## Limitations
