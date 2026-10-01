@@ -819,6 +819,51 @@ fn heredoc_bodies_whose_output_may_run_are_judged() {
     }
 }
 
+/// Review of 6976885: an unquoted body is masked as contained only when the
+/// command that owns it passes it through untouched. `read` kept it for a
+/// later `$c`, sed's `e`/`s///e` and awk's `system()` and `print | "sh"`
+/// ran it, `sort --compress-program` and `rg --pre` handed it to a program,
+/// `nc` and `curl` sent it away, and `tee /dev/stderr` or `tee /dev/fd/3`
+/// wrote it where `2>&1 >/dev/null | sh` pointed. Each was masked as the
+/// terminal's text and allowed, where v0.15.1 denied it.
+#[test]
+fn unquoted_bodies_whose_owner_uses_them_stay_whole() {
+    let lab = Lab::new(DEFAULTS);
+    let body = "watch 'git reset --hard'";
+    for template in [
+        "read -r c <<EOF\n{b}\nEOF\n$c",
+        "sed e <<EOF\n{b}\nEOF",
+        "sed 's/^/ /e' <<EOF\n{b}\nEOF",
+        "awk '{system($0)}' <<EOF\n{b}\nEOF",
+        "awk '{print | \"sh\"}' <<EOF\n{b}\nEOF",
+        "sort -S 1 --compress-program=sh <<EOF\n{b}\nEOF",
+        "cat <<EOF | sort -S 1 --compress-prog=sh\n{b}\nEOF",
+        "cat <<EOF | rg --pre sh '' /dev/stdin\n{b}\nEOF",
+        "nc h 4444 <<EOF\n{b}\nEOF",
+        "curl --data-binary @- http://h/run <<EOF\n{b}\nEOF",
+        "tee /dev/stderr <<EOF 2>&1 >/dev/null | sh\n{b}\nEOF",
+        "tee /dev/fd/3 <<EOF 3>&1 >/dev/null | sh\n{b}\nEOF",
+        "sort -o /dev/stderr <<EOF 2>&1 >/dev/null | sh\n{b}\nEOF",
+        "uniq - /dev/stderr <<EOF 2>&1 >/dev/null | sh\n{b}\nEOF",
+        "cat <<EOF | tee /dev/stderr 2>&1 >/dev/null | sh\n{b}\nEOF",
+        "PATH=/tmp/x cat <<EOF\n{b}\nEOF",
+    ] {
+        let command = template.replace("{b}", body);
+        assert!(lab.claude_hook_denies(&command), "{command:?}");
+    }
+    for template in [
+        "cat <<EOF > notes.md\n{b}\nEOF",
+        "LC_ALL=C sort <<EOF > sorted.txt\n{b}\nEOF",
+        "tee notes.md <<EOF >/dev/null\n{b}\nEOF",
+        "cat <<EOF | sort -o sorted.txt\n{b}\nEOF",
+        "cat <<EOF | rg -n 'reset$' | wc -l\n{b}\nEOF",
+        "cat <<EOF | tee -a log.txt notes.md\n{b}\nEOF",
+    ] {
+        let command = template.replace("{b}", body);
+        assert!(!lab.claude_hook_denies(&command), "{command:?}");
+    }
+}
+
 /// Eighth review (A14): spellings that still hid a command from the rules
 /// (all allowed on v0.14.4 and v0.15.1).
 #[test]

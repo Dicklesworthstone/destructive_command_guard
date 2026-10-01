@@ -21,11 +21,15 @@ yet.
 - **A heredoc with an unquoted delimiter that only stores text was judged as
   commands.** `cat <<EOF > notes.md` documenting `watch '…'`, `sh -c '…'`,
   `ssh host '…'` or `eval "$x"` was denied, while the same note behind
-  `<<'EOF'` was allowed. When the data sink's output provably stays put —
-  shown on the terminal, written to a plain file, or piped only through
-  read-only text tools (`wc`, `grep`, `sort`, `tee`, …) — only the parts the
-  shell runs while reading such a body are judged now: `$(…)`, backquotes and
-  arithmetic. Every other unquoted body is judged whole, as in v0.15.1: one
+  `<<'EOF'` was allowed. When the command reading such a body only passes it
+  on as text (`cat`, `grep`, `sort`, `tee` to plain files, …) and its output
+  provably stays put — shown on the terminal, written to a plain file, or
+  piped only through read-only text tools (`wc`, `grep`, `sort`, `tee`, …) —
+  only the parts the shell runs while reading the body are judged now:
+  `$(…)`, backquotes and arithmetic. A body read by a command that uses it
+  (`read c` then `$c`, sed's `e`, awk's `system()`, `nc`, `curl`,
+  `sort --compress-program`, `rg --pre`, `tee /dev/stderr` behind
+  `2>&1 >/dev/null | sh`) is judged whole. Every other unquoted body is judged whole, as in v0.15.1: one
   whose output goes anywhere dcg cannot follow (`>&2`, `> "$f"`, a command
   substitution, an unrecognized pipeline stage, a parse it is unsure of), and
   one whose substitutions cannot be bounded. A body is also judged when it is

